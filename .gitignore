@@ -1,0 +1,34 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+src-tauri/target/
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+*.eden.bak
+*.eden
+
+# Claude Code session files (contain local absolute paths)
+.claude/
+
+# C# reference project — compiled output only, keep source
+EdenWorldManipulator2.0/**/obj/
+EdenWorldManipulator2.0/**/bin/
