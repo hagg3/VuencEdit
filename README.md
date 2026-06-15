@@ -2,7 +2,7 @@
   <img src="assets/logotemp.png" width="300" alt="VuencEdit logo">
 </p>
 
-<h1 align="center">VuencEdit</h1>
+# VuencEdit world editor
 
 A map viewer and block editor for **Eden World Builder** world files (`.eden`).
 
