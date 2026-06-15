@@ -4,7 +4,7 @@
 
 # VuencEdit world editor
 
-A map viewer and block editor for **Eden World Builder** world files (`.eden`). Based on [Eden World Manipulator](https://github.com/jldeiro/EdenWorldManipulator2.0) which itself is built upon [Vuenctools](https://github.com/bLUUBfACE/EdenWorldManipulator) and Robert Munafo's [documentation](https://www.mrob.com/pub/vidgames/eden-file-format.html) on the game's file format
+A map viewer and block editor for **Eden World Builder** world files (`.eden`). Based on [Eden World Manipulator](https://github.com/jldeiro/EdenWorldManipulator2.0) which itself is built upon [Vuenctools](https://github.com/bLUUBfACE/EdenWorldManipulator) and Robert Munafo's [documentation](https://www.mrob.com/pub/vidgames/eden-file-format.html) on the game's file format.
 
 You can open a world file and get a colour-coded top-down map of everything in it. Pan and zoom around, select regions, fill or replace blocks, copy and paste structures, and save your changes. You can also export a PNG of the top-down map.
 
