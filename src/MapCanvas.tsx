@@ -1,7 +1,14 @@
 import { useEffect, useRef, useCallback, forwardRef, useImperativeHandle } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { brushFootprint, bresenhamLine, rectPixels, ellipsePixels, type WP, type BrushShape, type FillMode } from "./drawTools";
 
-export type Tool = "pan" | "select" | "paste";
+export type Tool = "pan" | "select" | "paste" | "pen" | "brush" | "rect" | "ellipse";
+
+export interface DrawConfig {
+  brushSize: number;
+  brushShape: BrushShape;
+  fillMode: FillMode;
+}
 
 /** World pixels per tile side. Each tile is fetched independently via IPC. */
 const TILE = 512;
@@ -34,7 +41,36 @@ interface WorldPoint { x: number; y: number }
 type DragOp =
   | { kind: "pan"; startX: number; startY: number; viewX: number; viewY: number }
   | { kind: "select"; start: WorldPoint; end: WorldPoint }
+  | { kind: "resizeEdge"; edge: "x1" | "x2" | "y1" | "y2"; live: SelectionBounds }
+  | { kind: "draw-stroke"; pts: Set<string>; lastWX: number; lastWY: number }
+  | { kind: "draw-shape"; tool: "rect" | "ellipse"; start: WP; end: WP }
   | null;
+
+const EDGE_HIT_PX = 6;
+
+function hitTestEdge(
+  sx: number, sy: number,
+  sel: SelectionBounds,
+  view: { x: number; y: number; scale: number },
+): "x1" | "x2" | "y1" | "y2" | null {
+  const { x: vx, y: vy, scale } = view;
+  const rx = Math.round(sel.x1 * scale + vx);
+  const ry = Math.round(sel.y1 * scale + vy);
+  const rw = Math.round((sel.x2 - sel.x1 + 1) * scale);
+  const rh = Math.round((sel.y2 - sel.y1 + 1) * scale);
+  const H  = EDGE_HIT_PX;
+  const nearL = Math.abs(sx - rx)        <= H;
+  const nearR = Math.abs(sx - (rx + rw)) <= H;
+  const nearT = Math.abs(sy - ry)        <= H;
+  const nearB = Math.abs(sy - (ry + rh)) <= H;
+  const inX   = sx >= rx - H && sx <= rx + rw + H;
+  const inY   = sy >= ry - H && sy <= ry + rh + H;
+  if (nearL && inY) return "x1";
+  if (nearR && inY) return "x2";
+  if (nearT && inX) return "y1";
+  if (nearB && inX) return "y2";
+  return null;
+}
 
 export interface SelectionBounds {
   x1: number; y1: number; x2: number; y2: number;
@@ -55,9 +91,20 @@ interface Props {
   committedSelection: SelectionBounds | null;
   onSelectionChange: (bounds: SelectionBounds | null) => void;
   pastePreview: { width: number; height: number } | null;
+  clipboardPreviewPixels: { width: number; height: number; pixels: Uint8Array } | null;
   onPasteAt: (pos: { x: number; y: number }) => void;
-  /** "tiled": fetch map in 512px tiles (low RAM). "full": single canvas load (instant pan/zoom). */
-  renderMode: "tiled" | "full";
+  /** "tiled": fetch map in 512px tiles (low RAM). "full": single canvas (instant pan/zoom). "axo": axonometric 3D view. */
+  renderMode: "tiled" | "full" | "axo";
+  /** Axonometric skew (depth) factor — only used when renderMode="axo". */
+  axoSkew?: number;
+  /** When set, the paste ghost box is fixed here (amber) instead of following the cursor (green). */
+  lockedPastePos?: { x: number; y: number } | null;
+  /** Draw tool configuration — only read when tool is pen/brush/rect/ellipse. */
+  drawConfig?: DrawConfig;
+  /** Called when a draw stroke or shape is committed with the list of world positions and the z override (null = surface). */
+  onDrawStroke?: (pts: [number, number][], zOverride: number | null) => void;
+  /** Current z-slice level — used as z override when drawing in z-slice mode. */
+  drawZOverride?: number | null;
 }
 
 function decodePixels(b64: string): Uint8Array {
@@ -71,12 +118,14 @@ type TileJob = { key: string; x1: number; y1: number; x2: number; y2: number };
 
 const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   { world, worldEpoch, tool, viewMode, zSliceZ,
-    committedSelection, onSelectionChange, pastePreview, onPasteAt,
-    renderMode }: Props,
+    committedSelection, onSelectionChange, pastePreview, clipboardPreviewPixels, onPasteAt,
+    renderMode, axoSkew = 0.2, lockedPastePos = null,
+    drawConfig, onDrawStroke, drawZOverride = null }: Props,
   ref,
 ) {
   const canvasRef  = useRef<HTMLCanvasElement>(null);
   const viewRef    = useRef({ x: 0, y: 0, scale: 2 });
+  const clipboardImgRef = useRef<HTMLCanvasElement | null>(null);
 
   // Tile state (used in "tiled" mode)
   const tileCacheRef  = useRef<Map<string, HTMLCanvasElement>>(new Map());
@@ -89,8 +138,9 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   const queueRef   = useRef<TileJob[]>([]);
   const drainRef   = useRef<() => void>(() => {});
 
-  // Full-canvas state (used in "full" mode)
+  // Full-canvas state (used in "full" and "axo" modes)
   const renderModeRef     = useRef(renderMode);
+  const axoSkewRef        = useRef(axoSkew);
   const fullCanvasRef     = useRef<HTMLCanvasElement | null>(null);
   // null = not loading; 0–1 = loading in progress (drives progress bar)
   const fullProgressRef   = useRef<number | null>(null);
@@ -105,12 +155,20 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   const pastePreviewRef = useRef(pastePreview);
   const pasteHoverRef   = useRef<WorldPoint | null>(null);
   const cursorPosRef    = useRef<WorldPoint | null>(null);
-  const onSelChangeRef  = useRef(onSelectionChange);
-  const onPasteAtRef    = useRef(onPasteAt);
+  const onSelChangeRef    = useRef(onSelectionChange);
+  const onPasteAtRef      = useRef(onPasteAt);
+  const lockedPastePosRef = useRef(lockedPastePos);
+  const drawConfigRef     = useRef(drawConfig);
+  const onDrawStrokeRef   = useRef(onDrawStroke);
+  const drawZOverrideRef  = useRef(drawZOverride);
 
   useEffect(() => { toolRef.current = tool; }, [tool]);
   useEffect(() => { onSelChangeRef.current = onSelectionChange; }, [onSelectionChange]);
   useEffect(() => { onPasteAtRef.current   = onPasteAt; }, [onPasteAt]);
+  useEffect(() => { lockedPastePosRef.current = lockedPastePos; }, [lockedPastePos]);
+  useEffect(() => { drawConfigRef.current = drawConfig; }, [drawConfig]);
+  useEffect(() => { onDrawStrokeRef.current = onDrawStroke; }, [onDrawStroke]);
+  useEffect(() => { drawZOverrideRef.current = drawZOverride; }, [drawZOverride]);
 
   const mapW = world.width_chunks * 16;
   const mapH = world.height_chunks * 16;
@@ -143,7 +201,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     ctx.scale(scale, scale);
     ctx.imageSmoothingEnabled = false;
 
-    if (renderModeRef.current === "full") {
+    if (renderModeRef.current === "full" || renderModeRef.current === "axo") {
       const fc = fullCanvasRef.current;
       if (fc) ctx.drawImage(fc, 0, 0);
     } else {
@@ -157,9 +215,9 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
 
     ctx.restore();
 
-    // Progress bar while full-map is loading (screen coords, outside world transform)
+    // Progress bar while full-map or axo is loading (screen coords, outside world transform)
     const loadProgress = fullProgressRef.current;
-    if (renderModeRef.current === "full" && loadProgress !== null) {
+    if ((renderModeRef.current === "full" || renderModeRef.current === "axo") && loadProgress !== null) {
       const cx = canvas.width / 2;
       const cy = canvas.height / 2;
       ctx.font = "13px monospace";
@@ -190,6 +248,9 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
       wx1 = Math.min(drag.start.x, drag.end.x); wy1 = Math.min(drag.start.y, drag.end.y);
       wx2 = Math.max(drag.start.x, drag.end.x); wy2 = Math.max(drag.start.y, drag.end.y);
       hasSel = true;
+    } else if (drag?.kind === "resizeEdge") {
+      ({ x1: wx1, y1: wy1, x2: wx2, y2: wy2 } = drag.live);
+      hasSel = true;
     } else if (committedSelRef.current) {
       ({ x1: wx1, y1: wy1, x2: wx2, y2: wy2 } = committedSelRef.current);
       hasSel = true;
@@ -209,22 +270,83 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
       ctx.strokeRect(rx + 2.5, ry + 2.5, rw - 5, rh - 5);
     }
 
-    // Paste ghost box
-    if (toolRef.current === "paste" && pastePreviewRef.current && pasteHoverRef.current) {
-      const hw = pasteHoverRef.current;
-      const { width: pw, height: ph } = pastePreviewRef.current;
-      const gx = Math.round(hw.x * scale + vx);
-      const gy = Math.round(hw.y * scale + vy);
-      const gw = Math.round(pw * scale);
-      const gh = Math.round(ph * scale);
-      ctx.fillStyle   = "rgba(34, 197, 94, 0.15)";
-      ctx.fillRect(gx, gy, gw, gh);
-      ctx.strokeStyle = "rgba(255, 255, 255, 0.9)";
-      ctx.lineWidth   = 2;
-      ctx.strokeRect(gx + 0.5, gy + 0.5, gw - 1, gh - 1);
-      ctx.strokeStyle = "rgba(34, 197, 94, 1)";
-      ctx.lineWidth   = 1;
-      ctx.strokeRect(gx + 2.5, gy + 2.5, gw - 5, gh - 5);
+    // Paste ghost box — amber when XY is locked, green when hovering
+    if (toolRef.current === "paste" && pastePreviewRef.current) {
+      const locked = lockedPastePosRef.current;
+      const ghostPos = locked ?? pasteHoverRef.current;
+      if (ghostPos) {
+        const { width: pw, height: ph } = pastePreviewRef.current;
+        const gx = Math.round(ghostPos.x * scale + vx);
+        const gy = Math.round(ghostPos.y * scale + vy);
+        const gw = Math.round(pw * scale);
+        const gh = Math.round(ph * scale);
+        if (clipboardImgRef.current) {
+          ctx.save();
+          ctx.globalAlpha = 0.5;
+          ctx.imageSmoothingEnabled = false;
+          ctx.drawImage(clipboardImgRef.current, gx, gy, gw, gh);
+          ctx.restore();
+        }
+        if (locked) {
+          ctx.fillStyle   = "rgba(251, 191, 36, 0.12)";
+          ctx.fillRect(gx, gy, gw, gh);
+          ctx.strokeStyle = "rgba(255, 255, 255, 0.9)";
+          ctx.lineWidth   = 2;
+          ctx.strokeRect(gx + 0.5, gy + 0.5, gw - 1, gh - 1);
+          ctx.strokeStyle = "rgba(251, 191, 36, 1)";
+          ctx.lineWidth   = 1;
+          ctx.strokeRect(gx + 2.5, gy + 2.5, gw - 5, gh - 5);
+        } else {
+          ctx.fillStyle   = "rgba(34, 197, 94, 0.12)";
+          ctx.fillRect(gx, gy, gw, gh);
+          ctx.strokeStyle = "rgba(255, 255, 255, 0.9)";
+          ctx.lineWidth   = 2;
+          ctx.strokeRect(gx + 0.5, gy + 0.5, gw - 1, gh - 1);
+          ctx.strokeStyle = "rgba(34, 197, 94, 1)";
+          ctx.lineWidth   = 1;
+          ctx.strokeRect(gx + 2.5, gy + 2.5, gw - 5, gh - 5);
+        }
+      }
+    }
+
+    // Draw tool ghost overlay
+    {
+      const drawTool = toolRef.current;
+      const cfg = drawConfigRef.current;
+      const gs = Math.max(1, Math.round(scale));
+      const paintPt = (wx: number, wy: number) => {
+        ctx.fillRect(Math.round(wx * scale + vx), Math.round(wy * scale + vy), gs, gs);
+      };
+      if (drag?.kind === "draw-stroke") {
+        ctx.fillStyle = "rgba(56,189,248,0.55)";
+        for (const key of drag.pts) {
+          const ci = key.indexOf(",");
+          paintPt(parseInt(key.slice(0, ci)), parseInt(key.slice(ci + 1)));
+        }
+      } else if (drag?.kind === "draw-shape" && cfg) {
+        const pts = drag.tool === "rect"
+          ? rectPixels(drag.start, drag.end, cfg.fillMode)
+          : ellipsePixels(drag.start, drag.end, cfg.fillMode);
+        ctx.fillStyle = "rgba(56,189,248,0.55)";
+        for (const p of pts) paintPt(p.x, p.y);
+        // Outline the bounding box
+        ctx.strokeStyle = "rgba(56,189,248,0.9)";
+        ctx.lineWidth = 1;
+        const bx1 = Math.min(drag.start.x, drag.end.x), by1 = Math.min(drag.start.y, drag.end.y);
+        const bx2 = Math.max(drag.start.x, drag.end.x), by2 = Math.max(drag.start.y, drag.end.y);
+        ctx.strokeRect(Math.round(bx1 * scale + vx) + 0.5, Math.round(by1 * scale + vy) + 0.5,
+          Math.round((bx2 - bx1 + 1) * scale), Math.round((by2 - by1 + 1) * scale));
+      } else if (!drag && (drawTool === "pen" || drawTool === "brush") && cfg) {
+        // Cursor preview when hovering (not dragging)
+        const pos = cursorPosRef.current;
+        if (pos) {
+          const pts = drawTool === "pen"
+            ? [pos]
+            : brushFootprint(pos, cfg.brushSize, cfg.brushShape);
+          ctx.fillStyle = "rgba(56,189,248,0.4)";
+          for (const p of pts) paintPt(p.x, p.y);
+        }
+      }
     }
 
     // Cursor coords + zoom level — bottom-right, screen coords
@@ -320,6 +442,10 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
           raw = await invoke<PixelPatchRaw>("render_zslice_patch", {
             z: zSliceZRef.current, x1: 0, y1: y, x2: mW - 1, y2,
           });
+        } else if (renderModeRef.current === "axo") {
+          raw = await invoke<PixelPatchRaw>("render_axo_region", {
+            x1: 0, y1: y, x2: mW - 1, y2, ski: axoSkewRef.current,
+          });
         } else {
           raw = await invoke<PixelPatchRaw>("fetch_tile", { x1: 0, y1: y, x2: mW - 1, y2 });
         }
@@ -344,7 +470,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   // In "full" mode: triggers a full-canvas load if not already cached, then redraws.
 
   const ensureTiles = useCallback(() => {
-    if (renderModeRef.current === "full") {
+    if (renderModeRef.current === "full" || renderModeRef.current === "axo") {
       if (!fullCanvasRef.current) loadFullCanvas();
       draw();
       return;
@@ -409,6 +535,12 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
 
   useImperativeHandle(ref, () => ({
     applyPatch(patch: PixelPatch) {
+      if (renderModeRef.current === "axo") {
+        // Axo: coordinate shift means flat patches land at wrong positions — force full reload
+        fullCanvasRef.current = null;
+        loadFullCanvas();
+        return;
+      }
       if (renderModeRef.current === "full") {
         const fc = fullCanvasRef.current;
         if (!fc) return;
@@ -441,7 +573,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
       draw();
     },
     refetchRegion(x1: number, y1: number, x2: number, y2: number) {
-      if (renderModeRef.current === "full") {
+      if (renderModeRef.current === "full" || renderModeRef.current === "axo") {
         fullCanvasRef.current = null;
         loadFullCanvas();
         return;
@@ -482,6 +614,17 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     if (!pastePreview) pasteHoverRef.current = null;
     draw();
   });
+  useEffect(() => {
+    if (!clipboardPreviewPixels) { clipboardImgRef.current = null; return; }
+    const c = document.createElement("canvas");
+    c.width  = clipboardPreviewPixels.width;
+    c.height = clipboardPreviewPixels.height;
+    const offCtx = c.getContext("2d")!;
+    const img = offCtx.createImageData(c.width, c.height);
+    img.data.set(clipboardPreviewPixels.pixels);
+    offCtx.putImageData(img, 0, 0);
+    clipboardImgRef.current = c;
+  }, [clipboardPreviewPixels]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -519,6 +662,15 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     ensureTiles();
   }, [renderMode, ensureTiles]);
 
+  // Re-render axo canvas when skew slider changes
+  useEffect(() => {
+    axoSkewRef.current = axoSkew;
+    if (renderModeRef.current !== "axo") return;
+    tileEpochRef.current++;
+    fullCanvasRef.current = null;
+    ensureTiles();
+  }, [axoSkew, ensureTiles]);
+
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -548,11 +700,35 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
       return;
     }
     if (toolRef.current === "select") {
+      const sel = committedSelRef.current;
+      if (sel !== null) {
+        const edge = hitTestEdge(e.clientX, e.clientY, sel, viewRef.current);
+        if (edge !== null) {
+          const cur = edge === "x1" || edge === "x2" ? "ew-resize" : "ns-resize";
+          (e.target as HTMLCanvasElement).style.cursor = cur;
+          dragRef.current = { kind: "resizeEdge", edge, live: { ...sel } };
+          draw();
+          return;
+        }
+      }
       const wp = screenToWorld(e.clientX, e.clientY);
       dragRef.current = { kind: "select", start: wp, end: wp };
       draw();
     } else if (toolRef.current === "paste") {
       // paste fires on pointer-up
+    } else if (toolRef.current === "pen" || toolRef.current === "brush") {
+      const wp = screenToWorld(e.clientX, e.clientY);
+      const cfg = drawConfigRef.current;
+      const footprint = (toolRef.current === "pen" || !cfg)
+        ? [wp]
+        : brushFootprint(wp, cfg.brushSize, cfg.brushShape);
+      const pts = new Set<string>(footprint.map(p => `${p.x},${p.y}`));
+      dragRef.current = { kind: "draw-stroke", pts, lastWX: wp.x, lastWY: wp.y };
+      draw();
+    } else if (toolRef.current === "rect" || toolRef.current === "ellipse") {
+      const wp = screenToWorld(e.clientX, e.clientY);
+      dragRef.current = { kind: "draw-shape", tool: toolRef.current, start: wp, end: wp };
+      draw();
     } else {
       dragRef.current = {
         kind: "pan",
@@ -571,8 +747,45 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
       viewRef.current.y = drag.viewY + e.clientY - drag.startY;
       ensureTiles(); // includes draw()
     } else {
-      if (drag?.kind === "select") drag.end = wp;
-      else if (toolRef.current === "paste") pasteHoverRef.current = wp;
+      if (drag?.kind === "resizeEdge") {
+        switch (drag.edge) {
+          case "x1": drag.live.x1 = Math.min(wp.x, drag.live.x2); break;
+          case "x2": drag.live.x2 = Math.max(wp.x, drag.live.x1); break;
+          case "y1": drag.live.y1 = Math.min(wp.y, drag.live.y2); break;
+          case "y2": drag.live.y2 = Math.max(wp.y, drag.live.y1); break;
+        }
+      } else if (drag?.kind === "draw-stroke") {
+        const cfg = drawConfigRef.current;
+        const line = bresenhamLine({ x: drag.lastWX, y: drag.lastWY }, wp);
+        for (const lp of line) {
+          const footprint = (toolRef.current === "pen" || !cfg)
+            ? [lp]
+            : brushFootprint(lp, cfg.brushSize, cfg.brushShape);
+          for (const p of footprint) drag.pts.add(`${p.x},${p.y}`);
+        }
+        drag.lastWX = wp.x;
+        drag.lastWY = wp.y;
+      } else if (drag?.kind === "draw-shape") {
+        drag.end = wp;
+      } else if (drag?.kind === "select") {
+        drag.end = wp;
+      } else if (toolRef.current === "paste") {
+        pasteHoverRef.current = wp;
+      } else if (toolRef.current === "select") {
+        // Hover cursor: show resize cursors near selection edges when idle
+        const canvas = canvasRef.current;
+        if (canvas) {
+          const sel = committedSelRef.current;
+          if (sel !== null) {
+            const edge = hitTestEdge(e.clientX, e.clientY, sel, viewRef.current);
+            if (edge === "x1" || edge === "x2") canvas.style.cursor = "ew-resize";
+            else if (edge === "y1" || edge === "y2") canvas.style.cursor = "ns-resize";
+            else canvas.style.cursor = "crosshair";
+          } else {
+            canvas.style.cursor = "crosshair";
+          }
+        }
+      }
       draw();
     }
   }, [draw, ensureTiles, screenToWorld]);
@@ -581,6 +794,17 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     const drag = dragRef.current;
     if (drag?.kind === "pan") {
       dragRef.current = null;
+      return;
+    }
+    if (drag?.kind === "resizeEdge") {
+      dragRef.current = null;
+      const canvas = canvasRef.current;
+      if (canvas) canvas.style.cursor = "crosshair";
+      // Only commit if the selection wasn't cancelled by Escape mid-drag
+      if (committedSelRef.current !== null) {
+        onSelChangeRef.current({ ...drag.live });
+      }
+      draw();
       return;
     }
     if (drag?.kind === "select") {
@@ -595,6 +819,33 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
       draw();
       return;
     }
+    if (drag?.kind === "draw-stroke") {
+      dragRef.current = null;
+      draw();
+      if (drag.pts.size > 0 && onDrawStrokeRef.current) {
+        const pts = Array.from(drag.pts).map(k => {
+          const ci = k.indexOf(",");
+          return [parseInt(k.slice(0, ci)), parseInt(k.slice(ci + 1))] as [number, number];
+        });
+        onDrawStrokeRef.current(pts, drawZOverrideRef.current);
+      }
+      return;
+    }
+    if (drag?.kind === "draw-shape") {
+      const end = screenToWorld(e.clientX, e.clientY);
+      dragRef.current = null;
+      draw();
+      const cfg = drawConfigRef.current;
+      if (onDrawStrokeRef.current && cfg) {
+        const pts = drag.tool === "rect"
+          ? rectPixels(drag.start, end, cfg.fillMode)
+          : ellipsePixels(drag.start, end, cfg.fillMode);
+        if (pts.length > 0) {
+          onDrawStrokeRef.current(pts.map(p => [p.x, p.y]), drawZOverrideRef.current);
+        }
+      }
+      return;
+    }
     if (toolRef.current === "paste") {
       onPasteAtRef.current(screenToWorld(e.clientX, e.clientY));
     }
@@ -602,6 +853,8 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
 
   const onPointerLeave = useCallback(() => {
     cursorPosRef.current = null;
+    const canvas = canvasRef.current;
+    if (canvas) canvas.style.cursor = toolRef.current === "pan" ? "grab" : "crosshair";
     draw();
   }, [draw]);
 

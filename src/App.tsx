@@ -4,7 +4,10 @@ import { open, save } from "@tauri-apps/plugin-dialog";
 import MapCanvas, { type Tool, type SelectionBounds, type PixelPatch, type MapCanvasRef } from "./MapCanvas";
 import { BLOCK_DEFS, PAINT_COLORS, resolveColor, RAMP_FAMILIES, RAMP_DIRS, rampFamilyBase, rampDirIndex, blockDisplayName } from "./blockDefs";
 import SelectionInspector from "./SelectionInspector";
+import ElevationPreviewPanel from "./ElevationPreviewPanel";
 import HelpModal from "./HelpModal";
+import WorldBrowserModal from "./WorldBrowserModal";
+import UploadModal from "./UploadModal";
 import "./App.css";
 
 // World metadata — pixels are never stored in JS; tiles are fetched on demand.
@@ -13,11 +16,13 @@ interface WorldData {
   width_chunks: number;
   height_chunks: number;
   max_z: number;
+  was_compressed: boolean;
 }
 
 // Raw IPC shapes (pixels still base64) — used only at invoke() callsites before decoding.
 interface PixelPatchRaw { x: number; y: number; width: number; height: number; pixels: string; }
 interface EditResultRaw { patch: PixelPatchRaw; undo_depth: number; redo_depth: number; }
+interface PreviewDataRaw { width: number; height: number; pixels: string; }
 
 function decodePixels(b64: string): Uint8Array {
   const bin = atob(b64);
@@ -39,6 +44,9 @@ export interface ClipboardInfo {
   z_anchor: number;
 }
 
+export type ExtrudeAxis = "z+" | "z-" | "x+" | "x-" | "y+" | "y-";
+export type TreeType = "normal" | "terrain" | "pine" | "tall_pine";
+
 // ── shared styles ────────────────────────────────────────────────────────────
 
 const overlayBtn: React.CSSProperties = {
@@ -56,6 +64,17 @@ const overlayBtnActive: React.CSSProperties = {
   ...overlayBtn,
   background: "rgba(59,130,246,0.5)",
   borderColor: "#3b82f6",
+};
+
+const menuItem: React.CSSProperties = {
+  display: "block", width: "100%", textAlign: "left",
+  background: "none", border: "none", color: "#e2e8f0",
+  padding: "6px 14px", fontSize: 13, cursor: "pointer",
+  lineHeight: "18px",
+};
+
+const menuDivider: React.CSSProperties = {
+  height: 1, background: "#1e293b", margin: "3px 0",
 };
 
 const zInput: React.CSSProperties = {
@@ -81,12 +100,23 @@ function App() {
   const [loading, setLoading] = useState(false);
   const [exporting, setExporting] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [saveCompressed, setSaveCompressed] = useState(false);
+  const [fileMenuOpen, setFileMenuOpen] = useState(false);
+  const fileMenuRef = useRef<HTMLDivElement>(null);
+  const [viewMenuOpen, setViewMenuOpen] = useState(false);
+  const viewMenuRef = useRef<HTMLDivElement>(null);
+  const [drawMenuOpen, setDrawMenuOpen] = useState(false);
+  const drawMenuRef = useRef<HTMLDivElement>(null);
   const [undoDepth, setUndoDepth] = useState(0);
   const [redoDepth, setRedoDepth] = useState(0);
   const [tool, setTool] = useState<Tool>("pan");
   const [sourcePath, setSourcePath] = useState<string | null>(null);
-  const [renderMode, setRenderMode] = useState<"tiled" | "full">("tiled");
+  const [renderMode, setRenderMode] = useState<"tiled" | "full" | "axo">("tiled");
+  const [axoSkew, setAxoSkew] = useState(0.2);
   const [showHelp, setShowHelp] = useState(false);
+  const [showElevationPanel, setShowElevationPanel] = useState(false);
+  const [showWorldBrowser, setShowWorldBrowser] = useState(false);
+  const [showUploadModal, setShowUploadModal] = useState(false);
 
   const [clipboard, setClipboard] = useState<ClipboardInfo | null>(null);
   const [pasteElevationOffset, setPasteElevationOffset] = useState(0);
@@ -94,9 +124,25 @@ function App() {
   const [persistPaste, setPersistPaste] = useState(false);
   const [pasteTerrain, setPasteTerrain] = useState(false);
   const [pasteTerrainAbove, setPasteTerrainAbove] = useState(true);
+  const [lockedPastePos, setLockedPastePos] = useState<{ x: number; y: number } | null>(null);
+  const lockedPastePosRef = useRef<{ x: number; y: number } | null>(null);
+  const [editEpoch, setEditEpoch] = useState(0);
+
+  const [extrudeCount, setExtrudeCount] = useState(2);
+  const [extrudeAxis, setExtrudeAxis]   = useState<ExtrudeAxis>("z+");
+  const [extrudeOpen, setExtrudeOpen]   = useState(true);
+
+  const [brushSize,  setBrushSize]  = useState(3);
+  const [brushShape, setBrushShape] = useState<"sq" | "circ">("sq");
+  const [drawFilled, setDrawFilled] = useState(true);
+
+  const [clipboardPreviewPixels, setClipboardPreviewPixels] = useState<{ width: number; height: number; pixels: Uint8Array } | null>(null);
 
   const appToolRef = useRef<Tool>("pan");
   useEffect(() => { appToolRef.current = tool; }, [tool]);
+  useEffect(() => { lockedPastePosRef.current = lockedPastePos; }, [lockedPastePos]);
+  useEffect(() => { if (tool !== "paste") setLockedPastePos(null); }, [tool]);
+  useEffect(() => { if (lockedPastePos) setShowElevationPanel(true); }, [lockedPastePos]);
 
   // Monotonically increasing counter; incremented at the START of every openFile().
   // Async invokes that captured a prior epoch discard their result on resolution.
@@ -110,6 +156,8 @@ function App() {
 
   const viewModeRef = useRef<"topdown" | "zslice">("topdown");
   useEffect(() => { viewModeRef.current = viewMode; }, [viewMode]);
+  const renderModeRef = useRef<"tiled" | "full" | "axo">("tiled");
+  useEffect(() => { renderModeRef.current = renderMode; }, [renderMode]);
   const zSliceZRef = useRef(32);
   useEffect(() => { zSliceZRef.current = zSliceZ; }, [zSliceZ]);
 
@@ -139,12 +187,49 @@ function App() {
     return () => clearTimeout(timer);
   }, [rawBounds, zMin, zMax]);
 
+  // Fetch top-down clipboard preview whenever clipboard changes.
+  useEffect(() => {
+    if (!clipboard) { setClipboardPreviewPixels(null); return; }
+    invoke<PreviewDataRaw>("render_clipboard_preview")
+      .then(raw => setClipboardPreviewPixels({ ...raw, pixels: decodePixels(raw.pixels) }))
+      .catch(() => setClipboardPreviewPixels(null));
+  }, [clipboard]);
+
   // ── Edit helpers ──────────────────────────────────────────────────────────
+
+  async function handleGenerateTrees(treeType: TreeType, density: number) {
+    if (!selection) return;
+    try {
+      const result = await invoke<EditResultRaw>("generate_trees", {
+        x1: selection.x1, y1: selection.y1, x2: selection.x2, y2: selection.y2,
+        treeType, density,
+      });
+      await applyEditResult(result);
+    } catch (e) { setError(String(e)); }
+  }
+
+  async function handleExtrude(ignoreAir: boolean) {
+    if (!selection) return;
+    try {
+      const result = await invoke<EditResultRaw>("extrude_selection", {
+        x1: selection.x1, y1: selection.y1, x2: selection.x2, y2: selection.y2,
+        zMin: selection.z_min, zMax: selection.z_max,
+        axis: extrudeAxis, count: extrudeCount, ignoreAir,
+      });
+      await applyEditResult(result);
+    } catch (e) { setError(String(e)); }
+  }
 
   async function applyEditResult(raw: EditResultRaw) {
     if (viewModeRef.current === "topdown") {
-      const patch: PixelPatch = { ...raw.patch, pixels: decodePixels(raw.patch.pixels) };
-      mapCanvasRef.current?.applyPatch(patch);
+      if (renderModeRef.current === "axo") {
+        // Axo projection: flat patch positions don't match axo pixel positions, force full re-render
+        const w = world;
+        if (w) mapCanvasRef.current?.refetchRegion(0, 0, w.width_chunks * 16, w.height_chunks * 16);
+      } else {
+        const patch: PixelPatch = { ...raw.patch, pixels: decodePixels(raw.patch.pixels) };
+        mapCanvasRef.current?.applyPatch(patch);
+      }
     } else {
       // z-slice: invalidate and re-fetch the affected tile region
       mapCanvasRef.current?.refetchRegion(
@@ -155,11 +240,12 @@ function App() {
     }
     setUndoDepth(raw.undo_depth);
     setRedoDepth(raw.redo_depth);
+    setEditEpoch(e => e + 1);
   }
 
   async function openFile() {
     const selected = await open({
-      filters: [{ name: "Eden World", extensions: ["eden"] }],
+      filters: [{ name: "Eden World", extensions: ["eden", "zip"] }],
       multiple: false,
     });
     if (!selected || typeof selected !== "string") return;
@@ -182,6 +268,35 @@ function App() {
       setZSliceZ(32);
       setZSliceDisplay(32);
       setClipboard(null);
+      setSaveCompressed(data.was_compressed);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function openFileAt(path: string) {
+    const myEpoch = ++loadEpochRef.current;
+    setLoading(true);
+    setError(null);
+    try {
+      const data = await invoke<WorldData>("load_world", { path });
+      if (loadEpochRef.current !== myEpoch) return;
+      setWorld(data);
+      setWorldEpoch((e) => e + 1);
+      setSourcePath(path);
+      setRawBounds(null);
+      setZMin(0);
+      setZMax(Math.min(63, data.max_z));
+      setTool("pan");
+      setUndoDepth(0);
+      setRedoDepth(0);
+      setViewMode("topdown");
+      setZSliceZ(32);
+      setZSliceDisplay(32);
+      setClipboard(null);
+      setSaveCompressed(data.was_compressed);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -255,6 +370,24 @@ function App() {
     }
   }
 
+  async function mirrorClipboardX() {
+    try {
+      const info = await invoke<ClipboardInfo>("mirror_clipboard_x");
+      setClipboard(info);
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  async function mirrorClipboardY() {
+    try {
+      const info = await invoke<ClipboardInfo>("mirror_clipboard_y");
+      setClipboard(info);
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
   async function pasteAt(pos: { x: number; y: number }) {
     try {
       const result = pasteTerrain
@@ -270,6 +403,40 @@ function App() {
             ignoreAir: pasteIgnoreAir,
           });
       if (!persistPaste) setTool("pan");
+      await applyEditResult(result);
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  function handlePasteClick(pos: { x: number; y: number }) {
+    if (persistPaste) {
+      pasteAt(pos);
+    } else if (lockedPastePos) {
+      pasteAt(lockedPastePos);
+      setLockedPastePos(null);
+    } else {
+      setLockedPastePos(pos);
+    }
+  }
+
+  async function handleDrawStroke(pts: [number, number][], zOverride: number | null) {
+    try {
+      const blocks = pts.map(([x, y]) => ({ x, y, z: zOverride }));
+      const result = await invoke<EditResultRaw>("paint_blocks", {
+        blocks, blockType: fillBlockType, paint: fillPaint,
+      });
+      await applyEditResult(result);
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  async function handleDrawElevation(x: number, y: number, z: number) {
+    try {
+      const result = await invoke<EditResultRaw>("paint_blocks", {
+        blocks: [{ x, y, z }], blockType: fillBlockType, paint: fillPaint,
+      });
       await applyEditResult(result);
     } catch (e) {
       setError(String(e));
@@ -308,7 +475,13 @@ function App() {
       }
       if (!world) return;
       if (e.key === "Escape") {
-        if (appToolRef.current === "paste") {
+        if (lockedPastePosRef.current) {
+          e.preventDefault();
+          setLockedPastePos(null);
+          return;
+        }
+        const t = appToolRef.current;
+        if (t === "paste" || t === "pen" || t === "brush" || t === "rect" || t === "ellipse") {
           e.preventDefault();
           setTool("pan");
         } else {
@@ -322,6 +495,13 @@ function App() {
         mapCanvasRef.current?.resetView();
         return;
       }
+      // Draw tool shortcuts (only when not typing in an input)
+      if (tag !== "INPUT" && tag !== "TEXTAREA" && !e.metaKey && !e.ctrlKey) {
+        if (e.key === "p" || e.key === "P") { e.preventDefault(); setTool("pen"); return; }
+        if (e.key === "b" || e.key === "B") { e.preventDefault(); setTool("brush"); return; }
+        if (e.key === "r" || e.key === "R") { e.preventDefault(); setTool("rect"); return; }
+        if (e.key === "e" || e.key === "E") { e.preventDefault(); setTool("ellipse"); return; }
+      }
       if (!(e.metaKey || e.ctrlKey)) return;
       if (e.key === "z" && !e.shiftKey) { e.preventDefault(); handleUndo(); }
       if ((e.key === "z" && e.shiftKey) || e.key === "y") { e.preventDefault(); handleRedo(); }
@@ -329,6 +509,40 @@ function App() {
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [world, showHelp, handleUndo, handleRedo]);
+
+  // Close menus when clicking outside them.
+  useEffect(() => {
+    if (!fileMenuOpen) return;
+    function handleOutside(e: MouseEvent) {
+      if (fileMenuRef.current && !fileMenuRef.current.contains(e.target as Node)) {
+        setFileMenuOpen(false);
+      }
+    }
+    document.addEventListener("mousedown", handleOutside);
+    return () => document.removeEventListener("mousedown", handleOutside);
+  }, [fileMenuOpen]);
+
+  useEffect(() => {
+    if (!viewMenuOpen) return;
+    function handleOutside(e: MouseEvent) {
+      if (viewMenuRef.current && !viewMenuRef.current.contains(e.target as Node)) {
+        setViewMenuOpen(false);
+      }
+    }
+    document.addEventListener("mousedown", handleOutside);
+    return () => document.removeEventListener("mousedown", handleOutside);
+  }, [viewMenuOpen]);
+
+  useEffect(() => {
+    if (!drawMenuOpen) return;
+    function handleOutside(e: MouseEvent) {
+      if (drawMenuRef.current && !drawMenuRef.current.contains(e.target as Node)) {
+        setDrawMenuOpen(false);
+      }
+    }
+    document.addEventListener("mousedown", handleOutside);
+    return () => document.removeEventListener("mousedown", handleOutside);
+  }, [drawMenuOpen]);
 
   const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
     setRawBounds(bounds);
@@ -338,7 +552,7 @@ function App() {
     setSaving(true);
     setError(null);
     try {
-      await invoke("save_world", { path });
+      await invoke("save_world", { path, compressed: saveCompressed });
     } catch (e) {
       setError(String(e));
     } finally {
@@ -348,12 +562,34 @@ function App() {
 
   async function saveWorldAs() {
     const chosen = await save({
-      filters: [{ name: "Eden World", extensions: ["eden"] }],
+      filters: [{ name: "Eden World", extensions: ["eden", "zip"] }],
       defaultPath: sourcePath ?? undefined,
     });
     if (!chosen) return;
     await saveWorld(chosen);
     setSourcePath(chosen);
+  }
+
+  async function savePrefab() {
+    const path = await save({
+      filters: [{ name: "Eden Prefab", extensions: ["epfab"] }],
+      defaultPath: `${world?.name ?? "prefab"}.epfab`,
+    });
+    if (!path) return;
+    await invoke("save_prefab", { path }).catch((e) => setError(String(e)));
+  }
+
+  async function loadPrefab() {
+    const path = await open({
+      filters: [{ name: "Eden Prefab", extensions: ["epfab"] }],
+      multiple: false,
+    });
+    if (!path || typeof path !== "string") return;
+    const info = await invoke<ClipboardInfo>("load_prefab", { path })
+      .catch((e: unknown) => { setError(String(e)); return null; });
+    if (!info) return;
+    setClipboard(info);
+    setTool("paste");
   }
 
   async function deleteBlocks() {
@@ -399,6 +635,27 @@ function App() {
     setZMax(Math.max(v, zMin));
   }
 
+  const pastePreviewSelection: SelectionInfo | null =
+    lockedPastePos && clipboard
+      ? {
+          x1: lockedPastePos.x,
+          y1: lockedPastePos.y,
+          x2: lockedPastePos.x + clipboard.width - 1,
+          y2: lockedPastePos.y + clipboard.height - 1,
+          z_min: clipboard.z_anchor + pasteElevationOffset,
+          z_max: clipboard.z_anchor + pasteElevationOffset + clipboard.depth - 1,
+          width: clipboard.width,
+          height: clipboard.height,
+          depth: clipboard.depth,
+        }
+      : null;
+
+  type DrawToolKey = "pen" | "brush" | "rect" | "ellipse";
+  const drawToolIcons: Record<DrawToolKey, string> = { pen: "✏", brush: "⬟", rect: "□", ellipse: "○" };
+  const drawToolNames: Record<DrawToolKey, string> = { pen: "Pen", brush: "Brush", rect: "Rect", ellipse: "Ellipse" };
+  const isDrawTool = tool === "pen" || tool === "brush" || tool === "rect" || tool === "ellipse";
+  const swatchColor = resolveColor(fillBlockType, fillPaint);
+
   if (world) {
     return (
       <div style={{ position: "relative", width: "100vw", height: "100vh" }}>
@@ -414,8 +671,14 @@ function App() {
           pastePreview={clipboard && tool === "paste"
             ? { width: clipboard.width, height: clipboard.height }
             : null}
-          onPasteAt={pasteAt}
+          clipboardPreviewPixels={tool === "paste" ? clipboardPreviewPixels : null}
+          onPasteAt={handlePasteClick}
+          lockedPastePos={lockedPastePos}
           renderMode={renderMode}
+          axoSkew={axoSkew}
+          drawConfig={{ brushSize, brushShape, fillMode: drawFilled ? "fill" : "outline" }}
+          onDrawStroke={handleDrawStroke}
+          drawZOverride={viewMode === "zslice" ? zSliceZ : null}
         />
 
         {/* Top-left: world info */}
@@ -441,73 +704,124 @@ function App() {
           </span>
         </div>
 
-        {/* Top-center: tool toggle + view mode */}
+        {/* Top-center: tool buttons + z-slice slider */}
         <div style={{
           position: "absolute", top: 12,
           left: "50%", transform: "translateX(-50%)",
           display: "flex", flexDirection: "column", alignItems: "center", gap: 4,
         }}>
-          {/* Row 1: Pan / Select / Undo / Redo / Top-down / Z-slice */}
           <div style={{ display: "flex", gap: 4 }}>
-            <button onClick={() => setTool("pan")} style={tool === "pan" ? overlayBtnActive : overlayBtn}>
-              Pan
-            </button>
-            <button onClick={() => setTool("select")} style={tool === "select" ? overlayBtnActive : overlayBtn}>
-              Select
-            </button>
+            <button onClick={() => setTool("pan")} style={tool === "pan" ? overlayBtnActive : overlayBtn}>Pan</button>
+            <button onClick={() => setTool("select")} style={tool === "select" ? overlayBtnActive : overlayBtn}>Select</button>
+            <div style={{ width: 1, background: "#334155", margin: "0 2px" }} />
+            <div ref={drawMenuRef} style={{ position: "relative" }}>
+              <button
+                onClick={() => setDrawMenuOpen(v => !v)}
+                style={isDrawTool
+                  ? { ...overlayBtnActive, borderColor: "#f472b6", color: "#fbcfe8" }
+                  : drawMenuOpen
+                    ? { ...overlayBtn, borderColor: "#f472b6", color: "#fbcfe8" }
+                    : overlayBtn}
+                title="Drawing tools (P/B/R/E)"
+              >
+                {isDrawTool ? `${drawToolIcons[tool as DrawToolKey]} ${drawToolNames[tool as DrawToolKey]}` : "Draw"} {drawMenuOpen ? "▴" : "▾"}
+              </button>
+              {drawMenuOpen && (
+                <div style={{
+                  position: "absolute", top: "calc(100% + 6px)", left: "50%", transform: "translateX(-50%)",
+                  background: "#0d1829", border: "1px solid #831843",
+                  borderRadius: 7, padding: "8px", minWidth: 190,
+                  boxShadow: "0 8px 24px rgba(0,0,0,0.6)", zIndex: 200,
+                }}>
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 4, marginBottom: 4 }}>
+                    {(["pen", "brush", "rect", "ellipse"] as const).map(t => (
+                      <button key={t} onClick={() => setTool(t)} style={{
+                        ...overlayBtn, fontSize: 12, padding: "5px 8px", textAlign: "center",
+                        borderColor: tool === t ? "#f472b6" : "#334155",
+                        color: tool === t ? "#fbcfe8" : "#94a3b8",
+                        background: tool === t ? "rgba(244,114,182,0.1)" : "rgba(0,0,0,0.4)",
+                      }}>
+                        {drawToolIcons[t]} {drawToolNames[t]}
+                        <span style={{ color: "#475569", fontSize: 10, marginLeft: 3 }}>({t[0].toUpperCase()})</span>
+                      </button>
+                    ))}
+                  </div>
+                  {isDrawTool && (
+                    <div style={{ borderTop: "1px solid #1e293b", paddingTop: 8 }}>
+                      {tool === "brush" && (
+                        <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+                          <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                            <span style={{ color: "#64748b", fontSize: 11, minWidth: 36 }}>Size</span>
+                            {([1, 3, 5, 7, 9] as const).map(s => (
+                              <button key={s} onClick={() => setBrushSize(s)} style={{
+                                ...overlayBtn, padding: "1px 6px", fontSize: 11,
+                                borderColor: brushSize === s ? "#f472b6" : "#334155",
+                                color: brushSize === s ? "#fbcfe8" : "#94a3b8",
+                              }}>{s}</button>
+                            ))}
+                          </div>
+                          <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                            <span style={{ color: "#64748b", fontSize: 11, minWidth: 36 }}>Shape</span>
+                            <button onClick={() => setBrushShape("sq")} style={{
+                              ...overlayBtn, padding: "1px 8px", fontSize: 11,
+                              borderColor: brushShape === "sq" ? "#f472b6" : "#334155",
+                              color: brushShape === "sq" ? "#fbcfe8" : "#94a3b8",
+                            }}>■ Square</button>
+                            <button onClick={() => setBrushShape("circ")} style={{
+                              ...overlayBtn, padding: "1px 8px", fontSize: 11,
+                              borderColor: brushShape === "circ" ? "#f472b6" : "#334155",
+                              color: brushShape === "circ" ? "#fbcfe8" : "#94a3b8",
+                            }}>● Circle</button>
+                          </div>
+                        </div>
+                      )}
+                      {(tool === "rect" || tool === "ellipse") && (
+                        <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                          <span style={{ color: "#64748b", fontSize: 11, minWidth: 36 }}>Mode</span>
+                          <button onClick={() => setDrawFilled(true)} style={{
+                            ...overlayBtn, padding: "1px 8px", fontSize: 11,
+                            borderColor: drawFilled ? "#f472b6" : "#334155",
+                            color: drawFilled ? "#fbcfe8" : "#94a3b8",
+                          }}>Fill</button>
+                          <button onClick={() => setDrawFilled(false)} style={{
+                            ...overlayBtn, padding: "1px 8px", fontSize: 11,
+                            borderColor: !drawFilled ? "#f472b6" : "#334155",
+                            color: !drawFilled ? "#fbcfe8" : "#94a3b8",
+                          }}>Hollow</button>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                  <div style={{ borderTop: "1px solid #1e293b", marginTop: 8, paddingTop: 8 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+                      <span style={{ color: "#475569", fontSize: 10 }}>DRAWING WITH</span>
+                      <div style={{
+                        width: 12, height: 12, borderRadius: 2, flexShrink: 0,
+                        background: `rgb(${swatchColor[0]},${swatchColor[1]},${swatchColor[2]})`,
+                        border: "1px solid rgba(255,255,255,0.2)",
+                      }} />
+                      <span style={{ color: "#94a3b8", fontSize: 11 }}>
+                        {blockDisplayName(fillBlockType)}{fillPaint > 0 ? ` / paint ${fillPaint}` : ""}
+                      </span>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
             <div style={{ width: 1, background: "#334155", margin: "0 2px" }} />
             <button
               onClick={handleUndo} disabled={undoDepth === 0}
               style={{ ...overlayBtn, opacity: undoDepth === 0 ? 0.4 : 1, cursor: undoDepth === 0 ? "not-allowed" : "pointer" }}
               title="Undo (Cmd+Z)"
-            >
-              Undo
-            </button>
+            >Undo</button>
             <button
               onClick={handleRedo} disabled={redoDepth === 0}
               style={{ ...overlayBtn, opacity: redoDepth === 0 ? 0.4 : 1, cursor: redoDepth === 0 ? "not-allowed" : "pointer" }}
               title="Redo (Cmd+Shift+Z)"
-            >
-              Redo
-            </button>
-            <div style={{ width: 1, background: "#334155", margin: "0 2px" }} />
-            <button
-              onClick={() => setViewMode("topdown")}
-              style={viewMode === "topdown" ? overlayBtnActive : overlayBtn}
-              title="Top-down view: first non-air block per column"
-            >
-              Top-down
-            </button>
-            <button
-              onClick={() => setViewMode("zslice")}
-              style={viewMode === "zslice" ? overlayBtnActive : overlayBtn}
-              title="Z-slice view: horizontal cross-section at a specific height"
-            >
-              Z-slice
-            </button>
-            <div style={{ width: 1, background: "#334155", margin: "0 2px" }} />
-            <button
-              onClick={() => mapCanvasRef.current?.resetView()}
-              style={overlayBtn}
-              title="Zoom to fit entire world in viewport (Home)"
-            >
-              Fit
-            </button>
-            <div style={{ width: 1, background: "#334155", margin: "0 2px" }} />
-            <button
-              onClick={() => setRenderMode(m => m === "tiled" ? "full" : "tiled")}
-              style={renderMode === "full"
-                ? { ...overlayBtn, background: "rgba(217,119,6,0.45)", borderColor: "#d97706", color: "#fde68a" }
-                : overlayBtn}
-              title={renderMode === "full"
-                ? "Full Map mode: entire map loaded in RAM — instant pan/zoom (click to switch to Tiled)"
-                : "Tiled mode: tiles fetched on demand — low RAM (click to switch to Full Map)"}
-            >
-              {renderMode === "full" ? "Full Map" : "Tiled"}
-            </button>
+            >Redo</button>
           </div>
 
-          {/* Row 2: Z slider — only in Z-slice mode */}
+          {/* Z-slice height slider — visible only in Z-slice mode */}
           {viewMode === "zslice" && (
             <div style={{
               display: "flex", alignItems: "center", gap: 8,
@@ -523,43 +837,190 @@ function App() {
                 style={{ width: 140, accentColor: "#3b82f6", cursor: "pointer" }}
                 title={`Z level (0 = bedrock, ${world.max_z} = sky)`}
               />
-              <span style={{
-                color: "#7dd3fc", fontSize: 13, fontVariantNumeric: "tabular-nums",
-                minWidth: 28, textAlign: "right",
-              }}>
+              <span style={{ color: "#7dd3fc", fontSize: 13, fontVariantNumeric: "tabular-nums", minWidth: 28, textAlign: "right" }}>
                 {zSliceDisplay}
               </span>
             </div>
           )}
         </div>
 
-        {/* Top-right: Save / Save As / Export / Open */}
-        <div style={{ position: "absolute", top: 12, right: 12, display: "flex", gap: 8 }}>
-          {sourcePath && (
+        {/* Top-right: View menu + File menu + Help */}
+        <div style={{ position: "absolute", top: 12, right: 12, display: "flex", gap: 6 }}>
+
+          {/* View ▾ dropdown */}
+          <div ref={viewMenuRef} style={{ position: "relative" }}>
             <button
-              onClick={() => saveWorld(sourcePath)}
-              disabled={saving}
-              style={{ ...overlayBtn, color: saving ? "#64748b" : "#e2e8f0", cursor: saving ? "not-allowed" : "pointer" }}
-              title={`Overwrite ${sourcePath}`}
+              onClick={() => { setFileMenuOpen(false); setViewMenuOpen(v => !v); }}
+              style={{
+                ...overlayBtn,
+                borderColor: viewMenuOpen ? "#3b82f6" : undefined,
+                color: viewMenuOpen ? "#93c5fd" : undefined,
+              }}
+              title="View options"
             >
-              {saving ? "Saving…" : "Save"}
+              View {viewMenuOpen ? "▴" : "▾"}
             </button>
-          )}
-          <button
-            onClick={saveWorldAs}
-            disabled={saving}
-            style={{ ...overlayBtn, cursor: saving ? "not-allowed" : "pointer" }}
-            title="Save a copy to a new location"
-          >
-            Save As…
-          </button>
-          <button
-            onClick={exportPng} disabled={exporting}
-            style={{ ...overlayBtn, color: exporting ? "#64748b" : "#e2e8f0", cursor: exporting ? "not-allowed" : "pointer" }}
-          >
-            {exporting ? "Exporting…" : "Export PNG"}
-          </button>
-          <button onClick={openFile} style={overlayBtn}>Open…</button>
+            {viewMenuOpen && (
+              <div style={{
+                position: "absolute", top: "calc(100% + 6px)", right: 0,
+                background: "#0d1829", border: "1px solid #1e40af",
+                borderRadius: 7, padding: "4px 0", minWidth: 200,
+                boxShadow: "0 8px 24px rgba(0,0,0,0.6)", zIndex: 200,
+              }}>
+                {/* View mode */}
+                <div style={{ ...menuItem, color: "#475569", fontSize: 11, cursor: "default", paddingBottom: 2 }}>
+                  MAP VIEW
+                </div>
+                <button
+                  onClick={() => { setViewMenuOpen(false); setViewMode("topdown"); }}
+                  style={menuItem}
+                >
+                  <span style={{ display: "inline-block", width: 16, color: "#3b82f6" }}>{viewMode === "topdown" ? "●" : ""}</span>
+                  Top-down
+                </button>
+                <button
+                  onClick={() => { setViewMenuOpen(false); setViewMode("zslice"); }}
+                  style={menuItem}
+                >
+                  <span style={{ display: "inline-block", width: 16, color: "#3b82f6" }}>{viewMode === "zslice" ? "●" : ""}</span>
+                  Z-slice
+                  {viewMode === "zslice" && <span style={{ marginLeft: 8, color: "#7dd3fc", fontSize: 11 }}>z={zSliceZ}</span>}
+                </button>
+                <div style={menuDivider} />
+                {/* Navigation */}
+                <button
+                  onClick={() => { setViewMenuOpen(false); mapCanvasRef.current?.resetView(); }}
+                  style={{ ...menuItem, display: "flex", justifyContent: "space-between", alignItems: "center" }}
+                >
+                  <span><span style={{ display: "inline-block", width: 16 }} />Fit Map</span>
+                  <span style={{ color: "#475569", fontSize: 11 }}>Home</span>
+                </button>
+                <div style={menuDivider} />
+                {/* Render mode */}
+                <div style={{ ...menuItem, color: "#475569", fontSize: 11, cursor: "default", paddingBottom: 2 }}>
+                  RENDER MODE
+                </div>
+                <button
+                  onClick={() => { setViewMenuOpen(false); setRenderMode("tiled"); }}
+                  style={menuItem}
+                >
+                  <span style={{ display: "inline-block", width: 16, color: "#3b82f6" }}>{renderMode === "tiled" ? "●" : ""}</span>
+                  Tiled
+                  <span style={{ marginLeft: 8, color: "#475569", fontSize: 11 }}>low RAM</span>
+                </button>
+                <button
+                  onClick={() => { setViewMenuOpen(false); setRenderMode("full"); }}
+                  style={menuItem}
+                >
+                  <span style={{ display: "inline-block", width: 16, color: "#d97706" }}>{renderMode === "full" ? "●" : ""}</span>
+                  <span style={{ color: renderMode === "full" ? "#fde68a" : undefined }}>Full Map</span>
+                  <span style={{ marginLeft: 8, color: "#475569", fontSize: 11 }}>fast pan</span>
+                </button>
+                <button
+                  onClick={() => { setViewMenuOpen(false); setRenderMode("axo"); }}
+                  style={menuItem}
+                >
+                  <span style={{ display: "inline-block", width: 16, color: "#10b981" }}>{renderMode === "axo" ? "●" : ""}</span>
+                  <span style={{ color: renderMode === "axo" ? "#6ee7b7" : undefined }}>Axo View</span>
+                  <span style={{ marginLeft: 8, color: "#475569", fontSize: 11 }}>3D depth</span>
+                </button>
+                {renderMode === "axo" && (
+                  <div style={{ padding: "6px 12px 4px", display: "flex", alignItems: "center", gap: 8 }}>
+                    <span style={{ color: "#94a3b8", fontSize: 11, whiteSpace: "nowrap" }}>Depth</span>
+                    <input
+                      type="range" min={0} max={0.5} step={0.02}
+                      value={axoSkew}
+                      onChange={e => setAxoSkew(parseFloat(e.target.value))}
+                      style={{ flex: 1, accentColor: "#10b981", cursor: "pointer" }}
+                    />
+                    <span style={{ color: "#94a3b8", fontSize: 11, width: 28, textAlign: "right" }}>
+                      {axoSkew.toFixed(2)}
+                    </span>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+
+          {/* File ▾ dropdown */}
+          <div ref={fileMenuRef} style={{ position: "relative" }}>
+            <button
+              onClick={() => { setViewMenuOpen(false); setFileMenuOpen(v => !v); }}
+              style={{
+                ...overlayBtn,
+                borderColor: fileMenuOpen ? "#3b82f6" : (saving || exporting ? "#475569" : undefined),
+                color: fileMenuOpen ? "#93c5fd" : undefined,
+              }}
+              title="File operations"
+            >
+              File {fileMenuOpen ? "▴" : "▾"}
+            </button>
+            {fileMenuOpen && (
+              <div style={{
+                position: "absolute", top: "calc(100% + 6px)", right: 0,
+                background: "#0d1829", border: "1px solid #1e40af",
+                borderRadius: 7, padding: "4px 0", minWidth: 170,
+                boxShadow: "0 8px 24px rgba(0,0,0,0.6)", zIndex: 200,
+              }}>
+                {/* Open */}
+                <button onClick={() => { setFileMenuOpen(false); openFile(); }} style={menuItem}>
+                  Open…
+                </button>
+                <div style={menuDivider} />
+                {/* Save (only when a file is open) */}
+                <button
+                  onClick={() => { if (!sourcePath || saving) return; setFileMenuOpen(false); saveWorld(sourcePath); }}
+                  style={{ ...menuItem, opacity: (!sourcePath || saving) ? 0.35 : 1, cursor: (!sourcePath || saving) ? "not-allowed" : "pointer" }}
+                  title={sourcePath ? `Overwrite ${sourcePath}` : "No file open"}
+                >
+                  {saving ? "Saving…" : "Save"}
+                </button>
+                <button
+                  onClick={() => { if (saving) return; setFileMenuOpen(false); saveWorldAs(); }}
+                  style={{ ...menuItem, opacity: saving ? 0.35 : 1, cursor: saving ? "not-allowed" : "pointer" }}
+                >
+                  Save As…
+                </button>
+                {/* Compressed toggle inline in menu */}
+                <div style={menuDivider} />
+                <label style={{ ...menuItem, display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
+                  <input
+                    type="checkbox"
+                    checked={saveCompressed}
+                    onChange={e => setSaveCompressed(e.target.checked)}
+                    style={{ accentColor: "#f59e0b", width: 13, height: 13 }}
+                  />
+                  <span style={{ color: saveCompressed ? "#fcd34d" : "#94a3b8" }}>
+                    Compressed
+                  </span>
+                </label>
+                <div style={menuDivider} />
+                {/* Export + prefab */}
+                <button
+                  onClick={() => { if (exporting) return; setFileMenuOpen(false); exportPng(); }}
+                  style={{ ...menuItem, opacity: exporting ? 0.35 : 1, cursor: exporting ? "not-allowed" : "pointer" }}
+                >
+                  {exporting ? "Exporting…" : "Export PNG"}
+                </button>
+                {world && (
+                  <button onClick={() => { setFileMenuOpen(false); loadPrefab(); }} style={menuItem}>
+                    Load Prefab
+                  </button>
+                )}
+                <div style={menuDivider} />
+                <button onClick={() => { setFileMenuOpen(false); setShowWorldBrowser(true); }} style={menuItem}>
+                  Browse Worlds…
+                </button>
+                {world && (
+                  <button onClick={() => { setFileMenuOpen(false); setShowUploadModal(true); }} style={menuItem}>
+                    Upload to Server…
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
+
+          {/* Help */}
           <button
             onClick={() => setShowHelp(h => !h)}
             style={showHelp ? { ...overlayBtn, background: "rgba(59,130,246,0.35)", borderColor: "#3b82f6" } : overlayBtn}
@@ -575,19 +1036,33 @@ function App() {
           background: "rgba(0,0,0,0.72)", padding: "6px 12px",
           borderRadius: 6, fontSize: 13,
           display: "flex", flexDirection: "column", gap: 6,
-          border: `1px solid ${tool === "paste" ? "#22c55e" : selection ? "#3b82f6" : "#334155"}`,
+          border: `1px solid ${tool === "paste" ? (lockedPastePos ? "#f59e0b" : "#22c55e") : isDrawTool ? "#831843" : selection ? "#3b82f6" : "#334155"}`,
           maxWidth: "calc(100vw - 24px)",
         }}>
 
           {/* Paste mode banner */}
           {tool === "paste" && (
             <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-              <span style={{ color: "#4ade80", fontWeight: 700, fontSize: 12, letterSpacing: "0.05em" }}>
-                PASTE MODE
-              </span>
-              <span style={{ color: "#6b7280", fontSize: 12 }}>
-                click map to place · Esc to cancel
-              </span>
+              {lockedPastePos ? (
+                <>
+                  <span style={{ color: "#fbbf24", fontWeight: 700, fontSize: 12, letterSpacing: "0.05em" }}>
+                    PASTE — LOCKED
+                  </span>
+                  <span style={{ color: "#92400e", fontSize: 11, fontVariantNumeric: "tabular-nums" }}>
+                    X{lockedPastePos.x}, Y{lockedPastePos.y}
+                  </span>
+                  <span style={{ color: "#6b7280", fontSize: 11 }}>· Esc to unlock ·</span>
+                </>
+              ) : (
+                <>
+                  <span style={{ color: "#4ade80", fontWeight: 700, fontSize: 12, letterSpacing: "0.05em" }}>
+                    PASTE MODE
+                  </span>
+                  <span style={{ color: "#6b7280", fontSize: 12 }}>
+                    click map to place · Esc to cancel
+                  </span>
+                </>
+              )}
               {clipboard && (
                 <span style={{ color: "#86efac", fontSize: 11 }}>
                   {clipboard.width}×{clipboard.height}×{clipboard.depth}, z{clipboard.z_anchor + pasteElevationOffset}–{clipboard.z_anchor + pasteElevationOffset + clipboard.depth - 1}
@@ -601,6 +1076,24 @@ function App() {
                 style={{ ...zInput, width: 48 }}
                 title="Vertical offset applied at paste time (does not change clipboard)"
               />
+              {lockedPastePos && (
+                <>
+                  <button
+                    onClick={() => { const p = lockedPastePos; pasteAt(p); setLockedPastePos(null); }}
+                    style={{ ...overlayBtn, padding: "2px 10px", fontSize: 12, borderColor: "#22c55e", color: "#86efac" }}
+                    title="Confirm paste at locked position"
+                  >
+                    Confirm Paste
+                  </button>
+                  <button
+                    onClick={() => setLockedPastePos(null)}
+                    style={{ ...overlayBtn, padding: "2px 10px", fontSize: 12 }}
+                    title="Unlock position — return to hover mode"
+                  >
+                    Unlock
+                  </button>
+                </>
+              )}
               <button
                 onClick={() => setPasteIgnoreAir((v) => !v)}
                 style={{
@@ -618,6 +1111,20 @@ function App() {
                 title="Rotate clipboard 90° clockwise"
               >
                 Rotate 90°
+              </button>
+              <button
+                onClick={mirrorClipboardX}
+                style={{ ...overlayBtn, padding: "2px 10px", fontSize: 12, borderColor: "#a78bfa", color: "#ddd6fe" }}
+                title="Mirror clipboard left↔right (flip on X axis)"
+              >
+                Flip X
+              </button>
+              <button
+                onClick={mirrorClipboardY}
+                style={{ ...overlayBtn, padding: "2px 10px", fontSize: 12, borderColor: "#a78bfa", color: "#ddd6fe" }}
+                title="Mirror clipboard top↔bottom (flip on Y axis)"
+              >
+                Flip Y
               </button>
               <button
                 onClick={() => setPersistPaste((v) => !v)}
@@ -761,6 +1268,20 @@ function App() {
                 Rotate 90°
               </button>
               <button
+                onClick={mirrorClipboardX}
+                style={{ ...overlayBtn, padding: "2px 10px", fontSize: 12, borderColor: "#a78bfa", color: "#ddd6fe" }}
+                title="Mirror clipboard left↔right (flip on X axis)"
+              >
+                Flip X
+              </button>
+              <button
+                onClick={mirrorClipboardY}
+                style={{ ...overlayBtn, padding: "2px 10px", fontSize: 12, borderColor: "#a78bfa", color: "#ddd6fe" }}
+                title="Mirror clipboard top↔bottom (flip on Y axis)"
+              >
+                Flip Y
+              </button>
+              <button
                 onClick={() => setPasteTerrain((v) => !v)}
                 style={{
                   ...overlayBtn, padding: "2px 10px", fontSize: 12,
@@ -806,13 +1327,13 @@ function App() {
             </div>
           )}
 
-          {/* Row 2: block + paint picker — only when selection exists */}
-          {selection && (
+          {/* Row 2: block + paint picker — shown when selection exists or a draw tool is active */}
+          {(selection || isDrawTool) && (
             <div style={{ display: "flex", flexDirection: "column", gap: 6, paddingTop: 4, borderTop: "1px solid #1e293b" }}>
 
               {/* Text summary: selected block name + paint */}
               <div style={{ fontSize: 11, display: "flex", alignItems: "center", gap: 5, flexWrap: "wrap" }}>
-                <span style={{ color: "#64748b" }}>Fill with:</span>
+                <span style={{ color: isDrawTool ? "#f9a8d4" : "#64748b" }}>{isDrawTool ? "Draw with:" : "Fill with:"}</span>
                 <span style={{ color: "#e2e8f0", fontWeight: 600 }}>
                   {blockDisplayName(fillBlockType)}
                 </span>
@@ -969,20 +1490,22 @@ function App() {
                       border: "1px solid #475569",
                     }}
                   />
-                  <button
-                    onClick={fillSelection}
-                    style={{ ...overlayBtn, padding: "2px 10px", fontSize: 12, borderColor: "#22c55e", color: "#86efac", whiteSpace: "nowrap" }}
-                    title="Fill every block in the selection with the chosen type and paint"
-                  >
-                    Fill Selection
-                  </button>
+                  {selection && (
+                    <button
+                      onClick={fillSelection}
+                      style={{ ...overlayBtn, padding: "2px 10px", fontSize: 12, borderColor: "#22c55e", color: "#86efac", whiteSpace: "nowrap" }}
+                      title="Fill every block in the selection with the chosen type and paint"
+                    >
+                      Fill Selection
+                    </button>
+                  )}
                 </div>
               </div>
 
               </div>{/* end pickers row */}
 
-              {/* Row 3: Replace only — filter for selective replace */}
-              <div style={{ borderTop: "1px solid #1e293b", paddingTop: 6, display: "flex", flexDirection: "column", gap: 4 }}>
+              {/* Row 3: Replace only — filter for selective replace (selection required) */}
+              {selection && <div style={{ borderTop: "1px solid #1e293b", paddingTop: 6, display: "flex", flexDirection: "column", gap: 4 }}>
 
                 {/* Summary label for filter */}
                 <div style={{ fontSize: 11, display: "flex", alignItems: "center", gap: 5, flexWrap: "wrap" }}>
@@ -1168,7 +1691,7 @@ function App() {
                   </div>
 
                 </div>{/* end filter pickers row */}
-              </div>{/* end replace-only section */}
+              </div>}{/* end replace-only section */}
 
             </div>
           )}
@@ -1179,6 +1702,31 @@ function App() {
           <SelectionInspector
             selection={selection}
             clipboard={clipboard}
+            elevationPanelOpen={showElevationPanel}
+            onToggleElevationPanel={() => setShowElevationPanel(v => !v)}
+            extrudeCount={extrudeCount}
+            onExtrudeCountChange={setExtrudeCount}
+            extrudeAxis={extrudeAxis}
+            onExtrudeAxisChange={setExtrudeAxis}
+            onExtrude={handleExtrude}
+            extrudeOpen={extrudeOpen}
+            onExtrudeOpenChange={setExtrudeOpen}
+            onSavePrefab={savePrefab}
+            onGenerateTrees={handleGenerateTrees}
+          />
+        )}
+
+        {/* Bottom-right panel: full-height elevation view — opt-in, off by default */}
+        {(pastePreviewSelection || selection) && showElevationPanel && (
+          <ElevationPreviewPanel
+            selection={pastePreviewSelection ?? selection!}
+            maxZ={world.max_z}
+            extrudeCount={pastePreviewSelection ? 0 : (extrudeOpen ? extrudeCount : 0)}
+            extrudeAxis={extrudeAxis}
+            isPastePreview={pastePreviewSelection !== null}
+            editEpoch={editEpoch}
+            drawActive={["pen","brush","rect","ellipse"].includes(tool)}
+            onDrawElevation={handleDrawElevation}
           />
         )}
 
@@ -1193,6 +1741,19 @@ function App() {
         )}
 
         {showHelp && <HelpModal onClose={() => setShowHelp(false)} />}
+
+        {showWorldBrowser && (
+          <WorldBrowserModal
+            onClose={() => setShowWorldBrowser(false)}
+            onOpenWorld={(path) => { setShowWorldBrowser(false); openFileAt(path); }}
+          />
+        )}
+        {showUploadModal && (
+          <UploadModal
+            sourcePath={sourcePath}
+            onClose={() => setShowUploadModal(false)}
+          />
+        )}
       </div>
     );
   }
@@ -1208,21 +1769,40 @@ function App() {
       <p style={{ color: "#94a3b8", margin: 0, fontSize: 14 }}>
         Load a .eden save file to view the map
       </p>
-      <button
-        onClick={openFile} disabled={loading}
-        style={{
-          background: "#3b82f6", border: "none", color: "#fff",
-          padding: "10px 24px", borderRadius: 8,
-          cursor: loading ? "not-allowed" : "pointer",
-          fontSize: 15, fontWeight: 600, opacity: loading ? 0.6 : 1,
-        }}
-      >
-        {loading ? "Loading…" : "Open .eden file"}
-      </button>
+      <div style={{ display: "flex", gap: 10 }}>
+        <button
+          onClick={openFile} disabled={loading}
+          style={{
+            background: "#334155", border: "1px solid #475569", color: "#e2e8f0",
+            padding: "10px 24px", borderRadius: 8,
+            cursor: loading ? "not-allowed" : "pointer",
+            fontSize: 15, fontWeight: 600, opacity: loading ? 0.6 : 1,
+          }}
+        >
+          {loading ? "Loading…" : "Open Local File"}
+        </button>
+        <button
+          onClick={() => setShowWorldBrowser(true)} disabled={loading}
+          style={{
+            background: "#3b82f6", border: "none", color: "#fff",
+            padding: "10px 24px", borderRadius: 8,
+            cursor: loading ? "not-allowed" : "pointer",
+            fontSize: 15, fontWeight: 600, opacity: loading ? 0.6 : 1,
+          }}
+        >
+          Browse Worlds
+        </button>
+      </div>
       {error && (
         <p style={{ color: "#f87171", fontSize: 13, maxWidth: 400, textAlign: "center" }}>
           {error}
         </p>
+      )}
+      {showWorldBrowser && (
+        <WorldBrowserModal
+          onClose={() => setShowWorldBrowser(false)}
+          onOpenWorld={(path) => { setShowWorldBrowser(false); openFileAt(path); }}
+        />
       )}
     </div>
   );
