@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import type { SelectionInfo, ClipboardInfo } from "./App";
+import type { SelectionInfo, ClipboardInfo, ExtrudeAxis, TreeType } from "./App";
 
 type PreviewView = "front" | "side" | "top";
 
@@ -26,11 +26,34 @@ function decodePixels(b64: string): Uint8Array {
 interface Props {
   selection: SelectionInfo;
   clipboard: ClipboardInfo | null;
+  elevationPanelOpen: boolean;
+  onToggleElevationPanel: () => void;
+  extrudeCount: number;
+  onExtrudeCountChange: (n: number) => void;
+  extrudeAxis: ExtrudeAxis;
+  onExtrudeAxisChange: (a: ExtrudeAxis) => void;
+  onExtrude: (ignoreAir: boolean) => void;
+  extrudeOpen: boolean;
+  onExtrudeOpenChange: (v: boolean) => void;
+  onSavePrefab: () => void;
+  onGenerateTrees: (treeType: TreeType, density: number) => void;
 }
 
 const CW = 190;
 const CH = 120;
 const LABEL_H = 16; // bottom strip reserved for the debug overlay label
+
+const zInput: React.CSSProperties = {
+  width: 54,
+  background: "rgba(0,0,0,0.5)",
+  border: "1px solid #475569",
+  color: "#e2e8f0",
+  borderRadius: 4,
+  padding: "2px 5px",
+  fontSize: 13,
+  textAlign: "center",
+  outline: "none",
+};
 
 // ── component ────────────────────────────────────────────────────────────────
 
@@ -51,10 +74,16 @@ const panelStyle: React.CSSProperties = {
   userSelect: "none",
 };
 
-export default function SelectionInspector({ selection: sel, clipboard }: Props) {
+export default function SelectionInspector({ selection: sel, clipboard, elevationPanelOpen, onToggleElevationPanel, extrudeCount, onExtrudeCountChange, extrudeAxis, onExtrudeAxisChange, onExtrude, extrudeOpen, onExtrudeOpenChange, onSavePrefab, onGenerateTrees }: Props) {
   const [view, setView] = useState<PreviewView>("front");
   const [previewData, setPreviewData] = useState<PreviewData | null>(null);
+  const [extrudeIgnoreAir, setExtrudeIgnoreAir] = useState(false);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+
+  const [treeGenOpen, setTreeGenOpen] = useState(false);
+  const [treeType, setTreeType] = useState<TreeType>("normal");
+  const [treeDensity, setTreeDensity] = useState(20); // percent 1–100
+  const [treeGenerating, setTreeGenerating] = useState(false);
 
   const chunksX = Math.floor(sel.x2 / 16) - Math.floor(sel.x1 / 16) + 1;
   const chunksY = Math.floor(sel.y2 / 16) - Math.floor(sel.y1 / 16) + 1;
@@ -224,9 +253,176 @@ export default function SelectionInspector({ selection: sel, clipboard }: Props)
                 {clipboard.z_anchor} – {clipboard.z_anchor + clipboard.depth - 1}
               </span>
             </div>
+            <button
+              onClick={onSavePrefab}
+              style={{
+                marginTop: 2, padding: "2px 0", fontSize: 11, cursor: "pointer",
+                background: "rgba(74,222,128,0.12)",
+                border: "1px solid #4ade80",
+                color: "#86efac",
+                borderRadius: 3,
+              }}
+              title="Save clipboard contents as a reusable .epfab prefab file"
+            >
+              Save Prefab…
+            </button>
           </div>
         </>
       )}
+
+      <div style={{ borderTop: "1px solid #1a2744" }} />
+
+      {/* Extrude — repeat the selection N times along an axis */}
+      <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+        {/* Collapsible header */}
+        <div
+          onClick={() => onExtrudeOpenChange(!extrudeOpen)}
+          style={{ display: "flex", alignItems: "center", gap: 5, cursor: "pointer", userSelect: "none" }}
+        >
+          <span style={{ color: "#475569", fontSize: 9 }}>{extrudeOpen ? "▼" : "▶"}</span>
+          <span style={{ color: "#93c5fd", fontWeight: 700, fontSize: 10, letterSpacing: "0.08em" }}>EXTRUDE</span>
+        </div>
+        {extrudeOpen && (<>
+          {/* Axis selector — 3 pairs */}
+          <div style={{ display: "flex", gap: 3 }}>
+            {([
+              ["z+", "↑ Z+"], ["z-", "↓ Z−"],
+              ["x+", "→ X+"], ["x-", "← X−"],
+              ["y+", "↓ Y+"], ["y-", "↑ Y−"],
+            ] as [ExtrudeAxis, string][]).map(([ax, label]) => (
+              <button
+                key={ax}
+                onClick={() => onExtrudeAxisChange(ax)}
+                style={{
+                  flex: 1, padding: "2px 0", fontSize: 10, cursor: "pointer",
+                  background: extrudeAxis === ax ? "rgba(59,130,246,0.35)" : "rgba(255,255,255,0.04)",
+                  border: `1px solid ${extrudeAxis === ax ? "#3b82f6" : "#334155"}`,
+                  color: extrudeAxis === ax ? "#93c5fd" : "#64748b",
+                  borderRadius: 3,
+                }}
+                title={`Extrude in ${ax} direction`}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          {/* Count + ignore-air row */}
+          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+            <span style={{ color: "#64748b", fontSize: 11, whiteSpace: "nowrap" }}>Copies</span>
+            <input
+              type="number"
+              min={1} max={20}
+              value={extrudeCount}
+              onChange={e => onExtrudeCountChange(Math.max(1, Math.min(20, parseInt(e.target.value) || 1)))}
+              style={{ ...zInput, width: 44 }}
+              title="Number of copies to make (not counting the original)"
+            />
+            <label style={{ display: "flex", alignItems: "center", gap: 4, cursor: "pointer", marginLeft: "auto" }}>
+              <input
+                type="checkbox"
+                checked={extrudeIgnoreAir}
+                onChange={e => setExtrudeIgnoreAir(e.target.checked)}
+                style={{ accentColor: "#3b82f6" }}
+              />
+              <span style={{ color: "#64748b", fontSize: 11, whiteSpace: "nowrap" }}>skip air</span>
+            </label>
+          </div>
+          {/* Execute button */}
+          <button
+            onClick={() => onExtrude(extrudeIgnoreAir)}
+            style={{
+              padding: "3px 0", fontSize: 11, cursor: "pointer",
+              background: "rgba(59,130,246,0.25)",
+              border: "1px solid #3b82f6",
+              color: "#93c5fd",
+              borderRadius: 3,
+              fontWeight: 600,
+            }}
+            title={`Copy selection ${extrudeCount}× in ${extrudeAxis} direction`}
+          >
+            Extrude ×{extrudeCount} {extrudeAxis}
+          </button>
+        </>)}
+      </div>
+
+      <div style={{ borderTop: "1px solid #1a2744" }} />
+
+      {/* Trees — scatter trees across the selection's terrain surface */}
+      <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+        <div
+          onClick={() => setTreeGenOpen(v => !v)}
+          style={{ display: "flex", alignItems: "center", gap: 5, cursor: "pointer", userSelect: "none" }}
+        >
+          <span style={{ color: "#475569", fontSize: 9 }}>{treeGenOpen ? "▼" : "▶"}</span>
+          <span style={{ color: "#4ade80", fontWeight: 700, fontSize: 10, letterSpacing: "0.08em" }}>TREES</span>
+        </div>
+        {treeGenOpen && (<>
+          {/* Tree type buttons */}
+          <div style={{ display: "flex", gap: 3 }}>
+            {([
+              ["normal",    "Normal"],
+              ["terrain",   "Terrain"],
+              ["pine",      "Pine"],
+              ["tall_pine", "Tall Pine"],
+            ] as [TreeType, string][]).map(([t, label]) => (
+              <button
+                key={t}
+                onClick={() => setTreeType(t)}
+                style={{
+                  flex: 1, padding: "2px 0", fontSize: 10, cursor: "pointer",
+                  background: treeType === t ? "rgba(74,222,128,0.25)" : "rgba(255,255,255,0.04)",
+                  border: `1px solid ${treeType === t ? "#4ade80" : "#334155"}`,
+                  color: treeType === t ? "#86efac" : "#64748b",
+                  borderRadius: 3,
+                }}
+                title={
+                  t === "normal"    ? "Deciduous tree: trunk + dome canopy (3–8 block trunk, 4 leaf layers)" :
+                  t === "terrain"   ? "Tall terrain tree: ragged wide canopy (6–11 block height)" :
+                  t === "pine"      ? "Conical pine: narrow 5×5 canopy, 2-block trunk" :
+                                      "Tall conical pine: wide 7×7 base canopy, 2-block trunk"
+                }
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          {/* Density */}
+          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+            <span style={{ color: "#64748b", fontSize: 11, whiteSpace: "nowrap" }}>Density</span>
+            <input
+              type="range"
+              min={1} max={100} step={1}
+              value={treeDensity}
+              onChange={e => setTreeDensity(parseInt(e.target.value))}
+              style={{ flex: 1, accentColor: "#4ade80" }}
+              title={`Plant a tree in roughly ${treeDensity}% of columns`}
+            />
+            <span style={{ color: "#86efac", fontVariantNumeric: "tabular-nums", fontSize: 11, minWidth: 28, textAlign: "right" }}>
+              {treeDensity}%
+            </span>
+          </div>
+          {/* Generate button */}
+          <button
+            disabled={treeGenerating}
+            onClick={async () => {
+              setTreeGenerating(true);
+              try { await onGenerateTrees(treeType, treeDensity / 100); }
+              finally { setTreeGenerating(false); }
+            }}
+            style={{
+              padding: "3px 0", fontSize: 11, cursor: treeGenerating ? "default" : "pointer",
+              background: treeGenerating ? "rgba(74,222,128,0.08)" : "rgba(74,222,128,0.2)",
+              border: "1px solid #4ade80",
+              color: treeGenerating ? "#475569" : "#86efac",
+              borderRadius: 3,
+              fontWeight: 600,
+            }}
+            title={`Scatter ${treeType.replace("_", " ")} trees at ${treeDensity}% density across the selection`}
+          >
+            {treeGenerating ? "Generating…" : `Plant Trees (${treeDensity}%)`}
+          </button>
+        </>)}
+      </div>
 
       <div style={{ borderTop: "1px solid #1a2744" }} />
 
@@ -247,6 +443,21 @@ export default function SelectionInspector({ selection: sel, clipboard }: Props)
         style={{ display: "block", width: CW, height: CH, borderRadius: 4, border: "1px solid #1a2744" }}
         title={`${view} view — actual block colors`}
       />
+
+      {/* Elevation view toggle — off by default; expensive on large 256z worlds */}
+      <button
+        onClick={onToggleElevationPanel}
+        style={{
+          padding: "2px 0", fontSize: 11, cursor: "pointer",
+          background: elevationPanelOpen ? "rgba(59,130,246,0.35)" : "rgba(255,255,255,0.04)",
+          border: `1px solid ${elevationPanelOpen ? "#3b82f6" : "#334155"}`,
+          color: elevationPanelOpen ? "#93c5fd" : "#64748b",
+          borderRadius: 3,
+        }}
+        title="Show full-height front/side elevation view below. Disable on large 256-layer worlds if panning feels sluggish."
+      >
+        {elevationPanelOpen ? "Elevation view ✓" : "Elevation view"}
+      </button>
     </div>
   );
 }

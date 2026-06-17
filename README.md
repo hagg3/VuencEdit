@@ -1,12 +1,8 @@
-<p align="center">
-  <img src="assets/logotemp.png" width="300" alt="VuencEdit logo">
-</p>
+# VuencEdit
 
-# VuencEdit world editor
+A map viewer and block editor for **Eden World Builder** world files (`.eden`).
 
-A map viewer and block editor for **Eden World Builder** world files (`.eden`). Based on [Eden World Manipulator](https://github.com/jldeiro/EdenWorldManipulator2.0) which itself is built upon [Vuenctools](https://github.com/bLUUBfACE/EdenWorldManipulator) and Robert Munafo's [documentation](https://www.mrob.com/pub/vidgames/eden-file-format.html) on the game's file format.
-
-You can open a world file and get a colour-coded top-down map of everything in it. Pan and zoom around, select regions, fill or replace blocks, copy and paste structures, and save your changes. You can also export a PNG of the top-down map.
+Open a world file and get a colour-coded top-down map of everything in it. Pan and zoom around, select regions, fill or replace blocks, copy and paste structures, and save your changes back — all without touching the game itself.
 
 ---
 
@@ -24,6 +20,8 @@ Pre-built installers for macOS (Apple Silicon + Intel universal), Windows, and L
 - **Copy and paste** — copy any volume and paste it anywhere; terrain-aware paste aligns to the ground surface automatically
 - **Z-slice mode** — step through horizontal layers one at a time
 - **Undo / redo** with multi-level history
+- **Browse Worlds** — search and download any world from the Eden community servers directly inside the editor
+- **Upload** — share your world back to the Eden servers with a thumbnail image
 
 ---
 
@@ -61,14 +59,15 @@ The compiled app and installers appear in `src-tauri/target/release/bundle/`.
 
 ## Usage
 
-1. **Open a world** — click *Open World* in the toolbar. On macOS, worlds are usually in  
-   `~/Library/Containers/com.manomio.eden/Data/Documents/worlds/`.
-2. **Navigate** — scroll to zoom; middle-click-drag or the pan tool to move. Press **Home** or *Fit* to zoom to the whole world.
-3. **Select a region** — switch to the Select tool, then click-drag a rectangle. Adjust the Z range in the inspector panel.
-4. **Inspect** — the right-hand panel shows dimensions, block counts, and orthographic previews of the selection.
-5. **Edit** — with a selection active, use the bottom-left panel to fill, replace, or delete blocks.
-6. **Copy / paste** — Copy captures the selection. Switch to Paste and click to place. Use the banner toggles for *No Air*, *Terrain*, and *Rotate 90°*.
-7. **Save** — *Save* writes changes to the original file in place. *Save As* writes to a new file.
+1. **Open a world** — click *Open Local File* on the welcome screen, or use *File → Open…*. On macOS, worlds are usually in `~/Library/Containers/com.manomio.eden/Data/Documents/worlds/`.
+2. **Browse Worlds** — click *Browse Worlds* on the welcome screen (or *File → Browse Worlds…*) to search the Eden community servers. Pick a result and click **Save & Open** to download and open it immediately.
+3. **Navigate** — scroll to zoom; middle-click-drag or the pan tool to move. Press **Home** or *Fit* to zoom to the whole world.
+4. **Select a region** — switch to the Select tool, then click-drag a rectangle. Adjust the Z range in the inspector panel.
+5. **Inspect** — the right-hand panel shows dimensions, block counts, and orthographic previews of the selection.
+6. **Edit** — with a selection active, use the bottom-left panel to fill, replace, or delete blocks.
+7. **Copy / paste** — Copy captures the selection. Switch to Paste and click to place. Use the banner toggles for *No Air*, *Terrain*, and *Rotate 90°*.
+8. **Save** — *Save* writes changes to the original file in place. *Save As* writes to a new file.
+9. **Upload** — *File → Upload to Server…* lets you share the current world to the Eden servers. A PNG thumbnail is required.
 
 ### Keyboard shortcuts
 
@@ -77,9 +76,13 @@ The compiled app and installers appear in `src-tauri/target/release/bundle/`.
 | Scroll | Zoom in / out |
 | Middle drag | Pan |
 | Home | Zoom to fit |
-| Escape | Clear selection / exit paste mode |
+| Escape | Clear selection / exit paste / exit draw tool |
 | Cmd/Ctrl+Z | Undo |
 | Cmd/Ctrl+Shift+Z | Redo |
+| P | Pen draw tool |
+| B | Brush draw tool |
+| R | Rectangle draw tool |
+| E | Ellipse draw tool |
 | ? | Keyboard shortcut reference |
 
 ---
@@ -106,6 +109,8 @@ src/
   App.tsx                 — file open, toolbar state, keyboard shortcuts
   MapCanvas.tsx           — Canvas: tiled rendering, pan/zoom/select/paste input
   SelectionInspector.tsx  — floating stats + orthographic preview panel
+  WorldBrowserModal.tsx   — search/download worlds from Eden servers
+  UploadModal.tsx         — upload world + thumbnail to Eden server
   blockDefs.ts            — block type registry, display colours, ramp helpers
 src-tauri/src/
   lib.rs                  — world parser, all Tauri commands, colour tables
