@@ -5,9 +5,22 @@ use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::sync::Mutex;
 use std::time::Instant;
+use tauri::Emitter;
 
 fn serialize_bytes_b64<S: serde::Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {
     s.serialize_str(&STANDARD.encode(bytes))
+}
+
+fn is_zip(buf: &[u8]) -> bool {
+    buf.starts_with(&[0x50, 0x4B, 0x03, 0x04])
+}
+
+fn temp_world_path() -> std::path::PathBuf {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    std::env::temp_dir().join(format!("vuencedit_{ts}.eden"))
 }
 
 // ── Public types ─────────────────────────────────────────────────────────────
@@ -20,6 +33,7 @@ pub struct WorldMeta {
     pub width_chunks: u32,
     pub height_chunks: u32,
     pub max_z: u32,
+    pub was_compressed: bool,
 }
 
 /// Full pixel map — used only by render_zslice (kept for legacy callers).
@@ -90,167 +104,221 @@ struct ClipboardInfo {
     z_anchor: i32,
 }
 
+/// A single block position for the paint_blocks command.
+/// z = None → resolve surface_z in Rust; z = Some(v) → write at that exact level.
+#[derive(serde::Deserialize)]
+struct PaintBlock {
+    x: i32,
+    y: i32,
+    z: Option<i32>,
+}
+
 struct WorldState {
     world: Option<LoadedWorld>,
     clipboard: Option<Clipboard>,
     undo_stack: VecDeque<UndoEntry>,
     redo_stack: VecDeque<UndoEntry>,
+    /// Path to the decompressed temp file when the current world was opened from a zip.
+    /// Deleted after the mmap is dropped on next world load.
+    temp_path: Option<std::path::PathBuf>,
 }
 
 impl WorldState {
     fn new() -> Self {
-        WorldState { world: None, clipboard: None, undo_stack: VecDeque::new(), redo_stack: VecDeque::new() }
+        WorldState { world: None, clipboard: None, undo_stack: VecDeque::new(), redo_stack: VecDeque::new(), temp_path: None }
     }
 }
 
 pub(crate) type AppState = Mutex<WorldState>;
 
-// ── Color tables (ported from MapColors.cs) ──────────────────────────────────
+// ── Eden server configuration ────────────────────────────────────────────────
 
-const PAINTED: [[u8; 3]; 54] = [
-    [255, 170, 170], [255, 234, 170], [251, 255, 170], [170, 255, 191],
-    [170, 255, 255], [170, 191, 255], [212, 170, 255], [255, 170, 234],
-    [255, 255, 255],
+struct EdenServer {
+    search_url: &'static str,
+    download_base_url: &'static str,
+    upload_url: &'static str,
+}
 
-    [255,  85,  85], [255, 212,  85], [246, 255,  85], [ 85, 255, 128],
-    [ 85, 255, 255], [ 85, 128, 255], [170,  85, 255], [255,  85, 212],
-    [204, 204, 204],
+const CURRENT_SERVER: EdenServer = EdenServer {
+    search_url: "http://app2.edengame.net/list2.php",
+    download_base_url: "http://files2.edengame.net",
+    upload_url: "http://app2.edengame.net/upload2.php",
+};
 
-    [255,   0,   0], [255, 191,   0], [242, 255,   0], [  0, 255,  64],
-    [  0, 255, 255], [  0,  64, 255], [128,   0, 255], [255,   0, 191],
-    [153, 153, 153],
+const LEGACY_SERVER: EdenServer = EdenServer {
+    search_url: "http://app.edengame.net/list2.php",
+    download_base_url: "http://files.edengame.net",
+    upload_url: "http://app.edengame.net/upload2.php",
+};
 
-    [191,   0,   0], [191, 143,   0], [182, 191,   0], [  0, 191,  48],
-    [  0, 191, 191], [  0,  48, 191], [ 96,   0, 191], [191,   0, 143],
-    [102, 102, 102],
+fn get_server(server: &str) -> Result<&'static EdenServer, String> {
+    match server {
+        "current" => Ok(&CURRENT_SERVER),
+        "legacy"  => Ok(&LEGACY_SERVER),
+        _         => Err(format!("Unknown server: {server}")),
+    }
+}
 
-    [128,   0,   0], [128,  96,   0], [121, 128,   0], [  0, 128,  32],
-    [  0, 128, 128], [  0,  32, 128], [ 64,   0, 128], [128,   0,  96],
-    [ 51,  51,  51],
+#[derive(serde::Serialize, Clone)]
+struct WorldSearchResult {
+    id: String,
+    name: String,
+    timestamp: i64,
+    file_size: Option<u64>,
+}
 
-    [ 64,   0,   0], [ 64,  48,   0], [ 61,  64,   0], [  0,  64,  16],
-    [  0,  64,  64], [  0,  16,  64], [ 32,   0,  64], [ 64,   0,  48],
-    [  3,   3,   3],
-];
+// ── Color system (HLS model, ported from la-map.c by Robert Munafo, GPL3) ─────
 
-// Table is indexed as (block_type - 1), matching the reference (Mapping.cs: pen = blockByte - 1).
-// Index 0 → block type 1 (Bedrock), index 1 → block type 2 (Stone), etc.
-const UNPAINTED: [[u8; 3]; 110] = [
-    [  3,   3,   3], // idx 0  → type 1  Bedrock
-    [162, 162, 162], // idx 1  → type 2  Stone
-    [162,  82,  45], // idx 2  → type 3  Dirt   (Sienna)
-    [242, 220, 140], // idx 3  → type 4  Sand
-    [ 10,  63,  13], // idx 4  → type 5  Leaves
-    [125,  91,  22], // idx 5  → type 6  Trunk
-    [186, 164,  88], // idx 6  → type 7  Wood
-    [ 82, 148,  53], // idx 7  → type 8  Grass  (overridden by grass_color())
-    [255,   0,   0], // idx 8  → type 9  TNT
-    [ 59,  59,  59], // idx 9  → type 10 DarkStone
-    [ 82, 148,  53], // idx 10 → type 11 Weeds
-    [ 82, 148,  53], // idx 11 → type 12 Flowers
-    [204,  48,  41], // idx 12 → type 13 Brick
-    [ 86,  92,  95], // idx 13 → type 14 Slate
-    [134, 164, 186], // idx 14 → type 15 Ice
-    [255, 255, 255], // idx 15 → type 16 Wallpaper
-    [ 50,  50,  50], // idx 16 → type 17 Bouncy
-    [210, 180, 140], // idx 17 → type 18 Ladder (Tan)
-    [255, 255, 255], // idx 18 → type 19 Cloud
-    [  0,   0, 255], // idx 19 → type 20 Water
-    [210, 180, 140], // idx 20 → type 21 Fence (Tan)
-    [  0, 128,   0], // idx 21 → type 22 Ivy (Green)
-    [255,  69,   0], // idx 22 → type 23 Lava (OrangeRed)
+fn hsl_to_rgb(h: f32, l: f32, s: f32) -> [u8; 3] {
+    let tc = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let hp = h / 60.0;
+    if hp < 0.0 || hp >= 6.0 {
+        let v = (l * 255.0).clamp(0.0, 255.0) as u8;
+        return [v, v, v];
+    }
+    let hm2 = if hp >= 4.0 { hp - 4.0 } else if hp >= 2.0 { hp - 2.0 } else { hp };
+    let tx = tc * (1.0 - (hm2 - 1.0).abs());
+    let (fr, fg, fb): (f32, f32, f32) =
+        if      hp < 1.0 { (tc, tx, 0.0) }
+        else if hp < 2.0 { (tx, tc, 0.0) }
+        else if hp < 3.0 { (0.0, tc, tx) }
+        else if hp < 4.0 { (0.0, tx, tc) }
+        else if hp < 5.0 { (tx, 0.0, tc) }
+        else              { (tc, 0.0, tx) };
+    let m = l - tc / 2.0;
+    [
+        ((fr + m).clamp(0.0, 1.0) * 255.0) as u8,
+        ((fg + m).clamp(0.0, 1.0) * 255.0) as u8,
+        ((fb + m).clamp(0.0, 1.0) * 255.0) as u8,
+    ]
+}
 
-    [162, 162, 162], // idx 23 → type 24 RockRampSouth
-    [162, 162, 162], // idx 24 → type 25 RockRampWest
-    [162, 162, 162], // idx 25 → type 26 RockRampNorth
-    [162, 162, 162], // idx 26 → type 27 RockRampEast
-    [186, 164,  88], // idx 27 → type 28 WoodRampSouth
-    [186, 164,  88], // idx 28 → type 29 WoodRampWest
-    [186, 164,  88], // idx 29 → type 30 WoodRampNorth
-    [186, 164,  88], // idx 30 → type 31 WoodRampEast
-    [105, 105, 105], // idx 31 → type 32 ShinglesRampSouth (DimGray)
-    [105, 105, 105], // idx 32 → type 33
-    [105, 105, 105], // idx 33 → type 34
-    [105, 105, 105], // idx 34 → type 35
-    [134, 164, 186], // idx 35 → type 36 IceRampSouth
-    [134, 164, 186], // idx 36 → type 37
-    [134, 164, 186], // idx 37 → type 38
-    [134, 164, 186], // idx 38 → type 39
+/// (hue 0-360, lightness 0-1, saturation 0-1, max_lt 0-1) per block type.
+/// max_lt scales painted colours so the same paint reads differently on different materials.
+fn block_hls(bt: u8) -> (f32, f32, f32, f32) {
+    match bt {
+        0  => (210.0, 0.80, 1.00, 1.00), // air
+        1  => (  0.0, 0.20, 0.00, 0.60), // bedrock
+        2  => (  0.0, 0.60, 0.00, 0.80), // stone
+        3  => ( 30.0, 0.20, 1.00, 0.60), // dirt
+        4  => ( 50.0, 0.80, 0.50, 0.80), // sand
+        5  => (120.0, 0.20, 0.80, 0.65), // leaves
+        6  => ( 30.0, 0.20, 1.00, 0.70), // trunk
+        7  => ( 50.0, 0.75, 0.50, 0.70), // wood
+        8  => (120.0, 0.25, 0.80, 0.60), // grass (sky override in block_color)
+        9  => ( 30.0, 0.50, 0.70, 0.70), // TNT
+        10 => (  0.0, 0.45, 0.00, 0.50), // dark stone
+        11 => (120.0, 0.25, 0.80, 0.60), // weeds
+        12 => (150.0, 0.25, 0.70, 0.60), // flowers
+        13 => (  0.0, 0.40, 0.80, 0.70), // brick
+        14 => (210.0, 0.25, 0.25, 0.40), // slate
+        15 => (210.0, 0.80, 0.70, 0.90), // ice
+        16 => (  0.0, 0.80, 0.00, 0.80), // wallpaper
+        17 => (  0.0, 0.20, 0.00, 0.40), // bouncy
+        18 => ( 50.0, 0.75, 0.50, 0.70), // ladder
+        19 => (  0.0, 1.00, 0.00, 1.00), // cloud
+        20 => (225.0, 0.40, 0.90, 0.90), // water
+        21 => ( 50.0, 0.75, 0.50, 0.80), // fence
+        22 => (120.0, 0.60, 0.30, 0.60), // ivy
+        23 => ( 20.0, 0.40, 0.70, 0.60), // lava
+        24..=27 | 40..=43       => (  0.0, 0.60, 0.00, 0.80), // stone ramps/wedges
+        28..=31 | 44..=47       => ( 50.0, 0.75, 0.50, 0.70), // wood ramps/wedges
+        32..=35 | 48..=51 | 56  => (  0.0, 0.40, 0.00, 0.45), // shingle ramps/wedges/block
+        36..=39 | 52..=55       => (210.0, 0.80, 0.70, 0.90), // ice ramps/wedges
+        57  => (  0.0, 0.90, 0.00, 0.90), // neon square
+        58  => (210.0, 0.70, 0.20, 0.60), // glass
+        59  => (225.0, 0.50, 0.90, 0.80), // water 3/4
+        60  => (225.0, 0.60, 0.90, 0.85), // water 1/2
+        61  => (225.0, 0.70, 0.90, 0.90), // water 1/4
+        62  => ( 20.0, 0.50, 0.70, 0.50), // lava 3/4
+        63  => ( 20.0, 0.60, 0.70, 0.55), // lava 1/2
+        64  => ( 20.0, 0.70, 0.70, 0.60), // lava 1/4
+        65  => ( 30.0, 0.50, 0.70, 0.70), // fireworks
+        66..=70 => ( 40.0, 0.50, 0.70, 0.70), // doors
+        71  => ( 50.0, 0.70, 0.50, 0.70), // treasure
+        72  => ( 50.0, 0.80, 0.50, 0.90), // light
+        73  => (150.0, 0.50, 0.70, 0.70), // new flower
+        74  => (  0.0, 0.60, 0.00, 0.70), // steel
+        75..=79 => (270.0, 0.45, 0.50, 0.60), // portals
+        80..=81 => (  0.0, 0.50, 0.00, 0.50), // unused
+        82  => (120.0, 0.25, 0.80, 0.60), // ExpGrass (sky override in block_color)
+        83  => (  0.0, 0.40, 0.00, 0.50), // ExpDarkStone
+        84  => (  0.0, 0.60, 0.00, 0.80), // ExpStone
+        85  => ( 30.0, 0.40, 0.70, 0.60), // ExpDirt
+        86  => ( 50.0, 0.80, 0.50, 0.80), // ExpSand
+        87  => (  0.0, 0.50, 0.80, 0.70), // ExpTNT
+        88  => ( 50.0, 0.75, 0.50, 0.70), // ExpWood
+        89  => (  0.0, 0.40, 0.00, 0.45), // ExpShingle
+        90  => (210.0, 0.70, 0.20, 0.60), // ExpGlass (transparent)
+        91  => (180.0, 0.60, 0.90, 0.90), // ExpNeonSquare
+        92  => ( 30.0, 0.20, 1.00, 0.70), // ExpTrunk
+        93  => (120.0, 0.20, 0.80, 0.65), // ExpLeaves
+        94  => (  0.0, 0.40, 0.80, 0.70), // ExpBrick
+        95  => (210.0, 0.25, 0.25, 0.40), // ExpSlate
+        96  => (120.0, 0.60, 0.30, 0.60), // ExpVines
+        97  => (180.0, 0.60, 0.90, 0.90), // ExpLadder
+        98  => (210.0, 0.80, 0.70, 0.90), // ExpIce
+        99  => (  0.0, 0.80, 0.00, 0.80), // ExpWallpaper
+        100 => (  0.0, 0.20, 0.00, 0.40), // ExpTrampoline
+        101 => (  0.0, 1.00, 0.00, 1.00), // ExpCloud
+        102..=105 => (  0.0, 0.40, 0.00, 0.50), // Exp slides
+        106 => ( 50.0, 0.75, 0.50, 0.80), // ExpFence (transparent)
+        107 => (225.0, 0.40, 0.90, 0.90), // ExpWater
+        108 => ( 20.0, 0.40, 0.70, 0.60), // ExpLava
+        109 => ( 30.0, 0.50, 0.70, 0.70), // ExpFirework
+        110 => ( 50.0, 0.80, 0.50, 0.90), // ExpLight
+        _   => (  0.0, 0.50, 0.00, 0.50),
+    }
+}
 
-    [162, 162, 162], // idx 39 → type 40 RockWedge_SE
-    [162, 162, 162], // idx 40 → type 41
-    [162, 162, 162], // idx 41 → type 42
-    [162, 162, 162], // idx 42 → type 43
-    [186, 164,  88], // idx 43 → type 44 WoodWedge_SE
-    [186, 164,  88], // idx 44 → type 45
-    [186, 164,  88], // idx 45 → type 46
-    [186, 164,  88], // idx 46 → type 47
-    [105, 105, 105], // idx 47 → type 48 ShinglesWedge_SE
-    [105, 105, 105], // idx 48 → type 49
-    [105, 105, 105], // idx 49 → type 50
-    [105, 105, 105], // idx 50 → type 51
-    [134, 164, 186], // idx 51 → type 52 IceWedge_SE
-    [134, 164, 186], // idx 52 → type 53
-    [134, 164, 186], // idx 53 → type 54
-    [134, 164, 186], // idx 54 → type 55
+/// HLS for paint byte (1-54 = game paint colours; 0/other → unused, block_color guards against call).
+fn paint_hls(paint: u8) -> (f32, f32, f32) {
+    match paint {
+        1  => (  0.0, 0.85, 1.00),  2  => ( 30.0, 0.85, 1.00),
+        3  => ( 60.0, 0.85, 1.00),  4  => (120.0, 0.85, 1.00),
+        5  => (180.0, 0.85, 1.00),  6  => (240.0, 0.85, 1.00),
+        7  => (270.0, 0.85, 1.00),  8  => (300.0, 0.85, 1.00),
+        9  => (  0.0, 1.00, 0.00), // white
+        10 => (  0.0, 0.70, 1.00), 11 => ( 30.0, 0.70, 1.00),
+        12 => ( 60.0, 0.70, 1.00), 13 => (120.0, 0.70, 1.00),
+        14 => (180.0, 0.70, 1.00), 15 => (240.0, 0.70, 1.00),
+        16 => (270.0, 0.70, 1.00), 17 => (300.0, 0.70, 1.00),
+        18 => (  0.0, 0.80, 0.00), // 80% gray
+        19 => (  0.0, 0.50, 1.00), 20 => ( 30.0, 0.50, 1.00),
+        21 => ( 60.0, 0.50, 1.00), 22 => (120.0, 0.50, 1.00),
+        23 => (180.0, 0.50, 1.00), 24 => (240.0, 0.50, 1.00),
+        25 => (270.0, 0.50, 1.00), 26 => (300.0, 0.50, 1.00),
+        27 => (  0.0, 0.60, 0.00), // 60% gray
+        28 => (  0.0, 0.35, 1.00), 29 => ( 30.0, 0.35, 1.00),
+        30 => ( 60.0, 0.35, 1.00), 31 => (120.0, 0.35, 1.00),
+        32 => (180.0, 0.35, 1.00), 33 => (240.0, 0.35, 1.00),
+        34 => (270.0, 0.35, 1.00), 35 => (300.0, 0.35, 1.00),
+        36 => (  0.0, 0.40, 0.00), // 40% gray
+        37 => (  0.0, 0.25, 1.00), 38 => ( 30.0, 0.25, 1.00),
+        39 => ( 60.0, 0.25, 1.00), 40 => (120.0, 0.25, 1.00),
+        41 => (180.0, 0.25, 1.00), 42 => (240.0, 0.25, 1.00),
+        43 => (270.0, 0.25, 1.00), 44 => (300.0, 0.25, 1.00),
+        45 => (  0.0, 0.20, 0.00), // 20% gray
+        46 => (  0.0, 0.15, 1.00), 47 => ( 30.0, 0.15, 1.00),
+        48 => ( 60.0, 0.15, 1.00), 49 => (120.0, 0.15, 1.00),
+        50 => (180.0, 0.15, 1.00), 51 => (240.0, 0.15, 1.00),
+        52 => (270.0, 0.15, 1.00), 53 => (300.0, 0.15, 1.00),
+        54 => (  0.0, 0.00, 0.00), // black
+        _  => (  0.0, 0.50, 0.00),
+    }
+}
 
-    [105, 105, 105], // idx 55 → type 56 Shingles
-    [255, 255, 255], // idx 56 → type 57 NeonSquare
-    [211, 211, 211], // idx 57 → type 58 Glass (LightGray)
-    [  0,   0, 255], // idx 58 → type 59 Water3_4
-    [  0,   0, 255], // idx 59 → type 60 Water2_4
-    [  0,   0, 255], // idx 60 → type 61 Water1_4
-    [255,  69,   0], // idx 61 → type 62 Lava3_4
-    [255,  69,   0], // idx 62 → type 63 Lava2_4
-    [255,  69,   0], // idx 63 → type 64 Lava1_4
-
-    [255,   0,   0], // idx 64 → type 65 Fireworks
-    [210, 180, 140], // idx 65 → type 66 DoorSouth
-    [210, 180, 140], // idx 66 → type 67 DoorWest
-    [210, 180, 140], // idx 67 → type 68 DoorNorth
-    [210, 180, 140], // idx 68 → type 69 DoorEast
-    [218, 165,  32], // idx 69 → type 70 DoorTop (Gold)
-    [255, 250, 205], // idx 70 → type 71 Treasure (LemonChiffon)
-    [  0,   0, 255], // idx 71 → type 72 Light
-    [105, 105, 105], // idx 72 → type 73 FlowerNew (DarkGray)
-    [211, 211, 211], // idx 73 → type 74 Steel (LightGray)
-    [211, 211, 211], // idx 74 → type 75 PortalSouth
-    [211, 211, 211], // idx 75 → type 76 PortalWest
-    [211, 211, 211], // idx 76 → type 77 PortalNorth
-    [211, 211, 211], // idx 77 → type 78 PortalEast
-    [255, 255, 255], // idx 78 → type 79 PortalTop
-    [255, 255, 255], // idx 79 → type 80 (unused)
-    [139,  69,  19], // idx 80 → type 81 (unused) SaddleBrown
-    [  0, 128,   0], // idx 81 → type 82 ExpansionGrass (overridden by grass_color())
-    [105, 105, 105], // idx 82 → type 83 ExpansionDarkStone
-    [162, 162, 162], // idx 83 → type 84 ExpansionStone
-    [242, 220, 140], // idx 84 → type 85 ExpansionDirt
-    [ 10,  63,  13], // idx 85 → type 86 ExpansionSand
-    [178,  34,  34], // 87 ExpansionTnt (Firebrick)
-    [128, 128, 128], // 88 ExpansionWood (Gray)
-    [  0, 128,   0], // 89 ExpansionShingle
-    [210, 180, 140], // 90 ExpansionGlass (Tan)
-    [  0, 191, 255], // 91 ExpansionNeonSquare (DeepSkyBlue)
-    [255, 255, 255], // 92 ExpansionTrunk
-    [ 50,  50,  50], // 93 ExpansionLeaves
-    [255, 255, 255], // 94 ExpansionBrick
-    [169, 169, 169], // 95 ExpansionSlate (DarkGray)
-    [210, 180, 140], // 96 ExpansionVines (Tan)
-    [  0, 191, 255], // 97 ExpansionLadder (DeepSkyBlue)
-    [105, 105, 105], // 98 ExpansionIce (DimGray)
-    [210, 180, 140], // 99 ExpansionWallpaper (Tan)
-    [  0,   0, 255], // 100 ExpansionTrampoline
-    [255,  69,   0], // 101 ExpansionCloud
-    [255,   0,   0], // 102 ExpansionStoneSlide
-    [255, 250, 205], // 103 ExpansionWoodSlide (LemonChiffon)
-    [169, 169, 169], // 104 ExpansionIceSlide
-    [105, 105, 105], // 105 ExpansionShingleSlide
-    [  0,   0, 255], // 106 ExpansionFence
-    [255,  69,   0], // 107 ExpansionWater
-    [255,   0,   0], // 108 ExpansionLava
-    [255, 250, 205], // 109 ExpansionFirework
-    [169, 169, 169], // 110 ExpansionLight
-];
+/// Alpha (0–1) for a transparent block; None = opaque.
+/// Glass/water are 50% transparent; fence nearly opaque at 90%; flower mostly see-through at 25%.
+fn transparent_alpha(bt: u8) -> Option<f32> {
+    match bt {
+        20 | 59..=61 | 107 => Some(0.50), // water variants
+        21 | 106           => Some(0.90), // fence (nearly opaque)
+        58 | 90            => Some(0.50), // glass variants
+        73                 => Some(0.25), // new flower
+        _ => None,
+    }
+}
 
 // ── Color helpers ─────────────────────────────────────────────────────────────
 
@@ -262,20 +330,23 @@ fn grass_color(sky: u8) -> [u8; 3] {
     }
 }
 
-fn block_color(block_type: u8, paint: u8, sky: u8) -> [u8; 3] {
+fn block_color(bt: u8, paint: u8, sky: u8) -> [u8; 3] {
+    if bt == 0 { return [30, 30, 30]; }
+    if bt == 8 || bt == 82 {
+        return if paint != 0 {
+            let (ph, pl, ps) = paint_hls(paint);
+            let rgb = hsl_to_rgb(ph, pl, ps);
+            [(rgb[0] as f32 * 0.60) as u8, (rgb[1] as f32 * 0.60) as u8, (rgb[2] as f32 * 0.60) as u8]
+        } else { grass_color(sky) };
+    }
+    let (h, l, s, max_lt) = block_hls(bt);
     if paint != 0 {
-        let idx = (paint as usize).saturating_sub(1);
-        if idx < PAINTED.len() {
-            return PAINTED[idx];
-        }
+        let (ph, pl, ps) = paint_hls(paint);
+        let rgb = hsl_to_rgb(ph, pl, ps);
+        [(rgb[0] as f32 * max_lt) as u8, (rgb[1] as f32 * max_lt) as u8, (rgb[2] as f32 * max_lt) as u8]
+    } else {
+        hsl_to_rgb(h, l, s)
     }
-    if block_type == 8 || block_type == 82 {
-        return grass_color(sky);
-    }
-    // The reference (Mapping.cs) indexes Unpainted as (block_type - 1), so the table
-    // is offset by one: index 0 maps to block type 1 (Bedrock), index 1 to Stone, etc.
-    let idx = (block_type as usize).saturating_sub(1);
-    if idx < UNPAINTED.len() { UNPAINTED[idx] } else { [128, 128, 128] }
 }
 
 // ── World parsing ─────────────────────────────────────────────────────────────
@@ -395,6 +466,8 @@ fn render_pixels_patch(world: &LoadedWorld, px1: i32, py1: i32, px2: i32, py2: i
             let lx = (px % 16) as usize;
             let ly = (py % 16) as usize;
             let &addr = match world.chunk_map.get(&(cx, cy)) { Some(a) => a, None => continue };
+            let mut top_bt = 0u8; let mut top_paint = 0u8;
+            let mut under_bt = 0u8; let mut under_paint = 0u8;
             'outer: for band in (0..world.num_bands).rev() {
                 for z in (0..16usize).rev() {
                     let bi = addr + band * 8192 + lx * 256 + ly * 16 + z;
@@ -402,16 +475,29 @@ fn render_pixels_patch(world: &LoadedWorld, px1: i32, py1: i32, px2: i32, py2: i
                     if bi >= world.bytes.len() || pi >= world.bytes.len() { continue; }
                     let bt = world.bytes[bi];
                     if bt == 0 { continue; }
-                    let paint = world.bytes[pi];
-                    let [r, g, b] = block_color(bt, paint, world.sky);
-                    let off = (((py - y1) * width + (px - x1)) * 4) as usize;
-                    pixels[off]     = r;
-                    pixels[off + 1] = g;
-                    pixels[off + 2] = b;
-                    pixels[off + 3] = 255;
-                    break 'outer;
+                    if top_bt == 0 {
+                        top_bt = bt; top_paint = world.bytes[pi];
+                        if transparent_alpha(bt).is_none() { break 'outer; }
+                    } else {
+                        under_bt = bt; under_paint = world.bytes[pi];
+                        break 'outer;
+                    }
                 }
             }
+            if top_bt == 0 { continue; }
+            let c1 = block_color(top_bt, top_paint, world.sky);
+            let [r, g, b] = if under_bt != 0 {
+                if let Some(alpha) = transparent_alpha(top_bt) {
+                    let c2 = block_color(under_bt, under_paint, world.sky);
+                    [
+                        (c1[0] as f32 * alpha + c2[0] as f32 * (1.0 - alpha)) as u8,
+                        (c1[1] as f32 * alpha + c2[1] as f32 * (1.0 - alpha)) as u8,
+                        (c1[2] as f32 * alpha + c2[2] as f32 * (1.0 - alpha)) as u8,
+                    ]
+                } else { c1 }
+            } else { c1 };
+            let off = (((py - y1) * width + (px - x1)) * 4) as usize;
+            pixels[off] = r; pixels[off + 1] = g; pixels[off + 2] = b; pixels[off + 3] = 255;
         }
     }
     PixelPatch { x: x1, y: y1, width, height, pixels }
@@ -655,7 +741,7 @@ fn load_world(path: String, state: tauri::State<'_, AppState>) -> Result<WorldMe
     // render_zslice) fail fast on their next lock attempt instead of blocking here.
     eprintln!("[LOCK] acquire_start  cmd=load_world/step1  t=+{}µs", us());
     let t_s1 = Instant::now();
-    let _old_world = {
+    let (_old_world, old_temp) = {
         let mut ws = state.lock().unwrap();
         let wait = t_s1.elapsed().as_micros();
         let prev_undo: usize = ws.undo_stack.iter().flat_map(|e| e.chunks.iter()).map(|c| c.data.len()).sum();
@@ -667,23 +753,55 @@ fn load_world(path: String, state: tauri::State<'_, AppState>) -> Result<WorldMe
         ws.clipboard = None;
         ws.undo_stack.clear();
         ws.redo_stack.clear();
+        let old_temp = ws.temp_path.take();
         drop(ws);
         eprintln!("[LOCK] released  cmd=load_world/step1  held={}µs  t=+{}µs", t_held.elapsed().as_micros(), us());
-        taken
+        (taken, old_temp)
     };
-    // _old_world (Option<LoadedWorld>) drops here, ~2 GB freed outside the mutex
+    // _old_world (Option<LoadedWorld>) drops here, releasing the mmap before we delete the temp file.
+    if let Some(p) = old_temp { let _ = fs::remove_file(&p); }
 
-    // Step 2: File I/O + parse + render_pixels — no lock held.
-    // Open read-only: map_copy (MAP_PRIVATE | PROT_WRITE) never writes back to the file,
-    // so read-only file access is sufficient. Pages are file-backed and OS-evictable until
-    // written; writes COW only the affected 4 KB page into process-private RAM.
-    let file = fs::File::open(&path).map_err(|e| format!("Failed to open file: {e}"))?;
-    // SAFETY: The file is opened read-only and we never truncate or replace it while mapped.
-    // map_copy creates a private mapping; external file changes after this point do not
-    // affect the mapping and our writes never reach disk until explicit save.
-    let mmap = unsafe { MmapOptions::new().map_copy(&file) }
-        .map_err(|e| format!("Failed to map file: {e}"))?;
-    eprintln!("[LOAD] file_mmap  bytes={}B  t=+{}µs", mmap.len(), us());
+    // Step 2: File I/O + parse — no lock held.
+    // Peek at 4 magic bytes to detect zip without reading the whole file.
+    let mut magic = [0u8; 4];
+    {
+        use std::io::Read;
+        if let Ok(mut f) = fs::File::open(&path) { let _ = f.read_exact(&mut magic); }
+    }
+
+    let (mmap, maybe_temp): (MmapMut, Option<std::path::PathBuf>) = if is_zip(&magic) {
+        use zip::ZipArchive;
+        eprintln!("[LOAD] detected zip archive, decompressing  t=+{}µs", us());
+        let raw = fs::read(&path).map_err(|e| format!("Failed to read file: {e}"))?;
+        let cursor = std::io::Cursor::new(&raw);
+        let mut archive = ZipArchive::new(cursor)
+            .map_err(|e| format!("Invalid zip archive: {e}"))?;
+        if archive.len() == 0 { return Err("Zip archive contains no files".into()); }
+        let mut entry = archive.by_index(0)
+            .map_err(|e| format!("Failed to read zip entry: {e}"))?;
+        let temp_path = temp_world_path();
+        {
+            let mut tmp = fs::File::create(&temp_path)
+                .map_err(|e| format!("Failed to create temp file: {e}"))?;
+            std::io::copy(&mut entry, &mut tmp)
+                .map_err(|e| format!("Failed to decompress: {e}"))?;
+        } // tmp closed here before mmap
+        eprintln!("[LOAD] decompressed to {:?}  t=+{}µs", temp_path, us());
+        let file = fs::File::open(&temp_path)
+            .map_err(|e| format!("Failed to open temp file: {e}"))?;
+        // SAFETY: temp file is private, written by us, and stays alive for the duration of the mmap.
+        let mmap = unsafe { MmapOptions::new().map_copy(&file) }
+            .map_err(|e| format!("Failed to map temp file: {e}"))?;
+        (mmap, Some(temp_path))
+    } else {
+        let file = fs::File::open(&path).map_err(|e| format!("Failed to open file: {e}"))?;
+        // SAFETY: The file is opened read-only and we never truncate or replace it while mapped.
+        // map_copy creates a private mapping; our writes never reach disk until explicit save.
+        let mmap = unsafe { MmapOptions::new().map_copy(&file) }
+            .map_err(|e| format!("Failed to map file: {e}"))?;
+        (mmap, None)
+    };
+    eprintln!("[LOAD] file_mmap  bytes={}B  compressed={}  t=+{}µs", mmap.len(), maybe_temp.is_some(), us());
 
     let loaded = parse_world_inner(mmap)?;
     eprintln!("[LOAD] parsed  {}×{} chunks  count={}  world_bytes={}B  t=+{}µs",
@@ -696,6 +814,7 @@ fn load_world(path: String, state: tauri::State<'_, AppState>) -> Result<WorldMe
         width_chunks:  loaded.w_chunks,
         height_chunks: loaded.h_chunks,
         max_z:         world_max_z(&loaded) as u32,
+        was_compressed: maybe_temp.is_some(),
     };
 
     // Step 3: Install new world.
@@ -706,6 +825,7 @@ fn load_world(path: String, state: tauri::State<'_, AppState>) -> Result<WorldMe
         eprintln!("[LOCK] acquired  cmd=load_world/step3  wait={}µs", t_s3.elapsed().as_micros());
         let t_held = Instant::now();
         ws.world = Some(loaded);
+        ws.temp_path = maybe_temp;
         drop(ws);
         eprintln!("[LOCK] released  cmd=load_world/step3  held={}µs  t=+{}µs", t_held.elapsed().as_micros(), us());
     }
@@ -941,6 +1061,204 @@ fn render_selection_view(
     Ok(PreviewData { width, height, pixels })
 }
 
+/// Front view with `ctx` context columns on each side at 50% alpha. b_lo always 0.
+fn render_view_front_ctx(
+    world: &LoadedWorld,
+    sel_x1: i32, sel_x2: i32, y1: i32, y2: i32,
+    z_max: i32, ctx: i32,
+) -> (u32, u32, Vec<u8>) {
+    let rx1 = sel_x1 - ctx;
+    let rx2 = sel_x2 + ctx;
+    let pw = (rx2 - rx1 + 1) as u32;
+    let ph = (z_max + 1) as u32;
+    const VOID: [u8; 4] = [20, 20, 35, 255];
+    let mut pixels = vec![0u8; (pw * ph * 4) as usize];
+    for p in pixels.chunks_exact_mut(4) { p.copy_from_slice(&VOID); }
+    let bytes_len = world.bytes.len();
+
+    for x in rx1..=rx2 {
+        // div_euclid handles negative x (context left of world origin).
+        // x & 15 == x.rem_euclid(16) for all i32 (two's-complement property).
+        let cx     = x.div_euclid(16) + world.min_x;
+        let lx_256 = (x & 15) as usize * 256;
+        let col    = (x - rx1) as usize;
+        for z in 0..=z_max {
+            let band  = (z as usize) / 16;
+            let lz    = (z as usize) & 15;
+            let z_off = band * 8192 + lz; // b_lo=0 always
+            let row   = (z_max - z) as usize;
+            let out   = (row * pw as usize + col) * 4;
+            let mut y = y1;
+            'y_scan: while y <= y2 {
+                let cy          = y / 16 + world.min_y;
+                let chunk_y_end = (y | 15).min(y2);
+                match world.chunk_map.get(&(cx, cy)) {
+                    None => { y = chunk_y_end + 1; }
+                    Some(&addr) => {
+                        let base = addr + z_off + lx_256;
+                        while y <= chunk_y_end {
+                            let bi = base + (y & 15) as usize * 16;
+                            let pi = bi + 4096;
+                            if bi < bytes_len && pi < bytes_len {
+                                let bt = world.bytes[bi];
+                                if bt != 0 {
+                                    let [r, g, b] = block_color(bt, world.bytes[pi], world.sky);
+                                    pixels[out]     = r;
+                                    pixels[out + 1] = g;
+                                    pixels[out + 2] = b;
+                                    break 'y_scan;
+                                }
+                            }
+                            y += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Post-process: dim context columns to 50% opacity.
+    let left_ctx  = (sel_x1 - rx1) as usize;
+    let right_ctx = (sel_x2 + 1 - rx1) as usize;
+    for col in (0..left_ctx).chain(right_ctx..(pw as usize)) {
+        for row in 0..(ph as usize) {
+            pixels[(row * pw as usize + col) * 4 + 3] = 128;
+        }
+    }
+    (pw, ph, pixels)
+}
+
+/// Side view with `ctx` context columns on each side at 50% alpha. b_lo always 0.
+fn render_view_side_ctx(
+    world: &LoadedWorld,
+    x1: i32, x2: i32, sel_y1: i32, sel_y2: i32,
+    z_max: i32, ctx: i32,
+) -> (u32, u32, Vec<u8>) {
+    let ry1 = sel_y1 - ctx;
+    let ry2 = sel_y2 + ctx;
+    let pw = (ry2 - ry1 + 1) as u32;
+    let ph = (z_max + 1) as u32;
+    const VOID: [u8; 4] = [20, 20, 35, 255];
+    let mut pixels = vec![0u8; (pw * ph * 4) as usize];
+    for p in pixels.chunks_exact_mut(4) { p.copy_from_slice(&VOID); }
+    let bytes_len = world.bytes.len();
+
+    for y in ry1..=ry2 {
+        let cy    = y.div_euclid(16) + world.min_y;
+        let ly_16 = (y & 15) as usize * 16;
+        let col   = (y - ry1) as usize;
+        for z in 0..=z_max {
+            let band  = (z as usize) / 16;
+            let lz    = (z as usize) & 15;
+            let z_off = band * 8192 + lz;
+            let row   = (z_max - z) as usize;
+            let out   = (row * pw as usize + col) * 4;
+            let mut x = x1;
+            'x_scan: while x <= x2 {
+                let cx          = x / 16 + world.min_x;
+                let chunk_x_end = (x | 15).min(x2);
+                match world.chunk_map.get(&(cx, cy)) {
+                    None => { x = chunk_x_end + 1; }
+                    Some(&addr) => {
+                        let base = addr + z_off + ly_16;
+                        while x <= chunk_x_end {
+                            let bi = base + (x & 15) as usize * 256;
+                            let pi = bi + 4096;
+                            if bi < bytes_len && pi < bytes_len {
+                                let bt = world.bytes[bi];
+                                if bt != 0 {
+                                    let [r, g, b] = block_color(bt, world.bytes[pi], world.sky);
+                                    pixels[out]     = r;
+                                    pixels[out + 1] = g;
+                                    pixels[out + 2] = b;
+                                    break 'x_scan;
+                                }
+                            }
+                            x += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let left_ctx  = (sel_y1 - ry1) as usize;
+    let right_ctx = (sel_y2 + 1 - ry1) as usize;
+    for col in (0..left_ctx).chain(right_ctx..(pw as usize)) {
+        for row in 0..(ph as usize) {
+            pixels[(row * pw as usize + col) * 4 + 3] = 128;
+        }
+    }
+    (pw, ph, pixels)
+}
+
+/// Full-height contextual front/side view. `context_blocks` columns outside the
+/// selection are rendered at 50% opacity to show surrounding terrain.
+#[tauri::command]
+fn render_full_height_view(
+    x1: i32, y1: i32, x2: i32, y2: i32,
+    view: String,
+    context_blocks: i32,
+    state: tauri::State<'_, AppState>,
+) -> Result<PreviewData, String> {
+    if x2 < x1 || y2 < y1 {
+        return Err("Invalid XY bounds".into());
+    }
+
+    let ctx = context_blocks.max(0);
+    let (scan_world, z_max) = {
+        let ws = state.lock().unwrap();
+        let world = ws.world.as_ref().ok_or("No world loaded")?;
+
+        let z_max        = world_max_z(world);
+        let chunk_size   = world.chunk_size;
+        let num_bands    = world.num_bands;
+        // Expand clone region by one extra chunk in all directions to cover context blocks.
+        let ctx_chunks = ctx / 16 + 1;
+        let cx_lo = x1.div_euclid(16) + world.min_x - ctx_chunks;
+        let cx_hi = x2.div_euclid(16) + world.min_x + ctx_chunks;
+        let cy_lo = y1.div_euclid(16) + world.min_y - ctx_chunks;
+        let cy_hi = y2.div_euclid(16) + world.min_y + ctx_chunks;
+
+        let n_sel = ((cx_hi - cx_lo + 1) * (cy_hi - cy_lo + 1)) as usize;
+        let mut local_vec: Vec<u8>                    = Vec::with_capacity(n_sel * chunk_size);
+        let mut local_map: HashMap<(i32, i32), usize> = HashMap::with_capacity(n_sel);
+
+        for (&(cx, cy), &addr) in &world.chunk_map {
+            if cx >= cx_lo && cx <= cx_hi && cy >= cy_lo && cy <= cy_hi {
+                let local_addr = local_vec.len();
+                let end = addr + chunk_size;
+                if end <= world.bytes.len() {
+                    local_vec.extend_from_slice(&world.bytes[addr..end]);
+                } else {
+                    local_vec.extend(std::iter::repeat(0u8).take(chunk_size));
+                }
+                local_map.insert((cx, cy), local_addr);
+            }
+        }
+
+        let mut local_bytes = MmapOptions::new().len(local_vec.len().max(1)).map_anon()
+            .map_err(|e| format!("Failed to allocate scan buffer: {e}"))?;
+        if !local_vec.is_empty() {
+            local_bytes[..local_vec.len()].copy_from_slice(&local_vec);
+        }
+        drop(local_vec);
+
+        let scan_world = LoadedWorld {
+            bytes: local_bytes, chunk_map: local_map,
+            min_x: world.min_x, min_y: world.min_y,
+            w_chunks: world.w_chunks, h_chunks: world.h_chunks,
+            chunk_size, num_bands, sky: world.sky, name: String::new(),
+        };
+        drop(ws);
+        (scan_world, z_max)
+    };
+
+    let (width, height, pixels) = match view.as_str() {
+        "front" => render_view_front_ctx(&scan_world, x1, x2, y1, y2, z_max, ctx),
+        _       => render_view_side_ctx(&scan_world,  x1, x2, y1, y2, z_max, ctx),
+    };
+    Ok(PreviewData { width, height, pixels })
+}
+
 // ── Editing — pure inner functions (also called by tests) ─────────────────────
 
 fn delete_blocks_inner(
@@ -1137,12 +1455,12 @@ fn replace_blocks(
     filter_invert: bool,
     state: tauri::State<'_, AppState>,
 ) -> Result<EditResult, String> {
-    if new_paint as usize > PAINTED.len() {
-        return Err(format!("Invalid paint byte {new_paint}: must be 0–{}", PAINTED.len()));
+    if new_paint > 54 {
+        return Err(format!("Invalid paint byte {new_paint}: must be 0–54"));
     }
     if let Some(fp) = filter_paint {
-        if fp as usize > PAINTED.len() {
-            return Err(format!("Invalid filter paint {fp}: must be 0–{}", PAINTED.len()));
+        if fp > 54 {
+            return Err(format!("Invalid filter paint {fp}: must be 0–54"));
         }
     }
     let mut ws = state.lock().unwrap();
@@ -1165,11 +1483,93 @@ fn replace_blocks(
     Ok(EditResult { patch, undo_depth: ws.undo_stack.len(), redo_depth: ws.redo_stack.len() })
 }
 
+/// Paint a batch of blocks in one operation — one undo entry for the whole stroke.
+/// For each block, if z is None the topmost non-air block at (x,y) is used (surface paint);
+/// if z is Some the block is placed at that exact z level.
+/// Positions outside existing chunk boundaries are silently skipped.
 #[tauri::command]
-fn save_world(path: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
+fn paint_blocks(
+    blocks: Vec<PaintBlock>,
+    block_type: u8,
+    paint: u8,
+    state: tauri::State<'_, AppState>,
+) -> Result<EditResult, String> {
+    if paint > 54 {
+        return Err(format!("Invalid paint byte {paint}: must be 0–54"));
+    }
+    if blocks.is_empty() {
+        return Err("No blocks to paint".into());
+    }
+    let mut ws = state.lock().unwrap();
+    let mut world = ws.world.take().ok_or("No world loaded")?;
+    let max_z = world_max_z(&world) as i32;
+
+    // Compute bounding rect for chunk snapshot + patch render.
+    let (mut x_min, mut y_min, mut x_max, mut y_max) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
+    for b in &blocks {
+        x_min = x_min.min(b.x); y_min = y_min.min(b.y);
+        x_max = x_max.max(b.x); y_max = y_max.max(b.y);
+    }
+
+    let affected = affected_chunk_coords(&world, x_min, y_min, x_max, y_max);
+    let pre_snap = snapshot_chunks(&world, &affected);
+
+    for b in &blocks {
+        let z = match b.z {
+            Some(z) => {
+                if z < 0 || z > max_z { continue; }
+                z
+            }
+            None => match surface_z(&world, b.x, b.y) {
+                Some(z) => z,
+                None => continue,
+            },
+        };
+        set_block_abs(&mut world, b.x, b.y, z, block_type, paint);
+    }
+
+    let patch = render_pixels_patch(&world, x_min, y_min, x_max, y_max);
+    let pre_snap = filter_unchanged_snapshots(&world, pre_snap);
+
+    ws.world = Some(world);
+    if !pre_snap.is_empty() {
+        push_undo(&mut ws.undo_stack, UndoEntry { operation: "paint_blocks".into(), chunks: pre_snap });
+        ws.redo_stack.clear();
+    }
+
+    Ok(EditResult { patch, undo_depth: ws.undo_stack.len(), redo_depth: ws.redo_stack.len() })
+}
+
+fn save_world_compressed(world: &LoadedWorld, path: &str) -> Result<(), String> {
+    use zip::write::{SimpleFileOptions, ZipWriter};
+    use std::io::Write;
+    let inner_name = {
+        let fname = std::path::Path::new(path)
+            .file_name().and_then(|f| f.to_str()).unwrap_or("world.eden");
+        // If saving as .eden.zip, the inner entry should be just .eden
+        if fname.ends_with(".eden.zip") { fname[..fname.len() - 4].to_string() }
+        else { fname.to_string() }
+    };
+    let bak = format!("{path}.bak");
+    if !std::path::Path::new(&bak).exists() && std::path::Path::new(path).exists() {
+        fs::copy(path, &bak).map_err(|e| format!("Failed to create backup: {e}"))?;
+    }
+    let file = fs::File::create(path).map_err(|e| format!("Failed to create file: {e}"))?;
+    let mut zip = ZipWriter::new(file);
+    let options = SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated)
+        .compression_level(Some(9));
+    zip.start_file(&inner_name, options).map_err(|e| format!("Zip error: {e}"))?;
+    zip.write_all(&world.bytes).map_err(|e| format!("Write error: {e}"))?;
+    zip.finish().map_err(|e| format!("Zip finish error: {e}"))?;
+    Ok(())
+}
+
+#[tauri::command]
+fn save_world(path: String, compressed: bool, state: tauri::State<'_, AppState>) -> Result<(), String> {
     let ws = state.lock().unwrap();
     let world = ws.world.as_ref().ok_or("No world loaded")?;
-    save_world_inner(world, &path)
+    if compressed { save_world_compressed(world, &path) } else { save_world_inner(world, &path) }
 }
 
 #[tauri::command]
@@ -1266,17 +1666,73 @@ fn copy_selection(
     Ok(ClipboardInfo { width, height, depth, z_anchor: z_min })
 }
 
-/// Rotate a ramp block ID 90° clockwise.
-/// Ramp families occupy consecutive 4-ID bands: [base+0=S, base+1=W, base+2=N, base+3=E].
-/// Under 90° CW in XY screen space: S→E, E→N, N→W, W→S → offset shifts by +3 mod 4.
-/// Ramp ID ranges: Rock 24–27, Wood 28–31, Shingles 32–35, Ice 36–39.
-/// All other block types are returned unchanged.
+/// Rotate a directional block ID 90° clockwise.
+///
+/// Ramps (24–39): [base+0=S, base+1=W, base+2=N, base+3=E]
+/// Wedges (40–55): [base+0=SE, base+1=SW, base+2=NW, base+3=NE]
+/// Doors (66–69): S/W/N/E order. Portals (75–78): S/W/N/E order.
+///
+/// Under 90° CW in XY screen space (S→E, E→N, N→W, W→S) the offset shifts by +3 mod 4
+/// for all four families, including wedges (SE→NE, SW→SE, NW→SW, NE→NW).
 #[inline]
 fn rotate_ramp_id_cw(bt: u8) -> u8 {
-    if (24..=39).contains(&bt) {
-        let base = bt & !3; // round down to multiple of 4
+    if (24..=55).contains(&bt) {
+        // Ramps and wedges: families always start at a multiple of 4.
+        let base = bt & !3;
         let off  = bt &  3;
         base | ((off + 3) & 3)
+    } else if (66..=69).contains(&bt) {
+        66 + ((bt - 66 + 3) & 3)
+    } else if (75..=78).contains(&bt) {
+        75 + ((bt - 75 + 3) & 3)
+    } else {
+        bt
+    }
+}
+
+/// Mirror a directional block ID on the X axis (left↔right on the map).
+/// Ramps: S/N unchanged, E(+3)↔W(+1).
+/// Wedges: SE(+0)↔SW(+1), NE(+3)↔NW(+2) — i.e., off ^= 1.
+/// Doors/Portals: S/N unchanged, E↔W.
+#[inline]
+fn mirror_ramp_id_x(bt: u8) -> u8 {
+    if (24..=39).contains(&bt) {
+        let base = bt & !3;
+        let off  = bt &  3;
+        base | match off { 1 => 3, 3 => 1, x => x }
+    } else if (40..=55).contains(&bt) {
+        // SE(0)↔SW(1), NW(2)↔NE(3): flip the E/W component → off ^ 1
+        (bt & !3) | ((bt & 3) ^ 1)
+    } else if (66..=69).contains(&bt) {
+        let off = bt - 66;
+        66 + match off { 1 => 3, 3 => 1, x => x }
+    } else if (75..=78).contains(&bt) {
+        let off = bt - 75;
+        75 + match off { 1 => 3, 3 => 1, x => x }
+    } else {
+        bt
+    }
+}
+
+/// Mirror a directional block ID on the Y axis (top↔bottom on the map).
+/// Ramps: E/W unchanged, S(+0)↔N(+2).
+/// Wedges: SE(+0)↔NE(+3), SW(+1)↔NW(+2) — i.e., off ^= 3.
+/// Doors/Portals: E/W unchanged, S↔N.
+#[inline]
+fn mirror_ramp_id_y(bt: u8) -> u8 {
+    if (24..=39).contains(&bt) {
+        let base = bt & !3;
+        let off  = bt &  3;
+        base | match off { 0 => 2, 2 => 0, x => x }
+    } else if (40..=55).contains(&bt) {
+        // SE(0)↔NE(3), SW(1)↔NW(2): flip the N/S component → off ^ 3
+        (bt & !3) | ((bt & 3) ^ 3)
+    } else if (66..=69).contains(&bt) {
+        let off = bt - 66;
+        66 + match off { 0 => 2, 2 => 0, x => x }
+    } else if (75..=78).contains(&bt) {
+        let off = bt - 75;
+        75 + match off { 0 => 2, 2 => 0, x => x }
     } else {
         bt
     }
@@ -1306,7 +1762,7 @@ fn surface_z(world: &LoadedWorld, px: i32, py: i32) -> Option<i32> {
 /// Rotate clipboard 90° clockwise in the XY plane.
 /// Transform: (dx, dy, dz) → (new_dx=dy, new_dy=old_width-1-dx, dz).
 /// New dimensions: new_width=old_height, new_height=old_width. Z range unchanged.
-/// Ramp block IDs (24–39) are remapped to match the new physical facing direction.
+/// Directional block IDs (ramps 24–39, wedges 40–55, doors 66–69, portals 75–78) are remapped.
 /// Does not touch world data; no undo entry required.
 #[tauri::command]
 fn rotate_clipboard(state: tauri::State<'_, AppState>) -> Result<ClipboardInfo, String> {
@@ -1337,6 +1793,62 @@ fn rotate_clipboard(state: tauri::State<'_, AppState>) -> Result<ClipboardInfo, 
     cb.block_types = new_types;
     cb.paints = new_paints;
     Ok(ClipboardInfo { width: new_w as i32, height: new_h as i32, depth: cb.depth, z_anchor: cb.z_anchor })
+}
+
+/// Mirror clipboard on the X axis (left↔right on the map): (dx,dy,dz) → (width-1-dx, dy, dz).
+/// Ramp IDs are remapped so E-facing ramps become W-facing and vice versa.
+#[tauri::command]
+fn mirror_clipboard_x(state: tauri::State<'_, AppState>) -> Result<ClipboardInfo, String> {
+    let mut ws = state.lock().unwrap();
+    let cb = ws.clipboard.as_mut().ok_or("Clipboard is empty")?;
+    let w = cb.width as usize;
+    let h = cb.height as usize;
+    let depth = cb.depth as usize;
+    let vol = w * h * depth;
+    let mut new_types = vec![0u8; vol];
+    let mut new_paints = vec![0u8; vol];
+    for dz in 0..depth {
+        for dy in 0..h {
+            for dx in 0..w {
+                let src = dz * h * w + dy * w + dx;
+                let ndx = w - 1 - dx;
+                let dst = dz * h * w + dy * w + ndx;
+                new_types[dst] = mirror_ramp_id_x(cb.block_types[src]);
+                new_paints[dst] = cb.paints[src];
+            }
+        }
+    }
+    cb.block_types = new_types;
+    cb.paints = new_paints;
+    Ok(ClipboardInfo { width: cb.width, height: cb.height, depth: cb.depth, z_anchor: cb.z_anchor })
+}
+
+/// Mirror clipboard on the Y axis (top↔bottom on the map): (dx,dy,dz) → (dx, height-1-dy, dz).
+/// Ramp IDs are remapped so S-facing ramps become N-facing and vice versa.
+#[tauri::command]
+fn mirror_clipboard_y(state: tauri::State<'_, AppState>) -> Result<ClipboardInfo, String> {
+    let mut ws = state.lock().unwrap();
+    let cb = ws.clipboard.as_mut().ok_or("Clipboard is empty")?;
+    let w = cb.width as usize;
+    let h = cb.height as usize;
+    let depth = cb.depth as usize;
+    let vol = w * h * depth;
+    let mut new_types = vec![0u8; vol];
+    let mut new_paints = vec![0u8; vol];
+    for dz in 0..depth {
+        for dy in 0..h {
+            for dx in 0..w {
+                let src = dz * h * w + dy * w + dx;
+                let ndy = h - 1 - dy;
+                let dst = dz * h * w + ndy * w + dx;
+                new_types[dst] = mirror_ramp_id_y(cb.block_types[src]);
+                new_paints[dst] = cb.paints[src];
+            }
+        }
+    }
+    cb.block_types = new_types;
+    cb.paints = new_paints;
+    Ok(ClipboardInfo { width: cb.width, height: cb.height, depth: cb.depth, z_anchor: cb.z_anchor })
 }
 
 /// Paste the clipboard at world pixel position (paste_x, paste_y).
@@ -1504,9 +2016,855 @@ fn paste_terrain(
     Ok(EditResult { patch, undo_depth: ws.undo_stack.len(), redo_depth: ws.redo_stack.len() })
 }
 
+/// Copies the selection N times in the given axis direction.
+/// axis: "z+" | "z-" | "x+" | "x-" | "y+" | "y-"
+/// count: number of copies (not counting the original), 1–20.
+/// ignore_air: if true, source air blocks are not written (gaps preserved).
+/// All copies land in a single undo entry.
+#[tauri::command]
+fn extrude_selection(
+    x1: i32, y1: i32, x2: i32, y2: i32,
+    z_min: i32, z_max: i32,
+    axis: String,
+    count: i32,
+    ignore_air: bool,
+    state: tauri::State<'_, AppState>,
+) -> Result<EditResult, String> {
+    let mut ws = state.lock().unwrap();
+    if count <= 0 { return Err("count must be at least 1".into()); }
+
+    // Pre-buffer source blocks under borrow, then release before taking world.
+    let (max_z, src_types, src_paints, width, height, depth) = {
+        let world_ref = ws.world.as_ref().ok_or("No world loaded")?;
+        let max_z = world_max_z(world_ref);
+        validate_selection(x1, y1, x2, y2, z_min, z_max, max_z)?;
+
+        let width  = x2 - x1 + 1;
+        let height = y2 - y1 + 1;
+        let depth  = z_max - z_min + 1;
+        let n = (width * height * depth) as usize;
+        let mut src_types  = vec![0u8; n];
+        let mut src_paints = vec![0u8; n];
+        let bytes_len = world_ref.bytes.len();
+
+        for dz in 0..depth {
+            let z    = z_min + dz;
+            let band = (z as usize) / 16;
+            let lz   = (z as usize) % 16;
+            for dy in 0..height {
+                let py     = y1 + dy;
+                let src_cy = py / 16 + world_ref.min_y;
+                let src_ly = (py % 16) as usize;
+                for dx in 0..width {
+                    let px     = x1 + dx;
+                    let src_cx = px / 16 + world_ref.min_x;
+                    let src_lx = (px % 16) as usize;
+                    let idx    = (dz * height * width + dy * width + dx) as usize;
+                    if let Some(&addr) = world_ref.chunk_map.get(&(src_cx, src_cy)) {
+                        let bi = addr + band * 8192 + src_lx * 256 + src_ly * 16 + lz;
+                        let pi = bi + 4096;
+                        if bi < bytes_len && pi < bytes_len {
+                            src_types[idx]  = world_ref.bytes[bi];
+                            src_paints[idx] = world_ref.bytes[pi];
+                        }
+                    }
+                }
+            }
+        }
+        (max_z, src_types, src_paints, width, height, depth)
+    };
+
+    // Full XY footprint covering source + all copies (for chunk snapshot + render patch).
+    let (ax1, ay1, ax2, ay2) = match axis.as_str() {
+        "x+" => (x1, y1, x2 + count * width,  y2),
+        "x-" => ((x1 - count * width).max(0), y1, x2, y2),
+        "y+" => (x1, y1, x2, y2 + count * height),
+        "y-" => (x1, (y1 - count * height).max(0), x2, y2),
+        _    => (x1, y1, x2, y2), // z+/z-: same XY footprint as source
+    };
+
+    let mut world = ws.world.take().ok_or("No world loaded")?;
+    let affected  = affected_chunk_coords(&world, ax1, ay1, ax2, ay2);
+    let pre_snap  = snapshot_chunks(&world, &affected);
+
+    for k in 1..=count {
+        let (dx_step, dy_step, dz_step) = match axis.as_str() {
+            "x+" => ( k * width,   0,        0),
+            "x-" => (-k * width,   0,        0),
+            "y+" => ( 0,  k * height,        0),
+            "y-" => ( 0, -k * height,        0),
+            "z-" => ( 0,  0,       -k * depth),
+            _    => ( 0,  0,        k * depth), // "z+"
+        };
+
+        for dz in 0..depth {
+            let tz = z_min + dz + dz_step;
+            if tz < 0 || tz > max_z { continue; }
+            let band = (tz as usize) / 16;
+            let lz   = (tz as usize) % 16;
+            for dy in 0..height {
+                let ty = y1 + dy + dy_step;
+                if ty < 0 { continue; }
+                let chunk_cy = ty / 16 + world.min_y;
+                let ly       = (ty % 16) as usize;
+                for dx in 0..width {
+                    let tx = x1 + dx + dx_step;
+                    if tx < 0 { continue; }
+                    let chunk_cx = tx / 16 + world.min_x;
+                    let lx       = (tx % 16) as usize;
+                    let idx      = (dz * height * width + dy * width + dx) as usize;
+                    let src_bt   = src_types[idx];
+                    if ignore_air && src_bt == 0 { continue; }
+                    let &addr = match world.chunk_map.get(&(chunk_cx, chunk_cy)) {
+                        None    => continue,
+                        Some(a) => a,
+                    };
+                    let bi = addr + band * 8192 + lx * 256 + ly * 16 + lz;
+                    let pi = bi + 4096;
+                    if bi < world.bytes.len() { world.bytes[bi] = src_bt; }
+                    if pi < world.bytes.len() { world.bytes[pi] = src_paints[idx]; }
+                }
+            }
+        }
+    }
+
+    let patch    = render_pixels_patch(&world, ax1, ay1, ax2, ay2);
+    let pre_snap = filter_unchanged_snapshots(&world, pre_snap);
+    ws.world     = Some(world);
+
+    if !pre_snap.is_empty() {
+        push_undo(&mut ws.undo_stack, UndoEntry { operation: "extrude_selection".into(), chunks: pre_snap });
+        ws.redo_stack.clear();
+    }
+
+    Ok(EditResult { patch, undo_depth: ws.undo_stack.len(), redo_depth: ws.redo_stack.len() })
+}
+
+// ── Tree generation ───────────────────────────────────────────────────────────
+
+/// Minimal xorshift64 RNG — avoids adding a rand dependency.
+struct Rng64(u64);
+impl Rng64 {
+    fn new(seed: u64) -> Self { Self(if seed == 0 { 0xdeadbeef_cafebabe } else { seed }) }
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+    /// Returns a value in lo..=hi (inclusive).
+    fn range(&mut self, lo: i32, hi: i32) -> i32 {
+        (self.next() % (hi - lo + 1) as u64) as i32 + lo
+    }
+    /// Returns true with probability num/den.
+    fn prob(&mut self, num: u64, den: u64) -> bool {
+        self.next() % den < num
+    }
+}
+
+/// Write one block at absolute world pixel coordinates using the correct band formula.
+/// Out-of-bounds writes (missing chunk, z > max) are silently dropped.
+#[inline]
+fn set_block_abs(world: &mut LoadedWorld, wx: i32, wy: i32, wz: i32, bt: u8, paint: u8) {
+    if wz < 0 || wz as usize >= world.num_bands * 16 { return; }
+    let cx = wx.div_euclid(16) + world.min_x;
+    let cy = wy.div_euclid(16) + world.min_y;
+    if let Some(&addr) = world.chunk_map.get(&(cx, cy)) {
+        let lx   = wx.rem_euclid(16) as usize;
+        let ly   = wy.rem_euclid(16) as usize;
+        let band = wz as usize / 16;
+        let lz   = wz as usize % 16;
+        let bi   = addr + band * 8192 + lx * 256 + ly * 16 + lz;
+        let pi   = bi + 4096;
+        if bi < world.bytes.len() && pi < world.bytes.len() {
+            world.bytes[bi] = bt;
+            world.bytes[pi] = paint;
+        }
+    }
+}
+
+#[inline]
+fn place_leaf_abs(world: &mut LoadedWorld, wx: i32, wy: i32, wz: i32, paint: u8) {
+    set_block_abs(world, wx, wy, wz, 5, paint);
+}
+
+/// Block types that trees should not grow on (air, water, lava, cloud, foliage).
+fn is_plantable(bt: u8) -> bool {
+    !matches!(bt, 0 | 5 | 6 | 19 | 20 | 23 | 59 | 60 | 61 | 62 | 63 | 64)
+}
+
+// Leaf paint palettes — indices into PAINTED (paint byte = index + 1).
+// 0 = unpainted = dark green [10,63,13]; 22=[0,255,64]; 31=[0,191,48]; 40=[0,128,32]; 49=[0,64,16]
+const NORMAL_LEAF_PAINTS: [u8; 4] = [0, 22, 31, 40];
+const PINE_LEAF_PAINTS:   [u8; 3] = [31, 40, 49];
+
+/// Deciduous mushroom-shaped tree (ported from NormalTree in reference, bug fixed: trunk placed
+/// after leaves so the log shows through the canopy, not overwritten by leaf blocks).
+fn place_normal_tree(world: &mut LoadedWorld, wx: i32, wy: i32, z_base: i32, rng: &mut Rng64) {
+    let trunk_h   = rng.range(3, 8);
+    let leaf_paint = NORMAL_LEAF_PAINTS[rng.range(0, 3) as usize];
+    let z_leaves  = z_base + trunk_h;
+
+    // 4 leaf layers above trunk (bottom-to-top: narrow → wide → narrow → tip)
+    for dz in 0..4i32 {
+        let wz = z_leaves + dz;
+        for dx in -2i32..=2 {
+            for dy in -2i32..=2 {
+                let adx = dx.abs(); let ady = dy.abs();
+                let place = match dz {
+                    // narrow: cross@dist1 + center
+                    0 | 2 => (adx == 1 && dy == 0) || (ady == 1 && dx == 0) || (dx == 0 && dy == 0),
+                    // wide: cross@dist2 + inner 3×3
+                    1     => (adx == 2 && dy == 0) || (ady == 2 && dx == 0) || (adx <= 1 && ady <= 1),
+                    // tip: center only
+                    _     => dx == 0 && dy == 0,
+                };
+                if place { place_leaf_abs(world, wx + dx, wy + dy, wz, leaf_paint); }
+            }
+        }
+    }
+    // Trunk written last so it punches through any leaf blocks at center.
+    for dz in 0..trunk_h { set_block_abs(world, wx, wy, z_base + dz, 6, 0); }
+}
+
+/// Tall terrain tree with wide ragged canopy (ported from NormalTerrainTree).
+/// Bug fixed: trunk placed after leaves so it remains visible through canopy.
+fn place_terrain_tree(world: &mut LoadedWorld, wx: i32, wy: i32, z_base: i32, rng: &mut Rng64) {
+    let tree_h    = rng.range(6, 11);
+    let trunk_h   = 3 * tree_h / 4;
+    let leaf_dz0  = 2 * tree_h / 3; // first leaf layer (rel to z_base)
+    let leaf_paint = NORMAL_LEAF_PAINTS[rng.range(0, 3) as usize];
+
+    for dz in leaf_dz0..tree_h {
+        let wz       = z_base + dz;
+        let is_bot   = dz == leaf_dz0;
+        let is_top   = dz == tree_h - 1;
+        for dx in -2i32..=2 {
+            for dy in -2i32..=2 {
+                let is_edge   = dx.abs() == 2 || dy.abs() == 2;
+                let is_corner = dx.abs() == 2 && dy.abs() == 2;
+                let place = if is_edge {
+                    // Skip corners on bottom & top layers; 50% random elsewhere on edges.
+                    !(is_corner && (is_bot || is_top)) && rng.prob(1, 2)
+                } else {
+                    true // inner 3×3 always placed
+                };
+                if place { place_leaf_abs(world, wx + dx, wy + dy, wz, leaf_paint); }
+            }
+        }
+    }
+    for dz in 0..trunk_h { set_block_abs(world, wx, wy, z_base + dz, 6, 0); }
+}
+
+/// Small conical pine tree (ported from PineTree).
+fn place_pine_tree(world: &mut LoadedWorld, wx: i32, wy: i32, z_base: i32, rng: &mut Rng64) {
+    let leaf_paint = PINE_LEAF_PAINTS[rng.range(0, 2) as usize];
+
+    // 8 leaf layers starting at dz=2 (trunk occupies dz=0..1)
+    for dz in 2..10i32 {
+        let wz = z_base + dz;
+        for dx in -2i32..=2 {
+            for dy in -2i32..=2 {
+                let adx = dx.abs(); let ady = dy.abs();
+                let place = match dz {
+                    // wide tier: cross@dist2 + inner 3×3
+                    2 | 4 => (adx == 2 && dy == 0) || (ady == 2 && dx == 0) || (adx < 2 && ady < 2),
+                    // medium tier: cross@dist1 + center
+                    3 | 5 | 7 => (adx == 1 && dy == 0) || (ady == 1 && dx == 0) || (dx == 0 && dy == 0),
+                    // tip tiers: center only
+                    _ => dx == 0 && dy == 0,
+                };
+                if place { place_leaf_abs(world, wx + dx, wy + dy, wz, leaf_paint); }
+            }
+        }
+    }
+    // Trunk: 2 blocks; written after leaves so they don't overwrite.
+    set_block_abs(world, wx, wy, z_base,     6, 0);
+    set_block_abs(world, wx, wy, z_base + 1, 6, 0);
+}
+
+/// Tall conical pine tree with 7×7 base tiers (ported from TallPineTree).
+fn place_tall_pine_tree(world: &mut LoadedWorld, wx: i32, wy: i32, z_base: i32, rng: &mut Rng64) {
+    let leaf_paint = PINE_LEAF_PAINTS[rng.range(0, 2) as usize];
+
+    // 11 leaf layers (dz 2..=12)
+    for dz in 2..13i32 {
+        let wz = z_base + dz;
+        for dx in -3i32..=3 {
+            for dy in -3i32..=3 {
+                let adx = dx.abs(); let ady = dy.abs();
+                match dz {
+                    2 | 4 => {
+                        // Wide tier: cardinal points at dist 3 + inner 5×5 minus diagonal corners
+                        if (adx == 3 && dy == 0) || (ady == 3 && dx == 0) {
+                            place_leaf_abs(world, wx + dx, wy + dy, wz, leaf_paint);
+                        } else if adx <= 2 && ady <= 2 {
+                            if adx == 2 && ady == 2 {
+                                // Rounded corners: clear (air) per reference behaviour
+                                set_block_abs(world, wx + dx, wy + dy, wz, 0, 0);
+                            } else {
+                                place_leaf_abs(world, wx + dx, wy + dy, wz, leaf_paint);
+                            }
+                        }
+                    }
+                    3 | 5 | 7 => {
+                        // Medium tier: cross@dist2 + inner 3×3
+                        if (adx == 2 && dy == 0) || (ady == 2 && dx == 0) || (adx <= 1 && ady <= 1) {
+                            place_leaf_abs(world, wx + dx, wy + dy, wz, leaf_paint);
+                        }
+                    }
+                    6 | 8 | 10 => {
+                        // Narrow tier: cross@dist1 + center
+                        if (adx == 1 && dy == 0) || (ady == 1 && dx == 0) || (dx == 0 && dy == 0) {
+                            place_leaf_abs(world, wx + dx, wy + dy, wz, leaf_paint);
+                        }
+                    }
+                    _ => {
+                        // Tip tiers (9, 11, 12): center only
+                        if dx == 0 && dy == 0 {
+                            place_leaf_abs(world, wx + dx, wy + dy, wz, leaf_paint);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    set_block_abs(world, wx, wy, z_base,     6, 0);
+    set_block_abs(world, wx, wy, z_base + 1, 6, 0);
+}
+
+/// Scatter trees across the XY footprint of the current selection.
+/// Each column in (x1..=x2, y1..=y2) is independently rolled against `density` (0–1).
+/// Trees are planted on the topmost solid block; columns over water, lava, cloud, or
+/// existing foliage are skipped. `seed` = None uses a random timestamp-based seed.
+#[tauri::command]
+fn generate_trees(
+    x1: i32, y1: i32, x2: i32, y2: i32,
+    tree_type: String,
+    density: f32,
+    seed: Option<u64>,
+    state: tauri::State<'_, AppState>,
+) -> Result<EditResult, String> {
+    if !matches!(tree_type.as_str(), "normal" | "terrain" | "pine" | "tall_pine") {
+        return Err(format!("Unknown tree type '{tree_type}'"));
+    }
+    if density <= 0.0 || density > 1.0 {
+        return Err("Density must be in range (0, 1]".into());
+    }
+
+    let seed = seed.unwrap_or_else(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos() as u64
+    });
+
+    let mut ws = state.lock().unwrap();
+    let max_z = ws.world.as_ref().map(|w| world_max_z(w)).unwrap_or(63);
+    // Only validate XY; z is ignored (trees find the surface themselves).
+    if x2 < x1 || y2 < y1 {
+        return Err("Invalid selection bounds".into());
+    }
+
+    let mut world = ws.world.take().ok_or("No world loaded")?;
+
+    // Expand snapshot area by 3 to include chunks where leaves may spill over.
+    let snap_x1 = (x1 - 3).max(0);
+    let snap_y1 = (y1 - 3).max(0);
+    let snap_x2 = x2 + 3;
+    let snap_y2 = y2 + 3;
+    let affected = affected_chunk_coords(&world, snap_x1, snap_y1, snap_x2, snap_y2);
+    let pre_snap = snapshot_chunks(&world, &affected);
+
+    let mut rng = Rng64::new(seed);
+    let density_num = (density.clamp(0.0, 1.0) * 1_000_000.0) as u64;
+
+    for wx in x1..=x2 {
+        for wy in y1..=y2 {
+            if !rng.prob(density_num, 1_000_000) { continue; }
+
+            let sz = match surface_z(&world, wx, wy) { Some(z) => z, None => continue };
+
+            // Read surface block type to check plantability.
+            let surf_bt = {
+                let cx = wx.div_euclid(16) + world.min_x;
+                let cy = wy.div_euclid(16) + world.min_y;
+                if let Some(&addr) = world.chunk_map.get(&(cx, cy)) {
+                    let lx   = wx.rem_euclid(16) as usize;
+                    let ly   = wy.rem_euclid(16) as usize;
+                    let band = sz as usize / 16;
+                    let lz   = sz as usize % 16;
+                    let bi   = addr + band * 8192 + lx * 256 + ly * 16 + lz;
+                    if bi < world.bytes.len() { world.bytes[bi] } else { 0 }
+                } else { 0 }
+            };
+
+            if !is_plantable(surf_bt) { continue; }
+
+            let z_base = sz + 1;
+            if z_base > max_z { continue; }
+
+            match tree_type.as_str() {
+                "normal"    => place_normal_tree(&mut world, wx, wy, z_base, &mut rng),
+                "terrain"   => place_terrain_tree(&mut world, wx, wy, z_base, &mut rng),
+                "pine"      => place_pine_tree(&mut world, wx, wy, z_base, &mut rng),
+                "tall_pine" => place_tall_pine_tree(&mut world, wx, wy, z_base, &mut rng),
+                _ => {}
+            }
+        }
+    }
+
+    let patch    = render_pixels_patch(&world, x1, y1, x2, y2);
+    let pre_snap = filter_unchanged_snapshots(&world, pre_snap);
+    ws.world     = Some(world);
+
+    if !pre_snap.is_empty() {
+        push_undo(&mut ws.undo_stack, UndoEntry { operation: "generate_trees".into(), chunks: pre_snap });
+        ws.redo_stack.clear();
+    }
+
+    Ok(EditResult { patch, undo_depth: ws.undo_stack.len(), redo_depth: ws.redo_stack.len() })
+}
+
+/// Top-down render of the current clipboard (highest non-air block per column).
+/// Axonometric top-down render for the visible region.
+/// For each output pixel (px, py), rays descend from max_z. At depth dz = max_z - z,
+/// the sample point drifts: sample_px = px + ski*0.5*dz, sample_py = py - ski*dz.
+/// This creates a south-east viewing angle with depth-derived parallax (ski=0 is flat top-down).
+#[tauri::command]
+fn render_axo_region(
+    x1: i32, y1: i32, x2: i32, y2: i32,
+    ski: f32,
+    state: tauri::State<'_, AppState>,
+) -> Result<PixelPatch, String> {
+    let ws = state.lock().unwrap();
+    let world = ws.world.as_ref().ok_or("No world loaded")?;
+    let world_w = (world.w_chunks * 16) as i32;
+    let world_h = (world.h_chunks * 16) as i32;
+    let ox1 = x1.clamp(0, world_w - 1) as u32;
+    let oy1 = y1.clamp(0, world_h - 1) as u32;
+    let ox2 = x2.clamp(0, world_w - 1) as u32;
+    let oy2 = y2.clamp(0, world_h - 1) as u32;
+    let width  = ox2 - ox1 + 1;
+    let height = oy2 - oy1 + 1;
+    let max_z = world_max_z(world) as f32;
+    let mut pixels = vec![30u8; (width * height * 4) as usize];
+    for p in pixels.chunks_exact_mut(4) { p[3] = 255; }
+
+    for py in oy1..=oy2 {
+        for px in ox1..=ox2 {
+            let mut top_bt = 0u8; let mut top_paint = 0u8;
+            let mut under_bt = 0u8; let mut under_paint = 0u8;
+
+            'zray: for dz in 0..=(max_z as i32) {
+                let wz = (max_z as i32) - dz;
+                let sx = (px as f32 + ski * 0.5 * dz as f32).round() as i32;
+                let sy = (py as f32 - ski * dz as f32).round() as i32;
+                if sx < 0 || sx >= world_w || sy < 0 || sy >= world_h { continue; }
+                let cx = (sx / 16) as i32 + world.min_x;
+                let cy = (sy / 16) as i32 + world.min_y;
+                let lx = (sx % 16) as usize;
+                let ly = (sy % 16) as usize;
+                let &addr = match world.chunk_map.get(&(cx, cy)) { Some(a) => a, None => continue };
+                let band = wz as usize / 16;
+                let lz   = wz as usize % 16;
+                let bi = addr + band * 8192 + lx * 256 + ly * 16 + lz;
+                let pi = bi + 4096;
+                if bi >= world.bytes.len() || pi >= world.bytes.len() { continue; }
+                let bt = world.bytes[bi];
+                if bt == 0 { continue; }
+                if top_bt == 0 {
+                    top_bt = bt; top_paint = world.bytes[pi];
+                    if transparent_alpha(bt).is_none() { break 'zray; }
+                } else {
+                    under_bt = bt; under_paint = world.bytes[pi];
+                    break 'zray;
+                }
+            }
+
+            if top_bt == 0 { continue; }
+            let c1 = block_color(top_bt, top_paint, world.sky);
+            let [r, g, b] = if under_bt != 0 {
+                if let Some(alpha) = transparent_alpha(top_bt) {
+                    let c2 = block_color(under_bt, under_paint, world.sky);
+                    [
+                        (c1[0] as f32 * alpha + c2[0] as f32 * (1.0 - alpha)) as u8,
+                        (c1[1] as f32 * alpha + c2[1] as f32 * (1.0 - alpha)) as u8,
+                        (c1[2] as f32 * alpha + c2[2] as f32 * (1.0 - alpha)) as u8,
+                    ]
+                } else { c1 }
+            } else { c1 };
+
+            let off = (((py - oy1) * width + (px - ox1)) * 4) as usize;
+            pixels[off] = r; pixels[off + 1] = g; pixels[off + 2] = b; pixels[off + 3] = 255;
+        }
+    }
+    Ok(PixelPatch { x: ox1, y: oy1, width, height, pixels })
+}
+
+/// Used to show a block preview inside the paste ghost box.
+/// Reads only from clipboard + sky — no world mutation.
+#[tauri::command]
+fn render_clipboard_preview(state: tauri::State<'_, AppState>) -> Result<PreviewData, String> {
+    let ws  = state.lock().unwrap();
+    let sky = ws.world.as_ref().map(|w| w.sky).unwrap_or(0);
+    let cb  = ws.clipboard.as_ref().ok_or("Clipboard is empty")?;
+    let (w, h, d) = (cb.width, cb.height, cb.depth);
+    const VOID: [u8; 4] = [20, 20, 35, 255];
+    let mut pixels = vec![0u8; (w * h * 4) as usize];
+    for p in pixels.chunks_exact_mut(4) { p.copy_from_slice(&VOID); }
+    for dy in 0..h {
+        for dx in 0..w {
+            let col = (dy * w + dx) as usize;
+            for dz in (0..d).rev() { // highest dz = topmost z layer
+                let idx = (dz * h * w + dy * w + dx) as usize;
+                let bt  = cb.block_types[idx];
+                if bt != 0 {
+                    let [r, g, b]       = block_color(bt, cb.paints[idx], sky);
+                    pixels[col * 4]     = r;
+                    pixels[col * 4 + 1] = g;
+                    pixels[col * 4 + 2] = b;
+                    pixels[col * 4 + 3] = 255;
+                    break;
+                }
+            }
+        }
+    }
+    Ok(PreviewData { width: w as u32, height: h as u32, pixels })
+}
+
+// Renders the front (X-Z) or side (Y-Z) face of the clipboard for use as a
+// ghost overlay in the elevation preview panel. Transparent pixels = air.
+#[tauri::command]
+fn render_clipboard_elevation_preview(
+    view: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<PreviewData, String> {
+    let ws  = state.lock().unwrap();
+    let sky = ws.world.as_ref().map(|w| w.sky).unwrap_or(0);
+    let cb  = ws.clipboard.as_ref().ok_or("Clipboard is empty")?;
+    let (w, h, d) = (cb.width as usize, cb.height as usize, cb.depth as usize);
+    let is_front = view != "side";
+    let img_w = if is_front { w } else { h };
+    let img_h = d;
+    let mut pixels = vec![0u8; img_w * img_h * 4]; // alpha 0 = transparent air
+    for dz in 0..d {
+        let row = d - 1 - dz; // row 0 = top = highest z
+        for col in 0..img_w {
+            let result = if is_front {
+                // col = dx, scan dy front-to-back
+                (0..h).find_map(|dy| {
+                    let bt = cb.block_types[dz * h * w + dy * w + col];
+                    if bt != 0 { Some((bt, cb.paints[dz * h * w + dy * w + col])) } else { None }
+                })
+            } else {
+                // col = dy, scan dx left-to-right
+                (0..w).find_map(|dx| {
+                    let bt = cb.block_types[dz * h * w + col * w + dx];
+                    if bt != 0 { Some((bt, cb.paints[dz * h * w + col * w + dx])) } else { None }
+                })
+            };
+            if let Some((bt, paint)) = result {
+                let [r, g, b] = block_color(bt, paint, sky);
+                let i = (row * img_w + col) * 4;
+                pixels[i] = r; pixels[i+1] = g; pixels[i+2] = b; pixels[i+3] = 255;
+            }
+        }
+    }
+    Ok(PreviewData { width: img_w as u32, height: img_h as u32, pixels })
+}
+
+// ── Prefab serialization ───────────────────────────────────────────────────────
+
+fn serialize_prefab(cb: &Clipboard) -> Vec<u8> {
+    use flate2::{write::GzEncoder, Compression};
+    use std::io::Write;
+    let n = (cb.width * cb.height * cb.depth) as usize;
+    let mut raw = Vec::with_capacity(22 + 2 * n);
+    raw.extend_from_slice(b"EPFAB\x01");
+    for v in [cb.width, cb.height, cb.depth, cb.z_anchor] {
+        raw.extend_from_slice(&v.to_le_bytes());
+    }
+    raw.extend_from_slice(&cb.block_types);
+    raw.extend_from_slice(&cb.paints);
+    let mut enc = GzEncoder::new(Vec::new(), Compression::best());
+    enc.write_all(&raw).unwrap();
+    enc.finish().unwrap()
+}
+
+fn deserialize_prefab(data: &[u8]) -> Result<Clipboard, String> {
+    use std::borrow::Cow;
+    // Auto-detect gzip (new compressed format) vs raw (legacy uncompressed).
+    let raw: Cow<[u8]> = if data.starts_with(&[0x1f, 0x8b]) {
+        use flate2::read::GzDecoder;
+        use std::io::Read;
+        let mut dec = GzDecoder::new(data);
+        let mut out = Vec::new();
+        dec.read_to_end(&mut out)
+            .map_err(|e| format!("Failed to decompress prefab: {e}"))?;
+        Cow::Owned(out)
+    } else {
+        Cow::Borrowed(data)
+    };
+    let data = raw.as_ref();
+    if data.len() < 22 || &data[0..6] != b"EPFAB\x01" {
+        return Err("Not a valid .epfab file".into());
+    }
+    let width    = i32::from_le_bytes(data[6..10].try_into().unwrap());
+    let height   = i32::from_le_bytes(data[10..14].try_into().unwrap());
+    let depth    = i32::from_le_bytes(data[14..18].try_into().unwrap());
+    let z_anchor = i32::from_le_bytes(data[18..22].try_into().unwrap());
+    let n = (width * height * depth) as usize;
+    if width <= 0 || height <= 0 || depth <= 0 || data.len() < 22 + 2 * n {
+        return Err("Corrupt or truncated .epfab file".into());
+    }
+    Ok(Clipboard {
+        width, height, depth, z_anchor,
+        block_types: data[22..22 + n].to_vec(),
+        paints:      data[22 + n..22 + 2 * n].to_vec(),
+    })
+}
+
+#[tauri::command]
+fn save_prefab(path: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let ws = state.lock().unwrap();
+    let cb = ws.clipboard.as_ref().ok_or("Clipboard is empty")?;
+    let bytes = serialize_prefab(cb);
+    fs::write(&path, bytes).map_err(|e| format!("Failed to write prefab: {e}"))
+}
+
+#[tauri::command]
+fn load_prefab(path: String, state: tauri::State<'_, AppState>) -> Result<ClipboardInfo, String> {
+    let data = fs::read(&path).map_err(|e| format!("Failed to read prefab: {e}"))?;
+    let cb   = deserialize_prefab(&data)?;
+    let info = ClipboardInfo {
+        width: cb.width, height: cb.height,
+        depth: cb.depth, z_anchor: cb.z_anchor,
+    };
+    let mut ws = state.lock().unwrap();
+    ws.clipboard = Some(cb);
+    Ok(info)
+}
+
 // ── App entry point ────────────────────────────────────────────────────────────
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
+// ── Network commands ─────────────────────────────────────────────────────────
+
+/// Search the Eden world server. Returns worlds ordered as received from server.
+/// Fetches file sizes via parallel HEAD requests.
+#[tauri::command]
+async fn search_worlds(query: String, server: String) -> Result<Vec<WorldSearchResult>, String> {
+    let srv = get_server(&server)?;
+    let url = format!("{}?search={}", srv.search_url, urlencoding_encode(&query));
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let text = client.get(&url).send().await
+        .map_err(|e| format!("Failed to query {server} server: {e}"))?
+        .text().await
+        .map_err(|e| e.to_string())?;
+
+    let lines: Vec<&str> = text.lines().collect();
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    let mut i = 0;
+    while i + 1 < lines.len() {
+        let id_line = lines[i].trim();
+        let name_line = lines[i + 1].trim();
+        if id_line.ends_with(".eden") && name_line.ends_with(".name") {
+            let id = id_line.trim_end_matches(".eden").to_string();
+            let name = name_line.trim_end_matches(".name").to_string();
+            pairs.push((id, name));
+        }
+        i += 2;
+    }
+
+    let download_base = srv.download_base_url;
+    let mut results = Vec::with_capacity(pairs.len());
+    for (id, name) in pairs {
+        let timestamp = id.parse::<i64>().unwrap_or(0);
+        let head_url = format!("{}/{}.eden", download_base, id);
+        let file_size = match client.head(&head_url)
+            .timeout(std::time::Duration::from_secs(5))
+            .send().await
+        {
+            Ok(resp) => resp.headers()
+                .get(reqwest::header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok()),
+            Err(_) => None,
+        };
+        results.push(WorldSearchResult { id, name, timestamp, file_size });
+    }
+
+    Ok(results)
+}
+
+fn urlencoding_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            b' ' => out.push('+'),
+            _ => {
+                out.push('%');
+                out.push(char::from_digit((b >> 4) as u32, 16).unwrap().to_ascii_uppercase());
+                out.push(char::from_digit((b & 0xf) as u32, 16).unwrap().to_ascii_uppercase());
+            }
+        }
+    }
+    out
+}
+
+/// Download a world from the Eden server, streaming to disk with progress events.
+#[tauri::command]
+async fn download_world(
+    app: tauri::AppHandle,
+    id: String,
+    server: String,
+    dest_path: String,
+) -> Result<(), String> {
+    let srv = get_server(&server)?;
+    let url = format!("{}/{}.eden", srv.download_base_url, id);
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let mut response = client.get(&url).send().await
+        .map_err(|e| format!("Download failed: {e}"))?;
+
+    if !response.status().is_success() {
+        return Err(format!("Server returned {}", response.status()));
+    }
+
+    let total = response.content_length();
+    let mut downloaded: u64 = 0;
+    let mut body: Vec<u8> = Vec::new();
+
+    while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
+        downloaded += chunk.len() as u64;
+        body.extend_from_slice(&chunk);
+        let _ = app.emit("download-progress", serde_json::json!({
+            "downloaded": downloaded,
+            "total": total
+        }));
+    }
+
+    // Server delivers worlds gzip-compressed; decompress to raw .eden before saving
+    // so load_world can mmap it directly (it only handles zip-PK or raw).
+    let final_bytes: Vec<u8> = if body.starts_with(&[0x1f, 0x8b]) {
+        use flate2::read::GzDecoder;
+        use std::io::Read;
+        let mut dec = GzDecoder::new(body.as_slice());
+        let mut out = Vec::new();
+        dec.read_to_end(&mut out).map_err(|e| format!("Decompression failed: {e}"))?;
+        out
+    } else {
+        body
+    };
+
+    let tmp_path = format!("{}.tmp", dest_path);
+    fs::write(&tmp_path, &final_bytes).map_err(|e| format!("Write failed: {e}"))?;
+    fs::rename(&tmp_path, &dest_path).map_err(|e| format!("Rename failed: {e}"))?;
+
+    Ok(())
+}
+
+/// Upload a world file + PNG preview to the Eden server.
+/// GETs the upload page first to obtain the server-assigned uuid (client IP),
+/// then POSTs the multipart form with ?uuid=<ip>.
+#[tauri::command]
+async fn upload_world(
+    app: tauri::AppHandle,
+    world_path: String,
+    image_path: String,
+    server: String,
+) -> Result<String, String> {
+    let srv = get_server(&server)?;
+    let raw_world = fs::read(&world_path).map_err(|e| format!("Cannot read world: {e}"))?;
+    let image_bytes = fs::read(&image_path).map_err(|e| format!("Cannot read image: {e}"))?;
+
+    // Server stores and delivers worlds as gzip; upload in gzip format to match.
+    // If already gzip: upload as-is. If zip (PK): decompress to raw first, then gzip.
+    let world_bytes: Vec<u8> = if raw_world.starts_with(&[0x1f, 0x8b]) {
+        raw_world
+    } else {
+        use flate2::{write::GzEncoder, Compression};
+        use std::io::Write;
+        let raw = if raw_world.starts_with(&[0x50, 0x4B, 0x03, 0x04]) {
+            use zip::ZipArchive;
+            let cursor = std::io::Cursor::new(&raw_world);
+            let mut archive = ZipArchive::new(cursor).map_err(|e| format!("Invalid zip: {e}"))?;
+            let mut entry = archive.by_index(0).map_err(|e| format!("Zip entry: {e}"))?;
+            let mut out = Vec::new();
+            std::io::copy(&mut entry, &mut out).map_err(|e| format!("Decompress zip: {e}"))?;
+            out
+        } else {
+            raw_world
+        };
+        let mut enc = GzEncoder::new(Vec::new(), Compression::best());
+        enc.write_all(&raw).map_err(|e| format!("Gzip write: {e}"))?;
+        enc.finish().map_err(|e| format!("Gzip finish: {e}"))?
+    };
+
+    let total = (world_bytes.len() + image_bytes.len()) as u64;
+
+    let _ = app.emit("upload-progress", serde_json::json!({ "bytes_sent": 0u64, "total": total }));
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    // Generate a UUID-format identifier matching what the iOS Eden client sends
+    // (UIDevice.identifierForVendor — format XXXXXXXX-XXXX-4XXX-8XXX-XXXXXXXXXXXX).
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    let uuid = format!("{:08X}-{:04X}-4{:03X}-{:04X}-{:012X}",
+        ts as u32,
+        (ts >> 32) as u16,
+        (ts >> 16) as u16 & 0xFFF,
+        0x8000u16 | ((ts >> 48) as u16 & 0x3FFF),
+        ts & 0x0000_FFFF_FFFF_FFFF_u64);
+    let post_url = format!("{}?uuid={}", srv.upload_url, uuid);
+
+    let world_filename = std::path::Path::new(&world_path)
+        .file_name().and_then(|f| f.to_str()).unwrap_or("world.eden")
+        .to_string();
+    let image_filename = std::path::Path::new(&image_path)
+        .file_name().and_then(|f| f.to_str()).unwrap_or("preview.png")
+        .to_string();
+
+    let form = reqwest::multipart::Form::new()
+        .part("file.bin", reqwest::multipart::Part::bytes(world_bytes)
+            .file_name(world_filename)
+            .mime_str("application/octet-stream").unwrap())
+        .part("image.bin", reqwest::multipart::Part::bytes(image_bytes)
+            .file_name(image_filename)
+            .mime_str("image/png").unwrap())
+        .text("submit", "Upload");
+
+    let response = client.post(&post_url).multipart(form).send().await
+        .map_err(|e| format!("Upload failed: {e}"))?;
+
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+
+    let _ = app.emit("upload-progress", serde_json::json!({ "bytes_sent": total, "total": total }));
+
+    if !status.is_success() {
+        return Err(format!("Server returned {status}: {body}"));
+    }
+
+    Ok(body)
+}
+
 pub fn run() {
     tauri::Builder::default()
         .manage(Mutex::new(WorldState::new()))
@@ -1520,15 +2878,29 @@ pub fn run() {
             describe_selection,
             delete_blocks,
             replace_blocks,
+            paint_blocks,
             save_world,
             undo_edit,
             redo_edit,
             copy_selection,
             rotate_clipboard,
+            mirror_clipboard_x,
+            mirror_clipboard_y,
             paste_at,
             paste_terrain,
             render_zslice_patch,
             render_selection_view,
+            render_full_height_view,
+            extrude_selection,
+            render_clipboard_preview,
+            render_clipboard_elevation_preview,
+            save_prefab,
+            load_prefab,
+            generate_trees,
+            render_axo_region,
+            search_worlds,
+            download_world,
+            upload_world,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
