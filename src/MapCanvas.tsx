@@ -2,7 +2,7 @@ import { useEffect, useRef, useCallback, forwardRef, useImperativeHandle } from 
 import { invoke } from "@tauri-apps/api/core";
 import { brushFootprint, bresenhamLine, rectPixels, ellipsePixels, type WP, type BrushShape, type FillMode } from "./drawTools";
 
-export type Tool = "pan" | "select" | "paste" | "pen" | "brush" | "rect" | "ellipse";
+export type Tool = "pan" | "select" | "paste" | "pen" | "brush" | "rect" | "ellipse" | "smooth" | "noise" | "flatten" | "erode" | "fill";
 
 export interface DrawConfig {
   brushSize: number;
@@ -105,6 +105,14 @@ interface Props {
   onDrawStroke?: (pts: [number, number][], zOverride: number | null) => void;
   /** Current z-slice level — used as z override when drawing in z-slice mode. */
   drawZOverride?: number | null;
+  /** When set, draws ghost copies of the selection on X or Y axis before the user commits. */
+  extrudePreview?: { axis: string; count: number } | null;
+  /** Last paste step vector — used to draw a look-ahead trail of repeat-paste positions. */
+  lastPasteDelta?: { dx: number; dy: number } | null;
+  /** Called on every pointer-move with current world coords — used for follow-surface z-slice. */
+  onCursorMove?: (wx: number, wy: number) => void;
+  /** Called on right-click in select mode for magic-wand selection. */
+  onMagicWand?: (wx: number, wy: number) => void;
 }
 
 function decodePixels(b64: string): Uint8Array {
@@ -120,7 +128,8 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   { world, worldEpoch, tool, viewMode, zSliceZ,
     committedSelection, onSelectionChange, pastePreview, clipboardPreviewPixels, onPasteAt,
     renderMode, axoSkew = 0.2, lockedPastePos = null,
-    drawConfig, onDrawStroke, drawZOverride = null }: Props,
+    drawConfig, onDrawStroke, drawZOverride = null,
+    extrudePreview = null, lastPasteDelta = null, onCursorMove, onMagicWand }: Props,
   ref,
 ) {
   const canvasRef  = useRef<HTMLCanvasElement>(null);
@@ -161,6 +170,10 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   const drawConfigRef     = useRef(drawConfig);
   const onDrawStrokeRef   = useRef(onDrawStroke);
   const drawZOverrideRef  = useRef(drawZOverride);
+  const extrudePreviewRef = useRef(extrudePreview);
+  const lastPasteDeltaRef = useRef(lastPasteDelta);
+  const onCursorMoveRef   = useRef(onCursorMove);
+  const onMagicWandRef    = useRef(onMagicWand);
 
   useEffect(() => { toolRef.current = tool; }, [tool]);
   useEffect(() => { onSelChangeRef.current = onSelectionChange; }, [onSelectionChange]);
@@ -169,6 +182,10 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   useEffect(() => { drawConfigRef.current = drawConfig; }, [drawConfig]);
   useEffect(() => { onDrawStrokeRef.current = onDrawStroke; }, [onDrawStroke]);
   useEffect(() => { drawZOverrideRef.current = drawZOverride; }, [drawZOverride]);
+  useEffect(() => { extrudePreviewRef.current = extrudePreview; }, [extrudePreview]);
+  useEffect(() => { lastPasteDeltaRef.current = lastPasteDelta; }, [lastPasteDelta]);
+  useEffect(() => { onCursorMoveRef.current = onCursorMove; }, [onCursorMove]);
+  useEffect(() => { onMagicWandRef.current  = onMagicWand;  }, [onMagicWand]);
 
   const mapW = world.width_chunks * 16;
   const mapH = world.height_chunks * 16;
@@ -270,6 +287,35 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
       ctx.strokeRect(rx + 2.5, ry + 2.5, rw - 5, rh - 5);
     }
 
+    // X/Y extrude ghost — dashed sky-blue copies of the selection along X or Y
+    {
+      const ep = extrudePreviewRef.current;
+      const sel = committedSelRef.current;
+      if (ep && sel && (ep.axis.startsWith("x") || ep.axis.startsWith("y"))) {
+        const selW = sel.x2 - sel.x1 + 1;
+        const selH = sel.y2 - sel.y1 + 1;
+        const dx = ep.axis === "x+" ? selW : ep.axis === "x-" ? -selW : 0;
+        const dy = ep.axis === "y+" ? selH : ep.axis === "y-" ? -selH : 0;
+        ctx.save();
+        ctx.setLineDash([4, 3]);
+        ctx.lineWidth = 1;
+        for (let k = 1; k <= ep.count; k++) {
+          const ox = sel.x1 + dx * k;
+          const oy = sel.y1 + dy * k;
+          const rx = Math.round(ox * scale + vx);
+          const ry = Math.round(oy * scale + vy);
+          const rw = Math.round(selW * scale);
+          const rh = Math.round(selH * scale);
+          const alpha = Math.max(0.08, 0.35 - k * 0.05);
+          ctx.fillStyle = `rgba(56,189,248,${alpha})`;
+          ctx.fillRect(rx, ry, rw, rh);
+          ctx.strokeStyle = `rgba(56,189,248,${Math.min(1, alpha * 3)})`;
+          ctx.strokeRect(rx + 0.5, ry + 0.5, rw - 1, rh - 1);
+        }
+        ctx.restore();
+      }
+    }
+
     // Paste ghost box — amber when XY is locked, green when hovering
     if (toolRef.current === "paste" && pastePreviewRef.current) {
       const locked = lockedPastePosRef.current;
@@ -309,6 +355,32 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
       }
     }
 
+    // Repeat-paste trail: 3 faded ghost copies in the last-paste direction
+    {
+      const delta = lastPasteDeltaRef.current;
+      if (toolRef.current === "paste" && pastePreviewRef.current && delta) {
+        const ghostPos = lockedPastePosRef.current ?? pasteHoverRef.current;
+        if (ghostPos) {
+          const { width: pw, height: ph } = pastePreviewRef.current;
+          ctx.save();
+          ctx.setLineDash([3, 3]);
+          ctx.lineWidth = 1;
+          for (let k = 1; k <= 3; k++) {
+            const alpha = Math.max(0.04, 0.16 - k * 0.04);
+            const gx = Math.round((ghostPos.x + delta.dx * k) * scale + vx);
+            const gy = Math.round((ghostPos.y + delta.dy * k) * scale + vy);
+            const gw = Math.round(pw * scale);
+            const gh = Math.round(ph * scale);
+            ctx.fillStyle   = `rgba(34, 197, 94, ${alpha})`;
+            ctx.fillRect(gx, gy, gw, gh);
+            ctx.strokeStyle = `rgba(34, 197, 94, ${Math.min(1, alpha * 3)})`;
+            ctx.strokeRect(gx + 0.5, gy + 0.5, gw - 1, gh - 1);
+          }
+          ctx.restore();
+        }
+      }
+    }
+
     // Draw tool ghost overlay
     {
       const drawTool = toolRef.current;
@@ -336,14 +408,15 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
         const bx2 = Math.max(drag.start.x, drag.end.x), by2 = Math.max(drag.start.y, drag.end.y);
         ctx.strokeRect(Math.round(bx1 * scale + vx) + 0.5, Math.round(by1 * scale + vy) + 0.5,
           Math.round((bx2 - bx1 + 1) * scale), Math.round((by2 - by1 + 1) * scale));
-      } else if (!drag && (drawTool === "pen" || drawTool === "brush") && cfg) {
+      } else if (!drag && (drawTool === "pen" || drawTool === "brush" || drawTool === "smooth" || drawTool === "noise" || drawTool === "flatten" || drawTool === "erode" || drawTool === "fill") && cfg) {
         // Cursor preview when hovering (not dragging)
         const pos = cursorPosRef.current;
         if (pos) {
-          const pts = drawTool === "pen"
+          const isSculpt = drawTool === "smooth" || drawTool === "noise" || drawTool === "flatten" || drawTool === "erode";
+          const pts = (drawTool === "pen" || drawTool === "fill")
             ? [pos]
-            : brushFootprint(pos, cfg.brushSize, cfg.brushShape);
-          ctx.fillStyle = "rgba(56,189,248,0.4)";
+            : brushFootprint(pos, cfg.brushSize, isSculpt ? "circ" : cfg.brushShape);
+          ctx.fillStyle = isSculpt ? "rgba(251,146,60,0.45)" : drawTool === "fill" ? "rgba(52,211,153,0.55)" : "rgba(56,189,248,0.4)";
           for (const p of pts) paintPt(p.x, p.y);
         }
       }
@@ -699,6 +772,13 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
       }
       return;
     }
+    // Right-click in select mode = magic wand
+    if (e.button === 2 && toolRef.current === "select") {
+      e.preventDefault();
+      const wp = screenToWorld(e.clientX, e.clientY);
+      onMagicWandRef.current?.(wp.x, wp.y);
+      return;
+    }
     if (toolRef.current === "select") {
       const sel = committedSelRef.current;
       if (sel !== null) {
@@ -716,13 +796,20 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
       draw();
     } else if (toolRef.current === "paste") {
       // paste fires on pointer-up
-    } else if (toolRef.current === "pen" || toolRef.current === "brush") {
+    } else if (toolRef.current === "pen" || toolRef.current === "brush" || toolRef.current === "smooth" || toolRef.current === "noise" || toolRef.current === "flatten" || toolRef.current === "erode") {
       const wp = screenToWorld(e.clientX, e.clientY);
       const cfg = drawConfigRef.current;
+      const isSculpt = toolRef.current === "smooth" || toolRef.current === "noise" || toolRef.current === "flatten" || toolRef.current === "erode";
       const footprint = (toolRef.current === "pen" || !cfg)
         ? [wp]
-        : brushFootprint(wp, cfg.brushSize, cfg.brushShape);
+        : brushFootprint(wp, cfg.brushSize, isSculpt ? "circ" : cfg.brushShape);
       const pts = new Set<string>(footprint.map(p => `${p.x},${p.y}`));
+      dragRef.current = { kind: "draw-stroke", pts, lastWX: wp.x, lastWY: wp.y };
+      draw();
+    } else if (toolRef.current === "fill") {
+      // Fill fires on pointer-up; nothing to drag. Start a minimal stroke so pointer-up fires it.
+      const wp = screenToWorld(e.clientX, e.clientY);
+      const pts = new Set<string>([`${wp.x},${wp.y}`]);
       dragRef.current = { kind: "draw-stroke", pts, lastWX: wp.x, lastWY: wp.y };
       draw();
     } else if (toolRef.current === "rect" || toolRef.current === "ellipse") {
@@ -741,6 +828,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   const onPointerMove = useCallback((e: React.PointerEvent) => {
     const wp = screenToWorld(e.clientX, e.clientY);
     cursorPosRef.current = wp;
+    onCursorMoveRef.current?.(wp.x, wp.y);
     const drag = dragRef.current;
     if (drag?.kind === "pan") {
       viewRef.current.x = drag.viewX + e.clientX - drag.startX;
@@ -756,11 +844,12 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
         }
       } else if (drag?.kind === "draw-stroke") {
         const cfg = drawConfigRef.current;
+        const isSculpt = toolRef.current === "smooth" || toolRef.current === "noise" || toolRef.current === "flatten" || toolRef.current === "erode";
         const line = bresenhamLine({ x: drag.lastWX, y: drag.lastWY }, wp);
         for (const lp of line) {
-          const footprint = (toolRef.current === "pen" || !cfg)
+          const footprint = (toolRef.current === "pen" || toolRef.current === "fill" || !cfg)
             ? [lp]
-            : brushFootprint(lp, cfg.brushSize, cfg.brushShape);
+            : brushFootprint(lp, cfg.brushSize, isSculpt ? "circ" : cfg.brushShape);
           for (const p of footprint) drag.pts.add(`${p.x},${p.y}`);
         }
         drag.lastWX = wp.x;
