@@ -118,6 +118,10 @@ function App() {
   const [showWorldBrowser, setShowWorldBrowser] = useState(false);
   const [showUploadModal, setShowUploadModal] = useState(false);
 
+  const [renamingWorld, setRenamingWorld] = useState(false);
+  const [renameInput, setRenameInput] = useState("");
+  const renameInputRef = useRef<HTMLInputElement>(null);
+
   const [clipboard, setClipboard] = useState<ClipboardInfo | null>(null);
   const [pasteElevationOffset, setPasteElevationOffset] = useState(0);
   const [pasteIgnoreAir, setPasteIgnoreAir] = useState(false);
@@ -132,17 +136,70 @@ function App() {
   const [extrudeAxis, setExtrudeAxis]   = useState<ExtrudeAxis>("z+");
   const [extrudeOpen, setExtrudeOpen]   = useState(true);
 
-  const [brushSize,  setBrushSize]  = useState(3);
-  const [brushShape, setBrushShape] = useState<"sq" | "circ">("sq");
-  const [drawFilled, setDrawFilled] = useState(true);
+  const [brushSize,    setBrushSize]    = useState(3);
+  const [brushShape,   setBrushShape]   = useState<"sq" | "circ">("sq");
+  const [drawFilled,   setDrawFilled]   = useState(true);
+  const [drawAbove,    setDrawAbove]    = useState(false);
+
+  // Sculpt tools
+  const [sculptStrength, setSculptStrength] = useState(2);
+  const sculptSeedRef = useRef(Math.floor(Math.random() * 0xFFFFFFFF));
+
+  // Mask
+  const [maskEnabled,   setMaskEnabled]   = useState(false);
+  const [maskBlockType, setMaskBlockType] = useState<number | null>(null);
+  const [maskPaint,     setMaskPaint]     = useState<number | null>(null);
+
+  // Recent blocks quick-pick (last 5 used block+paint combos)
+  const [recentBlocks, setRecentBlocks] = useState<{type: number; paint: number}[]>([]);
+
+  // Find menu
+  const [findMenuOpen, setFindMenuOpen] = useState(false);
+  const findMenuRef = useRef<HTMLDivElement>(null);
+  const [findBlockType, setFindBlockType] = useState(2);
+  const [gotoX, setGotoX] = useState("");
+  const [gotoY, setGotoY] = useState("");
+
+  // Paste mode: normal | scatter | array
+  const [pasteMode, setPasteMode] = useState<"normal" | "scatter" | "array">("normal");
+  const [scatterCount, setScatterCount] = useState(5);
+  const [arrayCols, setArrayCols] = useState(3);
+  const [arrayRows, setArrayRows] = useState(3);
+  const [arraySpacingX, setArraySpacingX] = useState(0);
+  const [arraySpacingY, setArraySpacingY] = useState(0);
 
   const [clipboardPreviewPixels, setClipboardPreviewPixels] = useState<{ width: number; height: number; pixels: Uint8Array } | null>(null);
+
+  // Repeat-paste trail: track last paste position + step vector for path preview and `.` shortcut.
+  const [lastPasteDelta, setLastPasteDelta] = useState<{ dx: number; dy: number } | null>(null);
+  const lastPastePosRef   = useRef<{ x: number; y: number } | null>(null);
+  const lastPasteDeltaRef = useRef<{ dx: number; dy: number } | null>(null);
+
+  // Z-slice follow-surface mode
+  const [followSurface, setFollowSurface] = useState(false);
+  const followSurfaceRef = useRef(false);
+  const cursorMoveThrottleRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => { followSurfaceRef.current = followSurface; }, [followSurface]);
 
   const appToolRef = useRef<Tool>("pan");
   useEffect(() => { appToolRef.current = tool; }, [tool]);
   useEffect(() => { lockedPastePosRef.current = lockedPastePos; }, [lockedPastePos]);
   useEffect(() => { if (tool !== "paste") setLockedPastePos(null); }, [tool]);
   useEffect(() => { if (lockedPastePos) setShowElevationPanel(true); }, [lockedPastePos]);
+
+  // Clear paste trail when clipboard changes or we leave paste mode.
+  useEffect(() => {
+    setLastPasteDelta(null);
+    lastPasteDeltaRef.current = null;
+    lastPastePosRef.current   = null;
+  }, [clipboard]);
+  useEffect(() => {
+    if (tool !== "paste") {
+      setLastPasteDelta(null);
+      lastPasteDeltaRef.current = null;
+      lastPastePosRef.current   = null;
+    }
+  }, [tool]);
 
   // Monotonically increasing counter; incremented at the START of every openFile().
   // Async invokes that captured a prior epoch discard their result on resolution.
@@ -402,6 +459,14 @@ function App() {
             elevationOffset: pasteElevationOffset,
             ignoreAir: pasteIgnoreAir,
           });
+      // Track last paste direction for repeat-paste trail and `.` shortcut.
+      const prev = lastPastePosRef.current;
+      if (prev) {
+        const delta = { dx: pos.x - prev.x, dy: pos.y - prev.y };
+        lastPasteDeltaRef.current = delta;
+        setLastPasteDelta(delta);
+      }
+      lastPastePosRef.current = pos;
       if (!persistPaste) setTool("pan");
       await applyEditResult(result);
     } catch (e) {
@@ -409,7 +474,19 @@ function App() {
     }
   }
 
+  // Stable ref so keyboard handler can always call the latest pasteAt closure.
+  const pasteAtRef = useRef(pasteAt);
+  useEffect(() => { pasteAtRef.current = pasteAt; });
+
   function handlePasteClick(pos: { x: number; y: number }) {
+    if (pasteMode === "scatter") {
+      handleScatterPaste(pos);
+      return;
+    }
+    if (pasteMode === "array") {
+      handleArrayPaste(pos);
+      return;
+    }
     if (persistPaste) {
       pasteAt(pos);
     } else if (lockedPastePos) {
@@ -420,16 +497,108 @@ function App() {
     }
   }
 
+  function trackRecentBlock(type: number, paint: number) {
+    setRecentBlocks(prev => {
+      const filtered = prev.filter(b => !(b.type === type && b.paint === paint));
+      return [{ type, paint }, ...filtered].slice(0, 5);
+    });
+  }
+
   async function handleDrawStroke(pts: [number, number][], zOverride: number | null) {
+    const t = appToolRef.current;
     try {
-      const blocks = pts.map(([x, y]) => ({ x, y, z: zOverride }));
-      const result = await invoke<EditResultRaw>("paint_blocks", {
-        blocks, blockType: fillBlockType, paint: fillPaint,
-      });
-      await applyEditResult(result);
+      if (t === "smooth" || t === "noise" || t === "flatten" || t === "erode") {
+        const points = pts.map(([x, y]) => ({ x, y }));
+        const seed = t === "noise" ? sculptSeedRef.current : 0;
+        if (t === "noise") sculptSeedRef.current = ((sculptSeedRef.current * 1664525 + 1013904223) >>> 0);
+        const result = await invoke<EditResultRaw>("sculpt_terrain", {
+          points, mode: t, strength: sculptStrength, seed,
+        });
+        await applyEditResult(result);
+      } else if (t === "fill") {
+        if (pts.length === 0) return;
+        const [x, y] = pts[0];
+        const result = await invoke<EditResultRaw>("fill_surface", {
+          wx: x, wy: y, newType: fillBlockType, newPaint: fillBlockType === 0 ? 0 : fillPaint, maxFill: 50000,
+        });
+        await applyEditResult(result);
+        trackRecentBlock(fillBlockType, fillPaint);
+      } else {
+        const blocks = pts.map(([x, y]) => ({ x, y, z: zOverride }));
+        const zOffset = drawAbove && zOverride === null ? 1 : 0;
+        const result = await invoke<EditResultRaw>("paint_blocks", {
+          blocks, blockType: fillBlockType, paint: fillBlockType === 0 ? 0 : fillPaint, zOffset,
+          maskType: maskEnabled ? maskBlockType : null,
+          maskPaint: maskEnabled ? maskPaint : null,
+        });
+        await applyEditResult(result);
+        trackRecentBlock(fillBlockType, fillPaint);
+      }
     } catch (e) {
       setError(String(e));
     }
+  }
+
+  function handleCursorMove(wx: number, wy: number) {
+    if (!followSurfaceRef.current || viewModeRef.current !== "zslice") return;
+    if (cursorMoveThrottleRef.current !== null) return;
+    cursorMoveThrottleRef.current = setTimeout(() => {
+      cursorMoveThrottleRef.current = null;
+      invoke<number | null>("get_surface_z", { x: wx, y: wy })
+        .then(z => { if (z !== null && followSurfaceRef.current) { setZSliceZ(z); setZSliceDisplay(z); } })
+        .catch(() => {});
+    }, 50);
+  }
+
+  async function handleFindBlock() {
+    if (!world || !rawBounds) return;
+    const cx = Math.round((rawBounds.x1 + rawBounds.x2) / 2);
+    const cy = Math.round((rawBounds.y1 + rawBounds.y2) / 2);
+    try {
+      const pos = await invoke<{ x: number; y: number } | null>("find_nearest_block", {
+        centerX: cx, centerY: cy, blockType: findBlockType,
+      });
+      if (pos) {
+        setRawBounds({ x1: pos.x, y1: pos.y, x2: pos.x, y2: pos.y });
+        setFindMenuOpen(false);
+      } else {
+        setError("No block of that type found within search radius");
+      }
+    } catch (e) { setError(String(e)); }
+  }
+
+  async function handleMagicWand(wx: number, wy: number) {
+    try {
+      const rect = await invoke<{ x1: number; y1: number; x2: number; y2: number } | null>("magic_wand_select", {
+        wx, wy,
+      });
+      if (rect) setRawBounds(rect);
+    } catch (e) { setError(String(e)); }
+  }
+
+  async function handleScatterPaste(_pos: { x: number; y: number }) {
+    if (!rawBounds) return;
+    try {
+      const result = await invoke<EditResultRaw>("scatter_paste", {
+        x1: rawBounds.x1, y1: rawBounds.y1, x2: rawBounds.x2, y2: rawBounds.y2,
+        count: scatterCount, seed: Math.floor(Math.random() * 0xFFFFFFFF),
+        elevationOffset: pasteElevationOffset, ignoreAir: pasteIgnoreAir,
+      });
+      await applyEditResult(result);
+    } catch (e) { setError(String(e)); }
+  }
+
+  async function handleArrayPaste(pos: { x: number; y: number }) {
+    try {
+      const result = await invoke<EditResultRaw>("array_paste", {
+        originX: pos.x, originY: pos.y,
+        cols: arrayCols, rows: arrayRows,
+        spacingX: arraySpacingX, spacingY: arraySpacingY,
+        elevationOffset: pasteElevationOffset, ignoreAir: pasteIgnoreAir,
+      });
+      await applyEditResult(result);
+      if (!persistPaste) setTool("pan");
+    } catch (e) { setError(String(e)); }
   }
 
   async function handleDrawElevation(x: number, y: number, z: number) {
@@ -481,7 +650,8 @@ function App() {
           return;
         }
         const t = appToolRef.current;
-        if (t === "paste" || t === "pen" || t === "brush" || t === "rect" || t === "ellipse") {
+        if (t === "paste" || t === "pen" || t === "brush" || t === "rect" || t === "ellipse" ||
+            t === "smooth" || t === "noise" || t === "flatten" || t === "erode" || t === "fill") {
           e.preventDefault();
           setTool("pan");
         } else {
@@ -501,6 +671,24 @@ function App() {
         if (e.key === "b" || e.key === "B") { e.preventDefault(); setTool("brush"); return; }
         if (e.key === "r" || e.key === "R") { e.preventDefault(); setTool("rect"); return; }
         if (e.key === "e" || e.key === "E") { e.preventDefault(); setTool("ellipse"); return; }
+        if (e.key === "f" || e.key === "F") { e.preventDefault(); setTool("fill"); return; }
+        // Number keys 1-5 = brush size (1→1, 2→3, 3→5, 4→7, 5→9)
+        if (["1","2","3","4","5"].includes(e.key)) {
+          const sizeMap: Record<string, number> = {"1":1,"2":3,"3":5,"4":7,"5":9};
+          e.preventDefault();
+          setBrushSize(sizeMap[e.key]);
+          return;
+        }
+        // `.` = repeat last paste one step further in the same direction
+        if (e.key === "." && appToolRef.current === "paste") {
+          const pos   = lastPastePosRef.current;
+          const delta = lastPasteDeltaRef.current;
+          if (pos && delta) {
+            e.preventDefault();
+            pasteAtRef.current({ x: pos.x + delta.dx, y: pos.y + delta.dy });
+          }
+          return;
+        }
       }
       if (!(e.metaKey || e.ctrlKey)) return;
       if (e.key === "z" && !e.shiftKey) { e.preventDefault(); handleUndo(); }
@@ -543,6 +731,17 @@ function App() {
     document.addEventListener("mousedown", handleOutside);
     return () => document.removeEventListener("mousedown", handleOutside);
   }, [drawMenuOpen]);
+
+  useEffect(() => {
+    if (!findMenuOpen) return;
+    function handleOutside(e: MouseEvent) {
+      if (findMenuRef.current && !findMenuRef.current.contains(e.target as Node)) {
+        setFindMenuOpen(false);
+      }
+    }
+    document.addEventListener("mousedown", handleOutside);
+    return () => document.removeEventListener("mousedown", handleOutside);
+  }, [findMenuOpen]);
 
   const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
     setRawBounds(bounds);
@@ -651,9 +850,13 @@ function App() {
       : null;
 
   type DrawToolKey = "pen" | "brush" | "rect" | "ellipse";
+  type SculptToolKey = "smooth" | "noise" | "flatten" | "erode";
   const drawToolIcons: Record<DrawToolKey, string> = { pen: "✏", brush: "⬟", rect: "□", ellipse: "○" };
   const drawToolNames: Record<DrawToolKey, string> = { pen: "Pen", brush: "Brush", rect: "Rect", ellipse: "Ellipse" };
-  const isDrawTool = tool === "pen" || tool === "brush" || tool === "rect" || tool === "ellipse";
+  const sculptToolIcons: Record<SculptToolKey, string> = { smooth: "〰", noise: "⛰", flatten: "▬", erode: "~" };
+  const sculptToolNames: Record<SculptToolKey, string> = { smooth: "Smooth", noise: "Noise", flatten: "Flatten", erode: "Erode" };
+  const isSculptTool = tool === "smooth" || tool === "noise" || tool === "flatten" || tool === "erode";
+  const isDrawTool = tool === "pen" || tool === "brush" || tool === "rect" || tool === "ellipse" || isSculptTool || tool === "fill";
   const swatchColor = resolveColor(fillBlockType, fillPaint);
 
   if (world) {
@@ -679,23 +882,85 @@ function App() {
           drawConfig={{ brushSize, brushShape, fillMode: drawFilled ? "fill" : "outline" }}
           onDrawStroke={handleDrawStroke}
           drawZOverride={viewMode === "zslice" ? zSliceZ : null}
+          extrudePreview={
+            extrudeOpen && rawBounds && (extrudeAxis.startsWith("x") || extrudeAxis.startsWith("y"))
+              ? { axis: extrudeAxis, count: extrudeCount }
+              : null
+          }
+          lastPasteDelta={lastPasteDelta}
+          onCursorMove={handleCursorMove}
+          onMagicWand={handleMagicWand}
         />
 
-        {/* Top-left: world info */}
+        {/* Top-left: world info + inline rename */}
         <div style={{
           position: "absolute", top: 12, left: 12,
           background: "rgba(0,0,0,0.6)", padding: "5px 12px",
-          borderRadius: 6, fontSize: 13, pointerEvents: "none", userSelect: "none",
+          borderRadius: 6, fontSize: 13, userSelect: "none",
+          display: "flex", alignItems: "center", gap: 0,
         }}>
-          <strong>{world.name}</strong>
-          <span style={{ marginLeft: 10, color: "#94a3b8" }}>
+          {renamingWorld ? (
+            <input
+              ref={renameInputRef}
+              value={renameInput}
+              onChange={e => {
+                // Filter to allowed chars: A-Za-z0-9 and apostrophe, max 32
+                const filtered = e.target.value
+                  .split("").filter(c => /[A-Za-z0-9']/.test(c)).join("")
+                  .slice(0, 32);
+                setRenameInput(filtered);
+              }}
+              onKeyDown={async e => {
+                if (e.key === "Enter") {
+                  e.currentTarget.blur();
+                } else if (e.key === "Escape") {
+                  setRenamingWorld(false);
+                }
+              }}
+              onBlur={async () => {
+                const trimmed = renameInput.trim();
+                if (trimmed && trimmed !== world.name) {
+                  try {
+                    await invoke("rename_world", { name: trimmed });
+                    setWorld(w => w ? { ...w, name: trimmed } : null);
+                  } catch (e) { setError(String(e)); }
+                }
+                setRenamingWorld(false);
+              }}
+              style={{
+                background: "rgba(255,255,255,0.08)",
+                border: "1px solid #3b82f6",
+                borderRadius: 4,
+                color: "#e2e8f0",
+                fontSize: 13,
+                fontWeight: 700,
+                padding: "0 5px",
+                outline: "none",
+                width: `${Math.max(80, renameInput.length * 8 + 20)}px`,
+              }}
+              autoFocus
+            />
+          ) : (
+            <strong
+              onClick={() => { setRenameInput(world.name); setRenamingWorld(true); }}
+              style={{
+                cursor: "text",
+                pointerEvents: "auto",
+                borderBottom: "1px dashed rgba(255,255,255,0.2)",
+              }}
+              title="Click to rename world"
+            >
+              {world.name}
+            </strong>
+          )}
+          <span style={{ marginLeft: 10, color: "#94a3b8", pointerEvents: "none" }}>
             {world.width_chunks}×{world.height_chunks} chunks
           </span>
           {viewMode === "zslice" && (
-            <span style={{ marginLeft: 10, color: "#7dd3fc" }}>z={zSliceZ}</span>
+            <span style={{ marginLeft: 10, color: "#7dd3fc", pointerEvents: "none" }}>z={zSliceZ}</span>
           )}
           <span style={{
-            marginLeft: 10, fontSize: 11,
+            marginLeft: 10, fontSize: 11, pointerEvents: "none",
             color: world.max_z === 255 ? "#a78bfa" : "#64748b",
           }}>
             {world.max_z === 63 ? "Legacy format"
@@ -718,22 +983,27 @@ function App() {
               <button
                 onClick={() => setDrawMenuOpen(v => !v)}
                 style={isDrawTool
-                  ? { ...overlayBtnActive, borderColor: "#f472b6", color: "#fbcfe8" }
+                  ? { ...overlayBtnActive, borderColor: isSculptTool ? "#fb923c" : tool === "fill" ? "#34d399" : "#f472b6", color: isSculptTool ? "#fdba74" : tool === "fill" ? "#6ee7b7" : "#fbcfe8" }
                   : drawMenuOpen
                     ? { ...overlayBtn, borderColor: "#f472b6", color: "#fbcfe8" }
                     : overlayBtn}
-                title="Drawing tools (P/B/R/E)"
+                title="Drawing tools (P/B/R/E/F)"
               >
-                {isDrawTool ? `${drawToolIcons[tool as DrawToolKey]} ${drawToolNames[tool as DrawToolKey]}` : "Draw"} {drawMenuOpen ? "▴" : "▾"}
+                {isSculptTool ? `${sculptToolIcons[tool as SculptToolKey]} ${sculptToolNames[tool as SculptToolKey]}`
+                  : tool === "fill" ? "⬤ Fill"
+                  : isDrawTool ? `${drawToolIcons[tool as DrawToolKey]} ${drawToolNames[tool as DrawToolKey]}`
+                  : "Draw"} {drawMenuOpen ? "▴" : "▾"}
               </button>
               {drawMenuOpen && (
                 <div style={{
                   position: "absolute", top: "calc(100% + 6px)", left: "50%", transform: "translateX(-50%)",
                   background: "#0d1829", border: "1px solid #831843",
-                  borderRadius: 7, padding: "8px", minWidth: 190,
+                  borderRadius: 7, padding: "8px", minWidth: 210,
                   boxShadow: "0 8px 24px rgba(0,0,0,0.6)", zIndex: 200,
                 }}>
-                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 4, marginBottom: 4 }}>
+                  {/* Draw tools row */}
+                  <div style={{ color: "#475569", fontSize: 10, marginBottom: 4 }}>DRAW</div>
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 4, marginBottom: 6 }}>
                     {(["pen", "brush", "rect", "ellipse"] as const).map(t => (
                       <button key={t} onClick={() => setTool(t)} style={{
                         ...overlayBtn, fontSize: 12, padding: "5px 8px", textAlign: "center",
@@ -746,52 +1016,115 @@ function App() {
                       </button>
                     ))}
                   </div>
-                  {isDrawTool && (
-                    <div style={{ borderTop: "1px solid #1e293b", paddingTop: 8 }}>
-                      {tool === "brush" && (
-                        <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
-                          <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
-                            <span style={{ color: "#64748b", fontSize: 11, minWidth: 36 }}>Size</span>
-                            {([1, 3, 5, 7, 9] as const).map(s => (
-                              <button key={s} onClick={() => setBrushSize(s)} style={{
-                                ...overlayBtn, padding: "1px 6px", fontSize: 11,
-                                borderColor: brushSize === s ? "#f472b6" : "#334155",
-                                color: brushSize === s ? "#fbcfe8" : "#94a3b8",
-                              }}>{s}</button>
-                            ))}
-                          </div>
-                          <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
-                            <span style={{ color: "#64748b", fontSize: 11, minWidth: 36 }}>Shape</span>
-                            <button onClick={() => setBrushShape("sq")} style={{
-                              ...overlayBtn, padding: "1px 8px", fontSize: 11,
-                              borderColor: brushShape === "sq" ? "#f472b6" : "#334155",
-                              color: brushShape === "sq" ? "#fbcfe8" : "#94a3b8",
-                            }}>■ Square</button>
-                            <button onClick={() => setBrushShape("circ")} style={{
-                              ...overlayBtn, padding: "1px 8px", fontSize: 11,
-                              borderColor: brushShape === "circ" ? "#f472b6" : "#334155",
-                              color: brushShape === "circ" ? "#fbcfe8" : "#94a3b8",
-                            }}>● Circle</button>
-                          </div>
-                        </div>
-                      )}
-                      {(tool === "rect" || tool === "ellipse") && (
+                  {/* Sculpt tools row */}
+                  <div style={{ color: "#475569", fontSize: 10, marginBottom: 4 }}>SCULPT</div>
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 4, marginBottom: 6 }}>
+                    {(["smooth", "noise", "flatten", "erode"] as const).map(t => (
+                      <button key={t} onClick={() => setTool(t)} style={{
+                        ...overlayBtn, fontSize: 12, padding: "5px 8px", textAlign: "center",
+                        borderColor: tool === t ? "#fb923c" : "#334155",
+                        color: tool === t ? "#fdba74" : "#94a3b8",
+                        background: tool === t ? "rgba(251,146,60,0.1)" : "rgba(0,0,0,0.4)",
+                      }}>
+                        {sculptToolIcons[t]} {sculptToolNames[t]}
+                      </button>
+                    ))}
+                  </div>
+                  {/* Fill + sculpt strength */}
+                  <div style={{ display: "flex", alignItems: "center", gap: 4, marginBottom: 6 }}>
+                    <button onClick={() => setTool("fill")} style={{
+                      ...overlayBtn, fontSize: 12, padding: "5px 8px", flex: 1, textAlign: "center",
+                      borderColor: tool === "fill" ? "#34d399" : "#334155",
+                      color: tool === "fill" ? "#6ee7b7" : "#94a3b8",
+                      background: tool === "fill" ? "rgba(52,211,153,0.1)" : "rgba(0,0,0,0.4)",
+                    }}>
+                      ⬤ Fill Bucket
+                      <span style={{ color: "#475569", fontSize: 10, marginLeft: 3 }}>(F)</span>
+                    </button>
+                  </div>
+                  <div style={{ borderTop: "1px solid #1e293b", paddingTop: 6 }}>
+                    {(tool === "brush") && (
+                      <div style={{ display: "flex", flexDirection: "column", gap: 5, marginBottom: 6 }}>
                         <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
-                          <span style={{ color: "#64748b", fontSize: 11, minWidth: 36 }}>Mode</span>
-                          <button onClick={() => setDrawFilled(true)} style={{
-                            ...overlayBtn, padding: "1px 8px", fontSize: 11,
-                            borderColor: drawFilled ? "#f472b6" : "#334155",
-                            color: drawFilled ? "#fbcfe8" : "#94a3b8",
-                          }}>Fill</button>
-                          <button onClick={() => setDrawFilled(false)} style={{
-                            ...overlayBtn, padding: "1px 8px", fontSize: 11,
-                            borderColor: !drawFilled ? "#f472b6" : "#334155",
-                            color: !drawFilled ? "#fbcfe8" : "#94a3b8",
-                          }}>Hollow</button>
+                          <span style={{ color: "#64748b", fontSize: 11, minWidth: 36 }}>Size</span>
+                          {([1, 3, 5, 7, 9] as const).map(s => (
+                            <button key={s} onClick={() => setBrushSize(s)} style={{
+                              ...overlayBtn, padding: "1px 6px", fontSize: 11,
+                              borderColor: brushSize === s ? "#f472b6" : "#334155",
+                              color: brushSize === s ? "#fbcfe8" : "#94a3b8",
+                            }}>{s}</button>
+                          ))}
                         </div>
-                      )}
-                    </div>
-                  )}
+                        <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                          <span style={{ color: "#64748b", fontSize: 11, minWidth: 36 }}>Shape</span>
+                          <button onClick={() => setBrushShape("sq")} style={{
+                            ...overlayBtn, padding: "1px 8px", fontSize: 11,
+                            borderColor: brushShape === "sq" ? "#f472b6" : "#334155",
+                            color: brushShape === "sq" ? "#fbcfe8" : "#94a3b8",
+                          }}>■ Square</button>
+                          <button onClick={() => setBrushShape("circ")} style={{
+                            ...overlayBtn, padding: "1px 8px", fontSize: 11,
+                            borderColor: brushShape === "circ" ? "#f472b6" : "#334155",
+                            color: brushShape === "circ" ? "#fbcfe8" : "#94a3b8",
+                          }}>● Circle</button>
+                        </div>
+                      </div>
+                    )}
+                    {isSculptTool && (
+                      <div style={{ display: "flex", flexDirection: "column", gap: 5, marginBottom: 6 }}>
+                        <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                          <span style={{ color: "#64748b", fontSize: 11, minWidth: 46 }}>Size</span>
+                          {([1, 3, 5, 7, 9] as const).map(s => (
+                            <button key={s} onClick={() => setBrushSize(s)} style={{
+                              ...overlayBtn, padding: "1px 6px", fontSize: 11,
+                              borderColor: brushSize === s ? "#fb923c" : "#334155",
+                              color: brushSize === s ? "#fdba74" : "#94a3b8",
+                            }}>{s}</button>
+                          ))}
+                        </div>
+                        <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                          <span style={{ color: "#64748b", fontSize: 11, minWidth: 46 }}>Strength</span>
+                          {([1, 2, 3, 4, 5] as const).map(s => (
+                            <button key={s} onClick={() => setSculptStrength(s)} style={{
+                              ...overlayBtn, padding: "1px 6px", fontSize: 11,
+                              borderColor: sculptStrength === s ? "#fb923c" : "#334155",
+                              color: sculptStrength === s ? "#fdba74" : "#94a3b8",
+                            }}>{s}</button>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                    {(tool === "rect" || tool === "ellipse") && (
+                      <div style={{ display: "flex", alignItems: "center", gap: 4, marginBottom: 6 }}>
+                        <span style={{ color: "#64748b", fontSize: 11, minWidth: 36 }}>Mode</span>
+                        <button onClick={() => setDrawFilled(true)} style={{
+                          ...overlayBtn, padding: "1px 8px", fontSize: 11,
+                          borderColor: drawFilled ? "#f472b6" : "#334155",
+                          color: drawFilled ? "#fbcfe8" : "#94a3b8",
+                        }}>Fill</button>
+                        <button onClick={() => setDrawFilled(false)} style={{
+                          ...overlayBtn, padding: "1px 8px", fontSize: 11,
+                          borderColor: !drawFilled ? "#f472b6" : "#334155",
+                          color: !drawFilled ? "#fbcfe8" : "#94a3b8",
+                        }}>Hollow</button>
+                      </div>
+                    )}
+                    {!isSculptTool && tool !== "fill" && (
+                      <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                        <span style={{ color: "#64748b", fontSize: 11, minWidth: 36 }}>Layer</span>
+                        <button onClick={() => setDrawAbove(false)} style={{
+                          ...overlayBtn, padding: "1px 8px", fontSize: 11,
+                          borderColor: !drawAbove ? "#f472b6" : "#334155",
+                          color: !drawAbove ? "#fbcfe8" : "#94a3b8",
+                        }}>Surface</button>
+                        <button onClick={() => setDrawAbove(true)} style={{
+                          ...overlayBtn, padding: "1px 8px", fontSize: 11,
+                          borderColor: drawAbove ? "#f472b6" : "#334155",
+                          color: drawAbove ? "#fbcfe8" : "#94a3b8",
+                        }}>+1 Above</button>
+                      </div>
+                    )}
+                  </div>
                   <div style={{ borderTop: "1px solid #1e293b", marginTop: 8, paddingTop: 8 }}>
                     <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
                       <span style={{ color: "#475569", fontSize: 10 }}>DRAWING WITH</span>
@@ -808,6 +1141,72 @@ function App() {
                 </div>
               )}
             </div>
+
+            {/* Find ▾ menu */}
+            <div ref={findMenuRef} style={{ position: "relative" }}>
+              <button
+                onClick={() => setFindMenuOpen(v => !v)}
+                style={{
+                  ...overlayBtn,
+                  borderColor: findMenuOpen ? "#7dd3fc" : undefined,
+                  color: findMenuOpen ? "#bfdbfe" : undefined,
+                }}
+                title="Find & Go To"
+              >
+                Find {findMenuOpen ? "▴" : "▾"}
+              </button>
+              {findMenuOpen && (
+                <div style={{
+                  position: "absolute", top: "calc(100% + 6px)", left: "50%", transform: "translateX(-50%)",
+                  background: "#0d1829", border: "1px solid #1e40af",
+                  borderRadius: 7, padding: "8px", minWidth: 200,
+                  boxShadow: "0 8px 24px rgba(0,0,0,0.6)", zIndex: 200,
+                  display: "flex", flexDirection: "column", gap: 6,
+                }}>
+                  <div style={{ color: "#475569", fontSize: 10 }}>FIND NEAREST BLOCK</div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                    <span style={{ color: "#64748b", fontSize: 11 }}>Type:</span>
+                    <select
+                      value={findBlockType}
+                      onChange={e => setFindBlockType(Number(e.target.value))}
+                      style={{ background: "#1e293b", border: "1px solid #475569", color: "#e2e8f0", borderRadius: 4, fontSize: 12, padding: "2px 4px" }}
+                    >
+                      {BLOCK_DEFS.map(b => <option key={b.type} value={b.type}>{b.name}</option>)}
+                    </select>
+                  </div>
+                  <button
+                    onClick={handleFindBlock}
+                    disabled={!rawBounds}
+                    style={{ ...overlayBtn, fontSize: 12, opacity: rawBounds ? 1 : 0.4, cursor: rawBounds ? "pointer" : "not-allowed" }}
+                    title={rawBounds ? "Find nearest from selection center" : "Make a selection first to set search origin"}
+                  >
+                    Find from selection
+                  </button>
+                  <div style={{ borderTop: "1px solid #1e293b", paddingTop: 6 }}>
+                    <div style={{ color: "#475569", fontSize: 10, marginBottom: 4 }}>GO TO COORDS</div>
+                    <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                      <span style={{ color: "#64748b", fontSize: 11 }}>X</span>
+                      <input value={gotoX} onChange={e => setGotoX(e.target.value)} style={{ ...zInput, width: 60 }} placeholder="0" />
+                      <span style={{ color: "#64748b", fontSize: 11 }}>Y</span>
+                      <input value={gotoY} onChange={e => setGotoY(e.target.value)} style={{ ...zInput, width: 60 }} placeholder="0" />
+                    </div>
+                    <button
+                      onClick={() => {
+                        const x = parseInt(gotoX, 10); const y = parseInt(gotoY, 10);
+                        if (!isNaN(x) && !isNaN(y)) {
+                          setRawBounds({ x1: x, y1: y, x2: x, y2: y });
+                          setFindMenuOpen(false);
+                        }
+                      }}
+                      style={{ ...overlayBtn, fontSize: 12, marginTop: 4, width: "100%" }}
+                    >
+                      Go
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+
             <div style={{ width: 1, background: "#334155", margin: "0 2px" }} />
             <button
               onClick={handleUndo} disabled={undoDepth === 0}
@@ -840,6 +1239,15 @@ function App() {
               <span style={{ color: "#7dd3fc", fontSize: 13, fontVariantNumeric: "tabular-nums", minWidth: 28, textAlign: "right" }}>
                 {zSliceDisplay}
               </span>
+              <label style={{ display: "flex", alignItems: "center", gap: 4, cursor: "pointer", marginLeft: 4 }}>
+                <input
+                  type="checkbox"
+                  checked={followSurface}
+                  onChange={e => setFollowSurface(e.target.checked)}
+                  style={{ accentColor: "#3b82f6" }}
+                />
+                <span style={{ color: "#64748b", fontSize: 11, whiteSpace: "nowrap" }}>surface</span>
+              </label>
             </div>
           )}
         </div>
@@ -1161,6 +1569,48 @@ function App() {
                   {pasteTerrainAbove ? "Above ✓" : "At surface"}
                 </button>
               )}
+              {/* Paste mode: normal / scatter / array */}
+              <div style={{ display: "flex", alignItems: "center", gap: 2, borderLeft: "1px solid #334155", paddingLeft: 6, marginLeft: 2 }}>
+                {(["normal", "scatter", "array"] as const).map(m => (
+                  <button key={m} onClick={() => setPasteMode(m)} style={{
+                    ...overlayBtn, padding: "2px 8px", fontSize: 11,
+                    borderColor: pasteMode === m ? "#7dd3fc" : "#334155",
+                    color: pasteMode === m ? "#bfdbfe" : "#64748b",
+                    background: pasteMode === m ? "rgba(125,211,252,0.1)" : "rgba(0,0,0,0.3)",
+                  }}>
+                    {m === "normal" ? "1×" : m === "scatter" ? "Scatter" : "Array"}
+                  </button>
+                ))}
+              </div>
+              {pasteMode === "scatter" && (
+                <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                  <span style={{ color: "#64748b", fontSize: 11 }}>Count</span>
+                  <input type="number" min={1} max={100} value={scatterCount}
+                    onChange={e => setScatterCount(Math.max(1, parseInt(e.target.value,10)||1))}
+                    style={{ ...zInput, width: 44 }} />
+                  <span style={{ color: "#475569", fontSize: 11 }}>within selection</span>
+                </div>
+              )}
+              {pasteMode === "array" && (
+                <div style={{ display: "flex", alignItems: "center", gap: 4, flexWrap: "wrap" }}>
+                  <span style={{ color: "#64748b", fontSize: 11 }}>Cols</span>
+                  <input type="number" min={1} max={20} value={arrayCols}
+                    onChange={e => setArrayCols(Math.max(1, parseInt(e.target.value,10)||1))}
+                    style={{ ...zInput, width: 40 }} />
+                  <span style={{ color: "#64748b", fontSize: 11 }}>Rows</span>
+                  <input type="number" min={1} max={20} value={arrayRows}
+                    onChange={e => setArrayRows(Math.max(1, parseInt(e.target.value,10)||1))}
+                    style={{ ...zInput, width: 40 }} />
+                  <span style={{ color: "#64748b", fontSize: 11 }}>SpX</span>
+                  <input type="number" min={0} value={arraySpacingX}
+                    onChange={e => setArraySpacingX(Math.max(0, parseInt(e.target.value,10)||0))}
+                    style={{ ...zInput, width: 40 }} title="Horizontal spacing (0 = auto)" />
+                  <span style={{ color: "#64748b", fontSize: 11 }}>SpY</span>
+                  <input type="number" min={0} value={arraySpacingY}
+                    onChange={e => setArraySpacingY(Math.max(0, parseInt(e.target.value,10)||0))}
+                    style={{ ...zInput, width: 40 }} title="Vertical spacing (0 = auto)" />
+                </div>
+              )}
               <button
                 onClick={() => setTool("pan")}
                 style={{ ...overlayBtn, padding: "2px 10px", fontSize: 12 }}
@@ -1221,6 +1671,17 @@ function App() {
                 >
                   Delete{filterBlockType !== null ? (filterInvert ? "!*" : "*") : ""}
                 </button>
+                {/* Grow / Shrink selection */}
+                <button
+                  onClick={() => setRawBounds(b => b ? { x1: b.x1 - 1, y1: b.y1 - 1, x2: b.x2 + 1, y2: b.y2 + 1 } : null)}
+                  style={{ ...overlayBtn, padding: "2px 8px", fontSize: 12 }}
+                  title="Grow selection by 1 block on each side"
+                >+1</button>
+                <button
+                  onClick={() => setRawBounds(b => b ? { x1: Math.min(b.x1 + 1, b.x2), y1: Math.min(b.y1 + 1, b.y2), x2: Math.max(b.x2 - 1, b.x1), y2: Math.max(b.y2 - 1, b.y1) } : null)}
+                  style={{ ...overlayBtn, padding: "2px 8px", fontSize: 12 }}
+                  title="Shrink selection by 1 block on each side"
+                >-1</button>
                 <button
                   onClick={() => setRawBounds(null)}
                   style={{ ...overlayBtn, padding: "2px 10px", fontSize: 12 }}
@@ -1228,6 +1689,12 @@ function App() {
                   Clear
                 </button>
               </>
+            )}
+            {/* Magic Wand — always visible in select mode */}
+            {tool === "select" && (
+              <span style={{ color: "#64748b", fontSize: 11, marginLeft: 4 }}>
+                · Right-click or hold S to magic-wand select
+              </span>
             )}
           </div>
 
@@ -1503,6 +1970,70 @@ function App() {
               </div>
 
               </div>{/* end pickers row */}
+
+              {/* Recent blocks quick-pick */}
+              {recentBlocks.length > 0 && (
+                <div style={{ display: "flex", alignItems: "center", gap: 4, paddingTop: 4, borderTop: "1px solid #1e293b" }}>
+                  <span style={{ color: "#475569", fontSize: 10 }}>RECENT</span>
+                  {recentBlocks.map((b, i) => {
+                    const [r, g, bl] = resolveColor(b.type, b.paint);
+                    return (
+                      <div
+                        key={i}
+                        title={`${blockDisplayName(b.type)}${b.paint > 0 ? ` paint ${b.paint}` : ""}`}
+                        onClick={() => { setFillBlockType(b.type); setFillPaint(b.paint); }}
+                        style={{
+                          width: 18, height: 18, borderRadius: 2, cursor: "pointer", flexShrink: 0,
+                          background: `rgb(${r},${g},${bl})`,
+                          border: (fillBlockType === b.type && fillPaint === b.paint) ? "2px solid #fff" : "2px solid rgba(255,255,255,0.15)",
+                          outline: (fillBlockType === b.type && fillPaint === b.paint) ? "1px solid #3b82f6" : "none",
+                          outlineOffset: 1,
+                        }}
+                      />
+                    );
+                  })}
+                </div>
+              )}
+
+              {/* Mask system — only visible when a draw tool is active */}
+              {isDrawTool && (
+                <div style={{ display: "flex", alignItems: "center", gap: 6, paddingTop: 4, borderTop: "1px solid #1e293b" }}>
+                  <button
+                    onClick={() => setMaskEnabled(v => !v)}
+                    style={{
+                      ...overlayBtn, padding: "1px 8px", fontSize: 11,
+                      borderColor: maskEnabled ? "#a78bfa" : "#334155",
+                      color: maskEnabled ? "#ddd6fe" : "#64748b",
+                    }}
+                    title="Mask: only paint on blocks matching the mask type/paint"
+                  >
+                    {maskEnabled ? "Mask ✓" : "Mask"}
+                  </button>
+                  {maskEnabled && (
+                    <>
+                      <span style={{ color: "#64748b", fontSize: 11 }}>Type:</span>
+                      <select
+                        value={maskBlockType ?? ""}
+                        onChange={e => setMaskBlockType(e.target.value === "" ? null : Number(e.target.value))}
+                        style={{ background: "#1e293b", border: "1px solid #475569", color: "#e2e8f0", borderRadius: 4, fontSize: 11, padding: "1px 3px" }}
+                      >
+                        <option value="">any</option>
+                        {BLOCK_DEFS.map(b => <option key={b.type} value={b.type}>{b.name}</option>)}
+                      </select>
+                      <span style={{ color: "#64748b", fontSize: 11 }}>Paint:</span>
+                      <select
+                        value={maskPaint ?? ""}
+                        onChange={e => setMaskPaint(e.target.value === "" ? null : Number(e.target.value))}
+                        style={{ background: "#1e293b", border: "1px solid #475569", color: "#e2e8f0", borderRadius: 4, fontSize: 11, padding: "1px 3px" }}
+                      >
+                        <option value="">any</option>
+                        <option value="0">none</option>
+                        {Array.from({ length: 54 }, (_, i) => i + 1).map(p => <option key={p} value={p}>#{p}</option>)}
+                      </select>
+                    </>
+                  )}
+                </div>
+              )}
 
               {/* Row 3: Replace only — filter for selective replace (selection required) */}
               {selection && <div style={{ borderTop: "1px solid #1e293b", paddingTop: 6, display: "flex", flexDirection: "column", gap: 4 }}>

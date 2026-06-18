@@ -43,18 +43,6 @@ const CW = 190;
 const CH = 120;
 const LABEL_H = 16; // bottom strip reserved for the debug overlay label
 
-const zInput: React.CSSProperties = {
-  width: 54,
-  background: "rgba(0,0,0,0.5)",
-  border: "1px solid #475569",
-  color: "#e2e8f0",
-  borderRadius: 4,
-  padding: "2px 5px",
-  fontSize: 13,
-  textAlign: "center",
-  outline: "none",
-};
-
 // ── component ────────────────────────────────────────────────────────────────
 
 const panelStyle: React.CSSProperties = {
@@ -306,18 +294,25 @@ export default function SelectionInspector({ selection: sel, clipboard, elevatio
               </button>
             ))}
           </div>
-          {/* Count + ignore-air row */}
-          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-            <span style={{ color: "#64748b", fontSize: 11, whiteSpace: "nowrap" }}>Copies</span>
-            <input
-              type="number"
-              min={1} max={20}
-              value={extrudeCount}
-              onChange={e => onExtrudeCountChange(Math.max(1, Math.min(20, parseInt(e.target.value) || 1)))}
-              style={{ ...zInput, width: 44 }}
-              title="Number of copies to make (not counting the original)"
-            />
-            <label style={{ display: "flex", alignItems: "center", gap: 4, cursor: "pointer", marginLeft: "auto" }}>
+          {/* Count quick-steps + ignore-air row */}
+          <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+            {[1, 2, 3, 5, 10, 20].map(n => (
+              <button
+                key={n}
+                onClick={() => onExtrudeCountChange(n)}
+                style={{
+                  flex: 1, padding: "2px 0", fontSize: 10, cursor: "pointer",
+                  background: extrudeCount === n ? "rgba(59,130,246,0.35)" : "rgba(255,255,255,0.04)",
+                  border: `1px solid ${extrudeCount === n ? "#3b82f6" : "#334155"}`,
+                  color: extrudeCount === n ? "#93c5fd" : "#64748b",
+                  borderRadius: 3,
+                }}
+                title={`${n} ${n === 1 ? "copy" : "copies"}`}
+              >
+                {n}
+              </button>
+            ))}
+            <label style={{ display: "flex", alignItems: "center", gap: 4, cursor: "pointer", marginLeft: 2 }}>
               <input
                 type="checkbox"
                 checked={extrudeIgnoreAir}
