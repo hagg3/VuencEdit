@@ -1492,6 +1492,9 @@ fn paint_blocks(
     blocks: Vec<PaintBlock>,
     block_type: u8,
     paint: u8,
+    z_offset: i32,
+    mask_type: Option<u8>,
+    mask_paint: Option<u8>,
     state: tauri::State<'_, AppState>,
 ) -> Result<EditResult, String> {
     if paint > 54 {
@@ -1521,10 +1524,21 @@ fn paint_blocks(
                 z
             }
             None => match surface_z(&world, b.x, b.y) {
-                Some(z) => z,
+                Some(z) => {
+                    let z2 = z + z_offset;
+                    if z2 < 0 || z2 > max_z { continue; }
+                    z2
+                }
                 None => continue,
             },
         };
+        // Mask check: skip if current block doesn't match mask
+        if let Some(mt) = mask_type {
+            if read_block_abs(&world, b.x, b.y, z) != mt { continue; }
+        }
+        if let Some(mp) = mask_paint {
+            if read_paint_abs(&world, b.x, b.y, z) != mp { continue; }
+        }
         set_block_abs(&mut world, b.x, b.y, z, block_type, paint);
     }
 
@@ -1670,14 +1684,14 @@ fn copy_selection(
 ///
 /// Ramps (24–39): [base+0=S, base+1=W, base+2=N, base+3=E]
 /// Wedges (40–55): [base+0=SE, base+1=SW, base+2=NW, base+3=NE]
-/// Doors (66–69): S/W/N/E order. Portals (75–78): S/W/N/E order.
+/// Doors (66–69): S/W/N/E order (matching C# DoorSouth=66,DoorWest=67,DoorNorth=68,DoorEast=69).
+/// Portals (75–78): same S/W/N/E order.
 ///
 /// Under 90° CW in XY screen space (S→E, E→N, N→W, W→S) the offset shifts by +3 mod 4
-/// for all four families, including wedges (SE→NE, SW→SE, NW→SW, NE→NW).
+/// for all families (ramps, wedges, doors, portals).
 #[inline]
 fn rotate_ramp_id_cw(bt: u8) -> u8 {
     if (24..=55).contains(&bt) {
-        // Ramps and wedges: families always start at a multiple of 4.
         let base = bt & !3;
         let off  = bt &  3;
         base | ((off + 3) & 3)
@@ -1757,6 +1771,36 @@ fn surface_z(world: &LoadedWorld, px: i32, py: i32) -> Option<i32> {
         }
     }
     None
+}
+
+#[tauri::command]
+fn rename_world(state: tauri::State<'_, AppState>, name: String) -> Result<(), String> {
+    if name.len() > 32 {
+        return Err("Name must be 32 characters or fewer".into());
+    }
+    for ch in name.chars() {
+        if !ch.is_ascii_alphabetic() && !ch.is_ascii_digit() && ch != '\'' {
+            return Err(format!("Invalid character '{}' — only A–Z, a–z, 0–9 and ' are allowed", ch));
+        }
+    }
+    let mut ws = state.lock().unwrap();
+    let world = ws.world.as_mut().ok_or("No world loaded")?;
+    if world.bytes.len() < 76 {
+        return Err("World file too small to contain name field".into());
+    }
+    let name_bytes = name.as_bytes();
+    for i in 0..36usize {
+        world.bytes[40 + i] = if i < name_bytes.len() { name_bytes[i] } else { 0 };
+    }
+    world.name = name;
+    Ok(())
+}
+
+#[tauri::command]
+fn get_surface_z(state: tauri::State<'_, AppState>, x: i32, y: i32) -> Result<Option<i32>, String> {
+    let ws = state.lock().unwrap();
+    let world = ws.world.as_ref().ok_or("no world")?;
+    Ok(surface_z(world, x, y))
 }
 
 /// Rotate clipboard 90° clockwise in the XY plane.
@@ -2787,6 +2831,13 @@ async fn upload_world(
     let srv = get_server(&server)?;
     let raw_world = fs::read(&world_path).map_err(|e| format!("Cannot read world: {e}"))?;
     let image_bytes = fs::read(&image_path).map_err(|e| format!("Cannot read image: {e}"))?;
+    const MAX_IMAGE_BYTES: usize = 2 * 1024 * 1024;
+    if image_bytes.len() > MAX_IMAGE_BYTES {
+        return Err(format!(
+            "Preview image is {:.1} MB — maximum allowed size is 2 MB",
+            image_bytes.len() as f64 / 1_048_576.0
+        ));
+    }
 
     // Server stores and delivers worlds as gzip; upload in gzip format to match.
     // If already gzip: upload as-is. If zip (PK): decompress to raw first, then gzip.
@@ -2865,6 +2916,460 @@ async fn upload_world(
     Ok(body)
 }
 
+// ── Terrain helpers ───────────────────────────────────────────────────────────
+
+/// Read block type at absolute world coords (0 if out of bounds or missing chunk).
+fn read_block_abs(world: &LoadedWorld, wx: i32, wy: i32, wz: i32) -> u8 {
+    if wz < 0 || wz as usize >= world.num_bands * 16 { return 0; }
+    let cx = wx.div_euclid(16) + world.min_x;
+    let cy = wy.div_euclid(16) + world.min_y;
+    if let Some(&addr) = world.chunk_map.get(&(cx, cy)) {
+        let lx = wx.rem_euclid(16) as usize;
+        let ly = wy.rem_euclid(16) as usize;
+        let bi = addr + (wz as usize / 16) * 8192 + lx * 256 + ly * 16 + wz as usize % 16;
+        if bi < world.bytes.len() { return world.bytes[bi]; }
+    }
+    0
+}
+
+/// Read paint byte at absolute world coords (0 if out of bounds or missing chunk).
+fn read_paint_abs(world: &LoadedWorld, wx: i32, wy: i32, wz: i32) -> u8 {
+    if wz < 0 || wz as usize >= world.num_bands * 16 { return 0; }
+    let cx = wx.div_euclid(16) + world.min_x;
+    let cy = wy.div_euclid(16) + world.min_y;
+    if let Some(&addr) = world.chunk_map.get(&(cx, cy)) {
+        let lx = wx.rem_euclid(16) as usize;
+        let ly = wy.rem_euclid(16) as usize;
+        let bi = addr + (wz as usize / 16) * 8192 + lx * 256 + ly * 16 + wz as usize % 16;
+        let pi = bi + 4096;
+        if pi < world.bytes.len() { return world.bytes[pi]; }
+    }
+    0
+}
+
+/// Raise or lower a terrain column to target_z. Raising copies the surface block;
+/// lowering deletes blocks above the new surface.
+fn sculpt_column(world: &mut LoadedWorld, wx: i32, wy: i32, cur_z: i32, target_z: i32, max_z: i32, surf_bt: u8, surf_paint: u8) {
+    let target_z = target_z.clamp(1, max_z);
+    if target_z == cur_z { return; }
+    if target_z > cur_z {
+        for z in (cur_z + 1)..=target_z {
+            set_block_abs(world, wx, wy, z, surf_bt, surf_paint);
+        }
+    } else {
+        for z in (target_z + 1)..=cur_z {
+            set_block_abs(world, wx, wy, z, 0, 0);
+        }
+    }
+}
+
+// ── Sculpt terrain command ────────────────────────────────────────────────────
+
+#[derive(serde::Deserialize)]
+struct SculptPoint { x: i32, y: i32 }
+
+/// Sculpt terrain at brush positions. mode: "smooth" | "noise" | "flatten" | "erode"
+#[tauri::command]
+fn sculpt_terrain(
+    points: Vec<SculptPoint>,
+    mode: String,
+    strength: i32,
+    seed: u64,
+    state: tauri::State<'_, AppState>,
+) -> Result<EditResult, String> {
+    if points.is_empty() { return Err("No points".into()); }
+    let strength = strength.clamp(1, 5);
+
+    let mut ws = state.lock().unwrap();
+
+    // Pre-read all heights and surface blocks while we have a shared ref.
+    let height_map: HashMap<(i32, i32), (i32, u8, u8)> = {
+        let world = ws.world.as_ref().ok_or("No world loaded")?;
+        let mut all_pts = std::collections::HashSet::new();
+        for p in &points {
+            all_pts.insert((p.x, p.y));
+            for (dx, dy) in [(-1i32, 0i32), (1, 0), (0, -1), (0, 1)] {
+                all_pts.insert((p.x + dx, p.y + dy));
+            }
+        }
+        all_pts.into_iter()
+            .filter_map(|(x, y)| {
+                surface_z(world, x, y).map(|z| {
+                    let bt    = read_block_abs(world, x, y, z);
+                    let paint = read_paint_abs(world, x, y, z);
+                    ((x, y), (z, bt, paint))
+                })
+            })
+            .collect()
+    };
+
+    let mut world = ws.world.take().ok_or("No world loaded")?;
+    let max_z = world_max_z(&world) as i32;
+
+    let (mut x_min, mut y_min, mut x_max, mut y_max) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
+    for p in &points {
+        x_min = x_min.min(p.x); y_min = y_min.min(p.y);
+        x_max = x_max.max(p.x); y_max = y_max.max(p.y);
+    }
+
+    let affected = affected_chunk_coords(&world, x_min, y_min, x_max, y_max);
+    let pre_snap = snapshot_chunks(&world, &affected);
+
+    match mode.as_str() {
+        "smooth" => {
+            for p in &points {
+                let Some(&(cur_z, surf_bt, surf_paint)) = height_map.get(&(p.x, p.y)) else { continue };
+                let neighbors: Vec<i32> = [(-1i32,0i32),(1,0),(0,-1),(0,1)].iter()
+                    .filter_map(|(dx,dy)| height_map.get(&(p.x+dx, p.y+dy)).map(|v| v.0))
+                    .collect();
+                if neighbors.is_empty() { continue; }
+                let sum = neighbors.iter().sum::<i32>() + cur_z;
+                let avg = (sum as f32 / (neighbors.len() + 1) as f32).round() as i32;
+                sculpt_column(&mut world, p.x, p.y, cur_z, avg, max_z, surf_bt, surf_paint);
+            }
+        }
+        "noise" => {
+            let mut rng = Rng64::new(if seed == 0 { 0xdeadbeef_cafebabe } else { seed });
+            for p in &points {
+                let Some(&(cur_z, surf_bt, surf_paint)) = height_map.get(&(p.x, p.y)) else { continue };
+                let _ = rng.next(); // positional mix for variation
+                let delta = rng.range(-strength, strength);
+                sculpt_column(&mut world, p.x, p.y, cur_z, cur_z + delta, max_z, surf_bt, surf_paint);
+            }
+        }
+        "flatten" => {
+            let heights: Vec<i32> = points.iter()
+                .filter_map(|p| height_map.get(&(p.x, p.y)).map(|v| v.0))
+                .collect();
+            if heights.is_empty() { ws.world = Some(world); return Err("No surface".into()); }
+            let avg = (heights.iter().sum::<i32>() as f32 / heights.len() as f32).round() as i32;
+            for p in &points {
+                let Some(&(cur_z, surf_bt, surf_paint)) = height_map.get(&(p.x, p.y)) else { continue };
+                sculpt_column(&mut world, p.x, p.y, cur_z, avg, max_z, surf_bt, surf_paint);
+            }
+        }
+        "erode" => {
+            for p in &points {
+                let Some(&(cur_z, surf_bt, surf_paint)) = height_map.get(&(p.x, p.y)) else { continue };
+                let min_n = [(-1i32,0i32),(1,0),(0,-1),(0,1)].iter()
+                    .filter_map(|(dx,dy)| height_map.get(&(p.x+dx, p.y+dy)).map(|v| v.0))
+                    .min();
+                if let Some(mn) = min_n {
+                    if cur_z > mn {
+                        let target = (cur_z - strength).max(mn);
+                        sculpt_column(&mut world, p.x, p.y, cur_z, target, max_z, surf_bt, surf_paint);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
+    let patch = render_pixels_patch(&world, x_min, y_min, x_max, y_max);
+    let pre_snap = filter_unchanged_snapshots(&world, pre_snap);
+    ws.world = Some(world);
+
+    if !pre_snap.is_empty() {
+        push_undo(&mut ws.undo_stack, UndoEntry { operation: format!("sculpt_{mode}"), chunks: pre_snap });
+        ws.redo_stack.clear();
+    }
+    Ok(EditResult { patch, undo_depth: ws.undo_stack.len(), redo_depth: ws.redo_stack.len() })
+}
+
+// ── Fill surface (flood fill) ─────────────────────────────────────────────────
+
+/// Flood-fill connected surface blocks of the same type as the seed position.
+#[tauri::command]
+fn fill_surface(
+    wx: i32, wy: i32,
+    new_type: u8, new_paint: u8,
+    max_fill: u32,
+    state: tauri::State<'_, AppState>,
+) -> Result<EditResult, String> {
+    if new_paint > 54 { return Err("Invalid paint".into()); }
+    let max_fill = max_fill.clamp(1, 50_000);
+
+    let mut ws = state.lock().unwrap();
+
+    // Phase 1: BFS to collect all cells to fill (read-only pass).
+    let (fill_cells, x_min, y_min, x_max, y_max) = {
+        let world = ws.world.as_ref().ok_or("No world loaded")?;
+        let seed_z     = surface_z(world, wx, wy).ok_or("No surface at position")?;
+        let seed_bt    = read_block_abs(world, wx, wy, seed_z);
+        let seed_paint = read_paint_abs(world, wx, wy, seed_z);
+        if seed_bt == 0 { return Err("No block at surface".into()); }
+        let ww = (world.w_chunks * 16) as i32;
+        let wh = (world.h_chunks * 16) as i32;
+
+        let mut visited: std::collections::HashSet<(i32, i32)> = std::collections::HashSet::new();
+        let mut queue: VecDeque<(i32, i32)> = VecDeque::new();
+        let mut cells: Vec<(i32, i32, i32)> = Vec::new();
+        queue.push_back((wx, wy));
+        visited.insert((wx, wy));
+
+        while let Some((x, y)) = queue.pop_front() {
+            if cells.len() as u32 >= max_fill { break; }
+            let Some(sz) = surface_z(world, x, y) else { continue };
+            if read_block_abs(world, x, y, sz) != seed_bt { continue; }
+            if read_paint_abs(world, x, y, sz) != seed_paint { continue; }
+            cells.push((x, y, sz));
+            for (dx, dy) in [(-1i32,0i32),(1,0),(0,-1),(0,1)] {
+                let nx = x + dx; let ny = y + dy;
+                if nx < 0 || ny < 0 || nx >= ww || ny >= wh { continue; }
+                if visited.insert((nx, ny)) { queue.push_back((nx, ny)); }
+            }
+        }
+
+        if cells.is_empty() {
+            return Err("No fillable surface found".into());
+        }
+        let (x0, y0, x1, y1) = cells.iter().fold(
+            (i32::MAX, i32::MAX, i32::MIN, i32::MIN),
+            |(x0,y0,x1,y1), &(x,y,_)| (x0.min(x), y0.min(y), x1.max(x), y1.max(y))
+        );
+        (cells, x0, y0, x1, y1)
+    };
+
+    let mut world = ws.world.take().ok_or("No world loaded")?;
+    let affected = affected_chunk_coords(&world, x_min, y_min, x_max, y_max);
+    let pre_snap = snapshot_chunks(&world, &affected);
+
+    for &(x, y, z) in &fill_cells {
+        set_block_abs(&mut world, x, y, z, new_type, new_paint);
+    }
+
+    let patch = render_pixels_patch(&world, x_min, y_min, x_max, y_max);
+    let pre_snap = filter_unchanged_snapshots(&world, pre_snap);
+    ws.world = Some(world);
+
+    if !pre_snap.is_empty() {
+        push_undo(&mut ws.undo_stack, UndoEntry { operation: "fill_surface".into(), chunks: pre_snap });
+        ws.redo_stack.clear();
+    }
+    Ok(EditResult { patch, undo_depth: ws.undo_stack.len(), redo_depth: ws.redo_stack.len() })
+}
+
+// ── Selection helpers ─────────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+struct SelectRect { x1: i32, y1: i32, x2: i32, y2: i32 }
+
+/// Flood-fill select connected surface region of the same block type as (wx,wy).
+/// Returns the bounding box of the selected region.
+#[tauri::command]
+fn magic_wand_select(
+    wx: i32, wy: i32,
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<SelectRect>, String> {
+    let ws = state.lock().unwrap();
+    let world = ws.world.as_ref().ok_or("No world loaded")?;
+    let seed_z     = match surface_z(world, wx, wy) { Some(z) => z, None => return Ok(None) };
+    let seed_bt    = read_block_abs(world, wx, wy, seed_z);
+    let seed_paint = read_paint_abs(world, wx, wy, seed_z);
+    if seed_bt == 0 { return Ok(None); }
+
+    let ww = (world.w_chunks * 16) as i32;
+    let wh = (world.h_chunks * 16) as i32;
+    const MAX_CELLS: u32 = 50_000;
+
+    let mut visited: std::collections::HashSet<(i32, i32)> = std::collections::HashSet::new();
+    let mut queue:   VecDeque<(i32, i32)> = VecDeque::new();
+    let (mut x_min, mut y_min, mut x_max, mut y_max) = (wx, wy, wx, wy);
+    let mut count = 0u32;
+
+    queue.push_back((wx, wy));
+    visited.insert((wx, wy));
+
+    while let Some((x, y)) = queue.pop_front() {
+        if count >= MAX_CELLS { break; }
+        let Some(sz) = surface_z(world, x, y) else { continue };
+        if read_block_abs(world, x, y, sz) != seed_bt { continue; }
+        if read_paint_abs(world, x, y, sz) != seed_paint { continue; }
+        x_min = x_min.min(x); y_min = y_min.min(y);
+        x_max = x_max.max(x); y_max = y_max.max(y);
+        count += 1;
+        for (dx, dy) in [(-1i32,0i32),(1,0),(0,-1),(0,1)] {
+            let nx = x + dx; let ny = y + dy;
+            if nx < 0 || ny < 0 || nx >= ww || ny >= wh { continue; }
+            if visited.insert((nx, ny)) { queue.push_back((nx, ny)); }
+        }
+    }
+
+    if count == 0 { return Ok(None); }
+    Ok(Some(SelectRect { x1: x_min, y1: y_min, x2: x_max, y2: y_max }))
+}
+
+// ── Scatter / Array paste ─────────────────────────────────────────────────────
+
+/// Helper: paste clipboard at a single world position. Assumes world is already taken.
+fn paste_clipboard_at(
+    world: &mut LoadedWorld,
+    px: i32, py: i32,
+    block_types: &[u8], paints: &[u8],
+    width: i32, height: i32, depth: i32, z_anchor: i32,
+    elevation_offset: i32, ignore_air: bool,
+    max_z: i32,
+) {
+    for dz in 0..depth {
+        let tz = z_anchor + elevation_offset + dz;
+        if tz < 0 || tz > max_z { continue; }
+        let band = tz as usize / 16;
+        let lz   = tz as usize % 16;
+        for dy in 0..height {
+            let ty = py + dy; if ty < 0 { continue; }
+            let chunk_cy = ty / 16 + world.min_y;
+            let ly = (ty % 16) as usize;
+            for dx in 0..width {
+                let tx = px + dx; if tx < 0 { continue; }
+                let chunk_cx = tx / 16 + world.min_x;
+                let lx = (tx % 16) as usize;
+                let idx = (dz * height * width + dy * width + dx) as usize;
+                let bt = block_types[idx];
+                if ignore_air && bt == 0 { continue; }
+                let &addr = match world.chunk_map.get(&(chunk_cx, chunk_cy)) { Some(a) => a, None => continue };
+                let bi = addr + band * 8192 + lx * 256 + ly * 16 + lz;
+                let pi = bi + 4096;
+                if bi < world.bytes.len() { world.bytes[bi] = bt; }
+                if pi < world.bytes.len() { world.bytes[pi] = paints[idx]; }
+            }
+        }
+    }
+}
+
+/// Paste clipboard at `count` random positions within the bounding box.
+#[tauri::command]
+fn scatter_paste(
+    x1: i32, y1: i32, x2: i32, y2: i32,
+    count: i32,
+    seed: u64,
+    elevation_offset: i32,
+    ignore_air: bool,
+    state: tauri::State<'_, AppState>,
+) -> Result<EditResult, String> {
+    let count = count.clamp(1, 100);
+    let mut ws = state.lock().unwrap();
+
+    let (width, height, depth, z_anchor, block_types, paints) = {
+        let cb = ws.clipboard.as_ref().ok_or("Clipboard is empty")?;
+        (cb.width, cb.height, cb.depth, cb.z_anchor, cb.block_types.clone(), cb.paints.clone())
+    };
+
+    let mut world = ws.world.take().ok_or("No world loaded")?;
+    let max_z = world_max_z(&world) as i32;
+
+    let affected = affected_chunk_coords(&world, x1, y1, x2, y2);
+    let pre_snap = snapshot_chunks(&world, &affected);
+
+    let range_x = (x2 - x1 - width + 2).max(1) as u64;
+    let range_y = (y2 - y1 - height + 2).max(1) as u64;
+    let mut rng = Rng64::new(if seed == 0 { 0xdeadbeef_cafebabe } else { seed });
+
+    for _ in 0..count {
+        let px = x1 + (rng.next() % range_x) as i32;
+        let py = y1 + (rng.next() % range_y) as i32;
+        paste_clipboard_at(&mut world, px, py, &block_types, &paints,
+            width, height, depth, z_anchor, elevation_offset, ignore_air, max_z);
+    }
+
+    let patch = render_pixels_patch(&world, x1, y1, x2, y2);
+    let pre_snap = filter_unchanged_snapshots(&world, pre_snap);
+    ws.world = Some(world);
+
+    if !pre_snap.is_empty() {
+        push_undo(&mut ws.undo_stack, UndoEntry { operation: "scatter_paste".into(), chunks: pre_snap });
+        ws.redo_stack.clear();
+    }
+    Ok(EditResult { patch, undo_depth: ws.undo_stack.len(), redo_depth: ws.redo_stack.len() })
+}
+
+/// Paste clipboard in a cols × rows grid with given spacing.
+#[tauri::command]
+fn array_paste(
+    origin_x: i32, origin_y: i32,
+    cols: i32, rows: i32,
+    spacing_x: i32, spacing_y: i32,
+    elevation_offset: i32,
+    ignore_air: bool,
+    state: tauri::State<'_, AppState>,
+) -> Result<EditResult, String> {
+    let cols = cols.clamp(1, 20);
+    let rows = rows.clamp(1, 20);
+    let mut ws = state.lock().unwrap();
+
+    let (width, height, depth, z_anchor, block_types, paints) = {
+        let cb = ws.clipboard.as_ref().ok_or("Clipboard is empty")?;
+        (cb.width, cb.height, cb.depth, cb.z_anchor, cb.block_types.clone(), cb.paints.clone())
+    };
+
+    let step_x = if spacing_x > 0 { spacing_x } else { width };
+    let step_y = if spacing_y > 0 { spacing_y } else { height };
+    let x2 = origin_x + (cols - 1) * step_x + width  - 1;
+    let y2 = origin_y + (rows - 1) * step_y + height - 1;
+
+    let mut world = ws.world.take().ok_or("No world loaded")?;
+    let max_z = world_max_z(&world) as i32;
+
+    let affected = affected_chunk_coords(&world, origin_x, origin_y, x2, y2);
+    let pre_snap = snapshot_chunks(&world, &affected);
+
+    for row in 0..rows {
+        for col in 0..cols {
+            let px = origin_x + col * step_x;
+            let py = origin_y + row * step_y;
+            paste_clipboard_at(&mut world, px, py, &block_types, &paints,
+                width, height, depth, z_anchor, elevation_offset, ignore_air, max_z);
+        }
+    }
+
+    let patch = render_pixels_patch(&world, origin_x, origin_y, x2, y2);
+    let pre_snap = filter_unchanged_snapshots(&world, pre_snap);
+    ws.world = Some(world);
+
+    if !pre_snap.is_empty() {
+        push_undo(&mut ws.undo_stack, UndoEntry { operation: "array_paste".into(), chunks: pre_snap });
+        ws.redo_stack.clear();
+    }
+    Ok(EditResult { patch, undo_depth: ws.undo_stack.len(), redo_depth: ws.redo_stack.len() })
+}
+
+// ── Find nearest block ────────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+struct WorldPos { x: i32, y: i32 }
+
+/// Find the nearest surface block of a given type, searching outward from center.
+#[tauri::command]
+fn find_nearest_block(
+    center_x: i32, center_y: i32,
+    block_type: u8,
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<WorldPos>, String> {
+    let ws = state.lock().unwrap();
+    let world = ws.world.as_ref().ok_or("No world loaded")?;
+    let ww = (world.w_chunks * 16) as i32;
+    let wh = (world.h_chunks * 16) as i32;
+    const MAX_RADIUS: i32 = 512;
+
+    for radius in 0..=MAX_RADIUS {
+        let x_lo = (center_x - radius).max(0);
+        let x_hi = (center_x + radius).min(ww - 1);
+        let y_lo = (center_y - radius).max(0);
+        let y_hi = (center_y + radius).min(wh - 1);
+        for y in y_lo..=y_hi {
+            for x in x_lo..=x_hi {
+                // Only scan the ring at this radius
+                if (y - center_y).abs() < radius && (x - center_x).abs() < radius { continue; }
+                if let Some(sz) = surface_z(world, x, y) {
+                    if read_block_abs(world, x, y, sz) == block_type {
+                        return Ok(Some(WorldPos { x, y }));
+                    }
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
 pub fn run() {
     tauri::Builder::default()
         .manage(Mutex::new(WorldState::new()))
@@ -2901,6 +3406,14 @@ pub fn run() {
             search_worlds,
             download_world,
             upload_world,
+            get_surface_z,
+            rename_world,
+            sculpt_terrain,
+            fill_surface,
+            magic_wand_select,
+            scatter_paste,
+            array_paste,
+            find_nearest_block,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
