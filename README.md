@@ -18,9 +18,12 @@ Pre-built installers for macOS (Apple Silicon + Intel universal), Windows, and L
 - **Inspect** a selection to see its dimensions, block counts, and Front / Side / Top previews
 - **Edit** — fill a region with any block type, replace one material with another, delete blocks selectively
 - **Copy and paste** — copy any volume and paste it anywhere; terrain-aware paste aligns to the ground surface automatically
+- **Draw** — pen, brush, rectangle, and ellipse tools paint blocks directly on the map; hotbar shows pinned and recent block+paint combos for fast switching; optional mask restricts painting to a specific block or block+paint type
+- **Magic Wand** *(experimental)* — click any surface block to flood-select the contiguous region sharing that block type or block+paint combination
 - **Z-slice mode** — step through horizontal layers one at a time
 - **Undo / redo** with multi-level history
-- **Browse Worlds** — search and download any world from the Eden community servers directly inside the editor
+- **OBJ export** *(experimental)* — export a selection or the whole world as a Wavefront OBJ + MTL file with face-culled geometry and per-block materials
+- **Browse Worlds** — search and download any world from the Eden community servers with preview images, date filters, and quality sorting
 - **Upload** — share your world back to the Eden servers with a thumbnail image
 
 ---
@@ -66,8 +69,11 @@ The compiled app and installers appear in `src-tauri/target/release/bundle/`.
 5. **Inspect** — the right-hand panel shows dimensions, block counts, and orthographic previews of the selection.
 6. **Edit** — with a selection active, use the bottom-left panel to fill, replace, or delete blocks.
 7. **Copy / paste** — Copy captures the selection. Switch to Paste and click to place. Use the banner toggles for *No Air*, *Terrain*, and *Rotate 90°*.
-8. **Save** — *Save* writes changes to the original file in place. *Save As* writes to a new file.
-9. **Upload** — *File → Upload to Server…* lets you share the current world to the Eden servers. A PNG thumbnail is required.
+8. **Draw** — activate a draw tool (Pen / Brush / Rect / Ellipse) from the Draw menu or keyboard. Pick a block from the hotbar or the picker. Enable *Mask* to restrict painting to a specific block type.
+9. **Magic Wand** — press **W** and click any surface block to select the contiguous region of matching blocks. Toggle *Type + Colour* / *Type only* in the options row.
+10. **Export OBJ** — *File → Export OBJ…* writes a `.obj` + `.mtl` pair. Exports the current selection if one is active, otherwise the full world.
+11. **Save** — *Save* writes changes to the original file in place. *Save As* writes to a new file.
+12. **Upload** — *File → Upload to Server…* lets you share the current world to the Eden servers. A PNG thumbnail is required.
 
 ### Keyboard shortcuts
 
@@ -83,6 +89,7 @@ The compiled app and installers appear in `src-tauri/target/release/bundle/`.
 | B | Brush draw tool |
 | R | Rectangle draw tool |
 | E | Ellipse draw tool |
+| W | Magic Wand tool |
 | ? | Keyboard shortcut reference |
 
 ---
