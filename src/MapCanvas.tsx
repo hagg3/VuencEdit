@@ -2,7 +2,7 @@ import { useEffect, useRef, useCallback, forwardRef, useImperativeHandle } from 
 import { invoke } from "@tauri-apps/api/core";
 import { brushFootprint, bresenhamLine, rectPixels, ellipsePixels, type WP, type BrushShape, type FillMode } from "./drawTools";
 
-export type Tool = "pan" | "select" | "paste" | "pen" | "brush" | "rect" | "ellipse" | "smooth" | "noise" | "flatten" | "erode" | "fill";
+export type Tool = "pan" | "select" | "wand" | "paste" | "pen" | "brush" | "rect" | "ellipse" | "smooth" | "noise" | "flatten" | "erode" | "fill";
 
 export interface DrawConfig {
   brushSize: number;
@@ -111,7 +111,7 @@ interface Props {
   lastPasteDelta?: { dx: number; dy: number } | null;
   /** Called on every pointer-move with current world coords — used for follow-surface z-slice. */
   onCursorMove?: (wx: number, wy: number) => void;
-  /** Called on right-click in select mode for magic-wand selection. */
+  /** Called when the wand tool clicks a world coordinate. */
   onMagicWand?: (wx: number, wy: number) => void;
 }
 
@@ -772,9 +772,8 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
       }
       return;
     }
-    // Right-click in select mode = magic wand
-    if (e.button === 2 && toolRef.current === "select") {
-      e.preventDefault();
+    if (e.button !== 0) return;
+    if (toolRef.current === "wand") {
       const wp = screenToWorld(e.clientX, e.clientY);
       onMagicWandRef.current?.(wp.x, wp.y);
       return;

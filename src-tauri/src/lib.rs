@@ -1,8 +1,9 @@
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use memmap2::{MmapMut, MmapOptions};
 use serde::Serialize;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
+use std::io::{BufWriter, Write};
 use std::sync::Mutex;
 use std::time::Instant;
 use tauri::Emitter;
@@ -164,7 +165,6 @@ struct WorldSearchResult {
     id: String,
     name: String,
     timestamp: i64,
-    file_size: Option<u64>,
 }
 
 // ── Color system (HLS model, ported from la-map.c by Robert Munafo, GPL3) ─────
@@ -2690,6 +2690,242 @@ fn load_prefab(path: String, state: tauri::State<'_, AppState>) -> Result<Clipbo
     Ok(info)
 }
 
+// ── OBJ Export ────────────────────────────────────────────────────────────────
+
+fn get_block_at(world: &LoadedWorld, wx: i32, wy: i32, wz: i32) -> (u8, u8) {
+    if wz < 0 || wz as usize >= world.num_bands * 16 { return (0, 0); }
+    let cx = wx.div_euclid(16) + world.min_x;
+    let cy = wy.div_euclid(16) + world.min_y;
+    if let Some(&addr) = world.chunk_map.get(&(cx, cy)) {
+        let lx = wx.rem_euclid(16) as usize;
+        let ly = wy.rem_euclid(16) as usize;
+        let band = wz as usize / 16;
+        let lz   = wz as usize % 16;
+        let bi = addr + band * 8192 + lx * 256 + ly * 16 + lz;
+        let pi = bi + 4096;
+        if bi < world.bytes.len() && pi < world.bytes.len() {
+            return (world.bytes[bi], world.bytes[pi]);
+        }
+    }
+    (0, 0)
+}
+
+/// True if this block fully occludes an adjacent face (solid, not air/transparent/ramp/wedge).
+fn obj_occludes(bt: u8) -> bool {
+    bt != 0 && transparent_alpha(bt).is_none() && !matches!(bt, 24..=55)
+}
+
+/// Eden (X right, Y south, Z up) → OBJ (X right, Y up, Z toward viewer)
+fn ov(ex: f32, ey: f32, ez: f32) -> (f32, f32, f32) { (ex, ez, -ey) }
+
+fn obj_v(w: &mut impl Write, (x, y, z): (f32, f32, f32)) -> std::io::Result<()> {
+    writeln!(w, "v {x} {y} {z}")
+}
+
+fn obj_quad(w: &mut impl Write) -> std::io::Result<()> { writeln!(w, "f -4 -3 -2 -1") }
+fn obj_tri(w: &mut impl Write)  -> std::io::Result<()> { writeln!(w, "f -3 -2 -1") }
+
+/// Emit a cube block with face culling (skips faces adjacent to fully-opaque neighbors).
+fn emit_cube(w: &mut impl Write, wx: i32, wy: i32, wz: i32, world: &LoadedWorld) -> std::io::Result<()> {
+    let (x0, x1) = (wx as f32, wx as f32 + 1.0);
+    let (y0, y1) = (wy as f32, wy as f32 + 1.0);
+    let (z0, z1) = (wz as f32, wz as f32 + 1.0);
+    if !obj_occludes(get_block_at(world,wx,wy,wz+1).0) {
+        obj_v(w,ov(x0,y0,z1))?; obj_v(w,ov(x1,y0,z1))?; obj_v(w,ov(x1,y1,z1))?; obj_v(w,ov(x0,y1,z1))?; obj_quad(w)?;
+    }
+    if !obj_occludes(get_block_at(world,wx,wy,wz-1).0) {
+        obj_v(w,ov(x0,y1,z0))?; obj_v(w,ov(x1,y1,z0))?; obj_v(w,ov(x1,y0,z0))?; obj_v(w,ov(x0,y0,z0))?; obj_quad(w)?;
+    }
+    if !obj_occludes(get_block_at(world,wx,wy+1,wz).0) {
+        obj_v(w,ov(x0,y1,z0))?; obj_v(w,ov(x1,y1,z0))?; obj_v(w,ov(x1,y1,z1))?; obj_v(w,ov(x0,y1,z1))?; obj_quad(w)?;
+    }
+    if !obj_occludes(get_block_at(world,wx,wy-1,wz).0) {
+        obj_v(w,ov(x1,y0,z0))?; obj_v(w,ov(x0,y0,z0))?; obj_v(w,ov(x0,y0,z1))?; obj_v(w,ov(x1,y0,z1))?; obj_quad(w)?;
+    }
+    if !obj_occludes(get_block_at(world,wx+1,wy,wz).0) {
+        obj_v(w,ov(x1,y1,z0))?; obj_v(w,ov(x1,y0,z0))?; obj_v(w,ov(x1,y0,z1))?; obj_v(w,ov(x1,y1,z1))?; obj_quad(w)?;
+    }
+    if !obj_occludes(get_block_at(world,wx-1,wy,wz).0) {
+        obj_v(w,ov(x0,y0,z0))?; obj_v(w,ov(x0,y1,z0))?; obj_v(w,ov(x0,y1,z1))?; obj_v(w,ov(x0,y0,z1))?; obj_quad(w)?;
+    }
+    Ok(())
+}
+
+/// Emit a ramp as a triangular prism. dir: 0=South 1=West 2=North 3=East (high edge direction).
+fn emit_ramp(w: &mut impl Write, wx: i32, wy: i32, wz: i32, dir: u8, world: &LoadedWorld) -> std::io::Result<()> {
+    let (x0, x1) = (wx as f32, wx as f32 + 1.0);
+    let (y0, y1) = (wy as f32, wy as f32 + 1.0);
+    let (z0, z1) = (wz as f32, wz as f32 + 1.0);
+    // Bottom — cull if solid below
+    if !obj_occludes(get_block_at(world, wx, wy, wz - 1).0) {
+        obj_v(w, ov(x0,y1,z0))?; obj_v(w, ov(x1,y1,z0))?;
+        obj_v(w, ov(x1,y0,z0))?; obj_v(w, ov(x0,y0,z0))?;
+        obj_quad(w)?;
+    }
+    match dir {
+        0 => { // South: high edge at +Y
+            obj_v(w,ov(x0,y1,z0))?; obj_v(w,ov(x1,y1,z0))?; obj_v(w,ov(x1,y1,z1))?; obj_v(w,ov(x0,y1,z1))?; obj_quad(w)?;
+            obj_v(w,ov(x0,y0,z0))?; obj_v(w,ov(x0,y1,z0))?; obj_v(w,ov(x0,y1,z1))?; obj_tri(w)?;
+            obj_v(w,ov(x1,y1,z0))?; obj_v(w,ov(x1,y0,z0))?; obj_v(w,ov(x1,y1,z1))?; obj_tri(w)?;
+            obj_v(w,ov(x0,y0,z0))?; obj_v(w,ov(x1,y0,z0))?; obj_v(w,ov(x1,y1,z1))?; obj_v(w,ov(x0,y1,z1))?; obj_quad(w)?;
+        }
+        1 => { // West: high edge at -X
+            obj_v(w,ov(x0,y0,z0))?; obj_v(w,ov(x0,y1,z0))?; obj_v(w,ov(x0,y1,z1))?; obj_v(w,ov(x0,y0,z1))?; obj_quad(w)?;
+            obj_v(w,ov(x0,y1,z0))?; obj_v(w,ov(x1,y1,z0))?; obj_v(w,ov(x0,y1,z1))?; obj_tri(w)?;
+            obj_v(w,ov(x1,y0,z0))?; obj_v(w,ov(x0,y0,z0))?; obj_v(w,ov(x0,y0,z1))?; obj_tri(w)?;
+            obj_v(w,ov(x1,y0,z0))?; obj_v(w,ov(x1,y1,z0))?; obj_v(w,ov(x0,y1,z1))?; obj_v(w,ov(x0,y0,z1))?; obj_quad(w)?;
+        }
+        2 => { // North: high edge at -Y
+            obj_v(w,ov(x1,y0,z0))?; obj_v(w,ov(x0,y0,z0))?; obj_v(w,ov(x0,y0,z1))?; obj_v(w,ov(x1,y0,z1))?; obj_quad(w)?;
+            obj_v(w,ov(x1,y0,z0))?; obj_v(w,ov(x1,y1,z0))?; obj_v(w,ov(x1,y0,z1))?; obj_tri(w)?;
+            obj_v(w,ov(x0,y1,z0))?; obj_v(w,ov(x0,y0,z0))?; obj_v(w,ov(x0,y0,z1))?; obj_tri(w)?;
+            obj_v(w,ov(x1,y1,z0))?; obj_v(w,ov(x0,y1,z0))?; obj_v(w,ov(x0,y0,z1))?; obj_v(w,ov(x1,y0,z1))?; obj_quad(w)?;
+        }
+        _ => { // East (dir=3): high edge at +X
+            obj_v(w,ov(x1,y1,z0))?; obj_v(w,ov(x1,y0,z0))?; obj_v(w,ov(x1,y0,z1))?; obj_v(w,ov(x1,y1,z1))?; obj_quad(w)?;
+            obj_v(w,ov(x1,y0,z0))?; obj_v(w,ov(x0,y0,z0))?; obj_v(w,ov(x1,y0,z1))?; obj_tri(w)?;
+            obj_v(w,ov(x0,y1,z0))?; obj_v(w,ov(x1,y1,z0))?; obj_v(w,ov(x1,y1,z1))?; obj_tri(w)?;
+            obj_v(w,ov(x0,y1,z0))?; obj_v(w,ov(x0,y0,z0))?; obj_v(w,ov(x1,y0,z1))?; obj_v(w,ov(x1,y1,z1))?; obj_quad(w)?;
+        }
+    }
+    Ok(())
+}
+
+/// Emit a wedge as a pyramid (1 apex, 4 base corners). dir: 0=SE 1=SW 2=NW 3=NE (apex at opposite corner).
+fn emit_wedge(w: &mut impl Write, wx: i32, wy: i32, wz: i32, dir: u8, world: &LoadedWorld) -> std::io::Result<()> {
+    let (x0, x1) = (wx as f32, wx as f32 + 1.0);
+    let (y0, y1) = (wy as f32, wy as f32 + 1.0);
+    let (z0, z1) = (wz as f32, wz as f32 + 1.0);
+    // Bottom
+    if !obj_occludes(get_block_at(world, wx, wy, wz - 1).0) {
+        obj_v(w, ov(x0,y1,z0))?; obj_v(w, ov(x1,y1,z0))?;
+        obj_v(w, ov(x1,y0,z0))?; obj_v(w, ov(x0,y0,z0))?;
+        obj_quad(w)?;
+    }
+    // Apex corner and 4 sloped/vertical faces
+    let (ax, ay) = match dir {
+        0 => (x0, y0), // SE wedge: apex at NW
+        1 => (x1, y0), // SW wedge: apex at NE
+        2 => (x1, y1), // NW wedge: apex at SE
+        _ => (x0, y1), // NE wedge: apex at SW
+    };
+    // Two vertical faces adjacent to the apex corner
+    match dir {
+        0 => {
+            obj_v(w,ov(x0,y0,z0))?; obj_v(w,ov(x0,y1,z0))?; obj_v(w,ov(ax,ay,z1))?; obj_tri(w)?; // West
+            obj_v(w,ov(x1,y0,z0))?; obj_v(w,ov(x0,y0,z0))?; obj_v(w,ov(ax,ay,z1))?; obj_tri(w)?; // North
+            obj_v(w,ov(ax,ay,z1))?; obj_v(w,ov(x0,y1,z0))?; obj_v(w,ov(x1,y1,z0))?; obj_tri(w)?; // Slope1
+            obj_v(w,ov(ax,ay,z1))?; obj_v(w,ov(x1,y1,z0))?; obj_v(w,ov(x1,y0,z0))?; obj_tri(w)?; // Slope2
+        }
+        1 => {
+            obj_v(w,ov(x1,y1,z0))?; obj_v(w,ov(x1,y0,z0))?; obj_v(w,ov(ax,ay,z1))?; obj_tri(w)?; // East
+            obj_v(w,ov(x0,y0,z0))?; obj_v(w,ov(x1,y0,z0))?; obj_v(w,ov(ax,ay,z1))?; obj_tri(w)?; // North
+            obj_v(w,ov(ax,ay,z1))?; obj_v(w,ov(x1,y1,z0))?; obj_v(w,ov(x0,y1,z0))?; obj_tri(w)?; // Slope1
+            obj_v(w,ov(ax,ay,z1))?; obj_v(w,ov(x0,y1,z0))?; obj_v(w,ov(x0,y0,z0))?; obj_tri(w)?; // Slope2
+        }
+        2 => {
+            obj_v(w,ov(x1,y0,z0))?; obj_v(w,ov(x1,y1,z0))?; obj_v(w,ov(ax,ay,z1))?; obj_tri(w)?; // East
+            obj_v(w,ov(x1,y1,z0))?; obj_v(w,ov(x0,y1,z0))?; obj_v(w,ov(ax,ay,z1))?; obj_tri(w)?; // South
+            obj_v(w,ov(ax,ay,z1))?; obj_v(w,ov(x0,y0,z0))?; obj_v(w,ov(x0,y1,z0))?; obj_tri(w)?; // Slope1
+            obj_v(w,ov(ax,ay,z1))?; obj_v(w,ov(x1,y0,z0))?; obj_v(w,ov(x0,y0,z0))?; obj_tri(w)?; // Slope2
+        }
+        _ => {
+            obj_v(w,ov(x0,y1,z0))?; obj_v(w,ov(x0,y0,z0))?; obj_v(w,ov(ax,ay,z1))?; obj_tri(w)?; // West
+            obj_v(w,ov(x0,y1,z0))?; obj_v(w,ov(x1,y1,z0))?; obj_v(w,ov(ax,ay,z1))?; obj_tri(w)?; // South
+            obj_v(w,ov(ax,ay,z1))?; obj_v(w,ov(x1,y0,z0))?; obj_v(w,ov(x1,y1,z0))?; obj_tri(w)?; // Slope1
+            obj_v(w,ov(ax,ay,z1))?; obj_v(w,ov(x0,y0,z0))?; obj_v(w,ov(x1,y0,z0))?; obj_tri(w)?; // Slope2
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn export_obj(
+    state: tauri::State<'_, AppState>,
+    path: String,
+    x1: i32, y1: i32, x2: i32, y2: i32,
+    z_min: i32, z_max: i32,
+) -> Result<(), String> {
+    let ws = state.lock().unwrap();
+    let world = ws.world.as_ref().ok_or("No world loaded")?;
+
+    let sx1 = x1.min(x2); let sx2 = x1.max(x2);
+    let sy1 = y1.min(y2); let sy2 = y1.max(y2);
+    let sz1 = z_min.min(z_max).max(0);
+    let sz2 = z_min.max(z_max).min(world_max_z(world));
+
+    // Collect unique (block_type, paint) combos for the MTL file.
+    let mut mat_set: HashSet<(u8, u8)> = HashSet::new();
+    for wz in sz1..=sz2 {
+        for wy in sy1..=sy2 {
+            for wx in sx1..=sx2 {
+                let (bt, paint) = get_block_at(world, wx, wy, wz);
+                if bt != 0 { mat_set.insert((bt, paint)); }
+            }
+        }
+    }
+    let mut mat_list: Vec<(u8, u8)> = mat_set.into_iter().collect();
+    mat_list.sort();
+
+    let obj_path = std::path::Path::new(&path);
+    let stem = obj_path.file_stem().and_then(|s| s.to_str()).unwrap_or("world");
+    let mtl_path = obj_path.with_extension("mtl");
+    let mtl_filename = format!("{stem}.mtl");
+
+    // Write MTL
+    {
+        let f = fs::File::create(&mtl_path).map_err(|e| format!("Cannot create MTL: {e}"))?;
+        let mut mw = BufWriter::new(f);
+        writeln!(mw, "# Eden World Editor — material library").map_err(|e| e.to_string())?;
+        for &(bt, paint) in &mat_list {
+            let [r, g, b] = block_color(bt, paint, world.sky);
+            writeln!(mw, "\nnewmtl m_{bt}_{paint}").map_err(|e| e.to_string())?;
+            writeln!(mw, "Kd {:.4} {:.4} {:.4}", r as f32/255.0, g as f32/255.0, b as f32/255.0)
+                .map_err(|e| e.to_string())?;
+            writeln!(mw, "Ka 0.1 0.1 0.1\nKs 0.0 0.0 0.0").map_err(|e| e.to_string())?;
+            if let Some(a) = transparent_alpha(bt) {
+                writeln!(mw, "d {a:.2}").map_err(|e| e.to_string())?;
+            }
+        }
+    }
+
+    // Write OBJ
+    let f = fs::File::create(&path).map_err(|e| format!("Cannot create OBJ: {e}"))?;
+    let mut ow = BufWriter::new(f);
+    writeln!(ow, "# Eden World Editor OBJ export").map_err(|e| e.to_string())?;
+    writeln!(ow, "# Bounds ({sx1},{sy1},{sz1})–({sx2},{sy2},{sz2})").map_err(|e| e.to_string())?;
+    writeln!(ow, "mtllib {mtl_filename}").map_err(|e| e.to_string())?;
+
+    let mut cur_mat = String::new();
+
+    for wz in sz1..=sz2 {
+        for wy in sy1..=sy2 {
+            for wx in sx1..=sx2 {
+                let (bt, paint) = get_block_at(world, wx, wy, wz);
+                if bt == 0 { continue; }
+
+                let mat = format!("m_{bt}_{paint}");
+                if mat != cur_mat {
+                    writeln!(ow, "\nusemtl {mat}").map_err(|e| e.to_string())?;
+                    cur_mat = mat;
+                }
+
+                if matches!(bt, 24..=39) {
+                    let base = 24 + ((bt - 24) / 4) * 4;
+                    emit_ramp(&mut ow, wx, wy, wz, bt - base, world).map_err(|e| e.to_string())?;
+                } else if matches!(bt, 40..=55) {
+                    let base = 40 + ((bt - 40) / 4) * 4;
+                    emit_wedge(&mut ow, wx, wy, wz, bt - base, world).map_err(|e| e.to_string())?;
+                } else {
+                    emit_cube(&mut ow, wx, wy, wz, world).map_err(|e| e.to_string())?;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 // ── App entry point ────────────────────────────────────────────────────────────
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -2724,23 +2960,13 @@ async fn search_worlds(query: String, server: String) -> Result<Vec<WorldSearchR
         i += 2;
     }
 
-    let download_base = srv.download_base_url;
-    let mut results = Vec::with_capacity(pairs.len());
-    for (id, name) in pairs {
-        let timestamp = id.parse::<i64>().unwrap_or(0);
-        let head_url = format!("{}/{}.eden", download_base, id);
-        let file_size = match client.head(&head_url)
-            .timeout(std::time::Duration::from_secs(5))
-            .send().await
-        {
-            Ok(resp) => resp.headers()
-                .get(reqwest::header::CONTENT_LENGTH)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse::<u64>().ok()),
-            Err(_) => None,
-        };
-        results.push(WorldSearchResult { id, name, timestamp, file_size });
-    }
+    let results: Vec<WorldSearchResult> = pairs
+        .into_iter()
+        .map(|(id, name)| {
+            let timestamp = id.parse::<i64>().unwrap_or(0);
+            WorldSearchResult { id, name, timestamp }
+        })
+        .collect();
 
     Ok(results)
 }
@@ -3154,11 +3380,13 @@ fn fill_surface(
 #[derive(Serialize)]
 struct SelectRect { x1: i32, y1: i32, x2: i32, y2: i32 }
 
-/// Flood-fill select connected surface region of the same block type as (wx,wy).
+/// Flood-fill select connected surface region matching (wx,wy).
+/// When match_paint is false, only block type is compared (ignores paint colour).
 /// Returns the bounding box of the selected region.
 #[tauri::command]
 fn magic_wand_select(
     wx: i32, wy: i32,
+    match_paint: bool,
     state: tauri::State<'_, AppState>,
 ) -> Result<Option<SelectRect>, String> {
     let ws = state.lock().unwrap();
@@ -3184,7 +3412,7 @@ fn magic_wand_select(
         if count >= MAX_CELLS { break; }
         let Some(sz) = surface_z(world, x, y) else { continue };
         if read_block_abs(world, x, y, sz) != seed_bt { continue; }
-        if read_paint_abs(world, x, y, sz) != seed_paint { continue; }
+        if match_paint && read_paint_abs(world, x, y, sz) != seed_paint { continue; }
         x_min = x_min.min(x); y_min = y_min.min(y);
         x_max = x_max.max(x); y_max = y_max.max(y);
         count += 1;
@@ -3414,6 +3642,7 @@ pub fn run() {
             scatter_paste,
             array_paste,
             find_nearest_block,
+            export_obj,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
