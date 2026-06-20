@@ -65,7 +65,9 @@ export default function HelpModal({ onClose }: { onClose: () => void }) {
           border: "1px solid #334155",
           borderRadius: 10,
           padding: "18px 24px 20px",
-          minWidth: 340,
+          minWidth: 380,
+          maxHeight: "88vh",
+          overflowY: "auto",
           boxShadow: "0 24px 48px rgba(0,0,0,0.7)",
           color: "#e2e8f0",
         }}
@@ -90,20 +92,32 @@ export default function HelpModal({ onClose }: { onClose: () => void }) {
           <tbody>
 
             <Section title="Navigation" />
-            <Row keys={<>Scroll wheel</>}                            action="Zoom in / out" />
-            <Row keys={<><Key>Home</Key></>}                         action="Zoom to fit" />
-            <Row keys={<>Middle mouse drag</>}                       action="Pan" />
+            <Row keys={<>Scroll</>}                                      action="Zoom in / out" />
+            <Row keys={<><Key>Home</Key></>}                             action="Fit map to window" />
+            <Row keys={<>Middle drag</>}                                  action="Pan" />
+
+            <Section title="Tools" />
+            <Row keys={<><Key>P</Key></>}                                action="Pen" />
+            <Row keys={<><Key>B</Key></>}                                action="Brush" />
+            <Row keys={<><Key>R</Key></>}                                action="Rect" />
+            <Row keys={<><Key>E</Key></>}                                action="Ellipse" />
+            <Row keys={<><Key>F</Key></>}                                action="Fill bucket" />
+            <Row keys={<><Key>W</Key></>}                                action="Magic Wand — flood-select matching surface blocks (type+colour toggle in toolbar)" />
+            <Row keys={<><Key>1</Key>–<Key>5</Key></>}                   action="Brush size (1 / 3 / 5 / 7 / 9)" />
 
             <Section title="Editing" />
-            <Row keys={<><Key>⌘</Key><Key>Z</Key></>}               action="Undo" />
+            <Row keys={<><Key>⌘</Key><Key>Z</Key></>}                   action="Undo" />
             <Row keys={<><Key>⌘</Key><Key>⇧</Key><Key>Z</Key> / <Key>⌘</Key><Key>Y</Key></>} action="Redo" />
 
-            <Section title="Selection" />
-            <Row keys={<><Key>Esc</Key></>}                          action="Clear selection" />
-            <Row keys={<><Key>Esc</Key> <span style={{ color: "#475569", fontSize: 11 }}>(paste mode)</span></>} action="Exit paste mode" />
+            <Section title="Paste mode" />
+            <Row keys={<>Click</>}                                        action="Lock paste position" />
+            <Row keys={<>Click again / Confirm</>}                        action="Stamp paste" />
+            <Row keys={<><Key>.</Key></>}                                 action="Repeat paste one step in same direction" />
+            <Row keys={<><Key>Esc</Key></>}                               action="Unlock position → exit paste mode" />
 
-            <Section title="Help" />
-            <Row keys={<><Key>?</Key></>}                            action="Toggle this panel" />
+            <Section title="General" />
+            <Row keys={<><Key>Esc</Key></>}                               action="Exit current tool / clear selection" />
+            <Row keys={<><Key>?</Key></>}                                 action="Toggle this panel" />
 
           </tbody>
         </table>

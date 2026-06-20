@@ -99,6 +99,7 @@ function App() {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [exporting, setExporting] = useState(false);
+  const [exportingObj, setExportingObj] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saveCompressed, setSaveCompressed] = useState(false);
   const [fileMenuOpen, setFileMenuOpen] = useState(false);
@@ -110,6 +111,7 @@ function App() {
   const [undoDepth, setUndoDepth] = useState(0);
   const [redoDepth, setRedoDepth] = useState(0);
   const [tool, setTool] = useState<Tool>("pan");
+  const [wandMatchPaint, setWandMatchPaint] = useState(true);
   const [sourcePath, setSourcePath] = useState<string | null>(null);
   const [renderMode, setRenderMode] = useState<"tiled" | "full" | "axo">("tiled");
   const [axoSkew, setAxoSkew] = useState(0.2);
@@ -150,15 +152,15 @@ function App() {
   const [maskBlockType, setMaskBlockType] = useState<number | null>(null);
   const [maskPaint,     setMaskPaint]     = useState<number | null>(null);
 
-  // Recent blocks quick-pick (last 5 used block+paint combos)
-  const [recentBlocks, setRecentBlocks] = useState<{type: number; paint: number}[]>([]);
+  // Bottom-left panel collapse state
+  const [fillPickerOpen, setFillPickerOpen] = useState(false);
+  const [replaceOpen, setReplaceOpen] = useState(false);
 
-  // Find menu
-  const [findMenuOpen, setFindMenuOpen] = useState(false);
-  const findMenuRef = useRef<HTMLDivElement>(null);
-  const [findBlockType, setFindBlockType] = useState(2);
-  const [gotoX, setGotoX] = useState("");
-  const [gotoY, setGotoY] = useState("");
+  // Hotbar: 5 pinned + 5 recent block+paint combos
+  const [pinnedBlocks, setPinnedBlocks] = useState<({type: number; paint: number} | null)[]>(Array(5).fill(null));
+  const [recentBlocks, setRecentBlocks] = useState<{type: number; paint: number}[]>([]);
+  const [hotbarHover, setHotbarHover] = useState<string | null>(null);
+
 
   // Paste mode: normal | scatter | array
   const [pasteMode, setPasteMode] = useState<"normal" | "scatter" | "array">("normal");
@@ -403,6 +405,30 @@ function App() {
     }
   }
 
+  async function exportObj() {
+    if (!world) return;
+    const defaultName = selection ? `${world.name}_selection.obj` : `${world.name}.obj`;
+    const savePath = await save({
+      filters: [{ name: "Wavefront OBJ", extensions: ["obj"] }],
+      defaultPath: defaultName,
+    });
+    if (!savePath) return;
+    const x1 = selection ? selection.x1 : 0;
+    const y1 = selection ? selection.y1 : 0;
+    const x2 = selection ? selection.x2 : world.width_chunks * 16 - 1;
+    const y2 = selection ? selection.y2 : world.height_chunks * 16 - 1;
+    const zMin = selection ? selection.z_min : 0;
+    const zMax = selection ? selection.z_max : world.max_z;
+    setExportingObj(true);
+    try {
+      await invoke("export_obj", { path: savePath, x1, y1, x2, y2, zMin, zMax });
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setExportingObj(false);
+    }
+  }
+
   function commitZSlice(z: number) {
     setZSliceZ(z);
     setZSliceDisplay(z);
@@ -550,27 +576,11 @@ function App() {
     }, 50);
   }
 
-  async function handleFindBlock() {
-    if (!world || !rawBounds) return;
-    const cx = Math.round((rawBounds.x1 + rawBounds.x2) / 2);
-    const cy = Math.round((rawBounds.y1 + rawBounds.y2) / 2);
-    try {
-      const pos = await invoke<{ x: number; y: number } | null>("find_nearest_block", {
-        centerX: cx, centerY: cy, blockType: findBlockType,
-      });
-      if (pos) {
-        setRawBounds({ x1: pos.x, y1: pos.y, x2: pos.x, y2: pos.y });
-        setFindMenuOpen(false);
-      } else {
-        setError("No block of that type found within search radius");
-      }
-    } catch (e) { setError(String(e)); }
-  }
 
   async function handleMagicWand(wx: number, wy: number) {
     try {
       const rect = await invoke<{ x1: number; y1: number; x2: number; y2: number } | null>("magic_wand_select", {
-        wx, wy,
+        wx, wy, matchPaint: wandMatchPaint,
       });
       if (rect) setRawBounds(rect);
     } catch (e) { setError(String(e)); }
@@ -650,7 +660,7 @@ function App() {
           return;
         }
         const t = appToolRef.current;
-        if (t === "paste" || t === "pen" || t === "brush" || t === "rect" || t === "ellipse" ||
+        if (t === "paste" || t === "wand" || t === "pen" || t === "brush" || t === "rect" || t === "ellipse" ||
             t === "smooth" || t === "noise" || t === "flatten" || t === "erode" || t === "fill") {
           e.preventDefault();
           setTool("pan");
@@ -672,6 +682,7 @@ function App() {
         if (e.key === "r" || e.key === "R") { e.preventDefault(); setTool("rect"); return; }
         if (e.key === "e" || e.key === "E") { e.preventDefault(); setTool("ellipse"); return; }
         if (e.key === "f" || e.key === "F") { e.preventDefault(); setTool("fill"); return; }
+        if (e.key === "w" || e.key === "W") { e.preventDefault(); setTool("wand"); return; }
         // Number keys 1-5 = brush size (1→1, 2→3, 3→5, 4→7, 5→9)
         if (["1","2","3","4","5"].includes(e.key)) {
           const sizeMap: Record<string, number> = {"1":1,"2":3,"3":5,"4":7,"5":9};
@@ -732,18 +743,7 @@ function App() {
     return () => document.removeEventListener("mousedown", handleOutside);
   }, [drawMenuOpen]);
 
-  useEffect(() => {
-    if (!findMenuOpen) return;
-    function handleOutside(e: MouseEvent) {
-      if (findMenuRef.current && !findMenuRef.current.contains(e.target as Node)) {
-        setFindMenuOpen(false);
-      }
-    }
-    document.addEventListener("mousedown", handleOutside);
-    return () => document.removeEventListener("mousedown", handleOutside);
-  }, [findMenuOpen]);
-
-  const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
+const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
     setRawBounds(bounds);
   }, []);
 
@@ -978,6 +978,10 @@ function App() {
           <div style={{ display: "flex", gap: 4 }}>
             <button onClick={() => setTool("pan")} style={tool === "pan" ? overlayBtnActive : overlayBtn}>Pan</button>
             <button onClick={() => setTool("select")} style={tool === "select" ? overlayBtnActive : overlayBtn}>Select</button>
+            <button onClick={() => setTool("wand")} title="Magic Wand — click to flood-select matching surface blocks (W)" style={{ ...(tool === "wand" ? { ...overlayBtnActive, borderColor: "#a78bfa", color: "#c4b5fd" } : overlayBtn), display: "flex", alignItems: "center", gap: 4 }}>
+              Wand
+              <span style={{ fontSize: 9, color: "#f59e0b", background: "rgba(245,158,11,0.12)", border: "1px solid rgba(245,158,11,0.3)", borderRadius: 3, padding: "0 3px", lineHeight: "14px" }}>exp</span>
+            </button>
             <div style={{ width: 1, background: "#334155", margin: "0 2px" }} />
             <div ref={drawMenuRef} style={{ position: "relative" }}>
               <button
@@ -1017,7 +1021,10 @@ function App() {
                     ))}
                   </div>
                   {/* Sculpt tools row */}
-                  <div style={{ color: "#475569", fontSize: 10, marginBottom: 4 }}>SCULPT</div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 5, marginBottom: 4 }}>
+                    <span style={{ color: "#475569", fontSize: 10 }}>SCULPT</span>
+                    <span style={{ fontSize: 9, color: "#f59e0b", background: "rgba(245,158,11,0.12)", border: "1px solid rgba(245,158,11,0.3)", borderRadius: 3, padding: "0 3px", lineHeight: "14px" }}>exp</span>
+                  </div>
                   <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 4, marginBottom: 6 }}>
                     {(["smooth", "noise", "flatten", "erode"] as const).map(t => (
                       <button key={t} onClick={() => setTool(t)} style={{
@@ -1142,71 +1149,6 @@ function App() {
               )}
             </div>
 
-            {/* Find ▾ menu */}
-            <div ref={findMenuRef} style={{ position: "relative" }}>
-              <button
-                onClick={() => setFindMenuOpen(v => !v)}
-                style={{
-                  ...overlayBtn,
-                  borderColor: findMenuOpen ? "#7dd3fc" : undefined,
-                  color: findMenuOpen ? "#bfdbfe" : undefined,
-                }}
-                title="Find & Go To"
-              >
-                Find {findMenuOpen ? "▴" : "▾"}
-              </button>
-              {findMenuOpen && (
-                <div style={{
-                  position: "absolute", top: "calc(100% + 6px)", left: "50%", transform: "translateX(-50%)",
-                  background: "#0d1829", border: "1px solid #1e40af",
-                  borderRadius: 7, padding: "8px", minWidth: 200,
-                  boxShadow: "0 8px 24px rgba(0,0,0,0.6)", zIndex: 200,
-                  display: "flex", flexDirection: "column", gap: 6,
-                }}>
-                  <div style={{ color: "#475569", fontSize: 10 }}>FIND NEAREST BLOCK</div>
-                  <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                    <span style={{ color: "#64748b", fontSize: 11 }}>Type:</span>
-                    <select
-                      value={findBlockType}
-                      onChange={e => setFindBlockType(Number(e.target.value))}
-                      style={{ background: "#1e293b", border: "1px solid #475569", color: "#e2e8f0", borderRadius: 4, fontSize: 12, padding: "2px 4px" }}
-                    >
-                      {BLOCK_DEFS.map(b => <option key={b.type} value={b.type}>{b.name}</option>)}
-                    </select>
-                  </div>
-                  <button
-                    onClick={handleFindBlock}
-                    disabled={!rawBounds}
-                    style={{ ...overlayBtn, fontSize: 12, opacity: rawBounds ? 1 : 0.4, cursor: rawBounds ? "pointer" : "not-allowed" }}
-                    title={rawBounds ? "Find nearest from selection center" : "Make a selection first to set search origin"}
-                  >
-                    Find from selection
-                  </button>
-                  <div style={{ borderTop: "1px solid #1e293b", paddingTop: 6 }}>
-                    <div style={{ color: "#475569", fontSize: 10, marginBottom: 4 }}>GO TO COORDS</div>
-                    <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
-                      <span style={{ color: "#64748b", fontSize: 11 }}>X</span>
-                      <input value={gotoX} onChange={e => setGotoX(e.target.value)} style={{ ...zInput, width: 60 }} placeholder="0" />
-                      <span style={{ color: "#64748b", fontSize: 11 }}>Y</span>
-                      <input value={gotoY} onChange={e => setGotoY(e.target.value)} style={{ ...zInput, width: 60 }} placeholder="0" />
-                    </div>
-                    <button
-                      onClick={() => {
-                        const x = parseInt(gotoX, 10); const y = parseInt(gotoY, 10);
-                        if (!isNaN(x) && !isNaN(y)) {
-                          setRawBounds({ x1: x, y1: y, x2: x, y2: y });
-                          setFindMenuOpen(false);
-                        }
-                      }}
-                      style={{ ...overlayBtn, fontSize: 12, marginTop: 4, width: "100%" }}
-                    >
-                      Go
-                    </button>
-                  </div>
-                </div>
-              )}
-            </div>
-
             <div style={{ width: 1, background: "#334155", margin: "0 2px" }} />
             <button
               onClick={handleUndo} disabled={undoDepth === 0}
@@ -1250,6 +1192,102 @@ function App() {
               </label>
             </div>
           )}
+
+          {/* Hotbar — visible when a draw tool is active */}
+          {isDrawTool && (() => {
+            const isActive = (b: {type: number; paint: number}) => b.type === fillBlockType && b.paint === fillPaint;
+            const slotBase: React.CSSProperties = {
+              width: 26, height: 26, borderRadius: 3, cursor: "pointer", flexShrink: 0,
+              position: "relative", display: "flex", alignItems: "center", justifyContent: "center",
+            };
+            const iconOverlay: React.CSSProperties = {
+              position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center",
+              background: "rgba(0,0,0,0.55)", borderRadius: 3, fontSize: 11, color: "#e2e8f0",
+            };
+            function pinToSlot(b: {type: number; paint: number}) {
+              setPinnedBlocks(prev => {
+                const next = [...prev];
+                const emptyIdx = next.findIndex(s => s === null);
+                if (emptyIdx !== -1) { next[emptyIdx] = b; return next; }
+                next[4] = b; return next; // replace last if full
+              });
+            }
+            return (
+              <div style={{
+                display: "flex", flexDirection: "column", alignItems: "center", gap: 2,
+                background: "rgba(13,24,41,0.88)", border: "1px solid #1e293b",
+                borderRadius: 6, padding: "4px 8px",
+              }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+                <span style={{ color: "#334155", fontSize: 9, letterSpacing: "0.07em", fontWeight: 700, userSelect: "none" }}>PINNED</span>
+                {pinnedBlocks.map((b, i) => {
+                  const key = `pinned-${i}`;
+                  const hovered = hotbarHover === key;
+                  const active = b && isActive(b);
+                  const [r, g, bl] = b ? resolveColor(b.type, b.paint) : [40, 50, 70];
+                  return (
+                    <div key={i} style={{
+                      ...slotBase,
+                      background: b ? `rgb(${r},${g},${bl})` : "rgba(255,255,255,0.03)",
+                      border: active ? "2px solid #fff" : b ? "1px solid rgba(255,255,255,0.18)" : "1px dashed #334155",
+                      outline: active ? "1px solid #a78bfa" : "none",
+                      outlineOffset: 1,
+                    }}
+                      title={b ? `${blockDisplayName(b.type)}${b.paint > 0 ? ` paint ${b.paint}` : ""} (click to select, hover for unpin)` : "Empty slot — pin a recent block here"}
+                      onClick={() => b && (setFillBlockType(b.type), setFillPaint(b.paint))}
+                      onMouseEnter={() => setHotbarHover(key)}
+                      onMouseLeave={() => setHotbarHover(null)}
+                    >
+                      {hovered && b && (
+                        <div style={iconOverlay}
+                          onClick={e => { e.stopPropagation(); setPinnedBlocks(prev => { const n = [...prev]; n[i] = null; return n; }); setHotbarHover(null); }}>
+                          ×
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+                <div style={{ width: 1, background: "#1e293b", height: 18, margin: "0 1px" }} />
+                <span style={{ color: "#334155", fontSize: 9, letterSpacing: "0.07em", fontWeight: 700, userSelect: "none" }}>RECENT</span>
+                {recentBlocks.length === 0
+                  ? <span style={{ color: "#1e293b", fontSize: 10, fontStyle: "italic" }}>none yet</span>
+                  : recentBlocks.map((b, i) => {
+                    const key = `recent-${i}`;
+                    const hovered = hotbarHover === key;
+                    const active = isActive(b);
+                    const [r, g, bl] = resolveColor(b.type, b.paint);
+                    const alreadyPinned = pinnedBlocks.some(p => p && p.type === b.type && p.paint === b.paint);
+                    return (
+                      <div key={i} style={{
+                        ...slotBase,
+                        background: `rgb(${r},${g},${bl})`,
+                        border: active ? "2px solid #fff" : "1px solid rgba(255,255,255,0.18)",
+                        outline: active ? "1px solid #f472b6" : "none",
+                        outlineOffset: 1,
+                        opacity: alreadyPinned ? 0.5 : 1,
+                      }}
+                        title={`${blockDisplayName(b.type)}${b.paint > 0 ? ` paint ${b.paint}` : ""} (click to select${alreadyPinned ? ", already pinned" : ", hover to pin"})`}
+                        onClick={() => { setFillBlockType(b.type); setFillPaint(b.paint); }}
+                        onMouseEnter={() => setHotbarHover(key)}
+                        onMouseLeave={() => setHotbarHover(null)}
+                      >
+                        {hovered && !alreadyPinned && (
+                          <div style={iconOverlay}
+                            onClick={e => { e.stopPropagation(); pinToSlot(b); setHotbarHover(null); }}>
+                            ↑
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })
+                }
+              </div>{/* end slots row */}
+              <div style={{ fontSize: 10, color: "#475569", letterSpacing: "0.03em", userSelect: "none" }}>
+                {blockDisplayName(fillBlockType)}{fillPaint > 0 ? ` · paint #${fillPaint}` : ""}
+              </div>
+            </div>
+            );
+          })()}
         </div>
 
         {/* Top-right: View menu + File menu + Help */}
@@ -1356,7 +1394,7 @@ function App() {
               onClick={() => { setViewMenuOpen(false); setFileMenuOpen(v => !v); }}
               style={{
                 ...overlayBtn,
-                borderColor: fileMenuOpen ? "#3b82f6" : (saving || exporting ? "#475569" : undefined),
+                borderColor: fileMenuOpen ? "#3b82f6" : (saving || exporting || exportingObj ? "#475569" : undefined),
                 color: fileMenuOpen ? "#93c5fd" : undefined,
               }}
               title="File operations"
@@ -1410,6 +1448,15 @@ function App() {
                 >
                   {exporting ? "Exporting…" : "Export PNG"}
                 </button>
+                {world && (
+                  <button
+                    onClick={() => { if (exportingObj) return; setFileMenuOpen(false); exportObj(); }}
+                    style={{ ...menuItem, opacity: exportingObj ? 0.35 : 1, cursor: exportingObj ? "not-allowed" : "pointer" }}
+                    title={selection ? "Export selection as 3D model" : "Export entire world as 3D model"}
+                  >
+                    {exportingObj ? "Exporting…" : `Export OBJ…${selection ? " (selection)" : ""}`}
+                  </button>
+                )}
                 {world && (
                   <button onClick={() => { setFileMenuOpen(false); loadPrefab(); }} style={menuItem}>
                     Load Prefab
@@ -1690,10 +1737,22 @@ function App() {
                 </button>
               </>
             )}
-            {/* Magic Wand — always visible in select mode */}
-            {tool === "select" && (
-              <span style={{ color: "#64748b", fontSize: 11, marginLeft: 4 }}>
-                · Right-click or hold S to magic-wand select
+            {/* Magic Wand hint + paint toggle */}
+            {tool === "wand" && (
+              <span style={{ display: "flex", alignItems: "center", gap: 6, marginLeft: 4 }}>
+                <span style={{ color: "#a78bfa", fontSize: 11 }}>· Click to flood-select</span>
+                <button
+                  onClick={() => setWandMatchPaint(v => !v)}
+                  title={wandMatchPaint ? "Matching block type + paint colour — click to ignore paint" : "Matching block type only — click to also match paint colour"}
+                  style={{
+                    background: wandMatchPaint ? "rgba(167,139,250,0.15)" : "rgba(100,116,139,0.15)",
+                    border: `1px solid ${wandMatchPaint ? "#a78bfa" : "#475569"}`,
+                    color: wandMatchPaint ? "#c4b5fd" : "#94a3b8",
+                    borderRadius: 4, padding: "1px 7px", fontSize: 11, cursor: "pointer",
+                  }}
+                >
+                  {wandMatchPaint ? "Type + Colour" : "Type only"}
+                </button>
               </span>
             )}
           </div>
@@ -1798,30 +1857,24 @@ function App() {
           {(selection || isDrawTool) && (
             <div style={{ display: "flex", flexDirection: "column", gap: 6, paddingTop: 4, borderTop: "1px solid #1e293b" }}>
 
-              {/* Text summary: selected block name + paint */}
-              <div style={{ fontSize: 11, display: "flex", alignItems: "center", gap: 5, flexWrap: "wrap" }}>
-                <span style={{ color: isDrawTool ? "#f9a8d4" : "#64748b" }}>{isDrawTool ? "Draw with:" : "Fill with:"}</span>
-                <span style={{ color: "#e2e8f0", fontWeight: 600 }}>
-                  {blockDisplayName(fillBlockType)}
+              {/* Collapsible header */}
+              <div
+                onClick={() => setFillPickerOpen(v => !v)}
+                style={{ display: "flex", alignItems: "center", gap: 5, cursor: "pointer", userSelect: "none" }}
+              >
+                <span style={{ color: "#475569", fontSize: 9 }}>{fillPickerOpen ? "▼" : "▶"}</span>
+                <span style={{ color: isDrawTool ? "#f9a8d4" : "#64748b", fontWeight: 700, fontSize: 10, letterSpacing: "0.08em" }}>
+                  {isDrawTool ? "DRAW WITH" : "FILL / REPLACE"}
                 </span>
-                <span style={{ color: "#1e293b" }}>·</span>
-                <span style={{ color: "#64748b" }}>Paint:</span>
-                {fillPaint === 0 ? (
-                  <span style={{ color: "#475569" }}>none</span>
-                ) : (
-                  <>
-                    <span style={{ color: "#e2e8f0" }}>#{fillPaint}</span>
-                    <span style={{
-                      display: "inline-block", width: 10, height: 10, borderRadius: 2,
-                      background: `rgb(${PAINT_COLORS[fillPaint - 1][0]},${PAINT_COLORS[fillPaint - 1][1]},${PAINT_COLORS[fillPaint - 1][2]})`,
-                      border: "1px solid #475569", verticalAlign: "middle", flexShrink: 0,
-                    }} />
-                  </>
+                {!fillPickerOpen && (
+                  <span style={{ color: "#64748b", fontSize: 11, marginLeft: 2 }}>
+                    — {blockDisplayName(fillBlockType)}{fillPaint > 0 ? ` #${fillPaint}` : ""}
+                  </span>
                 )}
               </div>
 
               {/* Pickers row */}
-              <div style={{ display: "flex", alignItems: "flex-start", gap: 10 }}>
+              {fillPickerOpen && <div style={{ display: "flex", alignItems: "flex-start", gap: 10 }}>
 
               {/* Block type 7×5 grid */}
               <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
@@ -1969,33 +2022,9 @@ function App() {
                 </div>
               </div>
 
-              </div>{/* end pickers row */}
+              </div>}{/* end pickers row */}
 
-              {/* Recent blocks quick-pick */}
-              {recentBlocks.length > 0 && (
-                <div style={{ display: "flex", alignItems: "center", gap: 4, paddingTop: 4, borderTop: "1px solid #1e293b" }}>
-                  <span style={{ color: "#475569", fontSize: 10 }}>RECENT</span>
-                  {recentBlocks.map((b, i) => {
-                    const [r, g, bl] = resolveColor(b.type, b.paint);
-                    return (
-                      <div
-                        key={i}
-                        title={`${blockDisplayName(b.type)}${b.paint > 0 ? ` paint ${b.paint}` : ""}`}
-                        onClick={() => { setFillBlockType(b.type); setFillPaint(b.paint); }}
-                        style={{
-                          width: 18, height: 18, borderRadius: 2, cursor: "pointer", flexShrink: 0,
-                          background: `rgb(${r},${g},${bl})`,
-                          border: (fillBlockType === b.type && fillPaint === b.paint) ? "2px solid #fff" : "2px solid rgba(255,255,255,0.15)",
-                          outline: (fillBlockType === b.type && fillPaint === b.paint) ? "1px solid #3b82f6" : "none",
-                          outlineOffset: 1,
-                        }}
-                      />
-                    );
-                  })}
-                </div>
-              )}
-
-              {/* Mask system — only visible when a draw tool is active */}
+{/* Mask system — only visible when a draw tool is active */}
               {isDrawTool && (
                 <div style={{ display: "flex", alignItems: "center", gap: 6, paddingTop: 4, borderTop: "1px solid #1e293b" }}>
                   <button
@@ -2038,8 +2067,22 @@ function App() {
               {/* Row 3: Replace only — filter for selective replace (selection required) */}
               {selection && <div style={{ borderTop: "1px solid #1e293b", paddingTop: 6, display: "flex", flexDirection: "column", gap: 4 }}>
 
-                {/* Summary label for filter */}
-                <div style={{ fontSize: 11, display: "flex", alignItems: "center", gap: 5, flexWrap: "wrap" }}>
+                {/* Collapsible replace header */}
+                <div
+                  onClick={() => setReplaceOpen(v => !v)}
+                  style={{ display: "flex", alignItems: "center", gap: 5, cursor: "pointer", userSelect: "none" }}
+                >
+                  <span style={{ color: "#475569", fontSize: 9 }}>{replaceOpen ? "▼" : "▶"}</span>
+                  <span style={{ color: "#64748b", fontWeight: 700, fontSize: 10, letterSpacing: "0.08em" }}>REPLACE FILTER</span>
+                  {!replaceOpen && (filterBlockType !== null || filterPaint !== null) && (
+                    <span style={{ color: "#64748b", fontSize: 11, marginLeft: 2 }}>
+                      — {filterBlockType !== null ? blockDisplayName(filterBlockType) : "any"}{filterPaint !== null ? ` #${filterPaint}` : ""}
+                      {filterInvert ? " (inv)" : ""}
+                    </span>
+                  )}
+                </div>
+
+                {replaceOpen && <><div style={{ fontSize: 11, display: "flex", alignItems: "center", gap: 5, flexWrap: "wrap" }}>
                   <span style={{ color: "#64748b" }}>{filterInvert ? "Replace except:" : "Replace only:"}</span>
                   {filterBlockType === null ? (
                     <span style={{ color: "#475569" }}>any block</span>
@@ -2222,6 +2265,7 @@ function App() {
                   </div>
 
                 </div>{/* end filter pickers row */}
+                </>}{/* end replace expand */}
               </div>}{/* end replace-only section */}
 
             </div>
