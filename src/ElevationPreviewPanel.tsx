@@ -45,6 +45,8 @@ const MIN_H   = 120;
 const MAX_W   = 800;
 const MAX_H   = 700;
 
+// Layout tracks the rendered position of the image for hit-testing and overlays.
+// ox/oy are absolute canvas coordinates; scale is pixels-per-block (zoom applied).
 interface Layout { ox: number; oy: number; scale: number; }
 
 function elevCanvasToWorld(
@@ -70,7 +72,8 @@ function elevCanvasToWorld(
   }
 }
 
-// Draws one elevation section (front or side) onto the canvas at yStart.
+// Draws one elevation section onto the canvas at yStart.
+// zoom/pan are applied on top of the fit-to-section base scale.
 function drawSection(
   ctx: CanvasRenderingContext2D,
   data: PreviewData | null,
@@ -85,11 +88,19 @@ function drawSection(
   extrudeCount: number,
   extrudeAxis: string,
   isPastePreview: boolean,
+  zoom: number,
+  pan: { x: number; y: number },
 ) {
   const availH = sectionH - LABEL_H;
 
+  // Clip to this section so zoomed image can't bleed into the other half
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(0, yStart, sectionW, availH);
+  ctx.clip();
+
   ctx.fillStyle = "#080f1e";
-  ctx.fillRect(0, yStart, sectionW, sectionH);
+  ctx.fillRect(0, yStart, sectionW, availH);
 
   let scale = 1, dw = 0, dh = 0, ox = 0, oy = yStart;
 
@@ -102,11 +113,12 @@ function drawSection(
     img.data.set(data.pixels);
     offCtx.putImageData(img, 0, 0);
 
-    scale = Math.min(sectionW / data.width, availH / data.height);
+    const baseScale = Math.min(sectionW / data.width, availH / data.height);
+    scale = baseScale * zoom;
     dw = Math.round(data.width  * scale);
     dh = Math.round(data.height * scale);
-    ox = Math.round((sectionW - dw) / 2);
-    const innerOy = Math.round((availH - dh) / 2);
+    ox = Math.round((sectionW - dw) / 2) + pan.x;
+    const innerOy = Math.round((availH - dh) / 2) + pan.y;
     oy = yStart + innerOy;
     layoutRef.current = { ox, oy, scale };
 
@@ -194,7 +206,9 @@ function drawSection(
     }
   }
 
-  // Label bar
+  ctx.restore(); // release clip
+
+  // Label bar (outside clip so it always renders at section bottom)
   const labelY = yStart + sectionH - LABEL_H;
   const viewLabel = view === "front" ? "Front X-Z" : "Side Y-Z";
   ctx.fillStyle = "rgba(0,0,0,0.65)";
@@ -224,12 +238,22 @@ export default function ElevationPreviewPanel({
   const [canvasH, setCanvasH] = useState(INIT_H);
   const [showContext, setShowContext] = useState(true);
 
+  // Zoom/pan live in refs so event handlers always see current values.
+  // viewTick increments trigger the canvas draw effect.
+  const zoomRef      = useRef(1.0);
+  const panFrontRef  = useRef({ x: 0, y: 0 });
+  const panSideRef   = useRef({ x: 0, y: 0 });
+  const [viewTick, setViewTick] = useState(0);
+  const [zoom, setZoom] = useState(1.0); // mirrored for display only
+  const triggerRedraw = () => setViewTick(t => t + 1);
+
   const canvasRef       = useRef<HTMLCanvasElement>(null);
   const frontLayoutRef  = useRef<Layout>({ ox: 0, oy: 0, scale: 1 });
   const sideLayoutRef   = useRef<Layout>({ ox: 0, oy: 0, scale: 1 });
   const drawViewRef     = useRef<"front" | "side">("front");
   const drawStrokeRef   = useRef<{ x: number; y: number; z: number }[]>([]);
   const resizeDragRef   = useRef<{ startX: number; startY: number; startW: number; startH: number } | null>(null);
+  const viewDragRef     = useRef<{ section: "front"|"side"; startX: number; startY: number; startPanX: number; startPanY: number } | null>(null);
 
   // Fetch front view
   useEffect(() => {
@@ -286,9 +310,10 @@ export default function ElevationPreviewPanel({
 
     const topH = Math.floor(canvasH / 2);
     const botH = canvasH - topH;
+    const z = zoomRef.current;
 
-    drawSection(ctx, frontData, clipFrontData, "front", frontLayoutRef, 0, topH, canvasW, sel, maxZ, extrudeCount, extrudeAxis, isPastePreview);
-    drawSection(ctx, sideData, clipSideData, "side", sideLayoutRef, topH, botH, canvasW, sel, maxZ, extrudeCount, extrudeAxis, isPastePreview);
+    drawSection(ctx, frontData, clipFrontData, "front", frontLayoutRef, 0, topH, canvasW, sel, maxZ, extrudeCount, extrudeAxis, isPastePreview, z, panFrontRef.current);
+    drawSection(ctx, sideData, clipSideData, "side", sideLayoutRef, topH, botH, canvasW, sel, maxZ, extrudeCount, extrudeAxis, isPastePreview, z, panSideRef.current);
 
     // Brush hover bands
     if (brushHoverX !== null) {
@@ -308,7 +333,15 @@ export default function ElevationPreviewPanel({
       }
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [frontData, sideData, clipFrontData, clipSideData, sel.z_min, sel.z_max, sel.width, sel.height, maxZ, canvasW, canvasH, extrudeCount, extrudeAxis, isPastePreview, brushHoverX, brushHoverY]);
+  }, [frontData, sideData, clipFrontData, clipSideData, sel.z_min, sel.z_max, sel.width, sel.height, maxZ, canvasW, canvasH, extrudeCount, extrudeAxis, isPastePreview, brushHoverX, brushHoverY, viewTick]);
+
+  function resetZoomPan() {
+    zoomRef.current = 1.0;
+    panFrontRef.current = { x: 0, y: 0 };
+    panSideRef.current  = { x: 0, y: 0 };
+    setZoom(1.0);
+    triggerRedraw();
+  }
 
   return (
     <div style={{
@@ -352,6 +385,17 @@ export default function ElevationPreviewPanel({
 
       <div style={{ display: "flex", alignItems: "center", paddingLeft: 14 }}>
         <span style={{ color: "#93c5fd", fontWeight: 700, fontSize: 10, letterSpacing: "0.08em" }}>ELEVATION VIEW</span>
+        {zoom !== 1.0 && (
+          <button
+            onClick={resetZoomPan}
+            style={{
+              marginLeft: 6, padding: "1px 5px", fontSize: 9, cursor: "pointer",
+              background: "rgba(99,102,241,0.2)", border: "1px solid #6366f1",
+              color: "#a5b4fc", borderRadius: 3,
+            }}
+            title="Reset zoom and pan"
+          >{zoom.toFixed(1)}× ✕</button>
+        )}
         <label style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 3, cursor: "pointer" }}>
           <input
             type="checkbox"
@@ -370,41 +414,92 @@ export default function ElevationPreviewPanel({
         style={{
           display: "block", width: canvasW, height: canvasH,
           borderRadius: 4, border: "1px solid #1a2744",
-          cursor: drawActive ? "crosshair" : "default",
+          cursor: drawActive ? "crosshair" : zoom > 1 ? "grab" : "default",
         }}
-        title={`Elevation view — front (top) + side (bottom), ±${CONTEXT_BLOCKS} context blocks, z${sel.z_min}–${sel.z_max} highlighted`}
-        onPointerDown={drawActive && onDrawElevation ? (e) => {
-          const rect = (e.target as HTMLCanvasElement).getBoundingClientRect();
-          const cy = e.clientY - rect.top;
-          const topH = Math.floor(canvasH / 2);
-          const view = cy < topH ? "front" : "side";
-          const layout = view === "front" ? frontLayoutRef.current : sideLayoutRef.current;
-          const data = view === "front" ? frontData : sideData;
-          if (!data) return;
-          drawViewRef.current = view;
-          (e.target as HTMLCanvasElement).setPointerCapture(e.pointerId);
-          drawStrokeRef.current = [];
-          const pos = elevCanvasToWorld(e.clientX - rect.left, cy, layout, view, sel, maxZ);
-          if (pos) drawStrokeRef.current.push(pos);
-        } : undefined}
-        onPointerMove={drawActive && onDrawElevation ? (e) => {
-          if (e.buttons === 0) return;
-          const rect = (e.target as HTMLCanvasElement).getBoundingClientRect();
-          const view = drawViewRef.current;
-          const layout = view === "front" ? frontLayoutRef.current : sideLayoutRef.current;
-          const data = view === "front" ? frontData : sideData;
-          if (!data) return;
-          const pos = elevCanvasToWorld(e.clientX - rect.left, e.clientY - rect.top, layout, view, sel, maxZ);
-          if (pos) {
-            const last = drawStrokeRef.current[drawStrokeRef.current.length - 1];
-            if (!last || last.x !== pos.x || last.y !== pos.y || last.z !== pos.z)
-              drawStrokeRef.current.push(pos);
+        title={`Elevation view — front (top) + side (bottom), ±${CONTEXT_BLOCKS} context blocks, z${sel.z_min}–${sel.z_max} highlighted. Scroll to zoom, drag to pan.`}
+        onWheel={(e) => {
+          e.preventDefault();
+          const factor = e.deltaY < 0 ? 1.18 : 1 / 1.18;
+          const oldZoom = zoomRef.current;
+          const newZoom = Math.max(1, Math.min(8, oldZoom * factor));
+          if (newZoom === oldZoom) return;
+
+          // Scale pan proportionally so the center stays fixed while zooming.
+          // Users can drag to reposition after zooming in.
+          const ratio = newZoom / oldZoom;
+          panFrontRef.current = { x: panFrontRef.current.x * ratio, y: panFrontRef.current.y * ratio };
+          panSideRef.current  = { x: panSideRef.current.x  * ratio, y: panSideRef.current.y  * ratio };
+          if (newZoom === 1) {
+            panFrontRef.current = { x: 0, y: 0 };
+            panSideRef.current  = { x: 0, y: 0 };
           }
-        } : undefined}
-        onPointerUp={drawActive && onDrawElevation ? () => {
-          for (const p of drawStrokeRef.current) onDrawElevation(p.x, p.y, p.z);
-          drawStrokeRef.current = [];
-        } : undefined}
+          zoomRef.current = newZoom;
+          setZoom(newZoom);
+          triggerRedraw();
+        }}
+        onPointerDown={(e) => {
+          if (drawActive && onDrawElevation) {
+            const rect = (e.target as HTMLCanvasElement).getBoundingClientRect();
+            const cy = e.clientY - rect.top;
+            const topH = Math.floor(canvasH / 2);
+            const view = cy < topH ? "front" : "side";
+            const layout = view === "front" ? frontLayoutRef.current : sideLayoutRef.current;
+            const data = view === "front" ? frontData : sideData;
+            if (!data) return;
+            drawViewRef.current = view;
+            (e.target as HTMLCanvasElement).setPointerCapture(e.pointerId);
+            drawStrokeRef.current = [];
+            const pos = elevCanvasToWorld(e.clientX - rect.left, cy, layout, view, sel, maxZ);
+            if (pos) drawStrokeRef.current.push(pos);
+          } else {
+            // Pan mode
+            const rect = (e.target as HTMLCanvasElement).getBoundingClientRect();
+            const cy = e.clientY - rect.top;
+            const topH = Math.floor(canvasH / 2);
+            const section = cy < topH ? "front" : "side";
+            const panRef = section === "front" ? panFrontRef : panSideRef;
+            (e.target as HTMLCanvasElement).setPointerCapture(e.pointerId);
+            viewDragRef.current = {
+              section,
+              startX: e.clientX, startY: e.clientY,
+              startPanX: panRef.current.x, startPanY: panRef.current.y,
+            };
+          }
+        }}
+        onPointerMove={(e) => {
+          if (drawActive && onDrawElevation) {
+            if (e.buttons === 0) return;
+            const rect = (e.target as HTMLCanvasElement).getBoundingClientRect();
+            const view = drawViewRef.current;
+            const layout = view === "front" ? frontLayoutRef.current : sideLayoutRef.current;
+            const data = view === "front" ? frontData : sideData;
+            if (!data) return;
+            const pos = elevCanvasToWorld(e.clientX - rect.left, e.clientY - rect.top, layout, view, sel, maxZ);
+            if (pos) {
+              const last = drawStrokeRef.current[drawStrokeRef.current.length - 1];
+              if (!last || last.x !== pos.x || last.y !== pos.y || last.z !== pos.z)
+                drawStrokeRef.current.push(pos);
+            }
+          } else {
+            const drag = viewDragRef.current;
+            if (!drag || e.buttons === 0) return;
+            const panRef = drag.section === "front" ? panFrontRef : panSideRef;
+            panRef.current = {
+              x: drag.startPanX + (e.clientX - drag.startX),
+              y: drag.startPanY + (e.clientY - drag.startY),
+            };
+            triggerRedraw();
+          }
+        }}
+        onPointerUp={(e) => {
+          if (drawActive && onDrawElevation) {
+            for (const p of drawStrokeRef.current) onDrawElevation(p.x, p.y, p.z);
+            drawStrokeRef.current = [];
+          } else {
+            viewDragRef.current = null;
+          }
+          void e;
+        }}
       />
     </div>
   );

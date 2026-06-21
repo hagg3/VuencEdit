@@ -113,6 +113,8 @@ interface Props {
   onCursorMove?: (wx: number, wy: number) => void;
   /** Called when the wand tool clicks a world coordinate. */
   onMagicWand?: (wx: number, wy: number) => void;
+  /** Spawn/home position in editor pixel coords — drawn as a marker on the map. */
+  spawnPos?: { px: number; py: number } | null;
 }
 
 function decodePixels(b64: string): Uint8Array {
@@ -129,7 +131,8 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     committedSelection, onSelectionChange, pastePreview, clipboardPreviewPixels, onPasteAt,
     renderMode, axoSkew = 0.2, lockedPastePos = null,
     drawConfig, onDrawStroke, drawZOverride = null,
-    extrudePreview = null, lastPasteDelta = null, onCursorMove, onMagicWand }: Props,
+    extrudePreview = null, lastPasteDelta = null, onCursorMove, onMagicWand,
+    spawnPos = null }: Props,
   ref,
 ) {
   const canvasRef  = useRef<HTMLCanvasElement>(null);
@@ -174,6 +177,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   const lastPasteDeltaRef = useRef(lastPasteDelta);
   const onCursorMoveRef   = useRef(onCursorMove);
   const onMagicWandRef    = useRef(onMagicWand);
+  const spawnPosRef       = useRef(spawnPos);
 
   useEffect(() => { toolRef.current = tool; }, [tool]);
   useEffect(() => { onSelChangeRef.current = onSelectionChange; }, [onSelectionChange]);
@@ -186,6 +190,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   useEffect(() => { lastPasteDeltaRef.current = lastPasteDelta; }, [lastPasteDelta]);
   useEffect(() => { onCursorMoveRef.current = onCursorMove; }, [onCursorMove]);
   useEffect(() => { onMagicWandRef.current  = onMagicWand;  }, [onMagicWand]);
+  useEffect(() => { spawnPosRef.current     = spawnPos;     }, [spawnPos]);
 
   const mapW = world.width_chunks * 16;
   const mapH = world.height_chunks * 16;
@@ -311,6 +316,34 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
           ctx.fillRect(rx, ry, rw, rh);
           ctx.strokeStyle = `rgba(56,189,248,${Math.min(1, alpha * 3)})`;
           ctx.strokeRect(rx + 0.5, ry + 0.5, rw - 1, rh - 1);
+        }
+        ctx.restore();
+      }
+    }
+
+    // Spawn marker — teal pin at the home position
+    {
+      const sp = spawnPosRef.current;
+      if (sp) {
+        const sx = Math.round(sp.px * scale + vx);
+        const sy = Math.round(sp.py * scale + vy);
+        const r  = Math.max(4, Math.min(10, scale * 1.5));
+        ctx.save();
+        ctx.beginPath();
+        ctx.arc(sx, sy, r, 0, Math.PI * 2);
+        ctx.fillStyle   = "rgba(20,184,166,0.85)";
+        ctx.fill();
+        ctx.strokeStyle = "#fff";
+        ctx.lineWidth   = 1.5;
+        ctx.stroke();
+        if (scale >= 3) {
+          ctx.fillStyle  = "#fff";
+          ctx.font       = `bold ${Math.round(r * 1.1)}px sans-serif`;
+          ctx.textAlign  = "center";
+          ctx.textBaseline = "middle";
+          ctx.fillText("⌂", sx, sy + 0.5);
+          ctx.textAlign    = "left";
+          ctx.textBaseline = "alphabetic";
         }
         ctx.restore();
       }
