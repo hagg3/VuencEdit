@@ -8,6 +8,8 @@ import ElevationPreviewPanel from "./ElevationPreviewPanel";
 import HelpModal from "./HelpModal";
 import WorldBrowserModal from "./WorldBrowserModal";
 import UploadModal from "./UploadModal";
+import NewWorldModal from "./NewWorldModal";
+import SchematicImportModal, { type SchematicInfo, type MappingEntry } from "./SchematicImportModal";
 import "./App.css";
 
 // World metadata — pixels are never stored in JS; tiles are fetched on demand.
@@ -17,6 +19,8 @@ interface WorldData {
   height_chunks: number;
   max_z: number;
   was_compressed: boolean;
+  spawn_px: number | null;
+  spawn_py: number | null;
 }
 
 // Raw IPC shapes (pixels still base64) — used only at invoke() callsites before decoding.
@@ -99,6 +103,7 @@ function App() {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [exporting, setExporting] = useState(false);
+  const [exportProgress, setExportProgress] = useState<number | null>(null);
   const [exportingObj, setExportingObj] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saveCompressed, setSaveCompressed] = useState(false);
@@ -119,6 +124,12 @@ function App() {
   const [showElevationPanel, setShowElevationPanel] = useState(false);
   const [showWorldBrowser, setShowWorldBrowser] = useState(false);
   const [showUploadModal, setShowUploadModal] = useState(false);
+  const [showNewWorld, setShowNewWorld] = useState(false);
+  const [schematicInfo, setSchematicInfo] = useState<SchematicInfo | null>(null);
+  const [schematicPath, setSchematicPath] = useState<string | null>(null);
+  const [schematicApplying, setSchematicApplying] = useState(false);
+  const [spawnPos, setSpawnPos] = useState<{ px: number; py: number } | null>(null);
+  const cursorWorldRef = useRef<{ wx: number; wy: number }>({ wx: 0, wy: 0 });
 
   const [renamingWorld, setRenamingWorld] = useState(false);
   const [renameInput, setRenameInput] = useState("");
@@ -328,6 +339,7 @@ function App() {
       setZSliceDisplay(32);
       setClipboard(null);
       setSaveCompressed(data.was_compressed);
+      setSpawnPos(data.spawn_px != null && data.spawn_py != null ? { px: data.spawn_px, py: data.spawn_py } : null);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -356,6 +368,7 @@ function App() {
       setZSliceDisplay(32);
       setClipboard(null);
       setSaveCompressed(data.was_compressed);
+      setSpawnPos(data.spawn_px != null && data.spawn_py != null ? { px: data.spawn_px, py: data.spawn_py } : null);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -372,21 +385,26 @@ function App() {
     });
     if (!savePath) return;
     setExporting(true);
+    setExportProgress(0);
     try {
       const w = world.width_chunks * 16;
       const h = world.height_chunks * 16;
-      // Fetch the full-world pixel buffer from Rust for export.
-      // This is the one place we allow a full-world pixel allocation in JS.
-      const raw = viewMode === "zslice"
-        ? await invoke<PixelPatchRaw>("render_zslice_patch", { z: zSliceZ, x1: 0, y1: 0, x2: w - 1, y2: h - 1 })
-        : await invoke<PixelPatchRaw>("fetch_tile", { x1: 0, y1: 0, x2: w - 1, y2: h - 1 });
-      const pixels = decodePixels(raw.pixels);
+      const STRIP_H = 128;
+      const buf = new Uint8Array(w * h * 4);
+      for (let y = 0; y < h; y += STRIP_H) {
+        const y2 = Math.min(y + STRIP_H - 1, h - 1);
+        const raw = viewMode === "zslice"
+          ? await invoke<PixelPatchRaw>("render_zslice_patch", { z: zSliceZ, x1: 0, y1: y, x2: w - 1, y2 })
+          : await invoke<PixelPatchRaw>("fetch_tile", { x1: 0, y1: y, x2: w - 1, y2 });
+        buf.set(decodePixels(raw.pixels), y * w * 4);
+        setExportProgress((y2 + 1) / h);
+      }
       const canvas = document.createElement("canvas");
       canvas.width = w;
       canvas.height = h;
       const ctx = canvas.getContext("2d")!;
       const img = ctx.createImageData(w, h);
-      img.data.set(pixels);
+      img.data.set(buf);
       ctx.putImageData(img, 0, 0);
       const blob = await new Promise<Blob>((resolve, reject) =>
         canvas.toBlob((b) => (b ? resolve(b) : reject(new Error("toBlob failed"))), "image/png")
@@ -402,6 +420,7 @@ function App() {
       setError(String(e));
     } finally {
       setExporting(false);
+      setExportProgress(null);
     }
   }
 
@@ -566,6 +585,7 @@ function App() {
   }
 
   function handleCursorMove(wx: number, wy: number) {
+    cursorWorldRef.current = { wx, wy };
     if (!followSurfaceRef.current || viewModeRef.current !== "zslice") return;
     if (cursorMoveThrottleRef.current !== null) return;
     cursorMoveThrottleRef.current = setTimeout(() => {
@@ -791,6 +811,37 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
     setTool("paste");
   }
 
+  async function importSchematic() {
+    const path = await open({
+      filters: [{ name: "Minecraft Schematic / Litematica", extensions: ["schematic", "litematic"] }],
+      multiple: false,
+    });
+    if (!path || typeof path !== "string") return;
+    const info = await invoke<SchematicInfo>("import_schematic_info", { path })
+      .catch((e: unknown) => { setError(String(e)); return null; });
+    if (!info) return;
+    setSchematicPath(path);
+    setSchematicInfo(info);
+  }
+
+  async function applySchematic(mapping: MappingEntry[]) {
+    if (!schematicPath) return;
+    setSchematicApplying(true);
+    try {
+      const info = await invoke<ClipboardInfo>("import_schematic_apply", {
+        path: schematicPath, mapping,
+      });
+      setClipboard(info);
+      setTool("paste");
+      setSchematicInfo(null);
+      setSchematicPath(null);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setSchematicApplying(false);
+    }
+  }
+
   async function deleteBlocks() {
     if (!rawBounds) return;
     try {
@@ -890,6 +941,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           lastPasteDelta={lastPasteDelta}
           onCursorMove={handleCursorMove}
           onMagicWand={handleMagicWand}
+          spawnPos={spawnPos}
         />
 
         {/* Top-left: world info + inline rename */}
@@ -1342,6 +1394,28 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
                   <span style={{ color: "#475569", fontSize: 11 }}>Home</span>
                 </button>
                 <div style={menuDivider} />
+                {/* Spawn */}
+                <div style={{ ...menuItem, color: "#475569", fontSize: 11, cursor: "default", paddingBottom: 2 }}>
+                  SPAWN POINT{spawnPos ? ` (${Math.round(spawnPos.px)}, ${Math.round(spawnPos.py)})` : " (unset)"}
+                </div>
+                <button
+                  disabled={!selection}
+                  onClick={async () => {
+                    if (!selection) return;
+                    const cx = Math.round((selection.x1 + selection.x2) / 2);
+                    const cy = Math.round((selection.y1 + selection.y2) / 2);
+                    setViewMenuOpen(false);
+                    try {
+                      await invoke("set_spawn_pos", { px: cx, py: cy });
+                      setSpawnPos({ px: cx, py: cy });
+                    } catch (e) { setError(String(e)); }
+                  }}
+                  style={{ ...menuItem, opacity: selection ? 1 : 0.35, cursor: selection ? "pointer" : "not-allowed" }}
+                >
+                  <span style={{ display: "inline-block", width: 16 }}>⌂</span>
+                  Set Spawn at Selection Centre
+                </button>
+                <div style={menuDivider} />
                 {/* Render mode */}
                 <div style={{ ...menuItem, color: "#475569", fontSize: 11, cursor: "default", paddingBottom: 2 }}>
                   RENDER MODE
@@ -1408,7 +1482,10 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
                 borderRadius: 7, padding: "4px 0", minWidth: 170,
                 boxShadow: "0 8px 24px rgba(0,0,0,0.6)", zIndex: 200,
               }}>
-                {/* Open */}
+                {/* New / Open */}
+                <button onClick={() => { setFileMenuOpen(false); setShowNewWorld(true); }} style={menuItem}>
+                  New World…
+                </button>
                 <button onClick={() => { setFileMenuOpen(false); openFile(); }} style={menuItem}>
                   Open…
                 </button>
@@ -1455,11 +1532,18 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
                     title={selection ? "Export selection as 3D model" : "Export entire world as 3D model"}
                   >
                     {exportingObj ? "Exporting…" : `Export OBJ…${selection ? " (selection)" : ""}`}
+                    {!exportingObj && <span style={{ fontSize: 9, color: "#f59e0b", background: "rgba(245,158,11,0.12)", border: "1px solid rgba(245,158,11,0.3)", borderRadius: 3, padding: "0 3px", lineHeight: "14px", marginLeft: 4 }}>exp</span>}
                   </button>
                 )}
                 {world && (
                   <button onClick={() => { setFileMenuOpen(false); loadPrefab(); }} style={menuItem}>
                     Load Prefab
+                  </button>
+                )}
+                {world && (
+                  <button onClick={() => { setFileMenuOpen(false); importSchematic(); }} style={{ ...menuItem, display: "flex", alignItems: "center", gap: 4 }}>
+                    Import Schematic…
+                    <span style={{ fontSize: 9, color: "#f59e0b", background: "rgba(245,158,11,0.12)", border: "1px solid rgba(245,158,11,0.3)", borderRadius: 3, padding: "0 3px", lineHeight: "14px" }}>exp</span>
                   </button>
                 )}
                 <div style={menuDivider} />
@@ -2020,6 +2104,9 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
                     </button>
                   )}
                 </div>
+                <div style={{ color: "#94a3b8", fontSize: 11, whiteSpace: "nowrap" }}>
+                  {blockDisplayName(fillBlockType)}{fillPaint > 0 ? <span style={{ color: "#7dd3fc" }}> #{fillPaint}</span> : ""}
+                </div>
               </div>
 
               </div>}{/* end pickers row */}
@@ -2305,6 +2392,37 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           />
         )}
 
+        {(exporting || exportingObj || loading) && (
+          <div style={{
+            position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center",
+            background: "rgba(0,0,0,0.45)", zIndex: 200, pointerEvents: "none",
+          }}>
+            <div style={{
+              background: "rgba(15,23,42,0.95)", border: "1px solid #334155",
+              borderRadius: 10, padding: "20px 32px", minWidth: 220, textAlign: "center",
+            }}>
+              {exporting ? (
+                <>
+                  <div style={{ color: "#e2e8f0", fontSize: 14, marginBottom: 12 }}>
+                    Exporting PNG… {exportProgress !== null ? `${Math.round(exportProgress * 100)}%` : ""}
+                  </div>
+                  <div style={{ background: "#1e293b", borderRadius: 4, height: 6, overflow: "hidden" }}>
+                    <div style={{
+                      background: "#f59e0b", height: "100%", borderRadius: 4,
+                      width: `${Math.round((exportProgress ?? 0) * 100)}%`,
+                      transition: "width 0.1s ease",
+                    }} />
+                  </div>
+                </>
+              ) : exportingObj ? (
+                <div style={{ color: "#e2e8f0", fontSize: 14 }}>Exporting OBJ…</div>
+              ) : (
+                <div style={{ color: "#e2e8f0", fontSize: 14 }}>Loading world…</div>
+              )}
+            </div>
+          </div>
+        )}
+
         {error && (
           <div style={{
             position: "absolute", bottom: 16, right: 12,
@@ -2329,6 +2447,21 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
             onClose={() => setShowUploadModal(false)}
           />
         )}
+        {showNewWorld && (
+          <NewWorldModal
+            onClose={() => setShowNewWorld(false)}
+            onCreated={(path) => { setShowNewWorld(false); openFileAt(path); }}
+          />
+        )}
+        {schematicInfo && schematicPath && (
+          <SchematicImportModal
+            info={schematicInfo}
+            path={schematicPath}
+            applying={schematicApplying}
+            onApply={(mapping) => applySchematic(mapping)}
+            onCancel={() => { setSchematicInfo(null); setSchematicPath(null); }}
+          />
+        )}
       </div>
     );
   }
@@ -2345,6 +2478,17 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
         Load a .eden save file to view the map
       </p>
       <div style={{ display: "flex", gap: 10 }}>
+        <button
+          onClick={() => setShowNewWorld(true)} disabled={loading}
+          style={{
+            background: "#134e4a", border: "1px solid #0f766e", color: "#5eead4",
+            padding: "10px 24px", borderRadius: 8,
+            cursor: loading ? "not-allowed" : "pointer",
+            fontSize: 15, fontWeight: 600, opacity: loading ? 0.6 : 1,
+          }}
+        >
+          New World
+        </button>
         <button
           onClick={openFile} disabled={loading}
           style={{
@@ -2377,6 +2521,12 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
         <WorldBrowserModal
           onClose={() => setShowWorldBrowser(false)}
           onOpenWorld={(path) => { setShowWorldBrowser(false); openFileAt(path); }}
+        />
+      )}
+      {showNewWorld && (
+        <NewWorldModal
+          onClose={() => setShowNewWorld(false)}
+          onCreated={(path) => { setShowNewWorld(false); openFileAt(path); }}
         />
       )}
     </div>
