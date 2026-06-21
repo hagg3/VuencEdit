@@ -1,8 +1,9 @@
 import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { SelectionInfo, ClipboardInfo, ExtrudeAxis, TreeType } from "./App";
+import ThreeDPreview from "./ThreeDPreview";
 
-type PreviewView = "front" | "side" | "top";
+type PreviewView = "front" | "side" | "top" | "axo";
 
 interface PreviewData {
   width: number;
@@ -66,9 +67,12 @@ export default function SelectionInspector({ selection: sel, clipboard, elevatio
   const [view, setView] = useState<PreviewView>("front");
   const [previewData, setPreviewData] = useState<PreviewData | null>(null);
   const [extrudeIgnoreAir, setExtrudeIgnoreAir] = useState(false);
+  const [axoSki, setAxoSki] = useState(0.2);
+  const [axoDir, setAxoDir] = useState(0); // 0=SE 1=SW 2=NE 3=NW
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
   const [treeGenOpen, setTreeGenOpen] = useState(false);
+  const [open3d, setOpen3d] = useState(false);
   const [treeType, setTreeType] = useState<TreeType>("normal");
   const [treeDensity, setTreeDensity] = useState(20); // percent 1–100
   const [treeGenerating, setTreeGenerating] = useState(false);
@@ -78,10 +82,9 @@ export default function SelectionInspector({ selection: sel, clipboard, elevatio
   const chunkCount = chunksX * chunksY;
   const volume = sel.width * sel.height * sel.depth;
 
-  // Fetch preview pixels from Rust whenever selection bounds or view tab changes.
-  // Debounced at 150ms — render_selection_view scans blocks and is expensive for
-  // large/tall selections; the debounce prevents it firing on every z-input keystroke.
+  // Fetch orthographic preview (front/side/top). Skips axo view — handled below.
   useEffect(() => {
+    if (view === "axo") return;
     const timer = setTimeout(() => {
       invoke<PreviewDataRaw>("render_selection_view", {
         x1: sel.x1, y1: sel.y1, x2: sel.x2, y2: sel.y2,
@@ -94,6 +97,20 @@ export default function SelectionInspector({ selection: sel, clipboard, elevatio
     return () => clearTimeout(timer);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sel.x1, sel.y1, sel.x2, sel.y2, sel.z_min, sel.z_max, view]);
+
+  // Fetch axo preview — clipboard contents if available, else selection footprint.
+  useEffect(() => {
+    if (view !== "axo") return;
+    const timer = setTimeout(() => {
+      const p = clipboard
+        ? invoke<PreviewDataRaw>("render_axo_clipboard", { ski: axoSki, dir: axoDir })
+        : invoke<PreviewDataRaw>("render_axo_region", { x1: sel.x1, y1: sel.y1, x2: sel.x2, y2: sel.y2, ski: axoSki, dir: axoDir });
+      p.then((raw) => setPreviewData({ width: raw.width, height: raw.height, pixels: decodePixels(raw.pixels) }))
+       .catch(() => setPreviewData(null));
+    }, 150);
+    return () => clearTimeout(timer);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sel.x1, sel.y1, sel.x2, sel.y2, clipboard?.width, clipboard?.height, clipboard?.depth, view, axoSki, axoDir]);
 
   // Render preview data (or clear) onto canvas; also re-renders when sel changes
   // so the overlay label stays current even before new pixels arrive.
@@ -129,7 +146,8 @@ export default function SelectionInspector({ selection: sel, clipboard, elevatio
     }
 
     // Debug overlay: always rendered with current sel values
-    const viewLabel = view === "front" ? "Front X-Z" : view === "side" ? "Side Y-Z" : "Top X-Y";
+    const axoDirLabel = ["SE", "SW", "NE", "NW"][axoDir] ?? "SE";
+    const viewLabel = view === "front" ? "Front X-Z" : view === "side" ? "Side Y-Z" : view === "axo" ? `Axo ${axoDirLabel} d=${axoSki.toFixed(2)}` : "Top X-Y";
     ctx.fillStyle = "rgba(0,0,0,0.65)";
     ctx.fillRect(0, CH - LABEL_H, CW, LABEL_H);
     ctx.fillStyle = "#7dd3fc";
@@ -142,7 +160,7 @@ export default function SelectionInspector({ selection: sel, clipboard, elevatio
       CH - LABEL_H / 2,
     );
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [previewData, view, sel.x1, sel.y1, sel.x2, sel.y2, sel.z_min, sel.z_max]);
+  }, [previewData, view, sel.x1, sel.y1, sel.x2, sel.y2, sel.z_min, sel.z_max, axoDir, axoSki]);
 
   const dimBox: React.CSSProperties = {
     flex: 1, textAlign: "center",
@@ -421,14 +439,61 @@ export default function SelectionInspector({ selection: sel, clipboard, elevatio
 
       <div style={{ borderTop: "1px solid #1a2744" }} />
 
+      {/* 3D VIEW — collapsible, off by default */}
+      <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+        <div
+          onClick={() => setOpen3d(v => !v)}
+          style={{ display: "flex", alignItems: "center", gap: 5, cursor: "pointer", userSelect: "none" }}
+        >
+          <span style={{ color: "#475569", fontSize: 9 }}>{open3d ? "▼" : "▶"}</span>
+          <span style={{ color: "#f472b6", fontWeight: 700, fontSize: 10, letterSpacing: "0.08em" }}>3D VIEW</span>
+          <span style={{ fontSize: 9, color: "#f59e0b", background: "rgba(245,158,11,0.12)", border: "1px solid rgba(245,158,11,0.3)", borderRadius: 3, padding: "0 3px", lineHeight: "14px" }}>exp</span>
+        </div>
+        {open3d && <ThreeDPreview selection={sel} />}
+      </div>
+
+      <div style={{ borderTop: "1px solid #1a2744" }} />
+
       {/* Preview view tabs */}
       <div style={{ display: "flex", gap: 3 }}>
-        {(["front", "side", "top"] as PreviewView[]).map((v) => (
+        {(["front", "side", "top", "axo"] as PreviewView[]).map((v) => (
           <button key={v} style={tabBtn(v)} onClick={() => setView(v)}>
             {v.charAt(0).toUpperCase() + v.slice(1)}
           </button>
         ))}
       </div>
+
+      {/* Axo controls — direction + depth, only when axo tab active */}
+      {view === "axo" && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+          <div style={{ display: "flex", gap: 3 }}>
+            {([["SE", 0], ["SW", 1], ["NE", 2], ["NW", 3]] as [string, number][]).map(([label, d]) => (
+              <button
+                key={d}
+                onClick={() => setAxoDir(d)}
+                style={{
+                  flex: 1, padding: "2px 0", fontSize: 10, cursor: "pointer",
+                  background: axoDir === d ? "rgba(168,85,247,0.25)" : "rgba(255,255,255,0.04)",
+                  border: `1px solid ${axoDir === d ? "#a855f7" : "#334155"}`,
+                  color: axoDir === d ? "#d8b4fe" : "#64748b",
+                  borderRadius: 3,
+                }}
+              >{label}</button>
+            ))}
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+            <span style={{ color: "#64748b", fontSize: 10, whiteSpace: "nowrap" }}>Depth</span>
+            <input
+              type="range" min={0.05} max={0.5} step={0.01} value={axoSki}
+              onChange={e => setAxoSki(parseFloat(e.target.value))}
+              style={{ flex: 1, accentColor: "#a855f7" }}
+            />
+            <span style={{ color: "#d8b4fe", fontSize: 10, minWidth: 28, textAlign: "right", fontVariantNumeric: "tabular-nums" }}>
+              {axoSki.toFixed(2)}
+            </span>
+          </div>
+        </div>
+      )}
 
       {/* Orthographic preview canvas */}
       <canvas
