@@ -198,146 +198,306 @@ struct WorldSearchResult {
     timestamp: i64,
 }
 
-// ── Color system (HLS model, ported from la-map.c by Robert Munafo, GPL3) ─────
+// ── Color system (tables ported from Globals.mm / Hud.mm game source) ─────────
 
-fn hsl_to_rgb(h: f32, l: f32, s: f32) -> [u8; 3] {
-    let tc = (1.0 - (2.0 * l - 1.0).abs()) * s;
-    let hp = h / 60.0;
-    if hp < 0.0 || hp >= 6.0 {
-        let v = (l * 255.0).clamp(0.0, 255.0) as u8;
-        return [v, v, v];
-    }
-    let hm2 = if hp >= 4.0 { hp - 4.0 } else if hp >= 2.0 { hp - 2.0 } else { hp };
-    let tx = tc * (1.0 - (hm2 - 1.0).abs());
-    let (fr, fg, fb): (f32, f32, f32) =
-        if      hp < 1.0 { (tc, tx, 0.0) }
-        else if hp < 2.0 { (tx, tc, 0.0) }
-        else if hp < 3.0 { (0.0, tc, tx) }
-        else if hp < 4.0 { (0.0, tx, tc) }
-        else if hp < 5.0 { (tx, 0.0, tc) }
-        else              { (tc, 0.0, tx) };
-    let m = l - tc / 2.0;
-    [
-        ((fr + m).clamp(0.0, 1.0) * 255.0) as u8,
-        ((fg + m).clamp(0.0, 1.0) * 255.0) as u8,
-        ((fb + m).clamp(0.0, 1.0) * 255.0) as u8,
-    ]
-}
+// Unpainted block base colours — blockColor[NUM_BLOCKS+1][3] from Globals.mm.
+// Index = block type ID (0–111). Zero entries are unused/unset in the game.
+const BLOCK_RGB: [[u8; 3]; 112] = [
+    [  0,   0,   0], //   0 air (handled before table lookup)
+    [ 90,  90,  90], //   1 bedrock
+    [198, 198, 198], //   2 stone
+    [118,  79,   5], //   3 dirt
+    [255, 231, 148], //   4 sand
+    [ 30, 180,  40], //   5 leaves
+    [136,  99,  24], //   6 trunk
+    [230, 202, 109], //   7 wood
+    [115, 206,  74], //   8 grass (overridden by grass_color when unpainted)
+    [229, 207, 170], //   9 tnt
+    [120, 120, 120], //  10 dark stone
+    [133, 227,  79], //  11 grass2 / weed
+    [115, 206,  74], //  12 grass3 / old flower
+    [255,  60,  57], //  13 brick
+    [162, 170, 178], //  14 cobblestone / slate
+    [145, 178, 201], //  15 ice
+    [255, 255, 255], //  16 crystal / wallpaper
+    [125, 125, 125], //  17 trampoline
+    [230, 202, 109], //  18 ladder
+    [255, 255, 255], //  19 cloud
+    [ 32,  43, 255], //  20 water
+    [235, 196, 110], //  21 weave / fence
+    [  0, 255,   0], //  22 vine
+    [253,  70,   0], //  23 lava
+    [198, 198, 198], //  24 stone ramp S
+    [198, 198, 198], //  25 stone ramp W
+    [198, 198, 198], //  26 stone ramp N
+    [198, 198, 198], //  27 stone ramp E
+    [230, 202, 109], //  28 wood ramp S
+    [230, 202, 109], //  29 wood ramp W
+    [230, 202, 109], //  30 wood ramp N
+    [230, 202, 109], //  31 wood ramp E
+    [200, 200, 200], //  32 shingle ramp S
+    [200, 200, 200], //  33 shingle ramp W
+    [200, 200, 200], //  34 shingle ramp N
+    [200, 200, 200], //  35 shingle ramp E
+    [145, 178, 201], //  36 ice ramp S
+    [145, 178, 201], //  37 ice ramp W
+    [145, 178, 201], //  38 ice ramp N
+    [145, 178, 201], //  39 ice ramp E
+    [198, 198, 198], //  40 stone wedge SE
+    [198, 198, 198], //  41 stone wedge SW
+    [198, 198, 198], //  42 stone wedge NW
+    [198, 198, 198], //  43 stone wedge NE
+    [230, 202, 109], //  44 wood wedge SE
+    [230, 202, 109], //  45 wood wedge SW
+    [230, 202, 109], //  46 wood wedge NW
+    [230, 202, 109], //  47 wood wedge NE
+    [200, 200, 200], //  48 shingle wedge SE
+    [200, 200, 200], //  49 shingle wedge SW
+    [200, 200, 200], //  50 shingle wedge NW
+    [200, 200, 200], //  51 shingle wedge NE
+    [145, 178, 201], //  52 ice wedge SE
+    [145, 178, 201], //  53 ice wedge SW
+    [145, 178, 201], //  54 ice wedge NW
+    [145, 178, 201], //  55 ice wedge NE
+    [200, 200, 200], //  56 shingles
+    [255, 255, 255], //  57 gradient / neon square
+    [255, 255, 255], //  58 glass
+    [ 32,  43, 255], //  59 water ¾
+    [ 32,  43, 255], //  60 water ½
+    [ 32,  43, 255], //  61 water ¼
+    [253,  70,   0], //  62 lava ¾
+    [253,  70,   0], //  63 lava ½
+    [253,  70,   0], //  64 lava ¼
+    [229, 207, 170], //  65 firework
+    [180, 152,  59], //  66 door 1
+    [180, 152,  59], //  67 door 2
+    [180, 152,  59], //  68 door 3
+    [180, 152,  59], //  69 door 4
+    [180, 152,  59], //  70 door top
+    [200, 160,  75], //  71 golden cube
+    [255, 255, 150], //  72 lightbox
+    [ 93, 163, 255], //  73 new flower
+    [255, 255, 255], //  74 steel
+    [ 90,  90,  90], //  75 portal 1
+    [ 90,  90,  90], //  76 portal 2
+    [ 90,  90,  90], //  77 portal 3
+    [ 90,  90,  90], //  78 portal 4
+    [ 90,  90,  90], //  79 portal top
+    [  0,   0,   0], //  80 custom (unset in game)
+    [  0,   0,   0], //  81 block tnt (unset in game)
+    [229, 207, 170], //  82 bt-grass (expansion, painted via PAINT_RGB)
+    [229, 207, 170], //  83 bt-dark-stone
+    [229, 207, 170], //  84 bt-stone
+    [229, 207, 170], //  85 bt-dirt
+    [229, 207, 170], //  86 bt-sand
+    [229, 207, 170], //  87 bt-tnt
+    [229, 207, 170], //  88 bt-wood
+    [229, 207, 170], //  89 bt-shingle
+    [229, 207, 170], //  90 bt-glass
+    [229, 207, 170], //  91 bt-gradient
+    [229, 207, 170], //  92 bt-tree
+    [229, 207, 170], //  93 bt-leaves
+    [229, 207, 170], //  94 bt-brick
+    [229, 207, 170], //  95 bt-cobblestone
+    [229, 207, 170], //  96 bt-vines
+    [229, 207, 170], //  97 bt-ladder
+    [229, 207, 170], //  98 bt-ice
+    [229, 207, 170], //  99 bt-crystal
+    [229, 207, 170], // 100 bt-trampoline
+    [229, 207, 170], // 101 bt-cloud
+    [229, 207, 170], // 102 bt-stone-side
+    [229, 207, 170], // 103 bt-wood-side
+    [229, 207, 170], // 104 bt-ice-side
+    [229, 207, 170], // 105 bt-shingle-side
+    [229, 207, 170], // 106 bt-fence
+    [229, 207, 170], // 107 bt-water
+    [229, 207, 170], // 108 bt-lava
+    [229, 207, 170], // 109 bt-firework
+    [229, 207, 170], // 110 bt-lightbox
+    [229, 207, 170], // 111 bt-steel
+];
 
-/// (hue 0-360, lightness 0-1, saturation 0-1, max_lt 0-1) per block type.
-/// max_lt scales painted colours so the same paint reads differently on different materials.
-fn block_hls(bt: u8) -> (f32, f32, f32, f32) {
-    match bt {
-        0  => (210.0, 0.80, 1.00, 1.00), // air
-        1  => (  0.0, 0.20, 0.00, 0.60), // bedrock
-        2  => (  0.0, 0.60, 0.00, 0.80), // stone
-        3  => ( 30.0, 0.20, 1.00, 0.60), // dirt
-        4  => ( 50.0, 0.80, 0.50, 0.80), // sand
-        5  => (120.0, 0.20, 0.80, 0.65), // leaves
-        6  => ( 30.0, 0.20, 1.00, 0.70), // trunk
-        7  => ( 50.0, 0.75, 0.50, 0.70), // wood
-        8  => (120.0, 0.25, 0.80, 0.60), // grass (sky override in block_color)
-        9  => ( 30.0, 0.50, 0.70, 0.70), // TNT
-        10 => (  0.0, 0.45, 0.00, 0.50), // dark stone
-        11 => (120.0, 0.25, 0.80, 0.60), // weeds
-        12 => (150.0, 0.25, 0.70, 0.60), // flowers
-        13 => (  0.0, 0.40, 0.80, 0.70), // brick
-        14 => (210.0, 0.25, 0.25, 0.40), // slate
-        15 => (210.0, 0.80, 0.70, 0.90), // ice
-        16 => (  0.0, 0.80, 0.00, 0.80), // wallpaper
-        17 => (  0.0, 0.20, 0.00, 0.40), // bouncy
-        18 => ( 50.0, 0.75, 0.50, 0.70), // ladder
-        19 => (  0.0, 1.00, 0.00, 1.00), // cloud
-        20 => (225.0, 0.40, 0.90, 0.90), // water
-        21 => ( 50.0, 0.75, 0.50, 0.80), // fence
-        22 => (120.0, 0.60, 0.30, 0.60), // ivy
-        23 => ( 20.0, 0.40, 0.70, 0.60), // lava
-        24..=27 | 40..=43       => (  0.0, 0.60, 0.00, 0.80), // stone ramps/wedges
-        28..=31 | 44..=47       => ( 50.0, 0.75, 0.50, 0.70), // wood ramps/wedges
-        32..=35 | 48..=51 | 56  => (  0.0, 0.40, 0.00, 0.45), // shingle ramps/wedges/block
-        36..=39 | 52..=55       => (210.0, 0.80, 0.70, 0.90), // ice ramps/wedges
-        57  => (  0.0, 0.90, 0.00, 0.90), // neon square
-        58  => (210.0, 0.70, 0.20, 0.60), // glass
-        59  => (225.0, 0.50, 0.90, 0.80), // water 3/4
-        60  => (225.0, 0.60, 0.90, 0.85), // water 1/2
-        61  => (225.0, 0.70, 0.90, 0.90), // water 1/4
-        62  => ( 20.0, 0.50, 0.70, 0.50), // lava 3/4
-        63  => ( 20.0, 0.60, 0.70, 0.55), // lava 1/2
-        64  => ( 20.0, 0.70, 0.70, 0.60), // lava 1/4
-        65  => ( 30.0, 0.50, 0.70, 0.70), // fireworks
-        66..=70 => ( 40.0, 0.50, 0.70, 0.70), // doors
-        71  => ( 50.0, 0.70, 0.50, 0.70), // treasure
-        72  => ( 50.0, 0.80, 0.50, 0.90), // light
-        73  => (150.0, 0.50, 0.70, 0.70), // new flower
-        74  => (  0.0, 0.60, 0.00, 0.70), // steel
-        75..=79 => (270.0, 0.45, 0.50, 0.60), // portals
-        80..=81 => (  0.0, 0.50, 0.00, 0.50), // unused
-        82  => (120.0, 0.25, 0.80, 0.60), // ExpGrass (sky override in block_color)
-        83  => (  0.0, 0.40, 0.00, 0.50), // ExpDarkStone
-        84  => (  0.0, 0.60, 0.00, 0.80), // ExpStone
-        85  => ( 30.0, 0.40, 0.70, 0.60), // ExpDirt
-        86  => ( 50.0, 0.80, 0.50, 0.80), // ExpSand
-        87  => (  0.0, 0.50, 0.80, 0.70), // ExpTNT
-        88  => ( 50.0, 0.75, 0.50, 0.70), // ExpWood
-        89  => (  0.0, 0.40, 0.00, 0.45), // ExpShingle
-        90  => (210.0, 0.70, 0.20, 0.60), // ExpGlass (transparent)
-        91  => (180.0, 0.60, 0.90, 0.90), // ExpNeonSquare
-        92  => ( 30.0, 0.20, 1.00, 0.70), // ExpTrunk
-        93  => (120.0, 0.20, 0.80, 0.65), // ExpLeaves
-        94  => (  0.0, 0.40, 0.80, 0.70), // ExpBrick
-        95  => (210.0, 0.25, 0.25, 0.40), // ExpSlate
-        96  => (120.0, 0.60, 0.30, 0.60), // ExpVines
-        97  => (180.0, 0.60, 0.90, 0.90), // ExpLadder
-        98  => (210.0, 0.80, 0.70, 0.90), // ExpIce
-        99  => (  0.0, 0.80, 0.00, 0.80), // ExpWallpaper
-        100 => (  0.0, 0.20, 0.00, 0.40), // ExpTrampoline
-        101 => (  0.0, 1.00, 0.00, 1.00), // ExpCloud
-        102..=105 => (  0.0, 0.40, 0.00, 0.50), // Exp slides
-        106 => ( 50.0, 0.75, 0.50, 0.80), // ExpFence (transparent)
-        107 => (225.0, 0.40, 0.90, 0.90), // ExpWater
-        108 => ( 20.0, 0.40, 0.70, 0.60), // ExpLava
-        109 => ( 30.0, 0.50, 0.70, 0.70), // ExpFirework
-        110 => ( 50.0, 0.80, 0.50, 0.90), // ExpLight
-        _   => (  0.0, 0.50, 0.00, 0.50),
-    }
-}
+// Paint colour table — colorTable[54] from Hud::genColorTable() (Hud.mm:150-196).
+// Index 0 is the "no-paint" white sentinel; indices 1–54 are the game's paint palette.
+const PAINT_RGB: [[u8; 3]; 55] = [
+    [255, 255, 255], //  0 unused (paint 0 = no paint; handled before lookup)
+    [255, 170, 170], //  1
+    [255, 233, 170], //  2
+    [250, 255, 170], //  3
+    [170, 255, 191], //  4
+    [170, 255, 255], //  5
+    [170, 191, 255], //  6
+    [212, 170, 255], //  7
+    [255, 170, 233], //  8
+    [255, 255, 255], //  9 white
+    [255,  85,  85], // 10
+    [255, 212,  85], // 11
+    [246, 255,  85], // 12
+    [ 85, 255, 127], // 13
+    [ 85, 255, 255], // 14
+    [ 85, 127, 255], // 15
+    [170,  85, 255], // 16
+    [255,  85, 212], // 17
+    [204, 204, 204], // 18 80 % gray
+    [255,   0,   0], // 19
+    [255, 191,   0], // 20
+    [242, 255,   0], // 21
+    [  0, 255,  63], // 22
+    [  0, 255, 255], // 23
+    [  0,  63, 255], // 24
+    [127,   0, 255], // 25
+    [255,   0, 191], // 26
+    [153, 153, 153], // 27 60 % gray
+    [191,   0,   0], // 28
+    [191, 143,   0], // 29
+    [181, 191,   0], // 30
+    [  0, 191,  47], // 31
+    [  0, 191, 191], // 32
+    [  0,  47, 191], // 33
+    [ 95,   0, 191], // 34
+    [191,   0, 143], // 35
+    [102, 102, 102], // 36 40 % gray
+    [127,   0,   0], // 37
+    [127,  95,   0], // 38
+    [121, 127,   0], // 39
+    [  0, 127,  31], // 40
+    [  0, 127, 127], // 41
+    [  0,  31, 127], // 42
+    [ 63,   0, 127], // 43
+    [127,   0,  95], // 44
+    [ 50,  50,  50], // 45 20 % gray
+    [ 63,   0,   0], // 46
+    [ 63,  47,   0], // 47
+    [ 60,  63,   0], // 48
+    [  0,  63,  15], // 49
+    [  0,  63,  63], // 50
+    [  0,  15,  63], // 51
+    [ 31,   0,  63], // 52
+    [ 63,   0,  47], // 53
+    [  2,   2,   2], // 54 near-black
+];
 
-/// HLS for paint byte (1-54 = game paint colours; 0/other → unused, block_color guards against call).
-fn paint_hls(paint: u8) -> (f32, f32, f32) {
-    match paint {
-        1  => (  0.0, 0.85, 1.00),  2  => ( 30.0, 0.85, 1.00),
-        3  => ( 60.0, 0.85, 1.00),  4  => (120.0, 0.85, 1.00),
-        5  => (180.0, 0.85, 1.00),  6  => (240.0, 0.85, 1.00),
-        7  => (270.0, 0.85, 1.00),  8  => (300.0, 0.85, 1.00),
-        9  => (  0.0, 1.00, 0.00), // white
-        10 => (  0.0, 0.70, 1.00), 11 => ( 30.0, 0.70, 1.00),
-        12 => ( 60.0, 0.70, 1.00), 13 => (120.0, 0.70, 1.00),
-        14 => (180.0, 0.70, 1.00), 15 => (240.0, 0.70, 1.00),
-        16 => (270.0, 0.70, 1.00), 17 => (300.0, 0.70, 1.00),
-        18 => (  0.0, 0.80, 0.00), // 80% gray
-        19 => (  0.0, 0.50, 1.00), 20 => ( 30.0, 0.50, 1.00),
-        21 => ( 60.0, 0.50, 1.00), 22 => (120.0, 0.50, 1.00),
-        23 => (180.0, 0.50, 1.00), 24 => (240.0, 0.50, 1.00),
-        25 => (270.0, 0.50, 1.00), 26 => (300.0, 0.50, 1.00),
-        27 => (  0.0, 0.60, 0.00), // 60% gray
-        28 => (  0.0, 0.35, 1.00), 29 => ( 30.0, 0.35, 1.00),
-        30 => ( 60.0, 0.35, 1.00), 31 => (120.0, 0.35, 1.00),
-        32 => (180.0, 0.35, 1.00), 33 => (240.0, 0.35, 1.00),
-        34 => (270.0, 0.35, 1.00), 35 => (300.0, 0.35, 1.00),
-        36 => (  0.0, 0.40, 0.00), // 40% gray
-        37 => (  0.0, 0.25, 1.00), 38 => ( 30.0, 0.25, 1.00),
-        39 => ( 60.0, 0.25, 1.00), 40 => (120.0, 0.25, 1.00),
-        41 => (180.0, 0.25, 1.00), 42 => (240.0, 0.25, 1.00),
-        43 => (270.0, 0.25, 1.00), 44 => (300.0, 0.25, 1.00),
-        45 => (  0.0, 0.20, 0.00), // 20% gray
-        46 => (  0.0, 0.15, 1.00), 47 => ( 30.0, 0.15, 1.00),
-        48 => ( 60.0, 0.15, 1.00), 49 => (120.0, 0.15, 1.00),
-        50 => (180.0, 0.15, 1.00), 51 => (240.0, 0.15, 1.00),
-        52 => (270.0, 0.15, 1.00), 53 => (300.0, 0.15, 1.00),
-        54 => (  0.0, 0.00, 0.00), // black
-        _  => (  0.0, 0.50, 0.00),
-    }
-}
+// ── blockinfo[] flags (Constants.h:175-191, Globals.mm:38-167) ────────────────
+
+const BI_NOTSOLID:   u32 = 0b0000_0000_0000_0010;
+const BI_RAMPORSIDE: u32 = 0b0000_0000_0001_0000;
+
+// blockinfo[NUM_BLOCKS+1] — one entry per block type (0–111).
+// Only the flags relevant to the editor are preserved verbatim; the rest stay zero.
+const BLOCK_INFO: [u32; 112] = [
+    BI_NOTSOLID,                 //   0 air
+    0,                           //   1 bedrock      IS_HARD
+    0,                           //   2 stone         IS_HARD
+    0,                           //   3 dirt
+    0,                           //   4 sand
+    0,                           //   5 leaves        IS_FLAMMABLE
+    0,                           //   6 trunk         IS_FLAMMABLE
+    0,                           //   7 wood          IS_FLAMMABLE|IS_HARD
+    0,                           //   8 grass         IS_GRASS|IS_COLOREDSPECIAL
+    0,                           //   9 tnt           IS_FLAMMABLE|IS_COLOREDSPECIAL|IS_HARD
+    0,                           //  10 dark stone    IS_HARD
+    0,                           //  11 weed          IS_GRASS|IS_COLOREDSPECIAL
+    0,                           //  12 old flower    IS_GRASS|IS_COLOREDSPECIAL
+    0,                           //  13 brick         IS_COLOREDSPECIAL|IS_HARD
+    0,                           //  14 cobblestone   IS_HARD
+    0,                           //  15 ice           IS_ICE
+    0,                           //  16 crystal       IS_HARD
+    0,                           //  17 trampoline
+    0,                           //  18 ladder        IS_FLAMMABLE|IS_HARD
+    0,                           //  19 cloud
+    BI_NOTSOLID,                 //  20 water         IS_NOTSOLID|IS_ATLAS2|IS_WATER|IS_LIQUID
+    BI_NOTSOLID,                 //  21 weave/fence   IS_FLAMMABLE|IS_NOTSOLID|IS_ATLAS2|IS_HARD
+    0,                           //  22 vine
+    BI_NOTSOLID,                 //  23 lava          IS_NOTSOLID|IS_ATLAS2|IS_LAVA|IS_LIQUID
+    BI_NOTSOLID | BI_RAMPORSIDE, //  24 stone ramp S  IS_NOTSOLID|IS_RAMP|IS_RAMPORSIDE|IS_HARD
+    BI_NOTSOLID | BI_RAMPORSIDE, //  25 stone ramp W
+    BI_NOTSOLID | BI_RAMPORSIDE, //  26 stone ramp N
+    BI_NOTSOLID | BI_RAMPORSIDE, //  27 stone ramp E
+    BI_NOTSOLID | BI_RAMPORSIDE, //  28 wood ramp S   IS_FLAMMABLE|IS_NOTSOLID|IS_RAMP|IS_RAMPORSIDE
+    BI_NOTSOLID | BI_RAMPORSIDE, //  29 wood ramp W
+    BI_NOTSOLID | BI_RAMPORSIDE, //  30 wood ramp N
+    BI_NOTSOLID | BI_RAMPORSIDE, //  31 wood ramp E
+    BI_NOTSOLID | BI_RAMPORSIDE, //  32 shingle ramp S IS_NOTSOLID|IS_RAMP|IS_RAMPORSIDE
+    BI_NOTSOLID | BI_RAMPORSIDE, //  33 shingle ramp W
+    BI_NOTSOLID | BI_RAMPORSIDE, //  34 shingle ramp N
+    BI_NOTSOLID | BI_RAMPORSIDE, //  35 shingle ramp E
+    BI_NOTSOLID | BI_RAMPORSIDE, //  36 ice ramp S    IS_NOTSOLID|IS_RAMP|IS_RAMPORSIDE|IS_ICE
+    BI_NOTSOLID | BI_RAMPORSIDE, //  37 ice ramp W
+    BI_NOTSOLID | BI_RAMPORSIDE, //  38 ice ramp N
+    BI_NOTSOLID | BI_RAMPORSIDE, //  39 ice ramp E
+    BI_NOTSOLID | BI_RAMPORSIDE, //  40 stone wedge SE IS_NOTSOLID|IS_SIDE|IS_RAMPORSIDE|IS_HARD
+    BI_NOTSOLID | BI_RAMPORSIDE, //  41 stone wedge SW
+    BI_NOTSOLID | BI_RAMPORSIDE, //  42 stone wedge NW
+    BI_NOTSOLID | BI_RAMPORSIDE, //  43 stone wedge NE
+    BI_NOTSOLID | BI_RAMPORSIDE, //  44 wood wedge SE  IS_FLAMMABLE|IS_NOTSOLID|IS_SIDE|IS_RAMPORSIDE|IS_HARD
+    BI_NOTSOLID | BI_RAMPORSIDE, //  45 wood wedge SW
+    BI_NOTSOLID | BI_RAMPORSIDE, //  46 wood wedge NW
+    BI_NOTSOLID | BI_RAMPORSIDE, //  47 wood wedge NE
+    BI_NOTSOLID | BI_RAMPORSIDE, //  48 shingle wedge SE IS_NOTSOLID|IS_SIDE|IS_RAMPORSIDE|IS_HARD
+    BI_NOTSOLID | BI_RAMPORSIDE, //  49 shingle wedge SW
+    BI_NOTSOLID | BI_RAMPORSIDE, //  50 shingle wedge NW
+    BI_NOTSOLID | BI_RAMPORSIDE, //  51 shingle wedge NE
+    BI_NOTSOLID | BI_RAMPORSIDE, //  52 ice wedge SE   IS_NOTSOLID|IS_SIDE|IS_RAMPORSIDE|IS_ICE
+    BI_NOTSOLID | BI_RAMPORSIDE, //  53 ice wedge SW
+    BI_NOTSOLID | BI_RAMPORSIDE, //  54 ice wedge NW
+    BI_NOTSOLID | BI_RAMPORSIDE, //  55 ice wedge NE
+    0,                           //  56 shingles      IS_HARD
+    0,                           //  57 gradient
+    BI_NOTSOLID,                 //  58 glass         IS_NOTSOLID|IS_ATLAS2|IS_HARD
+    BI_NOTSOLID,                 //  59 water ¾       IS_NOTSOLID|IS_ATLAS2|IS_WATER|IS_LIQUID
+    BI_NOTSOLID,                 //  60 water ½
+    BI_NOTSOLID,                 //  61 water ¼
+    BI_NOTSOLID,                 //  62 lava ¾        IS_NOTSOLID|IS_ATLAS2|IS_LAVA|IS_LIQUID
+    BI_NOTSOLID,                 //  63 lava ½
+    BI_NOTSOLID,                 //  64 lava ¼
+    0,                           //  65 firework      IS_FLAMMABLE|IS_COLOREDSPECIAL|IS_HARD
+    BI_NOTSOLID,                 //  66 door 1        IS_FLAMMABLE|IS_NOTSOLID|IS_OBJECT|IS_DOOR
+    BI_NOTSOLID,                 //  67 door 2
+    BI_NOTSOLID,                 //  68 door 3
+    BI_NOTSOLID,                 //  69 door 4
+    BI_NOTSOLID,                 //  70 door top
+    BI_NOTSOLID,                 //  71 golden cube   IS_NOTSOLID|IS_OBJECT
+    0,                           //  72 lightbox      IS_HARD
+    BI_NOTSOLID,                 //  73 new flower    IS_NOTSOLID|IS_OBJECT|IS_FLAMMABLE
+    0,                           //  74 steel         IS_HARD
+    0,                           //  75 portal 1      IS_OBJECT|IS_PORTAL|IS_HARD (solid)
+    0,                           //  76 portal 2
+    0,                           //  77 portal 3
+    0,                           //  78 portal 4
+    0,                           //  79 portal top
+    BI_NOTSOLID,                 //  80 custom        IS_NOTSOLID (commented out in game)
+    0,                           //  81 block tnt     IS_FLAMMABLE|IS_COLOREDSPECIAL|IS_HARD|IS_BLOCKTNT
+    0,                           //  82 bt-grass      IS_FLAMMABLE|IS_COLOREDSPECIAL|IS_HARD|IS_BLOCKTNT
+    0,                           //  83 bt-dark-stone
+    0,                           //  84 bt-stone
+    0,                           //  85 bt-dirt
+    0,                           //  86 bt-sand
+    0,                           //  87 bt-tnt
+    0,                           //  88 bt-wood
+    0,                           //  89 bt-shingle
+    0,                           //  90 bt-glass
+    0,                           //  91 bt-gradient
+    0,                           //  92 bt-tree
+    0,                           //  93 bt-leaves
+    0,                           //  94 bt-brick
+    0,                           //  95 bt-cobblestone
+    0,                           //  96 bt-vines
+    0,                           //  97 bt-ladder
+    0,                           //  98 bt-ice
+    0,                           //  99 bt-crystal
+    0,                           // 100 bt-trampoline
+    0,                           // 101 bt-cloud
+    0,                           // 102 bt-stone-side
+    0,                           // 103 bt-wood-side
+    0,                           // 104 bt-ice-side
+    0,                           // 105 bt-shingle-side
+    0,                           // 106 bt-fence
+    0,                           // 107 bt-water
+    0,                           // 108 bt-lava
+    0,                           // 109 bt-firework
+    0,                           // 110 bt-lightbox
+    0,                           // 111 bt-steel
+];
 
 /// Alpha (0–1) for a transparent block; None = opaque.
 /// Glass/water are 50% transparent; fence nearly opaque at 90%; flower mostly see-through at 25%.
@@ -353,31 +513,146 @@ fn transparent_alpha(bt: u8) -> Option<f32> {
 
 // ── Color helpers ─────────────────────────────────────────────────────────────
 
+// Per-block paint brightness scale, ported from la-map.c `max_lt` values.
+// Scales painted colours so the same paint reads differently on different
+// materials (e.g. dark stone 0.50 vs ice 0.90), preserving visual distinction
+// in the flat top-down renderer where no texture contributes that difference.
+const BLOCK_PAINT_SCALE: [f32; 112] = [
+    1.00, // 0  air
+    0.60, // 1  bedrock
+    0.80, // 2  stone
+    0.60, // 3  dirt
+    0.80, // 4  sand
+    0.65, // 5  leaves
+    0.70, // 6  trunk
+    0.70, // 7  wood
+    0.60, // 8  grass
+    0.70, // 9  tnt
+    0.50, // 10 dark stone
+    0.60, // 11 weed
+    0.60, // 12 old flower
+    0.70, // 13 brick
+    0.40, // 14 slate / cobblestone
+    0.90, // 15 ice
+    0.80, // 16 wallpaper / crystal
+    0.40, // 17 trampoline
+    0.70, // 18 ladder
+    1.00, // 19 cloud
+    0.90, // 20 water
+    0.80, // 21 fence / weave
+    0.60, // 22 vine
+    0.60, // 23 lava
+    0.80, // 24 stone ramp S
+    0.80, // 25 stone ramp W
+    0.80, // 26 stone ramp N
+    0.80, // 27 stone ramp E
+    0.70, // 28 wood ramp S
+    0.70, // 29 wood ramp W
+    0.70, // 30 wood ramp N
+    0.70, // 31 wood ramp E
+    0.45, // 32 shingle ramp S
+    0.45, // 33 shingle ramp W
+    0.45, // 34 shingle ramp N
+    0.45, // 35 shingle ramp E
+    0.90, // 36 ice ramp S
+    0.90, // 37 ice ramp W
+    0.90, // 38 ice ramp N
+    0.90, // 39 ice ramp E
+    0.80, // 40 stone wedge SE
+    0.80, // 41 stone wedge SW
+    0.80, // 42 stone wedge NW
+    0.80, // 43 stone wedge NE
+    0.70, // 44 wood wedge SE
+    0.70, // 45 wood wedge SW
+    0.70, // 46 wood wedge NW
+    0.70, // 47 wood wedge NE
+    0.45, // 48 shingle wedge SE
+    0.45, // 49 shingle wedge SW
+    0.45, // 50 shingle wedge NW
+    0.45, // 51 shingle wedge NE
+    0.90, // 52 ice wedge SE
+    0.90, // 53 ice wedge SW
+    0.90, // 54 ice wedge NW
+    0.90, // 55 ice wedge NE
+    0.45, // 56 shingles
+    0.90, // 57 neon square / gradient
+    0.60, // 58 glass
+    0.80, // 59 water ¾
+    0.85, // 60 water ½
+    0.90, // 61 water ¼
+    0.50, // 62 lava ¾
+    0.55, // 63 lava ½
+    0.60, // 64 lava ¼
+    0.70, // 65 firework
+    0.70, // 66 door 1
+    0.70, // 67 door 2
+    0.70, // 68 door 3
+    0.70, // 69 door 4
+    0.70, // 70 door top
+    0.70, // 71 golden cube
+    0.90, // 72 lightbox
+    0.70, // 73 new flower
+    0.70, // 74 steel
+    0.60, // 75 portal 1
+    0.60, // 76 portal 2
+    0.60, // 77 portal 3
+    0.60, // 78 portal 4
+    0.60, // 79 portal top
+    0.50, // 80 custom
+    0.50, // 81 block tnt
+    0.60, // 82 bt-grass
+    0.50, // 83 bt-dark-stone
+    0.80, // 84 bt-stone
+    0.60, // 85 bt-dirt
+    0.80, // 86 bt-sand
+    0.70, // 87 bt-tnt
+    0.70, // 88 bt-wood
+    0.45, // 89 bt-shingle
+    0.60, // 90 bt-glass
+    0.90, // 91 bt-gradient
+    0.70, // 92 bt-tree
+    0.65, // 93 bt-leaves
+    0.70, // 94 bt-brick
+    0.40, // 95 bt-cobblestone
+    0.60, // 96 bt-vines
+    0.90, // 97 bt-ladder
+    0.90, // 98 bt-ice
+    0.80, // 99 bt-crystal
+    0.40, // 100 bt-trampoline
+    1.00, // 101 bt-cloud
+    0.80, // 102 bt-stone-side
+    0.70, // 103 bt-wood-side
+    0.90, // 104 bt-ice-side
+    0.45, // 105 bt-shingle-side
+    0.80, // 106 bt-fence
+    0.90, // 107 bt-water
+    0.60, // 108 bt-lava
+    0.70, // 109 bt-firework
+    0.90, // 110 bt-lightbox
+    0.70, // 111 bt-steel
+];
+
 fn grass_color(sky: u8) -> [u8; 3] {
     match sky {
-        11 => [242, 220, 140], // desert
-        13 => [255, 255, 255], // snow
-        _  => [ 82, 148,  53], // default green
+        11 => [242, 220, 140], // desert sky
+        13 => [255, 255, 255], // snow sky
+        _  => [115, 206,  74], // game's blockColor[TYPE_GRASS]
     }
 }
 
 fn block_color(bt: u8, paint: u8, sky: u8) -> [u8; 3] {
     if bt == 0 { return [30, 30, 30]; }
-    if bt == 8 || bt == 82 {
-        return if paint != 0 {
-            let (ph, pl, ps) = paint_hls(paint);
-            let rgb = hsl_to_rgb(ph, pl, ps);
-            [(rgb[0] as f32 * 0.60) as u8, (rgb[1] as f32 * 0.60) as u8, (rgb[2] as f32 * 0.60) as u8]
-        } else { grass_color(sky) };
+    if (bt == 8 || bt == 82) && paint == 0 { return grass_color(sky); }
+    if paint != 0 && (paint as usize) < PAINT_RGB.len() {
+        let [r, g, b] = PAINT_RGB[paint as usize];
+        let scale = if (bt as usize) < BLOCK_PAINT_SCALE.len() { BLOCK_PAINT_SCALE[bt as usize] } else { 0.70 };
+        return [
+            (r as f32 * scale).clamp(0.0, 255.0) as u8,
+            (g as f32 * scale).clamp(0.0, 255.0) as u8,
+            (b as f32 * scale).clamp(0.0, 255.0) as u8,
+        ];
     }
-    let (h, l, s, max_lt) = block_hls(bt);
-    if paint != 0 {
-        let (ph, pl, ps) = paint_hls(paint);
-        let rgb = hsl_to_rgb(ph, pl, ps);
-        [(rgb[0] as f32 * max_lt) as u8, (rgb[1] as f32 * max_lt) as u8, (rgb[2] as f32 * max_lt) as u8]
-    } else {
-        hsl_to_rgb(h, l, s)
-    }
+    if (bt as usize) < BLOCK_RGB.len() { BLOCK_RGB[bt as usize] } else { [128, 128, 128] }
 }
 
 // ── World parsing ─────────────────────────────────────────────────────────────
@@ -1550,6 +1825,10 @@ fn paint_blocks(
     let affected = affected_chunk_coords(&world, x_min, y_min, x_max, y_max);
     let pre_snap = snapshot_chunks(&world, &affected);
 
+    let is_door   = (66..=69).contains(&block_type);
+    let is_portal = (75..=78).contains(&block_type);
+    let top_type: u8 = if is_door { 70 } else if is_portal { 79 } else { 0 };
+
     for b in &blocks {
         let z = match b.z {
             Some(z) => {
@@ -1558,7 +1837,9 @@ fn paint_blocks(
             }
             None => match surface_z(&world, b.x, b.y) {
                 Some(z) => {
-                    let z2 = z + z_offset;
+                    // Doors/portals float one block above ground; top goes two above.
+                    let elev = if is_door || is_portal { z_offset + 1 } else { z_offset };
+                    let z2 = z + elev;
                     if z2 < 0 || z2 > max_z { continue; }
                     z2
                 }
@@ -1573,6 +1854,10 @@ fn paint_blocks(
             if read_paint_abs(&world, b.x, b.y, z) != mp { continue; }
         }
         set_block_abs(&mut world, b.x, b.y, z, block_type, paint);
+        // Auto-place paired top block for doors and portals.
+        if top_type != 0 && z + 1 <= max_z {
+            set_block_abs(&mut world, b.x, b.y, z + 1, top_type, paint);
+        }
     }
 
     let patch = render_pixels_patch(&world, x_min, y_min, x_max, y_max);
@@ -1658,7 +1943,13 @@ fn chunk_set_paint(data: &mut [u8], lx: usize, ly: usize, z: usize, paint: u8) {
     let bi = (z / 16) * 8192 + lx * 256 + ly * 16 + (z % 16) + 4096;
     if bi < data.len() { data[bi] = paint; }
 }
+#[cfg(test)]
+fn chunk_get_paint(data: &[u8], lx: usize, ly: usize, z: usize) -> u8 {
+    let bi = (z / 16) * 8192 + lx * 256 + ly * 16 + (z % 16) + 4096;
+    if bi < data.len() { data[bi] } else { 0 }
+}
 
+#[derive(Clone, Copy)]
 struct NaturalConfig {
     seed: u32,
     base_height: usize,
@@ -1667,10 +1958,13 @@ struct NaturalConfig {
     extreme: bool,           // 256z only: towering mountain relief + sharper ridges
     water_z: i32,            // -1 = no standing water
     rivers: bool,
-    biome: u8,               // 0 grassland, 1 desert, 2 snow, 3 lava
+    biome: u8,               // single-mode biome: 0 grassland, 1 desert, 2 snow, 3 lava, 4 classic hills
+    biome_mode: u32,         // 0 single (use `biome`), 1 mixed (per-column climate blend)
+    biome_scale: f64,        // mixed-mode biome region wavelength in blocks
     snow_caps: bool,
     tree_density_denom: u64, // 0 = none; else 1-in-N grass columns
     cave_density: u32,       // 0 none, 1 rare, 2 common
+    cave_style: u32,         // 0 spaghetti tunnels, 1 classic 3D-noise caves
     caverns: bool,           // large open caverns + deep lava pools
     ore_density: u32,        // 0 none, 1 sparse, 2 rich
     vegetation: u32,         // 0 none, 1 light, 2 lush
@@ -1763,24 +2057,32 @@ fn terrain_height(wx: f64, wy: f64, cfg: &NaturalConfig, t_height: usize) -> i32
     let amp = cfg.roughness * max_relief;
     let peak_mask = (cont * 0.5 + 0.5).clamp(0.0, 1.0).powf(1.7);
 
-    let mut h = cfg.base_height as f64
+    let h = cfg.base_height as f64
         + cont * amp * 0.65
         + ridge * peak_mask * amp * ridge_weight(cfg);
 
-    if cfg.rivers {
-        let rn = fbm2((wx + sf * 2.0) / (scale * 2.2), (wy + sf * 2.0) / (scale * 2.2), 2);
-        let d = rn.abs();
-        let bank = 0.055;
-        if d < bank {
-            let river_bottom = cfg.base_height as f64 - 4.0;
-            let t = (d / bank).clamp(0.0, 1.0);
-            let s = t * t * (3.0 - 2.0 * t); // smoothstep: 0 at centre, 1 at bank
-            let carved = river_bottom + (h - river_bottom) * s;
-            h = h.min(carved);
-        }
-    }
-
+    let h = river_carved_height(h, wx, wy, cfg);
     (h.round() as i32).clamp(2, (t_height - 6) as i32)
+}
+
+/// Lower a column toward the river bed where it lies inside a river channel
+/// (smoothstep from bank to centre). Shared by the natural and Classic+ heightmaps.
+#[inline]
+fn river_carved_height(h: f64, wx: f64, wy: f64, cfg: &NaturalConfig) -> f64 {
+    if !cfg.rivers { return h; }
+    let sf = natural_sf(cfg.seed);
+    let scale = cfg.terrain_scale.max(24.0);
+    let rn = fbm2((wx + sf * 2.0) / (scale * 2.2), (wy + sf * 2.0) / (scale * 2.2), 2);
+    let d = rn.abs();
+    let bank = 0.055;
+    if d < bank {
+        let river_bottom = cfg.base_height as f64 - 4.0;
+        let t = (d / bank).clamp(0.0, 1.0);
+        let s = t * t * (3.0 - 2.0 * t); // smoothstep: 0 at centre, 1 at bank
+        let carved = river_bottom + (h - river_bottom) * s;
+        return h.min(carved);
+    }
+    h
 }
 
 /// True if the cell should be carved to air (cave/tunnel/cavern).
@@ -1818,9 +2120,53 @@ fn ore_block(wx: i32, wy: i32, z: i32, surf_z: usize, cfg: &NaturalConfig) -> u8
     else { 14 }                                       // slate "ore"
 }
 
-/// Surface block + paint for a dry-land column.
-fn surface_block(cfg: &NaturalConfig, surf_z: usize, snowline: f64, near_water: bool, wx: i32, wy: i32) -> (u8, u8) {
-    match cfg.biome {
+/// Low-frequency temperature & moisture fields (each ~ -1..1) used to lay out
+/// biome regions in mixed mode. Domain offsets keep the two fields uncorrelated.
+#[inline]
+fn biome_climate(wx: i32, wy: i32, cfg: &NaturalConfig) -> (f64, f64) {
+    let sf = natural_sf(cfg.seed);
+    let scale = cfg.biome_scale.max(16.0);
+    let temp  = fbm2((wx as f64 + sf * 3.0) / scale,        (wy as f64 - sf * 3.0) / scale,        3);
+    let moist = fbm2((wx as f64 - sf * 5.0) / (scale * 1.3), (wy as f64 + sf * 5.0) / (scale * 1.3), 3);
+    (temp, moist)
+}
+
+/// Per-column biome id. In single mode this is just `cfg.biome`; in mixed mode it
+/// blends grassland / desert / snow by temperature, moisture and altitude (higher
+/// ground reads colder, so peaks turn snowy). Lava & classic are single-mode only.
+#[inline]
+fn biome_at(wx: i32, wy: i32, surf_z: usize, cfg: &NaturalConfig, t_height: usize) -> u8 {
+    if cfg.biome_mode == 0 { return cfg.biome; }
+    let (temp, moist) = biome_climate(wx, wy, cfg);
+    // Altitude lapse: ground above the base height cools down.
+    let alt = ((surf_z as f64 - cfg.base_height as f64) / t_height as f64).max(0.0);
+    let warmth = temp - alt * 1.6;
+    if warmth < -0.28 { 2 }                                 // snow (cold / high)
+    else if warmth > 0.18 && moist < -0.05 { 1 }            // desert (hot & dry)
+    else { 0 }                                              // grassland
+}
+
+/// Max absolute surface-height difference to the 4-connected neighbours — a cheap
+/// slope measure. Steep columns (≥ `CLIFF_SLOPE`) expose bare rock instead of soil.
+#[inline]
+fn column_slope(heights: &[u16], bw: usize, bh: usize, wx: i32, wy: i32) -> i32 {
+    let h = heights[wy as usize * bw + wx as usize] as i32;
+    let mut maxd = 0;
+    for (dx, dy) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+        let (nx, ny) = (wx + dx, wy + dy);
+        if nx < 0 || ny < 0 || nx as usize >= bw || ny as usize >= bh { continue; }
+        let nh = heights[ny as usize * bw + nx as usize] as i32;
+        maxd = maxd.max((h - nh).abs());
+    }
+    maxd
+}
+
+/// Surface steeper than this (blocks of drop to a neighbour) shows bare stone.
+const CLIFF_SLOPE: i32 = 2;
+
+/// Surface block + paint for a dry-land column of the given (already-resolved) biome.
+fn surface_block(biome: u8, cfg: &NaturalConfig, surf_z: usize, snowline: f64, near_water: bool, wx: i32, wy: i32) -> (u8, u8) {
+    match biome {
         1 => (4, 0),                       // desert sand
         2 => (8, 9),                       // snow: grass painted white
         3 => (10, 0),                      // lava: charred stone
@@ -1840,15 +2186,24 @@ fn fill_chunk_terrain(
     cx: usize, cy: usize, wc: usize,
     heights: &[u16],
     cfg: &NaturalConfig,
+    noise: &ClassicNoise,
     t_height: usize,
 ) {
+    if cfg.biome_mode == 0 && cfg.biome == BIOME_CLASSIC {
+        fill_classic_biome_chunk(data, cx, cy, wc, heights, cfg, noise, t_height);
+        return;
+    }
     let bw = wc * 16;
+    let bh = heights.len() / bw;
     let snowline = cfg.base_height as f64 + (t_height as f64) * relief_factor(cfg) * 0.60;
+    let classic_caves = cfg.cave_style == 1 && cfg.cave_density > 0;
+    let seedf = cfg.seed as f64;
     for lx in 0..16usize {
         for ly in 0..16usize {
             let wx = (cx * 16 + lx) as i32;
             let wy = (cy * 16 + ly) as i32;
             let surf_z = heights[(wy as usize) * bw + wx as usize] as usize;
+            let b = biome_at(wx, wy, surf_z, cfg, t_height); // resolved per-column biome
 
             // Standing-water level for this column (lakes/ocean + rivers).
             let mut water_level = cfg.water_z;
@@ -1857,25 +2212,50 @@ fn fill_chunk_terrain(
             }
             let underwater = (surf_z as i32) <= water_level;
             let near_water = water_level >= 0 && (surf_z as i32) <= water_level + 2;
+            // Steep, dry columns expose bare rock (cliff faces, rocky mountainsides).
+            let cliff = !underwater && !near_water && column_slope(heights, bw, bh, wx, wy) >= CLIFF_SLOPE;
 
             chunk_set(data, lx, ly, 0, 1); // bedrock
 
             let soft_start = surf_z.saturating_sub(4);
-            let soft_bt: u8 = match cfg.biome {
-                1 => 4,
-                3 => 2,
-                _ => if near_water { 4 } else { 3 },
+            let soft_bt: u8 = if cliff {
+                2
+            } else {
+                match b {
+                    1 => 4,
+                    3 => 2,
+                    _ => if near_water { 4 } else { 3 },
+                }
             };
 
             // Body of the column with caves + ore.
+            // Classic caves carve only the deeper band so the surface stays supported.
+            let cave_top = surf_z.saturating_sub(6);
             for z in 1..surf_z {
                 let mut bt = if z < soft_start {
                     ore_block(wx, wy, z as i32, surf_z, cfg)
                 } else {
                     soft_bt
                 };
-                // Caves never touch the top two layers (keeps the surface supported).
-                if z >= 2 && z + 2 < surf_z && carve_cave(wx as f64, wy as f64, z as f64, cfg) {
+                if classic_caves {
+                    // Classic 3D-noise caves: air where the noise is non-positive,
+                    // dark-stone lining where it is barely positive (keeps natural
+                    // ore in the rest of the rock).
+                    if z >= 2 && z < cave_top {
+                        match classic_cave_block(noise, wx, wy, z as i32, 1.0, seedf) {
+                            0 => {
+                                if cfg.caverns && (z as i32) <= cfg.base_height as i32 / 4 + 2 {
+                                    bt = 23; // lava floor deep down
+                                } else {
+                                    bt = 0;  // open cave
+                                }
+                            }
+                            10 if z < soft_start => bt = 10, // dark-stone vein lining
+                            _ => {}
+                        }
+                    }
+                } else if z >= 2 && z + 2 < surf_z && carve_cave(wx as f64, wy as f64, z as f64, cfg) {
+                    // Spaghetti tunnels never touch the top two layers.
                     if cfg.caverns && (z as i32) <= cfg.base_height as i32 / 4 + 2 {
                         bt = 23; // lava floor deep in caverns
                     } else {
@@ -1887,21 +2267,111 @@ fn fill_chunk_terrain(
 
             // Surface block.
             if underwater {
-                let bed = match cfg.biome { 3 => 2, _ => 4 };
+                let bed = match b { 3 => 2, _ => 4 };
                 chunk_set(data, lx, ly, surf_z, bed);
+            } else if cliff {
+                chunk_set(data, lx, ly, surf_z, 2); // bare rock on steep faces
             } else {
-                let (bt, paint) = surface_block(cfg, surf_z, snowline, near_water, wx, wy);
+                let (bt, paint) = surface_block(b, cfg, surf_z, snowline, near_water, wx, wy);
                 chunk_set(data, lx, ly, surf_z, bt);
                 if paint > 0 { chunk_set_paint(data, lx, ly, surf_z, paint); }
             }
 
             // Standing water / ice / lava fill.
             if water_level >= 0 {
-                let fill_bt = match cfg.biome { 2 => 15, 3 => 23, _ => 20 };
+                let fill_bt = match b { 2 => 15, 3 => 23, _ => 20 };
                 let top = (water_level as usize).min(t_height - 1);
                 for z in 1..=top {
                     if chunk_get(data, lx, ly, z) == 0 {
                         chunk_set(data, lx, ly, z, fill_bt);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// True where the Classic Hills surface is a bare-rock outcrop rather than soil.
+/// Driven by the classic skin noise: where the holey dirt skin "holes out" at the
+/// surface, that column is exposed rock. Shared by the fill + the preview so they
+/// agree on where the top-down stone patches appear.
+#[inline]
+fn classic_biome_rocky(noise: &ClassicNoise, wx: i32, wy: i32, surf_z: i32, seed: f64) -> bool {
+    classic_skin_block(noise, wx, wy, surf_z, seed) == 0
+}
+
+/// Classic Hills biome column fill: the legacy stone body + classic caves + the
+/// bumpy, overhung holey dirt skin. Soil columns are capped with grass so the
+/// natural decoration pass (trees, vegetation, structures) still finds a grassy
+/// top; rock-outcrop columns (`classic_biome_rocky`) are solid stone capped with
+/// stone, giving exposed stone patches visible from directly above. Shares the
+/// classic noise helpers with the Classic terrain tab.
+fn fill_classic_biome_chunk(
+    data: &mut [u8],
+    cx: usize, cy: usize, wc: usize,
+    heights: &[u16],
+    cfg: &NaturalConfig,
+    noise: &ClassicNoise,
+    t_height: usize,
+) {
+    let bw = wc * 16;
+    let s = t_height as f64 / 64.0;
+    let skin = (6.0 * s).round() as i32;
+    let cave_margin = (16.0 * s).round() as i32;
+    let seed = cfg.seed as f64;
+    let gen_caves = cfg.cave_density > 0;
+    for lx in 0..16usize {
+        for ly in 0..16usize {
+            let wx = (cx * 16 + lx) as i32;
+            let wy = (cy * 16 + ly) as i32;
+            let h = heights[(wy as usize) * bw + wx as usize] as i32;
+            chunk_set(data, lx, ly, 0, 1); // bedrock
+            let formation = h - skin;
+
+            // Standing water (lakes/ocean + rivers) — classic terrain with modern water.
+            let mut water_level = cfg.water_z;
+            if river_here(wx as f64, wy as f64, cfg) {
+                water_level = water_level.max(cfg.base_height as i32 - 1);
+            }
+            let underwater = h <= water_level;
+            let near_water = water_level >= 0 && h <= water_level + 2;
+
+            // Rock outcrops are solid stone in the skin zone (no holes → no floating
+            // cap); soil columns keep the holey dirt skin.
+            let rocky = classic_biome_rocky(noise, wx, wy, h, seed) && !underwater;
+            for y in 1..h {
+                let bt: u8 = if y < formation {
+                    if gen_caves && y > (h % 2 + 1) && y < formation - cave_margin {
+                        classic_cave_block(noise, wx, wy, y, 1.0, seed)
+                    } else {
+                        2
+                    }
+                } else if rocky {
+                    2
+                } else {
+                    classic_skin_block(noise, wx, wy, y, seed)
+                };
+                if bt != 0 { chunk_set(data, lx, ly, y as usize, bt); }
+            }
+            if underwater {
+                chunk_set(data, lx, ly, h as usize, 4); // sandy lake/sea bed
+            } else if rocky {
+                chunk_set(data, lx, ly, h as usize, 2); // stone outcrop cap
+            } else {
+                // Soil column: guarantee the cap rests on dirt (the holey skin can
+                // leave a hole directly beneath the surface).
+                if h > 1 && chunk_get(data, lx, ly, (h - 1) as usize) == 0 {
+                    chunk_set(data, lx, ly, (h - 1) as usize, 3);
+                }
+                chunk_set(data, lx, ly, h as usize, if near_water { 4 } else { 8 }); // beach / grass
+            }
+
+            // Fill the column with water up to the standing-water level.
+            if water_level >= 0 {
+                let top = (water_level as usize).min(t_height - 1);
+                for z in 1..=top {
+                    if chunk_get(data, lx, ly, z) == 0 {
+                        chunk_set(data, lx, ly, z, 20);
                     }
                 }
             }
@@ -2025,6 +2495,7 @@ fn decorate(gen: &mut WorldGen, heights: &[u16], cfg: &NaturalConfig) {
     for wy in 0..bh as i32 {
         for wx in 0..bw as i32 {
             let surf_z = heights[(wy as usize) * bw + wx as usize] as i32;
+            let b = biome_at(wx, wy, surf_z as usize, cfg, gen.t_height); // resolved per-column biome
             let on = gen.get(wx, wy, surf_z);
             let above = gen.get(wx, wy, surf_z + 1);
             if above != 0 { continue; }        // occupied / underwater → never decorate
@@ -2037,8 +2508,10 @@ fn decorate(gen: &mut WorldGen, heights: &[u16], cfg: &NaturalConfig) {
                     // Need vertical headroom for trunk + canopy.
                     if surf_z + 10 < gen.t_height as i32 {
                         let mut rng = Rng64::new(h | 1);
-                        if cfg.biome == 2 {
-                            place_pine_tree(gen, wx, wy, surf_z + 1, &mut rng);
+                        if b == 2 {
+                            // Snow biome: frosted (white/light-gray) pine canopy.
+                            let leaf = SNOW_LEAF_PAINTS[rng.range(0, 1) as usize];
+                            place_pine_tree(gen, wx, wy, surf_z + 1, &mut rng, Some(leaf));
                         } else {
                             // Trunks 3–5 logs, varied leaf shade.
                             let trunk_h = rng.range(3, 5);
@@ -2048,7 +2521,7 @@ fn decorate(gen: &mut WorldGen, heights: &[u16], cfg: &NaturalConfig) {
                     }
                     continue;
                 }
-                if cfg.biome == 1 && on == 4 && h % (cfg.tree_density_denom * 2) == 0 {
+                if b == 1 && on == 4 && h % (cfg.tree_density_denom * 2) == 0 {
                     place_cactus(gen, wx, wy, surf_z, h);
                     continue;
                 }
@@ -2060,17 +2533,21 @@ fn decorate(gen: &mut WorldGen, heights: &[u16], cfg: &NaturalConfig) {
                 let r = rand01(h);
                 let lush = if cfg.vegetation >= 2 { 1.0 } else { 0.45 };
                 if r < 0.045 * lush {
-                    let paint = FLOWER_PAINTS[((h >> 8) as usize) % FLOWER_PAINTS.len()];
-                    gen.put(wx, wy, surf_z + 1, 73, paint);
-                } else if r < 0.11 * lush {
-                    gen.put(wx, wy, surf_z + 1, 11, 0); // tuft of weeds
+                    // Cold flowers (white/blue) in snow, the warm palette elsewhere.
+                    let paint = if b == 2 {
+                        SNOW_FLOWER_PAINTS[((h >> 8) as usize) % SNOW_FLOWER_PAINTS.len()]
+                    } else {
+                        FLOWER_PAINTS[((h >> 8) as usize) % FLOWER_PAINTS.len()]
+                    };
+                    gen.put(wx, wy, surf_z + 1, 73, paint); // flower sprite sits above grass
+                } else if r < (0.045 + if rand01(hash2(wx >> 3, wy >> 3, cfg.seed ^ 0x5678)) > 0.5 { 0.45 } else { 0.08 }) * lush {
+                    // Weeds (11) are a solid grass variant — replace the surface block
+                    // so they sit flush with the grass instead of floating above it.
+                    // Painted white in snow so they match the snowy grass.
+                    let weed_paint = if b == 2 { 9 } else { 0 };
+                    gen.put(wx, wy, surf_z, 11, weed_paint);
                 } else if r < 0.114 * lush {
                     place_boulder(gen, wx, wy, surf_z, h);
-                }
-            } else if cfg.vegetation >= 2 && cfg.biome == 1 && on == 4 {
-                let h = hash2(wx, wy, cfg.seed ^ 0x2BAD);
-                if rand01(h) < 0.01 {
-                    gen.put(wx, wy, surf_z + 1, 11, 3); // desert shrub
                 }
             }
         }
@@ -2291,6 +2768,26 @@ fn place_clouds(gen: &mut WorldGen, cfg: &NaturalConfig) {
     }
 }
 
+/// Biome id for the "Classic Hills" biome: legacy Eden terrain shape (rolling
+/// Perlin hills) with the classic holey dirt skin (exposed stone) and classic caves.
+const BIOME_CLASSIC: u8 = 4;
+
+/// Map a `NaturalConfig` onto a `ClassicConfig` so the stable classic heightmap /
+/// cave / skin routines can drive the Classic Hills biome inside the natural
+/// pipeline. Roughness picks the legacy `variance`; caves follow `cave_density`.
+fn classic_cfg_for_natural(cfg: &NaturalConfig) -> ClassicConfig {
+    ClassicConfig {
+        seed: cfg.seed,
+        variance: (1.0 + cfg.roughness * 4.0).clamp(1.0, 6.0),
+        base_height: cfg.base_height,
+        gen_caves: cfg.cave_density > 0,
+        tall_caves: false,
+        tree_spacing: 0,
+        flowers: false,
+        clouds: false,
+    }
+}
+
 /// Whole-world procedural pipeline. Fills `chunks` (row-major cy*wc+cx) and
 /// returns the surface z at the world centre (for spawn placement).
 fn generate_natural_world(
@@ -2298,17 +2795,30 @@ fn generate_natural_world(
     wc: usize, hc: usize,
     cfg: &NaturalConfig,
     t_height: usize,
+    progress: &mut dyn FnMut(&str, f32),
 ) -> usize {
     let bw = wc * 16;
     let bh = hc * 16;
+
+    // Classic-noise generator + derived config, used by the "Classic Hills" biome
+    // (legacy heightmap / surface skin) and the classic cave style.
+    let classic_noise = ClassicNoise::new(cfg.seed);
+    let ccfg = classic_cfg_for_natural(cfg);
 
     // 1. Global heightmap (single source of truth for cross-chunk features).
     let mut heights = vec![0u16; bw * bh];
     for wy in 0..bh {
         for wx in 0..bw {
-            heights[wy * bw + wx] = terrain_height(wx as f64, wy as f64, cfg, t_height) as u16;
+            heights[wy * bw + wx] = if cfg.biome == BIOME_CLASSIC {
+                let h = classic_height(&classic_noise, wx as f64, wy as f64, &ccfg, t_height) as f64;
+                let h = river_carved_height(h, wx as f64, wy as f64, cfg);
+                (h.round() as i32).clamp(2, (t_height - 6) as i32) as u16
+            } else {
+                terrain_height(wx as f64, wy as f64, cfg, t_height) as u16
+            };
         }
     }
+    progress("Shaping terrain", 0.08);
 
     // 1b. Water mask — which columns end up under standing water (lake/ocean/river).
     //     Used so vegetation and boulders never sit on or overhang water.
@@ -2326,28 +2836,49 @@ fn generate_natural_world(
         }
     }
 
+    progress("Filling chunks", 0.12);
+
     // 2. Per-chunk column fill (cache-friendly, continuous noise across borders).
     for cy in 0..hc {
         for cx in 0..wc {
             let ci = cy * wc + cx;
-            fill_chunk_terrain(&mut chunks[ci], cx, cy, wc, &heights, cfg, t_height);
+            fill_chunk_terrain(&mut chunks[ci], cx, cy, wc, &heights, cfg, &classic_noise, t_height);
         }
+        progress("Filling chunks", 0.12 + 0.68 * ((cy + 1) as f32 / hc as f32));
     }
 
     // 3. Cross-chunk features (trees, vegetation, structures, clouds).
     {
         let mut gen = WorldGen { chunks, wc, hc, t_height, water_mask: &water_mask };
         decorate(&mut gen, &heights, cfg);
+        progress("Planting & decorating", 0.88);
         place_structures(&mut gen, &heights, cfg);
+        progress("Building structures", 0.93);
         place_clouds(&mut gen, cfg);
     }
+    progress("Finishing", 0.95);
 
     heights[(bh / 2) * bw + bw / 2] as usize
+}
+
+/// Build a throttled progress reporter that emits `world-gen-progress` events
+/// (`{ phase, pct }`). Only fires when the rounded percentage advances, so big
+/// worlds don't flood the IPC channel. Used by all three world-creation commands.
+fn gen_progress_reporter(app: tauri::AppHandle) -> impl FnMut(&str, f32) {
+    let mut last = -1i32;
+    move |phase: &str, frac: f32| {
+        let pct = (frac * 100.0).round().clamp(0.0, 100.0) as i32;
+        if pct != last {
+            last = pct;
+            let _ = app.emit("world-gen-progress", serde_json::json!({ "phase": phase, "pct": pct }));
+        }
+    }
 }
 
 /// Generate a flat world file at `path`.
 #[tauri::command]
 fn create_world(
+    app: tauri::AppHandle,
     path: String,
     name: String,
     width_chunks: u32,
@@ -2357,7 +2888,8 @@ fn create_world(
     dirt_depth: u8,
 ) -> Result<(), String> {
     if width_chunks == 0 || height_chunks == 0 { return Err("Dimensions must be at least 1×1 chunk".into()); }
-    if width_chunks > 64 || height_chunks > 64  { return Err("Maximum world size is 64×64 chunks (1024×1024 blocks)".into()); }
+    if width_chunks > 128 || height_chunks > 128 { return Err("Maximum world size is 128×128 chunks (2048×2048 blocks)".into()); }
+    let mut report = gen_progress_reporter(app);
 
     let max_z: u32 = if extended_z { 255 } else { 63 };
     let surface_z: u32 = 1 + stone_depth as u32 + dirt_depth as u32;
@@ -2373,7 +2905,7 @@ fn create_world(
     let start_cy = CENTER_CHUNK;
 
     let mut chunks: Vec<Vec<u8>> = Vec::with_capacity(n_chunks);
-    for _cy in 0..height_chunks {
+    for cy in 0..height_chunks {
         for _cx in 0..width_chunks {
             let mut data = vec![0u8; chunk_size];
             let set = |d: &mut Vec<u8>, z: u32, bt: u8| {
@@ -2392,14 +2924,165 @@ fn create_world(
             set(&mut data, surface_z, 8);
             chunks.push(data);
         }
+        report("Filling chunks", 0.90 * ((cy + 1) as f32 / height_chunks as f32));
     }
 
-    write_world_file(&path, &name, width_chunks, height_chunks, chunk_size, start_cx, start_cy, surface_z, &chunks)
+    report("Writing file", 0.95);
+    let res = write_world_file(&path, &name, width_chunks, height_chunks, chunk_size, start_cx, start_cy, surface_z, &chunks);
+    report("Done", 1.0);
+    res
+}
+
+/// Build a `NaturalConfig` (and resolve `t_height`) from the raw GUI parameters.
+/// Shared by `create_natural_world` and `preview_natural_world` so the two never
+/// drift apart.
+#[allow(clippy::too_many_arguments)]
+fn natural_config_from_params(
+    extended_z: bool, seed: u32, base_height: u32,
+    roughness_level: u32, terrain_scale_level: u32, extreme: bool,
+    water_mode: &str, rivers: bool,
+    biome: &str, biome_mode: u32, biome_scale_level: u32, snow_caps: bool,
+    tree_density: u32, cave_density: u32, cave_style: u32, caverns: bool,
+    ore_density: u32, vegetation: u32, structures: u32, clouds: bool,
+) -> (NaturalConfig, usize) {
+    let t_height = (if extended_z { 255u32 } else { 63 } + 1) as usize;
+    let base_h = (base_height as usize).min(t_height - 10).max(5);
+    let roughness = match roughness_level { 0 => 0.0f64, 1 => 0.30, 2 => 0.55, 3 => 0.80, _ => 1.05 };
+    let terrain_scale = match terrain_scale_level { 0 => 70.0f64, 1 => 120.0, 2 => 190.0, _ => 300.0 };
+    let mut water_z: i32 = match water_mode {
+        "ponds" => base_h as i32 - 8,
+        "lakes" => base_h as i32 - 4,
+        "ocean" => base_h as i32 - 1,
+        _       => -1,
+    };
+    water_z = water_z.max(-1);
+    let biome_id: u8 = match biome { "desert" => 1, "snow" => 2, "lava" => 3, "classic" => 4, _ => 0 };
+    let tree_density_denom: u64 = match tree_density { 0 => 0, 1 => 80, 2 => 40, _ => 20 };
+    let biome_scale = match biome_scale_level { 0 => 110.0f64, 1 => 200.0, _ => 340.0 };
+    let extreme = extreme && extended_z;
+    // Mixed mode blends grass/desert/snow only; lava & classic stay single-mode.
+    let biome_mode = if biome_id == 4 { 0 } else { biome_mode };
+    (NaturalConfig {
+        seed, base_height: base_h, roughness, terrain_scale, extreme, water_z, rivers,
+        biome: biome_id, biome_mode, biome_scale, snow_caps,
+        tree_density_denom, cave_density, cave_style, caverns,
+        ore_density, vegetation, structures, clouds,
+    }, t_height)
+}
+
+#[derive(Serialize)]
+struct PreviewImage {
+    width: u32,
+    height: u32,
+    #[serde(serialize_with = "serialize_bytes_b64")]
+    pixels: Vec<u8>, // RGBA, row-major (alpha always 255)
+}
+
+/// Fast top-down preview of a natural world: samples the heightmap, biome and
+/// surface colour on a downsampled grid (no chunk fill, caves or decoration) and
+/// applies a light height/slope hillshade. Lets the New World dialog show the
+/// terrain before committing to a full generate + file write.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+fn preview_natural_world(
+    width_chunks: u32, height_chunks: u32, extended_z: bool,
+    seed: u32, base_height: u32, roughness_level: u32, terrain_scale_level: u32, extreme: bool,
+    water_mode: String, rivers: bool,
+    biome: String, biome_mode: u32, biome_scale_level: u32, snow_caps: bool,
+    tree_density: u32, cave_density: u32, cave_style: u32, caverns: bool,
+    ore_density: u32, vegetation: u32, structures: u32, clouds: bool,
+    max_px: u32,
+) -> Result<PreviewImage, String> {
+    if width_chunks == 0 || height_chunks == 0 { return Err("Dimensions must be at least 1×1 chunk".into()); }
+    let (cfg, t_height) = natural_config_from_params(
+        extended_z, seed, base_height, roughness_level, terrain_scale_level, extreme,
+        &water_mode, rivers, &biome, biome_mode, biome_scale_level, snow_caps,
+        tree_density, cave_density, cave_style, caverns, ore_density, vegetation, structures, clouds,
+    );
+    let bw = (width_chunks * 16) as i32;
+    let bh = (height_chunks * 16) as i32;
+    let cap = max_px.clamp(32, 512) as i32;
+    let step = ((bw.max(bh) + cap - 1) / cap).max(1);
+    let pw = ((bw + step - 1) / step).max(1);
+    let ph = ((bh + step - 1) / step).max(1);
+
+    let classic_noise = ClassicNoise::new(cfg.seed);
+    let ccfg = classic_cfg_for_natural(&cfg);
+    let is_classic = cfg.biome_mode == 0 && cfg.biome == BIOME_CLASSIC;
+    let snowline = cfg.base_height as f64 + (t_height as f64) * relief_factor(&cfg) * 0.60;
+    let sky = 14u8;
+
+    // First pass: surface heights for the sample grid (for water test + hillshade).
+    let surf_at = |wx: i32, wy: i32| -> i32 {
+        if is_classic {
+            let h = classic_height(&classic_noise, wx as f64, wy as f64, &ccfg, t_height) as f64;
+            (river_carved_height(h, wx as f64, wy as f64, &cfg).round() as i32).clamp(2, (t_height - 6) as i32)
+        } else {
+            terrain_height(wx as f64, wy as f64, &cfg, t_height)
+        }
+    };
+
+    let mut pixels = vec![0u8; (pw * ph * 4) as usize];
+    for py in 0..ph {
+        for pxi in 0..pw {
+            let wx = (pxi * step).min(bw - 1);
+            let wy = (py * step).min(bh - 1);
+            let surf = surf_at(wx, wy);
+
+            // Standing water for this column.
+            let mut wl = cfg.water_z;
+            if river_here(wx as f64, wy as f64, &cfg) { wl = wl.max(cfg.base_height as i32 - 1); }
+
+            let mut rgb = if surf <= wl {
+                // Frozen in snow regions, else water/lava.
+                let b = biome_at(wx, wy, surf as usize, &cfg, t_height);
+                let fill = match b { 2 => 15u8, 3 => 23, _ => 20 };
+                block_color(fill, 0, sky)
+            } else {
+                let b = biome_at(wx, wy, surf as usize, &cfg, t_height);
+                // Cliff (steep) → bare rock, matching the generator.
+                let mut maxd = 0;
+                for (dx, dy) in [(-step, 0), (step, 0), (0, -step), (0, step)] {
+                    let (nx, ny) = (wx + dx, wy + dy);
+                    if nx < 0 || ny < 0 || nx >= bw || ny >= bh { continue; }
+                    maxd = maxd.max((surf - surf_at(nx, ny)).abs());
+                }
+                // Slope is measured over `step` blocks here, so scale the threshold.
+                if maxd >= CLIFF_SLOPE * step.max(1) {
+                    block_color(2, 0, sky)
+                } else if is_classic {
+                    if classic_biome_rocky(&classic_noise, wx, wy, surf, cfg.seed as f64) {
+                        block_color(2, 0, sky) // rock outcrop
+                    } else {
+                        grass_color(sky)
+                    }
+                } else {
+                    let (bt, paint) = surface_block(b, &cfg, surf as usize, snowline, surf <= wl + 2, wx, wy);
+                    block_color(bt, paint, sky)
+                }
+            };
+
+            // Hillshade: brighten high ground, darken low, for readable relief.
+            let span = (t_height as f64).max(1.0);
+            let t = ((surf as f64 - cfg.base_height as f64) / (span * 0.5)).clamp(-0.6, 0.6);
+            let shade = 1.0 + t * 0.45;
+            for c in rgb.iter_mut() { *c = (*c as f64 * shade).clamp(0.0, 255.0) as u8; }
+
+            let idx = ((py * pw + pxi) * 4) as usize;
+            pixels[idx] = rgb[0];
+            pixels[idx + 1] = rgb[1];
+            pixels[idx + 2] = rgb[2];
+            pixels[idx + 3] = 255;
+        }
+    }
+
+    Ok(PreviewImage { width: pw as u32, height: ph as u32, pixels })
 }
 
 /// Generate a procedural natural world file at `path`.
 #[tauri::command]
 fn create_natural_world(
+    app: tauri::AppHandle,
     path: String,
     name: String,
     width_chunks: u32,
@@ -2412,10 +3095,13 @@ fn create_natural_world(
     extreme: bool,            // 256z only: towering mountain relief
     water_mode: String,       // "none"|"ponds"|"lakes"|"ocean"
     rivers: bool,
-    biome: String,            // "grassland"|"desert"|"snow"|"lava"
+    biome: String,            // single-mode biome: "grassland"|"desert"|"snow"|"lava"|"classic"
+    biome_mode: u32,          // 0=single 1=mixed (climate blend of grass/desert/snow)
+    biome_scale_level: u32,   // 0=small 1=medium 2=large biome regions (mixed mode)
     snow_caps: bool,
     tree_density: u32,        // 0=none 1=sparse 2=normal 3=dense
     cave_density: u32,        // 0=none 1=rare 2=common
+    cave_style: u32,          // 0=tunnels 1=classic 3D-noise caves
     caverns: bool,
     ore_density: u32,         // 0=none 1=sparse 2=rich
     vegetation: u32,          // 0=none 1=light 2=lush
@@ -2423,34 +3109,16 @@ fn create_natural_world(
     clouds: bool,
 ) -> Result<(), String> {
     if width_chunks == 0 || height_chunks == 0 { return Err("Dimensions must be at least 1×1 chunk".into()); }
-    if width_chunks > 64 || height_chunks > 64  { return Err("Maximum world size is 64×64 chunks (1024×1024 blocks)".into()); }
+    if width_chunks > 128 || height_chunks > 128 { return Err("Maximum world size is 128×128 chunks (2048×2048 blocks)".into()); }
 
-    let max_z: u32 = if extended_z { 255 } else { 63 };
-    let t_height = (max_z + 1) as usize;
     let chunk_size = if extended_z { 131_072usize } else { 32_768usize };
     let n_chunks = (width_chunks * height_chunks) as usize;
 
-    let base_h = (base_height as usize).min(t_height - 10).max(5);
-    let roughness = match roughness_level { 0 => 0.0f64, 1 => 0.30, 2 => 0.55, 3 => 0.80, _ => 1.05 };
-    let terrain_scale = match terrain_scale_level { 0 => 70.0f64, 1 => 120.0, 2 => 190.0, _ => 300.0 };
-    let water_z: i32 = match water_mode.as_str() {
-        "ponds"  => base_h as i32 - 8,
-        "lakes"  => base_h as i32 - 4,
-        "ocean"  => base_h as i32 - 1,
-        _        => -1,
-    };
-    let water_z = water_z.max(-1);
-    let biome_id: u8 = match biome.as_str() { "desert" => 1, "snow" => 2, "lava" => 3, _ => 0 };
-    let tree_density_denom: u64 = match tree_density { 0 => 0, 1 => 80, 2 => 40, _ => 20 };
-
-    // Extreme relief is only meaningful (and only offered) on 256z worlds.
-    let extreme = extreme && extended_z;
-
-    let cfg = NaturalConfig {
-        seed, base_height: base_h, roughness, terrain_scale, extreme, water_z, rivers,
-        biome: biome_id, snow_caps, tree_density_denom, cave_density, caverns,
-        ore_density, vegetation, structures, clouds,
-    };
+    let (cfg, t_height) = natural_config_from_params(
+        extended_z, seed, base_height, roughness_level, terrain_scale_level, extreme,
+        &water_mode, rivers, &biome, biome_mode, biome_scale_level, snow_caps,
+        tree_density, cave_density, cave_style, caverns, ore_density, vegetation, structures, clouds,
+    );
 
     const CENTER_CHUNK: i32 = 4096;
     let start_cx = CENTER_CHUNK;
@@ -2459,10 +3127,14 @@ fn create_natural_world(
     let mut chunks: Vec<Vec<u8>> = Vec::with_capacity(n_chunks);
     for _ in 0..n_chunks { chunks.push(vec![0u8; chunk_size]); }
 
+    let mut report = gen_progress_reporter(app);
     let center_surface_z =
-        generate_natural_world(&mut chunks, width_chunks as usize, height_chunks as usize, &cfg, t_height) as u32;
+        generate_natural_world(&mut chunks, width_chunks as usize, height_chunks as usize, &cfg, t_height, &mut report) as u32;
 
-    write_world_file(&path, &name, width_chunks, height_chunks, chunk_size, start_cx, start_cy, center_surface_z, &chunks)
+    report("Writing file", 0.97);
+    let res = write_world_file(&path, &name, width_chunks, height_chunks, chunk_size, start_cx, start_cy, center_surface_z, &chunks);
+    report("Done", 1.0);
+    res
 }
 
 // ── Classic terrain (legacy Eden procedural generator) ─────────────────────────
@@ -2605,6 +3277,44 @@ fn classic_height(noise: &ClassicNoise, wx: f64, wy: f64, cfg: &ClassicConfig, t
     (n.round() as i64).clamp(3, t_height as i64 - 2) as usize
 }
 
+/// Classic deep-cave cell (legacy FREQ3=4, amp 0.25, 3 octaves). `y_scale` < 1
+/// stretches chambers vertically (tall-cave style). Returns 0 = open air,
+/// 10 = dark-stone vein lining (where the noise is barely positive), else 2 = stone.
+#[inline]
+fn classic_cave_block(noise: &ClassicNoise, wx: i32, wy: i32, y: i32, y_scale: f64, seed: f64) -> u8 {
+    let mut n3 = 0.0f64;
+    let mut f3 = 4.0f64;
+    let mut a3 = 0.25f64;
+    for _ in 0..3 {
+        n3 += noise.noise3(
+            f3 * (wx as f64 + seed) / 128.0,
+            f3 * (wy as f64 + seed) / 128.0,
+            f3 * (y  as f64 + seed) * y_scale / 128.0,
+        ) * a3;
+        f3 *= 2.0; a3 /= 2.0;
+    }
+    if n3 > 0.0 { if n3 <= 0.01 { 10 } else { 2 } } else { 0 }
+}
+
+/// Classic surface-skin cell (legacy FREQ3=3, amp 0.5, 3 octaves): dirt (3) where
+/// the noise is below 0.07, else air — the bumpy, overhung dirt skin that leaves
+/// exposed stone underneath.
+#[inline]
+fn classic_skin_block(noise: &ClassicNoise, wx: i32, wy: i32, y: i32, seed: f64) -> u8 {
+    let mut n3 = 0.0f64;
+    let mut f3 = 3.0f64;
+    let mut a3 = 0.5f64;
+    for _ in 0..3 {
+        n3 += noise.noise3(
+            f3 * (wx as f64 + seed) / 128.0,
+            f3 * (wy as f64 + seed) / 128.0,
+            f3 * (y  as f64 + seed) / 128.0,
+        ) * a3;
+        f3 *= 2.0; a3 /= 2.0;
+    }
+    if n3 < 0.07 { 3 } else { 0 }
+}
+
 /// Per-column body fill: bedrock, stone, dark-stone & dirt skin, with optional
 /// 3D-noise caves (faithful legacy generateColumn 347–439). Depth constants scale
 /// with world height so the cave band keeps its proportions on 256z worlds.
@@ -2637,46 +3347,14 @@ fn fill_classic_chunk(
             let formation = h - skin;
             for y in 1..h {
                 let bt: u8 = if y < formation {
-                    if y > (h % 2 + 1) && y < formation - cave_margin {
-                        if !cfg.gen_caves {
-                            2
-                        } else {
-                            // 3-octave 3D noise (legacy FREQ3=4, amp 0.25),
-                            // vertically stretched for tall caves.
-                            let mut n3 = 0.0f64;
-                            let mut f3 = 4.0f64;
-                            let mut a3 = 0.25f64;
-                            for _ in 0..3 {
-                                n3 += noise.noise3(
-                                    f3 * (wx as f64 + seed) / 128.0,
-                                    f3 * (wy as f64 + seed) / 128.0,
-                                    f3 * (y  as f64 + seed) * y_scale / 128.0,
-                                ) * a3;
-                                f3 *= 2.0; a3 /= 2.0;
-                            }
-                            if n3 > 0.0 {
-                                if n3 <= 0.01 { 10 } else { 2 } // dark-stone vein / stone
-                            } else {
-                                0                               // open cave
-                            }
-                        }
+                    if cfg.gen_caves && y > (h % 2 + 1) && y < formation - cave_margin {
+                        classic_cave_block(noise, wx, wy, y, y_scale, seed)
                     } else {
                         2
                     }
                 } else {
                     // Surface skin: legacy 3D noise leaves dirt patches & overhangs.
-                    let mut n3 = 0.0f64;
-                    let mut f3 = 3.0f64;
-                    let mut a3 = 0.5f64;
-                    for _ in 0..3 {
-                        n3 += noise.noise3(
-                            f3 * (wx as f64 + seed) / 128.0,
-                            f3 * (wy as f64 + seed) / 128.0,
-                            f3 * (y  as f64 + seed) / 128.0,
-                        ) * a3;
-                        f3 *= 2.0; a3 /= 2.0;
-                    }
-                    if n3 < 0.07 { 3 } else { 0 }
+                    classic_skin_block(noise, wx, wy, y, seed)
                 };
                 if bt != 0 { chunk_set(data, lx, ly, y as usize, bt); }
             }
@@ -2814,6 +3492,7 @@ fn generate_classic_world(
     wc: usize, hc: usize,
     cfg: &ClassicConfig,
     t_height: usize,
+    progress: &mut dyn FnMut(&str, f32),
 ) -> usize {
     let bw = wc * 16;
     let bh = hc * 16;
@@ -2825,12 +3504,14 @@ fn generate_classic_world(
             heights[wy * bw + wx] = classic_height(&noise, wx as f64, wy as f64, cfg, t_height) as u16;
         }
     }
+    progress("Shaping terrain", 0.10);
 
     for cy in 0..hc {
         for cx in 0..wc {
             let ci = cy * wc + cx;
             fill_classic_chunk(&mut chunks[ci], cx, cy, wc, &heights, cfg, &noise, t_height);
         }
+        progress("Filling chunks", 0.10 + 0.70 * ((cy + 1) as f32 / hc as f32));
     }
 
     let water_mask = vec![false; bw * bh]; // classic terrain has no standing water
@@ -2841,6 +3522,7 @@ fn generate_classic_world(
         classic_place_trees(&mut gen, &heights, cfg, &mut rng);
         place_classic_clouds(&mut gen, cfg, &mut rng);
     }
+    progress("Finishing", 0.95);
 
     heights[(bh / 2) * bw + bw / 2] as usize
 }
@@ -2848,6 +3530,7 @@ fn generate_classic_world(
 /// Generate a classic (legacy procedural) world file at `path`.
 #[tauri::command]
 fn create_classic_world(
+    app: tauri::AppHandle,
     path: String,
     name: String,
     width_chunks: u32,
@@ -2862,8 +3545,34 @@ fn create_classic_world(
     flowers: bool,       // sparse flowers
     clouds: bool,
 ) -> Result<(), String> {
+    let mut report = gen_progress_reporter(app);
+    create_classic_world_inner(
+        path, name, width_chunks, height_chunks, extended_z, seed,
+        variance_level, base_height, caves, tall_caves, tree_density, flowers, clouds,
+        &mut report,
+    )
+}
+
+/// Reporter-driven core of `create_classic_world` (callable from tests without an
+/// `AppHandle`).
+fn create_classic_world_inner(
+    path: String,
+    name: String,
+    width_chunks: u32,
+    height_chunks: u32,
+    extended_z: bool,
+    seed: u32,
+    variance_level: u32,
+    base_height: u32,
+    caves: bool,
+    tall_caves: bool,
+    tree_density: u32,
+    flowers: bool,
+    clouds: bool,
+    report: &mut dyn FnMut(&str, f32),
+) -> Result<(), String> {
     if width_chunks == 0 || height_chunks == 0 { return Err("Dimensions must be at least 1×1 chunk".into()); }
-    if width_chunks > 64 || height_chunks > 64  { return Err("Maximum world size is 64×64 chunks (1024×1024 blocks)".into()); }
+    if width_chunks > 128 || height_chunks > 128 { return Err("Maximum world size is 128×128 chunks (2048×2048 blocks)".into()); }
 
     let max_z: u32 = if extended_z { 255 } else { 63 };
     let t_height = (max_z + 1) as usize;
@@ -2888,9 +3597,12 @@ fn create_classic_world(
     for _ in 0..n_chunks { chunks.push(vec![0u8; chunk_size]); }
 
     let center_surface_z =
-        generate_classic_world(&mut chunks, width_chunks as usize, height_chunks as usize, &cfg, t_height) as u32;
+        generate_classic_world(&mut chunks, width_chunks as usize, height_chunks as usize, &cfg, t_height, report) as u32;
 
-    write_world_file(&path, &name, width_chunks, height_chunks, chunk_size, start_cx, start_cy, center_surface_z, &chunks)
+    report("Writing file", 0.97);
+    let res = write_world_file(&path, &name, width_chunks, height_chunks, chunk_size, start_cx, start_cy, center_surface_z, &chunks);
+    report("Done", 1.0);
+    res
 }
 
 fn write_world_file(
@@ -2904,6 +3616,14 @@ fn write_world_file(
     use std::io::Write;
     let n_chunks = chunks.len();
     let ptr_table_offset = 192 + chunk_size * n_chunks;
+    // Chunk data offsets and the directory pointer are stored as u32 in the file
+    // format, so the whole chunk region must fit under 4 GiB. Guard against a
+    // silently-corrupt file (the dialog caps dimensions, but be defensive).
+    if ptr_table_offset > u32::MAX as usize {
+        return Err(format!(
+            "World too large: {n_chunks} chunks × {chunk_size} B exceed the 4 GB file-offset limit. Use a smaller size or the 64z format."
+        ));
+    }
     let mut header = vec![0u8; 192];
     header[32..36].copy_from_slice(&(ptr_table_offset as u32).to_le_bytes());
     let nb = name.as_bytes().len().min(35);
@@ -2943,6 +3663,964 @@ fn write_world_file(
     for chunk in chunks { file.write_all(chunk).map_err(|e| format!("Write error: {e}"))?; }
     file.write_all(&ptr_table).map_err(|e| format!("Write error: {e}"))?;
     Ok(())
+}
+
+// ── TG2 World Generator ───────────────────────────────────────────────────────
+// Port of TerrainGen2.mm (Eden 2.0+ pre-generated world generator, ~2917 lines ObjC).
+// Uses a flat blockz/colorz workspace (read-modify-write by multiple passes), then
+// flushed into WorldGen chunks at the end — faithful to the original's architecture.
+
+struct Tg2Config {
+    seed: u32,
+    terrain_type: u8,  // 0=Plains 1=Mars 2=RiverForest 3=Mtn+River 4=Desert
+                       // 5=Ponies 6=Beach 7=Mix 8=Flat 9=CustomMix
+    sky_islands: bool,
+    struct_freq: u32,  // 0=sparse 1=normal 2=dense
+    clouds: bool,
+    amplitude: f64,    // relief multiplier (1.0 = native TG2 relief)
+    sea_level_off: i32,// additive offset to water/sea levels (blocks, pre-vscale)
+    blend: bool,       // soften biome zone boundaries (experimental)
+    caves: bool,
+    tall_caves: bool,
+    custom_biomes: [u8; 4], // NW/NE/SW/SE biome for terrain_type=9
+}
+
+/// Flat voxel workspace.  Axes: x=EdenX, z=EdenY(south), y=EdenZ(height).
+struct Tg2Grid {
+    blockz: Vec<u8>,
+    colorz: Vec<u8>,
+    gsize:    usize,
+    t_height: usize,
+    // Vertical scale: 1.0 for 64z worlds, t_height/64 for taller (New Dawn 256z)
+    // worlds so terrain proportionally fills the extra headroom (matches Classic).
+    vs: f64,
+    // User relief multiplier (Tg2Config.amplitude); folded into `relief`.
+    amp: f64,
+    // Additive sea/water-level offset in blocks (pre-vscale; see `sea_level`).
+    sea_off: i32,
+}
+
+impl Tg2Grid {
+    fn new(gsize: usize, t_height: usize, vs: f64, amp: f64, sea_off: i32) -> Self {
+        let n = gsize * gsize * t_height;
+        Self { blockz: vec![0u8; n], colorz: vec![0u8; n], gsize, t_height, vs, amp, sea_off }
+    }
+    /// Scale a vertical block offset / absolute z-band by the world's vertical scale.
+    /// At vs=1.0 this is the identity, so 64z generation is byte-identical to before.
+    #[inline] fn sv(&self, n: i32) -> i32 { (n as f64 * self.vs).round() as i32 }
+    /// Scale a noise relief amplitude by both the vertical scale and the user
+    /// amplitude knob. Pass the result as `a0` to `tg2_fbm2`.
+    #[inline] fn relief(&self, a0: f64) -> f64 { a0 * self.vs * self.amp }
+    /// Resolve a water/sea level: native band `n` plus the user offset, vscaled.
+    #[inline] fn sea_level(&self, n: i32) -> i32 { self.sv(n + self.sea_off).max(2) }
+    #[inline] fn ok(&self, x: i32, z: i32, y: i32) -> bool {
+        x>=0&&z>=0&&y>=0
+            &&(x as usize)<self.gsize&&(z as usize)<self.gsize&&(y as usize)<self.t_height
+    }
+    #[inline] fn idx(&self, x: usize, z: usize, y: usize) -> usize {
+        x*(self.gsize*self.t_height)+z*self.t_height+y
+    }
+    fn get(&self, x: i32, z: i32, y: i32) -> u8 {
+        if !self.ok(x,z,y) { return 0; }
+        self.blockz[self.idx(x as usize, z as usize, y as usize)]
+    }
+    fn put(&mut self, x: i32, z: i32, y: i32, bt: u8, c: u8) {
+        if !self.ok(x,z,y) { return; }
+        let i = self.idx(x as usize, z as usize, y as usize);
+        self.blockz[i]=bt; self.colorz[i]=c;
+    }
+    fn set_bt(&mut self, x: i32, z: i32, y: i32, bt: u8) {
+        if !self.ok(x,z,y) { return; }
+        let i = self.idx(x as usize, z as usize, y as usize);
+        self.blockz[i]=bt;
+    }
+    fn clampy(&self, h: i32) -> i32 { h.max(1).min(self.t_height as i32 - 1) }
+}
+
+// Paint cycle helpers — ports of colorCycle/2-7 (TerrainGen2.mm L39-212).
+// NUM_COLORS=54; return value is a paint index 0-53.
+const TG2_NUM_COLORS: i32 = 54;
+fn tg2_cc (idx:i32,typ:i32)->u8{let c=if typ==1{8}else{(idx/12)%8};let mut h=idx%8;if h>=4{h=7-h;}h+=1;((h*9+c+1).rem_euclid(TG2_NUM_COLORS))as u8}
+fn tg2_cc2(idx:i32,c:i32  )->u8{let mut h=(idx/5)%8;if h>=4{h=7-h;}h+=1;((h*9+c+1).rem_euclid(TG2_NUM_COLORS))as u8}
+fn tg2_cc3(idx:i32,c:i32  )->u8{let mut h=(idx/5)%8;if h>=4{h=7-h;}h+=3;if h==6{h=5;}((h*9+c+1).rem_euclid(TG2_NUM_COLORS))as u8}
+fn tg2_cc4(idx:i32,c:i32  )->u8{let mut h=(idx/5)%8;if h>=4{h=7-h;}h+=2;if h==6{return 0;}((h*9+c+1).rem_euclid(TG2_NUM_COLORS))as u8}
+fn tg2_cc5(idx:i32,c:i32  )->u8{let mut h=(idx/5)%8;if h>=4{h=7-h;}if h==6{return 0;}((h*9+c+1).rem_euclid(TG2_NUM_COLORS))as u8}
+fn tg2_cc6(idx:i32,c:i32  )->u8{let mut h=idx%8;if h>=4{h=7-h;}if h==6{return 0;}((h*9+c+1).rem_euclid(TG2_NUM_COLORS))as u8}
+fn tg2_cc7(idx:i32,c:i32  )->u8{let mut h=(idx/5)%8;if h>=5{h=8-h;}((h*9+c+1).rem_euclid(TG2_NUM_COLORS))as u8}
+
+// Noise helpers
+fn tg2_fbm2(n: &ClassicNoise, x: i32, z: i32, seed: f64, f0: f64, a0: f64, var: f64) -> f64 {
+    let (mut f, mut a, mut acc) = (f0, a0, 0.0f64);
+    for _ in 0..10 {
+        acc += n.noise2(f*(x as f64+seed)/128.0, f*(z as f64+seed)/128.0)*a*var;
+        f*=2.0; a/=2.0;
+    }
+    acc
+}
+fn tg2_fbm3(n: &ClassicNoise, x: i32, z: i32, y: i32, seed: f64, f0: f64, a0: f64) -> f64 {
+    let (mut f, mut a, mut acc) = (f0, a0, 0.0f64);
+    for _ in 0..3 {
+        acc += n.noise3(f*(x as f64+seed)/128.0, f*(z as f64+seed)/128.0, f*(y as f64+seed)/128.0)*a;
+        f*=2.0; a/=2.0;
+    }
+    acc
+}
+
+// Standard heightmap body: stone core with 3D-noise skin.
+// FORMATION_HEIGHT is always overridden to T_HEIGHT-1 in the original, so `fh_cap`
+// below = t_height-17 (the `FORMATION_HEIGHT-16` threshold).
+fn tg2_fill_column(
+    g: &mut Tg2Grid, noise: &ClassicNoise, x: i32, z: i32,
+    h: i32, seed: f64, stone: u8, stone_paint: u8,
+) {
+    let fh_cap = (g.t_height as i32 - g.sv(17)).max(0);
+    let bot = h % 2 + 1; // below this: skin (3D noise)
+    for y in 0..h {
+        if y > bot && y < fh_cap {
+            g.put(x, z, y, stone, stone_paint);
+        } else {
+            let n3 = tg2_fbm3(noise, x, z, y, seed, 3.0, 0.5);
+            if n3 < 0.07 { g.set_bt(x, z, y, 3); } // dirt
+        }
+    }
+}
+
+// Trees
+fn tg2_make_tree(g: &mut Tg2Grid, x: i32, z: i32, y: i32, rng: &mut Rng64) {
+    let th_i = (rng.next()%3+6) as i32;
+    if y+th_i >= g.t_height as i32 { return; }
+    for i in 0..(3*th_i/4) { g.put(x, z, y+i, 6, 0); }
+    let ct=[0u8,19,20,21]; let lc=ct[(rng.next()%4) as usize];
+    for dx in -2i32..=2 { for dz in -2i32..=2 { for dy in (2*th_i/3)..th_i {
+        let (nx,nz,ny)=(x+dx,z+dz,y+dy);
+        if g.get(nx,nz,ny)==6 { continue; }
+        if dx.abs()==2&&dz.abs()==2&&(dy==2*th_i/3||dy==th_i-1) { continue; }
+        if (dx.abs()==2||dz.abs()==2) && rng.next()%2==0 { continue; }
+        g.put(nx,nz,ny,5,lc);
+    }}}
+}
+fn tg2_make_tree2(g: &mut Tg2Grid, x: i32, z: i32, y: i32, hh: i32, rng: &mut Rng64) {
+    let th_i = (rng.next()%4+hh as u64) as i32;
+    if y+th_i >= g.t_height as i32 { return; }
+    for i in 0..(3*th_i/4) { g.put(x, z, y+i, 6, 0); }
+    let ct=[0u8,31,40,40]; let lc=ct[(rng.next()%4) as usize];
+    for dx in -2i32..=2 { for dz in -2i32..=2 { for dy in (2*th_i/3)..th_i {
+        let (nx,nz,ny)=(x+dx,z+dz,y+dy);
+        if g.get(nx,nz,ny)==6 { continue; }
+        if dx.abs()==2&&dz.abs()==2&&(dy==2*th_i/3||dy==th_i-1) { continue; }
+        if (dx.abs()==2||dz.abs()==2) && rng.next()%2==0 { continue; }
+        g.put(nx,nz,ny,5,lc);
+    }}}
+}
+fn tg2_make_palm(g: &mut Tg2Grid, x: i32, z: i32, y: i32, hh: i32, rng: &mut Rng64) {
+    let th_i = (rng.next()%4+hh as u64) as i32;
+    if y+th_i >= g.t_height as i32 { return; }
+    let colort=[2u8,0,29,38][(rng.next()%4) as usize];
+    let lc=[0u8,31,22,40][(rng.next()%4) as usize];
+    for i in 0..th_i { g.put(x,z,y+i,7,colort); }
+    let dx=[0i32,-1,1,0,0]; let dz=[0i32,0,0,-1,1]; let yp=[0i32,1,1,1,1];
+    let ty=y+th_i;
+    for i in 0i32..4 { for d in 0usize..4 {
+        g.put(x+dx[d]*i,z+dz[d]*i,ty+yp[i as usize],5,lc);
+        if i==1 { g.put(x+dx[d]*i,z+dz[d]*i,ty+yp[1]-1,5,lc); }
+    }}
+}
+
+// makeDirt: grass plains (offsety=T_HEIGHT/2, freq=2, amp=4)
+fn tg2_make_dirt(g: &mut Tg2Grid, noise: &ClassicNoise, seed: f64, sx: i32, sz: i32, ex: i32, ez: i32) {
+    let th=g.t_height as i32; let amp=g.relief(4.0);
+    for x in sx..ex { for z in sz..ez {
+        let h=(th as f64/2.0+tg2_fbm2(noise,x,z,seed,2.0,amp,3.0)).round() as i32;
+        let h=h.max(1).min(th-1);
+        tg2_fill_column(g,noise,x,z,h,seed,2,tg2_cc2(h,8));
+        g.set_bt(x,z,0,4); // sand base
+    }}
+    // surface: dirt → grass
+    for x in sx..ex { for z in sz..ez {
+        for y in 1..th { if g.get(x,z,y)==0&&g.get(x,z,y-1)==3 { g.set_bt(x,z,y-1,8); } }
+    }}
+}
+
+// makeMars: red/dark-stone low terrain with lava pools (offsety=T_HEIGHT/8)
+fn tg2_make_mars(g: &mut Tg2Grid, noise: &ClassicNoise, seed: f64, sx: i32, sz: i32, ex: i32, ez: i32) {
+    let th=g.t_height as i32; let amp=g.relief(4.0); let lava_top=g.sv(5).max(2);
+    for x in sx..ex { for z in sz..ez {
+        let h=(th as f64/8.0+tg2_fbm2(noise,x,z,seed,2.0,amp,3.0)).round() as i32;
+        let h=h.max(1).min(th-1);
+        tg2_fill_column(g,noise,x,z,h,seed,2,tg2_cc2(h,0));
+        g.set_bt(x,z,0,4);
+    }}
+    for x in sx..ex { for z in sz..ez {
+        for y in 0..lava_top { if g.get(x,z,y)==0 { g.put(x,z,y,23,0); } } // lava
+    }}
+}
+
+// makeRiverTrees: rolling hills + river channel + dense trees (offsety=T_HEIGHT/2-10, amp=20)
+fn tg2_make_river_trees(g: &mut Tg2Grid, noise: &ClassicNoise, seed: f64, rng: &mut Rng64, sx: i32, sz: i32, ex: i32, ez: i32) {
+    let th=g.t_height as i32;
+    let fh_cap=(th-g.sv(17)).max(0);
+    let amp=g.relief(20.0); let base=th/2-g.sv(10);
+    let (riv_lo,riv_hi,riv_d)=(g.sv(6),g.sv(15),g.sv(6).max(2));
+    for x in sx..ex { for z in sz..ez {
+        let h=(base as f64+tg2_fbm2(noise,x,z,seed,1.0,amp,3.0)).round() as i32;
+        let h=h.max(1).min(th-1);
+        let bot=h%2+1;
+        for y in 0..h {
+            let c=if y>bot&&y<fh_cap {tg2_cc3(y+30,1)} else {tg2_cc3(h+30,1)};
+            g.put(x,z,y,3,c); // dirt with green palette
+        }
+    }}
+    // dirt → grass (top of column within y < th-dirtlevel)
+    for x in sx..ex { for z in sz..ez {
+        for y in 1..(th-g.sv(25)) { if g.get(x,z,y)==0&&g.get(x,z,y-1)==3 { g.put(x,z,y-1,8,tg2_cc4(y-1+30,3)); } }
+    }}
+    // river: fill if air in the river band
+    for x in sx..ex { for z in sz..ez {
+        for y in riv_lo..riv_hi {
+            if g.get(x,z,y)==0 { for iy in 1..riv_d { g.put(x,z,y-iy,20,0); } }
+        }
+    }}
+    // trees 1-in-70
+    for x in (sx+4)..(ex-4) { for z in (sz+4)..(ez-4) {
+        for y in 4..(th-g.sv(10)) {
+            if g.get(x,z,y)==3&&g.get(x,z,y+1)==0 {
+                if rng.next()%70==0 { tg2_make_tree2(g,x,z,y,12,rng); }
+                break;
+            }
+        }
+    }}
+}
+
+// makeMountains: high peaks, snow (cloud) caps at y≥34, ice/water base
+fn tg2_make_mountains(g: &mut Tg2Grid, noise: &ClassicNoise, seed: f64, rng: &mut Rng64, sx: i32, sz: i32, ex: i32, ez: i32) {
+    let th=g.t_height as i32; let amp=g.relief(20.0); let base=th/2-g.sv(10);
+    for x in sx..ex { for z in sz..ez {
+        let h=(base as f64+tg2_fbm2(noise,x,z,seed,1.0,amp,3.0)).round() as i32;
+        let h=h.max(1).min(th-1);
+        for y in 0..h { g.put(x,z,y,2,tg2_cc5(y+50,8)); }
+    }}
+    // snow caps (cloud blocks): denser the higher you go, above the snow line
+    let snowlevel=g.sv(34); let (b4,b6)=(g.sv(4),g.sv(6));
+    for x in sx..ex { for z in sz..ez {
+        for y in snowlevel..th {
+            let band=y-snowlevel;
+            let skip = if band<b4 { rng.next()%2==0 }
+                       else if band<b6 { rng.next()%2==0 && rng.next()%2==0 }
+                       else { false };
+            if skip { continue; }
+            if g.get(x,z,y)==0&&y>0&&g.get(x,z,y-1)==2 {
+                g.put(x,z,y-1,19,0);
+                if y>1&&g.get(x,z,y-2)==2 { g.put(x,z,y-2,19,0); }
+            }
+        }
+    }}
+    // base: ice/water in lower area, water elsewhere
+    let xspan=ex-sx; let zspan=ez-sz;
+    let (base_lo,base_hi,base_d)=(g.sv(3),g.sv(6),g.sv(3).max(2));
+    for x in sx..ex { for z in sz..ez {
+        for y in base_lo..base_hi {
+            if g.get(x,z,y)==0 {
+                let inner=(x-sx)<xspan*3/4&&(z-sz)<zspan*3/4;
+                let on_edge=(x-sx)==xspan*3/4||(z-sz)==zspan*3/4;
+                let bt=if inner&&!on_edge{15}else{20}; // ice or water
+                for iy in 1..base_d { g.put(x,z,y-iy,bt,6); }
+                break;
+            }
+        }
+    }}
+}
+
+// makeTransition: linearly blend terrain heights across a seam
+fn tg2_make_transition(g: &mut Tg2Grid, sx: i32, sz: i32, ex: i32, ez: i32) {
+    let th=g.t_height as i32;
+    for z in sz..ez {
+        let mut lh=0i32; let mut ltype=0u8;
+        for i in (0..th).rev() { if g.get(sx-1,z,i)!=0&&g.get(sx-1,z,i)!=19 {lh=i+1;ltype=g.get(sx-1,z,i);break;} }
+        let mut rh=0i32; let mut rtype=0u8;
+        for i in (0..th).rev() { if g.get(ex,z,i)!=0&&g.get(ex,z,i)!=19 {rh=i+1;rtype=g.get(ex,z,i);break;} }
+        let delta=rh-lh; let span=(ex-sx).max(1) as f32;
+        for x in sx..ex {
+            let fx=(x-sx) as f32/span;
+            let h=(delta as f32*fx+lh as f32) as i32;
+            let bt=if fx<0.5{ltype}else{rtype};
+            for y in 1..h { g.put(x,z,y,bt,0); }
+        }
+    }
+}
+
+// makeGreenHills: rolling grass hills that fill most of the world with edge tapering
+fn tg2_make_green_hills(g: &mut Tg2Grid, noise: &ClassicNoise, seed2: f64, height: i32) {
+    let th=g.t_height as i32; let gs=g.gsize as i32;
+    let fh_cap=(th-g.sv(17)).max(0); let amp=g.relief(8.0); let hcap=g.sv(10);
+    for x in 0..gs {
+        if x<gs/4-15 { continue; }
+        for z in 0..(3*gs/4+15) {
+            let mut oy=height;
+            if x<gs/4+15&&z>gs/4    { oy=g.clampy(height+(gs/4+15-x).abs()); }
+            if x<gs/4    &&z>gs/4   { oy=g.clampy(height-(gs/4-x).abs()+15); }
+            if x<gs/4    &&z<=gs/4  { oy=g.clampy(height-(gs/4-x).abs()); }
+            if x>3*gs/4             { oy=g.clampy(height-(x-3*gs/4)); }
+            if z>gs/2&&x>=3*gs/4+35 { continue; }
+            if z>3*gs/4-7&&x<3*gs/4 { oy=g.clampy(height+(3*gs/4-7-z).abs()); }
+            if z>3*gs/4  &&x<3*gs/4 { oy=g.clampy(height-(3*gs/4-z).abs()+7); }
+            let n=oy as f64+tg2_fbm2(noise,x,z,seed2,1.0,amp,3.0);
+            let h=(n.round() as i32).min(height+hcap).max(1).min(th-1);
+            let bot=h%2+1;
+            for y in 0..h {
+                let c=if y>bot&&y<fh_cap{tg2_cc3(y,1)}else{tg2_cc3(h,1)};
+                g.put(x,z,y,3,c);
+            }
+        }
+    }
+    // dirt → grass
+    for x in 0..gs { for z in 0..gs {
+        for y in 1..th { if g.get(x,z,y)==0&&g.get(x,z,y-1)==3 { g.put(x,z,y-1,8,tg2_cc3(y+30,3)); } }
+    }}
+    // water lake in middle-left (x: gs/4..gs/2-60)
+    let (lake_lo,lake_hi,lake_d,flood_y)=(g.sv(6),g.sv(19),g.sv(6).max(2),g.sv(17));
+    for x in gs/4..(gs/2-60) {
+        for z in 0..3*gs/4 {
+            for y in lake_lo..lake_hi {
+                if g.get(x,z,y)==0 {
+                    for iy in 1..lake_d { g.put(x,z,y-iy,20,15); }
+                    break;
+                }
+            }
+        }
+    }
+    if gs/2-60 > gs/4 { // flood fill origin at (gs/2-60, z, flood_y)
+        for z in 0..3*gs/4 {
+            if g.get(gs/2-60,z,flood_y)==0 { g.put(gs/2-60,z,flood_y,20,15); }
+        }
+    }
+}
+
+// makeBeach: coastal sand with shallow ocean and palm trees
+fn tg2_make_beach(g: &mut Tg2Grid, noise: &ClassicNoise, seed: f64, rng: &mut Rng64, sx: i32, sz: i32, ex: i32, ez: i32) {
+    let th=g.t_height as i32; let sealevel=g.sea_level(19);
+    let amp=g.relief(18.0); let grass_h=sealevel+g.sv(2);
+    let xe=ex-sx; // x extent for relative calculations
+    let mut oy=th/2-g.sv(14);
+    for x in sx..ex {
+        let xr=x-sx;
+        if xr>=3*xe/4-35 { oy+=1; }
+        if xr>=3*xe/4    { oy-=2; }
+        for z in sz..ez {
+            let raw=tg2_fbm2(noise,x,z,seed,1.0,amp,3.0);
+            let n=if raw>0.0{raw/9.0+oy as f64}else{raw+oy as f64};
+            let h=(n.round() as i32).max(2).min(grass_h);
+            for y in 0..h {
+                if h>=grass_h&&xr<3*xe/4-35 { g.put(x,z,y,8,0); }
+                else                          { g.put(x,z,y,4,tg2_cc6(h-1+14,1)); }
+            }
+        }
+    }
+    // water fill
+    for x in sx..ex { for z in sz..ez {
+        for y in 1..sealevel { if g.get(x,z,y)==0 { g.put(x,z,y,20,23); } }
+    }}
+    // palm trees 1-in-90
+    for x in (sx+4)..(ex-4) { for z in (sz+4)..(ez-4) {
+        for y in sealevel..(th-g.sv(10)) {
+            if g.get(x,z,y)==8&&g.get(x,z,y+1)==0 {
+                if rng.next()%90==0 { tg2_make_palm(g,x,z,y,4,rng); }
+                break;
+            }
+        }
+    }}
+}
+
+// makeDesert: flat sand with pyramid structures
+fn tg2_make_desert(g: &mut Tg2Grid, noise: &ClassicNoise, seed: f64, rng: &mut Rng64, sx: i32, sz: i32, ex: i32, ez: i32, pyramid_freq: u32) {
+    let th=g.t_height as i32;
+    let h=th/2-g.sv(10); // flat (AMPLITUDE=0)
+    let water_top=g.sea_level(17);
+    for x in sx..ex { for z in sz..ez {
+        for y in 0..h { g.put(x,z,y,4,tg2_cc6(y-1+14,1)); } // sand
+    }}
+    // water at base level
+    for x in sx..ex { for z in sz..ez {
+        for y in 1..water_top { if g.get(x,z,y)==0 { g.put(x,z,y,20,23); break; } }
+    }}
+    // pyramids
+    let xs=ex-sx; let zs=ez-sz;
+    for _ in 0..pyramid_freq {
+        let rh=(rng.next()%30+15) as i32;
+        let rx=sx+(rng.next()%(xs.max(rh*2+4) as u64)) as i32;
+        let rz=sz+(rng.next()%(zs.max(rh*2+4) as u64)) as i32;
+        tg2_make_pyramid2(g,rx,rz,rh,45,-1);
+    }
+}
+
+// makePonies: colourful stone hills with cave + water pool
+fn tg2_make_ponies(g: &mut Tg2Grid, noise: &ClassicNoise, seed: f64, sx: i32, sz: i32, ex: i32, ez: i32) {
+    let th=g.t_height as i32; let base=th/2-g.sv(10); let amp=g.relief(4.0);
+    let xe=ex-sx; let ze=ez-sz;
+    for x in sx..ex { for z in sz..ez {
+        let xr=x-sx; let zr=z-sz;
+        let mut oy=base;
+        if xr>xe-10 { oy=base+(xe-10-xr).abs(); if xr>=xe { oy=base+(xe-10-xr).abs()-2*(xe-xr).abs(); } }
+        if zr<10    { oy=base+(10-zr).abs(); }
+        if zr<0     { oy=base+(10-zr).abs()-2*(-zr).abs(); } // only if sz offset applied
+        let h=(oy as f64+tg2_fbm2(noise,x,z,seed,2.0,amp,3.0)).round() as i32;
+        let h=h.max(1).min(th-1);
+        for y in 0..h { g.put(x,z,y,2,tg2_cc2(h,6)); }
+    }}
+    // cave carve (3D noise) in lower portion
+    let cave_top=th/2-g.sv(15);
+    for x in sx..ex { for z in sz..ez {
+        for y in 2..cave_top {
+            let n3=tg2_fbm3(noise,x,z,y,seed,4.0,0.25);
+            if n3>0.0 { let c=if y==cave_top-1{25}else{tg2_cc(z+x,0)};g.put(x,z,y,2,c); }
+            else       { g.set_bt(x,z,y,0); }
+        }
+    }}
+    // water at bottom
+    let wt=th/5;
+    for x in sx..ex { for z in sz..ez {
+        for y in 1..wt { if g.get(x,z,y)==0 { g.put(x,z,y,20,6); } }
+    }}
+}
+
+// makeClassicGen: legacy FBM terrain (dirt/stone + grass surface)
+fn tg2_make_classic_gen(g: &mut Tg2Grid, noise: &ClassicNoise, seed: f64, sx: i32, sz: i32, ex: i32, ez: i32) {
+    let th=g.t_height as i32; let amp=g.relief(4.0); let base=th/2-g.sv(10);
+    for x in sx..ex { for z in sz..ez {
+        let h=(base as f64+tg2_fbm2(noise,x,z,seed,2.0,amp,3.0)).round() as i32;
+        let h=h.max(1).min(th-1);
+        tg2_fill_column(g,noise,x,z,h,seed,2,0);
+        g.set_bt(x,z,0,1); // bedrock
+    }}
+    for x in sx..ex { for z in sz..ez {
+        for y in 1..th { if g.get(x,z,y)==0&&g.get(x,z,y-1)==3 { g.set_bt(x,z,y-1,8); } }
+    }}
+}
+
+// Structures
+fn tg2_make_pyramid(g: &mut Tg2Grid, cx: i32, cz: i32, h: i32) {
+    let th=g.t_height as i32;
+    let mut starty=th-1; let mut found=false;
+    'f: while starty>5 {
+        for sx in (cx-h)..cx+h { for sz in (cz-h)..cz+h {
+            let bt=g.get(sx,sz,starty);
+            if bt!=4{if bt!=0{return;}found=false;break 'f;}
+        }}
+        found=true; break;
+    }
+    if !found { return; }
+    let mut r=h;
+    for y in starty..starty+h {
+        if y>th-8 { break; }
+        for sx in (cx-r)..cx+r { for sz in (cz-r)..cz+r { g.put(sx,sz,y,14,0); } }
+        r-=1;
+    }
+}
+fn tg2_make_pyramid2(g: &mut Tg2Grid, cx: i32, cz: i32, h: i32, _color: u8, sy: i32) {
+    let th=g.t_height as i32;
+    let starty=if sy==-1 {
+        let mut sy2=th-1; let mut ok=false;
+        'f: while sy2>5 {
+            let mut good=true;
+            'c: for sx in (cx-h)..=cx+h { for sz in (cz-h)..=cz+h {
+                if (sx-cx).abs()+(sz-cz).abs()<=h {
+                    let bt=g.get(sx,sz,sy2);
+                    if bt!=4{if bt!=0{return;}good=false;break 'c;}
+                }
+            }}
+            if good{ok=true;break;}
+            sy2-=1;
+        }
+        if !ok { return; } sy2
+    } else { sy };
+    let mut r=h;
+    for y in starty..=starty+h {
+        if y>th-4 { continue; }
+        for sx in (cx-r)..=cx+r { for sz in (cz-r)..=cz+r {
+            if (sx-cx).abs()+(sz-cz).abs()<=r { g.put(sx,sz,y,14,0); }
+        }}
+        r-=1;
+    }
+}
+fn tg2_make_volcano(g: &mut Tg2Grid, cx: i32, cz: i32, base_y: i32, start_radius: i32, rng: &mut Rng64) {
+    let th=g.t_height as i32;
+    let mut h=1i32;
+    for radius in (1..=start_radius).rev() {
+        h+=1; let w=5i32; let r2=radius+w;
+        for i in -r2..=r2 { for j in -r2..=r2 {
+            let ang=(i as f64).atan2(j as f64);
+            let rh=r2 as f64+3.0*(12.0*ang).sin();
+            if radius>2&&((i*i+j*j) as f64)<rh*rh { g.put(cx+i,cz+j,base_y+h,2,36); }
+            else if i*i+j*j<r2*r2               { g.put(cx+i,cz+j,base_y+h,23,0); }
+        }}
+    }
+    for iy in 0..h/2 {
+        let r=iy+1;
+        for i in -r..=r { for j in -r..=r {
+            if i*i+j*j<r*r+(rng.next()%8) as i32 { g.put(cx+i,cz+j,base_y+h-iy,23,0); }
+        }}
+    }
+}
+fn tg2_make_sky_island(g: &mut Tg2Grid, cx: i32, cz: i32, r: i32, rng: &mut Rng64) {
+    let th=g.t_height as i32;
+    let cy=g.sv(18)+r-r/4-r/8;
+    for x in -r..=r { for z in -r..=r { for y in -r..=-r/2 {
+        if x*x+z*z+y*y<=r*r {
+            let ny=cy+y; if ny<=1||ny>=th { continue; }
+            if y==-r/2 {
+                g.put(cx+x,cz+z,ny,8,0);
+                if x*x+z*z+y*y<(r-1)*(r-1)&&rng.next()%90==0 { tg2_make_palm(g,cx+x,cz+z,ny,4,rng); }
+            } else { g.put(cx+x,cz+z,ny,4,tg2_cc3(ny,1)); }
+        }
+    }}}
+}
+
+// makeMix: the original composite biome layout (faithful quadrant layout)
+fn tg2_make_mix(g: &mut Tg2Grid, noise: &ClassicNoise, seed: f64, seed2: f64, rng: &mut Rng64, pyramid_freq: u32, volcano_freq: u32, report: &mut dyn FnMut(&str, f32)) {
+    let gs=g.gsize as i32; let th=g.t_height as i32;
+    let fh_cap=(th-g.sv(17)).max(0);
+    let cbase=th/2-g.sv(10); let camp=g.relief(20.0);
+
+    let rp=|r: &mut dyn FnMut(&str,f32), sub: f32| r("Generating terrain", 0.05+0.62*sub);
+    // Green hills base
+    rp(report, 0.0);
+    tg2_make_green_hills(g,noise,seed2,th/3);
+
+    // Central mix heightmap (stone) overwrites interior zone
+    rp(report, 0.12);
+    for z in 0..gs { for x in 0..gs {
+        let mut oy=cbase;
+        if x<gs/4+10&&z>=gs/4&&z<gs/2+10 {
+            if z>gs/2+10 { continue; }
+            if z>gs/2-10 { oy-=20-(gs/2+10-z); }
+            if x>gs/4-10 { oy-=20-(gs/4+10-x); }
+        } else {
+            if z>gs/4+10 { continue; }
+            if z>gs/4-10 { oy-=20-(gs/4+10-z); }
+            if x>3*gs/4-10 { let v=cbase-((3*gs/4-10-x).abs());oy=v.max(th/12); }
+        }
+        let h=(oy as f64+tg2_fbm2(noise,x,z,seed,1.0,camp,3.0)).round() as i32;
+        let h=h.max(1).min(th-1);
+        let bot=h%2+1;
+        for y in 0..h {
+            let c=if y>bot&&y<fh_cap{tg2_cc7(y+10,8)}else{tg2_cc7(y+10,8)};
+            g.put(x,z,y,2,c);
+        }
+    }}
+    // Beach (bottom-right zone)
+    rp(report, 0.24);
+    tg2_make_beach(g,noise,seed,rng,gs/4,3*gs/4,3*gs/4+64.min(gs-gs/4),gs);
+    // Mars (right strip)
+    rp(report, 0.32);
+    tg2_make_mars(g,noise,seed,3*gs/4,0,gs,gs);
+    // Water in right-strip lower area
+    let (ws_lo,ws_hi,ws_d)=(g.sv(3),g.sv(6),g.sv(3).max(2));
+    for x in 3*gs/4..gs { for z in 0..=3*gs/4 {
+        for y in ws_lo..ws_hi {
+            if g.get(x,z,y)==0||g.get(x,z,y)==23 {
+                for iy in 1..ws_d { g.put(x,z,y-iy,20,0); }
+                break;
+            }
+        }
+    }}
+    // Second beach pass
+    tg2_make_beach(g,noise,seed,rng,gs/4,3*gs/4,3*gs/4+64.min(gs-gs/4),gs);
+    // Ponies (bottom-left)
+    rp(report, 0.42);
+    tg2_make_ponies(g,noise,seed,0,3*gs/4-15,gs/4+15,gs);
+    // Classic gen (left interior)
+    rp(report, 0.52);
+    tg2_make_classic_gen(g,noise,seed,0,gs/2,gs/4,3*gs/4);
+    // Desert (left-center)
+    rp(report, 0.60);
+    tg2_make_desert(g,noise,seed,rng,0,gs/4,gs/4+20,3*gs/4,0);
+    // Mountains (top-left corner)
+    rp(report, 0.67);
+    tg2_make_mountains(g,noise,seed,rng,0,0,gs/4,gs/4);
+    // Pyramids in left interior zone
+    rp(report, 0.74);
+    for _ in 0..pyramid_freq {
+        let rh=(rng.next()%30+15) as i32;
+        let rx=(rng.next()%((gs/4-(rh+3)/2).max(2) as u64)) as i32+(rh+3);
+        let rz=(rng.next()%((gs/2+gs/4-(rh+3)/2).max(2) as u64)) as i32+(rh+3);
+        if rx<gs/4&&rz<3*gs/4&&rz>gs/4 { tg2_make_pyramid2(g,rx,rz,rh,45,-1); }
+    }
+    tg2_make_pyramid2(g,gs/4,3*gs/4,25,22,g.sv(17));
+    // Trees in classic-gen area
+    rp(report, 0.82);
+    for x in 2..gs/4-2 { for z in gs/2+2..3*gs/4-2 {
+        for y in 1..th-1 {
+            if (g.get(x,z,y)==8||g.get(x,z,y)==11)&&g.get(x,z,y+1)==0 {
+                if rng.next()%50==0 { tg2_make_tree(g,x,z,y+1,rng); }
+                break;
+            }
+        }
+    }}
+    // Sky islands in middle-upper zone
+    rp(report, 0.89);
+    for _ in 0..40i32 {
+        let rs=(rng.next()%20+5) as i32;
+        let rx=gs/4+rs+(rng.next()%((gs/2-rs*2).max(2) as u64)) as i32;
+        let rz=3*gs/4+gs/8+rs+(rng.next()%((gs/8-rs).max(2) as u64)) as i32;
+        tg2_make_sky_island(g,rx,rz,rs,rng);
+    }
+    // Volcanoes in right area — enforce minimum spacing so cones never overlap
+    let mut placed_volcanoes: Vec<(i32,i32,i32)> = Vec::new(); // (rx,rz,rh)
+    let mut attempts=0i32;
+    let mut placed=0u32;
+    while placed<volcano_freq && attempts<volcano_freq as i32*20 {
+        attempts+=1;
+        let rh=(rng.next()%10+25) as i32;
+        let rx=3*gs/4+50+(rng.next()%((gs/4-rh*2-50).max(2) as u64)) as i32;
+        let rz=gs/4+rh*2+(rng.next()%((3*gs/4-rh*2).max(2) as u64)) as i32;
+        // min separation = sum of outer radii (rh+5 each) plus a 10-block gap
+        let too_close=placed_volcanoes.iter().any(|&(ox,oz,oh)|{
+            let min_sep=(rh+oh+20) as i64;
+            let dx=(rx-ox) as i64; let dz=(rz-oz) as i64;
+            dx*dx+dz*dz < min_sep*min_sep
+        });
+        if too_close { continue; }
+        placed_volcanoes.push((rx,rz,rh));
+        tg2_make_volcano(g,rx,rz,1,rh,rng);
+        placed+=1;
+    }
+    // Bedrock floor
+    for x in 0..gs { for z in 0..gs { g.set_bt(x,z,0,1); } }
+    // Global trees
+    for x in 4..gs-4 { for z in 4..gs-4 {
+        for y in 4..th-10 {
+            if g.get(x,z,y)==8&&g.get(x,z,y+1)==0 {
+                if rng.next()%300==0 { tg2_make_tree2(g,x,z,y,12,rng); }
+                break;
+            }
+        }
+    }}
+}
+
+// Flush TG2 flat grid → WorldGen chunk storage, emitting progress per x-slice.
+fn tg2_flush(g: &Tg2Grid, gen: &mut WorldGen, report: &mut dyn FnMut(&str, f32)) {
+    let gs=g.gsize;
+    for x in 0..gs {
+        if x % 32 == 0 {
+            report("Writing chunks", 0.84 + 0.12 * x as f32 / gs as f32);
+        }
+        for z in 0..gs { for y in 0..g.t_height {
+            let i=g.idx(x,z,y);
+            let bt=g.blockz[i]; if bt==0 { continue; }
+            let paint=g.colorz[i];
+            gen.set(x as i32,z as i32,y as i32,bt);
+            if paint!=0 { gen.set_paint(x as i32,z as i32,y as i32,paint); }
+        }}
+    }
+}
+
+// Cave carving pass on the TG2 grid using the same 3D-noise formula as the
+// classic generator. Applied after terrain generation, before flush.
+fn tg2_carve_caves(g: &mut Tg2Grid, noise: &ClassicNoise, seed: f64, tall_caves: bool) {
+    let gs=g.gsize as i32; let th=g.t_height as i32;
+    let vs=g.vs;
+    let skin=(6.0*vs).round() as i32;
+    let cave_margin=if tall_caves{(4.0*vs).round() as i32}else{(16.0*vs).round() as i32};
+    let y_scale=if tall_caves{0.5f64}else{1.0};
+    for x in 0..gs { for z in 0..gs {
+        // Find surface (first non-air scanning down)
+        let mut surf=-1i32;
+        for y in (1..th).rev() { if g.get(x,z,y)!=0 { surf=y; break; } }
+        if surf<1 { continue; }
+        let h=surf+1; // height above surface (like fill_classic_chunk)
+        let formation=h-skin;
+        for y in 1..formation {
+            if y<=(h%2+1) || y>=formation-cave_margin { continue; }
+            let bt=g.get(x,z,y);
+            if bt!=2 && bt!=10 { continue; } // only carve stone/dark-stone
+            if classic_cave_block(noise,x,z,y,y_scale,seed)==0 {
+                g.set_bt(x,z,y,0);
+            }
+        }
+    }}
+}
+
+// Dispatch a single biome to a rectangular region of the grid.
+// Used by tg2_make_custom_mix for each quadrant.
+fn tg2_dispatch_biome(
+    g: &mut Tg2Grid, noise: &ClassicNoise, seed: f64, rng: &mut Rng64,
+    biome: u8, sx: i32, sz: i32, ex: i32, ez: i32, pf: u32,
+) {
+    match biome {
+        0 => tg2_make_dirt(g,noise,seed,sx,sz,ex,ez),
+        1 => tg2_make_mars(g,noise,seed,sx,sz,ex,ez),
+        2 => tg2_make_river_trees(g,noise,seed,rng,sx,sz,ex,ez),
+        3 => { // Mtn+River: split quadrant east/west
+            let mid=(sx+ex)/2;
+            tg2_make_river_trees(g,noise,seed,rng,mid,sz,ex,ez);
+            tg2_make_mountains(g,noise,seed,rng,sx,sz,(mid-16).max(sx),ez);
+            tg2_make_transition(g,(mid-16).max(sx),sz,mid,ez);
+        }
+        4 => tg2_make_desert(g,noise,seed,rng,sx,sz,ex,ez,pf),
+        5 => tg2_make_ponies(g,noise,seed,sx,sz,ex,ez),
+        6 => tg2_make_beach(g,noise,seed,rng,sx,sz,ex,ez),
+        _ => {} // unknown or flat: leave as bedrock
+    }
+}
+
+// Custom biome mix: user-specified biome per quadrant (NW/NE/SW/SE).
+fn tg2_make_custom_mix(
+    g: &mut Tg2Grid, noise: &ClassicNoise, seed: f64, rng: &mut Rng64,
+    biomes: &[u8; 4], pf: u32, report: &mut dyn FnMut(&str, f32),
+) {
+    let gs=g.gsize as i32; let mid=gs/2;
+    let rp=|r: &mut dyn FnMut(&str,f32), sub: f32| r("Generating terrain", 0.05+0.62*sub);
+    rp(report, 0.0);
+    tg2_dispatch_biome(g,noise,seed,rng,biomes[0],0,0,mid,mid,pf);
+    rp(report, 0.25);
+    tg2_dispatch_biome(g,noise,seed,rng,biomes[1],mid,0,gs,mid,pf);
+    rp(report, 0.50);
+    tg2_dispatch_biome(g,noise,seed,rng,biomes[2],0,mid,mid,gs,pf);
+    rp(report, 0.75);
+    tg2_dispatch_biome(g,noise,seed,rng,biomes[3],mid,mid,gs,gs,pf);
+    rp(report, 1.0);
+}
+
+// Experimental biome blend: soften hard surface-height discontinuities between
+// adjacent zones by building a talus ramp up toward higher natural-terrain
+// neighbours.  Only *adds* blocks (never carves), and only between natural
+// surfaces (stone/dirt/sand/grass) — so water, structures (slate) and sky
+// features are left untouched.  Each iteration raises a column by at most one
+// block, so N iterations yields a ~1:N slope; scaled by `vs` for taller worlds.
+// When raising, the block type from the highest natural neighbour is used so
+// the slope transitions into the higher biome's material rather than dragging
+// the lower biome's material upward (which created painted-sand staircases, etc.)
+fn tg2_blend_seams(g: &mut Tg2Grid, iters: i32) {
+    let gs=g.gsize as i32; let th=g.t_height as i32;
+    let natural=|bt:u8| matches!(bt,2|3|4|8);
+    let sidx=|x:i32,z:i32| (x*gs+z) as usize;
+    // Snapshot each column's surface (skip air/cloud/water/lava/ice).
+    let mut surf=vec![(-1i32,0u8,0u8); (gs*gs) as usize];
+    for x in 0..gs { for z in 0..gs {
+        for y in (1..th).rev() {
+            let bt=g.get(x,z,y);
+            if bt!=0 && bt!=19 && bt!=20 && bt!=23 && bt!=15 {
+                let c=g.colorz[g.idx(x as usize,z as usize,y as usize)];
+                surf[sidx(x,z)]=(y,bt,c);
+                break;
+            }
+        }
+    }}
+    for _ in 0..iters.max(0) {
+        let mut raises: Vec<(i32,i32)> = Vec::new();
+        for x in 0..gs { for z in 0..gs {
+            let (h,bt,_)=surf[sidx(x,z)];
+            if h<1 || !natural(bt) { continue; }
+            let mut target=h;
+            for (dx,dz) in [(-1i32,0i32),(1,0),(0,-1),(0,1)] {
+                let (nx,nz)=(x+dx,z+dz);
+                if nx<0||nz<0||nx>=gs||nz>=gs { continue; }
+                let (nh,nbt,_)=surf[sidx(nx,nz)];
+                if nh<1 || !natural(nbt) { continue; }
+                if nh-1>target { target=nh-1; }
+            }
+            if target>h { raises.push((x,z)); }
+        }}
+        if raises.is_empty() { break; }
+        for (x,z) in raises {
+            let (h,_,_)=surf[sidx(x,z)];
+            let ny=h+1; if ny>=th { continue; }
+            // Use block type from the highest natural neighbour so the slope
+            // inherits the higher biome's material rather than dragging the
+            // lower biome's material upward.
+            let mut best_nh=-1i32; let mut fill_bt=2u8; let mut fill_pt=0u8;
+            for (dx,dz) in [(-1i32,0i32),(1,0),(0,-1),(0,1)] {
+                let (nx,nz)=(x+dx,z+dz);
+                if nx<0||nz<0||nx>=gs||nz>=gs { continue; }
+                let (nh,nbt,npt)=surf[sidx(nx,nz)];
+                if nh>best_nh && natural(nbt) { best_nh=nh; fill_bt=nbt; fill_pt=npt; }
+            }
+            g.put(x,z,ny,fill_bt,fill_pt);
+            surf[sidx(x,z)]=(ny,fill_bt,fill_pt);
+        }
+    }
+}
+
+fn tg2_place_clouds(g: &mut Tg2Grid, rng: &mut Rng64) {
+    let gs=g.gsize as i32; let cz=(g.t_height as i32*4/5).min(g.t_height as i32-4);
+    let n=((gs*gs/500).max(2)) as u64;
+    for _ in 0..n {
+        let cx=(rng.next()%gs as u64) as i32; let czr=(rng.next()%gs as u64) as i32;
+        let w=(rng.next()%12+6) as i32; let d=(rng.next()%12+6) as i32;
+        for dx in 0..w { for dz in 0..d { g.put(cx+dx,czr+dz,cz,19,0); } }
+    }
+}
+
+fn generate_tg2_world(
+    cfg: &Tg2Config,
+    wc: usize, hc: usize, t_height: usize,
+    chunks: &mut Vec<Vec<u8>>,
+    mut report: &mut dyn FnMut(&str, f32),
+) -> u32 {
+    let gsize=wc*16;
+    // Generate at the full world height. `vs` scales every amplitude & z-band so
+    // 256z worlds proportionally fill the headroom (64z → vs=1.0, unchanged).
+    let tg2_h=t_height;
+    let vs=(tg2_h as f64/64.0).max(1.0);
+    let noise=ClassicNoise::new(cfg.seed);
+    let seed=cfg.seed as f64;
+    let seed2=cfg.seed as f64+123.0;
+    let mut rng=Rng64::new(cfg.seed as u64^0xDEAD_C0DE_B16B_00B5);
+    report("Initialising",0.0);
+    let mut g=Tg2Grid::new(gsize,tg2_h,vs,cfg.amplitude.max(0.1),cfg.sea_level_off);
+    // bedrock floor (clear() equivalent)
+    for x in 0..gsize as i32 { for z in 0..gsize as i32 { g.set_bt(x,z,0,1); g.set_bt(x,z,1,1); } }
+    // scale structure counts proportionally to world area vs canonical 2880×2880
+    let sf=(gsize as f64/2880.0).powi(2);
+    let ff=match cfg.struct_freq{0=>0.3f64,1=>1.0,_=>2.0};
+    let pf=((175.0*sf*ff).round() as u32).max(1).min(500);
+    let vf=((20.0*sf*ff).round() as u32).max(1).min(20);
+    report("Generating terrain",0.05);
+    let gs=gsize as i32;
+    match cfg.terrain_type {
+        0 => { tg2_make_dirt(&mut g,&noise,seed,0,0,gs,gs); report("Generating terrain",0.67); }
+        1 => { tg2_make_mars(&mut g,&noise,seed,0,0,gs,gs); report("Generating terrain",0.67); }
+        2 => { tg2_make_river_trees(&mut g,&noise,seed,&mut rng,0,0,gs,gs); report("Generating terrain",0.67); }
+        3 => {
+            let mid=gs/2;
+            tg2_make_river_trees(&mut g,&noise,seed,&mut rng,mid,0,gs,gs);
+            report("Generating terrain",0.35);
+            tg2_make_mountains(&mut g,&noise,seed,&mut rng,0,0,(mid-32).max(0),gs);
+            report("Generating terrain",0.56);
+            tg2_make_transition(&mut g,(mid-32).max(0),0,mid,gs);
+            report("Generating terrain",0.67);
+        }
+        4 => { tg2_make_desert(&mut g,&noise,seed,&mut rng,0,0,gs,gs,pf); report("Generating terrain",0.67); }
+        5 => { tg2_make_ponies(&mut g,&noise,seed,0,0,gs,gs); report("Generating terrain",0.67); }
+        6 => { tg2_make_beach(&mut g,&noise,seed,&mut rng,0,0,gs,gs); report("Generating terrain",0.67); }
+        7 => tg2_make_mix(&mut g,&noise,seed,seed2,&mut rng,pf,vf,&mut report),
+        9 => tg2_make_custom_mix(&mut g,&noise,seed,&mut rng,&cfg.custom_biomes,pf,&mut report),
+        _ => {} // Flat / unknown: bedrock only
+    }
+    if cfg.caves && cfg.terrain_type!=8 {
+        report("Carving caves",0.70);
+        tg2_carve_caves(&mut g,&noise,seed as f64,cfg.tall_caves);
+    }
+    if cfg.blend && cfg.terrain_type!=8 {
+        report("Blending biomes",0.74);
+        tg2_blend_seams(&mut g,(24.0*vs).round() as i32);
+    }
+    report("Placing features",0.79);
+    if cfg.sky_islands && cfg.terrain_type!=7 && cfg.terrain_type!=9 {
+        let ni=((gsize as f64/300.0*6.0) as i32).max(1);
+        for _ in 0..ni {
+            let rs=(rng.next()%20+5) as i32;
+            let rx=rs+(rng.next()%((gsize as i64-rs as i64*2).max(2) as u64)) as i32;
+            let rz=rs+(rng.next()%((gsize as i64-rs as i64*2).max(2) as u64)) as i32;
+            tg2_make_sky_island(&mut g,rx,rz,rs,&mut rng);
+        }
+    }
+    if cfg.clouds { tg2_place_clouds(&mut g,&mut rng); }
+    // ensure bedrock floor
+    for x in 0..gs { for z in 0..gs { g.set_bt(x,z,0,1); } }
+    let water_mask=vec![false;gsize*gsize];
+    let mut gen=WorldGen{chunks,wc,hc,t_height,water_mask:&water_mask};
+    tg2_flush(&g,&mut gen,&mut report);
+    // surface z at world centre
+    let cx=gsize as i32/2; let cz=gsize as i32/2;
+    let mut surf=tg2_h as i32/2;
+    for y in (0..tg2_h as i32).rev() { if g.get(cx,cz,y)!=0{surf=y+1;break;} }
+    surf as u32
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+fn create_tg2_world(
+    app: tauri::AppHandle,
+    path: String, name: String,
+    size_chunks: u32, extended_z: bool,
+    seed: u32, terrain_type: u8,
+    sky_islands: bool, struct_freq: u32, clouds: bool,
+    amplitude: f64, sea_level_off: i32, blend: bool,
+    caves: bool, tall_caves: bool,
+    custom_biomes: Option<Vec<u8>>,
+) -> Result<(),String> {
+    if size_chunks==0 { return Err("Size must be ≥ 1 chunk".into()); }
+    if size_chunks>180 { return Err("Maximum TG2 world size is 180×180 chunks (2880×2880 blocks)".into()); }
+    let mut report=gen_progress_reporter(app);
+    let wc=size_chunks as usize; let hc=wc;
+    let t_height=if extended_z{256}else{64};
+    let chunk_size=if extended_z{131_072usize}else{32_768usize};
+    let cb=custom_biomes.unwrap_or_default();
+    let custom_biomes_arr=[
+        cb.first().copied().unwrap_or(0),
+        cb.get(1).copied().unwrap_or(6),
+        cb.get(2).copied().unwrap_or(4),
+        cb.get(3).copied().unwrap_or(2),
+    ];
+    let cfg=Tg2Config{seed,terrain_type,sky_islands,struct_freq,clouds,
+        amplitude:amplitude.clamp(0.1,4.0),sea_level_off:sea_level_off.clamp(-16,32),blend,
+        caves,tall_caves,custom_biomes:custom_biomes_arr};
+    let mut chunks:Vec<Vec<u8>>=(0..wc*hc).map(|_|vec![0u8;chunk_size]).collect();
+    let surf=generate_tg2_world(&cfg,wc,hc,t_height,&mut chunks,&mut report);
+    report("Writing file",0.97);
+    const CENTER_CHUNK:i32=4096;
+    let res=write_world_file(&path,&name,wc as u32,hc as u32,chunk_size,CENTER_CHUNK,CENTER_CHUNK,surf,&chunks);
+    report("Done",1.0);
+    res
+}
+
+#[tauri::command]
+fn preview_tg2_world(
+    size_chunks: u32, seed: u32, terrain_type: u8, max_px: u32,
+    custom_biomes: Option<Vec<u8>>,
+) -> Result<PreviewImage,String> {
+    if size_chunks==0 { return Err("Size must be ≥ 1".into()); }
+    let gsize=(size_chunks as usize*16).min(2880);
+    let noise=ClassicNoise::new(seed);
+    let sf=seed as f64; let sf2=seed as f64+123.0;
+    let cap=max_px.clamp(32,512) as usize;
+    let step=((gsize+cap-1)/cap).max(1);
+    let pw=(gsize+step-1)/step;
+    let mut pixels=vec![0u8;pw*pw*4];
+    let gs=gsize as i32;
+    // helper: per-pixel colour for a single biome type
+    let preview_biome=|biome:u8,wx:i32,wz:i32,gs:i32|->(i32,u8,u8){
+        match biome {
+            0 => {let h=(32.0+tg2_fbm2(&noise,wx,wz,sf,2.0,4.0,3.0)).round()as i32;(h,8u8,0u8)}
+            1 => {let h=(8.0+tg2_fbm2(&noise,wx,wz,sf,2.0,4.0,3.0)).round()as i32;(h,2u8,tg2_cc2(h,0))}
+            2 => {let n=22.0+tg2_fbm2(&noise,wx,wz,sf,1.0,20.0,3.0);let h=n.round()as i32;let bt=if h<15{20u8}else{8u8};(h,bt,0u8)}
+            3 => {if wx<gs/2{let h=(22.0+tg2_fbm2(&noise,wx,wz,sf,1.0,20.0,3.0)).round()as i32;(h,2u8,tg2_cc5(h+50,8))}
+                  else      {let n=22.0+tg2_fbm2(&noise,wx,wz,sf,1.0,20.0,3.0);let h=n.round()as i32;let bt=if h<15{20u8}else{8u8};(h,bt,0u8)}}
+            4 => {let h=22i32;(h,4u8,tg2_cc6(h+13,1))}
+            5 => {let h=(22.0+tg2_fbm2(&noise,wx,wz,sf,2.0,4.0,3.0)).round()as i32;(h,2u8,tg2_cc2(h,6))}
+            6 => {let n=(18.0+tg2_fbm2(&noise,wx,wz,sf,1.0,18.0,3.0))/9.0+18.0;let h=n.round()as i32;let bt=if h<19{20u8}else{4u8};(h,bt,tg2_cc6(h+13,1))}
+            _ => (2i32,1u8,0u8) // flat/unknown
+        }
+    };
+    let cb=custom_biomes.unwrap_or_default();
+    let cba=[cb.first().copied().unwrap_or(0),cb.get(1).copied().unwrap_or(6),
+              cb.get(2).copied().unwrap_or(4),cb.get(3).copied().unwrap_or(2)];
+    for px in 0..pw { for py in 0..pw {
+        let wx=(px*step) as i32; let wz=(py*step) as i32;
+        let (h,bt,paint)=match terrain_type {
+            9 => { // custom mix: 4 quadrants
+                let q=if wx<gs/2{if wz<gs/2{0}else{2}}else{if wz<gs/2{1}else{3}};
+                preview_biome(cba[q],wx,wz,gs)
+            }
+            7 => {
+                if wx<gs/4&&wz<gs/4      {let h=(22.0+tg2_fbm2(&noise,wx,wz,sf,1.0,20.0,3.0)).round()as i32;(h,2u8,tg2_cc5(h+50,8))}
+                else if wx>=3*gs/4        {(8i32,2u8,tg2_cc2(8,0))}
+                else if wz>=3*gs/4        {let h=((18.0+tg2_fbm2(&noise,wx,wz,sf,1.0,18.0,3.0)/9.0) as i32).max(2).min(21);(h,4u8,0u8)}
+                else                      {let n=21.0+tg2_fbm2(&noise,wx,wz,sf2,1.0,8.0,3.0);let h=(n.min(31.0)).round()as i32;(h,8u8,tg2_cc3(h+30,3))}
+            }
+            t => preview_biome(t,wx,wz,gs)
+        };
+        let h=h.max(0).min(63);
+        let hr=(h+1).min(63);
+        let [r,gr,b]=block_color(bt,paint,14);
+        let shade=(1.0+(hr-h) as f64*0.04).clamp(0.6,1.4);
+        let ri=((r as f64*shade).round()as u32).min(255)as u8;
+        let gi=((gr as f64*shade).round()as u32).min(255)as u8;
+        let bi=((b as f64*shade).round()as u32).min(255)as u8;
+        let i=(py*pw+px)*4;
+        pixels[i]=ri;pixels[i+1]=gi;pixels[i+2]=bi;pixels[i+3]=255;
+    }}
+    Ok(PreviewImage{width:pw as u32,height:pw as u32,pixels})
 }
 
 /// Move the player spawn/home position to the given editor-coordinate pixel (px, py).
@@ -3643,6 +5321,9 @@ fn is_plantable(bt: u8) -> bool {
 // 0 = unpainted = dark green [10,63,13]; 22=[0,255,64]; 31=[0,191,48]; 40=[0,128,32]; 49=[0,64,16]
 const NORMAL_LEAF_PAINTS: [u8; 4] = [0, 22, 31, 40];
 const PINE_LEAF_PAINTS:   [u8; 3] = [31, 40, 49];
+// Snow biome: frosted foliage (white + light gray) and cold flowers (white + blue).
+const SNOW_LEAF_PAINTS:   [u8; 2] = [9, 18];     // white, 80% light gray
+const SNOW_FLOWER_PAINTS: [u8; 3] = [9, 6, 15];  // white, light blue, blue
 
 /// Deciduous mushroom-shaped tree (ported from NormalTree in reference, bug fixed: trunk placed
 /// after leaves so the log shows through the canopy, not overwritten by leaf blocks).
@@ -3702,9 +5383,10 @@ fn place_terrain_tree(world: &mut impl VoxelSink, wx: i32, wy: i32, z_base: i32,
     for dz in 0..trunk_h { world.put(wx, wy, z_base + dz, 6, 0); }
 }
 
-/// Small conical pine tree (ported from PineTree).
-fn place_pine_tree(world: &mut impl VoxelSink, wx: i32, wy: i32, z_base: i32, rng: &mut Rng64) {
-    let leaf_paint = PINE_LEAF_PAINTS[rng.range(0, 2) as usize];
+/// Small conical pine tree (ported from PineTree). `leaf_override` forces a leaf
+/// paint (e.g. frosted white in snow biomes); `None` picks a random green.
+fn place_pine_tree(world: &mut impl VoxelSink, wx: i32, wy: i32, z_base: i32, rng: &mut Rng64, leaf_override: Option<u8>) {
+    let leaf_paint = leaf_override.unwrap_or_else(|| PINE_LEAF_PAINTS[rng.range(0, 2) as usize]);
 
     // 8 leaf layers starting at dz=2 (trunk occupies dz=0..1)
     for dz in 2..10i32 {
@@ -3857,7 +5539,7 @@ fn generate_trees(
                     place_normal_tree(&mut world, wx, wy, z_base, trunk_h, leaf_paint);
                 }
                 "terrain"   => place_terrain_tree(&mut world, wx, wy, z_base, &mut rng),
-                "pine"      => place_pine_tree(&mut world, wx, wy, z_base, &mut rng),
+                "pine"      => place_pine_tree(&mut world, wx, wy, z_base, &mut rng, None),
                 "tall_pine" => place_tall_pine_tree(&mut world, wx, wy, z_base, &mut rng),
                 _ => {}
             }
@@ -4185,9 +5867,10 @@ fn get_block_at(world: &LoadedWorld, wx: i32, wy: i32, wz: i32) -> (u8, u8) {
     (0, 0)
 }
 
-/// True if this block fully occludes an adjacent face (solid, not air/transparent/ramp/wedge).
+/// True if this block fully occludes an adjacent face (not air, not notsolid, not ramp/wedge).
 fn obj_occludes(bt: u8) -> bool {
-    bt != 0 && transparent_alpha(bt).is_none() && !matches!(bt, 24..=55)
+    let idx = bt as usize;
+    idx != 0 && idx < BLOCK_INFO.len() && (BLOCK_INFO[idx] & (BI_NOTSOLID | BI_RAMPORSIDE)) == 0
 }
 
 /// Eden (X right, Y south, Z up) → OBJ (X right, Y up, Z toward viewer)
@@ -5408,13 +7091,114 @@ pub fn run() {
             get_obj_geometry,
             create_world,
             create_natural_world,
+            preview_natural_world,
             create_classic_world,
+            create_tg2_world,
+            preview_tg2_world,
             set_spawn_pos,
             import_schematic_info,
             import_schematic_apply,
+            get_sky_grid,
+            set_sky_grid,
+            get_creatures,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+// ── Sky grid (Phase 5) ───────────────────────────────────────────────────────
+
+/// Read the 4×4 sky-colour grid from header bytes 132–147.
+/// Returns 16 paint indices (0 = default blue, 1–54 = paint palette).
+#[tauri::command]
+fn get_sky_grid(state: tauri::State<'_, AppState>) -> Result<Vec<u8>, String> {
+    let ws = state.lock().unwrap();
+    let world = ws.world.as_ref().ok_or("No world loaded")?;
+    if world.bytes.len() < 148 {
+        return Ok(vec![0u8; 16]);
+    }
+    Ok(world.bytes[132..148].to_vec())
+}
+
+/// Write a 4×4 sky-colour grid to header bytes 132–147 and recompute sky majority.
+#[tauri::command]
+fn set_sky_grid(grid: Vec<u8>, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    if grid.len() != 16 { return Err("Expected exactly 16 sky values".into()); }
+    let mut ws = state.lock().unwrap();
+    let world = ws.world.as_mut().ok_or("No world loaded")?;
+    if world.bytes.len() < 148 { return Err("World header too short".into()); }
+    world.bytes[132..148].copy_from_slice(&grid);
+    // Recompute sky majority so grass tint updates without a reload.
+    let candidates: Vec<u8> = grid.iter().copied().filter(|&b| b != 14).collect();
+    world.sky = if candidates.is_empty() {
+        14
+    } else {
+        let mut counts = [0u32; 256];
+        for &b in &candidates { counts[b as usize] += 1; }
+        counts.iter().enumerate().max_by_key(|(_, &c)| c)
+            .map(|(i, _)| i as u8).unwrap_or(14)
+    };
+    Ok(())
+}
+
+// ── Creature viewer (Phase 6) ─────────────────────────────────────────────────
+
+#[derive(Serialize)]
+struct CreatureInfo {
+    type_id: i32,
+    color:   i32,
+    x:       f32,
+    y:       f32,
+    z:       f32,
+    angle:   f32,
+}
+
+/// Read up to 200 entity slots from the 12 000-byte block that precedes the
+/// chunk directory.  Skips empty slots (type == −1) and out-of-range types.
+/// Returns an empty list for editor-created worlds that have no entity block.
+#[tauri::command]
+fn get_creatures(state: tauri::State<'_, AppState>) -> Result<Vec<CreatureInfo>, String> {
+    const MAX_SAVED: usize = 200;
+    const ENTITY_BYTES: usize = 60; // sizeof(EntityData)
+    const BLOCK_SIZE: usize = MAX_SAVED * ENTITY_BYTES; // 12 000
+
+    let ws = state.lock().unwrap();
+    let world = ws.world.as_ref().ok_or("No world loaded")?;
+    let bytes = &world.bytes[..];
+
+    if bytes.len() < 192 { return Ok(vec![]); }
+
+    // directory_offset is stored as u64 at bytes 32..40 (but editor uses u32 in
+    // practice; read as u64 and clamp to usize).
+    let dir_off = u64::from_le_bytes(bytes[32..40].try_into().unwrap()) as usize;
+
+    // Sanity check: the entity block must fit before directory_offset.
+    if dir_off < BLOCK_SIZE || dir_off > bytes.len() { return Ok(vec![]); }
+
+    let block_start = dir_off - BLOCK_SIZE;
+    let mut out = Vec::new();
+
+    // EntityData layout (Vector.h):
+    //   pos(3×f32 @0): x=Eden-X, y=Eden-Z(up), z=Eden-Y(south)
+    //   vel(3×f32 @12)
+    //   angle(f32 @24)  type(i32 @28)  color(i32 @32)  touched/extra2/extra3/extra4 @36
+    for i in 0..MAX_SAVED {
+        let base = block_start + i * ENTITY_BYTES;
+        if base + ENTITY_BYTES > bytes.len() { break; }
+        let s = &bytes[base..base + ENTITY_BYTES];
+
+        let type_id = i32::from_le_bytes(s[28..32].try_into().unwrap());
+        if type_id < 0 || type_id > 6 { continue; } // −1 = empty slot
+
+        let pos_x   = f32::from_le_bytes(s[ 0.. 4].try_into().unwrap()); // Eden X
+        let pos_z   = f32::from_le_bytes(s[ 8..12].try_into().unwrap()); // Eden Y (south)
+        let pos_y   = f32::from_le_bytes(s[ 4.. 8].try_into().unwrap()); // Eden Z (height)
+        let angle   = f32::from_le_bytes(s[24..28].try_into().unwrap());
+        let color   = i32::from_le_bytes(s[32..36].try_into().unwrap());
+
+        out.push(CreatureInfo { type_id, color, x: pos_x, y: pos_z, z: pos_y, angle });
+    }
+    Ok(out)
 }
 
 // ── Minecraft Schematic / Litematica Import ──────────────────────────────────
@@ -6375,12 +8159,12 @@ mod tests {
         let chunk_size = 32_768usize;
         let cfg = NaturalConfig {
             seed: 12345, base_height: 28, roughness: 0.8, terrain_scale: 120.0, extreme: false,
-            water_z: 24, rivers: true, biome: 0, snow_caps: true,
-            tree_density_denom: 40, cave_density: 2, caverns: true,
+            water_z: 24, rivers: true, biome: 0, biome_mode: 0, biome_scale: 200.0, snow_caps: true,
+            tree_density_denom: 40, cave_density: 2, cave_style: 0, caverns: true,
             ore_density: 2, vegetation: 2, structures: 2, clouds: true,
         };
         let mut chunks: Vec<Vec<u8>> = (0..wc * hc).map(|_| vec![0u8; chunk_size]).collect();
-        let center = generate_natural_world(&mut chunks, wc, hc, &cfg, t_height);
+        let center = generate_natural_world(&mut chunks, wc, hc, &cfg, t_height, &mut |_, _| {});
 
         assert!(center >= 2 && center < t_height, "centre surface z out of range: {center}");
 
@@ -6408,15 +8192,232 @@ mod tests {
         let t_height = 64usize;
         let cfg = NaturalConfig {
             seed: 7, base_height: 20, roughness: 0.0, terrain_scale: 120.0, extreme: false,
-            water_z: -1, rivers: false, biome: 1, snow_caps: false,
-            tree_density_denom: 0, cave_density: 0, caverns: false,
+            water_z: -1, rivers: false, biome: 1, biome_mode: 0, biome_scale: 200.0, snow_caps: false,
+            tree_density_denom: 0, cave_density: 0, cave_style: 0, caverns: false,
             ore_density: 0, vegetation: 0, structures: 0, clouds: false,
         };
         let mut chunks: Vec<Vec<u8>> = (0..wc * hc).map(|_| vec![0u8; 32_768]).collect();
-        let center = generate_natural_world(&mut chunks, wc, hc, &cfg, t_height);
+        let center = generate_natural_world(&mut chunks, wc, hc, &cfg, t_height, &mut |_, _| {});
         // Flat terrain → centre surface should equal base height.
         assert_eq!(center, 20);
         assert_eq!(chunk_get(&chunks[0], 8, 8, center as usize), 4, "desert surface must be sand");
+    }
+
+    /// The Classic Hills biome must produce a grass-capped surface (so natural
+    /// decoration works) over a classic stone body, and its classic 3D-noise caves
+    /// must carve open air underground when enabled.
+    #[test]
+    fn natural_classic_biome_grass_cap_and_caves() {
+        let (wc, hc) = (3usize, 3usize);
+        let t_height = 64usize;
+        let base = NaturalConfig {
+            seed: 4242, base_height: 30, roughness: 0.6, terrain_scale: 120.0, extreme: false,
+            water_z: -1, rivers: false, biome: BIOME_CLASSIC, biome_mode: 0, biome_scale: 200.0, snow_caps: false,
+            tree_density_denom: 0, cave_density: 0, cave_style: 1, caverns: false,
+            ore_density: 0, vegetation: 0, structures: 0, clouds: false,
+        };
+
+        // Every column's surface is either a grass cap (soil) or a stone cap (rock
+        // outcrop), and always rests on a solid body. Both kinds must appear.
+        let mut chunks: Vec<Vec<u8>> = (0..wc * hc).map(|_| vec![0u8; 32_768]).collect();
+        let cn = ClassicNoise::new(base.seed);
+        let ccfg = classic_cfg_for_natural(&base);
+        generate_natural_world(&mut chunks, wc, hc, &base, t_height, &mut |_, _| {});
+        let (mut grass_caps, mut stone_caps) = (0u32, 0u32);
+        for cy in 0..hc { for cx in 0..wc {
+            for lx in 0..16usize { for ly in 0..16usize {
+                let wx = cx * 16 + lx; let wy = cy * 16 + ly;
+                let h = classic_height(&cn, wx as f64, wy as f64, &ccfg, t_height);
+                let top = chunk_get(&chunks[cy * wc + cx], lx, ly, h);
+                assert!(top == 8 || top == 2, "classic-biome cap must be grass or stone, got {top}");
+                assert_ne!(chunk_get(&chunks[cy * wc + cx], lx, ly, h - 1), 0, "cap must rest on a solid body");
+                if top == 8 { grass_caps += 1; } else { stone_caps += 1; }
+            }}
+        }}
+        assert!(grass_caps > 0, "classic biome should have grassy soil columns");
+        assert!(stone_caps > 0, "classic biome should expose stone outcrops top-down");
+
+        // Classic+ supports standing water (unlike the legacy Classic tab): a low
+        // water level must place water blocks.
+        let mut wet = base; wet.water_z = (base.base_height as i32 + 6).max(1);
+        let mut wch: Vec<Vec<u8>> = (0..wc * hc).map(|_| vec![0u8; 32_768]).collect();
+        generate_natural_world(&mut wch, wc, hc, &wet, t_height, &mut |_, _| {});
+        assert!(count_blocks(&wch, t_height, 20) > 0, "Classic+ with water should place water blocks");
+
+        // Caves on vs off: enabling caves must remove some stone (carve air).
+        let mut caves_off = base; caves_off.cave_density = 0;
+        let mut on = (0..wc * hc).map(|_| vec![0u8; 32_768]).collect::<Vec<_>>();
+        let mut off = (0..wc * hc).map(|_| vec![0u8; 32_768]).collect::<Vec<_>>();
+        let mut on_cfg = base; on_cfg.cave_density = 2;
+        generate_natural_world(&mut on,  wc, hc, &on_cfg,    t_height, &mut |_, _| {});
+        generate_natural_world(&mut off, wc, hc, &caves_off, t_height, &mut |_, _| {});
+        let stone_on  = count_blocks(&on,  t_height, 2);
+        let stone_off = count_blocks(&off, t_height, 2);
+        assert!(stone_on < stone_off, "classic caves should carve stone: on={stone_on} off={stone_off}");
+    }
+
+    /// Snow biome foliage must use the cold palette: white-painted weeds, frosted
+    /// (white / light-gray) tree leaves, and white/blue flowers — never the default
+    /// green / warm paints.
+    #[test]
+    fn natural_snow_foliage_is_cold() {
+        let (wc, hc) = (6usize, 6usize);
+        let t_height = 64usize;
+        let cfg = NaturalConfig {
+            seed: 808, base_height: 28, roughness: 0.5, terrain_scale: 120.0, extreme: false,
+            water_z: -1, rivers: false, biome: 2, biome_mode: 0, biome_scale: 200.0, snow_caps: false,
+            tree_density_denom: 6, cave_density: 0, cave_style: 0, caverns: false,
+            ore_density: 0, vegetation: 2, structures: 0, clouds: false,
+        };
+        let mut chunks: Vec<Vec<u8>> = (0..wc * hc).map(|_| vec![0u8; 32_768]).collect();
+        generate_natural_world(&mut chunks, wc, hc, &cfg, t_height, &mut |_, _| {});
+
+        let (mut weeds, mut leaves, mut flowers) = (0u32, 0u32, 0u32);
+        for cy in 0..hc { for cx in 0..wc {
+            let data = &chunks[cy * wc + cx];
+            for lx in 0..16 { for ly in 0..16 { for z in 0..t_height {
+                let bt = chunk_get(data, lx, ly, z);
+                let p = chunk_get_paint(data, lx, ly, z);
+                match bt {
+                    11 => { weeds += 1; assert_eq!(p, 9, "snow weeds must be white"); }
+                    5  => { leaves += 1; assert!(SNOW_LEAF_PAINTS.contains(&p), "snow leaves must be frosted, got paint {p}"); }
+                    73 => { flowers += 1; assert!(SNOW_FLOWER_PAINTS.contains(&p), "snow flowers must be cold, got paint {p}"); }
+                    _ => {}
+                }
+            }}}
+        }}
+        assert!(weeds > 0 && leaves > 0 && flowers > 0,
+            "expected snow weeds ({weeds}), leaves ({leaves}) and flowers ({flowers})");
+    }
+
+    /// Mixed-biome mode must vary the per-column biome across space (and stay
+    /// constant in single mode), and a generated mixed world must contain more
+    /// than one biome's surface material.
+    #[test]
+    fn natural_mixed_biomes_vary() {
+        let cfg = NaturalConfig {
+            seed: 2026, base_height: 30, roughness: 0.6, terrain_scale: 120.0, extreme: false,
+            water_z: -1, rivers: false, biome: 0, biome_mode: 1, biome_scale: 30.0, snow_caps: false,
+            tree_density_denom: 0, cave_density: 0, cave_style: 0, caverns: false,
+            ore_density: 0, vegetation: 0, structures: 0, clouds: false,
+        };
+        // biome_at returns several distinct biomes over a wide area (altitude held
+        // constant so this isolates the temperature/moisture blend).
+        let mut seen = HashSet::new();
+        for wy in 0..256i32 {
+            for wx in 0..256i32 {
+                seen.insert(biome_at(wx, wy, cfg.base_height, &cfg, 64));
+            }
+        }
+        assert!(seen.len() >= 2, "mixed mode should yield multiple biomes, got {seen:?}");
+
+        // Single mode is constant regardless of position.
+        let mut single = cfg; single.biome_mode = 0; single.biome = 1;
+        for wy in 0..40i32 {
+            for wx in 0..40i32 {
+                assert_eq!(biome_at(wx, wy, 30, &single, 64), 1, "single mode must be constant");
+            }
+        }
+
+        // A generated mixed world contains both desert sand and grassland grass.
+        let (wc, hc) = (8usize, 8usize);
+        let mut chunks: Vec<Vec<u8>> = (0..wc * hc).map(|_| vec![0u8; 32_768]).collect();
+        generate_natural_world(&mut chunks, wc, hc, &cfg, 64, &mut |_, _| {});
+        assert!(count_blocks(&chunks, 64, 4) > 0, "mixed world should have desert sand");
+        assert!(count_blocks(&chunks, 64, 8) > 0, "mixed world should have grassland grass");
+    }
+
+    /// The preview command returns a correctly-sized, non-blank RGB image and
+    /// honours the `max_px` cap.
+    #[test]
+    fn natural_preview_renders() {
+        let img = preview_natural_world(
+            16, 16, false,
+            7, 30, 2, 1, false,
+            "lakes".into(), true,
+            "grassland".into(), 1, 1, true,
+            2, 1, 0, true, 1, 1, 1, true,
+            64,
+        ).expect("preview failed");
+        assert!(img.width <= 64 && img.height <= 64, "preview must respect max_px");
+        assert_eq!(img.pixels.len(), (img.width * img.height * 4) as usize, "RGBA buffer size");
+        assert!(img.pixels.iter().any(|&c| c != 0), "preview should not be blank");
+    }
+
+    /// Steep terrain must expose bare rock at the surface (cliff faces), while
+    /// perfectly flat terrain keeps its soil surface.
+    #[test]
+    fn natural_cliffs_expose_rock() {
+        let t_height = 64usize;
+        // Surface block = first non-air scanning down from the top of a column.
+        let surface_of = |data: &Vec<u8>, lx: usize, ly: usize| -> u8 {
+            for z in (0..t_height).rev() {
+                let b = chunk_get(data, lx, ly, z);
+                if b != 0 { return b; }
+            }
+            0
+        };
+
+        // Jagged, dry grassland → some columns are steep enough to show stone.
+        let jagged = NaturalConfig {
+            seed: 555, base_height: 30, roughness: 1.05, terrain_scale: 60.0, extreme: false,
+            water_z: -1, rivers: false, biome: 0, biome_mode: 0, biome_scale: 200.0, snow_caps: false,
+            tree_density_denom: 0, cave_density: 0, cave_style: 0, caverns: false,
+            ore_density: 0, vegetation: 0, structures: 0, clouds: false,
+        };
+        let (wc, hc) = (4usize, 4usize);
+        let mut chunks: Vec<Vec<u8>> = (0..wc * hc).map(|_| vec![0u8; 32_768]).collect();
+        generate_natural_world(&mut chunks, wc, hc, &jagged, t_height, &mut |_, _| {});
+        let mut rock = 0;
+        for cy in 0..hc { for cx in 0..wc {
+            let data = &chunks[cy * wc + cx];
+            for lx in 0..16 { for ly in 0..16 {
+                if surface_of(data, lx, ly) == 2 { rock += 1; }
+            }}
+        }}
+        assert!(rock > 0, "jagged terrain should expose surface rock on cliffs");
+
+        // Flat terrain → centre column surface stays grass, never stone.
+        let mut flat = jagged; flat.roughness = 0.0;
+        let mut fc: Vec<Vec<u8>> = (0..wc * hc).map(|_| vec![0u8; 32_768]).collect();
+        let center = generate_natural_world(&mut fc, wc, hc, &flat, t_height, &mut |_, _| {});
+        assert_eq!(chunk_get(&fc[0], 8, 8, center), 8, "flat terrain centre must stay grass");
+    }
+
+    /// Weeds (block 11) are a solid grass variant and must replace the surface
+    /// block, never stack on top of grass — regression guard for the bug where
+    /// they floated one cell above the grass surface.
+    #[test]
+    fn natural_weeds_flush_with_surface() {
+        let (wc, hc) = (4usize, 4usize);
+        let t_height = 64usize;
+        let cfg = NaturalConfig {
+            seed: 123, base_height: 30, roughness: 0.5, terrain_scale: 110.0, extreme: false,
+            water_z: -1, rivers: false, biome: 0, biome_mode: 0, biome_scale: 200.0, snow_caps: false,
+            tree_density_denom: 0, cave_density: 0, cave_style: 0, caverns: false,
+            ore_density: 0, vegetation: 2, structures: 0, clouds: false,
+        };
+        let mut chunks: Vec<Vec<u8>> = (0..wc * hc).map(|_| vec![0u8; 32_768]).collect();
+        generate_natural_world(&mut chunks, wc, hc, &cfg, t_height, &mut |_, _| {});
+
+        let mut weeds = 0usize;
+        for cy in 0..hc {
+            for cx in 0..wc {
+                let data = &chunks[cy * wc + cx];
+                for lx in 0..16 { for ly in 0..16 { for z in 1..t_height {
+                    if chunk_get(data, lx, ly, z) == 11 {
+                        weeds += 1;
+                        // The old bug placed weeds one cell above the grass, so a
+                        // weed sat directly on a grass/weeds block. A flush weed
+                        // replaces the surface and rests on dirt/stone instead.
+                        let below = chunk_get(data, lx, ly, z - 1);
+                        assert!(below != 8 && below != 11,
+                            "weed at local ({lx},{ly},{z}) stacks on grass/weeds ({below}) — should be flush");
+                    }
+                }}}
+            }
+        }
+        assert!(weeds > 0, "expected some weeds to be generated");
     }
 
     /// No foliage may share a column with standing water — guards the fix for
@@ -6427,12 +8428,12 @@ mod tests {
         let t_height = 64usize;
         let cfg = NaturalConfig {
             seed: 99, base_height: 30, roughness: 0.9, terrain_scale: 90.0, extreme: false,
-            water_z: 26, rivers: true, biome: 0, snow_caps: false,
-            tree_density_denom: 8, cave_density: 0, caverns: false,
+            water_z: 26, rivers: true, biome: 0, biome_mode: 0, biome_scale: 200.0, snow_caps: false,
+            tree_density_denom: 8, cave_density: 0, cave_style: 0, caverns: false,
             ore_density: 0, vegetation: 2, structures: 0, clouds: false,
         };
         let mut chunks: Vec<Vec<u8>> = (0..wc * hc).map(|_| vec![0u8; 32_768]).collect();
-        generate_natural_world(&mut chunks, wc, hc, &cfg, t_height);
+        generate_natural_world(&mut chunks, wc, hc, &cfg, t_height, &mut |_, _| {});
 
         let is_foliage = |b: u8| matches!(b, 5 | 6 | 11 | 16 | 73);
         for cy in 0..hc {
@@ -6482,7 +8483,7 @@ mod tests {
         let t_height = 64usize;
 
         let mut on: Vec<Vec<u8>> = (0..wc * hc).map(|_| vec![0u8; 32_768]).collect();
-        generate_classic_world(&mut on, wc, hc, &classic_cfg(2024, true, 0), t_height);
+        generate_classic_world(&mut on, wc, hc, &classic_cfg(2024, true, 0), t_height, &mut |_, _| {});
         let flowers = count_blocks(&on, t_height, 73);
         let grass   = count_blocks(&on, t_height, 8);
         assert!(grass > 0, "expected a grass surface");
@@ -6492,7 +8493,7 @@ mod tests {
         let mut off_cfg = classic_cfg(2024, true, 0);
         off_cfg.flowers = false;
         let mut off: Vec<Vec<u8>> = (0..wc * hc).map(|_| vec![0u8; 32_768]).collect();
-        generate_classic_world(&mut off, wc, hc, &off_cfg, t_height);
+        generate_classic_world(&mut off, wc, hc, &off_cfg, t_height, &mut |_, _| {});
         assert_eq!(count_blocks(&off, t_height, 73), 0, "flowers present with option off");
     }
 
@@ -6505,10 +8506,11 @@ mod tests {
             let p = std::env::temp_dir().join(format!("eden_ver_{extended}.eden"));
             let ps = p.to_str().unwrap().to_string();
             let _ = fs::remove_file(&p);
-            create_classic_world(
+            create_classic_world_inner(
                 ps.clone(), "VerTest".into(),
                 2, 2, extended,
                 7, 2, 0, true, false, 1, true, true,
+                &mut |_, _| {},
             ).expect("create failed");
 
             let b = fs::read(&p).expect("read back");
@@ -6525,6 +8527,66 @@ mod tests {
         }
     }
 
+    fn tg2_cfg(seed: u32, terrain_type: u8) -> Tg2Config {
+        Tg2Config {
+            seed, terrain_type, sky_islands: false, struct_freq: 1, clouds: false,
+            amplitude: 1.0, sea_level_off: 0, blend: false,
+            caves: false, tall_caves: false, custom_biomes: [0,6,4,2],
+        }
+    }
+
+    /// A 256z (New Dawn) TG2 world must proportionally fill the taller space —
+    /// its surface should track ~t_height/2 (≈128), not stay pinned near the
+    /// legacy 64z baseline (~32). 64z generation must be unaffected (vs=1.0).
+    #[test]
+    fn tg2_scales_to_extended_height() {
+        let (wc, hc) = (4usize, 4usize);
+        let cfg = tg2_cfg(4242, 0); // Plains: baseline = t_height/2
+
+        let mut c64: Vec<Vec<u8>> = (0..wc * hc).map(|_| vec![0u8; 32_768]).collect();
+        let surf64 = generate_tg2_world(&cfg, wc, hc, 64, &mut c64, &mut |_, _| {});
+
+        let mut c256: Vec<Vec<u8>> = (0..wc * hc).map(|_| vec![0u8; 131_072]).collect();
+        let surf256 = generate_tg2_world(&cfg, wc, hc, 256, &mut c256, &mut |_, _| {});
+
+        assert!((20..45).contains(&surf64), "64z plains surface off baseline: {surf64}");
+        assert!((100..160).contains(&surf256), "256z plains surface did not fill height: {surf256}");
+
+        // The tall world must carry solid terrain well above the legacy 64-block
+        // ceiling (surf64 ≈ baseline already proves the 64z path is unchanged).
+        let mut solid_high = false;
+        'o: for data in &c256 {
+            for lx in 0..16 { for ly in 0..16 {
+                for z in 100..130 { if chunk_get(data, lx, ly, z) != 0 { solid_high = true; break 'o; } }
+            }}
+        }
+        assert!(solid_high, "256z world has no terrain near z=128");
+    }
+
+    /// The biome-blend pass only adds blocks (never carves), so it must not lower
+    /// any column's surface, and it should add solid volume that softens seams.
+    #[test]
+    fn tg2_blend_only_adds_terrain() {
+        let (wc, hc) = (6usize, 6usize);
+        let solid = |chunks: &[Vec<u8>]| -> usize {
+            let mut n = 0;
+            for data in chunks { for lx in 0..16 { for ly in 0..16 { for z in 0..64 {
+                if chunk_get(data, lx, ly, z) != 0 { n += 1; }
+            }}}}
+            n
+        };
+        let mut plain: Vec<Vec<u8>> = (0..wc * hc).map(|_| vec![0u8; 32_768]).collect();
+        generate_tg2_world(&tg2_cfg(99, 7), wc, hc, 64, &mut plain, &mut |_, _| {});
+
+        let mut blended_cfg = tg2_cfg(99, 7);
+        blended_cfg.blend = true;
+        let mut blended: Vec<Vec<u8>> = (0..wc * hc).map(|_| vec![0u8; 32_768]).collect();
+        generate_tg2_world(&blended_cfg, wc, hc, 64, &mut blended, &mut |_, _| {});
+
+        assert!(solid(&blended) >= solid(&plain),
+            "blend removed terrain: {} < {}", solid(&blended), solid(&plain));
+    }
+
     /// Weeds (block 11) must appear on the surface but stay at most half of the
     /// ground cover (grass 8 + weeds 11) — too many were never the crash cause
     /// (flowers were), but the legacy look keeps grass dominant.
@@ -6533,7 +8595,7 @@ mod tests {
         let (wc, hc) = (4usize, 4usize);
         let t_height = 64usize;
         let mut chunks: Vec<Vec<u8>> = (0..wc * hc).map(|_| vec![0u8; 32_768]).collect();
-        generate_classic_world(&mut chunks, wc, hc, &classic_cfg(2024, true, 0), t_height);
+        generate_classic_world(&mut chunks, wc, hc, &classic_cfg(2024, true, 0), t_height, &mut |_, _| {});
         let grass = count_blocks(&chunks, t_height, 8);
         let weeds = count_blocks(&chunks, t_height, 11);
         assert!(weeds > 0, "expected some tall grass / weeds on the surface");
@@ -6564,11 +8626,11 @@ mod tests {
         let mut normal_cfg = classic_cfg(2024, true, 0);
         normal_cfg.clouds = false; // clouds raise `top` and leak sky air into the measure
         let mut normal: Vec<Vec<u8>> = (0..wc * hc).map(|_| vec![0u8; 32_768]).collect();
-        generate_classic_world(&mut normal, wc, hc, &normal_cfg, t_height);
+        generate_classic_world(&mut normal, wc, hc, &normal_cfg, t_height, &mut |_, _| {});
         let mut tall_cfg = normal_cfg;
         tall_cfg.tall_caves = true;
         let mut tall: Vec<Vec<u8>> = (0..wc * hc).map(|_| vec![0u8; 32_768]).collect();
-        generate_classic_world(&mut tall, wc, hc, &tall_cfg, t_height);
+        generate_classic_world(&mut tall, wc, hc, &tall_cfg, t_height, &mut |_, _| {});
 
         assert!(highest_cave_air(&tall) > highest_cave_air(&normal),
             "tall caves ({}) should reach higher than normal caves ({})",
@@ -6585,7 +8647,7 @@ mod tests {
         let (wc, hc) = (3usize, 3usize);
         let t_height = 64usize;
         let mut chunks: Vec<Vec<u8>> = (0..wc * hc).map(|_| vec![0u8; 32_768]).collect();
-        let center = generate_classic_world(&mut chunks, wc, hc, &classic_cfg(2024, true, 50), t_height);
+        let center = generate_classic_world(&mut chunks, wc, hc, &classic_cfg(2024, true, 50), t_height, &mut |_, _| {});
         assert!(center >= 3 && center < t_height, "centre surface z out of range: {center}");
 
         let mut grass = 0usize;
@@ -6647,7 +8709,7 @@ mod tests {
         let (wc, hc) = (4usize, 4usize);
         let t_height = 64usize;
         let mut chunks: Vec<Vec<u8>> = (0..wc * hc).map(|_| vec![0u8; 32_768]).collect();
-        generate_classic_world(&mut chunks, wc, hc, &classic_cfg(31337, false, 12), t_height);
+        generate_classic_world(&mut chunks, wc, hc, &classic_cfg(31337, false, 12), t_height, &mut |_, _| {});
 
         let water_mask = vec![false; wc * 16 * hc * 16];
         let gen = WorldGen { chunks: &mut chunks, wc, hc, t_height, water_mask: &water_mask };
