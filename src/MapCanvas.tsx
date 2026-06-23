@@ -115,6 +115,8 @@ interface Props {
   onMagicWand?: (wx: number, wy: number) => void;
   /** Spawn/home position in editor pixel coords — drawn as a marker on the map. */
   spawnPos?: { px: number; py: number } | null;
+  /** Creature list from get_creatures() — drawn as coloured dots when non-empty. */
+  creatures?: { type_id: number; color: number; x: number; y: number }[];
 }
 
 function decodePixels(b64: string): Uint8Array {
@@ -132,7 +134,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     renderMode, axoSkew = 0.2, lockedPastePos = null,
     drawConfig, onDrawStroke, drawZOverride = null,
     extrudePreview = null, lastPasteDelta = null, onCursorMove, onMagicWand,
-    spawnPos = null }: Props,
+    spawnPos = null, creatures = [] }: Props,
   ref,
 ) {
   const canvasRef  = useRef<HTMLCanvasElement>(null);
@@ -178,6 +180,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   const onCursorMoveRef   = useRef(onCursorMove);
   const onMagicWandRef    = useRef(onMagicWand);
   const spawnPosRef       = useRef(spawnPos);
+  const creaturesRef      = useRef(creatures);
 
   useEffect(() => { toolRef.current = tool; }, [tool]);
   useEffect(() => { onSelChangeRef.current = onSelectionChange; }, [onSelectionChange]);
@@ -191,6 +194,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   useEffect(() => { onCursorMoveRef.current = onCursorMove; }, [onCursorMove]);
   useEffect(() => { onMagicWandRef.current  = onMagicWand;  }, [onMagicWand]);
   useEffect(() => { spawnPosRef.current     = spawnPos;     }, [spawnPos]);
+  useEffect(() => { creaturesRef.current    = creatures;    }, [creatures]);
 
   const mapW = world.width_chunks * 16;
   const mapH = world.height_chunks * 16;
@@ -346,6 +350,32 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
           ctx.textBaseline = "alphabetic";
         }
         ctx.restore();
+      }
+    }
+
+    // Creature markers — coloured dots at each creature's world position
+    {
+      const clist = creaturesRef.current;
+      if (clist.length > 0) {
+        // Per-type colours from creatureColor[NUM_CREATURES+1][3] (Globals.mm)
+        const typeColors = ["#4646ff","#73ce4a","#ff46ff","#ff46ff","#ffa500","#eb1414","#eb1414"];
+        const r2 = Math.max(3, Math.min(8, scale * 1.2));
+        for (const c of clist) {
+          const cx2 = Math.round(c.x * scale + vx);
+          const cy2 = Math.round(c.y * scale + vy);
+          const baseCol = typeColors[c.type_id] ?? "#ffffff";
+          ctx.save();
+          ctx.beginPath();
+          ctx.arc(cx2, cy2, r2, 0, Math.PI * 2);
+          ctx.fillStyle = baseCol;
+          ctx.globalAlpha = 0.85;
+          ctx.fill();
+          ctx.globalAlpha = 1;
+          ctx.strokeStyle = "#000";
+          ctx.lineWidth = 1;
+          ctx.stroke();
+          ctx.restore();
+        }
       }
     }
 

@@ -1,16 +1,31 @@
 import { useState, useCallback, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { getVersion } from "@tauri-apps/api/app";
 import { open, save } from "@tauri-apps/plugin-dialog";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import MapCanvas, { type Tool, type SelectionBounds, type PixelPatch, type MapCanvasRef } from "./MapCanvas";
-import { BLOCK_DEFS, PAINT_COLORS, resolveColor, RAMP_FAMILIES, RAMP_DIRS, rampFamilyBase, rampDirIndex, blockDisplayName } from "./blockDefs";
+import { BLOCK_DEFS, PAINT_COLORS, resolveColor, RAMP_FAMILIES, RAMP_DIRS, WEDGE_FAMILIES, WEDGE_DIRS, rampFamilyBase, wedgeFamilyBase, rampDirIndex, blockDisplayName, doorFamilyBase, portalFamilyBase, DOOR_PORTAL_DIRS, EXPANSION_BLOCKS, isExpansionBlock, PARTIAL_WATER, PARTIAL_LAVA, SPECIAL_BLOCKS } from "./blockDefs";
 import SelectionInspector from "./SelectionInspector";
 import ElevationPreviewPanel from "./ElevationPreviewPanel";
 import HelpModal from "./HelpModal";
+import AboutModal from "./AboutModal";
 import WorldBrowserModal from "./WorldBrowserModal";
 import UploadModal from "./UploadModal";
 import NewWorldModal from "./NewWorldModal";
 import SchematicImportModal, { type SchematicInfo, type MappingEntry } from "./SchematicImportModal";
 import "./App.css";
+
+function SplashLink({ href, children }: { href: string; children: React.ReactNode }) {
+  return (
+    <a
+      href="#"
+      onClick={(e) => { e.preventDefault(); openUrl(href); }}
+      style={{ color: "#64748b", textDecoration: "underline" }}
+    >
+      {children}
+    </a>
+  );
+}
 
 // World metadata — pixels are never stored in JS; tiles are fetched on demand.
 interface WorldData {
@@ -50,6 +65,24 @@ export interface ClipboardInfo {
 
 export type ExtrudeAxis = "z+" | "z-" | "x+" | "x-" | "y+" | "y-";
 export type TreeType = "normal" | "terrain" | "pine" | "tall_pine";
+
+const RECENT_WORLDS_KEY = "eden_recent_worlds";
+const MAX_RECENT = 8;
+
+interface RecentWorld { path: string; name: string; timestamp: number; }
+
+function timeAgo(ts: number): string {
+  const s = Math.floor((Date.now() - ts) / 1000);
+  if (s < 60) return "just now";
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ago`;
+  const d = Math.floor(h / 24);
+  if (d < 7) return `${d}d ago`;
+  if (d < 31) return `${Math.floor(d / 7)}w ago`;
+  return new Date(ts).toLocaleDateString(undefined, { month: "short", day: "numeric" });
+}
 
 // ── shared styles ────────────────────────────────────────────────────────────
 
@@ -108,6 +141,11 @@ function App() {
   const [saving, setSaving] = useState(false);
   const [saveCompressed, setSaveCompressed] = useState(false);
   const [fileMenuOpen, setFileMenuOpen] = useState(false);
+  const [showRecentSubmenu, setShowRecentSubmenu] = useState(false);
+  const [recentWorlds, setRecentWorlds] = useState<RecentWorld[]>(() => {
+    try { return JSON.parse(localStorage.getItem(RECENT_WORLDS_KEY) ?? "[]"); }
+    catch { return []; }
+  });
   const fileMenuRef = useRef<HTMLDivElement>(null);
   const [viewMenuOpen, setViewMenuOpen] = useState(false);
   const viewMenuRef = useRef<HTMLDivElement>(null);
@@ -121,6 +159,11 @@ function App() {
   const [renderMode, setRenderMode] = useState<"tiled" | "full" | "axo">("tiled");
   const [axoSkew, setAxoSkew] = useState(0.2);
   const [showHelp, setShowHelp] = useState(false);
+  const [showAbout, setShowAbout] = useState(false);
+  const [helpMenuOpen, setHelpMenuOpen] = useState(false);
+  const helpMenuRef = useRef<HTMLDivElement>(null);
+  const [appVersion, setAppVersion] = useState("…");
+  useEffect(() => { getVersion().then(setAppVersion); }, []);
   const [showElevationPanel, setShowElevationPanel] = useState(false);
   const [showWorldBrowser, setShowWorldBrowser] = useState(false);
   const [showUploadModal, setShowUploadModal] = useState(false);
@@ -187,6 +230,8 @@ function App() {
   const [lastPasteDelta, setLastPasteDelta] = useState<{ dx: number; dy: number } | null>(null);
   const lastPastePosRef   = useRef<{ x: number; y: number } | null>(null);
   const lastPasteDeltaRef = useRef<{ dx: number; dy: number } | null>(null);
+
+  // Creature viewer (Phase 6) — UI + state hidden pending testing; Rust get_creatures command is implemented
 
   // Z-slice follow-surface mode
   const [followSurface, setFollowSurface] = useState(false);
@@ -313,6 +358,14 @@ function App() {
     setEditEpoch(e => e + 1);
   }
 
+  function addRecentWorld(path: string, name: string) {
+    setRecentWorlds(prev => {
+      const next = [{ path, name, timestamp: Date.now() }, ...prev.filter(r => r.path !== path)].slice(0, MAX_RECENT);
+      try { localStorage.setItem(RECENT_WORLDS_KEY, JSON.stringify(next)); } catch {}
+      return next;
+    });
+  }
+
   async function openFile() {
     const selected = await open({
       filters: [{ name: "Eden World", extensions: ["eden", "zip"] }],
@@ -340,6 +393,7 @@ function App() {
       setClipboard(null);
       setSaveCompressed(data.was_compressed);
       setSpawnPos(data.spawn_px != null && data.spawn_py != null ? { px: data.spawn_px, py: data.spawn_py } : null);
+      addRecentWorld(selected, data.name);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -369,6 +423,7 @@ function App() {
       setClipboard(null);
       setSaveCompressed(data.was_compressed);
       setSpawnPos(data.spawn_px != null && data.spawn_py != null ? { px: data.spawn_px, py: data.spawn_py } : null);
+      addRecentWorld(path, data.name);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -731,7 +786,7 @@ function App() {
 
   // Close menus when clicking outside them.
   useEffect(() => {
-    if (!fileMenuOpen) return;
+    if (!fileMenuOpen) { setShowRecentSubmenu(false); return; }
     function handleOutside(e: MouseEvent) {
       if (fileMenuRef.current && !fileMenuRef.current.contains(e.target as Node)) {
         setFileMenuOpen(false);
@@ -762,6 +817,17 @@ function App() {
     document.addEventListener("mousedown", handleOutside);
     return () => document.removeEventListener("mousedown", handleOutside);
   }, [drawMenuOpen]);
+
+  useEffect(() => {
+    if (!helpMenuOpen) return;
+    function handleOutside(e: MouseEvent) {
+      if (helpMenuRef.current && !helpMenuRef.current.contains(e.target as Node)) {
+        setHelpMenuOpen(false);
+      }
+    }
+    document.addEventListener("mousedown", handleOutside);
+    return () => document.removeEventListener("mousedown", handleOutside);
+  }, [helpMenuOpen]);
 
 const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
     setRawBounds(bounds);
@@ -942,6 +1008,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           onCursorMove={handleCursorMove}
           onMagicWand={handleMagicWand}
           spawnPos={spawnPos}
+          creatures={[]}
         />
 
         {/* Top-left: world info + inline rename */}
@@ -1458,6 +1525,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
                     </span>
                   </div>
                 )}
+                {/* Sky Editor and Creature Viewer implemented but hidden pending testing */}
               </div>
             )}
           </div>
@@ -1489,6 +1557,30 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
                 <button onClick={() => { setFileMenuOpen(false); openFile(); }} style={menuItem}>
                   Open…
                 </button>
+                <button
+                  onClick={() => setShowRecentSubmenu(v => !v)}
+                  style={{ ...menuItem, display: "flex", justifyContent: "space-between", alignItems: "center", color: recentWorlds.length === 0 ? "#475569" : "#e2e8f0" }}
+                >
+                  <span>Open Recent</span>
+                  <span style={{ fontSize: 10 }}>{showRecentSubmenu ? "▴" : "▾"}</span>
+                </button>
+                {showRecentSubmenu && (
+                  <div style={{ background: "#07090f", borderTop: "1px solid #1e293b", borderBottom: "1px solid #1e293b", margin: "2px 0" }}>
+                    {recentWorlds.length === 0 ? (
+                      <div style={{ ...menuItem, color: "#475569", cursor: "default" }}>No recent worlds</div>
+                    ) : recentWorlds.map(r => (
+                      <button
+                        key={r.path}
+                        onClick={() => { setFileMenuOpen(false); setShowRecentSubmenu(false); openFileAt(r.path); }}
+                        style={{ ...menuItem, paddingLeft: 20, paddingTop: 5, paddingBottom: 5 }}
+                        title={r.path}
+                      >
+                        <div style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 210 }}>{r.name}</div>
+                        <div style={{ fontSize: 11, color: "#64748b", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 210 }}>{timeAgo(r.timestamp)}</div>
+                      </button>
+                    ))}
+                  </div>
+                )}
                 <div style={menuDivider} />
                 {/* Save (only when a file is open) */}
                 <button
@@ -1559,14 +1651,41 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
             )}
           </div>
 
-          {/* Help */}
-          <button
-            onClick={() => setShowHelp(h => !h)}
-            style={showHelp ? { ...overlayBtn, background: "rgba(59,130,246,0.35)", borderColor: "#3b82f6" } : overlayBtn}
-            title="Keyboard shortcuts (?)"
-          >
-            ?
-          </button>
+          {/* Help dropdown */}
+          <div ref={helpMenuRef} style={{ position: "relative" }}>
+            <button
+              onClick={() => setHelpMenuOpen(o => !o)}
+              style={helpMenuOpen ? { ...overlayBtn, background: "rgba(59,130,246,0.35)", borderColor: "#3b82f6" } : overlayBtn}
+            >
+              Help {helpMenuOpen ? "▴" : "▾"}
+            </button>
+            {helpMenuOpen && (
+              <div style={{
+                position: "absolute", top: "calc(100% + 4px)", right: 0,
+                background: "#1a1f2e", border: "1px solid #2d3448",
+                borderRadius: 8, minWidth: 180, zIndex: 200,
+                boxShadow: "0 8px 24px rgba(0,0,0,0.5)",
+                overflow: "hidden",
+              }}>
+                <button
+                  onClick={() => { setHelpMenuOpen(false); setShowHelp(true); }}
+                  style={{ ...menuItem, width: "100%", textAlign: "left" }}
+                  onMouseEnter={e => (e.currentTarget.style.background = "#232a3d")}
+                  onMouseLeave={e => (e.currentTarget.style.background = "transparent")}
+                >
+                  Keyboard Shortcuts <span style={{ color: "#4b5568", marginLeft: 8 }}>?</span>
+                </button>
+                <button
+                  onClick={() => { setHelpMenuOpen(false); setShowAbout(true); }}
+                  style={{ ...menuItem, width: "100%", textAlign: "left" }}
+                  onMouseEnter={e => (e.currentTarget.style.background = "#232a3d")}
+                  onMouseLeave={e => (e.currentTarget.style.background = "transparent")}
+                >
+                  About VuencEdit
+                </button>
+              </div>
+            )}
+          </div>
         </div>
 
         {/* Bottom-left: z-range + selection info + fill picker */}
@@ -1978,28 +2097,76 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
                 </div>
                 <div style={{ display: "grid", gridTemplateColumns: "repeat(7, 18px)", gap: 2 }}>
                   {BLOCK_DEFS.map((b) => {
+                    const isRamp = rampFamilyBase(b.type) !== null;
                     const selected = fillBlockType === b.type ||
                       (rampFamilyBase(fillBlockType) !== null &&
-                       rampFamilyBase(fillBlockType) === rampFamilyBase(b.type));
+                       rampFamilyBase(fillBlockType) === rampFamilyBase(b.type)) ||
+                      (wedgeFamilyBase(fillBlockType) !== null &&
+                       wedgeFamilyBase(fillBlockType) === wedgeFamilyBase(b.type)) ||
+                      (doorFamilyBase(fillBlockType) !== null && b.type === 66) ||
+                      (portalFamilyBase(fillBlockType) !== null && b.type === 75) ||
+                      (isExpansionBlock(fillBlockType) && b.type === 82);
+                    const bg = `rgb(${b.color[0]},${b.color[1]},${b.color[2]})`;
+                    const border = selected ? "2px solid #fff" : "2px solid rgba(255,255,255,0.08)";
                     return (
                       <div
                         key={b.type}
                         title={`${b.name} (type ${b.type})`}
                         onClick={() => setFillBlockType(b.type)}
                         style={{
-                          width: 18, height: 18,
-                          background: `rgb(${b.color[0]},${b.color[1]},${b.color[2]})`,
+                          width: 18, height: 18, position: "relative",
+                          background: isRamp ? "rgba(255,255,255,0.04)" : bg,
+                          borderRadius: 2, cursor: "pointer",
+                          boxSizing: "border-box",
+                          border,
+                          outline: selected ? "1px solid #3b82f6" : "none",
+                          outlineOffset: 1,
+                          overflow: "hidden",
+                        }}
+                      >
+                        {isRamp && (
+                          <div style={{
+                            position: "absolute", inset: 0,
+                            background: bg,
+                            clipPath: "polygon(0% 100%, 100% 100%, 100% 0%)",
+                          }} />
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+                {/* Wedge family picker row — diamond shape to distinguish from ramps */}
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 18px)", gap: 2, marginTop: 2 }}>
+                  {WEDGE_FAMILIES.map((wf) => {
+                    const selected = wedgeFamilyBase(fillBlockType) === wf.base;
+                    const bg = `rgb(${wf.color[0]},${wf.color[1]},${wf.color[2]})`;
+                    return (
+                      <div
+                        key={wf.base}
+                        title={`${wf.name} (type ${wf.base})`}
+                        onClick={() => setFillBlockType(wf.base + (rampDirIndex(fillBlockType)))}
+                        style={{
+                          width: 18, height: 18, position: "relative",
+                          background: "rgba(255,255,255,0.04)",
                           borderRadius: 2, cursor: "pointer",
                           boxSizing: "border-box",
                           border: selected ? "2px solid #fff" : "2px solid rgba(255,255,255,0.08)",
                           outline: selected ? "1px solid #3b82f6" : "none",
                           outlineOffset: 1,
+                          overflow: "hidden",
                         }}
-                      />
+                      >
+                        {/* Diamond = 45°-rotated square, visually distinct from ramp triangle */}
+                        <div style={{
+                          position: "absolute", inset: 0,
+                          background: bg,
+                          clipPath: "polygon(50% 0%, 100% 50%, 50% 100%, 0% 50%)",
+                        }} />
+                      </div>
                     );
                   })}
                 </div>
-                {/* Orientation selector — only shown when a ramp family is selected */}
+                {/* Orientation selector — ramps (S/W/N/E) */}
                 {rampFamilyBase(fillBlockType) !== null && (() => {
                   const base = rampFamilyBase(fillBlockType)!;
                   const family = RAMP_FAMILIES.find((f) => f.base === base);
@@ -2028,6 +2195,149 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
                     </div>
                   );
                 })()}
+                {/* Orientation selector — wedges (SE/SW/NW/NE apex) */}
+                {wedgeFamilyBase(fillBlockType) !== null && (() => {
+                  const base = wedgeFamilyBase(fillBlockType)!;
+                  const family = WEDGE_FAMILIES.find((f) => f.base === base);
+                  return (
+                    <div style={{ display: "flex", alignItems: "center", gap: 3, marginTop: 1 }}>
+                      <span style={{ color: "#64748b", fontSize: 9, minWidth: 20 }}>Apex</span>
+                      {WEDGE_DIRS.map((dir, i) => {
+                        const active = rampDirIndex(fillBlockType) === i;
+                        return (
+                          <button
+                            key={dir}
+                            onClick={() => setFillBlockType(base + i)}
+                            style={{
+                              width: 26, padding: "1px 0", fontSize: 10, cursor: "pointer",
+                              background: active ? "rgba(59,130,246,0.35)" : "rgba(255,255,255,0.04)",
+                              border: `1px solid ${active ? "#3b82f6" : "#334155"}`,
+                              color: active ? "#93c5fd" : "#64748b",
+                              borderRadius: 3,
+                            }}
+                            title={`${family?.name} apex at ${["SE","SW","NW","NE"][i]}`}
+                          >
+                            {dir}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  );
+                })()}
+                {/* Orientation selector — doors (S/W/N/E) */}
+                {doorFamilyBase(fillBlockType) !== null && (
+                  <div style={{ display: "flex", alignItems: "center", gap: 3, marginTop: 1 }}>
+                    <span style={{ color: "#64748b", fontSize: 9, minWidth: 20 }}>Dir</span>
+                    {DOOR_PORTAL_DIRS.map((dir, i) => {
+                      const active = fillBlockType - 66 === i;
+                      return (
+                        <button
+                          key={dir}
+                          onClick={() => setFillBlockType(66 + i)}
+                          style={{
+                            width: 22, padding: "1px 0", fontSize: 10, cursor: "pointer",
+                            background: active ? "rgba(59,130,246,0.35)" : "rgba(255,255,255,0.04)",
+                            border: `1px solid ${active ? "#3b82f6" : "#334155"}`,
+                            color: active ? "#93c5fd" : "#64748b",
+                            borderRadius: 3,
+                          }}
+                          title={`Door facing ${["South","West","North","East"][i]}`}
+                        >
+                          {dir}
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+                {/* Orientation selector — portals (S/W/N/E) */}
+                {portalFamilyBase(fillBlockType) !== null && (
+                  <div style={{ display: "flex", alignItems: "center", gap: 3, marginTop: 1 }}>
+                    <span style={{ color: "#64748b", fontSize: 9, minWidth: 20 }}>Dir</span>
+                    {DOOR_PORTAL_DIRS.map((dir, i) => {
+                      const active = fillBlockType - 75 === i;
+                      return (
+                        <button
+                          key={dir}
+                          onClick={() => setFillBlockType(75 + i)}
+                          style={{
+                            width: 22, padding: "1px 0", fontSize: 10, cursor: "pointer",
+                            background: active ? "rgba(59,130,246,0.35)" : "rgba(255,255,255,0.04)",
+                            border: `1px solid ${active ? "#3b82f6" : "#334155"}`,
+                            color: active ? "#93c5fd" : "#64748b",
+                            borderRadius: 3,
+                          }}
+                          title={`Portal facing ${["South","West","North","East"][i]}`}
+                        >
+                          {dir}
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+                {/* Expansion sub-type dropdown */}
+                {isExpansionBlock(fillBlockType) && (
+                  <div style={{ marginTop: 2 }}>
+                    <select
+                      value={fillBlockType}
+                      onChange={e => setFillBlockType(Number(e.target.value))}
+                      style={{
+                        background: "#0d1829", border: "1px solid #334155", color: "#e2e8f0",
+                        fontSize: 10, borderRadius: 3, padding: "1px 3px", width: "100%", cursor: "pointer",
+                      }}
+                    >
+                      {EXPANSION_BLOCKS.map(eb => (
+                        <option key={eb.type} value={eb.type}>{eb.name}</option>
+                      ))}
+                    </select>
+                  </div>
+                )}
+                {/* Partial water/lava row */}
+                <div style={{ display: "flex", gap: 2, marginTop: 2 }}>
+                  {[...PARTIAL_WATER, ...PARTIAL_LAVA].map(b => {
+                    const isWater = b.type <= 61;
+                    const baseColor = isWater ? "70,135,210" : "255,69,0";
+                    const selected = fillBlockType === b.type;
+                    return (
+                      <div
+                        key={b.type}
+                        title={b.name}
+                        onClick={() => setFillBlockType(b.type)}
+                        style={{
+                          width: 18, height: 18, position: "relative", overflow: "hidden",
+                          borderRadius: 2, cursor: "pointer", boxSizing: "border-box",
+                          background: `rgba(${baseColor},0.15)`,
+                          border: selected ? "2px solid #fff" : "2px solid rgba(255,255,255,0.08)",
+                          outline: selected ? "1px solid #3b82f6" : "none", outlineOffset: 1,
+                        }}
+                      >
+                        <div style={{
+                          position: "absolute", bottom: 0, left: 0, right: 0,
+                          height: `${b.fill * 100}%`,
+                          background: `rgb(${baseColor})`,
+                        }} />
+                      </div>
+                    );
+                  })}
+                </div>
+                {/* Special blocks row (Weeds) */}
+                <div style={{ display: "flex", gap: 2, marginTop: 1 }}>
+                  {SPECIAL_BLOCKS.map(b => {
+                    const selected = fillBlockType === b.type;
+                    return (
+                      <div
+                        key={b.type}
+                        title={`${b.name} (type ${b.type})`}
+                        onClick={() => setFillBlockType(b.type)}
+                        style={{
+                          width: 18, height: 18, borderRadius: 2, cursor: "pointer", boxSizing: "border-box",
+                          background: `rgb(${b.color[0]},${b.color[1]},${b.color[2]})`,
+                          border: selected ? "2px solid #fff" : "2px solid rgba(255,255,255,0.08)",
+                          outline: selected ? "1px solid #3b82f6" : "none", outlineOffset: 1,
+                        }}
+                      />
+                    );
+                  })}
+                </div>
               </div>
 
               <div style={{ width: 1, background: "#1e293b", alignSelf: "stretch" }} />
@@ -2234,7 +2544,10 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
                         const selected = filterBlockType === b.type ||
                           (filterBlockType !== null &&
                            rampFamilyBase(filterBlockType) !== null &&
-                           rampFamilyBase(filterBlockType) === rampFamilyBase(b.type));
+                           rampFamilyBase(filterBlockType) === rampFamilyBase(b.type)) ||
+                          (filterBlockType !== null && doorFamilyBase(filterBlockType) !== null && b.type === 66) ||
+                          (filterBlockType !== null && portalFamilyBase(filterBlockType) !== null && b.type === 75) ||
+                          (filterBlockType !== null && isExpansionBlock(filterBlockType) && b.type === 82);
                         return (
                         <div
                           key={b.type}
@@ -2282,6 +2595,120 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
                         </div>
                       );
                     })()}
+                    {/* Orientation selector — doors */}
+                    {filterBlockType !== null && doorFamilyBase(filterBlockType) !== null && (
+                      <div style={{ display: "flex", alignItems: "center", gap: 3, marginTop: 1 }}>
+                        <span style={{ color: "#64748b", fontSize: 9, minWidth: 20 }}>Dir</span>
+                        {DOOR_PORTAL_DIRS.map((dir, i) => {
+                          const active = filterBlockType - 66 === i;
+                          return (
+                            <button
+                              key={dir}
+                              onClick={() => setFilterBlockType(66 + i)}
+                              style={{
+                                width: 22, padding: "1px 0", fontSize: 10, cursor: "pointer",
+                                background: active ? "rgba(59,130,246,0.35)" : "rgba(255,255,255,0.04)",
+                                border: `1px solid ${active ? "#3b82f6" : "#334155"}`,
+                                color: active ? "#93c5fd" : "#64748b",
+                                borderRadius: 3,
+                              }}
+                              title={`Door facing ${["South","West","North","East"][i]}`}
+                            >
+                              {dir}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    )}
+                    {/* Orientation selector — portals */}
+                    {filterBlockType !== null && portalFamilyBase(filterBlockType) !== null && (
+                      <div style={{ display: "flex", alignItems: "center", gap: 3, marginTop: 1 }}>
+                        <span style={{ color: "#64748b", fontSize: 9, minWidth: 20 }}>Dir</span>
+                        {DOOR_PORTAL_DIRS.map((dir, i) => {
+                          const active = filterBlockType - 75 === i;
+                          return (
+                            <button
+                              key={dir}
+                              onClick={() => setFilterBlockType(75 + i)}
+                              style={{
+                                width: 22, padding: "1px 0", fontSize: 10, cursor: "pointer",
+                                background: active ? "rgba(59,130,246,0.35)" : "rgba(255,255,255,0.04)",
+                                border: `1px solid ${active ? "#3b82f6" : "#334155"}`,
+                                color: active ? "#93c5fd" : "#64748b",
+                                borderRadius: 3,
+                              }}
+                              title={`Portal facing ${["South","West","North","East"][i]}`}
+                            >
+                              {dir}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    )}
+                    {/* Expansion sub-type dropdown (filter) */}
+                    {filterBlockType !== null && isExpansionBlock(filterBlockType) && (
+                      <div style={{ marginTop: 2 }}>
+                        <select
+                          value={filterBlockType}
+                          onChange={e => setFilterBlockType(Number(e.target.value))}
+                          style={{
+                            background: "#0d1829", border: "1px solid #334155", color: "#e2e8f0",
+                            fontSize: 10, borderRadius: 3, padding: "1px 3px", width: "100%", cursor: "pointer",
+                          }}
+                        >
+                          {EXPANSION_BLOCKS.map(eb => (
+                            <option key={eb.type} value={eb.type}>{eb.name}</option>
+                          ))}
+                        </select>
+                      </div>
+                    )}
+                    {/* Partial water/lava row (filter) */}
+                    <div style={{ display: "flex", gap: 2, marginTop: 2 }}>
+                      {[...PARTIAL_WATER, ...PARTIAL_LAVA].map(b => {
+                        const isWater = b.type <= 61;
+                        const baseColor = isWater ? "70,135,210" : "255,69,0";
+                        const selected = filterBlockType === b.type;
+                        return (
+                          <div
+                            key={b.type}
+                            title={b.name}
+                            onClick={() => setFilterBlockType(b.type)}
+                            style={{
+                              width: 18, height: 18, position: "relative", overflow: "hidden",
+                              borderRadius: 2, cursor: "pointer", boxSizing: "border-box",
+                              background: `rgba(${baseColor},0.15)`,
+                              border: selected ? "2px solid #fff" : "2px solid rgba(255,255,255,0.08)",
+                              outline: selected ? "1px solid #3b82f6" : "none", outlineOffset: 1,
+                            }}
+                          >
+                            <div style={{
+                              position: "absolute", bottom: 0, left: 0, right: 0,
+                              height: `${b.fill * 100}%`,
+                              background: `rgb(${baseColor})`,
+                            }} />
+                          </div>
+                        );
+                      })}
+                    </div>
+                    {/* Special blocks row (filter) */}
+                    <div style={{ display: "flex", gap: 2, marginTop: 1 }}>
+                      {SPECIAL_BLOCKS.map(b => {
+                        const selected = filterBlockType === b.type;
+                        return (
+                          <div
+                            key={b.type}
+                            title={`${b.name} (type ${b.type})`}
+                            onClick={() => setFilterBlockType(b.type)}
+                            style={{
+                              width: 18, height: 18, borderRadius: 2, cursor: "pointer", boxSizing: "border-box",
+                              background: `rgb(${b.color[0]},${b.color[1]},${b.color[2]})`,
+                              border: selected ? "2px solid #fff" : "2px solid rgba(255,255,255,0.08)",
+                              outline: selected ? "1px solid #3b82f6" : "none", outlineOffset: 1,
+                            }}
+                          />
+                        );
+                      })}
+                    </div>
                   </div>
 
                   <div style={{ width: 1, background: "#1e293b", alignSelf: "stretch", flexShrink: 0 }} />
@@ -2434,6 +2861,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
         )}
 
         {showHelp && <HelpModal onClose={() => setShowHelp(false)} />}
+        {showAbout && <AboutModal version={appVersion} onClose={() => setShowAbout(false)} />}
 
         {showWorldBrowser && (
           <WorldBrowserModal
@@ -2462,61 +2890,180 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
             onCancel={() => { setSchematicInfo(null); setSchematicPath(null); }}
           />
         )}
+
+        {/* Sky Editor and Creature Viewer panels — implemented, hidden pending testing */}
       </div>
     );
   }
 
   return (
-    <div style={{
-      display: "flex", flexDirection: "column", alignItems: "center",
-      justifyContent: "center", height: "100vh", gap: 16,
-    }}>
-      <h1 style={{ fontSize: 24, fontWeight: 700, color: "#e2e8f0", margin: 0 }}>
-        Eden World Editor
-      </h1>
-      <p style={{ color: "#94a3b8", margin: 0, fontSize: 14 }}>
-        Load a .eden save file to view the map
-      </p>
-      <div style={{ display: "flex", gap: 10 }}>
-        <button
-          onClick={() => setShowNewWorld(true)} disabled={loading}
-          style={{
-            background: "#134e4a", border: "1px solid #0f766e", color: "#5eead4",
-            padding: "10px 24px", borderRadius: 8,
-            cursor: loading ? "not-allowed" : "pointer",
-            fontSize: 15, fontWeight: 600, opacity: loading ? 0.6 : 1,
-          }}
-        >
-          New World
-        </button>
-        <button
-          onClick={openFile} disabled={loading}
-          style={{
-            background: "#334155", border: "1px solid #475569", color: "#e2e8f0",
-            padding: "10px 24px", borderRadius: 8,
-            cursor: loading ? "not-allowed" : "pointer",
-            fontSize: 15, fontWeight: 600, opacity: loading ? 0.6 : 1,
-          }}
-        >
-          {loading ? "Loading…" : "Open Local File"}
-        </button>
-        <button
-          onClick={() => setShowWorldBrowser(true)} disabled={loading}
-          style={{
-            background: "#3b82f6", border: "none", color: "#fff",
-            padding: "10px 24px", borderRadius: 8,
-            cursor: loading ? "not-allowed" : "pointer",
-            fontSize: 15, fontWeight: 600, opacity: loading ? 0.6 : 1,
-          }}
-        >
-          Browse Worlds
-        </button>
+    <div style={{ display: "flex", height: "100vh", background: "#0f1117" }}>
+      {/* Left panel */}
+      <div style={{
+        width: 560, minWidth: 400, display: "flex", flexDirection: "column",
+        alignItems: "center", justifyContent: "center", padding: "48px 56px",
+        gap: 0, background: "#13161f",
+      }}>
+        {/* App icon */}
+        <img
+          src="/src/assets/app-icon.png"
+          alt="VuencEdit"
+          style={{ width: 120, height: 120, borderRadius: 24, marginBottom: 20, imageRendering: "pixelated" }}
+        />
+        {/* Title */}
+        <div style={{ fontSize: 36, letterSpacing: -0.5, lineHeight: 1 }}>
+          <span style={{ fontWeight: 800, color: "#ffffff" }}>Vuenc</span>
+          <span style={{ fontWeight: 400, color: "#cbd5e1" }}>Edit</span>
+        </div>
+        <div style={{ fontSize: 13, color: "#4b5568", marginBottom: 28, marginTop: 6 }}>v{appVersion}</div>
+
+        {/* Action buttons */}
+        <div style={{ display: "flex", flexDirection: "column", gap: 10, width: "100%", maxWidth: 480 }}>
+          {/* New World */}
+          <button
+            onClick={() => setShowNewWorld(true)}
+            disabled={loading}
+            style={{
+              display: "flex", alignItems: "center", gap: 16,
+              background: "#1a3a2e", border: "1px solid #2d5a44",
+              borderRadius: 10, padding: "14px 20px",
+              cursor: loading ? "not-allowed" : "pointer",
+              opacity: loading ? 0.6 : 1, textAlign: "left", width: "100%",
+            }}
+          >
+            <span style={{ fontSize: 28, lineHeight: 1 }}>✏️</span>
+            <div>
+              <div style={{ fontSize: 15, fontWeight: 700, color: "#e2e8f0" }}>New World</div>
+              <div style={{ fontSize: 13, color: "#94a3b8", marginTop: 2 }}>Create a new world file</div>
+            </div>
+          </button>
+
+          {/* Open World */}
+          <button
+            onClick={openFile}
+            disabled={loading}
+            style={{
+              display: "flex", alignItems: "center", gap: 16,
+              background: "#1e2330", border: "1px solid #2d3448",
+              borderRadius: 10, padding: "14px 20px",
+              cursor: loading ? "not-allowed" : "pointer",
+              opacity: loading ? 0.6 : 1, textAlign: "left", width: "100%",
+            }}
+          >
+            <span style={{ fontSize: 28, lineHeight: 1 }}>🗂️</span>
+            <div>
+              <div style={{ fontSize: 15, fontWeight: 700, color: "#e2e8f0" }}>
+                {loading ? "Loading…" : "Open World"}
+              </div>
+              <div style={{ fontSize: 13, color: "#94a3b8", marginTop: 2 }}>Open a local world file</div>
+            </div>
+          </button>
+
+          {/* Browse Worlds */}
+          <button
+            onClick={() => setShowWorldBrowser(true)}
+            disabled={loading}
+            style={{
+              display: "flex", alignItems: "center", gap: 16,
+              background: "#1e2330", border: "1px solid #2d3448",
+              borderRadius: 10, padding: "14px 20px",
+              cursor: loading ? "not-allowed" : "pointer",
+              opacity: loading ? 0.6 : 1, textAlign: "left", width: "100%",
+            }}
+          >
+            <span style={{ fontSize: 28, lineHeight: 1 }}>🔍</span>
+            <div>
+              <div style={{ fontSize: 15, fontWeight: 700, color: "#e2e8f0" }}>Browse Worlds</div>
+              <div style={{ fontSize: 13, color: "#94a3b8", marginTop: 2 }}>Browse shared worlds</div>
+            </div>
+          </button>
+        </div>
+
+        {error && (
+          <p style={{ color: "#f87171", fontSize: 13, maxWidth: 420, textAlign: "center", marginTop: 16 }}>
+            {error}
+          </p>
+        )}
+
+        {/* Attribution footer */}
+        <div style={{
+          marginTop: "auto", paddingTop: 20, borderTop: "1px solid #1e2333",
+          fontSize: 11, color: "#4b5568", lineHeight: 1.6, textAlign: "center",
+          width: "100%", maxWidth: 480,
+        }}>
+          <p style={{ margin: "0 0 4px" }}>
+            Based on{" "}
+            <SplashLink href="https://github.com/jldeiro/EdenWorldManipulator2.0">Eden World Manipulator</SplashLink>
+            {" "}and{" "}
+            <SplashLink href="https://github.com/bLUUBfACE/EdenWorldManipulator">Vuenctools</SplashLink>.
+            Docs by{" "}
+            <SplashLink href="https://mrob.com/pub/vidgames/eden-file-format.html">Robert Munafo</SplashLink>.
+          </p>
+          <p style={{ margin: "0 0 8px" }}>
+            Eden World Builder by Ari Ronen (open source 2018). Support:{" "}
+            <SplashLink href="https://discord.com/invite/rjYXwBC">Discord</SplashLink>.
+          </p>
+          <button
+            onClick={() => setShowAbout(true)}
+            style={{
+              background: "none", border: "none", color: "#4b5568",
+              fontSize: 11, cursor: "pointer", padding: 0, textDecoration: "underline",
+            }}
+            onMouseEnter={e => (e.currentTarget.style.color = "#64748b")}
+            onMouseLeave={e => (e.currentTarget.style.color = "#4b5568")}
+          >
+            About VuencEdit…
+          </button>
+        </div>
       </div>
-      {error && (
-        <p style={{ color: "#f87171", fontSize: 13, maxWidth: 400, textAlign: "center" }}>
-          {error}
-        </p>
-      )}
+
+      {showAbout && <AboutModal version={appVersion} onClose={() => setShowAbout(false)} />}
+
+      {/* Right panel — recent worlds */}
+      <div style={{ flex: 1, display: "flex", flexDirection: "column", background: "#181c27", overflow: "hidden" }}>
+        <div style={{ padding: "20px 24px 10px", borderBottom: "1px solid #1e2333" }}>
+          <span style={{ fontSize: 11, fontWeight: 600, letterSpacing: "0.08em", color: "#4b5568", textTransform: "uppercase" }}>
+            Recent Worlds
+          </span>
+        </div>
+        {recentWorlds.length === 0 ? (
+          <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center" }}>
+            <span style={{ color: "#4b5568", fontSize: 15 }}>No Recent Worlds</span>
+          </div>
+        ) : (
+          <div style={{ flex: 1, overflowY: "auto" }}>
+            {recentWorlds.map((r, i) => (
+              <button
+                key={r.path}
+                onClick={() => { if (!loading) openFileAt(r.path); }}
+                disabled={loading}
+                style={{
+                  display: "flex", alignItems: "center", gap: 14,
+                  width: "100%", textAlign: "left", background: "none",
+                  border: "none", borderBottom: i < recentWorlds.length - 1 ? "1px solid #1e2333" : "none",
+                  padding: "14px 24px", cursor: loading ? "not-allowed" : "pointer",
+                  opacity: loading ? 0.5 : 1,
+                }}
+                onMouseEnter={e => { if (!loading) (e.currentTarget as HTMLElement).style.background = "#1e2333"; }}
+                onMouseLeave={e => { (e.currentTarget as HTMLElement).style.background = "none"; }}
+                title={r.path}
+              >
+                <span style={{ fontSize: 22, lineHeight: 1, flexShrink: 0 }}>🌍</span>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontSize: 14, fontWeight: 600, color: "#e2e8f0", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    {r.name}
+                  </div>
+                  <div style={{ fontSize: 11, color: "#4b5568", marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", direction: "rtl", textAlign: "left" }}>
+                    {r.path}
+                  </div>
+                </div>
+                <span style={{ fontSize: 11, color: "#475569", flexShrink: 0 }}>{timeAgo(r.timestamp)}</span>
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+
       {showWorldBrowser && (
         <WorldBrowserModal
           onClose={() => setShowWorldBrowser(false)}
