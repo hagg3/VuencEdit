@@ -2,7 +2,7 @@ import { useEffect, useRef, useCallback, forwardRef, useImperativeHandle } from 
 import { invoke } from "@tauri-apps/api/core";
 import { brushFootprint, bresenhamLine, rectPixels, ellipsePixels, type WP, type BrushShape, type FillMode } from "./drawTools";
 
-export type Tool = "pan" | "select" | "wand" | "paste" | "pen" | "brush" | "rect" | "ellipse" | "smooth" | "noise" | "flatten" | "erode" | "fill";
+export type Tool = "pan" | "select" | "wand" | "paste" | "pen" | "brush" | "rect" | "ellipse" | "smooth" | "noise" | "flatten" | "erode" | "fill" | "eyedropper";
 
 export interface DrawConfig {
   brushSize: number;
@@ -117,6 +117,12 @@ interface Props {
   spawnPos?: { px: number; py: number } | null;
   /** Creature list from get_creatures() — drawn as coloured dots when non-empty. */
   creatures?: { type_id: number; color: number; x: number; y: number }[];
+  /** Elevation offset applied to paste (shown as label above ghost rect). */
+  pasteElevationOffset?: number;
+  /** Called when eyedropper tool clicks a world coordinate. */
+  onEyedropper?: (wx: number, wy: number) => void;
+  /** Slice-viewport cut lines: vertical at world X, horizontal at world Y (the slab depths). */
+  sliceLines?: { x: number | null; y: number | null } | null;
 }
 
 function decodePixels(b64: string): Uint8Array {
@@ -134,7 +140,8 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     renderMode, axoSkew = 0.2, lockedPastePos = null,
     drawConfig, onDrawStroke, drawZOverride = null,
     extrudePreview = null, lastPasteDelta = null, onCursorMove, onMagicWand,
-    spawnPos = null, creatures = [] }: Props,
+    spawnPos = null, creatures = [],
+    pasteElevationOffset = 0, onEyedropper, sliceLines = null }: Props,
   ref,
 ) {
   const canvasRef  = useRef<HTMLCanvasElement>(null);
@@ -178,9 +185,12 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   const extrudePreviewRef = useRef(extrudePreview);
   const lastPasteDeltaRef = useRef(lastPasteDelta);
   const onCursorMoveRef   = useRef(onCursorMove);
-  const onMagicWandRef    = useRef(onMagicWand);
-  const spawnPosRef       = useRef(spawnPos);
-  const creaturesRef      = useRef(creatures);
+  const onMagicWandRef      = useRef(onMagicWand);
+  const spawnPosRef         = useRef(spawnPos);
+  const creaturesRef        = useRef(creatures);
+  const sliceLinesRef       = useRef(sliceLines);
+  const pasteElevOffsetRef  = useRef(pasteElevationOffset);
+  const onEyedropperRef     = useRef(onEyedropper);
 
   useEffect(() => { toolRef.current = tool; }, [tool]);
   useEffect(() => { onSelChangeRef.current = onSelectionChange; }, [onSelectionChange]);
@@ -192,9 +202,12 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   useEffect(() => { extrudePreviewRef.current = extrudePreview; }, [extrudePreview]);
   useEffect(() => { lastPasteDeltaRef.current = lastPasteDelta; }, [lastPasteDelta]);
   useEffect(() => { onCursorMoveRef.current = onCursorMove; }, [onCursorMove]);
-  useEffect(() => { onMagicWandRef.current  = onMagicWand;  }, [onMagicWand]);
-  useEffect(() => { spawnPosRef.current     = spawnPos;     }, [spawnPos]);
-  useEffect(() => { creaturesRef.current    = creatures;    }, [creatures]);
+  useEffect(() => { onMagicWandRef.current     = onMagicWand;         }, [onMagicWand]);
+  useEffect(() => { spawnPosRef.current        = spawnPos;            }, [spawnPos]);
+  useEffect(() => { creaturesRef.current       = creatures;           }, [creatures]);
+  useEffect(() => { sliceLinesRef.current      = sliceLines;           }, [sliceLines]);
+  useEffect(() => { pasteElevOffsetRef.current = pasteElevationOffset; }, [pasteElevationOffset]);
+  useEffect(() => { onEyedropperRef.current    = onEyedropper;        }, [onEyedropper]);
 
   const mapW = world.width_chunks * 16;
   const mapH = world.height_chunks * 16;
@@ -203,13 +216,22 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   const mapHRef = useRef(mapH);
   useEffect(() => { mapWRef.current = mapW; mapHRef.current = mapH; }, [mapW, mapH]);
 
+  // Convert clientX/clientY (viewport coords) to canvas-local coords. The canvas is no longer
+  // guaranteed to fill the window at origin (0,0) — in quad/multi-viewport mode it lives in a
+  // grid cell — so we subtract its bounding-rect offset.
+  const toLocal = useCallback((cx: number, cy: number): { x: number; y: number } => {
+    const r = canvasRef.current?.getBoundingClientRect();
+    return { x: cx - (r?.left ?? 0), y: cy - (r?.top ?? 0) };
+  }, []);
+
   const screenToWorld = useCallback((sx: number, sy: number): WorldPoint => {
     const { x, y, scale } = viewRef.current;
+    const l = toLocal(sx, sy);
     return {
-      x: Math.max(0, Math.min(mapW - 1, Math.floor((sx - x) / scale))),
-      y: Math.max(0, Math.min(mapH - 1, Math.floor((sy - y) / scale))),
+      x: Math.max(0, Math.min(mapW - 1, Math.floor((l.x - x) / scale))),
+      y: Math.max(0, Math.min(mapH - 1, Math.floor((l.y - y) / scale))),
     };
-  }, [mapW, mapH]);
+  }, [mapW, mapH, toLocal]);
 
   // ── draw ──────────────────────────────────────────────────────────────────
 
@@ -353,6 +375,25 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
       }
     }
 
+    // Slice cut-lines — where the front (world Y) / side (world X) slabs cut the map
+    {
+      const sl = sliceLinesRef.current;
+      if (sl) {
+        ctx.save();
+        ctx.lineWidth = 1;
+        ctx.strokeStyle = "rgba(168,85,247,0.8)";
+        if (sl.x != null) {
+          const sx = Math.round((sl.x + 0.5) * scale + vx) + 0.5;
+          ctx.beginPath(); ctx.moveTo(sx, 0); ctx.lineTo(sx, canvas.height); ctx.stroke();
+        }
+        if (sl.y != null) {
+          const sy = Math.round((sl.y + 0.5) * scale + vy) + 0.5;
+          ctx.beginPath(); ctx.moveTo(0, sy); ctx.lineTo(canvas.width, sy); ctx.stroke();
+        }
+        ctx.restore();
+      }
+    }
+
     // Creature markers — coloured dots at each creature's world position
     {
       const clist = creaturesRef.current;
@@ -415,6 +456,21 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
           ctx.lineWidth   = 1;
           ctx.strokeRect(gx + 2.5, gy + 2.5, gw - 5, gh - 5);
         }
+        // Z-offset label above the ghost rect
+        const off = pasteElevOffsetRef.current;
+        const label = off === 0 ? "z+0" : off > 0 ? `z+${off}` : `z${off}`;
+        const labelColor = locked ? "rgba(251,191,36,1)" : "rgba(34,197,94,1)";
+        ctx.save();
+        ctx.font = "bold 11px monospace";
+        ctx.textAlign = "center";
+        const tw = ctx.measureText(label).width + 6;
+        const lx = gx + gw / 2;
+        const ly = gy - 6;
+        ctx.fillStyle = "rgba(0,0,0,0.65)";
+        ctx.fillRect(lx - tw / 2, ly - 11, tw, 13);
+        ctx.fillStyle = labelColor;
+        ctx.fillText(label, lx, ly);
+        ctx.restore();
       }
     }
 
@@ -810,14 +866,22 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
+    // Size the backing store to the canvas's own laid-out box (CSS 100%/100% of its parent),
+    // not the window — so the canvas works both full-screen and inside a quad-view grid cell.
     const resize = () => {
-      canvas.width  = window.innerWidth;
-      canvas.height = window.innerHeight;
+      const r = canvas.getBoundingClientRect();
+      const w = Math.max(1, Math.floor(r.width));
+      const h = Math.max(1, Math.floor(r.height));
+      if (canvas.width !== w || canvas.height !== h) {
+        canvas.width = w;
+        canvas.height = h;
+      }
       ensureTiles();
     };
     resize();
-    window.addEventListener("resize", resize);
-    return () => window.removeEventListener("resize", resize);
+    const ro = new ResizeObserver(resize);
+    ro.observe(canvas);
+    return () => ro.disconnect();
   }, [ensureTiles]);
 
   // ── Pointer / wheel handlers ──────────────────────────────────────────────
@@ -841,10 +905,16 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
       onMagicWandRef.current?.(wp.x, wp.y);
       return;
     }
+    if (toolRef.current === "eyedropper") {
+      const wp = screenToWorld(e.clientX, e.clientY);
+      onEyedropperRef.current?.(wp.x, wp.y);
+      return;
+    }
     if (toolRef.current === "select") {
       const sel = committedSelRef.current;
       if (sel !== null) {
-        const edge = hitTestEdge(e.clientX, e.clientY, sel, viewRef.current);
+        const lp = toLocal(e.clientX, e.clientY);
+        const edge = hitTestEdge(lp.x, lp.y, sel, viewRef.current);
         if (edge !== null) {
           const cur = edge === "x1" || edge === "x2" ? "ew-resize" : "ns-resize";
           (e.target as HTMLCanvasElement).style.cursor = cur;
@@ -928,7 +998,8 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
         if (canvas) {
           const sel = committedSelRef.current;
           if (sel !== null) {
-            const edge = hitTestEdge(e.clientX, e.clientY, sel, viewRef.current);
+            const lp = toLocal(e.clientX, e.clientY);
+            const edge = hitTestEdge(lp.x, lp.y, sel, viewRef.current);
             if (edge === "x1" || edge === "x2") canvas.style.cursor = "ew-resize";
             else if (edge === "y1" || edge === "y2") canvas.style.cursor = "ns-resize";
             else canvas.style.cursor = "crosshair";
@@ -1014,18 +1085,19 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     const { x, y, scale } = viewRef.current;
     const factor   = e.deltaY < 0 ? 1.1 : 1 / 1.1;
     const newScale = Math.min(32, Math.max(0.25, scale * factor));
+    const lp = toLocal(e.clientX, e.clientY);
     viewRef.current = {
       scale: newScale,
-      x: e.clientX - (e.clientX - x) * (newScale / scale),
-      y: e.clientY - (e.clientY - y) * (newScale / scale),
+      x: lp.x - (lp.x - x) * (newScale / scale),
+      y: lp.y - (lp.y - y) * (newScale / scale),
     };
     ensureTiles(); // in full mode: just draw(); in tiled mode: loads new tiles
-  }, [ensureTiles]);
+  }, [ensureTiles, toLocal]);
 
   return (
     <canvas
       ref={canvasRef}
-      style={{ display: "block", cursor: tool === "pan" ? "grab" : "crosshair" }}
+      style={{ display: "block", width: "100%", height: "100%", cursor: tool === "pan" ? "grab" : tool === "eyedropper" ? "cell" : "crosshair" }}
       onPointerDown={onPointerDown}
       onPointerMove={onPointerMove}
       onPointerUp={onPointerUp}

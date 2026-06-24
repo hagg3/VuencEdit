@@ -34,6 +34,8 @@ interface Props {
   brushHoverX?: number | null;
   /** World Y of current brush hover position — draws a horizontal band highlight. */
   brushHoverY?: number | null;
+  /** Called when user drags the z_min or z_max edge handle to resize the selection's z range. */
+  onZRangeChange?: (zMin: number, zMax: number) => void;
 }
 
 const CONTEXT_BLOCKS = 7;
@@ -223,12 +225,15 @@ function drawSection(
   );
 }
 
+const Z_EDGE_HIT = 5; // pixels proximity to trigger z-resize handle
+
 export default function ElevationPreviewPanel({
   selection: sel, maxZ,
   extrudeCount = 0, extrudeAxis = "z+",
   isPastePreview = false, editEpoch = 0,
   drawActive = false, onDrawElevation,
   brushHoverX = null, brushHoverY = null,
+  onZRangeChange,
 }: Props) {
   const [frontData,     setFrontData]     = useState<PreviewData | null>(null);
   const [sideData,      setSideData]      = useState<PreviewData | null>(null);
@@ -254,6 +259,8 @@ export default function ElevationPreviewPanel({
   const drawStrokeRef   = useRef<{ x: number; y: number; z: number }[]>([]);
   const resizeDragRef   = useRef<{ startX: number; startY: number; startW: number; startH: number } | null>(null);
   const viewDragRef     = useRef<{ section: "front"|"side"; startX: number; startY: number; startPanX: number; startPanY: number } | null>(null);
+  const zResizeDragRef  = useRef<{ edge: "z_max" | "z_min"; startY: number; startZ: number; scale: number } | null>(null);
+  const [canvasCursor, setCanvasCursor] = useState<string>("default");
 
   // Fetch front view
   useEffect(() => {
@@ -343,6 +350,19 @@ export default function ElevationPreviewPanel({
     triggerRedraw();
   }
 
+  // Returns which z edge (if any) the canvas y is close to, based on which section is active.
+  function hitZEdge(cy: number): { edge: "z_max" | "z_min"; scale: number } | null {
+    if (!onZRangeChange) return null;
+    const topH = Math.floor(canvasH / 2);
+    const layout = cy < topH ? frontLayoutRef.current : sideLayoutRef.current;
+    const { oy, scale } = layout;
+    const zMaxY = oy + (maxZ - sel.z_max) * scale;
+    const zMinY = oy + (maxZ - sel.z_min + 1) * scale;
+    if (Math.abs(cy - zMaxY) <= Z_EDGE_HIT) return { edge: "z_max", scale };
+    if (Math.abs(cy - zMinY) <= Z_EDGE_HIT) return { edge: "z_min", scale };
+    return null;
+  }
+
   return (
     <div style={{
       position: "absolute",
@@ -414,7 +434,7 @@ export default function ElevationPreviewPanel({
         style={{
           display: "block", width: canvasW, height: canvasH,
           borderRadius: 4, border: "1px solid #1a2744",
-          cursor: drawActive ? "crosshair" : zoom > 1 ? "grab" : "default",
+          cursor: canvasCursor !== "default" ? canvasCursor : drawActive ? "crosshair" : zoom > 1 ? "grab" : "default",
         }}
         title={`Elevation view — front (top) + side (bottom), ±${CONTEXT_BLOCKS} context blocks, z${sel.z_min}–${sel.z_max} highlighted. Scroll to zoom, drag to pan.`}
         onWheel={(e) => {
@@ -438,9 +458,17 @@ export default function ElevationPreviewPanel({
           triggerRedraw();
         }}
         onPointerDown={(e) => {
+          const rect = (e.target as HTMLCanvasElement).getBoundingClientRect();
+          const cy = e.clientY - rect.top;
+          // Z-edge resize takes priority over draw/pan
+          const zHit = hitZEdge(cy);
+          if (zHit) {
+            (e.target as HTMLCanvasElement).setPointerCapture(e.pointerId);
+            const startZ = zHit.edge === "z_max" ? sel.z_max : sel.z_min;
+            zResizeDragRef.current = { edge: zHit.edge, startY: cy, startZ, scale: zHit.scale };
+            return;
+          }
           if (drawActive && onDrawElevation) {
-            const rect = (e.target as HTMLCanvasElement).getBoundingClientRect();
-            const cy = e.clientY - rect.top;
             const topH = Math.floor(canvasH / 2);
             const view = cy < topH ? "front" : "side";
             const layout = view === "front" ? frontLayoutRef.current : sideLayoutRef.current;
@@ -453,8 +481,6 @@ export default function ElevationPreviewPanel({
             if (pos) drawStrokeRef.current.push(pos);
           } else {
             // Pan mode
-            const rect = (e.target as HTMLCanvasElement).getBoundingClientRect();
-            const cy = e.clientY - rect.top;
             const topH = Math.floor(canvasH / 2);
             const section = cy < topH ? "front" : "side";
             const panRef = section === "front" ? panFrontRef : panSideRef;
@@ -467,14 +493,32 @@ export default function ElevationPreviewPanel({
           }
         }}
         onPointerMove={(e) => {
+          const rect = (e.target as HTMLCanvasElement).getBoundingClientRect();
+          const cy = e.clientY - rect.top;
+          // Z-resize drag
+          if (zResizeDragRef.current) {
+            const { edge, startY, startZ, scale } = zResizeDragRef.current;
+            const dz = Math.round((startY - cy) / scale);
+            const newZ = Math.max(0, Math.min(maxZ, startZ + dz));
+            if (edge === "z_max") {
+              onZRangeChange?.(Math.min(sel.z_min, newZ), newZ);
+            } else {
+              onZRangeChange?.(newZ, Math.max(sel.z_max, newZ));
+            }
+            return;
+          }
+          // Update cursor for z-edge proximity
+          if (e.buttons === 0) {
+            const zHit = hitZEdge(cy);
+            setCanvasCursor(zHit ? "ns-resize" : "default");
+          }
           if (drawActive && onDrawElevation) {
             if (e.buttons === 0) return;
-            const rect = (e.target as HTMLCanvasElement).getBoundingClientRect();
             const view = drawViewRef.current;
             const layout = view === "front" ? frontLayoutRef.current : sideLayoutRef.current;
             const data = view === "front" ? frontData : sideData;
             if (!data) return;
-            const pos = elevCanvasToWorld(e.clientX - rect.left, e.clientY - rect.top, layout, view, sel, maxZ);
+            const pos = elevCanvasToWorld(e.clientX - rect.left, cy, layout, view, sel, maxZ);
             if (pos) {
               const last = drawStrokeRef.current[drawStrokeRef.current.length - 1];
               if (!last || last.x !== pos.x || last.y !== pos.y || last.z !== pos.z)
@@ -492,6 +536,10 @@ export default function ElevationPreviewPanel({
           }
         }}
         onPointerUp={(e) => {
+          if (zResizeDragRef.current) {
+            zResizeDragRef.current = null;
+            return;
+          }
           if (drawActive && onDrawElevation) {
             for (const p of drawStrokeRef.current) onDrawElevation(p.x, p.y, p.z);
             drawStrokeRef.current = [];
@@ -500,6 +548,7 @@ export default function ElevationPreviewPanel({
           }
           void e;
         }}
+        onPointerLeave={() => setCanvasCursor("default")}
       />
     </div>
   );
