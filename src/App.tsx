@@ -7,12 +7,15 @@ import MapCanvas, { type Tool, type SelectionBounds, type PixelPatch, type MapCa
 import { BLOCK_DEFS, PAINT_COLORS, resolveColor, RAMP_FAMILIES, RAMP_DIRS, WEDGE_FAMILIES, WEDGE_DIRS, rampFamilyBase, wedgeFamilyBase, rampDirIndex, blockDisplayName, doorFamilyBase, portalFamilyBase, DOOR_PORTAL_DIRS, EXPANSION_BLOCKS, isExpansionBlock, PARTIAL_WATER, PARTIAL_LAVA, SPECIAL_BLOCKS } from "./blockDefs";
 import SelectionInspector from "./SelectionInspector";
 import ElevationPreviewPanel from "./ElevationPreviewPanel";
+import SliceViewport from "./SliceViewport";
+import FlyView3D from "./FlyView3D";
 import HelpModal from "./HelpModal";
 import AboutModal from "./AboutModal";
 import WorldBrowserModal from "./WorldBrowserModal";
 import UploadModal from "./UploadModal";
 import NewWorldModal from "./NewWorldModal";
 import SchematicImportModal, { type SchematicInfo, type MappingEntry } from "./SchematicImportModal";
+import appIcon from "./assets/app-icon.png";
 import "./App.css";
 
 function SplashLink({ href, children }: { href: string; children: React.ReactNode }) {
@@ -149,11 +152,10 @@ function App() {
   const fileMenuRef = useRef<HTMLDivElement>(null);
   const [viewMenuOpen, setViewMenuOpen] = useState(false);
   const viewMenuRef = useRef<HTMLDivElement>(null);
-  const [drawMenuOpen, setDrawMenuOpen] = useState(false);
-  const drawMenuRef = useRef<HTMLDivElement>(null);
   const [undoDepth, setUndoDepth] = useState(0);
   const [redoDepth, setRedoDepth] = useState(0);
   const [tool, setTool] = useState<Tool>("pan");
+  const prevToolRef = useRef<Tool>("pan");
   const [wandMatchPaint, setWandMatchPaint] = useState(true);
   const [sourcePath, setSourcePath] = useState<string | null>(null);
   const [renderMode, setRenderMode] = useState<"tiled" | "full" | "axo">("tiled");
@@ -164,7 +166,13 @@ function App() {
   const helpMenuRef = useRef<HTMLDivElement>(null);
   const [appVersion, setAppVersion] = useState("…");
   useEffect(() => { getVersion().then(setAppVersion); }, []);
-  const [showElevationPanel, setShowElevationPanel] = useState(false);
+  const [showSlicePanels, setShowSlicePanels] = useState(false);
+  // 3D fly-through pane (4th quad cell) — off by default; it's the most expensive pane, so the user
+  // opts in. `exp` (experimental, perf-heavy on large worlds).
+  const [enable3dPane, setEnable3dPane] = useState(false);
+  const flyActiveRef = useRef(false); // true while FlyView3D fly mode is active — blocks global shortcuts
+  const [sliceFrontY, setSliceFrontY] = useState(0); // front slab depth (world Y)
+  const [sliceSideX, setSliceSideX] = useState(0);   // side slab depth (world X)
   const [showWorldBrowser, setShowWorldBrowser] = useState(false);
   const [showUploadModal, setShowUploadModal] = useState(false);
   const [showNewWorld, setShowNewWorld] = useState(false);
@@ -187,10 +195,12 @@ function App() {
   const [lockedPastePos, setLockedPastePos] = useState<{ x: number; y: number } | null>(null);
   const lockedPastePosRef = useRef<{ x: number; y: number } | null>(null);
   const [editEpoch, setEditEpoch] = useState(0);
+  // World bounds of the most recent edit (top-down X/Y) — lets slabs skip refetch if untouched.
+  const [lastEditBounds, setLastEditBounds] = useState<{ x: number; y: number; w: number; h: number } | null>(null);
 
   const [extrudeCount, setExtrudeCount] = useState(2);
   const [extrudeAxis, setExtrudeAxis]   = useState<ExtrudeAxis>("z+");
-  const [extrudeOpen, setExtrudeOpen]   = useState(true);
+  const [extrudeOpen, setExtrudeOpen]   = useState(false);
 
   const [brushSize,    setBrushSize]    = useState(3);
   const [brushShape,   setBrushShape]   = useState<"sq" | "circ">("sq");
@@ -243,7 +253,7 @@ function App() {
   useEffect(() => { appToolRef.current = tool; }, [tool]);
   useEffect(() => { lockedPastePosRef.current = lockedPastePos; }, [lockedPastePos]);
   useEffect(() => { if (tool !== "paste") setLockedPastePos(null); }, [tool]);
-  useEffect(() => { if (lockedPastePos) setShowElevationPanel(true); }, [lockedPastePos]);
+  useEffect(() => { /* elevation panel always visible in normal mode */ }, [lockedPastePos]);
 
   // Clear paste trail when clipboard changes or we leave paste mode.
   useEffect(() => {
@@ -288,6 +298,22 @@ function App() {
   const [zMax, setZMax] = useState(63);
 
   const [selection, setSelection] = useState<SelectionInfo | null>(null);
+
+  // When a selection is made, snap the Front/Side slice planes to its centre so the slabs show the
+  // selection by default (mirrors what the elevation preview shows). Only fires on selection change,
+  // so the user can still scrub freely afterwards.
+  useEffect(() => {
+    if (!rawBounds) return;
+    setSliceFrontY(Math.round((rawBounds.y1 + rawBounds.y2) / 2));
+    setSliceSideX(Math.round((rawBounds.x1 + rawBounds.x2) / 2));
+  }, [rawBounds]);
+
+  // Snap slab depths to the paste footprint when a paste is locked in (so the ghost shows in context).
+  useEffect(() => {
+    if (!lockedPastePos || !clipboard) return;
+    setSliceFrontY(Math.round(lockedPastePos.y + clipboard.height / 2));
+    setSliceSideX(Math.round(lockedPastePos.x + clipboard.width / 2));
+  }, [lockedPastePos, clipboard]);
 
   useEffect(() => {
     if (!rawBounds) {
@@ -353,6 +379,9 @@ function App() {
         raw.patch.y + raw.patch.height,
       );
     }
+    // Broadcast the edit's world bounds so slice slabs can skip refetching when their depth plane
+    // wasn't touched. (Patch carries top-down X/Y extent; z always overlaps the full-height slabs.)
+    setLastEditBounds({ x: raw.patch.x, y: raw.patch.y, w: raw.patch.width, h: raw.patch.height });
     setUndoDepth(raw.undo_depth);
     setRedoDepth(raw.redo_depth);
     setEditEpoch(e => e + 1);
@@ -604,6 +633,22 @@ function App() {
     });
   }
 
+  async function handleEyedropper(wx: number, wy: number) {
+    try {
+      const result = await invoke<{ block_type: number; paint: number }>("pick_block_surface", { wx, wy });
+      if (result.block_type !== 0) {
+        setFillBlockType(result.block_type);
+        setFillPaint(result.paint);
+        trackRecentBlock(result.block_type, result.paint);
+      }
+    } catch (e) {
+      setError(String(e));
+    }
+    // One-shot: return to previous draw tool
+    const prev = prevToolRef.current;
+    setTool(prev === "eyedropper" ? "pen" : prev);
+  }
+
   async function handleDrawStroke(pts: [number, number][], zOverride: number | null) {
     const t = appToolRef.current;
     try {
@@ -613,6 +658,8 @@ function App() {
         if (t === "noise") sculptSeedRef.current = ((sculptSeedRef.current * 1664525 + 1013904223) >>> 0);
         const result = await invoke<EditResultRaw>("sculpt_terrain", {
           points, mode: t, strength: sculptStrength, seed,
+          blockType: fillBlockType || null,
+          paint: fillPaint || null,
         });
         await applyEditResult(result);
       } else if (t === "fill") {
@@ -697,6 +744,20 @@ function App() {
     }
   }
 
+  // Batch paint at exact world cells (one undo entry). Used by the slice viewports.
+  async function handleSlicePaint(cells: { x: number; y: number; z: number }[]) {
+    if (!cells.length) return;
+    try {
+      const result = await invoke<EditResultRaw>("paint_blocks", {
+        blocks: cells, blockType: fillBlockType, paint: fillBlockType === 0 ? 0 : fillPaint,
+      });
+      await applyEditResult(result);
+      trackRecentBlock(fillBlockType, fillPaint);
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
   const handleUndo = useCallback(async () => {
     try {
       const result = await invoke<EditResultRaw>("undo_edit");
@@ -715,6 +776,8 @@ function App() {
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
+      // While the 3D fly camera is active, it owns all keyboard input — don't fire editor shortcuts.
+      if (flyActiveRef.current) return;
       const tag = (e.target as HTMLElement).tagName;
       // ? always toggles help (skip when typing in an input)
       if (e.key === "?" && tag !== "INPUT" && tag !== "TEXTAREA" && !e.metaKey && !e.ctrlKey) {
@@ -758,11 +821,31 @@ function App() {
         if (e.key === "e" || e.key === "E") { e.preventDefault(); setTool("ellipse"); return; }
         if (e.key === "f" || e.key === "F") { e.preventDefault(); setTool("fill"); return; }
         if (e.key === "w" || e.key === "W") { e.preventDefault(); setTool("wand"); return; }
-        // Number keys 1-5 = brush size (1→1, 2→3, 3→5, 4→7, 5→9)
-        if (["1","2","3","4","5"].includes(e.key)) {
-          const sizeMap: Record<string, number> = {"1":1,"2":3,"3":5,"4":7,"5":9};
+        if (e.key === "i" || e.key === "I") {
           e.preventDefault();
-          setBrushSize(sizeMap[e.key]);
+          prevToolRef.current = appToolRef.current === "eyedropper" ? "pen" : appToolRef.current;
+          setTool("eyedropper");
+          return;
+        }
+        // Number keys 1-5 = pinned hotbar slots; 6-0 = recent hotbar slots
+        if (["1","2","3","4","5"].includes(e.key)) {
+          const idx = parseInt(e.key) - 1;
+          e.preventDefault();
+          setPinnedBlocks(prev => {
+            const b = prev[idx];
+            if (b) { setFillBlockType(b.type); setFillPaint(b.paint); }
+            return prev;
+          });
+          return;
+        }
+        if (["6","7","8","9","0"].includes(e.key)) {
+          const idx = e.key === "0" ? 4 : parseInt(e.key) - 6;
+          e.preventDefault();
+          setRecentBlocks(prev => {
+            const b = prev[idx];
+            if (b) { setFillBlockType(b.type); setFillPaint(b.paint); }
+            return prev;
+          });
           return;
         }
         // `.` = repeat last paste one step further in the same direction
@@ -779,10 +862,20 @@ function App() {
       if (!(e.metaKey || e.ctrlKey)) return;
       if (e.key === "z" && !e.shiftKey) { e.preventDefault(); handleUndo(); }
       if ((e.key === "z" && e.shiftKey) || e.key === "y") { e.preventDefault(); handleRedo(); }
+      if (e.key === "c") { e.preventDefault(); copySelection(); }
+      if (e.key === "v") {
+        e.preventDefault();
+        if (clipboard) setTool("paste");
+      }
+      if (e.key === "s") {
+        e.preventDefault();
+        if (sourcePath) saveWorld(sourcePath);
+        else saveWorldAs();
+      }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [world, showHelp, handleUndo, handleRedo]);
+  }, [world, showHelp, handleUndo, handleRedo, clipboard, sourcePath, copySelection, saveWorld, saveWorldAs]);
 
   // Close menus when clicking outside them.
   useEffect(() => {
@@ -806,17 +899,6 @@ function App() {
     document.addEventListener("mousedown", handleOutside);
     return () => document.removeEventListener("mousedown", handleOutside);
   }, [viewMenuOpen]);
-
-  useEffect(() => {
-    if (!drawMenuOpen) return;
-    function handleOutside(e: MouseEvent) {
-      if (drawMenuRef.current && !drawMenuRef.current.contains(e.target as Node)) {
-        setDrawMenuOpen(false);
-      }
-    }
-    document.addEventListener("mousedown", handleOutside);
-    return () => document.removeEventListener("mousedown", handleOutside);
-  }, [drawMenuOpen]);
 
   useEffect(() => {
     if (!helpMenuOpen) return;
@@ -976,40 +1058,151 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
   const isDrawTool = tool === "pen" || tool === "brush" || tool === "rect" || tool === "ellipse" || isSculptTool || tool === "fill";
   const swatchColor = resolveColor(fillBlockType, fillPaint);
 
+  const mapPaneEl = world ? (
+    <MapCanvas
+      ref={mapCanvasRef}
+      world={world}
+      worldEpoch={worldEpoch}
+      tool={tool}
+      viewMode={viewMode}
+      zSliceZ={zSliceZ}
+      committedSelection={rawBounds}
+      onSelectionChange={handleSelectionChange}
+      pastePreview={clipboard && tool === "paste"
+        ? { width: clipboard.width, height: clipboard.height }
+        : null}
+      clipboardPreviewPixels={tool === "paste" ? clipboardPreviewPixels : null}
+      onPasteAt={handlePasteClick}
+      lockedPastePos={lockedPastePos}
+      renderMode={renderMode}
+      axoSkew={axoSkew}
+      sliceLines={showSlicePanels ? { x: sliceSideX, y: sliceFrontY } : null}
+      drawConfig={{ brushSize, brushShape, fillMode: drawFilled ? "fill" : "outline" }}
+      onDrawStroke={handleDrawStroke}
+      drawZOverride={viewMode === "zslice" ? zSliceZ : null}
+      extrudePreview={
+        extrudeOpen && rawBounds && (extrudeAxis.startsWith("x") || extrudeAxis.startsWith("y"))
+          ? { axis: extrudeAxis, count: extrudeCount }
+          : null
+      }
+      lastPasteDelta={lastPasteDelta}
+      onCursorMove={handleCursorMove}
+      onMagicWand={handleMagicWand}
+      spawnPos={spawnPos}
+      creatures={[]}
+      pasteElevationOffset={pasteElevationOffset}
+      onEyedropper={handleEyedropper}
+    />
+  ) : null;
+
   if (world) {
+    const sliceDrawTool = (["pen","brush","rect","ellipse"] as const).find(t => t === tool);
+    // Active region shown on the slabs: the paste footprint (preview) or the current selection.
+    const sliceIsPaste = pastePreviewSelection != null;
+    const sliceSel = pastePreviewSelection
+      ?? (rawBounds ? { x1: rawBounds.x1, y1: rawBounds.y1, x2: rawBounds.x2, y2: rawBounds.y2, z_min: zMin, z_max: zMax } : null);
+    const sliceSelZ = sliceSel ? { min: sliceSel.z_min, max: sliceSel.z_max } : null;
+    const sliceExtrudeCount = sliceIsPaste ? 0 : (extrudeOpen ? extrudeCount : 0);
+    const sliceZResize = sliceIsPaste ? undefined : (a: number, b: number) => { setZMin(a); setZMax(b); };
+    const sliceHResizeFront = sliceIsPaste ? undefined : (lo: number, hi: number) => setRawBounds(rb => rb ? { ...rb, x1: lo, x2: hi } : rb);
+    const sliceHResizeSide = sliceIsPaste ? undefined : (lo: number, hi: number) => setRawBounds(rb => rb ? { ...rb, y1: lo, y2: hi } : rb);
+    // Marquee-select on a slab: front sets X+Z (Y kept, or pinned to the slab's depth for a fresh
+    // selection); side sets Y+Z (X kept / pinned). The orthogonal extent is then adjustable via the
+    // other slab's divider or the top-down map.
+    const sliceSelectMode = !sliceIsPaste && tool === "select";
+    const sliceSelectFront = sliceSelectMode
+      ? (xLo: number, xHi: number, zLo: number, zHi: number) => {
+          setRawBounds(rb => rb ? { ...rb, x1: xLo, x2: xHi } : { x1: xLo, y1: sliceFrontY, x2: xHi, y2: sliceFrontY });
+          setZMin(zLo); setZMax(zHi);
+        }
+      : undefined;
+    const sliceSelectSide = sliceSelectMode
+      ? (yLo: number, yHi: number, zLo: number, zHi: number) => {
+          setRawBounds(rb => rb ? { ...rb, y1: yLo, y2: yHi } : { x1: sliceSideX, y1: yLo, x2: sliceSideX, y2: yHi });
+          setZMin(zLo); setZMax(zHi);
+        }
+      : undefined;
+    const sliceCommon = {
+      world,
+      editEpoch,
+      lastEdit: lastEditBounds,
+      brush: { size: tool === "brush" ? brushSize : 1, shape: brushShape },
+      tool: sliceDrawTool,
+      fill: drawFilled,
+      onPaint: sliceDrawTool ? handleSlicePaint : undefined,
+      selZ: sliceSelZ,
+      extrudeCount: sliceExtrudeCount,
+      extrudeAxis,
+      isPaste: sliceIsPaste,
+      onZRangeChange: sliceZResize,
+      selectMode: sliceSelectMode,
+    };
     return (
       <div style={{ position: "relative", width: "100vw", height: "100vh" }}>
-        <MapCanvas
-          ref={mapCanvasRef}
-          world={world}
-          worldEpoch={worldEpoch}
-          tool={tool}
-          viewMode={viewMode}
-          zSliceZ={zSliceZ}
-          committedSelection={rawBounds}
-          onSelectionChange={handleSelectionChange}
-          pastePreview={clipboard && tool === "paste"
-            ? { width: clipboard.width, height: clipboard.height }
-            : null}
-          clipboardPreviewPixels={tool === "paste" ? clipboardPreviewPixels : null}
-          onPasteAt={handlePasteClick}
-          lockedPastePos={lockedPastePos}
-          renderMode={renderMode}
-          axoSkew={axoSkew}
-          drawConfig={{ brushSize, brushShape, fillMode: drawFilled ? "fill" : "outline" }}
-          onDrawStroke={handleDrawStroke}
-          drawZOverride={viewMode === "zslice" ? zSliceZ : null}
-          extrudePreview={
-            extrudeOpen && rawBounds && (extrudeAxis.startsWith("x") || extrudeAxis.startsWith("y"))
-              ? { axis: extrudeAxis, count: extrudeCount }
-              : null
-          }
-          lastPasteDelta={lastPasteDelta}
-          onCursorMove={handleCursorMove}
-          onMagicWand={handleMagicWand}
-          spawnPos={spawnPos}
-          creatures={[]}
-        />
+        {showSlicePanels ? (
+          // Quad view: the real top-down map (top-left) + Front / Side slices + 3D placeholder.
+          // Top strip is left clear for the floating menu/toolbar chrome.
+          <div style={{
+            position: "absolute", inset: 0, paddingTop: 50,
+            display: "grid", gridTemplateColumns: "1fr 1fr", gridTemplateRows: "1fr 1fr",
+            gap: 2, background: "#0a0f1e",
+          }}>
+            <div style={{ position: "relative", minWidth: 0, minHeight: 0, overflow: "hidden", outline: "1px solid #1e293b" }}>
+              {mapPaneEl}
+            </div>
+            <div style={{ minWidth: 0, minHeight: 0, overflow: "hidden", outline: "1px solid #1e293b" }}>
+              <SliceViewport {...sliceCommon} axis="front"
+                depth={sliceFrontY} onDepthChange={setSliceFrontY}
+                crossH={sliceSideX} crossV={zSliceZ}
+                selRange={sliceSel ? { lo: sliceSel.x1, hi: sliceSel.x2 } : null}
+                onHRangeChange={sliceHResizeFront} onSelect={sliceSelectFront} />
+            </div>
+            <div style={{ minWidth: 0, minHeight: 0, overflow: "hidden", outline: "1px solid #1e293b" }}>
+              <SliceViewport {...sliceCommon} axis="side"
+                depth={sliceSideX} onDepthChange={setSliceSideX}
+                crossH={sliceFrontY} crossV={zSliceZ}
+                selRange={sliceSel ? { lo: sliceSel.y1, hi: sliceSel.y2 } : null}
+                onHRangeChange={sliceHResizeSide} onSelect={sliceSelectSide} />
+            </div>
+            <div style={{ position: "relative", minWidth: 0, minHeight: 0, overflow: "hidden", outline: "1px solid #1e293b" }}>
+              {enable3dPane ? (
+                <>
+                  <FlyView3D world={world} editEpoch={editEpoch} lastEdit={lastEditBounds} onFlyModeChange={(a) => { flyActiveRef.current = a; }} />
+                  <button
+                    onClick={() => setEnable3dPane(false)}
+                    title="Disable the 3D pane (saves performance)"
+                    style={{
+                      position: "absolute", top: 4, right: 6, zIndex: 2,
+                      background: "rgba(15,23,42,0.85)", color: "#94a3b8", border: "1px solid #334155",
+                      borderRadius: 4, padding: "1px 7px", fontSize: 11, cursor: "pointer",
+                    }}
+                  >✕ 3D</button>
+                </>
+              ) : (
+                // Off by default — the 3D pane is the heaviest viewport. Opt in here.
+                <div style={{
+                  display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center",
+                  gap: 10, width: "100%", height: "100%", background: "#0a0f1e", color: "#64748b",
+                }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, fontWeight: 600, letterSpacing: "0.04em" }}>
+                    3D FLY-THROUGH
+                    <span style={{ fontSize: 9, color: "#f59e0b", background: "rgba(245,158,11,0.12)", border: "1px solid rgba(245,158,11,0.3)", borderRadius: 3, padding: "0 3px", lineHeight: "14px" }}>exp</span>
+                  </div>
+                  <button
+                    onClick={() => setEnable3dPane(true)}
+                    style={{
+                      background: "#1e293b", color: "#cbd5e1", border: "1px solid #475569",
+                      borderRadius: 6, padding: "6px 14px", fontSize: 12, cursor: "pointer",
+                    }}
+                  >Enable 3D view</button>
+                  <div style={{ fontSize: 10, color: "#475569", maxWidth: 220, textAlign: "center" }}>
+                    Off by default to save performance. Streams chunk geometry around the camera.
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        ) : mapPaneEl}
 
         {/* Top-left: world info + inline rename */}
         <div style={{
@@ -1023,9 +1216,9 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
               ref={renameInputRef}
               value={renameInput}
               onChange={e => {
-                // Filter to allowed chars: A-Za-z0-9 and apostrophe, max 32
+                // Filter to allowed chars: A-Za-z0-9, space, and apostrophe, max 32
                 const filtered = e.target.value
-                  .split("").filter(c => /[A-Za-z0-9']/.test(c)).join("")
+                  .split("").filter(c => /[A-Za-z0-9' ]/.test(c)).join("")
                   .slice(0, 32);
                 setRenameInput(filtered);
               }}
@@ -1096,190 +1289,179 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
         }}>
           <div style={{ display: "flex", gap: 4 }}>
             <button onClick={() => setTool("pan")} style={tool === "pan" ? overlayBtnActive : overlayBtn}>Pan</button>
-            <button onClick={() => setTool("select")} style={tool === "select" ? overlayBtnActive : overlayBtn}>Select</button>
-            <button onClick={() => setTool("wand")} title="Magic Wand — click to flood-select matching surface blocks (W)" style={{ ...(tool === "wand" ? { ...overlayBtnActive, borderColor: "#a78bfa", color: "#c4b5fd" } : overlayBtn), display: "flex", alignItems: "center", gap: 4 }}>
+            <button onClick={() => setTool("select")} style={tool === "select" ? overlayBtnActive : overlayBtn}>⬚ Select</button>
+            <button onClick={() => setTool("wand")} title="Magic Wand — click to flood-select matching surface blocks (W)" style={tool === "wand" ? { ...overlayBtnActive, borderColor: "#a78bfa", color: "#c4b5fd" } : overlayBtn}>
               Wand
-              <span style={{ fontSize: 9, color: "#f59e0b", background: "rgba(245,158,11,0.12)", border: "1px solid rgba(245,158,11,0.3)", borderRadius: 3, padding: "0 3px", lineHeight: "14px" }}>exp</span>
             </button>
             <div style={{ width: 1, background: "#334155", margin: "0 2px" }} />
-            <div ref={drawMenuRef} style={{ position: "relative" }}>
-              <button
-                onClick={() => setDrawMenuOpen(v => !v)}
-                style={isDrawTool
-                  ? { ...overlayBtnActive, borderColor: isSculptTool ? "#fb923c" : tool === "fill" ? "#34d399" : "#f472b6", color: isSculptTool ? "#fdba74" : tool === "fill" ? "#6ee7b7" : "#fbcfe8" }
-                  : drawMenuOpen
-                    ? { ...overlayBtn, borderColor: "#f472b6", color: "#fbcfe8" }
-                    : overlayBtn}
-                title="Drawing tools (P/B/R/E/F)"
-              >
-                {isSculptTool ? `${sculptToolIcons[tool as SculptToolKey]} ${sculptToolNames[tool as SculptToolKey]}`
-                  : tool === "fill" ? "⬤ Fill"
-                  : isDrawTool ? `${drawToolIcons[tool as DrawToolKey]} ${drawToolNames[tool as DrawToolKey]}`
-                  : "Draw"} {drawMenuOpen ? "▴" : "▾"}
-              </button>
-              {drawMenuOpen && (
-                <div style={{
-                  position: "absolute", top: "calc(100% + 6px)", left: "50%", transform: "translateX(-50%)",
-                  background: "#0d1829", border: "1px solid #831843",
-                  borderRadius: 7, padding: "8px", minWidth: 210,
-                  boxShadow: "0 8px 24px rgba(0,0,0,0.6)", zIndex: 200,
-                }}>
-                  {/* Draw tools row */}
-                  <div style={{ color: "#475569", fontSize: 10, marginBottom: 4 }}>DRAW</div>
-                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 4, marginBottom: 6 }}>
-                    {(["pen", "brush", "rect", "ellipse"] as const).map(t => (
-                      <button key={t} onClick={() => setTool(t)} style={{
-                        ...overlayBtn, fontSize: 12, padding: "5px 8px", textAlign: "center",
-                        borderColor: tool === t ? "#f472b6" : "#334155",
-                        color: tool === t ? "#fbcfe8" : "#94a3b8",
-                        background: tool === t ? "rgba(244,114,182,0.1)" : "rgba(0,0,0,0.4)",
-                      }}>
-                        {drawToolIcons[t]} {drawToolNames[t]}
-                        <span style={{ color: "#475569", fontSize: 10, marginLeft: 3 }}>({t[0].toUpperCase()})</span>
-                      </button>
-                    ))}
-                  </div>
-                  {/* Sculpt tools row */}
-                  <div style={{ display: "flex", alignItems: "center", gap: 5, marginBottom: 4 }}>
-                    <span style={{ color: "#475569", fontSize: 10 }}>SCULPT</span>
-                    <span style={{ fontSize: 9, color: "#f59e0b", background: "rgba(245,158,11,0.12)", border: "1px solid rgba(245,158,11,0.3)", borderRadius: 3, padding: "0 3px", lineHeight: "14px" }}>exp</span>
-                  </div>
-                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 4, marginBottom: 6 }}>
-                    {(["smooth", "noise", "flatten", "erode"] as const).map(t => (
-                      <button key={t} onClick={() => setTool(t)} style={{
-                        ...overlayBtn, fontSize: 12, padding: "5px 8px", textAlign: "center",
-                        borderColor: tool === t ? "#fb923c" : "#334155",
-                        color: tool === t ? "#fdba74" : "#94a3b8",
-                        background: tool === t ? "rgba(251,146,60,0.1)" : "rgba(0,0,0,0.4)",
-                      }}>
-                        {sculptToolIcons[t]} {sculptToolNames[t]}
-                      </button>
-                    ))}
-                  </div>
-                  {/* Fill + sculpt strength */}
-                  <div style={{ display: "flex", alignItems: "center", gap: 4, marginBottom: 6 }}>
-                    <button onClick={() => setTool("fill")} style={{
-                      ...overlayBtn, fontSize: 12, padding: "5px 8px", flex: 1, textAlign: "center",
-                      borderColor: tool === "fill" ? "#34d399" : "#334155",
-                      color: tool === "fill" ? "#6ee7b7" : "#94a3b8",
-                      background: tool === "fill" ? "rgba(52,211,153,0.1)" : "rgba(0,0,0,0.4)",
-                    }}>
-                      ⬤ Fill Bucket
-                      <span style={{ color: "#475569", fontSize: 10, marginLeft: 3 }}>(F)</span>
-                    </button>
-                  </div>
-                  <div style={{ borderTop: "1px solid #1e293b", paddingTop: 6 }}>
-                    {(tool === "brush") && (
-                      <div style={{ display: "flex", flexDirection: "column", gap: 5, marginBottom: 6 }}>
-                        <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
-                          <span style={{ color: "#64748b", fontSize: 11, minWidth: 36 }}>Size</span>
-                          {([1, 3, 5, 7, 9] as const).map(s => (
-                            <button key={s} onClick={() => setBrushSize(s)} style={{
-                              ...overlayBtn, padding: "1px 6px", fontSize: 11,
-                              borderColor: brushSize === s ? "#f472b6" : "#334155",
-                              color: brushSize === s ? "#fbcfe8" : "#94a3b8",
-                            }}>{s}</button>
-                          ))}
-                        </div>
-                        <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
-                          <span style={{ color: "#64748b", fontSize: 11, minWidth: 36 }}>Shape</span>
-                          <button onClick={() => setBrushShape("sq")} style={{
-                            ...overlayBtn, padding: "1px 8px", fontSize: 11,
-                            borderColor: brushShape === "sq" ? "#f472b6" : "#334155",
-                            color: brushShape === "sq" ? "#fbcfe8" : "#94a3b8",
-                          }}>■ Square</button>
-                          <button onClick={() => setBrushShape("circ")} style={{
-                            ...overlayBtn, padding: "1px 8px", fontSize: 11,
-                            borderColor: brushShape === "circ" ? "#f472b6" : "#334155",
-                            color: brushShape === "circ" ? "#fbcfe8" : "#94a3b8",
-                          }}>● Circle</button>
-                        </div>
-                      </div>
-                    )}
-                    {isSculptTool && (
-                      <div style={{ display: "flex", flexDirection: "column", gap: 5, marginBottom: 6 }}>
-                        <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
-                          <span style={{ color: "#64748b", fontSize: 11, minWidth: 46 }}>Size</span>
-                          {([1, 3, 5, 7, 9] as const).map(s => (
-                            <button key={s} onClick={() => setBrushSize(s)} style={{
-                              ...overlayBtn, padding: "1px 6px", fontSize: 11,
-                              borderColor: brushSize === s ? "#fb923c" : "#334155",
-                              color: brushSize === s ? "#fdba74" : "#94a3b8",
-                            }}>{s}</button>
-                          ))}
-                        </div>
-                        <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
-                          <span style={{ color: "#64748b", fontSize: 11, minWidth: 46 }}>Strength</span>
-                          {([1, 2, 3, 4, 5] as const).map(s => (
-                            <button key={s} onClick={() => setSculptStrength(s)} style={{
-                              ...overlayBtn, padding: "1px 6px", fontSize: 11,
-                              borderColor: sculptStrength === s ? "#fb923c" : "#334155",
-                              color: sculptStrength === s ? "#fdba74" : "#94a3b8",
-                            }}>{s}</button>
-                          ))}
-                        </div>
-                      </div>
-                    )}
-                    {(tool === "rect" || tool === "ellipse") && (
-                      <div style={{ display: "flex", alignItems: "center", gap: 4, marginBottom: 6 }}>
-                        <span style={{ color: "#64748b", fontSize: 11, minWidth: 36 }}>Mode</span>
-                        <button onClick={() => setDrawFilled(true)} style={{
-                          ...overlayBtn, padding: "1px 8px", fontSize: 11,
-                          borderColor: drawFilled ? "#f472b6" : "#334155",
-                          color: drawFilled ? "#fbcfe8" : "#94a3b8",
-                        }}>Fill</button>
-                        <button onClick={() => setDrawFilled(false)} style={{
-                          ...overlayBtn, padding: "1px 8px", fontSize: 11,
-                          borderColor: !drawFilled ? "#f472b6" : "#334155",
-                          color: !drawFilled ? "#fbcfe8" : "#94a3b8",
-                        }}>Hollow</button>
-                      </div>
-                    )}
-                    {!isSculptTool && tool !== "fill" && (
-                      <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
-                        <span style={{ color: "#64748b", fontSize: 11, minWidth: 36 }}>Layer</span>
-                        <button onClick={() => setDrawAbove(false)} style={{
-                          ...overlayBtn, padding: "1px 8px", fontSize: 11,
-                          borderColor: !drawAbove ? "#f472b6" : "#334155",
-                          color: !drawAbove ? "#fbcfe8" : "#94a3b8",
-                        }}>Surface</button>
-                        <button onClick={() => setDrawAbove(true)} style={{
-                          ...overlayBtn, padding: "1px 8px", fontSize: 11,
-                          borderColor: drawAbove ? "#f472b6" : "#334155",
-                          color: drawAbove ? "#fbcfe8" : "#94a3b8",
-                        }}>+1 Above</button>
-                      </div>
-                    )}
-                  </div>
-                  <div style={{ borderTop: "1px solid #1e293b", marginTop: 8, paddingTop: 8 }}>
-                    <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
-                      <span style={{ color: "#475569", fontSize: 10 }}>DRAWING WITH</span>
-                      <div style={{
-                        width: 12, height: 12, borderRadius: 2, flexShrink: 0,
-                        background: `rgb(${swatchColor[0]},${swatchColor[1]},${swatchColor[2]})`,
-                        border: "1px solid rgba(255,255,255,0.2)",
-                      }} />
-                      <span style={{ color: "#94a3b8", fontSize: 11 }}>
-                        {blockDisplayName(fillBlockType)}{fillPaint > 0 ? ` / paint ${fillPaint}` : ""}
-                      </span>
-                    </div>
-                  </div>
-                </div>
+            <button
+              onClick={() => { if (!isDrawTool) setTool("pen"); }}
+              style={isDrawTool
+                ? { ...overlayBtnActive, borderColor: isSculptTool ? "#fb923c" : tool === "fill" ? "#34d399" : "#f472b6", color: isSculptTool ? "#fdba74" : tool === "fill" ? "#6ee7b7" : "#fbcfe8" }
+                : overlayBtn}
+              title="Drawing tools (P/B/R/E/F)"
+            >
+              {isSculptTool ? `${sculptToolIcons[tool as SculptToolKey]} ${sculptToolNames[tool as SculptToolKey]}`
+                : tool === "fill" ? "Fill"
+                : isDrawTool ? `${drawToolIcons[tool as DrawToolKey]} ${drawToolNames[tool as DrawToolKey]}`
+                : "Draw"}
+              {isDrawTool && !isSculptTool && tool !== "fill" && (
+                <span style={{
+                  marginLeft: 4, fontSize: 10, fontWeight: 700,
+                  color: drawAbove ? "#fcd34d" : "#6ee7b7",
+                  background: drawAbove ? "rgba(252,211,77,0.15)" : "rgba(110,231,183,0.12)",
+                  border: `1px solid ${drawAbove ? "rgba(252,211,77,0.4)" : "rgba(110,231,183,0.35)"}`,
+                  borderRadius: 3, padding: "0 3px", lineHeight: "14px",
+                }}>{drawAbove ? "+1" : "surf"}</span>
               )}
-            </div>
+            </button>
 
             <div style={{ width: 1, background: "#334155", margin: "0 2px" }} />
             <button
               onClick={handleUndo} disabled={undoDepth === 0}
               style={{ ...overlayBtn, opacity: undoDepth === 0 ? 0.4 : 1, cursor: undoDepth === 0 ? "not-allowed" : "pointer" }}
               title="Undo (Cmd+Z)"
-            >Undo</button>
+            >↩ Undo</button>
             <button
               onClick={handleRedo} disabled={redoDepth === 0}
               style={{ ...overlayBtn, opacity: redoDepth === 0 ? 0.4 : 1, cursor: redoDepth === 0 ? "not-allowed" : "pointer" }}
               title="Redo (Cmd+Shift+Z)"
-            >Redo</button>
+            >↪ Redo</button>
           </div>
+
+          {/* Draw toolbar — visible when a draw tool or eyedropper is active */}
+          {(isDrawTool || tool === "eyedropper") && (
+            <div style={{
+              display: "flex", alignItems: "center", gap: 4, flexWrap: "wrap",
+              background: "rgba(0,0,0,0.6)", padding: "4px 10px",
+              borderRadius: 6, border: "1px solid #831843",
+            }}>
+              {/* Pick */}
+              <button
+                onClick={() => { prevToolRef.current = tool === "eyedropper" ? "pen" : tool; setTool("eyedropper"); }}
+                title="Eyedropper — click any block to pick its type and paint (I)"
+                style={{ ...(tool === "eyedropper" ? { ...overlayBtnActive, borderColor: "#67e8f9", color: "#a5f3fc" } : overlayBtn) }}
+              >
+                {tool === "eyedropper" ? "💉 Pick" : "💉"}
+              </button>
+              <div style={{ width: 1, background: "#334155", margin: "0 2px", alignSelf: "stretch" }} />
+              {/* Draw tools */}
+              {(["pen", "brush", "rect", "ellipse"] as const).map(t => (
+                <button key={t} onClick={() => setTool(t)} title={drawToolNames[t]} style={{
+                  ...overlayBtn, fontSize: 12,
+                  borderColor: tool === t ? "#f472b6" : "#334155",
+                  color: tool === t ? "#fbcfe8" : "#94a3b8",
+                  background: tool === t ? "rgba(244,114,182,0.1)" : "rgba(0,0,0,0.4)",
+                }}>
+                  {tool === t ? `${drawToolIcons[t]} ${drawToolNames[t]}` : drawToolIcons[t]}
+                </button>
+              ))}
+              {/* Fill bucket */}
+              <button onClick={() => setTool("fill")} title="Fill Bucket (F)" style={{
+                ...overlayBtn, fontSize: 12,
+                borderColor: tool === "fill" ? "#34d399" : "#334155",
+                color: tool === "fill" ? "#6ee7b7" : "#94a3b8",
+                background: tool === "fill" ? "rgba(52,211,153,0.1)" : "rgba(0,0,0,0.4)",
+              }}>
+                {tool === "fill" ? "🪣 Fill" : "🪣"}
+              </button>
+              <div style={{ width: 1, background: "#334155", margin: "0 2px", alignSelf: "stretch" }} />
+              {/* Sculpt tools */}
+              <span style={{ color: "#475569", fontSize: 10, marginRight: 2 }}>Sculpt</span>
+              <span style={{ fontSize: 9, color: "#f59e0b", background: "rgba(245,158,11,0.12)", border: "1px solid rgba(245,158,11,0.3)", borderRadius: 3, padding: "0 3px", lineHeight: "14px", marginRight: 2 }}>exp</span>
+              {(["smooth", "noise", "flatten", "erode"] as const).map(t => (
+                <button key={t} onClick={() => setTool(t)} title={sculptToolNames[t]} style={{
+                  ...overlayBtn, fontSize: 12,
+                  borderColor: tool === t ? "#fb923c" : "#334155",
+                  color: tool === t ? "#fdba74" : "#94a3b8",
+                  background: tool === t ? "rgba(251,146,60,0.1)" : "rgba(0,0,0,0.4)",
+                }}>
+                  {tool === t ? `${sculptToolIcons[t]} ${sculptToolNames[t]}` : sculptToolIcons[t]}
+                </button>
+              ))}
+              {/* Context options */}
+              {(tool === "brush") && (<>
+                <div style={{ width: 1, background: "#334155", margin: "0 2px", alignSelf: "stretch" }} />
+                <span style={{ color: "#64748b", fontSize: 11 }}>Size</span>
+                {([1, 3, 5, 7, 9] as const).map(s => (
+                  <button key={s} onClick={() => setBrushSize(s)} style={{
+                    ...overlayBtn, padding: "1px 6px", fontSize: 11,
+                    borderColor: brushSize === s ? "#f472b6" : "#334155",
+                    color: brushSize === s ? "#fbcfe8" : "#94a3b8",
+                  }}>{s}</button>
+                ))}
+                <div style={{ width: 1, background: "#334155", margin: "0 2px", alignSelf: "stretch" }} />
+                <button onClick={() => setBrushShape("sq")} style={{
+                  ...overlayBtn, padding: "1px 8px", fontSize: 11,
+                  borderColor: brushShape === "sq" ? "#f472b6" : "#334155",
+                  color: brushShape === "sq" ? "#fbcfe8" : "#94a3b8",
+                }}>■ Sq</button>
+                <button onClick={() => setBrushShape("circ")} style={{
+                  ...overlayBtn, padding: "1px 8px", fontSize: 11,
+                  borderColor: brushShape === "circ" ? "#f472b6" : "#334155",
+                  color: brushShape === "circ" ? "#fbcfe8" : "#94a3b8",
+                }}>● Circ</button>
+              </>)}
+              {isSculptTool && (<>
+                <div style={{ width: 1, background: "#334155", margin: "0 2px", alignSelf: "stretch" }} />
+                <span style={{ color: "#64748b", fontSize: 11 }}>Size</span>
+                {([1, 3, 5, 7, 9] as const).map(s => (
+                  <button key={s} onClick={() => setBrushSize(s)} style={{
+                    ...overlayBtn, padding: "1px 6px", fontSize: 11,
+                    borderColor: brushSize === s ? "#fb923c" : "#334155",
+                    color: brushSize === s ? "#fdba74" : "#94a3b8",
+                  }}>{s}</button>
+                ))}
+                <div style={{ width: 1, background: "#334155", margin: "0 2px", alignSelf: "stretch" }} />
+                <span style={{ color: "#64748b", fontSize: 11 }}>Str</span>
+                {([1, 2, 3, 4, 5] as const).map(s => (
+                  <button key={s} onClick={() => setSculptStrength(s)} style={{
+                    ...overlayBtn, padding: "1px 6px", fontSize: 11,
+                    borderColor: sculptStrength === s ? "#fb923c" : "#334155",
+                    color: sculptStrength === s ? "#fdba74" : "#94a3b8",
+                  }}>{s}</button>
+                ))}
+              </>)}
+              {(tool === "rect" || tool === "ellipse") && (<>
+                <div style={{ width: 1, background: "#334155", margin: "0 2px", alignSelf: "stretch" }} />
+                <button onClick={() => setDrawFilled(true)} style={{
+                  ...overlayBtn, padding: "1px 8px", fontSize: 11,
+                  borderColor: drawFilled ? "#f472b6" : "#334155",
+                  color: drawFilled ? "#fbcfe8" : "#94a3b8",
+                }}>Fill</button>
+                <button onClick={() => setDrawFilled(false)} style={{
+                  ...overlayBtn, padding: "1px 8px", fontSize: 11,
+                  borderColor: !drawFilled ? "#f472b6" : "#334155",
+                  color: !drawFilled ? "#fbcfe8" : "#94a3b8",
+                }}>Hollow</button>
+              </>)}
+              {!isSculptTool && tool !== "fill" && tool !== "eyedropper" && (<>
+                <div style={{ width: 1, background: "#334155", margin: "0 2px", alignSelf: "stretch" }} />
+                <button onClick={() => setDrawAbove(false)} style={{
+                  ...overlayBtn, padding: "1px 8px", fontSize: 11,
+                  borderColor: !drawAbove ? "#f472b6" : "#334155",
+                  color: !drawAbove ? "#fbcfe8" : "#94a3b8",
+                }}>Surface</button>
+                <button onClick={() => setDrawAbove(true)} style={{
+                  ...overlayBtn, padding: "1px 8px", fontSize: 11,
+                  borderColor: drawAbove ? "#f472b6" : "#334155",
+                  color: drawAbove ? "#fbcfe8" : "#94a3b8",
+                }}>+1 Above</button>
+              </>)}
+              {/* Drawing with swatch */}
+              {isDrawTool && (<>
+                <div style={{ width: 1, background: "#334155", margin: "0 2px", alignSelf: "stretch" }} />
+                <div style={{
+                  width: 12, height: 12, borderRadius: 2, flexShrink: 0,
+                  background: `rgb(${swatchColor[0]},${swatchColor[1]},${swatchColor[2]})`,
+                  border: "1px solid rgba(255,255,255,0.2)",
+                }} />
+                <span style={{ color: "#94a3b8", fontSize: 11 }}>
+                  {blockDisplayName(fillBlockType)}{fillPaint > 0 ? ` / paint ${fillPaint}` : ""}
+                </span>
+              </>)}
+            </div>
+          )}
 
           {/* Z-slice height slider — visible only in Z-slice mode */}
           {viewMode === "zslice" && (
@@ -1319,9 +1501,25 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
               width: 26, height: 26, borderRadius: 3, cursor: "pointer", flexShrink: 0,
               position: "relative", display: "flex", alignItems: "center", justifyContent: "center",
             };
-            const iconOverlay: React.CSSProperties = {
-              position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center",
-              background: "rgba(0,0,0,0.55)", borderRadius: 3, fontSize: 11, color: "#e2e8f0",
+            // Small corner badge — pin (↑) for recent, unpin (×) for pinned
+            const cornerBadge: React.CSSProperties = {
+              position: "absolute", top: 0, right: 0,
+              width: 11, height: 11, borderRadius: "0 3px 0 3px",
+              background: "rgba(0,0,0,0.72)", display: "flex", alignItems: "center", justifyContent: "center",
+              fontSize: 9, color: "#e2e8f0", lineHeight: 1, zIndex: 1,
+            };
+            // Block letter overlay (bottom-left, always visible)
+            const letterOverlay = (bt: number): React.ReactNode => {
+              const letter = blockDisplayName(bt)[0]?.toUpperCase() ?? "";
+              if (!letter) return null;
+              return (
+                <span style={{
+                  position: "absolute", bottom: 1, left: 2,
+                  fontSize: 8, fontWeight: 700, lineHeight: 1,
+                  color: "rgba(255,255,255,0.7)", textShadow: "0 0 2px rgba(0,0,0,0.9)",
+                  pointerEvents: "none", userSelect: "none",
+                }}>{letter}</span>
+              );
             };
             function pinToSlot(b: {type: number; paint: number}) {
               setPinnedBlocks(prev => {
@@ -1331,6 +1529,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
                 next[4] = b; return next; // replace last if full
               });
             }
+            const slotKeys = ["1","2","3","4","5","6","7","8","9","0"];
             return (
               <div style={{
                 display: "flex", flexDirection: "column", alignItems: "center", gap: 2,
@@ -1352,16 +1551,23 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
                       outline: active ? "1px solid #a78bfa" : "none",
                       outlineOffset: 1,
                     }}
-                      title={b ? `${blockDisplayName(b.type)}${b.paint > 0 ? ` paint ${b.paint}` : ""} (click to select, hover for unpin)` : "Empty slot — pin a recent block here"}
+                      title={b ? `${blockDisplayName(b.type)}${b.paint > 0 ? ` paint ${b.paint}` : ""} · key ${slotKeys[i]} (click to select)` : `Empty slot ${slotKeys[i]} — pin a recent block here`}
                       onClick={() => b && (setFillBlockType(b.type), setFillPaint(b.paint))}
                       onMouseEnter={() => setHotbarHover(key)}
                       onMouseLeave={() => setHotbarHover(null)}
                     >
+                      {/* Slot key number */}
+                      <span style={{
+                        position: "absolute", top: 0, left: 2,
+                        fontSize: 7, color: "rgba(255,255,255,0.4)", lineHeight: 1,
+                        pointerEvents: "none", userSelect: "none",
+                      }}>{slotKeys[i]}</span>
+                      {b && letterOverlay(b.type)}
+                      {/* Unpin badge — only on hover */}
                       {hovered && b && (
-                        <div style={iconOverlay}
-                          onClick={e => { e.stopPropagation(); setPinnedBlocks(prev => { const n = [...prev]; n[i] = null; return n; }); setHotbarHover(null); }}>
-                          ×
-                        </div>
+                        <div style={cornerBadge}
+                          onClick={e => { e.stopPropagation(); setPinnedBlocks(prev => { const n = [...prev]; n[i] = null; return n; }); setHotbarHover(null); }}
+                          title="Unpin">×</div>
                       )}
                     </div>
                   );
@@ -1385,16 +1591,22 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
                         outlineOffset: 1,
                         opacity: alreadyPinned ? 0.5 : 1,
                       }}
-                        title={`${blockDisplayName(b.type)}${b.paint > 0 ? ` paint ${b.paint}` : ""} (click to select${alreadyPinned ? ", already pinned" : ", hover to pin"})`}
+                        title={`${blockDisplayName(b.type)}${b.paint > 0 ? ` paint ${b.paint}` : ""} · key ${slotKeys[i + 5]} (click to select${alreadyPinned ? ", already pinned" : ""})`}
                         onClick={() => { setFillBlockType(b.type); setFillPaint(b.paint); }}
                         onMouseEnter={() => setHotbarHover(key)}
                         onMouseLeave={() => setHotbarHover(null)}
                       >
+                        <span style={{
+                          position: "absolute", top: 0, left: 2,
+                          fontSize: 7, color: "rgba(255,255,255,0.4)", lineHeight: 1,
+                          pointerEvents: "none", userSelect: "none",
+                        }}>{slotKeys[i + 5]}</span>
+                        {letterOverlay(b.type)}
+                        {/* Pin badge — only on hover when not already pinned */}
                         {hovered && !alreadyPinned && (
-                          <div style={iconOverlay}
-                            onClick={e => { e.stopPropagation(); pinToSlot(b); setHotbarHover(null); }}>
-                            ↑
-                          </div>
+                          <div style={cornerBadge}
+                            onClick={e => { e.stopPropagation(); pinToSlot(b); setHotbarHover(null); }}
+                            title="Pin to pinned slots">↑</div>
                         )}
                       </div>
                     );
@@ -1492,7 +1704,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
                   style={menuItem}
                 >
                   <span style={{ display: "inline-block", width: 16, color: "#3b82f6" }}>{renderMode === "tiled" ? "●" : ""}</span>
-                  Tiled
+                  ⊞ Tiled
                   <span style={{ marginLeft: 8, color: "#475569", fontSize: 11 }}>low RAM</span>
                 </button>
                 <button
@@ -1525,6 +1737,18 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
                     </span>
                   </div>
                 )}
+                <div style={{ height: 1, background: "#1e293b", margin: "4px 0" }} />
+                <div style={{ padding: "4px 12px 2px", color: "#64748b", fontSize: 10, letterSpacing: 1, fontWeight: 600 }}>
+                  VIEWPORTS
+                </div>
+                <button
+                  onClick={() => { setViewMenuOpen(false); setShowSlicePanels(v => !v); }}
+                  style={menuItem}
+                >
+                  <span style={{ display: "inline-block", width: 16, color: "#a855f7" }}>{showSlicePanels ? "●" : ""}</span>
+                  <span style={{ color: showSlicePanels ? "#d8b4fe" : undefined }}>◫ Quad view (Top / Front / Side / 3D)</span>
+                  <span style={{ marginLeft: 6, fontSize: 9, color: "#f59e0b", background: "rgba(245,158,11,0.12)", border: "1px solid rgba(245,158,11,0.3)", borderRadius: 3, padding: "0 3px", lineHeight: "14px" }}>exp</span>
+                </button>
                 {/* Sky Editor and Creature Viewer implemented but hidden pending testing */}
               </div>
             )}
@@ -1775,14 +1999,14 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
                 style={{ ...overlayBtn, padding: "2px 10px", fontSize: 12, borderColor: "#a78bfa", color: "#ddd6fe" }}
                 title="Mirror clipboard left↔right (flip on X axis)"
               >
-                Flip X
+                ↔ Flip X
               </button>
               <button
                 onClick={mirrorClipboardY}
                 style={{ ...overlayBtn, padding: "2px 10px", fontSize: 12, borderColor: "#a78bfa", color: "#ddd6fe" }}
                 title="Mirror clipboard top↔bottom (flip on Y axis)"
               >
-                Flip Y
+                ↕ Flip Y
               </button>
               <button
                 onClick={() => setPersistPaste((v) => !v)}
@@ -2001,14 +2225,14 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
                 style={{ ...overlayBtn, padding: "2px 10px", fontSize: 12, borderColor: "#a78bfa", color: "#ddd6fe" }}
                 title="Mirror clipboard left↔right (flip on X axis)"
               >
-                Flip X
+                ↔ Flip X
               </button>
               <button
                 onClick={mirrorClipboardY}
                 style={{ ...overlayBtn, padding: "2px 10px", fontSize: 12, borderColor: "#a78bfa", color: "#ddd6fe" }}
                 title="Mirror clipboard top↔bottom (flip on Y axis)"
               >
-                Flip Y
+                ↕ Flip Y
               </button>
               <button
                 onClick={() => setPasteTerrain((v) => !v)}
@@ -2131,6 +2355,12 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
                             clipPath: "polygon(0% 100%, 100% 100%, 100% 0%)",
                           }} />
                         )}
+                        <span style={{
+                          position: "absolute", bottom: 0, left: 1,
+                          fontSize: 7, fontWeight: 700, lineHeight: 1,
+                          color: "rgba(255,255,255,0.65)", textShadow: "0 0 2px rgba(0,0,0,1)",
+                          pointerEvents: "none", userSelect: "none",
+                        }}>{b.name[0]?.toUpperCase()}</span>
                       </div>
                     );
                   })}
@@ -2791,8 +3021,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           <SelectionInspector
             selection={selection}
             clipboard={clipboard}
-            elevationPanelOpen={showElevationPanel}
-            onToggleElevationPanel={() => setShowElevationPanel(v => !v)}
+            quadMode={showSlicePanels}
             extrudeCount={extrudeCount}
             onExtrudeCountChange={setExtrudeCount}
             extrudeAxis={extrudeAxis}
@@ -2802,11 +3031,13 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
             onExtrudeOpenChange={setExtrudeOpen}
             onSavePrefab={savePrefab}
             onGenerateTrees={handleGenerateTrees}
+            topPx={showSlicePanels ? 92 : undefined}
           />
         )}
 
-        {/* Bottom-right panel: full-height elevation view — opt-in, off by default */}
-        {(pastePreviewSelection || selection) && showElevationPanel && (
+        {/* Bottom-right panel: full-height elevation view — opt-in; redundant in quad view (the slabs
+            now carry its overlays), so it's suppressed while quad view is open. */}
+        {!showSlicePanels && (pastePreviewSelection || selection) && (
           <ElevationPreviewPanel
             selection={pastePreviewSelection ?? selection!}
             maxZ={world.max_z}
@@ -2816,6 +3047,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
             editEpoch={editEpoch}
             drawActive={["pen","brush","rect","ellipse"].includes(tool)}
             onDrawElevation={handleDrawElevation}
+            onZRangeChange={pastePreviewSelection ? undefined : (zMin, zMax) => { setZMin(zMin); setZMax(zMax); }}
           />
         )}
 
@@ -2906,7 +3138,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
       }}>
         {/* App icon */}
         <img
-          src="/src/assets/app-icon.png"
+          src={appIcon}
           alt="VuencEdit"
           style={{ width: 120, height: 120, borderRadius: 24, marginBottom: 20, imageRendering: "pixelated" }}
         />

@@ -75,7 +75,7 @@ struct Tg2Config {
     clouds:        bool, // scatter cloud blocks near top of world
     amplitude:     f64,  // relief multiplier, clamped 0.1–4.0 (UI: 0.5–3.0×)
     sea_level_off: i32,  // additive water-level offset, clamped −16..32 blocks
-    blend:         bool, // soften Mix/Mtn+River zone seams (talus post-pass)
+    blend:         bool, // soften Mix/Mtn+River zone seams (bidirectional blur post-pass)
 }
 ```
 
@@ -174,7 +174,8 @@ Grass top via second pass.  River: any column with air at y=6..15 gets water
 ### 3 — Mtn+River
 East half (x ≥ gsize/2): `tg2_make_river_trees`.
 West half (x < gsize/2 - 32): `tg2_make_mountains`.
-Seam (width 32): `tg2_make_transition` linearly blends column heights.
+Seam (width 32): `tg2_make_transition` smoothstep-blends column heights along a
+noise-warped boundary (carries each side's surface paint).
 
 ### 4 — Desert (`tg2_make_desert`)
 Flat sand at `T_HEIGHT/2-10` (AMPLITUDE=0 in original).  Sand painted `cc6`.
@@ -296,21 +297,30 @@ seed noise used by the overlaid biomes.
 
 Scatters rectangular cloud (19) patches near `T_HEIGHT * 4/5`.  Patch count ≈
 `(gsize² / 500).max(2)`.  Each patch is 6–18 blocks wide/deep at a random position.
-No attempt is made to avoid placing clouds over land — the flat rectangles sit in
-empty sky.
+The slab altitude is jittered ±2 blocks per patch (clamped to `[th/2, th-2]`) so
+clouds don't all sit on one flat plane, and any cell where terrain already rises
+into the cloud layer is skipped (`g.get(px,pz,cy)!=0` → continue) so a cloud never
+buries a mountain top.
 
 ---
 
 ## Transition Seam (`tg2_make_transition`)
 
 Used by terrain type 3 (Mtn+River) to blend the height boundary between mountains
-and river-forest.  For each z row, reads the column height from the left side
-(`x = sx-1`) and right side (`x = ex`) and linearly interpolates across the seam
-width.  Block type switches at the midpoint (`fx < 0.5` → left type, else right type).
+and river-forest.  Signature: `tg2_make_transition(g, noise, seed, sx, sz, ex, ez)`.
+For each z row it reads the surface `(height, block, paint)` of the left reference
+column (`x = sx-1`) and right reference column (`x = ex`), then for each x in the
+band:
 
-The original `makeTransition` uses `lookupColor` (nearest-palette colour match for
-a blended RGB) — the Rust port simplifies this to a hard block-type cutoff at the
-midpoint, which is visually equivalent for the seam widths used.
+- **Noise-warped seam** — the normalised seam position is offset by
+  `tg2_fbm2(noise, x, z, seed+533, 1.0, span*0.25, 1.0)`, so the boundary wobbles
+  across rows instead of tracing a straight column (covered by the
+  `tg2_warped_borders_not_axis_aligned` test).
+- **Smoothstep height ramp** — `s = fx²(3-2fx)` eases the height interpolation in/out
+  rather than ramping linearly.
+- **Paint carried across** — the chosen side contributes both its block type *and*
+  its surface paint (`s < 0.5` → left, else right), so the seam keeps the natural
+  colour of whichever biome it resolves to.
 
 ---
 
@@ -320,7 +330,7 @@ midpoint, which is visually equivalent for the seam widths used.
 |--------|--------------|-----------|
 | World size | Fixed `GSIZE = T_SIZE * 10 ≈ 300` | User-selectable 5–40 chunks (80–640 blocks) |
 | Structure frequency | Hard-coded per-biome counts | Scaled by `(gsize/300)²` × `struct_freq` |
-| `makeTransition` colour | `lookupColor(blended RGB)` | Hard midpoint block-type cutoff |
+| `makeTransition` colour | `lookupColor(blended RGB)` | Smoothstep + noise-warped seam; carries each side's surface paint |
 | `makeWorm` | Physics-simulated worm tunnels | Not ported (complex, visual impact minimal) |
 | `genTemperatureMap` | 16×16 Perlin → bilinear upsample | Not needed — TM() checks are dead code |
 | `makeCave` (standalone) | Local cavern carve | Not exposed; Ponies uses inline 3D noise instead |
@@ -348,20 +358,31 @@ separate count that follows the same `(gsize/300)² × freq_scale` pattern.
 - **Mix layout is approximate.** The original `makeMix()` in ObjC has exact pixel-level
   coordinate math for each zone boundary; the port reconstructs these from reading the
   source but some zone edges may differ by a few blocks.
-- **`makeTransition` block type** at the midpoint depends on which side has higher
-  terrain, which may cause a hard step in some seeds.  The original's `lookupColor`
-  approach would blend paint only, not geometry.
+- **Biome *material* borders stay axis-aligned.** Block-type boundaries between Mix
+  zones (e.g. desert sand meeting grass) remain straight lines — only the *heights*
+  (via `tg2_blend_seams`) and the explicit Mtn+River seam (via `tg2_make_transition`)
+  are noise-warped.  A full domain-warped biome-ID map was evaluated and deliberately
+  **not** implemented: `tg2_make_mix` composes zones by reading back already-placed
+  blocks in a fixed order, so warping the zone footprints would require a generator
+  rewrite, against the project's "pragmatic edge-blending only" guidance.  The
+  height blur + paint dither already remove the most jarring cliff/colour artifacts.
 - **No `makeOcean`** — the original has a `makeOcean()` function (referenced in header)
   but it was not found in the ~2917 lines read.  Beach's water fill covers this use case.
 - **Extended_z worlds now scale** to fill the full 256z (via `vs = t_height/64`).  This
   is a deviation from the original (T_HEIGHT=64 only).  Mix's inter-zone horizontal
   tapers stay native, so a few zone edges in 256z Mix may ramp slightly differently
   than a perfectly-scaled version would.
-- **Preview ignores the new knobs.** `preview_tg2_world` is a fixed 64z top-down
-  heightmap and does not take `extended_z`, `amplitude`, `sea_level_off`, or `blend`.
-  The biome *layout* it shows is correct; paint shades (height-driven) and water
-  extent can differ slightly from the generated world.
-- **Biome blend (`blend`)** is an additive talus post-pass (`tg2_blend_seams`): it
-  raises lower natural-terrain columns one block per iteration toward higher
-  natural neighbours (skipping water/slate/sky features), so it only ever *adds*
-  blocks.  ~`8 × vs` iterations → ~1:N slopes at zone borders.
+- **Preview parity.** `preview_tg2_world(size_chunks, seed, terrain_type, max_px,
+  custom_biomes, extended_z, amplitude, sea_level_off)` now reflects the height
+  format (`th`/`vs`), amplitude (relief multiplier) and sea-level offset, so the
+  preview tracks those sliders.  It remains a fast heightmap-only approximation:
+  **no** fill, caves, structures, trees or `blend` are shown.
+- **Biome blend (`blend`)** is a bidirectional smoothing post-pass
+  (`tg2_blend_seams(g, noise, seed, iters)`, ~`6 × vs` iterations).  Each iteration
+  snapshots every natural-terrain (`2|3|4|8`) column's surface, then for each column
+  computes a noise-warped, box-blurred (`radius = clamp(round(vs*2), 2, 5)`) target
+  height and moves halfway toward it — **raising** low columns (stacking the column's
+  own material) *or* **carving** high columns (to air).  Surface paint is re-tinted
+  with a hash-dithered pick from the kernel's neighbours, so a seam between two
+  palettes resolves to a speckled gradient.  Verified by
+  `tg2_blend_smooths_both_directions` (mean neighbour-height delta drops after blend).

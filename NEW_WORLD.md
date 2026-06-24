@@ -42,11 +42,12 @@ chunk borders without grid artifacts. **Experimental.**
 | **Seed** | number (🎲) | Deterministic. |
 | **Base height** | 5–55 / 5–200 | Average ground/sea level. |
 | **Terrain roughness** | Plains → Jagged | Relief amplitude. |
+| **Erosion** | None / Light / Medium / Strong | A low-frequency field that *reduces* relief where it reads high, so broad flat plains alternate with rugged highlands over one continuous surface (Minecraft-style, no biome cliffs). None = uniform relief everywhere. |
 | **Feature scale** | Small → Huge | Continent/range wavelength. |
 | **Extreme mountains** | toggle (**256z only**) | Towering peaks using the full height; reset when leaving 256z. |
 | **Water** | None / Ponds / Lakes / Ocean | Standing-water level vs base height. |
 | **Rivers** | toggle | Carves winding channels. |
-| **Biome mode** | Single / **Mixed** | **Mixed** blends Grassland/Desert/Snow per-column by temperature + moisture (+ altitude → snowy peaks) over one continuous heightmap, so no border cliffs. |
+| **Biome mode** | Single / **Mixed** | **Mixed** blends Grassland/Desert/Snow per-column by temperature + moisture (+ altitude → snowy peaks) over one continuous heightmap, so no border cliffs. A small per-column climate dither speckles biome edges into a soft transition band instead of a crisp line. |
 | → **Biome** (single) | Grassland / Desert / Snow / Lava / **Classic+** | Surface & palette. **Snow** uses a cold palette (white weeds, frosted leaves, white/blue flowers). **Classic+** is the legacy hill terrain & caves (with bare-stone outcrops) run through the modern pipeline, so it gains rivers, lakes/ocean, structures & natural trees the plain **Classic** tab lacks. **Lava & Classic+ are single-mode only.** |
 | → **Biome size** (mixed) | Small / Medium / Large | Climate-region wavelength. |
 | **Snow-capped peaks** | toggle (single grassland) | Alpine snow above the snowline. |
