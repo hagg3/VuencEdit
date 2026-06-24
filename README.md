@@ -4,6 +4,12 @@ A map viewer and block editor for **Eden World Builder** world files (`.eden`).
 
 Open a world file and get a colour-coded top-down map of everything in it. Pan and zoom around, select regions, fill or replace blocks, copy and paste structures, and save your changes back — all without touching the game itself.
 
+Based on Eden World Manipulator which is itself based on Vuenctools. Original file format documentation by Robert Munafo.
+
+Eden World Builder was created by Ari Ronen and made open source in 2018.
+
+For support, visit the Discord server for the game and community.
+
 ---
 
 ## Downloads
