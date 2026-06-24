@@ -27,8 +27,7 @@ function decodePixels(b64: string): Uint8Array {
 interface Props {
   selection: SelectionInfo;
   clipboard: ClipboardInfo | null;
-  elevationPanelOpen: boolean;
-  onToggleElevationPanel: () => void;
+  quadMode: boolean;
   extrudeCount: number;
   onExtrudeCountChange: (n: number) => void;
   extrudeAxis: ExtrudeAxis;
@@ -38,6 +37,8 @@ interface Props {
   onExtrudeOpenChange: (v: boolean) => void;
   onSavePrefab: () => void;
   onGenerateTrees: (treeType: TreeType, density: number) => void;
+  /** Override the panel's top offset (px). In quad view it's pushed down to clear the front pane header. */
+  topPx?: number;
 }
 
 const CW = 190;
@@ -63,10 +64,11 @@ const panelStyle: React.CSSProperties = {
   userSelect: "none",
 };
 
-export default function SelectionInspector({ selection: sel, clipboard, elevationPanelOpen, onToggleElevationPanel, extrudeCount, onExtrudeCountChange, extrudeAxis, onExtrudeAxisChange, onExtrude, extrudeOpen, onExtrudeOpenChange, onSavePrefab, onGenerateTrees }: Props) {
+export default function SelectionInspector({ selection: sel, clipboard, quadMode, extrudeCount, onExtrudeCountChange, extrudeAxis, onExtrudeAxisChange, onExtrude, extrudeOpen, onExtrudeOpenChange, onSavePrefab, onGenerateTrees, topPx }: Props) {
   const [view, setView] = useState<PreviewView>("front");
   const [previewData, setPreviewData] = useState<PreviewData | null>(null);
   const [extrudeIgnoreAir, setExtrudeIgnoreAir] = useState(false);
+  const [orthoOpen, setOrthoOpen] = useState(!quadMode);
   const [axoSki, setAxoSki] = useState(0.2);
   const [axoDir, setAxoDir] = useState(0); // 0=SE 1=SW 2=NE 3=NW
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -181,7 +183,7 @@ export default function SelectionInspector({ selection: sel, clipboard, elevatio
   };
 
   return (
-    <div style={panelStyle}>
+    <div style={topPx != null ? { ...panelStyle, top: topPx } : panelStyle}>
 
       {/* Header */}
       <div style={{ color: "#93c5fd", fontWeight: 700, fontSize: 10, letterSpacing: "0.08em" }}>
@@ -454,70 +456,67 @@ export default function SelectionInspector({ selection: sel, clipboard, elevatio
 
       <div style={{ borderTop: "1px solid #1a2744" }} />
 
-      {/* Preview view tabs */}
-      <div style={{ display: "flex", gap: 3 }}>
-        {(["front", "side", "top", "axo"] as PreviewView[]).map((v) => (
-          <button key={v} style={tabBtn(v)} onClick={() => setView(v)}>
-            {v.charAt(0).toUpperCase() + v.slice(1)}
-          </button>
-        ))}
-      </div>
-
-      {/* Axo controls — direction + depth, only when axo tab active */}
-      {view === "axo" && (
-        <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+      {/* Orthographic preview — collapsible; collapsed by default in quad mode */}
+      <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+        <div
+          onClick={() => setOrthoOpen(v => !v)}
+          style={{ display: "flex", alignItems: "center", gap: 5, cursor: "pointer", userSelect: "none" }}
+        >
+          <span style={{ color: "#475569", fontSize: 9 }}>{orthoOpen ? "▼" : "▶"}</span>
+          <span style={{ color: "#94a3b8", fontWeight: 700, fontSize: 10, letterSpacing: "0.08em" }}>ORTHO VIEW</span>
+        </div>
+        {orthoOpen && (<>
+          {/* Preview view tabs */}
           <div style={{ display: "flex", gap: 3 }}>
-            {([["SE", 0], ["SW", 1], ["NE", 2], ["NW", 3]] as [string, number][]).map(([label, d]) => (
-              <button
-                key={d}
-                onClick={() => setAxoDir(d)}
-                style={{
-                  flex: 1, padding: "2px 0", fontSize: 10, cursor: "pointer",
-                  background: axoDir === d ? "rgba(168,85,247,0.25)" : "rgba(255,255,255,0.04)",
-                  border: `1px solid ${axoDir === d ? "#a855f7" : "#334155"}`,
-                  color: axoDir === d ? "#d8b4fe" : "#64748b",
-                  borderRadius: 3,
-                }}
-              >{label}</button>
+            {(["front", "side", "top", "axo"] as PreviewView[]).map((v) => (
+              <button key={v} style={tabBtn(v)} onClick={() => setView(v)}>
+                {v.charAt(0).toUpperCase() + v.slice(1)}
+              </button>
             ))}
           </div>
-          <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
-            <span style={{ color: "#64748b", fontSize: 10, whiteSpace: "nowrap" }}>Depth</span>
-            <input
-              type="range" min={0.05} max={0.5} step={0.01} value={axoSki}
-              onChange={e => setAxoSki(parseFloat(e.target.value))}
-              style={{ flex: 1, accentColor: "#a855f7" }}
-            />
-            <span style={{ color: "#d8b4fe", fontSize: 10, minWidth: 28, textAlign: "right", fontVariantNumeric: "tabular-nums" }}>
-              {axoSki.toFixed(2)}
-            </span>
-          </div>
-        </div>
-      )}
 
-      {/* Orthographic preview canvas */}
-      <canvas
-        ref={canvasRef}
-        width={CW}
-        height={CH}
-        style={{ display: "block", width: CW, height: CH, borderRadius: 4, border: "1px solid #1a2744" }}
-        title={`${view} view — actual block colors`}
-      />
+          {/* Axo controls — direction + depth, only when axo tab active */}
+          {view === "axo" && (
+            <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+              <div style={{ display: "flex", gap: 3 }}>
+                {([["SE", 0], ["SW", 1], ["NE", 2], ["NW", 3]] as [string, number][]).map(([label, d]) => (
+                  <button
+                    key={d}
+                    onClick={() => setAxoDir(d)}
+                    style={{
+                      flex: 1, padding: "2px 0", fontSize: 10, cursor: "pointer",
+                      background: axoDir === d ? "rgba(168,85,247,0.25)" : "rgba(255,255,255,0.04)",
+                      border: `1px solid ${axoDir === d ? "#a855f7" : "#334155"}`,
+                      color: axoDir === d ? "#d8b4fe" : "#64748b",
+                      borderRadius: 3,
+                    }}
+                  >{label}</button>
+                ))}
+              </div>
+              <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+                <span style={{ color: "#64748b", fontSize: 10, whiteSpace: "nowrap" }}>Depth</span>
+                <input
+                  type="range" min={0.05} max={0.5} step={0.01} value={axoSki}
+                  onChange={e => setAxoSki(parseFloat(e.target.value))}
+                  style={{ flex: 1, accentColor: "#a855f7" }}
+                />
+                <span style={{ color: "#d8b4fe", fontSize: 10, minWidth: 28, textAlign: "right", fontVariantNumeric: "tabular-nums" }}>
+                  {axoSki.toFixed(2)}
+                </span>
+              </div>
+            </div>
+          )}
 
-      {/* Elevation view toggle — off by default; expensive on large 256z worlds */}
-      <button
-        onClick={onToggleElevationPanel}
-        style={{
-          padding: "2px 0", fontSize: 11, cursor: "pointer",
-          background: elevationPanelOpen ? "rgba(59,130,246,0.35)" : "rgba(255,255,255,0.04)",
-          border: `1px solid ${elevationPanelOpen ? "#3b82f6" : "#334155"}`,
-          color: elevationPanelOpen ? "#93c5fd" : "#64748b",
-          borderRadius: 3,
-        }}
-        title="Show full-height front/side elevation view below. Disable on large 256-layer worlds if panning feels sluggish."
-      >
-        {elevationPanelOpen ? "Elevation view ✓" : "Elevation view"}
-      </button>
+          {/* Orthographic preview canvas */}
+          <canvas
+            ref={canvasRef}
+            width={CW}
+            height={CH}
+            style={{ display: "block", width: CW, height: CH, borderRadius: 4, border: "1px solid #1a2744" }}
+            title={`${view} view — actual block colors`}
+          />
+        </>)}
+      </div>
     </div>
   );
 }

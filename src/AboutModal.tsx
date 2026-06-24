@@ -1,4 +1,5 @@
 import { openUrl } from "@tauri-apps/plugin-opener";
+import appIcon from "./assets/app-icon.png";
 
 interface Props {
   version: string;
@@ -36,7 +37,7 @@ export default function AboutModal({ version, onClose }: Props) {
         boxShadow: "0 24px 64px rgba(0,0,0,0.6)",
       }}>
         <img
-          src="/src/assets/app-icon.png"
+          src={appIcon}
           alt="VuencEdit"
           style={{ width: 80, height: 80, borderRadius: 18, marginBottom: 16, imageRendering: "pixelated" }}
         />

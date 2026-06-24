@@ -67,6 +67,7 @@ export default function NewWorldModal({ onClose, onCreated }: Props) {
   const [seed,           setSeed]           = useState(() => Math.floor(Math.random() * 2_000_000) + 1);
   const [baseHeight,     setBaseHeight]     = useState(28);
   const [roughnessLevel, setRoughnessLevel] = useState(2);
+  const [erosionLevel,   setErosionLevel]   = useState(1); // 0 none … 3 strong (flattens regions)
   const [terrainScale,   setTerrainScale]   = useState(1); // 0 small … 3 huge
   const [extreme,        setExtreme]        = useState(false); // 256z only: towering peaks
   const [waterMode,      setWaterMode]      = useState<WaterMode>("lakes");
@@ -102,7 +103,7 @@ export default function NewWorldModal({ onClose, onCreated }: Props) {
   const [tg2Clouds,      setTg2Clouds]      = useState(false);
   const [tg2Amplitude,   setTg2Amplitude]   = useState(1);   // relief multiplier 0.5–3×
   const [tg2SeaLevel,    setTg2SeaLevel]    = useState(0);   // additive sea-level offset (blocks)
-  const [tg2Blend,       setTg2Blend]       = useState(false);// soften zone seams (experimental)
+  const [tg2Blend,       setTg2Blend]       = useState(true); // soften zone seams (warped, palette-aware)
   const [tg2Caves,       setTg2Caves]       = useState(false);
   const [tg2TallCaves,   setTg2TallCaves]   = useState(false);
   const [tg2CustomBiomes, setTg2CustomBiomes] = useState<[number,number,number,number]>([0,6,4,2]); // NW/NE/SW/SE
@@ -111,9 +112,14 @@ export default function NewWorldModal({ onClose, onCreated }: Props) {
 
   // Drop a stale preview whenever a surface-affecting parameter changes.
   useEffect(() => { setPreview(null); }, [
-    seed, baseHeight, roughnessLevel, terrainScale, extreme,
+    seed, baseHeight, roughnessLevel, erosionLevel, terrainScale, extreme,
     waterMode, rivers, biome, biomeMode, biomeScale, snowCaps,
     widthChunks, heightChunks, extendedZ,
+  ]);
+
+  useEffect(() => { setTg2Preview(null); }, [
+    tg2Seed, tg2TerrainType, tg2SizeChunks, tg2CustomBiomes,
+    tg2Amplitude, tg2SeaLevel, extendedZ,
   ]);
 
   const maxZ     = extendedZ ? 255 : 63;
@@ -208,7 +214,7 @@ export default function NewWorldModal({ onClose, onCreated }: Props) {
         await invoke("create_natural_world", {
           path: savePath, name: name.trim(),
           widthChunks, heightChunks, extendedZ,
-          seed, baseHeight, roughnessLevel,
+          seed, baseHeight, roughnessLevel, erosionLevel,
           terrainScaleLevel: terrainScale,
           extreme: extendedZ && extreme,
           waterMode, rivers,
@@ -236,7 +242,7 @@ export default function NewWorldModal({ onClose, onCreated }: Props) {
     try {
       const raw = await invoke<PreviewRaw>("preview_natural_world", {
         widthChunks, heightChunks, extendedZ,
-        seed, baseHeight, roughnessLevel,
+        seed, baseHeight, roughnessLevel, erosionLevel,
         terrainScaleLevel: terrainScale,
         extreme: extendedZ && extreme,
         waterMode, rivers,
@@ -262,6 +268,7 @@ export default function NewWorldModal({ onClose, onCreated }: Props) {
       const raw = await invoke<PreviewRaw>("preview_tg2_world", {
         sizeChunks: tg2SizeChunks, seed: tg2Seed, terrainType: tg2TerrainType, maxPx: 220,
         customBiomes: tg2TerrainType === 9 ? [...tg2CustomBiomes] : null,
+        extendedZ, amplitude: tg2Amplitude, seaLevelOff: tg2SeaLevel,
       });
       setTg2Preview({ width: raw.width, height: raw.height, pixels: decodePixels(raw.pixels) });
     } catch (e) {
@@ -301,6 +308,7 @@ export default function NewWorldModal({ onClose, onCreated }: Props) {
   const pBuild = (Math.max(1, buildLayers) / total * 100).toFixed(1);
 
   const roughnessLabels = ["Plains", "Rolling", "Hilly", "Rugged", "Jagged"];
+  const erosionLabels   = ["None", "Light", "Medium", "Strong"];
   const scaleLabels     = ["Small", "Medium", "Large", "Huge"];
   const biomeColors: Record<Biome, string> = {
     grassland: "#22c55e", desert: "#f59e0b", snow: "#93c5fd", lava: "#ef4444", classic: "#a8a29e",
@@ -467,6 +475,20 @@ export default function NewWorldModal({ onClose, onCreated }: Props) {
                 <button key={i} style={optBtn(roughnessLevel === i, "#6366f1")}
                   onClick={() => setRoughnessLevel(i)}>{lbl}</button>
               ))}
+            </div>
+          </div>
+
+          {/* Erosion (flatness) */}
+          <div>
+            <div style={label}>EROSION</div>
+            <div style={{ display: "flex", gap: 4 }}>
+              {erosionLabels.map((lbl, i) => (
+                <button key={i} style={optBtn(erosionLevel === i, "#6366f1")}
+                  onClick={() => setErosionLevel(i)}>{lbl}</button>
+              ))}
+            </div>
+            <div style={{ color: "#475569", fontSize: 11, marginTop: 4 }}>
+              Higher = broad flat plains carved between rugged highlands (relief varies by region).
             </div>
           </div>
 
@@ -1022,7 +1044,14 @@ export default function NewWorldModal({ onClose, onCreated }: Props) {
               style={{ ...btnBase, background: "rgba(245,158,11,0.15)", borderColor: "#f59e0b", color: "#fcd34d", width: "100%", marginBottom: 8 }}>
               {tg2Previewing ? "Generating preview…" : "Preview Terrain"}
             </button>
-            {tg2Preview && <PreviewCanvas preview={tg2Preview} />}
+            {tg2Preview && (
+              <div>
+                <PreviewCanvas preview={tg2Preview} />
+                <div style={{ color: "#475569", fontSize: 11, marginTop: 4 }}>
+                  Top-down heightmap (reflects amplitude, sea level &amp; height format; structures, trees &amp; blend not shown).
+                </div>
+              </div>
+            )}
           </div>
 
           {/* File size */}
