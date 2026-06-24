@@ -681,8 +681,11 @@ fn parse_world_inner(bytes: MmapMut) -> Result<LoadedWorld, String> {
     let name_end = name_bytes.iter().position(|&b| b == 0).unwrap_or(name_bytes.len());
     let name = String::from_utf8_lossy(&name_bytes[..name_end]).into_owned();
 
-    // Chunk pointer table offset at bytes 32–35 (little-endian u32)
-    let ptr_offset = u32::from_le_bytes([bytes[32], bytes[33], bytes[34], bytes[35]]) as usize;
+    // Chunk pointer table offset at bytes 32–39 (little-endian u64)
+    let ptr_offset = u64::from_le_bytes([
+        bytes[32], bytes[33], bytes[34], bytes[35],
+        bytes[36], bytes[37], bytes[38], bytes[39],
+    ]) as usize;
 
     // Each chunk pointer entry is 16 bytes: X@[0..2], Y@[4..6], file_offset@[8..12]
     let mut chunk_map: HashMap<(i32, i32), usize> = HashMap::new();
