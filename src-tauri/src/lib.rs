@@ -852,6 +852,93 @@ fn render_zslice_patch_inner(world: &LoadedWorld, z: i32, px1: i32, py1: i32, px
     PixelPatch { x: x1, y: y1, width, height, pixels }
 }
 
+/// Front slab (constant world-Y plane). Horizontal axis = world X, vertical axis = world Z.
+/// One O(1) voxel read per pixel — the X/Z analog of `render_zslice_patch_inner`, fully tileable.
+/// Image row 0 = top = highest Z (`pz2`); `row = pz2 - z`. The returned `PixelPatch.x` is the
+/// horizontal world-X start and `.y` is the vertical world-Z start (`pz1`).
+fn render_yslice_patch_inner(world: &LoadedWorld, sy: i32, px1: i32, pz1: i32, px2: i32, pz2: i32) -> PixelPatch {
+    let world_w = (world.w_chunks * 16) as i32;
+    let world_h = (world.h_chunks * 16) as i32;
+    let max_z   = world_max_z(world);
+    if sy < 0 || sy >= world_h {
+        return PixelPatch { x: 0, y: 0, width: 1, height: 1, pixels: vec![20, 20, 35, 255] };
+    }
+    let x1 = px1.clamp(0, world_w - 1);
+    let x2 = px2.clamp(0, world_w - 1);
+    let z1 = pz1.clamp(0, max_z);
+    let z2 = pz2.clamp(0, max_z);
+    let width  = (x2 - x1 + 1) as u32;
+    let height = (z2 - z1 + 1) as u32;
+    const VOID: [u8; 4] = [20, 20, 35, 255];
+    let mut pixels = vec![0u8; (width * height * 4) as usize];
+    for p in pixels.chunks_exact_mut(4) { p.copy_from_slice(&VOID); }
+
+    let cy = (sy.div_euclid(16)) + world.min_y;
+    let ly = sy.rem_euclid(16) as usize;
+    for px in x1..=x2 {
+        let cx = px.div_euclid(16) + world.min_x;
+        let lx = px.rem_euclid(16) as usize;
+        let &addr = match world.chunk_map.get(&(cx, cy)) { Some(a) => a, None => continue };
+        for z in z1..=z2 {
+            let band = (z as usize) / 16;
+            let lz   = (z as usize) % 16;
+            let bi = addr + band * 8192 + lx * 256 + ly * 16 + lz;
+            let pi = bi + 4096;
+            if bi >= world.bytes.len() || pi >= world.bytes.len() { continue; }
+            let bt = world.bytes[bi];
+            if bt == 0 { continue; }
+            let [r, g, b] = block_color(bt, world.bytes[pi], world.sky);
+            let row = (z2 - z) as u32;
+            let off = ((row * width + (px - x1) as u32) * 4) as usize;
+            pixels[off] = r; pixels[off + 1] = g; pixels[off + 2] = b; pixels[off + 3] = 255;
+        }
+    }
+    PixelPatch { x: x1 as u32, y: z1 as u32, width, height, pixels }
+}
+
+/// Side slab (constant world-X plane). Horizontal axis = world Y, vertical axis = world Z.
+/// One O(1) voxel read per pixel. Image row 0 = top = highest Z (`pz2`); `row = pz2 - z`.
+/// Returned `PixelPatch.x` is the horizontal world-Y start and `.y` is the vertical world-Z start.
+fn render_xslice_patch_inner(world: &LoadedWorld, sx: i32, py1: i32, pz1: i32, py2: i32, pz2: i32) -> PixelPatch {
+    let world_w = (world.w_chunks * 16) as i32;
+    let world_h = (world.h_chunks * 16) as i32;
+    let max_z   = world_max_z(world);
+    if sx < 0 || sx >= world_w {
+        return PixelPatch { x: 0, y: 0, width: 1, height: 1, pixels: vec![20, 20, 35, 255] };
+    }
+    let y1 = py1.clamp(0, world_h - 1);
+    let y2 = py2.clamp(0, world_h - 1);
+    let z1 = pz1.clamp(0, max_z);
+    let z2 = pz2.clamp(0, max_z);
+    let width  = (y2 - y1 + 1) as u32;
+    let height = (z2 - z1 + 1) as u32;
+    const VOID: [u8; 4] = [20, 20, 35, 255];
+    let mut pixels = vec![0u8; (width * height * 4) as usize];
+    for p in pixels.chunks_exact_mut(4) { p.copy_from_slice(&VOID); }
+
+    let cx = sx.div_euclid(16) + world.min_x;
+    let lx = sx.rem_euclid(16) as usize;
+    for py in y1..=y2 {
+        let cy = py.div_euclid(16) + world.min_y;
+        let ly = py.rem_euclid(16) as usize;
+        let &addr = match world.chunk_map.get(&(cx, cy)) { Some(a) => a, None => continue };
+        for z in z1..=z2 {
+            let band = (z as usize) / 16;
+            let lz   = (z as usize) % 16;
+            let bi = addr + band * 8192 + lx * 256 + ly * 16 + lz;
+            let pi = bi + 4096;
+            if bi >= world.bytes.len() || pi >= world.bytes.len() { continue; }
+            let bt = world.bytes[bi];
+            if bt == 0 { continue; }
+            let [r, g, b] = block_color(bt, world.bytes[pi], world.sky);
+            let row = (z2 - z) as u32;
+            let off = ((row * width + (py - y1) as u32) * 4) as usize;
+            pixels[off] = r; pixels[off + 1] = g; pixels[off + 2] = b; pixels[off + 3] = 255;
+        }
+    }
+    PixelPatch { x: y1 as u32, y: z1 as u32, width, height, pixels }
+}
+
 /// Compute the pixel-space bounding box of a set of chunk coordinates and
 /// return a freshly rendered top-down patch for that rectangle.
 /// Used by undo/redo where the affected region is known only as chunk coords.
@@ -1285,6 +1372,38 @@ fn render_zslice_patch(
         return Err(format!("Z must be 0–{max_z}, got {z}"));
     }
     Ok(render_zslice_patch_inner(world, z, x1 as i32, y1 as i32, x2 as i32, y2 as i32))
+}
+
+/// Front-slab tile: constant world-Y plane. Horizontal = X (x1..x2), vertical = Z (z1..z2).
+/// Tiled, O(1) per pixel. Used by the front viewport in multi-viewport mode.
+#[tauri::command]
+fn render_yslice_patch(
+    y: i32, x1: i32, z1: i32, x2: i32, z2: i32,
+    state: tauri::State<'_, AppState>,
+) -> Result<PixelPatch, String> {
+    let ws = state.lock().unwrap();
+    let world = ws.world.as_ref().ok_or("No world loaded")?;
+    let world_h = (world.h_chunks * 16) as i32;
+    if y < 0 || y >= world_h {
+        return Err(format!("Y must be 0–{}, got {y}", world_h - 1));
+    }
+    Ok(render_yslice_patch_inner(world, y, x1, z1, x2, z2))
+}
+
+/// Side-slab tile: constant world-X plane. Horizontal = Y (y1..y2), vertical = Z (z1..z2).
+/// Tiled, O(1) per pixel. Used by the side viewport in multi-viewport mode.
+#[tauri::command]
+fn render_xslice_patch(
+    x: i32, y1: i32, z1: i32, y2: i32, z2: i32,
+    state: tauri::State<'_, AppState>,
+) -> Result<PixelPatch, String> {
+    let ws = state.lock().unwrap();
+    let world = ws.world.as_ref().ok_or("No world loaded")?;
+    let world_w = (world.w_chunks * 16) as i32;
+    if x < 0 || x >= world_w {
+        return Err(format!("X must be 0–{}, got {x}", world_w - 1));
+    }
+    Ok(render_xslice_patch_inner(world, x, y1, z1, y2, z2))
 }
 
 #[tauri::command]
@@ -1957,6 +2076,7 @@ struct NaturalConfig {
     seed: u32,
     base_height: usize,
     roughness: f64,          // 0..1 amplitude scale
+    erosion: f64,            // 0..1 flatness strength: high-erosion regions get reduced relief
     terrain_scale: f64,      // base noise wavelength in blocks (larger = broader features)
     extreme: bool,           // 256z only: towering mountain relief + sharper ridges
     water_z: i32,            // -1 = no standing water
@@ -2057,7 +2177,15 @@ fn terrain_height(wx: f64, wy: f64, cfg: &NaturalConfig, t_height: usize) -> i32
     let ridge = ridged2((wx + sf * 1.3) / (scale * 0.55), (wy - sf * 1.3) / (scale * 0.55), 4); // 0..1 sharp peaks
 
     let max_relief = (t_height as f64) * relief_factor(cfg);
-    let amp = cfg.roughness * max_relief;
+    let mut amp = cfg.roughness * max_relief;
+    // Erosion: a low-frequency field flattens relief where it reads high, giving
+    // Minecraft-like alternation between flat plains and rugged highlands over the
+    // *same* continuous surface (no biome cliffs). 0 = uniform relief everywhere.
+    if cfg.erosion > 0.0 {
+        let er = fbm2((wx + sf * 4.0) / (scale * 2.5), (wy - sf * 4.0) / (scale * 2.5), 3);
+        let flat = (er * 0.5 + 0.5).clamp(0.0, 1.0).powf(1.3); // 0..1, high = flat
+        amp *= 1.0 - cfg.erosion * flat * 0.80; // up to 80% relief reduction
+    }
     let peak_mask = (cont * 0.5 + 0.5).clamp(0.0, 1.0).powf(1.7);
 
     let h = cfg.base_height as f64
@@ -2143,7 +2271,14 @@ fn biome_at(wx: i32, wy: i32, surf_z: usize, cfg: &NaturalConfig, t_height: usiz
     let (temp, moist) = biome_climate(wx, wy, cfg);
     // Altitude lapse: ground above the base height cools down.
     let alt = ((surf_z as f64 - cfg.base_height as f64) / t_height as f64).max(0.0);
-    let warmth = temp - alt * 1.6;
+    // Per-column jitter scatters the climate values within a small band so biome
+    // borders break up into a speckled transition (à la Minecraft) instead of a
+    // crisp line. Deterministic per column, so every pass agrees on the result.
+    const BIOME_DITHER: f64 = 0.16;
+    let jw = (rand01(hash2(wx, wy, cfg.seed ^ 0x00BE)) - 0.5) * BIOME_DITHER;
+    let jm = (rand01(hash2(wx, wy, cfg.seed ^ 0x00BF)) - 0.5) * BIOME_DITHER;
+    let warmth = temp - alt * 1.6 + jw;
+    let moist = moist + jm;
     if warmth < -0.28 { 2 }                                 // snow (cold / high)
     else if warmth > 0.18 && moist < -0.05 { 1 }            // desert (hot & dry)
     else { 0 }                                              // grassland
@@ -2942,7 +3077,7 @@ fn create_world(
 #[allow(clippy::too_many_arguments)]
 fn natural_config_from_params(
     extended_z: bool, seed: u32, base_height: u32,
-    roughness_level: u32, terrain_scale_level: u32, extreme: bool,
+    roughness_level: u32, erosion_level: u32, terrain_scale_level: u32, extreme: bool,
     water_mode: &str, rivers: bool,
     biome: &str, biome_mode: u32, biome_scale_level: u32, snow_caps: bool,
     tree_density: u32, cave_density: u32, cave_style: u32, caverns: bool,
@@ -2951,6 +3086,7 @@ fn natural_config_from_params(
     let t_height = (if extended_z { 255u32 } else { 63 } + 1) as usize;
     let base_h = (base_height as usize).min(t_height - 10).max(5);
     let roughness = match roughness_level { 0 => 0.0f64, 1 => 0.30, 2 => 0.55, 3 => 0.80, _ => 1.05 };
+    let erosion = match erosion_level { 0 => 0.0f64, 1 => 0.45, 2 => 0.75, _ => 1.0 };
     let terrain_scale = match terrain_scale_level { 0 => 70.0f64, 1 => 120.0, 2 => 190.0, _ => 300.0 };
     let mut water_z: i32 = match water_mode {
         "ponds" => base_h as i32 - 8,
@@ -2966,7 +3102,7 @@ fn natural_config_from_params(
     // Mixed mode blends grass/desert/snow only; lava & classic stay single-mode.
     let biome_mode = if biome_id == 4 { 0 } else { biome_mode };
     (NaturalConfig {
-        seed, base_height: base_h, roughness, terrain_scale, extreme, water_z, rivers,
+        seed, base_height: base_h, roughness, erosion, terrain_scale, extreme, water_z, rivers,
         biome: biome_id, biome_mode, biome_scale, snow_caps,
         tree_density_denom, cave_density, cave_style, caverns,
         ore_density, vegetation, structures, clouds,
@@ -2989,7 +3125,7 @@ struct PreviewImage {
 #[allow(clippy::too_many_arguments)]
 fn preview_natural_world(
     width_chunks: u32, height_chunks: u32, extended_z: bool,
-    seed: u32, base_height: u32, roughness_level: u32, terrain_scale_level: u32, extreme: bool,
+    seed: u32, base_height: u32, roughness_level: u32, erosion_level: u32, terrain_scale_level: u32, extreme: bool,
     water_mode: String, rivers: bool,
     biome: String, biome_mode: u32, biome_scale_level: u32, snow_caps: bool,
     tree_density: u32, cave_density: u32, cave_style: u32, caverns: bool,
@@ -2998,7 +3134,7 @@ fn preview_natural_world(
 ) -> Result<PreviewImage, String> {
     if width_chunks == 0 || height_chunks == 0 { return Err("Dimensions must be at least 1×1 chunk".into()); }
     let (cfg, t_height) = natural_config_from_params(
-        extended_z, seed, base_height, roughness_level, terrain_scale_level, extreme,
+        extended_z, seed, base_height, roughness_level, erosion_level, terrain_scale_level, extreme,
         &water_mode, rivers, &biome, biome_mode, biome_scale_level, snow_caps,
         tree_density, cave_density, cave_style, caverns, ore_density, vegetation, structures, clouds,
     );
@@ -3094,6 +3230,7 @@ fn create_natural_world(
     seed: u32,
     base_height: u32,
     roughness_level: u32,     // 0=plains 1=rolling 2=hilly 3=rugged 4=jagged
+    erosion_level: u32,       // 0=none 1=light 2=medium 3=strong (flattens high-erosion regions)
     terrain_scale_level: u32, // 0=small 1=medium 2=large 3=huge feature size
     extreme: bool,            // 256z only: towering mountain relief
     water_mode: String,       // "none"|"ponds"|"lakes"|"ocean"
@@ -3118,7 +3255,7 @@ fn create_natural_world(
     let n_chunks = (width_chunks * height_chunks) as usize;
 
     let (cfg, t_height) = natural_config_from_params(
-        extended_z, seed, base_height, roughness_level, terrain_scale_level, extreme,
+        extended_z, seed, base_height, roughness_level, erosion_level, terrain_scale_level, extreme,
         &water_mode, rivers, &biome, biome_mode, biome_scale_level, snow_caps,
         tree_density, cave_density, cave_style, caverns, ore_density, vegetation, structures, clouds,
     );
@@ -3933,20 +4070,31 @@ fn tg2_make_mountains(g: &mut Tg2Grid, noise: &ClassicNoise, seed: f64, rng: &mu
     }}
 }
 
-// makeTransition: linearly blend terrain heights across a seam
-fn tg2_make_transition(g: &mut Tg2Grid, sx: i32, sz: i32, ex: i32, ez: i32) {
+// makeTransition: blend terrain heights across a seam with a smoothstep ramp and
+// a noise-warped boundary so the mountains↔river-forest border meanders instead
+// of stepping along a straight grid line. Carries the source columns' paint too.
+fn tg2_make_transition(g: &mut Tg2Grid, noise: &ClassicNoise, seed: f64, sx: i32, sz: i32, ex: i32, ez: i32) {
     let th=g.t_height as i32;
+    let span=(ex-sx).max(1) as f64;
+    let surf=|g:&Tg2Grid,cx:i32,z:i32|->(i32,u8,u8){
+        for i in (0..th).rev() {
+            let bt=g.get(cx,z,i);
+            if bt!=0&&bt!=19 { return (i+1, bt, g.colorz[g.idx(cx as usize,z as usize,i as usize)]); }
+        }
+        (0,0,0)
+    };
     for z in sz..ez {
-        let mut lh=0i32; let mut ltype=0u8;
-        for i in (0..th).rev() { if g.get(sx-1,z,i)!=0&&g.get(sx-1,z,i)!=19 {lh=i+1;ltype=g.get(sx-1,z,i);break;} }
-        let mut rh=0i32; let mut rtype=0u8;
-        for i in (0..th).rev() { if g.get(ex,z,i)!=0&&g.get(ex,z,i)!=19 {rh=i+1;rtype=g.get(ex,z,i);break;} }
-        let delta=rh-lh; let span=(ex-sx).max(1) as f32;
+        let (lh,ltype,lpt)=surf(g,sx-1,z);
+        let (rh,rtype,rpt)=surf(g,ex,z);
+        let delta=(rh-lh) as f64;
         for x in sx..ex {
-            let fx=(x-sx) as f32/span;
-            let h=(delta as f32*fx+lh as f32) as i32;
-            let bt=if fx<0.5{ltype}else{rtype};
-            for y in 1..h { g.put(x,z,y,bt,0); }
+            // Warp the normalised seam position; smoothstep the height ramp.
+            let w=tg2_fbm2(noise,x,z,seed+533.0,1.0,span*0.25,1.0);
+            let fx=(((x-sx) as f64 + w)/span).clamp(0.0,1.0);
+            let s=fx*fx*(3.0-2.0*fx);
+            let h=(lh as f64+delta*s).round() as i32;
+            let (bt,pt)=if s<0.5{(ltype,lpt)}else{(rtype,rpt)};
+            for y in 1..h.max(1) { g.put(x,z,y,bt,pt); }
         }
     }
 }
@@ -4058,13 +4206,12 @@ fn tg2_make_desert(g: &mut Tg2Grid, noise: &ClassicNoise, seed: f64, rng: &mut R
 // makePonies: colourful stone hills with cave + water pool
 fn tg2_make_ponies(g: &mut Tg2Grid, noise: &ClassicNoise, seed: f64, sx: i32, sz: i32, ex: i32, ez: i32) {
     let th=g.t_height as i32; let base=th/2-g.sv(10); let amp=g.relief(4.0);
-    let xe=ex-sx; let ze=ez-sz;
+    let xe=ex-sx;
     for x in sx..ex { for z in sz..ez {
         let xr=x-sx; let zr=z-sz;
         let mut oy=base;
         if xr>xe-10 { oy=base+(xe-10-xr).abs(); if xr>=xe { oy=base+(xe-10-xr).abs()-2*(xe-xr).abs(); } }
         if zr<10    { oy=base+(10-zr).abs(); }
-        if zr<0     { oy=base+(10-zr).abs()-2*(-zr).abs(); } // only if sz offset applied
         let h=(oy as f64+tg2_fbm2(noise,x,z,seed,2.0,amp,3.0)).round() as i32;
         let h=h.max(1).min(th-1);
         for y in 0..h { g.put(x,z,y,2,tg2_cc2(h,6)); }
@@ -4193,7 +4340,6 @@ fn tg2_make_mix(g: &mut Tg2Grid, noise: &ClassicNoise, seed: f64, seed2: f64, rn
     for z in 0..gs { for x in 0..gs {
         let mut oy=cbase;
         if x<gs/4+10&&z>=gs/4&&z<gs/2+10 {
-            if z>gs/2+10 { continue; }
             if z>gs/2-10 { oy-=20-(gs/2+10-z); }
             if x>gs/4-10 { oy-=20-(gs/4+10-x); }
         } else {
@@ -4356,7 +4502,7 @@ fn tg2_dispatch_biome(
             let mid=(sx+ex)/2;
             tg2_make_river_trees(g,noise,seed,rng,mid,sz,ex,ez);
             tg2_make_mountains(g,noise,seed,rng,sx,sz,(mid-16).max(sx),ez);
-            tg2_make_transition(g,(mid-16).max(sx),sz,mid,ez);
+            tg2_make_transition(g,noise,seed,(mid-16).max(sx),sz,mid,ez);
         }
         4 => tg2_make_desert(g,noise,seed,rng,sx,sz,ex,ez,pf),
         5 => tg2_make_ponies(g,noise,seed,sx,sz,ex,ez),
@@ -4392,64 +4538,97 @@ fn tg2_make_custom_mix(
 // When raising, the block type from the highest natural neighbour is used so
 // the slope transitions into the higher biome's material rather than dragging
 // the lower biome's material upward (which created painted-sand staircases, etc.)
-fn tg2_blend_seams(g: &mut Tg2Grid, iters: i32) {
+fn tg2_blend_seams(g: &mut Tg2Grid, noise: &ClassicNoise, seed: f64, iters: i32) {
     let gs=g.gsize as i32; let th=g.t_height as i32;
+    // "Natural" surfaces participate in the blend; water/lava/ice/cloud and
+    // structures (slate) are skipped so they keep their crisp form.
     let natural=|bt:u8| matches!(bt,2|3|4|8);
     let sidx=|x:i32,z:i32| (x*gs+z) as usize;
-    // Snapshot each column's surface (skip air/cloud/water/lava/ice).
-    let mut surf=vec![(-1i32,0u8,0u8); (gs*gs) as usize];
-    for x in 0..gs { for z in 0..gs {
-        for y in (1..th).rev() {
-            let bt=g.get(x,z,y);
-            if bt!=0 && bt!=19 && bt!=20 && bt!=23 && bt!=15 {
-                let c=g.colorz[g.idx(x as usize,z as usize,y as usize)];
-                surf[sidx(x,z)]=(y,bt,c);
-                break;
+    // Snapshot each column's surface (h, block, paint).
+    let snapshot=|g:&Tg2Grid, surf:&mut Vec<(i32,u8,u8)>| {
+        for x in 0..gs { for z in 0..gs {
+            surf[sidx(x,z)]=(-1,0,0);
+            for y in (1..th).rev() {
+                let bt=g.get(x,z,y);
+                if bt!=0 && bt!=19 && bt!=20 && bt!=23 && bt!=15 && bt!=14 {
+                    let c=g.colorz[g.idx(x as usize,z as usize,y as usize)];
+                    surf[sidx(x,z)]=(y,bt,c);
+                    break;
+                }
             }
-        }
-    }}
-    for _ in 0..iters.max(0) {
-        let mut raises: Vec<(i32,i32)> = Vec::new();
+        }}
+    };
+    let mut surf=vec![(-1i32,0u8,0u8); (gs*gs) as usize];
+    snapshot(g, &mut surf);
+    // Kernel radius scales with world height; warp magnitude follows it so the
+    // smoothed band wanders organically instead of tracing the straight zone grid.
+    let radius=((g.vs*2.0).round() as i32).clamp(2,5);
+    let warp_amp=radius as f64*1.5;
+    for _ in 0..iters.max(1) {
+        // Pass 1: compute the warped, box-blurred target height + a dithered
+        // surface paint for every natural column from the current snapshot.
+        let mut plan: Vec<(i32,i32,i32,u8,u8)> = Vec::new(); // (x,z,target_h,bt,paint)
         for x in 0..gs { for z in 0..gs {
             let (h,bt,_)=surf[sidx(x,z)];
             if h<1 || !natural(bt) { continue; }
-            let mut target=h;
-            for (dx,dz) in [(-1i32,0i32),(1,0),(0,-1),(0,1)] {
-                let (nx,nz)=(x+dx,z+dz);
-                if nx<0||nz<0||nx>=gs||nz>=gs { continue; }
-                let (nh,nbt,_)=surf[sidx(nx,nz)];
-                if nh<1 || !natural(nbt) { continue; }
-                if nh-1>target { target=nh-1; }
-            }
-            if target>h { raises.push((x,z)); }
-        }}
-        if raises.is_empty() { break; }
-        for (x,z) in raises {
-            let (h,_,_)=surf[sidx(x,z)];
-            let ny=h+1; if ny>=th { continue; }
-            // Use block type from the highest natural neighbour so the slope
-            // inherits the higher biome's material rather than dragging the
-            // lower biome's material upward.
-            let mut best_nh=-1i32; let mut fill_bt=2u8; let mut fill_pt=0u8;
-            for (dx,dz) in [(-1i32,0i32),(1,0),(0,-1),(0,1)] {
-                let (nx,nz)=(x+dx,z+dz);
+            // Warp the kernel centre with low-frequency noise → wavy seams.
+            let wx=x+(tg2_fbm2(noise,x,z,seed+700.0,1.0,warp_amp,1.0).round() as i32).clamp(-radius*2,radius*2);
+            let wz=z+(tg2_fbm2(noise,z,x,seed+811.0,1.0,warp_amp,1.0).round() as i32).clamp(-radius*2,radius*2);
+            let (mut hsum,mut hcnt)=(0i64,0i64);
+            let mut paints: Vec<u8> = Vec::new();
+            for dx in -radius..=radius { for dz in -radius..=radius {
+                let (nx,nz)=(wx+dx,wz+dz);
                 if nx<0||nz<0||nx>=gs||nz>=gs { continue; }
                 let (nh,nbt,npt)=surf[sidx(nx,nz)];
-                if nh>best_nh && natural(nbt) { best_nh=nh; fill_bt=nbt; fill_pt=npt; }
+                if nh<1 || !natural(nbt) { continue; }
+                hsum+=nh as i64; hcnt+=1;
+                paints.push(npt);
+            }}
+            if hcnt==0 { continue; }
+            let avg=(hsum as f64/hcnt as f64).round() as i32;
+            // Move halfway toward the blurred average (both up and down).
+            let target=h+(((avg-h) as f64*0.5).round() as i32);
+            // Dithered palette blend: pick one neighbour's paint by a stable hash,
+            // so a seam between two palettes resolves to a speckled gradient rather
+            // than averaging to a meaningless third hue.
+            let hsh=((x as u32).wrapping_mul(73856093)^(z as u32).wrapping_mul(19349663)) as usize;
+            let pt=if paints.is_empty(){0}else{paints[hsh%paints.len()]};
+            plan.push((x,z,target.clamp(1,th-1),bt,pt));
+        }}
+        if plan.is_empty() { break; }
+        // Pass 2: apply. Raise by stacking the column's own material; lower by
+        // carving to air. Always retint the resulting surface cell.
+        for (x,z,target,bt,pt) in &plan {
+            let (h,_,_)=surf[sidx(*x,*z)];
+            if *target>h {
+                for y in h+1..=*target { g.put(*x,*z,y,*bt,*pt); }
+            } else if *target<h {
+                for y in *target+1..=h { g.set_bt(*x,*z,y,0); }
             }
-            g.put(x,z,ny,fill_bt,fill_pt);
-            surf[sidx(x,z)]=(ny,fill_bt,fill_pt);
+            g.put(*x,*z,*target,*bt,*pt);
+            surf[sidx(*x,*z)]=(*target,*bt,*pt);
         }
     }
 }
 
 fn tg2_place_clouds(g: &mut Tg2Grid, rng: &mut Rng64) {
-    let gs=g.gsize as i32; let cz=(g.t_height as i32*4/5).min(g.t_height as i32-4);
+    let gs=g.gsize as i32; let th=g.t_height as i32;
+    let cz=(th*4/5).min(th-4);
     let n=((gs*gs/500).max(2)) as u64;
     for _ in 0..n {
         let cx=(rng.next()%gs as u64) as i32; let czr=(rng.next()%gs as u64) as i32;
         let w=(rng.next()%12+6) as i32; let d=(rng.next()%12+6) as i32;
-        for dx in 0..w { for dz in 0..d { g.put(cx+dx,czr+dz,cz,19,0); } }
+        // Vary the slab height a little so clouds don't all sit on one flat plane.
+        let yj=(rng.next()%5) as i32-2;
+        let cy=(cz+yj).clamp(th/2,th-2);
+        for dx in 0..w { for dz in 0..d {
+            let (px,pz)=(cx+dx,czr+dz);
+            if px<0||pz<0||px>=gs||pz>=gs { continue; }
+            // Skip cells where terrain already rises into the cloud layer, so a
+            // cloud never buries a mountain top.
+            if g.get(px,pz,cy)!=0 { continue; }
+            g.put(px,pz,cy,19,0);
+        }}
     }
 }
 
@@ -4489,7 +4668,7 @@ fn generate_tg2_world(
             report("Generating terrain",0.35);
             tg2_make_mountains(&mut g,&noise,seed,&mut rng,0,0,(mid-32).max(0),gs);
             report("Generating terrain",0.56);
-            tg2_make_transition(&mut g,(mid-32).max(0),0,mid,gs);
+            tg2_make_transition(&mut g,&noise,seed,(mid-32).max(0),0,mid,gs);
             report("Generating terrain",0.67);
         }
         4 => { tg2_make_desert(&mut g,&noise,seed,&mut rng,0,0,gs,gs,pf); report("Generating terrain",0.67); }
@@ -4505,7 +4684,9 @@ fn generate_tg2_world(
     }
     if cfg.blend && cfg.terrain_type!=8 {
         report("Blending biomes",0.74);
-        tg2_blend_seams(&mut g,(24.0*vs).round() as i32);
+        // Fewer, wider-kernel passes now smooth in both directions, so the old
+        // 24-iteration talus count is overkill; ~6·vs gives gentle seams.
+        tg2_blend_seams(&mut g,&noise,seed,(6.0*vs).round() as i32);
     }
     report("Placing features",0.79);
     if cfg.sky_islands && cfg.terrain_type!=7 && cfg.terrain_type!=9 {
@@ -4568,9 +4749,11 @@ fn create_tg2_world(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 fn preview_tg2_world(
     size_chunks: u32, seed: u32, terrain_type: u8, max_px: u32,
     custom_biomes: Option<Vec<u8>>,
+    extended_z: Option<bool>, amplitude: Option<f64>, sea_level_off: Option<i32>,
 ) -> Result<PreviewImage,String> {
     if size_chunks==0 { return Err("Size must be ≥ 1".into()); }
     let gsize=(size_chunks as usize*16).min(2880);
@@ -4581,17 +4764,25 @@ fn preview_tg2_world(
     let pw=(gsize+step-1)/step;
     let mut pixels=vec![0u8;pw*pw*4];
     let gs=gsize as i32;
+    // Reflect the same vertical envelope the generator uses so the preview tracks
+    // the height-format, amplitude and sea-level knobs (still a fast heightmap-only
+    // approximation: no fill, caves, structures or blend).
+    let th=if extended_z.unwrap_or(false){256i32}else{64i32};
+    let vs=th as f64/64.0;
+    let amp=amplitude.unwrap_or(1.0).clamp(0.1,4.0)*vs; // relief multiplier
+    let sea=(sea_level_off.unwrap_or(0) as f64)*vs;     // additive water-level shift
+    let bl=|n:f64| n*vs;                                // scale a baseline constant
     // helper: per-pixel colour for a single biome type
     let preview_biome=|biome:u8,wx:i32,wz:i32,gs:i32|->(i32,u8,u8){
         match biome {
-            0 => {let h=(32.0+tg2_fbm2(&noise,wx,wz,sf,2.0,4.0,3.0)).round()as i32;(h,8u8,0u8)}
-            1 => {let h=(8.0+tg2_fbm2(&noise,wx,wz,sf,2.0,4.0,3.0)).round()as i32;(h,2u8,tg2_cc2(h,0))}
-            2 => {let n=22.0+tg2_fbm2(&noise,wx,wz,sf,1.0,20.0,3.0);let h=n.round()as i32;let bt=if h<15{20u8}else{8u8};(h,bt,0u8)}
-            3 => {if wx<gs/2{let h=(22.0+tg2_fbm2(&noise,wx,wz,sf,1.0,20.0,3.0)).round()as i32;(h,2u8,tg2_cc5(h+50,8))}
-                  else      {let n=22.0+tg2_fbm2(&noise,wx,wz,sf,1.0,20.0,3.0);let h=n.round()as i32;let bt=if h<15{20u8}else{8u8};(h,bt,0u8)}}
-            4 => {let h=22i32;(h,4u8,tg2_cc6(h+13,1))}
-            5 => {let h=(22.0+tg2_fbm2(&noise,wx,wz,sf,2.0,4.0,3.0)).round()as i32;(h,2u8,tg2_cc2(h,6))}
-            6 => {let n=(18.0+tg2_fbm2(&noise,wx,wz,sf,1.0,18.0,3.0))/9.0+18.0;let h=n.round()as i32;let bt=if h<19{20u8}else{4u8};(h,bt,tg2_cc6(h+13,1))}
+            0 => {let h=(bl(32.0)+tg2_fbm2(&noise,wx,wz,sf,2.0,4.0*amp,3.0)).round()as i32;(h,8u8,0u8)}
+            1 => {let h=(bl(8.0)+tg2_fbm2(&noise,wx,wz,sf,2.0,4.0*amp,3.0)).round()as i32;(h,2u8,tg2_cc2(h,0))}
+            2 => {let n=bl(22.0)+tg2_fbm2(&noise,wx,wz,sf,1.0,20.0*amp,3.0);let h=n.round()as i32;let bt=if (h as f64)<bl(15.0)+sea{20u8}else{8u8};(h,bt,0u8)}
+            3 => {if wx<gs/2{let h=(bl(22.0)+tg2_fbm2(&noise,wx,wz,sf,1.0,20.0*amp,3.0)).round()as i32;(h,2u8,tg2_cc5(h+50,8))}
+                  else      {let n=bl(22.0)+tg2_fbm2(&noise,wx,wz,sf,1.0,20.0*amp,3.0);let h=n.round()as i32;let bt=if (h as f64)<bl(15.0)+sea{20u8}else{8u8};(h,bt,0u8)}}
+            4 => {let h=bl(22.0)as i32;(h,4u8,tg2_cc6(h+13,1))}
+            5 => {let h=(bl(22.0)+tg2_fbm2(&noise,wx,wz,sf,2.0,4.0*amp,3.0)).round()as i32;(h,2u8,tg2_cc2(h,6))}
+            6 => {let n=(bl(18.0)+tg2_fbm2(&noise,wx,wz,sf,1.0,18.0*amp,3.0))/9.0+bl(18.0)+sea;let h=n.round()as i32;let bt=if (h as f64)<bl(19.0)+sea{20u8}else{4u8};(h,bt,tg2_cc6(h+13,1))}
             _ => (2i32,1u8,0u8) // flat/unknown
         }
     };
@@ -4606,15 +4797,15 @@ fn preview_tg2_world(
                 preview_biome(cba[q],wx,wz,gs)
             }
             7 => {
-                if wx<gs/4&&wz<gs/4      {let h=(22.0+tg2_fbm2(&noise,wx,wz,sf,1.0,20.0,3.0)).round()as i32;(h,2u8,tg2_cc5(h+50,8))}
-                else if wx>=3*gs/4        {(8i32,2u8,tg2_cc2(8,0))}
-                else if wz>=3*gs/4        {let h=((18.0+tg2_fbm2(&noise,wx,wz,sf,1.0,18.0,3.0)/9.0) as i32).max(2).min(21);(h,4u8,0u8)}
-                else                      {let n=21.0+tg2_fbm2(&noise,wx,wz,sf2,1.0,8.0,3.0);let h=(n.min(31.0)).round()as i32;(h,8u8,tg2_cc3(h+30,3))}
+                if wx<gs/4&&wz<gs/4      {let h=(bl(22.0)+tg2_fbm2(&noise,wx,wz,sf,1.0,20.0*amp,3.0)).round()as i32;(h,2u8,tg2_cc5(h+50,8))}
+                else if wx>=3*gs/4        {(bl(8.0)as i32,2u8,tg2_cc2(8,0))}
+                else if wz>=3*gs/4        {let h=((bl(18.0)+tg2_fbm2(&noise,wx,wz,sf,1.0,18.0*amp,3.0)/9.0) as i32).max(2).min(bl(21.0)as i32);(h,4u8,0u8)}
+                else                      {let n=bl(21.0)+tg2_fbm2(&noise,wx,wz,sf2,1.0,8.0*amp,3.0);let h=(n.min(bl(31.0))).round()as i32;(h,8u8,tg2_cc3(h+30,3))}
             }
             t => preview_biome(t,wx,wz,gs)
         };
-        let h=h.max(0).min(63);
-        let hr=(h+1).min(63);
+        let h=h.max(0).min(th-1);
+        let hr=(h+1).min(th-1);
         let [r,gr,b]=block_color(bt,paint,14);
         let shade=(1.0+(hr-h) as f64*0.04).clamp(0.6,1.4);
         let ri=((r as f64*shade).round()as u32).min(255)as u8;
@@ -4884,6 +5075,20 @@ fn get_surface_z(state: tauri::State<'_, AppState>, x: i32, y: i32) -> Result<Op
     let ws = state.lock().unwrap();
     let world = ws.world.as_ref().ok_or("no world")?;
     Ok(surface_z(world, x, y))
+}
+
+#[derive(serde::Serialize)]
+struct PickedBlock { block_type: u8, paint: u8 }
+
+/// Return the block type and paint at the surface of (wx, wy).
+/// Returns air (0,0) if the column is empty or out of bounds.
+#[tauri::command]
+fn pick_block_surface(state: tauri::State<'_, AppState>, wx: i32, wy: i32) -> Result<PickedBlock, String> {
+    let ws = state.lock().unwrap();
+    let world = ws.world.as_ref().ok_or("no world")?;
+    let z = surface_z(world, wx, wy).unwrap_or(0);
+    let (bt, paint) = get_block_at(world, wx, wy, z);
+    Ok(PickedBlock { block_type: bt, paint })
 }
 
 /// Rotate clipboard 90° clockwise in the XY plane.
@@ -6243,6 +6448,13 @@ fn get_obj_geometry(
         return Err(format!("Selection too large ({vol} blocks) — max 64×64×64 for 3D preview"));
     }
 
+    Ok(obj_geometry_region(world, sx1, sy1, sx2, sy2, sz1, sz2))
+}
+
+/// Face-culled cube/ramp/wedge geometry for an arbitrary world box, encoded as LE f32 position +
+/// colour triplets (Three.js Y-up coords). Shared by `get_obj_geometry` (64³ selection preview) and
+/// `get_chunk_geometry` (world-scale fly-through chunk streaming).
+fn obj_geometry_region(world: &LoadedWorld, sx1: i32, sy1: i32, sx2: i32, sy2: i32, sz1: i32, sz2: i32) -> ObjGeometryResult {
     let mut pos_f: Vec<f32> = Vec::new();
     let mut col_f: Vec<f32> = Vec::new();
 
@@ -6370,7 +6582,20 @@ fn get_obj_geometry(
     let vertex_count = (pos_f.len()/3) as u32;
     let positions: Vec<u8> = pos_f.iter().flat_map(|f| f.to_le_bytes()).collect();
     let colors: Vec<u8> = col_f.iter().flat_map(|f| f.to_le_bytes()).collect();
-    Ok(ObjGeometryResult { positions, colors, vertex_count })
+    ObjGeometryResult { positions, colors, vertex_count }
+}
+
+/// Face-culled geometry for a single chunk (16×16 XY × full Z). For the 3D fly-through pane, which
+/// streams meshes per chunk near the camera.
+#[tauri::command]
+fn get_chunk_geometry(
+    state: tauri::State<'_, AppState>,
+    cx: i32, cy: i32,
+) -> Result<ObjGeometryResult, String> {
+    let ws = state.lock().unwrap();
+    let world = ws.world.as_ref().ok_or("No world loaded")?;
+    let sx1 = cx * 16; let sy1 = cy * 16;
+    Ok(obj_geometry_region(world, sx1, sy1, sx1 + 15, sy1 + 15, 0, world_max_z(world)))
 }
 
 // ── App entry point ────────────────────────────────────────────────────────────
@@ -6622,12 +6847,14 @@ fn read_paint_abs(world: &LoadedWorld, wx: i32, wy: i32, wz: i32) -> u8 {
 
 /// Raise or lower a terrain column to target_z. Raising copies the surface block;
 /// lowering deletes blocks above the new surface.
-fn sculpt_column(world: &mut LoadedWorld, wx: i32, wy: i32, cur_z: i32, target_z: i32, max_z: i32, surf_bt: u8, surf_paint: u8) {
+fn sculpt_column(world: &mut LoadedWorld, wx: i32, wy: i32, cur_z: i32, target_z: i32, max_z: i32, surf_bt: u8, surf_paint: u8, fill_bt: Option<u8>, fill_paint: Option<u8>) {
     let target_z = target_z.clamp(1, max_z);
     if target_z == cur_z { return; }
     if target_z > cur_z {
+        let bt = fill_bt.unwrap_or(surf_bt);
+        let paint = fill_paint.unwrap_or(surf_paint);
         for z in (cur_z + 1)..=target_z {
-            set_block_abs(world, wx, wy, z, surf_bt, surf_paint);
+            set_block_abs(world, wx, wy, z, bt, paint);
         }
     } else {
         for z in (target_z + 1)..=cur_z {
@@ -6648,6 +6875,8 @@ fn sculpt_terrain(
     mode: String,
     strength: i32,
     seed: u64,
+    block_type: Option<u8>,
+    paint: Option<u8>,
     state: tauri::State<'_, AppState>,
 ) -> Result<EditResult, String> {
     if points.is_empty() { return Err("No points".into()); }
@@ -6698,7 +6927,7 @@ fn sculpt_terrain(
                 if neighbors.is_empty() { continue; }
                 let sum = neighbors.iter().sum::<i32>() + cur_z;
                 let avg = (sum as f32 / (neighbors.len() + 1) as f32).round() as i32;
-                sculpt_column(&mut world, p.x, p.y, cur_z, avg, max_z, surf_bt, surf_paint);
+                sculpt_column(&mut world, p.x, p.y, cur_z, avg, max_z, surf_bt, surf_paint, block_type, paint);
             }
         }
         "noise" => {
@@ -6707,7 +6936,7 @@ fn sculpt_terrain(
                 let Some(&(cur_z, surf_bt, surf_paint)) = height_map.get(&(p.x, p.y)) else { continue };
                 let _ = rng.next(); // positional mix for variation
                 let delta = rng.range(-strength, strength);
-                sculpt_column(&mut world, p.x, p.y, cur_z, cur_z + delta, max_z, surf_bt, surf_paint);
+                sculpt_column(&mut world, p.x, p.y, cur_z, cur_z + delta, max_z, surf_bt, surf_paint, block_type, paint);
             }
         }
         "flatten" => {
@@ -6718,7 +6947,7 @@ fn sculpt_terrain(
             let avg = (heights.iter().sum::<i32>() as f32 / heights.len() as f32).round() as i32;
             for p in &points {
                 let Some(&(cur_z, surf_bt, surf_paint)) = height_map.get(&(p.x, p.y)) else { continue };
-                sculpt_column(&mut world, p.x, p.y, cur_z, avg, max_z, surf_bt, surf_paint);
+                sculpt_column(&mut world, p.x, p.y, cur_z, avg, max_z, surf_bt, surf_paint, block_type, paint);
             }
         }
         "erode" => {
@@ -6730,7 +6959,7 @@ fn sculpt_terrain(
                 if let Some(mn) = min_n {
                     if cur_z > mn {
                         let target = (cur_z - strength).max(mn);
-                        sculpt_column(&mut world, p.x, p.y, cur_z, target, max_z, surf_bt, surf_paint);
+                        sculpt_column(&mut world, p.x, p.y, cur_z, target, max_z, surf_bt, surf_paint, block_type, paint);
                     }
                 }
             }
@@ -7069,6 +7298,8 @@ pub fn run() {
             paste_at,
             paste_terrain,
             render_zslice_patch,
+            render_yslice_patch,
+            render_xslice_patch,
             render_selection_view,
             render_full_height_view,
             extrude_selection,
@@ -7092,6 +7323,7 @@ pub fn run() {
             find_nearest_block,
             export_obj,
             get_obj_geometry,
+            get_chunk_geometry,
             create_world,
             create_natural_world,
             preview_natural_world,
@@ -7104,6 +7336,7 @@ pub fn run() {
             get_sky_grid,
             set_sky_grid,
             get_creatures,
+            pick_block_surface,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -8119,6 +8352,37 @@ mod tests {
         let _ = fs::remove_file(&tmp);
     }
 
+    /// X/Y slice renderers place the known column (px=3, py=5) blocks at the right pixels.
+    /// Column has Wood@z0, Stone@z17, Dirt@z48; image row = z2 - z (row 0 = top).
+    #[test]
+    fn test_xy_slice_patches() {
+        let world = parse_world_inner(mmap_from_bytes(make_test_world())).expect("parse failed");
+        let at = |p: &PixelPatch, col: u32, row: u32| -> (u8, u8, u8, u8) {
+            let off = ((row * p.width + col) * 4) as usize;
+            (p.pixels[off], p.pixels[off + 1], p.pixels[off + 2], p.pixels[off + 3])
+        };
+
+        // Front slab at world Y=5, X range 0..7, Z range 0..63. Column X=3.
+        let front = render_yslice_patch_inner(&world, 5, 0, 0, 7, 63);
+        assert_eq!(front.width, 8);
+        assert_eq!(front.height, 64);
+        // Wood@z0 → row 63; Stone@z17 → row 46; Dirt@z48 → row 15; all at col=3.
+        assert_eq!(at(&front, 3, 63).3, 255, "wood present at z0 (row 63)");
+        assert_eq!(at(&front, 3, 46).3, 255, "stone present at z17 (row 46)");
+        assert_eq!(at(&front, 3, 15).3, 255, "dirt present at z48 (row 15)");
+        // Empty cell (col 0, row 0) is VOID background.
+        assert_eq!(at(&front, 0, 0), (20, 20, 35, 255), "void background");
+
+        // Side slab at world X=3, Y range 0..7, Z range 0..63. Column Y=5.
+        let side = render_xslice_patch_inner(&world, 3, 0, 0, 7, 63);
+        assert_eq!(side.width, 8);
+        assert_eq!(side.height, 64);
+        assert_eq!(at(&side, 5, 63).3, 255, "wood present at z0 (row 63)");
+        assert_eq!(at(&side, 5, 46).3, 255, "stone present at z17 (row 46)");
+        assert_eq!(at(&side, 5, 15).3, 255, "dirt present at z48 (row 15)");
+        assert_eq!(at(&side, 0, 0), (20, 20, 35, 255), "void background");
+    }
+
     /// Backup semantics: first save to an existing path creates path.bak;
     /// second save does NOT overwrite an already-present .bak.
     #[test]
@@ -8161,7 +8425,7 @@ mod tests {
         let t_height = 64usize;
         let chunk_size = 32_768usize;
         let cfg = NaturalConfig {
-            seed: 12345, base_height: 28, roughness: 0.8, terrain_scale: 120.0, extreme: false,
+            seed: 12345, base_height: 28, roughness: 0.8, erosion: 0.0, terrain_scale: 120.0, extreme: false,
             water_z: 24, rivers: true, biome: 0, biome_mode: 0, biome_scale: 200.0, snow_caps: true,
             tree_density_denom: 40, cave_density: 2, cave_style: 0, caverns: true,
             ore_density: 2, vegetation: 2, structures: 2, clouds: true,
@@ -8194,7 +8458,7 @@ mod tests {
         let (wc, hc) = (2usize, 2usize);
         let t_height = 64usize;
         let cfg = NaturalConfig {
-            seed: 7, base_height: 20, roughness: 0.0, terrain_scale: 120.0, extreme: false,
+            seed: 7, base_height: 20, roughness: 0.0, erosion: 0.0, terrain_scale: 120.0, extreme: false,
             water_z: -1, rivers: false, biome: 1, biome_mode: 0, biome_scale: 200.0, snow_caps: false,
             tree_density_denom: 0, cave_density: 0, cave_style: 0, caverns: false,
             ore_density: 0, vegetation: 0, structures: 0, clouds: false,
@@ -8214,7 +8478,7 @@ mod tests {
         let (wc, hc) = (3usize, 3usize);
         let t_height = 64usize;
         let base = NaturalConfig {
-            seed: 4242, base_height: 30, roughness: 0.6, terrain_scale: 120.0, extreme: false,
+            seed: 4242, base_height: 30, roughness: 0.6, erosion: 0.0, terrain_scale: 120.0, extreme: false,
             water_z: -1, rivers: false, biome: BIOME_CLASSIC, biome_mode: 0, biome_scale: 200.0, snow_caps: false,
             tree_density_denom: 0, cave_density: 0, cave_style: 1, caverns: false,
             ore_density: 0, vegetation: 0, structures: 0, clouds: false,
@@ -8267,7 +8531,7 @@ mod tests {
         let (wc, hc) = (6usize, 6usize);
         let t_height = 64usize;
         let cfg = NaturalConfig {
-            seed: 808, base_height: 28, roughness: 0.5, terrain_scale: 120.0, extreme: false,
+            seed: 808, base_height: 28, roughness: 0.5, erosion: 0.0, terrain_scale: 120.0, extreme: false,
             water_z: -1, rivers: false, biome: 2, biome_mode: 0, biome_scale: 200.0, snow_caps: false,
             tree_density_denom: 6, cave_density: 0, cave_style: 0, caverns: false,
             ore_density: 0, vegetation: 2, structures: 0, clouds: false,
@@ -8299,7 +8563,7 @@ mod tests {
     #[test]
     fn natural_mixed_biomes_vary() {
         let cfg = NaturalConfig {
-            seed: 2026, base_height: 30, roughness: 0.6, terrain_scale: 120.0, extreme: false,
+            seed: 2026, base_height: 30, roughness: 0.6, erosion: 0.0, terrain_scale: 120.0, extreme: false,
             water_z: -1, rivers: false, biome: 0, biome_mode: 1, biome_scale: 30.0, snow_caps: false,
             tree_density_denom: 0, cave_density: 0, cave_style: 0, caverns: false,
             ore_density: 0, vegetation: 0, structures: 0, clouds: false,
@@ -8330,13 +8594,75 @@ mod tests {
         assert!(count_blocks(&chunks, 64, 8) > 0, "mixed world should have grassland grass");
     }
 
+    /// Erosion is a relief multiplier that only ever *reduces* amplitude (it can
+    /// never add relief), so a strong-erosion world must read flatter than the
+    /// same seed with erosion off — the std-dev of the heightmap drops.
+    #[test]
+    fn natural_erosion_flattens() {
+        let base = NaturalConfig {
+            seed: 31337, base_height: 30, roughness: 1.0, erosion: 0.0, terrain_scale: 90.0, extreme: false,
+            water_z: -1, rivers: false, biome: 0, biome_mode: 0, biome_scale: 200.0, snow_caps: false,
+            tree_density_denom: 0, cave_density: 0, cave_style: 0, caverns: false,
+            ore_density: 0, vegetation: 0, structures: 0, clouds: false,
+        };
+        // Standard deviation of terrain_height sampled over a wide region.
+        let relief_std = |cfg: &NaturalConfig| -> f64 {
+            let mut hs = Vec::new();
+            for wy in 0..256i32 { for wx in 0..256i32 {
+                hs.push(terrain_height(wx as f64, wy as f64, cfg, 64) as f64);
+            }}
+            let mean = hs.iter().sum::<f64>() / hs.len() as f64;
+            (hs.iter().map(|h| (h - mean).powi(2)).sum::<f64>() / hs.len() as f64).sqrt()
+        };
+
+        let flat = base; // erosion 0.0
+        let mut rugged = base; rugged.erosion = 1.0; // strong erosion → flatter
+        let s_none = relief_std(&flat);
+        let s_strong = relief_std(&rugged);
+        assert!(s_strong < s_none,
+            "strong erosion should flatten relief: std {s_strong} !< {s_none}");
+    }
+
+    /// The biome-edge dither perturbs each column's climate by a small per-cell
+    /// jitter, so a mixed-mode biome map has *more* short-range boundary flips
+    /// (speckled edges) than the same climate fields evaluated without jitter.
+    #[test]
+    fn natural_biome_band_dithers() {
+        let cfg = NaturalConfig {
+            seed: 5150, base_height: 30, roughness: 0.0, erosion: 0.0, terrain_scale: 120.0, extreme: false,
+            water_z: -1, rivers: false, biome: 0, biome_mode: 1, biome_scale: 24.0, snow_caps: false,
+            tree_density_denom: 0, cave_density: 0, cave_style: 0, caverns: false,
+            ore_density: 0, vegetation: 0, structures: 0, clouds: false,
+        };
+        // Surface held at base_height so altitude lapse is zero and this isolates
+        // the temperature/moisture dither. Baseline replicates biome_at's threshold
+        // decision *without* the per-column jitter.
+        let baseline = |wx: i32, wy: i32| -> u8 {
+            let (temp, moist) = biome_climate(wx, wy, &cfg);
+            if temp < -0.28 { 2 } else if temp > 0.18 && moist < -0.05 { 1 } else { 0 }
+        };
+        let count_flips = |f: &dyn Fn(i32, i32) -> u8| -> u32 {
+            let mut flips = 0u32;
+            for wy in 0..256i32 {
+                for wx in 0..255i32 {
+                    if f(wx, wy) != f(wx + 1, wy) { flips += 1; }
+                }
+            }
+            flips
+        };
+        let real = count_flips(&|wx, wy| biome_at(wx, wy, cfg.base_height, &cfg, 64));
+        let plain = count_flips(&baseline);
+        assert!(real > plain,
+            "dither should add boundary speckle: {real} !> {plain}");
+    }
+
     /// The preview command returns a correctly-sized, non-blank RGB image and
     /// honours the `max_px` cap.
     #[test]
     fn natural_preview_renders() {
         let img = preview_natural_world(
             16, 16, false,
-            7, 30, 2, 1, false,
+            7, 30, 2, 1, 1, false,
             "lakes".into(), true,
             "grassland".into(), 1, 1, true,
             2, 1, 0, true, 1, 1, 1, true,
@@ -8363,7 +8689,7 @@ mod tests {
 
         // Jagged, dry grassland → some columns are steep enough to show stone.
         let jagged = NaturalConfig {
-            seed: 555, base_height: 30, roughness: 1.05, terrain_scale: 60.0, extreme: false,
+            seed: 555, base_height: 30, roughness: 1.05, erosion: 0.0, terrain_scale: 60.0, extreme: false,
             water_z: -1, rivers: false, biome: 0, biome_mode: 0, biome_scale: 200.0, snow_caps: false,
             tree_density_denom: 0, cave_density: 0, cave_style: 0, caverns: false,
             ore_density: 0, vegetation: 0, structures: 0, clouds: false,
@@ -8395,7 +8721,7 @@ mod tests {
         let (wc, hc) = (4usize, 4usize);
         let t_height = 64usize;
         let cfg = NaturalConfig {
-            seed: 123, base_height: 30, roughness: 0.5, terrain_scale: 110.0, extreme: false,
+            seed: 123, base_height: 30, roughness: 0.5, erosion: 0.0, terrain_scale: 110.0, extreme: false,
             water_z: -1, rivers: false, biome: 0, biome_mode: 0, biome_scale: 200.0, snow_caps: false,
             tree_density_denom: 0, cave_density: 0, cave_style: 0, caverns: false,
             ore_density: 0, vegetation: 2, structures: 0, clouds: false,
@@ -8430,7 +8756,7 @@ mod tests {
         let (wc, hc) = (4usize, 4usize);
         let t_height = 64usize;
         let cfg = NaturalConfig {
-            seed: 99, base_height: 30, roughness: 0.9, terrain_scale: 90.0, extreme: false,
+            seed: 99, base_height: 30, roughness: 0.9, erosion: 0.0, terrain_scale: 90.0, extreme: false,
             water_z: 26, rivers: true, biome: 0, biome_mode: 0, biome_scale: 200.0, snow_caps: false,
             tree_density_denom: 8, cave_density: 0, cave_style: 0, caverns: false,
             ore_density: 0, vegetation: 2, structures: 0, clouds: false,
@@ -8566,18 +8892,38 @@ mod tests {
         assert!(solid_high, "256z world has no terrain near z=128");
     }
 
-    /// The biome-blend pass only adds blocks (never carves), so it must not lower
-    /// any column's surface, and it should add solid volume that softens seams.
+    /// The biome-blend pass smooths surface seams in *both* directions (it may
+    /// raise low columns and carve high ones), so the average step between
+    /// neighbouring surface heights must drop after blending.
     #[test]
-    fn tg2_blend_only_adds_terrain() {
+    fn tg2_blend_smooths_both_directions() {
         let (wc, hc) = (6usize, 6usize);
-        let solid = |chunks: &[Vec<u8>]| -> usize {
-            let mut n = 0;
-            for data in chunks { for lx in 0..16 { for ly in 0..16 { for z in 0..64 {
-                if chunk_get(data, lx, ly, z) != 0 { n += 1; }
-            }}}}
-            n
+        let bw = wc * 16;
+        // Build a top-down surface-height map from chunk storage.
+        let surface_map = |chunks: &[Vec<u8>]| -> Vec<i32> {
+            let mut m = vec![0i32; bw * bw];
+            for cy in 0..hc { for cx in 0..wc {
+                let data = &chunks[cy * wc + cx];
+                for ly in 0..16 { for lx in 0..16 {
+                    let mut h = 0i32;
+                    for z in (0..64).rev() { if chunk_get(data, lx, ly, z) != 0 { h = z as i32 + 1; break; } }
+                    let (wx, wyy) = (cx * 16 + lx, cy * 16 + ly);
+                    m[wyy * bw + wx] = h;
+                }}
+            }}
+            m
         };
+        // Mean absolute height difference to the east/south neighbour.
+        let roughness = |m: &[i32]| -> f64 {
+            let (mut sum, mut cnt) = (0i64, 0i64);
+            for y in 0..bw { for x in 0..bw {
+                let h = m[y * bw + x];
+                if x + 1 < bw { sum += (h - m[y * bw + x + 1]).unsigned_abs() as i64; cnt += 1; }
+                if y + 1 < bw { sum += (h - m[(y + 1) * bw + x]).unsigned_abs() as i64; cnt += 1; }
+            }}
+            sum as f64 / cnt.max(1) as f64
+        };
+
         let mut plain: Vec<Vec<u8>> = (0..wc * hc).map(|_| vec![0u8; 32_768]).collect();
         generate_tg2_world(&tg2_cfg(99, 7), wc, hc, 64, &mut plain, &mut |_, _| {});
 
@@ -8586,8 +8932,43 @@ mod tests {
         let mut blended: Vec<Vec<u8>> = (0..wc * hc).map(|_| vec![0u8; 32_768]).collect();
         generate_tg2_world(&blended_cfg, wc, hc, 64, &mut blended, &mut |_, _| {});
 
-        assert!(solid(&blended) >= solid(&plain),
-            "blend removed terrain: {} < {}", solid(&blended), solid(&plain));
+        let r_plain = roughness(&surface_map(&plain));
+        let r_blended = roughness(&surface_map(&blended));
+        assert!(r_blended < r_plain,
+            "blend did not smooth seams: {r_blended} !< {r_plain}");
+    }
+
+    /// The reworked `tg2_make_transition` warps the seam with low-frequency noise,
+    /// so the material boundary between two biomes wanders across rows instead of
+    /// tracing a single straight axis-aligned column.
+    #[test]
+    fn tg2_warped_borders_not_axis_aligned() {
+        let (gsize, th) = (128usize, 64usize);
+        let mut g = Tg2Grid::new(gsize, th, 1.0, 1.0, 0);
+        // Left half: sand (4) at height 20; right half: stone (2) at height 30.
+        for x in 0..64i32 { for z in 0..gsize as i32 {
+            for y in 1..20 { g.put(x, z, y, 4, 0); }
+        }}
+        for x in 64..gsize as i32 { for z in 0..gsize as i32 {
+            for y in 1..30 { g.put(x, z, y, 2, 0); }
+        }}
+        let noise = ClassicNoise::new(777);
+        let (sx, ex) = (48i32, 80i32);
+        tg2_make_transition(&mut g, &noise, 777.0, sx, 0, ex, gsize as i32);
+
+        // For each row, find the first x inside the band whose surface is stone (2).
+        let surface_switch = |g: &Tg2Grid, z: i32| -> i32 {
+            for x in sx..ex {
+                let mut top = 0u8;
+                for y in (1..th as i32).rev() { let b = g.get(x, z, y); if b != 0 { top = b; break; } }
+                if top == 2 { return x; }
+            }
+            ex
+        };
+        let mut switches = std::collections::HashSet::new();
+        for z in 0..gsize as i32 { switches.insert(surface_switch(&g, z)); }
+        assert!(switches.len() >= 3,
+            "transition seam is too straight (axis-aligned): only {} distinct switch columns", switches.len());
     }
 
     /// Weeds (block 11) must appear on the surface but stay at most half of the
