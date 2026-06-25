@@ -210,7 +210,7 @@ const BLOCK_RGB: [[u8; 3]; 112] = [
     [245, 221, 141], //   4 sand         #f5dd8d
     [ 20, 129,  28], //   5 leaves       #14811c
     [112,  81,  19], //   6 trunk        #705113
-    [148,  15,   2], //   7 wood         #940f02
+    [167, 146,  79], //   7 wood         #a7924f
     [ 82, 148,  53], //   8 grass        #529435 (overridden by grass_color when unpainted)
     [148,  15,   2], //   9 tnt          #940f02
     [ 67,  66,  66], //  10 dark stone   #434242
@@ -231,10 +231,10 @@ const BLOCK_RGB: [[u8; 3]; 112] = [
     [158, 156, 158], //  25 stone ramp W
     [158, 156, 158], //  26 stone ramp N
     [158, 156, 158], //  27 stone ramp E
-    [148,  15,   2], //  28 wood ramp S
-    [148,  15,   2], //  29 wood ramp W
-    [148,  15,   2], //  30 wood ramp N
-    [148,  15,   2], //  31 wood ramp E
+    [167, 146,  79], //  28 wood ramp S
+    [167, 146,  79], //  29 wood ramp W
+    [167, 146,  79], //  30 wood ramp N
+    [167, 146,  79], //  31 wood ramp E
     [ 95,  94,  95], //  32 shingle ramp S  #5f5e5f
     [ 95,  94,  95], //  33 shingle ramp W
     [ 95,  94,  95], //  34 shingle ramp N
@@ -247,10 +247,10 @@ const BLOCK_RGB: [[u8; 3]; 112] = [
     [158, 156, 158], //  41 stone wedge SW
     [158, 156, 158], //  42 stone wedge NW
     [158, 156, 158], //  43 stone wedge NE
-    [148,  15,   2], //  44 wood wedge SE
-    [148,  15,   2], //  45 wood wedge SW
-    [148,  15,   2], //  46 wood wedge NW
-    [148,  15,   2], //  47 wood wedge NE
+    [167, 146,  79], //  44 wood wedge SE
+    [167, 146,  79], //  45 wood wedge SW
+    [167, 146,  79], //  46 wood wedge NW
+    [167, 146,  79], //  47 wood wedge NE
     [ 95,  94,  95], //  48 shingle wedge SE
     [ 95,  94,  95], //  49 shingle wedge SW
     [ 95,  94,  95], //  50 shingle wedge NW

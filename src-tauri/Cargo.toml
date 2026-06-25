@@ -1,6 +1,6 @@
 [package]
 name = "eden-world-editor"
-version = "0.6.0"
+version = "0.7.1"
 description = "Eden world file editor"
 edition = "2021"
 
