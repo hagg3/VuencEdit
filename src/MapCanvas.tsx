@@ -44,6 +44,7 @@ type DragOp =
   | { kind: "resizeEdge"; edge: "x1" | "x2" | "y1" | "y2"; live: SelectionBounds }
   | { kind: "draw-stroke"; pts: Set<string>; lastWX: number; lastWY: number }
   | { kind: "draw-shape"; tool: "rect" | "ellipse"; start: WP; end: WP }
+  | { kind: "cam3d-drag" }
   | null;
 
 const EDGE_HIT_PX = 6;
@@ -123,6 +124,10 @@ interface Props {
   onEyedropper?: (wx: number, wy: number) => void;
   /** Slice-viewport cut lines: vertical at world X, horizontal at world Y (the slab depths). */
   sliceLines?: { x: number | null; y: number | null } | null;
+  /** 3D fly-camera world XY position — drawn as a teal dot on the map. */
+  cameraPos3d?: { x: number; y: number } | null;
+  /** Called when the user clicks or drags the 3D camera icon to move it. */
+  onSetCamera3d?: (wx: number, wy: number) => void;
 }
 
 function decodePixels(b64: string): Uint8Array {
@@ -141,7 +146,8 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     drawConfig, onDrawStroke, drawZOverride = null,
     extrudePreview = null, lastPasteDelta = null, onCursorMove, onMagicWand,
     spawnPos = null, creatures = [],
-    pasteElevationOffset = 0, onEyedropper, sliceLines = null }: Props,
+    pasteElevationOffset = 0, onEyedropper, sliceLines = null,
+    cameraPos3d = null, onSetCamera3d }: Props,
   ref,
 ) {
   const canvasRef  = useRef<HTMLCanvasElement>(null);
@@ -191,6 +197,8 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   const sliceLinesRef       = useRef(sliceLines);
   const pasteElevOffsetRef  = useRef(pasteElevationOffset);
   const onEyedropperRef     = useRef(onEyedropper);
+  const cameraPos3dRef      = useRef(cameraPos3d ?? null);
+  const onSetCamera3dRef    = useRef(onSetCamera3d);
 
   useEffect(() => { toolRef.current = tool; }, [tool]);
   useEffect(() => { onSelChangeRef.current = onSelectionChange; }, [onSelectionChange]);
@@ -208,6 +216,8 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   useEffect(() => { sliceLinesRef.current      = sliceLines;           }, [sliceLines]);
   useEffect(() => { pasteElevOffsetRef.current = pasteElevationOffset; }, [pasteElevationOffset]);
   useEffect(() => { onEyedropperRef.current    = onEyedropper;        }, [onEyedropper]);
+  useEffect(() => { cameraPos3dRef.current     = cameraPos3d ?? null; }, [cameraPos3d]);
+  useEffect(() => { onSetCamera3dRef.current   = onSetCamera3d;       }, [onSetCamera3d]);
 
   const mapW = world.width_chunks * 16;
   const mapH = world.height_chunks * 16;
@@ -371,6 +381,36 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
           ctx.textAlign    = "left";
           ctx.textBaseline = "alphabetic";
         }
+        ctx.restore();
+      }
+    }
+
+    // 3D fly-camera position marker — teal dot with dark outline for contrast on any terrain colour
+    {
+      const cp = cameraPos3dRef.current;
+      if (cp) {
+        const cpx = cp.x * scale + vx;
+        const cpy = cp.y * scale + vy;
+        ctx.save();
+        // Dark halo so the marker reads on grass, sand, snow, etc.
+        ctx.beginPath();
+        ctx.arc(cpx, cpy, 9, 0, Math.PI * 2);
+        ctx.fillStyle = "rgba(0,0,0,0.45)";
+        ctx.fill();
+        // Teal fill disc
+        ctx.beginPath();
+        ctx.arc(cpx, cpy, 7, 0, Math.PI * 2);
+        ctx.fillStyle = "rgba(52,211,153,0.35)";
+        ctx.fill();
+        // Bright teal ring
+        ctx.strokeStyle = "#34d399";
+        ctx.lineWidth = 2;
+        ctx.stroke();
+        // Bright centre dot
+        ctx.beginPath();
+        ctx.arc(cpx, cpy, 2.5, 0, Math.PI * 2);
+        ctx.fillStyle = "#fff";
+        ctx.fill();
         ctx.restore();
       }
     }
@@ -900,6 +940,21 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
       return;
     }
     if (e.button !== 0) return;
+    // Camera icon: clicking near the teal dot starts a drag to teleport the 3D camera.
+    {
+      const cp = cameraPos3dRef.current;
+      if (cp && onSetCamera3dRef.current) {
+        const lp = toLocal(e.clientX, e.clientY);
+        const { x: vx2, y: vy2, scale: s2 } = viewRef.current;
+        const iconX = cp.x * s2 + vx2, iconY = cp.y * s2 + vy2;
+        const dx = lp.x - iconX, dy = lp.y - iconY;
+        if (dx * dx + dy * dy <= 144) { // 12px hit radius
+          dragRef.current = { kind: "cam3d-drag" };
+          draw();
+          return;
+        }
+      }
+    }
     if (toolRef.current === "wand") {
       const wp = screenToWorld(e.clientX, e.clientY);
       onMagicWandRef.current?.(wp.x, wp.y);
@@ -962,6 +1017,18 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     cursorPosRef.current = wp;
     onCursorMoveRef.current?.(wp.x, wp.y);
     const drag = dragRef.current;
+    // Cursor: show "move" when hovering the 3D camera icon with no active drag.
+    if (!drag && onSetCamera3dRef.current) {
+      const cp = cameraPos3dRef.current;
+      if (cp) {
+        const lp = toLocal(e.clientX, e.clientY);
+        const { x: vx2, y: vy2, scale: s2 } = viewRef.current;
+        const iconX = cp.x * s2 + vx2, iconY = cp.y * s2 + vy2;
+        const dx = lp.x - iconX, dy = lp.y - iconY;
+        const canvas = canvasRef.current;
+        if (canvas) canvas.style.cursor = (dx * dx + dy * dy <= 144) ? "move" : "";
+      }
+    }
     if (drag?.kind === "pan") {
       viewRef.current.x = drag.viewX + e.clientX - drag.startX;
       viewRef.current.y = drag.viewY + e.clientY - drag.startY;
@@ -990,6 +1057,8 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
         drag.end = wp;
       } else if (drag?.kind === "select") {
         drag.end = wp;
+      } else if (drag?.kind === "cam3d-drag") {
+        onSetCamera3dRef.current?.(wp.x, wp.y);
       } else if (toolRef.current === "paste") {
         pasteHoverRef.current = wp;
       } else if (toolRef.current === "select") {
@@ -1016,6 +1085,13 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     const drag = dragRef.current;
     if (drag?.kind === "pan") {
       dragRef.current = null;
+      return;
+    }
+    if (drag?.kind === "cam3d-drag") {
+      dragRef.current = null;
+      const wp2 = screenToWorld(e.clientX, e.clientY);
+      onSetCamera3dRef.current?.(wp2.x, wp2.y);
+      draw();
       return;
     }
     if (drag?.kind === "resizeEdge") {

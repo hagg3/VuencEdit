@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, forwardRef, useImperativeHandle } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
@@ -13,8 +13,9 @@ function decodeF32(b64: string): Float32Array {
 
 // World-scale 3D fly-through viewport — the 4th quad-view pane.
 //
-// Coordinate mapping mirrors export_obj / ThreeDPreview: Eden (X east, Y south, Z up) → Three.js
-// (x = wx, y = wz, z = -wy), i.e. Y-up right-handed, one unit per block.
+// Coordinate mapping: Eden (X east, Y south, Z up) → Three.js (x = wx, y = wz, z = wy).
+// Eden north = Three.js −Z; camera starts south of the world looking north (−Z), so Eden east
+// (+X) appears on the right — matching the top-down map orientation.
 //
 // Two camera modes (Hammer-style):
 //  • Orbit (default) — drag to orbit, scroll zoom.
@@ -31,14 +32,34 @@ const LOAD_RADIUS = 5;   // chunks loaded around the camera (in chunk units)
 const STREAM_MS = 150;   // throttle for the load/dispose sweep
 const MAX_DPR = 1.5;     // cap device-pixel-ratio — Retina (2×) quadruples fragment load for ~no gain
 
-export default function FlyView3D({
-  world, editEpoch = 0, lastEdit = null, onFlyModeChange,
-}: { world: World; editEpoch?: number; lastEdit?: EditBounds | null; onFlyModeChange?: (active: boolean) => void }) {
+export interface FlyView3DRef {
+  /** Move the camera to a world XY position (keeps current height). */
+  teleport: (wx: number, wy: number) => void;
+}
+
+/** A wireframe box overlay in Eden world coordinates (Three.js coords are derived internally). */
+export interface Overlay3D {
+  /** Three.js min corner: [eden_x, eden_z, eden_y] */
+  min: [number, number, number];
+  /** Three.js max corner: [eden_x, eden_z, eden_y] */
+  max: [number, number, number];
+  color: number;
+}
+
+const FlyView3D = forwardRef<FlyView3DRef, {
+  world: World; editEpoch?: number; lastEdit?: EditBounds | null;
+  onFlyModeChange?: (active: boolean) => void;
+  onCameraMove?: (wx: number, wy: number) => void;
+  overlays3d?: Overlay3D[] | null;
+}>(function FlyView3D({
+  world, editEpoch = 0, lastEdit = null, onFlyModeChange, onCameraMove, overlays3d = null,
+}, ref) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [flyMode, setFlyMode] = useState(false);
   const flyModeRef = useRef(false);
   const hoverRef = useRef(false);      // pointer over this pane — gates the Z fly-toggle
   const speedMultRef = useRef(1);      // wheel-adjustable fly-speed multiplier
+  const [flySpeed, setFlySpeed] = useState(1);
 
   const mapW = world.width_chunks * 16;
   const mapH = world.height_chunks * 16;
@@ -46,6 +67,11 @@ export default function FlyView3D({
 
   const onFlyModeChangeRef = useRef(onFlyModeChange);
   onFlyModeChangeRef.current = onFlyModeChange;
+  const onCameraMoveRef = useRef(onCameraMove);
+  onCameraMoveRef.current = onCameraMove;
+
+  const overlays3dRef = useRef(overlays3d);
+  useEffect(() => { overlays3dRef.current = overlays3d; }, [overlays3d]);
 
   // Stable refs so the effect can be re-run only on world change, while edit-sync and fly-mode
   // toggles flow through refs without tearing down the scene.
@@ -53,7 +79,14 @@ export default function FlyView3D({
     scene: THREE.Scene;
     camera: THREE.PerspectiveCamera;
     reloadChunk: (cx: number, cy: number) => void;
+    resetCamera: () => void;
+    teleport: (wx: number, wy: number) => void;
+    setOverlays: (ovs: Overlay3D[] | null) => void;
   } | null>(null);
+
+  useImperativeHandle(ref, () => ({
+    teleport: (wx, wy) => sceneApi.current?.teleport(wx, wy),
+  }), []);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -65,41 +98,44 @@ export default function FlyView3D({
 
     // Render-on-demand: only draw when something actually changed (camera moved, chunks streamed,
     // resize) or while actively flying. Avoids burning the GPU at 60fps next to 3 other quad-view panes.
-    let dirty = true;
-    const invalidate = () => { dirty = true; };
+    // `invalidate` schedules a single rAF frame; `frame` reschedules itself only while fly/damping
+    // need continuous updates. `frame` is a hoisted function declaration so `invalidate` can safely
+    // reference it before the definition site.
+    let dirty = false;
+    let rafPending = false;
+    const invalidate = () => {
+      dirty = true;
+      if (rafPending) return;
+      rafPending = true;
+      raf = requestAnimationFrame(frame);
+    };
 
     const scene = new THREE.Scene();
-    // Lit setup so faces shade by orientation. Strong hemisphere fill keeps all faces legible (no
-    // near-black sides); the sun adds subtle directional shading. Ground color is kept fairly bright
-    // so downward/back faces don't read as missing.
-    scene.add(new THREE.HemisphereLight(0xffffff, 0x9aa6b8, 1.05));
-    const sun = new THREE.DirectionalLight(0xffffff, 0.55);
-    sun.position.set(0.45, 1, 0.35);
-    scene.add(sun);
-    const fill = new THREE.DirectionalLight(0xaab4c4, 0.35);
-    fill.position.set(-0.5, 0.4, -0.6);
-    scene.add(fill);
+    // No scene lights — directional shading is baked into vertex colours by the Rust geometry pass
+    // (obj_geometry_region SH_TOP/BOT/E/W/N/S constants).  MeshBasicMaterial renders vertex colours
+    // directly with no normal calculations, eliminating the computeVertexNormals CPU spike and the
+    // normal attribute buffer (~⅓ of geometry RAM).
 
-    const cx = mapW / 2, cz = -mapH / 2;
+    const cx = mapW / 2, cy = mapH / 2;
 
     const grid = new THREE.GridHelper(Math.max(mapW, mapH), Math.max(world.width_chunks, world.height_chunks));
-    grid.position.set(cx, 0, cz);
+    grid.position.set(cx, 0, cy);
     scene.add(grid);
     scene.add(new THREE.AxesHelper(24));
 
-    const box = new THREE.Box3(new THREE.Vector3(0, 0, -mapH), new THREE.Vector3(mapW, maxZ, 0));
+    // World occupies Three.js (0,0,0) → (mapW, maxZ, mapH). Eden north = Three.js −Z.
+    const box = new THREE.Box3(new THREE.Vector3(0, 0, 0), new THREE.Vector3(mapW, maxZ, mapH));
     scene.add(new THREE.Box3Helper(box, new THREE.Color(0x1e3a5f)));
 
     const camera = new THREE.PerspectiveCamera(70, 1, 0.5, 100000);
-    // Start ABOVE the world centre (not offset by a fraction of the map — on huge worlds that lands
-    // the camera outside the world, so streaming finds no chunks and the pane shows an empty plane).
-    // Pulled slightly south and up, looking toward the centre.
-    camera.position.set(cx, maxZ + 60, cz + 110);
+    // Start south of the world centre looking north (−Z). Cameras looking in −Z have Eden east
+    // (+X) on the right, matching the top-down map.
+    camera.position.set(cx, maxZ + 60, cy + 110);
 
     const controls = new OrbitControls(camera, renderer.domElement);
     controls.enableDamping = true;
     controls.dampingFactor = 0.1;
-    controls.target.set(cx, Math.min(maxZ, 28), cz);
+    controls.target.set(cx, Math.min(maxZ, 28), cy);
 
     const resize = () => {
       const r = canvas.getBoundingClientRect();
@@ -114,10 +150,10 @@ export default function FlyView3D({
     const ro = new ResizeObserver(resize);
     ro.observe(canvas);
 
-    // ---- Lit material (shared) ----
-    // DoubleSide so any face whose winding ends up reversed still renders (no see-through gaps);
-    // face culling already removes hidden faces in the Rust geometry, so the cost is bounded.
-    const mat = new THREE.MeshLambertMaterial({ vertexColors: true, side: THREE.DoubleSide });
+    // Unlit material — vertex colours carry baked directional shading from Rust.
+    // DoubleSide kept: the face winding was designed for the old coordinate convention and is not
+    // uniformly outward-facing yet, so FrontSide would drop some faces.
+    const mat = new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide });
 
     // ---- Per-chunk mesh cache ----
     const meshes = new Map<string, THREE.Mesh>();
@@ -156,7 +192,7 @@ export default function FlyView3D({
           const geom = new THREE.BufferGeometry();
           geom.setAttribute("position", new THREE.BufferAttribute(decodeF32(g.positions), 3));
           geom.setAttribute("color", new THREE.BufferAttribute(decodeF32(g.colors), 3));
-          geom.computeVertexNormals();
+          // No computeVertexNormals — MeshBasicMaterial ignores normals; shading is baked into colours.
           geom.computeBoundingSphere(); // cheap frustum-cull test per frame
           const mesh = new THREE.Mesh(geom, mat);
           scene.add(mesh);
@@ -177,10 +213,9 @@ export default function FlyView3D({
     };
 
     // Camera-window streaming: keep chunks within LOAD_RADIUS of the camera's XY footprint.
-    let lastSweep = 0;
     const streamSweep = () => {
       const ccx = Math.floor(camera.position.x / 16);
-      const ccy = Math.floor(-camera.position.z / 16);
+      const ccy = Math.floor(camera.position.z / 16); // Three.js Z = Eden Y
       // Rebuild the work queue each sweep (nearest-first) so the camera's current position drives
       // priority and chunks that fell out of range stop being requested.
       const needed: { cx: number; cy: number; d2: number }[] = [];
@@ -293,6 +328,7 @@ export default function FlyView3D({
       e.preventDefault();
       const f = e.deltaY < 0 ? 1.15 : 1 / 1.15;
       speedMultRef.current = THREE.MathUtils.clamp(speedMultRef.current * f, 0.1, 12);
+      setFlySpeed(Math.round(speedMultRef.current * 10) / 10);
     };
     canvas.addEventListener("wheel", onWheel, { passive: false });
 
@@ -330,14 +366,30 @@ export default function FlyView3D({
     let prev = performance.now();
     let raf = 0;
     let disposed = false;
-    const animate = () => {
-      raf = requestAnimationFrame(animate);
+    let lastEmitT = 0;
+    let lastEmitEX = NaN, lastEmitEY = NaN;
+
+    // Orbit-controls "change" wakes the loop whenever the user drags/zooms; damping keeps it alive
+    // until inertia settles (controls.update() returns false), then it goes fully idle.
+    controls.addEventListener("change", invalidate);
+    // streamSweep runs on its own interval — independent of render cadence.
+    const sweepInterval = setInterval(streamSweep, STREAM_MS);
+
+    // Kick off: first chunk load + first render.
+    streamSweep();
+    invalidate();
+
+    // Hoisted function declaration so `invalidate` (defined above) can reference `frame` safely.
+    function frame() {
+      rafPending = false;
       const now = performance.now();
       const dt = Math.min(0.05, (now - prev) / 1000);
       prev = now;
 
-      let render = dirty;
+      const wasDirty = dirty;
       dirty = false;
+
+      let keepGoing = false;
 
       if (flyModeRef.current) {
         euler.set(pitch, yaw, 0);
@@ -354,34 +406,94 @@ export default function FlyView3D({
         if (keys.has(" ") || keys.has("e")) move.add(WORLD_UP);
         if (keys.has("control") || keys.has("q")) move.sub(WORLD_UP);
         if (move.lengthSq() > 0) camera.position.addScaledVector(move.normalize(), speed);
-        render = true; // actively flying — look/move may have changed every frame
-      } else if (controls.update()) {
-        render = true; // orbit moved or damping inertia still settling
+        keepGoing = true; // actively flying — look/move may change every frame
+      } else {
+        if (controls.update()) keepGoing = true; // orbit damping still settling
       }
 
-      if (now - lastSweep > STREAM_MS) { lastSweep = now; streamSweep(); }
-
-      if (!render) return; // nothing changed — skip the draw entirely
-
-      // Frustum-cull loaded meshes: streaming keeps a radius disc resident, but only the chunks in
-      // view need to draw. Toggles .visible only — disposal still happens by radius in streamSweep.
-      camera.updateMatrixWorld();
-      viewProj.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
-      frustum.setFromProjectionMatrix(viewProj);
-      for (const m of meshes.values()) {
-        if (m === EMPTY || !m.geometry.boundingSphere) continue;
-        m.visible = frustum.intersectsObject(m);
+      // Throttled camera-position broadcast (~10fps) so the top-down map can show an icon.
+      if (now - lastEmitT >= 100) {
+        const ex = camera.position.x, ey = camera.position.z; // Three.js Z = Eden Y
+        if (ex !== lastEmitEX || ey !== lastEmitEY) {
+          lastEmitEX = ex; lastEmitEY = ey;
+          onCameraMoveRef.current?.(ex, ey);
+        }
+        lastEmitT = now;
       }
 
-      renderer.render(scene, camera);
+      if (wasDirty || keepGoing) {
+        // Frustum-cull loaded meshes: streaming keeps a radius disc resident, but only the chunks in
+        // view need to draw. Toggles .visible only — disposal still happens by radius in streamSweep.
+        camera.updateMatrixWorld();
+        viewProj.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+        frustum.setFromProjectionMatrix(viewProj);
+        for (const m of meshes.values()) {
+          if (m === EMPTY || !m.geometry.boundingSphere) continue;
+          m.visible = frustum.intersectsObject(m);
+        }
+        renderer.render(scene, camera);
+      }
+
+      // Reschedule if fly/damping need more frames, or if invalidate() fired during this frame.
+      if (keepGoing || dirty) {
+        rafPending = true;
+        raf = requestAnimationFrame(frame);
+      }
+    }
+
+    const resetCamera = () => {
+      if (flyModeRef.current) exitFly();
+      camera.position.set(cx, maxZ + 60, cy + 110);
+      controls.target.set(cx, Math.min(maxZ, 28), cy);
+      controls.update();
+      invalidate();
     };
-    animate();
 
-    sceneApi.current = { scene, camera, reloadChunk };
+    // Teleport camera to an Eden world XY position, keeping the current height.
+    // Force an immediate chunk sweep so old far-away chunks are cleared right away.
+    const teleport = (wx: number, wy: number) => {
+      camera.position.x = wx;
+      camera.position.z = wy; // Three.js Z = Eden Y
+      controls.target.x = wx;
+      controls.target.z = wy;
+      controls.update();
+      streamSweep(); // immediate sweep without waiting for the next interval tick
+      invalidate();
+    };
+
+    // ---- Overlay wireframe boxes ----
+    const overlayHelpers: THREE.Box3Helper[] = [];
+
+    const clearOverlays = () => {
+      for (const h of overlayHelpers) { scene.remove(h); (h.geometry as THREE.BufferGeometry).dispose(); }
+      overlayHelpers.length = 0;
+    };
+
+    const setOverlays = (ovs: Overlay3D[] | null) => {
+      clearOverlays();
+      if (!ovs) { invalidate(); return; }
+      for (const ov of ovs) {
+        const box = new THREE.Box3(
+          new THREE.Vector3(...ov.min),
+          new THREE.Vector3(...ov.max),
+        );
+        const helper = new THREE.Box3Helper(box, new THREE.Color(ov.color));
+        scene.add(helper);
+        overlayHelpers.push(helper);
+      }
+      invalidate();
+    };
+
+    // Apply any overlays that were already set before scene init (e.g. selection exists at world-load).
+    setOverlays(overlays3dRef.current);
+
+    sceneApi.current = { scene, camera, reloadChunk, resetCamera, teleport, setOverlays };
 
     return () => {
       disposed = true;
       cancelAnimationFrame(raf);
+      clearInterval(sweepInterval);
+      controls.removeEventListener("change", invalidate);
       ro.disconnect();
       document.removeEventListener("pointerlockchange", onPointerLockChange);
       document.removeEventListener("pointerlockerror", onPointerLockError);
@@ -395,6 +507,7 @@ export default function FlyView3D({
       window.removeEventListener("keyup", onKeyUp);
       if (document.pointerLockElement === canvas) document.exitPointerLock();
       for (const k of [...meshes.keys()]) disposeMesh(k);
+      clearOverlays();
       mat.dispose();
       controls.dispose();
       renderer.dispose();
@@ -403,6 +516,11 @@ export default function FlyView3D({
     };
   // Re-init only when world dimensions change (new world loaded).
   }, [mapW, mapH, maxZ, world.width_chunks, world.height_chunks]);
+
+  // Overlay sync: push updated wireframe boxes to the scene.
+  useEffect(() => {
+    sceneApi.current?.setOverlays(overlays3d ?? null);
+  }, [overlays3d]);
 
   // Edit sync: reload chunk meshes overlapping the last edit's top-down bounds.
   useEffect(() => {
@@ -420,14 +538,46 @@ export default function FlyView3D({
 
   return (
     <div style={{ position: "relative", width: "100%", height: "100%", background: "#0a0f1e" }}>
+      {/* Mode hint — pill badge style (A5) */}
       <div style={{
-        position: "absolute", top: 4, left: 6, zIndex: 1, pointerEvents: "none",
-        color: flyMode ? "#34d399" : "#64748b", fontSize: 10, fontWeight: 600, letterSpacing: "0.06em",
+        position: "absolute", top: 6, left: 6, zIndex: 1, pointerEvents: "none",
+        display: "flex", alignItems: "center", gap: 6,
       }}>
-        {flyMode
-          ? "3D · FLY — drag/move to look · WASD · Space/Ctrl up/down · Shift fast · wheel speed · Z exit"
-          : "3D · orbit (drag) · press Z to fly"}
+        <span style={{
+          padding: "2px 7px", borderRadius: 10, fontSize: 10, fontWeight: 600, letterSpacing: "0.05em",
+          background: flyMode ? "rgba(52,211,153,0.18)" : "rgba(100,116,139,0.18)",
+          border: `1px solid ${flyMode ? "rgba(52,211,153,0.45)" : "rgba(100,116,139,0.35)"}`,
+          color: flyMode ? "#34d399" : "#94a3b8",
+        }}>
+          {flyMode ? "FLY" : "3D"}
+        </span>
+        <span style={{ fontSize: 9, color: flyMode ? "#6ee7b7" : "#475569", pointerEvents: "none" }}>
+          {flyMode
+            ? "WASD · Space/Ctrl · Shift boost · wheel speed · Z or Esc exit"
+            : "drag to orbit · scroll zoom · Z to fly"}
+        </span>
+        {/* Speed indicator (A6) */}
+        {flyMode && (
+          <span style={{
+            padding: "1px 5px", borderRadius: 4, fontSize: 9, fontWeight: 700,
+            background: "rgba(52,211,153,0.12)", border: "1px solid rgba(52,211,153,0.3)",
+            color: "#34d399",
+          }}>
+            {flySpeed.toFixed(1)}×
+          </span>
+        )}
       </div>
+      {/* Camera reset button (A4) */}
+      <button
+        onClick={() => sceneApi.current?.resetCamera()}
+        title="Reset camera to world overview"
+        style={{
+          position: "absolute", top: 6, right: 6, zIndex: 1,
+          padding: "2px 7px", fontSize: 10, cursor: "pointer", borderRadius: 4,
+          background: "rgba(30,41,59,0.8)", border: "1px solid #334155",
+          color: "#94a3b8",
+        }}
+      >⌂ Reset</button>
       {flyMode && (
         // Centre crosshair (fly mode hides the cursor via pointer-lock).
         <div style={{
@@ -443,4 +593,6 @@ export default function FlyView3D({
       />
     </div>
   );
-}
+});
+
+export default FlyView3D;

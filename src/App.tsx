@@ -1,20 +1,21 @@
-import { useState, useCallback, useEffect, useRef } from "react";
+import { useState, useCallback, useEffect, useRef, useMemo } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import MapCanvas, { type Tool, type SelectionBounds, type PixelPatch, type MapCanvasRef } from "./MapCanvas";
-import { BLOCK_DEFS, PAINT_COLORS, resolveColor, RAMP_FAMILIES, RAMP_DIRS, WEDGE_FAMILIES, WEDGE_DIRS, rampFamilyBase, wedgeFamilyBase, rampDirIndex, blockDisplayName, doorFamilyBase, portalFamilyBase, DOOR_PORTAL_DIRS, EXPANSION_BLOCKS, isExpansionBlock, PARTIAL_WATER, PARTIAL_LAVA, SPECIAL_BLOCKS } from "./blockDefs";
+import { BLOCK_DEFS, PAINT_COLORS, resolveColor, blockDisplayName } from "./blockDefs";
 import SelectionInspector from "./SelectionInspector";
 import ElevationPreviewPanel from "./ElevationPreviewPanel";
 import SliceViewport from "./SliceViewport";
-import FlyView3D from "./FlyView3D";
+import FlyView3D, { type FlyView3DRef, type Overlay3D } from "./FlyView3D";
 import HelpModal from "./HelpModal";
 import AboutModal from "./AboutModal";
 import WorldBrowserModal from "./WorldBrowserModal";
 import UploadModal from "./UploadModal";
 import NewWorldModal from "./NewWorldModal";
 import SchematicImportModal, { type SchematicInfo, type MappingEntry } from "./SchematicImportModal";
+import BlockPaintPicker from "./BlockPaintPicker";
 import appIcon from "./assets/app-icon.png";
 import "./App.css";
 
@@ -171,6 +172,8 @@ function App() {
   // opts in. `exp` (experimental, perf-heavy on large worlds).
   const [enable3dPane, setEnable3dPane] = useState(false);
   const flyActiveRef = useRef(false); // true while FlyView3D fly mode is active — blocks global shortcuts
+  const flyView3dRef = useRef<FlyView3DRef>(null);
+  const [cam3dPos, setCam3dPos] = useState<{ x: number; y: number } | null>(null);
   const [sliceFrontY, setSliceFrontY] = useState(0); // front slab depth (world Y)
   const [sliceSideX, setSliceSideX] = useState(0);   // side slab depth (world X)
   const [showWorldBrowser, setShowWorldBrowser] = useState(false);
@@ -228,6 +231,7 @@ function App() {
 
   // Paste mode: normal | scatter | array
   const [pasteMode, setPasteMode] = useState<"normal" | "scatter" | "array">("normal");
+  const [advancedPasteOpen, setAdvancedPasteOpen] = useState(false);
   const [scatterCount, setScatterCount] = useState(5);
   const [arrayCols, setArrayCols] = useState(3);
   const [arrayRows, setArrayRows] = useState(3);
@@ -299,6 +303,43 @@ function App() {
 
   const [selection, setSelection] = useState<SelectionInfo | null>(null);
 
+  // 3D wireframe overlays for the fly-through pane: selection (blue), extrude copies (amber), paste (green).
+  const overlays3d = useMemo<Overlay3D[] | null>(() => {
+    if (!showSlicePanels || !enable3dPane) return null;
+    const ovs: Overlay3D[] = [];
+    if (rawBounds) {
+      const { x1, y1, x2, y2 } = rawBounds;
+      ovs.push({ min: [x1, zMin, y1], max: [x2 + 1, zMax + 1, y2 + 1], color: 0x3b82f6 });
+      if (extrudeOpen) {
+        const w = x2 - x1 + 1, h = y2 - y1 + 1, d = zMax - zMin + 1;
+        for (let i = 1; i <= extrudeCount; i++) {
+          let ox = 0, oy = 0, oz = 0;
+          if (extrudeAxis === "x+") ox = w * i;
+          else if (extrudeAxis === "x-") ox = -w * i;
+          else if (extrudeAxis === "y+") oy = h * i;
+          else if (extrudeAxis === "y-") oy = -h * i;
+          else if (extrudeAxis === "z+") oz = d * i;
+          else if (extrudeAxis === "z-") oz = -d * i;
+          ovs.push({
+            min: [x1 + ox, zMin + oz, y1 + oy],
+            max: [x2 + ox + 1, zMax + oz + 1, y2 + oy + 1],
+            color: 0xf59e0b,
+          });
+        }
+      }
+    }
+    if (lockedPastePos && clipboard) {
+      const px = lockedPastePos.x, py = lockedPastePos.y;
+      const pz = clipboard.z_anchor + pasteElevationOffset;
+      ovs.push({
+        min: [px, pz, py],
+        max: [px + clipboard.width, pz + clipboard.depth, py + clipboard.height],
+        color: 0x22c55e,
+      });
+    }
+    return ovs.length > 0 ? ovs : null;
+  }, [showSlicePanels, enable3dPane, rawBounds, zMin, zMax, extrudeOpen, extrudeAxis, extrudeCount, lockedPastePos, clipboard, pasteElevationOffset]);
+
   // When a selection is made, snap the Front/Side slice planes to its centre so the slabs show the
   // selection by default (mirrors what the elevation preview shows). Only fires on selection change,
   // so the user can still scrub freely afterwards.
@@ -338,12 +379,12 @@ function App() {
 
   // ── Edit helpers ──────────────────────────────────────────────────────────
 
-  async function handleGenerateTrees(treeType: TreeType, density: number) {
+  async function handleGenerateTrees(treeTypes: string[], density: number, leafPaints: number[], smartPlacement: boolean) {
     if (!selection) return;
     try {
       const result = await invoke<EditResultRaw>("generate_trees", {
         x1: selection.x1, y1: selection.y1, x2: selection.x2, y2: selection.y2,
-        treeType, density,
+        treeTypes, density, leafPaints, smartPlacement,
       });
       await applyEditResult(result);
     } catch (e) { setError(String(e)); }
@@ -1092,6 +1133,8 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
       creatures={[]}
       pasteElevationOffset={pasteElevationOffset}
       onEyedropper={handleEyedropper}
+      cameraPos3d={showSlicePanels && enable3dPane ? cam3dPos : null}
+      onSetCamera3d={showSlicePanels && enable3dPane ? (wx, wy) => flyView3dRef.current?.teleport(wx, wy) : undefined}
     />
   ) : null;
 
@@ -1155,6 +1198,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
                 depth={sliceFrontY} onDepthChange={setSliceFrontY}
                 crossH={sliceSideX} crossV={zSliceZ}
                 selRange={sliceSel ? { lo: sliceSel.x1, hi: sliceSel.x2 } : null}
+                selFull={!sliceIsPaste && sliceSel ? { xLo: sliceSel.x1, yLo: sliceSel.y1, xHi: sliceSel.x2, yHi: sliceSel.y2, zLo: sliceSel.z_min, zHi: sliceSel.z_max } : null}
                 onHRangeChange={sliceHResizeFront} onSelect={sliceSelectFront} />
             </div>
             <div style={{ minWidth: 0, minHeight: 0, overflow: "hidden", outline: "1px solid #1e293b" }}>
@@ -1162,12 +1206,13 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
                 depth={sliceSideX} onDepthChange={setSliceSideX}
                 crossH={sliceFrontY} crossV={zSliceZ}
                 selRange={sliceSel ? { lo: sliceSel.y1, hi: sliceSel.y2 } : null}
+                selFull={!sliceIsPaste && sliceSel ? { xLo: sliceSel.x1, yLo: sliceSel.y1, xHi: sliceSel.x2, yHi: sliceSel.y2, zLo: sliceSel.z_min, zHi: sliceSel.z_max } : null}
                 onHRangeChange={sliceHResizeSide} onSelect={sliceSelectSide} />
             </div>
             <div style={{ position: "relative", minWidth: 0, minHeight: 0, overflow: "hidden", outline: "1px solid #1e293b" }}>
               {enable3dPane ? (
                 <>
-                  <FlyView3D world={world} editEpoch={editEpoch} lastEdit={lastEditBounds} onFlyModeChange={(a) => { flyActiveRef.current = a; }} />
+                  <FlyView3D ref={flyView3dRef} world={world} editEpoch={editEpoch} lastEdit={lastEditBounds} onFlyModeChange={(a) => { flyActiveRef.current = a; }} onCameraMove={(wx, wy) => setCam3dPos({ x: wx, y: wy })} overlays3d={overlays3d} />
                   <button
                     onClick={() => setEnable3dPane(false)}
                     title="Disable the 3D pane (saves performance)"
@@ -1920,6 +1965,8 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           display: "flex", flexDirection: "column", gap: 6,
           border: `1px solid ${tool === "paste" ? (lockedPastePos ? "#f59e0b" : "#22c55e") : isDrawTool ? "#831843" : selection ? "#3b82f6" : "#334155"}`,
           maxWidth: "calc(100vw - 24px)",
+          maxHeight: "calc(100vh - 140px)",
+          overflowY: "auto",
         }}>
 
           {/* Paste mode banner */}
@@ -2043,48 +2090,62 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
                   {pasteTerrainAbove ? "Above ✓" : "At surface"}
                 </button>
               )}
-              {/* Paste mode: normal / scatter / array */}
-              <div style={{ display: "flex", alignItems: "center", gap: 2, borderLeft: "1px solid #334155", paddingLeft: 6, marginLeft: 2 }}>
-                {(["normal", "scatter", "array"] as const).map(m => (
-                  <button key={m} onClick={() => setPasteMode(m)} style={{
-                    ...overlayBtn, padding: "2px 8px", fontSize: 11,
-                    borderColor: pasteMode === m ? "#7dd3fc" : "#334155",
-                    color: pasteMode === m ? "#bfdbfe" : "#64748b",
-                    background: pasteMode === m ? "rgba(125,211,252,0.1)" : "rgba(0,0,0,0.3)",
-                  }}>
-                    {m === "normal" ? "1×" : m === "scatter" ? "Scatter" : "Array"}
-                  </button>
-                ))}
-              </div>
-              {pasteMode === "scatter" && (
-                <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
-                  <span style={{ color: "#64748b", fontSize: 11 }}>Count</span>
-                  <input type="number" min={1} max={100} value={scatterCount}
-                    onChange={e => setScatterCount(Math.max(1, parseInt(e.target.value,10)||1))}
-                    style={{ ...zInput, width: 44 }} />
-                  <span style={{ color: "#475569", fontSize: 11 }}>within selection</span>
+              {/* Advanced paste options (scatter / array) — collapsed by default */}
+              <button
+                onClick={() => setAdvancedPasteOpen(v => !v)}
+                style={{
+                  ...overlayBtn, padding: "2px 8px", fontSize: 11,
+                  borderColor: advancedPasteOpen || pasteMode !== "normal" ? "#7dd3fc" : "#334155",
+                  color: advancedPasteOpen || pasteMode !== "normal" ? "#bfdbfe" : "#64748b",
+                  background: advancedPasteOpen ? "rgba(125,211,252,0.1)" : "rgba(0,0,0,0.3)",
+                }}
+                title="Scatter and array paste modes"
+              >
+                {pasteMode !== "normal" ? `▼ ${pasteMode}` : `▶ Advanced`}
+              </button>
+              {advancedPasteOpen && (<>
+                <div style={{ display: "flex", alignItems: "center", gap: 2, borderLeft: "1px solid #334155", paddingLeft: 6, marginLeft: 2 }}>
+                  {(["normal", "scatter", "array"] as const).map(m => (
+                    <button key={m} onClick={() => setPasteMode(m)} style={{
+                      ...overlayBtn, padding: "2px 8px", fontSize: 11,
+                      borderColor: pasteMode === m ? "#7dd3fc" : "#334155",
+                      color: pasteMode === m ? "#bfdbfe" : "#64748b",
+                      background: pasteMode === m ? "rgba(125,211,252,0.1)" : "rgba(0,0,0,0.3)",
+                    }}>
+                      {m === "normal" ? "1×" : m === "scatter" ? "Scatter" : "Array"}
+                    </button>
+                  ))}
                 </div>
-              )}
-              {pasteMode === "array" && (
-                <div style={{ display: "flex", alignItems: "center", gap: 4, flexWrap: "wrap" }}>
-                  <span style={{ color: "#64748b", fontSize: 11 }}>Cols</span>
-                  <input type="number" min={1} max={20} value={arrayCols}
-                    onChange={e => setArrayCols(Math.max(1, parseInt(e.target.value,10)||1))}
-                    style={{ ...zInput, width: 40 }} />
-                  <span style={{ color: "#64748b", fontSize: 11 }}>Rows</span>
-                  <input type="number" min={1} max={20} value={arrayRows}
-                    onChange={e => setArrayRows(Math.max(1, parseInt(e.target.value,10)||1))}
-                    style={{ ...zInput, width: 40 }} />
-                  <span style={{ color: "#64748b", fontSize: 11 }}>SpX</span>
-                  <input type="number" min={0} value={arraySpacingX}
-                    onChange={e => setArraySpacingX(Math.max(0, parseInt(e.target.value,10)||0))}
-                    style={{ ...zInput, width: 40 }} title="Horizontal spacing (0 = auto)" />
-                  <span style={{ color: "#64748b", fontSize: 11 }}>SpY</span>
-                  <input type="number" min={0} value={arraySpacingY}
-                    onChange={e => setArraySpacingY(Math.max(0, parseInt(e.target.value,10)||0))}
-                    style={{ ...zInput, width: 40 }} title="Vertical spacing (0 = auto)" />
-                </div>
-              )}
+                {pasteMode === "scatter" && (
+                  <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                    <span style={{ color: "#64748b", fontSize: 11 }}>Count</span>
+                    <input type="number" min={1} max={100} value={scatterCount}
+                      onChange={e => setScatterCount(Math.max(1, parseInt(e.target.value,10)||1))}
+                      style={{ ...zInput, width: 44 }} />
+                    <span style={{ color: "#475569", fontSize: 11 }}>within selection</span>
+                  </div>
+                )}
+                {pasteMode === "array" && (
+                  <div style={{ display: "flex", alignItems: "center", gap: 4, flexWrap: "wrap" }}>
+                    <span style={{ color: "#64748b", fontSize: 11 }}>Cols</span>
+                    <input type="number" min={1} max={20} value={arrayCols}
+                      onChange={e => setArrayCols(Math.max(1, parseInt(e.target.value,10)||1))}
+                      style={{ ...zInput, width: 40 }} />
+                    <span style={{ color: "#64748b", fontSize: 11 }}>Rows</span>
+                    <input type="number" min={1} max={20} value={arrayRows}
+                      onChange={e => setArrayRows(Math.max(1, parseInt(e.target.value,10)||1))}
+                      style={{ ...zInput, width: 40 }} />
+                    <span style={{ color: "#64748b", fontSize: 11 }}>SpX</span>
+                    <input type="number" min={0} value={arraySpacingX}
+                      onChange={e => setArraySpacingX(Math.max(0, parseInt(e.target.value,10)||0))}
+                      style={{ ...zInput, width: 40 }} title="Horizontal spacing (0 = auto)" />
+                    <span style={{ color: "#64748b", fontSize: 11 }}>SpY</span>
+                    <input type="number" min={0} value={arraySpacingY}
+                      onChange={e => setArraySpacingY(Math.max(0, parseInt(e.target.value,10)||0))}
+                      style={{ ...zInput, width: 40 }} title="Vertical spacing (0 = auto)" />
+                  </div>
+                )}
+              </>)}
               <button
                 onClick={() => setTool("pan")}
                 style={{ ...overlayBtn, padding: "2px 10px", fontSize: 12 }}
@@ -2301,355 +2362,17 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
               </div>
 
               {/* Pickers row */}
-              {fillPickerOpen && <div style={{ display: "flex", alignItems: "flex-start", gap: 10 }}>
-
-              {/* Block type 7×5 grid */}
-              <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
-                <span style={{ color: "#64748b", fontSize: 11 }}>Block</span>
-                <div
-                  title="Air — erase blocks in the selection"
-                  onClick={() => setFillBlockType(0)}
-                  style={{
-                    fontSize: 10, textAlign: "center", cursor: "pointer",
-                    padding: "1px 0", borderRadius: 2, userSelect: "none",
-                    border: fillBlockType === 0 ? "1px solid #3b82f6" : "1px solid #334155",
-                    background: fillBlockType === 0 ? "rgba(59,130,246,0.25)" : "rgba(0,0,0,0.3)",
-                    color: fillBlockType === 0 ? "#93c5fd" : "#475569",
-                  }}
-                >
-                  Air
-                </div>
-                <div style={{ display: "grid", gridTemplateColumns: "repeat(7, 18px)", gap: 2 }}>
-                  {BLOCK_DEFS.map((b) => {
-                    const isRamp = rampFamilyBase(b.type) !== null;
-                    const selected = fillBlockType === b.type ||
-                      (rampFamilyBase(fillBlockType) !== null &&
-                       rampFamilyBase(fillBlockType) === rampFamilyBase(b.type)) ||
-                      (wedgeFamilyBase(fillBlockType) !== null &&
-                       wedgeFamilyBase(fillBlockType) === wedgeFamilyBase(b.type)) ||
-                      (doorFamilyBase(fillBlockType) !== null && b.type === 66) ||
-                      (portalFamilyBase(fillBlockType) !== null && b.type === 75) ||
-                      (isExpansionBlock(fillBlockType) && b.type === 82);
-                    const bg = `rgb(${b.color[0]},${b.color[1]},${b.color[2]})`;
-                    const border = selected ? "2px solid #fff" : "2px solid rgba(255,255,255,0.08)";
-                    return (
-                      <div
-                        key={b.type}
-                        title={`${b.name} (type ${b.type})`}
-                        onClick={() => setFillBlockType(b.type)}
-                        style={{
-                          width: 18, height: 18, position: "relative",
-                          background: isRamp ? "rgba(255,255,255,0.04)" : bg,
-                          borderRadius: 2, cursor: "pointer",
-                          boxSizing: "border-box",
-                          border,
-                          outline: selected ? "1px solid #3b82f6" : "none",
-                          outlineOffset: 1,
-                          overflow: "hidden",
-                        }}
-                      >
-                        {isRamp && (
-                          <div style={{
-                            position: "absolute", inset: 0,
-                            background: bg,
-                            clipPath: "polygon(0% 100%, 100% 100%, 100% 0%)",
-                          }} />
-                        )}
-                        <span style={{
-                          position: "absolute", bottom: 0, left: 1,
-                          fontSize: 7, fontWeight: 700, lineHeight: 1,
-                          color: "rgba(255,255,255,0.65)", textShadow: "0 0 2px rgba(0,0,0,1)",
-                          pointerEvents: "none", userSelect: "none",
-                        }}>{b.name[0]?.toUpperCase()}</span>
-                      </div>
-                    );
-                  })}
-                </div>
-                {/* Wedge family picker row — diamond shape to distinguish from ramps */}
-                <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 18px)", gap: 2, marginTop: 2 }}>
-                  {WEDGE_FAMILIES.map((wf) => {
-                    const selected = wedgeFamilyBase(fillBlockType) === wf.base;
-                    const bg = `rgb(${wf.color[0]},${wf.color[1]},${wf.color[2]})`;
-                    return (
-                      <div
-                        key={wf.base}
-                        title={`${wf.name} (type ${wf.base})`}
-                        onClick={() => setFillBlockType(wf.base + (rampDirIndex(fillBlockType)))}
-                        style={{
-                          width: 18, height: 18, position: "relative",
-                          background: "rgba(255,255,255,0.04)",
-                          borderRadius: 2, cursor: "pointer",
-                          boxSizing: "border-box",
-                          border: selected ? "2px solid #fff" : "2px solid rgba(255,255,255,0.08)",
-                          outline: selected ? "1px solid #3b82f6" : "none",
-                          outlineOffset: 1,
-                          overflow: "hidden",
-                        }}
-                      >
-                        {/* Diamond = 45°-rotated square, visually distinct from ramp triangle */}
-                        <div style={{
-                          position: "absolute", inset: 0,
-                          background: bg,
-                          clipPath: "polygon(50% 0%, 100% 50%, 50% 100%, 0% 50%)",
-                        }} />
-                      </div>
-                    );
-                  })}
-                </div>
-                {/* Orientation selector — ramps (S/W/N/E) */}
-                {rampFamilyBase(fillBlockType) !== null && (() => {
-                  const base = rampFamilyBase(fillBlockType)!;
-                  const family = RAMP_FAMILIES.find((f) => f.base === base);
-                  return (
-                    <div style={{ display: "flex", alignItems: "center", gap: 3, marginTop: 1 }}>
-                      <span style={{ color: "#64748b", fontSize: 9, minWidth: 20 }}>Dir</span>
-                      {RAMP_DIRS.map((dir, i) => {
-                        const active = rampDirIndex(fillBlockType) === i;
-                        return (
-                          <button
-                            key={dir}
-                            onClick={() => setFillBlockType(base + i)}
-                            style={{
-                              width: 22, padding: "1px 0", fontSize: 10, cursor: "pointer",
-                              background: active ? "rgba(59,130,246,0.35)" : "rgba(255,255,255,0.04)",
-                              border: `1px solid ${active ? "#3b82f6" : "#334155"}`,
-                              color: active ? "#93c5fd" : "#64748b",
-                              borderRadius: 3,
-                            }}
-                            title={`${family?.name} facing ${["South", "West", "North", "East"][i]}`}
-                          >
-                            {dir}
-                          </button>
-                        );
-                      })}
-                    </div>
-                  );
-                })()}
-                {/* Orientation selector — wedges (SE/SW/NW/NE apex) */}
-                {wedgeFamilyBase(fillBlockType) !== null && (() => {
-                  const base = wedgeFamilyBase(fillBlockType)!;
-                  const family = WEDGE_FAMILIES.find((f) => f.base === base);
-                  return (
-                    <div style={{ display: "flex", alignItems: "center", gap: 3, marginTop: 1 }}>
-                      <span style={{ color: "#64748b", fontSize: 9, minWidth: 20 }}>Apex</span>
-                      {WEDGE_DIRS.map((dir, i) => {
-                        const active = rampDirIndex(fillBlockType) === i;
-                        return (
-                          <button
-                            key={dir}
-                            onClick={() => setFillBlockType(base + i)}
-                            style={{
-                              width: 26, padding: "1px 0", fontSize: 10, cursor: "pointer",
-                              background: active ? "rgba(59,130,246,0.35)" : "rgba(255,255,255,0.04)",
-                              border: `1px solid ${active ? "#3b82f6" : "#334155"}`,
-                              color: active ? "#93c5fd" : "#64748b",
-                              borderRadius: 3,
-                            }}
-                            title={`${family?.name} apex at ${["SE","SW","NW","NE"][i]}`}
-                          >
-                            {dir}
-                          </button>
-                        );
-                      })}
-                    </div>
-                  );
-                })()}
-                {/* Orientation selector — doors (S/W/N/E) */}
-                {doorFamilyBase(fillBlockType) !== null && (
-                  <div style={{ display: "flex", alignItems: "center", gap: 3, marginTop: 1 }}>
-                    <span style={{ color: "#64748b", fontSize: 9, minWidth: 20 }}>Dir</span>
-                    {DOOR_PORTAL_DIRS.map((dir, i) => {
-                      const active = fillBlockType - 66 === i;
-                      return (
-                        <button
-                          key={dir}
-                          onClick={() => setFillBlockType(66 + i)}
-                          style={{
-                            width: 22, padding: "1px 0", fontSize: 10, cursor: "pointer",
-                            background: active ? "rgba(59,130,246,0.35)" : "rgba(255,255,255,0.04)",
-                            border: `1px solid ${active ? "#3b82f6" : "#334155"}`,
-                            color: active ? "#93c5fd" : "#64748b",
-                            borderRadius: 3,
-                          }}
-                          title={`Door facing ${["South","West","North","East"][i]}`}
-                        >
-                          {dir}
-                        </button>
-                      );
-                    })}
-                  </div>
-                )}
-                {/* Orientation selector — portals (S/W/N/E) */}
-                {portalFamilyBase(fillBlockType) !== null && (
-                  <div style={{ display: "flex", alignItems: "center", gap: 3, marginTop: 1 }}>
-                    <span style={{ color: "#64748b", fontSize: 9, minWidth: 20 }}>Dir</span>
-                    {DOOR_PORTAL_DIRS.map((dir, i) => {
-                      const active = fillBlockType - 75 === i;
-                      return (
-                        <button
-                          key={dir}
-                          onClick={() => setFillBlockType(75 + i)}
-                          style={{
-                            width: 22, padding: "1px 0", fontSize: 10, cursor: "pointer",
-                            background: active ? "rgba(59,130,246,0.35)" : "rgba(255,255,255,0.04)",
-                            border: `1px solid ${active ? "#3b82f6" : "#334155"}`,
-                            color: active ? "#93c5fd" : "#64748b",
-                            borderRadius: 3,
-                          }}
-                          title={`Portal facing ${["South","West","North","East"][i]}`}
-                        >
-                          {dir}
-                        </button>
-                      );
-                    })}
-                  </div>
-                )}
-                {/* Expansion sub-type dropdown */}
-                {isExpansionBlock(fillBlockType) && (
-                  <div style={{ marginTop: 2 }}>
-                    <select
-                      value={fillBlockType}
-                      onChange={e => setFillBlockType(Number(e.target.value))}
-                      style={{
-                        background: "#0d1829", border: "1px solid #334155", color: "#e2e8f0",
-                        fontSize: 10, borderRadius: 3, padding: "1px 3px", width: "100%", cursor: "pointer",
-                      }}
-                    >
-                      {EXPANSION_BLOCKS.map(eb => (
-                        <option key={eb.type} value={eb.type}>{eb.name}</option>
-                      ))}
-                    </select>
-                  </div>
-                )}
-                {/* Partial water/lava row */}
-                <div style={{ display: "flex", gap: 2, marginTop: 2 }}>
-                  {[...PARTIAL_WATER, ...PARTIAL_LAVA].map(b => {
-                    const isWater = b.type <= 61;
-                    const baseColor = isWater ? "70,135,210" : "255,69,0";
-                    const selected = fillBlockType === b.type;
-                    return (
-                      <div
-                        key={b.type}
-                        title={b.name}
-                        onClick={() => setFillBlockType(b.type)}
-                        style={{
-                          width: 18, height: 18, position: "relative", overflow: "hidden",
-                          borderRadius: 2, cursor: "pointer", boxSizing: "border-box",
-                          background: `rgba(${baseColor},0.15)`,
-                          border: selected ? "2px solid #fff" : "2px solid rgba(255,255,255,0.08)",
-                          outline: selected ? "1px solid #3b82f6" : "none", outlineOffset: 1,
-                        }}
-                      >
-                        <div style={{
-                          position: "absolute", bottom: 0, left: 0, right: 0,
-                          height: `${b.fill * 100}%`,
-                          background: `rgb(${baseColor})`,
-                        }} />
-                      </div>
-                    );
-                  })}
-                </div>
-                {/* Special blocks row (Weeds) */}
-                <div style={{ display: "flex", gap: 2, marginTop: 1 }}>
-                  {SPECIAL_BLOCKS.map(b => {
-                    const selected = fillBlockType === b.type;
-                    return (
-                      <div
-                        key={b.type}
-                        title={`${b.name} (type ${b.type})`}
-                        onClick={() => setFillBlockType(b.type)}
-                        style={{
-                          width: 18, height: 18, borderRadius: 2, cursor: "pointer", boxSizing: "border-box",
-                          background: `rgb(${b.color[0]},${b.color[1]},${b.color[2]})`,
-                          border: selected ? "2px solid #fff" : "2px solid rgba(255,255,255,0.08)",
-                          outline: selected ? "1px solid #3b82f6" : "none", outlineOffset: 1,
-                        }}
-                      />
-                    );
-                  })}
-                </div>
-              </div>
-
-              <div style={{ width: 1, background: "#1e293b", alignSelf: "stretch" }} />
-
-              {/* Paint picker: no-paint + 9×6 color grid */}
-              <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
-                <span style={{ color: "#64748b", fontSize: 11 }}>Paint</span>
-                <div style={{ display: "flex", gap: 3 }}>
-                  {/* No-paint swatch */}
-                  <div
-                    title="No paint (use block default color)"
-                    onClick={() => setFillPaint(0)}
-                    style={{
-                      width: 18, height: 18, flexShrink: 0,
-                      background: "transparent",
-                      borderRadius: 2, cursor: "pointer",
-                      boxSizing: "border-box",
-                      border: fillPaint === 0 ? "2px solid #fff" : "2px solid #334155",
-                      outline: fillPaint === 0 ? "1px solid #3b82f6" : "none",
-                      outlineOffset: 1,
-                      display: "flex", alignItems: "center", justifyContent: "center",
-                      color: "#475569", fontSize: 11, lineHeight: 1,
-                    }}
-                  >
-                    ✕
-                  </div>
-                  {/* 9-per-row grid */}
-                  <div style={{ display: "grid", gridTemplateColumns: "repeat(9, 18px)", gap: 2 }}>
-                    {PAINT_COLORS.map(([r, g, b], i) => (
-                      <div
-                        key={i}
-                        title={`Paint color ${i + 1}`}
-                        onClick={() => setFillPaint(i + 1)}
-                        style={{
-                          width: 18, height: 18,
-                          background: `rgb(${r},${g},${b})`,
-                          borderRadius: 2, cursor: "pointer",
-                          boxSizing: "border-box",
-                          border: fillPaint === i + 1
-                            ? "2px solid #fff"
-                            : "2px solid rgba(255,255,255,0.08)",
-                          outline: fillPaint === i + 1 ? "1px solid #3b82f6" : "none",
-                          outlineOffset: 1,
-                        }}
-                      />
-                    ))}
-                  </div>
-                </div>
-              </div>
-
-              <div style={{ width: 1, background: "#1e293b", alignSelf: "stretch" }} />
-
-              {/* Preview + Fill button */}
-              <div style={{ display: "flex", flexDirection: "column", gap: 4, justifyContent: "flex-end", alignSelf: "flex-end" }}>
-                <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                  <div
-                    title="Preview: selected block + paint"
-                    style={{
-                      width: 22, height: 22, borderRadius: 3, flexShrink: 0,
-                      background: (() => {
-                        const [r, g, b] = resolveColor(fillBlockType, fillPaint);
-                        return `rgb(${r},${g},${b})`;
-                      })(),
-                      border: "1px solid #475569",
-                    }}
-                  />
-                  {selection && (
-                    <button
-                      onClick={fillSelection}
-                      style={{ ...overlayBtn, padding: "2px 10px", fontSize: 12, borderColor: "#22c55e", color: "#86efac", whiteSpace: "nowrap" }}
-                      title="Fill every block in the selection with the chosen type and paint"
-                    >
-                      Fill Selection
-                    </button>
-                  )}
-                </div>
-                <div style={{ color: "#94a3b8", fontSize: 11, whiteSpace: "nowrap" }}>
-                  {blockDisplayName(fillBlockType)}{fillPaint > 0 ? <span style={{ color: "#7dd3fc" }}> #{fillPaint}</span> : ""}
-                </div>
-              </div>
-
-              </div>}{/* end pickers row */}
+              {fillPickerOpen && (
+                <BlockPaintPicker
+                  mode="fill"
+                  blockType={fillBlockType}
+                  paint={fillPaint}
+                  onBlockTypeChange={(bt) => { if (bt !== null) setFillBlockType(bt); }}
+                  onPaintChange={(p) => setFillPaint(p ?? 0)}
+                  onFill={fillSelection}
+                  selectionExists={!!selection}
+                />
+              )}
 
 {/* Mask system — only visible when a draw tool is active */}
               {isDrawTool && (
@@ -2751,264 +2474,13 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
                 </div>
 
                 {/* Filter pickers row */}
-                <div style={{ display: "flex", alignItems: "flex-start", gap: 10, overflowX: "auto" }}>
-
-                  {/* Filter block picker */}
-                  <div style={{ display: "flex", flexDirection: "column", gap: 3, flexShrink: 0 }}>
-                    <span style={{ color: "#64748b", fontSize: 11 }}>Block</span>
-                    {/* "Any block" toggle */}
-                    <div
-                      onClick={() => setFilterBlockType(null)}
-                      style={{
-                        fontSize: 10, textAlign: "center", cursor: "pointer",
-                        padding: "1px 0", borderRadius: 2, userSelect: "none",
-                        border: filterBlockType === null ? "1px solid #3b82f6" : "1px solid #334155",
-                        background: filterBlockType === null ? "rgba(59,130,246,0.25)" : "rgba(255,255,255,0.04)",
-                        color: filterBlockType === null ? "#93c5fd" : "#475569",
-                      }}
-                    >
-                      Any
-                    </div>
-                    <div style={{ display: "grid", gridTemplateColumns: "repeat(7, 18px)", gap: 2 }}>
-                      {BLOCK_DEFS.map((b) => {
-                        const selected = filterBlockType === b.type ||
-                          (filterBlockType !== null &&
-                           rampFamilyBase(filterBlockType) !== null &&
-                           rampFamilyBase(filterBlockType) === rampFamilyBase(b.type)) ||
-                          (filterBlockType !== null && doorFamilyBase(filterBlockType) !== null && b.type === 66) ||
-                          (filterBlockType !== null && portalFamilyBase(filterBlockType) !== null && b.type === 75) ||
-                          (filterBlockType !== null && isExpansionBlock(filterBlockType) && b.type === 82);
-                        return (
-                        <div
-                          key={b.type}
-                          title={`${b.name} (type ${b.type})`}
-                          onClick={() => setFilterBlockType(b.type)}
-                          style={{
-                            width: 18, height: 18,
-                            background: `rgb(${b.color[0]},${b.color[1]},${b.color[2]})`,
-                            borderRadius: 2, cursor: "pointer",
-                            boxSizing: "border-box",
-                            border: selected ? "2px solid #fff" : "2px solid rgba(255,255,255,0.08)",
-                            outline: selected ? "1px solid #3b82f6" : "none",
-                            outlineOffset: 1,
-                          }}
-                        />
-                        );
-                      })}
-                    </div>
-                    {/* Orientation selector — only shown when a ramp family is the active filter */}
-                    {filterBlockType !== null && rampFamilyBase(filterBlockType) !== null && (() => {
-                      const base = rampFamilyBase(filterBlockType)!;
-                      const family = RAMP_FAMILIES.find((f) => f.base === base);
-                      return (
-                        <div style={{ display: "flex", alignItems: "center", gap: 3, marginTop: 1 }}>
-                          <span style={{ color: "#64748b", fontSize: 9, minWidth: 20 }}>Dir</span>
-                          {RAMP_DIRS.map((dir, i) => {
-                            const active = rampDirIndex(filterBlockType) === i;
-                            return (
-                              <button
-                                key={dir}
-                                onClick={() => setFilterBlockType(base + i)}
-                                style={{
-                                  width: 22, padding: "1px 0", fontSize: 10, cursor: "pointer",
-                                  background: active ? "rgba(59,130,246,0.35)" : "rgba(255,255,255,0.04)",
-                                  border: `1px solid ${active ? "#3b82f6" : "#334155"}`,
-                                  color: active ? "#93c5fd" : "#64748b",
-                                  borderRadius: 3,
-                                }}
-                                title={`${family?.name} facing ${["South", "West", "North", "East"][i]}`}
-                              >
-                                {dir}
-                              </button>
-                            );
-                          })}
-                        </div>
-                      );
-                    })()}
-                    {/* Orientation selector — doors */}
-                    {filterBlockType !== null && doorFamilyBase(filterBlockType) !== null && (
-                      <div style={{ display: "flex", alignItems: "center", gap: 3, marginTop: 1 }}>
-                        <span style={{ color: "#64748b", fontSize: 9, minWidth: 20 }}>Dir</span>
-                        {DOOR_PORTAL_DIRS.map((dir, i) => {
-                          const active = filterBlockType - 66 === i;
-                          return (
-                            <button
-                              key={dir}
-                              onClick={() => setFilterBlockType(66 + i)}
-                              style={{
-                                width: 22, padding: "1px 0", fontSize: 10, cursor: "pointer",
-                                background: active ? "rgba(59,130,246,0.35)" : "rgba(255,255,255,0.04)",
-                                border: `1px solid ${active ? "#3b82f6" : "#334155"}`,
-                                color: active ? "#93c5fd" : "#64748b",
-                                borderRadius: 3,
-                              }}
-                              title={`Door facing ${["South","West","North","East"][i]}`}
-                            >
-                              {dir}
-                            </button>
-                          );
-                        })}
-                      </div>
-                    )}
-                    {/* Orientation selector — portals */}
-                    {filterBlockType !== null && portalFamilyBase(filterBlockType) !== null && (
-                      <div style={{ display: "flex", alignItems: "center", gap: 3, marginTop: 1 }}>
-                        <span style={{ color: "#64748b", fontSize: 9, minWidth: 20 }}>Dir</span>
-                        {DOOR_PORTAL_DIRS.map((dir, i) => {
-                          const active = filterBlockType - 75 === i;
-                          return (
-                            <button
-                              key={dir}
-                              onClick={() => setFilterBlockType(75 + i)}
-                              style={{
-                                width: 22, padding: "1px 0", fontSize: 10, cursor: "pointer",
-                                background: active ? "rgba(59,130,246,0.35)" : "rgba(255,255,255,0.04)",
-                                border: `1px solid ${active ? "#3b82f6" : "#334155"}`,
-                                color: active ? "#93c5fd" : "#64748b",
-                                borderRadius: 3,
-                              }}
-                              title={`Portal facing ${["South","West","North","East"][i]}`}
-                            >
-                              {dir}
-                            </button>
-                          );
-                        })}
-                      </div>
-                    )}
-                    {/* Expansion sub-type dropdown (filter) */}
-                    {filterBlockType !== null && isExpansionBlock(filterBlockType) && (
-                      <div style={{ marginTop: 2 }}>
-                        <select
-                          value={filterBlockType}
-                          onChange={e => setFilterBlockType(Number(e.target.value))}
-                          style={{
-                            background: "#0d1829", border: "1px solid #334155", color: "#e2e8f0",
-                            fontSize: 10, borderRadius: 3, padding: "1px 3px", width: "100%", cursor: "pointer",
-                          }}
-                        >
-                          {EXPANSION_BLOCKS.map(eb => (
-                            <option key={eb.type} value={eb.type}>{eb.name}</option>
-                          ))}
-                        </select>
-                      </div>
-                    )}
-                    {/* Partial water/lava row (filter) */}
-                    <div style={{ display: "flex", gap: 2, marginTop: 2 }}>
-                      {[...PARTIAL_WATER, ...PARTIAL_LAVA].map(b => {
-                        const isWater = b.type <= 61;
-                        const baseColor = isWater ? "70,135,210" : "255,69,0";
-                        const selected = filterBlockType === b.type;
-                        return (
-                          <div
-                            key={b.type}
-                            title={b.name}
-                            onClick={() => setFilterBlockType(b.type)}
-                            style={{
-                              width: 18, height: 18, position: "relative", overflow: "hidden",
-                              borderRadius: 2, cursor: "pointer", boxSizing: "border-box",
-                              background: `rgba(${baseColor},0.15)`,
-                              border: selected ? "2px solid #fff" : "2px solid rgba(255,255,255,0.08)",
-                              outline: selected ? "1px solid #3b82f6" : "none", outlineOffset: 1,
-                            }}
-                          >
-                            <div style={{
-                              position: "absolute", bottom: 0, left: 0, right: 0,
-                              height: `${b.fill * 100}%`,
-                              background: `rgb(${baseColor})`,
-                            }} />
-                          </div>
-                        );
-                      })}
-                    </div>
-                    {/* Special blocks row (filter) */}
-                    <div style={{ display: "flex", gap: 2, marginTop: 1 }}>
-                      {SPECIAL_BLOCKS.map(b => {
-                        const selected = filterBlockType === b.type;
-                        return (
-                          <div
-                            key={b.type}
-                            title={`${b.name} (type ${b.type})`}
-                            onClick={() => setFilterBlockType(b.type)}
-                            style={{
-                              width: 18, height: 18, borderRadius: 2, cursor: "pointer", boxSizing: "border-box",
-                              background: `rgb(${b.color[0]},${b.color[1]},${b.color[2]})`,
-                              border: selected ? "2px solid #fff" : "2px solid rgba(255,255,255,0.08)",
-                              outline: selected ? "1px solid #3b82f6" : "none", outlineOffset: 1,
-                            }}
-                          />
-                        );
-                      })}
-                    </div>
-                  </div>
-
-                  <div style={{ width: 1, background: "#1e293b", alignSelf: "stretch", flexShrink: 0 }} />
-
-                  {/* Filter paint picker */}
-                  <div style={{ display: "flex", flexDirection: "column", gap: 3, flexShrink: 0 }}>
-                    <span style={{ color: "#64748b", fontSize: 11 }}>Paint</span>
-                    <div style={{ display: "flex", gap: 3 }}>
-                      {/* "Any paint" toggle */}
-                      <div
-                        title="Any paint (no paint filter)"
-                        onClick={() => setFilterPaint(null)}
-                        style={{
-                          width: 18, height: 18, flexShrink: 0,
-                          borderRadius: 2, cursor: "pointer",
-                          boxSizing: "border-box",
-                          border: filterPaint === null ? "2px solid #fff" : "2px solid #334155",
-                          outline: filterPaint === null ? "1px solid #3b82f6" : "none",
-                          outlineOffset: 1,
-                          display: "flex", alignItems: "center", justifyContent: "center",
-                          background: filterPaint === null ? "rgba(59,130,246,0.25)" : "rgba(255,255,255,0.04)",
-                          color: filterPaint === null ? "#93c5fd" : "#475569",
-                          fontSize: 9, lineHeight: 1, userSelect: "none",
-                        }}
-                      >
-                        Any
-                      </div>
-                      {/* No-paint swatch */}
-                      <div
-                        title="No paint (unpainted blocks only)"
-                        onClick={() => setFilterPaint(0)}
-                        style={{
-                          width: 18, height: 18, flexShrink: 0,
-                          background: "transparent",
-                          borderRadius: 2, cursor: "pointer",
-                          boxSizing: "border-box",
-                          border: filterPaint === 0 ? "2px solid #fff" : "2px solid #334155",
-                          outline: filterPaint === 0 ? "1px solid #3b82f6" : "none",
-                          outlineOffset: 1,
-                          display: "flex", alignItems: "center", justifyContent: "center",
-                          color: "#475569", fontSize: 11, lineHeight: 1,
-                        }}
-                      >
-                        ✕
-                      </div>
-                      {/* 9-per-row paint grid */}
-                      <div style={{ display: "grid", gridTemplateColumns: "repeat(9, 18px)", gap: 2 }}>
-                        {PAINT_COLORS.map(([r, g, b], i) => (
-                          <div
-                            key={i}
-                            title={`Paint color ${i + 1}`}
-                            onClick={() => setFilterPaint(i + 1)}
-                            style={{
-                              width: 18, height: 18,
-                              background: `rgb(${r},${g},${b})`,
-                              borderRadius: 2, cursor: "pointer",
-                              boxSizing: "border-box",
-                              border: filterPaint === i + 1
-                                ? "2px solid #fff"
-                                : "2px solid rgba(255,255,255,0.08)",
-                              outline: filterPaint === i + 1 ? "1px solid #3b82f6" : "none",
-                              outlineOffset: 1,
-                            }}
-                          />
-                        ))}
-                      </div>
-                    </div>
-                  </div>
-
-                </div>{/* end filter pickers row */}
+                <BlockPaintPicker
+                  mode="filter"
+                  blockType={filterBlockType}
+                  paint={filterPaint}
+                  onBlockTypeChange={setFilterBlockType}
+                  onPaintChange={setFilterPaint}
+                />
                 </>}{/* end replace expand */}
               </div>}{/* end replace-only section */}
 

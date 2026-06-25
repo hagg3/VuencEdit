@@ -46,6 +46,9 @@ interface Props {
   selRange?: { lo: number; hi: number } | null;
   /** Selection's Z range — draws the highlighted z-band box (ported from the elevation panel). */
   selZ?: { min: number; max: number } | null;
+  /** Full 3D selection bounds. When set on front/side viewports, enables ortho projection mode
+   *  (auto-enabled; shows solid facade of selection instead of a depth slab). */
+  selFull?: { xLo: number; yLo: number; xHi: number; yHi: number; zLo: number; zHi: number } | null;
   /** Z-axis extrude preview: ghost bands above/below the selection. */
   extrudeCount?: number;
   extrudeAxis?: string;
@@ -62,7 +65,7 @@ interface Props {
   onSelect?: (hLo: number, hHi: number, zLo: number, zHi: number) => void;
 }
 
-export default function SliceViewport({ world, axis, editEpoch, lastEdit, onPaint, brush, tool, fill, depth, onDepthChange, crossH, crossV, selRange, selZ, extrudeCount = 0, extrudeAxis = "z+", isPaste = false, onZRangeChange, onHRangeChange, selectMode = false, onSelect }: Props) {
+export default function SliceViewport({ world, axis, editEpoch, lastEdit, onPaint, brush, tool, fill, depth, onDepthChange, crossH, crossV, selRange, selZ, selFull, extrudeCount = 0, extrudeAxis = "z+", isPaste = false, onZRangeChange, onHRangeChange, selectMode = false, onSelect }: Props) {
   const worldW = world.width_chunks * 16;
   const worldH = world.height_chunks * 16;
   const maxZ = world.max_z;
@@ -102,8 +105,11 @@ export default function SliceViewport({ world, axis, editEpoch, lastEdit, onPain
   }, [depthMax, onDepthChange]);
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const slabRef = useRef<HTMLCanvasElement | null>(null); // offscreen, planeW × (maxZ+1)
+  const slabRef = useRef<HTMLCanvasElement | null>(null); // offscreen slab canvas
+  const orthoSlabRef = useRef<HTMLCanvasElement | null>(null); // offscreen ortho canvas (selection only)
   const clipRef = useRef<HTMLCanvasElement | null>(null);  // offscreen clipboard ghost (paste preview)
+  const edgeHoverRef = useRef<string | null>(null);  // "z-max"|"z-min"|"h-lo"|"h-hi" or null
+  const [loading, setLoading] = useState(false);
   const viewRef = useRef({ x: 0, y: 0, scale: 2 });
   const dragRef = useRef<{ sx: number; sy: number; vx: number; vy: number } | null>(null);
   const zDragRef = useRef<{ edge: "min" | "max"; startY: number; startZ: number; scale: number } | null>(null);
@@ -122,6 +128,39 @@ export default function SliceViewport({ world, axis, editEpoch, lastEdit, onPain
   fillRef.current = fill;
   const [, force] = useState(0);
 
+  // ── Ortho mode ───────────────────────────────────────────────────────────────
+  // Only available for front/side viewports when a selection is active (selFull set).
+  // Auto-enabled when a selection first appears; auto-clears on deselect.
+  const [orthoMode, setOrthoMode] = useState(false);
+  const orthoModeRef = useRef(false);
+  orthoModeRef.current = orthoMode;
+  // Keep a ref so stable callbacks (draw, doOrthoFetch) can read the latest selFull without
+  // it appearing in their dep arrays (which would cause spurious fetch cascades).
+  const selFullRef = useRef(selFull);
+  selFullRef.current = selFull;
+
+  // Stable key representing selFull bounds — used as an effect dep to retrigger on selection change
+  // without creating a new object reference on every render.
+  const selFullKey = selFull
+    ? `${selFull.xLo},${selFull.yLo},${selFull.xHi},${selFull.yHi},${selFull.zLo},${selFull.zHi}`
+    : null;
+
+  // Track whether selFull was previously present so we only auto-enable on first appearance.
+  const hadSelFullRef = useRef(false);
+  const hasSelFull = selFull != null && axis !== "top";
+
+  useEffect(() => {
+    if (!hasSelFull) {
+      setOrthoMode(false);
+      orthoSlabRef.current = null; // free memory immediately
+      hadSelFullRef.current = false;
+      force(n => n + 1);
+    } else if (!hadSelFullRef.current) {
+      hadSelFullRef.current = true;
+      setOrthoMode(true);
+    }
+  }, [hasSelFull]);
+
   // Reset the free-scroll window when switching axis. (Re-fitting is handled when the fetched slab's
   // dimensions actually change — see the fetch handler below — so zoom is preserved on depth/edit refetch.)
   useEffect(() => { setWinOrigin(0); }, [axis]);
@@ -132,6 +171,7 @@ export default function SliceViewport({ world, axis, editEpoch, lastEdit, onPain
   const STRIP = 256;
   const fetchSeqRef = useRef(0);
   const doFetch = useCallback(() => {
+    if (orthoModeRef.current) return; // ortho mode handles its own fetch
     const seq = ++fetchSeqRef.current;
     const h0 = fetchLo, h1 = fetchHi;
     const totalW = h1 - h0 + 1;
@@ -148,7 +188,11 @@ export default function SliceViewport({ world, axis, editEpoch, lastEdit, onPain
     // front: render_yslice_patch(y,x1,z1,x2,z2); side: render_xslice_patch(x,y1,z1,y2,z2);
     // top: render_zslice_patch(z,x1,y1,x2,y2)
     const cmd = axis === "front" ? "render_yslice_patch" : axis === "side" ? "render_xslice_patch" : "render_zslice_patch";
+    let pending = 0;
+    const done = () => { if (--pending === 0 && seq === fetchSeqRef.current) setLoading(false); };
+    setLoading(true);
     for (let s = h0; s <= h1; s += STRIP) {
+      pending++;
       const e = Math.min(h1, s + STRIP - 1);
       const args = axis === "front"
         ? { y: curDepth, x1: s, z1: 0, x2: e, z2: maxZ }
@@ -158,23 +202,67 @@ export default function SliceViewport({ world, axis, editEpoch, lastEdit, onPain
       const dx = s - h0;
       invoke<PixelPatchRaw>(cmd, args)
         .then((raw) => {
-          if (seq !== fetchSeqRef.current) return; // superseded
+          if (seq !== fetchSeqRef.current) { done(); return; } // superseded
           const px = decodePixels(raw.pixels);
           sctx.putImageData(new ImageData(new Uint8ClampedArray(px), raw.width, raw.height), dx, 0);
           force((n) => n + 1);
+          done();
         })
-        .catch(() => { /* no world / out of range */ });
+        .catch(() => done());
     }
+    if (pending === 0) setLoading(false);
   }, [axis, curDepth, fetchLo, fetchHi, vMax, maxZ]);
+
+  // Fetch the ortho projection of the current selection via render_selection_view.
+  const orthoFetchSeqRef = useRef(0);
+  const doOrthoFetch = useCallback(() => {
+    const sf = selFullRef.current;
+    if (!sf || axis === "top") return;
+    const seq = ++orthoFetchSeqRef.current;
+    ++fetchSeqRef.current; // cancel any in-flight slab strip fetches
+    setLoading(true);
+    invoke<{ width: number; height: number; pixels: string }>("render_selection_view", {
+      x1: sf.xLo, y1: sf.yLo, x2: sf.xHi, y2: sf.yHi,
+      zMin: sf.zLo, zMax: sf.zHi,
+      view: axis === "front" ? "front" : "side",
+    }).then((raw) => {
+      if (seq !== orthoFetchSeqRef.current) { setLoading(false); return; }
+      const px = decodePixels(raw.pixels);
+      let c = orthoSlabRef.current;
+      if (!c) { c = document.createElement("canvas"); orthoSlabRef.current = c; }
+      if (c.width !== raw.width || c.height !== raw.height) {
+        fittedRef.current = false;
+        c.width = raw.width; c.height = raw.height;
+      }
+      c.getContext("2d")!.putImageData(new ImageData(new Uint8ClampedArray(px), raw.width, raw.height), 0, 0);
+      setLoading(false);
+      force(n => n + 1);
+    }).catch(() => setLoading(false));
+  }, [axis]); // selFull read via ref to avoid dep-cascade
 
   // View-driven refetch (axis / depth / selection range / window scroll).
   useEffect(() => { doFetch(); }, [doFetch]);
+
+  // Ortho fetch: runs when ortho mode is on and the selection changes.
+  useEffect(() => {
+    if (orthoMode && selFullKey && axis !== "top") doOrthoFetch();
+  }, [orthoMode, selFullKey, doOrthoFetch, axis]);
 
   // Edit-driven refetch — only when the edit's bounds intersect this slab's depth plane.
   const lastEpochRef = useRef(editEpoch);
   useEffect(() => {
     if (editEpoch === lastEpochRef.current) return;
     lastEpochRef.current = editEpoch;
+    if (orthoModeRef.current && selFullRef.current && axis !== "top") {
+      if (lastEdit) {
+        const sf = selFullRef.current;
+        const overlapX = lastEdit.x < sf.xHi + 1 && lastEdit.x + lastEdit.w > sf.xLo;
+        const overlapY = lastEdit.y < sf.yHi + 1 && lastEdit.y + lastEdit.h > sf.yLo;
+        if (!overlapX || !overlapY) return;
+      }
+      doOrthoFetch();
+      return;
+    }
     if (lastEdit) {
       const touched = axis === "front" ? (curDepth >= lastEdit.y && curDepth < lastEdit.y + lastEdit.h)
                     : axis === "side"  ? (curDepth >= lastEdit.x && curDepth < lastEdit.x + lastEdit.w)
@@ -182,7 +270,7 @@ export default function SliceViewport({ world, axis, editEpoch, lastEdit, onPain
       if (!touched) return;
     }
     doFetch();
-  }, [editEpoch, lastEdit, axis, curDepth, doFetch]);
+  }, [editEpoch, lastEdit, axis, curDepth, doFetch, doOrthoFetch]);
 
   // Clipboard elevation ghost for paste preview (front/side image matching this slab's axis).
   useEffect(() => {
@@ -219,19 +307,36 @@ export default function SliceViewport({ world, axis, editEpoch, lastEdit, onPain
 
   // ── paint the visible canvas from the offscreen slab ──────────────────────
   const draw = useCallback(() => {
-    const canvas = canvasRef.current, slab = slabRef.current;
+    const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext("2d")!;
     ctx.imageSmoothingEnabled = false;
     ctx.fillStyle = "#0a0f1e";
     ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    // Choose which offscreen canvas to display.
+    const isOrtho = orthoModeRef.current && orthoSlabRef.current != null && axis !== "top";
+    const slab = isOrtho ? orthoSlabRef.current! : slabRef.current;
     if (!slab) return;
+
+    // In ortho mode, the image covers exactly selFull's horizontal extent; in slab mode it covers
+    // the fetch window. Both crosshair and overlay coords are computed relative to the active origin.
+    const sf = selFullRef.current;
+    const activeWinOrigin = isOrtho && sf
+      ? (axis === "front" ? sf.xLo : sf.yLo)
+      : winOriginRef.current;
+    // Row ↔ Z mapping differs: slab uses maxZ−row; ortho uses selFull.zHi−row.
+    const activeVToRow = isOrtho && sf
+      ? (v: number) => sf.zHi - v
+      : vToRow;
+
     const { x, y, scale } = viewRef.current;
     ctx.drawImage(slab, 0, 0, slab.width, slab.height, x, y, slab.width * scale, slab.height * scale);
 
     // Selection-scoped: gray out the context columns flanking the selection + draw divider lines.
+    // Skipped in ortho mode — the image IS the selection, no context cols to gray.
     // effSel reflects an in-progress horizontal edge drag (preview) before it's committed.
-    const effSel = hPreviewRef.current ?? selRange;
+    const effSel = isOrtho ? null : (hPreviewRef.current ?? selRange);
     if (effSel) {
       const a = effSel.lo - winOriginRef.current;       // slab col of selection start
       const b = effSel.hi - winOriginRef.current + 1;   // slab col just past selection end
@@ -250,6 +355,7 @@ export default function SliceViewport({ world, axis, editEpoch, lastEdit, onPain
 
     // Selection / paste z-band box (front/side only — vertical axis is Z). Ported from the
     // elevation panel: blue band for a selection, green band + clipboard ghost during paste.
+    // Skipped in ortho mode — the image already shows the full Z extent of the selection.
     if (effSel && selZ && axis !== "top") {
       const a = effSel.lo - winOriginRef.current;
       const b = effSel.hi - winOriginRef.current + 1;
@@ -298,15 +404,16 @@ export default function SliceViewport({ world, axis, editEpoch, lastEdit, onPain
 
     // Crosshair: vertical line = where the perpendicular slab cuts (horizontal world coord);
     // horizontal line = the z-slice level. Both in slab-pixel space → screen.
+    // In ortho mode, coords are relative to the selection's horizontal/vertical origin.
     ctx.lineWidth = 1;
-    const crossCol = crossH != null ? crossH - winOriginRef.current : null;
+    const crossCol = crossH != null ? crossH - activeWinOrigin : null;
     if (crossCol != null && crossCol >= 0 && crossCol < slab.width) {
       const sx = x + (crossCol + 0.5) * scale;
       ctx.strokeStyle = "rgba(168,85,247,0.7)";
       ctx.beginPath(); ctx.moveTo(sx, 0); ctx.lineTo(sx, canvas.height); ctx.stroke();
     }
     if (crossV != null) {
-      const row = vToRow(crossV); // image row for that vertical-axis world coord
+      const row = activeVToRow(crossV); // image row for that vertical-axis world coord
       if (row >= 0 && row < slab.height) {
         const sy = y + (row + 0.5) * scale;
         ctx.strokeStyle = "rgba(56,189,248,0.7)";
@@ -314,39 +421,81 @@ export default function SliceViewport({ world, axis, editEpoch, lastEdit, onPain
       }
     }
 
-    // Live rect/ellipse drag ghost (sky-blue cells, like MapCanvas).
-    const sh = shapeRef.current;
-    if (sh) {
-      ctx.fillStyle = "rgba(56,189,248,0.45)";
-      const cells = shapeToolRef.current === "ellipse"
-        ? ellipsePixels(sh.start, sh.end, fillRef.current ? "fill" : "outline")
-        : rectPixels(sh.start, sh.end, fillRef.current ? "fill" : "outline");
-      for (const p of cells) {
-        if (p.x < 0 || p.x >= slab.width || p.y < 0 || p.y >= slab.height) continue;
-        ctx.fillRect(x + p.x * scale, y + p.y * scale, Math.ceil(scale), Math.ceil(scale));
+    // Live rect/ellipse drag ghost and marquee are slab-mode only (painting disabled in ortho).
+    if (!isOrtho) {
+      const sh = shapeRef.current;
+      if (sh) {
+        ctx.fillStyle = "rgba(56,189,248,0.45)";
+        const cells = shapeToolRef.current === "ellipse"
+          ? ellipsePixels(sh.start, sh.end, fillRef.current ? "fill" : "outline")
+          : rectPixels(sh.start, sh.end, fillRef.current ? "fill" : "outline");
+        for (const p of cells) {
+          if (p.x < 0 || p.x >= slab.width || p.y < 0 || p.y >= slab.height) continue;
+          ctx.fillRect(x + p.x * scale, y + p.y * scale, Math.ceil(scale), Math.ceil(scale));
+        }
+      }
+
+      const mq = marqueeRef.current;
+      if (mq) {
+        const c0 = Math.min(mq.start.x, mq.end.x), c1 = Math.max(mq.start.x, mq.end.x) + 1;
+        const r0 = Math.min(mq.start.y, mq.end.y), r1 = Math.max(mq.start.y, mq.end.y) + 1;
+        const bx = x + c0 * scale, by = y + r0 * scale;
+        const bw = (c1 - c0) * scale, bh = (r1 - r0) * scale;
+        ctx.fillStyle = "rgba(59,130,246,0.18)";
+        ctx.fillRect(bx, by, bw, bh);
+        ctx.setLineDash([4, 3]);
+        ctx.lineWidth = 1.5;
+        ctx.strokeStyle = "rgba(147,197,253,0.95)";
+        ctx.strokeRect(bx + 0.75, by + 0.75, bw - 1.5, bh - 1.5);
+        ctx.setLineDash([]);
+      }
+
+      // Edge-hover grip cues + hint text (A1 / B3).
+      const eh = edgeHoverRef.current;
+      if (eh && slab) {
+        ctx.fillStyle = "rgba(148,163,184,0.85)";
+        if (eh === "z-max" || eh === "z-min") {
+          const ez = eh === "z-max" ? selZ?.max : selZ?.min;
+          if (ez != null) {
+            const ey = eh === "z-max" ? y + (maxZ - ez) * scale : y + (maxZ - ez + 1) * scale;
+            for (let i = -1; i <= 1; i++) {
+              ctx.beginPath(); ctx.arc(canvas.width / 2 + i * 8, ey, 3, 0, Math.PI * 2); ctx.fill();
+            }
+            ctx.fillStyle = "rgba(148,163,184,0.7)";
+            ctx.font = "9px monospace";
+            ctx.textBaseline = "middle";
+            ctx.fillText("drag to resize Z", canvas.width / 2 + 16, ey);
+          }
+        } else if (eh === "h-lo" || eh === "h-hi") {
+          const hw = eh === "h-lo" ? selRange?.lo : selRange != null ? selRange.hi + 1 : null;
+          if (hw != null) {
+            const ex = x + (hw - winOriginRef.current) * scale;
+            for (let i = -1; i <= 1; i++) {
+              ctx.beginPath(); ctx.arc(ex, canvas.height / 2 + i * 8, 3, 0, Math.PI * 2); ctx.fill();
+            }
+            ctx.fillStyle = "rgba(148,163,184,0.7)";
+            ctx.font = "9px monospace";
+            ctx.textBaseline = "top";
+            ctx.fillText(`drag to resize ${axis === "side" ? "Y" : "X"}`, ex + 6, canvas.height / 2 + 12);
+            ctx.textBaseline = "middle";
+          }
+        }
       }
     }
 
-    // Live marquee-select ghost (blue box, like MapCanvas selection).
-    const mq = marqueeRef.current;
-    if (mq) {
-      const c0 = Math.min(mq.start.x, mq.end.x), c1 = Math.max(mq.start.x, mq.end.x) + 1;
-      const r0 = Math.min(mq.start.y, mq.end.y), r1 = Math.max(mq.start.y, mq.end.y) + 1;
-      const bx = x + c0 * scale, by = y + r0 * scale;
-      const bw = (c1 - c0) * scale, bh = (r1 - r0) * scale;
-      ctx.fillStyle = "rgba(59,130,246,0.18)";
-      ctx.fillRect(bx, by, bw, bh);
-      ctx.setLineDash([4, 3]);
-      ctx.lineWidth = 1.5;
-      ctx.strokeStyle = "rgba(147,197,253,0.95)";
-      ctx.strokeRect(bx + 0.75, by + 0.75, bw - 1.5, bh - 1.5);
-      ctx.setLineDash([]);
+    // Ortho mode hint.
+    if (isOrtho) {
+      ctx.fillStyle = "rgba(100,116,139,0.6)";
+      ctx.font = "9px monospace";
+      ctx.textBaseline = "bottom";
+      ctx.fillText("ortho — paint disabled", 6, canvas.height - 4);
     }
   }, [crossH, crossV, axis, maxZ, selRange, selZ, extrudeCount, extrudeAxis, isPaste]);
 
   // Fit the whole slab into the canvas (contain) and center it.
   const fit = useCallback(() => {
-    const canvas = canvasRef.current, slab = slabRef.current;
+    const canvas = canvasRef.current;
+    const slab = (orthoModeRef.current && orthoSlabRef.current) ? orthoSlabRef.current : slabRef.current;
     if (!canvas || !slab) return;
     const s = Math.max(0.25, Math.min(32, Math.min(canvas.width / slab.width, canvas.height / slab.height)));
     viewRef.current = {
@@ -359,7 +508,8 @@ export default function SliceViewport({ world, axis, editEpoch, lastEdit, onPain
 
   // Auto-fit once the first slab + sized canvas are ready; redraw every render after.
   useEffect(() => {
-    if (!fittedRef.current && canvasRef.current && slabRef.current && canvasRef.current.width > 1) {
+    const activeSlab = (orthoModeRef.current && orthoSlabRef.current) ? orthoSlabRef.current : slabRef.current;
+    if (!fittedRef.current && canvasRef.current && activeSlab && canvasRef.current.width > 1) {
       fittedRef.current = true;
       fit();
     } else {
@@ -444,6 +594,14 @@ export default function SliceViewport({ world, axis, editEpoch, lastEdit, onPain
   };
 
   const onPointerDown = (e: React.PointerEvent) => {
+    // In ortho mode only panning is allowed — painting, edge-resize, and marquee are disabled.
+    if (orthoMode) {
+      const v = viewRef.current;
+      dragRef.current = { sx: e.clientX, sy: e.clientY, vx: v.x, vy: v.y };
+      (e.target as Element).setPointerCapture(e.pointerId);
+      return;
+    }
+
     const leftBtn = e.button === 0 && !e.altKey;
     const zEdge = leftBtn ? hitZEdge(localY(e.clientY)) : null;
     const hEdge = leftBtn && !zEdge ? hitHEdge(localX(e.clientX)) : null;
@@ -492,29 +650,45 @@ export default function SliceViewport({ world, axis, editEpoch, lastEdit, onPain
     }
   };
   const onPointerMove = (e: React.PointerEvent) => {
-    const zd = zDragRef.current;
-    if (zd && onZRangeChange && selZ) {
-      const dz = Math.round((zd.startY - localY(e.clientY)) / zd.scale);
-      const nz = Math.max(0, Math.min(maxZ, zd.startZ + dz));
-      if (zd.edge === "max") onZRangeChange(Math.min(selZ.min, nz), nz);
-      else onZRangeChange(nz, Math.max(selZ.max, nz));
-      return;
+    // Edge drags and marquee only active in slab mode.
+    if (!orthoMode) {
+      const zd = zDragRef.current;
+      if (zd && onZRangeChange && selZ) {
+        const dz = Math.round((zd.startY - localY(e.clientY)) / zd.scale);
+        const nz = Math.max(0, Math.min(maxZ, zd.startZ + dz));
+        if (zd.edge === "max") onZRangeChange(Math.min(selZ.min, nz), nz);
+        else onZRangeChange(nz, Math.max(selZ.max, nz));
+        return;
+      }
+      const hd = hDragRef.current;
+      if (hd && hPreviewRef.current && selRange) {
+        const w = Math.max(0, Math.min(planeW - 1, localXToWorld(localX(e.clientX))));
+        hPreviewRef.current = hd.edge === "lo"
+          ? { lo: Math.min(w, selRange.hi), hi: selRange.hi }
+          : { lo: selRange.lo, hi: Math.max(w, selRange.lo) };
+        draw();
+        return;
+      }
     }
-    const hd = hDragRef.current;
-    if (hd && hPreviewRef.current && selRange) {
-      const w = Math.max(0, Math.min(planeW - 1, localXToWorld(localX(e.clientX))));
-      hPreviewRef.current = hd.edge === "lo"
-        ? { lo: Math.min(w, selRange.hi), hi: selRange.hi }
-        : { lo: selRange.lo, hi: Math.max(w, selRange.lo) };
-      draw();
-      return;
-    }
-    // Hover cursor feedback for the resize edges when idle (z = ns, x/y = ew).
+
+    // Hover cursor feedback + grip cue state for the resize edges when idle (z = ns, x/y = ew).
     if (e.buttons === 0 && canvasRef.current) {
-      const c = hitZEdge(localY(e.clientY)) ? "ns-resize" : hitHEdge(localX(e.clientX)) ? "ew-resize" : (onPaint || selectMode ? "crosshair" : "grab");
-      canvasRef.current.style.cursor = c;
+      if (orthoMode) {
+        canvasRef.current.style.cursor = "grab";
+      } else {
+        const zEdge = hitZEdge(localY(e.clientY));
+        const hEdge = !zEdge ? hitHEdge(localX(e.clientX)) : null;
+        const c = zEdge ? "ns-resize" : hEdge ? "ew-resize" : (onPaint || selectMode ? "crosshair" : "grab");
+        canvasRef.current.style.cursor = c;
+        const newHover: string | null = zEdge ? `z-${zEdge}` : hEdge ? `h-${hEdge}` : null;
+        if (newHover !== edgeHoverRef.current) {
+          edgeHoverRef.current = newHover;
+          draw();
+        }
+      }
     }
-    if (marqueeRef.current) {
+
+    if (!orthoMode && marqueeRef.current) {
       const cell = screenToCell(e.clientX, e.clientY);
       if (cell) { marqueeRef.current.end = { x: cell.col, y: cell.row }; draw(); }
       return;
@@ -524,49 +698,53 @@ export default function SliceViewport({ world, axis, editEpoch, lastEdit, onPain
       viewRef.current.x = d.vx + (e.clientX - d.sx);
       viewRef.current.y = d.vy + (e.clientY - d.sy);
       draw();
-    } else if (shapeRef.current) {
+    } else if (!orthoMode && shapeRef.current) {
       const cell = screenToCell(e.clientX, e.clientY);
       if (cell) { shapeRef.current.end = { x: cell.col, y: cell.row }; draw(); }
-    } else if (strokeRef.current) {
+    } else if (!orthoMode && strokeRef.current) {
       addFootprint(e.clientX, e.clientY);
     }
   };
   const onPointerUp = () => {
-    if (zDragRef.current) { zDragRef.current = null; return; }
-    if (hDragRef.current) {
-      const p = hPreviewRef.current;
-      hDragRef.current = null; hPreviewRef.current = null;
-      if (p && onHRangeChange) onHRangeChange(p.lo, p.hi);
-      draw();
-      return;
+    if (!orthoMode) {
+      if (zDragRef.current) { zDragRef.current = null; return; }
+      if (hDragRef.current) {
+        const p = hPreviewRef.current;
+        hDragRef.current = null; hPreviewRef.current = null;
+        if (p && onHRangeChange) onHRangeChange(p.lo, p.hi);
+        draw();
+        return;
+      }
     }
-    if (dragRef.current) { dragRef.current = null; maybeMoveWindow(); return; }
-    if (marqueeRef.current) {
-      const m = marqueeRef.current;
-      marqueeRef.current = null;
-      const c0 = Math.min(m.start.x, m.end.x), c1 = Math.max(m.start.x, m.end.x);
-      const r0 = Math.min(m.start.y, m.end.y), r1 = Math.max(m.start.y, m.end.y);
-      const hLo = Math.max(0, Math.min(planeW - 1, c0 + winOriginRef.current));
-      const hHi = Math.max(0, Math.min(planeW - 1, c1 + winOriginRef.current));
-      const v0 = rowToV(r0), v1 = rowToV(r1);
-      const vLo = Math.max(0, Math.min(vMax, Math.min(v0, v1)));
-      const vHi = Math.max(0, Math.min(vMax, Math.max(v0, v1)));
-      draw();
-      if (onSelect) onSelect(hLo, hHi, vLo, vHi);
-      return;
-    }
-    if (shapeRef.current) {
-      const { start, end } = shapeRef.current;
-      shapeRef.current = null;
-      const mode = fill ? "fill" : "outline";
-      const plane = tool === "ellipse" ? ellipsePixels(start, end, mode) : rectPixels(start, end, mode);
-      const cells = plane.map(cellToWorld).filter((c): c is { x: number; y: number; z: number } => c != null);
-      draw();
-      if (cells.length && onPaint) onPaint(cells);
-    } else if (strokeRef.current) {
-      const cells = [...strokeRef.current.values()];
-      strokeRef.current = null;
-      if (cells.length && onPaint) onPaint(cells);
+    if (dragRef.current) { dragRef.current = null; if (!orthoMode) maybeMoveWindow(); return; }
+    if (!orthoMode) {
+      if (marqueeRef.current) {
+        const m = marqueeRef.current;
+        marqueeRef.current = null;
+        const c0 = Math.min(m.start.x, m.end.x), c1 = Math.max(m.start.x, m.end.x);
+        const r0 = Math.min(m.start.y, m.end.y), r1 = Math.max(m.start.y, m.end.y);
+        const hLo = Math.max(0, Math.min(planeW - 1, c0 + winOriginRef.current));
+        const hHi = Math.max(0, Math.min(planeW - 1, c1 + winOriginRef.current));
+        const v0 = rowToV(r0), v1 = rowToV(r1);
+        const vLo = Math.max(0, Math.min(vMax, Math.min(v0, v1)));
+        const vHi = Math.max(0, Math.min(vMax, Math.max(v0, v1)));
+        draw();
+        if (onSelect) onSelect(hLo, hHi, vLo, vHi);
+        return;
+      }
+      if (shapeRef.current) {
+        const { start, end } = shapeRef.current;
+        shapeRef.current = null;
+        const mode = fill ? "fill" : "outline";
+        const plane = tool === "ellipse" ? ellipsePixels(start, end, mode) : rectPixels(start, end, mode);
+        const cells = plane.map(cellToWorld).filter((c): c is { x: number; y: number; z: number } => c != null);
+        draw();
+        if (cells.length && onPaint) onPaint(cells);
+      } else if (strokeRef.current) {
+        const cells = [...strokeRef.current.values()];
+        strokeRef.current = null;
+        if (cells.length && onPaint) onPaint(cells);
+      }
     }
   };
   const onWheel = (e: React.WheelEvent) => {
@@ -593,24 +771,44 @@ export default function SliceViewport({ world, axis, editEpoch, lastEdit, onPain
           type="range" min={0} max={depthMax} value={curDepth}
           onChange={(e) => setDepth(parseInt(e.target.value, 10))}
           style={{ flex: 1 }}
+          title={orthoMode ? "Depth slider moves the crosshair in ortho mode" : undefined}
         />
         <input
           type="number" min={0} max={depthMax} value={curDepth}
           onChange={(e) => setDepth(parseInt(e.target.value, 10) || 0)}
           style={{ width: 56, background: "#1e293b", color: "#cbd5e1", border: "1px solid #334155", borderRadius: 4 }}
         />
+        {selFull && axis !== "top" && (
+          <button
+            onClick={() => setOrthoMode(m => !m)}
+            title={orthoMode ? "Ortho projection — click to switch to slab view (enables painting)" : "Slab view — click to switch to ortho projection"}
+            style={{
+              background: orthoMode ? "#1e1b4b" : "#1e293b",
+              color: orthoMode ? "#a5b4fc" : "#64748b",
+              border: `1px solid ${orthoMode ? "#6366f1" : "#334155"}`,
+              borderRadius: 4, padding: "1px 7px", cursor: "pointer",
+              fontSize: 10, fontWeight: 700, letterSpacing: "0.04em", flexShrink: 0,
+            }}
+          >
+            ORTHO
+          </button>
+        )}
         <button
           onClick={fit}
           title="Fit slab to view"
           style={{ background: "#1e293b", color: "#cbd5e1", border: "1px solid #334155", borderRadius: 4, padding: "1px 6px", cursor: "pointer" }}
         >⊡</button>
       </div>
+      {loading && (
+        <div style={{ height: 2, background: "#f59e0b", flexShrink: 0 }} />
+      )}
       <canvas
         ref={canvasRef}
-        style={{ flex: 1, width: "100%", cursor: onPaint || selectMode ? "crosshair" : "grab", touchAction: "none", userSelect: "none", WebkitUserSelect: "none" }}
+        style={{ flex: 1, width: "100%", cursor: orthoMode ? "grab" : (onPaint || selectMode ? "crosshair" : "grab"), touchAction: "none", userSelect: "none", WebkitUserSelect: "none" }}
         onPointerDown={onPointerDown}
         onPointerMove={onPointerMove}
         onPointerUp={onPointerUp}
+        onPointerLeave={() => { if (edgeHoverRef.current !== null) { edgeHoverRef.current = null; draw(); } }}
         onWheel={onWheel}
         onContextMenu={(e) => e.preventDefault()}
       />
