@@ -16,7 +16,7 @@ export const BLOCK_DEFS: readonly BlockDef[] = [
   { type:  4, name: "Sand",          color: [245, 221, 141] }, // #f5dd8d
   { type:  9, name: "TNT",           color: [148,  15,   2] }, // #940f02
   // Row 2
-  { type:  7, name: "Wood",          color: [148,  15,   2] }, // #940f02
+  { type:  7, name: "Wood",          color: [167, 146,  79] }, // #a7924f
   { type: 56, name: "Shingles",      color: [ 95,  94,  95] }, // #5f5e5f
   { type: 58, name: "Glass",         color: [182, 183, 185] }, // #b6b7b9
   { type: 57, name: "Neon Square",   color: [228, 225, 228] }, // #e4e1e4
@@ -33,7 +33,7 @@ export const BLOCK_DEFS: readonly BlockDef[] = [
   // Row 4
   { type: 19, name: "Cloud",         color: [255, 255, 255] }, // #ffffff
   { type: 24, name: "Stone Ramp",    color: [158, 156, 158] }, // #9e9c9e
-  { type: 28, name: "Wood Ramp",     color: [148,  15,   2] }, // #940f02
+  { type: 28, name: "Wood Ramp",     color: [167, 146,  79] }, // #a7924f
   { type: 36, name: "Ice Ramp",      color: [120, 145, 167] }, // #7891a7
   { type: 32, name: "Shingle Ramp",  color: [ 95,  94,  95] }, // #5f5e5f
   { type: 21, name: "Fence",         color: [216, 180, 101] }, // #d8b465
@@ -97,7 +97,7 @@ export const RAMP_DIRS = ["S", "W", "N", "E"] as const;
 
 export const WEDGE_FAMILIES = [
   { base: 40, name: "Stone Wedge",   color: [158, 156, 158] as [number, number, number] }, // #9e9c9e
-  { base: 44, name: "Wood Wedge",    color: [148,  15,   2] as [number, number, number] }, // #940f02
+  { base: 44, name: "Wood Wedge",    color: [167, 146,  79] as [number, number, number] }, // #a7924f
   { base: 48, name: "Shingle Wedge", color: [ 95,  94,  95] as [number, number, number] }, // #5f5e5f
   { base: 52, name: "Ice Wedge",     color: [120, 145, 167] as [number, number, number] }, // #7891a7
 ] as const;
