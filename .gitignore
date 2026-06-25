@@ -29,6 +29,12 @@ src-tauri/target/
 # Claude Code session files (contain local absolute paths)
 .claude/
 
-# C# reference project — compiled output only, keep source
-EdenWorldManipulator2.0/**/obj/
-EdenWorldManipulator2.0/**/bin/
+# Private directories not for public release
+TEST WORLDS/
+PREFABS/
+EdenWorldManipulator2.0/
+
+# Private file types
+*.md
+!README.md
+*.epfab
