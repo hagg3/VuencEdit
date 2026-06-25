@@ -212,16 +212,15 @@ function drawSection(
 
   // Label bar (outside clip so it always renders at section bottom)
   const labelY = yStart + sectionH - LABEL_H;
-  const viewLabel = view === "front" ? "Front X-Z" : "Side Y-Z";
   ctx.fillStyle = "rgba(0,0,0,0.65)";
   ctx.fillRect(0, labelY, sectionW, LABEL_H);
   ctx.fillStyle = "#7dd3fc";
-  ctx.font = "7px monospace";
+  ctx.font = "9px monospace";
   ctx.textAlign = "left";
   ctx.textBaseline = "middle";
   ctx.fillText(
-    `${viewLabel}  ±${CONTEXT_BLOCKS}ctx  ·  ${isPastePreview ? "paste" : "sel"} z${sel.z_min}–${sel.z_max} / 0–${maxZ}`,
-    3, labelY + LABEL_H / 2,
+    `${isPastePreview ? "paste" : "sel"}  z${sel.z_min}–${sel.z_max}`,
+    4, labelY + LABEL_H / 2,
   );
 }
 
@@ -242,6 +241,7 @@ export default function ElevationPreviewPanel({
   const [canvasW, setCanvasW] = useState(INIT_W);
   const [canvasH, setCanvasH] = useState(INIT_H);
   const [showContext, setShowContext] = useState(true);
+  const [hoverZEdge, setHoverZEdge] = useState<{ y: number; edge: "z_max" | "z_min" } | null>(null);
 
   // Zoom/pan live in refs so event handlers always see current values.
   // viewTick increments trigger the canvas draw effect.
@@ -322,6 +322,41 @@ export default function ElevationPreviewPanel({
     drawSection(ctx, frontData, clipFrontData, "front", frontLayoutRef, 0, topH, canvasW, sel, maxZ, extrudeCount, extrudeAxis, isPastePreview, z, panFrontRef.current);
     drawSection(ctx, sideData, clipSideData, "side", sideLayoutRef, topH, botH, canvasW, sel, maxZ, extrudeCount, extrudeAxis, isPastePreview, z, panSideRef.current);
 
+    // Section header labels — FRONT / SIDE (B4)
+    ctx.font = "bold 9px monospace";
+    ctx.textBaseline = "top";
+    ctx.textAlign = "left";
+    ctx.fillStyle = "rgba(0,0,0,0.55)";
+    ctx.fillRect(0, 0, 44, 14);
+    ctx.fillStyle = "#93c5fd";
+    ctx.fillText("FRONT", 3, 3);
+    ctx.fillStyle = "rgba(0,0,0,0.55)";
+    ctx.fillRect(0, topH, 38, 14);
+    ctx.fillStyle = "#86efac";
+    ctx.fillText("SIDE", 3, topH + 3);
+    // Divider line between sections
+    ctx.strokeStyle = "rgba(148,163,184,0.3)";
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(0, topH); ctx.lineTo(canvasW, topH); ctx.stroke();
+    ctx.textBaseline = "middle";
+    ctx.textAlign = "left";
+
+    // Z-edge grip indicator (A1)
+    if (hoverZEdge) {
+      const gy = hoverZEdge.y;
+      ctx.fillStyle = "rgba(148,163,184,0.85)";
+      for (let i = -1; i <= 1; i++) {
+        ctx.beginPath();
+        ctx.arc(canvasW / 2 + i * 7, gy, 2.5, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.fillStyle = "rgba(148,163,184,0.75)";
+      ctx.font = "8px monospace";
+      ctx.textAlign = "left";
+      ctx.fillText("drag to resize Z", canvasW / 2 + 14, gy);
+      ctx.textAlign = "left";
+    }
+
     // Brush hover bands
     if (brushHoverX !== null) {
       const fl = frontLayoutRef.current;
@@ -340,7 +375,7 @@ export default function ElevationPreviewPanel({
       }
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [frontData, sideData, clipFrontData, clipSideData, sel.z_min, sel.z_max, sel.width, sel.height, maxZ, canvasW, canvasH, extrudeCount, extrudeAxis, isPastePreview, brushHoverX, brushHoverY, viewTick]);
+  }, [frontData, sideData, clipFrontData, clipSideData, sel.z_min, sel.z_max, sel.width, sel.height, maxZ, canvasW, canvasH, extrudeCount, extrudeAxis, isPastePreview, brushHoverX, brushHoverY, viewTick, hoverZEdge]);
 
   function resetZoomPan() {
     zoomRef.current = 1.0;
@@ -416,14 +451,17 @@ export default function ElevationPreviewPanel({
             title="Reset zoom and pan"
           >{zoom.toFixed(1)}× ✕</button>
         )}
-        <label style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 3, cursor: "pointer" }}>
+        <label
+          style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 3, cursor: "pointer" }}
+          title="Show ±7 context columns outside the selection boundary"
+        >
           <input
             type="checkbox"
             checked={showContext}
             onChange={e => setShowContext(e.target.checked)}
             style={{ accentColor: "#3b82f6" }}
           />
-          <span style={{ color: "#64748b", fontSize: 10, whiteSpace: "nowrap" }}>±ctx</span>
+          <span style={{ color: "#64748b", fontSize: 10, whiteSpace: "nowrap" }}>± context cols</span>
         </label>
       </div>
 
@@ -507,10 +545,21 @@ export default function ElevationPreviewPanel({
             }
             return;
           }
-          // Update cursor for z-edge proximity
+          // Update cursor and grip indicator for z-edge proximity
           if (e.buttons === 0) {
             const zHit = hitZEdge(cy);
             setCanvasCursor(zHit ? "ns-resize" : "default");
+            if (zHit) {
+              const topH = Math.floor(canvasH / 2);
+              const layout = cy < topH ? frontLayoutRef.current : sideLayoutRef.current;
+              const { oy, scale } = layout;
+              const edgeY = zHit.edge === "z_max"
+                ? oy + (maxZ - sel.z_max) * scale
+                : oy + (maxZ - sel.z_min + 1) * scale;
+              setHoverZEdge({ y: edgeY, edge: zHit.edge });
+            } else {
+              setHoverZEdge(null);
+            }
           }
           if (drawActive && onDrawElevation) {
             if (e.buttons === 0) return;
@@ -548,7 +597,7 @@ export default function ElevationPreviewPanel({
           }
           void e;
         }}
-        onPointerLeave={() => setCanvasCursor("default")}
+        onPointerLeave={() => { setCanvasCursor("default"); setHoverZEdge(null); }}
       />
     </div>
   );

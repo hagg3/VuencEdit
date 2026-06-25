@@ -8,45 +8,45 @@ export interface BlockDef {
 // Ramp/wedge blocks use the South/SE-facing variant as a representative type.
 export const BLOCK_DEFS: readonly BlockDef[] = [
   // Row 1
-  { type:  8, name: "Grass",         color: [ 82, 148,  53] }, // render=grass_color()
-  { type: 73, name: "New Flower",    color: [ 93, 163, 255] }, // render=BLOCK_RGB[73]=sky blue; transparent 0.25
-  { type: 10, name: "Dark Stone",    color: [ 59,  59,  59] }, // render=BLOCK_RGB[10]
-  { type:  2, name: "Stone",         color: [162, 162, 162] }, // render=BLOCK_RGB[2]
-  { type:  3, name: "Dirt",          color: [162,  82,  45] }, // render=BLOCK_RGB[3]
-  { type:  4, name: "Sand",          color: [242, 220, 140] }, // render=BLOCK_RGB[4]
-  { type:  9, name: "TNT",           color: [255,   0,   0] }, // render=BLOCK_RGB[9]
+  { type:  8, name: "Grass",         color: [ 82, 148,  53] }, // #529435
+  { type: 73, name: "New Flower",    color: [ 28, 157, 193] }, // #1c9dc1
+  { type: 10, name: "Dark Stone",    color: [ 67,  66,  66] }, // #434242
+  { type:  2, name: "Stone",         color: [158, 156, 158] }, // #9e9c9e
+  { type:  3, name: "Dirt",          color: [ 91,  61,   2] }, // #5b3d02
+  { type:  4, name: "Sand",          color: [245, 221, 141] }, // #f5dd8d
+  { type:  9, name: "TNT",           color: [148,  15,   2] }, // #940f02
   // Row 2
-  { type:  7, name: "Wood",          color: [186, 164,  88] }, // render=BLOCK_RGB[7]
-  { type: 56, name: "Shingles",      color: [105, 105, 105] }, // render=BLOCK_RGB[56]
-  { type: 58, name: "Glass",         color: [211, 211, 211] }, // render=BLOCK_RGB[58]
-  { type: 57, name: "Neon Square",   color: [255, 255, 255] }, // render=BLOCK_RGB[57]
-  { type:  6, name: "Trunk",         color: [186, 164,  88] }, // render=BLOCK_RGB[6]
-  { type:  5, name: "Leaves",        color: [ 10,  63,  13] }, // render=BLOCK_RGB[5]
-  { type: 13, name: "Brick",         color: [204,  48,  41] }, // render=BLOCK_RGB[13]
+  { type:  7, name: "Wood",          color: [148,  15,   2] }, // #940f02
+  { type: 56, name: "Shingles",      color: [ 95,  94,  95] }, // #5f5e5f
+  { type: 58, name: "Glass",         color: [182, 183, 185] }, // #b6b7b9
+  { type: 57, name: "Neon Square",   color: [228, 225, 228] }, // #e4e1e4
+  { type:  6, name: "Trunk",         color: [112,  81,  19] }, // #705113
+  { type:  5, name: "Leaves",        color: [ 20, 129,  28] }, // #14811c
+  { type: 13, name: "Brick",         color: [195,  98,  94] }, // #c3625e
   // Row 3
-  { type: 14, name: "Slate",          color: [162, 170, 178] }, // render=BLOCK_RGB[14]; TYPE_COBBLESTONE (Constants.h) / Slate (BlockTypes.cs)
-  { type: 22, name: "Vine",          color: [  0, 128,   0] }, // render=BLOCK_RGB[22]=Green
-  { type: 18, name: "Ladder",        color: [210, 180, 140] }, // render=UNPAINTED[17]=Tan
-  { type: 15, name: "Ice",           color: [200, 230, 255] }, // render=UNPAINTED[14]=[134,164,186] → icy blue-white
-  { type: 16, name: "Wallpaper",     color: [255, 255, 255] }, // render=UNPAINTED[15]=White
-  { type: 17, name: "Trampoline",    color: [210, 180, 140] }, // render=UNPAINTED[16]=[50,50,50] dark → Tan for picker
+  { type: 14, name: "Slate",         color: [ 49,  52,  54] }, // #313436
+  { type: 22, name: "Vine",          color: [ 52, 205, 109] }, // #34cd6d
+  { type: 18, name: "Ladder",        color: [103,  89,  48] }, // #675930
+  { type: 15, name: "Ice",           color: [120, 145, 167] }, // #7891a7
+  { type: 16, name: "Wallpaper",     color: [158, 159, 158] }, // #9e9f9e
+  { type: 17, name: "Trampoline",    color: [ 52,  51,  52] }, // #343334
   // Row 4
-  { type: 19, name: "Cloud",         color: [210, 225, 255] }, // render=UNPAINTED[18]=White → light cloud for picker
-  { type: 24, name: "Stone Ramp",    color: [162, 162, 162] }, // render=UNPAINTED[23]=[162,162,162]
-  { type: 28, name: "Wood Ramp",     color: [186, 164,  88] }, // render=UNPAINTED[27]=[186,164,88]
-  { type: 36, name: "Ice Ramp",      color: [134, 164, 186] }, // render=UNPAINTED[35]=[134,164,186]
-  { type: 32, name: "Shingle Ramp",  color: [105, 105, 105] }, // render=UNPAINTED[31]=DimGray
-  { type: 21, name: "Fence",         color: [210, 180, 140] }, // render=UNPAINTED[20]=Tan
-  { type: 20, name: "Water",         color: [ 70, 135, 210] }, // render=UNPAINTED[19]=Blue → mid-blue for picker
+  { type: 19, name: "Cloud",         color: [255, 255, 255] }, // #ffffff
+  { type: 24, name: "Stone Ramp",    color: [158, 156, 158] }, // #9e9c9e
+  { type: 28, name: "Wood Ramp",     color: [148,  15,   2] }, // #940f02
+  { type: 36, name: "Ice Ramp",      color: [120, 145, 167] }, // #7891a7
+  { type: 32, name: "Shingle Ramp",  color: [ 95,  94,  95] }, // #5f5e5f
+  { type: 21, name: "Fence",         color: [216, 180, 101] }, // #d8b465
+  { type: 20, name: "Water",         color: [ 22,  31, 184] }, // #161fb8
   // Row 5
-  { type: 23, name: "Lava",          color: [255,  69,   0] }, // render=UNPAINTED[22]=OrangeRed
-  { type: 82, name: "Expansion",     color: [100, 180, 100] }, // render=grass_color(); [0,128,0] → lighter green
-  { type: 65, name: "Fireworks",     color: [255,   0,   0] }, // render=UNPAINTED[64]=Red
-  { type: 66, name: "Door",          color: [210, 180, 140] }, // render=UNPAINTED[65]=Tan
-  { type: 71, name: "Treasure",      color: [255, 250, 205] }, // render=UNPAINTED[70]=LemonChiffon
-  { type: 72, name: "Lamp",          color: [255, 220, 100] }, // render=UNPAINTED[71]=Blue → warm yellow for picker
-  { type: 74, name: "Steel",         color: [211, 211, 211] }, // render=UNPAINTED[73]=LightGray
-  { type: 75, name: "Portal",        color: [ 90,  90,  90] }, // render=BLOCK_RGB[75]=dark gray; S-facing representative
+  { type: 23, name: "Lava",          color: [244,  68,   0] }, // #f44400
+  { type: 82, name: "Expansion",     color: [148,  15,   2] }, // #940f02
+  { type: 65, name: "Fireworks",     color: [148,  15,   2] }, // #940f02
+  { type: 66, name: "Door",          color: [102,  64,  18] }, // #664012
+  { type: 71, name: "Treasure",      color: [235, 201,  52] }, // #ebc934
+  { type: 72, name: "Lamp",          color: [254, 251, 149] }, // #fefb95
+  { type: 74, name: "Steel",         color: [129, 128, 128] }, // #818080
+  { type: 75, name: "Portal",        color: [ 39,  39,  39] }, // #272727
 ] as const;
 
 // 54 paint colors from the PAINTED table in lib.rs.
@@ -96,10 +96,10 @@ export const RAMP_FAMILIES = [
 export const RAMP_DIRS = ["S", "W", "N", "E"] as const;
 
 export const WEDGE_FAMILIES = [
-  { base: 40, name: "Stone Wedge", color: [198, 198, 198] as [number, number, number] },
-  { base: 44, name: "Wood Wedge",  color: [230, 202, 109] as [number, number, number] },
-  { base: 48, name: "Shingle Wedge", color: [200, 200, 200] as [number, number, number] },
-  { base: 52, name: "Ice Wedge",   color: [145, 178, 201] as [number, number, number] },
+  { base: 40, name: "Stone Wedge",   color: [158, 156, 158] as [number, number, number] }, // #9e9c9e
+  { base: 44, name: "Wood Wedge",    color: [148,  15,   2] as [number, number, number] }, // #940f02
+  { base: 48, name: "Shingle Wedge", color: [ 95,  94,  95] as [number, number, number] }, // #5f5e5f
+  { base: 52, name: "Ice Wedge",     color: [120, 145, 167] as [number, number, number] }, // #7891a7
 ] as const;
 
 export const WEDGE_DIRS = ["SE", "SW", "NW", "NE"] as const;
@@ -160,7 +160,7 @@ export const PARTIAL_LAVA = [
 // used as the unbreakable world foundation). Both shown in a dedicated special row.
 export const SPECIAL_BLOCKS: readonly { type: number; name: string; color: [number, number, number] }[] = [
   { type:  1, name: "Bedrock", color: [90, 90, 90] },
-  { type: 11, name: "Weeds",   color: [133, 227, 79] },
+  { type: 11, name: "Weeds",   color: [ 71, 128,  46] }, // #47802e
 ] as const;
 
 /** If blockType is any ramp variant (24–39), returns the family base ID; else null. */

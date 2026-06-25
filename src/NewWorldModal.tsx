@@ -80,6 +80,7 @@ export default function NewWorldModal({ onClose, onCreated }: Props) {
   const [caveDensity,    setCaveDensity]    = useState(1);
   const [caveStyle,      setCaveStyle]      = useState(0); // 0 tunnels, 1 classic
   const [caverns,        setCaverns]        = useState(true);
+  const [floodCaves,     setFloodCaves]     = useState(false);
   const [oreDensity,     setOreDensity]     = useState(1);
   const [vegetation,     setVegetation]     = useState(1);
   const [structures,     setStructures]     = useState(1);
@@ -219,7 +220,7 @@ export default function NewWorldModal({ onClose, onCreated }: Props) {
           extreme: extendedZ && extreme,
           waterMode, rivers,
           biome, biomeMode, biomeScaleLevel: biomeScale, snowCaps,
-          treeDensity, caveDensity, caveStyle, caverns,
+          treeDensity, caveDensity, caveStyle, caverns, floodCaves,
           oreDensity, vegetation, structures,
           clouds: cloudsEnabled,
         });
@@ -247,7 +248,7 @@ export default function NewWorldModal({ onClose, onCreated }: Props) {
         extreme: extendedZ && extreme,
         waterMode, rivers,
         biome, biomeMode, biomeScaleLevel: biomeScale, snowCaps,
-        treeDensity, caveDensity, caveStyle, caverns,
+        treeDensity, caveDensity, caveStyle, caverns, floodCaves,
         oreDensity, vegetation, structures,
         clouds: cloudsEnabled,
         maxPx: 220,
@@ -640,6 +641,16 @@ export default function NewWorldModal({ onClose, onCreated }: Props) {
                   Large caverns &amp; deep lava pools
                 </label>
               </div>
+              {waterMode !== "none" && (
+                <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 8 }}>
+                  <input type="checkbox" id="flood-caves" checked={floodCaves}
+                    onChange={e => setFloodCaves(e.target.checked)}
+                    style={{ width: 16, height: 16, accentColor: "#78716c", cursor: "pointer" }} />
+                  <label htmlFor="flood-caves" style={{ color: "#94a3b8", fontSize: 13, cursor: "pointer" }}>
+                    Flood caves with water
+                  </label>
+                </div>
+              )}
             </>)}
           </div>
 

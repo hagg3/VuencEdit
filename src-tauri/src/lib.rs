@@ -205,116 +205,116 @@ struct WorldSearchResult {
 const BLOCK_RGB: [[u8; 3]; 112] = [
     [  0,   0,   0], //   0 air (handled before table lookup)
     [ 90,  90,  90], //   1 bedrock
-    [198, 198, 198], //   2 stone
-    [118,  79,   5], //   3 dirt
-    [255, 231, 148], //   4 sand
-    [ 30, 180,  40], //   5 leaves
-    [136,  99,  24], //   6 trunk
-    [230, 202, 109], //   7 wood
-    [115, 206,  74], //   8 grass (overridden by grass_color when unpainted)
-    [229, 207, 170], //   9 tnt
-    [120, 120, 120], //  10 dark stone
-    [133, 227,  79], //  11 grass2 / weed
+    [158, 156, 158], //   2 stone        #9e9c9e
+    [ 91,  61,   2], //   3 dirt         #5b3d02
+    [245, 221, 141], //   4 sand         #f5dd8d
+    [ 20, 129,  28], //   5 leaves       #14811c
+    [112,  81,  19], //   6 trunk        #705113
+    [148,  15,   2], //   7 wood         #940f02
+    [ 82, 148,  53], //   8 grass        #529435 (overridden by grass_color when unpainted)
+    [148,  15,   2], //   9 tnt          #940f02
+    [ 67,  66,  66], //  10 dark stone   #434242
+    [ 71, 128,  46], //  11 grass2 / weed  #47802e (darker grass)
     [115, 206,  74], //  12 grass3 / old flower
-    [255,  60,  57], //  13 brick
-    [162, 170, 178], //  14 cobblestone / slate
-    [145, 178, 201], //  15 ice
-    [255, 255, 255], //  16 crystal / wallpaper
-    [125, 125, 125], //  17 trampoline
-    [230, 202, 109], //  18 ladder
-    [255, 255, 255], //  19 cloud
-    [ 32,  43, 255], //  20 water
-    [235, 196, 110], //  21 weave / fence
-    [  0, 255,   0], //  22 vine
-    [253,  70,   0], //  23 lava
-    [198, 198, 198], //  24 stone ramp S
-    [198, 198, 198], //  25 stone ramp W
-    [198, 198, 198], //  26 stone ramp N
-    [198, 198, 198], //  27 stone ramp E
-    [230, 202, 109], //  28 wood ramp S
-    [230, 202, 109], //  29 wood ramp W
-    [230, 202, 109], //  30 wood ramp N
-    [230, 202, 109], //  31 wood ramp E
-    [200, 200, 200], //  32 shingle ramp S
-    [200, 200, 200], //  33 shingle ramp W
-    [200, 200, 200], //  34 shingle ramp N
-    [200, 200, 200], //  35 shingle ramp E
-    [145, 178, 201], //  36 ice ramp S
-    [145, 178, 201], //  37 ice ramp W
-    [145, 178, 201], //  38 ice ramp N
-    [145, 178, 201], //  39 ice ramp E
-    [198, 198, 198], //  40 stone wedge SE
-    [198, 198, 198], //  41 stone wedge SW
-    [198, 198, 198], //  42 stone wedge NW
-    [198, 198, 198], //  43 stone wedge NE
-    [230, 202, 109], //  44 wood wedge SE
-    [230, 202, 109], //  45 wood wedge SW
-    [230, 202, 109], //  46 wood wedge NW
-    [230, 202, 109], //  47 wood wedge NE
-    [200, 200, 200], //  48 shingle wedge SE
-    [200, 200, 200], //  49 shingle wedge SW
-    [200, 200, 200], //  50 shingle wedge NW
-    [200, 200, 200], //  51 shingle wedge NE
-    [145, 178, 201], //  52 ice wedge SE
-    [145, 178, 201], //  53 ice wedge SW
-    [145, 178, 201], //  54 ice wedge NW
-    [145, 178, 201], //  55 ice wedge NE
-    [200, 200, 200], //  56 shingles
-    [255, 255, 255], //  57 gradient / neon square
-    [255, 255, 255], //  58 glass
-    [ 32,  43, 255], //  59 water ¾
-    [ 32,  43, 255], //  60 water ½
-    [ 32,  43, 255], //  61 water ¼
-    [253,  70,   0], //  62 lava ¾
-    [253,  70,   0], //  63 lava ½
-    [253,  70,   0], //  64 lava ¼
-    [229, 207, 170], //  65 firework
-    [180, 152,  59], //  66 door 1
-    [180, 152,  59], //  67 door 2
-    [180, 152,  59], //  68 door 3
-    [180, 152,  59], //  69 door 4
-    [180, 152,  59], //  70 door top
-    [200, 160,  75], //  71 golden cube
-    [255, 255, 150], //  72 lightbox
-    [ 93, 163, 255], //  73 new flower
-    [255, 255, 255], //  74 steel
-    [ 90,  90,  90], //  75 portal 1
-    [ 90,  90,  90], //  76 portal 2
-    [ 90,  90,  90], //  77 portal 3
-    [ 90,  90,  90], //  78 portal 4
-    [ 90,  90,  90], //  79 portal top
+    [195,  98,  94], //  13 brick        #c3625e
+    [ 49,  52,  54], //  14 cobblestone / slate  #313436
+    [120, 145, 167], //  15 ice          #7891a7
+    [158, 159, 158], //  16 crystal / wallpaper  #9e9f9e
+    [ 52,  51,  52], //  17 trampoline   #343334
+    [103,  89,  48], //  18 ladder       #675930
+    [255, 255, 255], //  19 cloud        #ffffff
+    [ 22,  31, 184], //  20 water        #161fb8
+    [216, 180, 101], //  21 weave / fence  #d8b465
+    [ 52, 205, 109], //  22 vine         #34cd6d
+    [244,  68,   0], //  23 lava         #f44400
+    [158, 156, 158], //  24 stone ramp S
+    [158, 156, 158], //  25 stone ramp W
+    [158, 156, 158], //  26 stone ramp N
+    [158, 156, 158], //  27 stone ramp E
+    [148,  15,   2], //  28 wood ramp S
+    [148,  15,   2], //  29 wood ramp W
+    [148,  15,   2], //  30 wood ramp N
+    [148,  15,   2], //  31 wood ramp E
+    [ 95,  94,  95], //  32 shingle ramp S  #5f5e5f
+    [ 95,  94,  95], //  33 shingle ramp W
+    [ 95,  94,  95], //  34 shingle ramp N
+    [ 95,  94,  95], //  35 shingle ramp E
+    [120, 145, 167], //  36 ice ramp S
+    [120, 145, 167], //  37 ice ramp W
+    [120, 145, 167], //  38 ice ramp N
+    [120, 145, 167], //  39 ice ramp E
+    [158, 156, 158], //  40 stone wedge SE
+    [158, 156, 158], //  41 stone wedge SW
+    [158, 156, 158], //  42 stone wedge NW
+    [158, 156, 158], //  43 stone wedge NE
+    [148,  15,   2], //  44 wood wedge SE
+    [148,  15,   2], //  45 wood wedge SW
+    [148,  15,   2], //  46 wood wedge NW
+    [148,  15,   2], //  47 wood wedge NE
+    [ 95,  94,  95], //  48 shingle wedge SE
+    [ 95,  94,  95], //  49 shingle wedge SW
+    [ 95,  94,  95], //  50 shingle wedge NW
+    [ 95,  94,  95], //  51 shingle wedge NE
+    [120, 145, 167], //  52 ice wedge SE
+    [120, 145, 167], //  53 ice wedge SW
+    [120, 145, 167], //  54 ice wedge NW
+    [120, 145, 167], //  55 ice wedge NE
+    [ 95,  94,  95], //  56 shingles     #5f5e5f
+    [228, 225, 228], //  57 gradient / neon square  #e4e1e4
+    [182, 183, 185], //  58 glass        #b6b7b9
+    [ 22,  31, 184], //  59 water ¾
+    [ 22,  31, 184], //  60 water ½
+    [ 22,  31, 184], //  61 water ¼
+    [244,  68,   0], //  62 lava ¾
+    [244,  68,   0], //  63 lava ½
+    [244,  68,   0], //  64 lava ¼
+    [148,  15,   2], //  65 firework     #940f02
+    [102,  64,  18], //  66 door 1       #664012
+    [102,  64,  18], //  67 door 2
+    [102,  64,  18], //  68 door 3
+    [102,  64,  18], //  69 door 4
+    [102,  64,  18], //  70 door top
+    [235, 201,  52], //  71 golden cube  #ebc934
+    [254, 251, 149], //  72 lightbox     #fefb95
+    [ 28, 157, 193], //  73 new flower   #1c9dc1
+    [129, 128, 128], //  74 steel        #818080
+    [ 39,  39,  39], //  75 portal 1     #272727
+    [ 39,  39,  39], //  76 portal 2
+    [ 39,  39,  39], //  77 portal 3
+    [ 39,  39,  39], //  78 portal 4
+    [ 39,  39,  39], //  79 portal top
     [  0,   0,   0], //  80 custom (unset in game)
     [  0,   0,   0], //  81 block tnt (unset in game)
-    [229, 207, 170], //  82 bt-grass (expansion, painted via PAINT_RGB)
-    [229, 207, 170], //  83 bt-dark-stone
-    [229, 207, 170], //  84 bt-stone
-    [229, 207, 170], //  85 bt-dirt
-    [229, 207, 170], //  86 bt-sand
-    [229, 207, 170], //  87 bt-tnt
-    [229, 207, 170], //  88 bt-wood
-    [229, 207, 170], //  89 bt-shingle
-    [229, 207, 170], //  90 bt-glass
-    [229, 207, 170], //  91 bt-gradient
-    [229, 207, 170], //  92 bt-tree
-    [229, 207, 170], //  93 bt-leaves
-    [229, 207, 170], //  94 bt-brick
-    [229, 207, 170], //  95 bt-cobblestone
-    [229, 207, 170], //  96 bt-vines
-    [229, 207, 170], //  97 bt-ladder
-    [229, 207, 170], //  98 bt-ice
-    [229, 207, 170], //  99 bt-crystal
-    [229, 207, 170], // 100 bt-trampoline
-    [229, 207, 170], // 101 bt-cloud
-    [229, 207, 170], // 102 bt-stone-side
-    [229, 207, 170], // 103 bt-wood-side
-    [229, 207, 170], // 104 bt-ice-side
-    [229, 207, 170], // 105 bt-shingle-side
-    [229, 207, 170], // 106 bt-fence
-    [229, 207, 170], // 107 bt-water
-    [229, 207, 170], // 108 bt-lava
-    [229, 207, 170], // 109 bt-firework
-    [229, 207, 170], // 110 bt-lightbox
-    [229, 207, 170], // 111 bt-steel
+    [148,  15,   2], //  82 bt-grass (expansion)  #940f02
+    [148,  15,   2], //  83 bt-dark-stone
+    [148,  15,   2], //  84 bt-stone
+    [148,  15,   2], //  85 bt-dirt
+    [148,  15,   2], //  86 bt-sand
+    [148,  15,   2], //  87 bt-tnt
+    [148,  15,   2], //  88 bt-wood
+    [148,  15,   2], //  89 bt-shingle
+    [148,  15,   2], //  90 bt-glass
+    [148,  15,   2], //  91 bt-gradient
+    [148,  15,   2], //  92 bt-tree
+    [148,  15,   2], //  93 bt-leaves
+    [148,  15,   2], //  94 bt-brick
+    [148,  15,   2], //  95 bt-cobblestone
+    [148,  15,   2], //  96 bt-vines
+    [148,  15,   2], //  97 bt-ladder
+    [148,  15,   2], //  98 bt-ice
+    [148,  15,   2], //  99 bt-crystal
+    [148,  15,   2], // 100 bt-trampoline
+    [148,  15,   2], // 101 bt-cloud
+    [148,  15,   2], // 102 bt-stone-side
+    [148,  15,   2], // 103 bt-wood-side
+    [148,  15,   2], // 104 bt-ice-side
+    [148,  15,   2], // 105 bt-shingle-side
+    [148,  15,   2], // 106 bt-fence
+    [148,  15,   2], // 107 bt-water
+    [148,  15,   2], // 108 bt-lava
+    [148,  15,   2], // 109 bt-firework
+    [148,  15,   2], // 110 bt-lightbox
+    [148,  15,   2], // 111 bt-steel
 ];
 
 // Paint colour table — colorTable[54] from Hud::genColorTable() (Hud.mm:150-196).
@@ -636,7 +636,7 @@ fn grass_color(sky: u8) -> [u8; 3] {
     match sky {
         11 => [242, 220, 140], // desert sky
         13 => [255, 255, 255], // snow sky
-        _  => [115, 206,  74], // game's blockColor[TYPE_GRASS]
+        _  => [ 82, 148,  53], // #529435
     }
 }
 
@@ -2089,6 +2089,7 @@ struct NaturalConfig {
     cave_density: u32,       // 0 none, 1 rare, 2 common
     cave_style: u32,         // 0 spaghetti tunnels, 1 classic 3D-noise caves
     caverns: bool,           // large open caverns + deep lava pools
+    flood_caves: bool,       // false = cave air stays dry; true = water floods caves below water_z
     ore_density: u32,        // 0 none, 1 sparse, 2 rich
     vegetation: u32,         // 0 none, 1 light, 2 lush
     structures: u32,         // 0 none, 1 sparse, 2 common
@@ -2416,7 +2417,10 @@ fn fill_chunk_terrain(
             }
 
             // Standing water / ice / lava fill.
-            if water_level >= 0 {
+            // Only fill columns whose surface is submerged (underwater), unless
+            // flood_caves is set — that preserves rivers/lakes while keeping inland
+            // cave voids dry.
+            if water_level >= 0 && (underwater || cfg.flood_caves) {
                 let fill_bt = match b { 2 => 15, 3 => 23, _ => 20 };
                 let top = (water_level as usize).min(t_height - 1);
                 for z in 1..=top {
@@ -2505,7 +2509,7 @@ fn fill_classic_biome_chunk(
             }
 
             // Fill the column with water up to the standing-water level.
-            if water_level >= 0 {
+            if water_level >= 0 && (underwater || cfg.flood_caves) {
                 let top = (water_level as usize).min(t_height - 1);
                 for z in 1..=top {
                     if chunk_get(data, lx, ly, z) == 0 {
@@ -3080,7 +3084,7 @@ fn natural_config_from_params(
     roughness_level: u32, erosion_level: u32, terrain_scale_level: u32, extreme: bool,
     water_mode: &str, rivers: bool,
     biome: &str, biome_mode: u32, biome_scale_level: u32, snow_caps: bool,
-    tree_density: u32, cave_density: u32, cave_style: u32, caverns: bool,
+    tree_density: u32, cave_density: u32, cave_style: u32, caverns: bool, flood_caves: bool,
     ore_density: u32, vegetation: u32, structures: u32, clouds: bool,
 ) -> (NaturalConfig, usize) {
     let t_height = (if extended_z { 255u32 } else { 63 } + 1) as usize;
@@ -3104,7 +3108,7 @@ fn natural_config_from_params(
     (NaturalConfig {
         seed, base_height: base_h, roughness, erosion, terrain_scale, extreme, water_z, rivers,
         biome: biome_id, biome_mode, biome_scale, snow_caps,
-        tree_density_denom, cave_density, cave_style, caverns,
+        tree_density_denom, cave_density, cave_style, caverns, flood_caves,
         ore_density, vegetation, structures, clouds,
     }, t_height)
 }
@@ -3128,7 +3132,7 @@ fn preview_natural_world(
     seed: u32, base_height: u32, roughness_level: u32, erosion_level: u32, terrain_scale_level: u32, extreme: bool,
     water_mode: String, rivers: bool,
     biome: String, biome_mode: u32, biome_scale_level: u32, snow_caps: bool,
-    tree_density: u32, cave_density: u32, cave_style: u32, caverns: bool,
+    tree_density: u32, cave_density: u32, cave_style: u32, caverns: bool, flood_caves: bool,
     ore_density: u32, vegetation: u32, structures: u32, clouds: bool,
     max_px: u32,
 ) -> Result<PreviewImage, String> {
@@ -3136,7 +3140,7 @@ fn preview_natural_world(
     let (cfg, t_height) = natural_config_from_params(
         extended_z, seed, base_height, roughness_level, erosion_level, terrain_scale_level, extreme,
         &water_mode, rivers, &biome, biome_mode, biome_scale_level, snow_caps,
-        tree_density, cave_density, cave_style, caverns, ore_density, vegetation, structures, clouds,
+        tree_density, cave_density, cave_style, caverns, flood_caves, ore_density, vegetation, structures, clouds,
     );
     let bw = (width_chunks * 16) as i32;
     let bh = (height_chunks * 16) as i32;
@@ -3243,6 +3247,7 @@ fn create_natural_world(
     cave_density: u32,        // 0=none 1=rare 2=common
     cave_style: u32,          // 0=tunnels 1=classic 3D-noise caves
     caverns: bool,
+    flood_caves: bool,        // false=dry caves (default); true=flood caves below water_z
     ore_density: u32,         // 0=none 1=sparse 2=rich
     vegetation: u32,          // 0=none 1=light 2=lush
     structures: u32,          // 0=none 1=sparse 2=common
@@ -3257,7 +3262,7 @@ fn create_natural_world(
     let (cfg, t_height) = natural_config_from_params(
         extended_z, seed, base_height, roughness_level, erosion_level, terrain_scale_level, extreme,
         &water_mode, rivers, &biome, biome_mode, biome_scale_level, snow_caps,
-        tree_density, cave_density, cave_style, caverns, ore_density, vegetation, structures, clouds,
+        tree_density, cave_density, cave_style, caverns, flood_caves, ore_density, vegetation, structures, clouds,
     );
 
     const CENTER_CHUNK: i32 = 4096;
@@ -5564,11 +5569,10 @@ fn place_normal_tree(world: &mut impl VoxelSink, wx: i32, wy: i32, z_base: i32, 
 
 /// Tall terrain tree with wide ragged canopy (ported from NormalTerrainTree).
 /// Bug fixed: trunk placed after leaves so it remains visible through canopy.
-fn place_terrain_tree(world: &mut impl VoxelSink, wx: i32, wy: i32, z_base: i32, rng: &mut Rng64) {
+fn place_terrain_tree(world: &mut impl VoxelSink, wx: i32, wy: i32, z_base: i32, rng: &mut Rng64, leaf_paint: u8) {
     let tree_h    = rng.range(6, 11);
     let trunk_h   = 3 * tree_h / 4;
     let leaf_dz0  = 2 * tree_h / 3; // first leaf layer (rel to z_base)
-    let leaf_paint = NORMAL_LEAF_PAINTS[rng.range(0, 3) as usize];
 
     for dz in leaf_dz0..tree_h {
         let wz       = z_base + dz;
@@ -5620,8 +5624,7 @@ fn place_pine_tree(world: &mut impl VoxelSink, wx: i32, wy: i32, z_base: i32, rn
 }
 
 /// Tall conical pine tree with 7×7 base tiers (ported from TallPineTree).
-fn place_tall_pine_tree(world: &mut impl VoxelSink, wx: i32, wy: i32, z_base: i32, rng: &mut Rng64) {
-    let leaf_paint = PINE_LEAF_PAINTS[rng.range(0, 2) as usize];
+fn place_tall_pine_tree(world: &mut impl VoxelSink, wx: i32, wy: i32, z_base: i32, rng: &mut Rng64, leaf_paint: u8) {
 
     // 11 leaf layers (dz 2..=12)
     for dz in 2..13i32 {
@@ -5669,20 +5672,35 @@ fn place_tall_pine_tree(world: &mut impl VoxelSink, wx: i32, wy: i32, z_base: i3
     world.put(wx, wy, z_base + 1, 6, 0);
 }
 
+/// Pick a leaf paint from the user-supplied pool, falling back to the type's default pool.
+fn pick_leaf_paint(user: &[u8], default: &[u8], rng: &mut Rng64) -> u8 {
+    let pool = if user.is_empty() { default } else { user };
+    pool[rng.range(0, pool.len() as i32 - 1) as usize]
+}
+
 /// Scatter trees across the XY footprint of the current selection.
 /// Each column in (x1..=x2, y1..=y2) is independently rolled against `density` (0–1).
 /// Trees are planted on the topmost solid block; columns over water, lava, cloud, or
 /// existing foliage are skipped. `seed` = None uses a random timestamp-based seed.
+/// `tree_types` may include multiple types; each column picks one randomly.
+/// `leaf_paints` is the user's chosen paint pool; empty = type-appropriate defaults.
 #[tauri::command]
 fn generate_trees(
     x1: i32, y1: i32, x2: i32, y2: i32,
-    tree_type: String,
+    tree_types: Vec<String>,
     density: f32,
+    leaf_paints: Vec<u8>,
     seed: Option<u64>,
+    smart_placement: bool,
     state: tauri::State<'_, AppState>,
 ) -> Result<EditResult, String> {
-    if !matches!(tree_type.as_str(), "normal" | "terrain" | "pine" | "tall_pine") {
-        return Err(format!("Unknown tree type '{tree_type}'"));
+    if tree_types.is_empty() {
+        return Err("No tree types selected".into());
+    }
+    for t in &tree_types {
+        if !matches!(t.as_str(), "normal" | "terrain" | "pine" | "tall_pine") {
+            return Err(format!("Unknown tree type '{t}'"));
+        }
     }
     if density <= 0.0 || density > 1.0 {
         return Err("Density must be in range (0, 1]".into());
@@ -5735,20 +5753,32 @@ fn generate_trees(
                 } else { 0 }
             };
 
-            if !is_plantable(surf_bt) { continue; }
+            if smart_placement {
+                if !matches!(surf_bt, 3 | 8) { continue; }
+            } else if !is_plantable(surf_bt) { continue; }
 
             let z_base = sz + 1;
             if z_base > max_z { continue; }
 
-            match tree_type.as_str() {
+            let chosen_type = &tree_types[rng.range(0, tree_types.len() as i32 - 1) as usize];
+            match chosen_type.as_str() {
                 "normal"    => {
                     let trunk_h = rng.range(3, 8);
-                    let leaf_paint = NORMAL_LEAF_PAINTS[rng.range(0, 3) as usize];
-                    place_normal_tree(&mut world, wx, wy, z_base, trunk_h, leaf_paint);
+                    let lp = pick_leaf_paint(&leaf_paints, &NORMAL_LEAF_PAINTS, &mut rng);
+                    place_normal_tree(&mut world, wx, wy, z_base, trunk_h, lp);
                 }
-                "terrain"   => place_terrain_tree(&mut world, wx, wy, z_base, &mut rng),
-                "pine"      => place_pine_tree(&mut world, wx, wy, z_base, &mut rng, None),
-                "tall_pine" => place_tall_pine_tree(&mut world, wx, wy, z_base, &mut rng),
+                "terrain"   => {
+                    let lp = pick_leaf_paint(&leaf_paints, &NORMAL_LEAF_PAINTS, &mut rng);
+                    place_terrain_tree(&mut world, wx, wy, z_base, &mut rng, lp);
+                }
+                "pine"      => {
+                    let lp = pick_leaf_paint(&leaf_paints, &PINE_LEAF_PAINTS, &mut rng);
+                    place_pine_tree(&mut world, wx, wy, z_base, &mut rng, Some(lp));
+                }
+                "tall_pine" => {
+                    let lp = pick_leaf_paint(&leaf_paints, &PINE_LEAF_PAINTS, &mut rng);
+                    place_tall_pine_tree(&mut world, wx, wy, z_base, &mut rng, lp);
+                }
                 _ => {}
             }
         }
@@ -6458,15 +6488,24 @@ fn obj_geometry_region(world: &LoadedWorld, sx1: i32, sy1: i32, sx2: i32, sy2: i
     let mut pos_f: Vec<f32> = Vec::new();
     let mut col_f: Vec<f32> = Vec::new();
 
+    // Directional face-shading baked into vertex colours — replaces normal-based lighting.
+    // Values approximate: sun from above + slightly east/south; fill from northwest.
+    const SH_TOP: f32 = 1.00;
+    const SH_BOT: f32 = 0.45;
+    const SH_E:   f32 = 0.85; // east  (+X)
+    const SH_W:   f32 = 0.60; // west  (-X)
+    const SH_S:   f32 = 0.70; // south (+Y)
+    const SH_N:   f32 = 0.75; // north (-Y)
+
     macro_rules! push_tri {
-        ($verts:expr, $rgb:expr) => {{
-            let (r,g,b) = ($rgb[0] as f32/255.0, $rgb[1] as f32/255.0, $rgb[2] as f32/255.0);
+        ($verts:expr, $rgb:expr, $sh:expr) => {{
+            let (r,g,b) = ($rgb[0] as f32/255.0*$sh, $rgb[1] as f32/255.0*$sh, $rgb[2] as f32/255.0*$sh);
             for (x,y,z) in $verts { pos_f.extend_from_slice(&[x,y,z]); col_f.extend_from_slice(&[r,g,b]); }
         }};
     }
     macro_rules! push_quad {
-        ($a:expr,$b:expr,$c:expr,$d:expr,$rgb:expr) => {{
-            let (r,g,b_) = ($rgb[0] as f32/255.0, $rgb[1] as f32/255.0, $rgb[2] as f32/255.0);
+        ($a:expr,$b:expr,$c:expr,$d:expr,$rgb:expr,$sh:expr) => {{
+            let (r,g,b_) = ($rgb[0] as f32/255.0*$sh, $rgb[1] as f32/255.0*$sh, $rgb[2] as f32/255.0*$sh);
             for (x,y,z) in [$a,$b,$d, $b,$c,$d] { pos_f.extend_from_slice(&[x,y,z]); col_f.extend_from_slice(&[r,g,b_]); }
         }};
     }
@@ -6480,8 +6519,9 @@ fn obj_geometry_region(world: &LoadedWorld, sx1: i32, sy1: i32, sx2: i32, sy2: i
                 let (x0,x1f) = (wx as f32, wx as f32+1.0);
                 let (y0,y1f) = (wy as f32, wy as f32+1.0);
                 let (z0,z1f) = (wz as f32, wz as f32+1.0);
-                // Eden (X right, Y south, Z up) → Three.js Y-up: (ex,ez,-ey)
-                let o = |ex:f32,ey:f32,ez:f32| -> (f32,f32,f32) { (ex,ez,-ey) };
+                // Eden (X east, Y south, Z up) → Three.js Y-up: (ex, ez, ey).
+                // Eden north = Three.js −Z so the camera faces −Z (north) and east (+X) is on the right.
+                let o = |ex:f32,ey:f32,ez:f32| -> (f32,f32,f32) { (ex,ez,ey) };
 
                 if matches!(bt, 24..=39) {
                     let dir = (bt-24)%4;
@@ -6490,32 +6530,32 @@ fn obj_geometry_region(world: &LoadedWorld, sx1: i32, sy1: i32, sx2: i32, sy2: i
                     let se = obj_occludes(get_block_at(world,wx+1,wy,wz).0);
                     let sw = obj_occludes(get_block_at(world,wx-1,wy,wz).0);
                     if !obj_occludes(get_block_at(world,wx,wy,wz-1).0) {
-                        push_quad!(o(x0,y1f,z0),o(x1f,y1f,z0),o(x1f,y0,z0),o(x0,y0,z0),rgb);
+                        push_quad!(o(x0,y1f,z0),o(x1f,y1f,z0),o(x1f,y0,z0),o(x0,y0,z0),rgb,SH_BOT);
                     }
                     match dir {
                         0 => {
-                            if !ss { push_quad!(o(x0,y1f,z0),o(x1f,y1f,z0),o(x1f,y1f,z1f),o(x0,y1f,z1f),rgb); }
-                            if !sw { push_tri!([o(x0,y0,z0),o(x0,y1f,z0),o(x0,y1f,z1f)],rgb); }
-                            if !se { push_tri!([o(x1f,y1f,z0),o(x1f,y0,z0),o(x1f,y1f,z1f)],rgb); }
-                            push_quad!(o(x0,y0,z0),o(x1f,y0,z0),o(x1f,y1f,z1f),o(x0,y1f,z1f),rgb);
+                            if !ss { push_quad!(o(x0,y1f,z0),o(x1f,y1f,z0),o(x1f,y1f,z1f),o(x0,y1f,z1f),rgb,SH_S); }
+                            if !sw { push_tri!([o(x0,y0,z0),o(x0,y1f,z0),o(x0,y1f,z1f)],rgb,SH_W); }
+                            if !se { push_tri!([o(x1f,y1f,z0),o(x1f,y0,z0),o(x1f,y1f,z1f)],rgb,SH_E); }
+                            push_quad!(o(x0,y0,z0),o(x1f,y0,z0),o(x1f,y1f,z1f),o(x0,y1f,z1f),rgb,SH_TOP);
                         }
                         1 => {
-                            if !sw { push_quad!(o(x0,y0,z0),o(x0,y1f,z0),o(x0,y1f,z1f),o(x0,y0,z1f),rgb); }
-                            if !ss { push_tri!([o(x0,y1f,z0),o(x1f,y1f,z0),o(x0,y1f,z1f)],rgb); }
-                            if !sn { push_tri!([o(x1f,y0,z0),o(x0,y0,z0),o(x0,y0,z1f)],rgb); }
-                            push_quad!(o(x1f,y0,z0),o(x1f,y1f,z0),o(x0,y1f,z1f),o(x0,y0,z1f),rgb);
+                            if !sw { push_quad!(o(x0,y0,z0),o(x0,y1f,z0),o(x0,y1f,z1f),o(x0,y0,z1f),rgb,SH_W); }
+                            if !ss { push_tri!([o(x0,y1f,z0),o(x1f,y1f,z0),o(x0,y1f,z1f)],rgb,SH_S); }
+                            if !sn { push_tri!([o(x1f,y0,z0),o(x0,y0,z0),o(x0,y0,z1f)],rgb,SH_N); }
+                            push_quad!(o(x1f,y0,z0),o(x1f,y1f,z0),o(x0,y1f,z1f),o(x0,y0,z1f),rgb,SH_TOP);
                         }
                         2 => {
-                            if !sn { push_quad!(o(x1f,y0,z0),o(x0,y0,z0),o(x0,y0,z1f),o(x1f,y0,z1f),rgb); }
-                            if !se { push_tri!([o(x1f,y0,z0),o(x1f,y1f,z0),o(x1f,y0,z1f)],rgb); }
-                            if !sw { push_tri!([o(x0,y1f,z0),o(x0,y0,z0),o(x0,y0,z1f)],rgb); }
-                            push_quad!(o(x1f,y1f,z0),o(x0,y1f,z0),o(x0,y0,z1f),o(x1f,y0,z1f),rgb);
+                            if !sn { push_quad!(o(x1f,y0,z0),o(x0,y0,z0),o(x0,y0,z1f),o(x1f,y0,z1f),rgb,SH_N); }
+                            if !se { push_tri!([o(x1f,y0,z0),o(x1f,y1f,z0),o(x1f,y0,z1f)],rgb,SH_E); }
+                            if !sw { push_tri!([o(x0,y1f,z0),o(x0,y0,z0),o(x0,y0,z1f)],rgb,SH_W); }
+                            push_quad!(o(x1f,y1f,z0),o(x0,y1f,z0),o(x0,y0,z1f),o(x1f,y0,z1f),rgb,SH_TOP);
                         }
                         _ => {
-                            if !se { push_quad!(o(x1f,y1f,z0),o(x1f,y0,z0),o(x1f,y0,z1f),o(x1f,y1f,z1f),rgb); }
-                            if !sn { push_tri!([o(x1f,y0,z0),o(x0,y0,z0),o(x1f,y0,z1f)],rgb); }
-                            if !ss { push_tri!([o(x0,y1f,z0),o(x1f,y1f,z0),o(x1f,y1f,z1f)],rgb); }
-                            push_quad!(o(x0,y1f,z0),o(x0,y0,z0),o(x1f,y0,z1f),o(x1f,y1f,z1f),rgb);
+                            if !se { push_quad!(o(x1f,y1f,z0),o(x1f,y0,z0),o(x1f,y0,z1f),o(x1f,y1f,z1f),rgb,SH_E); }
+                            if !sn { push_tri!([o(x1f,y0,z0),o(x0,y0,z0),o(x1f,y0,z1f)],rgb,SH_N); }
+                            if !ss { push_tri!([o(x0,y1f,z0),o(x1f,y1f,z0),o(x1f,y1f,z1f)],rgb,SH_S); }
+                            push_quad!(o(x0,y1f,z0),o(x0,y0,z0),o(x1f,y0,z1f),o(x1f,y1f,z1f),rgb,SH_TOP);
                         }
                     }
                 } else if matches!(bt, 40..=55) {
@@ -6525,54 +6565,54 @@ fn obj_geometry_region(world: &LoadedWorld, sx1: i32, sy1: i32, sx2: i32, sy2: i
                     let se = obj_occludes(get_block_at(world,wx+1,wy,wz).0);
                     let sw = obj_occludes(get_block_at(world,wx-1,wy,wz).0);
                     if !obj_occludes(get_block_at(world,wx,wy,wz-1).0) {
-                        push_quad!(o(x0,y1f,z0),o(x1f,y1f,z0),o(x1f,y0,z0),o(x0,y0,z0),rgb);
+                        push_quad!(o(x0,y1f,z0),o(x1f,y1f,z0),o(x1f,y0,z0),o(x0,y0,z0),rgb,SH_BOT);
                     }
                     let (ax,ay) = match dir { 0=>(x0,y0), 1=>(x1f,y0), 2=>(x1f,y1f), _=>(x0,y1f) };
                     match dir {
                         0 => {
-                            if !sw { push_tri!([o(x0,y0,z0),o(x0,y1f,z0),o(ax,ay,z1f)],rgb); }
-                            if !sn { push_tri!([o(x1f,y0,z0),o(x0,y0,z0),o(ax,ay,z1f)],rgb); }
-                            push_tri!([o(ax,ay,z1f),o(x0,y1f,z0),o(x1f,y1f,z0)],rgb);
-                            push_tri!([o(ax,ay,z1f),o(x1f,y1f,z0),o(x1f,y0,z0)],rgb);
+                            if !sw { push_tri!([o(x0,y0,z0),o(x0,y1f,z0),o(ax,ay,z1f)],rgb,SH_W); }
+                            if !sn { push_tri!([o(x1f,y0,z0),o(x0,y0,z0),o(ax,ay,z1f)],rgb,SH_N); }
+                            push_tri!([o(ax,ay,z1f),o(x0,y1f,z0),o(x1f,y1f,z0)],rgb,SH_TOP);
+                            push_tri!([o(ax,ay,z1f),o(x1f,y1f,z0),o(x1f,y0,z0)],rgb,SH_TOP);
                         }
                         1 => {
-                            if !se { push_tri!([o(x1f,y1f,z0),o(x1f,y0,z0),o(ax,ay,z1f)],rgb); }
-                            if !sn { push_tri!([o(x0,y0,z0),o(x1f,y0,z0),o(ax,ay,z1f)],rgb); }
-                            push_tri!([o(ax,ay,z1f),o(x1f,y1f,z0),o(x0,y1f,z0)],rgb);
-                            push_tri!([o(ax,ay,z1f),o(x0,y1f,z0),o(x0,y0,z0)],rgb);
+                            if !se { push_tri!([o(x1f,y1f,z0),o(x1f,y0,z0),o(ax,ay,z1f)],rgb,SH_E); }
+                            if !sn { push_tri!([o(x0,y0,z0),o(x1f,y0,z0),o(ax,ay,z1f)],rgb,SH_N); }
+                            push_tri!([o(ax,ay,z1f),o(x1f,y1f,z0),o(x0,y1f,z0)],rgb,SH_TOP);
+                            push_tri!([o(ax,ay,z1f),o(x0,y1f,z0),o(x0,y0,z0)],rgb,SH_TOP);
                         }
                         2 => {
-                            if !se { push_tri!([o(x1f,y0,z0),o(x1f,y1f,z0),o(ax,ay,z1f)],rgb); }
-                            if !ss { push_tri!([o(x1f,y1f,z0),o(x0,y1f,z0),o(ax,ay,z1f)],rgb); }
-                            push_tri!([o(ax,ay,z1f),o(x0,y0,z0),o(x0,y1f,z0)],rgb);
-                            push_tri!([o(ax,ay,z1f),o(x1f,y0,z0),o(x0,y0,z0)],rgb);
+                            if !se { push_tri!([o(x1f,y0,z0),o(x1f,y1f,z0),o(ax,ay,z1f)],rgb,SH_E); }
+                            if !ss { push_tri!([o(x1f,y1f,z0),o(x0,y1f,z0),o(ax,ay,z1f)],rgb,SH_S); }
+                            push_tri!([o(ax,ay,z1f),o(x0,y0,z0),o(x0,y1f,z0)],rgb,SH_TOP);
+                            push_tri!([o(ax,ay,z1f),o(x1f,y0,z0),o(x0,y0,z0)],rgb,SH_TOP);
                         }
                         _ => {
-                            if !sw { push_tri!([o(x0,y1f,z0),o(x0,y0,z0),o(ax,ay,z1f)],rgb); }
-                            if !ss { push_tri!([o(x0,y1f,z0),o(x1f,y1f,z0),o(ax,ay,z1f)],rgb); }
-                            push_tri!([o(ax,ay,z1f),o(x1f,y0,z0),o(x1f,y1f,z0)],rgb);
-                            push_tri!([o(ax,ay,z1f),o(x0,y0,z0),o(x1f,y0,z0)],rgb);
+                            if !sw { push_tri!([o(x0,y1f,z0),o(x0,y0,z0),o(ax,ay,z1f)],rgb,SH_W); }
+                            if !ss { push_tri!([o(x0,y1f,z0),o(x1f,y1f,z0),o(ax,ay,z1f)],rgb,SH_S); }
+                            push_tri!([o(ax,ay,z1f),o(x1f,y0,z0),o(x1f,y1f,z0)],rgb,SH_TOP);
+                            push_tri!([o(ax,ay,z1f),o(x0,y0,z0),o(x1f,y0,z0)],rgb,SH_TOP);
                         }
                     }
                 } else {
                     // Cube with face culling
                     if !obj_occludes(get_block_at(world,wx,wy,wz+1).0) {
-                        push_quad!(o(x0,y0,z1f),o(x1f,y0,z1f),o(x1f,y1f,z1f),o(x0,y1f,z1f),rgb);
+                        push_quad!(o(x0,y0,z1f),o(x1f,y0,z1f),o(x1f,y1f,z1f),o(x0,y1f,z1f),rgb,SH_TOP);
                     }
                     if !obj_occludes(get_block_at(world,wx,wy,wz-1).0) {
-                        push_quad!(o(x0,y1f,z0),o(x1f,y1f,z0),o(x1f,y0,z0),o(x0,y0,z0),rgb);
+                        push_quad!(o(x0,y1f,z0),o(x1f,y1f,z0),o(x1f,y0,z0),o(x0,y0,z0),rgb,SH_BOT);
                     }
                     if !obj_occludes(get_block_at(world,wx,wy+1,wz).0) {
-                        push_quad!(o(x0,y1f,z0),o(x1f,y1f,z0),o(x1f,y1f,z1f),o(x0,y1f,z1f),rgb);
+                        push_quad!(o(x0,y1f,z0),o(x1f,y1f,z0),o(x1f,y1f,z1f),o(x0,y1f,z1f),rgb,SH_S);
                     }
                     if !obj_occludes(get_block_at(world,wx,wy-1,wz).0) {
-                        push_quad!(o(x1f,y0,z0),o(x0,y0,z0),o(x0,y0,z1f),o(x1f,y0,z1f),rgb);
+                        push_quad!(o(x1f,y0,z0),o(x0,y0,z0),o(x0,y0,z1f),o(x1f,y0,z1f),rgb,SH_N);
                     }
                     if !obj_occludes(get_block_at(world,wx+1,wy,wz).0) {
-                        push_quad!(o(x1f,y1f,z0),o(x1f,y0,z0),o(x1f,y0,z1f),o(x1f,y1f,z1f),rgb);
+                        push_quad!(o(x1f,y1f,z0),o(x1f,y0,z0),o(x1f,y0,z1f),o(x1f,y1f,z1f),rgb,SH_E);
                     }
                     if !obj_occludes(get_block_at(world,wx-1,wy,wz).0) {
-                        push_quad!(o(x0,y0,z0),o(x0,y1f,z0),o(x0,y1f,z1f),o(x0,y0,z1f),rgb);
+                        push_quad!(o(x0,y0,z0),o(x0,y1f,z0),o(x0,y1f,z1f),o(x0,y0,z1f),rgb,SH_W);
                     }
                 }
             }
