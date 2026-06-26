@@ -1,5 +1,6 @@
 import { useState, useCallback, useEffect, useRef, useMemo } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { getVersion } from "@tauri-apps/api/app";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -9,6 +10,7 @@ import SelectionInspector from "./SelectionInspector";
 import ElevationPreviewPanel from "./ElevationPreviewPanel";
 import SliceViewport from "./SliceViewport";
 import FlyView3D, { type FlyView3DRef, type Overlay3D } from "./FlyView3D";
+import ErrorBoundary from "./ErrorBoundary";
 import HelpModal from "./HelpModal";
 import AboutModal from "./AboutModal";
 import WorldBrowserModal from "./WorldBrowserModal";
@@ -16,6 +18,7 @@ import UploadModal from "./UploadModal";
 import NewWorldModal from "./NewWorldModal";
 import SchematicImportModal, { type SchematicInfo, type MappingEntry } from "./SchematicImportModal";
 import BlockPaintPicker from "./BlockPaintPicker";
+import SettingsModal, { loadSettings, saveSettings } from "./SettingsModal";
 import appIcon from "./assets/app-icon.png";
 import "./App.css";
 
@@ -40,6 +43,10 @@ interface WorldData {
   was_compressed: boolean;
   spawn_px: number | null;
   spawn_py: number | null;
+  center_px: number | null;
+  center_py: number | null;
+  abs_min_x: number;
+  abs_min_y: number;
 }
 
 // Raw IPC shapes (pixels still base64) — used only at invoke() callsites before decoding.
@@ -143,7 +150,7 @@ function App() {
   const [exportProgress, setExportProgress] = useState<number | null>(null);
   const [exportingObj, setExportingObj] = useState(false);
   const [saving, setSaving] = useState(false);
-  const [saveCompressed, setSaveCompressed] = useState(false);
+  const [saveCompressed, setSaveCompressed] = useState(() => loadSettings().defaultSaveCompressed);
   const [fileMenuOpen, setFileMenuOpen] = useState(false);
   const [showRecentSubmenu, setShowRecentSubmenu] = useState(false);
   const [recentWorlds, setRecentWorlds] = useState<RecentWorld[]>(() => {
@@ -163,14 +170,15 @@ function App() {
   const [axoSkew, setAxoSkew] = useState(0.2);
   const [showHelp, setShowHelp] = useState(false);
   const [showAbout, setShowAbout] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
   const [helpMenuOpen, setHelpMenuOpen] = useState(false);
   const helpMenuRef = useRef<HTMLDivElement>(null);
   const [appVersion, setAppVersion] = useState("…");
   useEffect(() => { getVersion().then(setAppVersion); }, []);
-  const [showSlicePanels, setShowSlicePanels] = useState(false);
+  const [showSlicePanels, setShowSlicePanels] = useState(() => loadSettings().defaultQuadView);
   // 3D fly-through pane (4th quad cell) — off by default; it's the most expensive pane, so the user
   // opts in. `exp` (experimental, perf-heavy on large worlds).
-  const [enable3dPane, setEnable3dPane] = useState(false);
+  const [enable3dPane, setEnable3dPane] = useState(() => loadSettings().default3dPane);
   const flyActiveRef = useRef(false); // true while FlyView3D fly mode is active — blocks global shortcuts
   const flyView3dRef = useRef<FlyView3DRef>(null);
   const [cam3dPos, setCam3dPos] = useState<{ x: number; y: number } | null>(null);
@@ -184,6 +192,18 @@ function App() {
   const [schematicApplying, setSchematicApplying] = useState(false);
   const [spawnPos, setSpawnPos] = useState<{ px: number; py: number } | null>(null);
   const cursorWorldRef = useRef<{ wx: number; wy: number }>({ wx: 0, wy: 0 });
+
+  // Template overlay state
+  const [templateLoaded, setTemplateLoaded] = useState(false);
+  const [templatePath, setTemplatePath] = useState<string | null>(() =>
+    loadSettings().templatePath
+  );
+  const [showTemplateOverlay, setShowTemplateOverlay] = useState(false);
+  const [showExpandModal, setShowExpandModal] = useState(false);
+  const [expandFullExtent, setExpandFullExtent] = useState(true);
+  const [expandInProgress, setExpandInProgress] = useState(false);
+  const [expandProgress, setExpandProgress] = useState(0);
+  const [expandResult, setExpandResult] = useState<{ chunksAdded: number; totalChunks: number } | null>(null);
 
   const [renamingWorld, setRenamingWorld] = useState(false);
   const [renameInput, setRenameInput] = useState("");
@@ -511,6 +531,7 @@ function App() {
     if (!savePath) return;
     setExporting(true);
     setExportProgress(0);
+    const useTemplate = showTemplateOverlay && templateLoaded && viewMode !== "zslice";
     try {
       const w = world.width_chunks * 16;
       const h = world.height_chunks * 16;
@@ -521,7 +542,21 @@ function App() {
         const raw = viewMode === "zslice"
           ? await invoke<PixelPatchRaw>("render_zslice_patch", { z: zSliceZ, x1: 0, y1: y, x2: w - 1, y2 })
           : await invoke<PixelPatchRaw>("fetch_tile", { x1: 0, y1: y, x2: w - 1, y2 });
-        buf.set(decodePixels(raw.pixels), y * w * 4);
+        const pixels = decodePixels(raw.pixels);
+        if (useTemplate) {
+          const traw = await invoke<PixelPatchRaw>("fetch_template_tile", { x1: 0, y1: y, x2: w - 1, y2 });
+          const tpixels = decodePixels(traw.pixels);
+          // Composite: where user pixel is transparent (alpha=0), use template at full opacity
+          for (let i = 0; i < pixels.length; i += 4) {
+            if (pixels[i + 3] === 0 && tpixels[i + 3] === 255) {
+              pixels[i]     = tpixels[i];
+              pixels[i + 1] = tpixels[i + 1];
+              pixels[i + 2] = tpixels[i + 2];
+              pixels[i + 3] = 255;
+            }
+          }
+        }
+        buf.set(pixels, y * w * 4);
         setExportProgress((y2 + 1) / h);
       }
       const canvas = document.createElement("canvas");
@@ -952,6 +987,51 @@ function App() {
     return () => document.removeEventListener("mousedown", handleOutside);
   }, [helpMenuOpen]);
 
+  // Template overlay helpers
+  async function loadTemplateFile(path: string) {
+    try {
+      await invoke<number>("load_eden_template", { path });
+      setTemplateLoaded(true);
+      setTemplatePath(path);
+      setShowTemplateOverlay(true);
+      saveSettings({ templatePath: path });
+    } catch (e) { setError(String(e)); }
+  }
+
+  async function openTemplateFile() {
+    const selected = await open({ filters: [{ name: "Eden World", extensions: ["eden"] }] });
+    if (!selected || Array.isArray(selected)) return;
+    await loadTemplateFile(selected);
+  }
+
+  // Expand progress event listener
+  useEffect(() => {
+    const unlisten = listen<number>("expand_progress", (e) => {
+      setExpandProgress(e.payload);
+    });
+    return () => { unlisten.then(f => f()); };
+  }, []);
+
+  async function runExpand() {
+    const outPath = await save({ filters: [{ name: "Eden World", extensions: ["eden"] }], defaultPath: "world_expanded.eden" });
+    if (!outPath) return;
+    setExpandInProgress(true);
+    setExpandProgress(0);
+    setExpandResult(null);
+    try {
+      const res = await invoke<{ chunks_added: number; total_chunks: number }>("expand_world_from_template", {
+        outputPath: outPath,
+        fullExtent: expandFullExtent,
+      });
+      setExpandResult({ chunksAdded: res.chunks_added, totalChunks: res.total_chunks });
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setExpandInProgress(false);
+      setExpandProgress(100);
+    }
+  }
+
 const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
     setRawBounds(bounds);
   }, []);
@@ -1135,6 +1215,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
       onEyedropper={handleEyedropper}
       cameraPos3d={showSlicePanels && enable3dPane ? cam3dPos : null}
       onSetCamera3d={showSlicePanels && enable3dPane ? (wx, wy) => flyView3dRef.current?.teleport(wx, wy) : undefined}
+      showTemplateOverlay={showTemplateOverlay && templateLoaded}
     />
   ) : null;
 
@@ -1194,25 +1275,47 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
               {mapPaneEl}
             </div>
             <div style={{ minWidth: 0, minHeight: 0, overflow: "hidden", outline: "1px solid #1e293b" }}>
-              <SliceViewport {...sliceCommon} axis="front"
-                depth={sliceFrontY} onDepthChange={setSliceFrontY}
-                crossH={sliceSideX} crossV={zSliceZ}
-                selRange={sliceSel ? { lo: sliceSel.x1, hi: sliceSel.x2 } : null}
-                selFull={!sliceIsPaste && sliceSel ? { xLo: sliceSel.x1, yLo: sliceSel.y1, xHi: sliceSel.x2, yHi: sliceSel.y2, zLo: sliceSel.z_min, zHi: sliceSel.z_max } : null}
-                onHRangeChange={sliceHResizeFront} onSelect={sliceSelectFront} />
+              <ErrorBoundary label="Front view">
+                <SliceViewport {...sliceCommon} axis="front"
+                  depth={sliceFrontY} onDepthChange={setSliceFrontY}
+                  crossH={sliceSideX} crossV={zSliceZ}
+                  selRange={sliceSel ? { lo: sliceSel.x1, hi: sliceSel.x2 } : null}
+                  selFull={!sliceIsPaste && sliceSel ? { xLo: sliceSel.x1, yLo: sliceSel.y1, xHi: sliceSel.x2, yHi: sliceSel.y2, zLo: sliceSel.z_min, zHi: sliceSel.z_max } : null}
+                  onHRangeChange={sliceHResizeFront} onSelect={sliceSelectFront} />
+              </ErrorBoundary>
             </div>
             <div style={{ minWidth: 0, minHeight: 0, overflow: "hidden", outline: "1px solid #1e293b" }}>
-              <SliceViewport {...sliceCommon} axis="side"
-                depth={sliceSideX} onDepthChange={setSliceSideX}
-                crossH={sliceFrontY} crossV={zSliceZ}
-                selRange={sliceSel ? { lo: sliceSel.y1, hi: sliceSel.y2 } : null}
-                selFull={!sliceIsPaste && sliceSel ? { xLo: sliceSel.x1, yLo: sliceSel.y1, xHi: sliceSel.x2, yHi: sliceSel.y2, zLo: sliceSel.z_min, zHi: sliceSel.z_max } : null}
-                onHRangeChange={sliceHResizeSide} onSelect={sliceSelectSide} />
+              <ErrorBoundary label="Side view">
+                <SliceViewport {...sliceCommon} axis="side"
+                  depth={sliceSideX} onDepthChange={setSliceSideX}
+                  crossH={sliceFrontY} crossV={zSliceZ}
+                  selRange={sliceSel ? { lo: sliceSel.y1, hi: sliceSel.y2 } : null}
+                  selFull={!sliceIsPaste && sliceSel ? { xLo: sliceSel.x1, yLo: sliceSel.y1, xHi: sliceSel.x2, yHi: sliceSel.y2, zLo: sliceSel.z_min, zHi: sliceSel.z_max } : null}
+                  onHRangeChange={sliceHResizeSide} onSelect={sliceSelectSide} />
+              </ErrorBoundary>
             </div>
             <div style={{ position: "relative", minWidth: 0, minHeight: 0, overflow: "hidden", outline: "1px solid #1e293b" }}>
               {enable3dPane ? (
                 <>
-                  <FlyView3D ref={flyView3dRef} world={world} editEpoch={editEpoch} lastEdit={lastEditBounds} onFlyModeChange={(a) => { flyActiveRef.current = a; }} onCameraMove={(wx, wy) => setCam3dPos({ x: wx, y: wy })} overlays3d={overlays3d} />
+                  <ErrorBoundary label="3D view">
+                    <FlyView3D
+                      ref={flyView3dRef}
+                      world={world}
+                      // Spawn the camera over real geometry: prefer the world's home/spawn point,
+                      // else the centroid of populated chunks (robust for sparse worlds whose
+                      // bounding-box centre is empty). Both are local block coords.
+                      spawnAt={
+                        spawnPos ? { x: spawnPos.px, y: spawnPos.py }
+                          : (world.center_px != null && world.center_py != null
+                            ? { x: world.center_px, y: world.center_py } : undefined)
+                      }
+                      editEpoch={editEpoch}
+                      lastEdit={lastEditBounds}
+                      onFlyModeChange={(a) => { flyActiveRef.current = a; }}
+                      onCameraMove={(wx, wy) => setCam3dPos({ x: wx, y: wy })}
+                      overlays3d={overlays3d}
+                    />
+                  </ErrorBoundary>
                   <button
                     onClick={() => setEnable3dPane(false)}
                     title="Disable the 3D pane (saves performance)"
@@ -1795,6 +1898,29 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
                   <span style={{ marginLeft: 6, fontSize: 9, color: "#f59e0b", background: "rgba(245,158,11,0.12)", border: "1px solid rgba(245,158,11,0.3)", borderRadius: 3, padding: "0 3px", lineHeight: "14px" }}>exp</span>
                 </button>
                 {/* Sky Editor and Creature Viewer implemented but hidden pending testing */}
+                <div style={menuDivider} />
+                <div style={{ ...menuItem, color: "#475569", fontSize: 11, cursor: "default", paddingBottom: 2 }}>
+                  TEMPLATE OVERLAY
+                </div>
+                <button
+                  onClick={() => { setViewMenuOpen(false); openTemplateFile(); }}
+                  style={menuItem}
+                  title={templatePath ? `Loaded: ${templatePath}` : "Load Eden.eden to enable template overlay"}
+                >
+                  <span style={{ display: "inline-block", width: 16 }}>⊕</span>
+                  {templateLoaded ? "Change Template…" : "Load Eden Template…"}
+                  <span style={{ marginLeft: 6, fontSize: 9, color: "#f59e0b", background: "rgba(245,158,11,0.12)", border: "1px solid rgba(245,158,11,0.3)", borderRadius: 3, padding: "0 3px", lineHeight: "14px" }}>exp</span>
+                  {templateLoaded && <span style={{ marginLeft: 4, color: "#4ade80", fontSize: 10 }}>✓</span>}
+                </button>
+                {templateLoaded && (
+                  <button
+                    onClick={() => { setViewMenuOpen(false); setShowTemplateOverlay(v => !v); }}
+                    style={menuItem}
+                  >
+                    <span style={{ display: "inline-block", width: 16, color: "#4ade80" }}>{showTemplateOverlay ? "●" : ""}</span>
+                    <span style={{ color: showTemplateOverlay ? "#86efac" : undefined }}>Template Overlay</span>
+                  </button>
+                )}
               </div>
             )}
           </div>
@@ -1908,6 +2034,16 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
                   </button>
                 )}
                 <div style={menuDivider} />
+                {world && templateLoaded && (
+                  <button
+                    onClick={() => { setFileMenuOpen(false); setShowExpandModal(true); setExpandResult(null); }}
+                    style={menuItem}
+                    title="Bake Eden.eden template chunks into a new world file"
+                  >
+                    Expand from Template…
+                  </button>
+                )}
+                <div style={menuDivider} />
                 <button onClick={() => { setFileMenuOpen(false); setShowWorldBrowser(true); }} style={menuItem}>
                   Browse Worlds…
                 </button>
@@ -1936,6 +2072,15 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
                 boxShadow: "0 8px 24px rgba(0,0,0,0.5)",
                 overflow: "hidden",
               }}>
+                <button
+                  onClick={() => { setHelpMenuOpen(false); setShowSettings(true); }}
+                  style={{ ...menuItem, width: "100%", textAlign: "left" }}
+                  onMouseEnter={e => (e.currentTarget.style.background = "#232a3d")}
+                  onMouseLeave={e => (e.currentTarget.style.background = "transparent")}
+                >
+                  Settings…
+                </button>
+                <div style={menuDivider} />
                 <button
                   onClick={() => { setHelpMenuOpen(false); setShowHelp(true); }}
                   style={{ ...menuItem, width: "100%", textAlign: "left" }}
@@ -2566,6 +2711,15 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
 
         {showHelp && <HelpModal onClose={() => setShowHelp(false)} />}
         {showAbout && <AboutModal version={appVersion} onClose={() => setShowAbout(false)} />}
+        {showSettings && (
+          <SettingsModal
+            onClose={() => setShowSettings(false)}
+            onSave={(s) => {
+              setSaveCompressed(s.defaultSaveCompressed);
+              if (s.templatePath !== templatePath) setTemplatePath(s.templatePath);
+            }}
+          />
+        )}
 
         {showWorldBrowser && (
           <WorldBrowserModal
@@ -2596,6 +2750,93 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
         )}
 
         {/* Sky Editor and Creature Viewer panels — implemented, hidden pending testing */}
+
+        {/* Expand from Template modal */}
+        {showExpandModal && (
+          <div style={{
+            position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", display: "flex",
+            alignItems: "center", justifyContent: "center", zIndex: 1000,
+          }}>
+            <div style={{
+              background: "#0d1829", border: "1px solid #1e40af", borderRadius: 10,
+              padding: "24px 28px", minWidth: 360, maxWidth: 440,
+              boxShadow: "0 16px 48px rgba(0,0,0,0.7)",
+            }}>
+              <div style={{ fontSize: 15, fontWeight: 600, color: "#e2e8f0", marginBottom: 12 }}>
+                Expand from Template
+              </div>
+              {!expandInProgress && expandResult === null && (
+                <>
+                  <div style={{ fontSize: 12, color: "#94a3b8", marginBottom: 16, lineHeight: 1.5 }}>
+                    Fills missing chunks from Eden.eden into a new world file. Your edits are preserved.
+                    Output can be ~1 GB for the full template.
+                  </div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 10, marginBottom: 20 }}>
+                    <label style={{ display: "flex", alignItems: "center", gap: 10, cursor: "pointer", color: "#e2e8f0", fontSize: 13 }}>
+                      <input
+                        type="radio" name="extentMode" checked={expandFullExtent}
+                        onChange={() => setExpandFullExtent(true)}
+                        style={{ accentColor: "#3b82f6" }}
+                      />
+                      Full world (180×180 chunks, ~1 GB)
+                    </label>
+                    <label style={{ display: "flex", alignItems: "center", gap: 10, cursor: "pointer", color: "#e2e8f0", fontSize: 13 }}>
+                      <input
+                        type="radio" name="extentMode" checked={!expandFullExtent}
+                        onChange={() => setExpandFullExtent(false)}
+                        style={{ accentColor: "#3b82f6" }}
+                      />
+                      Within current world bounds only
+                    </label>
+                  </div>
+                  <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+                    <button onClick={() => setShowExpandModal(false)} style={{
+                      padding: "6px 14px", borderRadius: 6, border: "1px solid #334155",
+                      background: "transparent", color: "#94a3b8", cursor: "pointer", fontSize: 13,
+                    }}>
+                      Cancel
+                    </button>
+                    <button onClick={runExpand} style={{
+                      padding: "6px 14px", borderRadius: 6, border: "none",
+                      background: "#1d4ed8", color: "#e2e8f0", cursor: "pointer", fontSize: 13,
+                    }}>
+                      Choose Output File & Expand
+                    </button>
+                  </div>
+                </>
+              )}
+              {expandInProgress && (
+                <>
+                  <div style={{ fontSize: 12, color: "#94a3b8", marginBottom: 12 }}>
+                    Writing chunks… {expandProgress}%
+                  </div>
+                  <div style={{ background: "#1e293b", borderRadius: 4, height: 8, overflow: "hidden" }}>
+                    <div style={{
+                      height: "100%", background: "#3b82f6", borderRadius: 4,
+                      width: `${expandProgress}%`, transition: "width 0.2s",
+                    }} />
+                  </div>
+                </>
+              )}
+              {expandResult !== null && !expandInProgress && (
+                <>
+                  <div style={{ fontSize: 13, color: "#86efac", marginBottom: 16 }}>
+                    Done — {expandResult.chunksAdded.toLocaleString()} chunks added
+                    ({expandResult.totalChunks.toLocaleString()} total).
+                  </div>
+                  <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+                    <button onClick={() => setShowExpandModal(false)} style={{
+                      padding: "6px 14px", borderRadius: 6, border: "1px solid #334155",
+                      background: "transparent", color: "#94a3b8", cursor: "pointer", fontSize: 13,
+                    }}>
+                      Close
+                    </button>
+                  </div>
+                </>
+              )}
+            </div>
+          </div>
+        )}
       </div>
     );
   }
@@ -2681,6 +2922,23 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
               <div style={{ fontSize: 13, color: "#94a3b8", marginTop: 2 }}>Browse shared worlds</div>
             </div>
           </button>
+
+          {/* Settings */}
+          <button
+            onClick={() => setShowSettings(true)}
+            style={{
+              display: "flex", alignItems: "center", gap: 14,
+              background: "none", border: "1px solid #1e2333",
+              borderRadius: 8, padding: "9px 16px",
+              cursor: "pointer", textAlign: "left", width: "100%",
+              color: "#64748b",
+            }}
+            onMouseEnter={e => { (e.currentTarget as HTMLElement).style.borderColor = "#2d3448"; (e.currentTarget as HTMLElement).style.color = "#94a3b8"; }}
+            onMouseLeave={e => { (e.currentTarget as HTMLElement).style.borderColor = "#1e2333"; (e.currentTarget as HTMLElement).style.color = "#64748b"; }}
+          >
+            <span style={{ fontSize: 16, lineHeight: 1 }}>⚙</span>
+            <span style={{ fontSize: 13 }}>Settings</span>
+          </button>
         </div>
 
         {error && (
@@ -2722,6 +2980,17 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
       </div>
 
       {showAbout && <AboutModal version={appVersion} onClose={() => setShowAbout(false)} />}
+      {showSettings && (
+        <SettingsModal
+          onClose={() => setShowSettings(false)}
+          onSave={(s) => {
+            setShowSlicePanels(s.defaultQuadView);
+            setEnable3dPane(s.default3dPane);
+            setSaveCompressed(s.defaultSaveCompressed);
+            if (s.templatePath !== templatePath) setTemplatePath(s.templatePath);
+          }}
+        />
+      )}
 
       {/* Right panel — recent worlds */}
       <div style={{ flex: 1, display: "flex", flexDirection: "column", background: "#181c27", overflow: "hidden" }}>
@@ -2780,6 +3049,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           onCreated={(path) => { setShowNewWorld(false); openFileAt(path); }}
         />
       )}
+
     </div>
   );
 }

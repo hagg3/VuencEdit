@@ -128,6 +128,8 @@ interface Props {
   cameraPos3d?: { x: number; y: number } | null;
   /** Called when the user clicks or drags the 3D camera icon to move it. */
   onSetCamera3d?: (wx: number, wy: number) => void;
+  /** When true, fetches and draws the Eden.eden template terrain at 35% opacity behind user chunks. */
+  showTemplateOverlay?: boolean;
 }
 
 function decodePixels(b64: string): Uint8Array {
@@ -147,7 +149,8 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     extrudePreview = null, lastPasteDelta = null, onCursorMove, onMagicWand,
     spawnPos = null, creatures = [],
     pasteElevationOffset = 0, onEyedropper, sliceLines = null,
-    cameraPos3d = null, onSetCamera3d }: Props,
+    cameraPos3d = null, onSetCamera3d,
+    showTemplateOverlay = false }: Props,
   ref,
 ) {
   const canvasRef  = useRef<HTMLCanvasElement>(null);
@@ -156,6 +159,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
 
   // Tile state (used in "tiled" mode)
   const tileCacheRef  = useRef<Map<string, HTMLCanvasElement>>(new Map());
+  const templateTileCacheRef = useRef<Map<string, HTMLCanvasElement>>(new Map());
   const pendingRef    = useRef<Set<string>>(new Set());
   // Incremented whenever mode/z/world/renderMode changes — lets in-flight fetches detect staleness
   const tileEpochRef  = useRef(0);
@@ -163,7 +167,8 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   // Concurrency-capped fetch queue (tiled mode)
   const activeRef  = useRef(0);
   const queueRef   = useRef<TileJob[]>([]);
-  const drainRef   = useRef<() => void>(() => {});
+  const drainRef      = useRef<() => void>(() => {});
+  const ensureTilesRef = useRef<() => void>(() => {});
 
   // Full-canvas state (used in "full" and "axo" modes)
   const renderModeRef     = useRef(renderMode);
@@ -218,6 +223,9 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   useEffect(() => { onEyedropperRef.current    = onEyedropper;        }, [onEyedropper]);
   useEffect(() => { cameraPos3dRef.current     = cameraPos3d ?? null; }, [cameraPos3d]);
   useEffect(() => { onSetCamera3dRef.current   = onSetCamera3d;       }, [onSetCamera3d]);
+  const showTemplateOverlayRef = useRef(showTemplateOverlay);
+  // Keep ref in sync; cache clear + redraw happen in the post-draw effect below
+  useEffect(() => { showTemplateOverlayRef.current = showTemplateOverlay; }, [showTemplateOverlay]);
 
   const mapW = world.width_chunks * 16;
   const mapH = world.height_chunks * 16;
@@ -263,6 +271,18 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
       const fc = fullCanvasRef.current;
       if (fc) ctx.drawImage(fc, 0, 0);
     } else {
+      // Draw template layer first at 35% opacity. User tile's transparent pixels (no chunk)
+      // let the template show through; opaque user pixels naturally cover it.
+      if (showTemplateOverlayRef.current && templateTileCacheRef.current.size > 0) {
+        ctx.globalAlpha = 0.35;
+        for (const [key, tile] of templateTileCacheRef.current) {
+          const comma = key.indexOf(",");
+          const tx = parseInt(key.slice(0, comma));
+          const ty = parseInt(key.slice(comma + 1));
+          ctx.drawImage(tile, tx * TILE, ty * TILE);
+        }
+        ctx.globalAlpha = 1.0;
+      }
       for (const [key, tile] of tileCacheRef.current) {
         const comma = key.indexOf(",");
         const tx = parseInt(key.slice(0, comma));
@@ -622,6 +642,24 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
       img.data.set(pixels);
       tctx.putImageData(img, 0, 0);
       tileCacheRef.current.set(key, tc);
+
+      // Also fetch template tile for overlay if enabled and in topdown mode
+      if (showTemplateOverlayRef.current && viewModeRef.current !== "zslice" && !templateTileCacheRef.current.has(key)) {
+        try {
+          const traw = await invoke<PixelPatchRaw>("fetch_template_tile", { x1, y1, x2, y2 });
+          if (tileEpochRef.current === myEpoch) {
+            const tpixels = decodePixels(traw.pixels);
+            const ttc = document.createElement("canvas");
+            ttc.width = traw.width; ttc.height = traw.height;
+            const ttctx = ttc.getContext("2d")!;
+            const timg = ttctx.createImageData(traw.width, traw.height);
+            timg.data.set(tpixels);
+            ttctx.putImageData(timg, 0, 0);
+            templateTileCacheRef.current.set(key, ttc);
+          }
+        } catch { /* template fetch failure is non-fatal */ }
+      }
+
       draw();
     } catch {
       // world not loaded or tile out of range — leave absent from cache
@@ -631,6 +669,20 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
       drainRef.current();
     }
   }, [draw]);
+
+  // When overlay is toggled, invalidate tile cache so loadTile re-runs and fetches template tiles too
+  useEffect(() => {
+    templateTileCacheRef.current.clear();
+    if (showTemplateOverlay) {
+      tileEpochRef.current++;
+      tileCacheRef.current.clear();
+      pendingRef.current.clear();
+      queueRef.current = [];
+      ensureTilesRef.current();
+    } else {
+      draw();
+    }
+  }, [showTemplateOverlay, draw]);
 
   // ── drain ─────────────────────────────────────────────────────────────────
 
@@ -735,6 +787,9 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     for (const key of tileCacheRef.current.keys()) {
       if (!needed.has(key)) tileCacheRef.current.delete(key);
     }
+    for (const key of templateTileCacheRef.current.keys()) {
+      if (!needed.has(key)) templateTileCacheRef.current.delete(key);
+    }
 
     draw();
 
@@ -762,6 +817,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     queueRef.current = jobs;
     drain();
   }, [draw, drain, loadFullCanvas]);
+  ensureTilesRef.current = ensureTiles;
 
   // ── Exposed API ───────────────────────────────────────────────────────────
 
@@ -877,6 +933,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     zSliceZRef.current  = zSliceZ;
     tileEpochRef.current++;
     tileCacheRef.current.clear();
+    templateTileCacheRef.current.clear();
     pendingRef.current.clear();
     queueRef.current = [];
     fullCanvasRef.current = null;
@@ -888,6 +945,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     renderModeRef.current = renderMode;
     tileEpochRef.current++;
     tileCacheRef.current.clear();
+    templateTileCacheRef.current.clear();
     pendingRef.current.clear();
     queueRef.current = [];
     fullCanvasRef.current = null;
