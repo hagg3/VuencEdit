@@ -6,9 +6,12 @@ import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 interface ChunkGeom { positions: string; colors: string; vertex_count: number }
 function decodeF32(b64: string): Float32Array {
   const bin = atob(b64);
-  const bytes = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-  return new Float32Array(bytes.buffer);
+  const n = bin.length;
+  const bytes = new Uint8Array(n);
+  for (let i = 0; i < n; i++) bytes[i] = bin.charCodeAt(i);
+  // Length in floats via (n >> 2) guards against a buffer whose byteLength isn't a multiple of 4
+  // (a truncated/odd payload would otherwise throw in the Float32Array ctor).
+  return new Float32Array(bytes.buffer, 0, n >> 2);
 }
 
 // World-scale 3D fly-through viewport — the 4th quad-view pane.
@@ -48,11 +51,14 @@ export interface Overlay3D {
 
 const FlyView3D = forwardRef<FlyView3DRef, {
   world: World; editEpoch?: number; lastEdit?: EditBounds | null;
+  /** Initial camera target in Eden local block coords (x = east, y = south). Spawns the camera
+   *  over real geometry; falls back to the world centre when null/undefined. */
+  spawnAt?: { x: number; y: number } | null;
   onFlyModeChange?: (active: boolean) => void;
   onCameraMove?: (wx: number, wy: number) => void;
   overlays3d?: Overlay3D[] | null;
 }>(function FlyView3D({
-  world, editEpoch = 0, lastEdit = null, onFlyModeChange, onCameraMove, overlays3d = null,
+  world, editEpoch = 0, lastEdit = null, spawnAt = null, onFlyModeChange, onCameraMove, overlays3d = null,
 }, ref) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [flyMode, setFlyMode] = useState(false);
@@ -73,6 +79,10 @@ const FlyView3D = forwardRef<FlyView3DRef, {
   const overlays3dRef = useRef(overlays3d);
   useEffect(() => { overlays3dRef.current = overlays3d; }, [overlays3d]);
 
+  // Read via ref so the spawn target can update (new world) without tearing down the scene.
+  const spawnAtRef = useRef(spawnAt);
+  spawnAtRef.current = spawnAt;
+
   // Stable refs so the effect can be re-run only on world change, while edit-sync and fly-mode
   // toggles flow through refs without tearing down the scene.
   const sceneApi = useRef<{
@@ -92,9 +102,23 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     const canvas = canvasRef.current;
     if (!canvas) return;
 
-    const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: "high-performance" });
+    let renderer: THREE.WebGLRenderer;
+    try {
+      // antialias:false — at DPR ≤1.5 in a small quad-view cell, MSAA's fragment cost outweighs the
+      // marginal edge quality. Disabling it buys steady-state fps headroom next to 3 other panes.
+      renderer = new THREE.WebGLRenderer({ canvas, antialias: false, powerPreference: "high-performance" });
+    } catch (e) {
+      // Genuine WebGL-unavailable (driver/webview without a usable context). Surface a clear
+      // message to the error boundary instead of a cryptic THREE internal stack.
+      throw new Error(`WebGL unavailable in this environment. (${(e as Error)?.message ?? e})`);
+    }
     renderer.setClearColor(0x0a0f1e);
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, MAX_DPR));
+
+    // Guard the remainder of init: if anything throws after the context exists, release it before
+    // rethrowing. React skips an effect's cleanup when the effect body throws, so without this a
+    // failed init would leak a live WebGL context on every mount/retry.
+    try {
 
     // Render-on-demand: only draw when something actually changed (camera moved, chunks streamed,
     // resize) or while actively flying. Avoids burning the GPU at 60fps next to 3 other quad-view panes.
@@ -103,6 +127,10 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     // reference it before the definition site.
     let dirty = false;
     let rafPending = false;
+    // Declared here (not at the render-loop block below) because `invalidate` writes `raf` and is
+    // called synchronously by the first `resize()` during init — referencing it later would hit the
+    // temporal dead zone and throw "cannot access uninitialized variable", blanking the pane.
+    let raf = 0;
     const invalidate = () => {
       dirty = true;
       if (rafPending) return;
@@ -117,6 +145,11 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     // normal attribute buffer (~⅓ of geometry RAM).
 
     const cx = mapW / 2, cy = mapH / 2;
+    // Camera spawn target — over real geometry when provided (sparse worlds), else world centre.
+    const spawnXY = () => {
+      const s = spawnAtRef.current;
+      return s ? { x: s.x, y: s.y } : { x: cx, y: cy };
+    };
 
     const grid = new THREE.GridHelper(Math.max(mapW, mapH), Math.max(world.width_chunks, world.height_chunks));
     grid.position.set(cx, 0, cy);
@@ -128,14 +161,20 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     scene.add(new THREE.Box3Helper(box, new THREE.Color(0x1e3a5f)));
 
     const camera = new THREE.PerspectiveCamera(70, 1, 0.5, 100000);
-    // Start south of the world centre looking north (−Z). Cameras looking in −Z have Eden east
+    // Start south of the spawn target looking north (−Z). Cameras looking in −Z have Eden east
     // (+X) on the right, matching the top-down map.
-    camera.position.set(cx, maxZ + 60, cy + 110);
+    {
+      const s = spawnXY();
+      camera.position.set(s.x, maxZ + 60, s.y + 110);
+    }
 
     const controls = new OrbitControls(camera, renderer.domElement);
     controls.enableDamping = true;
     controls.dampingFactor = 0.1;
-    controls.target.set(cx, Math.min(maxZ, 28), cy);
+    {
+      const s = spawnXY();
+      controls.target.set(s.x, Math.min(maxZ, 28), s.y);
+    }
 
     const resize = () => {
       const r = canvas.getBoundingClientRect();
@@ -174,8 +213,14 @@ const FlyView3D = forwardRef<FlyView3DRef, {
 
     // Bounded-concurrency fetch queue. The streaming sweep can need ~100 chunks; firing them all at
     // once floods the IPC bridge and the world mutex (each get_chunk_geometry locks it), tanking fps.
-    // We keep at most MAX_CONCURRENT requests in flight, pulling nearest-to-camera first.
-    const MAX_CONCURRENT = 4;
+    // We keep a bounded number of requests in flight, pulling nearest-to-camera first.
+    // Concurrency is throttled while flying: each fetch locks the world mutex and its callback builds a
+    // BufferGeometry + uploads to the GPU on the main thread. Four of those landing in one frame causes
+    // a visible hitch as you fly into new terrain, so we drop to 2 in-flight while the camera is moving
+    // (smoother stream-in) and use the full 4 when idle/orbiting (faster fill, hitches don't matter).
+    const MAX_CONCURRENT_IDLE = 4;
+    const MAX_CONCURRENT_FLY = 2;
+    const maxConcurrent = () => (flyModeRef.current ? MAX_CONCURRENT_FLY : MAX_CONCURRENT_IDLE);
     let active = 0;
     let queue: { cx: number; cy: number }[] = [];
 
@@ -204,7 +249,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     };
 
     const pump = () => {
-      while (active < MAX_CONCURRENT && queue.length) {
+      while (active < maxConcurrent() && queue.length) {
         const it = queue.shift()!;
         const k = key(it.cx, it.cy);
         if (inflight.has(k) || meshes.has(k)) continue;
@@ -274,10 +319,16 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       // Best-effort pointer lock (free-look). Swallow rejection — drag-to-look covers the fallback.
       const p = canvas.requestPointerLock() as unknown as Promise<void> | undefined;
       if (p && typeof p.catch === "function") p.catch(() => {});
+      // CRITICAL: wake the render loop. The pane renders on demand, and the loop only self-sustains
+      // once a frame is already executing (frame() sets keepGoing while flying). If the scene was idle
+      // when fly mode engaged, nothing would schedule a frame — WASD/look would be silently dead until
+      // some unrelated event (a stream tick, resize) happened to invalidate. This made fly mode "stick".
+      invalidate();
     };
     const exitFly = () => {
       controls.enabled = true;
       lookDrag = false;
+      keys.clear(); // drop any held movement keys so the camera doesn't drift after exit
       if (document.pointerLockElement === canvas) document.exitPointerLock();
       flyModeRef.current = false;
       setFlyMode(false);
@@ -355,6 +406,11 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     window.addEventListener("keydown", onKeyDown);
     window.addEventListener("keyup", onKeyUp);
 
+    // Losing window focus (alt-tab, pointer-lock transitions, devtools) can swallow the keyup for a
+    // held direction key, leaving it stuck in the set so the camera drifts indefinitely. Clear on blur.
+    const onBlur = () => { keys.clear(); lookDrag = false; };
+    window.addEventListener("blur", onBlur);
+
     const fwd = new THREE.Vector3();
     const right = new THREE.Vector3();
     const WORLD_UP = new THREE.Vector3(0, 1, 0);
@@ -364,7 +420,6 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     const viewProj = new THREE.Matrix4();
 
     let prev = performance.now();
-    let raf = 0;
     let disposed = false;
     let lastEmitT = 0;
     let lastEmitEX = NaN, lastEmitEY = NaN;
@@ -443,9 +498,11 @@ const FlyView3D = forwardRef<FlyView3DRef, {
 
     const resetCamera = () => {
       if (flyModeRef.current) exitFly();
-      camera.position.set(cx, maxZ + 60, cy + 110);
-      controls.target.set(cx, Math.min(maxZ, 28), cy);
+      const s = spawnXY();
+      camera.position.set(s.x, maxZ + 60, s.y + 110);
+      controls.target.set(s.x, Math.min(maxZ, 28), s.y);
       controls.update();
+      streamSweep(); // re-prioritise chunk streaming around the new viewpoint
       invalidate();
     };
 
@@ -505,15 +562,29 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       canvas.removeEventListener("pointerup", onCanvasUp);
       window.removeEventListener("keydown", onKeyDown);
       window.removeEventListener("keyup", onKeyUp);
+      window.removeEventListener("blur", onBlur);
       if (document.pointerLockElement === canvas) document.exitPointerLock();
       for (const k of [...meshes.keys()]) disposeMesh(k);
       clearOverlays();
       mat.dispose();
       controls.dispose();
+      // dispose() only — do NOT forceContextLoss() here. The renderer binds to the fixed <canvas>
+      // ref, and a canvas can own just one WebGL context for its lifetime. Losing it would leave a
+      // dead context that the next init on the same canvas (React StrictMode's double-mount, HMR)
+      // would reuse — `new WebGLRenderer` then crashes in getShaderPrecisionFormat. dispose() frees
+      // GPU resources while leaving the context healthy for reuse. (Mirrors ThreeDPreview.)
       renderer.dispose();
       scene.clear();
       sceneApi.current = null;
     };
+    } catch (e) {
+      // Init failed after the context was created — free GPU resources before rethrowing. dispose()
+      // only (not forceContextLoss): the context stays bound to the fixed canvas and is reused by
+      // the next mount/retry on that same canvas.
+      try { renderer.dispose(); } catch { /* ignore */ }
+      sceneApi.current = null;
+      throw e;
+    }
   // Re-init only when world dimensions change (new world loaded).
   }, [mapW, mapH, maxZ, world.width_chunks, world.height_chunks]);
 
@@ -521,6 +592,13 @@ const FlyView3D = forwardRef<FlyView3DRef, {
   useEffect(() => {
     sceneApi.current?.setOverlays(overlays3d ?? null);
   }, [overlays3d]);
+
+  // Re-centre over the spawn target when it changes. The init effect only re-runs on world-size
+  // change, so a new world of identical dimensions would otherwise keep the old viewpoint.
+  useEffect(() => {
+    sceneApi.current?.resetCamera();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [spawnAt?.x, spawnAt?.y]);
 
   // Edit sync: reload chunk meshes overlapping the last edit's top-down bounds.
   useEffect(() => {

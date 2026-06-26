@@ -1,9 +1,9 @@
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use memmap2::{MmapMut, MmapOptions};
+use memmap2::{Mmap, MmapMut, MmapOptions};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::sync::Mutex;
 use std::time::Instant;
 use tauri::Emitter;
@@ -38,6 +38,15 @@ pub struct WorldMeta {
     /// Spawn position in editor (0-indexed) coordinates. None if header bytes are zero (unset).
     pub spawn_px: Option<f32>,
     pub spawn_py: Option<f32>,
+    /// Centroid of populated chunks, in editor (local) block coordinates. Used to spawn the 3D
+    /// fly-through camera over actual geometry on sparse worlds (where the bounding-box centre is
+    /// frequently empty). None only if there are no chunks (cannot happen post-parse).
+    pub center_px: Option<f32>,
+    pub center_py: Option<f32>,
+    /// Absolute chunk coordinates of the world's top-left corner (min_x, min_y).
+    /// Used by the frontend to align template overlay coords. Eden.eden covers 4006..4185.
+    pub abs_min_x: i32,
+    pub abs_min_y: i32,
 }
 
 /// Full pixel map — used only by render_zslice (kept for legacy callers).
@@ -153,11 +162,28 @@ struct WorldState {
     /// Path to the decompressed temp file when the current world was opened from a zip.
     /// Deleted after the mmap is dropped on next world load.
     temp_path: Option<std::path::PathBuf>,
+    /// Read-only mmap of Eden.eden template (loaded on demand via load_eden_template).
+    template_bytes: Option<Mmap>,
+    /// Absolute (tx, tz) chunk coords → byte offset into template_bytes.
+    /// Eden.eden uses i32+i32+u64 directory, different from regular saves.
+    template_dir: HashMap<(i32, i32), usize>,
+    /// Per-chunk surface colors: [r,g,b,a] for each of the 256 (lx*16+ly) positions.
+    /// a=255 = solid block; a=0 = air column. 1 KB/chunk vs 32 KB for full raw.
+    template_surface_cache: HashMap<(i32, i32), Box<[[u8; 4]; 256]>>,
 }
 
 impl WorldState {
     fn new() -> Self {
-        WorldState { world: None, clipboard: None, undo_stack: VecDeque::new(), redo_stack: VecDeque::new(), temp_path: None }
+        WorldState {
+            world: None,
+            clipboard: None,
+            undo_stack: VecDeque::new(),
+            redo_stack: VecDeque::new(),
+            temp_path: None,
+            template_bytes: None,
+            template_dir: HashMap::new(),
+            template_surface_cache: HashMap::new(),
+        }
     }
 }
 
@@ -1205,6 +1231,18 @@ fn load_world(path: String, state: tauri::State<'_, AppState>) -> Result<WorldMe
     // Capture metadata before moving loaded into state.
     // No render_pixels call — tiles are fetched on demand by the frontend.
     let spawn = read_spawn(&loaded);
+    // Centroid of populated chunks in local block coords (chunk centres). Robust spawn target for
+    // the 3D camera on sparse worlds where the bounding-box centre lands on empty space.
+    let center = {
+        let n = loaded.chunk_map.len();
+        if n == 0 { None } else {
+            let (sx, sy) = loaded.chunk_map.keys().fold((0i64, 0i64), |(ax, ay), &(cx, cy)| {
+                (ax + ((cx - loaded.min_x) as i64 * 16 + 8),
+                 ay + ((cy - loaded.min_y) as i64 * 16 + 8))
+            });
+            Some((sx as f32 / n as f32, sy as f32 / n as f32))
+        }
+    };
     let meta = WorldMeta {
         name:          loaded.name.clone(),
         width_chunks:  loaded.w_chunks,
@@ -1213,6 +1251,10 @@ fn load_world(path: String, state: tauri::State<'_, AppState>) -> Result<WorldMe
         was_compressed: maybe_temp.is_some(),
         spawn_px: spawn.map(|(x, _)| x),
         spawn_py: spawn.map(|(_, y)| y),
+        center_px: center.map(|(x, _)| x),
+        center_py: center.map(|(_, y)| y),
+        abs_min_x: loaded.min_x,
+        abs_min_y: loaded.min_y,
     };
 
     // Step 3: Install new world.
@@ -1344,6 +1386,320 @@ fn describe_selection(
         height: y2 - y1 + 1,
         depth:  z_max - z_min + 1,
     })
+}
+
+// ── Eden.eden template overlay ────────────────────────────────────────────────
+
+/// Decode one column (4 RLE sub-chunks) from Eden.eden into a raw 32768-byte chunk.
+/// Eden.eden voxel order: (lz, ly, lx) i.e. rle_i = lz*256 + ly*16 + lx.
+/// Eden raw storage order: block at band*8192 + lx*256 + ly*16 + lz, paint at +4096.
+fn decode_template_column(data: &[u8], col_offset: usize) -> Option<Box<[u8; 32768]>> {
+    let mut raw = Box::new([0u8; 32768]);
+    let mut pos = col_offset;
+    for band in 0..4usize {
+        if pos + 2 > data.len() { return None; }
+        let size = (data[pos] as usize) * 256 + (data[pos + 1] as usize);
+        if size < 2 || pos + size > data.len() { return None; }
+        let payload = &data[pos + 2..pos + size];
+        pos += size;
+        let band_base = band * 8192;
+        let mut rle_idx: usize = 0;
+        let mut pi = 0usize;
+        while pi + 2 < payload.len() && rle_idx < 4096 {
+            let block = payload[pi];
+            let paint = payload[pi + 1];
+            let count = payload[pi + 2] as usize;
+            pi += 3;
+            for _ in 0..count {
+                if rle_idx >= 4096 { break; }
+                let lz = rle_idx / 256;
+                let ly = (rle_idx % 256) / 16;
+                let lx = rle_idx % 16;
+                let storage = lx * 256 + ly * 16 + lz;
+                raw[band_base + storage] = block;
+                raw[band_base + 4096 + storage] = paint;
+                rle_idx += 1;
+            }
+        }
+    }
+    Some(raw)
+}
+
+/// Decode a column's RLE directly to surface colors: one [r,g,b,a] per (lx*16+ly) position.
+/// Scans bands from highest to lowest; within each band, a later (higher lz) non-air block
+/// overwrites an earlier one. Stops filling positions once all 256 are covered.
+/// Result: a=255 means a block exists at that column, a=0 means the entire column is air.
+fn decode_template_surface(data: &[u8], col_offset: usize, sky: u8) -> Option<Box<[[u8; 4]; 256]>> {
+    let mut surface = Box::new([[0u8; 4]; 256]);
+    let mut filled = 0usize;
+
+    // Collect sub-chunk offsets first (need to iterate bands highest-to-lowest)
+    let mut offsets = [0usize; 4];
+    let mut pos = col_offset;
+    for band in 0..4usize {
+        if pos + 2 > data.len() { return None; }
+        let size = (data[pos] as usize) * 256 + (data[pos + 1] as usize);
+        if size < 2 || pos + size > data.len() { return None; }
+        offsets[band] = pos;
+        pos += size;
+    }
+
+    // Process bands highest to lowest; within a band, last non-air block (highest lz) wins
+    for band in (0..4usize).rev() {
+        let pos0 = offsets[band];
+        let size = (data[pos0] as usize) * 256 + (data[pos0 + 1] as usize);
+        let payload = &data[pos0 + 2..pos0 + size];
+
+        // Scan RLE forward; rle_idx = lz*256 + ly*16 + lx, so lz increases as rle_idx increases.
+        // Overwrite band_top with each non-air block seen, so the last wins (highest lz).
+        let mut band_top = [(0u8, 0u8); 256]; // (block_type, paint) per (lx*16+ly)
+        let mut rle_idx: usize = 0;
+        let mut pi = 0usize;
+        while pi + 2 < payload.len() && rle_idx < 4096 {
+            let block = payload[pi];
+            let paint = payload[pi + 1];
+            let count = payload[pi + 2] as usize;
+            pi += 3;
+            for _ in 0..count {
+                if rle_idx >= 4096 { break; }
+                let ly = (rle_idx % 256) / 16;
+                let lx = rle_idx % 16;
+                if block != 0 {
+                    band_top[lx * 16 + ly] = (block, paint);
+                }
+                rle_idx += 1;
+            }
+        }
+
+        // Merge into surface: only fill positions not already covered by a higher band
+        for pos in 0..256 {
+            let (bt, paint) = band_top[pos];
+            if bt != 0 && surface[pos][3] == 0 {
+                let [r, g, b] = block_color(bt, paint, sky);
+                surface[pos] = [r, g, b, 255];
+                filled += 1;
+                if filled == 256 { break; }
+            }
+        }
+        if filled == 256 { break; }
+    }
+
+    Some(surface)
+}
+
+/// Load an Eden.eden template file. Parses its i32+i32+u64 directory (different from
+/// regular saves which use i16+u16+u32). Stores mmap + directory in WorldState.
+#[tauri::command]
+fn load_eden_template(path: String, state: tauri::State<'_, AppState>) -> Result<u32, String> {
+    let file = fs::File::open(&path).map_err(|e| format!("Cannot open template: {e}"))?;
+    let mmap = unsafe { Mmap::map(&file).map_err(|e| format!("Cannot mmap template: {e}"))? };
+
+    if mmap.len() < 192 {
+        return Err("File too small to be a valid Eden.eden template".into());
+    }
+
+    let dir_offset = u64::from_le_bytes(
+        mmap[32..40].try_into().map_err(|_| "Bad header")?
+    ) as usize;
+
+    if dir_offset >= mmap.len() || (mmap.len() - dir_offset) % 16 != 0 {
+        return Err("Invalid template directory offset".into());
+    }
+
+    let n_entries = (mmap.len() - dir_offset) / 16;
+    let mut template_dir: HashMap<(i32, i32), usize> = HashMap::with_capacity(n_entries);
+    let mut i = dir_offset;
+    while i + 16 <= mmap.len() {
+        let tx = i32::from_le_bytes(mmap[i..i+4].try_into().unwrap());
+        let tz = i32::from_le_bytes(mmap[i+4..i+8].try_into().unwrap());
+        let offset = u64::from_le_bytes(mmap[i+8..i+16].try_into().unwrap()) as usize;
+        if offset < mmap.len() {
+            template_dir.insert((tx, tz), offset);
+        }
+        i += 16;
+    }
+
+    let chunk_count = template_dir.len() as u32;
+    let mut ws = state.lock().unwrap();
+    ws.template_bytes = Some(mmap);
+    ws.template_dir = template_dir;
+    ws.template_surface_cache.clear();
+    Ok(chunk_count)
+}
+
+/// Render a top-down pixel patch from the Eden.eden template, aligned to the loaded world's
+/// coordinate space. Returns RGBA pixels; alpha=0 where no template chunk exists.
+#[tauri::command]
+fn fetch_template_tile(
+    x1: i32, y1: i32, x2: i32, y2: i32,
+    state: tauri::State<'_, AppState>,
+) -> Result<PixelPatch, String> {
+    let mut ws = state.lock().unwrap();
+    if ws.world.is_none() { return Err("No world loaded".into()); }
+    if ws.template_bytes.is_none() { return Err("No template loaded".into()); }
+
+    let min_x = ws.world.as_ref().unwrap().min_x;
+    let min_y = ws.world.as_ref().unwrap().min_y;
+    let sky    = ws.world.as_ref().unwrap().sky;
+    let world_w = (ws.world.as_ref().unwrap().w_chunks * 16) as i32;
+    let world_h = (ws.world.as_ref().unwrap().h_chunks * 16) as i32;
+
+    let x1u = x1.clamp(0, world_w - 1) as u32;
+    let y1u = y1.clamp(0, world_h - 1) as u32;
+    let x2u = x2.clamp(0, world_w - 1) as u32;
+    let y2u = y2.clamp(0, world_h - 1) as u32;
+    let width  = x2u - x1u + 1;
+    let height = y2u - y1u + 1;
+    let mut pixels = vec![0u8; (width * height * 4) as usize];
+
+    // Collect unique chunks needed for this tile and decode missing ones
+    let cx0 = (x1u / 16) as i32 + min_x;
+    let cx1 = (x2u / 16) as i32 + min_x;
+    let cz0 = (y1u / 16) as i32 + min_y;
+    let cz1 = (y2u / 16) as i32 + min_y;
+    for tx in cx0..=cx1 {
+        for tz in cz0..=cz1 {
+            if ws.template_surface_cache.contains_key(&(tx, tz)) { continue; }
+            if let Some(&col_off) = ws.template_dir.get(&(tx, tz)) {
+                if let Some(surf) = decode_template_surface(ws.template_bytes.as_ref().unwrap(), col_off, sky) {
+                    ws.template_surface_cache.insert((tx, tz), surf);
+                }
+            }
+        }
+    }
+
+    for px in x1u..=x2u {
+        for py in y1u..=y2u {
+            let tx = (px / 16) as i32 + min_x;
+            let tz = (py / 16) as i32 + min_y;
+            let lx = (px % 16) as usize;
+            let ly = (py % 16) as usize;
+
+            if let Some(surf) = ws.template_surface_cache.get(&(tx, tz)) {
+                let [r, g, b, a] = surf[lx * 16 + ly];
+                if a == 255 {
+                    let off = (((py - y1u) * width + (px - x1u)) * 4) as usize;
+                    pixels[off] = r; pixels[off+1] = g; pixels[off+2] = b; pixels[off+3] = 255;
+                }
+            }
+        }
+    }
+
+    Ok(PixelPatch { x: x1u, y: y1u, width, height, pixels })
+}
+
+#[derive(Serialize)]
+struct ExpandResult {
+    chunks_added: u32,
+    total_chunks: u32,
+}
+
+/// Bake Eden.eden template chunks into a new world file. Only fills chunks not already edited
+/// by the user. full_extent=true expands to full 180×180 template; false = within current bounds.
+#[tauri::command]
+fn expand_world_from_template(
+    output_path: String,
+    full_extent: bool,
+    app_handle: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<ExpandResult, String> {
+    let ws = state.lock().unwrap();
+    let world = ws.world.as_ref().ok_or("No world loaded")?;
+    if ws.template_bytes.is_none() {
+        return Err("No template loaded".into());
+    }
+
+    let min_x = world.min_x;
+    let min_y = world.min_y;
+    let max_x = min_x + world.w_chunks as i32 - 1;
+    let max_y = min_y + world.h_chunks as i32 - 1;
+    let sky = world.sky;
+    let chunk_size = world.chunk_size;
+    let _ = sky; // used only for rendering
+
+    let tmpl = ws.template_bytes.as_ref().unwrap();
+    let tdir = &ws.template_dir;
+
+    // Collect target template chunks
+    let mut targets: Vec<(i32, i32)> = tdir.keys().copied().filter(|&(tx, tz)| {
+        if full_extent { true }
+        else { tx >= min_x && tx <= max_x && tz >= min_y && tz <= max_y }
+    }).collect();
+    targets.sort_unstable();
+
+    let user_chunks: HashSet<(i32, i32)> = world.chunk_map.keys().copied().collect();
+    let to_add: Vec<(i32, i32)> = targets.into_iter()
+        .filter(|k| !user_chunks.contains(k))
+        .collect();
+    let total = (user_chunks.len() + to_add.len()) as u32;
+    let add_count = to_add.len() as u32;
+
+    // Write output file using BufWriter for performance
+    let out_file = fs::File::create(&output_path)
+        .map_err(|e| format!("Cannot create output file: {e}"))?;
+    let mut writer = BufWriter::with_capacity(4 * 1024 * 1024, out_file);
+
+    // Header: copy from world, will patch directory_offset at the end
+    let header = &world.bytes[..192.min(world.bytes.len())];
+    writer.write_all(header).map_err(|e| format!("Write error: {e}"))?;
+    let mut cur_offset: u64 = 192;
+
+    let mut dir_entries: Vec<(i16, i16, u32)> = Vec::with_capacity(total as usize);
+
+    // Write existing user chunks
+    let mut user_chunk_list: Vec<(i32, i32, usize)> = world.chunk_map.iter()
+        .map(|(&(cx, cy), &off)| (cx, cy, off))
+        .collect();
+    user_chunk_list.sort_unstable_by_key(|&(cx, cy, _)| (cx, cy));
+
+    for (cx, cy, off) in &user_chunk_list {
+        let end = off + chunk_size;
+        if end > world.bytes.len() { continue; }
+        writer.write_all(&world.bytes[*off..end])
+            .map_err(|e| format!("Write error: {e}"))?;
+        dir_entries.push((*cx as i16, *cy as i16, cur_offset as u32));
+        cur_offset += chunk_size as u64;
+    }
+
+    // Write template chunks (decoded from RLE)
+    let template_total = to_add.len();
+    for (i, (tx, tz)) in to_add.iter().enumerate() {
+        if let Some(&col_off) = tdir.get(&(*tx, *tz)) {
+            if let Some(raw) = decode_template_column(tmpl, col_off) {
+                writer.write_all(raw.as_ref())
+                    .map_err(|e| format!("Write error: {e}"))?;
+                dir_entries.push((*tx as i16, *tz as i16, cur_offset as u32));
+                cur_offset += 32768u64;
+            }
+        }
+        if (i + 1) % 500 == 0 || i + 1 == template_total {
+            let pct = ((i + 1) as f64 / template_total as f64 * 100.0) as u32;
+            let _ = app_handle.emit("expand_progress", pct);
+        }
+    }
+
+    // Write directory (standard save format: i16 cx, pad 2, i16 cy, pad 2, u32 off, pad 4)
+    let dir_offset = cur_offset;
+    for (cx, cy, off) in &dir_entries {
+        writer.write_all(&cx.to_le_bytes()).map_err(|e| format!("Write error: {e}"))?;
+        writer.write_all(&[0u8, 0]).map_err(|e| format!("Write error: {e}"))?;
+        writer.write_all(&cy.to_le_bytes()).map_err(|e| format!("Write error: {e}"))?;
+        writer.write_all(&[0u8, 0]).map_err(|e| format!("Write error: {e}"))?;
+        writer.write_all(&off.to_le_bytes()).map_err(|e| format!("Write error: {e}"))?;
+        writer.write_all(&[0u8, 0, 0, 0]).map_err(|e| format!("Write error: {e}"))?;
+    }
+
+    writer.flush().map_err(|e| format!("Flush error: {e}"))?;
+    drop(writer);
+
+    // Patch directory_offset in header (bytes 32–39)
+    let mut f = fs::OpenOptions::new().write(true).open(&output_path)
+        .map_err(|e| format!("Cannot reopen output: {e}"))?;
+    f.seek(SeekFrom::Start(32)).map_err(|e| format!("Seek error: {e}"))?;
+    f.write_all(&dir_offset.to_le_bytes()).map_err(|e| format!("Patch error: {e}"))?;
+    drop(f);
+
+    Ok(ExpandResult { chunks_added: add_count, total_chunks: total })
 }
 
 /// Return a top-down pixel patch for the rectangle (x1,y1)–(x2,y2).
@@ -6634,6 +6990,12 @@ fn get_chunk_geometry(
 ) -> Result<ObjGeometryResult, String> {
     let ws = state.lock().unwrap();
     let world = ws.world.as_ref().ok_or("No world loaded")?;
+    // Defensive: only serve chunks inside the world's chunk grid. Out-of-range indices already scan
+    // to all-air (empty geometry), but bailing early avoids the wasted 16×16×Z probe and documents
+    // the frontend contract (local 0-based chunk indices).
+    if cx < 0 || cy < 0 || cx as u32 >= world.w_chunks || cy as u32 >= world.h_chunks {
+        return Ok(ObjGeometryResult { positions: Vec::new(), colors: Vec::new(), vertex_count: 0 });
+    }
     let sx1 = cx * 16; let sy1 = cy * 16;
     Ok(obj_geometry_region(world, sx1, sy1, sx1 + 15, sy1 + 15, 0, world_max_z(world)))
 }
@@ -7377,6 +7739,9 @@ pub fn run() {
             set_sky_grid,
             get_creatures,
             pick_block_surface,
+            load_eden_template,
+            fetch_template_tile,
+            expand_world_from_template,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
