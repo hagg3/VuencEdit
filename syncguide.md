@@ -98,8 +98,8 @@ git commit -m "add new feature"
 
 # 3. Tag a release (triggers automated build)
 cd ~/VuencEdit
-git tag v1.3.0
-git push origin v1.3.0
+git tag v0.8.0
+git push origin v0.8.0
 ```
 
 ---

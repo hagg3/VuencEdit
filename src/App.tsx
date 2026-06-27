@@ -5,7 +5,6 @@ import { getVersion } from "@tauri-apps/api/app";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import MapCanvas, { type Tool, type SelectionBounds, type PixelPatch, type MapCanvasRef } from "./MapCanvas";
-import { BLOCK_DEFS, PAINT_COLORS, resolveColor, blockDisplayName } from "./blockDefs";
 import SelectionInspector from "./SelectionInspector";
 import ElevationPreviewPanel from "./ElevationPreviewPanel";
 import SliceViewport from "./SliceViewport";
@@ -17,8 +16,10 @@ import WorldBrowserModal from "./WorldBrowserModal";
 import UploadModal from "./UploadModal";
 import NewWorldModal from "./NewWorldModal";
 import SchematicImportModal, { type SchematicInfo, type MappingEntry } from "./SchematicImportModal";
-import BlockPaintPicker from "./BlockPaintPicker";
+import Ribbon, { RIBBON_HEIGHT_COLLAPSED, TAB_BAR_HEIGHT, DEFAULT_BODY_HEIGHT } from "./Ribbon";
 import SettingsModal, { loadSettings, saveSettings } from "./SettingsModal";
+import { decodeAtlas, type AtlasData, type TexturePackRaw, clearSwatchCache } from "./texturePack";
+import { blockDisplayName } from "./blockDefs";
 import appIcon from "./assets/app-icon.png";
 import "./App.css";
 
@@ -95,48 +96,6 @@ function timeAgo(ts: number): string {
   return new Date(ts).toLocaleDateString(undefined, { month: "short", day: "numeric" });
 }
 
-// ── shared styles ────────────────────────────────────────────────────────────
-
-const overlayBtn: React.CSSProperties = {
-  background: "rgba(0,0,0,0.6)",
-  border: "1px solid #475569",
-  color: "#e2e8f0",
-  padding: "5px 13px",
-  borderRadius: 6,
-  cursor: "pointer",
-  fontSize: 13,
-  lineHeight: "20px",
-};
-
-const overlayBtnActive: React.CSSProperties = {
-  ...overlayBtn,
-  background: "rgba(59,130,246,0.5)",
-  borderColor: "#3b82f6",
-};
-
-const menuItem: React.CSSProperties = {
-  display: "block", width: "100%", textAlign: "left",
-  background: "none", border: "none", color: "#e2e8f0",
-  padding: "6px 14px", fontSize: 13, cursor: "pointer",
-  lineHeight: "18px",
-};
-
-const menuDivider: React.CSSProperties = {
-  height: 1, background: "#1e293b", margin: "3px 0",
-};
-
-const zInput: React.CSSProperties = {
-  width: 54,
-  background: "rgba(0,0,0,0.5)",
-  border: "1px solid #475569",
-  color: "#e2e8f0",
-  borderRadius: 4,
-  padding: "2px 5px",
-  fontSize: 13,
-  textAlign: "center",
-  outline: "none",
-};
-
 // ── component ────────────────────────────────────────────────────────────────
 
 function App() {
@@ -149,19 +108,42 @@ function App() {
   const [exporting, setExporting] = useState(false);
   const [exportProgress, setExportProgress] = useState<number | null>(null);
   const [exportingObj, setExportingObj] = useState(false);
+  const [exportingJson, setExportingJson] = useState(false);
+  const [exportingVox, setExportingVox] = useState(false);
+  const [voxProgress, setVoxProgress] = useState<{ phase: string; pct: number } | null>(null);
   const [saving, setSaving] = useState(false);
   const [saveCompressed, setSaveCompressed] = useState(() => loadSettings().defaultSaveCompressed);
-  const [fileMenuOpen, setFileMenuOpen] = useState(false);
-  const [showRecentSubmenu, setShowRecentSubmenu] = useState(false);
   const [recentWorlds, setRecentWorlds] = useState<RecentWorld[]>(() => {
     try { return JSON.parse(localStorage.getItem(RECENT_WORLDS_KEY) ?? "[]"); }
     catch { return []; }
   });
-  const fileMenuRef = useRef<HTMLDivElement>(null);
-  const [viewMenuOpen, setViewMenuOpen] = useState(false);
-  const viewMenuRef = useRef<HTMLDivElement>(null);
+  const [ribbonCollapsed, setRibbonCollapsed] = useState(() => {
+    try { return localStorage.getItem("ribbon_collapsed") === "true"; } catch { return false; }
+  });
+  const [ribbonBodyHeight, setRibbonBodyHeight] = useState(() => {
+    try { return parseInt(localStorage.getItem("ribbon_body_height") ?? String(DEFAULT_BODY_HEIGHT), 10) || DEFAULT_BODY_HEIGHT; } catch { return DEFAULT_BODY_HEIGHT; }
+  });
+  const effectiveRibbonHeight = ribbonCollapsed ? RIBBON_HEIGHT_COLLAPSED : TAB_BAR_HEIGHT + ribbonBodyHeight + 4;
   const [undoDepth, setUndoDepth] = useState(0);
   const [redoDepth, setRedoDepth] = useState(0);
+
+  // Status bar: cursor world position and FPS
+  const [cursorPos, setCursorPos] = useState<{wx:number;wy:number}|null>(null);
+  const [cursorBlock, setCursorBlock] = useState<{z:number;bt:number;paint:number}|null>(null);
+  const [ctxMenu, setCtxMenu] = useState<{wx:number;wy:number;x:number;y:number}|null>(null);
+  const cursorPosThrottleRef = useRef<ReturnType<typeof setTimeout>|null>(null);
+  const [fps, setFps] = useState(0);
+  useEffect(() => {
+    let frames = 0; let last = performance.now();
+    let rafId: number;
+    const tick = (now: number) => {
+      frames++;
+      if (now - last >= 1000) { setFps(Math.round(frames * 1000 / (now - last))); frames = 0; last = now; }
+      rafId = requestAnimationFrame(tick);
+    };
+    rafId = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(rafId);
+  }, []);
   const [tool, setTool] = useState<Tool>("pan");
   const prevToolRef = useRef<Tool>("pan");
   const [wandMatchPaint, setWandMatchPaint] = useState(true);
@@ -171,8 +153,6 @@ function App() {
   const [showHelp, setShowHelp] = useState(false);
   const [showAbout, setShowAbout] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
-  const [helpMenuOpen, setHelpMenuOpen] = useState(false);
-  const helpMenuRef = useRef<HTMLDivElement>(null);
   const [appVersion, setAppVersion] = useState("…");
   useEffect(() => { getVersion().then(setAppVersion); }, []);
   const [showSlicePanels, setShowSlicePanels] = useState(() => loadSettings().defaultQuadView);
@@ -205,6 +185,11 @@ function App() {
   const [expandProgress, setExpandProgress] = useState(0);
   const [expandResult, setExpandResult] = useState<{ chunksAdded: number; totalChunks: number } | null>(null);
 
+  // Texture pack state
+  const [texturePackPath, setTexturePackPath] = useState<string | null>(() => loadSettings().texturePackPath);
+  const [texturePackInfo, setTexturePackInfo] = useState<AtlasData | null>(null);
+  const [texEpoch, setTexEpoch] = useState(0);
+
   const [renamingWorld, setRenamingWorld] = useState(false);
   const [renameInput, setRenameInput] = useState("");
   const renameInputRef = useRef<HTMLInputElement>(null);
@@ -221,7 +206,7 @@ function App() {
   // World bounds of the most recent edit (top-down X/Y) — lets slabs skip refetch if untouched.
   const [lastEditBounds, setLastEditBounds] = useState<{ x: number; y: number; w: number; h: number } | null>(null);
 
-  const [extrudeCount, setExtrudeCount] = useState(2);
+  const [extrudeCount, setExtrudeCount] = useState(0);
   const [extrudeAxis, setExtrudeAxis]   = useState<ExtrudeAxis>("z+");
   const [extrudeOpen, setExtrudeOpen]   = useState(false);
 
@@ -239,10 +224,6 @@ function App() {
   const [maskBlockType, setMaskBlockType] = useState<number | null>(null);
   const [maskPaint,     setMaskPaint]     = useState<number | null>(null);
 
-  // Bottom-left panel collapse state
-  const [fillPickerOpen, setFillPickerOpen] = useState(false);
-  const [replaceOpen, setReplaceOpen] = useState(false);
-
   // Hotbar: 5 pinned + 5 recent block+paint combos
   const [pinnedBlocks, setPinnedBlocks] = useState<({type: number; paint: number} | null)[]>(Array(5).fill(null));
   const [recentBlocks, setRecentBlocks] = useState<{type: number; paint: number}[]>([]);
@@ -251,7 +232,6 @@ function App() {
 
   // Paste mode: normal | scatter | array
   const [pasteMode, setPasteMode] = useState<"normal" | "scatter" | "array">("normal");
-  const [advancedPasteOpen, setAdvancedPasteOpen] = useState(false);
   const [scatterCount, setScatterCount] = useState(5);
   const [arrayCols, setArrayCols] = useState(3);
   const [arrayRows, setArrayRows] = useState(3);
@@ -259,6 +239,12 @@ function App() {
   const [arraySpacingY, setArraySpacingY] = useState(0);
 
   const [clipboardPreviewPixels, setClipboardPreviewPixels] = useState<{ width: number; height: number; pixels: Uint8Array } | null>(null);
+
+  // Tree generation state (lifted from SelectionInspector so Ribbon can render the tree UI)
+  const [treeTypes, setTreeTypes] = useState<string[]>(["normal"]);
+  const [treeDensity, setTreeDensity] = useState(20);
+  const [leafPaints, setLeafPaints] = useState<number[]>([0, 22, 31, 40]);
+  const [smartPlacement, setSmartPlacement] = useState(true);
 
   // Repeat-paste trail: track last paste position + step vector for path preview and `.` shortcut.
   const [lastPasteDelta, setLastPasteDelta] = useState<{ dx: number; dy: number } | null>(null);
@@ -305,6 +291,21 @@ function App() {
 
   const viewModeRef = useRef<"topdown" | "zslice">("topdown");
   useEffect(() => { viewModeRef.current = viewMode; }, [viewMode]);
+
+  // Dismiss context menu on any outside click.
+  // Delay registration to avoid macOS right-click pointerdown firing after contextmenu.
+  useEffect(() => {
+    if (!ctxMenu) return;
+    let handler: (() => void) | null = null;
+    const timer = setTimeout(() => {
+      handler = () => setCtxMenu(null);
+      document.addEventListener("mousedown", handler);
+    }, 80);
+    return () => {
+      clearTimeout(timer);
+      if (handler) document.removeEventListener("mousedown", handler);
+    };
+  }, [ctxMenu]);
   const renderModeRef = useRef<"tiled" | "full" | "axo">("tiled");
   useEffect(() => { renderModeRef.current = renderMode; }, [renderMode]);
   const zSliceZRef = useRef(32);
@@ -330,7 +331,7 @@ function App() {
     if (rawBounds) {
       const { x1, y1, x2, y2 } = rawBounds;
       ovs.push({ min: [x1, zMin, y1], max: [x2 + 1, zMax + 1, y2 + 1], color: 0x3b82f6 });
-      if (extrudeOpen) {
+      if (extrudeOpen && extrudeCount > 0) {
         const w = x2 - x1 + 1, h = y2 - y1 + 1, d = zMax - zMin + 1;
         for (let i = 1; i <= extrudeCount; i++) {
           let ox = 0, oy = 0, oz = 0;
@@ -608,6 +609,57 @@ function App() {
     }
   }
 
+  async function exportJson() {
+    if (!world) return;
+    const defaultName = selection ? `${world.name}_selection.json.gz` : `${world.name}.json.gz`;
+    const savePath = await save({
+      filters: [{ name: "Gzipped JSON", extensions: ["json.gz", "gz"] }],
+      defaultPath: defaultName,
+    });
+    if (!savePath) return;
+    const x1 = selection ? selection.x1 : 0;
+    const y1 = selection ? selection.y1 : 0;
+    const x2 = selection ? selection.x2 : world.width_chunks * 16 - 1;
+    const y2 = selection ? selection.y2 : world.height_chunks * 16 - 1;
+    const zMin = selection ? selection.z_min : 0;
+    const zMax = selection ? selection.z_max : world.max_z;
+    setExportingJson(true);
+    try {
+      await invoke("export_json", { path: savePath, x1, y1, x2, y2, zMin, zMax });
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setExportingJson(false);
+    }
+  }
+
+  // VOX export hidden pending better test coverage — prefixed to silence TS unused warning
+  const _exportVox = async () => {
+    if (!world) return;
+    const defaultName = selection ? `${world.name}_selection.vox` : `${world.name}.vox`;
+    const savePath = await save({
+      filters: [{ name: "MagicaVoxel VOX", extensions: ["vox"] }],
+      defaultPath: defaultName,
+    });
+    if (!savePath) return;
+    const x1 = selection ? selection.x1 : 0;
+    const y1 = selection ? selection.y1 : 0;
+    const x2 = selection ? selection.x2 : world.width_chunks * 16 - 1;
+    const y2 = selection ? selection.y2 : world.height_chunks * 16 - 1;
+    const zMin = selection ? selection.z_min : 0;
+    const zMax = selection ? selection.z_max : world.max_z;
+    setExportingVox(true);
+    setVoxProgress({ phase: "Starting…", pct: 0 });
+    try {
+      await invoke("export_vox", { path: savePath, x1, y1, x2, y2, zMin, zMax });
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setExportingVox(false);
+      setVoxProgress(null);
+    }
+  }; void _exportVox;
+
   function commitZSlice(z: number) {
     setZSliceZ(z);
     setZSliceDisplay(z);
@@ -618,6 +670,7 @@ function App() {
     try {
       const info = await invoke<ClipboardInfo>("copy_selection", { ...rawBounds, zMin, zMax });
       setClipboard(info);
+      setTool("paste");
     } catch (e) {
       setError(String(e));
     }
@@ -764,6 +817,16 @@ function App() {
 
   function handleCursorMove(wx: number, wy: number) {
     cursorWorldRef.current = { wx, wy };
+    if (cursorPosThrottleRef.current === null) {
+      cursorPosThrottleRef.current = setTimeout(() => {
+        cursorPosThrottleRef.current = null;
+        const { wx: cx, wy: cy } = cursorWorldRef.current!;
+        setCursorPos({ wx: cx, wy: cy });
+        invoke<[number,number,number] | null>("get_cursor_block", { wx: Math.floor(cx), wy: Math.floor(cy) })
+          .then(r => setCursorBlock(r ? { z: r[0], bt: r[1], paint: r[2] } : null))
+          .catch(() => {});
+      }, 80);
+    }
     if (!followSurfaceRef.current || viewModeRef.current !== "zslice") return;
     if (cursorMoveThrottleRef.current !== null) return;
     cursorMoveThrottleRef.current = setTimeout(() => {
@@ -953,41 +1016,42 @@ function App() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [world, showHelp, handleUndo, handleRedo, clipboard, sourcePath, copySelection, saveWorld, saveWorldAs]);
 
-  // Close menus when clicking outside them.
-  useEffect(() => {
-    if (!fileMenuOpen) { setShowRecentSubmenu(false); return; }
-    function handleOutside(e: MouseEvent) {
-      if (fileMenuRef.current && !fileMenuRef.current.contains(e.target as Node)) {
-        setFileMenuOpen(false);
-      }
-    }
-    document.addEventListener("mousedown", handleOutside);
-    return () => document.removeEventListener("mousedown", handleOutside);
-  }, [fileMenuOpen]);
-
-  useEffect(() => {
-    if (!viewMenuOpen) return;
-    function handleOutside(e: MouseEvent) {
-      if (viewMenuRef.current && !viewMenuRef.current.contains(e.target as Node)) {
-        setViewMenuOpen(false);
-      }
-    }
-    document.addEventListener("mousedown", handleOutside);
-    return () => document.removeEventListener("mousedown", handleOutside);
-  }, [viewMenuOpen]);
-
-  useEffect(() => {
-    if (!helpMenuOpen) return;
-    function handleOutside(e: MouseEvent) {
-      if (helpMenuRef.current && !helpMenuRef.current.contains(e.target as Node)) {
-        setHelpMenuOpen(false);
-      }
-    }
-    document.addEventListener("mousedown", handleOutside);
-    return () => document.removeEventListener("mousedown", handleOutside);
-  }, [helpMenuOpen]);
+  // Menu close effects handled inside Ribbon component
 
   // Template overlay helpers
+  async function loadTexturePackFile(path: string) {
+    try {
+      const raw = await invoke<TexturePackRaw>("load_texture_pack", { path });
+      const atlas = decodeAtlas(raw);
+      clearSwatchCache();
+      setTexturePackInfo(atlas);
+      setTexturePackPath(path);
+      setTexEpoch(e => e + 1);
+      saveSettings({ texturePackPath: path });
+    } catch (e) { setError(String(e)); }
+  }
+
+  async function openTexturePackFile() {
+    const selected = await open({ filters: [{ name: "Texture Pack", extensions: ["zip"] }] });
+    if (!selected || Array.isArray(selected)) return;
+    await loadTexturePackFile(selected);
+  }
+
+  function unloadTexturePack() {
+    invoke("unload_texture_pack").catch(() => {});
+    clearSwatchCache();
+    setTexturePackInfo(null);
+    setTexturePackPath(null);
+    setTexEpoch(e => e + 1);
+    saveSettings({ texturePackPath: null });
+  }
+
+  // Auto-load texture pack from settings on startup
+  useEffect(() => {
+    if (texturePackPath) loadTexturePackFile(texturePackPath);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   async function loadTemplateFile(path: string) {
     try {
       await invoke<number>("load_eden_template", { path });
@@ -1008,6 +1072,14 @@ function App() {
   useEffect(() => {
     const unlisten = listen<number>("expand_progress", (e) => {
       setExpandProgress(e.payload);
+    });
+    return () => { unlisten.then(f => f()); };
+  }, []);
+
+  // VOX export progress event listener
+  useEffect(() => {
+    const unlisten = listen<{ phase: string; pct: number }>("vox-progress", (e) => {
+      setVoxProgress(e.payload);
     });
     return () => { unlisten.then(f => f()); };
   }, []);
@@ -1154,6 +1226,39 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
     setZMax(Math.max(v, zMin));
   }
 
+  function closeWorld() {
+    setWorld(null);
+    setSourcePath(null);
+    setRawBounds(null);
+    setClipboard(null);
+    setUndoDepth(0);
+    setRedoDepth(0);
+    setTool("pan");
+    setSpawnPos(null);
+    setTemplateLoaded(false);
+    setShowTemplateOverlay(false);
+  }
+
+  async function setSpawnAtSelection() {
+    if (!selection) return;
+    const cx = Math.round((selection.x1 + selection.x2) / 2);
+    const cy = Math.round((selection.y1 + selection.y2) / 2);
+    try {
+      await invoke("set_spawn_pos", { px: cx, py: cy });
+      setSpawnPos({ px: cx, py: cy });
+    } catch (e) { setError(String(e)); }
+  }
+
+  async function onRenameBlur(trimmed: string) {
+    if (trimmed && world && trimmed !== world.name) {
+      try {
+        await invoke("rename_world", { name: trimmed });
+        setWorld(w => w ? { ...w, name: trimmed } : null);
+      } catch (e) { setError(String(e)); }
+    }
+    setRenamingWorld(false);
+  }
+
   const pastePreviewSelection: SelectionInfo | null =
     lockedPastePos && clipboard
       ? {
@@ -1169,15 +1274,8 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
         }
       : null;
 
-  type DrawToolKey = "pen" | "brush" | "rect" | "ellipse";
-  type SculptToolKey = "smooth" | "noise" | "flatten" | "erode";
-  const drawToolIcons: Record<DrawToolKey, string> = { pen: "✏", brush: "⬟", rect: "□", ellipse: "○" };
-  const drawToolNames: Record<DrawToolKey, string> = { pen: "Pen", brush: "Brush", rect: "Rect", ellipse: "Ellipse" };
-  const sculptToolIcons: Record<SculptToolKey, string> = { smooth: "〰", noise: "⛰", flatten: "▬", erode: "~" };
-  const sculptToolNames: Record<SculptToolKey, string> = { smooth: "Smooth", noise: "Noise", flatten: "Flatten", erode: "Erode" };
   const isSculptTool = tool === "smooth" || tool === "noise" || tool === "flatten" || tool === "erode";
   const isDrawTool = tool === "pen" || tool === "brush" || tool === "rect" || tool === "ellipse" || isSculptTool || tool === "fill";
-  const swatchColor = resolveColor(fillBlockType, fillPaint);
 
   const mapPaneEl = world ? (
     <MapCanvas
@@ -1202,7 +1300,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
       onDrawStroke={handleDrawStroke}
       drawZOverride={viewMode === "zslice" ? zSliceZ : null}
       extrudePreview={
-        extrudeOpen && rawBounds && (extrudeAxis.startsWith("x") || extrudeAxis.startsWith("y"))
+        extrudeOpen && extrudeCount > 0 && rawBounds && (extrudeAxis.startsWith("x") || extrudeAxis.startsWith("y"))
           ? { axis: extrudeAxis, count: extrudeCount }
           : null
       }
@@ -1216,7 +1314,56 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
       cameraPos3d={showSlicePanels && enable3dPane ? cam3dPos : null}
       onSetCamera3d={showSlicePanels && enable3dPane ? (wx, wy) => flyView3dRef.current?.teleport(wx, wy) : undefined}
       showTemplateOverlay={showTemplateOverlay && templateLoaded}
+      onMapContextMenu={(wx, wy, x, y) => setCtxMenu({ wx, wy, x, y })}
     />
+  ) : null;
+
+  // Status bar element — computed outside JSX so TypeScript narrows `world` properly
+  const statusBarEl = world ? (
+    <div style={{
+      position: "fixed", bottom: 0, left: 0, right: 0, height: 20, zIndex: 150,
+      background: "linear-gradient(to bottom, #081020, #060c18)",
+      borderTop: "1px solid #1a2540",
+      display: "flex", alignItems: "center",
+      fontSize: 10, color: "#475569", userSelect: "none",
+      fontVariantNumeric: "tabular-nums",
+    }}>
+      <div style={{ padding: "0 10px", borderRight: "1px solid #1a2540", color: "#334155", whiteSpace: "nowrap" }}>
+        {world.name}
+      </div>
+      <div style={{ padding: "0 10px", borderRight: "1px solid #1a2540", whiteSpace: "nowrap" }}>
+        {world.width_chunks * 16}×{world.height_chunks * 16}
+        <span style={{ color: world.max_z === 255 ? "#6d28d9" : "#1e3a5f", marginLeft: 6 }}>
+          {world.max_z === 255 ? "256z" : "64z"}
+        </span>
+      </div>
+      <div style={{ padding: "0 10px", borderRight: "1px solid #1a2540", minWidth: 100, whiteSpace: "nowrap" }}>
+        {cursorPos
+          ? <>X <span style={{ color: "#64748b" }}>{Math.round(cursorPos.wx)}</span>{"  "}Y <span style={{ color: "#64748b" }}>{Math.round(cursorPos.wy)}</span></>
+          : <span style={{ color: "#1e293b" }}>X — Y —</span>
+        }
+      </div>
+      {cursorBlock && (
+        <div style={{ padding: "0 10px", borderRight: "1px solid #1a2540", whiteSpace: "nowrap" }}>
+          Z <span style={{ color: "#64748b" }}>{cursorBlock.z}</span>
+          {"  "}<span style={{ color: "#475569" }}>{blockDisplayName(cursorBlock.bt)}{cursorBlock.paint > 0 ? <span style={{ color: "#334155" }}> #{cursorBlock.paint}</span> : null}</span>
+        </div>
+      )}
+      {selection && (
+        <div style={{ padding: "0 10px", borderRight: "1px solid #1a2540", color: "#4b6280", whiteSpace: "nowrap" }}>
+          Sel <span style={{ color: "#64748b" }}>{selection.width}×{selection.height}</span>
+          {" · Z "}<span style={{ color: "#4b6280" }}>{selection.z_min}–{selection.z_max}</span>
+        </div>
+      )}
+      <div style={{ padding: "0 10px", borderRight: "1px solid #1a2540", whiteSpace: "nowrap" }}>
+        ↩ <span style={{ color: "#334155" }}>{undoDepth}</span>
+        {"  "}↪ <span style={{ color: "#334155" }}>{redoDepth}</span>
+      </div>
+      <div style={{ flex: 1 }} />
+      <div style={{ padding: "0 10px", borderLeft: "1px solid #1a2540", color: "#2d4060", whiteSpace: "nowrap" }}>
+        {fps} fps
+      </div>
+    </div>
   ) : null;
 
   if (world) {
@@ -1226,7 +1373,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
     const sliceSel = pastePreviewSelection
       ?? (rawBounds ? { x1: rawBounds.x1, y1: rawBounds.y1, x2: rawBounds.x2, y2: rawBounds.y2, z_min: zMin, z_max: zMax } : null);
     const sliceSelZ = sliceSel ? { min: sliceSel.z_min, max: sliceSel.z_max } : null;
-    const sliceExtrudeCount = sliceIsPaste ? 0 : (extrudeOpen ? extrudeCount : 0);
+    const sliceExtrudeCount = sliceIsPaste ? 0 : (extrudeOpen && extrudeCount > 0 ? extrudeCount : 0);
     const sliceZResize = sliceIsPaste ? undefined : (a: number, b: number) => { setZMin(a); setZMax(b); };
     const sliceHResizeFront = sliceIsPaste ? undefined : (lo: number, hi: number) => setRawBounds(rb => rb ? { ...rb, x1: lo, x2: hi } : rb);
     const sliceHResizeSide = sliceIsPaste ? undefined : (lo: number, hi: number) => setRawBounds(rb => rb ? { ...rb, y1: lo, y2: hi } : rb);
@@ -1267,7 +1414,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           // Quad view: the real top-down map (top-left) + Front / Side slices + 3D placeholder.
           // Top strip is left clear for the floating menu/toolbar chrome.
           <div style={{
-            position: "absolute", inset: 0, paddingTop: 50,
+            position: "absolute", inset: 0, paddingTop: effectiveRibbonHeight,
             display: "grid", gridTemplateColumns: "1fr 1fr", gridTemplateRows: "1fr 1fr",
             gap: 2, background: "#0a0f1e",
           }}>
@@ -1314,13 +1461,15 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
                       onFlyModeChange={(a) => { flyActiveRef.current = a; }}
                       onCameraMove={(wx, wy) => setCam3dPos({ x: wx, y: wy })}
                       overlays3d={overlays3d}
+                      texturePack={texturePackInfo}
+                      texEpoch={texEpoch}
                     />
                   </ErrorBoundary>
                   <button
                     onClick={() => setEnable3dPane(false)}
                     title="Disable the 3D pane (saves performance)"
                     style={{
-                      position: "absolute", top: 4, right: 6, zIndex: 2,
+                      position: "absolute", top: 36, right: 6, zIndex: 2,
                       background: "rgba(15,23,42,0.85)", color: "#94a3b8", border: "1px solid #334155",
                       borderRadius: 4, padding: "1px 7px", fontSize: 11, cursor: "pointer",
                     }}
@@ -1352,1303 +1501,186 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           </div>
         ) : mapPaneEl}
 
-        {/* Top-left: world info + inline rename */}
-        <div style={{
-          position: "absolute", top: 12, left: 12,
-          background: "rgba(0,0,0,0.6)", padding: "5px 12px",
-          borderRadius: 6, fontSize: 13, userSelect: "none",
-          display: "flex", alignItems: "center", gap: 0,
-        }}>
-          {renamingWorld ? (
-            <input
-              ref={renameInputRef}
-              value={renameInput}
-              onChange={e => {
-                // Filter to allowed chars: A-Za-z0-9, space, and apostrophe, max 32
-                const filtered = e.target.value
-                  .split("").filter(c => /[A-Za-z0-9' ]/.test(c)).join("")
-                  .slice(0, 32);
-                setRenameInput(filtered);
-              }}
-              onKeyDown={async e => {
-                if (e.key === "Enter") {
-                  e.currentTarget.blur();
-                } else if (e.key === "Escape") {
-                  setRenamingWorld(false);
-                }
-              }}
-              onBlur={async () => {
-                const trimmed = renameInput.trim();
-                if (trimmed && trimmed !== world.name) {
-                  try {
-                    await invoke("rename_world", { name: trimmed });
-                    setWorld(w => w ? { ...w, name: trimmed } : null);
-                  } catch (e) { setError(String(e)); }
-                }
-                setRenamingWorld(false);
-              }}
-              style={{
-                background: "rgba(255,255,255,0.08)",
-                border: "1px solid #3b82f6",
-                borderRadius: 4,
-                color: "#e2e8f0",
-                fontSize: 13,
-                fontWeight: 700,
-                padding: "0 5px",
-                outline: "none",
-                width: `${Math.max(80, renameInput.length * 8 + 20)}px`,
-              }}
-              autoFocus
-            />
-          ) : (
-            <strong
-              onClick={() => { setRenameInput(world.name); setRenamingWorld(true); }}
-              style={{
-                cursor: "text",
-                pointerEvents: "auto",
-                borderBottom: "1px dashed rgba(255,255,255,0.2)",
-              }}
-              title="Click to rename world"
-            >
-              {world.name}
-            </strong>
-          )}
-          <span style={{ marginLeft: 10, color: "#94a3b8", pointerEvents: "none" }}>
-            {world.width_chunks}×{world.height_chunks} chunks
-          </span>
-          {viewMode === "zslice" && (
-            <span style={{ marginLeft: 10, color: "#7dd3fc", pointerEvents: "none" }}>z={zSliceZ}</span>
-          )}
-          <span style={{
-            marginLeft: 10, fontSize: 11, pointerEvents: "none",
-            color: world.max_z === 255 ? "#a78bfa" : "#64748b",
-          }}>
-            {world.max_z === 63 ? "Legacy format"
-              : world.max_z === 255 ? "New Dawn format"
-              : "Unknown format"}
-          </span>
-        </div>
 
-        {/* Top-center: tool buttons + z-slice slider */}
-        <div style={{
-          position: "absolute", top: 12,
-          left: "50%", transform: "translateX(-50%)",
-          display: "flex", flexDirection: "column", alignItems: "center", gap: 4,
-        }}>
-          <div style={{ display: "flex", gap: 4 }}>
-            <button onClick={() => setTool("pan")} style={tool === "pan" ? overlayBtnActive : overlayBtn}>Pan</button>
-            <button onClick={() => setTool("select")} style={tool === "select" ? overlayBtnActive : overlayBtn}>⬚ Select</button>
-            <button onClick={() => setTool("wand")} title="Magic Wand — click to flood-select matching surface blocks (W)" style={tool === "wand" ? { ...overlayBtnActive, borderColor: "#a78bfa", color: "#c4b5fd" } : overlayBtn}>
-              Wand
-            </button>
-            <div style={{ width: 1, background: "#334155", margin: "0 2px" }} />
-            <button
-              onClick={() => { if (!isDrawTool) setTool("pen"); }}
-              style={isDrawTool
-                ? { ...overlayBtnActive, borderColor: isSculptTool ? "#fb923c" : tool === "fill" ? "#34d399" : "#f472b6", color: isSculptTool ? "#fdba74" : tool === "fill" ? "#6ee7b7" : "#fbcfe8" }
-                : overlayBtn}
-              title="Drawing tools (P/B/R/E/F)"
-            >
-              {isSculptTool ? `${sculptToolIcons[tool as SculptToolKey]} ${sculptToolNames[tool as SculptToolKey]}`
-                : tool === "fill" ? "Fill"
-                : isDrawTool ? `${drawToolIcons[tool as DrawToolKey]} ${drawToolNames[tool as DrawToolKey]}`
-                : "Draw"}
-              {isDrawTool && !isSculptTool && tool !== "fill" && (
-                <span style={{
-                  marginLeft: 4, fontSize: 10, fontWeight: 700,
-                  color: drawAbove ? "#fcd34d" : "#6ee7b7",
-                  background: drawAbove ? "rgba(252,211,77,0.15)" : "rgba(110,231,183,0.12)",
-                  border: `1px solid ${drawAbove ? "rgba(252,211,77,0.4)" : "rgba(110,231,183,0.35)"}`,
-                  borderRadius: 3, padding: "0 3px", lineHeight: "14px",
-                }}>{drawAbove ? "+1" : "surf"}</span>
-              )}
-            </button>
+        <Ribbon
+          world={world}
+          appVersion={appVersion}
+          renamingWorld={renamingWorld}
+          renameInput={renameInput}
+          renameInputRef={renameInputRef}
+          setRenamingWorld={setRenamingWorld}
+          setRenameInput={setRenameInput}
+          onRenameBlur={onRenameBlur}
+          tool={tool}
+          setTool={setTool}
+          isDrawTool={isDrawTool}
+          isSculptTool={isSculptTool}
+          wandMatchPaint={wandMatchPaint}
+          setWandMatchPaint={setWandMatchPaint}
+          undoDepth={undoDepth}
+          redoDepth={redoDepth}
+          handleUndo={handleUndo}
+          handleRedo={handleRedo}
+          brushSize={brushSize}
+          setBrushSize={setBrushSize}
+          brushShape={brushShape}
+          setBrushShape={setBrushShape}
+          drawFilled={drawFilled}
+          setDrawFilled={setDrawFilled}
+          drawAbove={drawAbove}
+          setDrawAbove={setDrawAbove}
+          sculptStrength={sculptStrength}
+          setSculptStrength={setSculptStrength}
+          prevToolRef={prevToolRef}
+          fillBlockType={fillBlockType}
+          fillPaint={fillPaint}
+          setFillBlockType={setFillBlockType}
+          setFillPaint={setFillPaint}
+          pinnedBlocks={pinnedBlocks}
+          recentBlocks={recentBlocks}
+          hotbarHover={hotbarHover}
+          setPinnedBlocks={setPinnedBlocks}
+          setHotbarHover={setHotbarHover}
+          maskEnabled={maskEnabled}
+          setMaskEnabled={setMaskEnabled}
+          maskBlockType={maskBlockType}
+          setMaskBlockType={setMaskBlockType}
+          maskPaint={maskPaint}
+          setMaskPaint={setMaskPaint}
+          zMin={zMin}
+          zMax={zMax}
+          handleZMin={handleZMin}
+          handleZMax={handleZMax}
+          viewMode={viewMode}
+          setViewMode={setViewMode}
+          zSliceZ={zSliceZ}
+          zSliceDisplay={zSliceDisplay}
+          setZSliceDisplay={setZSliceDisplay}
+          commitZSlice={commitZSlice}
+          followSurface={followSurface}
+          setFollowSurface={setFollowSurface}
+          renderMode={renderMode}
+          setRenderMode={setRenderMode}
+          axoSkew={axoSkew}
+          setAxoSkew={setAxoSkew}
+          showSlicePanels={showSlicePanels}
+          setShowSlicePanels={setShowSlicePanels}
+          enable3dPane={enable3dPane}
+          setEnable3dPane={setEnable3dPane}
+          onFitMap={() => mapCanvasRef.current?.resetView()}
+          templateLoaded={templateLoaded}
+          templatePath={templatePath}
+          showTemplateOverlay={showTemplateOverlay}
+          setShowTemplateOverlay={setShowTemplateOverlay}
+          openTemplateFile={openTemplateFile}
+          texturePackLoaded={texturePackInfo !== null}
+          texturePackPath={texturePackPath}
+          texturePack={texturePackInfo}
+          openTexturePackFile={openTexturePackFile}
+          unloadTexturePack={unloadTexturePack}
+          spawnPos={spawnPos}
+          onSetSpawnAtSelection={setSpawnAtSelection}
+          selection={selection}
+          rawBounds={rawBounds}
+          setRawBounds={setRawBounds}
+          copySelection={copySelection}
+          deleteBlocks={deleteBlocks}
+          fillSelection={fillSelection}
+          filterBlockType={filterBlockType}
+          filterPaint={filterPaint}
+          filterInvert={filterInvert}
+          setFilterBlockType={setFilterBlockType}
+          setFilterPaint={setFilterPaint}
+          setFilterInvert={setFilterInvert}
+          clipboard={clipboard}
+          pasteElevationOffset={pasteElevationOffset}
+          setPasteElevationOffset={setPasteElevationOffset}
+          pasteIgnoreAir={pasteIgnoreAir}
+          setPasteIgnoreAir={setPasteIgnoreAir}
+          pasteTerrain={pasteTerrain}
+          setPasteTerrain={setPasteTerrain}
+          pasteTerrainAbove={pasteTerrainAbove}
+          setPasteTerrainAbove={setPasteTerrainAbove}
+          persistPaste={persistPaste}
+          setPersistPaste={setPersistPaste}
+          lockedPastePos={lockedPastePos}
+          setLockedPastePos={setLockedPastePos}
+          pasteMode={pasteMode}
+          setPasteMode={setPasteMode}
+          scatterCount={scatterCount}
+          setScatterCount={setScatterCount}
+          arrayCols={arrayCols}
+          setArrayCols={setArrayCols}
+          arrayRows={arrayRows}
+          setArrayRows={setArrayRows}
+          arraySpacingX={arraySpacingX}
+          setArraySpacingX={setArraySpacingX}
+          arraySpacingY={arraySpacingY}
+          setArraySpacingY={setArraySpacingY}
+          rotateClipboard={rotateClipboard}
+          mirrorClipboardX={mirrorClipboardX}
+          mirrorClipboardY={mirrorClipboardY}
+          pasteAt={pasteAt}
+          sourcePath={sourcePath}
+          saving={saving}
+          exporting={exporting}
+          exportingObj={exportingObj}
+          exportingJson={exportingJson}
+          saveCompressed={saveCompressed}
+          setSaveCompressed={setSaveCompressed}
+          recentWorlds={recentWorlds}
+          openFile={openFile}
+          openFileAt={openFileAt}
+          saveWorld={saveWorld}
+          saveWorldAs={saveWorldAs}
+          exportPng={exportPng}
+          exportObj={exportObj}
+          exportJson={exportJson}
+          loadPrefab={loadPrefab}
+          importSchematic={importSchematic}
+          setShowNewWorld={setShowNewWorld}
+          setShowWorldBrowser={setShowWorldBrowser}
+          setShowUploadModal={setShowUploadModal}
+          setShowExpandModal={setShowExpandModal}
+          setExpandResult={setExpandResult}
+          closeWorld={closeWorld}
+          setShowHelp={setShowHelp}
+          setShowAbout={setShowAbout}
+          setShowSettings={setShowSettings}
+          onSavePrefab={savePrefab}
+          extrudeCount={extrudeCount}
+          setExtrudeCount={setExtrudeCount}
+          extrudeAxis={extrudeAxis}
+          setExtrudeAxis={setExtrudeAxis}
+          extrudeOpen={extrudeOpen}
+          setExtrudeOpen={setExtrudeOpen}
+          onExtrude={handleExtrude}
+          treeTypes={treeTypes}
+          setTreeTypes={setTreeTypes}
+          treeDensity={treeDensity}
+          setTreeDensity={setTreeDensity}
+          leafPaints={leafPaints}
+          setLeafPaints={setLeafPaints}
+          smartPlacement={smartPlacement}
+          setSmartPlacement={setSmartPlacement}
+          onGenerateTrees={handleGenerateTrees}
+          collapsed={ribbonCollapsed}
+          onCollapse={(v) => { setRibbonCollapsed(v); try { localStorage.setItem("ribbon_collapsed", String(v)); } catch {} }}
+          ribbonBodyHeight={ribbonBodyHeight}
+          onBodyHeightChange={(h) => {
+            const clamped = Math.max(60, Math.min(240, h));
+            setRibbonBodyHeight(clamped);
+            try { localStorage.setItem("ribbon_body_height", String(clamped)); } catch {}
+          }}
+        />
 
-            <div style={{ width: 1, background: "#334155", margin: "0 2px" }} />
-            <button
-              onClick={handleUndo} disabled={undoDepth === 0}
-              style={{ ...overlayBtn, opacity: undoDepth === 0 ? 0.4 : 1, cursor: undoDepth === 0 ? "not-allowed" : "pointer" }}
-              title="Undo (Cmd+Z)"
-            >↩ Undo</button>
-            <button
-              onClick={handleRedo} disabled={redoDepth === 0}
-              style={{ ...overlayBtn, opacity: redoDepth === 0 ? 0.4 : 1, cursor: redoDepth === 0 ? "not-allowed" : "pointer" }}
-              title="Redo (Cmd+Shift+Z)"
-            >↪ Redo</button>
-          </div>
-
-          {/* Draw toolbar — visible when a draw tool or eyedropper is active */}
-          {(isDrawTool || tool === "eyedropper") && (
-            <div style={{
-              display: "flex", alignItems: "center", gap: 4, flexWrap: "wrap",
-              background: "rgba(0,0,0,0.6)", padding: "4px 10px",
-              borderRadius: 6, border: "1px solid #831843",
-            }}>
-              {/* Pick */}
-              <button
-                onClick={() => { prevToolRef.current = tool === "eyedropper" ? "pen" : tool; setTool("eyedropper"); }}
-                title="Eyedropper — click any block to pick its type and paint (I)"
-                style={{ ...(tool === "eyedropper" ? { ...overlayBtnActive, borderColor: "#67e8f9", color: "#a5f3fc" } : overlayBtn) }}
-              >
-                {tool === "eyedropper" ? "💉 Pick" : "💉"}
-              </button>
-              <div style={{ width: 1, background: "#334155", margin: "0 2px", alignSelf: "stretch" }} />
-              {/* Draw tools */}
-              {(["pen", "brush", "rect", "ellipse"] as const).map(t => (
-                <button key={t} onClick={() => setTool(t)} title={drawToolNames[t]} style={{
-                  ...overlayBtn, fontSize: 12,
-                  borderColor: tool === t ? "#f472b6" : "#334155",
-                  color: tool === t ? "#fbcfe8" : "#94a3b8",
-                  background: tool === t ? "rgba(244,114,182,0.1)" : "rgba(0,0,0,0.4)",
-                }}>
-                  {tool === t ? `${drawToolIcons[t]} ${drawToolNames[t]}` : drawToolIcons[t]}
-                </button>
-              ))}
-              {/* Fill bucket */}
-              <button onClick={() => setTool("fill")} title="Fill Bucket (F)" style={{
-                ...overlayBtn, fontSize: 12,
-                borderColor: tool === "fill" ? "#34d399" : "#334155",
-                color: tool === "fill" ? "#6ee7b7" : "#94a3b8",
-                background: tool === "fill" ? "rgba(52,211,153,0.1)" : "rgba(0,0,0,0.4)",
-              }}>
-                {tool === "fill" ? "🪣 Fill" : "🪣"}
-              </button>
-              <div style={{ width: 1, background: "#334155", margin: "0 2px", alignSelf: "stretch" }} />
-              {/* Sculpt tools */}
-              <span style={{ color: "#475569", fontSize: 10, marginRight: 2 }}>Sculpt</span>
-              <span style={{ fontSize: 9, color: "#f59e0b", background: "rgba(245,158,11,0.12)", border: "1px solid rgba(245,158,11,0.3)", borderRadius: 3, padding: "0 3px", lineHeight: "14px", marginRight: 2 }}>exp</span>
-              {(["smooth", "noise", "flatten", "erode"] as const).map(t => (
-                <button key={t} onClick={() => setTool(t)} title={sculptToolNames[t]} style={{
-                  ...overlayBtn, fontSize: 12,
-                  borderColor: tool === t ? "#fb923c" : "#334155",
-                  color: tool === t ? "#fdba74" : "#94a3b8",
-                  background: tool === t ? "rgba(251,146,60,0.1)" : "rgba(0,0,0,0.4)",
-                }}>
-                  {tool === t ? `${sculptToolIcons[t]} ${sculptToolNames[t]}` : sculptToolIcons[t]}
-                </button>
-              ))}
-              {/* Context options */}
-              {(tool === "brush") && (<>
-                <div style={{ width: 1, background: "#334155", margin: "0 2px", alignSelf: "stretch" }} />
-                <span style={{ color: "#64748b", fontSize: 11 }}>Size</span>
-                {([1, 3, 5, 7, 9] as const).map(s => (
-                  <button key={s} onClick={() => setBrushSize(s)} style={{
-                    ...overlayBtn, padding: "1px 6px", fontSize: 11,
-                    borderColor: brushSize === s ? "#f472b6" : "#334155",
-                    color: brushSize === s ? "#fbcfe8" : "#94a3b8",
-                  }}>{s}</button>
-                ))}
-                <div style={{ width: 1, background: "#334155", margin: "0 2px", alignSelf: "stretch" }} />
-                <button onClick={() => setBrushShape("sq")} style={{
-                  ...overlayBtn, padding: "1px 8px", fontSize: 11,
-                  borderColor: brushShape === "sq" ? "#f472b6" : "#334155",
-                  color: brushShape === "sq" ? "#fbcfe8" : "#94a3b8",
-                }}>■ Sq</button>
-                <button onClick={() => setBrushShape("circ")} style={{
-                  ...overlayBtn, padding: "1px 8px", fontSize: 11,
-                  borderColor: brushShape === "circ" ? "#f472b6" : "#334155",
-                  color: brushShape === "circ" ? "#fbcfe8" : "#94a3b8",
-                }}>● Circ</button>
-              </>)}
-              {isSculptTool && (<>
-                <div style={{ width: 1, background: "#334155", margin: "0 2px", alignSelf: "stretch" }} />
-                <span style={{ color: "#64748b", fontSize: 11 }}>Size</span>
-                {([1, 3, 5, 7, 9] as const).map(s => (
-                  <button key={s} onClick={() => setBrushSize(s)} style={{
-                    ...overlayBtn, padding: "1px 6px", fontSize: 11,
-                    borderColor: brushSize === s ? "#fb923c" : "#334155",
-                    color: brushSize === s ? "#fdba74" : "#94a3b8",
-                  }}>{s}</button>
-                ))}
-                <div style={{ width: 1, background: "#334155", margin: "0 2px", alignSelf: "stretch" }} />
-                <span style={{ color: "#64748b", fontSize: 11 }}>Str</span>
-                {([1, 2, 3, 4, 5] as const).map(s => (
-                  <button key={s} onClick={() => setSculptStrength(s)} style={{
-                    ...overlayBtn, padding: "1px 6px", fontSize: 11,
-                    borderColor: sculptStrength === s ? "#fb923c" : "#334155",
-                    color: sculptStrength === s ? "#fdba74" : "#94a3b8",
-                  }}>{s}</button>
-                ))}
-              </>)}
-              {(tool === "rect" || tool === "ellipse") && (<>
-                <div style={{ width: 1, background: "#334155", margin: "0 2px", alignSelf: "stretch" }} />
-                <button onClick={() => setDrawFilled(true)} style={{
-                  ...overlayBtn, padding: "1px 8px", fontSize: 11,
-                  borderColor: drawFilled ? "#f472b6" : "#334155",
-                  color: drawFilled ? "#fbcfe8" : "#94a3b8",
-                }}>Fill</button>
-                <button onClick={() => setDrawFilled(false)} style={{
-                  ...overlayBtn, padding: "1px 8px", fontSize: 11,
-                  borderColor: !drawFilled ? "#f472b6" : "#334155",
-                  color: !drawFilled ? "#fbcfe8" : "#94a3b8",
-                }}>Hollow</button>
-              </>)}
-              {!isSculptTool && tool !== "fill" && tool !== "eyedropper" && (<>
-                <div style={{ width: 1, background: "#334155", margin: "0 2px", alignSelf: "stretch" }} />
-                <button onClick={() => setDrawAbove(false)} style={{
-                  ...overlayBtn, padding: "1px 8px", fontSize: 11,
-                  borderColor: !drawAbove ? "#f472b6" : "#334155",
-                  color: !drawAbove ? "#fbcfe8" : "#94a3b8",
-                }}>Surface</button>
-                <button onClick={() => setDrawAbove(true)} style={{
-                  ...overlayBtn, padding: "1px 8px", fontSize: 11,
-                  borderColor: drawAbove ? "#f472b6" : "#334155",
-                  color: drawAbove ? "#fbcfe8" : "#94a3b8",
-                }}>+1 Above</button>
-              </>)}
-              {/* Drawing with swatch */}
-              {isDrawTool && (<>
-                <div style={{ width: 1, background: "#334155", margin: "0 2px", alignSelf: "stretch" }} />
-                <div style={{
-                  width: 12, height: 12, borderRadius: 2, flexShrink: 0,
-                  background: `rgb(${swatchColor[0]},${swatchColor[1]},${swatchColor[2]})`,
-                  border: "1px solid rgba(255,255,255,0.2)",
-                }} />
-                <span style={{ color: "#94a3b8", fontSize: 11 }}>
-                  {blockDisplayName(fillBlockType)}{fillPaint > 0 ? ` / paint ${fillPaint}` : ""}
-                </span>
-              </>)}
-            </div>
-          )}
-
-          {/* Z-slice height slider — visible only in Z-slice mode */}
-          {viewMode === "zslice" && (
-            <div style={{
-              display: "flex", alignItems: "center", gap: 8,
-              background: "rgba(0,0,0,0.6)", padding: "4px 12px",
-              borderRadius: 6, border: "1px solid #1e40af",
-            }}>
-              <span style={{ color: "#94a3b8", fontSize: 12 }}>Height</span>
-              <input
-                type="range" min={0} max={world.max_z} value={zSliceDisplay}
-                onChange={(e) => setZSliceDisplay(Number(e.target.value))}
-                onPointerUp={(e) => commitZSlice(Number((e.target as HTMLInputElement).value))}
-                onKeyUp={(e) => commitZSlice(Number((e.target as HTMLInputElement).value))}
-                style={{ width: 140, accentColor: "#3b82f6", cursor: "pointer" }}
-                title={`Z level (0 = bedrock, ${world.max_z} = sky)`}
-              />
-              <span style={{ color: "#7dd3fc", fontSize: 13, fontVariantNumeric: "tabular-nums", minWidth: 28, textAlign: "right" }}>
-                {zSliceDisplay}
-              </span>
-              <label style={{ display: "flex", alignItems: "center", gap: 4, cursor: "pointer", marginLeft: 4 }}>
-                <input
-                  type="checkbox"
-                  checked={followSurface}
-                  onChange={e => setFollowSurface(e.target.checked)}
-                  style={{ accentColor: "#3b82f6" }}
-                />
-                <span style={{ color: "#64748b", fontSize: 11, whiteSpace: "nowrap" }}>surface</span>
-              </label>
-            </div>
-          )}
-
-          {/* Hotbar — visible when a draw tool is active */}
-          {isDrawTool && (() => {
-            const isActive = (b: {type: number; paint: number}) => b.type === fillBlockType && b.paint === fillPaint;
-            const slotBase: React.CSSProperties = {
-              width: 26, height: 26, borderRadius: 3, cursor: "pointer", flexShrink: 0,
-              position: "relative", display: "flex", alignItems: "center", justifyContent: "center",
-            };
-            // Small corner badge — pin (↑) for recent, unpin (×) for pinned
-            const cornerBadge: React.CSSProperties = {
-              position: "absolute", top: 0, right: 0,
-              width: 11, height: 11, borderRadius: "0 3px 0 3px",
-              background: "rgba(0,0,0,0.72)", display: "flex", alignItems: "center", justifyContent: "center",
-              fontSize: 9, color: "#e2e8f0", lineHeight: 1, zIndex: 1,
-            };
-            // Block letter overlay (bottom-left, always visible)
-            const letterOverlay = (bt: number): React.ReactNode => {
-              const letter = blockDisplayName(bt)[0]?.toUpperCase() ?? "";
-              if (!letter) return null;
-              return (
-                <span style={{
-                  position: "absolute", bottom: 1, left: 2,
-                  fontSize: 8, fontWeight: 700, lineHeight: 1,
-                  color: "rgba(255,255,255,0.7)", textShadow: "0 0 2px rgba(0,0,0,0.9)",
-                  pointerEvents: "none", userSelect: "none",
-                }}>{letter}</span>
-              );
-            };
-            function pinToSlot(b: {type: number; paint: number}) {
-              setPinnedBlocks(prev => {
-                const next = [...prev];
-                const emptyIdx = next.findIndex(s => s === null);
-                if (emptyIdx !== -1) { next[emptyIdx] = b; return next; }
-                next[4] = b; return next; // replace last if full
-              });
-            }
-            const slotKeys = ["1","2","3","4","5","6","7","8","9","0"];
-            return (
-              <div style={{
-                display: "flex", flexDirection: "column", alignItems: "center", gap: 2,
-                background: "rgba(13,24,41,0.88)", border: "1px solid #1e293b",
-                borderRadius: 6, padding: "4px 8px",
-              }}>
-              <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
-                <span style={{ color: "#334155", fontSize: 9, letterSpacing: "0.07em", fontWeight: 700, userSelect: "none" }}>PINNED</span>
-                {pinnedBlocks.map((b, i) => {
-                  const key = `pinned-${i}`;
-                  const hovered = hotbarHover === key;
-                  const active = b && isActive(b);
-                  const [r, g, bl] = b ? resolveColor(b.type, b.paint) : [40, 50, 70];
-                  return (
-                    <div key={i} style={{
-                      ...slotBase,
-                      background: b ? `rgb(${r},${g},${bl})` : "rgba(255,255,255,0.03)",
-                      border: active ? "2px solid #fff" : b ? "1px solid rgba(255,255,255,0.18)" : "1px dashed #334155",
-                      outline: active ? "1px solid #a78bfa" : "none",
-                      outlineOffset: 1,
-                    }}
-                      title={b ? `${blockDisplayName(b.type)}${b.paint > 0 ? ` paint ${b.paint}` : ""} · key ${slotKeys[i]} (click to select)` : `Empty slot ${slotKeys[i]} — pin a recent block here`}
-                      onClick={() => b && (setFillBlockType(b.type), setFillPaint(b.paint))}
-                      onMouseEnter={() => setHotbarHover(key)}
-                      onMouseLeave={() => setHotbarHover(null)}
-                    >
-                      {/* Slot key number */}
-                      <span style={{
-                        position: "absolute", top: 0, left: 2,
-                        fontSize: 7, color: "rgba(255,255,255,0.4)", lineHeight: 1,
-                        pointerEvents: "none", userSelect: "none",
-                      }}>{slotKeys[i]}</span>
-                      {b && letterOverlay(b.type)}
-                      {/* Unpin badge — only on hover */}
-                      {hovered && b && (
-                        <div style={cornerBadge}
-                          onClick={e => { e.stopPropagation(); setPinnedBlocks(prev => { const n = [...prev]; n[i] = null; return n; }); setHotbarHover(null); }}
-                          title="Unpin">×</div>
-                      )}
-                    </div>
-                  );
-                })}
-                <div style={{ width: 1, background: "#1e293b", height: 18, margin: "0 1px" }} />
-                <span style={{ color: "#334155", fontSize: 9, letterSpacing: "0.07em", fontWeight: 700, userSelect: "none" }}>RECENT</span>
-                {recentBlocks.length === 0
-                  ? <span style={{ color: "#1e293b", fontSize: 10, fontStyle: "italic" }}>none yet</span>
-                  : recentBlocks.map((b, i) => {
-                    const key = `recent-${i}`;
-                    const hovered = hotbarHover === key;
-                    const active = isActive(b);
-                    const [r, g, bl] = resolveColor(b.type, b.paint);
-                    const alreadyPinned = pinnedBlocks.some(p => p && p.type === b.type && p.paint === b.paint);
-                    return (
-                      <div key={i} style={{
-                        ...slotBase,
-                        background: `rgb(${r},${g},${bl})`,
-                        border: active ? "2px solid #fff" : "1px solid rgba(255,255,255,0.18)",
-                        outline: active ? "1px solid #f472b6" : "none",
-                        outlineOffset: 1,
-                        opacity: alreadyPinned ? 0.5 : 1,
-                      }}
-                        title={`${blockDisplayName(b.type)}${b.paint > 0 ? ` paint ${b.paint}` : ""} · key ${slotKeys[i + 5]} (click to select${alreadyPinned ? ", already pinned" : ""})`}
-                        onClick={() => { setFillBlockType(b.type); setFillPaint(b.paint); }}
-                        onMouseEnter={() => setHotbarHover(key)}
-                        onMouseLeave={() => setHotbarHover(null)}
-                      >
-                        <span style={{
-                          position: "absolute", top: 0, left: 2,
-                          fontSize: 7, color: "rgba(255,255,255,0.4)", lineHeight: 1,
-                          pointerEvents: "none", userSelect: "none",
-                        }}>{slotKeys[i + 5]}</span>
-                        {letterOverlay(b.type)}
-                        {/* Pin badge — only on hover when not already pinned */}
-                        {hovered && !alreadyPinned && (
-                          <div style={cornerBadge}
-                            onClick={e => { e.stopPropagation(); pinToSlot(b); setHotbarHover(null); }}
-                            title="Pin to pinned slots">↑</div>
-                        )}
-                      </div>
-                    );
-                  })
-                }
-              </div>{/* end slots row */}
-              <div style={{ fontSize: 10, color: "#475569", letterSpacing: "0.03em", userSelect: "none" }}>
-                {blockDisplayName(fillBlockType)}{fillPaint > 0 ? ` · paint #${fillPaint}` : ""}
-              </div>
-            </div>
-            );
-          })()}
-        </div>
-
-        {/* Top-right: View menu + File menu + Help */}
-        <div style={{ position: "absolute", top: 12, right: 12, display: "flex", gap: 6 }}>
-
-          {/* View ▾ dropdown */}
-          <div ref={viewMenuRef} style={{ position: "relative" }}>
-            <button
-              onClick={() => { setFileMenuOpen(false); setViewMenuOpen(v => !v); }}
-              style={{
-                ...overlayBtn,
-                borderColor: viewMenuOpen ? "#3b82f6" : undefined,
-                color: viewMenuOpen ? "#93c5fd" : undefined,
-              }}
-              title="View options"
-            >
-              View {viewMenuOpen ? "▴" : "▾"}
-            </button>
-            {viewMenuOpen && (
-              <div style={{
-                position: "absolute", top: "calc(100% + 6px)", right: 0,
-                background: "#0d1829", border: "1px solid #1e40af",
-                borderRadius: 7, padding: "4px 0", minWidth: 200,
-                boxShadow: "0 8px 24px rgba(0,0,0,0.6)", zIndex: 200,
-              }}>
-                {/* View mode */}
-                <div style={{ ...menuItem, color: "#475569", fontSize: 11, cursor: "default", paddingBottom: 2 }}>
-                  MAP VIEW
-                </div>
-                <button
-                  onClick={() => { setViewMenuOpen(false); setViewMode("topdown"); }}
-                  style={menuItem}
-                >
-                  <span style={{ display: "inline-block", width: 16, color: "#3b82f6" }}>{viewMode === "topdown" ? "●" : ""}</span>
-                  Top-down
-                </button>
-                <button
-                  onClick={() => { setViewMenuOpen(false); setViewMode("zslice"); }}
-                  style={menuItem}
-                >
-                  <span style={{ display: "inline-block", width: 16, color: "#3b82f6" }}>{viewMode === "zslice" ? "●" : ""}</span>
-                  Z-slice
-                  {viewMode === "zslice" && <span style={{ marginLeft: 8, color: "#7dd3fc", fontSize: 11 }}>z={zSliceZ}</span>}
-                </button>
-                <div style={menuDivider} />
-                {/* Navigation */}
-                <button
-                  onClick={() => { setViewMenuOpen(false); mapCanvasRef.current?.resetView(); }}
-                  style={{ ...menuItem, display: "flex", justifyContent: "space-between", alignItems: "center" }}
-                >
-                  <span><span style={{ display: "inline-block", width: 16 }} />Fit Map</span>
-                  <span style={{ color: "#475569", fontSize: 11 }}>Home</span>
-                </button>
-                <div style={menuDivider} />
-                {/* Spawn */}
-                <div style={{ ...menuItem, color: "#475569", fontSize: 11, cursor: "default", paddingBottom: 2 }}>
-                  SPAWN POINT{spawnPos ? ` (${Math.round(spawnPos.px)}, ${Math.round(spawnPos.py)})` : " (unset)"}
-                </div>
-                <button
-                  disabled={!selection}
-                  onClick={async () => {
-                    if (!selection) return;
-                    const cx = Math.round((selection.x1 + selection.x2) / 2);
-                    const cy = Math.round((selection.y1 + selection.y2) / 2);
-                    setViewMenuOpen(false);
-                    try {
-                      await invoke("set_spawn_pos", { px: cx, py: cy });
-                      setSpawnPos({ px: cx, py: cy });
-                    } catch (e) { setError(String(e)); }
-                  }}
-                  style={{ ...menuItem, opacity: selection ? 1 : 0.35, cursor: selection ? "pointer" : "not-allowed" }}
-                >
-                  <span style={{ display: "inline-block", width: 16 }}>⌂</span>
-                  Set Spawn at Selection Centre
-                </button>
-                <div style={menuDivider} />
-                {/* Render mode */}
-                <div style={{ ...menuItem, color: "#475569", fontSize: 11, cursor: "default", paddingBottom: 2 }}>
-                  RENDER MODE
-                </div>
-                <button
-                  onClick={() => { setViewMenuOpen(false); setRenderMode("tiled"); }}
-                  style={menuItem}
-                >
-                  <span style={{ display: "inline-block", width: 16, color: "#3b82f6" }}>{renderMode === "tiled" ? "●" : ""}</span>
-                  ⊞ Tiled
-                  <span style={{ marginLeft: 8, color: "#475569", fontSize: 11 }}>low RAM</span>
-                </button>
-                <button
-                  onClick={() => { setViewMenuOpen(false); setRenderMode("full"); }}
-                  style={menuItem}
-                >
-                  <span style={{ display: "inline-block", width: 16, color: "#d97706" }}>{renderMode === "full" ? "●" : ""}</span>
-                  <span style={{ color: renderMode === "full" ? "#fde68a" : undefined }}>Full Map</span>
-                  <span style={{ marginLeft: 8, color: "#475569", fontSize: 11 }}>fast pan</span>
-                </button>
-                <button
-                  onClick={() => { setViewMenuOpen(false); setRenderMode("axo"); }}
-                  style={menuItem}
-                >
-                  <span style={{ display: "inline-block", width: 16, color: "#10b981" }}>{renderMode === "axo" ? "●" : ""}</span>
-                  <span style={{ color: renderMode === "axo" ? "#6ee7b7" : undefined }}>Axo View</span>
-                  <span style={{ marginLeft: 8, color: "#475569", fontSize: 11 }}>3D depth</span>
-                </button>
-                {renderMode === "axo" && (
-                  <div style={{ padding: "6px 12px 4px", display: "flex", alignItems: "center", gap: 8 }}>
-                    <span style={{ color: "#94a3b8", fontSize: 11, whiteSpace: "nowrap" }}>Depth</span>
-                    <input
-                      type="range" min={0} max={0.5} step={0.02}
-                      value={axoSkew}
-                      onChange={e => setAxoSkew(parseFloat(e.target.value))}
-                      style={{ flex: 1, accentColor: "#10b981", cursor: "pointer" }}
-                    />
-                    <span style={{ color: "#94a3b8", fontSize: 11, width: 28, textAlign: "right" }}>
-                      {axoSkew.toFixed(2)}
-                    </span>
-                  </div>
-                )}
-                <div style={{ height: 1, background: "#1e293b", margin: "4px 0" }} />
-                <div style={{ padding: "4px 12px 2px", color: "#64748b", fontSize: 10, letterSpacing: 1, fontWeight: 600 }}>
-                  VIEWPORTS
-                </div>
-                <button
-                  onClick={() => { setViewMenuOpen(false); setShowSlicePanels(v => !v); }}
-                  style={menuItem}
-                >
-                  <span style={{ display: "inline-block", width: 16, color: "#a855f7" }}>{showSlicePanels ? "●" : ""}</span>
-                  <span style={{ color: showSlicePanels ? "#d8b4fe" : undefined }}>◫ Quad view (Top / Front / Side / 3D)</span>
-                  <span style={{ marginLeft: 6, fontSize: 9, color: "#f59e0b", background: "rgba(245,158,11,0.12)", border: "1px solid rgba(245,158,11,0.3)", borderRadius: 3, padding: "0 3px", lineHeight: "14px" }}>exp</span>
-                </button>
-                {/* Sky Editor and Creature Viewer implemented but hidden pending testing */}
-                <div style={menuDivider} />
-                <div style={{ ...menuItem, color: "#475569", fontSize: 11, cursor: "default", paddingBottom: 2 }}>
-                  TEMPLATE OVERLAY
-                </div>
-                <button
-                  onClick={() => { setViewMenuOpen(false); openTemplateFile(); }}
-                  style={menuItem}
-                  title={templatePath ? `Loaded: ${templatePath}` : "Load Eden.eden to enable template overlay"}
-                >
-                  <span style={{ display: "inline-block", width: 16 }}>⊕</span>
-                  {templateLoaded ? "Change Template…" : "Load Eden Template…"}
-                  <span style={{ marginLeft: 6, fontSize: 9, color: "#f59e0b", background: "rgba(245,158,11,0.12)", border: "1px solid rgba(245,158,11,0.3)", borderRadius: 3, padding: "0 3px", lineHeight: "14px" }}>exp</span>
-                  {templateLoaded && <span style={{ marginLeft: 4, color: "#4ade80", fontSize: 10 }}>✓</span>}
-                </button>
-                {templateLoaded && (
-                  <button
-                    onClick={() => { setViewMenuOpen(false); setShowTemplateOverlay(v => !v); }}
-                    style={menuItem}
-                  >
-                    <span style={{ display: "inline-block", width: 16, color: "#4ade80" }}>{showTemplateOverlay ? "●" : ""}</span>
-                    <span style={{ color: showTemplateOverlay ? "#86efac" : undefined }}>Template Overlay</span>
-                  </button>
-                )}
-              </div>
-            )}
-          </div>
-
-          {/* File ▾ dropdown */}
-          <div ref={fileMenuRef} style={{ position: "relative" }}>
-            <button
-              onClick={() => { setViewMenuOpen(false); setFileMenuOpen(v => !v); }}
-              style={{
-                ...overlayBtn,
-                borderColor: fileMenuOpen ? "#3b82f6" : (saving || exporting || exportingObj ? "#475569" : undefined),
-                color: fileMenuOpen ? "#93c5fd" : undefined,
-              }}
-              title="File operations"
-            >
-              File {fileMenuOpen ? "▴" : "▾"}
-            </button>
-            {fileMenuOpen && (
-              <div style={{
-                position: "absolute", top: "calc(100% + 6px)", right: 0,
-                background: "#0d1829", border: "1px solid #1e40af",
-                borderRadius: 7, padding: "4px 0", minWidth: 170,
-                boxShadow: "0 8px 24px rgba(0,0,0,0.6)", zIndex: 200,
-              }}>
-                {/* New / Open */}
-                <button onClick={() => { setFileMenuOpen(false); setShowNewWorld(true); }} style={menuItem}>
-                  New World…
-                </button>
-                <button onClick={() => { setFileMenuOpen(false); openFile(); }} style={menuItem}>
-                  Open…
-                </button>
-                <button
-                  onClick={() => setShowRecentSubmenu(v => !v)}
-                  style={{ ...menuItem, display: "flex", justifyContent: "space-between", alignItems: "center", color: recentWorlds.length === 0 ? "#475569" : "#e2e8f0" }}
-                >
-                  <span>Open Recent</span>
-                  <span style={{ fontSize: 10 }}>{showRecentSubmenu ? "▴" : "▾"}</span>
-                </button>
-                {showRecentSubmenu && (
-                  <div style={{ background: "#07090f", borderTop: "1px solid #1e293b", borderBottom: "1px solid #1e293b", margin: "2px 0" }}>
-                    {recentWorlds.length === 0 ? (
-                      <div style={{ ...menuItem, color: "#475569", cursor: "default" }}>No recent worlds</div>
-                    ) : recentWorlds.map(r => (
-                      <button
-                        key={r.path}
-                        onClick={() => { setFileMenuOpen(false); setShowRecentSubmenu(false); openFileAt(r.path); }}
-                        style={{ ...menuItem, paddingLeft: 20, paddingTop: 5, paddingBottom: 5 }}
-                        title={r.path}
-                      >
-                        <div style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 210 }}>{r.name}</div>
-                        <div style={{ fontSize: 11, color: "#64748b", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 210 }}>{timeAgo(r.timestamp)}</div>
-                      </button>
-                    ))}
-                  </div>
-                )}
-                <div style={menuDivider} />
-                {/* Save (only when a file is open) */}
-                <button
-                  onClick={() => { if (!sourcePath || saving) return; setFileMenuOpen(false); saveWorld(sourcePath); }}
-                  style={{ ...menuItem, opacity: (!sourcePath || saving) ? 0.35 : 1, cursor: (!sourcePath || saving) ? "not-allowed" : "pointer" }}
-                  title={sourcePath ? `Overwrite ${sourcePath}` : "No file open"}
-                >
-                  {saving ? "Saving…" : "Save"}
-                </button>
-                <button
-                  onClick={() => { if (saving) return; setFileMenuOpen(false); saveWorldAs(); }}
-                  style={{ ...menuItem, opacity: saving ? 0.35 : 1, cursor: saving ? "not-allowed" : "pointer" }}
-                >
-                  Save As…
-                </button>
-                {/* Compressed toggle inline in menu */}
-                <div style={menuDivider} />
-                <label style={{ ...menuItem, display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
-                  <input
-                    type="checkbox"
-                    checked={saveCompressed}
-                    onChange={e => setSaveCompressed(e.target.checked)}
-                    style={{ accentColor: "#f59e0b", width: 13, height: 13 }}
-                  />
-                  <span style={{ color: saveCompressed ? "#fcd34d" : "#94a3b8" }}>
-                    Compressed
-                  </span>
-                </label>
-                <div style={menuDivider} />
-                {/* Export + prefab */}
-                <button
-                  onClick={() => { if (exporting) return; setFileMenuOpen(false); exportPng(); }}
-                  style={{ ...menuItem, opacity: exporting ? 0.35 : 1, cursor: exporting ? "not-allowed" : "pointer" }}
-                >
-                  {exporting ? "Exporting…" : "Export PNG"}
-                </button>
-                {world && (
-                  <button
-                    onClick={() => { if (exportingObj) return; setFileMenuOpen(false); exportObj(); }}
-                    style={{ ...menuItem, opacity: exportingObj ? 0.35 : 1, cursor: exportingObj ? "not-allowed" : "pointer" }}
-                    title={selection ? "Export selection as 3D model" : "Export entire world as 3D model"}
-                  >
-                    {exportingObj ? "Exporting…" : `Export OBJ…${selection ? " (selection)" : ""}`}
-                    {!exportingObj && <span style={{ fontSize: 9, color: "#f59e0b", background: "rgba(245,158,11,0.12)", border: "1px solid rgba(245,158,11,0.3)", borderRadius: 3, padding: "0 3px", lineHeight: "14px", marginLeft: 4 }}>exp</span>}
-                  </button>
-                )}
-                {world && (
-                  <button onClick={() => { setFileMenuOpen(false); loadPrefab(); }} style={menuItem}>
-                    Load Prefab
-                  </button>
-                )}
-                {world && (
-                  <button onClick={() => { setFileMenuOpen(false); importSchematic(); }} style={{ ...menuItem, display: "flex", alignItems: "center", gap: 4 }}>
-                    Import Schematic…
-                    <span style={{ fontSize: 9, color: "#f59e0b", background: "rgba(245,158,11,0.12)", border: "1px solid rgba(245,158,11,0.3)", borderRadius: 3, padding: "0 3px", lineHeight: "14px" }}>exp</span>
-                  </button>
-                )}
-                <div style={menuDivider} />
-                {world && templateLoaded && (
-                  <button
-                    onClick={() => { setFileMenuOpen(false); setShowExpandModal(true); setExpandResult(null); }}
-                    style={menuItem}
-                    title="Bake Eden.eden template chunks into a new world file"
-                  >
-                    Expand from Template…
-                  </button>
-                )}
-                <div style={menuDivider} />
-                <button onClick={() => { setFileMenuOpen(false); setShowWorldBrowser(true); }} style={menuItem}>
-                  Browse Worlds…
-                </button>
-                {world && (
-                  <button onClick={() => { setFileMenuOpen(false); setShowUploadModal(true); }} style={menuItem}>
-                    Upload to Server…
-                  </button>
-                )}
-              </div>
-            )}
-          </div>
-
-          {/* Help dropdown */}
-          <div ref={helpMenuRef} style={{ position: "relative" }}>
-            <button
-              onClick={() => setHelpMenuOpen(o => !o)}
-              style={helpMenuOpen ? { ...overlayBtn, background: "rgba(59,130,246,0.35)", borderColor: "#3b82f6" } : overlayBtn}
-            >
-              Help {helpMenuOpen ? "▴" : "▾"}
-            </button>
-            {helpMenuOpen && (
-              <div style={{
-                position: "absolute", top: "calc(100% + 4px)", right: 0,
-                background: "#1a1f2e", border: "1px solid #2d3448",
-                borderRadius: 8, minWidth: 180, zIndex: 200,
-                boxShadow: "0 8px 24px rgba(0,0,0,0.5)",
-                overflow: "hidden",
-              }}>
-                <button
-                  onClick={() => { setHelpMenuOpen(false); setShowSettings(true); }}
-                  style={{ ...menuItem, width: "100%", textAlign: "left" }}
-                  onMouseEnter={e => (e.currentTarget.style.background = "#232a3d")}
-                  onMouseLeave={e => (e.currentTarget.style.background = "transparent")}
-                >
-                  Settings…
-                </button>
-                <div style={menuDivider} />
-                <button
-                  onClick={() => { setHelpMenuOpen(false); setShowHelp(true); }}
-                  style={{ ...menuItem, width: "100%", textAlign: "left" }}
-                  onMouseEnter={e => (e.currentTarget.style.background = "#232a3d")}
-                  onMouseLeave={e => (e.currentTarget.style.background = "transparent")}
-                >
-                  Keyboard Shortcuts <span style={{ color: "#4b5568", marginLeft: 8 }}>?</span>
-                </button>
-                <button
-                  onClick={() => { setHelpMenuOpen(false); setShowAbout(true); }}
-                  style={{ ...menuItem, width: "100%", textAlign: "left" }}
-                  onMouseEnter={e => (e.currentTarget.style.background = "#232a3d")}
-                  onMouseLeave={e => (e.currentTarget.style.background = "transparent")}
-                >
-                  About VuencEdit
-                </button>
-              </div>
-            )}
-          </div>
-        </div>
-
-        {/* Bottom-left: z-range + selection info + fill picker */}
-        <div style={{
-          position: "absolute", bottom: 16, left: 12,
-          background: "rgba(0,0,0,0.72)", padding: "6px 12px",
-          borderRadius: 6, fontSize: 13,
-          display: "flex", flexDirection: "column", gap: 6,
-          border: `1px solid ${tool === "paste" ? (lockedPastePos ? "#f59e0b" : "#22c55e") : isDrawTool ? "#831843" : selection ? "#3b82f6" : "#334155"}`,
-          maxWidth: "calc(100vw - 24px)",
-          maxHeight: "calc(100vh - 140px)",
-          overflowY: "auto",
-        }}>
-
-          {/* Paste mode banner */}
-          {tool === "paste" && (
-            <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-              {lockedPastePos ? (
-                <>
-                  <span style={{ color: "#fbbf24", fontWeight: 700, fontSize: 12, letterSpacing: "0.05em" }}>
-                    PASTE — LOCKED
-                  </span>
-                  <span style={{ color: "#92400e", fontSize: 11, fontVariantNumeric: "tabular-nums" }}>
-                    X{lockedPastePos.x}, Y{lockedPastePos.y}
-                  </span>
-                  <span style={{ color: "#6b7280", fontSize: 11 }}>· Esc to unlock ·</span>
-                </>
-              ) : (
-                <>
-                  <span style={{ color: "#4ade80", fontWeight: 700, fontSize: 12, letterSpacing: "0.05em" }}>
-                    PASTE MODE
-                  </span>
-                  <span style={{ color: "#6b7280", fontSize: 12 }}>
-                    click map to place · Esc to cancel
-                  </span>
-                </>
-              )}
-              {clipboard && (
-                <span style={{ color: "#86efac", fontSize: 11 }}>
-                  {clipboard.width}×{clipboard.height}×{clipboard.depth}, z{clipboard.z_anchor + pasteElevationOffset}–{clipboard.z_anchor + pasteElevationOffset + clipboard.depth - 1}
-                </span>
-              )}
-              <span style={{ color: "#94a3b8", fontSize: 11, whiteSpace: "nowrap" }}>Z offset</span>
-              <input
-                type="number"
-                value={pasteElevationOffset}
-                onChange={(e) => setPasteElevationOffset(Number(e.target.value))}
-                style={{ ...zInput, width: 48 }}
-                title="Vertical offset applied at paste time (does not change clipboard)"
-              />
-              {lockedPastePos && (
-                <>
-                  <button
-                    onClick={() => { const p = lockedPastePos; pasteAt(p); setLockedPastePos(null); }}
-                    style={{ ...overlayBtn, padding: "2px 10px", fontSize: 12, borderColor: "#22c55e", color: "#86efac" }}
-                    title="Confirm paste at locked position"
-                  >
-                    Confirm Paste
-                  </button>
-                  <button
-                    onClick={() => setLockedPastePos(null)}
-                    style={{ ...overlayBtn, padding: "2px 10px", fontSize: 12 }}
-                    title="Unlock position — return to hover mode"
-                  >
-                    Unlock
-                  </button>
-                </>
-              )}
-              <button
-                onClick={() => setPasteIgnoreAir((v) => !v)}
-                style={{
-                  ...overlayBtn, padding: "2px 10px", fontSize: 12,
-                  borderColor: pasteIgnoreAir ? "#34d399" : "#475569",
-                  color: pasteIgnoreAir ? "#6ee7b7" : "#94a3b8",
-                }}
-                title={pasteIgnoreAir ? "Air blocks in clipboard are skipped (click to disable)" : "Air blocks in clipboard overwrite destination (click to enable no-air mode)"}
-              >
-                {pasteIgnoreAir ? "No air ✓" : "No air"}
-              </button>
-              <button
-                onClick={rotateClipboard}
-                style={{ ...overlayBtn, padding: "2px 10px", fontSize: 12, borderColor: "#a78bfa", color: "#ddd6fe" }}
-                title="Rotate clipboard 90° clockwise"
-              >
-                Rotate 90°
-              </button>
-              <button
-                onClick={mirrorClipboardX}
-                style={{ ...overlayBtn, padding: "2px 10px", fontSize: 12, borderColor: "#a78bfa", color: "#ddd6fe" }}
-                title="Mirror clipboard left↔right (flip on X axis)"
-              >
-                ↔ Flip X
-              </button>
-              <button
-                onClick={mirrorClipboardY}
-                style={{ ...overlayBtn, padding: "2px 10px", fontSize: 12, borderColor: "#a78bfa", color: "#ddd6fe" }}
-                title="Mirror clipboard top↔bottom (flip on Y axis)"
-              >
-                ↕ Flip Y
-              </button>
-              <button
-                onClick={() => setPersistPaste((v) => !v)}
-                style={{
-                  ...overlayBtn, padding: "2px 10px", fontSize: 12,
-                  borderColor: persistPaste ? "#34d399" : "#475569",
-                  color: persistPaste ? "#6ee7b7" : "#94a3b8",
-                }}
-                title={persistPaste ? "Paste mode stays active after each placement (click to disable)" : "Stay in paste mode after each placement"}
-              >
-                {persistPaste ? "Repeat ✓" : "Repeat"}
-              </button>
-              <button
-                onClick={() => setPasteTerrain((v) => !v)}
-                style={{
-                  ...overlayBtn, padding: "2px 10px", fontSize: 12,
-                  borderColor: pasteTerrain ? "#f59e0b" : "#475569",
-                  color: pasteTerrain ? "#fcd34d" : "#94a3b8",
-                }}
-                title={pasteTerrain ? "Terrain mode: each column aligns to the surface (click to disable)" : "Enable terrain mode: align paste per column to surface height"}
-              >
-                {pasteTerrain ? "Terrain ✓" : "Terrain"}
-              </button>
-              {pasteTerrain && (
-                <button
-                  onClick={() => setPasteTerrainAbove((v) => !v)}
-                  style={{
-                    ...overlayBtn, padding: "2px 10px", fontSize: 12,
-                    borderColor: pasteTerrainAbove ? "#fb923c" : "#475569",
-                    color: pasteTerrainAbove ? "#fdba74" : "#94a3b8",
-                  }}
-                  title={pasteTerrainAbove ? "Bottom clipboard layer sits one block above the surface (click to place at surface level)" : "Bottom clipboard layer sits at the surface block (click to place above surface)"}
-                >
-                  {pasteTerrainAbove ? "Above ✓" : "At surface"}
-                </button>
-              )}
-              {/* Advanced paste options (scatter / array) — collapsed by default */}
-              <button
-                onClick={() => setAdvancedPasteOpen(v => !v)}
-                style={{
-                  ...overlayBtn, padding: "2px 8px", fontSize: 11,
-                  borderColor: advancedPasteOpen || pasteMode !== "normal" ? "#7dd3fc" : "#334155",
-                  color: advancedPasteOpen || pasteMode !== "normal" ? "#bfdbfe" : "#64748b",
-                  background: advancedPasteOpen ? "rgba(125,211,252,0.1)" : "rgba(0,0,0,0.3)",
-                }}
-                title="Scatter and array paste modes"
-              >
-                {pasteMode !== "normal" ? `▼ ${pasteMode}` : `▶ Advanced`}
-              </button>
-              {advancedPasteOpen && (<>
-                <div style={{ display: "flex", alignItems: "center", gap: 2, borderLeft: "1px solid #334155", paddingLeft: 6, marginLeft: 2 }}>
-                  {(["normal", "scatter", "array"] as const).map(m => (
-                    <button key={m} onClick={() => setPasteMode(m)} style={{
-                      ...overlayBtn, padding: "2px 8px", fontSize: 11,
-                      borderColor: pasteMode === m ? "#7dd3fc" : "#334155",
-                      color: pasteMode === m ? "#bfdbfe" : "#64748b",
-                      background: pasteMode === m ? "rgba(125,211,252,0.1)" : "rgba(0,0,0,0.3)",
-                    }}>
-                      {m === "normal" ? "1×" : m === "scatter" ? "Scatter" : "Array"}
-                    </button>
-                  ))}
-                </div>
-                {pasteMode === "scatter" && (
-                  <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
-                    <span style={{ color: "#64748b", fontSize: 11 }}>Count</span>
-                    <input type="number" min={1} max={100} value={scatterCount}
-                      onChange={e => setScatterCount(Math.max(1, parseInt(e.target.value,10)||1))}
-                      style={{ ...zInput, width: 44 }} />
-                    <span style={{ color: "#475569", fontSize: 11 }}>within selection</span>
-                  </div>
-                )}
-                {pasteMode === "array" && (
-                  <div style={{ display: "flex", alignItems: "center", gap: 4, flexWrap: "wrap" }}>
-                    <span style={{ color: "#64748b", fontSize: 11 }}>Cols</span>
-                    <input type="number" min={1} max={20} value={arrayCols}
-                      onChange={e => setArrayCols(Math.max(1, parseInt(e.target.value,10)||1))}
-                      style={{ ...zInput, width: 40 }} />
-                    <span style={{ color: "#64748b", fontSize: 11 }}>Rows</span>
-                    <input type="number" min={1} max={20} value={arrayRows}
-                      onChange={e => setArrayRows(Math.max(1, parseInt(e.target.value,10)||1))}
-                      style={{ ...zInput, width: 40 }} />
-                    <span style={{ color: "#64748b", fontSize: 11 }}>SpX</span>
-                    <input type="number" min={0} value={arraySpacingX}
-                      onChange={e => setArraySpacingX(Math.max(0, parseInt(e.target.value,10)||0))}
-                      style={{ ...zInput, width: 40 }} title="Horizontal spacing (0 = auto)" />
-                    <span style={{ color: "#64748b", fontSize: 11 }}>SpY</span>
-                    <input type="number" min={0} value={arraySpacingY}
-                      onChange={e => setArraySpacingY(Math.max(0, parseInt(e.target.value,10)||0))}
-                      style={{ ...zInput, width: 40 }} title="Vertical spacing (0 = auto)" />
-                  </div>
-                )}
-              </>)}
-              <button
-                onClick={() => setTool("pan")}
-                style={{ ...overlayBtn, padding: "2px 10px", fontSize: 12 }}
-              >
-                Cancel
-              </button>
-            </div>
-          )}
-
-          {/* Row 1: z-range + selection info + clipboard actions */}
-          <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
-            <span style={{ color: "#94a3b8", whiteSpace: "nowrap" }}>Height</span>
-            <input
-              type="number" min={0} max={world.max_z} value={zMin}
-              onChange={(e) => handleZMin(e.target.value)}
-              style={zInput}
-              title="Minimum Z (0 = bedrock level)"
-            />
-            <span style={{ color: "#475569" }}>–</span>
-            <input
-              type="number" min={0} max={world.max_z} value={zMax}
-              onChange={(e) => handleZMax(e.target.value)}
-              style={zInput}
-              title={`Maximum Z (${world.max_z} = sky)`}
-            />
-            {selection && (
-              <>
-                <span style={{ color: "#334155", margin: "0 2px" }}>│</span>
-                <span style={{ color: "#93c5fd", whiteSpace: "nowrap" }}>Selection</span>
-                <span style={{ color: "#e2e8f0", fontVariantNumeric: "tabular-nums", whiteSpace: "nowrap" }}>
-                  ({selection.x1}, {selection.y1}) → ({selection.x2}, {selection.y2})
-                  &nbsp;·&nbsp;
-                  <strong>{selection.width} × {selection.height} × {selection.depth}</strong>
-                </span>
-                <button
-                  onClick={copySelection}
-                  style={{ ...overlayBtn, padding: "2px 10px", fontSize: 12, borderColor: "#7dd3fc", color: "#bfdbfe" }}
-                  title={`Copy selection to clipboard (${selection.width}×${selection.height}×${selection.depth} blocks)`}
-                >
-                  Copy
-                </button>
-                <button
-                  onClick={deleteBlocks}
-                  style={{
-                    ...overlayBtn, padding: "2px 10px", fontSize: 12,
-                    borderColor: filterBlockType !== null
-                      ? (filterInvert ? "#a78bfa" : "#f97316")
-                      : "#ef4444",
-                    color: filterBlockType !== null
-                      ? (filterInvert ? "#ddd6fe" : "#fca5a5")
-                      : "#fca5a5",
-                  }}
-                  title={filterBlockType !== null
-                    ? (filterInvert
-                        ? `Delete all blocks EXCEPT ${blockDisplayName(filterBlockType)} in selection`
-                        : `Delete only ${blockDisplayName(filterBlockType)} blocks in selection`)
-                    : "Set all blocks in selection to Air"}
-                >
-                  Delete{filterBlockType !== null ? (filterInvert ? "!*" : "*") : ""}
-                </button>
-                {/* Grow / Shrink selection */}
-                <button
-                  onClick={() => setRawBounds(b => b ? { x1: b.x1 - 1, y1: b.y1 - 1, x2: b.x2 + 1, y2: b.y2 + 1 } : null)}
-                  style={{ ...overlayBtn, padding: "2px 8px", fontSize: 12 }}
-                  title="Grow selection by 1 block on each side"
-                >+1</button>
-                <button
-                  onClick={() => setRawBounds(b => b ? { x1: Math.min(b.x1 + 1, b.x2), y1: Math.min(b.y1 + 1, b.y2), x2: Math.max(b.x2 - 1, b.x1), y2: Math.max(b.y2 - 1, b.y1) } : null)}
-                  style={{ ...overlayBtn, padding: "2px 8px", fontSize: 12 }}
-                  title="Shrink selection by 1 block on each side"
-                >-1</button>
-                <button
-                  onClick={() => setRawBounds(null)}
-                  style={{ ...overlayBtn, padding: "2px 10px", fontSize: 12 }}
-                >
-                  Clear
-                </button>
-              </>
-            )}
-            {/* Magic Wand hint + paint toggle */}
-            {tool === "wand" && (
-              <span style={{ display: "flex", alignItems: "center", gap: 6, marginLeft: 4 }}>
-                <span style={{ color: "#a78bfa", fontSize: 11 }}>· Click to flood-select</span>
-                <button
-                  onClick={() => setWandMatchPaint(v => !v)}
-                  title={wandMatchPaint ? "Matching block type + paint colour — click to ignore paint" : "Matching block type only — click to also match paint colour"}
-                  style={{
-                    background: wandMatchPaint ? "rgba(167,139,250,0.15)" : "rgba(100,116,139,0.15)",
-                    border: `1px solid ${wandMatchPaint ? "#a78bfa" : "#475569"}`,
-                    color: wandMatchPaint ? "#c4b5fd" : "#94a3b8",
-                    borderRadius: 4, padding: "1px 7px", fontSize: 11, cursor: "pointer",
-                  }}
-                >
-                  {wandMatchPaint ? "Type + Colour" : "Type only"}
-                </button>
-              </span>
-            )}
-          </div>
-
-          {/* Clipboard status + Paste button (always visible when clipboard has data) */}
-          {clipboard && tool !== "paste" && (
-            <div style={{
-              display: "flex", alignItems: "center", gap: 8,
-              paddingTop: 4, borderTop: "1px solid #1e293b",
-            }}>
-              <span style={{ color: "#64748b", fontSize: 11 }}>Clipboard:</span>
-              <span style={{ color: "#94a3b8", fontSize: 11, fontVariantNumeric: "tabular-nums" }}>
-                {clipboard.width}×{clipboard.height}×{clipboard.depth} blocks, z{clipboard.z_anchor + pasteElevationOffset}–{clipboard.z_anchor + pasteElevationOffset + clipboard.depth - 1}
-              </span>
-              <span style={{ color: "#64748b", fontSize: 11, whiteSpace: "nowrap" }}>Z offset</span>
-              <input
-                type="number"
-                value={pasteElevationOffset}
-                onChange={(e) => setPasteElevationOffset(Number(e.target.value))}
-                style={{ ...zInput, width: 48 }}
-                title="Vertical offset applied at paste time"
-              />
-              <button
-                onClick={() => setPasteIgnoreAir((v) => !v)}
-                style={{
-                  ...overlayBtn, padding: "2px 10px", fontSize: 12,
-                  borderColor: pasteIgnoreAir ? "#34d399" : "#475569",
-                  color: pasteIgnoreAir ? "#6ee7b7" : "#94a3b8",
-                }}
-                title={pasteIgnoreAir ? "Air blocks in clipboard are skipped (click to disable)" : "Air blocks in clipboard overwrite destination (click to enable no-air mode)"}
-              >
-                {pasteIgnoreAir ? "No air ✓" : "No air"}
-              </button>
-              <button
-                onClick={rotateClipboard}
-                style={{ ...overlayBtn, padding: "2px 10px", fontSize: 12, borderColor: "#a78bfa", color: "#ddd6fe" }}
-                title="Rotate clipboard 90° clockwise"
-              >
-                Rotate 90°
-              </button>
-              <button
-                onClick={mirrorClipboardX}
-                style={{ ...overlayBtn, padding: "2px 10px", fontSize: 12, borderColor: "#a78bfa", color: "#ddd6fe" }}
-                title="Mirror clipboard left↔right (flip on X axis)"
-              >
-                ↔ Flip X
-              </button>
-              <button
-                onClick={mirrorClipboardY}
-                style={{ ...overlayBtn, padding: "2px 10px", fontSize: 12, borderColor: "#a78bfa", color: "#ddd6fe" }}
-                title="Mirror clipboard top↔bottom (flip on Y axis)"
-              >
-                ↕ Flip Y
-              </button>
-              <button
-                onClick={() => setPasteTerrain((v) => !v)}
-                style={{
-                  ...overlayBtn, padding: "2px 10px", fontSize: 12,
-                  borderColor: pasteTerrain ? "#f59e0b" : "#475569",
-                  color: pasteTerrain ? "#fcd34d" : "#94a3b8",
-                }}
-                title={pasteTerrain ? "Terrain mode active: each column aligns to surface height (click to disable)" : "Enable terrain mode: align paste per column to surface height"}
-              >
-                {pasteTerrain ? "Terrain ✓" : "Terrain"}
-              </button>
-              {pasteTerrain && (
-                <button
-                  onClick={() => setPasteTerrainAbove((v) => !v)}
-                  style={{
-                    ...overlayBtn, padding: "2px 10px", fontSize: 12,
-                    borderColor: pasteTerrainAbove ? "#fb923c" : "#475569",
-                    color: pasteTerrainAbove ? "#fdba74" : "#94a3b8",
-                  }}
-                  title={pasteTerrainAbove ? "Bottom layer sits one block above surface (click to place at surface level)" : "Bottom layer sits at the surface block (click to place above surface)"}
-                >
-                  {pasteTerrainAbove ? "Above ✓" : "At surface"}
-                </button>
-              )}
-              <button
-                onClick={() => setTool("paste")}
-                style={{ ...overlayBtn, padding: "2px 10px", fontSize: 12, borderColor: "#22c55e", color: "#86efac" }}
-                title="Enter paste mode — click map to place clipboard"
-              >
-                Paste
-              </button>
-              <label
-                style={{ display: "flex", alignItems: "center", gap: 4, cursor: "pointer", userSelect: "none" }}
-                title="Stay in paste mode after each placement so you can paste multiple times"
-              >
-                <input
-                  type="checkbox"
-                  checked={persistPaste}
-                  onChange={(e) => setPersistPaste(e.target.checked)}
-                  style={{ accentColor: "#22c55e", cursor: "pointer" }}
-                />
-                <span style={{ color: persistPaste ? "#6ee7b7" : "#94a3b8", fontSize: 11 }}>Repeat</span>
-              </label>
-            </div>
-          )}
-
-          {/* Row 2: block + paint picker — shown when selection exists or a draw tool is active */}
-          {(selection || isDrawTool) && (
-            <div style={{ display: "flex", flexDirection: "column", gap: 6, paddingTop: 4, borderTop: "1px solid #1e293b" }}>
-
-              {/* Collapsible header */}
-              <div
-                onClick={() => setFillPickerOpen(v => !v)}
-                style={{ display: "flex", alignItems: "center", gap: 5, cursor: "pointer", userSelect: "none" }}
-              >
-                <span style={{ color: "#475569", fontSize: 9 }}>{fillPickerOpen ? "▼" : "▶"}</span>
-                <span style={{ color: isDrawTool ? "#f9a8d4" : "#64748b", fontWeight: 700, fontSize: 10, letterSpacing: "0.08em" }}>
-                  {isDrawTool ? "DRAW WITH" : "FILL / REPLACE"}
-                </span>
-                {!fillPickerOpen && (
-                  <span style={{ color: "#64748b", fontSize: 11, marginLeft: 2 }}>
-                    — {blockDisplayName(fillBlockType)}{fillPaint > 0 ? ` #${fillPaint}` : ""}
-                  </span>
-                )}
-              </div>
-
-              {/* Pickers row */}
-              {fillPickerOpen && (
-                <BlockPaintPicker
-                  mode="fill"
-                  blockType={fillBlockType}
-                  paint={fillPaint}
-                  onBlockTypeChange={(bt) => { if (bt !== null) setFillBlockType(bt); }}
-                  onPaintChange={(p) => setFillPaint(p ?? 0)}
-                  onFill={fillSelection}
-                  selectionExists={!!selection}
-                />
-              )}
-
-{/* Mask system — only visible when a draw tool is active */}
-              {isDrawTool && (
-                <div style={{ display: "flex", alignItems: "center", gap: 6, paddingTop: 4, borderTop: "1px solid #1e293b" }}>
-                  <button
-                    onClick={() => setMaskEnabled(v => !v)}
-                    style={{
-                      ...overlayBtn, padding: "1px 8px", fontSize: 11,
-                      borderColor: maskEnabled ? "#a78bfa" : "#334155",
-                      color: maskEnabled ? "#ddd6fe" : "#64748b",
-                    }}
-                    title="Mask: only paint on blocks matching the mask type/paint"
-                  >
-                    {maskEnabled ? "Mask ✓" : "Mask"}
-                  </button>
-                  {maskEnabled && (
-                    <>
-                      <span style={{ color: "#64748b", fontSize: 11 }}>Type:</span>
-                      <select
-                        value={maskBlockType ?? ""}
-                        onChange={e => setMaskBlockType(e.target.value === "" ? null : Number(e.target.value))}
-                        style={{ background: "#1e293b", border: "1px solid #475569", color: "#e2e8f0", borderRadius: 4, fontSize: 11, padding: "1px 3px" }}
-                      >
-                        <option value="">any</option>
-                        {BLOCK_DEFS.map(b => <option key={b.type} value={b.type}>{b.name}</option>)}
-                      </select>
-                      <span style={{ color: "#64748b", fontSize: 11 }}>Paint:</span>
-                      <select
-                        value={maskPaint ?? ""}
-                        onChange={e => setMaskPaint(e.target.value === "" ? null : Number(e.target.value))}
-                        style={{ background: "#1e293b", border: "1px solid #475569", color: "#e2e8f0", borderRadius: 4, fontSize: 11, padding: "1px 3px" }}
-                      >
-                        <option value="">any</option>
-                        <option value="0">none</option>
-                        {Array.from({ length: 54 }, (_, i) => i + 1).map(p => <option key={p} value={p}>#{p}</option>)}
-                      </select>
-                    </>
-                  )}
-                </div>
-              )}
-
-              {/* Row 3: Replace only — filter for selective replace (selection required) */}
-              {selection && <div style={{ borderTop: "1px solid #1e293b", paddingTop: 6, display: "flex", flexDirection: "column", gap: 4 }}>
-
-                {/* Collapsible replace header */}
-                <div
-                  onClick={() => setReplaceOpen(v => !v)}
-                  style={{ display: "flex", alignItems: "center", gap: 5, cursor: "pointer", userSelect: "none" }}
-                >
-                  <span style={{ color: "#475569", fontSize: 9 }}>{replaceOpen ? "▼" : "▶"}</span>
-                  <span style={{ color: "#64748b", fontWeight: 700, fontSize: 10, letterSpacing: "0.08em" }}>REPLACE FILTER</span>
-                  {!replaceOpen && (filterBlockType !== null || filterPaint !== null) && (
-                    <span style={{ color: "#64748b", fontSize: 11, marginLeft: 2 }}>
-                      — {filterBlockType !== null ? blockDisplayName(filterBlockType) : "any"}{filterPaint !== null ? ` #${filterPaint}` : ""}
-                      {filterInvert ? " (inv)" : ""}
-                    </span>
-                  )}
-                </div>
-
-                {replaceOpen && <><div style={{ fontSize: 11, display: "flex", alignItems: "center", gap: 5, flexWrap: "wrap" }}>
-                  <span style={{ color: "#64748b" }}>{filterInvert ? "Replace except:" : "Replace only:"}</span>
-                  {filterBlockType === null ? (
-                    <span style={{ color: "#475569" }}>any block</span>
-                  ) : (
-                    <span style={{ color: "#e2e8f0", fontWeight: 600 }}>
-                      {blockDisplayName(filterBlockType)}
-                    </span>
-                  )}
-                  <span style={{ color: "#1e293b" }}>·</span>
-                  {filterPaint === null ? (
-                    <span style={{ color: "#475569" }}>any paint</span>
-                  ) : filterPaint === 0 ? (
-                    <span style={{ color: "#475569" }}>no paint</span>
-                  ) : (
-                    <>
-                      <span style={{ color: "#e2e8f0" }}>paint #{filterPaint}</span>
-                      <span style={{
-                        display: "inline-block", width: 10, height: 10, borderRadius: 2,
-                        background: `rgb(${PAINT_COLORS[filterPaint - 1][0]},${PAINT_COLORS[filterPaint - 1][1]},${PAINT_COLORS[filterPaint - 1][2]})`,
-                        border: "1px solid #475569", verticalAlign: "middle", flexShrink: 0,
-                      }} />
-                    </>
-                  )}
-                  {(filterBlockType !== null || filterPaint !== null) && (
-                    <button
-                      onClick={() => setFilterInvert((v) => !v)}
-                      style={{
-                        ...overlayBtn, padding: "1px 8px", fontSize: 11,
-                        borderColor: filterInvert ? "#a78bfa" : "#475569",
-                        color: filterInvert ? "#ddd6fe" : "#94a3b8",
-                      }}
-                      title={filterInvert
-                        ? "Inverted: affects all blocks EXCEPT the filter match (click to restore normal mode)"
-                        : "Normal: affects only blocks matching the filter (click to invert)"}
-                    >
-                      {filterInvert ? "Inverted ✓" : "Invert"}
-                    </button>
-                  )}
-                </div>
-
-                {/* Filter pickers row */}
-                <BlockPaintPicker
-                  mode="filter"
-                  blockType={filterBlockType}
-                  paint={filterPaint}
-                  onBlockTypeChange={setFilterBlockType}
-                  onPaintChange={setFilterPaint}
-                />
-                </>}{/* end replace expand */}
-              </div>}{/* end replace-only section */}
-
-            </div>
-          )}
-        </div>
-
-        {/* Right panel: Selection Inspector */}
+        {/* Right panel: Selection Inspector (ortho view only) */}
         {selection && (
           <SelectionInspector
             selection={selection}
             clipboard={clipboard}
             quadMode={showSlicePanels}
-            extrudeCount={extrudeCount}
-            onExtrudeCountChange={setExtrudeCount}
-            extrudeAxis={extrudeAxis}
-            onExtrudeAxisChange={setExtrudeAxis}
-            onExtrude={handleExtrude}
-            extrudeOpen={extrudeOpen}
-            onExtrudeOpenChange={setExtrudeOpen}
-            onSavePrefab={savePrefab}
-            onGenerateTrees={handleGenerateTrees}
-            topPx={showSlicePanels ? 92 : undefined}
+            topPx={effectiveRibbonHeight + (showSlicePanels ? 40 : 4)}
           />
         )}
 
@@ -2658,7 +1690,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           <ElevationPreviewPanel
             selection={pastePreviewSelection ?? selection!}
             maxZ={world.max_z}
-            extrudeCount={pastePreviewSelection ? 0 : (extrudeOpen ? extrudeCount : 0)}
+            extrudeCount={pastePreviewSelection ? 0 : (extrudeOpen && extrudeCount > 0 ? extrudeCount : 0)}
             extrudeAxis={extrudeAxis}
             isPastePreview={pastePreviewSelection !== null}
             editEpoch={editEpoch}
@@ -2668,7 +1700,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           />
         )}
 
-        {(exporting || exportingObj || loading) && (
+        {(exporting || exportingObj || exportingJson || loading) && (
           <div style={{
             position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center",
             background: "rgba(0,0,0,0.45)", zIndex: 200, pointerEvents: "none",
@@ -2692,6 +1724,26 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
                 </>
               ) : exportingObj ? (
                 <div style={{ color: "#e2e8f0", fontSize: 14 }}>Exporting OBJ…</div>
+              ) : exportingJson ? (
+                <div style={{ color: "#e2e8f0", fontSize: 14 }}>Exporting JSON…</div>
+              ) : exportingVox ? (
+                <>
+                  <div style={{ color: "#e2e8f0", fontSize: 14, marginBottom: 8 }}>
+                    Exporting VOX… {voxProgress ? `${voxProgress.pct}%` : ""}
+                  </div>
+                  {voxProgress && (
+                    <div style={{ color: "#94a3b8", fontSize: 12, marginBottom: 8 }}>
+                      {voxProgress.phase}
+                    </div>
+                  )}
+                  <div style={{ background: "#1e293b", borderRadius: 4, height: 6, overflow: "hidden" }}>
+                    <div style={{
+                      background: "#f59e0b", height: "100%", borderRadius: 4,
+                      width: `${voxProgress?.pct ?? 0}%`,
+                      transition: "width 0.15s ease",
+                    }} />
+                  </div>
+                </>
               ) : (
                 <div style={{ color: "#e2e8f0", fontSize: 14 }}>Loading world…</div>
               )}
@@ -2717,6 +1769,10 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
             onSave={(s) => {
               setSaveCompressed(s.defaultSaveCompressed);
               if (s.templatePath !== templatePath) setTemplatePath(s.templatePath);
+              if (s.texturePackPath !== texturePackPath) {
+                if (s.texturePackPath) loadTexturePackFile(s.texturePackPath);
+                else unloadTexturePack();
+              }
             }}
           />
         )}
@@ -2837,6 +1893,83 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
             </div>
           </div>
         )}
+
+        {/* Map right-click context menu */}
+        {ctxMenu && (() => {
+          const close = () => setCtxMenu(null);
+          const ic = (ch: string) => <span style={{ display: "inline-block", width: 18, textAlign: "center", color: "#64748b", flexShrink: 0 }}>{ch}</span>;
+          const noIc = () => <span style={{ display: "inline-block", width: 18, flexShrink: 0 }} />;
+          const miBtnStyle: React.CSSProperties = {
+            display: "flex", alignItems: "center", gap: 0,
+            width: "100%", textAlign: "left", background: "none", border: "none",
+            color: "#e2e8f0", padding: "5px 12px 5px 8px", fontSize: 12, cursor: "pointer",
+            whiteSpace: "nowrap",
+          };
+          const miHov = (e: React.MouseEvent<HTMLButtonElement>) => { e.currentTarget.style.background = "#1e293b"; };
+          const miLve = (e: React.MouseEvent<HTMLButtonElement>) => { e.currentTarget.style.background = ""; };
+          const div = <div style={{ height: 1, background: "#1e293b", margin: "3px 0" }} />;
+          const menuY = Math.min(ctxMenu.y, window.innerHeight - 260);
+          return (
+            <div
+              style={{
+                position: "fixed", top: menuY, left: ctxMenu.x, zIndex: 9000,
+                background: "#0d1829", border: "1px solid #1e40af",
+                borderRadius: 6, padding: "4px 0", minWidth: 210,
+                boxShadow: "0 8px 24px rgba(0,0,0,0.7)",
+              }}
+              onMouseDown={e => e.stopPropagation()}
+              onContextMenu={e => e.preventDefault()}
+            >
+              <button style={miBtnStyle} onMouseEnter={miHov} onMouseLeave={miLve}
+                onClick={() => { close(); invoke<[number,number]>("set_spawn_pos", { px: Math.round(ctxMenu.wx), py: Math.round(ctxMenu.wy) }).then(([px, py]) => setSpawnPos({ px, py })).catch(() => {}); }}>
+                {ic("⌂")} Set Spawn Here
+              </button>
+              {div}
+              {rawBounds && <button style={miBtnStyle} onMouseEnter={miHov} onMouseLeave={miLve}
+                onClick={() => { close(); copySelection(); }}>
+                {ic("⊡")} Copy
+              </button>}
+              {clipboard && <button style={miBtnStyle} onMouseEnter={miHov} onMouseLeave={miLve}
+                onClick={() => { close(); setLockedPastePos({ x: Math.round(ctxMenu.wx), y: Math.round(ctxMenu.wy) }); setTool("paste"); }}>
+                {ic("⊞")} Paste Here
+              </button>}
+              {rawBounds && <button style={miBtnStyle} onMouseEnter={miHov} onMouseLeave={miLve}
+                onClick={() => { close(); fillSelection(); }}>
+                {noIc()} Fill Selection
+              </button>}
+              {rawBounds && <button style={miBtnStyle} onMouseEnter={miHov} onMouseLeave={miLve}
+                onClick={() => { close(); deleteBlocks(); }}>
+                {noIc()} Delete Blocks
+              </button>}
+              {rawBounds && <button style={miBtnStyle} onMouseEnter={miHov} onMouseLeave={miLve}
+                onClick={() => { close(); setRawBounds(null); }}>
+                {ic("✕")} Clear Selection
+              </button>}
+              {showSlicePanels && enable3dPane && <>{div}
+                <button style={miBtnStyle} onMouseEnter={miHov} onMouseLeave={miLve}
+                  onClick={() => { close(); flyView3dRef.current?.teleport(ctxMenu.wx, ctxMenu.wy); }}>
+                  {noIc()} Teleport 3D Camera Here
+                </button>
+              </>}
+              {div}
+              <button style={{ ...miBtnStyle, color: tool === "select" ? "#93c5fd" : "#e2e8f0" }} onMouseEnter={miHov} onMouseLeave={miLve}
+                onClick={() => { close(); setTool("select"); }}>
+                {noIc()} Select Tool
+              </button>
+              <button style={{ ...miBtnStyle, color: tool === "pen" ? "#f9a8d4" : "#e2e8f0" }} onMouseEnter={miHov} onMouseLeave={miLve}
+                onClick={() => { close(); setTool("pen"); }}>
+                {noIc()} Pen Tool
+              </button>
+              <button style={{ ...miBtnStyle, color: tool === "pan" ? "#93c5fd" : "#e2e8f0" }} onMouseEnter={miHov} onMouseLeave={miLve}
+                onClick={() => { close(); setTool("pan"); }}>
+                {noIc()} Pan Tool
+              </button>
+            </div>
+          );
+        })()}
+
+        {/* Status bar */}
+        {statusBarEl}
       </div>
     );
   }
@@ -2988,6 +2121,10 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
             setEnable3dPane(s.default3dPane);
             setSaveCompressed(s.defaultSaveCompressed);
             if (s.templatePath !== templatePath) setTemplatePath(s.templatePath);
+            if (s.texturePackPath !== texturePackPath) {
+              if (s.texturePackPath) loadTexturePackFile(s.texturePackPath);
+              else unloadTexturePack();
+            }
           }}
         />
       )}
@@ -3049,7 +2186,6 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           onCreated={(path) => { setShowNewWorld(false); openFileAt(path); }}
         />
       )}
-
     </div>
   );
 }

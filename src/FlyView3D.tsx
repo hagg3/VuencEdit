@@ -2,8 +2,9 @@ import { useEffect, useRef, useState, forwardRef, useImperativeHandle } from "re
 import { invoke } from "@tauri-apps/api/core";
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import type { AtlasData } from "./texturePack";
 
-interface ChunkGeom { positions: string; colors: string; vertex_count: number }
+interface ChunkGeom { positions: string; colors: string; uvs: string; vertex_count: number }
 function decodeF32(b64: string): Float32Array {
   const bin = atob(b64);
   const n = bin.length;
@@ -57,8 +58,13 @@ const FlyView3D = forwardRef<FlyView3DRef, {
   onFlyModeChange?: (active: boolean) => void;
   onCameraMove?: (wx: number, wy: number) => void;
   overlays3d?: Overlay3D[] | null;
+  /** Decoded atlas data from a loaded texture pack, or null when none loaded. */
+  texturePack?: AtlasData | null;
+  /** Increments whenever the texture pack changes (loaded/unloaded/toggled). */
+  texEpoch?: number;
 }>(function FlyView3D({
   world, editEpoch = 0, lastEdit = null, spawnAt = null, onFlyModeChange, onCameraMove, overlays3d = null,
+  texturePack = null, texEpoch = 0,
 }, ref) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [flyMode, setFlyMode] = useState(false);
@@ -83,12 +89,17 @@ const FlyView3D = forwardRef<FlyView3DRef, {
   const spawnAtRef = useRef(spawnAt);
   spawnAtRef.current = spawnAt;
 
+  // Texture pack refs — updated by a dedicated effect, read by startFetch inside the scene closure.
+  const texMatRef = useRef<THREE.MeshBasicMaterial | null>(null);
+  const atlasTexRef = useRef<THREE.DataTexture | null>(null);
+
   // Stable refs so the effect can be re-run only on world change, while edit-sync and fly-mode
   // toggles flow through refs without tearing down the scene.
   const sceneApi = useRef<{
     scene: THREE.Scene;
     camera: THREE.PerspectiveCamera;
     reloadChunk: (cx: number, cy: number) => void;
+    reloadAllChunks: () => void;
     resetCamera: () => void;
     teleport: (wx: number, wy: number) => void;
     setOverlays: (ovs: Overlay3D[] | null) => void;
@@ -237,9 +248,15 @@ const FlyView3D = forwardRef<FlyView3DRef, {
           const geom = new THREE.BufferGeometry();
           geom.setAttribute("position", new THREE.BufferAttribute(decodeF32(g.positions), 3));
           geom.setAttribute("color", new THREE.BufferAttribute(decodeF32(g.colors), 3));
+          // Add UV attribute when the pack is loaded (uvs is non-empty base64 string).
+          const hasUVs = g.uvs && g.uvs.length > 0;
+          if (hasUVs) {
+            geom.setAttribute("uv", new THREE.BufferAttribute(decodeF32(g.uvs), 2));
+          }
           // No computeVertexNormals — MeshBasicMaterial ignores normals; shading is baked into colours.
           geom.computeBoundingSphere(); // cheap frustum-cull test per frame
-          const mesh = new THREE.Mesh(geom, mat);
+          const meshMat = (hasUVs && texMatRef.current) ? texMatRef.current : mat;
+          const mesh = new THREE.Mesh(geom, meshMat);
           scene.add(mesh);
           meshes.set(k, mesh);
           invalidate();
@@ -296,6 +313,18 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       else disposeMesh(k);
       queue.unshift({ cx: cxk, cy: cyk });
       pump();
+    };
+
+    // Reload all chunks — called when texture pack changes so meshes are rebuilt with new material.
+    const reloadAllChunks = () => {
+      inflight.clear();
+      active = 0;
+      queue = [];
+      for (const k of [...meshes.keys()]) {
+        if (meshes.get(k) === EMPTY) meshes.delete(k);
+        else disposeMesh(k);
+      }
+      streamSweep();
     };
 
     // ---- Fly controller ----
@@ -390,7 +419,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     canvas.addEventListener("pointerleave", onLeave);
 
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key.toLowerCase() === "z" && !e.repeat) {
+      if (e.key.toLowerCase() === "z" && !e.repeat && !e.metaKey && !e.ctrlKey) {
         // Toggle fly mode. Entering requires the pointer to be over this pane (so Z while working in
         // another quad-view pane is ignored); exiting always works.
         if (flyModeRef.current) { exitFly(); e.preventDefault(); }
@@ -544,7 +573,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     // Apply any overlays that were already set before scene init (e.g. selection exists at world-load).
     setOverlays(overlays3dRef.current);
 
-    sceneApi.current = { scene, camera, reloadChunk, resetCamera, teleport, setOverlays };
+    sceneApi.current = { scene, camera, reloadChunk, reloadAllChunks, resetCamera, teleport, setOverlays };
 
     return () => {
       disposed = true;
@@ -567,6 +596,8 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       for (const k of [...meshes.keys()]) disposeMesh(k);
       clearOverlays();
       mat.dispose();
+      if (texMatRef.current) { texMatRef.current.dispose(); texMatRef.current = null; }
+      if (atlasTexRef.current) { atlasTexRef.current.dispose(); atlasTexRef.current = null; }
       controls.dispose();
       // dispose() only — do NOT forceContextLoss() here. The renderer binds to the fixed <canvas>
       // ref, and a canvas can own just one WebGL context for its lifetime. Losing it would leave a
@@ -613,6 +644,34 @@ const FlyView3D = forwardRef<FlyView3DRef, {
         api.reloadChunk(cx, cy);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [editEpoch]);
+
+  // Texture pack sync: rebuild the DataTexture + material when the pack changes.
+  useEffect(() => {
+    if (atlasTexRef.current) { atlasTexRef.current.dispose(); atlasTexRef.current = null; }
+    if (texMatRef.current) { texMatRef.current.dispose(); texMatRef.current = null; }
+    if (texturePack) {
+      const { rgba, tile, rows } = texturePack;
+      const tex = new THREE.DataTexture(
+        new Uint8ClampedArray(rgba.buffer, rgba.byteOffset, rgba.byteLength),
+        tile, tile * rows,
+        THREE.RGBAFormat,
+      );
+      tex.minFilter = THREE.NearestFilter;
+      tex.magFilter = THREE.NearestFilter;
+      tex.flipY = false;
+      tex.needsUpdate = true;
+      atlasTexRef.current = tex;
+      texMatRef.current = new THREE.MeshBasicMaterial({
+        map: tex, vertexColors: true, side: THREE.DoubleSide,
+      });
+    }
+  }, [texturePack]);
+
+  // Reload all chunk meshes when the texture epoch changes (pack loaded / unloaded / toggled).
+  useEffect(() => {
+    sceneApi.current?.reloadAllChunks();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [texEpoch]);
 
   return (
     <div style={{ position: "relative", width: "100%", height: "100%", background: "#0a0f1e" }}>

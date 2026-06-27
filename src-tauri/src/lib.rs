@@ -1,3 +1,5 @@
+mod texturepack;
+
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use memmap2::{Mmap, MmapMut, MmapOptions};
 use serde::Serialize;
@@ -170,6 +172,8 @@ struct WorldState {
     /// Per-chunk surface colors: [r,g,b,a] for each of the 256 (lx*16+ly) positions.
     /// a=255 = solid block; a=0 = air column. 1 KB/chunk vs 32 KB for full raw.
     template_surface_cache: HashMap<(i32, i32), Box<[[u8; 4]; 256]>>,
+    /// Optional texture pack loaded by the user (world-independent).
+    texture_pack: Option<texturepack::TexturePack>,
 }
 
 impl WorldState {
@@ -183,6 +187,7 @@ impl WorldState {
             template_bytes: None,
             template_dir: HashMap::new(),
             template_surface_cache: HashMap::new(),
+            texture_pack: None,
         }
     }
 }
@@ -5441,6 +5446,17 @@ fn get_surface_z(state: tauri::State<'_, AppState>, x: i32, y: i32) -> Result<Op
 #[derive(serde::Serialize)]
 struct PickedBlock { block_type: u8, paint: u8 }
 
+/// Return the surface Z, block type, and paint at (wx, wy). Used by status bar cursor info.
+/// Returns None if no world loaded or column is empty.
+#[tauri::command]
+fn get_cursor_block(state: tauri::State<'_, AppState>, wx: i32, wy: i32) -> Option<[i32; 3]> {
+    let ws = state.lock().unwrap();
+    let world = ws.world.as_ref()?;
+    let z = surface_z(world, wx, wy)?;
+    let (bt, paint) = get_block_at(world, wx, wy, z);
+    Some([z, bt as i32, paint as i32])
+}
+
 /// Return the block type and paint at the surface of (wx, wy).
 /// Returns air (0,0) if the column is empty or out of bounds.
 #[tauri::command]
@@ -6477,6 +6493,13 @@ fn obj_v(w: &mut impl Write, (x, y, z): (f32, f32, f32)) -> std::io::Result<()> 
 fn obj_quad(w: &mut impl Write) -> std::io::Result<()> { writeln!(w, "f -4 -3 -2 -1") }
 fn obj_tri(w: &mut impl Write)  -> std::io::Result<()> { writeln!(w, "f -3 -2 -1") }
 
+fn write_vox_chunk(buf: &mut Vec<u8>, id: &[u8; 4], content: &[u8]) {
+    buf.extend_from_slice(id);
+    buf.extend_from_slice(&(content.len() as i32).to_le_bytes());
+    buf.extend_from_slice(&0i32.to_le_bytes()); // children_size always 0 for leaf chunks
+    buf.extend_from_slice(content);
+}
+
 /// Emit a cube block with face culling (skips faces adjacent to fully-opaque neighbors).
 fn emit_cube(w: &mut impl Write, wx: i32, wy: i32, wz: i32, world: &LoadedWorld) -> std::io::Result<()> {
     let (x0, x1) = (wx as f32, wx as f32 + 1.0);
@@ -6558,44 +6581,55 @@ fn emit_wedge(w: &mut impl Write, wx: i32, wy: i32, wz: i32, dir: u8, world: &Lo
     let solid_n = obj_occludes(get_block_at(world, wx, wy - 1, wz).0);
     let solid_e = obj_occludes(get_block_at(world, wx + 1, wy, wz).0);
     let solid_w = obj_occludes(get_block_at(world, wx - 1, wy, wz).0);
-    // Bottom
-    if !obj_occludes(get_block_at(world, wx, wy, wz - 1).0) {
-        obj_v(w, ov(x0,y1,z0))?; obj_v(w, ov(x1,y1,z0))?;
-        obj_v(w, ov(x1,y0,z0))?; obj_v(w, ov(x0,y0,z0))?;
-        obj_quad(w)?;
-    }
-    // Apex corner and 4 sloped/vertical faces
-    let (ax, ay) = match dir {
-        0 => (x0, y0), // SE wedge: apex at NW
-        1 => (x1, y0), // SW wedge: apex at NE
-        2 => (x1, y1), // NW wedge: apex at SE
-        _ => (x0, y1), // NE wedge: apex at SW
-    };
-    // Two vertical faces adjacent to the apex corner (culled against solid neighbours)
+    // Wedges are vertical triangular prisms (full Z height, triangle footprint in XY).
+    // Each wedge occupies the diagonal half named by its direction.
+    // Two axis-aligned rectangular faces at the named sides + one diagonal 45° rectangular face.
     match dir {
-        0 => { // apex NW: vertical West + North faces
-            if !solid_w { obj_v(w,ov(x0,y0,z0))?; obj_v(w,ov(x0,y1,z0))?; obj_v(w,ov(ax,ay,z1))?; obj_tri(w)?; }
-            if !solid_n { obj_v(w,ov(x1,y0,z0))?; obj_v(w,ov(x0,y0,z0))?; obj_v(w,ov(ax,ay,z1))?; obj_tri(w)?; }
-            obj_v(w,ov(ax,ay,z1))?; obj_v(w,ov(x0,y1,z0))?; obj_v(w,ov(x1,y1,z0))?; obj_tri(w)?;
-            obj_v(w,ov(ax,ay,z1))?; obj_v(w,ov(x1,y1,z0))?; obj_v(w,ov(x1,y0,z0))?; obj_tri(w)?;
+        0 => { // SE: triangle NE(x1,y0)-SE(x1,y1)-SW(x0,y1). East+South faces; diagonal NE↔SW.
+            // Bottom triangle
+            if !obj_occludes(get_block_at(world, wx, wy, wz-1).0) {
+                obj_v(w,ov(x1,y0,z0))?; obj_v(w,ov(x1,y1,z0))?; obj_v(w,ov(x0,y1,z0))?; obj_tri(w)?;
+            }
+            // Top triangle
+            if !obj_occludes(get_block_at(world, wx, wy, wz+1).0) {
+                obj_v(w,ov(x1,y0,z1))?; obj_v(w,ov(x0,y1,z1))?; obj_v(w,ov(x1,y1,z1))?; obj_tri(w)?;
+            }
+            if !solid_e { obj_v(w,ov(x1,y0,z0))?; obj_v(w,ov(x1,y1,z0))?; obj_v(w,ov(x1,y1,z1))?; obj_v(w,ov(x1,y0,z1))?; obj_quad(w)?; }
+            if !solid_s { obj_v(w,ov(x1,y1,z0))?; obj_v(w,ov(x0,y1,z0))?; obj_v(w,ov(x0,y1,z1))?; obj_v(w,ov(x1,y1,z1))?; obj_quad(w)?; }
+            obj_v(w,ov(x1,y0,z0))?; obj_v(w,ov(x0,y1,z0))?; obj_v(w,ov(x0,y1,z1))?; obj_v(w,ov(x1,y0,z1))?; obj_quad(w)?; // diag
         }
-        1 => { // apex NE: vertical East + North faces
-            if !solid_e { obj_v(w,ov(x1,y1,z0))?; obj_v(w,ov(x1,y0,z0))?; obj_v(w,ov(ax,ay,z1))?; obj_tri(w)?; }
-            if !solid_n { obj_v(w,ov(x0,y0,z0))?; obj_v(w,ov(x1,y0,z0))?; obj_v(w,ov(ax,ay,z1))?; obj_tri(w)?; }
-            obj_v(w,ov(ax,ay,z1))?; obj_v(w,ov(x1,y1,z0))?; obj_v(w,ov(x0,y1,z0))?; obj_tri(w)?;
-            obj_v(w,ov(ax,ay,z1))?; obj_v(w,ov(x0,y1,z0))?; obj_v(w,ov(x0,y0,z0))?; obj_tri(w)?;
+        1 => { // SW: triangle NW(x0,y0)-SW(x0,y1)-SE(x1,y1). West+South faces; diagonal NW↔SE.
+            if !obj_occludes(get_block_at(world, wx, wy, wz-1).0) {
+                obj_v(w,ov(x0,y0,z0))?; obj_v(w,ov(x0,y1,z0))?; obj_v(w,ov(x1,y1,z0))?; obj_tri(w)?;
+            }
+            if !obj_occludes(get_block_at(world, wx, wy, wz+1).0) {
+                obj_v(w,ov(x0,y0,z1))?; obj_v(w,ov(x1,y1,z1))?; obj_v(w,ov(x0,y1,z1))?; obj_tri(w)?;
+            }
+            if !solid_w { obj_v(w,ov(x0,y0,z0))?; obj_v(w,ov(x0,y1,z0))?; obj_v(w,ov(x0,y1,z1))?; obj_v(w,ov(x0,y0,z1))?; obj_quad(w)?; }
+            if !solid_s { obj_v(w,ov(x0,y1,z0))?; obj_v(w,ov(x1,y1,z0))?; obj_v(w,ov(x1,y1,z1))?; obj_v(w,ov(x0,y1,z1))?; obj_quad(w)?; }
+            obj_v(w,ov(x0,y0,z0))?; obj_v(w,ov(x1,y1,z0))?; obj_v(w,ov(x1,y1,z1))?; obj_v(w,ov(x0,y0,z1))?; obj_quad(w)?; // diag
         }
-        2 => { // apex SE: vertical East + South faces
-            if !solid_e { obj_v(w,ov(x1,y0,z0))?; obj_v(w,ov(x1,y1,z0))?; obj_v(w,ov(ax,ay,z1))?; obj_tri(w)?; }
-            if !solid_s { obj_v(w,ov(x1,y1,z0))?; obj_v(w,ov(x0,y1,z0))?; obj_v(w,ov(ax,ay,z1))?; obj_tri(w)?; }
-            obj_v(w,ov(ax,ay,z1))?; obj_v(w,ov(x0,y0,z0))?; obj_v(w,ov(x0,y1,z0))?; obj_tri(w)?;
-            obj_v(w,ov(ax,ay,z1))?; obj_v(w,ov(x1,y0,z0))?; obj_v(w,ov(x0,y0,z0))?; obj_tri(w)?;
+        2 => { // NW: triangle NE(x1,y0)-NW(x0,y0)-SW(x0,y1). North+West faces; diagonal NE↔SW.
+            if !obj_occludes(get_block_at(world, wx, wy, wz-1).0) {
+                obj_v(w,ov(x1,y0,z0))?; obj_v(w,ov(x0,y0,z0))?; obj_v(w,ov(x0,y1,z0))?; obj_tri(w)?;
+            }
+            if !obj_occludes(get_block_at(world, wx, wy, wz+1).0) {
+                obj_v(w,ov(x1,y0,z1))?; obj_v(w,ov(x0,y1,z1))?; obj_v(w,ov(x0,y0,z1))?; obj_tri(w)?;
+            }
+            if !solid_n { obj_v(w,ov(x1,y0,z0))?; obj_v(w,ov(x0,y0,z0))?; obj_v(w,ov(x0,y0,z1))?; obj_v(w,ov(x1,y0,z1))?; obj_quad(w)?; }
+            if !solid_w { obj_v(w,ov(x0,y0,z0))?; obj_v(w,ov(x0,y1,z0))?; obj_v(w,ov(x0,y1,z1))?; obj_v(w,ov(x0,y0,z1))?; obj_quad(w)?; }
+            obj_v(w,ov(x1,y0,z0))?; obj_v(w,ov(x0,y1,z0))?; obj_v(w,ov(x0,y1,z1))?; obj_v(w,ov(x1,y0,z1))?; obj_quad(w)?; // diag
         }
-        _ => { // apex SW: vertical West + South faces
-            if !solid_w { obj_v(w,ov(x0,y1,z0))?; obj_v(w,ov(x0,y0,z0))?; obj_v(w,ov(ax,ay,z1))?; obj_tri(w)?; }
-            if !solid_s { obj_v(w,ov(x0,y1,z0))?; obj_v(w,ov(x1,y1,z0))?; obj_v(w,ov(ax,ay,z1))?; obj_tri(w)?; }
-            obj_v(w,ov(ax,ay,z1))?; obj_v(w,ov(x1,y0,z0))?; obj_v(w,ov(x1,y1,z0))?; obj_tri(w)?;
-            obj_v(w,ov(ax,ay,z1))?; obj_v(w,ov(x0,y0,z0))?; obj_v(w,ov(x1,y0,z0))?; obj_tri(w)?;
+        _ => { // NE: triangle NW(x0,y0)-NE(x1,y0)-SE(x1,y1). North+East faces; diagonal NW↔SE.
+            if !obj_occludes(get_block_at(world, wx, wy, wz-1).0) {
+                obj_v(w,ov(x0,y0,z0))?; obj_v(w,ov(x1,y0,z0))?; obj_v(w,ov(x1,y1,z0))?; obj_tri(w)?;
+            }
+            if !obj_occludes(get_block_at(world, wx, wy, wz+1).0) {
+                obj_v(w,ov(x0,y0,z1))?; obj_v(w,ov(x1,y1,z1))?; obj_v(w,ov(x1,y0,z1))?; obj_tri(w)?;
+            }
+            if !solid_n { obj_v(w,ov(x0,y0,z0))?; obj_v(w,ov(x1,y0,z0))?; obj_v(w,ov(x1,y0,z1))?; obj_v(w,ov(x0,y0,z1))?; obj_quad(w)?; }
+            if !solid_e { obj_v(w,ov(x1,y0,z0))?; obj_v(w,ov(x1,y1,z0))?; obj_v(w,ov(x1,y1,z1))?; obj_v(w,ov(x1,y0,z1))?; obj_quad(w)?; }
+            obj_v(w,ov(x0,y0,z0))?; obj_v(w,ov(x1,y1,z0))?; obj_v(w,ov(x1,y1,z1))?; obj_v(w,ov(x0,y0,z1))?; obj_quad(w)?; // diag
         }
     }
     Ok(())
@@ -6806,12 +6840,238 @@ fn export_obj(
     Ok(())
 }
 
+// ── JSON Export ────────────────────────────────────────────────────────────────
+
+#[tauri::command]
+fn export_json(
+    state: tauri::State<'_, AppState>,
+    path: String,
+    x1: i32, y1: i32, x2: i32, y2: i32,
+    z_min: i32, z_max: i32,
+) -> Result<u32, String> {
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+
+    let ws = state.lock().unwrap();
+    let world = ws.world.as_ref().ok_or("No world loaded")?;
+
+    let sx1 = x1.min(x2); let sx2 = x1.max(x2);
+    let sy1 = y1.min(y2); let sy2 = y1.max(y2);
+    let sz1 = z_min.min(z_max).max(0);
+    let sz2 = z_min.max(z_max).min(world_max_z(world));
+
+    let format_str = if world.chunk_size >= 131072 { "256z" } else { "64z" };
+
+    let f = fs::File::create(&path).map_err(|e| format!("Cannot create file: {e}"))?;
+    let mut gz = GzEncoder::new(f, Compression::best());
+
+    // Write header manually to avoid building a giant serde_json::Value in memory.
+    let header = format!(
+        "{{\n\
+         \"generator\":\"VuencEdit\",\n\
+         \"world_name\":{},\n\
+         \"format\":\"{format_str}\",\n\
+         \"width_blocks\":{},\n\
+         \"height_blocks\":{},\n\
+         \"max_z\":{},\n\
+         \"sky\":{},\n\
+         \"exported_bounds\":{{\"x1\":{sx1},\"y1\":{sy1},\"x2\":{sx2},\"y2\":{sy2},\"z_min\":{sz1},\"z_max\":{sz2}}},\n\
+         \"blocks\":[\n",
+        serde_json::to_string(&world.name).unwrap(),
+        world.w_chunks * 16,
+        world.h_chunks * 16,
+        world_max_z(world),
+        world.sky,
+    );
+    gz.write_all(header.as_bytes()).map_err(|e| e.to_string())?;
+
+    let mut count: u32 = 0;
+    let mut first = true;
+    for wz in sz1..=sz2 {
+        for wy in sy1..=sy2 {
+            for wx in sx1..=sx2 {
+                let (bt, paint) = get_block_at(world, wx, wy, wz);
+                if bt == 0 { continue; }
+                if !first { gz.write_all(b",\n").map_err(|e| e.to_string())?; }
+                first = false;
+                let line = format!("{{\"x\":{wx},\"y\":{wy},\"z\":{wz},\"t\":{bt},\"p\":{paint}}}");
+                gz.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
+                count += 1;
+            }
+        }
+    }
+
+    gz.write_all(b"\n]}\n").map_err(|e| e.to_string())?;
+    gz.finish().map_err(|e| e.to_string())?;
+
+    Ok(count)
+}
+
+// ── VOX Export ────────────────────────────────────────────────────────────────
+
+#[tauri::command]
+fn export_vox(
+    app_handle: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    path: String,
+    x1: i32, y1: i32, x2: i32, y2: i32,
+    z_min: i32, z_max: i32,
+) -> Result<u32, String> {
+    let ws = state.lock().unwrap();
+    let world = ws.world.as_ref().ok_or("No world loaded")?;
+
+    let sx1 = x1.min(x2); let sx2 = x1.max(x2);
+    let sy1 = y1.min(y2); let sy2 = y1.max(y2);
+    let sz1 = z_min.min(z_max).max(0);
+    let sz2 = z_min.max(z_max).min(world_max_z(world));
+    let total_z = (sz2 - sz1 + 1) as f32;
+
+    // Throttled progress emitter — fires only when rounded integer pct advances.
+    let mut last_pct = -1i32;
+    let mut emit_progress = |phase: &str, frac: f32| {
+        let pct = (frac * 100.0).round().clamp(0.0, 100.0) as i32;
+        if pct != last_pct {
+            last_pct = pct;
+            let _ = app_handle.emit("vox-progress",
+                serde_json::json!({ "phase": phase, "pct": pct }));
+        }
+    };
+
+    // Pass 1: collect unique RGB values in encounter order (0–45% of progress).
+    let mut unique_colors: Vec<[u8; 3]> = Vec::new();
+    let mut seen: HashSet<[u8; 3]> = HashSet::new();
+    for wz in sz1..=sz2 {
+        emit_progress("Scanning colors", (wz - sz1) as f32 / total_z * 0.45);
+        for wy in sy1..=sy2 {
+            for wx in sx1..=sx2 {
+                let (bt, paint) = get_block_at(world, wx, wy, wz);
+                if bt == 0 { continue; }
+                let rgb = block_color(bt, paint, world.sky);
+                if seen.insert(rgb) { unique_colors.push(rgb); }
+            }
+        }
+    }
+    if unique_colors.is_empty() {
+        return Err("No non-air blocks in the selected region".into());
+    }
+
+    // Build palette (max 255 entries; VOX color index 0 = empty).
+    let n_colors = unique_colors.len();
+    let palette: Vec<[u8; 3]> = unique_colors.iter().copied().take(255).collect();
+    let mut color_to_idx: HashMap<[u8; 3], u8> = palette.iter().enumerate()
+        .map(|(i, &rgb)| (rgb, (i + 1) as u8))
+        .collect();
+
+    // Nearest-neighbor quantization for any overflow colors (>255 unique).
+    let overflow_count = n_colors.saturating_sub(255);
+    if overflow_count > 0 {
+        emit_progress(&format!("Quantizing palette ({overflow_count} overflow colors)"), 0.46);
+        for &rgb in unique_colors.iter().skip(255) {
+            let best = palette.iter().enumerate()
+                .min_by_key(|(_, &p)| {
+                    let d = |a: u8, b: u8| (a as i32 - b as i32).pow(2);
+                    d(p[0], rgb[0]) + d(p[1], rgb[1]) + d(p[2], rgb[2])
+                })
+                .map(|(i, _)| (i + 1) as u8)
+                .unwrap_or(1);
+            color_to_idx.insert(rgb, best);
+        }
+    }
+
+    let w_blocks     = (sx2 - sx1 + 1) as usize;
+    let h_blocks     = (sy2 - sy1 + 1) as usize;
+    let z_depth      = (sz2 - sz1 + 1) as usize; // always ≤ 256
+    let gx_count     = (w_blocks + 255) / 256;
+    let gy_count     = (h_blocks + 255) / 256;
+    let total_models = (gx_count * gy_count) as f32;
+
+    // Pass 2: build children buffer (SIZE+XYZI per sub-model, then RGBA) — 47–97%.
+    let mut children_buf: Vec<u8> = Vec::new();
+    let mut total_voxels: u32 = 0;
+    let mut model_idx: usize = 0;
+
+    for gy in 0..gy_count {
+        for gx in 0..gx_count {
+            let wx_start = sx1 + (gx * 256) as i32;
+            let wx_end   = (wx_start + 255).min(sx2);
+            let wy_start = sy1 + (gy * 256) as i32;
+            let wy_end   = (wy_start + 255).min(sy2);
+            let model_w  = (wx_end - wx_start + 1) as i32;
+            let model_h  = (wy_end - wy_start + 1) as i32;
+            let model_z  = z_depth as i32;
+
+            let label = if total_models > 1.0 {
+                format!("Building model {}/{}", model_idx + 1, gx_count * gy_count)
+            } else {
+                "Building model".to_string()
+            };
+            emit_progress(&label, 0.47 + model_idx as f32 / total_models * 0.50);
+            model_idx += 1;
+
+            let mut voxels: Vec<[u8; 4]> = Vec::new();
+            for wz in sz1..=sz2 {
+                for wy in wy_start..=wy_end {
+                    for wx in wx_start..=wx_end {
+                        let (bt, paint) = get_block_at(world, wx, wy, wz);
+                        if bt == 0 { continue; }
+                        let rgb  = block_color(bt, paint, world.sky);
+                        let cidx = *color_to_idx.get(&rgb).unwrap_or(&1);
+                        let lx   = (wx - wx_start) as u8;
+                        let ly   = (wy - wy_start) as u8;
+                        let lz   = (wz - sz1) as u8;
+                        voxels.push([lx, ly, lz, cidx]);
+                    }
+                }
+            }
+            if voxels.is_empty() { continue; }
+            total_voxels += voxels.len() as u32;
+
+            let mut size_content = Vec::with_capacity(12);
+            size_content.extend_from_slice(&model_w.to_le_bytes());
+            size_content.extend_from_slice(&model_h.to_le_bytes());
+            size_content.extend_from_slice(&model_z.to_le_bytes());
+            write_vox_chunk(&mut children_buf, b"SIZE", &size_content);
+
+            let n = voxels.len() as i32;
+            let mut xyzi_content = Vec::with_capacity(4 + voxels.len() * 4);
+            xyzi_content.extend_from_slice(&n.to_le_bytes());
+            for v in &voxels { xyzi_content.extend_from_slice(v); }
+            write_vox_chunk(&mut children_buf, b"XYZI", &xyzi_content);
+        }
+    }
+
+    // RGBA palette chunk (always 1024 bytes; index 0 is unused per spec).
+    let mut rgba = vec![0u8; 1024];
+    for (i, &[r, g, b]) in palette.iter().enumerate() {
+        let s = (i + 1) * 4;
+        rgba[s] = r; rgba[s + 1] = g; rgba[s + 2] = b; rgba[s + 3] = 255;
+    }
+    write_vox_chunk(&mut children_buf, b"RGBA", &rgba);
+
+    // Write file: magic + version + MAIN chunk.
+    emit_progress("Writing file", 0.97);
+    let f = fs::File::create(&path).map_err(|e| format!("Cannot create .vox: {e}"))?;
+    let mut w = BufWriter::with_capacity(1 << 20, f);
+    w.write_all(b"VOX ").map_err(|e| e.to_string())?;
+    w.write_all(&150i32.to_le_bytes()).map_err(|e| e.to_string())?;
+    w.write_all(b"MAIN").map_err(|e| e.to_string())?;
+    w.write_all(&0i32.to_le_bytes()).map_err(|e| e.to_string())?; // MAIN content_size
+    w.write_all(&(children_buf.len() as i32).to_le_bytes()).map_err(|e| e.to_string())?;
+    w.write_all(&children_buf).map_err(|e| e.to_string())?;
+    emit_progress("Done", 1.0);
+
+    Ok(total_voxels)
+}
+
 #[derive(serde::Serialize)]
 struct ObjGeometryResult {
     #[serde(serialize_with = "serialize_bytes_b64")]
     positions: Vec<u8>, // LE f32 triplets (x,y,z) per vertex
     #[serde(serialize_with = "serialize_bytes_b64")]
     colors: Vec<u8>,    // LE f32 triplets (r,g,b 0..1) per vertex
+    #[serde(serialize_with = "serialize_bytes_b64")]
+    uvs: Vec<u8>,       // LE f32 pairs (u,v) per vertex; empty when no texture pack loaded
     vertex_count: u32,
 }
 
@@ -6834,15 +7094,16 @@ fn get_obj_geometry(
         return Err(format!("Selection too large ({vol} blocks) — max 64×64×64 for 3D preview"));
     }
 
-    Ok(obj_geometry_region(world, sx1, sy1, sx2, sy2, sz1, sz2))
+    Ok(obj_geometry_region(world, ws.texture_pack.as_ref(), sx1, sy1, sx2, sy2, sz1, sz2))
 }
 
 /// Face-culled cube/ramp/wedge geometry for an arbitrary world box, encoded as LE f32 position +
 /// colour triplets (Three.js Y-up coords). Shared by `get_obj_geometry` (64³ selection preview) and
 /// `get_chunk_geometry` (world-scale fly-through chunk streaming).
-fn obj_geometry_region(world: &LoadedWorld, sx1: i32, sy1: i32, sx2: i32, sy2: i32, sz1: i32, sz2: i32) -> ObjGeometryResult {
+fn obj_geometry_region(world: &LoadedWorld, pack: Option<&texturepack::TexturePack>, sx1: i32, sy1: i32, sx2: i32, sy2: i32, sz1: i32, sz2: i32) -> ObjGeometryResult {
     let mut pos_f: Vec<f32> = Vec::new();
     let mut col_f: Vec<f32> = Vec::new();
+    let mut uv_f:  Vec<f32> = Vec::new();
 
     // Directional face-shading baked into vertex colours — replaces normal-based lighting.
     // Values approximate: sun from above + slightly east/south; fill from northwest.
@@ -6853,16 +7114,60 @@ fn obj_geometry_region(world: &LoadedWorld, sx1: i32, sy1: i32, sx2: i32, sy2: i
     const SH_S:   f32 = 0.70; // south (+Y)
     const SH_N:   f32 = 0.75; // north (-Y)
 
+    // Detect face kind from shade constant so per-face textures work without touching every call site.
+    // SH_TOP → top face (2), SH_BOT → bottom face (1), anything else → side face (0).
+    // Wedge diagonal blended shades ((SH_N+SH_W)*0.5 etc.) are not equal to SH_TOP/SH_BOT → side.
+    macro_rules! face_kind {
+        ($sh:expr) => {{
+            let s: f32 = $sh;
+            if s == SH_TOP { 2u8 } else if s == SH_BOT { 1u8 } else { 0u8 }
+        }};
+    }
+
+    // Push UV coords for a quad (6 verts: ABD, BCD) covering atlas row with v in [v0,v1].
+    macro_rules! push_quad_uv {
+        ($v0:expr, $v1:expr) => {
+            uv_f.extend_from_slice(&[
+                0.0, $v0,  1.0, $v0,  0.0, $v1,
+                1.0, $v0,  1.0, $v1,  0.0, $v1,
+            ]);
+        };
+    }
+    // Push UV coords for a triangle covering the same atlas row.
+    macro_rules! push_tri_uv {
+        ($v0:expr, $v1:expr) => {
+            uv_f.extend_from_slice(&[0.0, $v0,  1.0, $v0,  0.5, $v1]);
+        };
+    }
+
     macro_rules! push_tri {
-        ($verts:expr, $rgb:expr, $sh:expr) => {{
-            let (r,g,b) = ($rgb[0] as f32/255.0*$sh, $rgb[1] as f32/255.0*$sh, $rgb[2] as f32/255.0*$sh);
+        ($verts:expr, $rgb:expr, $sh:expr, $btype:expr, $bpaint:expr) => {{
+            let fk = face_kind!($sh);
+            let (rgb2, row_opt) = if let Some(p) = pack {
+                texturepack::face_color_and_row(p, $btype, $bpaint, fk, $rgb)
+            } else { ($rgb, None) };
+            let (r,g,b) = (rgb2[0] as f32/255.0*$sh, rgb2[1] as f32/255.0*$sh, rgb2[2] as f32/255.0*$sh);
             for (x,y,z) in $verts { pos_f.extend_from_slice(&[x,y,z]); col_f.extend_from_slice(&[r,g,b]); }
+            if let Some(p) = pack {
+                let ar = p.atlas_rows as f32;
+                let (v0, v1) = match row_opt { Some(row) => (row as f32/ar, (row+1) as f32/ar), None => (0.0, 1.0/ar) };
+                push_tri_uv!(v1, v0); // swap: $v0 arg → floor vertex, $v1 arg → apex; tile reads top→bottom
+            }
         }};
     }
     macro_rules! push_quad {
-        ($a:expr,$b:expr,$c:expr,$d:expr,$rgb:expr,$sh:expr) => {{
-            let (r,g,b_) = ($rgb[0] as f32/255.0*$sh, $rgb[1] as f32/255.0*$sh, $rgb[2] as f32/255.0*$sh);
+        ($a:expr,$b:expr,$c:expr,$d:expr,$rgb:expr,$sh:expr,$btype:expr,$bpaint:expr) => {{
+            let fk = face_kind!($sh);
+            let (rgb2, row_opt) = if let Some(p) = pack {
+                texturepack::face_color_and_row(p, $btype, $bpaint, fk, $rgb)
+            } else { ($rgb, None) };
+            let (r,g,b_) = (rgb2[0] as f32/255.0*$sh, rgb2[1] as f32/255.0*$sh, rgb2[2] as f32/255.0*$sh);
             for (x,y,z) in [$a,$b,$d, $b,$c,$d] { pos_f.extend_from_slice(&[x,y,z]); col_f.extend_from_slice(&[r,g,b_]); }
+            if let Some(p) = pack {
+                let ar = p.atlas_rows as f32;
+                let (v0, v1) = match row_opt { Some(row) => (row as f32/ar, (row+1) as f32/ar), None => (0.0, 1.0/ar) };
+                push_quad_uv!(v1, v0); // swap: $v0 arg → A/B vertices, $v1 arg → C/D vertices; tile reads top→bottom
+            }
         }};
     }
 
@@ -6886,89 +7191,95 @@ fn obj_geometry_region(world: &LoadedWorld, sx1: i32, sy1: i32, sx2: i32, sy2: i
                     let se = obj_occludes(get_block_at(world,wx+1,wy,wz).0);
                     let sw = obj_occludes(get_block_at(world,wx-1,wy,wz).0);
                     if !obj_occludes(get_block_at(world,wx,wy,wz-1).0) {
-                        push_quad!(o(x0,y1f,z0),o(x1f,y1f,z0),o(x1f,y0,z0),o(x0,y0,z0),rgb,SH_BOT);
+                        push_quad!(o(x0,y1f,z0),o(x1f,y1f,z0),o(x1f,y0,z0),o(x0,y0,z0),rgb,SH_BOT,bt,paint);
                     }
                     match dir {
                         0 => {
-                            if !ss { push_quad!(o(x0,y1f,z0),o(x1f,y1f,z0),o(x1f,y1f,z1f),o(x0,y1f,z1f),rgb,SH_S); }
-                            if !sw { push_tri!([o(x0,y0,z0),o(x0,y1f,z0),o(x0,y1f,z1f)],rgb,SH_W); }
-                            if !se { push_tri!([o(x1f,y1f,z0),o(x1f,y0,z0),o(x1f,y1f,z1f)],rgb,SH_E); }
-                            push_quad!(o(x0,y0,z0),o(x1f,y0,z0),o(x1f,y1f,z1f),o(x0,y1f,z1f),rgb,SH_TOP);
+                            if !ss { push_quad!(o(x0,y1f,z0),o(x1f,y1f,z0),o(x1f,y1f,z1f),o(x0,y1f,z1f),rgb,SH_S,bt,paint); }
+                            if !sw { push_tri!([o(x0,y0,z0),o(x0,y1f,z0),o(x0,y1f,z1f)],rgb,SH_W,bt,paint); }
+                            if !se { push_tri!([o(x1f,y1f,z0),o(x1f,y0,z0),o(x1f,y1f,z1f)],rgb,SH_E,bt,paint); }
+                            push_quad!(o(x0,y0,z0),o(x1f,y0,z0),o(x1f,y1f,z1f),o(x0,y1f,z1f),rgb,SH_TOP,bt,paint);
                         }
                         1 => {
-                            if !sw { push_quad!(o(x0,y0,z0),o(x0,y1f,z0),o(x0,y1f,z1f),o(x0,y0,z1f),rgb,SH_W); }
-                            if !ss { push_tri!([o(x0,y1f,z0),o(x1f,y1f,z0),o(x0,y1f,z1f)],rgb,SH_S); }
-                            if !sn { push_tri!([o(x1f,y0,z0),o(x0,y0,z0),o(x0,y0,z1f)],rgb,SH_N); }
-                            push_quad!(o(x1f,y0,z0),o(x1f,y1f,z0),o(x0,y1f,z1f),o(x0,y0,z1f),rgb,SH_TOP);
+                            if !sw { push_quad!(o(x0,y0,z0),o(x0,y1f,z0),o(x0,y1f,z1f),o(x0,y0,z1f),rgb,SH_W,bt,paint); }
+                            if !ss { push_tri!([o(x0,y1f,z0),o(x1f,y1f,z0),o(x0,y1f,z1f)],rgb,SH_S,bt,paint); }
+                            if !sn { push_tri!([o(x1f,y0,z0),o(x0,y0,z0),o(x0,y0,z1f)],rgb,SH_N,bt,paint); }
+                            push_quad!(o(x1f,y0,z0),o(x1f,y1f,z0),o(x0,y1f,z1f),o(x0,y0,z1f),rgb,SH_TOP,bt,paint);
                         }
                         2 => {
-                            if !sn { push_quad!(o(x1f,y0,z0),o(x0,y0,z0),o(x0,y0,z1f),o(x1f,y0,z1f),rgb,SH_N); }
-                            if !se { push_tri!([o(x1f,y0,z0),o(x1f,y1f,z0),o(x1f,y0,z1f)],rgb,SH_E); }
-                            if !sw { push_tri!([o(x0,y1f,z0),o(x0,y0,z0),o(x0,y0,z1f)],rgb,SH_W); }
-                            push_quad!(o(x1f,y1f,z0),o(x0,y1f,z0),o(x0,y0,z1f),o(x1f,y0,z1f),rgb,SH_TOP);
+                            if !sn { push_quad!(o(x1f,y0,z0),o(x0,y0,z0),o(x0,y0,z1f),o(x1f,y0,z1f),rgb,SH_N,bt,paint); }
+                            if !se { push_tri!([o(x1f,y0,z0),o(x1f,y1f,z0),o(x1f,y0,z1f)],rgb,SH_E,bt,paint); }
+                            if !sw { push_tri!([o(x0,y1f,z0),o(x0,y0,z0),o(x0,y0,z1f)],rgb,SH_W,bt,paint); }
+                            push_quad!(o(x1f,y1f,z0),o(x0,y1f,z0),o(x0,y0,z1f),o(x1f,y0,z1f),rgb,SH_TOP,bt,paint);
                         }
                         _ => {
-                            if !se { push_quad!(o(x1f,y1f,z0),o(x1f,y0,z0),o(x1f,y0,z1f),o(x1f,y1f,z1f),rgb,SH_E); }
-                            if !sn { push_tri!([o(x1f,y0,z0),o(x0,y0,z0),o(x1f,y0,z1f)],rgb,SH_N); }
-                            if !ss { push_tri!([o(x0,y1f,z0),o(x1f,y1f,z0),o(x1f,y1f,z1f)],rgb,SH_S); }
-                            push_quad!(o(x0,y1f,z0),o(x0,y0,z0),o(x1f,y0,z1f),o(x1f,y1f,z1f),rgb,SH_TOP);
+                            if !se { push_quad!(o(x1f,y1f,z0),o(x1f,y0,z0),o(x1f,y0,z1f),o(x1f,y1f,z1f),rgb,SH_E,bt,paint); }
+                            if !sn { push_tri!([o(x1f,y0,z0),o(x0,y0,z0),o(x1f,y0,z1f)],rgb,SH_N,bt,paint); }
+                            if !ss { push_tri!([o(x0,y1f,z0),o(x1f,y1f,z0),o(x1f,y1f,z1f)],rgb,SH_S,bt,paint); }
+                            push_quad!(o(x0,y1f,z0),o(x0,y0,z0),o(x1f,y0,z1f),o(x1f,y1f,z1f),rgb,SH_TOP,bt,paint);
                         }
                     }
                 } else if matches!(bt, 40..=55) {
+                    // Wedges are vertical triangular prisms: full Z height, triangle footprint in XY.
+                    // Each wedge occupies the diagonal half of the block named by its direction —
+                    // SE fills the NE-SE-SW triangle (cuts off the NW corner), etc.
+                    // Two rectangular faces at the named sides + one diagonal 45° rectangular face.
                     let dir = (bt-40)%4;
                     let ss = obj_occludes(get_block_at(world,wx,wy+1,wz).0);
                     let sn = obj_occludes(get_block_at(world,wx,wy-1,wz).0);
                     let se = obj_occludes(get_block_at(world,wx+1,wy,wz).0);
                     let sw = obj_occludes(get_block_at(world,wx-1,wy,wz).0);
-                    if !obj_occludes(get_block_at(world,wx,wy,wz-1).0) {
-                        push_quad!(o(x0,y1f,z0),o(x1f,y1f,z0),o(x1f,y0,z0),o(x0,y0,z0),rgb,SH_BOT);
-                    }
-                    let (ax,ay) = match dir { 0=>(x0,y0), 1=>(x1f,y0), 2=>(x1f,y1f), _=>(x0,y1f) };
+                    let s_top = obj_occludes(get_block_at(world,wx,wy,wz+1).0);
+                    let s_bot = obj_occludes(get_block_at(world,wx,wy,wz-1).0);
                     match dir {
-                        0 => {
-                            if !sw { push_tri!([o(x0,y0,z0),o(x0,y1f,z0),o(ax,ay,z1f)],rgb,SH_W); }
-                            if !sn { push_tri!([o(x1f,y0,z0),o(x0,y0,z0),o(ax,ay,z1f)],rgb,SH_N); }
-                            push_tri!([o(ax,ay,z1f),o(x0,y1f,z0),o(x1f,y1f,z0)],rgb,SH_TOP);
-                            push_tri!([o(ax,ay,z1f),o(x1f,y1f,z0),o(x1f,y0,z0)],rgb,SH_TOP);
+                        0 => { // SE: triangle NE(x1f,y0)-SE(x1f,y1f)-SW(x0,y1f). Diagonal NE↔SW faces NW.
+                            if !s_bot { push_tri!([o(x1f,y0,z0),o(x1f,y1f,z0),o(x0,y1f,z0)],rgb,SH_BOT,bt,paint); }
+                            if !s_top { push_tri!([o(x1f,y0,z1f),o(x0,y1f,z1f),o(x1f,y1f,z1f)],rgb,SH_TOP,bt,paint); }
+                            if !se { push_quad!(o(x1f,y0,z0),o(x1f,y1f,z0),o(x1f,y1f,z1f),o(x1f,y0,z1f),rgb,SH_E,bt,paint); }
+                            if !ss { push_quad!(o(x1f,y1f,z0),o(x0,y1f,z0),o(x0,y1f,z1f),o(x1f,y1f,z1f),rgb,SH_S,bt,paint); }
+                            push_quad!(o(x1f,y0,z0),o(x0,y1f,z0),o(x0,y1f,z1f),o(x1f,y0,z1f),rgb,(SH_N+SH_W)*0.5,bt,paint);
                         }
-                        1 => {
-                            if !se { push_tri!([o(x1f,y1f,z0),o(x1f,y0,z0),o(ax,ay,z1f)],rgb,SH_E); }
-                            if !sn { push_tri!([o(x0,y0,z0),o(x1f,y0,z0),o(ax,ay,z1f)],rgb,SH_N); }
-                            push_tri!([o(ax,ay,z1f),o(x1f,y1f,z0),o(x0,y1f,z0)],rgb,SH_TOP);
-                            push_tri!([o(ax,ay,z1f),o(x0,y1f,z0),o(x0,y0,z0)],rgb,SH_TOP);
+                        1 => { // SW: triangle NW(x0,y0)-SW(x0,y1f)-SE(x1f,y1f). Diagonal NW↔SE faces NE.
+                            if !s_bot { push_tri!([o(x0,y0,z0),o(x0,y1f,z0),o(x1f,y1f,z0)],rgb,SH_BOT,bt,paint); }
+                            if !s_top { push_tri!([o(x0,y0,z1f),o(x1f,y1f,z1f),o(x0,y1f,z1f)],rgb,SH_TOP,bt,paint); }
+                            if !sw { push_quad!(o(x0,y0,z0),o(x0,y1f,z0),o(x0,y1f,z1f),o(x0,y0,z1f),rgb,SH_W,bt,paint); }
+                            if !ss { push_quad!(o(x0,y1f,z0),o(x1f,y1f,z0),o(x1f,y1f,z1f),o(x0,y1f,z1f),rgb,SH_S,bt,paint); }
+                            push_quad!(o(x0,y0,z0),o(x1f,y1f,z0),o(x1f,y1f,z1f),o(x0,y0,z1f),rgb,(SH_N+SH_E)*0.5,bt,paint);
                         }
-                        2 => {
-                            if !se { push_tri!([o(x1f,y0,z0),o(x1f,y1f,z0),o(ax,ay,z1f)],rgb,SH_E); }
-                            if !ss { push_tri!([o(x1f,y1f,z0),o(x0,y1f,z0),o(ax,ay,z1f)],rgb,SH_S); }
-                            push_tri!([o(ax,ay,z1f),o(x0,y0,z0),o(x0,y1f,z0)],rgb,SH_TOP);
-                            push_tri!([o(ax,ay,z1f),o(x1f,y0,z0),o(x0,y0,z0)],rgb,SH_TOP);
+                        2 => { // NW: triangle NE(x1f,y0)-NW(x0,y0)-SW(x0,y1f). Diagonal NE↔SW faces SE.
+                            if !s_bot { push_tri!([o(x1f,y0,z0),o(x0,y0,z0),o(x0,y1f,z0)],rgb,SH_BOT,bt,paint); }
+                            if !s_top { push_tri!([o(x1f,y0,z1f),o(x0,y1f,z1f),o(x0,y0,z1f)],rgb,SH_TOP,bt,paint); }
+                            if !sn { push_quad!(o(x1f,y0,z0),o(x0,y0,z0),o(x0,y0,z1f),o(x1f,y0,z1f),rgb,SH_N,bt,paint); }
+                            if !sw { push_quad!(o(x0,y0,z0),o(x0,y1f,z0),o(x0,y1f,z1f),o(x0,y0,z1f),rgb,SH_W,bt,paint); }
+                            push_quad!(o(x1f,y0,z0),o(x0,y1f,z0),o(x0,y1f,z1f),o(x1f,y0,z1f),rgb,(SH_S+SH_E)*0.5,bt,paint);
                         }
-                        _ => {
-                            if !sw { push_tri!([o(x0,y1f,z0),o(x0,y0,z0),o(ax,ay,z1f)],rgb,SH_W); }
-                            if !ss { push_tri!([o(x0,y1f,z0),o(x1f,y1f,z0),o(ax,ay,z1f)],rgb,SH_S); }
-                            push_tri!([o(ax,ay,z1f),o(x1f,y0,z0),o(x1f,y1f,z0)],rgb,SH_TOP);
-                            push_tri!([o(ax,ay,z1f),o(x0,y0,z0),o(x1f,y0,z0)],rgb,SH_TOP);
+                        _ => { // NE: triangle NW(x0,y0)-NE(x1f,y0)-SE(x1f,y1f). Diagonal NW↔SE faces SW.
+                            if !s_bot { push_tri!([o(x0,y0,z0),o(x1f,y0,z0),o(x1f,y1f,z0)],rgb,SH_BOT,bt,paint); }
+                            if !s_top { push_tri!([o(x0,y0,z1f),o(x1f,y1f,z1f),o(x1f,y0,z1f)],rgb,SH_TOP,bt,paint); }
+                            if !sn { push_quad!(o(x0,y0,z0),o(x1f,y0,z0),o(x1f,y0,z1f),o(x0,y0,z1f),rgb,SH_N,bt,paint); }
+                            if !se { push_quad!(o(x1f,y0,z0),o(x1f,y1f,z0),o(x1f,y1f,z1f),o(x1f,y0,z1f),rgb,SH_E,bt,paint); }
+                            push_quad!(o(x0,y0,z0),o(x1f,y1f,z0),o(x1f,y1f,z1f),o(x0,y0,z1f),rgb,(SH_S+SH_W)*0.5,bt,paint);
                         }
                     }
                 } else {
                     // Cube with face culling
                     if !obj_occludes(get_block_at(world,wx,wy,wz+1).0) {
-                        push_quad!(o(x0,y0,z1f),o(x1f,y0,z1f),o(x1f,y1f,z1f),o(x0,y1f,z1f),rgb,SH_TOP);
+                        push_quad!(o(x0,y0,z1f),o(x1f,y0,z1f),o(x1f,y1f,z1f),o(x0,y1f,z1f),rgb,SH_TOP,bt,paint);
                     }
                     if !obj_occludes(get_block_at(world,wx,wy,wz-1).0) {
-                        push_quad!(o(x0,y1f,z0),o(x1f,y1f,z0),o(x1f,y0,z0),o(x0,y0,z0),rgb,SH_BOT);
+                        push_quad!(o(x0,y1f,z0),o(x1f,y1f,z0),o(x1f,y0,z0),o(x0,y0,z0),rgb,SH_BOT,bt,paint);
                     }
                     if !obj_occludes(get_block_at(world,wx,wy+1,wz).0) {
-                        push_quad!(o(x0,y1f,z0),o(x1f,y1f,z0),o(x1f,y1f,z1f),o(x0,y1f,z1f),rgb,SH_S);
+                        push_quad!(o(x0,y1f,z0),o(x1f,y1f,z0),o(x1f,y1f,z1f),o(x0,y1f,z1f),rgb,SH_S,bt,paint);
                     }
                     if !obj_occludes(get_block_at(world,wx,wy-1,wz).0) {
-                        push_quad!(o(x1f,y0,z0),o(x0,y0,z0),o(x0,y0,z1f),o(x1f,y0,z1f),rgb,SH_N);
+                        push_quad!(o(x1f,y0,z0),o(x0,y0,z0),o(x0,y0,z1f),o(x1f,y0,z1f),rgb,SH_N,bt,paint);
                     }
                     if !obj_occludes(get_block_at(world,wx+1,wy,wz).0) {
-                        push_quad!(o(x1f,y1f,z0),o(x1f,y0,z0),o(x1f,y0,z1f),o(x1f,y1f,z1f),rgb,SH_E);
+                        push_quad!(o(x1f,y1f,z0),o(x1f,y0,z0),o(x1f,y0,z1f),o(x1f,y1f,z1f),rgb,SH_E,bt,paint);
                     }
                     if !obj_occludes(get_block_at(world,wx-1,wy,wz).0) {
-                        push_quad!(o(x0,y0,z0),o(x0,y1f,z0),o(x0,y1f,z1f),o(x0,y0,z1f),rgb,SH_W);
+                        push_quad!(o(x0,y0,z0),o(x0,y1f,z0),o(x0,y1f,z1f),o(x0,y0,z1f),rgb,SH_W,bt,paint);
                     }
                 }
             }
@@ -6978,7 +7289,8 @@ fn obj_geometry_region(world: &LoadedWorld, sx1: i32, sy1: i32, sx2: i32, sy2: i
     let vertex_count = (pos_f.len()/3) as u32;
     let positions: Vec<u8> = pos_f.iter().flat_map(|f| f.to_le_bytes()).collect();
     let colors: Vec<u8> = col_f.iter().flat_map(|f| f.to_le_bytes()).collect();
-    ObjGeometryResult { positions, colors, vertex_count }
+    let uvs: Vec<u8> = uv_f.iter().flat_map(|f| f.to_le_bytes()).collect();
+    ObjGeometryResult { positions, colors, uvs, vertex_count }
 }
 
 /// Face-culled geometry for a single chunk (16×16 XY × full Z). For the 3D fly-through pane, which
@@ -6994,10 +7306,43 @@ fn get_chunk_geometry(
     // to all-air (empty geometry), but bailing early avoids the wasted 16×16×Z probe and documents
     // the frontend contract (local 0-based chunk indices).
     if cx < 0 || cy < 0 || cx as u32 >= world.w_chunks || cy as u32 >= world.h_chunks {
-        return Ok(ObjGeometryResult { positions: Vec::new(), colors: Vec::new(), vertex_count: 0 });
+        return Ok(ObjGeometryResult { positions: Vec::new(), colors: Vec::new(), uvs: Vec::new(), vertex_count: 0 });
     }
     let sx1 = cx * 16; let sy1 = cy * 16;
-    Ok(obj_geometry_region(world, sx1, sy1, sx1 + 15, sy1 + 15, 0, world_max_z(world)))
+    Ok(obj_geometry_region(world, ws.texture_pack.as_ref(), sx1, sy1, sx1 + 15, sy1 + 15, 0, world_max_z(world)))
+}
+
+// ── Texture pack commands ────────────────────────────────────────────────────
+
+#[derive(serde::Serialize)]
+struct TexturePackInfo {
+    rows: u32,
+    tile: u32,
+    #[serde(serialize_with = "serialize_bytes_b64")]
+    atlas: Vec<u8>,
+    name_to_row: HashMap<String, u32>,
+}
+
+/// Load a texture pack zip and return the atlas RGBA + name→row map.
+/// The pack is stored in AppState (world-independent) and automatically used by subsequent
+/// get_chunk_geometry / get_obj_geometry calls.
+#[tauri::command]
+fn load_texture_pack(path: String, state: tauri::State<'_, AppState>) -> Result<TexturePackInfo, String> {
+    let pack = texturepack::load_pack(&path)?;
+    let info = TexturePackInfo {
+        rows: pack.atlas_rows,
+        tile: pack.tile,
+        atlas: pack.atlas_rgba.clone(),
+        name_to_row: pack.name_to_row.clone(),
+    };
+    state.lock().unwrap().texture_pack = Some(pack);
+    Ok(info)
+}
+
+/// Unload the current texture pack, reverting to flat vertex-color rendering.
+#[tauri::command]
+fn unload_texture_pack(state: tauri::State<'_, AppState>) {
+    state.lock().unwrap().texture_pack = None;
 }
 
 // ── App entry point ────────────────────────────────────────────────────────────
@@ -7724,6 +8069,8 @@ pub fn run() {
             array_paste,
             find_nearest_block,
             export_obj,
+            export_json,
+            export_vox,
             get_obj_geometry,
             get_chunk_geometry,
             create_world,
@@ -7739,9 +8086,12 @@ pub fn run() {
             set_sky_grid,
             get_creatures,
             pick_block_surface,
+            get_cursor_block,
             load_eden_template,
             fetch_template_tile,
             expand_world_from_template,
+            load_texture_pack,
+            unload_texture_pack,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
