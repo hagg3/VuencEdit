@@ -5,6 +5,7 @@ import {
   doorFamilyBase, portalFamilyBase, DOOR_PORTAL_DIRS,
   EXPANSION_BLOCKS, isExpansionBlock, PARTIAL_WATER, PARTIAL_LAVA, SPECIAL_BLOCKS,
 } from "./blockDefs";
+import { tintedSwatch, type AtlasData } from "./texturePack";
 
 interface Props {
   mode: "fill" | "filter";
@@ -17,10 +18,11 @@ interface Props {
   // fill-mode extras
   onFill?: () => void;
   selectionExists?: boolean;
+  texturePack?: AtlasData | null;
 }
 
 export default function BlockPaintPicker({
-  mode, blockType, paint, onBlockTypeChange, onPaintChange, onFill, selectionExists,
+  mode, blockType, paint, onBlockTypeChange, onPaintChange, onFill, selectionExists, texturePack = null,
 }: Props) {
   const isFill = mode === "fill";
   const bt = blockType;
@@ -64,6 +66,7 @@ export default function BlockPaintPicker({
                  (portalFamilyBase(bt) !== null && b.type === 75) ||
                  (isExpansionBlock(bt) && b.type === 82));
             const bg = `rgb(${b.color[0]},${b.color[1]},${b.color[2]})`;
+            const texUrl = texturePack ? tintedSwatch(b.type, paint ?? 0, texturePack) : null;
             return (
               <div
                 key={b.type}
@@ -71,15 +74,16 @@ export default function BlockPaintPicker({
                 onClick={() => onBlockTypeChange(b.type)}
                 style={{
                   width: 18, height: 18, position: "relative",
-                  background: isRamp ? "rgba(255,255,255,0.04)" : bg,
+                  background: texUrl ? `url(${texUrl}) center/cover` : (isRamp ? "rgba(255,255,255,0.04)" : bg),
                   borderRadius: 2, cursor: "pointer",
                   boxSizing: "border-box",
                   border: selected ? "2px solid #fff" : "2px solid rgba(255,255,255,0.08)",
                   outline: selected ? "1px solid #3b82f6" : "none",
                   outlineOffset: 1, overflow: "hidden",
+                  imageRendering: texUrl ? "pixelated" : undefined,
                 }}
               >
-                {isRamp && (
+                {!texUrl && isRamp && (
                   <div style={{
                     position: "absolute", inset: 0,
                     background: bg,
@@ -311,19 +315,24 @@ export default function BlockPaintPicker({
           >✕</div>
           {/* 9-per-row paint grid */}
           <div style={{ display: "grid", gridTemplateColumns: "repeat(9, 18px)", gap: 2 }}>
-            {PAINT_COLORS.map(([r, g, b], i) => (
-              <div
-                key={i} title={`Paint color ${i + 1}`}
-                onClick={() => onPaintChange(i + 1)}
-                style={{
-                  width: 18, height: 18,
-                  background: `rgb(${r},${g},${b})`,
-                  borderRadius: 2, cursor: "pointer", boxSizing: "border-box",
-                  border: paint === i + 1 ? "2px solid #fff" : "2px solid rgba(255,255,255,0.08)",
-                  outline: paint === i + 1 ? "1px solid #3b82f6" : "none", outlineOffset: 1,
-                }}
-              />
-            ))}
+            {PAINT_COLORS.map(([r, g, b], i) => {
+              const pIdx = i + 1;
+              const paintTexUrl = texturePack && bt !== null ? tintedSwatch(bt, pIdx, texturePack) : null;
+              return (
+                <div
+                  key={i} title={`Paint color ${i + 1}`}
+                  onClick={() => onPaintChange(pIdx)}
+                  style={{
+                    width: 18, height: 18,
+                    background: paintTexUrl ? `url(${paintTexUrl}) center/cover` : `rgb(${r},${g},${b})`,
+                    borderRadius: 2, cursor: "pointer", boxSizing: "border-box",
+                    border: paint === pIdx ? "2px solid #fff" : "2px solid rgba(255,255,255,0.08)",
+                    outline: paint === pIdx ? "1px solid #3b82f6" : "none", outlineOffset: 1,
+                    imageRendering: paintTexUrl ? "pixelated" : undefined,
+                  }}
+                />
+              );
+            })}
           </div>
         </div>
       </div>
@@ -336,14 +345,16 @@ export default function BlockPaintPicker({
             <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
               <div
                 title="Preview: selected block + paint"
-                style={{
-                  width: 22, height: 22, borderRadius: 3, flexShrink: 0,
-                  background: (() => {
-                    const [r, g, b] = resolveColor(bt ?? 0, paint ?? 0);
-                    return `rgb(${r},${g},${b})`;
-                  })(),
-                  border: "1px solid #475569",
-                }}
+                style={(() => {
+                  const previewTex = texturePack && bt !== null ? tintedSwatch(bt, paint ?? 0, texturePack) : null;
+                  const [r, g, b] = resolveColor(bt ?? 0, paint ?? 0);
+                  return {
+                    width: 22, height: 22, borderRadius: 3, flexShrink: 0,
+                    background: previewTex ? `url(${previewTex}) center/cover` : `rgb(${r},${g},${b})`,
+                    border: "1px solid #475569",
+                    imageRendering: previewTex ? "pixelated" as const : undefined,
+                  };
+                })()}
               />
               {selectionExists && (
                 <button

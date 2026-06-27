@@ -130,6 +130,8 @@ interface Props {
   onSetCamera3d?: (wx: number, wy: number) => void;
   /** When true, fetches and draws the Eden.eden template terrain at 35% opacity behind user chunks. */
   showTemplateOverlay?: boolean;
+  /** Right-click context menu callback — receives world coords + screen coords. */
+  onMapContextMenu?: (wx: number, wy: number, screenX: number, screenY: number) => void;
 }
 
 function decodePixels(b64: string): Uint8Array {
@@ -150,7 +152,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     spawnPos = null, creatures = [],
     pasteElevationOffset = 0, onEyedropper, sliceLines = null,
     cameraPos3d = null, onSetCamera3d,
-    showTemplateOverlay = false }: Props,
+    showTemplateOverlay = false, onMapContextMenu }: Props,
   ref,
 ) {
   const canvasRef  = useRef<HTMLCanvasElement>(null);
@@ -196,6 +198,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   const extrudePreviewRef = useRef(extrudePreview);
   const lastPasteDeltaRef = useRef(lastPasteDelta);
   const onCursorMoveRef   = useRef(onCursorMove);
+  const onMapContextMenuRef = useRef(onMapContextMenu);
   const onMagicWandRef      = useRef(onMagicWand);
   const spawnPosRef         = useRef(spawnPos);
   const creaturesRef        = useRef(creatures);
@@ -215,6 +218,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   useEffect(() => { extrudePreviewRef.current = extrudePreview; }, [extrudePreview]);
   useEffect(() => { lastPasteDeltaRef.current = lastPasteDelta; }, [lastPasteDelta]);
   useEffect(() => { onCursorMoveRef.current = onCursorMove; }, [onCursorMove]);
+  useEffect(() => { onMapContextMenuRef.current = onMapContextMenu; }, [onMapContextMenu]);
   useEffect(() => { onMagicWandRef.current     = onMagicWand;         }, [onMagicWand]);
   useEffect(() => { spawnPosRef.current        = spawnPos;            }, [spawnPos]);
   useEffect(() => { creaturesRef.current       = creatures;           }, [creatures]);
@@ -985,8 +989,8 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   // ── Pointer / wheel handlers ──────────────────────────────────────────────
 
   const onPointerDown = useCallback((e: React.PointerEvent) => {
-    (e.target as HTMLCanvasElement).setPointerCapture(e.pointerId);
     if (e.button === 1) {
+      (e.target as HTMLCanvasElement).setPointerCapture(e.pointerId);
       e.preventDefault();
       if (dragRef.current === null) {
         dragRef.current = {
@@ -997,7 +1001,9 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
       }
       return;
     }
+    if (e.button === 2) return;
     if (e.button !== 0) return;
+    (e.target as HTMLCanvasElement).setPointerCapture(e.pointerId);
     // Camera icon: clicking near the teal dot starts a drag to teleport the 3D camera.
     {
       const cp = cameraPos3dRef.current;
@@ -1237,6 +1243,11 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
       onPointerUp={onPointerUp}
       onPointerLeave={onPointerLeave}
       onWheel={onWheel}
+      onContextMenu={e => {
+        e.preventDefault();
+        const wp = screenToWorld(e.clientX, e.clientY);
+        onMapContextMenuRef.current?.(wp.x, wp.y, e.clientX, e.clientY);
+      }}
     />
   );
 });

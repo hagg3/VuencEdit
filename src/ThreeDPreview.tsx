@@ -3,10 +3,12 @@ import { invoke } from "@tauri-apps/api/core";
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import type { SelectionInfo } from "./App";
+import type { AtlasData } from "./texturePack";
 
 interface ObjGeometryResult {
   positions: string; // base64 LE f32
   colors: string;    // base64 LE f32
+  uvs: string;       // base64 LE f32; empty when no pack
   vertex_count: number;
 }
 
@@ -19,7 +21,11 @@ function decodeF32Array(b64: string): Float32Array {
 
 const W = 190, H = 160;
 
-export default function ThreeDPreview({ selection: sel }: { selection: SelectionInfo }) {
+export default function ThreeDPreview({ selection: sel, texturePack = null, texEpoch = 0 }: {
+  selection: SelectionInfo;
+  texturePack?: AtlasData | null;
+  texEpoch?: number;
+}) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const threeRef = useRef<{
     renderer: THREE.WebGLRenderer;
@@ -33,6 +39,8 @@ export default function ThreeDPreview({ selection: sel }: { selection: Selection
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [rendered, setRendered] = useState(false);
+  const atlasTexRef = useRef<THREE.DataTexture | null>(null);
+  const texMatRef = useRef<THREE.MeshBasicMaterial | null>(null);
 
   const vol = sel.width * sel.height * sel.depth;
   const tooBig = vol > 64 * 64 * 64;
@@ -63,19 +71,40 @@ export default function ThreeDPreview({ selection: sel }: { selection: Selection
     return () => {
       cancelAnimationFrame(raf);
       controls.dispose();
+      if (atlasTexRef.current) { atlasTexRef.current.dispose(); atlasTexRef.current = null; }
+      if (texMatRef.current) { texMatRef.current.dispose(); texMatRef.current = null; }
       renderer.dispose();
       threeRef.current = null;
     };
   }, []);
 
-  // Clear mesh when selection changes
+  // Clear mesh when selection or texture pack changes (user must re-render).
   useEffect(() => {
     const t = threeRef.current;
     if (!t) return;
     if (t.mesh) { t.scene.remove(t.mesh); t.mesh.geometry.dispose(); t.mesh = null; }
     setRendered(false);
     setError(null);
-  }, [sel.x1, sel.y1, sel.x2, sel.y2, sel.z_min, sel.z_max]);
+  }, [sel.x1, sel.y1, sel.x2, sel.y2, sel.z_min, sel.z_max, texEpoch]);
+
+  // Rebuild atlas texture when pack changes.
+  useEffect(() => {
+    if (atlasTexRef.current) { atlasTexRef.current.dispose(); atlasTexRef.current = null; }
+    if (texMatRef.current) { texMatRef.current.dispose(); texMatRef.current = null; }
+    if (texturePack) {
+      const { rgba, tile, rows } = texturePack;
+      const tex = new THREE.DataTexture(
+        new Uint8ClampedArray(rgba.buffer, rgba.byteOffset, rgba.byteLength),
+        tile, tile * rows, THREE.RGBAFormat,
+      );
+      tex.minFilter = THREE.NearestFilter;
+      tex.magFilter = THREE.NearestFilter;
+      tex.flipY = false;
+      tex.needsUpdate = true;
+      atlasTexRef.current = tex;
+      texMatRef.current = new THREE.MeshBasicMaterial({ map: tex, vertexColors: true, side: THREE.DoubleSide });
+    }
+  }, [texturePack]);
 
   async function handleRender() {
     if (tooBig || !threeRef.current) return;
@@ -97,8 +126,12 @@ export default function ThreeDPreview({ selection: sel }: { selection: Selection
       const geo = new THREE.BufferGeometry();
       geo.setAttribute("position", new THREE.BufferAttribute(positions, 3));
       geo.setAttribute("color", new THREE.BufferAttribute(colors, 3));
-      const mat = new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide });
-      const mesh = new THREE.Mesh(geo, mat);
+      const hasUVs = result.uvs && result.uvs.length > 0;
+      if (hasUVs) geo.setAttribute("uv", new THREE.BufferAttribute(decodeF32Array(result.uvs), 2));
+      const meshMat = (hasUVs && texMatRef.current)
+        ? texMatRef.current
+        : new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide });
+      const mesh = new THREE.Mesh(geo, meshMat);
       t.scene.add(mesh);
       t.mesh = mesh;
 

@@ -8,6 +8,7 @@ export interface AppSettings {
   default3dPane: boolean;
   defaultSaveCompressed: boolean;
   templatePath: string | null;
+  texturePackPath: string | null;
 }
 
 const DEFAULTS: AppSettings = {
@@ -15,6 +16,7 @@ const DEFAULTS: AppSettings = {
   default3dPane: false,
   defaultSaveCompressed: false,
   templatePath: null,
+  texturePackPath: null,
 };
 
 export function loadSettings(): AppSettings {
@@ -109,6 +111,11 @@ export default function SettingsModal({ onClose, onSave }: Props) {
     if (selected && !Array.isArray(selected)) set("templatePath", selected);
   }
 
+  async function browseTexturePack() {
+    const selected = await open({ filters: [{ name: "Texture Pack", extensions: ["zip"] }] });
+    if (selected && !Array.isArray(selected)) set("texturePackPath", selected);
+  }
+
   function handleSave() {
     saveSettings(local);
     onSave(local);
@@ -194,6 +201,44 @@ export default function SettingsModal({ onClose, onSave }: Props) {
               {local.templatePath && (
                 <button
                   onClick={() => set("templatePath", null)}
+                  style={{
+                    background: "none", border: "none", color: "#475569",
+                    fontSize: 16, cursor: "pointer", padding: "0 4px", lineHeight: 1, flexShrink: 0,
+                  }}
+                  title="Clear"
+                >✕</button>
+              )}
+            </div>
+          </div>
+        </div>
+
+        <div style={{ ...row, borderBottom: "none", alignItems: "flex-start", paddingTop: 12 }}>
+          <div style={{ ...labelCol, flex: 1, marginRight: 12 }}>
+            <span style={labelText}>Texture pack path</span>
+            <span style={labelSub}>ZIP of PNGs — adds textures to 3D views and block picker icons</span>
+            <div style={{ marginTop: 8, display: "flex", gap: 8, alignItems: "center" }}>
+              <div style={{
+                flex: 1, fontSize: 12, color: local.texturePackPath ? "#94a3b8" : "#475569",
+                background: "#0f1117", border: "1px solid #2d3448", borderRadius: 6,
+                padding: "5px 10px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+                direction: "rtl", textAlign: "left",
+              }}>
+                {local.texturePackPath ?? "Not set"}
+              </div>
+              <button
+                onClick={browseTexturePack}
+                style={{
+                  background: "#232a3d", border: "1px solid #2d3448", color: "#94a3b8",
+                  borderRadius: 6, padding: "5px 12px", fontSize: 12, cursor: "pointer", flexShrink: 0,
+                }}
+                onMouseEnter={e => (e.currentTarget.style.background = "#2d3a52")}
+                onMouseLeave={e => (e.currentTarget.style.background = "#232a3d")}
+              >
+                Browse…
+              </button>
+              {local.texturePackPath && (
+                <button
+                  onClick={() => set("texturePackPath", null)}
                   style={{
                     background: "none", border: "none", color: "#475569",
                     fontSize: 16, cursor: "pointer", padding: "0 4px", lineHeight: 1, flexShrink: 0,
