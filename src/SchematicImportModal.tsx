@@ -353,7 +353,7 @@ export default function SchematicImportModal({ info, path, onApply, onCancel, ap
           {/* Header */}
           <div>
             <div style={{ color: "#93c5fd", fontWeight: 700, fontSize: 15, marginBottom: 5 }}>
-              Import Minecraft {info.format === "litematic" ? "Litematica" : "Schematic"}
+              Import Minecraft {info.format === "litematic" ? "Litematica" : info.format === "schem" ? "Sponge Schematic" : "Schematic"}
             </div>
             <div style={{ display: "flex", gap: 16, color: "#94a3b8", fontSize: 12, flexWrap: "wrap", alignItems: "center" }}>
               <span>MC: {info.mc_width}×{info.mc_length}×{info.mc_height}</span>

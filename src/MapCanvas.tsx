@@ -535,6 +535,21 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
         ctx.fillStyle = labelColor;
         ctx.fillText(label, lx, ly);
         ctx.restore();
+        // Out-of-bounds warning
+        const oob = ghostPos.x < 0 || ghostPos.y < 0 ||
+          ghostPos.x + pw > mapWRef.current || ghostPos.y + ph > mapHRef.current;
+        if (oob) {
+          const warnLabel = "Out of bounds";
+          ctx.save();
+          ctx.font = "bold 10px monospace";
+          ctx.textAlign = "center";
+          const wtw = ctx.measureText(warnLabel).width + 8;
+          ctx.fillStyle = "rgba(0,0,0,0.75)";
+          ctx.fillRect(lx - wtw / 2, ly - 26, wtw, 13);
+          ctx.fillStyle = "rgba(239,68,68,1)";
+          ctx.fillText(warnLabel, lx, ly - 14);
+          ctx.restore();
+        }
       }
     }
 

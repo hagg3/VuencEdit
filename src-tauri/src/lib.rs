@@ -736,10 +736,22 @@ fn parse_world_inner(bytes: MmapMut) -> Result<LoadedWorld, String> {
     }
 
     // Detect whether this is a 64-layer world (32768 bytes/chunk, 4 bands) or a
-    // 256-layer world (131072 bytes/chunk, 16 bands) by checking the minimum gap
-    // between consecutive chunk offsets. Both formats use the same band formula:
-    // addr + band * 8192 + x * 256 + y * 16 + z — only the band count differs.
-    let chunk_size = {
+    // 256-layer world (131072 bytes/chunk, 16 bands).
+    //
+    // Version field at bytes[92..96] selects the format:
+    //   version >= 5       → 256z New Dawn (versions 5 and 6 observed in the wild)
+    //   version <= 4       → 64z legacy (Eden 2.1 and older; version 2 is also legacy)
+    // This check is authoritative even for single-chunk worlds where the gap heuristic
+    // below would silently default to 64z.
+    //
+    // Fallback (unknown version): check the minimum gap between sorted chunk offsets.
+    // A valid 256z file never has two chunks closer than 131072 bytes apart.
+    let version = if bytes.len() >= 96 {
+        i32::from_le_bytes([bytes[92], bytes[93], bytes[94], bytes[95]])
+    } else { 4 };
+    let chunk_size = if version >= 5 {
+        131072
+    } else {
         let mut offsets: Vec<usize> = chunk_map.values().copied().collect();
         offsets.sort_unstable();
         let min_gap = offsets.windows(2).map(|w| w[1] - w[0]).min().unwrap_or(32768);
@@ -1277,6 +1289,70 @@ fn load_world(path: String, state: tauri::State<'_, AppState>) -> Result<WorldMe
     eprintln!("[LOAD] end  total={}µs", us());
 
     Ok(meta)
+}
+
+#[derive(Serialize)]
+struct WorldInfo {
+    name: String,
+    level_seed: i32,
+    /// Last-walked position, converted to local block coords (editor X, editor Y, block Z/height).
+    pos_local_x: f32, pos_local_y: f32, pos_height: f32,
+    /// Spawn/home position, local block coords.
+    home_local_x: f32, home_local_y: f32, home_height: f32,
+    /// Unknown float at header byte 28 — possibly player heading/yaw.
+    heading: f32,
+    version: i32,
+    sky_colors: Vec<u8>,
+    golden_cubes: i32,
+    width_chunks: u32, height_chunks: u32,
+    max_z: u32, chunk_count: usize,
+    abs_min_x: i32, abs_min_y: i32,
+    spawn_px: Option<f32>, spawn_py: Option<f32>,
+}
+
+#[tauri::command]
+fn get_world_info(state: tauri::State<'_, AppState>) -> Result<WorldInfo, String> {
+    let ws = state.lock().unwrap();
+    let world = ws.world.as_ref().ok_or("No world loaded")?;
+    let b = &world.bytes;
+
+    macro_rules! read_i32 { ($o:expr) => { if b.len() >= $o + 4 { i32::from_le_bytes([b[$o],b[$o+1],b[$o+2],b[$o+3]]) } else { 0 } }; }
+    macro_rules! read_f32 { ($o:expr) => { if b.len() >= $o + 4 { f32::from_le_bytes([b[$o],b[$o+1],b[$o+2],b[$o+3]]) } else { 0.0 } }; }
+
+    let level_seed = read_i32!(0);
+    // @4: last-walked position (abs game x, height-y, z) — game Z maps to editor Y
+    let pos_abs_x = read_f32!(4);
+    let pos_height = read_f32!(8);
+    let pos_abs_z = read_f32!(12);
+    let home_abs_x = read_f32!(16);
+    let home_height = read_f32!(20);
+    let home_abs_z = read_f32!(24);
+    let heading = read_f32!(28);
+    let version  = read_i32!(92);
+
+    let sky_colors: Vec<u8> = if b.len() >= 148 { b[132..148].to_vec() } else { vec![14; 16] };
+    let golden_cubes = read_i32!(148);
+
+    // Convert absolute game coords → local block coords
+    let origin_x = world.min_x as f32 * 16.0;
+    let origin_y = world.min_y as f32 * 16.0;
+    let pos_local_x = pos_abs_x - origin_x;
+    let pos_local_y = pos_abs_z - origin_y;
+    let home_local_x = home_abs_x - origin_x;
+    let home_local_y = home_abs_z - origin_y;
+
+    let spawn = read_spawn(world);
+
+    Ok(WorldInfo {
+        name: world.name.clone(), level_seed,
+        pos_local_x, pos_local_y, pos_height,
+        home_local_x, home_local_y, home_height,
+        heading, version, sky_colors, golden_cubes,
+        width_chunks: world.w_chunks, height_chunks: world.h_chunks,
+        max_z: world_max_z(world) as u32, chunk_count: world.chunk_map.len(),
+        abs_min_x: world.min_x, abs_min_y: world.min_y,
+        spawn_px: spawn.map(|(x,_)| x), spawn_py: spawn.map(|(_,y)| y),
+    })
 }
 
 #[tauri::command]
@@ -4137,9 +4213,9 @@ fn write_world_file(
     // version field at offset 92 (int, LE). Must be 1–1000 or the game applies
     // legacy block-ID conversion. The value also selects the column format the
     // game expects: 64z legacy worlds use 4 (16 384 block bytes / 4 sub-chunks),
-    // New Dawn 256z worlds use 2 (16 sub-chunks). Writing 4 for a 256z world makes
+    // New Dawn 256z worlds use 5+ (16 sub-chunks). Writing 4 for a 256z world makes
     // the game read it as 64z → totally misaligned ("conversion-bug" look).
-    let version: u32 = if chunk_size >= 131_072 { 2 } else { 4 };
+    let version: u32 = if chunk_size >= 131_072 { 5 } else { 4 };
     header[92..96].copy_from_slice(&version.to_le_bytes());
     for b in &mut header[132..148] { *b = 14; }
 
@@ -8028,6 +8104,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             load_world,
+            get_world_info,
             fetch_tile,
             save_png,
             render_zslice,
@@ -8462,6 +8539,7 @@ impl NbtVal {
     }
     fn as_list(&self) -> Option<&[NbtVal]> { if let NbtVal::List(v) = self { Some(v) } else { None } }
     fn as_long_arr(&self) -> Option<&[i64]> { if let NbtVal::LongArr(v) = self { Some(v) } else { None } }
+    fn as_byte_arr(&self) -> Option<&[u8]> { if let NbtVal::ByteArr(v) = self { Some(v) } else { None } }
     fn get(&self, key: &str) -> Option<&NbtVal> { self.as_compound()?.get(key) }
 }
 
@@ -8718,6 +8796,77 @@ fn nbt_skip_payload(d: &[u8], pos: &mut usize, tag: u8) -> Option<()> {
     Some(())
 }
 
+// ── Sponge .schem parser ──────────────────────────────────────────────────────
+
+struct ParsedSchem {
+    width: i32, height: i32, length: i32,
+    palette: Vec<String>,  // palette_index → full block-state string e.g. "minecraft:oak_stairs[facing=north]"
+    blocks: Vec<u32>,      // varint-decoded palette indices, order: (y*length + z)*width + x
+}
+
+fn parse_schem_bytes(raw: &[u8]) -> Result<ParsedSchem, String> {
+    use flate2::read::GzDecoder;
+    use std::io::Read;
+    let mut dec = GzDecoder::new(raw);
+    let mut d = Vec::new();
+    dec.read_to_end(&mut d).map_err(|e| format!("gzip: {e}"))?;
+    let root = nbt_parse_root(&d).ok_or("NBT parse failed")?;
+
+    let width  = root.get("Width") .and_then(|v| v.as_int()).ok_or("Missing Width")?;
+    let height = root.get("Height").and_then(|v| v.as_int()).ok_or("Missing Height")?;
+    let length = root.get("Length").and_then(|v| v.as_int()).ok_or("Missing Length")?;
+
+    // Palette: compound of { block_state_string → int_index }
+    let pal_map = root.get("Palette")
+        .and_then(|v| v.as_compound())
+        .ok_or("Missing Palette")?;
+    let pal_size = pal_map.len();
+    let mut palette = vec![String::new(); pal_size];
+    for (name, val) in pal_map {
+        let idx = val.as_int().ok_or("Palette value not int")? as usize;
+        if idx < pal_size { palette[idx] = name.clone(); }
+    }
+
+    // BlockData: varint-packed byte array
+    let block_data = root.get("BlockData")
+        .and_then(|v| v.as_byte_arr())
+        .ok_or("Missing BlockData")?;
+
+    let vol = (width * height * length) as usize;
+    let mut blocks = Vec::with_capacity(vol);
+    let mut i = 0;
+    while i < block_data.len() && blocks.len() < vol {
+        let mut val = 0u32;
+        let mut shift = 0u32;
+        loop {
+            if i >= block_data.len() { return Err("varint truncated".into()); }
+            let b = block_data[i] as u32; i += 1;
+            val |= (b & 0x7F) << shift;
+            shift += 7;
+            if b & 0x80 == 0 { break; }
+            if shift >= 35 { return Err("varint overflow".into()); }
+        }
+        blocks.push(val);
+    }
+
+    Ok(ParsedSchem { width, height, length, palette, blocks })
+}
+
+/// Parse "minecraft:oak_stairs[facing=north,half=bottom]" into (name, props).
+fn split_block_state(s: &str) -> (&str, HashMap<String, String>) {
+    if let Some(bi) = s.find('[') {
+        let name = &s[..bi];
+        let rest = s[bi+1..].trim_end_matches(']');
+        let props = rest.split(',').filter_map(|kv| {
+            let mut it = kv.splitn(2, '=');
+            Some((it.next()?.to_string(), it.next()?.to_string()))
+        }).collect();
+        (name, props)
+    } else {
+        (s, HashMap::new())
+    }
+}
+
 // ── MCEdit .schematic parser ──────────────────────────────────────────────────
 
 struct ParsedSchematic {
@@ -8790,6 +8939,9 @@ struct SchematicInfo {
 fn is_litematic(path: &str) -> bool {
     path.to_lowercase().ends_with(".litematic")
 }
+fn is_schem(path: &str) -> bool {
+    path.to_lowercase().ends_with(".schem")
+}
 
 #[tauri::command]
 fn import_schematic_info(path: String) -> Result<SchematicInfo, String> {
@@ -8849,6 +9001,32 @@ fn import_schematic_info(path: String) -> Result<SchematicInfo, String> {
             format: "litematic".into(),
             mc_width: tot_x, mc_height: tot_y, mc_length: tot_z,
             eden_width: tot_x, eden_height: tot_z, eden_depth: tot_y,
+            block_count, unique_blocks, too_large,
+        })
+    } else if is_schem(&path) {
+        // ── Sponge .schem ───────────────────────────────────────────────────
+        let sc = parse_schem_bytes(&raw)?;
+        let pal_size = sc.palette.len();
+        let mut counts: HashMap<String, u32> = HashMap::new();
+        for &pi in &sc.blocks {
+            let state = sc.palette.get(pi as usize).map(|s| s.as_str()).unwrap_or("");
+            let (name, _) = split_block_state(state);
+            let id = name.strip_prefix("minecraft:").unwrap_or(name);
+            if id.is_empty() || id == "air" || id == "cave_air" || id == "void_air" { continue; }
+            *counts.entry(id.to_string()).or_insert(0) += 1;
+        }
+        let block_count: u32 = counts.values().sum();
+        let too_large = sc.width > 256 || sc.height > 256 || sc.length > 256;
+        let mut unique_blocks: Vec<SchematicBlockEntry> = counts.into_iter().map(|(mc_id, count)| {
+            let (eden_type, eden_paint) = mc_named_to_eden(&format!("minecraft:{mc_id}"), None);
+            SchematicBlockEntry { mc_id, count, eden_type, eden_paint }
+        }).collect();
+        unique_blocks.sort_by(|a, b| b.count.cmp(&a.count));
+        let _ = pal_size;
+        Ok(SchematicInfo {
+            format: "schem".into(),
+            mc_width: sc.width as u32, mc_height: sc.height as u32, mc_length: sc.length as u32,
+            eden_width: sc.width as u32, eden_height: sc.length as u32, eden_depth: sc.height as u32,
             block_count, unique_blocks, too_large,
         })
     } else {
@@ -8947,6 +9125,22 @@ fn import_schematic_apply(
         }
         Clipboard { width: mc_w as i32, height: mc_l as i32, depth: mc_h as i32,
             z_anchor: 0, block_types: bt, paints: pt }
+    } else if is_schem(&path) {
+        // ── Sponge .schem ───────────────────────────────────────────────────
+        let sc = parse_schem_bytes(&raw)?;
+        let (mc_w, mc_h, mc_l) = (sc.width as usize, sc.height as usize, sc.length as usize);
+        schematic_to_clipboard(mc_w, mc_h, mc_l, |mc_x, mc_y, mc_z| {
+            let mi = (mc_y * mc_l + mc_z) * mc_w + mc_x;
+            let pi = sc.blocks.get(mi).copied().unwrap_or(0) as usize;
+            let state = sc.palette.get(pi).map(|s| s.as_str()).unwrap_or("");
+            let (name, props) = split_block_state(state);
+            let short = name.strip_prefix("minecraft:").unwrap_or(name);
+            if short.is_empty() || short == "air" || short == "cave_air" || short == "void_air" {
+                return (0, 0);
+            }
+            overrides.get(short).copied()
+                .unwrap_or_else(|| mc_named_to_eden(name, Some(&props)))
+        })
     } else {
         // ── MCEdit .schematic ───────────────────────────────────────────────
         let sc = parse_schematic_bytes(&raw)?;

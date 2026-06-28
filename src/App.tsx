@@ -18,6 +18,7 @@ import NewWorldModal from "./NewWorldModal";
 import SchematicImportModal, { type SchematicInfo, type MappingEntry } from "./SchematicImportModal";
 import Ribbon, { RIBBON_HEIGHT_COLLAPSED, TAB_BAR_HEIGHT, DEFAULT_BODY_HEIGHT } from "./Ribbon";
 import SettingsModal, { loadSettings, saveSettings } from "./SettingsModal";
+import WorldInfoModal from "./WorldInfoModal";
 import { decodeAtlas, type AtlasData, type TexturePackRaw, clearSwatchCache } from "./texturePack";
 import { blockDisplayName } from "./blockDefs";
 import appIcon from "./assets/app-icon.png";
@@ -153,6 +154,7 @@ function App() {
   const [showHelp, setShowHelp] = useState(false);
   const [showAbout, setShowAbout] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
+  const [showWorldInfo, setShowWorldInfo] = useState(false);
   const [appVersion, setAppVersion] = useState("…");
   useEffect(() => { getVersion().then(setAppVersion); }, []);
   const [showSlicePanels, setShowSlicePanels] = useState(() => loadSettings().defaultQuadView);
@@ -474,7 +476,7 @@ function App() {
       setSourcePath(selected);
       setRawBounds(null);
       setZMin(0);
-      setZMax(Math.min(63, data.max_z));
+      setZMax(data.max_z);
       setTool("pan");
       setUndoDepth(0);
       setRedoDepth(0);
@@ -504,7 +506,7 @@ function App() {
       setSourcePath(path);
       setRawBounds(null);
       setZMin(0);
-      setZMax(Math.min(63, data.max_z));
+      setZMax(data.max_z);
       setTool("pan");
       setUndoDepth(0);
       setRedoDepth(0);
@@ -1154,7 +1156,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
 
   async function importSchematic() {
     const path = await open({
-      filters: [{ name: "Minecraft Schematic / Litematica", extensions: ["schematic", "litematic"] }],
+      filters: [{ name: "Minecraft Schematic / Sponge / Litematica", extensions: ["schematic", "schem", "litematic"] }],
       multiple: false,
     });
     if (!path || typeof path !== "string") return;
@@ -1328,6 +1330,9 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
       fontSize: 10, color: "#475569", userSelect: "none",
       fontVariantNumeric: "tabular-nums",
     }}>
+      <div style={{ padding: "0 10px", borderRight: "1px solid #1a2540", whiteSpace: "nowrap", color: "#4b6280" }}>
+        {tool === "brush" ? `Brush ${brushSize}px` : tool === "pen" ? "Pen" : tool === "rect" ? "Rect" : tool === "ellipse" ? "Ellipse" : tool === "fill" ? "Fill" : tool === "eyedropper" ? "Eyedropper" : tool === "wand" ? "Wand" : tool === "paste" ? (pasteMode !== "normal" ? `Paste (${pasteMode})` : "Paste") : tool === "select" ? "Select" : tool === "smooth" ? "Smooth" : tool === "noise" ? "Noise" : tool === "flatten" ? "Flatten" : tool === "erode" ? "Erode" : "Pan"}
+      </div>
       <div style={{ padding: "0 10px", borderRight: "1px solid #1a2540", color: "#334155", whiteSpace: "nowrap" }}>
         {world.name}
       </div>
@@ -1359,6 +1364,18 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
         ↩ <span style={{ color: "#334155" }}>{undoDepth}</span>
         {"  "}↪ <span style={{ color: "#334155" }}>{redoDepth}</span>
       </div>
+      {filterBlockType !== null && (
+        <div style={{ padding: "0 8px", borderRight: "1px solid #1a2540", whiteSpace: "nowrap",
+          color: "#f59e0b", background: "rgba(245,158,11,0.07)" }}>
+          Filter: {blockDisplayName(filterBlockType)}{filterPaint !== null ? ` #${filterPaint}` : ""}{filterInvert ? " (inv)" : ""}
+        </div>
+      )}
+      {maskEnabled && maskBlockType !== null && (
+        <div style={{ padding: "0 8px", borderRight: "1px solid #1a2540", whiteSpace: "nowrap",
+          color: "#a78bfa", background: "rgba(167,139,250,0.07)" }}>
+          Mask: {blockDisplayName(maskBlockType)}{maskPaint !== null ? ` #${maskPaint}` : ""}
+        </div>
+      )}
       <div style={{ flex: 1 }} />
       <div style={{ padding: "0 10px", borderLeft: "1px solid #1a2540", color: "#2d4060", whiteSpace: "nowrap" }}>
         {fps} fps
@@ -1580,6 +1597,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           unloadTexturePack={unloadTexturePack}
           spawnPos={spawnPos}
           onSetSpawnAtSelection={setSpawnAtSelection}
+          onShowWorldInfo={() => setShowWorldInfo(true)}
           selection={selection}
           rawBounds={rawBounds}
           setRawBounds={setRawBounds}
@@ -1763,6 +1781,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
 
         {showHelp && <HelpModal onClose={() => setShowHelp(false)} />}
         {showAbout && <AboutModal version={appVersion} onClose={() => setShowAbout(false)} />}
+        {showWorldInfo && <WorldInfoModal onClose={() => setShowWorldInfo(false)} />}
         {showSettings && (
           <SettingsModal
             onClose={() => setShowSettings(false)}
