@@ -77,6 +77,7 @@ export interface RibbonProps {
   // Spawn
   spawnPos: { px: number; py: number } | null;
   onSetSpawnAtSelection: () => void;
+  onShowWorldInfo: () => void;
   // Selection
   selection: SelectionInfo | null;
   rawBounds: SelectionBounds | null;
@@ -309,6 +310,14 @@ export default function Ribbon(p: RibbonProps) {
   const [extrudeIgnoreAir, setExtrudeIgnoreAir] = useState(false);
   const [treeGenerating, setTreeGenerating] = useState(false);
 
+  // Track which toggles have ever been activated, to show a "was-active" off border
+  const toggledOnce = useRef(new Set<string>());
+  function toggleStyle(id: string, active: boolean, accent?: string): React.CSSProperties {
+    if (active) { toggledOnce.current.add(id); return rbActive(accent); }
+    if (toggledOnce.current.has(id)) return { ...rb, borderColor: "rgba(255,255,255,0.38)", color: "#94a3b8" };
+    return rb;
+  }
+
   // Clipboard axo preview
   const [clipAxoPixels, setClipAxoPixels] = useState<{width:number;height:number;pixels:Uint8Array}|null>(null);
   const clipAxoCanvasRef = useRef<HTMLCanvasElement>(null);
@@ -442,15 +451,21 @@ export default function Ribbon(p: RibbonProps) {
       : accent === "#22c55e" ? (isActive ? "#86efac" : "#4ade80")
       : (isActive ? "#e2e8f0" : "#64748b");
     return {
-      background: isActive ? "#0f2244" : "transparent",
+      background: isActive ? "#0f2244" : "rgba(255,255,255,0.04)",
       border: "none",
-      borderBottom: isActive ? `2px solid #0f2244` : `2px solid transparent`,
-      borderTop: isActive ? `2px solid ${accent}` : "2px solid transparent",
+      borderTop: `2px solid ${isActive ? accent : "transparent"}`,
+      borderLeft: `1px solid ${isActive ? "#253a5e" : "transparent"}`,
+      borderRight: `1px solid ${isActive ? "#253a5e" : "transparent"}`,
+      borderBottom: `2px solid ${isActive ? "#0f2244" : "transparent"}`,
+      borderRadius: "5px 5px 0 0",
       color: textColor,
-      cursor: "pointer", padding: "0 13px", height: "100%",
+      cursor: "pointer", padding: "0 13px",
+      height: isActive ? TAB_BAR_HEIGHT : TAB_BAR_HEIGHT - 5,
+      alignSelf: "flex-end",
       fontSize: 12, fontWeight: isActive ? 600 : 400, whiteSpace: "nowrap",
       userSelect: "none", outline: "none",
       position: "relative", zIndex: isActive ? 2 : 1,
+      marginTop: 0, marginLeft: 1, marginRight: 1,
       marginBottom: isActive ? -2 : 0,
     };
   };
@@ -473,6 +488,8 @@ export default function Ribbon(p: RibbonProps) {
   // ── tab content renderers ──────────────────────────────────────────────────
 
   function renderHomeTab() {
+    const hasSelection = !!p.rawBounds;
+    const hasClipboard = !!p.clipboard;
     return (
       <div style={{ display: "flex", alignItems: "stretch", height: "100%" }}>
 
@@ -489,10 +506,17 @@ export default function Ribbon(p: RibbonProps) {
                 autoFocus
               />
             ) : (
-              <div onClick={() => { p.setRenameInput(p.world?.name ?? ""); p.setRenamingWorld(true); }}
-                style={{ color: "#e2e8f0", fontWeight: 700, fontSize: 12, cursor: "text", borderBottom: "1px dashed rgba(255,255,255,0.15)", paddingBottom: 1, userSelect: "none", maxWidth: 140, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
-                title="Click to rename world">
-                {p.world?.name ?? "—"}
+              <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                <div onClick={() => { p.setRenameInput(p.world?.name ?? ""); p.setRenamingWorld(true); }}
+                  style={{ color: "#e2e8f0", fontWeight: 700, fontSize: 12, cursor: "text", borderBottom: "1px dashed rgba(255,255,255,0.15)", paddingBottom: 1, userSelect: "none", maxWidth: 120, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
+                  title="Click to rename world">
+                  {p.world?.name ?? "—"}
+                </div>
+                {p.world && (
+                  <button onClick={p.onShowWorldInfo}
+                    style={{ background: "none", border: "none", padding: "0 2px", cursor: "pointer", color: "#475569", fontSize: 12, lineHeight: 1, display: "flex", alignItems: "center" }}
+                    title="World info">ⓘ</button>
+                )}
               </div>
             )}
             <div style={{ color: "#475569", fontSize: 10 }}>{p.world ? `${p.world.width_chunks}×${p.world.height_chunks} chunks` : ""}</div>
@@ -511,16 +535,54 @@ export default function Ribbon(p: RibbonProps) {
         </div>
         <div style={rbDivider} />
 
-        {p.tool === "wand" && (<>
-          <div style={rbGroup}>
-            <div style={{ color: "#a78bfa", fontSize: 11 }}>Click to flood-select</div>
+        {/* Navigate — tool shortcuts */}
+        <div style={rbGroup}>
+          <div style={{ display: "flex", gap: 2 }}>
+            <button onClick={() => p.setTool("pan")} style={p.tool === "pan" ? rbActive() : rb} title="Pan (Space)">
+              <span style={{ display: "flex", alignItems: "center", gap: 3 }}><PanCursorIcon />Pan</span>
+            </button>
+            <button onClick={() => p.setTool("select")} style={p.tool === "select" ? rbActive() : rb} title="Select (S)">⬚ Select</button>
+            <button onClick={() => p.setTool("wand")} style={p.tool === "wand" ? rbActive("#a78bfa") : rb} title="Magic Wand (W)">⁂ Wand</button>
+          </div>
+          {p.tool === "wand" && (
             <button onClick={() => p.setWandMatchPaint(!p.wandMatchPaint)} style={p.wandMatchPaint ? rbActive("#a855f7") : rb}>
               {p.wandMatchPaint ? "Type + Colour" : "Type only"}
             </button>
-            <div style={rbGroupLabel}>Wand</div>
+          )}
+          <div style={rbGroupLabel}>Navigate</div>
+        </div>
+        <div style={rbDivider} />
+
+        {/* Selection quick actions — grayed when no selection */}
+        <div style={{ ...rbGroup, opacity: hasSelection ? 1 : 0.38, pointerEvents: hasSelection ? "auto" : "none" }}>
+          <div style={{ display: "flex", gap: 2 }}>
+            <button onClick={p.copySelection} style={rb}>Copy</button>
+            <button onClick={p.deleteBlocks} style={{ ...rb, borderColor: "#ef4444", color: "#fca5a5" }} title="Fill with air">Delete</button>
+            <button onClick={p.fillSelection} style={{ ...rb, borderColor: "#f59e0b", color: "#fcd34d" }}>Fill</button>
           </div>
-          <div style={rbDivider} />
-        </>)}
+          <div style={{ display: "flex", gap: 2 }}>
+            <button onClick={() => p.setRawBounds(b => b ? { x1: b.x1-1, y1: b.y1-1, x2: b.x2+1, y2: b.y2+1 } : null)} style={rb}>Grow</button>
+            <button onClick={() => p.setRawBounds(b => b ? { x1: Math.min(b.x1+1,b.x2), y1: Math.min(b.y1+1,b.y2), x2: Math.max(b.x2-1,b.x1), y2: Math.max(b.y2-1,b.y1) } : null)} style={rb}>Shrink</button>
+            <button onClick={() => p.setRawBounds(null)} style={rb}>Clear</button>
+          </div>
+          <div style={rbGroupLabel}>Selection {!hasSelection && <span style={{ color: "#f59e0b", opacity: 0.7 }}>(none)</span>}</div>
+        </div>
+        <div style={rbDivider} />
+
+        {/* Clipboard quick actions — grayed when no clipboard */}
+        <div style={{ ...rbGroup, opacity: hasClipboard ? 1 : 0.38, pointerEvents: hasClipboard ? "auto" : "none" }}>
+          <button onClick={() => p.setTool("paste")}
+            style={p.tool === "paste" ? rbActive("#22c55e") : { ...rb, borderColor: "#22c55e", color: "#86efac" }}>
+            ▣ Paste Mode
+          </button>
+          <div style={{ display: "flex", gap: 2 }}>
+            <button onClick={p.rotateClipboard} style={rb}>↻ Rotate</button>
+            <button onClick={p.mirrorClipboardX} style={rb}>↔ Flip X</button>
+            <button onClick={p.mirrorClipboardY} style={rb}>↕ Flip Y</button>
+          </div>
+          <div style={rbGroupLabel}>Clipboard {!hasClipboard && <span style={{ color: "#475569", opacity: 0.7 }}>(empty)</span>}</div>
+        </div>
+        <div style={rbDivider} />
 
         <div style={rbGroup}>
           <div style={{ color: "#64748b", fontSize: 10 }}>
@@ -890,7 +952,7 @@ export default function Ribbon(p: RibbonProps) {
           )}
           <div style={rbGroupLabel}>Layout</div>
         </div>
-        {(p.templateLoaded || true) && (<>
+        <>
           <div style={rbDivider} />
           <div style={rbGroup}>
             <button onClick={p.openTemplateFile} style={{ ...rb, display: "flex", gap: 4, alignItems: "center" }}>
@@ -905,7 +967,7 @@ export default function Ribbon(p: RibbonProps) {
             )}
             <div style={rbGroupLabel}>Template</div>
           </div>
-        </>)}
+        </>
         <div style={rbDivider} />
         <div style={rbGroup}>
           <button onClick={p.openTexturePackFile} style={{ ...rb, display: "flex", gap: 4, alignItems: "center" }}>
@@ -975,17 +1037,17 @@ export default function Ribbon(p: RibbonProps) {
               borderRadius: "50%", background: "#2563eb", border: "1px solid #60a5fa", pointerEvents: "none",
             }} />
           </div>
-          {/* Max on top, Min below */}
+          {/* Min on left, Max on right — matches slider low→high left→right */}
           <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
-            <div style={{ display: "flex", alignItems: "center", gap: 3 }}>
-              <span style={{ color: "#60a5fa", fontSize: 10, minWidth: 22 }}>Max</span>
-              <input type="number" min={0} max={maxZ} value={p.zMax}
-                onChange={e => p.handleZMax(e.target.value)} style={zInp} />
-            </div>
             <div style={{ display: "flex", alignItems: "center", gap: 3 }}>
               <span style={{ color: "#94a3b8", fontSize: 10, minWidth: 22 }}>Min</span>
               <input type="number" min={0} max={maxZ} value={p.zMin}
                 onChange={e => p.handleZMin(e.target.value)} style={zInp} />
+            </div>
+            <div style={{ display: "flex", alignItems: "center", gap: 3 }}>
+              <span style={{ color: "#60a5fa", fontSize: 10, minWidth: 22 }}>Max</span>
+              <input type="number" min={0} max={maxZ} value={p.zMax}
+                onChange={e => p.handleZMax(e.target.value)} style={zInp} />
             </div>
           </div>
           <div style={rbGroupLabel}>Z Range · {zHi - zLo + 1} levels</div>
@@ -1122,17 +1184,15 @@ export default function Ribbon(p: RibbonProps) {
             {p.lockedPastePos && <button onClick={() => p.setLockedPastePos(null)} style={rb}>Unlock</button>}
             <button onClick={() => p.setTool("pan")} style={rb}>Cancel</button>
           </div>
-          <div style={{ display: "flex", gap: 2 }}>
-            <button onClick={() => p.setPasteIgnoreAir(!p.pasteIgnoreAir)} style={p.pasteIgnoreAir ? rbActive("#34d399") : rb} title="Skip air blocks">No Air</button>
-            <button onClick={() => p.setPersistPaste(!p.persistPaste)} style={p.persistPaste ? rbActive("#34d399") : rb} title="Repeat on each click">Repeat</button>
-          </div>
-          <div style={{ display: "flex", gap: 2 }}>
-            <button onClick={() => p.setPasteTerrain(!p.pasteTerrain)} style={p.pasteTerrain ? rbActive("#f59e0b") : rb}>Terrain</button>
-            {p.pasteTerrain && <button onClick={() => p.setPasteTerrainAbove(!p.pasteTerrainAbove)} style={p.pasteTerrainAbove ? rbActive("#fb923c") : rb}>{p.pasteTerrainAbove ? "Above" : "At surf"}</button>}
-          </div>
-          <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
-            <span style={{ color: "#64748b", fontSize: 10 }}>Z offset</span>
-            <input type="number" value={p.pasteElevationOffset} onChange={e => p.setPasteElevationOffset(Number(e.target.value))} style={{ ...zInp, width: 44 }} />
+          <div style={{ display: "flex", gap: 2, flexWrap: "wrap" }}>
+            <button onClick={() => p.setPasteIgnoreAir(!p.pasteIgnoreAir)} style={toggleStyle("pasteNoAir", p.pasteIgnoreAir, "#34d399")} title="Skip air blocks">No Air</button>
+            <button onClick={() => p.setPersistPaste(!p.persistPaste)} style={toggleStyle("pasteRepeat", p.persistPaste, "#34d399")} title="Repeat on each click">Repeat</button>
+            <button onClick={() => p.setPasteTerrain(!p.pasteTerrain)} style={toggleStyle("pasteTerrain", p.pasteTerrain, "#f59e0b")}>Terrain</button>
+            {p.pasteTerrain && <button onClick={() => p.setPasteTerrainAbove(!p.pasteTerrainAbove)} style={toggleStyle("pasteTerrainAbove", p.pasteTerrainAbove, "#fb923c")}>{p.pasteTerrainAbove ? "Above" : "At surf"}</button>}
+            <span style={{ display: "flex", alignItems: "center", gap: 3 }}>
+              <span style={{ color: "#64748b", fontSize: 10 }}>Z</span>
+              <input type="number" value={p.pasteElevationOffset} onChange={e => p.setPasteElevationOffset(Number(e.target.value))} style={{ ...zInp, width: 44 }} />
+            </span>
           </div>
           <div style={rbGroupLabel}>Place</div>
         </div>
@@ -1206,14 +1266,14 @@ export default function Ribbon(p: RibbonProps) {
         .zr-thumb::-webkit-slider-runnable-track { height: 4px; }
       `}</style>
       {/* Tab row */}
-      <div style={{ height: TAB_BAR_HEIGHT, display: "flex", alignItems: "stretch" }}>
+      <div style={{ height: TAB_BAR_HEIGHT, display: "flex", alignItems: "flex-end" }}>
 
         {/* App button — subtle violet tint (distinct from File amber) */}
-        <div ref={appMenuRef} style={{ position: "relative", flexShrink: 0 }}>
+        <div ref={appMenuRef} style={{ position: "relative", flexShrink: 0, alignSelf: "stretch" }}>
           <button
             onClick={() => { setAppMenuOpen(v => !v); setFileMenuOpen(false); }}
             style={{
-              height: TAB_BAR_HEIGHT, border: "none", cursor: "pointer", padding: "0 10px 0 8px",
+              height: "100%", border: "none", cursor: "pointer", padding: "0 10px 0 8px",
               background: appMenuOpen ? "rgba(139,92,246,0.28)" : "rgba(139,92,246,0.13)",
               display: "flex", alignItems: "center", gap: 6,
               borderRight: "1px solid rgba(139,92,246,0.22)",
@@ -1239,11 +1299,11 @@ export default function Ribbon(p: RibbonProps) {
         </div>
 
         {/* File ▾ — amber tinted */}
-        <div ref={fileMenuRef} style={{ position: "relative", flexShrink: 0 }}>
+        <div ref={fileMenuRef} style={{ position: "relative", flexShrink: 0, alignSelf: "stretch" }}>
           <button
             onClick={() => { setFileMenuOpen(v => !v); setAppMenuOpen(false); setShowRecentSub(false); setShowExportSub(false); }}
             style={{
-              height: TAB_BAR_HEIGHT, border: "none", cursor: "pointer", padding: "0 12px", outline: "none",
+              height: "100%", border: "none", cursor: "pointer", padding: "0 12px", outline: "none",
               background: fileMenuOpen ? "rgba(245,158,11,0.18)" : "rgba(245,158,11,0.07)",
               color: fileMenuOpen ? "#fcd34d" : "#c4963c",
               fontSize: 12, fontWeight: 600,
@@ -1336,6 +1396,55 @@ export default function Ribbon(p: RibbonProps) {
         {/* Separator after File */}
         <div style={{ width: 1, background: "#1a2540", margin: "5px 6px", alignSelf: "stretch" }} />
 
+        {/* QAT — Pan, Select, Undo, Redo (between File▾ and tabs for easy reach) */}
+        {(["pan","select"] as const).map(t => (
+          <button key={t} title={t === "pan" ? "Pan (Space)" : "Select (S)"} onClick={() => p.setTool(t)}
+            style={{
+              height: TAB_BAR_HEIGHT - 5, alignSelf: "flex-end",
+              border: "none", cursor: "pointer", padding: "0 7px",
+              background: p.tool === t ? "rgba(59,130,246,0.18)" : "rgba(255,255,255,0.04)",
+              color: p.tool === t ? "#93c5fd" : "#64748b",
+              display: "flex", alignItems: "center", gap: 4, fontSize: 11,
+              fontWeight: p.tool === t ? 600 : 400, outline: "none",
+              borderRadius: "4px 4px 0 0",
+              borderTop: `1px solid ${p.tool === t ? "rgba(59,130,246,0.5)" : "transparent"}`,
+              marginLeft: 1, marginRight: 1, marginBottom: 0,
+            }}>
+            {t === "pan" ? <><PanCursorIcon /><span>Pan</span></> : <><span style={{ fontSize: 13 }}>⬚</span><span>Sel</span></>}
+          </button>
+        ))}
+
+        <div style={{ width: 1, background: "#1a2540", margin: "6px 3px 4px", alignSelf: "stretch" }} />
+
+        <button title={`Undo (⌘Z) · ${p.undoDepth} available`}
+          onClick={p.handleUndo} disabled={p.undoDepth === 0}
+          style={{
+            height: TAB_BAR_HEIGHT - 5, alignSelf: "flex-end",
+            border: "none", cursor: p.undoDepth === 0 ? "not-allowed" : "pointer",
+            padding: "0 6px", background: "transparent", outline: "none",
+            color: p.undoDepth === 0 ? "#334155" : "#64748b",
+            display: "flex", alignItems: "center", gap: 2, fontSize: 13,
+            borderRadius: "4px 4px 0 0", marginLeft: 1, marginRight: 1, marginBottom: 0,
+          }}>
+          <span>↩</span>
+          {p.undoDepth > 0 && <span style={{ fontSize: 9, fontVariantNumeric: "tabular-nums", color: "#475569", minWidth: 10 }}>{p.undoDepth}</span>}
+        </button>
+        <button title={`Redo (⌘⇧Z) · ${p.redoDepth} available`}
+          onClick={p.handleRedo} disabled={p.redoDepth === 0}
+          style={{
+            height: TAB_BAR_HEIGHT - 5, alignSelf: "flex-end",
+            border: "none", cursor: p.redoDepth === 0 ? "not-allowed" : "pointer",
+            padding: "0 6px", background: "transparent", outline: "none",
+            color: p.redoDepth === 0 ? "#334155" : "#64748b",
+            display: "flex", alignItems: "center", gap: 2, fontSize: 13,
+            borderRadius: "4px 4px 0 0", marginLeft: 1, marginRight: 1, marginBottom: 0,
+          }}>
+          <span>↪</span>
+          {p.redoDepth > 0 && <span style={{ fontSize: 9, fontVariantNumeric: "tabular-nums", color: "#475569", minWidth: 10 }}>{p.redoDepth}</span>}
+        </button>
+
+        <div style={{ width: 1, background: "#1a2540", margin: "6px 4px 4px", alignSelf: "stretch" }} />
+
         {/* Permanent tabs */}
         {(["home","draw","insert","view"] as RibbonTab[]).map(id => (
           <button key={id} style={tabStyle(id)} onClick={() => setActiveTab(id)}>
@@ -1345,39 +1454,21 @@ export default function Ribbon(p: RibbonProps) {
 
         {/* Context group — Selection (merged: selection + fill/replace) */}
         {p.rawBounds && (<>
-          <div style={{ width: 1, background: "#3d2a00", margin: "5px 2px", alignSelf: "stretch" }} />
+          <div style={{ width: 1, background: "#3d2a00", margin: "6px 2px 4px", alignSelf: "stretch" }} />
           <div key={selFlash} style={{
-            display: "flex", alignItems: "stretch", position: "relative",
-            background: "rgba(245,158,11,0.07)",
-            borderLeft: "1px solid rgba(245,158,11,0.15)",
-            borderRight: "1px solid rgba(245,158,11,0.15)",
+            display: "flex", alignItems: "flex-end", position: "relative",
             animation: selFlash > 0 ? "ctxPulse 0.45s ease-out" : "none",
           }}>
-            {/* Label strip — hidden when the tab is active (would be obstructed by tab highlight) */}
-            {activeTab !== "selection" && (
-              <div style={{
-                position: "absolute", top: 0, left: 0, right: 0, height: 9,
-                display: "flex", alignItems: "center", justifyContent: "center",
-                background: "rgba(245,158,11,0.22)",
-                borderBottom: "1px solid rgba(245,158,11,0.3)",
-                pointerEvents: "none",
-              }}>
-                <span style={{ fontSize: 7, fontWeight: 700, letterSpacing: "0.12em", textTransform: "uppercase", lineHeight: 1, color: "#d97706" }}>Selection</span>
-              </div>
-            )}
             <button style={tabStyle("selection","#f59e0b")} onClick={() => setActiveTab("selection")}>◈ Selection</button>
           </div>
-          <div style={{ width: 1, background: "#3d2a00", margin: "5px 2px", alignSelf: "stretch" }} />
+          <div style={{ width: 1, background: "#3d2a00", margin: "6px 2px 4px", alignSelf: "stretch" }} />
         </>)}
 
-        {/* Context group — Clipboard (no label strip — single-button group) */}
+        {/* Context group — Clipboard */}
         {p.clipboard && (<>
-          <div style={{ width: 1, background: "#0d3020", margin: "5px 2px", alignSelf: "stretch" }} />
+          <div style={{ width: 1, background: "#0d3020", margin: "6px 2px 4px", alignSelf: "stretch" }} />
           <div key={clipFlash} style={{
-            display: "flex", alignItems: "stretch", position: "relative",
-            background: "rgba(34,197,94,0.06)",
-            borderLeft: "1px solid rgba(34,197,94,0.14)",
-            borderRight: "1px solid rgba(34,197,94,0.14)",
+            display: "flex", alignItems: "flex-end", position: "relative",
             animation: clipFlash > 0 ? "ctxPulse 0.45s ease-out" : "none",
           }}>
             <button
@@ -1390,73 +1481,26 @@ export default function Ribbon(p: RibbonProps) {
               </span>
             </button>
           </div>
-          <div style={{ width: 1, background: "#0d3020", margin: "5px 2px", alignSelf: "stretch" }} />
+          <div style={{ width: 1, background: "#0d3020", margin: "6px 2px 4px", alignSelf: "stretch" }} />
         </>)}
 
-        {/* Spacer pushes QAT to the right */}
+        {/* Spacer */}
         <div style={{ flex: 1 }} />
 
-        {/* QAT — right-aligned: Pan, Select, Undo, Redo */}
-        <div style={{ width: 1, background: "#1a2540", margin: "5px 4px", alignSelf: "stretch" }} />
-
-        <button title="Pan tool (Space)" onClick={() => p.setTool("pan")}
-          style={{
-            height: TAB_BAR_HEIGHT, border: "none", cursor: "pointer", padding: "0 8px",
-            background: p.tool === "pan" ? "rgba(59,130,246,0.15)" : "transparent",
-            color: p.tool === "pan" ? "#93c5fd" : "#64748b",
-            display: "flex", alignItems: "center", gap: 4, fontSize: 11,
-            fontWeight: p.tool === "pan" ? 600 : 400, outline: "none",
-          }}>
-          <PanCursorIcon />
-          <span>PAN</span>
-        </button>
-
-        <button title="Select tool (S)" onClick={() => p.setTool("select")}
-          style={{
-            height: TAB_BAR_HEIGHT, border: "none", cursor: "pointer", padding: "0 8px",
-            background: p.tool === "select" ? "rgba(59,130,246,0.15)" : "transparent",
-            color: p.tool === "select" ? "#93c5fd" : "#64748b",
-            display: "flex", alignItems: "center", gap: 4, fontSize: 11,
-            fontWeight: p.tool === "select" ? 600 : 400, outline: "none",
-          }}>
-          <span style={{ fontSize: 13 }}>⬚</span>
-          <span>SELECT</span>
-        </button>
-
-        <div style={{ width: 1, background: "#1a2540", margin: "5px 3px", alignSelf: "stretch" }} />
-
+        {/* Help button */}
+        <div style={{ width: 1, background: "#1a2540", margin: "5px 4px 5px 6px", alignSelf: "stretch" }} />
         <button
-          title={`Undo (⌘Z) · ${p.undoDepth} available`}
-          style={{
-            height: TAB_BAR_HEIGHT, border: "none", cursor: p.undoDepth === 0 ? "not-allowed" : "pointer",
-            padding: "0 7px", background: "transparent", outline: "none",
-            color: p.undoDepth === 0 ? "#334155" : "#64748b",
-            display: "flex", alignItems: "center", gap: 2, fontSize: 13,
-          }}
-          onClick={p.handleUndo} disabled={p.undoDepth === 0}>
-          <span>↩</span>
-          {p.undoDepth > 0 && <span style={{ fontSize: 9, fontVariantNumeric: "tabular-nums", color: "#475569", minWidth: 10 }}>{p.undoDepth}</span>}
+          onClick={() => p.setShowHelp(true)}
+          title="Help & shortcuts (?)"
+          style={{ width: 24, height: TAB_BAR_HEIGHT, border: "none", background: "transparent", color: "#475569", cursor: "pointer", outline: "none", display: "flex", alignItems: "center", justifyContent: "center", alignSelf: "center", fontSize: 12 }}>
+          ?
         </button>
-
-        <button
-          title={`Redo (⌘⇧Z) · ${p.redoDepth} available`}
-          style={{
-            height: TAB_BAR_HEIGHT, border: "none", cursor: p.redoDepth === 0 ? "not-allowed" : "pointer",
-            padding: "0 7px", background: "transparent", outline: "none",
-            color: p.redoDepth === 0 ? "#334155" : "#64748b",
-            display: "flex", alignItems: "center", gap: 2, fontSize: 13,
-          }}
-          onClick={p.handleRedo} disabled={p.redoDepth === 0}>
-          <span>↪</span>
-          {p.redoDepth > 0 && <span style={{ fontSize: 9, fontVariantNumeric: "tabular-nums", color: "#475569", minWidth: 10 }}>{p.redoDepth}</span>}
-        </button>
-
         {/* Collapse toggle */}
         <div style={{ width: 1, background: "#1a2540", margin: "5px 4px 5px 6px", alignSelf: "stretch" }} />
         <button
           onClick={() => p.onCollapse(!p.collapsed)}
           title={p.collapsed ? "Expand ribbon" : "Collapse ribbon"}
-          style={{ width: 28, height: TAB_BAR_HEIGHT, border: "none", background: "transparent", color: "#475569", cursor: "pointer", outline: "none", display: "flex", alignItems: "center", justifyContent: "center" }}>
+          style={{ width: 28, height: TAB_BAR_HEIGHT, border: "none", background: "transparent", color: "#475569", cursor: "pointer", outline: "none", display: "flex", alignItems: "center", justifyContent: "center", alignSelf: "center" }}>
           <ChevronIcon up={!p.collapsed} />
         </button>
       </div>

@@ -72,6 +72,10 @@ const FlyView3D = forwardRef<FlyView3DRef, {
   const hoverRef = useRef(false);      // pointer over this pane — gates the Z fly-toggle
   const speedMultRef = useRef(1);      // wheel-adjustable fly-speed multiplier
   const [flySpeed, setFlySpeed] = useState(1);
+  const [loadRadius, setLoadRadius] = useState(LOAD_RADIUS);
+  const loadRadiusRef = useRef(LOAD_RADIUS);
+  const [loadingCount, setLoadingCount] = useState(0);
+  const setLoadingCountRef = useRef(setLoadingCount);
 
   const mapW = world.width_chunks * 16;
   const mapH = world.height_chunks * 16;
@@ -240,6 +244,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       if (inflight.has(k) || meshes.has(k)) return;
       inflight.add(k);
       active++;
+      setLoadingCountRef.current(inflight.size);
       invoke<ChunkGeom>("get_chunk_geometry", { cx: cxk, cy: cyk })
         .then((g) => {
           if (disposed) return;
@@ -262,7 +267,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
           invalidate();
         })
         .catch(() => { /* no world / out of range */ })
-        .finally(() => { inflight.delete(k); active--; pump(); });
+        .finally(() => { inflight.delete(k); active--; pump(); setLoadingCountRef.current(inflight.size); });
     };
 
     const pump = () => {
@@ -280,14 +285,15 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       const ccy = Math.floor(camera.position.z / 16); // Three.js Z = Eden Y
       // Rebuild the work queue each sweep (nearest-first) so the camera's current position drives
       // priority and chunks that fell out of range stop being requested.
+      const r = loadRadiusRef.current;
       const needed: { cx: number; cy: number; d2: number }[] = [];
-      for (let cy = ccy - LOAD_RADIUS; cy <= ccy + LOAD_RADIUS; cy++) {
+      for (let cy = ccy - r; cy <= ccy + r; cy++) {
         if (cy < 0 || cy >= world.height_chunks) continue;
-        for (let cx2 = ccx - LOAD_RADIUS; cx2 <= ccx + LOAD_RADIUS; cx2++) {
+        for (let cx2 = ccx - r; cx2 <= ccx + r; cx2++) {
           if (cx2 < 0 || cx2 >= world.width_chunks) continue;
           const dx = cx2 - ccx, dy = cy - ccy;
           const d2 = dx * dx + dy * dy;
-          if (d2 > LOAD_RADIUS * LOAD_RADIUS) continue;
+          if (d2 > r * r) continue;
           if (meshes.has(key(cx2, cy)) || inflight.has(key(cx2, cy))) continue;
           needed.push({ cx: cx2, cy, d2 });
         }
@@ -296,7 +302,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       queue = needed;
       pump();
       // Dispose far chunks (keep a small hysteresis margin).
-      const drop = LOAD_RADIUS + 2;
+      const drop = r + 2;
       for (const k of [...meshes.keys()]) {
         const [kx, ky] = k.split(",").map(Number);
         if (Math.abs(kx - ccx) > drop || Math.abs(ky - ccy) > drop) {
@@ -688,11 +694,16 @@ const FlyView3D = forwardRef<FlyView3DRef, {
         }}>
           {flyMode ? "FLY" : "3D"}
         </span>
-        <span style={{ fontSize: 9, color: flyMode ? "#6ee7b7" : "#475569", pointerEvents: "none" }}>
-          {flyMode
-            ? "WASD · Space/Ctrl · Shift boost · wheel speed · Z or Esc exit"
-            : "drag to orbit · scroll zoom · Z to fly"}
-        </span>
+        {flyMode ? (
+          <span style={{ fontSize: 9, color: "#6ee7b7", pointerEvents: "none", lineHeight: 1.6 }}>
+            WASD move · Space/E up · Ctrl/Q down · Shift boost<br />
+            drag look · scroll speed · Z or Esc exit
+          </span>
+        ) : (
+          <span style={{ fontSize: 9, color: "#475569", pointerEvents: "none" }}>
+            drag to orbit · scroll zoom · Z to fly
+          </span>
+        )}
         {/* Speed indicator (A6) */}
         {flyMode && (
           <span style={{
@@ -703,18 +714,47 @@ const FlyView3D = forwardRef<FlyView3DRef, {
             {flySpeed.toFixed(1)}×
           </span>
         )}
+        {loadingCount > 0 && (
+          <span style={{
+            padding: "1px 5px", borderRadius: 4, fontSize: 9,
+            background: "rgba(100,116,139,0.12)", border: "1px solid rgba(100,116,139,0.25)",
+            color: "#64748b",
+          }}>
+            loading {loadingCount}…
+          </span>
+        )}
       </div>
       {/* Camera reset button (A4) */}
-      <button
-        onClick={() => sceneApi.current?.resetCamera()}
-        title="Reset camera to world overview"
-        style={{
-          position: "absolute", top: 6, right: 6, zIndex: 1,
-          padding: "2px 7px", fontSize: 10, cursor: "pointer", borderRadius: 4,
+      <div style={{ position: "absolute", top: 6, right: 6, zIndex: 1, display: "flex", alignItems: "center", gap: 6 }}>
+        {/* Render distance slider */}
+        <div style={{
+          display: "flex", alignItems: "center", gap: 4,
+          padding: "2px 6px", borderRadius: 4,
           background: "rgba(30,41,59,0.8)", border: "1px solid #334155",
-          color: "#94a3b8",
-        }}
-      >⌂ Reset</button>
+        }}>
+          <span style={{ fontSize: 9, color: "#64748b", userSelect: "none" }}>R</span>
+          <input
+            type="range" min={2} max={15} step={1} value={loadRadius}
+            onChange={e => {
+              const v = Number(e.target.value);
+              loadRadiusRef.current = v;
+              setLoadRadius(v);
+            }}
+            title={`Render distance: ${loadRadius} chunks`}
+            style={{ width: 60, cursor: "pointer", accentColor: "#64748b" }}
+          />
+          <span style={{ fontSize: 9, color: "#94a3b8", minWidth: 14, textAlign: "right", userSelect: "none" }}>{loadRadius}</span>
+        </div>
+        <button
+          onClick={() => sceneApi.current?.resetCamera()}
+          title="Reset camera to world overview"
+          style={{
+            padding: "2px 7px", fontSize: 10, cursor: "pointer", borderRadius: 4,
+            background: "rgba(30,41,59,0.8)", border: "1px solid #334155",
+            color: "#94a3b8",
+          }}
+        >⌂ Reset</button>
+      </div>
       {flyMode && (
         // Centre crosshair (fly mode hides the cursor via pointer-lock).
         <div style={{
