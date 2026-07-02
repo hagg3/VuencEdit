@@ -1,5 +1,7 @@
 import { useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
+import { EDEN_TEAL, EDEN_TEAL_READABLE, glassPanel, chromeButton, chromeButtonAccent, recessedWell } from "./designTokens";
+import Modal from "./Modal";
 
 export const SETTINGS_KEY = "eden_settings";
 
@@ -42,17 +44,9 @@ export function saveSettings(patch: Partial<AppSettings>) {
   localStorage.setItem(SETTINGS_KEY, JSON.stringify({ ...current, ...patch }));
 }
 
-const overlay: React.CSSProperties = {
-  position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)",
-  display: "flex", alignItems: "center", justifyContent: "center",
-  zIndex: 1000,
-};
-
-const modal: React.CSSProperties = {
-  background: "#1a1f2e", border: "1px solid #2d3448",
-  borderRadius: 12, padding: "28px 32px", width: 480,
-  boxShadow: "0 16px 48px rgba(0,0,0,0.6)", color: "#e2e8f0",
-};
+const modal: React.CSSProperties = glassPanel({
+  padding: "28px 32px", width: 480, borderRadius: 12, color: "#e2e8f0",
+});
 
 const sectionLabel: React.CSSProperties = {
   fontSize: 10, fontWeight: 700, letterSpacing: "0.1em",
@@ -81,14 +75,20 @@ function Toggle({ value, onChange }: { value: boolean; onChange: (v: boolean) =>
       onClick={() => onChange(!value)}
       style={{
         width: 40, height: 22, borderRadius: 11, border: "none", cursor: "pointer",
-        background: value ? "#3b82f6" : "#334155", position: "relative", flexShrink: 0,
+        background: value
+          ? `linear-gradient(180deg, rgba(${EDEN_TEAL},0.9) 0%, rgb(0,68,72) 100%)`
+          : "linear-gradient(180deg, rgb(51,65,85) 0%, rgb(38,48,64) 100%)",
+        boxShadow: "inset 0 0 0 1px rgba(0,0,0,.4)",
+        position: "relative", flexShrink: 0,
         transition: "background 0.15s",
       }}
     >
       <span style={{
         position: "absolute", top: 3, left: value ? 21 : 3,
         width: 16, height: 16, borderRadius: "50%",
-        background: "#fff", transition: "left 0.15s",
+        background: "linear-gradient(180deg, rgb(243,243,243) 0%, rgb(200,200,200) 100%)",
+        boxShadow: "0 1px 2px rgba(0,0,0,.4)",
+        transition: "left 0.15s",
       }} />
     </button>
   );
@@ -123,14 +123,16 @@ export default function SettingsModal({ onClose, onSave }: Props) {
   }
 
   return (
-    <div style={overlay} onClick={e => { if (e.target === e.currentTarget) onClose(); }}>
+    <Modal onClose={onClose} zIndex={1000} labelledBy="settings-title">
       <div style={modal}>
         {/* Header */}
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 24 }}>
-          <span style={{ fontSize: 18, fontWeight: 700 }}>Settings</span>
+          <span id="settings-title" style={{ fontSize: 18, fontWeight: 700 }}>Settings</span>
           <button
             onClick={onClose}
-            style={{ background: "none", border: "none", color: "#64748b", fontSize: 20, cursor: "pointer", lineHeight: 1 }}
+            onMouseEnter={e => (e.currentTarget.style.color = EDEN_TEAL_READABLE)}
+            onMouseLeave={e => (e.currentTarget.style.color = "#64748b")}
+            style={{ background: "none", border: "none", color: "#64748b", fontSize: 20, cursor: "pointer", lineHeight: 1, transition: "color .1s" }}
           >✕</button>
         </div>
 
@@ -180,8 +182,9 @@ export default function SettingsModal({ onClose, onSave }: Props) {
               marginTop: 8, display: "flex", gap: 8, alignItems: "center",
             }}>
               <div style={{
+                ...recessedWell,
                 flex: 1, fontSize: 12, color: local.templatePath ? "#94a3b8" : "#475569",
-                background: "#0f1117", border: "1px solid #2d3448", borderRadius: 6,
+                borderRadius: 6,
                 padding: "5px 10px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
                 direction: "rtl", textAlign: "left",
               }}>
@@ -189,12 +192,9 @@ export default function SettingsModal({ onClose, onSave }: Props) {
               </div>
               <button
                 onClick={browsePath}
-                style={{
-                  background: "#232a3d", border: "1px solid #2d3448", color: "#94a3b8",
-                  borderRadius: 6, padding: "5px 12px", fontSize: 12, cursor: "pointer", flexShrink: 0,
-                }}
-                onMouseEnter={e => (e.currentTarget.style.background = "#2d3a52")}
-                onMouseLeave={e => (e.currentTarget.style.background = "#232a3d")}
+                style={chromeButton({ padding: "5px 12px", fontSize: 12, flexShrink: 0 })}
+                onMouseEnter={e => (e.currentTarget.style.boxShadow = `inset 0 0 0 1px rgba(${EDEN_TEAL},.6), 0 .5px .5px rgba(255,255,255,.2)`)}
+                onMouseLeave={e => (e.currentTarget.style.boxShadow = "inset 0 0 0 1px rgba(0,0,0,.5), 0 .5px .5px rgba(255,255,255,.15)")}
               >
                 Browse…
               </button>
@@ -218,8 +218,9 @@ export default function SettingsModal({ onClose, onSave }: Props) {
             <span style={labelSub}>ZIP of PNGs — adds textures to 3D views and block picker icons</span>
             <div style={{ marginTop: 8, display: "flex", gap: 8, alignItems: "center" }}>
               <div style={{
+                ...recessedWell,
                 flex: 1, fontSize: 12, color: local.texturePackPath ? "#94a3b8" : "#475569",
-                background: "#0f1117", border: "1px solid #2d3448", borderRadius: 6,
+                borderRadius: 6,
                 padding: "5px 10px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
                 direction: "rtl", textAlign: "left",
               }}>
@@ -227,12 +228,9 @@ export default function SettingsModal({ onClose, onSave }: Props) {
               </div>
               <button
                 onClick={browseTexturePack}
-                style={{
-                  background: "#232a3d", border: "1px solid #2d3448", color: "#94a3b8",
-                  borderRadius: 6, padding: "5px 12px", fontSize: 12, cursor: "pointer", flexShrink: 0,
-                }}
-                onMouseEnter={e => (e.currentTarget.style.background = "#2d3a52")}
-                onMouseLeave={e => (e.currentTarget.style.background = "#232a3d")}
+                style={chromeButton({ padding: "5px 12px", fontSize: 12, flexShrink: 0 })}
+                onMouseEnter={e => (e.currentTarget.style.boxShadow = `inset 0 0 0 1px rgba(${EDEN_TEAL},.6), 0 .5px .5px rgba(255,255,255,.2)`)}
+                onMouseLeave={e => (e.currentTarget.style.boxShadow = "inset 0 0 0 1px rgba(0,0,0,.5), 0 .5px .5px rgba(255,255,255,.15)")}
               >
                 Browse…
               </button>
@@ -254,28 +252,18 @@ export default function SettingsModal({ onClose, onSave }: Props) {
         <div style={{ display: "flex", justifyContent: "flex-end", gap: 10, marginTop: 28 }}>
           <button
             onClick={onClose}
-            style={{
-              background: "none", border: "1px solid #334155", color: "#94a3b8",
-              borderRadius: 6, padding: "7px 18px", fontSize: 13, cursor: "pointer",
-            }}
-            onMouseEnter={e => (e.currentTarget.style.borderColor = "#475569")}
-            onMouseLeave={e => (e.currentTarget.style.borderColor = "#334155")}
+            style={chromeButton({ color: "#94a3b8", padding: "7px 18px", fontSize: 13 })}
           >
             Cancel
           </button>
           <button
             onClick={handleSave}
-            style={{
-              background: "#3b82f6", border: "none", color: "#fff",
-              borderRadius: 6, padding: "7px 18px", fontSize: 13, cursor: "pointer", fontWeight: 600,
-            }}
-            onMouseEnter={e => (e.currentTarget.style.background = "#2563eb")}
-            onMouseLeave={e => (e.currentTarget.style.background = "#3b82f6")}
+            style={chromeButtonAccent(EDEN_TEAL, `rgb(${EDEN_TEAL})`, { color: "#fff", padding: "7px 18px", fontSize: 13, fontWeight: 600 })}
           >
             Save
           </button>
         </div>
       </div>
-    </div>
+    </Modal>
   );
 }

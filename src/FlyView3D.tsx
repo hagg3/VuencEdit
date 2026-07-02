@@ -1,20 +1,12 @@
+import { decodeF32 } from "./codec";
 import { useEffect, useRef, useState, forwardRef, useImperativeHandle } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import type { AtlasData } from "./texturePack";
+import { chromeButton } from "./designTokens";
 
 interface ChunkGeom { positions: string; colors: string; uvs: string; vertex_count: number }
-function decodeF32(b64: string): Float32Array {
-  const bin = atob(b64);
-  const n = bin.length;
-  const bytes = new Uint8Array(n);
-  for (let i = 0; i < n; i++) bytes[i] = bin.charCodeAt(i);
-  // Length in floats via (n >> 2) guards against a buffer whose byteLength isn't a multiple of 4
-  // (a truncated/odd payload would otherwise throw in the Float32Array ctor).
-  return new Float32Array(bytes.buffer, 0, n >> 2);
-}
-
 // World-scale 3D fly-through viewport — the 4th quad-view pane.
 //
 // Coordinate mapping: Eden (X east, Y south, Z up) → Three.js (x = wx, y = wz, z = wy).
@@ -323,8 +315,9 @@ const FlyView3D = forwardRef<FlyView3DRef, {
 
     // Reload all chunks — called when texture pack changes so meshes are rebuilt with new material.
     const reloadAllChunks = () => {
-      inflight.clear();
-      active = 0;
+      // Leave in-flight fetches alone: zeroing `active`/`inflight` here lets their
+      // .finally push `active` negative, breaking the concurrency cap. They resolve
+      // against the current texMatRef, so their results are still valid.
       queue = [];
       for (const k of [...meshes.keys()]) {
         if (meshes.get(k) === EMPTY) meshes.delete(k);
@@ -727,11 +720,10 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       {/* Camera reset button (A4) */}
       <div style={{ position: "absolute", top: 6, right: 6, zIndex: 1, display: "flex", alignItems: "center", gap: 6 }}>
         {/* Render distance slider */}
-        <div style={{
+        <div style={chromeButton({
           display: "flex", alignItems: "center", gap: 4,
-          padding: "2px 6px", borderRadius: 4,
-          background: "rgba(30,41,59,0.8)", border: "1px solid #334155",
-        }}>
+          padding: "2px 6px", cursor: "default",
+        })}>
           <span style={{ fontSize: 9, color: "#64748b", userSelect: "none" }}>R</span>
           <input
             type="range" min={2} max={15} step={1} value={loadRadius}
@@ -748,11 +740,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
         <button
           onClick={() => sceneApi.current?.resetCamera()}
           title="Reset camera to world overview"
-          style={{
-            padding: "2px 7px", fontSize: 10, cursor: "pointer", borderRadius: 4,
-            background: "rgba(30,41,59,0.8)", border: "1px solid #334155",
-            color: "#94a3b8",
-          }}
+          style={chromeButton({ padding: "2px 7px", fontSize: 10, color: "#94a3b8" })}
         >⌂ Reset</button>
       </div>
       {flyMode && (

@@ -1,5 +1,7 @@
 import { openUrl } from "@tauri-apps/plugin-opener";
 import appIcon from "./assets/app-icon.png";
+import { EDEN_TEAL, EDEN_TEAL_READABLE, glassPanel, chromeButton } from "./designTokens";
+import Modal from "./Modal";
 
 interface Props {
   version: string;
@@ -11,7 +13,7 @@ function Link({ href, children }: { href: string; children: React.ReactNode }) {
     <a
       href="#"
       onClick={(e) => { e.preventDefault(); openUrl(href); }}
-      style={{ color: "#60a5fa", textDecoration: "none" }}
+      style={{ color: EDEN_TEAL_READABLE, textDecoration: "none" }}
       onMouseEnter={e => (e.currentTarget.style.textDecoration = "underline")}
       onMouseLeave={e => (e.currentTarget.style.textDecoration = "none")}
     >
@@ -22,28 +24,22 @@ function Link({ href, children }: { href: string; children: React.ReactNode }) {
 
 export default function AboutModal({ version, onClose }: Props) {
   return (
-    <div
-      style={{
-        position: "fixed", inset: 0, zIndex: 9999,
-        background: "rgba(0,0,0,0.7)", display: "flex",
-        alignItems: "center", justifyContent: "center",
-      }}
-      onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
-    >
-      <div style={{
-        background: "#13161f", border: "1px solid #1e2333",
-        borderRadius: 16, padding: "40px 44px", width: 480,
+    <Modal onClose={onClose} zIndex={9999} label="About VuencEdit">
+      <div style={glassPanel({
+        padding: "40px 44px", width: 480, borderRadius: 16,
         display: "flex", flexDirection: "column", alignItems: "center", gap: 0,
-        boxShadow: "0 24px 64px rgba(0,0,0,0.6)",
-      }}>
+      })}>
         <img
           src={appIcon}
           alt="VuencEdit"
-          style={{ width: 80, height: 80, borderRadius: 18, marginBottom: 16, imageRendering: "pixelated" }}
+          style={{
+            width: 80, height: 80, borderRadius: 18, marginBottom: 16, imageRendering: "pixelated",
+            boxShadow: "inset 0 0 0 1px rgba(255,255,255,.12), 0 6px 16px rgba(0,0,0,.5)",
+          }}
         />
         <div style={{ fontSize: 28, marginBottom: 6, letterSpacing: -0.5, lineHeight: 1 }}>
-          <span style={{ fontWeight: 800, color: "#ffffff" }}>Vuenc</span>
-          <span style={{ fontWeight: 400, color: "#cbd5e1" }}>Edit</span>
+          <span style={{ fontWeight: 800, color: "#ffffff", textShadow: "0 -1px 0 rgba(0,0,0,.5)" }}>Vuenc</span>
+          <span style={{ fontWeight: 400, color: EDEN_TEAL_READABLE, textShadow: "0 -1px 0 rgba(0,0,0,.5)" }}>Edit</span>
         </div>
         <div style={{ fontSize: 13, color: "#64748b", marginBottom: 28 }}>v{version}</div>
 
@@ -73,18 +69,13 @@ export default function AboutModal({ version, onClose }: Props) {
 
         <button
           onClick={onClose}
-          style={{
-            marginTop: 28, padding: "8px 32px",
-            background: "rgba(255,255,255,0.06)", border: "1px solid #334155",
-            borderRadius: 8, color: "#cbd5e1", fontSize: 14,
-            cursor: "pointer",
-          }}
-          onMouseEnter={e => (e.currentTarget.style.background = "rgba(255,255,255,0.1)")}
-          onMouseLeave={e => (e.currentTarget.style.background = "rgba(255,255,255,0.06)")}
+          style={chromeButton({ marginTop: 28, padding: "8px 32px", fontSize: 14 })}
+          onMouseEnter={e => (e.currentTarget.style.boxShadow = `inset 0 0 0 1px rgba(${EDEN_TEAL},.6), 0 .5px .5px rgba(255,255,255,.2)`)}
+          onMouseLeave={e => (e.currentTarget.style.boxShadow = "inset 0 0 0 1px rgba(0,0,0,.5), 0 .5px .5px rgba(255,255,255,.15)")}
         >
           Close
         </button>
       </div>
-    </div>
+    </Modal>
   );
 }

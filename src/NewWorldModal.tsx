@@ -1,18 +1,14 @@
+import { decodeU8 } from "./codec";
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { save } from "@tauri-apps/plugin-dialog";
+import { EDEN_TEAL, EDEN_TEAL_READABLE, glassPanel, chromeButton, chromeButtonAccent, recessedWell } from "./designTokens";
+import Modal from "./Modal";
 
 interface GenProgress { phase: string; pct: number; }
 interface PreviewRaw { width: number; height: number; pixels: string; }
 interface Preview { width: number; height: number; pixels: Uint8Array; }
-
-function decodePixels(b64: string): Uint8Array {
-  const bin = atob(b64);
-  const out = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-  return out;
-}
 
 function PreviewCanvas({ preview }: { preview: Preview }) {
   const ref = useRef<HTMLCanvasElement>(null);
@@ -253,7 +249,7 @@ export default function NewWorldModal({ onClose, onCreated }: Props) {
         clouds: cloudsEnabled,
         maxPx: 220,
       });
-      setPreview({ width: raw.width, height: raw.height, pixels: decodePixels(raw.pixels) });
+      setPreview({ width: raw.width, height: raw.height, pixels: decodeU8(raw.pixels) });
     } catch (e) {
       setError(String(e));
     } finally {
@@ -271,7 +267,7 @@ export default function NewWorldModal({ onClose, onCreated }: Props) {
         customBiomes: tg2TerrainType === 9 ? [...tg2CustomBiomes] : null,
         extendedZ, amplitude: tg2Amplitude, seaLevelOff: tg2SeaLevel,
       });
-      setTg2Preview({ width: raw.width, height: raw.height, pixels: decodePixels(raw.pixels) });
+      setTg2Preview({ width: raw.width, height: raw.height, pixels: decodeU8(raw.pixels) });
     } catch (e) {
       setError(String(e));
     } finally {
@@ -281,23 +277,32 @@ export default function NewWorldModal({ onClose, onCreated }: Props) {
 
   // ── styles ──────────────────────────────────────────────────────────────────
   const label: React.CSSProperties   = { color: "#64748b", fontSize: 11, fontWeight: 700, letterSpacing: "0.06em", marginBottom: 5 };
-  const inp: React.CSSProperties     = { background: "#1e293b", border: "1px solid #334155", borderRadius: 6, color: "#e2e8f0", padding: "7px 10px", fontSize: 14, width: "100%", boxSizing: "border-box" };
-  const btnBase: React.CSSProperties = { border: "1px solid #334155", borderRadius: 6, padding: "6px 14px", fontSize: 13, cursor: "pointer" };
+  const inp: React.CSSProperties     = { ...recessedWell, background: "#1e293b", borderRadius: 6, color: "#e2e8f0", padding: "7px 10px", fontSize: 14, width: "100%", boxSizing: "border-box" };
+  const btnBase: React.CSSProperties = chromeButton({ borderRadius: 6, padding: "6px 14px", fontSize: 13 });
 
+  // Accent hex → "r,g,b" for rgba()/gradient math (small fixed palette used across this modal)
+  function rgbOf(hex: string): string {
+    const m: Record<string, string> = {
+      "#3b82f6": "59,130,246", "#22c55e": "34,197,94", "#6366f1": "99,102,241",
+      "#f59e0b": "245,158,11", "#a855f7": "168,85,247", "#ef4444": "239,68,68",
+      "#93c5fd": "147,197,253",
+    };
+    return m[hex] ?? EDEN_TEAL;
+  }
   function fmtBtn(active: boolean): React.CSSProperties {
     return active
-      ? { ...btnBase, flex: 1, background: "rgba(59,130,246,0.2)", borderColor: "#3b82f6", color: "#93c5fd" }
-      : { ...btnBase, flex: 1, background: "transparent", color: "#64748b" };
+      ? chromeButtonAccent(EDEN_TEAL, EDEN_TEAL_READABLE, { flex: 1, color: EDEN_TEAL_READABLE, fontSize: 13 })
+      : { ...btnBase, flex: 1, background: "transparent", boxShadow: "none", color: "#64748b" };
   }
   function typeBtn(active: boolean): React.CSSProperties {
     return active
-      ? { ...btnBase, flex: 1, background: "rgba(34,197,94,0.15)", borderColor: "#22c55e", color: "#86efac" }
-      : { ...btnBase, flex: 1, background: "transparent", color: "#64748b" };
+      ? chromeButtonAccent("34,197,94", "#22c55e", { flex: 1, color: "#86efac", fontSize: 13 })
+      : { ...btnBase, flex: 1, background: "transparent", boxShadow: "none", color: "#64748b" };
   }
   function optBtn(active: boolean, accent = "#6366f1"): React.CSSProperties {
     return active
-      ? { ...btnBase, flex: 1, background: `${accent}26`, borderColor: accent, color: "#e2e8f0", fontSize: 12 }
-      : { ...btnBase, flex: 1, background: "transparent", color: "#64748b", fontSize: 12 };
+      ? chromeButtonAccent(rgbOf(accent), accent, { flex: 1, color: "#e2e8f0", fontSize: 12 })
+      : { ...btnBase, flex: 1, background: "transparent", boxShadow: "none", color: "#64748b", fontSize: 12 };
   }
 
   // Layer preview bar
@@ -319,18 +324,15 @@ export default function NewWorldModal({ onClose, onCreated }: Props) {
   };
 
   return (
-    <div
-      style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.65)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 400 }}
-      onClick={e => { if (e.target === e.currentTarget) onClose(); }}
-    >
-      <div style={{
-        background: "#0d1829", border: "1px solid #1e40af", borderRadius: 12,
+    <Modal onClose={onClose} zIndex={400} labelledBy="newworld-title"
+      backdropStyle={{ background: "rgba(0,0,0,0.65)" }}
+      closeOnBackdrop={!creating} closeOnEsc={!creating}>
+      <div style={glassPanel({
         padding: "28px 30px", width: 460, maxWidth: "94vw", maxHeight: "90vh",
         overflowY: "auto",
         display: "flex", flexDirection: "column", gap: 18,
-        boxShadow: "0 16px 48px rgba(0,0,0,0.7)",
-      }}>
-        <div style={{ fontSize: 17, fontWeight: 700, color: "#e2e8f0" }}>New World</div>
+      })}>
+        <div id="newworld-title" style={{ fontSize: 17, fontWeight: 700, color: "#e2e8f0" }}>New World</div>
 
         {/* Terrain type tabs */}
         <div>
@@ -927,7 +929,7 @@ export default function NewWorldModal({ onClose, onCreated }: Props) {
                           next[qi] = +e.target.value;
                           setTg2CustomBiomes(next);
                         }}
-                        style={{ background: "#0f172a", color: "#e2e8f0", border: "1px solid #334155", borderRadius: 4, padding: "4px 6px", fontSize: 12, cursor: "pointer" }}>
+                        style={{ ...recessedWell, background: "#0f172a", color: "#e2e8f0", borderRadius: 4, padding: "4px 6px", fontSize: 12, cursor: "pointer" }}>
                         {biomeNames.map((bn, bi) => (
                           <option key={bi} value={bi}>{bn}</option>
                         ))}
@@ -1133,23 +1135,22 @@ export default function NewWorldModal({ onClose, onCreated }: Props) {
 
         {/* Action buttons */}
         <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
-          <button onClick={onClose} style={{ ...btnBase, background: "transparent", color: "#64748b" }}>
+          <button onClick={onClose} style={{ ...btnBase, background: "transparent", boxShadow: "none", color: "#64748b" }}>
             Cancel
           </button>
           <button
             onClick={handleCreate}
             disabled={!valid || creating}
-            style={{
-              ...btnBase, padding: "8px 22px", fontWeight: 600,
-              background: valid && !creating ? "rgba(59,130,246,0.85)" : "rgba(59,130,246,0.25)",
-              borderColor: "#3b82f6", color: "#fff",
+            style={chromeButtonAccent(EDEN_TEAL, EDEN_TEAL_READABLE, {
+              padding: "8px 22px", fontWeight: 600, color: "#fff",
+              opacity: valid && !creating ? 1 : 0.5,
               cursor: valid && !creating ? "pointer" : "not-allowed",
-            }}
+            })}
           >
             {creating ? (progress ? `Creating… ${Math.round(progress.pct)}%` : "Creating…") : "Create World…"}
           </button>
         </div>
       </div>
-    </div>
+    </Modal>
   );
 }

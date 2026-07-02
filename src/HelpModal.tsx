@@ -1,4 +1,6 @@
 import React, { useState } from "react";
+import { EDEN_TEAL, EDEN_TEAL_READABLE, glassPanel, glassTab } from "./designTokens";
+import Modal from "./Modal";
 
 function Key({ children }: { children: React.ReactNode }) {
   return (
@@ -77,9 +79,9 @@ function TileName({ name }: { name: string }) {
       display: "inline-block",
       fontFamily: "ui-monospace, 'SF Mono', monospace",
       fontSize: 11,
-      color: "#93c5fd",
-      background: "rgba(59,130,246,0.08)",
-      border: "1px solid rgba(59,130,246,0.2)",
+      color: EDEN_TEAL_READABLE,
+      background: `rgba(${EDEN_TEAL},0.10)`,
+      border: `1px solid rgba(${EDEN_TEAL},0.3)`,
       borderRadius: 3,
       padding: "1px 5px",
       margin: "1px 2px",
@@ -167,30 +169,12 @@ export default function HelpModal({ onClose }: { onClose: () => void }) {
   const [tab, setTab] = useState<"shortcuts" | "textures">("shortcuts");
 
   return (
-    <div
-      style={{
-        position: "fixed", inset: 0,
-        background: "rgba(0,0,0,0.5)",
-        display: "flex", alignItems: "center", justifyContent: "center",
-        zIndex: 1000,
-      }}
-      onClick={onClose}
-    >
+    <Modal onClose={onClose} zIndex={1000} label="Help">
       <div
-        style={{
-          background: "#0f172a",
-          border: "1px solid #334155",
-          borderRadius: 10,
-          padding: "18px 24px 20px",
-          width: 480,
-          maxHeight: "88vh",
-          overflowY: "auto",
-          boxShadow: "0 24px 48px rgba(0,0,0,0.7)",
-          color: "#e2e8f0",
-          display: "flex",
-          flexDirection: "column",
-        }}
-        onClick={e => e.stopPropagation()}
+        style={glassPanel({
+          padding: "18px 24px 20px", width: 480, maxHeight: "88vh",
+          overflowY: "auto", color: "#e2e8f0", display: "flex", flexDirection: "column",
+        })}
       >
         {/* Header */}
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
@@ -201,12 +185,10 @@ export default function HelpModal({ onClose }: { onClose: () => void }) {
                 key={id}
                 onClick={() => setTab(id)}
                 style={{
-                  background: tab === id ? "rgba(59,130,246,0.18)" : "none",
-                  border: "none",
-                  borderBottom: tab === id ? "2px solid #3b82f6" : "2px solid transparent",
-                  color: tab === id ? "#93c5fd" : "#475569",
+                  ...glassTab(tab === id),
+                  color: tab === id ? EDEN_TEAL_READABLE : "#475569",
                   fontSize: 13, fontWeight: tab === id ? 600 : 400,
-                  padding: "4px 10px", cursor: "pointer", borderRadius: "4px 4px 0 0",
+                  padding: "4px 10px", borderRadius: "4px 4px 0 0",
                 }}
               >
                 {label}
@@ -215,9 +197,11 @@ export default function HelpModal({ onClose }: { onClose: () => void }) {
           </div>
           <button
             onClick={onClose}
+            onMouseEnter={e => (e.currentTarget.style.color = EDEN_TEAL_READABLE)}
+            onMouseLeave={e => (e.currentTarget.style.color = "#475569")}
             style={{
               background: "none", border: "none", color: "#475569",
-              fontSize: 20, lineHeight: 1, cursor: "pointer", padding: "0 2px",
+              fontSize: 20, lineHeight: 1, cursor: "pointer", padding: "0 2px", transition: "color .1s",
             }}
             title="Close"
           >×</button>
@@ -269,6 +253,6 @@ export default function HelpModal({ onClose }: { onClose: () => void }) {
           <TexturePackHelp />
         )}
       </div>
-    </div>
+    </Modal>
   );
 }

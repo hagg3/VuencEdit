@@ -1,3 +1,4 @@
+import { decodeU8 } from "./codec";
 import { useState, useRef, useEffect } from "react";
 import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
@@ -7,6 +8,8 @@ import BlockPaintPicker from "./BlockPaintPicker";
 import { BLOCK_DEFS, resolveColor, blockDisplayName } from "./blockDefs";
 import { tintedSwatch } from "./texturePack";
 import appIcon from "./assets/app-icon.png";
+import { EDEN_TEAL, EDEN_TEAL_READABLE, recessedWell } from "./designTokens";
+export { EDEN_TEAL, EDEN_TEAL_READABLE } from "./designTokens";
 
 export const RIBBON_HEIGHT_COLLAPSED = 32;
 export const TAB_BAR_HEIGHT = 32;
@@ -155,26 +158,42 @@ function timeAgo(ts: number): string {
 }
 
 // ── shared styles ──────────────────────────────────────────────────────────────
+// Dense adaptation of the "X Design System" glass/chrome language: gradient
+// chrome buttons, 1px insets (X uses 2px — halved here for compact controls),
+// engraved captions, recessed wells. Radii/sizes/fonts are left exactly as
+// they were — X's own 9-12px radii and 17px control scale don't fit this
+// toolbar's density, so only color/gradient/shadow recipes are adopted.
 
 const rb: React.CSSProperties = {
-  background: "rgba(255,255,255,0.05)", border: "1px solid #2a3448",
+  background: "linear-gradient(180deg, rgb(46,58,82) 0%, rgb(26,34,52) 100%)",
+  border: "none", boxShadow: "inset 0 0 0 1px rgba(0,0,0,.5), 0 .5px .5px rgba(255,255,255,.15)",
   color: "#cbd5e1", padding: "2px 8px", borderRadius: 3, cursor: "pointer",
   fontSize: 11, lineHeight: "18px", whiteSpace: "nowrap", outline: "none",
 };
 const rbDim: React.CSSProperties = {
-  ...rb, color: "#64748b", borderColor: "#334155", background: "rgba(255,255,255,0.03)",
+  ...rb, color: "#64748b",
+  background: "linear-gradient(180deg, rgb(30,38,54) 0%, rgb(20,26,38) 100%)",
+  boxShadow: "inset 0 0 0 1px rgba(0,0,0,.5), 0 .5px .5px rgba(255,255,255,.06)",
 };
-const rbActive = (accent = "#3b82f6"): React.CSSProperties => {
-  const rgb = accent === "#3b82f6" ? "59,130,246"
+function accentRgb(accent: string): string {
+  return accent === "#3b82f6" ? "59,130,246"
     : accent === "#f59e0b" ? "245,158,11"
     : accent === "#a78bfa" ? "167,139,250"
     : accent === "#4ade80" ? "74,222,128"
     : "34,197,94";
+}
+const rbActive = (accent = "#3b82f6"): React.CSSProperties => {
+  const rgb = accentRgb(accent);
   const textColor = accent === "#3b82f6" ? "#93c5fd"
     : accent === "#f59e0b" ? "#fcd34d"
     : accent === "#a78bfa" ? "#c4b5fd"
     : "#86efac";
-  return { ...rb, background: `rgba(${rgb},0.18)`, borderColor: accent, color: textColor };
+  return {
+    ...rb,
+    background: `linear-gradient(180deg, rgba(${rgb},0.30) 0%, rgba(${rgb},0.12) 100%)`,
+    boxShadow: `inset 0 0 0 1px ${accent}, 0 .5px .5px rgba(255,255,255,.2)`,
+    color: textColor,
+  };
 };
 const rbGroup: React.CSSProperties = {
   display: "flex", flexDirection: "column", alignItems: "flex-start", gap: 3,
@@ -184,14 +203,15 @@ const rbGroupLabel: React.CSSProperties = {
   fontSize: 9, color: "#475569", letterSpacing: "0.07em", fontWeight: 700,
   textTransform: "uppercase", userSelect: "none", marginTop: "auto",
   paddingTop: 3, textAlign: "center", alignSelf: "stretch",
-  borderTop: "1px solid #1a2d4a",
+  borderTop: "1px solid #1a2d4a", textShadow: "0 -1px 0 rgba(0,0,0,.5)",
 };
 const rbDivider: React.CSSProperties = {
   width: 1, background: "#233452", alignSelf: "stretch", margin: "4px 2px",
   boxShadow: "1px 0 0 rgba(255,255,255,0.03)",
 };
 const zInp: React.CSSProperties = {
-  width: 46, background: "rgba(0,0,0,0.4)", border: "1px solid #2a3448",
+  width: 46, background: "rgba(0,0,0,0.35)", border: "none",
+  boxShadow: "inset 0 0 0 1px rgba(0,0,0,.4), inset 0 2px 3px rgba(0,0,0,.35)",
   color: "#e2e8f0", borderRadius: 3, padding: "1px 4px", fontSize: 11,
   textAlign: "center", outline: "none",
 };
@@ -247,13 +267,6 @@ const LEAF_COLORS: [number, string, string][] = [
 interface PickerState {
   type: "block-draw" | "block-fill" | "filter";
   top: number; left: number;
-}
-
-function decodeB64(b64: string): Uint8Array {
-  const bin = atob(b64);
-  const arr = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
-  return arr;
 }
 
 export default function Ribbon(p: RibbonProps) {
@@ -394,7 +407,7 @@ export default function Ribbon(p: RibbonProps) {
   useEffect(() => {
     if (!p.clipboard) { setClipAxoPixels(null); return; }
     invoke<{width:number;height:number;pixels:string}>("render_clipboard_preview")
-      .then(raw => setClipAxoPixels({ width: raw.width, height: raw.height, pixels: decodeB64(raw.pixels) }))
+      .then(raw => setClipAxoPixels({ width: raw.width, height: raw.height, pixels: decodeU8(raw.pixels) }))
       .catch(() => setClipAxoPixels(null));
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [p.clipboard]);
@@ -450,13 +463,19 @@ export default function Ribbon(p: RibbonProps) {
     const textColor = accent === "#f59e0b" ? (isActive ? "#fcd34d" : "#c4963c")
       : accent === "#22c55e" ? (isActive ? "#86efac" : "#4ade80")
       : (isActive ? "#e2e8f0" : "#64748b");
+    const rgb = accentRgb(accent);
     return {
-      background: isActive ? "#0f2244" : "rgba(255,255,255,0.04)",
+      background: isActive
+        ? `linear-gradient(180deg, rgba(${rgb},0.30) 0%, rgba(${rgb},0.09) 45%, rgb(15,34,68) 100%)`
+        : "linear-gradient(180deg, rgba(255,255,255,0.05) 0%, rgba(255,255,255,0.02) 100%)",
       border: "none",
-      borderTop: `2px solid ${isActive ? accent : "transparent"}`,
-      borderLeft: `1px solid ${isActive ? "#253a5e" : "transparent"}`,
-      borderRight: `1px solid ${isActive ? "#253a5e" : "transparent"}`,
+      borderTop: `1px solid ${isActive ? accent : "transparent"}`,
+      borderLeft: `1px solid ${isActive ? `rgba(${rgb},0.7)` : "transparent"}`,
+      borderRight: `1px solid ${isActive ? `rgba(${rgb},0.7)` : "transparent"}`,
       borderBottom: `2px solid ${isActive ? "#0f2244" : "transparent"}`,
+      boxShadow: isActive
+        ? `inset 0 1px 0 rgba(255,255,255,.12), inset -1px 0 0 rgba(${rgb},.25), inset 1px 0 0 rgba(${rgb},.25)`
+        : "none",
       borderRadius: "5px 5px 0 0",
       color: textColor,
       cursor: "pointer", padding: "0 13px",
@@ -474,15 +493,17 @@ export default function Ribbon(p: RibbonProps) {
     display: "block", width: "100%", textAlign: "left", background: "none",
     border: "none", color: "#e2e8f0", padding: "5px 14px", fontSize: 12, cursor: "pointer",
   };
-  const miHover = (e: React.MouseEvent<HTMLButtonElement>) => { (e.currentTarget.style.background = "#1e293b"); };
+  const miHover = (e: React.MouseEvent<HTMLButtonElement>) => { (e.currentTarget.style.background = `rgba(${EDEN_TEAL},0.18)`); };
   const miLeave = (e: React.MouseEvent<HTMLButtonElement>) => { (e.currentTarget.style.background = ""); };
   const miShortcut: React.CSSProperties = { fontSize: 10, color: "#475569", marginLeft: "auto", paddingLeft: 12 };
 
   const dropStyle: React.CSSProperties = {
     position: "absolute", top: "calc(100% + 2px)", left: 0, zIndex: 500,
-    background: "#0d1829", border: "1px solid #1e40af",
+    background: "linear-gradient(180deg, rgba(20,30,48,.95) 0%, rgba(10,16,28,.95) 100%)",
+    backdropFilter: "blur(12px)", WebkitBackdropFilter: "blur(12px)",
+    border: "1px solid rgba(255,255,255,.12)",
     borderRadius: 6, padding: "4px 0", minWidth: 180,
-    boxShadow: "0 8px 24px rgba(0,0,0,0.7)",
+    boxShadow: `0 10px 28px rgba(0,0,0,0.75), inset 0 1px 0 rgba(255,255,255,.06), 0 0 0 1px rgba(${EDEN_TEAL},.15)`,
   };
 
   // ── tab content renderers ──────────────────────────────────────────────────
@@ -773,13 +794,13 @@ export default function Ribbon(p: RibbonProps) {
             <div style={{ display: "flex", alignItems: "center", gap: 3 }}>
               <span style={{ color: "#64748b", fontSize: 10 }}>Type</span>
               <select value={p.maskBlockType ?? ""} onChange={e => p.setMaskBlockType(e.target.value === "" ? null : Number(e.target.value))}
-                style={{ background: "#1e293b", border: "1px solid #475569", color: "#e2e8f0", borderRadius: 3, fontSize: 10, padding: "1px 2px" }}>
+                style={{ ...recessedWell, background: "#1e293b", color: "#e2e8f0", borderRadius: 3, fontSize: 10, padding: "1px 2px" }}>
                 <option value="">any</option>
                 {BLOCK_DEFS.map(b => <option key={b.type} value={b.type}>{b.name}</option>)}
               </select>
               <span style={{ color: "#64748b", fontSize: 10 }}>Paint</span>
               <select value={p.maskPaint ?? ""} onChange={e => p.setMaskPaint(e.target.value === "" ? null : Number(e.target.value))}
-                style={{ background: "#1e293b", border: "1px solid #475569", color: "#e2e8f0", borderRadius: 3, fontSize: 10, padding: "1px 2px" }}>
+                style={{ ...recessedWell, background: "#1e293b", color: "#e2e8f0", borderRadius: 3, fontSize: 10, padding: "1px 2px" }}>
                 <option value="">any</option>
                 <option value="0">none</option>
                 {Array.from({length:54},(_,i)=>i+1).map(p2 => <option key={p2} value={p2}>#{p2}</option>)}
@@ -1249,9 +1270,10 @@ export default function Ribbon(p: RibbonProps) {
   const bodyHeight = p.ribbonBodyHeight;
 
   return (
-    <div style={{
+    <div className="eden-ribbon" style={{
       position: "fixed", top: 0, left: 0, right: 0, zIndex: 100,
-      background: "#060c18", borderBottom: "1px solid #1a2540",
+      background: `radial-gradient(320px 60px at 50% 0%, rgba(${EDEN_TEAL},.22) 0%, rgba(0,0,0,0) 100%), #060c18`,
+      borderBottom: "1px solid #1a2540",
       boxShadow: "0 2px 12px rgba(0,0,0,0.6)",
       userSelect: "none",
     }}>
@@ -1262,8 +1284,16 @@ export default function Ribbon(p: RibbonProps) {
           100% { box-shadow: 0 0 0 0 rgba(245,158,11,0); }
         }
         .zr-thumb { -webkit-appearance: none; appearance: none; background: transparent; pointer-events: none; }
-        .zr-thumb::-webkit-slider-thumb { -webkit-appearance: none; appearance: none; pointer-events: all; width: 10px; height: 10px; border-radius: 50%; background: transparent; cursor: pointer; margin-top: -3px; }
+        .zr-thumb::-webkit-slider-thumb {
+          -webkit-appearance: none; appearance: none; pointer-events: all; width: 10px; height: 10px;
+          border-radius: 50%; cursor: pointer; margin-top: -3px;
+          background: linear-gradient(180deg, rgb(220,224,235) 0%, rgb(150,156,175) 100%);
+          box-shadow: inset 0 0 0 1px rgba(0,0,0,.5), 0 1px 1px rgba(0,0,0,.4);
+        }
         .zr-thumb::-webkit-slider-runnable-track { height: 4px; }
+        .eden-ribbon button:focus-visible, .eden-ribbon select:focus-visible, .eden-ribbon input:focus-visible {
+          outline: 1px solid ${EDEN_TEAL_READABLE}; outline-offset: 1px;
+        }
       `}</style>
       {/* Tab row */}
       <div style={{ height: TAB_BAR_HEIGHT, display: "flex", alignItems: "flex-end" }}>
@@ -1274,9 +1304,11 @@ export default function Ribbon(p: RibbonProps) {
             onClick={() => { setAppMenuOpen(v => !v); setFileMenuOpen(false); }}
             style={{
               height: "100%", border: "none", cursor: "pointer", padding: "0 10px 0 8px",
-              background: appMenuOpen ? "rgba(139,92,246,0.28)" : "rgba(139,92,246,0.13)",
+              background: appMenuOpen
+                ? "linear-gradient(180deg, rgba(139,92,246,0.34) 0%, rgba(139,92,246,0.10) 100%)"
+                : "linear-gradient(180deg, rgba(139,92,246,0.16) 0%, rgba(139,92,246,0.04) 100%)",
               display: "flex", alignItems: "center", gap: 6,
-              borderRight: "1px solid rgba(139,92,246,0.22)",
+              boxShadow: `inset -1px 0 0 rgba(139,92,246,${appMenuOpen ? 0.35 : 0.18}), 0 .5px .5px rgba(255,255,255,.12)`,
               borderBottom: `2px solid ${appMenuOpen ? "#8b5cf6" : "rgba(139,92,246,0.3)"}`,
               outline: "none",
             }}
@@ -1304,11 +1336,13 @@ export default function Ribbon(p: RibbonProps) {
             onClick={() => { setFileMenuOpen(v => !v); setAppMenuOpen(false); setShowRecentSub(false); setShowExportSub(false); }}
             style={{
               height: "100%", border: "none", cursor: "pointer", padding: "0 12px", outline: "none",
-              background: fileMenuOpen ? "rgba(245,158,11,0.18)" : "rgba(245,158,11,0.07)",
+              background: fileMenuOpen
+                ? "linear-gradient(180deg, rgba(245,158,11,0.30) 0%, rgba(245,158,11,0.08) 100%)"
+                : "linear-gradient(180deg, rgba(245,158,11,0.14) 0%, rgba(245,158,11,0.03) 100%)",
               color: fileMenuOpen ? "#fcd34d" : "#c4963c",
               fontSize: 12, fontWeight: 600,
               borderBottom: `2px solid ${fileMenuOpen ? "#f59e0b" : "rgba(245,158,11,0.35)"}`,
-              borderRight: "1px solid rgba(245,158,11,0.15)",
+              boxShadow: `inset -1px 0 0 rgba(245,158,11,${fileMenuOpen ? 0.3 : 0.15}), 0 .5px .5px rgba(255,255,255,.12)`,
             }}>
             File {fileMenuOpen ? "▴" : "▾"}
           </button>
@@ -1402,12 +1436,15 @@ export default function Ribbon(p: RibbonProps) {
             style={{
               height: TAB_BAR_HEIGHT - 5, alignSelf: "flex-end",
               border: "none", cursor: "pointer", padding: "0 7px",
-              background: p.tool === t ? "rgba(59,130,246,0.18)" : "rgba(255,255,255,0.04)",
+              background: p.tool === t
+                ? "linear-gradient(180deg, rgba(59,130,246,0.32) 0%, rgba(59,130,246,0.08) 100%)"
+                : "linear-gradient(180deg, rgba(255,255,255,0.05) 0%, rgba(255,255,255,0.02) 100%)",
               color: p.tool === t ? "#93c5fd" : "#64748b",
               display: "flex", alignItems: "center", gap: 4, fontSize: 11,
               fontWeight: p.tool === t ? 600 : 400, outline: "none",
               borderRadius: "4px 4px 0 0",
-              borderTop: `1px solid ${p.tool === t ? "rgba(59,130,246,0.5)" : "transparent"}`,
+              borderTop: `1px solid ${p.tool === t ? "rgba(59,130,246,0.7)" : "transparent"}`,
+              boxShadow: p.tool === t ? "inset 0 1px 0 rgba(255,255,255,.1)" : "none",
               marginLeft: 1, marginRight: 1, marginBottom: 0,
             }}>
             {t === "pan" ? <><PanCursorIcon /><span>Pan</span></> : <><span style={{ fontSize: 13 }}>⬚</span><span>Sel</span></>}
@@ -1418,26 +1455,34 @@ export default function Ribbon(p: RibbonProps) {
 
         <button title={`Undo (⌘Z) · ${p.undoDepth} available`}
           onClick={p.handleUndo} disabled={p.undoDepth === 0}
+          onMouseEnter={e => { if (p.undoDepth > 0) e.currentTarget.style.background = `rgba(${EDEN_TEAL},0.16)`; }}
+          onMouseLeave={e => { e.currentTarget.style.background = "transparent"; }}
           style={{
             height: TAB_BAR_HEIGHT - 5, alignSelf: "flex-end",
             border: "none", cursor: p.undoDepth === 0 ? "not-allowed" : "pointer",
             padding: "0 6px", background: "transparent", outline: "none",
+            borderRadius: 4,
             color: p.undoDepth === 0 ? "#334155" : "#64748b",
             display: "flex", alignItems: "center", gap: 2, fontSize: 13,
-            borderRadius: "4px 4px 0 0", marginLeft: 1, marginRight: 1, marginBottom: 0,
+            marginLeft: 1, marginRight: 1, marginBottom: 3,
+            transition: "background .1s",
           }}>
           <span>↩</span>
           {p.undoDepth > 0 && <span style={{ fontSize: 9, fontVariantNumeric: "tabular-nums", color: "#475569", minWidth: 10 }}>{p.undoDepth}</span>}
         </button>
         <button title={`Redo (⌘⇧Z) · ${p.redoDepth} available`}
           onClick={p.handleRedo} disabled={p.redoDepth === 0}
+          onMouseEnter={e => { if (p.redoDepth > 0) e.currentTarget.style.background = `rgba(${EDEN_TEAL},0.16)`; }}
+          onMouseLeave={e => { e.currentTarget.style.background = "transparent"; }}
           style={{
             height: TAB_BAR_HEIGHT - 5, alignSelf: "flex-end",
             border: "none", cursor: p.redoDepth === 0 ? "not-allowed" : "pointer",
             padding: "0 6px", background: "transparent", outline: "none",
+            borderRadius: 4,
             color: p.redoDepth === 0 ? "#334155" : "#64748b",
             display: "flex", alignItems: "center", gap: 2, fontSize: 13,
-            borderRadius: "4px 4px 0 0", marginLeft: 1, marginRight: 1, marginBottom: 0,
+            marginLeft: 1, marginRight: 1, marginBottom: 3,
+            transition: "background .1s",
           }}>
           <span>↪</span>
           {p.redoDepth > 0 && <span style={{ fontSize: 9, fontVariantNumeric: "tabular-nums", color: "#475569", minWidth: 10 }}>{p.redoDepth}</span>}
@@ -1492,7 +1537,9 @@ export default function Ribbon(p: RibbonProps) {
         <button
           onClick={() => p.setShowHelp(true)}
           title="Help & shortcuts (?)"
-          style={{ width: 24, height: TAB_BAR_HEIGHT, border: "none", background: "transparent", color: "#475569", cursor: "pointer", outline: "none", display: "flex", alignItems: "center", justifyContent: "center", alignSelf: "center", fontSize: 12 }}>
+          onMouseEnter={e => { e.currentTarget.style.background = `rgba(${EDEN_TEAL},0.16)`; e.currentTarget.style.color = EDEN_TEAL_READABLE; }}
+          onMouseLeave={e => { e.currentTarget.style.background = "transparent"; e.currentTarget.style.color = "#475569"; }}
+          style={{ width: 24, height: 22, borderRadius: 4, border: "none", background: "transparent", color: "#475569", cursor: "pointer", outline: "none", display: "flex", alignItems: "center", justifyContent: "center", alignSelf: "center", fontSize: 12, transition: "background .1s, color .1s" }}>
           ?
         </button>
         {/* Collapse toggle */}
@@ -1500,7 +1547,9 @@ export default function Ribbon(p: RibbonProps) {
         <button
           onClick={() => p.onCollapse(!p.collapsed)}
           title={p.collapsed ? "Expand ribbon" : "Collapse ribbon"}
-          style={{ width: 28, height: TAB_BAR_HEIGHT, border: "none", background: "transparent", color: "#475569", cursor: "pointer", outline: "none", display: "flex", alignItems: "center", justifyContent: "center", alignSelf: "center" }}>
+          onMouseEnter={e => { e.currentTarget.style.background = `rgba(${EDEN_TEAL},0.16)`; e.currentTarget.style.color = EDEN_TEAL_READABLE; }}
+          onMouseLeave={e => { e.currentTarget.style.background = "transparent"; e.currentTarget.style.color = "#475569"; }}
+          style={{ width: 28, height: 22, borderRadius: 4, border: "none", background: "transparent", color: "#475569", cursor: "pointer", outline: "none", display: "flex", alignItems: "center", justifyContent: "center", alignSelf: "center", transition: "background .1s, color .1s" }}>
           <ChevronIcon up={!p.collapsed} />
         </button>
       </div>
@@ -1526,6 +1575,7 @@ export default function Ribbon(p: RibbonProps) {
             <div ref={ribbonBodyRef} style={{
               height: "100%",
               background: "linear-gradient(to bottom, #0f2244, #091526)",
+              boxShadow: "inset 0 1px 0 rgba(255,255,255,.06), inset 0 0 24px rgba(0,0,0,.35)",
               display: "flex", alignItems: "stretch",
               overflowX: "auto", overflowY: "hidden",
               scrollbarWidth: "none",

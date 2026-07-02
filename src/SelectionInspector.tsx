@@ -1,6 +1,8 @@
+import { decodeU8 } from "./codec";
 import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { SelectionInfo, ClipboardInfo } from "./App";
+import { EDEN_TEAL_READABLE } from "./designTokens";
 
 type PreviewView = "front" | "side" | "top" | "axo";
 
@@ -8,13 +10,6 @@ interface PreviewDataRaw {
   width: number;
   height: number;
   pixels: string; // base64
-}
-
-function decodePixels(b64: string): Uint8Array {
-  const bin = atob(b64);
-  const arr = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
-  return arr;
 }
 
 interface PreviewData {
@@ -39,8 +34,10 @@ const panelStyle: React.CSSProperties = {
   position: "absolute",
   top: 108,
   right: 12,
-  background: "rgba(5,12,26,0.85)",
-  border: "1px solid #1e40af",
+  background: "linear-gradient(180deg, rgba(20,30,48,.92) 0%, rgba(8,14,26,.92) 100%)",
+  backdropFilter: "blur(10px)", WebkitBackdropFilter: "blur(10px)",
+  border: "1px solid rgba(255,255,255,.12)",
+  boxShadow: "inset 0 1px 0 rgba(255,255,255,.08), 0 8px 20px rgba(0,0,0,.5)",
   borderRadius: 7,
   padding: "8px 10px",
   fontSize: 12,
@@ -69,7 +66,7 @@ export default function SelectionInspector({ selection: sel, clipboard, quadMode
         zMin: sel.z_min, zMax: sel.z_max,
         view,
       })
-        .then((raw) => setPreviewData({ ...raw, pixels: decodePixels(raw.pixels) }))
+        .then((raw) => setPreviewData({ ...raw, pixels: decodeU8(raw.pixels) }))
         .catch(() => setPreviewData(null));
     }, 150);
     return () => clearTimeout(timer);
@@ -83,7 +80,7 @@ export default function SelectionInspector({ selection: sel, clipboard, quadMode
       const p = clipboard
         ? invoke<PreviewDataRaw>("render_axo_clipboard", { ski: axoSki, dir: axoDir })
         : invoke<PreviewDataRaw>("render_axo_region", { x1: sel.x1, y1: sel.y1, x2: sel.x2, y2: sel.y2, ski: axoSki, dir: axoDir });
-      p.then((raw) => setPreviewData({ width: raw.width, height: raw.height, pixels: decodePixels(raw.pixels) }))
+      p.then((raw) => setPreviewData({ width: raw.width, height: raw.height, pixels: decodeU8(raw.pixels) }))
        .catch(() => setPreviewData(null));
     }, 150);
     return () => clearTimeout(timer);
@@ -134,10 +131,14 @@ export default function SelectionInspector({ selection: sel, clipboard, quadMode
   }, [previewData, view, sel.x1, sel.y1, sel.x2, sel.y2, sel.z_min, sel.z_max, axoDir, axoSki]);
 
   const tabBtn = (v: PreviewView): React.CSSProperties => ({
-    flex: 1, padding: "2px 0", fontSize: 11, cursor: "pointer",
-    background: view === v ? "rgba(59,130,246,0.35)" : "rgba(255,255,255,0.04)",
-    border: `1px solid ${view === v ? "#3b82f6" : "#334155"}`,
-    color: view === v ? "#93c5fd" : "#64748b",
+    flex: 1, padding: "2px 0", fontSize: 11, cursor: "pointer", border: "none",
+    background: view === v
+      ? "linear-gradient(180deg, rgba(0,164,173,0.35) 0%, rgba(0,164,173,0.10) 100%)"
+      : "linear-gradient(180deg, rgba(255,255,255,0.05) 0%, rgba(255,255,255,0.02) 100%)",
+    boxShadow: view === v
+      ? `inset 0 0 0 1px ${EDEN_TEAL_READABLE}, 0 .5px .5px rgba(255,255,255,.15)`
+      : "inset 0 0 0 1px rgba(0,0,0,.5)",
+    color: view === v ? EDEN_TEAL_READABLE : "#64748b",
     borderRadius: 3,
   });
 
@@ -166,9 +167,11 @@ export default function SelectionInspector({ selection: sel, clipboard, quadMode
                 {([["SE", 0], ["SW", 1], ["NE", 2], ["NW", 3]] as [string, number][]).map(([label, d]) => (
                   <button key={d} onClick={() => setAxoDir(d)}
                     style={{
-                      flex: 1, padding: "2px 0", fontSize: 10, cursor: "pointer",
-                      background: axoDir === d ? "rgba(168,85,247,0.25)" : "rgba(255,255,255,0.04)",
-                      border: `1px solid ${axoDir === d ? "#a855f7" : "#334155"}`,
+                      flex: 1, padding: "2px 0", fontSize: 10, cursor: "pointer", border: "none",
+                      background: axoDir === d
+                        ? "linear-gradient(180deg, rgba(168,85,247,0.35) 0%, rgba(168,85,247,0.10) 100%)"
+                        : "linear-gradient(180deg, rgba(255,255,255,0.05) 0%, rgba(255,255,255,0.02) 100%)",
+                      boxShadow: axoDir === d ? "inset 0 0 0 1px #a855f7, 0 .5px .5px rgba(255,255,255,.15)" : "inset 0 0 0 1px rgba(0,0,0,.5)",
                       color: axoDir === d ? "#d8b4fe" : "#64748b", borderRadius: 3,
                     }}
                   >{label}</button>
@@ -189,7 +192,7 @@ export default function SelectionInspector({ selection: sel, clipboard, quadMode
             ref={canvasRef}
             width={CW}
             height={CH}
-            style={{ display: "block", width: CW, height: CH, borderRadius: 4, border: "1px solid #1a2744" }}
+            style={{ display: "block", width: CW, height: CH, borderRadius: 4, border: "none", boxShadow: "inset 0 0 0 1px rgba(0,0,0,.4)" }}
             title={`${view} view — actual block colors`}
           />
         </>)}

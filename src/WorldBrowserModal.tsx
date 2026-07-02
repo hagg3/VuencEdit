@@ -2,6 +2,8 @@ import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { save } from "@tauri-apps/plugin-dialog";
+import { EDEN_TEAL, EDEN_TEAL_READABLE, glassPanel, chromeButton, chromeButtonAccent, recessedWell, spinnerStyle } from "./designTokens";
+import Modal from "./Modal";
 
 interface WorldSearchResult {
   id: string;
@@ -57,29 +59,12 @@ function scoreWorld(name: string, timestamp: number): number {
   return score;
 }
 
-const overlay: React.CSSProperties = {
-  position: "fixed", inset: 0,
-  background: "rgba(0,0,0,0.75)",
-  display: "flex", alignItems: "center", justifyContent: "center",
-  zIndex: 1000,
-};
 
-const btn: React.CSSProperties = {
-  background: "rgba(0,0,0,0.5)",
-  border: "1px solid #475569",
-  color: "#e2e8f0",
-  padding: "5px 13px",
-  borderRadius: 6,
-  cursor: "pointer",
-  fontSize: 13,
-};
+const btn: React.CSSProperties = chromeButton({ padding: "5px 13px", fontSize: 13 });
 
-const btnActive: React.CSSProperties = {
-  ...btn,
-  background: "rgba(59,130,246,0.4)",
-  borderColor: "#3b82f6",
-  color: "#93c5fd",
-};
+const btnActive: React.CSSProperties = chromeButtonAccent(EDEN_TEAL, EDEN_TEAL_READABLE, {
+  padding: "5px 13px", fontSize: 13, color: EDEN_TEAL_READABLE,
+});
 
 export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
   const [server, setServer] = useState<"current" | "legacy">("current");
@@ -177,30 +162,22 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
     : null;
 
   return (
-    <div style={overlay} onClick={onClose}>
+    <Modal onClose={onClose} zIndex={1000} label="World Browser"
+      backdropStyle={{ background: "rgba(0,0,0,0.75)" }}>
       <div
-        style={{
-          background: "#0f172a",
-          border: "1px solid #334155",
-          borderRadius: 10,
-          padding: "18px 20px",
-          width: 900,
-          maxWidth: "96vw",
-          maxHeight: "88vh",
-          display: "flex",
-          flexDirection: "column",
-          gap: 12,
-          boxShadow: "0 24px 48px rgba(0,0,0,0.7)",
-          color: "#e2e8f0",
-        }}
-        onClick={e => e.stopPropagation()}
+        style={glassPanel({
+          padding: "18px 20px", width: 900, maxWidth: "96vw", maxHeight: "88vh",
+          display: "flex", flexDirection: "column", gap: 12, color: "#e2e8f0",
+        })}
       >
         {/* Header */}
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
           <span style={{ fontSize: 14, fontWeight: 600 }}>World Browser</span>
           <button
             onClick={onClose}
-            style={{ background: "none", border: "none", color: "#475569", fontSize: 20, cursor: "pointer", lineHeight: 1 }}
+            onMouseEnter={e => (e.currentTarget.style.color = EDEN_TEAL_READABLE)}
+            onMouseLeave={e => (e.currentTarget.style.color = "#475569")}
+            style={{ background: "none", border: "none", color: "#475569", fontSize: 20, cursor: "pointer", lineHeight: 1, transition: "color .1s" }}
           >×</button>
         </div>
 
@@ -223,9 +200,8 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
             onKeyDown={e => { if (e.key === "Enter") doSearch(); }}
             placeholder="Search worlds…"
             style={{
+              ...recessedWell,
               flex: 1,
-              background: "rgba(0,0,0,0.5)",
-              border: "1px solid #475569",
               color: "#e2e8f0",
               borderRadius: 6,
               padding: "5px 10px",
@@ -255,7 +231,7 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
             { key: "quality",  label: "Quality" },
           ] as const;
           const fi: React.CSSProperties = {
-            background: "rgba(0,0,0,0.4)", border: "1px solid #334155",
+            ...recessedWell,
             color: "#e2e8f0", borderRadius: 5, padding: "3px 7px", fontSize: 11,
             colorScheme: "dark",
           } as React.CSSProperties;
@@ -269,9 +245,9 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
                 <span style={fl}>Sort</span>
                 {sortModes.map(m => (
                   <button key={m.key} onClick={() => setSortBy(m.key)} style={{
-                    background: sortBy === m.key ? "rgba(59,130,246,0.15)" : "transparent",
-                    border: "1px solid " + (sortBy === m.key ? "#3b82f6" : "transparent"),
-                    color: sortBy === m.key ? "#93c5fd" : "#64748b",
+                    background: sortBy === m.key ? "rgba(0,164,173,0.15)" : "transparent",
+                    border: "1px solid " + (sortBy === m.key ? "#00dde9" : "transparent"),
+                    color: sortBy === m.key ? "#00dde9" : "#64748b",
                     padding: "2px 7px", borderRadius: 5, cursor: "pointer", fontSize: 11,
                     display: "flex", alignItems: "center", gap: 4,
                   }}>
@@ -284,9 +260,9 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
                 <div style={{ flex: 1 }} />
                 <button onClick={() => setShowFilters(!showFilters)} style={{
                   ...btn, fontSize: 11, padding: "2px 9px",
-                  background: (activeFilters > 0 || showFilters) ? "rgba(59,130,246,0.1)" : "rgba(0,0,0,0.3)",
-                  borderColor: activeFilters > 0 ? "#3b82f6" : "#475569",
-                  color: activeFilters > 0 ? "#93c5fd" : "#e2e8f0",
+                  background: (activeFilters > 0 || showFilters) ? "rgba(0,164,173,0.1)" : btn.background,
+                  boxShadow: activeFilters > 0 ? `inset 0 0 0 1px #00dde9, 0 .5px .5px rgba(255,255,255,.2)` : btn.boxShadow,
+                  color: activeFilters > 0 ? "#00dde9" : "#e2e8f0",
                 }}>
                   Filters{activeFilters > 0 ? ` (${activeFilters})` : ""}
                 </button>
@@ -327,7 +303,7 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
         <div style={{ display: "flex", gap: 12, flex: 1, minHeight: 0 }}>
 
           {/* Results table */}
-          <div style={{ flex: 1, overflowY: "auto", border: "1px solid #1e293b", borderRadius: 6, minWidth: 0, minHeight: 200 }}>
+          <div style={{ flex: 1, overflowY: "auto", boxShadow: "inset 0 0 0 1px rgba(0,0,0,.4)", borderRadius: 6, minWidth: 0, minHeight: 200 }}>
             {filteredResults.length > 0 ? (
               <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
                 <thead>
@@ -345,12 +321,12 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
                         key={`${r.id}-${i}`}
                         onClick={() => setSelectedId(r.id)}
                         style={{
-                          background: isSelected ? "rgba(59,130,246,0.18)" : i % 2 === 0 ? "rgba(255,255,255,0.02)" : "transparent",
+                          background: isSelected ? "rgba(0,164,173,0.18)" : i % 2 === 0 ? "rgba(255,255,255,0.02)" : "transparent",
                           cursor: "pointer",
                           borderBottom: "1px solid #1e293b",
                         }}
                       >
-                        <td style={{ padding: "6px 10px", color: isSelected ? "#93c5fd" : "#e2e8f0" }}>
+                        <td style={{ padding: "6px 10px", color: isSelected ? "#00dde9" : "#e2e8f0" }}>
                           {isSelected ? "▶ " : "  "}{r.name}
                         </td>
                         <td style={{ padding: "6px 10px", color: "#64748b", fontVariantNumeric: "tabular-nums" }}>{r.id}</td>
@@ -376,7 +352,7 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
             <div style={{
               height: 200,
               background: "#0d1829",
-              border: "1px solid #1e293b",
+              boxShadow: "inset 0 0 0 1px rgba(0,0,0,.4)",
               borderRadius: 8,
               overflow: "hidden",
               position: "relative",
@@ -405,13 +381,7 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
                   position: "absolute", inset: 0,
                   display: "flex", alignItems: "center", justifyContent: "center",
                 }}>
-                  <div style={{
-                    width: 20, height: 20,
-                    border: "2px solid #1e293b",
-                    borderTopColor: "#3b82f6",
-                    borderRadius: "50%",
-                    animation: "spin 0.7s linear infinite",
-                  }} />
+                  <div style={spinnerStyle(20)} />
                 </div>
               )}
 
@@ -436,7 +406,7 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
             {/* World details card */}
             <div style={{
               background: "#0d1829",
-              border: "1px solid #1e293b",
+              boxShadow: "inset 0 0 0 1px rgba(0,0,0,.4)",
               borderRadius: 8,
               padding: "12px 14px",
               display: "flex",
@@ -472,29 +442,18 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
               <button
                 onClick={() => startDownload(false)}
                 disabled={!selectedId || downloading}
-                style={{
-                  ...btn,
-                  width: "100%",
-                  opacity: (!selectedId || downloading) ? 0.4 : 1,
-                  cursor: (!selectedId || downloading) ? "not-allowed" : "pointer",
-                  background: "rgba(59,130,246,0.15)",
-                  borderColor: (!selectedId || downloading) ? "#475569" : "#3b82f6",
-                  color: "#93c5fd",
-                }}
+                style={(!selectedId || downloading)
+                  ? { ...btn, width: "100%", opacity: 0.4, cursor: "not-allowed" }
+                  : chromeButtonAccent(EDEN_TEAL, EDEN_TEAL_READABLE, { width: "100%", color: EDEN_TEAL_READABLE, fontSize: 13 })}
               >
                 Save to File
               </button>
               <button
                 onClick={() => startDownload(true)}
                 disabled={!selectedId || downloading}
-                style={{
-                  ...btn,
-                  width: "100%",
-                  borderColor: (!selectedId || downloading) ? "#475569" : "#22c55e",
-                  color: (!selectedId || downloading) ? "#e2e8f0" : "#86efac",
-                  opacity: (!selectedId || downloading) ? 0.4 : 1,
-                  cursor: (!selectedId || downloading) ? "not-allowed" : "pointer",
-                }}
+                style={(!selectedId || downloading)
+                  ? { ...btn, width: "100%", opacity: 0.4, cursor: "not-allowed" }
+                  : chromeButtonAccent("74,222,128", "#22c55e", { width: "100%", color: "#86efac", fontSize: 13 })}
               >
                 Save &amp; Open
               </button>
@@ -505,7 +464,7 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
                   <div style={{ flex: 1, background: "#1e293b", borderRadius: 4, height: 5, overflow: "hidden" }}>
                     <div style={{
                       height: "100%",
-                      background: "#3b82f6",
+                      background: `linear-gradient(90deg, rgb(${EDEN_TEAL}) 0%, ${EDEN_TEAL_READABLE} 100%)`,
                       width: downloadProgress.total
                         ? `${Math.min(100, (downloadProgress.downloaded / downloadProgress.total) * 100).toFixed(0)}%`
                         : "40%",
@@ -529,6 +488,6 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
         </div>{/* /body row */}
 
       </div>
-    </div>
+    </Modal>
   );
 }

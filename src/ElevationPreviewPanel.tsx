@@ -1,3 +1,4 @@
+import { decodeU8 } from "./codec";
 import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { SelectionInfo } from "./App";
@@ -12,13 +13,6 @@ interface PreviewData {
   width: number;
   height: number;
   pixels: Uint8Array;
-}
-
-function decodePixels(b64: string): Uint8Array {
-  const bin = atob(b64);
-  const arr = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
-  return arr;
 }
 
 interface Props {
@@ -269,7 +263,7 @@ export default function ElevationPreviewPanel({
         x1: sel.x1, y1: sel.y1, x2: sel.x2, y2: sel.y2,
         view: "front", contextBlocks: showContext ? CONTEXT_BLOCKS : 0,
       })
-        .then(raw => setFrontData({ ...raw, pixels: decodePixels(raw.pixels) }))
+        .then(raw => setFrontData({ ...raw, pixels: decodeU8(raw.pixels) }))
         .catch(() => setFrontData(null));
     }, 150);
     return () => clearTimeout(timer);
@@ -283,7 +277,7 @@ export default function ElevationPreviewPanel({
         x1: sel.x1, y1: sel.y1, x2: sel.x2, y2: sel.y2,
         view: "side", contextBlocks: showContext ? CONTEXT_BLOCKS : 0,
       })
-        .then(raw => setSideData({ ...raw, pixels: decodePixels(raw.pixels) }))
+        .then(raw => setSideData({ ...raw, pixels: decodeU8(raw.pixels) }))
         .catch(() => setSideData(null));
     }, 150);
     return () => clearTimeout(timer);
@@ -294,14 +288,14 @@ export default function ElevationPreviewPanel({
   useEffect(() => {
     if (!isPastePreview) { setClipFrontData(null); return; }
     invoke<PreviewDataRaw>("render_clipboard_elevation_preview", { view: "front" })
-      .then(raw => setClipFrontData({ ...raw, pixels: decodePixels(raw.pixels) }))
+      .then(raw => setClipFrontData({ ...raw, pixels: decodeU8(raw.pixels) }))
       .catch(() => setClipFrontData(null));
   }, [isPastePreview]);
 
   useEffect(() => {
     if (!isPastePreview) { setClipSideData(null); return; }
     invoke<PreviewDataRaw>("render_clipboard_elevation_preview", { view: "side" })
-      .then(raw => setClipSideData({ ...raw, pixels: decodePixels(raw.pixels) }))
+      .then(raw => setClipSideData({ ...raw, pixels: decodeU8(raw.pixels) }))
       .catch(() => setClipSideData(null));
   }, [isPastePreview]);
 

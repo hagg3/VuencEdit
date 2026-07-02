@@ -6,6 +6,11 @@ import {
   EXPANSION_BLOCKS, isExpansionBlock, PARTIAL_WATER, PARTIAL_LAVA, SPECIAL_BLOCKS,
 } from "./blockDefs";
 import { tintedSwatch, type AtlasData } from "./texturePack";
+import { EDEN_TEAL, EDEN_TEAL_READABLE, recessedWell, chromeButtonAccent } from "./designTokens";
+
+function gradTeal(alpha: number): string {
+  return `linear-gradient(180deg, rgba(${EDEN_TEAL},${alpha}) 0%, rgba(${EDEN_TEAL},${alpha * 0.4}) 100%)`;
+}
 
 interface Props {
   mode: "fill" | "filter";
@@ -41,11 +46,11 @@ export default function BlockPaintPicker({
           style={{
             fontSize: 10, textAlign: "center", cursor: "pointer",
             padding: "1px 0", borderRadius: 2, userSelect: "none",
-            border: (isFill ? bt === 0 : bt === null) ? "1px solid #3b82f6" : "1px solid #334155",
+            border: (isFill ? bt === 0 : bt === null) ? "1px solid #00dde9" : "1px solid #334155",
             background: (isFill ? bt === 0 : bt === null)
-              ? "rgba(59,130,246,0.25)"
+              ? gradTeal(0.25)
               : isFill ? "rgba(0,0,0,0.3)" : "rgba(255,255,255,0.04)",
-            color: (isFill ? bt === 0 : bt === null) ? "#93c5fd" : "#475569",
+            color: (isFill ? bt === 0 : bt === null) ? EDEN_TEAL_READABLE : "#475569",
           }}
         >{isFill ? "Air" : "Any"}</div>
 
@@ -78,7 +83,7 @@ export default function BlockPaintPicker({
                   borderRadius: 2, cursor: "pointer",
                   boxSizing: "border-box",
                   border: selected ? "2px solid #fff" : "2px solid rgba(255,255,255,0.08)",
-                  outline: selected ? "1px solid #3b82f6" : "none",
+                  outline: selected ? "1px solid #00dde9" : "none",
                   outlineOffset: 1, overflow: "hidden",
                   imageRendering: texUrl ? "pixelated" : undefined,
                 }}
@@ -120,7 +125,7 @@ export default function BlockPaintPicker({
                     borderRadius: 2, cursor: "pointer",
                     boxSizing: "border-box",
                     border: selected ? "2px solid #fff" : "2px solid rgba(255,255,255,0.08)",
-                    outline: selected ? "1px solid #3b82f6" : "none",
+                    outline: selected ? "1px solid #00dde9" : "none",
                     outlineOffset: 1, overflow: "hidden",
                   }}
                 >
@@ -147,9 +152,9 @@ export default function BlockPaintPicker({
                 return (
                   <button key={dir} onClick={() => onBlockTypeChange(base + i)} style={{
                     width: 22, padding: "1px 0", fontSize: 10, cursor: "pointer",
-                    background: active ? "rgba(59,130,246,0.35)" : "rgba(255,255,255,0.04)",
-                    border: `1px solid ${active ? "#3b82f6" : "#334155"}`,
-                    color: active ? "#93c5fd" : "#64748b", borderRadius: 3,
+                    background: active ? gradTeal(0.35) : "rgba(255,255,255,0.04)",
+                    border: `1px solid ${active ? "#00dde9" : "#334155"}`,
+                    color: active ? EDEN_TEAL_READABLE : "#64748b", borderRadius: 3,
                   }} title={`${family?.name} facing ${["South","West","North","East"][i]}`}>{dir}</button>
                 );
               })}
@@ -169,9 +174,9 @@ export default function BlockPaintPicker({
                 return (
                   <button key={dir} onClick={() => onBlockTypeChange(base + i)} style={{
                     width: 26, padding: "1px 0", fontSize: 10, cursor: "pointer",
-                    background: active ? "rgba(59,130,246,0.35)" : "rgba(255,255,255,0.04)",
-                    border: `1px solid ${active ? "#3b82f6" : "#334155"}`,
-                    color: active ? "#93c5fd" : "#64748b", borderRadius: 3,
+                    background: active ? gradTeal(0.35) : "rgba(255,255,255,0.04)",
+                    border: `1px solid ${active ? "#00dde9" : "#334155"}`,
+                    color: active ? EDEN_TEAL_READABLE : "#64748b", borderRadius: 3,
                   }} title={`${family?.name} apex at ${["SE","SW","NW","NE"][i]}`}>{dir}</button>
                 );
               })}
@@ -188,9 +193,9 @@ export default function BlockPaintPicker({
               return (
                 <button key={dir} onClick={() => onBlockTypeChange(66 + i)} style={{
                   width: 22, padding: "1px 0", fontSize: 10, cursor: "pointer",
-                  background: active ? "rgba(59,130,246,0.35)" : "rgba(255,255,255,0.04)",
-                  border: `1px solid ${active ? "#3b82f6" : "#334155"}`,
-                  color: active ? "#93c5fd" : "#64748b", borderRadius: 3,
+                  background: active ? gradTeal(0.35) : "rgba(255,255,255,0.04)",
+                  border: `1px solid ${active ? "#00dde9" : "#334155"}`,
+                  color: active ? EDEN_TEAL_READABLE : "#64748b", borderRadius: 3,
                 }} title={`Door facing ${["South","West","North","East"][i]}`}>{dir}</button>
               );
             })}
@@ -206,9 +211,9 @@ export default function BlockPaintPicker({
               return (
                 <button key={dir} onClick={() => onBlockTypeChange(75 + i)} style={{
                   width: 22, padding: "1px 0", fontSize: 10, cursor: "pointer",
-                  background: active ? "rgba(59,130,246,0.35)" : "rgba(255,255,255,0.04)",
-                  border: `1px solid ${active ? "#3b82f6" : "#334155"}`,
-                  color: active ? "#93c5fd" : "#64748b", borderRadius: 3,
+                  background: active ? gradTeal(0.35) : "rgba(255,255,255,0.04)",
+                  border: `1px solid ${active ? "#00dde9" : "#334155"}`,
+                  color: active ? EDEN_TEAL_READABLE : "#64748b", borderRadius: 3,
                 }} title={`Portal facing ${["South","West","North","East"][i]}`}>{dir}</button>
               );
             })}
@@ -222,7 +227,7 @@ export default function BlockPaintPicker({
               value={bt}
               onChange={e => onBlockTypeChange(Number(e.target.value))}
               style={{
-                background: "#0d1829", border: "1px solid #334155", color: "#e2e8f0",
+                ...recessedWell, background: "#0d1829", color: "#e2e8f0",
                 fontSize: 10, borderRadius: 3, padding: "1px 3px", width: "100%", cursor: "pointer",
               }}
             >
@@ -246,7 +251,7 @@ export default function BlockPaintPicker({
                   borderRadius: 2, cursor: "pointer", boxSizing: "border-box",
                   background: `rgba(${baseColor},0.15)`,
                   border: selected ? "2px solid #fff" : "2px solid rgba(255,255,255,0.08)",
-                  outline: selected ? "1px solid #3b82f6" : "none", outlineOffset: 1,
+                  outline: selected ? "1px solid #00dde9" : "none", outlineOffset: 1,
                 }}
               >
                 <div style={{
@@ -269,7 +274,7 @@ export default function BlockPaintPicker({
                   width: 18, height: 18, borderRadius: 2, cursor: "pointer", boxSizing: "border-box",
                   background: `rgb(${b.color[0]},${b.color[1]},${b.color[2]})`,
                   border: selected ? "2px solid #fff" : "2px solid rgba(255,255,255,0.08)",
-                  outline: selected ? "1px solid #3b82f6" : "none", outlineOffset: 1,
+                  outline: selected ? "1px solid #00dde9" : "none", outlineOffset: 1,
                 }}
               />
             );
@@ -292,10 +297,10 @@ export default function BlockPaintPicker({
                 width: 18, height: 18, flexShrink: 0,
                 borderRadius: 2, cursor: "pointer", boxSizing: "border-box",
                 border: paint === null ? "2px solid #fff" : "2px solid #334155",
-                outline: paint === null ? "1px solid #3b82f6" : "none", outlineOffset: 1,
+                outline: paint === null ? "1px solid #00dde9" : "none", outlineOffset: 1,
                 display: "flex", alignItems: "center", justifyContent: "center",
-                background: paint === null ? "rgba(59,130,246,0.25)" : "rgba(255,255,255,0.04)",
-                color: paint === null ? "#93c5fd" : "#475569",
+                background: paint === null ? gradTeal(0.25) : "rgba(255,255,255,0.04)",
+                color: paint === null ? EDEN_TEAL_READABLE : "#475569",
                 fontSize: 9, lineHeight: 1, userSelect: "none",
               }}
             >Any</div>
@@ -308,7 +313,7 @@ export default function BlockPaintPicker({
               width: 18, height: 18, flexShrink: 0,
               background: "transparent", borderRadius: 2, cursor: "pointer", boxSizing: "border-box",
               border: paint === 0 ? "2px solid #fff" : "2px solid #334155",
-              outline: paint === 0 ? "1px solid #3b82f6" : "none", outlineOffset: 1,
+              outline: paint === 0 ? "1px solid #00dde9" : "none", outlineOffset: 1,
               display: "flex", alignItems: "center", justifyContent: "center",
               color: "#475569", fontSize: 11, lineHeight: 1,
             }}
@@ -327,7 +332,7 @@ export default function BlockPaintPicker({
                     background: paintTexUrl ? `url(${paintTexUrl}) center/cover` : `rgb(${r},${g},${b})`,
                     borderRadius: 2, cursor: "pointer", boxSizing: "border-box",
                     border: paint === pIdx ? "2px solid #fff" : "2px solid rgba(255,255,255,0.08)",
-                    outline: paint === pIdx ? "1px solid #3b82f6" : "none", outlineOffset: 1,
+                    outline: paint === pIdx ? "1px solid #00dde9" : "none", outlineOffset: 1,
                     imageRendering: paintTexUrl ? "pixelated" : undefined,
                   }}
                 />
@@ -351,7 +356,7 @@ export default function BlockPaintPicker({
                   return {
                     width: 22, height: 22, borderRadius: 3, flexShrink: 0,
                     background: previewTex ? `url(${previewTex}) center/cover` : `rgb(${r},${g},${b})`,
-                    border: "1px solid #475569",
+                    border: "none", boxShadow: "inset 0 0 0 1px rgba(255,255,255,.25), inset 0 0 0 2px rgba(0,0,0,.4)",
                     imageRendering: previewTex ? "pixelated" as const : undefined,
                   };
                 })()}
@@ -359,17 +364,13 @@ export default function BlockPaintPicker({
               {selectionExists && (
                 <button
                   onClick={onFill}
-                  style={{
-                    background: "rgba(0,0,0,0.6)", border: "1px solid #22c55e",
-                    color: "#86efac", padding: "2px 10px", borderRadius: 6,
-                    cursor: "pointer", fontSize: 12, lineHeight: "20px", whiteSpace: "nowrap",
-                  }}
+                  style={chromeButtonAccent("74,222,128", "#22c55e", { color: "#86efac", padding: "2px 10px", fontSize: 12, lineHeight: "20px", whiteSpace: "nowrap" })}
                   title="Fill every block in the selection with the chosen type and paint"
                 >Fill Selection</button>
               )}
             </div>
             <div style={{ color: "#94a3b8", fontSize: 11, whiteSpace: "nowrap" }}>
-              {blockDisplayName(bt ?? 0)}{(paint ?? 0) > 0 ? <span style={{ color: "#7dd3fc" }}> #{paint}</span> : ""}
+              {blockDisplayName(bt ?? 0)}{(paint ?? 0) > 0 ? <span style={{ color: EDEN_TEAL_READABLE }}> #{paint}</span> : ""}
             </div>
           </div>
         </>
