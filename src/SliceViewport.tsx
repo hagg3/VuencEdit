@@ -1,6 +1,8 @@
+import { decodeU8 } from "./codec";
 import { useEffect, useRef, useState, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { brushFootprint, rectPixels, ellipsePixels, type BrushShape, type WP } from "./drawTools";
+import { chromeButton, chromeButtonAccent, recessedWell } from "./designTokens";
 
 // Front slab = constant world-Y plane (horizontal axis = X, vertical = Z; row 0 = highest Z).
 // Side slab  = constant world-X plane (horizontal axis = Y, vertical = Z; row 0 = highest Z).
@@ -9,13 +11,6 @@ import { brushFootprint, rectPixels, ellipsePixels, type BrushShape, type WP } f
 export type SliceAxis = "front" | "side" | "top";
 
 interface PixelPatchRaw { x: number; y: number; width: number; height: number; pixels: string; }
-
-function decodePixels(b64: string): Uint8Array {
-  const bin = atob(b64);
-  const arr = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
-  return arr;
-}
 
 interface Props {
   world: { width_chunks: number; height_chunks: number; max_z: number };
@@ -203,7 +198,7 @@ export default function SliceViewport({ world, axis, editEpoch, lastEdit, onPain
       invoke<PixelPatchRaw>(cmd, args)
         .then((raw) => {
           if (seq !== fetchSeqRef.current) { done(); return; } // superseded
-          const px = decodePixels(raw.pixels);
+          const px = decodeU8(raw.pixels);
           sctx.putImageData(new ImageData(new Uint8ClampedArray(px), raw.width, raw.height), dx, 0);
           force((n) => n + 1);
           done();
@@ -227,7 +222,7 @@ export default function SliceViewport({ world, axis, editEpoch, lastEdit, onPain
       view: axis === "front" ? "front" : "side",
     }).then((raw) => {
       if (seq !== orthoFetchSeqRef.current) { setLoading(false); return; }
-      const px = decodePixels(raw.pixels);
+      const px = decodeU8(raw.pixels);
       let c = orthoSlabRef.current;
       if (!c) { c = document.createElement("canvas"); orthoSlabRef.current = c; }
       if (c.width !== raw.width || c.height !== raw.height) {
@@ -279,7 +274,7 @@ export default function SliceViewport({ world, axis, editEpoch, lastEdit, onPain
     invoke<PixelPatchRaw>("render_clipboard_elevation_preview", { view: axis })
       .then((raw) => {
         if (cancelled) return;
-        const px = decodePixels(raw.pixels);
+        const px = decodeU8(raw.pixels);
         const c = document.createElement("canvas");
         c.width = raw.width; c.height = raw.height;
         c.getContext("2d")!.putImageData(new ImageData(new Uint8ClampedArray(px), raw.width, raw.height), 0, 0);
@@ -776,19 +771,21 @@ export default function SliceViewport({ world, axis, editEpoch, lastEdit, onPain
         <input
           type="number" min={0} max={depthMax} value={curDepth}
           onChange={(e) => setDepth(parseInt(e.target.value, 10) || 0)}
-          style={{ width: 56, background: "#1e293b", color: "#cbd5e1", border: "1px solid #334155", borderRadius: 4 }}
+          style={{ ...recessedWell, width: 56, background: "#1e293b", color: "#cbd5e1", borderRadius: 4 }}
         />
         {selFull && axis !== "top" && (
           <button
             onClick={() => setOrthoMode(m => !m)}
             title={orthoMode ? "Ortho projection — click to switch to slab view (enables painting)" : "Slab view — click to switch to ortho projection"}
-            style={{
-              background: orthoMode ? "#1e1b4b" : "#1e293b",
-              color: orthoMode ? "#a5b4fc" : "#64748b",
-              border: `1px solid ${orthoMode ? "#6366f1" : "#334155"}`,
-              borderRadius: 4, padding: "1px 7px", cursor: "pointer",
-              fontSize: 10, fontWeight: 700, letterSpacing: "0.04em", flexShrink: 0,
-            }}
+            style={orthoMode
+              ? chromeButtonAccent("99,102,241", "#818cf8", {
+                  color: "#a5b4fc", padding: "1px 7px",
+                  fontSize: 10, fontWeight: 700, letterSpacing: "0.04em", flexShrink: 0,
+                })
+              : chromeButton({
+                  color: "#64748b", padding: "1px 7px",
+                  fontSize: 10, fontWeight: 700, letterSpacing: "0.04em", flexShrink: 0,
+                })}
           >
             ORTHO
           </button>
@@ -796,7 +793,7 @@ export default function SliceViewport({ world, axis, editEpoch, lastEdit, onPain
         <button
           onClick={fit}
           title="Fit slab to view"
-          style={{ background: "#1e293b", color: "#cbd5e1", border: "1px solid #334155", borderRadius: 4, padding: "1px 6px", cursor: "pointer" }}
+          style={chromeButton({ color: "#cbd5e1", padding: "1px 6px" })}
         >⊡</button>
       </div>
       {loading && (

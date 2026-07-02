@@ -2,6 +2,8 @@ import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
+import { EDEN_TEAL, EDEN_TEAL_READABLE, glassPanel, chromeButton, chromeButtonAccent } from "./designTokens";
+import Modal from "./Modal";
 
 interface UploadProgress {
   bytes_sent: number;
@@ -13,22 +15,8 @@ interface Props {
   onClose: () => void;
 }
 
-const overlay: React.CSSProperties = {
-  position: "fixed", inset: 0,
-  background: "rgba(0,0,0,0.75)",
-  display: "flex", alignItems: "center", justifyContent: "center",
-  zIndex: 1000,
-};
 
-const btn: React.CSSProperties = {
-  background: "rgba(0,0,0,0.5)",
-  border: "1px solid #475569",
-  color: "#e2e8f0",
-  padding: "5px 13px",
-  borderRadius: 6,
-  cursor: "pointer",
-  fontSize: 13,
-};
+const btn: React.CSSProperties = chromeButton({ padding: "5px 13px", fontSize: 13 });
 
 const radioLabel: React.CSSProperties = {
   display: "flex",
@@ -98,29 +86,22 @@ export default function UploadModal({ sourcePath, onClose }: Props) {
   const imageFilename = imagePath ? imagePath.split(/[\\/]/).pop() ?? imagePath : null;
 
   return (
-    <div style={overlay} onClick={onClose}>
+    <Modal onClose={onClose} zIndex={1000} label="Upload World"
+      backdropStyle={{ background: "rgba(0,0,0,0.75)" }}>
       <div
-        style={{
-          background: "#0f172a",
-          border: "1px solid #334155",
-          borderRadius: 10,
-          padding: "18px 24px 20px",
-          width: 400,
-          maxWidth: "95vw",
-          display: "flex",
-          flexDirection: "column",
-          gap: 14,
-          boxShadow: "0 24px 48px rgba(0,0,0,0.7)",
-          color: "#e2e8f0",
-        }}
-        onClick={e => e.stopPropagation()}
+        style={glassPanel({
+          padding: "18px 24px 20px", width: 400, maxWidth: "95vw",
+          display: "flex", flexDirection: "column", gap: 14, color: "#e2e8f0",
+        })}
       >
         {/* Header */}
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
           <span style={{ fontSize: 14, fontWeight: 600 }}>Upload World</span>
           <button
             onClick={onClose}
-            style={{ background: "none", border: "none", color: "#475569", fontSize: 20, cursor: "pointer", lineHeight: 1 }}
+            onMouseEnter={e => (e.currentTarget.style.color = EDEN_TEAL_READABLE)}
+            onMouseLeave={e => (e.currentTarget.style.color = "#475569")}
+            style={{ background: "none", border: "none", color: "#475569", fontSize: 20, cursor: "pointer", lineHeight: 1, transition: "color .1s" }}
           >×</button>
         </div>
 
@@ -135,7 +116,7 @@ export default function UploadModal({ sourcePath, onClose }: Props) {
                 value="current"
                 checked={server === "current"}
                 onChange={() => setServer("current")}
-                style={{ accentColor: "#3b82f6" }}
+                style={{ accentColor: `rgb(${EDEN_TEAL})` }}
               />
               Current
             </label>
@@ -146,7 +127,7 @@ export default function UploadModal({ sourcePath, onClose }: Props) {
                 value="legacy"
                 checked={server === "legacy"}
                 onChange={() => setServer("legacy")}
-                style={{ accentColor: "#3b82f6" }}
+                style={{ accentColor: `rgb(${EDEN_TEAL})` }}
               />
               Legacy
             </label>
@@ -185,14 +166,9 @@ export default function UploadModal({ sourcePath, onClose }: Props) {
           <button
             onClick={doUpload}
             disabled={!canUpload}
-            style={{
-              ...btn,
-              opacity: canUpload ? 1 : 0.4,
-              cursor: canUpload ? "pointer" : "not-allowed",
-              background: canUpload ? "rgba(59,130,246,0.25)" : undefined,
-              borderColor: canUpload ? "#3b82f6" : undefined,
-              color: canUpload ? "#93c5fd" : undefined,
-            }}
+            style={canUpload
+              ? chromeButtonAccent(EDEN_TEAL, `rgb(${EDEN_TEAL})`, { color: EDEN_TEAL_READABLE, padding: "5px 13px", fontSize: 13 })
+              : { ...btn, opacity: 0.4, cursor: "not-allowed" }}
           >
             {uploading ? "Uploading…" : "Upload"}
           </button>
@@ -202,7 +178,7 @@ export default function UploadModal({ sourcePath, onClose }: Props) {
               <div style={{ flex: 1, background: "#1e293b", borderRadius: 4, height: 6, overflow: "hidden" }}>
                 <div style={{
                   height: "100%",
-                  background: "#3b82f6",
+                  background: `linear-gradient(90deg, rgb(${EDEN_TEAL}) 0%, ${EDEN_TEAL_READABLE} 100%)`,
                   width: `${uploadProgress}%`,
                   transition: "width 0.3s",
                 }} />
@@ -229,6 +205,6 @@ export default function UploadModal({ sourcePath, onClose }: Props) {
           )}
         </div>
       </div>
-    </div>
+    </Modal>
   );
 }

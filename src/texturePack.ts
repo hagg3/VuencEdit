@@ -1,3 +1,4 @@
+import { decodeU8 } from "./codec";
 import { resolveColor } from "./blockDefs";
 
 export interface AtlasData {
@@ -5,13 +6,6 @@ export interface AtlasData {
   tile: number;
   rows: number;
   nameToRow: Record<string, number>;
-}
-
-function decodeB64(b64: string): Uint8Array {
-  const bin = atob(b64);
-  const arr = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
-  return arr;
 }
 
 export interface TexturePackRaw {
@@ -23,7 +17,7 @@ export interface TexturePackRaw {
 
 export function decodeAtlas(raw: TexturePackRaw): AtlasData {
   return {
-    rgba: decodeB64(raw.atlas),
+    rgba: decodeU8(raw.atlas),
     tile: raw.tile,
     rows: raw.rows,
     nameToRow: raw.name_to_row,

@@ -78,6 +78,40 @@ export const PAINT_COLORS: readonly (readonly [number, number, number])[] = [
   [  3,   3,   3],
 ] as const;
 
+// ── Canonical colour tables (single source of truth = Rust) ──────────────────
+//
+// These mirror BLOCK_RGB / PAINT_RGB / BLOCK_PAINT_SCALE in lib.rs. To end the
+// Rust↔TS drift (C6 — the paint RGB rounding and the per-block brightness scale
+// had already diverged), `applyBlockTables()` overwrites them at startup with the
+// values returned by the `get_block_tables` Tauri command. The literals below are
+// only a fallback for the pre-fetch first paint; Rust remains authoritative.
+//
+// `paintRgbTable` is indexed by the raw paint byte (0 = white sentinel, 1–54 =
+// palette), matching Rust PAINT_RGB — NOT the 0-based PAINT_COLORS above.
+
+let paintRgbTable: readonly (readonly [number, number, number])[] = [
+  [255, 255, 255], // 0 sentinel (paint 0 handled before lookup)
+  ...PAINT_COLORS,
+];
+
+let blockPaintScaleTable: readonly number[] = (() => {
+  const t = new Array<number>(112).fill(0.7);
+  t[0] = 1.0; t[19] = 1.0; t[101] = 1.0;
+  return t;
+})();
+
+export interface BlockTables {
+  block_rgb: [number, number, number][];
+  paint_rgb: [number, number, number][];
+  block_paint_scale: number[];
+}
+
+/** Install the canonical tables fetched from Rust (`get_block_tables`). */
+export function applyBlockTables(t: BlockTables): void {
+  if (t.paint_rgb?.length) paintRgbTable = t.paint_rgb;
+  if (t.block_paint_scale?.length) blockPaintScaleTable = t.block_paint_scale;
+}
+
 // ── Ramp orientation system ──────────────────────────────────────────────────
 //
 // Ramp orientation is encoded as separate block IDs — no metadata byte.
@@ -210,8 +244,17 @@ export function blockDisplayName(blockType: number): string {
 /** Returns the display RGB for a given block type + paint byte, matching lib.rs logic. */
 export function resolveColor(blockType: number, paintByte: number): readonly [number, number, number] {
   if (blockType === 0) return [20, 20, 35]; // void/air
-  if (paintByte > 0 && paintByte <= PAINT_COLORS.length) {
-    return PAINT_COLORS[paintByte - 1];
+  if (paintByte > 0 && paintByte < paintRgbTable.length) {
+    // Match Rust block_color: PAINT_RGB[paint] * BLOCK_PAINT_SCALE[bt].
+    // Without the scale, 2D swatch tints drifted brighter than the 3D/map render.
+    const [r, g, b] = paintRgbTable[paintByte];
+    const scale = blockType < blockPaintScaleTable.length ? blockPaintScaleTable[blockType] : 0.7;
+    // Rust casts f32→u8 (truncation), so floor here to match pixel-for-pixel.
+    return [
+      Math.min(255, Math.floor(r * scale)),
+      Math.min(255, Math.floor(g * scale)),
+      Math.min(255, Math.floor(b * scale)),
+    ];
   }
   const def = BLOCK_DEFS.find((b) => b.type === blockType);
   if (def) return def.color;

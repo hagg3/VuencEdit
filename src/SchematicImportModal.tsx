@@ -1,6 +1,9 @@
 import { useState, useEffect, useRef, useCallback } from "react";
+import { decodeU8 } from "./codec";
 import { invoke } from "@tauri-apps/api/core";
 import { BLOCK_DEFS, PAINT_COLORS } from "./blockDefs";
+import { EDEN_TEAL, EDEN_TEAL_READABLE, glassPanel, glassBackdrop, glassMenuPanel, chromeButton, chromeButtonAccent, recessedWell } from "./designTokens";
+import Modal from "./Modal";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -120,23 +123,22 @@ function BlockPicker({ current, onSelect, onClose }: {
 }) {
   return (
     <div onClick={e => e.stopPropagation()} style={{
+      ...glassMenuPanel,
       position: "absolute", zIndex: 2000, left: 0, top: "100%",
-      background: "#0d1829", border: "1px solid #1e40af",
-      borderRadius: 6, padding: 6, width: 200,
-      boxShadow: "0 8px 24px rgba(0,0,0,0.7)",
+      padding: 6, width: 200,
       display: "flex", flexWrap: "wrap", gap: 2,
     }}>
       <button onClick={() => { onSelect(0); onClose(); }} style={{
         width: "100%", textAlign: "left",
-        background: current === 0 ? "rgba(59,130,246,0.3)" : "none",
+        background: current === 0 ? "rgba(0,164,173,0.3)" : "none",
         border: "none", color: "#94a3b8", padding: "2px 6px", fontSize: 11, cursor: "pointer",
       }}>Air (skip)</button>
       {BLOCK_DEFS.map(bd => (
         <button key={bd.type} onClick={() => { onSelect(bd.type); onClose(); }} title={bd.name}
           style={{
             width: 28, height: 22,
-            background: current === bd.type ? "rgba(59,130,246,0.4)" : "rgba(255,255,255,0.05)",
-            border: current === bd.type ? "1px solid #3b82f6" : "1px solid transparent",
+            background: current === bd.type ? "rgba(0,164,173,0.4)" : "rgba(255,255,255,0.05)",
+            border: current === bd.type ? "1px solid #00dde9" : "1px solid transparent",
             borderRadius: 3, cursor: "pointer",
             display: "flex", alignItems: "center", justifyContent: "center",
           }}>
@@ -157,16 +159,15 @@ function PaintPicker({ current, onSelect, onClose }: {
 }) {
   return (
     <div onClick={e => e.stopPropagation()} style={{
+      ...glassMenuPanel,
       position: "absolute", zIndex: 2000, left: 0, top: "100%",
-      background: "#0d1829", border: "1px solid #1e40af",
-      borderRadius: 6, padding: 6,
-      boxShadow: "0 8px 24px rgba(0,0,0,0.7)",
+      padding: 6,
       display: "grid", gridTemplateColumns: "repeat(9, 18px)", gap: 2,
     }}>
       <button onClick={() => { onSelect(0); onClose(); }} title="No paint" style={{
         width: 18, height: 18,
-        background: current === 0 ? "rgba(59,130,246,0.4)" : "rgba(255,255,255,0.05)",
-        border: current === 0 ? "1px solid #3b82f6" : "1px solid #334155",
+        background: current === 0 ? "rgba(0,164,173,0.4)" : "rgba(255,255,255,0.05)",
+        border: current === 0 ? "1px solid #00dde9" : "1px solid #334155",
         borderRadius: 2, cursor: "pointer", fontSize: 9, color: "#64748b",
       }}>×</button>
       {PAINT_COLORS.map(([r, g, b], i) => {
@@ -276,10 +277,7 @@ export default function SchematicImportModal({ info, path, onApply, onCancel, ap
     try {
       await invoke("import_schematic_apply", { path, mapping });
       const raw = await invoke<{ width: number; height: number; pixels: string }>("render_clipboard_preview");
-      const bin = atob(raw.pixels);
-      const arr = new Uint8Array(bin.length);
-      for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
-      setPreviewPixels({ pixels: arr, width: raw.width, height: raw.height });
+      setPreviewPixels({ pixels: decodeU8(raw.pixels), width: raw.width, height: raw.height });
       setShowPreview(true);
     } catch (e) {
       console.error("Preview failed:", e);
@@ -320,39 +318,39 @@ export default function SchematicImportModal({ info, path, onApply, onCancel, ap
   const nUnmapped = rows.filter(b => b.eden_type === 0).length;
 
   function filterBtn(f: Filter, label: string, count?: number) {
+    const active = filter === f;
+    const style = active
+      ? chromeButtonAccent(EDEN_TEAL, EDEN_TEAL_READABLE, {
+          color: "#8beef5", padding: "3px 10px", fontSize: 11,
+        })
+      : chromeButton({ color: "#94a3b8", padding: "3px 10px", fontSize: 11 });
     return (
-      <button onClick={() => setFilter(f)} style={{
-        background: filter === f ? "rgba(59,130,246,0.35)" : "rgba(255,255,255,0.05)",
-        border: `1px solid ${filter === f ? "#3b82f6" : "#334155"}`,
-        color: filter === f ? "#93c5fd" : "#94a3b8",
-        padding: "3px 10px", borderRadius: 4, cursor: "pointer", fontSize: 11,
-      }}>
+      <button onClick={() => setFilter(f)} style={style}>
         {label}{count !== undefined ? ` (${count})` : ""}
       </button>
     );
   }
 
   return (
+    <Modal onClose={onCancel} zIndex={1000} label="Import Schematic"
+      closeOnBackdrop={false} closeOnEsc={!applying}>
     <div
-      style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.75)",
-        display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000 }}
+      style={{ ...glassBackdrop, background: "rgba(0,0,0,0.75)", zIndex: 1000 }}
       onClick={closePopover}
     >
-      <div style={{
-        background: "#0d1829", border: "1px solid #1e40af", borderRadius: 10,
+      <div style={glassPanel({
         padding: "18px 22px",
         width: showPreview && previewPixels ? "min(95vw, 1000px)" : "min(92vw, 720px)",
         maxHeight: "90vh",
         display: "flex", flexDirection: "row", gap: 16,
-        boxShadow: "0 16px 48px rgba(0,0,0,0.7)",
-      }}>
+      })}>
 
         {/* ── Left: main panel ── */}
         <div style={{ flex: 1, display: "flex", flexDirection: "column", gap: 12, minWidth: 0 }}>
 
           {/* Header */}
           <div>
-            <div style={{ color: "#93c5fd", fontWeight: 700, fontSize: 15, marginBottom: 5 }}>
+            <div style={{ color: "#00dde9", fontWeight: 700, fontSize: 15, marginBottom: 5 }}>
               Import Minecraft {info.format === "litematic" ? "Litematica" : info.format === "schem" ? "Sponge Schematic" : "Schematic"}
             </div>
             <div style={{ display: "flex", gap: 16, color: "#94a3b8", fontSize: 12, flexWrap: "wrap", alignItems: "center" }}>
@@ -379,7 +377,7 @@ export default function SchematicImportModal({ info, path, onApply, onCancel, ap
               value={colorSubstrate}
               onChange={e => handleSubstrateChange(Number(e.target.value))}
               style={{
-                background: "#0d1829", border: "1px solid #334155", color: "#e2e8f0",
+                ...recessedWell, background: "#0d1829", color: "#e2e8f0",
                 borderRadius: 4, padding: "2px 6px", fontSize: 11, cursor: "pointer",
               }}
             >
@@ -431,12 +429,11 @@ export default function SchematicImportModal({ info, path, onApply, onCancel, ap
                       <td style={{ padding: "3px 8px", position: "relative" }}>
                         <button
                           onClick={e => { e.stopPropagation(); setOpenPop(isTypeOpen ? null : { idx: origIdx, field: "type" }); }}
-                          style={{
-                            background: "rgba(255,255,255,0.06)", border: "1px solid #334155",
-                            borderRadius: 3, color: isSkipped ? "#64748b" : "#bfdbfe",
-                            padding: "1px 7px", cursor: "pointer", fontSize: 11,
+                          style={chromeButton({
+                            color: isSkipped ? "#64748b" : "#8beef5",
+                            padding: "1px 7px", fontSize: 11,
                             display: "flex", alignItems: "center", gap: 4,
-                          }}
+                          })}
                         >
                           {b.eden_type !== 0 && (() => {
                             const d = BLOCK_DEFS.find(bd => bd.type === b.eden_type);
@@ -456,12 +453,11 @@ export default function SchematicImportModal({ info, path, onApply, onCancel, ap
                         {b.eden_type !== 0 && (
                           <button
                             onClick={e => { e.stopPropagation(); setOpenPop(isPaintOpen ? null : { idx: origIdx, field: "paint" }); }}
-                            style={{
-                              background: "rgba(255,255,255,0.06)", border: "1px solid #334155",
-                              borderRadius: 3, color: "#e2e8f0",
-                              padding: "1px 7px", cursor: "pointer", fontSize: 11,
+                            style={chromeButton({
+                              color: "#e2e8f0",
+                              padding: "1px 7px", fontSize: 11,
                               display: "flex", alignItems: "center", gap: 4,
-                            }}
+                            })}
                           >
                             <Swatch paint={b.eden_paint} />
                             <span style={{ color: "#475569" }}>▾</span>
@@ -494,32 +490,28 @@ export default function SchematicImportModal({ info, path, onApply, onCancel, ap
               onKeyDown={e => e.key === "Enter" && handleSavePreset()}
               placeholder="Name…"
               style={{
-                width: 110, background: "rgba(0,0,0,0.4)", border: "1px solid #334155",
-                borderRadius: 4, color: "#e2e8f0", padding: "2px 7px", fontSize: 11, outline: "none",
+                ...recessedWell,
+                width: 110, borderRadius: 4, color: "#e2e8f0", padding: "2px 7px", fontSize: 11, outline: "none",
               }}
             />
-            <button onClick={handleSavePreset} disabled={!presetName.trim()} style={{
-              background: "rgba(255,255,255,0.07)", border: "1px solid #334155",
+            <button onClick={handleSavePreset} disabled={!presetName.trim()} style={chromeButton({
               color: presetName.trim() ? "#e2e8f0" : "#475569",
-              padding: "2px 10px", borderRadius: 4,
-              cursor: presetName.trim() ? "pointer" : "not-allowed", fontSize: 11,
-            }}>Save</button>
+              padding: "2px 10px", fontSize: 11,
+              cursor: presetName.trim() ? "pointer" : "not-allowed",
+            })}>Save</button>
             {presets.length > 0 && (
               <div style={{ position: "relative" }}>
                 <button
                   onClick={e => { e.stopPropagation(); setShowPresets(v => !v); }}
-                  style={{
-                    background: showPresets ? "rgba(59,130,246,0.2)" : "rgba(255,255,255,0.07)",
-                    border: "1px solid #334155", color: "#93c5fd",
-                    padding: "2px 10px", borderRadius: 4, cursor: "pointer", fontSize: 11,
-                  }}
+                  style={showPresets
+                    ? chromeButtonAccent(EDEN_TEAL, EDEN_TEAL_READABLE, { color: "#8beef5", padding: "2px 10px", fontSize: 11 })
+                    : chromeButton({ color: "#00dde9", padding: "2px 10px", fontSize: 11 })}
                 >Load ({presets.length}) ▾</button>
                 {showPresets && (
                   <div onClick={e => e.stopPropagation()} style={{
+                    ...glassMenuPanel,
                     position: "absolute", bottom: "100%", left: 0, marginBottom: 4,
-                    background: "#0d1829", border: "1px solid #1e40af",
-                    borderRadius: 6, padding: "4px 0", minWidth: 180, zIndex: 2000,
-                    boxShadow: "0 8px 24px rgba(0,0,0,0.7)",
+                    padding: "4px 0", minWidth: 180, zIndex: 2000,
                   }}>
                     {presets.map(p => (
                       <div key={p.name} style={{ display: "flex", alignItems: "center" }}>
@@ -537,10 +529,9 @@ export default function SchematicImportModal({ info, path, onApply, onCancel, ap
                 )}
               </div>
             )}
-            <button onClick={resetToDefaults} style={{
-              background: "rgba(255,255,255,0.05)", border: "1px solid #334155",
-              color: "#94a3b8", padding: "2px 10px", borderRadius: 4, cursor: "pointer", fontSize: 11,
-            }}>Reset</button>
+            <button onClick={resetToDefaults} style={chromeButton({
+              color: "#94a3b8", padding: "2px 10px", fontSize: 11,
+            })}>Reset</button>
           </div>
 
           {/* Footer */}
@@ -551,26 +542,19 @@ export default function SchematicImportModal({ info, path, onApply, onCancel, ap
             <button
               onClick={handlePreview}
               disabled={previewing}
-              style={{
-                background: previewing ? "rgba(255,255,255,0.04)" : "rgba(255,255,255,0.08)",
-                border: "1px solid #334155", color: previewing ? "#64748b" : "#94a3b8",
-                padding: "7px 14px", borderRadius: 6, cursor: previewing ? "not-allowed" : "pointer",
-                fontSize: 13,
-              }}
+              style={chromeButton({
+                color: previewing ? "#64748b" : "#94a3b8",
+                padding: "7px 14px", fontSize: 13, cursor: previewing ? "not-allowed" : "pointer",
+              })}
             >{previewing ? "Loading…" : showPreview ? "Refresh Preview" : "Preview"}</button>
-            <button onClick={onCancel} style={{
-              background: "rgba(0,0,0,0.4)", border: "1px solid #475569",
-              color: "#94a3b8", padding: "7px 18px", borderRadius: 6, cursor: "pointer", fontSize: 13,
-            }}>Cancel</button>
+            <button onClick={onCancel} style={chromeButton({ color: "#94a3b8", padding: "7px 18px", fontSize: 13 })}>Cancel</button>
             <button
               onClick={() => onApply(mapping)}
               disabled={applying}
-              style={{
-                background: applying ? "rgba(37,99,235,0.3)" : "rgba(37,99,235,0.7)",
-                border: "1px solid #3b82f6", color: "#e0f2fe",
-                padding: "7px 18px", borderRadius: 6, fontSize: 13, fontWeight: 600,
-                cursor: applying ? "not-allowed" : "pointer",
-              }}
+              style={chromeButtonAccent(EDEN_TEAL, EDEN_TEAL_READABLE, {
+                color: "#fff", padding: "7px 18px", fontSize: 13, fontWeight: 600,
+                cursor: applying ? "not-allowed" : "pointer", opacity: applying ? 0.6 : 1,
+              })}
             >{applying ? "Converting…" : "Apply & Paste"}</button>
           </div>
         </div>
@@ -600,5 +584,6 @@ export default function SchematicImportModal({ info, path, onApply, onCancel, ap
         )}
       </div>
     </div>
+    </Modal>
   );
 }

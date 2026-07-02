@@ -1,3 +1,4 @@
+import { decodeF32 } from "./codec";
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import * as THREE from "three";
@@ -10,13 +11,6 @@ interface ObjGeometryResult {
   colors: string;    // base64 LE f32
   uvs: string;       // base64 LE f32; empty when no pack
   vertex_count: number;
-}
-
-function decodeF32Array(b64: string): Float32Array {
-  const bin = atob(b64);
-  const bytes = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-  return new Float32Array(bytes.buffer);
 }
 
 const W = 190, H = 160;
@@ -44,6 +38,13 @@ export default function ThreeDPreview({ selection: sel, texturePack = null, texE
 
   const vol = sel.width * sel.height * sel.depth;
   const tooBig = vol > 64 * 64 * 64;
+
+  // The untextured render path creates a one-off material per mesh; dispose it
+  // with the geometry. The textured path shares texMatRef, disposed on pack change.
+  function disposeMesh(mesh: THREE.Mesh) {
+    mesh.geometry.dispose();
+    if (mesh.material !== texMatRef.current) (mesh.material as THREE.Material).dispose();
+  }
 
   // Init Three.js once on mount
   useEffect(() => {
@@ -82,7 +83,7 @@ export default function ThreeDPreview({ selection: sel, texturePack = null, texE
   useEffect(() => {
     const t = threeRef.current;
     if (!t) return;
-    if (t.mesh) { t.scene.remove(t.mesh); t.mesh.geometry.dispose(); t.mesh = null; }
+    if (t.mesh) { t.scene.remove(t.mesh); disposeMesh(t.mesh); t.mesh = null; }
     setRendered(false);
     setError(null);
   }, [sel.x1, sel.y1, sel.x2, sel.y2, sel.z_min, sel.z_max, texEpoch]);
@@ -118,16 +119,16 @@ export default function ThreeDPreview({ selection: sel, texturePack = null, texE
       const t = threeRef.current;
       if (!t) return;
 
-      if (t.mesh) { t.scene.remove(t.mesh); t.mesh.geometry.dispose(); t.mesh = null; }
+      if (t.mesh) { t.scene.remove(t.mesh); disposeMesh(t.mesh); t.mesh = null; }
 
-      const positions = decodeF32Array(result.positions);
-      const colors = decodeF32Array(result.colors);
+      const positions = decodeF32(result.positions);
+      const colors = decodeF32(result.colors);
 
       const geo = new THREE.BufferGeometry();
       geo.setAttribute("position", new THREE.BufferAttribute(positions, 3));
       geo.setAttribute("color", new THREE.BufferAttribute(colors, 3));
       const hasUVs = result.uvs && result.uvs.length > 0;
-      if (hasUVs) geo.setAttribute("uv", new THREE.BufferAttribute(decodeF32Array(result.uvs), 2));
+      if (hasUVs) geo.setAttribute("uv", new THREE.BufferAttribute(decodeF32(result.uvs), 2));
       const meshMat = (hasUVs && texMatRef.current)
         ? texMatRef.current
         : new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide });

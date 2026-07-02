@@ -36,6 +36,8 @@ Pre-built installers for macOS (Apple Silicon + Intel universal), Windows, and L
 - **Ribbon toolbar** — a tabbed, collapsible toolbar (Home / Selection / View / File) replaces the old menu bar; resizable height, persisted between sessions, with an app menu for settings, help, and about
 - **Right-click context menu** — right-click anywhere on the map for quick actions: set spawn here, copy, paste here, fill/delete/clear selection, teleport the 3D camera, and tool switching
 - **Settings** — persistent app preferences (default quad view, default 3D pane, default save compression, template path, texture-pack path)
+- **World Info** — a dialog summarising the open world: name, seed, format/version, dimensions, chunk count, spawn/last position, golden cubes, and the 16-band sky-colour palette
+- **Accessible modals** — every dialog closes on **Escape**, traps keyboard focus, and reports itself to screen readers
 
 ### Viewing & navigation
 - **Zoomable, pannable top-down map** of any Eden world file
@@ -203,7 +205,9 @@ src/
   SchematicImportModal.tsx   — Minecraft .schematic/.litematic import with block mapping
   SettingsModal.tsx          — persistent app settings
   HelpModal.tsx              — shortcuts + texture-pack help
+  Modal.tsx                  — shared modal shell (backdrop, Escape, focus-trap, ARIA)
   ErrorBoundary.tsx          — inline error fallback wrapping the quad-view panes
+  codec.ts                   — shared base64 → typed-array decoders for all IPC payloads
   drawTools.ts               — geometry helpers (penFootprint, brushFootprint, Bresenham line, rect, ellipse)
   blockDefs.ts               — block type registry, display colours, ramp/wedge helpers
 src-tauri/src/

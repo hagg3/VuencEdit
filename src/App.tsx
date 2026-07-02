@@ -1,3 +1,4 @@
+import { decodeU8 } from "./codec";
 import { useState, useCallback, useEffect, useRef, useMemo } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -16,11 +17,12 @@ import WorldBrowserModal from "./WorldBrowserModal";
 import UploadModal from "./UploadModal";
 import NewWorldModal from "./NewWorldModal";
 import SchematicImportModal, { type SchematicInfo, type MappingEntry } from "./SchematicImportModal";
-import Ribbon, { RIBBON_HEIGHT_COLLAPSED, TAB_BAR_HEIGHT, DEFAULT_BODY_HEIGHT } from "./Ribbon";
+import Ribbon, { RIBBON_HEIGHT_COLLAPSED, TAB_BAR_HEIGHT, DEFAULT_BODY_HEIGHT, EDEN_TEAL, EDEN_TEAL_READABLE } from "./Ribbon";
 import SettingsModal, { loadSettings, saveSettings } from "./SettingsModal";
 import WorldInfoModal from "./WorldInfoModal";
+import Modal from "./Modal";
 import { decodeAtlas, type AtlasData, type TexturePackRaw, clearSwatchCache } from "./texturePack";
-import { blockDisplayName } from "./blockDefs";
+import { blockDisplayName, applyBlockTables, type BlockTables } from "./blockDefs";
 import appIcon from "./assets/app-icon.png";
 import "./App.css";
 
@@ -55,13 +57,6 @@ interface WorldData {
 interface PixelPatchRaw { x: number; y: number; width: number; height: number; pixels: string; }
 interface EditResultRaw { patch: PixelPatchRaw; undo_depth: number; redo_depth: number; }
 interface PreviewDataRaw { width: number; height: number; pixels: string; }
-
-function decodePixels(b64: string): Uint8Array {
-  const bin = atob(b64);
-  const arr = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
-  return arr;
-}
 
 export interface SelectionInfo {
   x1: number; y1: number; x2: number; y2: number;
@@ -99,8 +94,29 @@ function timeAgo(ts: number): string {
 
 // ── component ────────────────────────────────────────────────────────────────
 
+// Self-contained FPS meter: owns its rAF loop and 1 Hz state update so the
+// per-second re-render stays inside this leaf instead of cascading from App.
+function FpsCounter() {
+  const [fps, setFps] = useState(0);
+  useEffect(() => {
+    let frames = 0; let last = performance.now();
+    let rafId: number;
+    const tick = (now: number) => {
+      frames++;
+      if (now - last >= 1000) { setFps(Math.round(frames * 1000 / (now - last))); frames = 0; last = now; }
+      rafId = requestAnimationFrame(tick);
+    };
+    rafId = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(rafId);
+  }, []);
+  return <>{fps} fps</>;
+}
+
 function App() {
   const [world, setWorld] = useState<WorldData | null>(null);
+  // Live mirror of `world` for []-memoized callbacks (undo/redo → applyEditResult).
+  const worldRef = useRef<WorldData | null>(null);
+  useEffect(() => { worldRef.current = world; }, [world]);
   // Monotonically increments only on full world load; triggers view+selection reset in MapCanvas.
   const [worldEpoch, setWorldEpoch] = useState(0);
   const mapCanvasRef = useRef<MapCanvasRef>(null);
@@ -133,18 +149,6 @@ function App() {
   const [cursorBlock, setCursorBlock] = useState<{z:number;bt:number;paint:number}|null>(null);
   const [ctxMenu, setCtxMenu] = useState<{wx:number;wy:number;x:number;y:number}|null>(null);
   const cursorPosThrottleRef = useRef<ReturnType<typeof setTimeout>|null>(null);
-  const [fps, setFps] = useState(0);
-  useEffect(() => {
-    let frames = 0; let last = performance.now();
-    let rafId: number;
-    const tick = (now: number) => {
-      frames++;
-      if (now - last >= 1000) { setFps(Math.round(frames * 1000 / (now - last))); frames = 0; last = now; }
-      rafId = requestAnimationFrame(tick);
-    };
-    rafId = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(rafId);
-  }, []);
   const [tool, setTool] = useState<Tool>("pan");
   const prevToolRef = useRef<Tool>("pan");
   const [wandMatchPaint, setWandMatchPaint] = useState(true);
@@ -157,6 +161,13 @@ function App() {
   const [showWorldInfo, setShowWorldInfo] = useState(false);
   const [appVersion, setAppVersion] = useState("…");
   useEffect(() => { getVersion().then(setAppVersion); }, []);
+  // Fetch canonical block/paint colour tables from Rust once at startup so TS
+  // swatch tints match the map/3D render exactly (C6 — ends dual-maintenance drift).
+  useEffect(() => {
+    invoke<BlockTables>("get_block_tables")
+      .then((t) => { applyBlockTables(t); clearSwatchCache(); })
+      .catch(() => {}); // fallback tables in blockDefs.ts keep the picker usable
+  }, []);
   const [showSlicePanels, setShowSlicePanels] = useState(() => loadSettings().defaultQuadView);
   // 3D fly-through pane (4th quad cell) — off by default; it's the most expensive pane, so the user
   // opts in. `exp` (experimental, perf-heavy on large worlds).
@@ -396,7 +407,7 @@ function App() {
   useEffect(() => {
     if (!clipboard) { setClipboardPreviewPixels(null); return; }
     invoke<PreviewDataRaw>("render_clipboard_preview")
-      .then(raw => setClipboardPreviewPixels({ ...raw, pixels: decodePixels(raw.pixels) }))
+      .then(raw => setClipboardPreviewPixels({ ...raw, pixels: decodeU8(raw.pixels) }))
       .catch(() => setClipboardPreviewPixels(null));
   }, [clipboard]);
 
@@ -428,11 +439,12 @@ function App() {
   async function applyEditResult(raw: EditResultRaw) {
     if (viewModeRef.current === "topdown") {
       if (renderModeRef.current === "axo") {
-        // Axo projection: flat patch positions don't match axo pixel positions, force full re-render
-        const w = world;
+        // Axo projection: flat patch positions don't match axo pixel positions, force full re-render.
+        // Read via ref: this runs from []-memoized undo/redo callbacks where `world` is stale.
+        const w = worldRef.current;
         if (w) mapCanvasRef.current?.refetchRegion(0, 0, w.width_chunks * 16, w.height_chunks * 16);
       } else {
-        const patch: PixelPatch = { ...raw.patch, pixels: decodePixels(raw.patch.pixels) };
+        const patch: PixelPatch = { ...raw.patch, pixels: decodeU8(raw.patch.pixels) };
         mapCanvasRef.current?.applyPatch(patch);
       }
     } else {
@@ -545,10 +557,10 @@ function App() {
         const raw = viewMode === "zslice"
           ? await invoke<PixelPatchRaw>("render_zslice_patch", { z: zSliceZ, x1: 0, y1: y, x2: w - 1, y2 })
           : await invoke<PixelPatchRaw>("fetch_tile", { x1: 0, y1: y, x2: w - 1, y2 });
-        const pixels = decodePixels(raw.pixels);
+        const pixels = decodeU8(raw.pixels);
         if (useTemplate) {
           const traw = await invoke<PixelPatchRaw>("fetch_template_tile", { x1: 0, y1: y, x2: w - 1, y2 });
-          const tpixels = decodePixels(traw.pixels);
+          const tpixels = decodeU8(traw.pixels);
           // Composite: where user pixel is transparent (alpha=0), use template at full opacity
           for (let i = 0; i < pixels.length; i += 4) {
             if (pixels[i + 3] === 0 && tpixels[i + 3] === 255) {
@@ -1040,7 +1052,7 @@ function App() {
   }
 
   function unloadTexturePack() {
-    invoke("unload_texture_pack").catch(() => {});
+    invoke("unload_texture_pack").catch(e => setError(String(e)));
     clearSwatchCache();
     setTexturePackInfo(null);
     setTexturePackPath(null);
@@ -1326,6 +1338,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
       position: "fixed", bottom: 0, left: 0, right: 0, height: 20, zIndex: 150,
       background: "linear-gradient(to bottom, #081020, #060c18)",
       borderTop: "1px solid #1a2540",
+      boxShadow: "inset 0 1px 0 rgba(255,255,255,.05)",
       display: "flex", alignItems: "center",
       fontSize: 10, color: "#475569", userSelect: "none",
       fontVariantNumeric: "tabular-nums",
@@ -1377,8 +1390,8 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
         </div>
       )}
       <div style={{ flex: 1 }} />
-      <div style={{ padding: "0 10px", borderLeft: "1px solid #1a2540", color: "#2d4060", whiteSpace: "nowrap" }}>
-        {fps} fps
+      <div style={{ padding: "0 10px", borderLeft: "1px solid #1a2540", color: EDEN_TEAL_READABLE, opacity: 0.6, whiteSpace: "nowrap" }}>
+        <FpsCounter />
       </div>
     </div>
   ) : null;
@@ -1774,8 +1787,17 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
             position: "absolute", bottom: 16, right: 12,
             background: "rgba(0,0,0,0.7)", color: "#f87171",
             padding: "6px 12px", borderRadius: 6, fontSize: 13, maxWidth: 360,
+            display: "flex", alignItems: "flex-start", gap: 8,
           }}>
-            {error}
+            <span style={{ flex: 1 }}>{error}</span>
+            <button
+              onClick={() => setError(null)}
+              title="Dismiss"
+              style={{
+                background: "none", border: "none", color: "#f87171", cursor: "pointer",
+                fontSize: 14, lineHeight: "16px", padding: 0, opacity: 0.7,
+              }}
+            >✕</button>
           </div>
         )}
 
@@ -1828,16 +1850,20 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
 
         {/* Expand from Template modal */}
         {showExpandModal && (
-          <div style={{
-            position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", display: "flex",
-            alignItems: "center", justifyContent: "center", zIndex: 1000,
-          }}>
+          <Modal
+            onClose={() => setShowExpandModal(false)}
+            zIndex={1000}
+            labelledBy="expand-title"
+            closeOnBackdrop={false}
+            closeOnEsc={!expandInProgress}
+            backdropStyle={{ background: "rgba(0,0,0,0.7)" }}
+          >
             <div style={{
               background: "#0d1829", border: "1px solid #1e40af", borderRadius: 10,
               padding: "24px 28px", minWidth: 360, maxWidth: 440,
               boxShadow: "0 16px 48px rgba(0,0,0,0.7)",
             }}>
-              <div style={{ fontSize: 15, fontWeight: 600, color: "#e2e8f0", marginBottom: 12 }}>
+              <div id="expand-title" style={{ fontSize: 15, fontWeight: 600, color: "#e2e8f0", marginBottom: 12 }}>
                 Expand from Template
               </div>
               {!expandInProgress && expandResult === null && (
@@ -1910,7 +1936,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
                 </>
               )}
             </div>
-          </div>
+          </Modal>
         )}
 
         {/* Map right-click context menu */}
@@ -1924,23 +1950,26 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
             color: "#e2e8f0", padding: "5px 12px 5px 8px", fontSize: 12, cursor: "pointer",
             whiteSpace: "nowrap",
           };
-          const miHov = (e: React.MouseEvent<HTMLButtonElement>) => { e.currentTarget.style.background = "#1e293b"; };
+          const miHov = (e: React.MouseEvent<HTMLButtonElement>) => { e.currentTarget.style.background = `rgba(${EDEN_TEAL},0.18)`; };
           const miLve = (e: React.MouseEvent<HTMLButtonElement>) => { e.currentTarget.style.background = ""; };
           const div = <div style={{ height: 1, background: "#1e293b", margin: "3px 0" }} />;
           const menuY = Math.min(ctxMenu.y, window.innerHeight - 260);
           return (
             <div
               style={{
-                position: "fixed", top: menuY, left: ctxMenu.x, zIndex: 9000,
-                background: "#0d1829", border: "1px solid #1e40af",
-                borderRadius: 6, padding: "4px 0", minWidth: 210,
-                boxShadow: "0 8px 24px rgba(0,0,0,0.7)",
+                position: "fixed", top: menuY, left: ctxMenu.x, zIndex: 9000, minWidth: 210,
+                padding: "4px 0",
+                background: "linear-gradient(180deg, rgba(20,30,48,.95) 0%, rgba(10,16,28,.95) 100%)",
+                backdropFilter: "blur(12px)", WebkitBackdropFilter: "blur(12px)",
+                border: "1px solid rgba(255,255,255,.12)",
+                borderRadius: 6,
+                boxShadow: `0 10px 28px rgba(0,0,0,0.75), inset 0 1px 0 rgba(255,255,255,.06), 0 0 0 1px rgba(${EDEN_TEAL},.15)`,
               }}
               onMouseDown={e => e.stopPropagation()}
               onContextMenu={e => e.preventDefault()}
             >
               <button style={miBtnStyle} onMouseEnter={miHov} onMouseLeave={miLve}
-                onClick={() => { close(); invoke<[number,number]>("set_spawn_pos", { px: Math.round(ctxMenu.wx), py: Math.round(ctxMenu.wy) }).then(([px, py]) => setSpawnPos({ px, py })).catch(() => {}); }}>
+                onClick={() => { close(); invoke<[number,number]>("set_spawn_pos", { px: Math.round(ctxMenu.wx), py: Math.round(ctxMenu.wy) }).then(([px, py]) => setSpawnPos({ px, py })).catch(e => setError(String(e))); }}>
                 {ic("⌂")} Set Spawn Here
               </button>
               {div}
@@ -1994,23 +2023,30 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
   }
 
   return (
-    <div style={{ display: "flex", height: "100vh", background: "#0f1117" }}>
+    <div style={{
+      display: "flex", height: "100vh",
+      background: `radial-gradient(600px 240px at 50% 0%, rgba(${EDEN_TEAL},.16) 0%, rgba(0,0,0,0) 100%), #0c1013`,
+    }}>
       {/* Left panel */}
       <div style={{
         width: 560, minWidth: 400, display: "flex", flexDirection: "column",
         alignItems: "center", justifyContent: "center", padding: "48px 56px",
-        gap: 0, background: "#13161f",
+        gap: 0, background: "linear-gradient(180deg, rgb(24,30,42) 0%, rgb(17,22,31) 100%)",
+        boxShadow: "inset -1px 0 0 rgba(255,255,255,.05), inset 0 0 40px rgba(0,0,0,.35)",
       }}>
         {/* App icon */}
         <img
           src={appIcon}
           alt="VuencEdit"
-          style={{ width: 120, height: 120, borderRadius: 24, marginBottom: 20, imageRendering: "pixelated" }}
+          style={{
+            width: 120, height: 120, borderRadius: 24, marginBottom: 20, imageRendering: "pixelated",
+            boxShadow: "inset 0 0 0 1px rgba(255,255,255,.12), 0 8px 24px rgba(0,0,0,.5)",
+          }}
         />
         {/* Title */}
         <div style={{ fontSize: 36, letterSpacing: -0.5, lineHeight: 1 }}>
-          <span style={{ fontWeight: 800, color: "#ffffff" }}>Vuenc</span>
-          <span style={{ fontWeight: 400, color: "#cbd5e1" }}>Edit</span>
+          <span style={{ fontWeight: 800, color: "#ffffff", textShadow: "0 -1px 0 rgba(0,0,0,.5)" }}>Vuenc</span>
+          <span style={{ fontWeight: 400, color: EDEN_TEAL_READABLE, textShadow: "0 -1px 0 rgba(0,0,0,.5)" }}>Edit</span>
         </div>
         <div style={{ fontSize: 13, color: "#4b5568", marginBottom: 28, marginTop: 6 }}>v{appVersion}</div>
 
@@ -2022,7 +2058,8 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
             disabled={loading}
             style={{
               display: "flex", alignItems: "center", gap: 16,
-              background: "#1a3a2e", border: "1px solid #2d5a44",
+              background: "linear-gradient(180deg, rgba(74,222,128,0.22) 0%, rgba(74,222,128,0.06) 100%)",
+              border: "none", boxShadow: "inset 0 0 0 1px rgba(74,222,128,.4), 0 .5px .5px rgba(255,255,255,.12)",
               borderRadius: 10, padding: "14px 20px",
               cursor: loading ? "not-allowed" : "pointer",
               opacity: loading ? 0.6 : 1, textAlign: "left", width: "100%",
@@ -2041,7 +2078,8 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
             disabled={loading}
             style={{
               display: "flex", alignItems: "center", gap: 16,
-              background: "#1e2330", border: "1px solid #2d3448",
+              background: "linear-gradient(180deg, rgb(46,58,82) 0%, rgb(26,34,52) 100%)",
+              border: "none", boxShadow: "inset 0 0 0 1px rgba(0,0,0,.5), 0 .5px .5px rgba(255,255,255,.15)",
               borderRadius: 10, padding: "14px 20px",
               cursor: loading ? "not-allowed" : "pointer",
               opacity: loading ? 0.6 : 1, textAlign: "left", width: "100%",
@@ -2062,7 +2100,8 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
             disabled={loading}
             style={{
               display: "flex", alignItems: "center", gap: 16,
-              background: "#1e2330", border: "1px solid #2d3448",
+              background: "linear-gradient(180deg, rgb(46,58,82) 0%, rgb(26,34,52) 100%)",
+              border: "none", boxShadow: "inset 0 0 0 1px rgba(0,0,0,.5), 0 .5px .5px rgba(255,255,255,.15)",
               borderRadius: 10, padding: "14px 20px",
               cursor: loading ? "not-allowed" : "pointer",
               opacity: loading ? 0.6 : 1, textAlign: "left", width: "100%",
@@ -2080,13 +2119,14 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
             onClick={() => setShowSettings(true)}
             style={{
               display: "flex", alignItems: "center", gap: 14,
-              background: "none", border: "1px solid #1e2333",
+              background: "none", border: "none",
+              boxShadow: "inset 0 0 0 1px #1e2333",
               borderRadius: 8, padding: "9px 16px",
               cursor: "pointer", textAlign: "left", width: "100%",
-              color: "#64748b",
+              color: "#64748b", transition: "box-shadow .1s, color .1s",
             }}
-            onMouseEnter={e => { (e.currentTarget as HTMLElement).style.borderColor = "#2d3448"; (e.currentTarget as HTMLElement).style.color = "#94a3b8"; }}
-            onMouseLeave={e => { (e.currentTarget as HTMLElement).style.borderColor = "#1e2333"; (e.currentTarget as HTMLElement).style.color = "#64748b"; }}
+            onMouseEnter={e => { (e.currentTarget as HTMLElement).style.boxShadow = `inset 0 0 0 1px rgba(${EDEN_TEAL},.5)`; (e.currentTarget as HTMLElement).style.color = EDEN_TEAL_READABLE; }}
+            onMouseLeave={e => { (e.currentTarget as HTMLElement).style.boxShadow = "inset 0 0 0 1px #1e2333"; (e.currentTarget as HTMLElement).style.color = "#64748b"; }}
           >
             <span style={{ fontSize: 16, lineHeight: 1 }}>⚙</span>
             <span style={{ fontSize: 13 }}>Settings</span>
@@ -2123,7 +2163,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
               background: "none", border: "none", color: "#4b5568",
               fontSize: 11, cursor: "pointer", padding: 0, textDecoration: "underline",
             }}
-            onMouseEnter={e => (e.currentTarget.style.color = "#64748b")}
+            onMouseEnter={e => (e.currentTarget.style.color = EDEN_TEAL_READABLE)}
             onMouseLeave={e => (e.currentTarget.style.color = "#4b5568")}
           >
             About VuencEdit…
@@ -2149,8 +2189,11 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
       )}
 
       {/* Right panel — recent worlds */}
-      <div style={{ flex: 1, display: "flex", flexDirection: "column", background: "#181c27", overflow: "hidden" }}>
-        <div style={{ padding: "20px 24px 10px", borderBottom: "1px solid #1e2333" }}>
+      <div style={{
+        flex: 1, display: "flex", flexDirection: "column", overflow: "hidden",
+        background: "linear-gradient(180deg, rgb(24,28,39) 0%, rgb(15,18,26) 100%)",
+      }}>
+        <div style={{ padding: "20px 24px 10px", borderBottom: "1px solid #1e2333", boxShadow: "inset 0 1px 0 rgba(255,255,255,.04)" }}>
           <span style={{ fontSize: 11, fontWeight: 600, letterSpacing: "0.08em", color: "#4b5568", textTransform: "uppercase" }}>
             Recent Worlds
           </span>
@@ -2173,7 +2216,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
                   padding: "14px 24px", cursor: loading ? "not-allowed" : "pointer",
                   opacity: loading ? 0.5 : 1,
                 }}
-                onMouseEnter={e => { if (!loading) (e.currentTarget as HTMLElement).style.background = "#1e2333"; }}
+                onMouseEnter={e => { if (!loading) (e.currentTarget as HTMLElement).style.background = `rgba(${EDEN_TEAL},0.10)`; }}
                 onMouseLeave={e => { (e.currentTarget as HTMLElement).style.background = "none"; }}
                 title={r.path}
               >

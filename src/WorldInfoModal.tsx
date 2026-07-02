@@ -1,6 +1,8 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { PAINT_COLORS } from "./blockDefs";
+import { EDEN_TEAL_READABLE, glassPanel } from "./designTokens";
+import Modal from "./Modal";
 
 interface WorldInfo {
   name: string;
@@ -36,18 +38,12 @@ export default function WorldInfoModal({ onClose }: { onClose: () => void }) {
       .catch(e => setErr(String(e)));
   }, []);
 
-  const overlay: React.CSSProperties = {
-    position: "fixed", inset: 0, background: "rgba(0,0,0,0.65)",
-    display: "flex", alignItems: "center", justifyContent: "center", zIndex: 9000,
-  };
-  const modal: React.CSSProperties = {
-    background: "#0f172a", border: "1px solid #1e3a5f", borderRadius: 10,
+  const modal: React.CSSProperties = glassPanel({
     padding: "20px 24px", minWidth: 440, maxWidth: 540, maxHeight: "85vh",
     overflowY: "auto", color: "#e2e8f0", fontFamily: "monospace", fontSize: 12,
-    boxShadow: "0 20px 60px rgba(0,0,0,0.8)",
-  };
+  });
   const heading: React.CSSProperties = {
-    margin: 0, fontSize: 15, fontWeight: 700, color: "#93c5fd", marginBottom: 16,
+    margin: 0, fontSize: 15, fontWeight: 700, color: EDEN_TEAL_READABLE, marginBottom: 16,
   };
   const section: React.CSSProperties = {
     marginBottom: 14,
@@ -74,11 +70,14 @@ export default function WorldInfoModal({ onClose }: { onClose: () => void }) {
   }
 
   return (
-    <div style={overlay} onMouseDown={e => e.target === e.currentTarget && onClose()}>
+    <Modal onClose={onClose} zIndex={9000} labelledBy="worldinfo-title">
       <div style={modal}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
-          <h2 style={heading}>World Info</h2>
-          <button onClick={onClose} style={{ background: "none", border: "none", color: "#64748b", fontSize: 18, cursor: "pointer", lineHeight: 1 }}>×</button>
+          <h2 id="worldinfo-title" style={heading}>World Info</h2>
+          <button onClick={onClose}
+            onMouseEnter={e => (e.currentTarget.style.color = EDEN_TEAL_READABLE)}
+            onMouseLeave={e => (e.currentTarget.style.color = "#64748b")}
+            style={{ background: "none", border: "none", color: "#64748b", fontSize: 18, cursor: "pointer", lineHeight: 1, transition: "color .1s" }}>×</button>
         </div>
 
         {err && <div style={{ color: "#f87171", marginBottom: 12 }}>{err}</div>}
@@ -145,6 +144,6 @@ export default function WorldInfoModal({ onClose }: { onClose: () => void }) {
 
         </>}
       </div>
-    </div>
+    </Modal>
   );
 }

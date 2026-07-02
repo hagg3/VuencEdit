@@ -1,3 +1,4 @@
+import { decodeU8 } from "./codec";
 import { useEffect, useRef, useCallback, forwardRef, useImperativeHandle } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { brushFootprint, bresenhamLine, rectPixels, ellipsePixels, type WP, type BrushShape, type FillMode } from "./drawTools";
@@ -132,13 +133,6 @@ interface Props {
   showTemplateOverlay?: boolean;
   /** Right-click context menu callback — receives world coords + screen coords. */
   onMapContextMenu?: (wx: number, wy: number, screenX: number, screenY: number) => void;
-}
-
-function decodePixels(b64: string): Uint8Array {
-  const bin = atob(b64);
-  const arr = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
-  return arr;
 }
 
 type TileJob = { key: string; x1: number; y1: number; x2: number; y2: number };
@@ -652,7 +646,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
         raw = await invoke<PixelPatchRaw>("fetch_tile", { x1, y1, x2, y2 });
       }
       if (tileEpochRef.current !== myEpoch) return;
-      const pixels = decodePixels(raw.pixels);
+      const pixels = decodeU8(raw.pixels);
       const tc  = document.createElement("canvas");
       tc.width  = raw.width;
       tc.height = raw.height;
@@ -667,7 +661,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
         try {
           const traw = await invoke<PixelPatchRaw>("fetch_template_tile", { x1, y1, x2, y2 });
           if (tileEpochRef.current === myEpoch) {
-            const tpixels = decodePixels(traw.pixels);
+            const tpixels = decodeU8(traw.pixels);
             const ttc = document.createElement("canvas");
             ttc.width = traw.width; ttc.height = traw.height;
             const ttctx = ttc.getContext("2d")!;
@@ -753,7 +747,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
           raw = await invoke<PixelPatchRaw>("fetch_tile", { x1: 0, y1: y, x2: mW - 1, y2 });
         }
         if (tileEpochRef.current !== myEpoch) return;
-        const pixels = decodePixels(raw.pixels);
+        const pixels = decodeU8(raw.pixels);
         const img = fctx.createImageData(raw.width, raw.height);
         img.data.set(pixels);
         fctx.putImageData(img, 0, y);

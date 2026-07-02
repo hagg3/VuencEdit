@@ -10,6 +10,12 @@ use std::sync::Mutex;
 use std::time::Instant;
 use tauri::Emitter;
 
+// Lock/render timing instrumentation ([LOAD]/[LOCK]/[SCAN]/[PREVIEW] lines).
+// Debug builds only — release builds stay quiet on stderr.
+macro_rules! timing_log {
+    ($($arg:tt)*) => { if cfg!(debug_assertions) { eprintln!($($arg)*); } };
+}
+
 fn serialize_bytes_b64<S: serde::Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {
     s.serialize_str(&STANDARD.encode(bytes))
 }
@@ -686,6 +692,26 @@ fn block_color(bt: u8, paint: u8, sky: u8) -> [u8; 3] {
     if (bt as usize) < BLOCK_RGB.len() { BLOCK_RGB[bt as usize] } else { [128, 128, 128] }
 }
 
+/// Canonical block/paint colour tables, shipped to the frontend at startup so
+/// the TS side (`blockTables.ts`) never hand-mirrors these values. Ends the
+/// Rust↔TS dual-maintenance drift (C6): both the paint RGB rounding and the
+/// per-block brightness scale previously diverged.
+#[derive(Serialize)]
+struct BlockTables {
+    block_rgb: Vec<[u8; 3]>,
+    paint_rgb: Vec<[u8; 3]>,
+    block_paint_scale: Vec<f32>,
+}
+
+#[tauri::command]
+fn get_block_tables() -> BlockTables {
+    BlockTables {
+        block_rgb: BLOCK_RGB.to_vec(),
+        paint_rgb: PAINT_RGB.to_vec(),
+        block_paint_scale: BLOCK_PAINT_SCALE.to_vec(),
+    }
+}
+
 // ── World parsing ─────────────────────────────────────────────────────────────
 
 fn parse_world_inner(bytes: MmapMut) -> Result<LoadedWorld, String> {
@@ -1173,18 +1199,18 @@ fn load_world(path: String, state: tauri::State<'_, AppState>) -> Result<WorldMe
     let t0 = Instant::now();
     let us = || t0.elapsed().as_micros();
 
-    eprintln!("[LOAD] start");
+    timing_log!("[LOAD] start");
 
     // Step 1: Brief lock — clear previous world so in-flight scans (render_selection_view,
     // render_zslice) fail fast on their next lock attempt instead of blocking here.
-    eprintln!("[LOCK] acquire_start  cmd=load_world/step1  t=+{}µs", us());
+    timing_log!("[LOCK] acquire_start  cmd=load_world/step1  t=+{}µs", us());
     let t_s1 = Instant::now();
     let (_old_world, old_temp) = {
-        let mut ws = state.lock().unwrap();
+        let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
         let wait = t_s1.elapsed().as_micros();
         let prev_undo: usize = ws.undo_stack.iter().flat_map(|e| e.chunks.iter()).map(|c| c.data.len()).sum();
         let prev_redo: usize = ws.redo_stack.iter().flat_map(|e| e.chunks.iter()).map(|c| c.data.len()).sum();
-        eprintln!("[LOCK] acquired  cmd=load_world/step1  wait={}µs  prev_undo={}B  prev_redo={}B",
+        timing_log!("[LOCK] acquired  cmd=load_world/step1  wait={}µs  prev_undo={}B  prev_redo={}B",
             wait, prev_undo, prev_redo);
         let t_held = Instant::now();
         let taken = ws.world.take();  // pointer swap only — dealloc happens outside the lock
@@ -1193,7 +1219,7 @@ fn load_world(path: String, state: tauri::State<'_, AppState>) -> Result<WorldMe
         ws.redo_stack.clear();
         let old_temp = ws.temp_path.take();
         drop(ws);
-        eprintln!("[LOCK] released  cmd=load_world/step1  held={}µs  t=+{}µs", t_held.elapsed().as_micros(), us());
+        timing_log!("[LOCK] released  cmd=load_world/step1  held={}µs  t=+{}µs", t_held.elapsed().as_micros(), us());
         (taken, old_temp)
     };
     // _old_world (Option<LoadedWorld>) drops here, releasing the mmap before we delete the temp file.
@@ -1209,7 +1235,7 @@ fn load_world(path: String, state: tauri::State<'_, AppState>) -> Result<WorldMe
 
     let (mmap, maybe_temp): (MmapMut, Option<std::path::PathBuf>) = if is_zip(&magic) {
         use zip::ZipArchive;
-        eprintln!("[LOAD] detected zip archive, decompressing  t=+{}µs", us());
+        timing_log!("[LOAD] detected zip archive, decompressing  t=+{}µs", us());
         let raw = fs::read(&path).map_err(|e| format!("Failed to read file: {e}"))?;
         let cursor = std::io::Cursor::new(&raw);
         let mut archive = ZipArchive::new(cursor)
@@ -1224,7 +1250,7 @@ fn load_world(path: String, state: tauri::State<'_, AppState>) -> Result<WorldMe
             std::io::copy(&mut entry, &mut tmp)
                 .map_err(|e| format!("Failed to decompress: {e}"))?;
         } // tmp closed here before mmap
-        eprintln!("[LOAD] decompressed to {:?}  t=+{}µs", temp_path, us());
+        timing_log!("[LOAD] decompressed to {:?}  t=+{}µs", temp_path, us());
         let file = fs::File::open(&temp_path)
             .map_err(|e| format!("Failed to open temp file: {e}"))?;
         // SAFETY: temp file is private, written by us, and stays alive for the duration of the mmap.
@@ -1239,10 +1265,10 @@ fn load_world(path: String, state: tauri::State<'_, AppState>) -> Result<WorldMe
             .map_err(|e| format!("Failed to map file: {e}"))?;
         (mmap, None)
     };
-    eprintln!("[LOAD] file_mmap  bytes={}B  compressed={}  t=+{}µs", mmap.len(), maybe_temp.is_some(), us());
+    timing_log!("[LOAD] file_mmap  bytes={}B  compressed={}  t=+{}µs", mmap.len(), maybe_temp.is_some(), us());
 
     let loaded = parse_world_inner(mmap)?;
-    eprintln!("[LOAD] parsed  {}×{} chunks  count={}  world_bytes={}B  t=+{}µs",
+    timing_log!("[LOAD] parsed  {}×{} chunks  count={}  world_bytes={}B  t=+{}µs",
         loaded.w_chunks, loaded.h_chunks, loaded.chunk_map.len(), loaded.bytes.len(), us());
 
     // Capture metadata before moving loaded into state.
@@ -1275,18 +1301,18 @@ fn load_world(path: String, state: tauri::State<'_, AppState>) -> Result<WorldMe
     };
 
     // Step 3: Install new world.
-    eprintln!("[LOCK] acquire_start  cmd=load_world/step3  t=+{}µs", us());
+    timing_log!("[LOCK] acquire_start  cmd=load_world/step3  t=+{}µs", us());
     let t_s3 = Instant::now();
     {
-        let mut ws = state.lock().unwrap();
-        eprintln!("[LOCK] acquired  cmd=load_world/step3  wait={}µs", t_s3.elapsed().as_micros());
+        let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
+        timing_log!("[LOCK] acquired  cmd=load_world/step3  wait={}µs", t_s3.elapsed().as_micros());
         let t_held = Instant::now();
         ws.world = Some(loaded);
         ws.temp_path = maybe_temp;
         drop(ws);
-        eprintln!("[LOCK] released  cmd=load_world/step3  held={}µs  t=+{}µs", t_held.elapsed().as_micros(), us());
+        timing_log!("[LOCK] released  cmd=load_world/step3  held={}µs  t=+{}µs", t_held.elapsed().as_micros(), us());
     }
-    eprintln!("[LOAD] end  total={}µs", us());
+    timing_log!("[LOAD] end  total={}µs", us());
 
     Ok(meta)
 }
@@ -1312,7 +1338,7 @@ struct WorldInfo {
 
 #[tauri::command]
 fn get_world_info(state: tauri::State<'_, AppState>) -> Result<WorldInfo, String> {
-    let ws = state.lock().unwrap();
+    let ws = state.lock().unwrap_or_else(|p| p.into_inner());
     let world = ws.world.as_ref().ok_or("No world loaded")?;
     let b = &world.bytes;
 
@@ -1366,15 +1392,15 @@ fn render_zslice(z: i32, state: tauri::State<'_, AppState>) -> Result<WorldData,
     let t0 = Instant::now();
     let us = || t0.elapsed().as_micros();
 
-    eprintln!("[PREVIEW] start  cmd=render_zslice  z={z}");
+    timing_log!("[PREVIEW] start  cmd=render_zslice  z={z}");
 
     const BAND_BYTES: usize = 8192;
-    eprintln!("[LOCK] acquire_start  cmd=render_zslice  t=+{}µs", us());
+    timing_log!("[LOCK] acquire_start  cmd=render_zslice  t=+{}µs", us());
     let t_lock = Instant::now();
     let (slices, positions, name, w_chunks, h_chunks, min_x, min_y, sky, max_z) = {
-        let ws = state.lock().unwrap();
+        let ws = state.lock().unwrap_or_else(|p| p.into_inner());
         let wait = t_lock.elapsed().as_micros();
-        eprintln!("[LOCK] acquired  cmd=render_zslice  wait={}µs", wait);
+        timing_log!("[LOCK] acquired  cmd=render_zslice  wait={}µs", wait);
         let t_held = Instant::now();
 
         let world = ws.world.as_ref().ok_or("No world loaded")?;
@@ -1398,7 +1424,7 @@ fn render_zslice(z: i32, state: tauri::State<'_, AppState>) -> Result<WorldData,
         let result = (slices, positions, world.name.clone(),
                       world.w_chunks, world.h_chunks, world.min_x, world.min_y, world.sky, max_z);
         drop(ws);
-        eprintln!("[LOCK] released  cmd=render_zslice  held={}µs  cloned={}B  t=+{}µs",
+        timing_log!("[LOCK] released  cmd=render_zslice  held={}µs  cloned={}B  t=+{}µs",
             t_held.elapsed().as_micros(), result.0.len(), us());
         result
     };
@@ -1410,7 +1436,7 @@ fn render_zslice(z: i32, state: tauri::State<'_, AppState>) -> Result<WorldData,
     let mut pixels = vec![0u8; pw * ph * 4];
     for p in pixels.chunks_exact_mut(4) { p.copy_from_slice(&VOID); }
 
-    eprintln!("[SCAN] start  cmd=render_zslice  chunks={}  t=+{}µs", positions.len(), us());
+    timing_log!("[SCAN] start  cmd=render_zslice  chunks={}  t=+{}µs", positions.len(), us());
     let t_scan = Instant::now();
     for ((cx, cy), local) in positions {
         let base_px = ((cx - min_x) * 16) as usize;
@@ -1427,8 +1453,8 @@ fn render_zslice(z: i32, state: tauri::State<'_, AppState>) -> Result<WorldData,
             }
         }
     }
-    eprintln!("[SCAN] end  cmd=render_zslice  elapsed={}µs", t_scan.elapsed().as_micros());
-    eprintln!("[PREVIEW] end  cmd=render_zslice  pixels={}B  total={}µs", pixels.len(), us());
+    timing_log!("[SCAN] end  cmd=render_zslice  elapsed={}µs", t_scan.elapsed().as_micros());
+    timing_log!("[PREVIEW] end  cmd=render_zslice  pixels={}B  total={}µs", pixels.len(), us());
     Ok(WorldData { name, width_chunks: w_chunks, height_chunks: h_chunks, pixels, max_z: max_z as u32 })
 }
 
@@ -1601,7 +1627,7 @@ fn load_eden_template(path: String, state: tauri::State<'_, AppState>) -> Result
     }
 
     let chunk_count = template_dir.len() as u32;
-    let mut ws = state.lock().unwrap();
+    let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
     ws.template_bytes = Some(mmap);
     ws.template_dir = template_dir;
     ws.template_surface_cache.clear();
@@ -1615,7 +1641,7 @@ fn fetch_template_tile(
     x1: i32, y1: i32, x2: i32, y2: i32,
     state: tauri::State<'_, AppState>,
 ) -> Result<PixelPatch, String> {
-    let mut ws = state.lock().unwrap();
+    let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
     if ws.world.is_none() { return Err("No world loaded".into()); }
     if ws.template_bytes.is_none() { return Err("No template loaded".into()); }
 
@@ -1684,7 +1710,7 @@ fn expand_world_from_template(
     app_handle: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<ExpandResult, String> {
-    let ws = state.lock().unwrap();
+    let ws = state.lock().unwrap_or_else(|p| p.into_inner());
     let world = ws.world.as_ref().ok_or("No world loaded")?;
     if ws.template_bytes.is_none() {
         return Err("No template loaded".into());
@@ -1790,7 +1816,7 @@ fn fetch_tile(
     x1: i32, y1: i32, x2: i32, y2: i32,
     state: tauri::State<'_, AppState>,
 ) -> Result<PixelPatch, String> {
-    let ws = state.lock().unwrap();
+    let ws = state.lock().unwrap_or_else(|p| p.into_inner());
     let world = ws.world.as_ref().ok_or("No world loaded")?;
     Ok(render_pixels_patch(world, x1, y1, x2, y2))
 }
@@ -1802,7 +1828,7 @@ fn render_zslice_patch(
     z: i32, x1: u32, y1: u32, x2: u32, y2: u32,
     state: tauri::State<'_, AppState>,
 ) -> Result<PixelPatch, String> {
-    let ws = state.lock().unwrap();
+    let ws = state.lock().unwrap_or_else(|p| p.into_inner());
     let world = ws.world.as_ref().ok_or("No world loaded")?;
     let max_z = world_max_z(world);
     if z < 0 || z > max_z {
@@ -1818,7 +1844,7 @@ fn render_yslice_patch(
     y: i32, x1: i32, z1: i32, x2: i32, z2: i32,
     state: tauri::State<'_, AppState>,
 ) -> Result<PixelPatch, String> {
-    let ws = state.lock().unwrap();
+    let ws = state.lock().unwrap_or_else(|p| p.into_inner());
     let world = ws.world.as_ref().ok_or("No world loaded")?;
     let world_h = (world.h_chunks * 16) as i32;
     if y < 0 || y >= world_h {
@@ -1834,7 +1860,7 @@ fn render_xslice_patch(
     x: i32, y1: i32, z1: i32, y2: i32, z2: i32,
     state: tauri::State<'_, AppState>,
 ) -> Result<PixelPatch, String> {
-    let ws = state.lock().unwrap();
+    let ws = state.lock().unwrap_or_else(|p| p.into_inner());
     let world = ws.world.as_ref().ok_or("No world loaded")?;
     let world_w = (world.w_chunks * 16) as i32;
     if x < 0 || x >= world_w {
@@ -1853,7 +1879,7 @@ fn render_selection_view(
     let t0 = Instant::now();
     let us = || t0.elapsed().as_micros();
 
-    eprintln!("[PREVIEW] start  cmd=render_selection_view  view={view}  sel={}×{}×{}  z={z_min}–{z_max}",
+    timing_log!("[PREVIEW] start  cmd=render_selection_view  view={view}  sel={}×{}×{}  z={z_min}–{z_max}",
         x2-x1+1, y2-y1+1, z_max-z_min+1);
 
     // Only the bands that overlap [z_min, z_max] are needed. Cloning a band-scoped
@@ -1864,12 +1890,12 @@ fn render_selection_view(
     let bands_per_chunk = b_hi - b_lo + 1;
     let local_band_bytes = bands_per_chunk * 8192;
 
-    eprintln!("[LOCK] acquire_start  cmd=render_selection_view  t=+{}µs", us());
+    timing_log!("[LOCK] acquire_start  cmd=render_selection_view  t=+{}µs", us());
     let t_lock = Instant::now();
     let scan_world = {
-        let ws = state.lock().unwrap();
+        let ws = state.lock().unwrap_or_else(|p| p.into_inner());
         let wait = t_lock.elapsed().as_micros();
-        eprintln!("[LOCK] acquired  cmd=render_selection_view  wait={}µs", wait);
+        timing_log!("[LOCK] acquired  cmd=render_selection_view  wait={}µs", wait);
         let t_held = Instant::now();
 
         let world = ws.world.as_ref().ok_or("No world loaded")?;
@@ -1911,20 +1937,20 @@ fn render_selection_view(
             sky: world.sky, name: String::new(),
         };
         drop(ws);  // explicit drop — lock released here, before any scanning
-        eprintln!("[LOCK] released  cmd=render_selection_view  held={}µs  cloned={}B  bands={}/{}  t=+{}µs",
+        timing_log!("[LOCK] released  cmd=render_selection_view  held={}µs  cloned={}B  bands={}/{}  t=+{}µs",
             t_held.elapsed().as_micros(), result.bytes.len(), bands_per_chunk, b_hi - b_lo + 1 + 0, us());
         result
     };
 
-    eprintln!("[SCAN] start  cmd=render_selection_view  t=+{}µs", us());
+    timing_log!("[SCAN] start  cmd=render_selection_view  t=+{}µs", us());
     let t_scan = Instant::now();
     let (width, height, pixels) = match view.as_str() {
         "front" => render_view_front(&scan_world, x1, x2, y1, y2, z_min, z_max, b_lo),
         "side"  => render_view_side(&scan_world, x1, x2, y1, y2, z_min, z_max, b_lo),
         _       => render_view_top(&scan_world, x1, x2, y1, y2, z_min, z_max, b_lo),
     };
-    eprintln!("[SCAN] end  cmd=render_selection_view  elapsed={}ms  result={}×{}", t_scan.elapsed().as_millis(), width, height);
-    eprintln!("[PREVIEW] end  cmd=render_selection_view  pixels={}B  total={}ms", pixels.len(), t0.elapsed().as_millis());
+    timing_log!("[SCAN] end  cmd=render_selection_view  elapsed={}ms  result={}×{}", t_scan.elapsed().as_millis(), width, height);
+    timing_log!("[PREVIEW] end  cmd=render_selection_view  pixels={}B  total={}ms", pixels.len(), t0.elapsed().as_millis());
     Ok(PreviewData { width, height, pixels })
 }
 
@@ -2072,7 +2098,7 @@ fn render_full_height_view(
 
     let ctx = context_blocks.max(0);
     let (scan_world, z_max) = {
-        let ws = state.lock().unwrap();
+        let ws = state.lock().unwrap_or_else(|p| p.into_inner());
         let world = ws.world.as_ref().ok_or("No world loaded")?;
 
         let z_max        = world_max_z(world);
@@ -2284,6 +2310,13 @@ struct EditResult {
 //  3. Compute affected chunk coords, snapshot pre-edit bytes → push undo, clear redo.
 //  4. Apply edit, re-render, put world back.
 //  5. Return EditResult with fresh pixels + stack depths.
+//
+// ⚠️ INVARIANT: between `ws.world.take()` and `ws.world = Some(world)` there must be
+// NO fallible operation (`?` / early `return`) that skips the reinstall — otherwise the
+// loaded world is silently dropped and every later command fails with "No world loaded".
+// Validate BEFORE the take; if you must bail after it, reinstall first (see sculpt_terrain).
+// All 13 take() sites audited clean as of 2026-07. Long-term fix: a with_edit() helper
+// that owns take/snapshot/reinstall in one place.
 
 #[tauri::command]
 fn delete_blocks(
@@ -2291,7 +2324,7 @@ fn delete_blocks(
     z_min: i32, z_max: i32,
     state: tauri::State<'_, AppState>,
 ) -> Result<EditResult, String> {
-    let mut ws = state.lock().unwrap();
+    let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
     let max_z = ws.world.as_ref().map(|w| world_max_z(w)).unwrap_or(63);
     validate_selection(x1, y1, x2, y2, z_min, z_max, max_z)?;
     let mut world = ws.world.take().ok_or("No world loaded")?;
@@ -2330,7 +2363,7 @@ fn replace_blocks(
             return Err(format!("Invalid filter paint {fp}: must be 0–54"));
         }
     }
-    let mut ws = state.lock().unwrap();
+    let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
     let max_z = ws.world.as_ref().map(|w| world_max_z(w)).unwrap_or(63);
     validate_selection(x1, y1, x2, y2, z_min, z_max, max_z)?;
     let mut world = ws.world.take().ok_or("No world loaded")?;
@@ -2370,7 +2403,7 @@ fn paint_blocks(
     if blocks.is_empty() {
         return Err("No blocks to paint".into());
     }
-    let mut ws = state.lock().unwrap();
+    let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
     let mut world = ws.world.take().ok_or("No world loaded")?;
     let max_z = world_max_z(&world) as i32;
 
@@ -5264,7 +5297,7 @@ fn preview_tg2_world(
 /// mmap and persists the next time the world is saved.
 #[tauri::command]
 fn set_spawn_pos(px: i32, py: i32, state: tauri::State<'_, AppState>) -> Result<(f32, f32), String> {
-    let mut ws = state.lock().unwrap();
+    let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
     let world = ws.world.as_mut().ok_or("No world loaded")?;
     write_spawn(world, px as f32, py as f32);
     Ok((px as f32, py as f32))
@@ -5297,14 +5330,14 @@ fn save_world_compressed(world: &LoadedWorld, path: &str) -> Result<(), String> 
 
 #[tauri::command]
 fn save_world(path: String, compressed: bool, state: tauri::State<'_, AppState>) -> Result<(), String> {
-    let ws = state.lock().unwrap();
+    let ws = state.lock().unwrap_or_else(|p| p.into_inner());
     let world = ws.world.as_ref().ok_or("No world loaded")?;
     if compressed { save_world_compressed(world, &path) } else { save_world_inner(world, &path) }
 }
 
 #[tauri::command]
 fn undo_edit(state: tauri::State<'_, AppState>) -> Result<EditResult, String> {
-    let mut ws = state.lock().unwrap();
+    let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
     let entry = ws.undo_stack.pop_back().ok_or("Nothing to undo")?;
     let mut world = ws.world.take().ok_or("No world loaded")?;
 
@@ -5325,7 +5358,7 @@ fn undo_edit(state: tauri::State<'_, AppState>) -> Result<EditResult, String> {
 
 #[tauri::command]
 fn redo_edit(state: tauri::State<'_, AppState>) -> Result<EditResult, String> {
-    let mut ws = state.lock().unwrap();
+    let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
     let entry = ws.redo_stack.pop_back().ok_or("Nothing to redo")?;
     let mut world = ws.world.take().ok_or("No world loaded")?;
 
@@ -5354,7 +5387,7 @@ fn copy_selection(
     z_min: i32, z_max: i32,
     state: tauri::State<'_, AppState>,
 ) -> Result<ClipboardInfo, String> {
-    let mut ws = state.lock().unwrap();
+    let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
     let max_z = ws.world.as_ref().map(|w| world_max_z(w)).unwrap_or(63);
     validate_selection(x1, y1, x2, y2, z_min, z_max, max_z)?;
     let world = ws.world.as_ref().ok_or("No world loaded")?;
@@ -5499,7 +5532,7 @@ fn rename_world(state: tauri::State<'_, AppState>, name: String) -> Result<(), S
             return Err(format!("Invalid character '{}' — only A–Z, a–z, 0–9 and ' are allowed", ch));
         }
     }
-    let mut ws = state.lock().unwrap();
+    let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
     let world = ws.world.as_mut().ok_or("No world loaded")?;
     if world.bytes.len() < 76 {
         return Err("World file too small to contain name field".into());
@@ -5514,7 +5547,7 @@ fn rename_world(state: tauri::State<'_, AppState>, name: String) -> Result<(), S
 
 #[tauri::command]
 fn get_surface_z(state: tauri::State<'_, AppState>, x: i32, y: i32) -> Result<Option<i32>, String> {
-    let ws = state.lock().unwrap();
+    let ws = state.lock().unwrap_or_else(|p| p.into_inner());
     let world = ws.world.as_ref().ok_or("no world")?;
     Ok(surface_z(world, x, y))
 }
@@ -5526,7 +5559,7 @@ struct PickedBlock { block_type: u8, paint: u8 }
 /// Returns None if no world loaded or column is empty.
 #[tauri::command]
 fn get_cursor_block(state: tauri::State<'_, AppState>, wx: i32, wy: i32) -> Option<[i32; 3]> {
-    let ws = state.lock().unwrap();
+    let ws = state.lock().unwrap_or_else(|p| p.into_inner());
     let world = ws.world.as_ref()?;
     let z = surface_z(world, wx, wy)?;
     let (bt, paint) = get_block_at(world, wx, wy, z);
@@ -5537,7 +5570,7 @@ fn get_cursor_block(state: tauri::State<'_, AppState>, wx: i32, wy: i32) -> Opti
 /// Returns air (0,0) if the column is empty or out of bounds.
 #[tauri::command]
 fn pick_block_surface(state: tauri::State<'_, AppState>, wx: i32, wy: i32) -> Result<PickedBlock, String> {
-    let ws = state.lock().unwrap();
+    let ws = state.lock().unwrap_or_else(|p| p.into_inner());
     let world = ws.world.as_ref().ok_or("no world")?;
     let z = surface_z(world, wx, wy).unwrap_or(0);
     let (bt, paint) = get_block_at(world, wx, wy, z);
@@ -5551,7 +5584,7 @@ fn pick_block_surface(state: tauri::State<'_, AppState>, wx: i32, wy: i32) -> Re
 /// Does not touch world data; no undo entry required.
 #[tauri::command]
 fn rotate_clipboard(state: tauri::State<'_, AppState>) -> Result<ClipboardInfo, String> {
-    let mut ws = state.lock().unwrap();
+    let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
     let cb = ws.clipboard.as_mut().ok_or("Clipboard is empty")?;
     let old_w = cb.width as usize;
     let old_h = cb.height as usize;
@@ -5584,7 +5617,7 @@ fn rotate_clipboard(state: tauri::State<'_, AppState>) -> Result<ClipboardInfo, 
 /// Ramp IDs are remapped so E-facing ramps become W-facing and vice versa.
 #[tauri::command]
 fn mirror_clipboard_x(state: tauri::State<'_, AppState>) -> Result<ClipboardInfo, String> {
-    let mut ws = state.lock().unwrap();
+    let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
     let cb = ws.clipboard.as_mut().ok_or("Clipboard is empty")?;
     let w = cb.width as usize;
     let h = cb.height as usize;
@@ -5612,7 +5645,7 @@ fn mirror_clipboard_x(state: tauri::State<'_, AppState>) -> Result<ClipboardInfo
 /// Ramp IDs are remapped so S-facing ramps become N-facing and vice versa.
 #[tauri::command]
 fn mirror_clipboard_y(state: tauri::State<'_, AppState>) -> Result<ClipboardInfo, String> {
-    let mut ws = state.lock().unwrap();
+    let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
     let cb = ws.clipboard.as_mut().ok_or("Clipboard is empty")?;
     let w = cb.width as usize;
     let h = cb.height as usize;
@@ -5649,7 +5682,7 @@ fn paste_at(
     ignore_air: bool,
     state: tauri::State<'_, AppState>,
 ) -> Result<EditResult, String> {
-    let mut ws = state.lock().unwrap();
+    let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
 
     // Clone clipboard data before taking world to avoid borrow conflict.
     let (width, height, depth, z_anchor, block_types, paints) = {
@@ -5727,7 +5760,7 @@ fn paste_terrain(
     above_surface: bool,
     state: tauri::State<'_, AppState>,
 ) -> Result<EditResult, String> {
-    let mut ws = state.lock().unwrap();
+    let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
 
     let (width, height, depth, block_types, paints) = {
         let cb = ws.clipboard.as_ref().ok_or("Clipboard is empty")?;
@@ -5815,7 +5848,7 @@ fn extrude_selection(
     ignore_air: bool,
     state: tauri::State<'_, AppState>,
 ) -> Result<EditResult, String> {
-    let mut ws = state.lock().unwrap();
+    let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
     if count <= 0 { return Err("count must be at least 1".into()); }
 
     // Pre-buffer source blocks under borrow, then release before taking world.
@@ -6161,7 +6194,7 @@ fn generate_trees(
             .subsec_nanos() as u64
     });
 
-    let mut ws = state.lock().unwrap();
+    let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
     let max_z = ws.world.as_ref().map(|w| world_max_z(w)).unwrap_or(63);
     // Only validate XY; z is ignored (trees find the surface themselves).
     if x2 < x1 || y2 < y1 {
@@ -6256,7 +6289,7 @@ fn render_axo_region(
     dir: u8, // 0=SE 1=SW 2=NE 3=NW
     state: tauri::State<'_, AppState>,
 ) -> Result<PixelPatch, String> {
-    let ws = state.lock().unwrap();
+    let ws = state.lock().unwrap_or_else(|p| p.into_inner());
     let world = ws.world.as_ref().ok_or("No world loaded")?;
     let world_w = (world.w_chunks * 16) as i32;
     let world_h = (world.h_chunks * 16) as i32;
@@ -6331,7 +6364,7 @@ fn render_axo_region(
 /// Same projection math as render_axo_region but iterates in-memory clipboard voxels.
 #[tauri::command]
 fn render_axo_clipboard(ski: f32, dir: u8, state: tauri::State<'_, AppState>) -> Result<PreviewData, String> {
-    let ws  = state.lock().unwrap();
+    let ws  = state.lock().unwrap_or_else(|p| p.into_inner());
     let sky = ws.world.as_ref().map(|w| w.sky).unwrap_or(0);
     let cb  = ws.clipboard.as_ref().ok_or("Clipboard is empty")?;
     let (cw, ch, cd) = (cb.width, cb.height, cb.depth);
@@ -6393,7 +6426,7 @@ fn render_axo_clipboard(ski: f32, dir: u8, state: tauri::State<'_, AppState>) ->
 /// Reads only from clipboard + sky — no world mutation.
 #[tauri::command]
 fn render_clipboard_preview(state: tauri::State<'_, AppState>) -> Result<PreviewData, String> {
-    let ws  = state.lock().unwrap();
+    let ws  = state.lock().unwrap_or_else(|p| p.into_inner());
     let sky = ws.world.as_ref().map(|w| w.sky).unwrap_or(0);
     let cb  = ws.clipboard.as_ref().ok_or("Clipboard is empty")?;
     let (w, h, d) = (cb.width, cb.height, cb.depth);
@@ -6427,7 +6460,7 @@ fn render_clipboard_elevation_preview(
     view: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<PreviewData, String> {
-    let ws  = state.lock().unwrap();
+    let ws  = state.lock().unwrap_or_else(|p| p.into_inner());
     let sky = ws.world.as_ref().map(|w| w.sky).unwrap_or(0);
     let cb  = ws.clipboard.as_ref().ok_or("Clipboard is empty")?;
     let (w, h, d) = (cb.width as usize, cb.height as usize, cb.depth as usize);
@@ -6514,7 +6547,7 @@ fn deserialize_prefab(data: &[u8]) -> Result<Clipboard, String> {
 
 #[tauri::command]
 fn save_prefab(path: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
-    let ws = state.lock().unwrap();
+    let ws = state.lock().unwrap_or_else(|p| p.into_inner());
     let cb = ws.clipboard.as_ref().ok_or("Clipboard is empty")?;
     let bytes = serialize_prefab(cb);
     fs::write(&path, bytes).map_err(|e| format!("Failed to write prefab: {e}"))
@@ -6528,7 +6561,7 @@ fn load_prefab(path: String, state: tauri::State<'_, AppState>) -> Result<Clipbo
         width: cb.width, height: cb.height,
         depth: cb.depth, z_anchor: cb.z_anchor,
     };
-    let mut ws = state.lock().unwrap();
+    let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
     ws.clipboard = Some(cb);
     Ok(info)
 }
@@ -6777,7 +6810,7 @@ fn export_obj(
     x1: i32, y1: i32, x2: i32, y2: i32,
     z_min: i32, z_max: i32,
 ) -> Result<(), String> {
-    let ws = state.lock().unwrap();
+    let ws = state.lock().unwrap_or_else(|p| p.into_inner());
     let world = ws.world.as_ref().ok_or("No world loaded")?;
 
     let sx1 = x1.min(x2); let sx2 = x1.max(x2);
@@ -6929,7 +6962,7 @@ fn export_json(
     use flate2::Compression;
     use std::io::Write;
 
-    let ws = state.lock().unwrap();
+    let ws = state.lock().unwrap_or_else(|p| p.into_inner());
     let world = ws.world.as_ref().ok_or("No world loaded")?;
 
     let sx1 = x1.min(x2); let sx2 = x1.max(x2);
@@ -6994,7 +7027,7 @@ fn export_vox(
     x1: i32, y1: i32, x2: i32, y2: i32,
     z_min: i32, z_max: i32,
 ) -> Result<u32, String> {
-    let ws = state.lock().unwrap();
+    let ws = state.lock().unwrap_or_else(|p| p.into_inner());
     let world = ws.world.as_ref().ok_or("No world loaded")?;
 
     let sx1 = x1.min(x2); let sx2 = x1.max(x2);
@@ -7157,7 +7190,7 @@ fn get_obj_geometry(
     x1: i32, y1: i32, x2: i32, y2: i32,
     z_min: i32, z_max: i32,
 ) -> Result<ObjGeometryResult, String> {
-    let ws = state.lock().unwrap();
+    let ws = state.lock().unwrap_or_else(|p| p.into_inner());
     let world = ws.world.as_ref().ok_or("No world loaded")?;
 
     let sx1 = x1.min(x2); let sx2 = x1.max(x2);
@@ -7376,7 +7409,7 @@ fn get_chunk_geometry(
     state: tauri::State<'_, AppState>,
     cx: i32, cy: i32,
 ) -> Result<ObjGeometryResult, String> {
-    let ws = state.lock().unwrap();
+    let ws = state.lock().unwrap_or_else(|p| p.into_inner());
     let world = ws.world.as_ref().ok_or("No world loaded")?;
     // Defensive: only serve chunks inside the world's chunk grid. Out-of-range indices already scan
     // to all-air (empty geometry), but bailing early avoids the wasted 16×16×Z probe and documents
@@ -7411,14 +7444,14 @@ fn load_texture_pack(path: String, state: tauri::State<'_, AppState>) -> Result<
         atlas: pack.atlas_rgba.clone(),
         name_to_row: pack.name_to_row.clone(),
     };
-    state.lock().unwrap().texture_pack = Some(pack);
+    state.lock().unwrap_or_else(|p| p.into_inner()).texture_pack = Some(pack);
     Ok(info)
 }
 
 /// Unload the current texture pack, reverting to flat vertex-color rendering.
 #[tauri::command]
 fn unload_texture_pack(state: tauri::State<'_, AppState>) {
-    state.lock().unwrap().texture_pack = None;
+    state.lock().unwrap_or_else(|p| p.into_inner()).texture_pack = None;
 }
 
 // ── App entry point ────────────────────────────────────────────────────────────
@@ -7705,7 +7738,7 @@ fn sculpt_terrain(
     if points.is_empty() { return Err("No points".into()); }
     let strength = strength.clamp(1, 5);
 
-    let mut ws = state.lock().unwrap();
+    let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
 
     // Pre-read all heights and surface blocks while we have a shared ref.
     let height_map: HashMap<(i32, i32), (i32, u8, u8)> = {
@@ -7814,7 +7847,7 @@ fn fill_surface(
     if new_paint > 54 { return Err("Invalid paint".into()); }
     let max_fill = max_fill.clamp(1, 50_000);
 
-    let mut ws = state.lock().unwrap();
+    let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
 
     // Phase 1: BFS to collect all cells to fill (read-only pass).
     let (fill_cells, x_min, y_min, x_max, y_max) = {
@@ -7888,7 +7921,7 @@ fn magic_wand_select(
     match_paint: bool,
     state: tauri::State<'_, AppState>,
 ) -> Result<Option<SelectRect>, String> {
-    let ws = state.lock().unwrap();
+    let ws = state.lock().unwrap_or_else(|p| p.into_inner());
     let world = ws.world.as_ref().ok_or("No world loaded")?;
     let seed_z     = match surface_z(world, wx, wy) { Some(z) => z, None => return Ok(None) };
     let seed_bt    = read_block_abs(world, wx, wy, seed_z);
@@ -7974,7 +8007,7 @@ fn scatter_paste(
     state: tauri::State<'_, AppState>,
 ) -> Result<EditResult, String> {
     let count = count.clamp(1, 100);
-    let mut ws = state.lock().unwrap();
+    let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
 
     let (width, height, depth, z_anchor, block_types, paints) = {
         let cb = ws.clipboard.as_ref().ok_or("Clipboard is empty")?;
@@ -8021,7 +8054,7 @@ fn array_paste(
 ) -> Result<EditResult, String> {
     let cols = cols.clamp(1, 20);
     let rows = rows.clamp(1, 20);
-    let mut ws = state.lock().unwrap();
+    let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
 
     let (width, height, depth, z_anchor, block_types, paints) = {
         let cb = ws.clipboard.as_ref().ok_or("Clipboard is empty")?;
@@ -8071,7 +8104,7 @@ fn find_nearest_block(
     block_type: u8,
     state: tauri::State<'_, AppState>,
 ) -> Result<Option<WorldPos>, String> {
-    let ws = state.lock().unwrap();
+    let ws = state.lock().unwrap_or_else(|p| p.into_inner());
     let world = ws.world.as_ref().ok_or("No world loaded")?;
     let ww = (world.w_chunks * 16) as i32;
     let wh = (world.h_chunks * 16) as i32;
@@ -8169,6 +8202,7 @@ pub fn run() {
             expand_world_from_template,
             load_texture_pack,
             unload_texture_pack,
+            get_block_tables,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -8180,7 +8214,7 @@ pub fn run() {
 /// Returns 16 paint indices (0 = default blue, 1–54 = paint palette).
 #[tauri::command]
 fn get_sky_grid(state: tauri::State<'_, AppState>) -> Result<Vec<u8>, String> {
-    let ws = state.lock().unwrap();
+    let ws = state.lock().unwrap_or_else(|p| p.into_inner());
     let world = ws.world.as_ref().ok_or("No world loaded")?;
     if world.bytes.len() < 148 {
         return Ok(vec![0u8; 16]);
@@ -8192,7 +8226,7 @@ fn get_sky_grid(state: tauri::State<'_, AppState>) -> Result<Vec<u8>, String> {
 #[tauri::command]
 fn set_sky_grid(grid: Vec<u8>, state: tauri::State<'_, AppState>) -> Result<(), String> {
     if grid.len() != 16 { return Err("Expected exactly 16 sky values".into()); }
-    let mut ws = state.lock().unwrap();
+    let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
     let world = ws.world.as_mut().ok_or("No world loaded")?;
     if world.bytes.len() < 148 { return Err("World header too short".into()); }
     world.bytes[132..148].copy_from_slice(&grid);
@@ -8230,7 +8264,7 @@ fn get_creatures(state: tauri::State<'_, AppState>) -> Result<Vec<CreatureInfo>,
     const ENTITY_BYTES: usize = 60; // sizeof(EntityData)
     const BLOCK_SIZE: usize = MAX_SAVED * ENTITY_BYTES; // 12 000
 
-    let ws = state.lock().unwrap();
+    let ws = state.lock().unwrap_or_else(|p| p.into_inner());
     let world = ws.world.as_ref().ok_or("No world loaded")?;
     let bytes = &world.bytes[..];
 
@@ -9158,7 +9192,7 @@ fn import_schematic_apply(
     };
 
     let info = ClipboardInfo { width: cb.width, height: cb.height, depth: cb.depth, z_anchor: cb.z_anchor };
-    state.lock().unwrap().clipboard = Some(cb);
+    state.lock().unwrap_or_else(|p| p.into_inner()).clipboard = Some(cb);
     Ok(info)
 }
 
@@ -9376,7 +9410,7 @@ mod tests {
         let cfg = NaturalConfig {
             seed: 12345, base_height: 28, roughness: 0.8, erosion: 0.0, terrain_scale: 120.0, extreme: false,
             water_z: 24, rivers: true, biome: 0, biome_mode: 0, biome_scale: 200.0, snow_caps: true,
-            tree_density_denom: 40, cave_density: 2, cave_style: 0, caverns: true,
+            tree_density_denom: 40, cave_density: 2, cave_style: 0, caverns: true, flood_caves: false,
             ore_density: 2, vegetation: 2, structures: 2, clouds: true,
         };
         let mut chunks: Vec<Vec<u8>> = (0..wc * hc).map(|_| vec![0u8; chunk_size]).collect();
@@ -9409,7 +9443,7 @@ mod tests {
         let cfg = NaturalConfig {
             seed: 7, base_height: 20, roughness: 0.0, erosion: 0.0, terrain_scale: 120.0, extreme: false,
             water_z: -1, rivers: false, biome: 1, biome_mode: 0, biome_scale: 200.0, snow_caps: false,
-            tree_density_denom: 0, cave_density: 0, cave_style: 0, caverns: false,
+            tree_density_denom: 0, cave_density: 0, cave_style: 0, caverns: false, flood_caves: false,
             ore_density: 0, vegetation: 0, structures: 0, clouds: false,
         };
         let mut chunks: Vec<Vec<u8>> = (0..wc * hc).map(|_| vec![0u8; 32_768]).collect();
@@ -9429,7 +9463,7 @@ mod tests {
         let base = NaturalConfig {
             seed: 4242, base_height: 30, roughness: 0.6, erosion: 0.0, terrain_scale: 120.0, extreme: false,
             water_z: -1, rivers: false, biome: BIOME_CLASSIC, biome_mode: 0, biome_scale: 200.0, snow_caps: false,
-            tree_density_denom: 0, cave_density: 0, cave_style: 1, caverns: false,
+            tree_density_denom: 0, cave_density: 0, cave_style: 1, caverns: false, flood_caves: false,
             ore_density: 0, vegetation: 0, structures: 0, clouds: false,
         };
 
@@ -9482,7 +9516,7 @@ mod tests {
         let cfg = NaturalConfig {
             seed: 808, base_height: 28, roughness: 0.5, erosion: 0.0, terrain_scale: 120.0, extreme: false,
             water_z: -1, rivers: false, biome: 2, biome_mode: 0, biome_scale: 200.0, snow_caps: false,
-            tree_density_denom: 6, cave_density: 0, cave_style: 0, caverns: false,
+            tree_density_denom: 6, cave_density: 0, cave_style: 0, caverns: false, flood_caves: false,
             ore_density: 0, vegetation: 2, structures: 0, clouds: false,
         };
         let mut chunks: Vec<Vec<u8>> = (0..wc * hc).map(|_| vec![0u8; 32_768]).collect();
@@ -9514,7 +9548,7 @@ mod tests {
         let cfg = NaturalConfig {
             seed: 2026, base_height: 30, roughness: 0.6, erosion: 0.0, terrain_scale: 120.0, extreme: false,
             water_z: -1, rivers: false, biome: 0, biome_mode: 1, biome_scale: 30.0, snow_caps: false,
-            tree_density_denom: 0, cave_density: 0, cave_style: 0, caverns: false,
+            tree_density_denom: 0, cave_density: 0, cave_style: 0, caverns: false, flood_caves: false,
             ore_density: 0, vegetation: 0, structures: 0, clouds: false,
         };
         // biome_at returns several distinct biomes over a wide area (altitude held
@@ -9551,7 +9585,7 @@ mod tests {
         let base = NaturalConfig {
             seed: 31337, base_height: 30, roughness: 1.0, erosion: 0.0, terrain_scale: 90.0, extreme: false,
             water_z: -1, rivers: false, biome: 0, biome_mode: 0, biome_scale: 200.0, snow_caps: false,
-            tree_density_denom: 0, cave_density: 0, cave_style: 0, caverns: false,
+            tree_density_denom: 0, cave_density: 0, cave_style: 0, caverns: false, flood_caves: false,
             ore_density: 0, vegetation: 0, structures: 0, clouds: false,
         };
         // Standard deviation of terrain_height sampled over a wide region.
@@ -9580,7 +9614,7 @@ mod tests {
         let cfg = NaturalConfig {
             seed: 5150, base_height: 30, roughness: 0.0, erosion: 0.0, terrain_scale: 120.0, extreme: false,
             water_z: -1, rivers: false, biome: 0, biome_mode: 1, biome_scale: 24.0, snow_caps: false,
-            tree_density_denom: 0, cave_density: 0, cave_style: 0, caverns: false,
+            tree_density_denom: 0, cave_density: 0, cave_style: 0, caverns: false, flood_caves: false,
             ore_density: 0, vegetation: 0, structures: 0, clouds: false,
         };
         // Surface held at base_height so altitude lapse is zero and this isolates
@@ -9614,7 +9648,7 @@ mod tests {
             7, 30, 2, 1, 1, false,
             "lakes".into(), true,
             "grassland".into(), 1, 1, true,
-            2, 1, 0, true, 1, 1, 1, true,
+            2, 1, 0, true, false, 1, 1, 1, true,
             64,
         ).expect("preview failed");
         assert!(img.width <= 64 && img.height <= 64, "preview must respect max_px");
@@ -9640,7 +9674,7 @@ mod tests {
         let jagged = NaturalConfig {
             seed: 555, base_height: 30, roughness: 1.05, erosion: 0.0, terrain_scale: 60.0, extreme: false,
             water_z: -1, rivers: false, biome: 0, biome_mode: 0, biome_scale: 200.0, snow_caps: false,
-            tree_density_denom: 0, cave_density: 0, cave_style: 0, caverns: false,
+            tree_density_denom: 0, cave_density: 0, cave_style: 0, caverns: false, flood_caves: false,
             ore_density: 0, vegetation: 0, structures: 0, clouds: false,
         };
         let (wc, hc) = (4usize, 4usize);
@@ -9672,7 +9706,7 @@ mod tests {
         let cfg = NaturalConfig {
             seed: 123, base_height: 30, roughness: 0.5, erosion: 0.0, terrain_scale: 110.0, extreme: false,
             water_z: -1, rivers: false, biome: 0, biome_mode: 0, biome_scale: 200.0, snow_caps: false,
-            tree_density_denom: 0, cave_density: 0, cave_style: 0, caverns: false,
+            tree_density_denom: 0, cave_density: 0, cave_style: 0, caverns: false, flood_caves: false,
             ore_density: 0, vegetation: 2, structures: 0, clouds: false,
         };
         let mut chunks: Vec<Vec<u8>> = (0..wc * hc).map(|_| vec![0u8; 32_768]).collect();
@@ -9707,7 +9741,7 @@ mod tests {
         let cfg = NaturalConfig {
             seed: 99, base_height: 30, roughness: 0.9, erosion: 0.0, terrain_scale: 90.0, extreme: false,
             water_z: 26, rivers: true, biome: 0, biome_mode: 0, biome_scale: 200.0, snow_caps: false,
-            tree_density_denom: 8, cave_density: 0, cave_style: 0, caverns: false,
+            tree_density_denom: 8, cave_density: 0, cave_style: 0, caverns: false, flood_caves: false,
             ore_density: 0, vegetation: 2, structures: 0, clouds: false,
         };
         let mut chunks: Vec<Vec<u8>> = (0..wc * hc).map(|_| vec![0u8; 32_768]).collect();
@@ -9776,11 +9810,12 @@ mod tests {
     }
 
     /// The header `version` field selects the column format the game expects:
-    /// 64z legacy worlds = 4, New Dawn 256z worlds = 2. Writing 4 for a 256z world
-    /// makes the game misread it as 64z (the "legacy-conversion" corruption look).
+    /// 64z legacy worlds = ≤4, New Dawn 256z worlds = ≥5 (5/6 observed in the wild).
+    /// Writing 4 for a 256z world makes the game misread it as 64z (the
+    /// "legacy-conversion" corruption look).
     #[test]
     fn world_file_version_matches_format() {
-        for (extended, want_version, want_stride) in [(false, 4u32, 32_768u64), (true, 2u32, 131_072u64)] {
+        for (extended, want_version, want_stride) in [(false, 4u32, 32_768u64), (true, 5u32, 131_072u64)] {
             let p = std::env::temp_dir().join(format!("eden_ver_{extended}.eden"));
             let ps = p.to_str().unwrap().to_string();
             let _ = fs::remove_file(&p);
