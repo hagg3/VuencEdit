@@ -11,6 +11,8 @@ export interface AppSettings {
   defaultSaveCompressed: boolean;
   templatePath: string | null;
   texturePackPath: string | null;
+  /** Directory the Prefab Library panel scans for .epfab files. null = app-managed default (see get_default_prefab_dir). */
+  prefabDirectory: string | null;
 }
 
 const DEFAULTS: AppSettings = {
@@ -19,6 +21,7 @@ const DEFAULTS: AppSettings = {
   defaultSaveCompressed: false,
   templatePath: null,
   texturePackPath: null,
+  prefabDirectory: null,
 };
 
 export function loadSettings(): AppSettings {
@@ -114,6 +117,11 @@ export default function SettingsModal({ onClose, onSave }: Props) {
   async function browseTexturePack() {
     const selected = await open({ filters: [{ name: "Texture Pack", extensions: ["zip"] }] });
     if (selected && !Array.isArray(selected)) set("texturePackPath", selected);
+  }
+
+  async function browsePrefabDir() {
+    const selected = await open({ directory: true });
+    if (selected && !Array.isArray(selected)) set("prefabDirectory", selected);
   }
 
   function handleSave() {
@@ -237,6 +245,42 @@ export default function SettingsModal({ onClose, onSave }: Props) {
               {local.texturePackPath && (
                 <button
                   onClick={() => set("texturePackPath", null)}
+                  style={{
+                    background: "none", border: "none", color: "#475569",
+                    fontSize: 16, cursor: "pointer", padding: "0 4px", lineHeight: 1, flexShrink: 0,
+                  }}
+                  title="Clear"
+                >✕</button>
+              )}
+            </div>
+          </div>
+        </div>
+
+        <div style={{ ...row, borderBottom: "none", alignItems: "flex-start", paddingTop: 12 }}>
+          <div style={{ ...labelCol, flex: 1, marginRight: 12 }}>
+            <span style={labelText}>Prefab library folder</span>
+            <span style={labelSub}>Scanned by the Prefab Library panel. Leave unset to use the app's own folder.</span>
+            <div style={{ marginTop: 8, display: "flex", gap: 8, alignItems: "center" }}>
+              <div style={{
+                ...recessedWell,
+                flex: 1, fontSize: 12, color: local.prefabDirectory ? "#94a3b8" : "#475569",
+                borderRadius: 6,
+                padding: "5px 10px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+                direction: "rtl", textAlign: "left",
+              }}>
+                {local.prefabDirectory ?? "App default"}
+              </div>
+              <button
+                onClick={browsePrefabDir}
+                style={chromeButton({ padding: "5px 12px", fontSize: 12, flexShrink: 0 })}
+                onMouseEnter={e => (e.currentTarget.style.boxShadow = `inset 0 0 0 1px rgba(${EDEN_TEAL},.6), 0 .5px .5px rgba(255,255,255,.2)`)}
+                onMouseLeave={e => (e.currentTarget.style.boxShadow = "inset 0 0 0 1px rgba(0,0,0,.5), 0 .5px .5px rgba(255,255,255,.15)")}
+              >
+                Browse…
+              </button>
+              {local.prefabDirectory && (
+                <button
+                  onClick={() => set("prefabDirectory", null)}
                   style={{
                     background: "none", border: "none", color: "#475569",
                     fontSize: 16, cursor: "pointer", padding: "0 4px", lineHeight: 1, flexShrink: 0,

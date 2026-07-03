@@ -65,7 +65,8 @@ Pre-built installers for macOS (Apple Silicon + Intel universal), Windows, and L
 - **Copy / paste** any volume; paste with optional *No Air*, *Terrain-align*, *Rotate 90°*, *Flip X/Y*, and *Repeat* modes
 - **Two-click paste lock-in** — first click locks XY position (amber ghost + elevation preview), second click places; Escape unlocks without placing
 - **Advanced paste** — *scatter* (N randomly placed copies) and *array* (a rows × columns grid with configurable spacing)
-- **Save prefab** — save any selection as a `.epfab` file and reload it later; prefabs are gzip-compatible
+- **Save prefab** — name a selection and save it straight into your prefab library (`.epfab`, gzip-compatible), or use *Save As…* to write it to any folder
+- **Prefab library** — a dockable gallery of your saved prefabs with thumbnails; search by name, sort by name/newest/size, switch between list and grid views, click one to arm it for pasting, rename or delete them inline, or open the library folder in your file browser
 - **Extrude** — repeat a selection N times along any of 6 axes in one undo step
 
 ### Texture packs *(experimental)*

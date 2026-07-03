@@ -6,6 +6,7 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "lint": "eslint src",
+    "test": "vitest run",
     "preview": "vite preview",
     "tauri": "tauri"
   },
@@ -30,6 +31,7 @@
     "tailwindcss": "^4.3.1",
     "typescript": "~5.8.3",
     "typescript-eslint": "^8.62.1",
-    "vite": "^7.0.4"
+    "vite": "^7.0.4",
+    "vitest": "^4.1.9"
   }
 }

@@ -3,7 +3,7 @@ import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
-import type { SelectionInfo } from "./App";
+import type { SelectionInfo } from "./types";
 import type { AtlasData } from "./texturePack";
 
 interface ObjGeometryResult {

@@ -1,22 +1,10 @@
 import { decodeU8 } from "./codec";
 import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import type { SelectionInfo, ClipboardInfo } from "./App";
+import type { SelectionInfo, ClipboardInfo, PreviewDataRaw, PreviewData } from "./types";
 import { EDEN_TEAL_READABLE } from "./designTokens";
 
 type PreviewView = "front" | "side" | "top" | "axo";
-
-interface PreviewDataRaw {
-  width: number;
-  height: number;
-  pixels: string; // base64
-}
-
-interface PreviewData {
-  width: number;
-  height: number;
-  pixels: Uint8Array;
-}
 
 interface Props {
   selection: SelectionInfo;

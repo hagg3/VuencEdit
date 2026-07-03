@@ -1,4 +1,10 @@
 import { decodeU8 } from "./codec";
+import {
+  type WorldMeta,
+  type PixelPatchRaw, type EditResultRaw, type PreviewDataRaw,
+  type SelectionInfo, type ClipboardInfo, type ExtrudeAxis, type AutosaveInfo,
+} from "./types";
+import { useRecentWorlds, timeAgo } from "./useRecentWorlds";
 import { useState, useCallback, useEffect, useRef, useMemo } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -20,7 +26,10 @@ import SchematicImportModal, { type SchematicInfo, type MappingEntry } from "./S
 import Ribbon, { RIBBON_HEIGHT_COLLAPSED, TAB_BAR_HEIGHT, DEFAULT_BODY_HEIGHT, EDEN_TEAL, EDEN_TEAL_READABLE } from "./Ribbon";
 import SettingsModal, { loadSettings, saveSettings } from "./SettingsModal";
 import WorldInfoModal from "./WorldInfoModal";
+import RecoveryModal from "./RecoveryModal";
+import PrefabLibraryPanel, { resolvePrefabDir } from "./PrefabLibraryPanel";
 import Modal from "./Modal";
+import { glassPanel, chromeButton } from "./designTokens";
 import { decodeAtlas, type AtlasData, type TexturePackRaw, clearSwatchCache } from "./texturePack";
 import { blockDisplayName, applyBlockTables, type BlockTables } from "./blockDefs";
 import appIcon from "./assets/app-icon.png";
@@ -36,60 +45,6 @@ function SplashLink({ href, children }: { href: string; children: React.ReactNod
       {children}
     </a>
   );
-}
-
-// World metadata — pixels are never stored in JS; tiles are fetched on demand.
-interface WorldData {
-  name: string;
-  width_chunks: number;
-  height_chunks: number;
-  max_z: number;
-  was_compressed: boolean;
-  spawn_px: number | null;
-  spawn_py: number | null;
-  center_px: number | null;
-  center_py: number | null;
-  abs_min_x: number;
-  abs_min_y: number;
-}
-
-// Raw IPC shapes (pixels still base64) — used only at invoke() callsites before decoding.
-interface PixelPatchRaw { x: number; y: number; width: number; height: number; pixels: string; }
-interface EditResultRaw { patch: PixelPatchRaw; undo_depth: number; redo_depth: number; }
-interface PreviewDataRaw { width: number; height: number; pixels: string; }
-
-export interface SelectionInfo {
-  x1: number; y1: number; x2: number; y2: number;
-  z_min: number; z_max: number;
-  width: number; height: number; depth: number;
-}
-
-export interface ClipboardInfo {
-  width: number;
-  height: number;
-  depth: number;
-  z_anchor: number;
-}
-
-export type ExtrudeAxis = "z+" | "z-" | "x+" | "x-" | "y+" | "y-";
-export type TreeType = "normal" | "terrain" | "pine" | "tall_pine";
-
-const RECENT_WORLDS_KEY = "eden_recent_worlds";
-const MAX_RECENT = 8;
-
-interface RecentWorld { path: string; name: string; timestamp: number; }
-
-function timeAgo(ts: number): string {
-  const s = Math.floor((Date.now() - ts) / 1000);
-  if (s < 60) return "just now";
-  const m = Math.floor(s / 60);
-  if (m < 60) return `${m}m ago`;
-  const h = Math.floor(m / 60);
-  if (h < 24) return `${h}h ago`;
-  const d = Math.floor(h / 24);
-  if (d < 7) return `${d}d ago`;
-  if (d < 31) return `${Math.floor(d / 7)}w ago`;
-  return new Date(ts).toLocaleDateString(undefined, { month: "short", day: "numeric" });
 }
 
 // ── component ────────────────────────────────────────────────────────────────
@@ -113,9 +68,9 @@ function FpsCounter() {
 }
 
 function App() {
-  const [world, setWorld] = useState<WorldData | null>(null);
+  const [world, setWorld] = useState<WorldMeta | null>(null);
   // Live mirror of `world` for []-memoized callbacks (undo/redo → applyEditResult).
-  const worldRef = useRef<WorldData | null>(null);
+  const worldRef = useRef<WorldMeta | null>(null);
   useEffect(() => { worldRef.current = world; }, [world]);
   // Monotonically increments only on full world load; triggers view+selection reset in MapCanvas.
   const [worldEpoch, setWorldEpoch] = useState(0);
@@ -130,10 +85,7 @@ function App() {
   const [voxProgress, setVoxProgress] = useState<{ phase: string; pct: number } | null>(null);
   const [saving, setSaving] = useState(false);
   const [saveCompressed, setSaveCompressed] = useState(() => loadSettings().defaultSaveCompressed);
-  const [recentWorlds, setRecentWorlds] = useState<RecentWorld[]>(() => {
-    try { return JSON.parse(localStorage.getItem(RECENT_WORLDS_KEY) ?? "[]"); }
-    catch { return []; }
-  });
+  const { recentWorlds, addRecentWorld } = useRecentWorlds();
   const [ribbonCollapsed, setRibbonCollapsed] = useState(() => {
     try { return localStorage.getItem("ribbon_collapsed") === "true"; } catch { return false; }
   });
@@ -152,13 +104,40 @@ function App() {
   const [tool, setTool] = useState<Tool>("pan");
   const prevToolRef = useRef<Tool>("pan");
   const [wandMatchPaint, setWandMatchPaint] = useState(true);
+  // E2: off by default — dragging/nudging the selection moves only the box, not its blocks.
+  const [moveWithContents, setMoveWithContents] = useState(false);
+  const moveWithContentsRef = useRef(false);
+  useEffect(() => { moveWithContentsRef.current = moveWithContents; }, [moveWithContents]);
   const [sourcePath, setSourcePath] = useState<string | null>(null);
+  const [recoveryInfo, setRecoveryInfo] = useState<AutosaveInfo | null>(null);
+  const [recovering, setRecovering] = useState(false);
+  const lastAutosavedEpochRef = useRef(-1);
+
+  // Toast: brief status-summary popup after named edit/undo/redo operations (E5).
+  const [toast, setToast] = useState<{ text: string; id: number } | null>(null);
+  const toastIdRef = useRef(0);
+  const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const showToast = useCallback((text: string) => {
+    const id = ++toastIdRef.current;
+    setToast({ text, id });
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+    toastTimerRef.current = setTimeout(() => {
+      setToast(t => (t?.id === id ? null : t));
+    }, 2500);
+  }, []);
+
   const [renderMode, setRenderMode] = useState<"tiled" | "full" | "axo">("tiled");
   const [axoSkew, setAxoSkew] = useState(0.2);
   const [showHelp, setShowHelp] = useState(false);
   const [showAbout, setShowAbout] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [showWorldInfo, setShowWorldInfo] = useState(false);
+  const [showPrefabLibrary, setShowPrefabLibrary] = useState(false);
+  const [prefabNameModal, setPrefabNameModal] = useState(false);
+  const [prefabNameInput, setPrefabNameInput] = useState("");
+  const [prefabSaving, setPrefabSaving] = useState(false);
+  const [prefabOverwrite, setPrefabOverwrite] = useState(false); // armed after an existing-name warning
+  const [prefabRefreshToken, setPrefabRefreshToken] = useState(0);
   const [appVersion, setAppVersion] = useState("…");
   useEffect(() => { getVersion().then(setAppVersion); }, []);
   // Fetch canonical block/paint colour tables from Rust once at startup so TS
@@ -216,6 +195,8 @@ function App() {
   const [lockedPastePos, setLockedPastePos] = useState<{ x: number; y: number } | null>(null);
   const lockedPastePosRef = useRef<{ x: number; y: number } | null>(null);
   const [editEpoch, setEditEpoch] = useState(0);
+  const editEpochRef = useRef(0);
+  useEffect(() => { editEpochRef.current = editEpoch; }, [editEpoch]);
   // World bounds of the most recent edit (top-down X/Y) — lets slabs skip refetch if untouched.
   const [lastEditBounds, setLastEditBounds] = useState<{ x: number; y: number; w: number; h: number } | null>(null);
 
@@ -227,9 +208,23 @@ function App() {
   const [brushShape,   setBrushShape]   = useState<"sq" | "circ">("sq");
   const [drawFilled,   setDrawFilled]   = useState(true);
   const [drawAbove,    setDrawAbove]    = useState(false);
+  const [sprayDensity, setSprayDensity] = useState(0.35); // spray/scatter fraction of footprint
+  const [strokeStabilizer, setStrokeStabilizer] = useState(false); // low-pass freehand path
+  // Gradient fill (Selection tab): blend the current fill block → a second block across an axis
+  const [gradientToBlock, setGradientToBlock] = useState(2); // stone
+  const [gradientToPaint, setGradientToPaint] = useState(0);
+  const [gradientAxis, setGradientAxis] = useState<"x" | "y" | "z">("y");
+  const [gradientIncludeAir, setGradientIncludeAir] = useState(false);
 
   // Sculpt tools
   const [sculptStrength, setSculptStrength] = useState(2);
+  const [sculptRadius, setSculptRadius] = useState(6); // brush radius in blocks (dedicated; not draw brush size)
+  const [sculptSoftness, setSculptSoftness] = useState(0.6); // 0 = hard edges, 1 = full radial dome
+  const [sculptProfile, setSculptProfile] = useState<"smooth" | "linear" | "sphere" | "sharp">("smooth");
+  const [sculptAccumulate, setSculptAccumulate] = useState(false); // hold-to-build (airbrush)
+  const [sculptClipToSelection, setSculptClipToSelection] = useState(false); // constrain strokes to selection
+  const [noiseMode, setNoiseMode] = useState<"hills" | "mountains">("hills");
+  const [noiseFeatureSize, setNoiseFeatureSize] = useState(24); // blocks per feature; freq = 1/size
   const sculptSeedRef = useRef(Math.floor(Math.random() * 0xFFFFFFFF));
 
   // Mask
@@ -332,8 +327,16 @@ function App() {
   const [filterInvert, setFilterInvert] = useState(false);
 
   const [rawBounds, setRawBounds] = useState<SelectionBounds | null>(null);
+  const rawBoundsRef = useRef<SelectionBounds | null>(null);
+  useEffect(() => { rawBoundsRef.current = rawBounds; }, [rawBounds]);
+  // Live marquee dims while dragging a new selection (before commit/describe_selection round-trip).
+  const [dragSelectRect, setDragSelectRect] = useState<SelectionBounds | null>(null);
   const [zMin, setZMin] = useState(0);
   const [zMax, setZMax] = useState(63);
+  const zMinRef = useRef(0);
+  const zMaxRef = useRef(63);
+  useEffect(() => { zMinRef.current = zMin; }, [zMin]);
+  useEffect(() => { zMaxRef.current = zMax; }, [zMax]);
 
   const [selection, setSelection] = useState<SelectionInfo | null>(null);
 
@@ -436,7 +439,7 @@ function App() {
     } catch (e) { setError(String(e)); }
   }
 
-  async function applyEditResult(raw: EditResultRaw) {
+  const applyEditResult = useCallback(async (raw: EditResultRaw, kind: "edit" | "undo" | "redo" = "edit") => {
     if (viewModeRef.current === "topdown") {
       if (renderModeRef.current === "axo") {
         // Axo projection: flat patch positions don't match axo pixel positions, force full re-render.
@@ -461,15 +464,11 @@ function App() {
     setUndoDepth(raw.undo_depth);
     setRedoDepth(raw.redo_depth);
     setEditEpoch(e => e + 1);
-  }
-
-  function addRecentWorld(path: string, name: string) {
-    setRecentWorlds(prev => {
-      const next = [{ path, name, timestamp: Date.now() }, ...prev.filter(r => r.path !== path)].slice(0, MAX_RECENT);
-      try { localStorage.setItem(RECENT_WORLDS_KEY, JSON.stringify(next)); } catch {}
-      return next;
-    });
-  }
+    if (raw.operation) {
+      const prefix = kind === "undo" ? "Undid: " : kind === "redo" ? "Redid: " : "";
+      showToast(prefix + raw.operation);
+    }
+  }, [showToast]);
 
   async function openFile() {
     const selected = await open({
@@ -481,7 +480,7 @@ function App() {
     setLoading(true);
     setError(null);
     try {
-      const data = await invoke<WorldData>("load_world", { path: selected });
+      const data = await invoke<WorldMeta>("load_world", { path: selected });
       if (loadEpochRef.current !== myEpoch) return;
       setWorld(data);
       setWorldEpoch((e) => e + 1);
@@ -499,6 +498,7 @@ function App() {
       setSaveCompressed(data.was_compressed);
       setSpawnPos(data.spawn_px != null && data.spawn_py != null ? { px: data.spawn_px, py: data.spawn_py } : null);
       addRecentWorld(selected, data.name);
+      lastAutosavedEpochRef.current = editEpochRef.current;
     } catch (e) {
       setError(String(e));
     } finally {
@@ -506,12 +506,12 @@ function App() {
     }
   }
 
-  async function openFileAt(path: string) {
+  async function openFileAt(path: string, opts?: { skipRecent?: boolean }) {
     const myEpoch = ++loadEpochRef.current;
     setLoading(true);
     setError(null);
     try {
-      const data = await invoke<WorldData>("load_world", { path });
+      const data = await invoke<WorldMeta>("load_world", { path });
       if (loadEpochRef.current !== myEpoch) return;
       setWorld(data);
       setWorldEpoch((e) => e + 1);
@@ -528,7 +528,8 @@ function App() {
       setClipboard(null);
       setSaveCompressed(data.was_compressed);
       setSpawnPos(data.spawn_px != null && data.spawn_py != null ? { px: data.spawn_px, py: data.spawn_py } : null);
-      addRecentWorld(path, data.name);
+      if (!opts?.skipRecent) addRecentWorld(path, data.name);
+      lastAutosavedEpochRef.current = editEpochRef.current;
     } catch (e) {
       setError(String(e));
     } finally {
@@ -679,7 +680,7 @@ function App() {
     setZSliceDisplay(z);
   }
 
-  async function copySelection() {
+  const copySelection = useCallback(async () => {
     if (!rawBounds) return;
     try {
       const info = await invoke<ClipboardInfo>("copy_selection", { ...rawBounds, zMin, zMax });
@@ -688,7 +689,63 @@ function App() {
     } catch (e) {
       setError(String(e));
     }
-  }
+  }, [rawBounds, zMin, zMax]);
+
+  // Move the current selection (and its contents) by (dx, dy) in one gesture — arrow-key
+  // nudge (E2). Reads live selection/z-range via refs so this stays []-stable for the
+  // keydown effect's dep array (mirrors the appToolRef pattern used elsewhere in this file).
+  // Guards nudgeSelection's backend path against overlapping calls: arrow-key repeat (or a
+  // fast double-tap) can fire a second call before the first's invoke() resolves. Since each
+  // call independently reads-clears-writes the *current* world state, a second call reading
+  // stale bounds would find the source already emptied by the first and overwrite the moved
+  // content with air. Extra calls while one is in flight are coalesced into a single pending
+  // delta and applied (against the now-current bounds) once the in-flight call finishes.
+  const nudgeBusyRef = useRef(false);
+  const nudgePendingRef = useRef<{ dx: number; dy: number } | null>(null);
+
+  const nudgeSelectionContents = useCallback(async (dx0: number, dy0: number) => {
+    if (nudgeBusyRef.current) {
+      const pending = nudgePendingRef.current;
+      nudgePendingRef.current = { dx: (pending?.dx ?? 0) + dx0, dy: (pending?.dy ?? 0) + dy0 };
+      return;
+    }
+    nudgeBusyRef.current = true;
+    // Drain any deltas that arrive (via the branch above) while a move is in flight, applying
+    // each against the then-current bounds — a loop instead of recursive self-calls so this
+    // stays a single stable closure (recursive useCallback self-reference defeats memoization).
+    let dx = dx0, dy = dy0;
+    for (;;) {
+      const bounds = rawBoundsRef.current;
+      if (!bounds) break;
+      try {
+        const result = await invoke<EditResultRaw>("move_selection", {
+          ...bounds, zMin: zMinRef.current, zMax: zMaxRef.current, dx, dy, dz: 0,
+        });
+        await applyEditResult(result);
+        setRawBounds({ x1: bounds.x1 + dx, y1: bounds.y1 + dy, x2: bounds.x2 + dx, y2: bounds.y2 + dy });
+      } catch (e) {
+        setError(String(e));
+      }
+      const pending = nudgePendingRef.current;
+      if (!pending) break;
+      nudgePendingRef.current = null;
+      dx = pending.dx; dy = pending.dy;
+    }
+    nudgeBusyRef.current = false;
+  }, [applyEditResult]);
+
+  // Entry point for both arrow-key nudge and drag-to-move: moves just the selection box by
+  // default (E2 — off by default per user feedback), or the box + its blocks when the
+  // "Move: Box + Contents" toggle (Selection tab) is on.
+  const nudgeSelection = useCallback((dx: number, dy: number) => {
+    if (!moveWithContentsRef.current) {
+      const bounds = rawBoundsRef.current;
+      if (!bounds) return;
+      setRawBounds({ x1: bounds.x1 + dx, y1: bounds.y1 + dy, x2: bounds.x2 + dx, y2: bounds.y2 + dy });
+      return;
+    }
+    nudgeSelectionContents(dx, dy);
+  }, [nudgeSelectionContents]);
 
   async function rotateClipboard() {
     try {
@@ -792,17 +849,31 @@ function App() {
     setTool(prev === "eyedropper" ? "pen" : prev);
   }
 
-  async function handleDrawStroke(pts: [number, number][], zOverride: number | null) {
+  async function handleDrawStroke(pts: [number, number][], zOverride: number | null, anchor?: [number, number], grabDelta?: number) {
     const t = appToolRef.current;
     try {
-      if (t === "smooth" || t === "noise" || t === "flatten" || t === "erode") {
-        const points = pts.map(([x, y]) => ({ x, y }));
-        const seed = t === "noise" ? sculptSeedRef.current : 0;
-        if (t === "noise") sculptSeedRef.current = ((sculptSeedRef.current * 1664525 + 1013904223) >>> 0);
+      if (t === "smooth" || t === "noise" || t === "flatten" || t === "erode" || t === "thermal" || t === "hydro" || t === "stamp" || t === "grab" || t === "raise" || t === "lower") {
+        // Optionally constrain the stroke to the active selection (sculpt mask).
+        let stroke = pts;
+        if (sculptClipToSelection && rawBounds) {
+          const { x1, y1, x2, y2 } = rawBounds;
+          stroke = pts.filter(([x, y]) => x >= x1 && x <= x2 && y >= y1 && y <= y2);
+          if (stroke.length === 0) return;
+        }
+        const points = stroke.map(([x, y]) => ({ x, y }));
+        const seed = (t === "noise" || t === "hydro") ? sculptSeedRef.current : 0;
+        if (t === "noise" || t === "hydro") sculptSeedRef.current = ((sculptSeedRef.current * 1664525 + 1013904223) >>> 0);
         const result = await invoke<EditResultRaw>("sculpt_terrain", {
           points, mode: t, strength: sculptStrength, seed,
           blockType: fillBlockType || null,
           paint: fillPaint || null,
+          freq: 1 / Math.max(4, noiseFeatureSize),
+          noiseMode,
+          softness: sculptSoftness,
+          profile: sculptProfile,
+          grabDelta: grabDelta ?? null,
+          anchorX: anchor ? anchor[0] : null,
+          anchorY: anchor ? anchor[1] : null,
         });
         await applyEditResult(result);
       } else if (t === "fill") {
@@ -914,18 +985,86 @@ function App() {
   const handleUndo = useCallback(async () => {
     try {
       const result = await invoke<EditResultRaw>("undo_edit");
-      await applyEditResult(result);
+      await applyEditResult(result, "undo");
     } catch { /* stack empty — ignore */ }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [applyEditResult]);
 
   const handleRedo = useCallback(async () => {
     try {
       const result = await invoke<EditResultRaw>("redo_edit");
-      await applyEditResult(result);
+      await applyEditResult(result, "redo");
     } catch { /* stack empty — ignore */ }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [applyEditResult]);
+
+  const saveWorld = useCallback(async (path: string) => {
+    setSaving(true);
+    setError(null);
+    try {
+      await invoke("save_world", { path, compressed: saveCompressed });
+      // A real save makes any pending autosave sidecar redundant — nothing left to recover.
+      lastAutosavedEpochRef.current = editEpochRef.current;
+      invoke("discard_autosave").catch(() => {});
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setSaving(false);
+    }
+  }, [saveCompressed]);
+
+  const saveWorldAs = useCallback(async () => {
+    const chosen = await save({
+      filters: [{ name: "Eden World", extensions: ["eden", "zip"] }],
+      defaultPath: sourcePath ?? undefined,
+    });
+    if (!chosen) return;
+    await saveWorld(chosen);
+    setSourcePath(chosen);
+  }, [sourcePath, saveWorld]);
+
+  // Timer-based autosave: every 3 minutes, if a world is loaded and has unsaved edits
+  // (editEpoch moved since the last autosave/save), snapshot it to a sidecar file so a
+  // crash doesn't lose everything since the last manual save. Does not touch sourcePath
+  // or the undo stack — purely a safety-net copy on disk.
+  useEffect(() => {
+    if (!world) return;
+    const AUTOSAVE_MS = 3 * 60 * 1000;
+    const id = setInterval(() => {
+      if (editEpochRef.current === lastAutosavedEpochRef.current) return;
+      const epoch = editEpochRef.current;
+      invoke("autosave_world", { sourcePath })
+        .then(() => { lastAutosavedEpochRef.current = epoch; })
+        .catch((e) => console.warn("Autosave failed:", e));
+    }, AUTOSAVE_MS);
+    return () => clearInterval(id);
+  }, [world, sourcePath]);
+
+  // Startup check: was there a pending autosave from a session that never cleanly saved?
+  useEffect(() => {
+    invoke<AutosaveInfo | null>("get_autosave_info")
+      .then((info) => { if (info) setRecoveryInfo(info); })
+      .catch(() => {});
   }, []);
+
+  async function recoverAutosave() {
+    if (!recoveryInfo) return;
+    setRecovering(true);
+    try {
+      const autosavePath = await invoke<string>("get_autosave_path");
+      await openFileAt(autosavePath, { skipRecent: true });
+      setSourcePath(recoveryInfo.source_path ?? null);
+      await invoke("discard_autosave");
+      setRecoveryInfo(null);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setRecovering(false);
+    }
+  }
+
+  async function discardRecovery() {
+    try { await invoke("discard_autosave"); } catch { /* best effort */ }
+    setRecoveryInfo(null);
+  }
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
@@ -951,8 +1090,9 @@ function App() {
           return;
         }
         const t = appToolRef.current;
-        if (t === "paste" || t === "wand" || t === "pen" || t === "brush" || t === "rect" || t === "ellipse" ||
-            t === "smooth" || t === "noise" || t === "flatten" || t === "erode" || t === "fill") {
+        if (t === "paste" || t === "wand" || t === "pen" || t === "brush" || t === "spray" || t === "line" || t === "rect" || t === "ellipse" || t === "polygon" ||
+            t === "smooth" || t === "noise" || t === "flatten" || t === "erode" || t === "thermal" ||
+            t === "hydro" || t === "stamp" || t === "grab" || t === "raise" || t === "lower" || t === "fill") {
           e.preventDefault();
           setTool("pan");
         } else {
@@ -970,8 +1110,10 @@ function App() {
       if (tag !== "INPUT" && tag !== "TEXTAREA" && !e.metaKey && !e.ctrlKey) {
         if (e.key === "p" || e.key === "P") { e.preventDefault(); setTool("pen"); return; }
         if (e.key === "b" || e.key === "B") { e.preventDefault(); setTool("brush"); return; }
+        if (e.key === "l" || e.key === "L") { e.preventDefault(); setTool("line"); return; }
         if (e.key === "r" || e.key === "R") { e.preventDefault(); setTool("rect"); return; }
         if (e.key === "e" || e.key === "E") { e.preventDefault(); setTool("ellipse"); return; }
+        if (e.key === "g" || e.key === "G") { e.preventDefault(); setTool("polygon"); return; }
         if (e.key === "f" || e.key === "F") { e.preventDefault(); setTool("fill"); return; }
         if (e.key === "w" || e.key === "W") { e.preventDefault(); setTool("wand"); return; }
         if (e.key === "i" || e.key === "I") {
@@ -1011,6 +1153,16 @@ function App() {
           }
           return;
         }
+        // Arrow keys nudge the selection (and its contents) by 1 block; Shift = 10.
+        if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(e.key)
+            && appToolRef.current === "select" && rawBoundsRef.current) {
+          e.preventDefault();
+          const step = e.shiftKey ? 10 : 1;
+          const dx = e.key === "ArrowLeft" ? -step : e.key === "ArrowRight" ? step : 0;
+          const dy = e.key === "ArrowUp" ? -step : e.key === "ArrowDown" ? step : 0;
+          nudgeSelection(dx, dy);
+          return;
+        }
       }
       if (!(e.metaKey || e.ctrlKey)) return;
       if (e.key === "z" && !e.shiftKey) { e.preventDefault(); handleUndo(); }
@@ -1028,7 +1180,7 @@ function App() {
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [world, showHelp, handleUndo, handleRedo, clipboard, sourcePath, copySelection, saveWorld, saveWorldAs]);
+  }, [world, showHelp, handleUndo, handleRedo, clipboard, sourcePath, copySelection, saveWorld, saveWorldAs, nudgeSelection]);
 
   // Menu close effects handled inside Ribbon component
 
@@ -1111,46 +1263,68 @@ function App() {
       });
       setExpandResult({ chunksAdded: res.chunks_added, totalChunks: res.total_chunks });
     } catch (e) {
-      setError(String(e));
+      if (String(e) !== "Cancelled") setError(String(e));
     } finally {
       setExpandInProgress(false);
       setExpandProgress(100);
     }
   }
 
+  function cancelExpand() {
+    invoke("cancel_expand").catch(() => {});
+  }
+
 const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
     setRawBounds(bounds);
   }, []);
 
-  async function saveWorld(path: string) {
-    setSaving(true);
-    setError(null);
+  // Default "Save Prefab" opens an in-app name modal that writes into the prefab library folder —
+  // deliberately avoiding the native NSSavePanel, which hangs ~30s on macOS Sonoma (ViewBridge
+  // XPC stall). "Save As…" (below) still offers the native picker for saving to any folder.
+  function openPrefabNameModal() {
+    if (!clipboard) { setError("Copy a selection first, then save it as a prefab."); return; }
+    setPrefabNameInput(world?.name?.trim() || "prefab");
+    setPrefabOverwrite(false);
+    setPrefabNameModal(true);
+  }
+
+  async function confirmSavePrefab() {
+    const name = prefabNameInput.trim();
+    if (!name || prefabSaving) return;
+    setPrefabSaving(true);
     try {
-      await invoke("save_world", { path, compressed: saveCompressed });
+      const dir = await resolvePrefabDir();
+      if (!dir) throw new Error("Could not resolve the prefab library folder");
+      const safe = name.replace(/[/\\]/g, "_").replace(/\.epfab$/i, "");
+      const path = `${dir}/${safe}.epfab`;
+      // First attempt: warn (don't save) if a prefab with this name already exists. A second click
+      // (prefabOverwrite armed) confirms the overwrite. Editing the name re-arms the guard.
+      if (!prefabOverwrite && await invoke<boolean>("prefab_exists", { path })) {
+        setPrefabOverwrite(true);
+        return;
+      }
+      await invoke("save_prefab", { path });
+      setPrefabRefreshToken((t) => t + 1);
+      setPrefabNameModal(false);
+      showToast(`Saved prefab “${safe}”`);
     } catch (e) {
       setError(String(e));
     } finally {
-      setSaving(false);
+      setPrefabSaving(false);
     }
   }
 
-  async function saveWorldAs() {
-    const chosen = await save({
-      filters: [{ name: "Eden World", extensions: ["eden", "zip"] }],
-      defaultPath: sourcePath ?? undefined,
-    });
-    if (!chosen) return;
-    await saveWorld(chosen);
-    setSourcePath(chosen);
-  }
-
-  async function savePrefab() {
+  // Native "save anywhere" fallback. Kept for users who want prefabs outside the library folder.
+  async function savePrefabAs() {
+    if (!clipboard) { setError("Copy a selection first, then save it as a prefab."); return; }
     const path = await save({
       filters: [{ name: "Eden Prefab", extensions: ["epfab"] }],
       defaultPath: `${world?.name ?? "prefab"}.epfab`,
     });
     if (!path) return;
-    await invoke("save_prefab", { path }).catch((e) => setError(String(e)));
+    await invoke("save_prefab", { path })
+      .then(() => setPrefabRefreshToken((t) => t + 1))
+      .catch((e) => setError(String(e)));
   }
 
   async function loadPrefab() {
@@ -1230,6 +1404,21 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
     }
   }
 
+  async function applyGradientFill() {
+    if (!rawBounds) return;
+    try {
+      const result = await invoke<EditResultRaw>("gradient_fill", {
+        ...rawBounds, zMin, zMax,
+        bt1: fillBlockType, paint1: fillBlockType === 0 ? 0 : fillPaint,
+        bt2: gradientToBlock, paint2: gradientToBlock === 0 ? 0 : gradientToPaint,
+        axis: gradientAxis, includeAir: gradientIncludeAir,
+      });
+      await applyEditResult(result);
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
   function handleZMin(raw: string) {
     const v = Math.max(0, Math.min(world?.max_z ?? 63, parseInt(raw, 10) || 0));
     setZMin(Math.min(v, zMax));
@@ -1288,8 +1477,8 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
         }
       : null;
 
-  const isSculptTool = tool === "smooth" || tool === "noise" || tool === "flatten" || tool === "erode";
-  const isDrawTool = tool === "pen" || tool === "brush" || tool === "rect" || tool === "ellipse" || isSculptTool || tool === "fill";
+  const isSculptTool = tool === "smooth" || tool === "noise" || tool === "flatten" || tool === "erode" || tool === "thermal" || tool === "hydro" || tool === "stamp" || tool === "grab" || tool === "raise" || tool === "lower";
+  const isDrawTool = tool === "pen" || tool === "brush" || tool === "spray" || tool === "line" || tool === "rect" || tool === "ellipse" || tool === "polygon" || isSculptTool || tool === "fill";
 
   const mapPaneEl = world ? (
     <MapCanvas
@@ -1310,7 +1499,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
       renderMode={renderMode}
       axoSkew={axoSkew}
       sliceLines={showSlicePanels ? { x: sliceSideX, y: sliceFrontY } : null}
-      drawConfig={{ brushSize, brushShape, fillMode: drawFilled ? "fill" : "outline" }}
+      drawConfig={{ brushSize, brushShape, fillMode: drawFilled ? "fill" : "outline", sculptRadius, sculptAccumulate, sprayDensity, strokeStabilizer }}
       onDrawStroke={handleDrawStroke}
       drawZOverride={viewMode === "zslice" ? zSliceZ : null}
       extrudePreview={
@@ -1329,6 +1518,9 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
       onSetCamera3d={showSlicePanels && enable3dPane ? (wx, wy) => flyView3dRef.current?.teleport(wx, wy) : undefined}
       showTemplateOverlay={showTemplateOverlay && templateLoaded}
       onMapContextMenu={(wx, wy, x, y) => setCtxMenu({ wx, wy, x, y })}
+      onSelectDragUpdate={setDragSelectRect}
+      onMoveSelection={nudgeSelection}
+      moveWithContents={moveWithContents}
     />
   ) : null;
 
@@ -1344,7 +1536,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
       fontVariantNumeric: "tabular-nums",
     }}>
       <div style={{ padding: "0 10px", borderRight: "1px solid #1a2540", whiteSpace: "nowrap", color: "#4b6280" }}>
-        {tool === "brush" ? `Brush ${brushSize}px` : tool === "pen" ? "Pen" : tool === "rect" ? "Rect" : tool === "ellipse" ? "Ellipse" : tool === "fill" ? "Fill" : tool === "eyedropper" ? "Eyedropper" : tool === "wand" ? "Wand" : tool === "paste" ? (pasteMode !== "normal" ? `Paste (${pasteMode})` : "Paste") : tool === "select" ? "Select" : tool === "smooth" ? "Smooth" : tool === "noise" ? "Noise" : tool === "flatten" ? "Flatten" : tool === "erode" ? "Erode" : "Pan"}
+        {tool === "brush" ? `Brush ${brushSize}px` : tool === "pen" ? "Pen" : tool === "spray" ? "Spray" : tool === "line" ? "Line" : tool === "rect" ? "Rect" : tool === "ellipse" ? "Ellipse" : tool === "polygon" ? "Polygon" : tool === "fill" ? "Fill" : tool === "eyedropper" ? "Eyedropper" : tool === "wand" ? "Wand" : tool === "paste" ? (pasteMode !== "normal" ? `Paste (${pasteMode})` : "Paste") : tool === "select" ? "Select" : tool === "smooth" ? "Smooth" : tool === "noise" ? "Noise" : tool === "flatten" ? "Flatten" : tool === "erode" ? "Erode" : tool === "thermal" ? "Thermal" : tool === "hydro" ? "Hydro Erode" : tool === "stamp" ? "Retexture" : tool === "grab" ? "Grab" : tool === "raise" ? "Raise" : tool === "lower" ? "Lower" : "Pan"}
       </div>
       <div style={{ padding: "0 10px", borderRight: "1px solid #1a2540", color: "#334155", whiteSpace: "nowrap" }}>
         {world.name}
@@ -1367,7 +1559,14 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           {"  "}<span style={{ color: "#475569" }}>{blockDisplayName(cursorBlock.bt)}{cursorBlock.paint > 0 ? <span style={{ color: "#334155" }}> #{cursorBlock.paint}</span> : null}</span>
         </div>
       )}
-      {selection && (
+      {dragSelectRect ? (
+        <div style={{ padding: "0 10px", borderRight: "1px solid #1a2540", color: EDEN_TEAL_READABLE, whiteSpace: "nowrap" }}>
+          Sel <span style={{ color: EDEN_TEAL_READABLE }}>
+            {Math.round(dragSelectRect.x2 - dragSelectRect.x1) + 1}×{Math.round(dragSelectRect.y2 - dragSelectRect.y1) + 1}
+          </span>
+          {" · Z "}<span style={{ color: "#4b6280" }}>{zMin}–{zMax}</span>
+        </div>
+      ) : selection && (
         <div style={{ padding: "0 10px", borderRight: "1px solid #1a2540", color: "#4b6280", whiteSpace: "nowrap" }}>
           Sel <span style={{ color: "#64748b" }}>{selection.width}×{selection.height}</span>
           {" · Z "}<span style={{ color: "#4b6280" }}>{selection.z_min}–{selection.z_max}</span>
@@ -1559,8 +1758,26 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           setDrawFilled={setDrawFilled}
           drawAbove={drawAbove}
           setDrawAbove={setDrawAbove}
+          sprayDensity={sprayDensity}
+          setSprayDensity={setSprayDensity}
+          strokeStabilizer={strokeStabilizer}
+          setStrokeStabilizer={setStrokeStabilizer}
           sculptStrength={sculptStrength}
           setSculptStrength={setSculptStrength}
+          sculptRadius={sculptRadius}
+          setSculptRadius={setSculptRadius}
+          sculptSoftness={sculptSoftness}
+          setSculptSoftness={setSculptSoftness}
+          sculptProfile={sculptProfile}
+          setSculptProfile={setSculptProfile}
+          sculptAccumulate={sculptAccumulate}
+          setSculptAccumulate={setSculptAccumulate}
+          sculptClipToSelection={sculptClipToSelection}
+          setSculptClipToSelection={setSculptClipToSelection}
+          noiseMode={noiseMode}
+          setNoiseMode={setNoiseMode}
+          noiseFeatureSize={noiseFeatureSize}
+          setNoiseFeatureSize={setNoiseFeatureSize}
           prevToolRef={prevToolRef}
           fillBlockType={fillBlockType}
           fillPaint={fillPaint}
@@ -1617,6 +1834,15 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           copySelection={copySelection}
           deleteBlocks={deleteBlocks}
           fillSelection={fillSelection}
+          gradientToBlock={gradientToBlock}
+          setGradientToBlock={setGradientToBlock}
+          gradientToPaint={gradientToPaint}
+          setGradientToPaint={setGradientToPaint}
+          gradientAxis={gradientAxis}
+          setGradientAxis={setGradientAxis}
+          gradientIncludeAir={gradientIncludeAir}
+          setGradientIncludeAir={setGradientIncludeAir}
+          applyGradientFill={applyGradientFill}
           filterBlockType={filterBlockType}
           filterPaint={filterPaint}
           filterInvert={filterInvert}
@@ -1669,6 +1895,10 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           exportJson={exportJson}
           loadPrefab={loadPrefab}
           importSchematic={importSchematic}
+          showPrefabLibrary={showPrefabLibrary}
+          onTogglePrefabLibrary={() => setShowPrefabLibrary(v => !v)}
+          moveWithContents={moveWithContents}
+          setMoveWithContents={setMoveWithContents}
           setShowNewWorld={setShowNewWorld}
           setShowWorldBrowser={setShowWorldBrowser}
           setShowUploadModal={setShowUploadModal}
@@ -1678,7 +1908,8 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           setShowHelp={setShowHelp}
           setShowAbout={setShowAbout}
           setShowSettings={setShowSettings}
-          onSavePrefab={savePrefab}
+          onSavePrefab={openPrefabNameModal}
+          onSavePrefabAs={savePrefabAs}
           extrudeCount={extrudeCount}
           setExtrudeCount={setExtrudeCount}
           extrudeAxis={extrudeAxis}
@@ -1713,6 +1944,79 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
             quadMode={showSlicePanels}
             topPx={effectiveRibbonHeight + (showSlicePanels ? 40 : 4)}
           />
+        )}
+
+        {showPrefabLibrary && (
+          <PrefabLibraryPanel
+            onClose={() => setShowPrefabLibrary(false)}
+            onArmPaste={() => setTool("paste")}
+            onSaveAs={savePrefabAs}
+            refreshToken={prefabRefreshToken}
+            topPx={effectiveRibbonHeight + 4}
+          />
+        )}
+
+        {prefabNameModal && (
+          <Modal
+            onClose={() => { if (!prefabSaving) setPrefabNameModal(false); }}
+            label="Save prefab"
+            zIndex={200}
+            closeOnEsc={!prefabSaving}
+            closeOnBackdrop={!prefabSaving}
+          >
+            <div style={glassPanel({ padding: 20, width: 360, display: "flex", flexDirection: "column", gap: 14, color: "#e2e8f0" })}>
+              <div style={{ fontWeight: 700, color: EDEN_TEAL_READABLE, fontSize: 14 }}>Save Prefab</div>
+              <label style={{ display: "flex", flexDirection: "column", gap: 6, fontSize: 12, color: "#94a3b8" }}>
+                Name
+                <input
+                  autoFocus
+                  value={prefabNameInput}
+                  onChange={(e) => { setPrefabNameInput(e.target.value); setPrefabOverwrite(false); }}
+                  onKeyDown={(e) => { if (e.key === "Enter") confirmSavePrefab(); }}
+                  style={{
+                    background: "rgba(0,0,0,0.5)", border: "1px solid #334155", borderRadius: 5,
+                    color: "#e2e8f0", padding: "7px 9px", fontSize: 13, outline: "none",
+                  }}
+                />
+              </label>
+              {prefabOverwrite ? (
+                <div style={{ fontSize: 11, color: "#fbbf24" }}>
+                  A prefab with this name already exists. Click Overwrite to replace it.
+                </div>
+              ) : (
+                <div style={{ fontSize: 11, color: "#64748b" }}>
+                  Saves to your prefab library and appears in the gallery.
+                </div>
+              )}
+              <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", alignItems: "center" }}>
+                <button
+                  onClick={() => { setPrefabNameModal(false); savePrefabAs(); }}
+                  style={chromeButton({ padding: "6px 12px", fontSize: 12 })}
+                >
+                  Save As…
+                </button>
+                <div style={{ flex: 1 }} />
+                <button
+                  onClick={() => setPrefabNameModal(false)}
+                  style={chromeButton({ padding: "6px 12px", fontSize: 12 })}
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={confirmSavePrefab}
+                  disabled={!prefabNameInput.trim() || prefabSaving}
+                  style={chromeButton({
+                    padding: "6px 14px", fontSize: 12,
+                    borderColor: prefabOverwrite ? "#fbbf24" : "#4ade80",
+                    color: prefabOverwrite ? "#fcd34d" : "#86efac",
+                    opacity: !prefabNameInput.trim() || prefabSaving ? 0.5 : 1,
+                  })}
+                >
+                  {prefabSaving ? "Saving…" : prefabOverwrite ? "Overwrite" : "Save"}
+                </button>
+              </div>
+            </div>
+          </Modal>
         )}
 
         {/* Bottom-right panel: full-height elevation view — opt-in; redundant in quad view (the slabs
@@ -1804,6 +2108,9 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
         {showHelp && <HelpModal onClose={() => setShowHelp(false)} />}
         {showAbout && <AboutModal version={appVersion} onClose={() => setShowAbout(false)} />}
         {showWorldInfo && <WorldInfoModal onClose={() => setShowWorldInfo(false)} />}
+        {recoveryInfo && (
+          <RecoveryModal info={recoveryInfo} recovering={recovering} onRecover={recoverAutosave} onDiscard={discardRecovery} />
+        )}
         {showSettings && (
           <SettingsModal
             onClose={() => setShowSettings(false)}
@@ -1911,11 +2218,19 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
                   <div style={{ fontSize: 12, color: "#94a3b8", marginBottom: 12 }}>
                     Writing chunks… {expandProgress}%
                   </div>
-                  <div style={{ background: "#1e293b", borderRadius: 4, height: 8, overflow: "hidden" }}>
+                  <div style={{ background: "#1e293b", borderRadius: 4, height: 8, overflow: "hidden", marginBottom: 12 }}>
                     <div style={{
                       height: "100%", background: "#3b82f6", borderRadius: 4,
                       width: `${expandProgress}%`, transition: "width 0.2s",
                     }} />
+                  </div>
+                  <div style={{ display: "flex", justifyContent: "flex-end" }}>
+                    <button onClick={cancelExpand} style={{
+                      padding: "6px 14px", borderRadius: 6, border: "1px solid #334155",
+                      background: "transparent", color: "#94a3b8", cursor: "pointer", fontSize: 13,
+                    }}>
+                      Cancel
+                    </button>
                   </div>
                 </>
               )}
@@ -2018,6 +2333,19 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
 
         {/* Status bar */}
         {statusBarEl}
+
+        {toast && (
+          <div key={toast.id} style={{
+            position: "fixed", bottom: 30, left: "50%", transform: "translateX(-50%)",
+            zIndex: 200, padding: "8px 16px", borderRadius: 6,
+            background: "linear-gradient(180deg, rgb(24,30,42) 0%, rgb(15,19,27) 100%)",
+            boxShadow: `inset 0 1px 0 rgba(255,255,255,.06), 0 8px 20px rgba(0,0,0,.4), 0 0 0 1px rgba(${EDEN_TEAL},.25)`,
+            color: "#e2e8f0", fontSize: 12, whiteSpace: "nowrap", pointerEvents: "none",
+            animation: "eden-toast-in .15s ease-out",
+          }}>
+            {toast.text}
+          </div>
+        )}
       </div>
     );
   }
@@ -2172,6 +2500,9 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
       </div>
 
       {showAbout && <AboutModal version={appVersion} onClose={() => setShowAbout(false)} />}
+      {recoveryInfo && (
+        <RecoveryModal info={recoveryInfo} recovering={recovering} onRecover={recoverAutosave} onDiscard={discardRecovery} />
+      )}
       {showSettings && (
         <SettingsModal
           onClose={() => setShowSettings(false)}

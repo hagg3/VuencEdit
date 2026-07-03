@@ -1,16 +1,15 @@
-import { decodeU8 } from "./codec";
 import { useEffect, useRef, useState, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { brushFootprint, rectPixels, ellipsePixels, type BrushShape, type WP } from "./drawTools";
 import { chromeButton, chromeButtonAccent, recessedWell } from "./designTokens";
+import type { PixelPatchRaw } from "./types";
+import { zoomAtPoint, resizeCanvasToContainer, makeSeqGuard, putPatchPixels } from "./viewportUtils";
 
 // Front slab = constant world-Y plane (horizontal axis = X, vertical = Z; row 0 = highest Z).
 // Side slab  = constant world-X plane (horizontal axis = Y, vertical = Z; row 0 = highest Z).
 // Top slab   = constant world-Z plane (horizontal axis = X, vertical = Y; row 0 = Y 0, no flip).
 // Backed by render_yslice_patch / render_xslice_patch / render_zslice_patch (lib.rs).
 export type SliceAxis = "front" | "side" | "top";
-
-interface PixelPatchRaw { x: number; y: number; width: number; height: number; pixels: string; }
 
 interface Props {
   world: { width_chunks: number; height_chunks: number; max_z: number };
@@ -164,10 +163,10 @@ export default function SliceViewport({ world, axis, editEpoch, lastEdit, onPain
   // Fetched in horizontal strips so wide windows render progressively and don't block the UI on a
   // single multi-megabyte IPC blob. A sequence token discards stale responses (view/edit races).
   const STRIP = 256;
-  const fetchSeqRef = useRef(0);
+  const fetchSeq = useRef(makeSeqGuard());
   const doFetch = useCallback(() => {
     if (orthoModeRef.current) return; // ortho mode handles its own fetch
-    const seq = ++fetchSeqRef.current;
+    const seq = fetchSeq.current.next();
     const h0 = fetchLo, h1 = fetchHi;
     const totalW = h1 - h0 + 1;
     const height = (axis === "top" ? vMax : maxZ) + 1;
@@ -184,7 +183,7 @@ export default function SliceViewport({ world, axis, editEpoch, lastEdit, onPain
     // top: render_zslice_patch(z,x1,y1,x2,y2)
     const cmd = axis === "front" ? "render_yslice_patch" : axis === "side" ? "render_xslice_patch" : "render_zslice_patch";
     let pending = 0;
-    const done = () => { if (--pending === 0 && seq === fetchSeqRef.current) setLoading(false); };
+    const done = () => { if (--pending === 0 && !fetchSeq.current.isStale(seq)) setLoading(false); };
     setLoading(true);
     for (let s = h0; s <= h1; s += STRIP) {
       pending++;
@@ -197,9 +196,8 @@ export default function SliceViewport({ world, axis, editEpoch, lastEdit, onPain
       const dx = s - h0;
       invoke<PixelPatchRaw>(cmd, args)
         .then((raw) => {
-          if (seq !== fetchSeqRef.current) { done(); return; } // superseded
-          const px = decodeU8(raw.pixels);
-          sctx.putImageData(new ImageData(new Uint8ClampedArray(px), raw.width, raw.height), dx, 0);
+          if (fetchSeq.current.isStale(seq)) { done(); return; } // superseded
+          putPatchPixels(sctx, raw, dx, 0);
           force((n) => n + 1);
           done();
         })
@@ -209,27 +207,26 @@ export default function SliceViewport({ world, axis, editEpoch, lastEdit, onPain
   }, [axis, curDepth, fetchLo, fetchHi, vMax, maxZ]);
 
   // Fetch the ortho projection of the current selection via render_selection_view.
-  const orthoFetchSeqRef = useRef(0);
+  const orthoFetchSeq = useRef(makeSeqGuard());
   const doOrthoFetch = useCallback(() => {
     const sf = selFullRef.current;
     if (!sf || axis === "top") return;
-    const seq = ++orthoFetchSeqRef.current;
-    ++fetchSeqRef.current; // cancel any in-flight slab strip fetches
+    const seq = orthoFetchSeq.current.next();
+    fetchSeq.current.next(); // cancel any in-flight slab strip fetches
     setLoading(true);
-    invoke<{ width: number; height: number; pixels: string }>("render_selection_view", {
+    invoke<PixelPatchRaw>("render_selection_view", {
       x1: sf.xLo, y1: sf.yLo, x2: sf.xHi, y2: sf.yHi,
       zMin: sf.zLo, zMax: sf.zHi,
       view: axis === "front" ? "front" : "side",
     }).then((raw) => {
-      if (seq !== orthoFetchSeqRef.current) { setLoading(false); return; }
-      const px = decodeU8(raw.pixels);
+      if (orthoFetchSeq.current.isStale(seq)) { setLoading(false); return; }
       let c = orthoSlabRef.current;
       if (!c) { c = document.createElement("canvas"); orthoSlabRef.current = c; }
       if (c.width !== raw.width || c.height !== raw.height) {
         fittedRef.current = false;
         c.width = raw.width; c.height = raw.height;
       }
-      c.getContext("2d")!.putImageData(new ImageData(new Uint8ClampedArray(px), raw.width, raw.height), 0, 0);
+      putPatchPixels(c.getContext("2d")!, raw);
       setLoading(false);
       force(n => n + 1);
     }).catch(() => setLoading(false));
@@ -274,10 +271,9 @@ export default function SliceViewport({ world, axis, editEpoch, lastEdit, onPain
     invoke<PixelPatchRaw>("render_clipboard_elevation_preview", { view: axis })
       .then((raw) => {
         if (cancelled) return;
-        const px = decodeU8(raw.pixels);
         const c = document.createElement("canvas");
         c.width = raw.width; c.height = raw.height;
-        c.getContext("2d")!.putImageData(new ImageData(new Uint8ClampedArray(px), raw.width, raw.height), 0, 0);
+        putPatchPixels(c.getContext("2d")!, raw);
         clipRef.current = c;
         force((n) => n + 1);
       })
@@ -516,9 +512,7 @@ export default function SliceViewport({ world, axis, editEpoch, lastEdit, onPain
   useEffect(() => {
     const canvas = canvasRef.current; if (!canvas) return;
     const ro = new ResizeObserver(() => {
-      const r = canvas.getBoundingClientRect();
-      canvas.width = Math.max(1, Math.floor(r.width));
-      canvas.height = Math.max(1, Math.floor(r.height));
+      resizeCanvasToContainer(canvas);
       draw();
     });
     ro.observe(canvas);
@@ -743,14 +737,9 @@ export default function SliceViewport({ world, axis, editEpoch, lastEdit, onPain
     }
   };
   const onWheel = (e: React.WheelEvent) => {
-    const v = viewRef.current;
     const r = canvasRef.current!.getBoundingClientRect();
     const mx = e.clientX - r.left, my = e.clientY - r.top;
-    const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
-    const ns = Math.max(0.25, Math.min(32, v.scale * factor));
-    v.x = mx - (mx - v.x) * (ns / v.scale);
-    v.y = my - (my - v.y) * (ns / v.scale);
-    v.scale = ns;
+    viewRef.current = zoomAtPoint(viewRef.current, mx, my, e.deltaY, { min: 0.25, max: 32, factor: 1.15 });
     draw();
     // NB: do NOT refetch on zoom — the slab is already cached offscreen and just
     // redrawn at the new scale. The fetch window only moves on pan-end (heavy IPC).
