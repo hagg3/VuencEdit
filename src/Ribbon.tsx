@@ -3,7 +3,7 @@ import { useState, useRef, useEffect } from "react";
 import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import type { Tool, SelectionBounds } from "./MapCanvas";
-import type { SelectionInfo, ClipboardInfo, ExtrudeAxis } from "./App";
+import type { SelectionInfo, ClipboardInfo, ExtrudeAxis, WorldMeta, RecentWorld } from "./types";
 import BlockPaintPicker from "./BlockPaintPicker";
 import { BLOCK_DEFS, resolveColor, blockDisplayName } from "./blockDefs";
 import { tintedSwatch } from "./texturePack";
@@ -15,13 +15,10 @@ export const RIBBON_HEIGHT_COLLAPSED = 32;
 export const TAB_BAR_HEIGHT = 32;
 export const DEFAULT_BODY_HEIGHT = 96;
 
-interface RecentWorld { path: string; name: string; timestamp: number; }
-interface WorldData { name: string; width_chunks: number; height_chunks: number; max_z: number; }
-
 export type RibbonTab = "home" | "draw" | "insert" | "view" | "selection" | "paste";
 
 export interface RibbonProps {
-  world: WorldData | null;
+  world: WorldMeta | null;
   appVersion: string;
   // World rename
   renamingWorld: boolean; renameInput: string;
@@ -41,7 +38,16 @@ export interface RibbonProps {
   brushShape: "sq" | "circ"; setBrushShape: (v: "sq" | "circ") => void;
   drawFilled: boolean; setDrawFilled: (v: boolean) => void;
   drawAbove: boolean; setDrawAbove: (v: boolean) => void;
+  sprayDensity: number; setSprayDensity: (v: number) => void;
+  strokeStabilizer: boolean; setStrokeStabilizer: (v: boolean) => void;
   sculptStrength: number; setSculptStrength: (v: number) => void;
+  sculptRadius: number; setSculptRadius: (v: number) => void;
+  sculptSoftness: number; setSculptSoftness: (v: number) => void;
+  sculptProfile: "smooth" | "linear" | "sphere" | "sharp"; setSculptProfile: (v: "smooth" | "linear" | "sphere" | "sharp") => void;
+  sculptAccumulate: boolean; setSculptAccumulate: (v: boolean) => void;
+  sculptClipToSelection: boolean; setSculptClipToSelection: (v: boolean) => void;
+  noiseMode: "hills" | "mountains"; setNoiseMode: (v: "hills" | "mountains") => void;
+  noiseFeatureSize: number; setNoiseFeatureSize: (v: number) => void;
   prevToolRef: React.RefObject<Tool>;
   fillBlockType: number; fillPaint: number;
   setFillBlockType: (v: number) => void; setFillPaint: (v: number) => void;
@@ -86,6 +92,12 @@ export interface RibbonProps {
   rawBounds: SelectionBounds | null;
   setRawBounds: React.Dispatch<React.SetStateAction<SelectionBounds | null>>;
   copySelection: () => void; deleteBlocks: () => void; fillSelection: () => void;
+  // Gradient fill
+  gradientToBlock: number; setGradientToBlock: (v: number) => void;
+  gradientToPaint: number; setGradientToPaint: (v: number) => void;
+  gradientAxis: "x" | "y" | "z"; setGradientAxis: (v: "x" | "y" | "z") => void;
+  gradientIncludeAir: boolean; setGradientIncludeAir: (v: boolean) => void;
+  applyGradientFill: () => void;
   // Filter
   filterBlockType: number | null; filterPaint: number | null; filterInvert: boolean;
   setFilterBlockType: (v: number | null) => void;
@@ -109,6 +121,7 @@ export interface RibbonProps {
   rotateClipboard: () => void; mirrorClipboardX: () => void; mirrorClipboardY: () => void;
   pasteAt: (pos: { x: number; y: number }) => void;
   onSavePrefab: () => void;
+  onSavePrefabAs: () => void;
   // Extrude
   extrudeCount: number; setExtrudeCount: (n: number) => void;
   extrudeAxis: ExtrudeAxis; setExtrudeAxis: (a: ExtrudeAxis) => void;
@@ -129,6 +142,8 @@ export interface RibbonProps {
   saveWorld: (path: string) => void; saveWorldAs: () => void;
   exportPng: () => void; exportObj: () => void; exportJson: () => void;
   loadPrefab: () => void; importSchematic: () => void;
+  showPrefabLibrary: boolean; onTogglePrefabLibrary: () => void;
+  moveWithContents: boolean; setMoveWithContents: (fn: (v: boolean) => boolean) => void;
   setShowNewWorld: (v: boolean) => void; setShowWorldBrowser: (v: boolean) => void;
   setShowUploadModal: (v: boolean) => void;
   setShowExpandModal: (v: boolean) => void; setExpandResult: (v: null) => void;
@@ -265,7 +280,7 @@ const LEAF_COLORS: [number, string, string][] = [
 // ── Picker portal ──────────────────────────────────────────────────────────────
 
 interface PickerState {
-  type: "block-draw" | "block-fill" | "filter";
+  type: "block-draw" | "block-fill" | "filter" | "gradient-to";
   top: number; left: number;
 }
 
@@ -363,7 +378,7 @@ export default function Ribbon(p: RibbonProps) {
   // Auto-tab: draw tool → Draw tab
   const prevToolRef2 = useRef<Tool | null>(null);
   useEffect(() => {
-    const drawTools = ["pen","brush","rect","ellipse","smooth","noise","flatten","erode","fill"];
+    const drawTools = ["pen","brush","spray","line","rect","ellipse","polygon","smooth","noise","flatten","erode","thermal","hydro","stamp","grab","raise","lower","fill"];
     const wasDrawTool = drawTools.includes(prevToolRef2.current ?? "");
     const isNowDraw = drawTools.includes(p.tool);
     if (isNowDraw && !wasDrawTool) setActiveTab("draw");
@@ -621,19 +636,34 @@ export default function Ribbon(p: RibbonProps) {
   }
 
   function renderDrawTab() {
-    const drawTools = ["pen","brush","rect","ellipse"] as const;
-    const sculptTools = ["smooth","noise","flatten","erode"] as const;
-    const drawToolIcons: Record<string,string> = { pen:"✏", brush:"⬟", rect:"□", ellipse:"○" };
-    const drawToolNames: Record<string,string> = { pen:"Pen", brush:"Brush", rect:"Rect", ellipse:"Ellipse" };
-    const drawToolKeys: Record<string,string> = { pen:"P", brush:"B", rect:"R", ellipse:"E" };
-    const sculptToolIcons: Record<string,string> = { smooth:"〰", noise:"⛰", flatten:"▬", erode:"~" };
-    const sculptToolNames: Record<string,string> = { smooth:"Smooth", noise:"Noise", flatten:"Flatten", erode:"Erode" };
+    const drawTools = ["pen","brush","spray","line","rect","ellipse","polygon"] as const;
+    const drawToolIcons: Record<string,string> = { pen:"✏", brush:"⬟", spray:"❉", line:"╱", rect:"□", ellipse:"○", polygon:"⬠" };
+    const drawToolNames: Record<string,string> = { pen:"Pen", brush:"Brush", spray:"Spray", line:"Line", rect:"Rect", ellipse:"Ellipse", polygon:"Polygon" };
+    const drawToolKeys: Record<string,string> = { pen:"P", brush:"B", spray:"", line:"L", rect:"R", ellipse:"E", polygon:"G" };
+    // All sculpt tools rendered uniformly as a compact icon grid (5 cols × 2 rows).
+    const sculptAllTools: { id: Tool; icon: string; short: string; name: string }[] = [
+      { id: "raise",   icon: "▲", short: "Raise",     name: "Raise — drag to pull up" },
+      { id: "lower",   icon: "▼", short: "Lower",     name: "Lower — drag to dig down" },
+      { id: "grab",    icon: "✥", short: "Grab",      name: "Grab — drag up/down to pull terrain" },
+      { id: "smooth",  icon: "〰", short: "Smooth",    name: "Smooth — average heights" },
+      { id: "flatten", icon: "▬", short: "Flatten",   name: "Flatten — level to click height" },
+      { id: "noise",   icon: "⛰", short: "Noise",     name: "Noise — coherent hills/mountains" },
+      { id: "erode",   icon: "◣", short: "Erode",     name: "Erode — drop toward lowest neighbour" },
+      { id: "thermal", icon: "♨", short: "Thermal",   name: "Thermal — talus-angle erosion" },
+      { id: "hydro",   icon: "≈", short: "Hydro",     name: "Hydro — droplet hydraulic erosion" },
+      { id: "stamp",   icon: "▦", short: "Retexture", name: "Retexture — repaint surface by slope" },
+    ];
+    const activeSculptTool = sculptAllTools.find(t => t.id === p.tool);
     const kbdBadge: React.CSSProperties = {
       fontSize: 8, fontFamily: "ui-monospace,'SF Mono',monospace", color: "#475569",
       background: "rgba(255,255,255,0.07)", border: "1px solid rgba(255,255,255,0.12)",
       borderRadius: 2, padding: "0 2px", lineHeight: "12px", marginLeft: 3, flexShrink: 0,
     };
     const isActive = (b: {type:number;paint:number}) => b.type === p.fillBlockType && b.paint === p.fillPaint;
+    const activeSwatchUrl = p.texturePack ? tintedSwatch(p.fillBlockType, p.fillPaint, p.texturePack) : null;
+    // Defined before the JSX so the prevToolRef mutation doesn't trip react-hooks/immutability
+    // (mutating a value read earlier in JSX is disallowed).
+    const armEyedropper = () => { p.prevToolRef.current = p.tool === "eyedropper" ? "pen" : p.tool as Tool; p.setTool("eyedropper"); };
     const slotBase: React.CSSProperties = {
       width: 24, height: 24, borderRadius: 3, cursor: "pointer", flexShrink: 0,
       position: "relative", display: "flex", alignItems: "center", justifyContent: "center",
@@ -657,89 +687,59 @@ export default function Ribbon(p: RibbonProps) {
     }
     return (
       <div style={{ display: "flex", alignItems: "stretch", height: "100%" }}>
-        <div style={{ ...rbGroup, minWidth: 180 }}>
-          <div style={{ display: "flex", gap: 2, flexWrap: "wrap", maxWidth: 220 }}>
-            <button onClick={() => { p.prevToolRef.current = p.tool === "eyedropper" ? "pen" : p.tool as Tool; p.setTool("eyedropper"); }}
-              title="Eyedropper (I)" style={p.tool === "eyedropper" ? {...rbActive("#67e8f9"), borderColor:"#67e8f9", color:"#a5f3fc"} : rb}>💉</button>
+        <div style={{ ...rbGroup, minWidth: 150 }}>
+          {/* Compact icon buttons (name + key in tooltip) so all 7 draw tools fit one row. */}
+          <div style={{ display: "flex", gap: 2 }}>
             {drawTools.map(t => (
-              <button key={t} onClick={() => p.setTool(t)} title={drawToolNames[t]}
-                style={{ ...(p.tool === t ? rbActive("#f472b6") : rb), display: "flex", alignItems: "center" }}>
-                {drawToolIcons[t]} {drawToolNames[t]}<span style={kbdBadge}>{drawToolKeys[t]}</span>
+              <button key={t} onClick={() => p.setTool(t)}
+                title={`${drawToolNames[t]}${drawToolKeys[t] ? ` (${drawToolKeys[t]})` : ""}`}
+                style={{ ...(p.tool === t ? rbActive("#f472b6") : rb), padding: "2px 7px", fontSize: 13, lineHeight: "18px" }}>
+                {drawToolIcons[t]}
               </button>
             ))}
-            <button onClick={() => p.setTool("fill")} title="Fill Bucket (F)"
+          </div>
+          <div style={{ display: "flex", gap: 2 }}>
+            <button onClick={() => p.setTool("fill")} title="Fill Bucket — flood fill (F)"
               style={{ ...(p.tool === "fill" ? rbActive("#34d399") : rb), display: "flex", alignItems: "center" }}>
               🪣 Fill<span style={kbdBadge}>F</span>
             </button>
+            <button onClick={armEyedropper}
+              title="Eyedropper — sample a block from the map (I)"
+              style={{ ...(p.tool === "eyedropper" ? {...rbActive("#67e8f9"), borderColor:"#67e8f9", color:"#a5f3fc"} : rb), display: "flex", alignItems: "center" }}>
+              💉 Pick<span style={kbdBadge}>I</span>
+            </button>
           </div>
-          <div style={{ display: "flex", gap: 2, alignItems: "center" }}>
-            <span style={{ color: "#475569", fontSize: 10 }}>Sculpt</span>
-            <span style={expBadge}>exp</span>
-            {sculptTools.map(t => (
-              <button key={t} onClick={() => p.setTool(t)} title={sculptToolNames[t]} style={p.tool === t ? rbActive("#fb923c") : rb}>
-                {sculptToolIcons[t]}
-              </button>
-            ))}
+          {/* Active-tool caption — mirrors the sculpt group so the icons aren't ambiguous. */}
+          <div style={{ fontSize: 10, color: "#f9a8d4", textAlign: "center", alignSelf: "stretch",
+                        fontWeight: 600, minHeight: 13 }}>
+            {drawToolNames[p.tool] ?? (p.tool === "fill" ? "Fill" : p.tool === "eyedropper" ? "Pick" : "")}
           </div>
-          <div style={rbGroupLabel}>Tool</div>
+          <div style={rbGroupLabel}>Tools</div>
         </div>
         <div style={rbDivider} />
 
-        {p.tool === "brush" && (<>
-          <div style={rbGroup}>
-            <div style={{ display: "flex", gap: 2 }}>
-              {([1,3,5,7,9] as const).map(s => (
-                <button key={s} onClick={() => p.setBrushSize(s)}
-                  style={p.brushSize === s ? rbActive("#f472b6") : { ...rb, padding: "2px 6px" }}>{s}</button>
-              ))}
-            </div>
-            <div style={{ display: "flex", gap: 2 }}>
-              <button onClick={() => p.setBrushShape("sq")} style={p.brushShape === "sq" ? rbActive("#f472b6") : rb}>■ Sq</button>
-              <button onClick={() => p.setBrushShape("circ")} style={p.brushShape === "circ" ? rbActive("#f472b6") : rb}>● Circ</button>
-            </div>
-            <div style={rbGroupLabel}>Brush</div>
-          </div>
-          <div style={rbDivider} />
-        </>)}
-
-        {!p.isSculptTool && p.tool !== "fill" && p.tool !== "eyedropper" && (<>
-          <div style={rbGroup}>
-            <div style={{ display: "flex", gap: 2 }}>
-              <button onClick={() => p.setDrawFilled(true)} style={p.drawFilled ? rbActive("#f472b6") : rb}>Fill</button>
-              <button onClick={() => p.setDrawFilled(false)} style={!p.drawFilled ? rbActive("#f472b6") : rb}>Hollow</button>
-            </div>
-            <div style={{ display: "flex", gap: 2 }}>
-              <button onClick={() => p.setDrawAbove(false)} style={!p.drawAbove ? rbActive("#f472b6") : rb}>Surface</button>
-              <button onClick={() => p.setDrawAbove(true)} style={p.drawAbove ? rbActive("#fcd34d") : rb}>+1 Above</button>
-            </div>
-            <div style={rbGroupLabel}>Mode</div>
-          </div>
-          <div style={rbDivider} />
-        </>)}
-
-        {/* Block picker — uses portal to escape overflow clipping */}
+        {/* Palette — active block + quick gallery; Browse opens the full picker flyout.
+            Placed here (only fixed-width Tools to its left) so it never shifts as
+            contextual option groups appear/disappear to its right. */}
         <div style={rbGroup}>
-          <button onClick={(e) => togglePicker(e, "block-draw")}
-            style={{ ...rb, display: "flex", gap: 5, alignItems: "center", padding: "3px 8px", background: openPicker?.type === "block-draw" ? "rgba(255,255,255,0.1)" : rb.background }}
-            title="Click to change draw block">
-            <div style={{ width: 16, height: 16, borderRadius: 2, flexShrink: 0, border: "1px solid rgba(255,255,255,0.2)", background: `rgb(${swatchColor[0]},${swatchColor[1]},${swatchColor[2]})` }} />
-            <span style={{ fontSize: 11, maxWidth: 90, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-              {blockDisplayName(p.fillBlockType)}{p.fillPaint > 0 ? ` #${p.fillPaint}` : ""}
-            </span>
-            <span style={{ color: "#475569", fontSize: 9 }}>▾</span>
-          </button>
-          <div style={rbGroupLabel}>Block</div>
-        </div>
-        <div style={rbDivider} />
-
-        {/* Hotbar — gallery style */}
-        <div style={rbGroup}>
-          <div style={{
-            display: "flex", alignItems: "center", gap: 3,
-            background: "rgba(255,255,255,0.03)", border: "1px solid #1e293b",
-            borderRadius: 4, padding: "3px 4px",
-            borderBottom: "1px solid rgba(255,255,255,0.06)",
-          }}>
+          <div style={{ display: "flex", alignItems: "flex-start", gap: 8 }}>
+            {/* Active block — large swatch, opens the full picker */}
+            <button onClick={(e) => togglePicker(e, "block-draw")}
+              title="Active block — click to browse all blocks & paints"
+              style={{ ...rb, display: "flex", flexDirection: "column", alignItems: "center", gap: 3, padding: "4px 6px", background: openPicker?.type === "block-draw" ? "rgba(255,255,255,0.1)" : rb.background }}>
+              <div style={{ width: 38, height: 38, borderRadius: 3, flexShrink: 0, border: "1px solid rgba(255,255,255,0.22)", background: activeSwatchUrl ? `url(${activeSwatchUrl}) center/cover` : `rgb(${swatchColor[0]},${swatchColor[1]},${swatchColor[2]})`, imageRendering: activeSwatchUrl ? "pixelated" : undefined }} />
+              <span style={{ fontSize: 10, maxWidth: 68, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "#cbd5e1" }}>
+                {blockDisplayName(p.fillBlockType)}{p.fillPaint > 0 ? ` #${p.fillPaint}` : ""}
+              </span>
+            </button>
+            {/* Quick gallery: pinned + recent, plus Browse-all button */}
+            <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+              <div style={{
+                display: "flex", alignItems: "center", gap: 3,
+                background: "rgba(255,255,255,0.03)", border: "1px solid #1e293b",
+                borderRadius: 4, padding: "3px 4px",
+                borderBottom: "1px solid rgba(255,255,255,0.06)",
+              }}>
             <span style={{ color: "#334155", fontSize: 8, fontWeight: 700, letterSpacing: "0.05em", userSelect: "none" }}>PINNED</span>
             {p.pinnedBlocks.map((b, i) => {
               const key = `pinned-${i}`;
@@ -781,10 +781,151 @@ export default function Ribbon(p: RibbonProps) {
                 );
               })
             }
+              </div>
+              <button onClick={(e) => togglePicker(e, "block-draw")}
+                title="Browse all blocks & paints"
+                style={{ ...rb, display: "flex", gap: 4, alignItems: "center", justifyContent: "center", padding: "2px 8px", background: openPicker?.type === "block-draw" ? "rgba(255,255,255,0.1)" : rb.background }}>
+                Browse all blocks<span style={{ color: "#475569", fontSize: 9 }}>▾</span>
+              </button>
+            </div>
           </div>
-          <div style={rbGroupLabel}>Hotbar</div>
+          <div style={rbGroupLabel}>Palette</div>
         </div>
         <div style={rbDivider} />
+
+        {/* Shape & Mode — contextual; kept to the RIGHT of Palette so Palette never shifts */}
+        {(p.tool === "brush" || (!p.isSculptTool && p.tool !== "fill" && p.tool !== "eyedropper")) && (<>
+          <div style={rbGroup}>
+            {(p.tool === "brush" || p.tool === "spray" || p.tool === "line") && (
+              <div style={{ display: "flex", gap: 2, alignItems: "center" }}>
+                {([1,3,5,7,9] as const).map(s => (
+                  <button key={s} onClick={() => p.setBrushSize(s)}
+                    style={p.brushSize === s ? rbActive("#f472b6") : { ...rb, padding: "2px 6px" }}>{s}</button>
+                ))}
+                <div style={{ width: 4 }} />
+                <button onClick={() => p.setBrushShape("sq")} title="Square brush" style={p.brushShape === "sq" ? rbActive("#f472b6") : rb}>■</button>
+                <button onClick={() => p.setBrushShape("circ")} title="Round brush" style={p.brushShape === "circ" ? rbActive("#f472b6") : rb}>●</button>
+              </div>
+            )}
+            {p.tool === "spray" && (
+              <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+                <span style={{ color: "#64748b", fontSize: 10, minWidth: 46 }}>Density</span>
+                <input type="range" min={5} max={100} step={5} value={Math.round(p.sprayDensity * 100)}
+                  onChange={e => p.setSprayDensity(Number(e.target.value) / 100)}
+                  title="Fraction of the brush footprint sprayed per stamp (hold to build up)"
+                  style={{ width: 72, accentColor: "#f472b6", cursor: "pointer" }} />
+                <span style={{ color: "#f9a8d4", fontSize: 11, fontVariantNumeric: "tabular-nums", minWidth: 24 }}>{Math.round(p.sprayDensity * 100)}%</span>
+              </div>
+            )}
+            <div style={{ display: "flex", gap: 2, alignItems: "center" }}>
+              <button onClick={() => p.setDrawFilled(true)} style={p.drawFilled ? rbActive("#f472b6") : rb}>Fill</button>
+              <button onClick={() => p.setDrawFilled(false)} style={!p.drawFilled ? rbActive("#f472b6") : rb}>Hollow</button>
+              <div style={{ width: 6 }} />
+              <button onClick={() => p.setDrawAbove(false)} style={!p.drawAbove ? rbActive("#f472b6") : rb}>Surface</button>
+              <button onClick={() => p.setDrawAbove(true)} style={p.drawAbove ? rbActive("#fcd34d") : rb}>+1 Above</button>
+              {(p.tool === "pen" || p.tool === "brush" || p.tool === "spray") && (<>
+                <div style={{ width: 6 }} />
+                <button onClick={() => p.setStrokeStabilizer(!p.strokeStabilizer)}
+                  title="Stabilizer — smooth out hand jitter on freehand strokes"
+                  style={p.strokeStabilizer ? rbActive("#f472b6") : rb}>{p.strokeStabilizer ? "Stabilize ✓" : "Stabilize"}</button>
+              </>)}
+            </div>
+            <div style={rbGroupLabel}>Shape &amp; Mode</div>
+          </div>
+          <div style={rbDivider} />
+        </>)}
+
+        {/* Sculpt tools — compact icon grid (5 cols × 2 rows) so the group stays ≤3 rows tall */}
+        <div style={rbGroup}>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(5, auto)", gap: 3 }}>
+            {sculptAllTools.map(t => (
+              <button key={t.id} onClick={() => p.setTool(t.id)} title={t.name}
+                style={{ ...(p.tool === t.id ? rbActive("#fb923c") : rb), padding: "2px 7px", fontSize: 13, lineHeight: "18px" }}>
+                {t.icon}
+              </button>
+            ))}
+          </div>
+          {/* Active-tool caption — the icons alone are ambiguous, so name the armed tool. */}
+          <div style={{ fontSize: 10, color: activeSculptTool ? "#fdba74" : "#475569", textAlign: "center",
+                        alignSelf: "stretch", fontWeight: 600, minHeight: 13, letterSpacing: "0.02em" }}>
+            {activeSculptTool ? activeSculptTool.short : "pick a tool"}
+          </div>
+          <div style={rbGroupLabel}>Sculpt <span style={{ ...expBadge, marginLeft: 2 }}>exp</span></div>
+        </div>
+        <div style={rbDivider} />
+
+        {/* Sculpt brush parameters — strength / radius / softness + falloff profile */}
+        <div style={rbGroup}>
+          <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+            <span style={{ color: "#64748b", fontSize: 10, minWidth: 46 }}>Strength</span>
+            <input type="range" min={1} max={8} step={1} value={p.sculptStrength}
+              onChange={e => p.setSculptStrength(Number(e.target.value))}
+              style={{ width: 72, accentColor: "#fb923c", cursor: "pointer" }} />
+            <span style={{ color: "#fdba74", fontSize: 11, fontVariantNumeric: "tabular-nums", minWidth: 10 }}>{p.sculptStrength}</span>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+            <span style={{ color: "#64748b", fontSize: 10, minWidth: 46 }}>Radius</span>
+            <input type="range" min={1} max={32} step={1} value={p.sculptRadius}
+              onChange={e => p.setSculptRadius(Number(e.target.value))}
+              title="Brush radius in blocks"
+              style={{ width: 72, accentColor: "#fb923c", cursor: "pointer" }} />
+            <span style={{ color: "#fdba74", fontSize: 11, fontVariantNumeric: "tabular-nums", minWidth: 14 }}>{p.sculptRadius}</span>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+            <span style={{ color: "#64748b", fontSize: 10, minWidth: 46 }}>Softness</span>
+            <input type="range" min={0} max={100} step={5} value={Math.round(p.sculptSoftness * 100)}
+              onChange={e => p.setSculptSoftness(Number(e.target.value) / 100)}
+              title="Radial falloff — 0 = hard edges, 100 = full dome (soft rim)"
+              style={{ width: 72, accentColor: "#fb923c", cursor: "pointer" }} />
+            <span style={{ color: "#fdba74", fontSize: 11, fontVariantNumeric: "tabular-nums", minWidth: 24 }}>{Math.round(p.sculptSoftness * 100)}%</span>
+          </div>
+          <div style={rbGroupLabel}>Brush</div>
+        </div>
+        <div style={rbDivider} />
+
+        {/* Falloff profile + hold-to-build + selection mask */}
+        <div style={rbGroup}>
+          <div style={{ display: "flex", alignItems: "center", gap: 3 }}>
+            <span style={{ color: "#64748b", fontSize: 10 }}>Profile</span>
+            {(["smooth","linear","sphere","sharp"] as const).map(pr => (
+              <button key={pr} onClick={() => p.setSculptProfile(pr)} title={`${pr} falloff curve`}
+                style={p.sculptProfile === pr ? rbActive("#fb923c") : { ...rb, padding: "2px 6px", textTransform: "capitalize" }}>
+                {pr}
+              </button>
+            ))}
+          </div>
+          <button onClick={() => p.setSculptAccumulate(!p.sculptAccumulate)}
+            title="Hold-to-build — keep applying while the mouse is held (airbrush)"
+            style={p.sculptAccumulate ? rbActive("#fb923c") : rb}>
+            {p.sculptAccumulate ? "Hold-build ✓" : "Hold-build"}
+          </button>
+          <button onClick={() => p.setSculptClipToSelection(!p.sculptClipToSelection)}
+            title="Constrain sculpt strokes to the active selection"
+            style={p.sculptClipToSelection ? rbActive("#fb923c") : rb}>
+            {p.sculptClipToSelection ? "In selection ✓" : "In selection"}
+          </button>
+          <div style={rbGroupLabel}>Falloff</div>
+        </div>
+        <div style={rbDivider} />
+
+        {/* Noise shape — only meaningful for the Noise tool */}
+        {p.tool === "noise" && (<>
+        <div style={rbGroup}>
+          <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+            <button onClick={() => p.setNoiseMode("hills")} style={p.noiseMode === "hills" ? rbActive("#fb923c") : { ...rb, padding: "2px 8px" }}>Hills</button>
+            <button onClick={() => p.setNoiseMode("mountains")} style={p.noiseMode === "mountains" ? rbActive("#fb923c") : { ...rb, padding: "2px 8px" }}>Mtns</button>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+            <span style={{ color: "#64748b", fontSize: 10, minWidth: 30 }}>Size</span>
+            <input type="range" min={6} max={80} step={2} value={p.noiseFeatureSize}
+              onChange={e => p.setNoiseFeatureSize(Number(e.target.value))}
+              style={{ width: 72, accentColor: "#fb923c", cursor: "pointer" }} />
+            <span style={{ color: "#fdba74", fontSize: 10, fontVariantNumeric: "tabular-nums", minWidth: 14 }}>{p.noiseFeatureSize}</span>
+          </div>
+          <div style={rbGroupLabel}>Noise</div>
+        </div>
+        <div style={rbDivider} />
+        </>)}
 
         <div style={rbGroup}>
           <button onClick={() => p.setMaskEnabled(!p.maskEnabled)} style={p.maskEnabled ? rbActive("#a78bfa") : rb}>
@@ -818,6 +959,7 @@ export default function Ribbon(p: RibbonProps) {
       <div style={{ display: "flex", alignItems: "stretch", height: "100%" }}>
         <div style={rbGroup}>
           <button onClick={p.loadPrefab} style={rb}>📦 Load Prefab (.epfab)…</button>
+          <button onClick={p.onTogglePrefabLibrary} style={p.showPrefabLibrary ? rbActive() : rb}>📚 Prefab Library</button>
           <div style={rbGroupLabel}>Prefab</div>
         </div>
         <div style={rbDivider} />
@@ -1034,6 +1176,18 @@ export default function Ribbon(p: RibbonProps) {
           <div style={rbDivider} />
         </>)}
 
+        <div style={rbGroup}>
+          <button
+            onClick={() => p.setMoveWithContents(v => !v)}
+            title="When on, dragging/arrow-nudging the selection also moves its blocks. When off (default), only the selection box moves."
+            style={p.moveWithContents ? rbActive("#f59e0b") : rb}
+          >
+            {p.moveWithContents ? "🧱 Move: Box + Contents" : "⬚ Move: Box Only"}
+          </button>
+          <div style={rbGroupLabel}>Nudge/Drag</div>
+        </div>
+        <div style={rbDivider} />
+
         {/* Z Range — dual-thumb slider */}
         <div style={rbGroup}>
           {/* Visual track */}
@@ -1104,6 +1258,35 @@ export default function Ribbon(p: RibbonProps) {
             Fill Selection
           </button>
           <div style={rbGroupLabel}>Fill</div>
+        </div>
+        <div style={rbDivider} />
+
+        {/* Gradient — blend the Fill block → a second block across an axis (dithered) */}
+        <div style={rbGroup}>
+          <button onClick={(e) => togglePicker(e, "gradient-to")}
+            title="Gradient target block (fades from the Fill block into this one)"
+            style={{ ...rb, display: "flex", gap: 5, alignItems: "center", background: openPicker?.type === "gradient-to" ? "rgba(255,255,255,0.1)" : rb.background }}>
+            <span style={{ color: "#64748b", fontSize: 10 }}>→</span>
+            <span style={{ maxWidth: 80, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 11 }}>
+              {blockDisplayName(p.gradientToBlock)}{p.gradientToPaint > 0 ? ` #${p.gradientToPaint}` : ""}
+            </span>
+            <span style={{ color:"#475569",fontSize:9 }}>▾</span>
+          </button>
+          <div style={{ display: "flex", gap: 2, alignItems: "center" }}>
+            <span style={{ color: "#64748b", fontSize: 10, minWidth: 26 }}>Axis</span>
+            {([["x","→ across (E–W)"],["y","↓ across (N–S)"],["z","↕ by height"]] as const).map(([a, tip]) => (
+              <button key={a} onClick={() => p.setGradientAxis(a)} title={`Gradient ${tip}${a === "z" ? " — visible in side/3D views" : " — visible top-down"}`}
+                style={p.gradientAxis === a ? rbActive("#f59e0b") : { ...rb, padding: "2px 7px", textTransform: "uppercase" }}>{a}</button>
+            ))}
+            <button onClick={() => p.setGradientIncludeAir(!p.gradientIncludeAir)}
+              title="Also fill empty (air) cells, not just existing blocks"
+              style={p.gradientIncludeAir ? rbActive("#f59e0b") : { ...rb, padding: "2px 6px" }}>+Air</button>
+          </div>
+          <button onClick={p.applyGradientFill} disabled={!p.rawBounds}
+            style={{ ...rb, opacity: p.rawBounds ? 1 : 0.35, cursor: p.rawBounds ? "pointer" : "not-allowed", borderColor: "#f59e0b", color: "#fcd34d" }}>
+            Gradient Fill
+          </button>
+          <div style={rbGroupLabel}>Gradient</div>
         </div>
         <div style={rbDivider} />
 
@@ -1190,7 +1373,10 @@ export default function Ribbon(p: RibbonProps) {
           ) : (
             <div style={{ color: "#4ade80", fontSize: 11 }}>Click map to place</div>
           )}
-          <button onClick={p.onSavePrefab} style={{ ...rb, borderColor: "#4ade80", color: "#86efac", fontSize: 10 }}>Save Prefab…</button>
+          <div style={{ display: "flex", gap: 2 }}>
+            <button onClick={p.onSavePrefab} style={{ ...rb, borderColor: "#4ade80", color: "#86efac", fontSize: 10 }}>Save Prefab…</button>
+            <button onClick={p.onSavePrefabAs} title="Save to any folder (native dialog)" style={{ ...rb, borderColor: "#4ade80", color: "#86efac", fontSize: 10 }}>As…</button>
+          </div>
           <div style={rbGroupLabel}>Clipboard</div>
         </div>
         <div style={rbDivider} />
@@ -1621,6 +1807,12 @@ export default function Ribbon(p: RibbonProps) {
               onBlockTypeChange={bt => { if (bt !== null) p.setFillBlockType(bt); }}
               onPaintChange={paint => p.setFillPaint(paint ?? 0)}
               onFill={p.fillSelection} selectionExists={!!p.rawBounds}
+              texturePack={p.texturePack} />
+          ) : openPicker.type === "gradient-to" ? (
+            <BlockPaintPicker mode="fill" blockType={p.gradientToBlock} paint={p.gradientToPaint}
+              onBlockTypeChange={bt => { if (bt !== null) p.setGradientToBlock(bt); }}
+              onPaintChange={paint => p.setGradientToPaint(paint ?? 0)}
+              onFill={p.applyGradientFill} selectionExists={!!p.rawBounds}
               texturePack={p.texturePack} />
           ) : (
             <BlockPaintPicker mode="filter" blockType={p.filterBlockType} paint={p.filterPaint}

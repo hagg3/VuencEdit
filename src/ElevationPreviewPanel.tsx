@@ -1,19 +1,7 @@
 import { decodeU8 } from "./codec";
 import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import type { SelectionInfo } from "./App";
-
-interface PreviewDataRaw {
-  width: number;
-  height: number;
-  pixels: string; // base64 RGBA
-}
-
-interface PreviewData {
-  width: number;
-  height: number;
-  pixels: Uint8Array;
-}
+import type { SelectionInfo, PreviewDataRaw, PreviewData } from "./types";
 
 interface Props {
   selection: SelectionInfo;

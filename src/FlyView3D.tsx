@@ -4,6 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import type { AtlasData } from "./texturePack";
+import type { WorldMeta } from "./types";
 import { chromeButton } from "./designTokens";
 
 interface ChunkGeom { positions: string; colors: string; uvs: string; vertex_count: number }
@@ -21,7 +22,6 @@ interface ChunkGeom { positions: string; colors: string; uvs: string; vertex_cou
 // Geometry streams per chunk within a radius of the camera; chunks outside the radius are disposed.
 // Edits refetch only the chunks overlapping the last edit's bounds.
 
-interface World { width_chunks: number; height_chunks: number; max_z: number }
 interface EditBounds { x: number; y: number; w: number; h: number }
 
 const LOAD_RADIUS = 5;   // chunks loaded around the camera (in chunk units)
@@ -43,7 +43,7 @@ export interface Overlay3D {
 }
 
 const FlyView3D = forwardRef<FlyView3DRef, {
-  world: World; editEpoch?: number; lastEdit?: EditBounds | null;
+  world: WorldMeta; editEpoch?: number; lastEdit?: EditBounds | null;
   /** Initial camera target in Eden local block coords (x = east, y = south). Spawns the camera
    *  over real geometry; falls back to the world centre when null/undefined. */
   spawnAt?: { x: number; y: number } | null;

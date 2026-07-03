@@ -28,6 +28,22 @@ function paintColor(idx: number): string {
 
 function fmt1(n: number) { return n.toFixed(1); }
 
+const rowStyle: React.CSSProperties = {
+  display: "flex", justifyContent: "space-between", alignItems: "baseline",
+  padding: "2px 0", gap: 12,
+};
+const keyStyle: React.CSSProperties = { color: "#94a3b8", flexShrink: 0 };
+const valStyle: React.CSSProperties = { color: "#e2e8f0", textAlign: "right", wordBreak: "break-all" };
+
+function Row({ k, v }: { k: string; v: React.ReactNode }) {
+  return (
+    <div style={rowStyle}>
+      <span style={keyStyle}>{k}</span>
+      <span style={valStyle}>{v}</span>
+    </div>
+  );
+}
+
 export default function WorldInfoModal({ onClose }: { onClose: () => void }) {
   const [info, setInfo] = useState<WorldInfo | null>(null);
   const [err, setErr] = useState<string | null>(null);
@@ -53,22 +69,6 @@ export default function WorldInfoModal({ onClose }: { onClose: () => void }) {
     color: "#475569", textTransform: "uppercase", marginBottom: 6,
     borderBottom: "1px solid #1e293b", paddingBottom: 3,
   };
-  const row: React.CSSProperties = {
-    display: "flex", justifyContent: "space-between", alignItems: "baseline",
-    padding: "2px 0", gap: 12,
-  };
-  const key: React.CSSProperties = { color: "#94a3b8", flexShrink: 0 };
-  const val: React.CSSProperties = { color: "#e2e8f0", textAlign: "right", wordBreak: "break-all" };
-
-  function Row({ k, v }: { k: string; v: React.ReactNode }) {
-    return (
-      <div style={row}>
-        <span style={key}>{k}</span>
-        <span style={val}>{v}</span>
-      </div>
-    );
-  }
-
   return (
     <Modal onClose={onClose} zIndex={9000} labelledBy="worldinfo-title">
       <div style={modal}>

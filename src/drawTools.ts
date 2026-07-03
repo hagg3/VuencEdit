@@ -36,6 +36,54 @@ export function bresenhamLine(a: WP, b: WP): WP[] {
   return pts;
 }
 
+/** A straight line from a→b, thickened by stamping the brush footprint along it. */
+export function linePixels(a: WP, b: WP, size: number, shape: BrushShape): WP[] {
+  const centre = bresenhamLine(a, b);
+  if (size <= 1) return centre;
+  const seen = new Set<string>();
+  const pts: WP[] = [];
+  for (const c of centre) {
+    for (const p of brushFootprint(c, size, shape)) {
+      const k = `${p.x},${p.y}`;
+      if (!seen.has(k)) { seen.add(k); pts.push(p); }
+    }
+  }
+  return pts;
+}
+
+/** Filled or outlined polygon from an ordered vertex list (auto-closed). */
+export function polygonPixels(verts: WP[], mode: FillMode): WP[] {
+  if (verts.length === 0) return [];
+  if (verts.length === 1) return [{ x: verts[0].x, y: verts[0].y }];
+  // Edge pixels (closed loop) via bresenham between consecutive vertices.
+  const edge: WP[] = [];
+  for (let i = 0; i < verts.length; i++) {
+    const a = verts[i], b = verts[(i + 1) % verts.length];
+    for (const p of bresenhamLine(a, b)) edge.push(p);
+  }
+  if (mode === "outline" || verts.length < 3) return dedup(edge);
+  // Scanline fill: for each row, find polygon-edge crossings and fill between pairs.
+  let minY = Infinity, maxY = -Infinity;
+  for (const v of verts) { minY = Math.min(minY, v.y); maxY = Math.max(maxY, v.y); }
+  const pts: WP[] = [...edge];
+  for (let y = Math.ceil(minY); y <= Math.floor(maxY); y++) {
+    const xs: number[] = [];
+    for (let i = 0; i < verts.length; i++) {
+      const a = verts[i], b = verts[(i + 1) % verts.length];
+      const y1 = a.y, y2 = b.y;
+      // Half-open edge test avoids double-counting shared vertices.
+      if ((y1 <= y && y2 > y) || (y2 <= y && y1 > y)) {
+        xs.push(a.x + ((y - y1) / (y2 - y1)) * (b.x - a.x));
+      }
+    }
+    xs.sort((m, n) => m - n);
+    for (let i = 0; i + 1 < xs.length; i += 2) {
+      for (let x = Math.ceil(xs[i]); x <= Math.floor(xs[i + 1]); x++) pts.push({ x, y });
+    }
+  }
+  return dedup(pts);
+}
+
 export function rectPixels(a: WP, b: WP, mode: FillMode): WP[] {
   const x1 = Math.min(a.x, b.x), x2 = Math.max(a.x, b.x);
   const y1 = Math.min(a.y, b.y), y2 = Math.max(a.y, b.y);

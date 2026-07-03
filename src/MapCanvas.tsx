@@ -1,14 +1,25 @@
-import { decodeU8 } from "./codec";
 import { useEffect, useRef, useCallback, forwardRef, useImperativeHandle } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { brushFootprint, bresenhamLine, rectPixels, ellipsePixels, type WP, type BrushShape, type FillMode } from "./drawTools";
+import { brushFootprint, bresenhamLine, linePixels, polygonPixels, rectPixels, ellipsePixels, type WP, type BrushShape, type FillMode } from "./drawTools";
+import { type WorldMeta, type PixelPatch, type PixelPatchRaw } from "./types";
+import { zoomAtPoint, resizeCanvasToContainer, makeSeqGuard, putPatchPixels } from "./viewportUtils";
 
-export type Tool = "pan" | "select" | "wand" | "paste" | "pen" | "brush" | "rect" | "ellipse" | "smooth" | "noise" | "flatten" | "erode" | "fill" | "eyedropper";
+export type { PixelPatch } from "./types";
+
+export type Tool = "pan" | "select" | "wand" | "paste" | "pen" | "brush" | "spray" | "line" | "rect" | "ellipse" | "polygon" | "smooth" | "noise" | "flatten" | "erode" | "thermal" | "hydro" | "stamp" | "grab" | "raise" | "lower" | "fill" | "eyedropper";
+
+/** Sculpt tools that paint a swept disc footprint (everything except the drag-controlled "grab"). */
+const SCULPT_STROKE_TOOLS: readonly Tool[] = ["smooth", "noise", "flatten", "erode", "thermal", "hydro", "stamp", "raise", "lower"];
+const isSculptStroke = (t: Tool): boolean => SCULPT_STROKE_TOOLS.includes(t);
 
 export interface DrawConfig {
   brushSize: number;
   brushShape: BrushShape;
   fillMode: FillMode;
+  sculptRadius: number;
+  sculptAccumulate: boolean;
+  sprayDensity: number;      // 0..1 — fraction of footprint cells placed per spray stamp
+  strokeStabilizer: boolean; // low-pass the freehand pointer path (Photoshop-style)
 }
 
 /** World pixels per tile side. Each tile is fetched independently via IPC. */
@@ -19,14 +30,6 @@ const TILE_BUFFER = 1;
 
 /** Maximum simultaneous in-flight tile fetches. Prevents IPC channel saturation. */
 const MAX_CONCURRENT = 4;
-
-export interface PixelPatch {
-  x: number; y: number;
-  width: number; height: number;
-  pixels: Uint8Array;
-}
-
-interface PixelPatchRaw { x: number; y: number; width: number; height: number; pixels: string; }
 
 export interface MapCanvasRef {
   /** Write top-down pixel patch directly into the affected tiles/canvas (top-down mode edit). */
@@ -43,12 +46,33 @@ type DragOp =
   | { kind: "pan"; startX: number; startY: number; viewX: number; viewY: number }
   | { kind: "select"; start: WorldPoint; end: WorldPoint }
   | { kind: "resizeEdge"; edge: "x1" | "x2" | "y1" | "y2"; live: SelectionBounds }
-  | { kind: "draw-stroke"; pts: Set<string>; lastWX: number; lastWY: number }
-  | { kind: "draw-shape"; tool: "rect" | "ellipse"; start: WP; end: WP }
+  | { kind: "moveSel"; origin: SelectionBounds; start: WorldPoint; dx: number; dy: number; ghost: HTMLCanvasElement | null }
+  | { kind: "draw-stroke"; pts: Set<string>; lastWX: number; lastWY: number; startWX: number; startWY: number }
+  | { kind: "sculpt-grab"; pts: Set<string>; cx: number; cy: number; downClientY: number; delta: number }
+  | { kind: "draw-shape"; tool: "rect" | "ellipse" | "line"; start: WP; end: WP }
   | { kind: "cam3d-drag" }
   | null;
 
 const EDGE_HIT_PX = 6;
+
+/** Draw-stroke tools that freehand-stamp a footprint along the pointer path. */
+const FREEHAND_TOOLS: readonly Tool[] = ["pen", "brush", "spray"];
+const isFreehand = (t: Tool): boolean => FREEHAND_TOOLS.includes(t);
+/** Two-click drag shapes committed on pointer-up. */
+const isShapeTool = (t: Tool): boolean => t === "line" || t === "rect" || t === "ellipse";
+
+/** Keep each cell with probability `density` (spray/scatter). */
+const sprayFilter = (cells: WP[], density: number): WP[] =>
+  density >= 1 ? cells : cells.filter(() => Math.random() < density);
+
+/** Footprint stamped at `p` for a freehand/sculpt tool given the current config. */
+function stampFootprint(p: WP, tool: Tool, cfg: DrawConfig | undefined): WP[] {
+  if (!cfg) return [p];
+  if (isSculptStroke(tool)) return brushFootprint(p, cfg.sculptRadius * 2 + 1, "circ");
+  if (tool === "pen") return [p];
+  const fp = brushFootprint(p, cfg.brushSize, cfg.brushShape);
+  return tool === "spray" ? sprayFilter(fp, cfg.sprayDensity) : fp;
+}
 
 function hitTestEdge(
   sx: number, sy: number,
@@ -78,14 +102,8 @@ export interface SelectionBounds {
   x1: number; y1: number; x2: number; y2: number;
 }
 
-interface WorldData {
-  name: string;
-  width_chunks: number;
-  height_chunks: number;
-}
-
 interface Props {
-  world: WorldData;
+  world: WorldMeta;
   worldEpoch: number;
   tool: Tool;
   viewMode: "topdown" | "zslice";
@@ -103,8 +121,8 @@ interface Props {
   lockedPastePos?: { x: number; y: number } | null;
   /** Draw tool configuration — only read when tool is pen/brush/rect/ellipse. */
   drawConfig?: DrawConfig;
-  /** Called when a draw stroke or shape is committed with the list of world positions and the z override (null = surface). */
-  onDrawStroke?: (pts: [number, number][], zOverride: number | null) => void;
+  /** Called when a draw stroke or shape is committed with the list of world positions, the z override (null = surface), the pointer-down anchor column (sculpt tools), and (grab tool) the drag-controlled vertical delta in blocks. */
+  onDrawStroke?: (pts: [number, number][], zOverride: number | null, anchor?: [number, number], grabDelta?: number) => void | Promise<void>;
   /** Current z-slice level — used as z override when drawing in z-slice mode. */
   drawZOverride?: number | null;
   /** When set, draws ghost copies of the selection on X or Y axis before the user commits. */
@@ -133,6 +151,12 @@ interface Props {
   showTemplateOverlay?: boolean;
   /** Right-click context menu callback — receives world coords + screen coords. */
   onMapContextMenu?: (wx: number, wy: number, screenX: number, screenY: number) => void;
+  /** Called on every pointer-move during a select-tool drag with the live (unnormalized) rect; null when the drag ends/cancels. Used for a live W×H status bar readout. */
+  onSelectDragUpdate?: (rect: { x1: number; y1: number; x2: number; y2: number } | null) => void;
+  /** Called when the user drags inside the committed selection (not on a resize edge) and releases with a nonzero offset — moves the selection and its contents as one gesture (E2). */
+  onMoveSelection?: (dx: number, dy: number) => void;
+  /** When true, a drag-move captures a snapshot of the selection's current pixels and shows it as a semi-transparent ghost following the drag (content will actually move on drop). When false, only the outline is dragged (E2 "Move: Box Only" default). */
+  moveWithContents?: boolean;
 }
 
 type TileJob = { key: string; x1: number; y1: number; x2: number; y2: number };
@@ -146,7 +170,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     spawnPos = null, creatures = [],
     pasteElevationOffset = 0, onEyedropper, sliceLines = null,
     cameraPos3d = null, onSetCamera3d,
-    showTemplateOverlay = false, onMapContextMenu }: Props,
+    showTemplateOverlay = false, onMapContextMenu, onSelectDragUpdate, onMoveSelection, moveWithContents = false }: Props,
   ref,
 ) {
   const canvasRef  = useRef<HTMLCanvasElement>(null);
@@ -157,8 +181,8 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   const tileCacheRef  = useRef<Map<string, HTMLCanvasElement>>(new Map());
   const templateTileCacheRef = useRef<Map<string, HTMLCanvasElement>>(new Map());
   const pendingRef    = useRef<Set<string>>(new Set());
-  // Incremented whenever mode/z/world/renderMode changes — lets in-flight fetches detect staleness
-  const tileEpochRef  = useRef(0);
+  // Bumped whenever mode/z/world/renderMode changes — lets in-flight fetches detect staleness
+  const tileEpoch = useRef(makeSeqGuard());
 
   // Concurrency-capped fetch queue (tiled mode)
   const activeRef  = useRef(0);
@@ -174,6 +198,16 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   const fullProgressRef   = useRef<number | null>(null);
 
   const dragRef = useRef<DragOp>(null);
+  // Hold-to-build: interval id while a sculpt stroke re-stamps the cursor; flag = a tick fired
+  // (so pointer-up skips the final one-shot stroke to avoid a double application).
+  const accumTimerRef = useRef<number | null>(null);
+  const accumFiredRef = useRef(false);
+  const accumBusyRef = useRef(false); // a tick's async edit is still in flight — skip overlaps
+  // Polygon tool: click-accumulated vertices (committed on click-near-start / double-click).
+  const polyVertsRef = useRef<WP[]>([]);
+  // Stroke stabilizer: fractional low-passed pointer position that the freehand stamp follows.
+  const smoothPosRef = useRef<{ x: number; y: number } | null>(null);
+  useEffect(() => () => { if (accumTimerRef.current !== null) clearInterval(accumTimerRef.current); }, []);
 
   // Stable refs for values read inside callbacks (avoids re-registering handlers)
   const toolRef         = useRef<Tool>(tool);
@@ -201,6 +235,9 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   const onEyedropperRef     = useRef(onEyedropper);
   const cameraPos3dRef      = useRef(cameraPos3d ?? null);
   const onSetCamera3dRef    = useRef(onSetCamera3d);
+  const onSelectDragUpdateRef = useRef(onSelectDragUpdate);
+  const onMoveSelectionRef = useRef(onMoveSelection);
+  const moveWithContentsRef = useRef(moveWithContents);
 
   useEffect(() => { toolRef.current = tool; }, [tool]);
   useEffect(() => { onSelChangeRef.current = onSelectionChange; }, [onSelectionChange]);
@@ -221,6 +258,9 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   useEffect(() => { onEyedropperRef.current    = onEyedropper;        }, [onEyedropper]);
   useEffect(() => { cameraPos3dRef.current     = cameraPos3d ?? null; }, [cameraPos3d]);
   useEffect(() => { onSetCamera3dRef.current   = onSetCamera3d;       }, [onSetCamera3d]);
+  useEffect(() => { onSelectDragUpdateRef.current = onSelectDragUpdate; }, [onSelectDragUpdate]);
+  useEffect(() => { onMoveSelectionRef.current = onMoveSelection; }, [onMoveSelection]);
+  useEffect(() => { moveWithContentsRef.current = moveWithContents; }, [moveWithContents]);
   const showTemplateOverlayRef = useRef(showTemplateOverlay);
   // Keep ref in sync; cache clear + redraw happen in the post-draw effect below
   useEffect(() => { showTemplateOverlayRef.current = showTemplateOverlay; }, [showTemplateOverlay]);
@@ -235,8 +275,11 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   // Convert clientX/clientY (viewport coords) to canvas-local coords. The canvas is no longer
   // guaranteed to fill the window at origin (0,0) — in quad/multi-viewport mode it lives in a
   // grid cell — so we subtract its bounding-rect offset.
+  // Cached rect avoids a layout read on every pointermove (getBoundingClientRect forces reflow);
+  // refreshed on resize (ResizeObserver) and at the start of each pointer gesture.
+  const rectRef = useRef<DOMRect | null>(null);
   const toLocal = useCallback((cx: number, cy: number): { x: number; y: number } => {
-    const r = canvasRef.current?.getBoundingClientRect();
+    const r = rectRef.current ?? canvasRef.current?.getBoundingClientRect() ?? null;
     return { x: cx - (r?.left ?? 0), y: cy - (r?.top ?? 0) };
   }, []);
 
@@ -327,6 +370,10 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     } else if (drag?.kind === "resizeEdge") {
       ({ x1: wx1, y1: wy1, x2: wx2, y2: wy2 } = drag.live);
       hasSel = true;
+    } else if (drag?.kind === "moveSel") {
+      wx1 = drag.origin.x1 + drag.dx; wy1 = drag.origin.y1 + drag.dy;
+      wx2 = drag.origin.x2 + drag.dx; wy2 = drag.origin.y2 + drag.dy;
+      hasSel = true;
     } else if (committedSelRef.current) {
       ({ x1: wx1, y1: wy1, x2: wx2, y2: wy2 } = committedSelRef.current);
       hasSel = true;
@@ -336,6 +383,11 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
       const ry = Math.round(wy1 * scale + vy);
       const rw = Math.round((wx2 - wx1 + 1) * scale);
       const rh = Math.round((wy2 - wy1 + 1) * scale);
+      if (drag?.kind === "moveSel" && drag.ghost) {
+        ctx.globalAlpha = 0.8;
+        ctx.drawImage(drag.ghost, rx, ry, rw, rh);
+        ctx.globalAlpha = 1;
+      }
       ctx.fillStyle   = "rgba(59, 130, 246, 0.18)";
       ctx.fillRect(rx, ry, rw, rh);
       ctx.strokeStyle = "rgba(255, 255, 255, 0.9)";
@@ -587,27 +639,64 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
           const ci = key.indexOf(",");
           paintPt(parseInt(key.slice(0, ci)), parseInt(key.slice(ci + 1)));
         }
+      } else if (drag?.kind === "sculpt-grab") {
+        // Fixed disc footprint tinted amber; a floating ±N label shows the pull amount.
+        ctx.fillStyle = "rgba(251,146,60,0.5)";
+        for (const key of drag.pts) {
+          const ci = key.indexOf(",");
+          paintPt(parseInt(key.slice(0, ci)), parseInt(key.slice(ci + 1)));
+        }
+        const lx = Math.round(drag.cx * scale + vx);
+        const ly = Math.round(drag.cy * scale + vy);
+        ctx.font = "bold 13px monospace";
+        ctx.fillStyle = drag.delta > 0 ? "#fbbf24" : drag.delta < 0 ? "#60a5fa" : "#94a3b8";
+        ctx.textAlign = "center";
+        ctx.fillText(`${drag.delta > 0 ? "+" : ""}${drag.delta}`, lx, ly - 8);
+        ctx.textAlign = "left";
       } else if (drag?.kind === "draw-shape" && cfg) {
-        const pts = drag.tool === "rect"
-          ? rectPixels(drag.start, drag.end, cfg.fillMode)
+        const pts = drag.tool === "rect" ? rectPixels(drag.start, drag.end, cfg.fillMode)
+          : drag.tool === "line" ? linePixels(drag.start, drag.end, cfg.brushSize, cfg.brushShape)
           : ellipsePixels(drag.start, drag.end, cfg.fillMode);
         ctx.fillStyle = "rgba(56,189,248,0.55)";
         for (const p of pts) paintPt(p.x, p.y);
-        // Outline the bounding box
+        if (drag.tool !== "line") {
+          // Outline the bounding box (line has no meaningful box)
+          ctx.strokeStyle = "rgba(56,189,248,0.9)";
+          ctx.lineWidth = 1;
+          const bx1 = Math.min(drag.start.x, drag.end.x), by1 = Math.min(drag.start.y, drag.end.y);
+          const bx2 = Math.max(drag.start.x, drag.end.x), by2 = Math.max(drag.start.y, drag.end.y);
+          ctx.strokeRect(Math.round(bx1 * scale + vx) + 0.5, Math.round(by1 * scale + vy) + 0.5,
+            Math.round((bx2 - bx1 + 1) * scale), Math.round((by2 - by1 + 1) * scale));
+        }
+      } else if (drawTool === "polygon" && polyVertsRef.current.length > 0) {
+        // Polygon-in-progress: vertices + edges + rubber-band to cursor.
+        const verts = polyVertsRef.current;
+        const toS = (p: WP) => ({ x: Math.round(p.x * scale + vx) + gs / 2, y: Math.round(p.y * scale + vy) + gs / 2 });
         ctx.strokeStyle = "rgba(56,189,248,0.9)";
-        ctx.lineWidth = 1;
-        const bx1 = Math.min(drag.start.x, drag.end.x), by1 = Math.min(drag.start.y, drag.end.y);
-        const bx2 = Math.max(drag.start.x, drag.end.x), by2 = Math.max(drag.start.y, drag.end.y);
-        ctx.strokeRect(Math.round(bx1 * scale + vx) + 0.5, Math.round(by1 * scale + vy) + 0.5,
-          Math.round((bx2 - bx1 + 1) * scale), Math.round((by2 - by1 + 1) * scale));
-      } else if (!drag && (drawTool === "pen" || drawTool === "brush" || drawTool === "smooth" || drawTool === "noise" || drawTool === "flatten" || drawTool === "erode" || drawTool === "fill") && cfg) {
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        const s0 = toS(verts[0]);
+        ctx.moveTo(s0.x, s0.y);
+        for (let i = 1; i < verts.length; i++) { const s = toS(verts[i]); ctx.lineTo(s.x, s.y); }
+        const cur = cursorPosRef.current;
+        if (cur) { const sc = toS(cur); ctx.lineTo(sc.x, sc.y); }
+        ctx.stroke();
+        // Vertex dots; the first is highlighted (click it to close).
+        for (let i = 0; i < verts.length; i++) {
+          const s = toS(verts[i]);
+          ctx.fillStyle = i === 0 ? "#22c55e" : "#38bdf8";
+          ctx.beginPath(); ctx.arc(s.x, s.y, i === 0 ? 4 : 3, 0, Math.PI * 2); ctx.fill();
+        }
+      } else if (!drag && (isFreehand(drawTool) || drawTool === "grab" || isSculptStroke(drawTool) || drawTool === "fill") && cfg) {
         // Cursor preview when hovering (not dragging)
         const pos = cursorPosRef.current;
         if (pos) {
-          const isSculpt = drawTool === "smooth" || drawTool === "noise" || drawTool === "flatten" || drawTool === "erode";
-          const pts = (drawTool === "pen" || drawTool === "fill")
-            ? [pos]
-            : brushFootprint(pos, cfg.brushSize, isSculpt ? "circ" : cfg.brushShape);
+          const isSculpt = drawTool === "grab" || isSculptStroke(drawTool);
+          const pts = isSculpt
+            ? brushFootprint(pos, cfg.sculptRadius * 2 + 1, "circ")
+            : (drawTool === "pen" || drawTool === "fill")
+              ? [pos]
+              : brushFootprint(pos, cfg.brushSize, cfg.brushShape);
           ctx.fillStyle = isSculpt ? "rgba(251,146,60,0.45)" : drawTool === "fill" ? "rgba(52,211,153,0.55)" : "rgba(56,189,248,0.4)";
           for (const p of pts) paintPt(p.x, p.y);
         }
@@ -629,12 +718,25 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     }
   }, []);
 
+  // rAF-coalesced draw: pointermove/wheel fire far faster than the display refresh rate, so a
+  // synchronous draw() per event does redundant canvas work. scheduleDraw collapses any number
+  // of calls within a frame into one (FlyView3D's dirty+rAF pattern).
+  const drawRafPendingRef = useRef(false);
+  const scheduleDraw = useCallback(() => {
+    if (drawRafPendingRef.current) return;
+    drawRafPendingRef.current = true;
+    requestAnimationFrame(() => {
+      drawRafPendingRef.current = false;
+      draw();
+    });
+  }, [draw]);
+
   // ── loadTile ──────────────────────────────────────────────────────────────
 
   const loadTile = useCallback(async (
     key: string, x1: number, y1: number, x2: number, y2: number,
   ) => {
-    const myEpoch = tileEpochRef.current;
+    const myEpoch = tileEpoch.current.peek();
     pendingRef.current.add(key);
     try {
       let raw: PixelPatchRaw;
@@ -645,29 +747,21 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
       } else {
         raw = await invoke<PixelPatchRaw>("fetch_tile", { x1, y1, x2, y2 });
       }
-      if (tileEpochRef.current !== myEpoch) return;
-      const pixels = decodeU8(raw.pixels);
+      if (tileEpoch.current.isStale(myEpoch)) return;
       const tc  = document.createElement("canvas");
       tc.width  = raw.width;
       tc.height = raw.height;
-      const tctx = tc.getContext("2d")!;
-      const img   = tctx.createImageData(raw.width, raw.height);
-      img.data.set(pixels);
-      tctx.putImageData(img, 0, 0);
+      putPatchPixels(tc.getContext("2d")!, raw);
       tileCacheRef.current.set(key, tc);
 
       // Also fetch template tile for overlay if enabled and in topdown mode
       if (showTemplateOverlayRef.current && viewModeRef.current !== "zslice" && !templateTileCacheRef.current.has(key)) {
         try {
           const traw = await invoke<PixelPatchRaw>("fetch_template_tile", { x1, y1, x2, y2 });
-          if (tileEpochRef.current === myEpoch) {
-            const tpixels = decodeU8(traw.pixels);
+          if (!tileEpoch.current.isStale(myEpoch)) {
             const ttc = document.createElement("canvas");
             ttc.width = traw.width; ttc.height = traw.height;
-            const ttctx = ttc.getContext("2d")!;
-            const timg = ttctx.createImageData(traw.width, traw.height);
-            timg.data.set(tpixels);
-            ttctx.putImageData(timg, 0, 0);
+            putPatchPixels(ttc.getContext("2d")!, traw);
             templateTileCacheRef.current.set(key, ttc);
           }
         } catch { /* template fetch failure is non-fatal */ }
@@ -687,7 +781,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   useEffect(() => {
     templateTileCacheRef.current.clear();
     if (showTemplateOverlay) {
-      tileEpochRef.current++;
+      tileEpoch.current.next();
       tileCacheRef.current.clear();
       pendingRef.current.clear();
       queueRef.current = [];
@@ -717,7 +811,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   // in progressively. Only used in "full" render mode.
 
   const loadFullCanvas = useCallback(async () => {
-    const myEpoch = tileEpochRef.current;
+    const myEpoch = tileEpoch.current.peek();
     const mW = mapWRef.current;
     const mH = mapHRef.current;
 
@@ -732,7 +826,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     const STRIP_H = 128;
     try {
       for (let y = 0; y < mH; y += STRIP_H) {
-        if (tileEpochRef.current !== myEpoch) return;
+        if (tileEpoch.current.isStale(myEpoch)) return;
         const y2 = Math.min(mH - 1, y + STRIP_H - 1);
         let raw: PixelPatchRaw;
         if (viewModeRef.current === "zslice") {
@@ -746,11 +840,8 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
         } else {
           raw = await invoke<PixelPatchRaw>("fetch_tile", { x1: 0, y1: y, x2: mW - 1, y2 });
         }
-        if (tileEpochRef.current !== myEpoch) return;
-        const pixels = decodeU8(raw.pixels);
-        const img = fctx.createImageData(raw.width, raw.height);
-        img.data.set(pixels);
-        fctx.putImageData(img, 0, y);
+        if (tileEpoch.current.isStale(myEpoch)) return;
+        putPatchPixels(fctx, raw, 0, y);
         fullProgressRef.current = Math.min(1, (y + STRIP_H) / mH);
         draw();
       }
@@ -831,6 +922,19 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     drain();
   }, [draw, drain, loadFullCanvas]);
   ensureTilesRef.current = ensureTiles;
+
+  // rAF-coalesced ensureTiles for the pan-drag hot path — panning fires pointermove far faster
+  // than the display refresh rate, and ensureTiles recomputes the tile window + does Set churn
+  // on top of draw(), so this matters more there than a bare scheduleDraw.
+  const ensureRafPendingRef = useRef(false);
+  const scheduleEnsureTiles = useCallback(() => {
+    if (ensureRafPendingRef.current) return;
+    ensureRafPendingRef.current = true;
+    requestAnimationFrame(() => {
+      ensureRafPendingRef.current = false;
+      ensureTiles();
+    });
+  }, [ensureTiles]);
 
   // ── Exposed API ───────────────────────────────────────────────────────────
 
@@ -944,7 +1048,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   useEffect(() => {
     viewModeRef.current = viewMode;
     zSliceZRef.current  = zSliceZ;
-    tileEpochRef.current++;
+    tileEpoch.current.next();
     tileCacheRef.current.clear();
     templateTileCacheRef.current.clear();
     pendingRef.current.clear();
@@ -956,7 +1060,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   // Invalidate everything when render mode changes
   useEffect(() => {
     renderModeRef.current = renderMode;
-    tileEpochRef.current++;
+    tileEpoch.current.next();
     tileCacheRef.current.clear();
     templateTileCacheRef.current.clear();
     pendingRef.current.clear();
@@ -969,7 +1073,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   useEffect(() => {
     axoSkewRef.current = axoSkew;
     if (renderModeRef.current !== "axo") return;
-    tileEpochRef.current++;
+    tileEpoch.current.next();
     fullCanvasRef.current = null;
     ensureTiles();
   }, [axoSkew, ensureTiles]);
@@ -980,13 +1084,8 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     // Size the backing store to the canvas's own laid-out box (CSS 100%/100% of its parent),
     // not the window — so the canvas works both full-screen and inside a quad-view grid cell.
     const resize = () => {
-      const r = canvas.getBoundingClientRect();
-      const w = Math.max(1, Math.floor(r.width));
-      const h = Math.max(1, Math.floor(r.height));
-      if (canvas.width !== w || canvas.height !== h) {
-        canvas.width = w;
-        canvas.height = h;
-      }
+      resizeCanvasToContainer(canvas);
+      rectRef.current = canvas.getBoundingClientRect();
       ensureTiles();
     };
     resize();
@@ -997,7 +1096,34 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
 
   // ── Pointer / wheel handlers ──────────────────────────────────────────────
 
+  // Close the polygon-in-progress: fill/outline its interior and commit as one stroke.
+  const commitPolygon = useCallback(() => {
+    const verts = polyVertsRef.current;
+    polyVertsRef.current = [];
+    if (verts.length >= 2 && onDrawStrokeRef.current) {
+      const mode: FillMode = drawConfigRef.current?.fillMode ?? "fill";
+      const pts = polygonPixels(verts, mode);
+      if (pts.length > 0) onDrawStrokeRef.current(pts.map(p => [p.x, p.y]), drawZOverrideRef.current);
+    }
+    draw();
+  }, [draw]);
+
+  // Escape cancels an in-progress polygon (before it reaches App's global Escape handler).
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && polyVertsRef.current.length > 0) {
+        e.stopPropagation();
+        polyVertsRef.current = [];
+        draw();
+      }
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [draw]);
+
   const onPointerDown = useCallback((e: React.PointerEvent) => {
+    // Refresh the cached rect at the start of each gesture (toLocal reads it for the duration).
+    rectRef.current = (e.target as HTMLCanvasElement).getBoundingClientRect();
     if (e.button === 1) {
       (e.target as HTMLCanvasElement).setPointerCapture(e.pointerId);
       e.preventDefault();
@@ -1050,31 +1176,103 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
           draw();
           return;
         }
+        const wpIn = screenToWorld(e.clientX, e.clientY);
+        if (wpIn.x >= sel.x1 && wpIn.x <= sel.x2 && wpIn.y >= sel.y1 && wpIn.y <= sel.y2) {
+          // Click-drag inside the committed selection (not on a resize edge) moves it with
+          // its contents (E2) instead of starting a new marquee.
+          (e.target as HTMLCanvasElement).style.cursor = "move";
+          let ghost: HTMLCanvasElement | null = null;
+          if (moveWithContentsRef.current) {
+            // Snapshot the selection's current on-screen pixels before any drag overlay is
+            // drawn, so it can be shown as a moving preview of what will actually relocate.
+            const src = canvasRef.current;
+            const { x: vx0, y: vy0, scale: s0 } = viewRef.current;
+            const rx = Math.round(sel.x1 * s0 + vx0);
+            const ry = Math.round(sel.y1 * s0 + vy0);
+            const rw = Math.round((sel.x2 - sel.x1 + 1) * s0);
+            const rh = Math.round((sel.y2 - sel.y1 + 1) * s0);
+            if (src && rw > 0 && rh > 0) {
+              const off = document.createElement("canvas");
+              off.width = rw; off.height = rh;
+              off.getContext("2d")?.drawImage(src, rx, ry, rw, rh, 0, 0, rw, rh);
+              ghost = off;
+            }
+          }
+          dragRef.current = { kind: "moveSel", origin: { ...sel }, start: wpIn, dx: 0, dy: 0, ghost };
+          draw();
+          return;
+        }
       }
       const wp = screenToWorld(e.clientX, e.clientY);
       dragRef.current = { kind: "select", start: wp, end: wp };
+      onSelectDragUpdateRef.current?.({ x1: wp.x, y1: wp.y, x2: wp.x, y2: wp.y });
       draw();
     } else if (toolRef.current === "paste") {
       // paste fires on pointer-up
-    } else if (toolRef.current === "pen" || toolRef.current === "brush" || toolRef.current === "smooth" || toolRef.current === "noise" || toolRef.current === "flatten" || toolRef.current === "erode") {
+    } else if (toolRef.current === "grab") {
+      // Grab: fixed disc footprint at the down point; vertical drag sets the displacement.
       const wp = screenToWorld(e.clientX, e.clientY);
       const cfg = drawConfigRef.current;
-      const isSculpt = toolRef.current === "smooth" || toolRef.current === "noise" || toolRef.current === "flatten" || toolRef.current === "erode";
-      const footprint = (toolRef.current === "pen" || !cfg)
-        ? [wp]
-        : brushFootprint(wp, cfg.brushSize, isSculpt ? "circ" : cfg.brushShape);
+      const disc = cfg ? brushFootprint(wp, cfg.sculptRadius * 2 + 1, "circ") : [wp];
+      const pts = new Set<string>(disc.map(p => `${p.x},${p.y}`));
+      dragRef.current = { kind: "sculpt-grab", pts, cx: wp.x, cy: wp.y, downClientY: e.clientY, delta: 0 };
+      draw();
+    } else if (toolRef.current === "polygon") {
+      // Polygon/lasso: each click adds a vertex; click near the first vertex (or double-click)
+      // closes and fills. No drag state — vertices persist in polyVertsRef across clicks.
+      const wp = screenToWorld(e.clientX, e.clientY);
+      const verts = polyVertsRef.current;
+      if (verts.length >= 3) {
+        const { x: vx0, y: vy0, scale: s0 } = viewRef.current;
+        const lp = toLocal(e.clientX, e.clientY);
+        const sx = verts[0].x * s0 + vx0, sy = verts[0].y * s0 + vy0;
+        if ((lp.x - sx) ** 2 + (lp.y - sy) ** 2 <= 100) { // within ~10 px of start → close
+          commitPolygon();
+          return;
+        }
+      }
+      verts.push(wp);
+      draw();
+    } else if (isFreehand(toolRef.current) || isSculptStroke(toolRef.current)) {
+      const wp = screenToWorld(e.clientX, e.clientY);
+      const cfg = drawConfigRef.current;
+      const isSculpt = isSculptStroke(toolRef.current);
+      smoothPosRef.current = { x: wp.x, y: wp.y }; // stabilizer origin
+      const footprint = stampFootprint(wp, toolRef.current, cfg);
       const pts = new Set<string>(footprint.map(p => `${p.x},${p.y}`));
-      dragRef.current = { kind: "draw-stroke", pts, lastWX: wp.x, lastWY: wp.y };
+      dragRef.current = { kind: "draw-stroke", pts, lastWX: wp.x, lastWY: wp.y, startWX: wp.x, startWY: wp.y };
+      // Hold-to-build / spray: re-stamp the current cursor footprint on a timer. Each tick is
+      // its own edit (own undo step), like an airbrush.
+      accumFiredRef.current = false;
+      accumBusyRef.current = false;
+      if (accumTimerRef.current !== null) { clearInterval(accumTimerRef.current); accumTimerRef.current = null; }
+      const wantTimer = toolRef.current === "spray"
+        || (isSculpt && cfg?.sculptAccumulate && toolRef.current !== "flatten");
+      if (wantTimer) {
+        const anchor: [number, number] = [wp.x, wp.y];
+        const timerTool = toolRef.current;
+        accumTimerRef.current = window.setInterval(() => {
+          const cur = cursorPosRef.current;
+          const c = drawConfigRef.current;
+          if (!cur || !c || !onDrawStrokeRef.current || accumBusyRef.current) return;
+          const fp = stampFootprint(cur, timerTool, c);
+          if (fp.length === 0) return;
+          accumFiredRef.current = true;
+          accumBusyRef.current = true;
+          Promise.resolve(onDrawStrokeRef.current(fp.map(p => [p.x, p.y]), drawZOverrideRef.current, anchor))
+            .finally(() => { accumBusyRef.current = false; });
+        }, 140);
+      }
       draw();
     } else if (toolRef.current === "fill") {
       // Fill fires on pointer-up; nothing to drag. Start a minimal stroke so pointer-up fires it.
       const wp = screenToWorld(e.clientX, e.clientY);
       const pts = new Set<string>([`${wp.x},${wp.y}`]);
-      dragRef.current = { kind: "draw-stroke", pts, lastWX: wp.x, lastWY: wp.y };
+      dragRef.current = { kind: "draw-stroke", pts, lastWX: wp.x, lastWY: wp.y, startWX: wp.x, startWY: wp.y };
       draw();
-    } else if (toolRef.current === "rect" || toolRef.current === "ellipse") {
+    } else if (isShapeTool(toolRef.current)) {
       const wp = screenToWorld(e.clientX, e.clientY);
-      dragRef.current = { kind: "draw-shape", tool: toolRef.current, start: wp, end: wp };
+      dragRef.current = { kind: "draw-shape", tool: toolRef.current as "rect" | "ellipse" | "line", start: wp, end: wp };
       draw();
     } else {
       dragRef.current = {
@@ -1105,7 +1303,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     if (drag?.kind === "pan") {
       viewRef.current.x = drag.viewX + e.clientX - drag.startX;
       viewRef.current.y = drag.viewY + e.clientY - drag.startY;
-      ensureTiles(); // includes draw()
+      scheduleEnsureTiles(); // includes draw(); rAF-coalesced, see scheduleEnsureTiles
     } else {
       if (drag?.kind === "resizeEdge") {
         switch (drag.edge) {
@@ -1114,22 +1312,42 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
           case "y1": drag.live.y1 = Math.min(wp.y, drag.live.y2); break;
           case "y2": drag.live.y2 = Math.max(wp.y, drag.live.y1); break;
         }
+      } else if (drag?.kind === "sculpt-grab") {
+        // Up-drag raises, down-drag lowers. 1 block per ~6 screen px, scaled by zoom.
+        const pxPerBlock = Math.max(3, viewRef.current.scale * 0.9);
+        drag.delta = Math.round((drag.downClientY - e.clientY) / pxPerBlock);
       } else if (drag?.kind === "draw-stroke") {
         const cfg = drawConfigRef.current;
-        const isSculpt = toolRef.current === "smooth" || toolRef.current === "noise" || toolRef.current === "flatten" || toolRef.current === "erode";
-        const line = bresenhamLine({ x: drag.lastWX, y: drag.lastWY }, wp);
+        // While a hold-to-build / spray timer is running, don't grow the swept set (the timer
+        // stamps the cursor instead); just track position for the ghost.
+        if (accumTimerRef.current !== null) { drag.lastWX = wp.x; drag.lastWY = wp.y; scheduleDraw(); return; }
+        // Stroke stabilizer: the stamp follows a low-passed position that lags the cursor,
+        // filtering out hand jitter. Higher lag = smoother. Freehand tools only.
+        let target = wp;
+        if (cfg?.strokeStabilizer && isFreehand(toolRef.current) && smoothPosRef.current) {
+          const s = smoothPosRef.current;
+          s.x += (wp.x - s.x) * 0.35;
+          s.y += (wp.y - s.y) * 0.35;
+          target = { x: Math.round(s.x), y: Math.round(s.y) };
+        }
+        const line = bresenhamLine({ x: drag.lastWX, y: drag.lastWY }, target);
         for (const lp of line) {
-          const footprint = (toolRef.current === "pen" || toolRef.current === "fill" || !cfg)
-            ? [lp]
-            : brushFootprint(lp, cfg.brushSize, isSculpt ? "circ" : cfg.brushShape);
+          const footprint = toolRef.current === "fill" ? [lp] : stampFootprint(lp, toolRef.current, cfg);
           for (const p of footprint) drag.pts.add(`${p.x},${p.y}`);
         }
-        drag.lastWX = wp.x;
-        drag.lastWY = wp.y;
+        drag.lastWX = target.x;
+        drag.lastWY = target.y;
       } else if (drag?.kind === "draw-shape") {
         drag.end = wp;
       } else if (drag?.kind === "select") {
         drag.end = wp;
+        onSelectDragUpdateRef.current?.({
+          x1: Math.min(drag.start.x, wp.x), y1: Math.min(drag.start.y, wp.y),
+          x2: Math.max(drag.start.x, wp.x), y2: Math.max(drag.start.y, wp.y),
+        });
+      } else if (drag?.kind === "moveSel") {
+        drag.dx = Math.round(wp.x - drag.start.x);
+        drag.dy = Math.round(wp.y - drag.start.y);
       } else if (drag?.kind === "cam3d-drag") {
         onSetCamera3dRef.current?.(wp.x, wp.y);
       } else if (toolRef.current === "paste") {
@@ -1150,9 +1368,9 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
           }
         }
       }
-      draw();
+      scheduleDraw();
     }
-  }, [draw, ensureTiles, screenToWorld]);
+  }, [scheduleDraw, scheduleEnsureTiles, screenToWorld]);
 
   const onPointerUp = useCallback((e: React.PointerEvent) => {
     const drag = dragRef.current;
@@ -1181,6 +1399,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     if (drag?.kind === "select") {
       const end = screenToWorld(e.clientX, e.clientY);
       dragRef.current = null;
+      onSelectDragUpdateRef.current?.(null);
       onSelChangeRef.current({
         x1: Math.min(drag.start.x, end.x),
         y1: Math.min(drag.start.y, end.y),
@@ -1190,15 +1409,51 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
       draw();
       return;
     }
-    if (drag?.kind === "draw-stroke") {
+    if (drag?.kind === "moveSel") {
+      dragRef.current = null;
+      const canvas = canvasRef.current;
+      if (canvas) canvas.style.cursor = "crosshair";
+      if (drag.dx !== 0 || drag.dy !== 0) {
+        onMoveSelectionRef.current?.(drag.dx, drag.dy);
+      }
+      draw();
+      return;
+    }
+    if (drag?.kind === "sculpt-grab") {
       dragRef.current = null;
       draw();
-      if (drag.pts.size > 0 && onDrawStrokeRef.current) {
+      if (drag.delta !== 0 && onDrawStrokeRef.current) {
         const pts = Array.from(drag.pts).map(k => {
           const ci = k.indexOf(",");
           return [parseInt(k.slice(0, ci)), parseInt(k.slice(ci + 1))] as [number, number];
         });
-        onDrawStrokeRef.current(pts, drawZOverrideRef.current);
+        onDrawStrokeRef.current(pts, drawZOverrideRef.current, [drag.cx, drag.cy], drag.delta);
+      }
+      return;
+    }
+    if (drag?.kind === "draw-stroke") {
+      dragRef.current = null;
+      // End any hold-to-build timer. If it fired at least once, the ticks already applied
+      // the edits — don't also fire the accumulated one-shot stroke.
+      const fired = accumFiredRef.current;
+      if (accumTimerRef.current !== null) { clearInterval(accumTimerRef.current); accumTimerRef.current = null; }
+      accumFiredRef.current = false;
+      // Stabilizer flush: the stamp lagged the cursor, so extend the stroke to the release
+      // point so it reaches where the user let go.
+      const cfg = drawConfigRef.current;
+      if (!fired && cfg?.strokeStabilizer && isFreehand(toolRef.current)) {
+        const end = screenToWorld(e.clientX, e.clientY);
+        for (const lp of bresenhamLine({ x: drag.lastWX, y: drag.lastWY }, end)) {
+          for (const p of stampFootprint(lp, toolRef.current, cfg)) drag.pts.add(`${p.x},${p.y}`);
+        }
+      }
+      draw();
+      if (!fired && drag.pts.size > 0 && onDrawStrokeRef.current) {
+        const pts = Array.from(drag.pts).map(k => {
+          const ci = k.indexOf(",");
+          return [parseInt(k.slice(0, ci)), parseInt(k.slice(ci + 1))] as [number, number];
+        });
+        onDrawStrokeRef.current(pts, drawZOverrideRef.current, [drag.startWX, drag.startWY]);
       }
       return;
     }
@@ -1208,8 +1463,8 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
       draw();
       const cfg = drawConfigRef.current;
       if (onDrawStrokeRef.current && cfg) {
-        const pts = drag.tool === "rect"
-          ? rectPixels(drag.start, end, cfg.fillMode)
+        const pts = drag.tool === "rect" ? rectPixels(drag.start, end, cfg.fillMode)
+          : drag.tool === "line" ? linePixels(drag.start, end, cfg.brushSize, cfg.brushShape)
           : ellipsePixels(drag.start, end, cfg.fillMode);
         if (pts.length > 0) {
           onDrawStrokeRef.current(pts.map(p => [p.x, p.y]), drawZOverrideRef.current);
@@ -1231,17 +1486,10 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
 
   const onWheel = useCallback((e: React.WheelEvent) => {
     e.preventDefault();
-    const { x, y, scale } = viewRef.current;
-    const factor   = e.deltaY < 0 ? 1.1 : 1 / 1.1;
-    const newScale = Math.min(32, Math.max(0.25, scale * factor));
     const lp = toLocal(e.clientX, e.clientY);
-    viewRef.current = {
-      scale: newScale,
-      x: lp.x - (lp.x - x) * (newScale / scale),
-      y: lp.y - (lp.y - y) * (newScale / scale),
-    };
-    ensureTiles(); // in full mode: just draw(); in tiled mode: loads new tiles
-  }, [ensureTiles, toLocal]);
+    viewRef.current = zoomAtPoint(viewRef.current, lp.x, lp.y, e.deltaY, { min: 0.25, max: 32, factor: 1.1 });
+    scheduleEnsureTiles(); // in full mode: just draw(); in tiled mode: loads new tiles; rAF-coalesced
+  }, [scheduleEnsureTiles, toLocal]);
 
   return (
     <canvas
@@ -1251,6 +1499,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
       onPointerMove={onPointerMove}
       onPointerUp={onPointerUp}
       onPointerLeave={onPointerLeave}
+      onDoubleClick={() => { if (toolRef.current === "polygon") commitPolygon(); }}
       onWheel={onWheel}
       onContextMenu={e => {
         e.preventDefault();
