@@ -736,14 +736,23 @@ export default function SliceViewport({ world, axis, editEpoch, lastEdit, onPain
       }
     }
   };
-  const onWheel = (e: React.WheelEvent) => {
-    const r = canvasRef.current!.getBoundingClientRect();
-    const mx = e.clientX - r.left, my = e.clientY - r.top;
-    viewRef.current = zoomAtPoint(viewRef.current, mx, my, e.deltaY, { min: 0.25, max: 32, factor: 1.15 });
-    draw();
-    // NB: do NOT refetch on zoom — the slab is already cached offscreen and just
-    // redrawn at the new scale. The fetch window only moves on pan-end (heavy IPC).
-  };
+  // Native (non-passive) wheel listener so preventDefault suppresses the webview's page-scroll /
+  // pinch-zoom (React's synthetic onWheel is passive, so its preventDefault is a no-op).
+  // NB: do NOT refetch on zoom — the slab is cached offscreen and just redrawn at the new scale.
+  // The fetch window only moves on pan-end (heavy IPC).
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const handler = (e: WheelEvent) => {
+      e.preventDefault();
+      const r = canvas.getBoundingClientRect();
+      const mx = e.clientX - r.left, my = e.clientY - r.top;
+      viewRef.current = zoomAtPoint(viewRef.current, mx, my, e.deltaY, { min: 0.25, max: 32, factor: 1.15 });
+      draw();
+    };
+    canvas.addEventListener("wheel", handler, { passive: false });
+    return () => canvas.removeEventListener("wheel", handler);
+  }, [draw]);
 
   const label = axis === "front" ? `Front  (Y=${curDepth})` : axis === "side" ? `Side  (X=${curDepth})` : `Top  (Z=${curDepth})`;
 
@@ -795,7 +804,6 @@ export default function SliceViewport({ world, axis, editEpoch, lastEdit, onPain
         onPointerMove={onPointerMove}
         onPointerUp={onPointerUp}
         onPointerLeave={() => { if (edgeHoverRef.current !== null) { edgeHoverRef.current = null; draw(); } }}
-        onWheel={onWheel}
         onContextMenu={(e) => e.preventDefault()}
       />
     </div>

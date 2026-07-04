@@ -239,7 +239,23 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   const onMoveSelectionRef = useRef(onMoveSelection);
   const moveWithContentsRef = useRef(moveWithContents);
 
-  useEffect(() => { toolRef.current = tool; }, [tool]);
+  useEffect(() => {
+    toolRef.current = tool;
+    // Abandon any in-flight draw/sculpt/shape gesture when the active tool changes mid-drag
+    // (Escape → pan, or a tool hotkey). Otherwise pointer-up would still commit the stroke under
+    // the NEW tool — e.g. a cancelled sculpt stroke getting stamped as paint blocks by the pen/paint
+    // branch of handleDrawStroke, which reads the current tool. No draw() call here (it isn't
+    // declared yet); a tool change re-renders MapCanvas and the no-deps draw effect below repaints.
+    const d = dragRef.current;
+    if (d && (d.kind === "draw-stroke" || d.kind === "sculpt-grab" || d.kind === "draw-shape")) {
+      dragRef.current = null;
+      if (accumTimerRef.current !== null) { clearInterval(accumTimerRef.current); accumTimerRef.current = null; }
+      accumFiredRef.current = false;
+      accumBusyRef.current = false;
+    }
+    // Leaving the polygon tool abandons an unclosed polygon.
+    if (tool !== "polygon") polyVertsRef.current = [];
+  }, [tool]);
   useEffect(() => { onSelChangeRef.current = onSelectionChange; }, [onSelectionChange]);
   useEffect(() => { onPasteAtRef.current   = onPasteAt; }, [onPasteAt]);
   useEffect(() => { lockedPastePosRef.current = lockedPastePos; }, [lockedPastePos]);
@@ -1484,11 +1500,21 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     draw();
   }, [draw]);
 
-  const onWheel = useCallback((e: React.WheelEvent) => {
-    e.preventDefault();
-    const lp = toLocal(e.clientX, e.clientY);
-    viewRef.current = zoomAtPoint(viewRef.current, lp.x, lp.y, e.deltaY, { min: 0.25, max: 32, factor: 1.1 });
-    scheduleEnsureTiles(); // in full mode: just draw(); in tiled mode: loads new tiles; rAF-coalesced
+  // Native (non-passive) wheel listener so preventDefault actually suppresses the WKWebView's
+  // page-scroll / pinch-zoom. React's synthetic onWheel is registered passively (React 17+), so
+  // e.preventDefault() there is a silent no-op — the zoom still worked but trackpad pinch could
+  // zoom the whole webview underneath it.
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const handler = (e: WheelEvent) => {
+      e.preventDefault();
+      const lp = toLocal(e.clientX, e.clientY);
+      viewRef.current = zoomAtPoint(viewRef.current, lp.x, lp.y, e.deltaY, { min: 0.25, max: 32, factor: 1.1 });
+      scheduleEnsureTiles(); // rAF-coalesced; loads new tiles in tiled mode, just draws in full mode
+    };
+    canvas.addEventListener("wheel", handler, { passive: false });
+    return () => canvas.removeEventListener("wheel", handler);
   }, [scheduleEnsureTiles, toLocal]);
 
   return (
@@ -1500,7 +1526,6 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
       onPointerUp={onPointerUp}
       onPointerLeave={onPointerLeave}
       onDoubleClick={() => { if (toolRef.current === "polygon") commitPolygon(); }}
-      onWheel={onWheel}
       onContextMenu={e => {
         e.preventDefault();
         const wp = screenToWorld(e.clientX, e.clientY);
