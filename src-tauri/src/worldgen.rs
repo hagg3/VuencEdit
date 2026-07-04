@@ -1038,7 +1038,8 @@ pub(crate) fn gen_progress_reporter(app: tauri::AppHandle) -> impl FnMut(&str, f
 }
 
 /// Generate a flat world file at `path`.
-#[tauri::command]
+// Runs off the main thread (world generation takes seconds) so the UI doesn't freeze.
+#[tauri::command(async)]
 pub(crate) fn create_world(
     app: tauri::AppHandle,
     path: String,
@@ -1145,7 +1146,7 @@ pub(crate) struct PreviewImage {
 /// surface colour on a downsampled grid (no chunk fill, caves or decoration) and
 /// applies a light height/slope hillshade. Lets the New World dialog show the
 /// terrain before committing to a full generate + file write.
-#[tauri::command]
+#[tauri::command(async)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn preview_natural_world(
     width_chunks: u32, height_chunks: u32, extended_z: bool,
@@ -1243,7 +1244,7 @@ pub(crate) fn preview_natural_world(
 }
 
 /// Generate a procedural natural world file at `path`.
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn create_natural_world(
     app: tauri::AppHandle,
     path: String,
@@ -1692,7 +1693,7 @@ pub(crate) fn generate_classic_world(
 }
 
 /// Generate a classic (legacy procedural) world file at `path`.
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn create_classic_world(
     app: tauri::AppHandle,
     path: String,
@@ -2735,7 +2736,7 @@ pub(crate) fn generate_tg2_world(
     surf as u32
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn create_tg2_world(
     app: tauri::AppHandle,
@@ -2772,7 +2773,7 @@ pub(crate) fn create_tg2_world(
     res
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn preview_tg2_world(
     size_chunks: u32, seed: u32, terrain_type: u8, max_px: u32,

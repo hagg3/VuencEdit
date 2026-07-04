@@ -43,6 +43,21 @@ fn temp_world_path() -> std::path::PathBuf {
     std::env::temp_dir().join(format!("vuencedit_{ts}.eden"))
 }
 
+/// Delete `vuencedit_*.eden` staging files left in the system temp dir by a previous session that
+/// quit without loading another world (normal operation deletes the prior temp on the next load, so
+/// only a clean quit leaks one). Best-effort, run once at startup. Deleting a file another running
+/// instance still has mapped is safe: Unix unlinks the name while the inode stays live; Windows
+/// refuses to delete a mapped file and the error is ignored.
+fn sweep_stale_temps() {
+    let Ok(entries) = fs::read_dir(std::env::temp_dir()) else { return };
+    for e in entries.flatten() {
+        let p = e.path();
+        let is_stale = p.extension().and_then(|x| x.to_str()) == Some("eden")
+            && p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("vuencedit_"));
+        if is_stale { let _ = fs::remove_file(&p); }
+    }
+}
+
 // ── Public types ─────────────────────────────────────────────────────────────
 
 /// Lightweight world metadata returned by load_world. No pixel buffer — the
@@ -66,17 +81,6 @@ pub struct WorldMeta {
     /// Used by the frontend to align template overlay coords. Eden.eden covers 4006..4185.
     pub abs_min_x: i32,
     pub abs_min_y: i32,
-}
-
-/// Full pixel map — used only by render_zslice (kept for legacy callers).
-#[derive(Serialize)]
-pub struct WorldData {
-    pub name: String,
-    pub width_chunks: u32,
-    pub height_chunks: u32,
-    #[serde(serialize_with = "serialize_bytes_b64")]
-    pub pixels: Vec<u8>,
-    pub max_z: u32,
 }
 
 // ── In-memory world state ────────────────────────────────────────────────────
@@ -752,7 +756,7 @@ fn render_view_top(
 
 // ── Tauri commands ─────────────────────────────────────────────────────────────
 
-#[tauri::command]
+#[tauri::command(async)]
 fn load_world(path: String, state: tauri::State<'_, AppState>) -> Result<WorldMeta, String> {
     let t0 = Instant::now();
     let us = || t0.elapsed().as_micros();
@@ -791,7 +795,7 @@ fn load_world(path: String, state: tauri::State<'_, AppState>) -> Result<WorldMe
         if let Ok(mut f) = fs::File::open(&path) { let _ = f.read_exact(&mut magic); }
     }
 
-    let (mmap, maybe_temp): (MmapMut, Option<std::path::PathBuf>) = if is_zip(&magic) {
+    let (mmap, maybe_temp, was_compressed): (MmapMut, Option<std::path::PathBuf>, bool) = if is_zip(&magic) {
         use zip::ZipArchive;
         timing_log!("[LOAD] detected zip archive, decompressing  t=+{}µs", us());
         let raw = fs::read(&path).map_err(|e| format!("Failed to read file: {e}"))?;
@@ -814,16 +818,24 @@ fn load_world(path: String, state: tauri::State<'_, AppState>) -> Result<WorldMe
         // SAFETY: temp file is private, written by us, and stays alive for the duration of the mmap.
         let mmap = unsafe { MmapOptions::new().map_copy(&file) }
             .map_err(|e| format!("Failed to map temp file: {e}"))?;
-        (mmap, Some(temp_path))
+        (mmap, Some(temp_path), true)
     } else {
-        let file = fs::File::open(&path).map_err(|e| format!("Failed to open file: {e}"))?;
-        // SAFETY: The file is opened read-only and we never truncate or replace it while mapped.
-        // map_copy creates a private mapping; our writes never reach disk until explicit save.
+        // Copy the source into a private temp file and map THAT — never the user's file directly.
+        // On Windows a memory-mapped file is locked against replace/delete, so mapping the source
+        // would make the atomic temp-file+rename save (see save_world_inner) fail with a sharing
+        // violation whenever the destination is the file being edited. Mapping a throwaway copy
+        // leaves the original unlocked so the rename can replace it. It also sidesteps the
+        // undefined behaviour of writing over a still-mmapped file on Unix. map_copy stays
+        // copy-on-write, so edits live in RAM and the temp is only the evictable read-backing store.
+        let temp_path = temp_world_path();
+        fs::copy(&path, &temp_path).map_err(|e| format!("Failed to stage world file: {e}"))?;
+        let file = fs::File::open(&temp_path).map_err(|e| format!("Failed to open staged file: {e}"))?;
+        // SAFETY: temp file is private, written by us, and stays alive for the duration of the mmap.
         let mmap = unsafe { MmapOptions::new().map_copy(&file) }
-            .map_err(|e| format!("Failed to map file: {e}"))?;
-        (mmap, None)
+            .map_err(|e| format!("Failed to map staged file: {e}"))?;
+        (mmap, Some(temp_path), false)
     };
-    timing_log!("[LOAD] file_mmap  bytes={}B  compressed={}  t=+{}µs", mmap.len(), maybe_temp.is_some(), us());
+    timing_log!("[LOAD] file_mmap  bytes={}B  compressed={}  t=+{}µs", mmap.len(), was_compressed, us());
 
     let loaded = parse_world_inner(mmap)?;
     timing_log!("[LOAD] parsed  {}×{} chunks  count={}  world_bytes={}B  t=+{}µs",
@@ -849,7 +861,7 @@ fn load_world(path: String, state: tauri::State<'_, AppState>) -> Result<WorldMe
         width_chunks:  loaded.w_chunks,
         height_chunks: loaded.h_chunks,
         max_z:         world_max_z(&loaded) as u32,
-        was_compressed: maybe_temp.is_some(),
+        was_compressed,
         spawn_px: spawn.map(|(x, _)| x),
         spawn_py: spawn.map(|(_, y)| y),
         center_px: center.map(|(x, _)| x),
@@ -945,76 +957,90 @@ fn save_png(path: String, data: String) -> Result<(), String> {
     fs::write(&path, &bytes).map_err(|e| format!("Failed to write PNG: {e}"))
 }
 
-#[tauri::command]
-fn render_zslice(z: i32, state: tauri::State<'_, AppState>) -> Result<WorldData, String> {
-    let t0 = Instant::now();
-    let us = || t0.elapsed().as_micros();
+/// Encode a row-major RGBA buffer to PNG bytes. Used by `export_png`; factored out so the encode
+/// path is unit-testable without a Tauri State handle.
+fn encode_rgba_png(buf: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String> {
+    use image::codecs::png::PngEncoder;
+    use image::ImageEncoder;
+    let mut out = Vec::new();
+    PngEncoder::new(&mut out)
+        .write_image(buf, width, height, image::ExtendedColorType::Rgba8)
+        .map_err(|e| format!("PNG encode failed: {e}"))?;
+    Ok(out)
+}
 
-    timing_log!("[PREVIEW] start  cmd=render_zslice  z={z}");
-
-    const BAND_BYTES: usize = 8192;
-    timing_log!("[LOCK] acquire_start  cmd=render_zslice  t=+{}µs", us());
-    let t_lock = Instant::now();
-    let (slices, positions, name, w_chunks, h_chunks, min_x, min_y, sky, max_z) = {
-        let ws = state.lock().unwrap_or_else(|p| p.into_inner());
-        let wait = t_lock.elapsed().as_micros();
-        timing_log!("[LOCK] acquired  cmd=render_zslice  wait={}µs", wait);
-        let t_held = Instant::now();
-
-        let world = ws.world.as_ref().ok_or("No world loaded")?;
-        let max_z = world_max_z(world);
-        if z < 0 || z > max_z {
-            return Err(format!("Z must be 0–{max_z}, got {z}"));
-        }
-        let band     = (z as usize) / 16;
-        let band_off = band * 8192;
-        let n        = world.chunk_map.len();
-        let mut slices:    Vec<u8>                     = Vec::with_capacity(n * BAND_BYTES);
-        let mut positions: Vec<((i32, i32), usize)>    = Vec::with_capacity(n);
-        for (&pos, &addr) in &world.chunk_map {
-            let start = addr + band_off;
-            if start + BAND_BYTES <= world.bytes.len() {
-                let local = slices.len();
-                slices.extend_from_slice(&world.bytes[start..start + BAND_BYTES]);
-                positions.push((pos, local));
-            }
-        }
-        let result = (slices, positions, world.name.clone(),
-                      world.w_chunks, world.h_chunks, world.min_x, world.min_y, world.sky, max_z);
-        drop(ws);
-        timing_log!("[LOCK] released  cmd=render_zslice  held={}µs  cloned={}B  t=+{}µs",
-            t_held.elapsed().as_micros(), result.0.len(), us());
-        result
+/// Composite Eden.eden template colours into `buf` wherever the user has no chunk (alpha == 0).
+/// Mirrors the on-screen overlay and the old JS export loop, but done in Rust so no pixels cross IPC.
+fn composite_template_full(ws: &mut WorldState, w: i32, h: i32, buf: &mut [u8]) {
+    let (min_x, min_y, sky) = match ws.world.as_ref() {
+        Some(world) => (world.min_x, world.min_y, world.sky),
+        None => return,
     };
-
-    let lz = (z as usize) & 15;
-    let pw = (w_chunks * 16) as usize;
-    let ph = (h_chunks * 16) as usize;
-    const VOID: [u8; 4] = [20, 20, 35, 255];
-    let mut pixels = vec![0u8; pw * ph * 4];
-    for p in pixels.chunks_exact_mut(4) { p.copy_from_slice(&VOID); }
-
-    timing_log!("[SCAN] start  cmd=render_zslice  chunks={}  t=+{}µs", positions.len(), us());
-    let t_scan = Instant::now();
-    for ((cx, cy), local) in positions {
-        let base_px = ((cx - min_x) * 16) as usize;
-        let base_py = ((cy - min_y) * 16) as usize;
-        let sl = &slices[local..local + BAND_BYTES];
-        for x in 0..16usize {
-            for y in 0..16usize {
-                let bi = x * 256 + y * 16 + lz;
-                let bt = sl[bi];
-                if bt == 0 { continue; }
-                let [r, g, b] = block_color(bt, sl[bi + 4096], sky);
-                let off = ((base_py + y) * pw + (base_px + x)) * 4;
-                pixels[off] = r; pixels[off + 1] = g; pixels[off + 2] = b;
+    let Some(tmpl) = ws.template_bytes.clone() else { return }; // Arc clone; frees the ws borrow
+    let (cx0, cx1) = (min_x, min_x + w / 16 - 1);
+    let (cz0, cz1) = (min_y, min_y + h / 16 - 1);
+    for tx in cx0..=cx1 {
+        for tz in cz0..=cz1 {
+            if ws.template_surface_cache.contains_key(&(tx, tz)) { continue; }
+            if let Some(&col_off) = ws.template_dir.get(&(tx, tz)) {
+                if let Some(surf) = decode_template_surface(&tmpl[..], col_off, sky) {
+                    ws.template_surface_cache.insert((tx, tz), surf);
+                }
             }
         }
     }
-    timing_log!("[SCAN] end  cmd=render_zslice  elapsed={}µs", t_scan.elapsed().as_micros());
-    timing_log!("[PREVIEW] end  cmd=render_zslice  pixels={}B  total={}µs", pixels.len(), us());
-    Ok(WorldData { name, width_chunks: w_chunks, height_chunks: h_chunks, pixels, max_z: max_z as u32 })
+    for py in 0..h {
+        for px in 0..w {
+            let off = ((py * w + px) * 4) as usize;
+            if buf[off + 3] != 0 { continue; } // user pixel already present
+            let tx = px / 16 + min_x;
+            let tz = py / 16 + min_y;
+            if let Some(surf) = ws.template_surface_cache.get(&(tx, tz)) {
+                let [r, g, b, a] = surf[(px % 16) as usize * 16 + (py % 16) as usize];
+                if a == 255 {
+                    buf[off] = r; buf[off + 1] = g; buf[off + 2] = b; buf[off + 3] = 255;
+                }
+            }
+        }
+    }
 }
+
+/// Render the whole map to a PNG on disk, entirely in Rust. Replaces the old path that built the
+/// full RGBA buffer in JS, then a binary string, then a base64 string (≈4× the map size in JS heap)
+/// before shipping it back over IPC. Renders under the lock, then releases it before encoding+writing.
+#[tauri::command(async)]
+fn export_png(
+    path: String,
+    view: String,
+    z: i32,
+    use_template: bool,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let (w, h, buf) = {
+        let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
+        let (w, h) = {
+            let world = ws.world.as_ref().ok_or("No world loaded")?;
+            ((world.w_chunks * 16) as i32, (world.h_chunks * 16) as i32)
+        };
+        let mut buf = {
+            let world = ws.world.as_ref().unwrap();
+            if view == "zslice" {
+                let max_z = world_max_z(world);
+                if z < 0 || z > max_z { return Err(format!("Z must be 0–{max_z}, got {z}")); }
+                render_zslice_patch_inner(world, z, 0, 0, w - 1, h - 1).pixels
+            } else {
+                render_pixels_patch(world, 0, 0, w - 1, h - 1).pixels
+            }
+        };
+        if use_template && view != "zslice" && ws.template_bytes.is_some() {
+            composite_template_full(&mut ws, w, h, &mut buf);
+        }
+        (w, h, buf)
+    };
+    let png = encode_rgba_png(&buf, w as u32, h as u32)?;
+    fs::write(&path, &png).map_err(|e| format!("Failed to write PNG: {e}"))
+}
+
 
 // ── Selection ──────────────────────────────────────────────────────────────────
 
@@ -1043,8 +1069,15 @@ fn validate_selection(x1: i32, y1: i32, x2: i32, y2: i32, z_min: i32, z_max: i32
 fn describe_selection(
     x1: i32, y1: i32, x2: i32, y2: i32,
     z_min: i32, z_max: i32,
+    state: tauri::State<'_, AppState>,
 ) -> Result<SelectionInfo, String> {
-    validate_selection(x1, y1, x2, y2, z_min, z_max, 255)?;
+    // Validate against the loaded world's real z ceiling (63 for 64z, 255 for 256z) rather than a
+    // hardcoded 255 — otherwise a z range a 64z world can't hold would validate here.
+    let max_z = {
+        let ws = state.lock().unwrap_or_else(|p| p.into_inner());
+        ws.world.as_ref().map(world_max_z).unwrap_or(255)
+    };
+    validate_selection(x1, y1, x2, y2, z_min, z_max, max_z)?;
     Ok(SelectionInfo {
         x1, y1, x2, y2, z_min, z_max,
         width:  x2 - x1 + 1,
@@ -1261,7 +1294,7 @@ struct ExpandResult {
 
 /// Bake Eden.eden template chunks into a new world file. Only fills chunks not already edited
 /// by the user. full_extent=true expands to full 180×180 template; false = within current bounds.
-#[tauri::command]
+#[tauri::command(async)]
 fn expand_world_from_template(
     output_path: String,
     full_extent: bool,
@@ -1330,14 +1363,31 @@ fn expand_world_from_template(
 
     let mut dir_entries: Vec<(i16, i16, u32)> = Vec::with_capacity(total as usize);
 
+    // Chunk offsets are stored as u32 in the directory, so the file can't exceed ~4 GB. Abort
+    // cleanly (deleting the partial output) rather than silently truncating an offset — which
+    // would corrupt the written world.
+    macro_rules! bail_too_large {
+        ($cur:expr) => {{
+            drop(writer);
+            let _ = fs::remove_file(&output_path);
+            return Err(format!("World too large to expand: chunk offset {} exceeds the 4 GB file-format limit", $cur));
+        }};
+    }
+
     // Write existing user chunks
     for (cx, cy, bytes) in &user_chunk_bytes {
+        if cur_offset + chunk_size as u64 > u32::MAX as u64 { bail_too_large!(cur_offset); }
         writer.write_all(bytes).map_err(|e| format!("Write error: {e}"))?;
         dir_entries.push((*cx, *cy, cur_offset as u32));
         cur_offset += chunk_size as u64;
     }
 
-    // Write template chunks (decoded from RLE)
+    // Write template chunks (decoded from RLE). Eden.eden is always a 64z (4-band, 32768-byte)
+    // file. When expanding a 256z world (chunk_size 131072) we must emit full-size chunks — the
+    // parser strides every chunk by the header's chunk_size, so writing a bare 32 KB block here
+    // would desync every subsequent offset and corrupt the whole output. Band b lives at the same
+    // offset (b*8192) in both layouts, so copying the 32 KB into the low bands and leaving the
+    // upper 12 bands (z 64–255) as air is a correct, direct placement.
     let template_total = to_add.len();
     for (i, (tx, tz)) in to_add.iter().enumerate() {
         if expand_cancelled(&cancel) {
@@ -1347,10 +1397,16 @@ fn expand_world_from_template(
         }
         if let Some(&col_off) = tdir.get(&(*tx, *tz)) {
             if let Some(raw) = decode_template_column(tmpl, col_off) {
-                writer.write_all(raw.as_ref())
-                    .map_err(|e| format!("Write error: {e}"))?;
+                if cur_offset + chunk_size as u64 > u32::MAX as u64 { bail_too_large!(cur_offset); }
+                if chunk_size == raw.len() {
+                    writer.write_all(raw.as_ref()).map_err(|e| format!("Write error: {e}"))?;
+                } else {
+                    let mut full = vec![0u8; chunk_size];
+                    full[..raw.len()].copy_from_slice(raw.as_ref());
+                    writer.write_all(&full).map_err(|e| format!("Write error: {e}"))?;
+                }
                 dir_entries.push((*tx as i16, *tz as i16, cur_offset as u32));
-                cur_offset += 32768u64;
+                cur_offset += chunk_size as u64;
             }
         }
         if (i + 1) % 500 == 0 || i + 1 == template_total {
@@ -1443,7 +1499,7 @@ fn render_xslice_patch(
     Ok(render_xslice_patch_inner(world, x, y1, z1, y2, z2))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn render_selection_view(
     x1: i32, y1: i32, x2: i32, y2: i32,
     z_min: i32, z_max: i32,
@@ -1659,7 +1715,7 @@ fn render_view_side_ctx(
 
 /// Full-height contextual front/side view. `context_blocks` columns outside the
 /// selection are rendered at 50% opacity to show surrounding terrain.
-#[tauri::command]
+#[tauri::command(async)]
 fn render_full_height_view(
     x1: i32, y1: i32, x2: i32, y2: i32,
     view: String,
@@ -1792,6 +1848,23 @@ fn replace_blocks_inner(
     }
 }
 
+/// Write `bytes` to `path` atomically: stage into a sibling `<path>.savetmp` file, then rename it
+/// over the destination. rename() swaps the directory entry in one step (both POSIX and Windows
+/// implement replace-if-exists), so a crash mid-write can never leave a half-written world on disk
+/// — the previous file survives until the rename completes. Staging also means we never write over
+/// a file that's currently memory-mapped: the loaded world is mapped from a private temp copy (see
+/// load_world), never the destination, so on Windows the destination isn't locked and rename wins.
+fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".savetmp");
+    let tmp = std::path::PathBuf::from(tmp);
+    fs::write(&tmp, bytes).map_err(|e| format!("Failed to write temp file: {e}"))?;
+    fs::rename(&tmp, path).map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        format!("Failed to finalize save: {e}")
+    })
+}
+
 /// Write `world.bytes` to `path`.  Before overwriting an existing file, copies
 /// it to `path.bak` — but only if that backup doesn't already exist, so the
 /// first-save snapshot is preserved across multiple saves.
@@ -1800,7 +1873,7 @@ fn save_world_inner(world: &LoadedWorld, path: &str) -> Result<(), String> {
     if !std::path::Path::new(&bak).exists() && std::path::Path::new(path).exists() {
         fs::copy(path, &bak).map_err(|e| format!("Failed to create backup: {e}"))?;
     }
-    fs::write(path, &*world.bytes).map_err(|e| format!("Failed to write world: {e}"))
+    atomic_write(std::path::Path::new(path), &world.bytes)
 }
 
 // ── Undo / Redo helpers ────────────────────────────────────────────────────────
@@ -1817,6 +1890,13 @@ fn undo_entry_bytes(entry: &UndoEntry) -> usize {
 /// Returns all chunk (cx, cy) coords whose x/y footprint overlaps the given pixel-space
 /// rectangle. z_min/z_max are irrelevant here — Eden chunks span all z layers.
 fn affected_chunk_coords(world: &LoadedWorld, x1: i32, y1: i32, x2: i32, y2: i32) -> Vec<(i16, i16)> {
+    // Clamp to the world's pixel bounds so an out-of-range coordinate (e.g. a frontend bug passing
+    // a huge value) can't make the cx/cy loops below iterate billions of empty chunk slots.
+    let ww = (world.w_chunks * 16) as i32;
+    let wh = (world.h_chunks * 16) as i32;
+    let x1 = x1.clamp(0, ww - 1); let x2 = x2.clamp(0, ww - 1);
+    let y1 = y1.clamp(0, wh - 1); let y2 = y2.clamp(0, wh - 1);
+    if x1 > x2 || y1 > y2 { return vec![]; }
     let cx_lo = x1 / 16 + world.min_x;
     let cx_hi = x2 / 16 + world.min_x;
     let cy_lo = y1 / 16 + world.min_y;
@@ -1899,6 +1979,8 @@ fn restore_and_invert(world: &mut LoadedWorld, entry: &UndoEntry) -> Vec<ChunkSn
     }).collect()
 }
 
+/// Push an entry onto an undo/redo stack, evicting oldest entries to keep the stack under
+/// UNDO_BYTE_BUDGET. Used for both `undo_stack` and `redo_stack` so neither can grow unbounded.
 fn push_undo(stack: &mut VecDeque<UndoEntry>, entry: UndoEntry) {
     stack.push_back(entry);
     let mut total: usize = stack.iter().map(undo_entry_bytes).sum();
@@ -2186,22 +2268,59 @@ fn save_world_compressed(world: &LoadedWorld, path: &str) -> Result<(), String> 
     if !std::path::Path::new(&bak).exists() && std::path::Path::new(path).exists() {
         fs::copy(path, &bak).map_err(|e| format!("Failed to create backup: {e}"))?;
     }
-    let file = fs::File::create(path).map_err(|e| format!("Failed to create file: {e}"))?;
-    let mut zip = ZipWriter::new(file);
-    let options = SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Deflated)
-        .compression_level(Some(9));
-    zip.start_file(&inner_name, options).map_err(|e| format!("Zip error: {e}"))?;
-    zip.write_all(&world.bytes).map_err(|e| format!("Write error: {e}"))?;
-    zip.finish().map_err(|e| format!("Zip finish error: {e}"))?;
+    // Stage the zip into a sibling temp file, then rename over the destination — same atomic-save
+    // rationale as save_world_inner (never truncate the destination in place; never touch a file
+    // that might be mapped).
+    let mut tmp = std::ffi::OsString::from(path);
+    tmp.push(".savetmp");
+    let tmp = std::path::PathBuf::from(tmp);
+    let write_result = (|| -> Result<(), String> {
+        let file = fs::File::create(&tmp).map_err(|e| format!("Failed to create file: {e}"))?;
+        let mut zip = ZipWriter::new(file);
+        let options = SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated)
+            .compression_level(Some(9));
+        zip.start_file(&inner_name, options).map_err(|e| format!("Zip error: {e}"))?;
+        zip.write_all(&world.bytes).map_err(|e| format!("Write error: {e}"))?;
+        // finish() returns the inner File; drop it so its handle is closed before the rename
+        // (Windows can't rename a file that still has an open handle).
+        let f = zip.finish().map_err(|e| format!("Zip finish error: {e}"))?;
+        drop(f);
+        Ok(())
+    })();
+    if let Err(e) = write_result {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    fs::rename(&tmp, path).map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        format!("Failed to finalize save: {e}")
+    })?;
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn save_world(path: String, compressed: bool, state: tauri::State<'_, AppState>) -> Result<(), String> {
     let ws = state.lock().unwrap_or_else(|p| p.into_inner());
     let world = ws.world.as_ref().ok_or("No world loaded")?;
     if compressed { save_world_compressed(world, &path) } else { save_world_inner(world, &path) }
+}
+
+/// Release the currently loaded world and everything tied to it — the mmap, clipboard, and the
+/// undo/redo stacks (up to 256 MB) — and delete its staged temp file. Without this, closing a
+/// world in the UI left all of that resident in the backend until the next `load_world`.
+/// World-independent state (texture pack, Eden.eden template) is intentionally left loaded.
+#[tauri::command]
+fn close_world(state: tauri::State<'_, AppState>) {
+    let (old_world, old_temp) = {
+        let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
+        ws.clipboard = None;
+        ws.undo_stack.clear();
+        ws.redo_stack.clear();
+        (ws.world.take(), ws.temp_path.take())
+    };
+    drop(old_world); // release the mmap before deleting its backing temp file
+    if let Some(p) = old_temp { let _ = fs::remove_file(&p); }
 }
 
 // ── Autosave / crash recovery ───────────────────────────────────────────────
@@ -2227,19 +2346,25 @@ fn autosave_paths(app: &tauri::AppHandle) -> Result<(std::path::PathBuf, std::pa
     Ok((dir.join("autosave.eden"), dir.join("autosave.meta.json")))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn autosave_world(
     app: tauri::AppHandle,
     source_path: Option<String>,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
-    let ws = state.lock().unwrap_or_else(|p| p.into_inner());
-    let world = ws.world.as_ref().ok_or("No world loaded")?;
+    // Snapshot the world bytes under the lock, then release it before the (potentially large) disk
+    // write — so a background autosave only blocks editing for the in-memory copy, not for the whole
+    // write. Async so the write runs off the main thread and can't freeze the UI mid-edit.
+    let (bytes, world_name) = {
+        let ws = state.lock().unwrap_or_else(|p| p.into_inner());
+        let world = ws.world.as_ref().ok_or("No world loaded")?;
+        (world.bytes.to_vec(), world.name.clone())
+    };
     let (data_path, meta_path) = autosave_paths(&app)?;
-    fs::write(&data_path, &*world.bytes).map_err(|e| format!("Failed to write autosave: {e}"))?;
+    atomic_write(&data_path, &bytes).map_err(|e| format!("Failed to write autosave: {e}"))?;
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-    let info = AutosaveInfo { world_name: world.name.clone(), source_path, timestamp };
+    let info = AutosaveInfo { world_name, source_path, timestamp };
     let json = serde_json::to_string(&info).map_err(|e| format!("Failed to serialize autosave meta: {e}"))?;
     fs::write(&meta_path, json).map_err(|e| format!("Failed to write autosave meta: {e}"))?;
     Ok(())
@@ -2287,7 +2412,7 @@ fn undo_edit(state: tauri::State<'_, AppState>) -> Result<EditResult, String> {
 
     let label = entry.operation.clone();
     ws.world = Some(world);
-    ws.redo_stack.push_back(UndoEntry { operation: entry.operation, chunks: redo_snaps });
+    push_undo(&mut ws.redo_stack, UndoEntry { operation: entry.operation, chunks: redo_snaps });
 
     Ok(EditResult { patch, undo_depth: ws.undo_stack.len(), redo_depth: ws.redo_stack.len(), operation: label })
 }
@@ -3231,7 +3356,7 @@ fn generate_trees(
 /// For each output pixel (px, py), rays descend from max_z. At depth dz = max_z - z,
 /// the sample point drifts: sample_px = px + ski*0.5*dz, sample_py = py - ski*dz.
 /// This creates a south-east viewing angle with depth-derived parallax (ski=0 is flat top-down).
-#[tauri::command]
+#[tauri::command(async)]
 fn render_axo_region(
     x1: i32, y1: i32, x2: i32, y2: i32,
     ski: f32,
@@ -3474,13 +3599,19 @@ fn serialize_prefab(cb: &Clipboard) -> Vec<u8> {
 fn deserialize_prefab(data: &[u8]) -> Result<Clipboard, String> {
     use std::borrow::Cow;
     // Auto-detect gzip (new compressed format) vs raw (legacy uncompressed).
+    // Cap the decompressed size so a tiny "gzip bomb" .epfab can't expand to gigabytes. The largest
+    // legitimate prefab is 22-byte header + 2 bytes per voxel at the MAX_CELLS cap below.
+    const MAX_CELLS: i64 = 64 * 1024 * 1024; // 64M voxels
+    const MAX_DECOMPRESSED: u64 = 22 + 2 * MAX_CELLS as u64;
     let raw: Cow<[u8]> = if data.starts_with(&[0x1f, 0x8b]) {
         use flate2::read::GzDecoder;
         use std::io::Read;
-        let mut dec = GzDecoder::new(data);
         let mut out = Vec::new();
-        dec.read_to_end(&mut out)
+        GzDecoder::new(data).take(MAX_DECOMPRESSED + 1).read_to_end(&mut out)
             .map_err(|e| format!("Failed to decompress prefab: {e}"))?;
+        if out.len() as u64 > MAX_DECOMPRESSED {
+            return Err("Prefab is too large".into());
+        }
         Cow::Owned(out)
     } else {
         Cow::Borrowed(data)
@@ -3493,8 +3624,17 @@ fn deserialize_prefab(data: &[u8]) -> Result<Clipboard, String> {
     let height   = i32::from_le_bytes(data[10..14].try_into().unwrap());
     let depth    = i32::from_le_bytes(data[14..18].try_into().unwrap());
     let z_anchor = i32::from_le_bytes(data[18..22].try_into().unwrap());
-    let n = (width * height * depth) as usize;
-    if width <= 0 || height <= 0 || depth <= 0 || data.len() < 22 + 2 * n {
+    if width <= 0 || height <= 0 || depth <= 0 {
+        return Err("Corrupt or truncated .epfab file".into());
+    }
+    // Volume in i64 so the multiply can't overflow i32 (which would wrap to a small n and pass the
+    // truncation check with a bogus header). Cap it so a hostile header can't request a huge alloc.
+    let vol = width as i64 * height as i64 * depth as i64;
+    if vol > MAX_CELLS {
+        return Err("Prefab dimensions too large".into());
+    }
+    let n = vol as usize;
+    if data.len() < 22 + 2 * n {
         return Err("Corrupt or truncated .epfab file".into());
     }
     Ok(Clipboard {
@@ -3569,12 +3709,19 @@ fn get_default_prefab_dir(app: tauri::AppHandle) -> Result<String, String> {
 /// stream but only until the 22-byte header is available, not the (much larger)
 /// block/paint payload.
 fn read_prefab_header(path: &std::path::Path) -> Option<(i32, i32, i32)> {
-    use flate2::read::GzDecoder;
     use std::io::Read;
-    let file = fs::File::open(path).ok()?;
-    let mut dec = GzDecoder::new(file);
+    let mut magic = [0u8; 2];
+    fs::File::open(path).ok()?.read_exact(&mut magic).ok()?;
     let mut header = [0u8; 22];
-    dec.read_exact(&mut header).ok()?;
+    if magic == [0x1f, 0x8b] {
+        // Gzip-compressed (current format) — decode just the header.
+        use flate2::read::GzDecoder;
+        GzDecoder::new(fs::File::open(path).ok()?).read_exact(&mut header).ok()?;
+    } else {
+        // Legacy uncompressed .epfab (still loadable by deserialize_prefab). Reading it as gzip
+        // would fail and drop it from the gallery, so read the raw header directly.
+        fs::File::open(path).ok()?.read_exact(&mut header).ok()?;
+    }
     if &header[0..6] != b"EPFAB\x01" { return None; }
     let width  = i32::from_le_bytes(header[6..10].try_into().ok()?);
     let height = i32::from_le_bytes(header[10..14].try_into().ok()?);
@@ -4353,6 +4500,7 @@ fn find_nearest_block(
 }
 
 pub fn run() {
+    sweep_stale_temps(); // clear staging temps leaked by a previous clean quit
     tauri::Builder::default()
         .manage(Mutex::new(WorldState::new()))
         .manage(ExpandCancel::default())
@@ -4363,13 +4511,14 @@ pub fn run() {
             get_world_info,
             fetch_tile,
             save_png,
-            render_zslice,
+            export_png,
             describe_selection,
             delete_blocks,
             replace_blocks,
             gradient_fill,
             paint_blocks,
             save_world,
+            close_world,
             autosave_world,
             get_autosave_info,
             get_autosave_path,
@@ -4719,6 +4868,21 @@ mod tests {
         restore_and_invert(&mut world, &UndoEntry { operation: "test".into(), chunks: vec![snap2] });
         assert_eq!(&world.bytes[HEADER..HEADER + 32768], &pre_full2[0].2[..],
             "Full-delta undo must restore the whole chunk");
+    }
+
+    /// export_png's encoder must produce a valid PNG of the right dimensions from a rendered
+    /// full-map RGBA buffer (the Rust-side replacement for the old JS canvas→base64 path).
+    #[test]
+    fn test_export_png_encodes_valid() {
+        let world = parse_world_inner(mmap_from_bytes(make_test_world())).expect("parse failed");
+        let w = (world.w_chunks * 16) as i32;
+        let h = (world.h_chunks * 16) as i32;
+        let patch = render_pixels_patch(&world, 0, 0, w - 1, h - 1);
+        let png = encode_rgba_png(&patch.pixels, w as u32, h as u32).expect("encode failed");
+        assert_eq!(&png[..8], &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A], "PNG magic");
+        let img = image::load_from_memory(&png).expect("decode failed");
+        assert_eq!(img.width(), w as u32);
+        assert_eq!(img.height(), h as u32);
     }
 
     /// X/Y slice renderers place the known column (px=3, py=5) blocks at the right pixels.

@@ -146,7 +146,7 @@ Most actions live on the **Ribbon** — a tabbed toolbar (Home / Selection / Vie
 17. **Template overlay** — **View** tab → *Template Overlay* → point at the game's `Eden.eden` file to show surrounding terrain behind a sparse world. **File** tab → *Expand from Template* bakes that terrain into a new world file.
 18. **Import Schematic** — **File** tab → *Import Schematic* lets you bring in a Minecraft build, remap blocks, and paste it in.
 19. **Export** — **File** tab → *Export* writes PNG, OBJ (+MTL), or JSON. OBJ/JSON export the current selection if one is active, otherwise the full world.
-20. **Save** — *Save* writes changes to the original file in place. *Save As* writes to a new file. Toggle *Compressed* to write a `.eden.zip`.
+20. **Save** — *Save* writes changes back to the original file, *Save As* writes to a new file. Saves are atomic — an interrupted save (crash, power loss) can't corrupt the file — and closing a world or quitting warns you first if you have unsaved changes. Toggle *Compressed* to write a `.eden.zip`.
 21. **Upload** — **File** tab → *Upload* lets you share the current world to the Eden servers. A PNG thumbnail is required.
 22. **Right-click** — right-click the map for a context menu: set spawn here, copy, paste here, fill/delete/clear selection, teleport the 3D camera, and quick tool switches.
 
@@ -248,7 +248,7 @@ Three procedural generators live in `lib.rs`:
 
 ### File format
 
-Two chunk layouts are supported: standard (32 768 B / 64 z-levels) and extended (131 072 B / 256 z-levels). Compressed worlds (deflate zip) are detected by PK magic, decompressed to a temp file, and mmapped. The format is documented in `MROB.txt` and cross-referenced against the reference C# implementation in `EdenWorldManipulator2.0/`.
+Two chunk layouts are supported: standard (32 768 B / 64 z-levels) and extended (131 072 B / 256 z-levels). Every world is mapped from a private temp copy (compressed worlds — detected by PK magic — are decompressed first), so the original file is never held open. Saves stage a sibling temp file and rename it into place atomically, which can't corrupt the world if interrupted and works even on Windows, where an open memory-mapped file can't be replaced. The format is documented in `MROB.txt` and cross-referenced against the reference C# implementation in `EdenWorldManipulator2.0/`.
 
 ### Automated releases
 

@@ -33,3 +33,23 @@ jobs:
       - run: cargo test --manifest-path src-tauri/Cargo.toml
       # Advisory for now — tighten to `-D warnings` once existing lints are cleared.
       - run: cargo clippy --manifest-path src-tauri/Cargo.toml || true
+
+  # Windows build gate — the app targets Windows but has only been developed on macOS. This catches
+  # platform-specific breakage early (path separators, the save/rename + mmap-lock behaviour, etc.).
+  # windows-latest ships WebView2, so the Tauri Rust deps build without extra setup.
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx tsc --noEmit
+      - run: npx vite build
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - run: cargo test --manifest-path src-tauri/Cargo.toml

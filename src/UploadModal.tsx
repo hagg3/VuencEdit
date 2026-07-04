@@ -132,6 +132,10 @@ export default function UploadModal({ sourcePath, onClose }: Props) {
               Legacy
             </label>
           </div>
+          <span style={{ fontSize: 10, color: "#64748b", lineHeight: 1.5 }}>
+            Uploads use plain HTTP — the world file, its name, and the preview travel unencrypted.
+            Don't upload anything private.
+          </span>
         </div>
 
         {/* World file */}

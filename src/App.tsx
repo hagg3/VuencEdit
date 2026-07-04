@@ -1,7 +1,7 @@
 import { decodeU8 } from "./codec";
 import {
   type WorldMeta,
-  type PixelPatchRaw, type EditResultRaw, type PreviewDataRaw,
+  type EditResultRaw, type PreviewDataRaw,
   type SelectionInfo, type ClipboardInfo, type ExtrudeAxis, type AutosaveInfo,
 } from "./types";
 import { useRecentWorlds, timeAgo } from "./useRecentWorlds";
@@ -9,8 +9,9 @@ import { useState, useCallback, useEffect, useRef, useMemo } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getVersion } from "@tauri-apps/api/app";
-import { open, save } from "@tauri-apps/plugin-dialog";
+import { open, save, ask } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import MapCanvas, { type Tool, type SelectionBounds, type PixelPatch, type MapCanvasRef } from "./MapCanvas";
 import SelectionInspector from "./SelectionInspector";
 import ElevationPreviewPanel from "./ElevationPreviewPanel";
@@ -197,6 +198,11 @@ function App() {
   const [editEpoch, setEditEpoch] = useState(0);
   const editEpochRef = useRef(0);
   useEffect(() => { editEpochRef.current = editEpoch; }, [editEpoch]);
+  // editEpoch value at the last load or manual Save. The world is "dirty" (has unsaved edits) when
+  // the live editEpoch has moved past it. Autosave deliberately does NOT update this — an autosave
+  // is a crash-safety copy, not a save to the user's file, so it must not suppress the close prompt.
+  const savedEpochRef = useRef(0);
+  const isDirty = useCallback(() => editEpochRef.current !== savedEpochRef.current, []);
   // World bounds of the most recent edit (top-down X/Y) — lets slabs skip refetch if untouched.
   const [lastEditBounds, setLastEditBounds] = useState<{ x: number; y: number; w: number; h: number } | null>(null);
 
@@ -476,34 +482,7 @@ function App() {
       multiple: false,
     });
     if (!selected || typeof selected !== "string") return;
-    const myEpoch = ++loadEpochRef.current;
-    setLoading(true);
-    setError(null);
-    try {
-      const data = await invoke<WorldMeta>("load_world", { path: selected });
-      if (loadEpochRef.current !== myEpoch) return;
-      setWorld(data);
-      setWorldEpoch((e) => e + 1);
-      setSourcePath(selected);
-      setRawBounds(null);
-      setZMin(0);
-      setZMax(data.max_z);
-      setTool("pan");
-      setUndoDepth(0);
-      setRedoDepth(0);
-      setViewMode("topdown");
-      setZSliceZ(32);
-      setZSliceDisplay(32);
-      setClipboard(null);
-      setSaveCompressed(data.was_compressed);
-      setSpawnPos(data.spawn_px != null && data.spawn_py != null ? { px: data.spawn_px, py: data.spawn_py } : null);
-      addRecentWorld(selected, data.name);
-      lastAutosavedEpochRef.current = editEpochRef.current;
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setLoading(false);
-    }
+    await openFileAt(selected);
   }
 
   async function openFileAt(path: string, opts?: { skipRecent?: boolean }) {
@@ -530,6 +509,7 @@ function App() {
       setSpawnPos(data.spawn_px != null && data.spawn_py != null ? { px: data.spawn_px, py: data.spawn_py } : null);
       if (!opts?.skipRecent) addRecentWorld(path, data.name);
       lastAutosavedEpochRef.current = editEpochRef.current;
+      savedEpochRef.current = editEpochRef.current;
     } catch (e) {
       setError(String(e));
     } finally {
@@ -546,52 +526,16 @@ function App() {
     });
     if (!savePath) return;
     setExporting(true);
-    setExportProgress(0);
-    const useTemplate = showTemplateOverlay && templateLoaded && viewMode !== "zslice";
+    setExportProgress(null); // indeterminate — Rust renders + encodes the whole map in one call
     try {
-      const w = world.width_chunks * 16;
-      const h = world.height_chunks * 16;
-      const STRIP_H = 128;
-      const buf = new Uint8Array(w * h * 4);
-      for (let y = 0; y < h; y += STRIP_H) {
-        const y2 = Math.min(y + STRIP_H - 1, h - 1);
-        const raw = viewMode === "zslice"
-          ? await invoke<PixelPatchRaw>("render_zslice_patch", { z: zSliceZ, x1: 0, y1: y, x2: w - 1, y2 })
-          : await invoke<PixelPatchRaw>("fetch_tile", { x1: 0, y1: y, x2: w - 1, y2 });
-        const pixels = decodeU8(raw.pixels);
-        if (useTemplate) {
-          const traw = await invoke<PixelPatchRaw>("fetch_template_tile", { x1: 0, y1: y, x2: w - 1, y2 });
-          const tpixels = decodeU8(traw.pixels);
-          // Composite: where user pixel is transparent (alpha=0), use template at full opacity
-          for (let i = 0; i < pixels.length; i += 4) {
-            if (pixels[i + 3] === 0 && tpixels[i + 3] === 255) {
-              pixels[i]     = tpixels[i];
-              pixels[i + 1] = tpixels[i + 1];
-              pixels[i + 2] = tpixels[i + 2];
-              pixels[i + 3] = 255;
-            }
-          }
-        }
-        buf.set(pixels, y * w * 4);
-        setExportProgress((y2 + 1) / h);
-      }
-      const canvas = document.createElement("canvas");
-      canvas.width = w;
-      canvas.height = h;
-      const ctx = canvas.getContext("2d")!;
-      const img = ctx.createImageData(w, h);
-      img.data.set(buf);
-      ctx.putImageData(img, 0, 0);
-      const blob = await new Promise<Blob>((resolve, reject) =>
-        canvas.toBlob((b) => (b ? resolve(b) : reject(new Error("toBlob failed"))), "image/png")
-      );
-      const pngBytes = new Uint8Array(await blob.arrayBuffer());
-      let binary = "";
-      const chunkSize = 8192;
-      for (let i = 0; i < pngBytes.length; i += chunkSize) {
-        binary += String.fromCharCode(...pngBytes.subarray(i, i + chunkSize));
-      }
-      await invoke("save_png", { path: savePath, data: btoa(binary) });
+      // Render + PNG-encode entirely in Rust. The old path built the full RGBA buffer, a binary
+      // string, and a base64 string in the JS heap (≈4× the map size) before this IPC hop.
+      await invoke("export_png", {
+        path: savePath,
+        view: viewMode === "zslice" ? "zslice" : "topdown",
+        z: zSliceZ,
+        useTemplate: showTemplateOverlay && templateLoaded && viewMode !== "zslice",
+      });
     } catch (e) {
       setError(String(e));
     } finally {
@@ -1003,6 +947,7 @@ function App() {
       await invoke("save_world", { path, compressed: saveCompressed });
       // A real save makes any pending autosave sidecar redundant — nothing left to recover.
       lastAutosavedEpochRef.current = editEpochRef.current;
+      savedEpochRef.current = editEpochRef.current;
       invoke("discard_autosave").catch(() => {});
     } catch (e) {
       setError(String(e));
@@ -1045,6 +990,21 @@ function App() {
       .catch(() => {});
   }, []);
 
+  // Warn before the OS window closes (title-bar close button / ⌘Q) if there are unsaved edits.
+  // preventDefault holds the window open until the user confirms, then destroy() closes it for real.
+  useEffect(() => {
+    const win = getCurrentWindow();
+    const unlisten = win.onCloseRequested(async (event) => {
+      if (!isDirty()) return; // clean — let the close proceed
+      event.preventDefault();
+      const ok = await ask("You have unsaved changes. Quit and discard them?", {
+        title: "Unsaved changes", kind: "warning",
+      });
+      if (ok) win.destroy();
+    });
+    return () => { unlisten.then((f) => f()); };
+  }, [isDirty]);
+
   async function recoverAutosave() {
     if (!recoveryInfo) return;
     setRecovering(true);
@@ -1066,10 +1026,20 @@ function App() {
     setRecoveryInfo(null);
   }
 
+  // Any dialog-style modal open? (HelpModal is excluded — it has its own key handling below.)
+  // When one is up it owns the keyboard, so editor shortcuts must not fire underneath it.
+  const anyModalOpen =
+    showAbout || showSettings || showWorldInfo || showWorldBrowser || showUploadModal ||
+    showNewWorld || !!schematicInfo || showExpandModal || !!recoveryInfo || prefabNameModal;
+  const anyModalOpenRef = useRef(false);
+  useEffect(() => { anyModalOpenRef.current = anyModalOpen; }, [anyModalOpen]);
+
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       // While the 3D fly camera is active, it owns all keyboard input — don't fire editor shortcuts.
       if (flyActiveRef.current) return;
+      // A modal dialog is open — let it own the keyboard (its own Escape/Enter handling applies).
+      if (anyModalOpenRef.current) return;
       const tag = (e.target as HTMLElement).tagName;
       // ? always toggles help (skip when typing in an input)
       if (e.key === "?" && tag !== "INPUT" && tag !== "TEXTAREA" && !e.metaKey && !e.ctrlKey) {
@@ -1165,14 +1135,17 @@ function App() {
         }
       }
       if (!(e.metaKey || e.ctrlKey)) return;
-      if (e.key === "z" && !e.shiftKey) { e.preventDefault(); handleUndo(); }
-      if ((e.key === "z" && e.shiftKey) || e.key === "y") { e.preventDefault(); handleRedo(); }
-      if (e.key === "c") { e.preventDefault(); copySelection(); }
-      if (e.key === "v") {
+      // Normalize case: with Shift (⌘⇧Z) or Caps Lock, e.key is uppercase ("Z"), so a bare
+      // === "z" comparison silently misses. This was why ⌘⇧Z redo never fired.
+      const k = e.key.toLowerCase();
+      if (k === "z" && !e.shiftKey) { e.preventDefault(); handleUndo(); }
+      if ((k === "z" && e.shiftKey) || k === "y") { e.preventDefault(); handleRedo(); }
+      if (k === "c") { e.preventDefault(); copySelection(); }
+      if (k === "v") {
         e.preventDefault();
         if (clipboard) setTool("paste");
       }
-      if (e.key === "s") {
+      if (k === "s") {
         e.preventDefault();
         if (sourcePath) saveWorld(sourcePath);
         else saveWorldAs();
@@ -1429,7 +1402,15 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
     setZMax(Math.max(v, zMin));
   }
 
-  function closeWorld() {
+  async function closeWorld() {
+    if (isDirty()) {
+      const ok = await ask("You have unsaved changes. Close this world and discard them?", {
+        title: "Unsaved changes", kind: "warning",
+      });
+      if (!ok) return;
+    }
+    invoke("close_world").catch(() => {});      // release backend mmap / undo stack / staged temp
+    invoke("discard_autosave").catch(() => {}); // discarded on purpose — nothing to recover
     setWorld(null);
     setSourcePath(null);
     setRawBounds(null);

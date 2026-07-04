@@ -244,7 +244,7 @@ pub(crate) fn emit_merged_quad(w: &mut impl Write, dir: u8, plane: i32, u0: i32,
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn export_obj(
     state: tauri::State<'_, AppState>,
     path: String,
@@ -392,7 +392,7 @@ pub(crate) fn export_obj(
 
 // ── JSON Export ────────────────────────────────────────────────────────────────
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn export_json(
     state: tauri::State<'_, AppState>,
     path: String,
@@ -460,7 +460,7 @@ pub(crate) fn export_json(
 
 // ── VOX Export ────────────────────────────────────────────────────────────────
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn export_vox(
     app_handle: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
@@ -625,7 +625,7 @@ pub(crate) struct ObjGeometryResult {
     vertex_count: u32,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn get_obj_geometry(
     state: tauri::State<'_, AppState>,
     x1: i32, y1: i32, x2: i32, y2: i32,
@@ -845,7 +845,7 @@ pub(crate) fn obj_geometry_region(world: &LoadedWorld, pack: Option<&texturepack
 
 /// Face-culled geometry for a single chunk (16×16 XY × full Z). For the 3D fly-through pane, which
 /// streams meshes per chunk near the camera.
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn get_chunk_geometry(
     state: tauri::State<'_, AppState>,
     cx: i32, cy: i32,

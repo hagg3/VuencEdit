@@ -300,15 +300,21 @@ pub(crate) fn nbt_parse_val(d: &[u8], pos: &mut usize, tag: u8) -> Option<NbtVal
             Some(NbtVal::Double(v))
         }
         7 => {
-            let len = nbt_read_be_i32(d, pos)? as usize;
-            if *pos + len > d.len() { return None; }
+            // Length is a signed i32 in the format but must be non-negative; guard the sign and
+            // compare against remaining bytes with saturating_sub so `*pos + len` can't overflow.
+            let len = nbt_read_be_i32(d, pos)?;
+            if len < 0 || len as usize > d.len().saturating_sub(*pos) { return None; }
+            let len = len as usize;
             let v = d[*pos..*pos+len].to_vec(); *pos += len; Some(NbtVal::ByteArr(v))
         }
         8 => Some(NbtVal::Str(nbt_read_nbt_string(d, pos)?)),
         9 => {
             let et = nbt_read_u8(d, pos)?;
             let n  = nbt_read_be_i32(d, pos)?;
-            let mut list = Vec::with_capacity(n as usize);
+            if n < 0 { return None; }
+            // Cap the preallocation: a hostile count must not drive a huge Vec::with_capacity. The
+            // loop is still bounded by the actual data (each element read is bounds-checked).
+            let mut list = Vec::with_capacity((n as usize).min(1024));
             for _ in 0..n { list.push(nbt_parse_val(d, pos, et)?); }
             Some(NbtVal::List(list))
         }
@@ -324,8 +330,10 @@ pub(crate) fn nbt_parse_val(d: &[u8], pos: &mut usize, tag: u8) -> Option<NbtVal
             Some(NbtVal::Compound(map))
         }
         11 => {
-            let n = nbt_read_be_i32(d, pos)? as usize;
-            let mut arr = Vec::with_capacity(n);
+            let n = nbt_read_be_i32(d, pos)?;
+            if n < 0 { return None; }
+            let n = n as usize;
+            let mut arr = Vec::with_capacity(n.min(1 << 16));
             for _ in 0..n {
                 if *pos + 4 > d.len() { return None; }
                 arr.push(i32::from_be_bytes(d[*pos..*pos+4].try_into().unwrap())); *pos += 4;
@@ -333,8 +341,10 @@ pub(crate) fn nbt_parse_val(d: &[u8], pos: &mut usize, tag: u8) -> Option<NbtVal
             Some(NbtVal::IntArr(arr))
         }
         12 => {
-            let n = nbt_read_be_i32(d, pos)? as usize;
-            let mut arr = Vec::with_capacity(n);
+            let n = nbt_read_be_i32(d, pos)?;
+            if n < 0 { return None; }
+            let n = n as usize;
+            let mut arr = Vec::with_capacity(n.min(1 << 16));
             for _ in 0..n {
                 if *pos + 8 > d.len() { return None; }
                 arr.push(i64::from_be_bytes(d[*pos..*pos+8].try_into().unwrap())); *pos += 8;
@@ -481,13 +491,16 @@ pub(crate) fn nbt_read_be_i32(d: &[u8], pos: &mut usize) -> Option<i32> {
     let v = i32::from_be_bytes(d[*pos..*pos+4].try_into().unwrap()); *pos += 4; Some(v)
 }
 pub(crate) fn nbt_skip_nbt_string(d: &[u8], pos: &mut usize) -> Option<()> {
-    let len = nbt_read_be_i16(d, pos)? as usize;
-    if *pos + len > d.len() { return None; }
+    // NBT string lengths are unsigned u16 — read the raw bits as u16, not i16, so a length above
+    // 32767 isn't misread as negative (which `as usize` would blow up into a huge value and wrap
+    // the bounds check).
+    let len = nbt_read_be_i16(d, pos)? as u16 as usize;
+    if len > d.len().saturating_sub(*pos) { return None; }
     *pos += len; Some(())
 }
 pub(crate) fn nbt_read_nbt_string(d: &[u8], pos: &mut usize) -> Option<String> {
-    let len = nbt_read_be_i16(d, pos)? as usize;
-    if *pos + len > d.len() { return None; }
+    let len = nbt_read_be_i16(d, pos)? as u16 as usize;
+    if len > d.len().saturating_sub(*pos) { return None; }
     let s = std::str::from_utf8(&d[*pos..*pos+len]).ok()?.to_string();
     *pos += len; Some(s)
 }
