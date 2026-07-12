@@ -5,7 +5,7 @@ import {
   type SelectionInfo, type ClipboardInfo, type ExtrudeAxis, type AutosaveInfo,
 } from "./types";
 import { useRecentWorlds, timeAgo } from "./useRecentWorlds";
-import { useState, useCallback, useEffect, useRef, useMemo } from "react";
+import { useState, useCallback, useEffect, useRef, useMemo, useImperativeHandle, forwardRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getVersion } from "@tauri-apps/api/app";
@@ -16,7 +16,7 @@ import MapCanvas, { type Tool, type SelectionBounds, type PixelPatch, type MapCa
 import SelectionInspector from "./SelectionInspector";
 import ElevationPreviewPanel from "./ElevationPreviewPanel";
 import SliceViewport from "./SliceViewport";
-import FlyView3D, { type FlyView3DRef, type Overlay3D } from "./FlyView3D";
+import FlyView3D, { type FlyView3DRef, type Overlay3D, type Interact3D } from "./FlyView3D";
 import ErrorBoundary from "./ErrorBoundary";
 import HelpModal from "./HelpModal";
 import AboutModal from "./AboutModal";
@@ -25,23 +25,50 @@ import UploadModal from "./UploadModal";
 import NewWorldModal from "./NewWorldModal";
 import SchematicImportModal, { type SchematicInfo, type MappingEntry } from "./SchematicImportModal";
 import Ribbon, { RIBBON_HEIGHT_COLLAPSED, TAB_BAR_HEIGHT, DEFAULT_BODY_HEIGHT, EDEN_TEAL, EDEN_TEAL_READABLE } from "./Ribbon";
-import SettingsModal, { loadSettings, saveSettings } from "./SettingsModal";
+import SettingsModal, { loadSettings, saveSettings, type AppSettings } from "./SettingsModal";
 import WorldInfoModal from "./WorldInfoModal";
 import RecoveryModal from "./RecoveryModal";
 import PrefabLibraryPanel, { resolvePrefabDir } from "./PrefabLibraryPanel";
 import Modal from "./Modal";
 import { glassPanel, chromeButton } from "./designTokens";
-import { decodeAtlas, type AtlasData, type TexturePackRaw, clearSwatchCache } from "./texturePack";
+import { decodeAtlas, tintedSwatch, type AtlasData, type TexturePackRaw, clearSwatchCache } from "./texturePack";
 import { blockDisplayName, applyBlockTables, type BlockTables } from "./blockDefs";
 import appIcon from "./assets/app-icon.png";
 import "./App.css";
+
+// Quad-view divider positions (column/row split fractions), persisted so a layout the user tuned
+// survives reloads. Clamped to 0.15–0.85 so no cell can be dragged to nothing.
+const STATUS_BAR_HEIGHT = 20; // px reserved at the bottom of the window for statusBarEl
+const QUAD_SPLITS_KEY = "eden_quad_splits";
+const clampSplit = (v: number) => Math.min(0.85, Math.max(0.15, v));
+
+// Input types that aren't text entry — a focused range/checkbox/etc. shouldn't suppress single-key
+// shortcuts. Testing `tagName === "INPUT"` alone also matches Ribbon sliders (brush size, sun angle,
+// …), which keep focus after a drag: touch one and P/B/R/E/W/F/1–0 go dead until something else is
+// clicked. Mirrors FlyView3D's NON_TEXT_INPUT_TYPES fix for the identical bug in that pane.
+const NON_TEXT_INPUT_TYPES = new Set(["range", "checkbox", "radio", "button", "submit", "reset", "color", "file"]);
+const isTypingTarget = (t: EventTarget | null): boolean => {
+  const el = t as HTMLElement | null;
+  const tag = el?.tagName;
+  return tag === "TEXTAREA" || el?.isContentEditable === true ||
+    (tag === "INPUT" && !NON_TEXT_INPUT_TYPES.has((el as HTMLInputElement).type));
+};
+function loadQuadSplits(): { col: number; row: number } {
+  try {
+    const p = JSON.parse(localStorage.getItem(QUAD_SPLITS_KEY) ?? "{}");
+    return { col: clampSplit(Number(p.col) || 0.5), row: clampSplit(Number(p.row) || 0.5) };
+  } catch { return { col: 0.5, row: 0.5 }; }
+}
+function saveQuadSplits(col: number, row: number) {
+  localStorage.setItem(QUAD_SPLITS_KEY, JSON.stringify({ col, row }));
+}
 
 function SplashLink({ href, children }: { href: string; children: React.ReactNode }) {
   return (
     <a
       href="#"
       onClick={(e) => { e.preventDefault(); openUrl(href); }}
-      style={{ color: "#64748b", textDecoration: "underline" }}
+      style={{ color: "#83786c", textDecoration: "underline" }}
     >
       {children}
     </a>
@@ -67,6 +94,42 @@ function FpsCounter() {
   }, []);
   return <>{fps} fps</>;
 }
+
+type CursorBlockInfo = { z: number; bt: number; paint: number };
+type CursorHudHandle = {
+  set: (wx: number, wy: number, block: CursorBlockInfo | null) => void;
+  setPos: (wx: number, wy: number) => void;
+};
+
+// Self-contained status-bar cursor readout: owns its own state so the ~12×/s throttled mouse-move
+// tick re-renders only this leaf instead of App (and everything App renders — Ribbon, panels, …).
+// Same pattern as FpsCounter/CoordHud (FlyView3D.tsx).
+const CursorHud = forwardRef<CursorHudHandle>((_props, ref) => {
+  const [pos, setPos] = useState<{ wx: number; wy: number } | null>(null);
+  const [block, setBlock] = useState<CursorBlockInfo | null>(null);
+  useImperativeHandle(ref, () => ({
+    set: (wx, wy, blk) => { setPos({ wx, wy }); setBlock(blk); },
+    // Position-only update — used when the cursor moves within the same block cell so the X/Y
+    // readout stays live without re-invoking get_cursor_block for an answer that can't have changed.
+    setPos: (wx, wy) => { setPos({ wx, wy }); },
+  }), []);
+  return (
+    <>
+      <div style={{ padding: "0 10px", borderRight: "1px solid #322d28", minWidth: 100, whiteSpace: "nowrap" }}>
+        {pos
+          ? <>X <span style={{ color: "#83786c" }}>{Math.round(pos.wx)}</span>{"  "}Y <span style={{ color: "#83786c" }}>{Math.round(pos.wy)}</span></>
+          : <span style={{ color: "#312c28" }}>X — Y —</span>
+        }
+      </div>
+      {block && (
+        <div style={{ padding: "0 10px", borderRight: "1px solid #322d28", whiteSpace: "nowrap" }}>
+          Z <span style={{ color: "#83786c" }}>{block.z}</span>
+          {"  "}<span style={{ color: "#61584f" }}>{blockDisplayName(block.bt)}{block.paint > 0 ? <span style={{ color: "#4b443d" }}> #{block.paint}</span> : null}</span>
+        </div>
+      )}
+    </>
+  );
+});
 
 function App() {
   const [world, setWorld] = useState<WorldMeta | null>(null);
@@ -97,11 +160,12 @@ function App() {
   const [undoDepth, setUndoDepth] = useState(0);
   const [redoDepth, setRedoDepth] = useState(0);
 
-  // Status bar: cursor world position and FPS
-  const [cursorPos, setCursorPos] = useState<{wx:number;wy:number}|null>(null);
-  const [cursorBlock, setCursorBlock] = useState<{z:number;bt:number;paint:number}|null>(null);
+  // Status bar: cursor world position and FPS. cursorHudRef feeds the leaf CursorHud component
+  // directly (see its definition) so the throttled mouse-move tick doesn't re-render all of App.
+  const cursorHudRef = useRef<CursorHudHandle>(null);
   const [ctxMenu, setCtxMenu] = useState<{wx:number;wy:number;x:number;y:number}|null>(null);
   const cursorPosThrottleRef = useRef<ReturnType<typeof setTimeout>|null>(null);
+  const lastCursorCellRef = useRef<{ cx: number; cy: number } | null>(null);
   const [tool, setTool] = useState<Tool>("pan");
   const prevToolRef = useRef<Tool>("pan");
   const [wandMatchPaint, setWandMatchPaint] = useState(true);
@@ -113,6 +177,9 @@ function App() {
   const [recoveryInfo, setRecoveryInfo] = useState<AutosaveInfo | null>(null);
   const [recovering, setRecovering] = useState(false);
   const lastAutosavedEpochRef = useRef(-1);
+  // Last "path|compressed" combo we've already warned about for a compressed-flag/extension
+  // mismatch on plain Save — avoids re-toasting on every ⌘S while the mismatch is unresolved.
+  const lastExtWarnRef = useRef<string | null>(null);
 
   // Toast: brief status-summary popup after named edit/undo/redo operations (E5).
   const [toast, setToast] = useState<{ text: string; id: number } | null>(null);
@@ -152,8 +219,89 @@ function App() {
   // 3D fly-through pane (4th quad cell) — off by default; it's the most expensive pane, so the user
   // opts in. `exp` (experimental, perf-heavy on large worlds).
   const [enable3dPane, setEnable3dPane] = useState(() => loadSettings().default3dPane);
+  const [fogEnabled, setFogEnabled] = useState(() => loadSettings().enableFog);
+  // Night lighting / shadow previews + the GPU shadow map for FlyView3D (see CLAUDE.md). `lightEpoch`
+  // bumps whenever the baked ones change, driving a chunk-mesh reload (same mechanism as texEpoch).
+  // These are the perf-heavy 3D lighting modes (⚡ badged in the Ribbon): deliberately **session-only,
+  // always off at startup** (not seeded from persisted settings) and reset off on every world load/
+  // close via `resetHeavyLighting()` — a heavy GPU mode must never silently persist across worlds.
+  const [nightLighting, setNightLighting] = useState(false);
+  const [shadows3d, setShadows3d] = useState(false);
+  // Opt-in real GPU shadow map (H5) — replaces the baked night/shadow preview with a lit material +
+  // directional sun + shadow map in FlyView3D. Independent of nightLighting/shadows3d; when on it
+  // overrides them. Doesn't drive lightEpoch reloads: FlyView3D rebuilds meshes off the prop change.
+  const [gpuShadows, setGpuShadows] = useState(false);
+  const [sunT, setSunT] = useState(() => loadSettings().sunT);
+  // sunTDisplay is the Ribbon slider's visual value while the user is dragging (same pattern as
+  // zSliceDisplay/commitZSlice) — only the committed sunT triggers the (expensive) chunk reload.
+  const [sunTDisplay, setSunTDisplay] = useState(() => loadSettings().sunT);
+  // Lamp light radius (blocks) for night lighting. Same display/commit split as sunT so dragging the
+  // Ribbon slider doesn't reload every chunk per pixel — only the committed value bumps lightEpoch.
+  const [lampRadius, setLampRadius] = useState(() => loadSettings().lampRadius);
+  const [lampRadiusDisplay, setLampRadiusDisplay] = useState(() => loadSettings().lampRadius);
+  const [lightEpoch, setLightEpoch] = useState(0);
+  useEffect(() => { setLightEpoch(e => e + 1); }, [nightLighting, shadows3d, sunT, lampRadius]);
+  // Force the perf-heavy 3D lighting modes off — called on every world load/close so none of them
+  // carry over to a different world (they're Ribbon-only session toggles, never persisted).
+  function resetHeavyLighting() {
+    setNightLighting(false);
+    setShadows3d(false);
+    setGpuShadows(false);
+  }
+  function commitSunT(t: number) {
+    setSunT(t);
+    setSunTDisplay(t);
+    saveSettings({ sunT: t });
+  }
+  function commitLampRadius(r: number) {
+    setLampRadius(r);
+    setLampRadiusDisplay(r);
+    saveSettings({ lampRadius: r });
+  }
+  // Persisted 3D fly-view render distance + fly speed (seed FlyView3D; written back as the user adjusts).
+  const [renderDistance, setRenderDistance] = useState(() => loadSettings().renderDistance);
+  const [flySpeed, setFlySpeed] = useState(() => loadSettings().flySpeed);
+  // Debounces the localStorage write only (state stays live so the slider/HUD track immediately) —
+  // dragging the render-distance slider fires an onChange per pixel, and saveSettings() does a full
+  // loadSettings() (JSON.parse) + JSON.stringify round-trip; without this a drag gesture does dozens
+  // of synchronous localStorage round-trips for a value that only needs to persist once released.
+  const saveSettingsDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  function saveSettingsDebounced(patch: Partial<AppSettings>) {
+    if (saveSettingsDebounceRef.current) clearTimeout(saveSettingsDebounceRef.current);
+    saveSettingsDebounceRef.current = setTimeout(() => saveSettings(patch), 250);
+  }
+  // Quad-view split fractions (0.15–0.85) + which pane is maximized (session-only). Splits persisted.
+  const [quadColSplit, setQuadColSplit] = useState(() => loadQuadSplits().col);
+  const [quadRowSplit, setQuadRowSplit] = useState(() => loadQuadSplits().row);
+  const [maximizedPane, setMaximizedPane] = useState<"map" | "front" | "side" | "3d" | null>(null);
+  const quadGridRef = useRef<HTMLDivElement>(null);
+  const quadDragRef = useRef<null | "col" | "row" | "both">(null);
   const flyActiveRef = useRef(false); // true while FlyView3D fly mode is active — blocks global shortcuts
   const flyView3dRef = useRef<FlyView3DRef>(null);
+
+  // Quad-view splitter drag: a vertical bar moves the column split, a horizontal bar the row split,
+  // and the centre knob moves both. Fraction is derived from the pointer position within the grid
+  // rect; committed to localStorage on release. Mirrors the Ribbon/SliceViewport drag idiom.
+  const beginQuadDrag = (kind: "col" | "row" | "both") => (e: React.PointerEvent) => {
+    e.preventDefault();
+    quadDragRef.current = kind;
+    let latestCol = quadColSplit, latestRow = quadRowSplit;
+    const move = (ev: PointerEvent) => {
+      const g = quadGridRef.current;
+      if (!g) return;
+      const r = g.getBoundingClientRect();
+      if (kind === "col" || kind === "both") { latestCol = clampSplit((ev.clientX - r.left) / r.width); setQuadColSplit(latestCol); }
+      if (kind === "row" || kind === "both") { latestRow = clampSplit((ev.clientY - r.top) / r.height); setQuadRowSplit(latestRow); }
+    };
+    const up = () => {
+      quadDragRef.current = null;
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+      saveQuadSplits(latestCol, latestRow);
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+  };
   const [cam3dPos, setCam3dPos] = useState<{ x: number; y: number } | null>(null);
   const [sliceFrontY, setSliceFrontY] = useState(0); // front slab depth (world Y)
   const [sliceSideX, setSliceSideX] = useState(0);   // side slab depth (world X)
@@ -197,7 +345,13 @@ function App() {
   const lockedPastePosRef = useRef<{ x: number; y: number } | null>(null);
   const [editEpoch, setEditEpoch] = useState(0);
   const editEpochRef = useRef(0);
-  useEffect(() => { editEpochRef.current = editEpoch; }, [editEpoch]);
+  useEffect(() => {
+    editEpochRef.current = editEpoch;
+    // An edit can repaint the block under a stationary cursor — invalidate the cached cell so the
+    // next mouse-move tick re-queries get_cursor_block instead of trusting the stale "same cell"
+    // skip in handleCursorMove.
+    lastCursorCellRef.current = null;
+  }, [editEpoch]);
   // editEpoch value at the last load or manual Save. The world is "dirty" (has unsaved edits) when
   // the live editEpoch has moved past it. Autosave deliberately does NOT update this — an autosave
   // is a crash-safety copy, not a save to the user's file, so it must not suppress the close prompt.
@@ -346,14 +500,37 @@ function App() {
 
   const [selection, setSelection] = useState<SelectionInfo | null>(null);
 
+  // First corner of a two-click 3D selection, or null. Mirrors MapCanvas's two-click paste flow:
+  // the first click arms an amber ghost, the second commits, Escape cancels.
+  const [pick3dFirst, setPick3dFirst] = useState<{ x: number; y: number; z: number } | null>(null);
+  const pick3dFirstRef = useRef<typeof pick3dFirst>(null);
+  useEffect(() => { pick3dFirstRef.current = pick3dFirst; }, [pick3dFirst]);
+
+  // 3D fly-view interaction, fully decoupled from the Draw/Select editor tools: the contextual "3D"
+  // ribbon tab owns this. "off" = camera only; "select" = two-click box select; "build" = place
+  // (left-click) / break (right-click). `build3dBlock`/`build3dPaint` is the 3D tab's own armed block,
+  // separate from the map's fill block, so 3D building has an independent picker.
+  const [mode3d, setMode3d] = useState<"off" | "select" | "build">("off");
+  const [build3dBlock, setBuild3dBlock] = useState(2); // Stone
+  const [build3dPaint, setBuild3dPaint] = useState(0);
+
   // 3D wireframe overlays for the fly-through pane: selection (blue), extrude copies (amber), paste (green).
   const overlays3d = useMemo<Overlay3D[] | null>(() => {
     if (!showSlicePanels || !enable3dPane) return null;
     const ovs: Overlay3D[] = [];
-    if (rawBounds) {
-      const { x1, y1, x2, y2 } = rawBounds;
+    if (pick3dFirst) {
+      const { x, y, z } = pick3dFirst;
+      ovs.push({ min: [x, z, y], max: [x + 1, z + 1, y + 1], color: 0xf59e0b });
+    }
+    // While a marquee select is in progress, `dragSelectRect` updates every pointer-move but
+    // `rawBounds` only commits on release — prefer the live rect so the blue 3D box tracks the drag
+    // in real time instead of snapping into place at the end. (Only the wireframe box follows live;
+    // the slab viewports still key off committed `rawBounds`, since they re-fetch pixels per change.)
+    const selRect = dragSelectRect ?? rawBounds;
+    if (selRect) {
+      const { x1, y1, x2, y2 } = selRect;
       ovs.push({ min: [x1, zMin, y1], max: [x2 + 1, zMax + 1, y2 + 1], color: 0x3b82f6 });
-      if (extrudeOpen && extrudeCount > 0) {
+      if (!dragSelectRect && extrudeOpen && extrudeCount > 0) {
         const w = x2 - x1 + 1, h = y2 - y1 + 1, d = zMax - zMin + 1;
         for (let i = 1; i <= extrudeCount; i++) {
           let ox = 0, oy = 0, oz = 0;
@@ -381,7 +558,7 @@ function App() {
       });
     }
     return ovs.length > 0 ? ovs : null;
-  }, [showSlicePanels, enable3dPane, rawBounds, zMin, zMax, extrudeOpen, extrudeAxis, extrudeCount, lockedPastePos, clipboard, pasteElevationOffset]);
+  }, [showSlicePanels, enable3dPane, rawBounds, dragSelectRect, zMin, zMax, extrudeOpen, extrudeAxis, extrudeCount, lockedPastePos, clipboard, pasteElevationOffset, pick3dFirst]);
 
   // When a selection is made, snap the Front/Side slice planes to its centre so the slabs show the
   // selection by default (mirrors what the elevation preview shows). Only fires on selection change,
@@ -486,6 +663,12 @@ function App() {
   }
 
   async function openFileAt(path: string, opts?: { skipRecent?: boolean }) {
+    if (world && isDirty()) {
+      const ok = await ask("You have unsaved changes. Open a new world and discard them?", {
+        title: "Unsaved changes", kind: "warning",
+      });
+      if (!ok) return;
+    }
     const myEpoch = ++loadEpochRef.current;
     setLoading(true);
     setError(null);
@@ -505,6 +688,7 @@ function App() {
       setZSliceZ(32);
       setZSliceDisplay(32);
       setClipboard(null);
+      resetHeavyLighting();
       setSaveCompressed(data.was_compressed);
       setSpawnPos(data.spawn_px != null && data.spawn_py != null ? { px: data.spawn_px, py: data.spawn_py } : null);
       if (!opts?.skipRecent) addRecentWorld(path, data.name);
@@ -850,10 +1034,18 @@ function App() {
       cursorPosThrottleRef.current = setTimeout(() => {
         cursorPosThrottleRef.current = null;
         const { wx: cx, wy: cy } = cursorWorldRef.current!;
-        setCursorPos({ wx: cx, wy: cy });
-        invoke<[number,number,number] | null>("get_cursor_block", { wx: Math.floor(cx), wy: Math.floor(cy) })
-          .then(r => setCursorBlock(r ? { z: r[0], bt: r[1], paint: r[2] } : null))
-          .catch(() => {});
+        const cellX = Math.floor(cx), cellY = Math.floor(cy);
+        const last = lastCursorCellRef.current;
+        if (last && last.cx === cellX && last.cy === cellY) {
+          // Cursor moved within the same block cell — the X/Y readout still needs the fractional
+          // position, but skip the invoke: block/paint under an unchanged cell can't have changed.
+          cursorHudRef.current?.setPos(cx, cy);
+          return;
+        }
+        lastCursorCellRef.current = { cx: cellX, cy: cellY };
+        invoke<[number,number,number] | null>("get_cursor_block", { wx: cellX, wy: cellY })
+          .then(r => cursorHudRef.current?.set(cx, cy, r ? { z: r[0], bt: r[1], paint: r[2] } : null))
+          .catch(() => cursorHudRef.current?.set(cx, cy, null));
       }, 80);
     }
     if (!followSurfaceRef.current || viewModeRef.current !== "zslice") return;
@@ -904,7 +1096,7 @@ function App() {
   async function handleDrawElevation(x: number, y: number, z: number) {
     try {
       const result = await invoke<EditResultRaw>("paint_blocks", {
-        blocks: [{ x, y, z }], blockType: fillBlockType, paint: fillPaint,
+        blocks: [{ x, y, z }], blockType: fillBlockType, paint: fillPaint, zOffset: 0,
       });
       await applyEditResult(result);
     } catch (e) {
@@ -912,12 +1104,59 @@ function App() {
     }
   }
 
+  // ---- 3D pane picking -----------------------------------------------------------------------
+  // Driven by the 3D ribbon tab's own mode (mode3d), independent of the map's Draw/Select tools.
+  const interact3d: Interact3D = mode3d === "build" ? "build" : mode3d === "select" ? "select" : "none";
+
+  // Leaving select mode abandons a half-finished two-click selection — otherwise the lone armed
+  // corner would silently complete a selection on the first click after switching back.
+  useEffect(() => { if (interact3d !== "select") setPick3dFirst(null); }, [interact3d]);
+
+  // The 3D pane only exists in quad view with the 3D pane enabled; reset its mode to camera-only when
+  // it's not showing, so a stale build/select mode doesn't linger when the pane comes back.
+  useEffect(() => { if (!(showSlicePanels && enable3dPane)) setMode3d("off"); }, [showSlicePanels, enable3dPane]);
+
+  /** Two-click 3D selection. Two picked voxels reduce to the existing rawBounds + zMin/zMax pair —
+   *  which is already a full 3D box — so every selection consumer (copy/fill/extrude/prefab/slabs)
+   *  works with no further changes. */
+  function handlePick3dSelect(x: number, y: number, z: number) {
+    const first = pick3dFirstRef.current;
+    if (!first) { setPick3dFirst({ x, y, z }); return; }
+    setRawBounds({
+      x1: Math.min(first.x, x), y1: Math.min(first.y, y),
+      x2: Math.max(first.x, x), y2: Math.max(first.y, y),
+    });
+    setZMin(Math.min(first.z, z));
+    setZMax(Math.max(first.z, z));
+    setPick3dFirst(null);
+  }
+
+  /** Break: clear the picked voxel. Goes through paint_blocks → with_edit, so undo/redo and the
+   *  chunk-mesh edit sync come for free. Same for place, below. */
+  async function handlePick3dBreak(x: number, y: number, z: number) {
+    try {
+      const result = await invoke<EditResultRaw>("paint_blocks", { blocks: [{ x, y, z }], blockType: 0, paint: 0, zOffset: 0 });
+      await applyEditResult(result);
+    } catch (e) { setError(String(e)); }
+  }
+
+  /** Place the 3D tab's armed block in the empty voxel against the picked face. */
+  async function handlePick3dPlace(x: number, y: number, z: number) {
+    if (build3dBlock === 0) return; // "Air" as the armed block would be a no-op place
+    try {
+      const result = await invoke<EditResultRaw>("paint_blocks", {
+        blocks: [{ x, y, z }], blockType: build3dBlock, paint: build3dPaint, zOffset: 0,
+      });
+      await applyEditResult(result);
+    } catch (e) { setError(String(e)); }
+  }
+
   // Batch paint at exact world cells (one undo entry). Used by the slice viewports.
   async function handleSlicePaint(cells: { x: number; y: number; z: number }[]) {
     if (!cells.length) return;
     try {
       const result = await invoke<EditResultRaw>("paint_blocks", {
-        blocks: cells, blockType: fillBlockType, paint: fillBlockType === 0 ? 0 : fillPaint,
+        blocks: cells, blockType: fillBlockType, paint: fillBlockType === 0 ? 0 : fillPaint, zOffset: 0,
       });
       await applyEditResult(result);
       trackRecentBlock(fillBlockType, fillPaint);
@@ -944,6 +1183,22 @@ function App() {
     setSaving(true);
     setError(null);
     try {
+      // save_world writes raw bytes or a zip purely based on `compressed` — it doesn't look at
+      // the path's extension. Loading detects the real format by magic bytes either way, so this
+      // never corrupts anything, but a saveCompressed toggle can leave a zip sitting in a
+      // ".eden"-named file (or vice versa), which the game and other non-magic-byte-aware tools
+      // won't necessarily open. Warn once per mismatched path/flag combo on a plain Save; Save As
+      // (below) fixes the extension outright since the user is choosing a fresh path anyway.
+      const dot = path.lastIndexOf(".");
+      const ext = dot >= 0 ? path.slice(dot + 1).toLowerCase() : "";
+      const expectedExt = saveCompressed ? "zip" : "eden";
+      if ((ext === "eden" || ext === "zip") && ext !== expectedExt) {
+        const warnKey = `${path}|${saveCompressed}`;
+        if (lastExtWarnRef.current !== warnKey) {
+          lastExtWarnRef.current = warnKey;
+          showToast(`Saved ${saveCompressed ? "compressed" : "uncompressed"} data into a “.${ext}” file — other tools may not recognize it`);
+        }
+      }
       await invoke("save_world", { path, compressed: saveCompressed });
       // A real save makes any pending autosave sidecar redundant — nothing left to recover.
       lastAutosavedEpochRef.current = editEpochRef.current;
@@ -954,7 +1209,7 @@ function App() {
     } finally {
       setSaving(false);
     }
-  }, [saveCompressed]);
+  }, [saveCompressed, showToast]);
 
   const saveWorldAs = useCallback(async () => {
     const chosen = await save({
@@ -962,9 +1217,17 @@ function App() {
       defaultPath: sourcePath ?? undefined,
     });
     if (!chosen) return;
-    await saveWorld(chosen);
-    setSourcePath(chosen);
-  }, [sourcePath, saveWorld]);
+    // Save As is a fresh path choice — silently correct the extension to match the compressed
+    // flag rather than warn, since there's no existing file identity to preserve.
+    const dot = chosen.lastIndexOf(".");
+    const ext = dot >= 0 ? chosen.slice(dot + 1).toLowerCase() : "";
+    const expectedExt = saveCompressed ? "zip" : "eden";
+    const finalPath = (ext === "eden" || ext === "zip") && ext !== expectedExt
+      ? `${chosen.slice(0, dot)}.${expectedExt}`
+      : chosen;
+    await saveWorld(finalPath);
+    setSourcePath(finalPath);
+  }, [sourcePath, saveWorld, saveCompressed]);
 
   // Timer-based autosave: every 3 minutes, if a world is loaded and has unsaved edits
   // (editEpoch moved since the last autosave/save), snapshot it to a sidecar file so a
@@ -1012,7 +1275,15 @@ function App() {
       const autosavePath = await invoke<string>("get_autosave_path");
       await openFileAt(autosavePath, { skipRecent: true });
       setSourcePath(recoveryInfo.source_path ?? null);
-      await invoke("discard_autosave");
+      // openFileAt marks the freshly-loaded autosave "clean" (savedEpochRef = current edit epoch),
+      // but the in-memory world differs from the file at sourcePath — nothing has actually been
+      // saved there yet. Force dirty so the close/quit prompt guards this until a real Save
+      // succeeds. Deliberately do NOT discard the autosave sidecar here (unlike the decline path
+      // below): the periodic autosave timer won't refire until the next edit (lastAutosavedEpochRef
+      // already matches), so a crash right after recovery — before any edit or manual save — would
+      // otherwise leave nothing to recover. The sidecar is only discarded once a real Save succeeds
+      // (saveWorld/saveWorldAs) or the user later declines a fresh recovery prompt.
+      savedEpochRef.current = -1;
       setRecoveryInfo(null);
     } catch (e) {
       setError(String(e));
@@ -1036,13 +1307,15 @@ function App() {
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
-      // While the 3D fly camera is active, it owns all keyboard input — don't fire editor shortcuts.
-      if (flyActiveRef.current) return;
+      // While the 3D fly camera is active, it owns unmodified keys (WASD/space/ctrl/shift) for
+      // movement — don't fire editor shortcuts for those. But the fly controller never consumes
+      // Cmd-combos, so let ⌘Z/⌘S/etc. through instead of leaving them dead until the pane exits.
+      if (flyActiveRef.current && !e.metaKey) return;
       // A modal dialog is open — let it own the keyboard (its own Escape/Enter handling applies).
       if (anyModalOpenRef.current) return;
-      const tag = (e.target as HTMLElement).tagName;
+      const typing = isTypingTarget(e.target);
       // ? always toggles help (skip when typing in an input)
-      if (e.key === "?" && tag !== "INPUT" && tag !== "TEXTAREA" && !e.metaKey && !e.ctrlKey) {
+      if (e.key === "?" && !typing && !e.metaKey && !e.ctrlKey) {
         e.preventDefault();
         setShowHelp(h => !h);
         return;
@@ -1059,10 +1332,17 @@ function App() {
           setLockedPastePos(null);
           return;
         }
+        // Abandon a half-finished two-click 3D selection before falling through to the tool/selection
+        // step-back below — same "Escape steps back one stage" idiom as the paste flow above.
+        if (pick3dFirstRef.current) {
+          e.preventDefault();
+          setPick3dFirst(null);
+          return;
+        }
         const t = appToolRef.current;
         if (t === "paste" || t === "wand" || t === "pen" || t === "brush" || t === "spray" || t === "line" || t === "rect" || t === "ellipse" || t === "polygon" ||
             t === "smooth" || t === "noise" || t === "flatten" || t === "erode" || t === "thermal" ||
-            t === "hydro" || t === "stamp" || t === "grab" || t === "raise" || t === "lower" || t === "fill") {
+            t === "hydro" || t === "stamp" || t === "grab" || t === "raise" || t === "lower" || t === "fill" || t === "eyedropper") {
           e.preventDefault();
           setTool("pan");
         } else {
@@ -1077,7 +1357,7 @@ function App() {
         return;
       }
       // Draw tool shortcuts (only when not typing in an input)
-      if (tag !== "INPUT" && tag !== "TEXTAREA" && !e.metaKey && !e.ctrlKey) {
+      if (!typing && !e.metaKey && !e.ctrlKey) {
         if (e.key === "p" || e.key === "P") { e.preventDefault(); setTool("pen"); return; }
         if (e.key === "b" || e.key === "B") { e.preventDefault(); setTool("brush"); return; }
         if (e.key === "l" || e.key === "L") { e.preventDefault(); setTool("line"); return; }
@@ -1171,7 +1451,13 @@ function App() {
   }
 
   async function openTexturePackFile() {
-    const selected = await open({ filters: [{ name: "Texture Pack", extensions: ["zip"] }] });
+    const selected = await open({
+      filters: [
+        { name: "Texture Pack or Atlas", extensions: ["zip", "png", "jpg", "jpeg", "bmp"] },
+        { name: "Zip Pack", extensions: ["zip"] },
+        { name: "Atlas Image", extensions: ["png", "jpg", "jpeg", "bmp"] },
+      ],
+    });
     if (!selected || Array.isArray(selected)) return;
     await loadTexturePackFile(selected);
   }
@@ -1411,6 +1697,11 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
     }
     invoke("close_world").catch(() => {});      // release backend mmap / undo stack / staged temp
     invoke("discard_autosave").catch(() => {}); // discarded on purpose — nothing to recover
+    // Reconcile the dirty-tracking refs to the now-closed world — otherwise a dirty close (just
+    // confirmed above) leaves savedEpochRef stale, and the very next onCloseRequested/openFileAt
+    // guard re-asks to discard changes that no longer exist (the world they belonged to is gone).
+    savedEpochRef.current = editEpochRef.current;
+    lastAutosavedEpochRef.current = editEpochRef.current;
     setWorld(null);
     setSourcePath(null);
     setRawBounds(null);
@@ -1421,6 +1712,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
     setSpawnPos(null);
     setTemplateLoaded(false);
     setShowTemplateOverlay(false);
+    resetHeavyLighting();
   }
 
   async function setSpawnAtSelection() {
@@ -1430,6 +1722,10 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
     try {
       await invoke("set_spawn_pos", { px: cx, py: cy });
       setSpawnPos({ px: cx, py: cy });
+      // set_spawn_pos writes into the mmapped header outside with_edit (no undo entry), so it
+      // doesn't otherwise bump editEpoch — without this, the change is silently lost if the user
+      // closes without saving (the unsaved-changes prompt only fires when dirty).
+      setEditEpoch(e => e + 1);
     } catch (e) { setError(String(e)); }
   }
 
@@ -1438,6 +1734,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
       try {
         await invoke("rename_world", { name: trimmed });
         setWorld(w => w ? { ...w, name: trimmed } : null);
+        setEditEpoch(e => e + 1); // header write outside with_edit — see setSpawnAtSelection
       } catch (e) { setError(String(e)); }
     }
     setRenamingWorld(false);
@@ -1508,69 +1805,58 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
   // Status bar element — computed outside JSX so TypeScript narrows `world` properly
   const statusBarEl = world ? (
     <div style={{
-      position: "fixed", bottom: 0, left: 0, right: 0, height: 20, zIndex: 150,
-      background: "linear-gradient(to bottom, #081020, #060c18)",
-      borderTop: "1px solid #1a2540",
+      position: "fixed", bottom: 0, left: 0, right: 0, height: STATUS_BAR_HEIGHT, zIndex: 150,
+      background: "linear-gradient(to bottom, #201208, #100f0d)",
+      borderTop: "1px solid #322d28",
       boxShadow: "inset 0 1px 0 rgba(255,255,255,.05)",
       display: "flex", alignItems: "center",
-      fontSize: 10, color: "#475569", userSelect: "none",
+      fontSize: 10, color: "#61584f", userSelect: "none",
       fontVariantNumeric: "tabular-nums",
     }}>
-      <div style={{ padding: "0 10px", borderRight: "1px solid #1a2540", whiteSpace: "nowrap", color: "#4b6280" }}>
+      <div style={{ padding: "0 10px", borderRight: "1px solid #322d28", whiteSpace: "nowrap", color: "#70665b" }}>
         {tool === "brush" ? `Brush ${brushSize}px` : tool === "pen" ? "Pen" : tool === "spray" ? "Spray" : tool === "line" ? "Line" : tool === "rect" ? "Rect" : tool === "ellipse" ? "Ellipse" : tool === "polygon" ? "Polygon" : tool === "fill" ? "Fill" : tool === "eyedropper" ? "Eyedropper" : tool === "wand" ? "Wand" : tool === "paste" ? (pasteMode !== "normal" ? `Paste (${pasteMode})` : "Paste") : tool === "select" ? "Select" : tool === "smooth" ? "Smooth" : tool === "noise" ? "Noise" : tool === "flatten" ? "Flatten" : tool === "erode" ? "Erode" : tool === "thermal" ? "Thermal" : tool === "hydro" ? "Hydro Erode" : tool === "stamp" ? "Retexture" : tool === "grab" ? "Grab" : tool === "raise" ? "Raise" : tool === "lower" ? "Lower" : "Pan"}
       </div>
-      <div style={{ padding: "0 10px", borderRight: "1px solid #1a2540", color: "#334155", whiteSpace: "nowrap" }}>
+      <div style={{ padding: "0 10px", borderRight: "1px solid #322d28", color: "#4b443d", whiteSpace: "nowrap" }}>
         {world.name}
       </div>
-      <div style={{ padding: "0 10px", borderRight: "1px solid #1a2540", whiteSpace: "nowrap" }}>
+      <div style={{ padding: "0 10px", borderRight: "1px solid #322d28", whiteSpace: "nowrap" }}>
         {world.width_chunks * 16}×{world.height_chunks * 16}
-        <span style={{ color: world.max_z === 255 ? "#6d28d9" : "#1e3a5f", marginLeft: 6 }}>
+        <span style={{ color: world.max_z === 255 ? "#6d28d9" : "#453f38", marginLeft: 6 }}>
           {world.max_z === 255 ? "256z" : "64z"}
         </span>
       </div>
-      <div style={{ padding: "0 10px", borderRight: "1px solid #1a2540", minWidth: 100, whiteSpace: "nowrap" }}>
-        {cursorPos
-          ? <>X <span style={{ color: "#64748b" }}>{Math.round(cursorPos.wx)}</span>{"  "}Y <span style={{ color: "#64748b" }}>{Math.round(cursorPos.wy)}</span></>
-          : <span style={{ color: "#1e293b" }}>X — Y —</span>
-        }
-      </div>
-      {cursorBlock && (
-        <div style={{ padding: "0 10px", borderRight: "1px solid #1a2540", whiteSpace: "nowrap" }}>
-          Z <span style={{ color: "#64748b" }}>{cursorBlock.z}</span>
-          {"  "}<span style={{ color: "#475569" }}>{blockDisplayName(cursorBlock.bt)}{cursorBlock.paint > 0 ? <span style={{ color: "#334155" }}> #{cursorBlock.paint}</span> : null}</span>
-        </div>
-      )}
+      <CursorHud ref={cursorHudRef} />
       {dragSelectRect ? (
-        <div style={{ padding: "0 10px", borderRight: "1px solid #1a2540", color: EDEN_TEAL_READABLE, whiteSpace: "nowrap" }}>
+        <div style={{ padding: "0 10px", borderRight: "1px solid #322d28", color: EDEN_TEAL_READABLE, whiteSpace: "nowrap" }}>
           Sel <span style={{ color: EDEN_TEAL_READABLE }}>
             {Math.round(dragSelectRect.x2 - dragSelectRect.x1) + 1}×{Math.round(dragSelectRect.y2 - dragSelectRect.y1) + 1}
           </span>
-          {" · Z "}<span style={{ color: "#4b6280" }}>{zMin}–{zMax}</span>
+          {" · Z "}<span style={{ color: "#70665b" }}>{zMin}–{zMax}</span>
         </div>
       ) : selection && (
-        <div style={{ padding: "0 10px", borderRight: "1px solid #1a2540", color: "#4b6280", whiteSpace: "nowrap" }}>
-          Sel <span style={{ color: "#64748b" }}>{selection.width}×{selection.height}</span>
-          {" · Z "}<span style={{ color: "#4b6280" }}>{selection.z_min}–{selection.z_max}</span>
+        <div style={{ padding: "0 10px", borderRight: "1px solid #322d28", color: "#70665b", whiteSpace: "nowrap" }}>
+          Sel <span style={{ color: "#83786c" }}>{selection.width}×{selection.height}</span>
+          {" · Z "}<span style={{ color: "#70665b" }}>{selection.z_min}–{selection.z_max}</span>
         </div>
       )}
-      <div style={{ padding: "0 10px", borderRight: "1px solid #1a2540", whiteSpace: "nowrap" }}>
-        ↩ <span style={{ color: "#334155" }}>{undoDepth}</span>
-        {"  "}↪ <span style={{ color: "#334155" }}>{redoDepth}</span>
+      <div style={{ padding: "0 10px", borderRight: "1px solid #322d28", whiteSpace: "nowrap" }}>
+        ↩ <span style={{ color: "#4b443d" }}>{undoDepth}</span>
+        {"  "}↪ <span style={{ color: "#4b443d" }}>{redoDepth}</span>
       </div>
       {filterBlockType !== null && (
-        <div style={{ padding: "0 8px", borderRight: "1px solid #1a2540", whiteSpace: "nowrap",
+        <div style={{ padding: "0 8px", borderRight: "1px solid #322d28", whiteSpace: "nowrap",
           color: "#f59e0b", background: "rgba(245,158,11,0.07)" }}>
           Filter: {blockDisplayName(filterBlockType)}{filterPaint !== null ? ` #${filterPaint}` : ""}{filterInvert ? " (inv)" : ""}
         </div>
       )}
       {maskEnabled && maskBlockType !== null && (
-        <div style={{ padding: "0 8px", borderRight: "1px solid #1a2540", whiteSpace: "nowrap",
+        <div style={{ padding: "0 8px", borderRight: "1px solid #322d28", whiteSpace: "nowrap",
           color: "#a78bfa", background: "rgba(167,139,250,0.07)" }}>
           Mask: {blockDisplayName(maskBlockType)}{maskPaint !== null ? ` #${maskPaint}` : ""}
         </div>
       )}
       <div style={{ flex: 1 }} />
-      <div style={{ padding: "0 10px", borderLeft: "1px solid #1a2540", color: EDEN_TEAL_READABLE, opacity: 0.6, whiteSpace: "nowrap" }}>
+      <div style={{ padding: "0 10px", borderLeft: "1px solid #322d28", color: EDEN_TEAL_READABLE, opacity: 0.6, whiteSpace: "nowrap" }}>
         <FpsCounter />
       </div>
     </div>
@@ -1618,20 +1904,42 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
       onZRangeChange: sliceZResize,
       selectMode: sliceSelectMode,
     };
+    // Quad-view grid templates. Normally fraction-driven from the split sliders; when a pane is
+    // maximized, collapse the other row/column to 0fr so the chosen quadrant fills the area (all four
+    // cells stay mounted, so FlyView3D's WebGL context and the slice panes are not torn down).
+    const qCol0Max = maximizedPane === "map" || maximizedPane === "side";
+    const qCol1Max = maximizedPane === "front" || maximizedPane === "3d";
+    const qRow0Max = maximizedPane === "map" || maximizedPane === "front";
+    const qRow1Max = maximizedPane === "side" || maximizedPane === "3d";
+    const quadCols = maximizedPane ? `${qCol0Max ? 1 : 0}fr ${qCol1Max ? 1 : 0}fr` : `${quadColSplit}fr ${1 - quadColSplit}fr`;
+    const quadRows = maximizedPane ? `${qRow0Max ? 1 : 0}fr ${qRow1Max ? 1 : 0}fr` : `${quadRowSplit}fr ${1 - quadRowSplit}fr`;
+    // Per-cell maximize/restore button (bottom-right corner, clear of FlyView3D's own chrome).
+    const maxBtn = (pane: "map" | "front" | "side" | "3d") => (
+      <button
+        onClick={() => setMaximizedPane(m => (m === pane ? null : pane))}
+        title={maximizedPane === pane ? "Restore quad view" : "Maximize this pane"}
+        style={{
+          position: "absolute", bottom: 6, right: 6, zIndex: 3,
+          background: "rgba(31,28,26,0.85)", color: "#afa69d", border: "1px solid #4b443d",
+          borderRadius: 4, padding: "1px 6px", fontSize: 12, lineHeight: 1.2, cursor: "pointer",
+        }}
+      >{maximizedPane === pane ? "⤡" : "⤢"}</button>
+    );
     return (
       <div style={{ position: "relative", width: "100vw", height: "100vh" }}>
         {showSlicePanels ? (
           // Quad view: the real top-down map (top-left) + Front / Side slices + 3D placeholder.
           // Top strip is left clear for the floating menu/toolbar chrome.
-          <div style={{
-            position: "absolute", inset: 0, paddingTop: effectiveRibbonHeight,
-            display: "grid", gridTemplateColumns: "1fr 1fr", gridTemplateRows: "1fr 1fr",
+          <div ref={quadGridRef} style={{
+            position: "absolute", top: effectiveRibbonHeight, left: 0, right: 0, bottom: STATUS_BAR_HEIGHT,
+            display: "grid", gridTemplateColumns: quadCols, gridTemplateRows: quadRows,
             gap: 2, background: "#0a0f1e",
           }}>
-            <div style={{ position: "relative", minWidth: 0, minHeight: 0, overflow: "hidden", outline: "1px solid #1e293b" }}>
+            <div style={{ position: "relative", minWidth: 0, minHeight: 0, overflow: "hidden", outline: "1px solid #312c28" }}>
               {mapPaneEl}
+              {maxBtn("map")}
             </div>
-            <div style={{ minWidth: 0, minHeight: 0, overflow: "hidden", outline: "1px solid #1e293b" }}>
+            <div style={{ position: "relative", minWidth: 0, minHeight: 0, overflow: "hidden", outline: "1px solid #312c28" }}>
               <ErrorBoundary label="Front view">
                 <SliceViewport {...sliceCommon} axis="front"
                   depth={sliceFrontY} onDepthChange={setSliceFrontY}
@@ -1640,8 +1948,9 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
                   selFull={!sliceIsPaste && sliceSel ? { xLo: sliceSel.x1, yLo: sliceSel.y1, xHi: sliceSel.x2, yHi: sliceSel.y2, zLo: sliceSel.z_min, zHi: sliceSel.z_max } : null}
                   onHRangeChange={sliceHResizeFront} onSelect={sliceSelectFront} />
               </ErrorBoundary>
+              {maxBtn("front")}
             </div>
-            <div style={{ minWidth: 0, minHeight: 0, overflow: "hidden", outline: "1px solid #1e293b" }}>
+            <div style={{ position: "relative", minWidth: 0, minHeight: 0, overflow: "hidden", outline: "1px solid #312c28" }}>
               <ErrorBoundary label="Side view">
                 <SliceViewport {...sliceCommon} axis="side"
                   depth={sliceSideX} onDepthChange={setSliceSideX}
@@ -1650,8 +1959,9 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
                   selFull={!sliceIsPaste && sliceSel ? { xLo: sliceSel.x1, yLo: sliceSel.y1, xHi: sliceSel.x2, yHi: sliceSel.y2, zLo: sliceSel.z_min, zHi: sliceSel.z_max } : null}
                   onHRangeChange={sliceHResizeSide} onSelect={sliceSelectSide} />
               </ErrorBoundary>
+              {maxBtn("side")}
             </div>
-            <div style={{ position: "relative", minWidth: 0, minHeight: 0, overflow: "hidden", outline: "1px solid #1e293b" }}>
+            <div style={{ position: "relative", minWidth: 0, minHeight: 0, overflow: "hidden", outline: "1px solid #312c28" }}>
               {enable3dPane ? (
                 <>
                   <ErrorBoundary label="3D view">
@@ -1666,6 +1976,8 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
                           : (world.center_px != null && world.center_py != null
                             ? { x: world.center_px, y: world.center_py } : undefined)
                       }
+                      worldLoadToken={worldEpoch}
+                      anyModalOpen={anyModalOpen}
                       editEpoch={editEpoch}
                       lastEdit={lastEditBounds}
                       onFlyModeChange={(a) => { flyActiveRef.current = a; }}
@@ -1673,6 +1985,23 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
                       overlays3d={overlays3d}
                       texturePack={texturePackInfo}
                       texEpoch={texEpoch}
+                      fogEnabled={fogEnabled}
+                      nightLighting={nightLighting}
+                      shadows3d={shadows3d}
+                      sunT={sunT}
+                      lampRadius={lampRadius}
+                      gpuShadows={gpuShadows}
+                      lightEpoch={lightEpoch}
+                      initialRenderDistance={renderDistance}
+                      initialFlySpeed={flySpeed}
+                      onRenderDistanceChange={(n) => { setRenderDistance(n); saveSettingsDebounced({ renderDistance: n }); }}
+                      onFlySpeedChange={(n) => { setFlySpeed(n); saveSettingsDebounced({ flySpeed: n }); }}
+                      interact3d={interact3d}
+                      onPickSelect={handlePick3dSelect}
+                      onPickBreak={handlePick3dBreak}
+                      onPickPlace={handlePick3dPlace}
+                      armedSwatch={texturePackInfo ? tintedSwatch(build3dBlock, build3dPaint, texturePackInfo) : null}
+                      armedLabel={blockDisplayName(build3dBlock)}
                     />
                   </ErrorBoundary>
                   <button
@@ -1680,7 +2009,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
                     title="Disable the 3D pane (saves performance)"
                     style={{
                       position: "absolute", top: 36, right: 6, zIndex: 2,
-                      background: "rgba(15,23,42,0.85)", color: "#94a3b8", border: "1px solid #334155",
+                      background: "rgba(31,28,26,0.85)", color: "#afa69d", border: "1px solid #4b443d",
                       borderRadius: 4, padding: "1px 7px", fontSize: 11, cursor: "pointer",
                     }}
                   >✕ 3D</button>
@@ -1689,7 +2018,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
                 // Off by default — the 3D pane is the heaviest viewport. Opt in here.
                 <div style={{
                   display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center",
-                  gap: 10, width: "100%", height: "100%", background: "#0a0f1e", color: "#64748b",
+                  gap: 10, width: "100%", height: "100%", background: "#0a0f1e", color: "#83786c",
                 }}>
                   <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, fontWeight: 600, letterSpacing: "0.04em" }}>
                     3D FLY-THROUGH
@@ -1698,16 +2027,49 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
                   <button
                     onClick={() => setEnable3dPane(true)}
                     style={{
-                      background: "#1e293b", color: "#cbd5e1", border: "1px solid #475569",
+                      background: "#312c28", color: "#dad6d2", border: "1px solid #61584f",
                       borderRadius: 6, padding: "6px 14px", fontSize: 12, cursor: "pointer",
                     }}
                   >Enable 3D view</button>
-                  <div style={{ fontSize: 10, color: "#475569", maxWidth: 220, textAlign: "center" }}>
+                  <div style={{ fontSize: 10, color: "#61584f", maxWidth: 220, textAlign: "center" }}>
                     Off by default to save performance. Streams chunk geometry around the camera.
                   </div>
                 </div>
               )}
+              {maxBtn("3d")}
             </div>
+
+            {/* Draggable splitters — hidden while a pane is maximized. A vertical bar moves the
+                column split, a horizontal bar the row split, and the centre knob moves both. */}
+            {!maximizedPane && (
+              <>
+                <div
+                  onPointerDown={beginQuadDrag("col")}
+                  title="Drag to resize columns"
+                  style={{
+                    position: "absolute", top: 0, bottom: 0, left: `${quadColSplit * 100}%`,
+                    width: 8, marginLeft: -4, cursor: "col-resize", zIndex: 4,
+                  }}
+                />
+                <div
+                  onPointerDown={beginQuadDrag("row")}
+                  title="Drag to resize rows"
+                  style={{
+                    position: "absolute", left: 0, right: 0, top: `${quadRowSplit * 100}%`,
+                    height: 8, marginTop: -4, cursor: "row-resize", zIndex: 4,
+                  }}
+                />
+                <div
+                  onPointerDown={beginQuadDrag("both")}
+                  title="Drag to resize all panes"
+                  style={{
+                    position: "absolute", left: `${quadColSplit * 100}%`, top: `${quadRowSplit * 100}%`,
+                    width: 14, height: 14, marginLeft: -7, marginTop: -7, cursor: "move", zIndex: 5,
+                    borderRadius: 3, background: "rgba(49,44,40,0.9)", border: "1px solid #61584f",
+                  }}
+                />
+              </>
+            )}
           </div>
         ) : mapPaneEl}
 
@@ -1795,6 +2157,24 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           setShowSlicePanels={setShowSlicePanels}
           enable3dPane={enable3dPane}
           setEnable3dPane={setEnable3dPane}
+          mode3d={mode3d}
+          setMode3d={setMode3d}
+          build3dBlock={build3dBlock}
+          build3dPaint={build3dPaint}
+          setBuild3dBlock={setBuild3dBlock}
+          setBuild3dPaint={setBuild3dPaint}
+          nightLighting={nightLighting}
+          setNightLighting={setNightLighting}
+          shadows3d={shadows3d}
+          setShadows3d={setShadows3d}
+          gpuShadows={gpuShadows}
+          setGpuShadows={setGpuShadows}
+          sunTDisplay={sunTDisplay}
+          setSunTDisplay={setSunTDisplay}
+          commitSunT={commitSunT}
+          lampRadiusDisplay={lampRadiusDisplay}
+          setLampRadiusDisplay={setLampRadiusDisplay}
+          commitLampRadius={commitLampRadius}
           onFitMap={() => mapCanvasRef.current?.resetView()}
           templateLoaded={templateLoaded}
           templatePath={templatePath}
@@ -1945,9 +2325,9 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
             closeOnEsc={!prefabSaving}
             closeOnBackdrop={!prefabSaving}
           >
-            <div style={glassPanel({ padding: 20, width: 360, display: "flex", flexDirection: "column", gap: 14, color: "#e2e8f0" })}>
+            <div style={glassPanel({ padding: 20, width: 360, display: "flex", flexDirection: "column", gap: 14, color: "#ebe9e7" })}>
               <div style={{ fontWeight: 700, color: EDEN_TEAL_READABLE, fontSize: 14 }}>Save Prefab</div>
-              <label style={{ display: "flex", flexDirection: "column", gap: 6, fontSize: 12, color: "#94a3b8" }}>
+              <label style={{ display: "flex", flexDirection: "column", gap: 6, fontSize: 12, color: "#afa69d" }}>
                 Name
                 <input
                   autoFocus
@@ -1955,8 +2335,8 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
                   onChange={(e) => { setPrefabNameInput(e.target.value); setPrefabOverwrite(false); }}
                   onKeyDown={(e) => { if (e.key === "Enter") confirmSavePrefab(); }}
                   style={{
-                    background: "rgba(0,0,0,0.5)", border: "1px solid #334155", borderRadius: 5,
-                    color: "#e2e8f0", padding: "7px 9px", fontSize: 13, outline: "none",
+                    background: "rgba(0,0,0,0.5)", border: "1px solid #4b443d", borderRadius: 5,
+                    color: "#ebe9e7", padding: "7px 9px", fontSize: 13, outline: "none",
                   }}
                 />
               </label>
@@ -1965,7 +2345,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
                   A prefab with this name already exists. Click Overwrite to replace it.
                 </div>
               ) : (
-                <div style={{ fontSize: 11, color: "#64748b" }}>
+                <div style={{ fontSize: 11, color: "#83786c" }}>
                   Saves to your prefab library and appears in the gallery.
                 </div>
               )}
@@ -2022,15 +2402,15 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
             background: "rgba(0,0,0,0.45)", zIndex: 200, pointerEvents: "none",
           }}>
             <div style={{
-              background: "rgba(15,23,42,0.95)", border: "1px solid #334155",
+              background: "rgba(31,28,26,0.95)", border: "1px solid #4b443d",
               borderRadius: 10, padding: "20px 32px", minWidth: 220, textAlign: "center",
             }}>
               {exporting ? (
                 <>
-                  <div style={{ color: "#e2e8f0", fontSize: 14, marginBottom: 12 }}>
+                  <div style={{ color: "#ebe9e7", fontSize: 14, marginBottom: 12 }}>
                     Exporting PNG… {exportProgress !== null ? `${Math.round(exportProgress * 100)}%` : ""}
                   </div>
-                  <div style={{ background: "#1e293b", borderRadius: 4, height: 6, overflow: "hidden" }}>
+                  <div style={{ background: "#312c28", borderRadius: 4, height: 6, overflow: "hidden" }}>
                     <div style={{
                       background: "#f59e0b", height: "100%", borderRadius: 4,
                       width: `${Math.round((exportProgress ?? 0) * 100)}%`,
@@ -2039,20 +2419,20 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
                   </div>
                 </>
               ) : exportingObj ? (
-                <div style={{ color: "#e2e8f0", fontSize: 14 }}>Exporting OBJ…</div>
+                <div style={{ color: "#ebe9e7", fontSize: 14 }}>Exporting OBJ…</div>
               ) : exportingJson ? (
-                <div style={{ color: "#e2e8f0", fontSize: 14 }}>Exporting JSON…</div>
+                <div style={{ color: "#ebe9e7", fontSize: 14 }}>Exporting JSON…</div>
               ) : exportingVox ? (
                 <>
-                  <div style={{ color: "#e2e8f0", fontSize: 14, marginBottom: 8 }}>
+                  <div style={{ color: "#ebe9e7", fontSize: 14, marginBottom: 8 }}>
                     Exporting VOX… {voxProgress ? `${voxProgress.pct}%` : ""}
                   </div>
                   {voxProgress && (
-                    <div style={{ color: "#94a3b8", fontSize: 12, marginBottom: 8 }}>
+                    <div style={{ color: "#afa69d", fontSize: 12, marginBottom: 8 }}>
                       {voxProgress.phase}
                     </div>
                   )}
-                  <div style={{ background: "#1e293b", borderRadius: 4, height: 6, overflow: "hidden" }}>
+                  <div style={{ background: "#312c28", borderRadius: 4, height: 6, overflow: "hidden" }}>
                     <div style={{
                       background: "#f59e0b", height: "100%", borderRadius: 4,
                       width: `${voxProgress?.pct ?? 0}%`,
@@ -2061,7 +2441,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
                   </div>
                 </>
               ) : (
-                <div style={{ color: "#e2e8f0", fontSize: 14 }}>Loading world…</div>
+                <div style={{ color: "#ebe9e7", fontSize: 14 }}>Loading world…</div>
               )}
             </div>
           </div>
@@ -2097,6 +2477,13 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
             onClose={() => setShowSettings(false)}
             onSave={(s) => {
               setSaveCompressed(s.defaultSaveCompressed);
+              setFogEnabled(s.enableFog);
+              setSunT(s.sunT);
+              setSunTDisplay(s.sunT);
+              setLampRadius(s.lampRadius);
+              setLampRadiusDisplay(s.lampRadius);
+              setRenderDistance(s.renderDistance);
+              setFlySpeed(s.flySpeed);
               if (s.templatePath !== templatePath) setTemplatePath(s.templatePath);
               if (s.texturePackPath !== texturePackPath) {
                 if (s.texturePackPath) loadTexturePackFile(s.texturePackPath);
@@ -2147,21 +2534,21 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
             backdropStyle={{ background: "rgba(0,0,0,0.7)" }}
           >
             <div style={{
-              background: "#0d1829", border: "1px solid #1e40af", borderRadius: 10,
+              background: "#1e1b18", border: "1px solid #71665c", borderRadius: 10,
               padding: "24px 28px", minWidth: 360, maxWidth: 440,
               boxShadow: "0 16px 48px rgba(0,0,0,0.7)",
             }}>
-              <div id="expand-title" style={{ fontSize: 15, fontWeight: 600, color: "#e2e8f0", marginBottom: 12 }}>
+              <div id="expand-title" style={{ fontSize: 15, fontWeight: 600, color: "#ebe9e7", marginBottom: 12 }}>
                 Expand from Template
               </div>
               {!expandInProgress && expandResult === null && (
                 <>
-                  <div style={{ fontSize: 12, color: "#94a3b8", marginBottom: 16, lineHeight: 1.5 }}>
+                  <div style={{ fontSize: 12, color: "#afa69d", marginBottom: 16, lineHeight: 1.5 }}>
                     Fills missing chunks from Eden.eden into a new world file. Your edits are preserved.
                     Output can be ~1 GB for the full template.
                   </div>
                   <div style={{ display: "flex", flexDirection: "column", gap: 10, marginBottom: 20 }}>
-                    <label style={{ display: "flex", alignItems: "center", gap: 10, cursor: "pointer", color: "#e2e8f0", fontSize: 13 }}>
+                    <label style={{ display: "flex", alignItems: "center", gap: 10, cursor: "pointer", color: "#ebe9e7", fontSize: 13 }}>
                       <input
                         type="radio" name="extentMode" checked={expandFullExtent}
                         onChange={() => setExpandFullExtent(true)}
@@ -2169,7 +2556,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
                       />
                       Full world (180×180 chunks, ~1 GB)
                     </label>
-                    <label style={{ display: "flex", alignItems: "center", gap: 10, cursor: "pointer", color: "#e2e8f0", fontSize: 13 }}>
+                    <label style={{ display: "flex", alignItems: "center", gap: 10, cursor: "pointer", color: "#ebe9e7", fontSize: 13 }}>
                       <input
                         type="radio" name="extentMode" checked={!expandFullExtent}
                         onChange={() => setExpandFullExtent(false)}
@@ -2180,14 +2567,14 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
                   </div>
                   <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
                     <button onClick={() => setShowExpandModal(false)} style={{
-                      padding: "6px 14px", borderRadius: 6, border: "1px solid #334155",
-                      background: "transparent", color: "#94a3b8", cursor: "pointer", fontSize: 13,
+                      padding: "6px 14px", borderRadius: 6, border: "1px solid #4b443d",
+                      background: "transparent", color: "#afa69d", cursor: "pointer", fontSize: 13,
                     }}>
                       Cancel
                     </button>
                     <button onClick={runExpand} style={{
                       padding: "6px 14px", borderRadius: 6, border: "none",
-                      background: "#1d4ed8", color: "#e2e8f0", cursor: "pointer", fontSize: 13,
+                      background: "#1d4ed8", color: "#ebe9e7", cursor: "pointer", fontSize: 13,
                     }}>
                       Choose Output File & Expand
                     </button>
@@ -2196,10 +2583,10 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
               )}
               {expandInProgress && (
                 <>
-                  <div style={{ fontSize: 12, color: "#94a3b8", marginBottom: 12 }}>
+                  <div style={{ fontSize: 12, color: "#afa69d", marginBottom: 12 }}>
                     Writing chunks… {expandProgress}%
                   </div>
-                  <div style={{ background: "#1e293b", borderRadius: 4, height: 8, overflow: "hidden", marginBottom: 12 }}>
+                  <div style={{ background: "#312c28", borderRadius: 4, height: 8, overflow: "hidden", marginBottom: 12 }}>
                     <div style={{
                       height: "100%", background: "#3b82f6", borderRadius: 4,
                       width: `${expandProgress}%`, transition: "width 0.2s",
@@ -2207,8 +2594,8 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
                   </div>
                   <div style={{ display: "flex", justifyContent: "flex-end" }}>
                     <button onClick={cancelExpand} style={{
-                      padding: "6px 14px", borderRadius: 6, border: "1px solid #334155",
-                      background: "transparent", color: "#94a3b8", cursor: "pointer", fontSize: 13,
+                      padding: "6px 14px", borderRadius: 6, border: "1px solid #4b443d",
+                      background: "transparent", color: "#afa69d", cursor: "pointer", fontSize: 13,
                     }}>
                       Cancel
                     </button>
@@ -2223,8 +2610,8 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
                   </div>
                   <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
                     <button onClick={() => setShowExpandModal(false)} style={{
-                      padding: "6px 14px", borderRadius: 6, border: "1px solid #334155",
-                      background: "transparent", color: "#94a3b8", cursor: "pointer", fontSize: 13,
+                      padding: "6px 14px", borderRadius: 6, border: "1px solid #4b443d",
+                      background: "transparent", color: "#afa69d", cursor: "pointer", fontSize: 13,
                     }}>
                       Close
                     </button>
@@ -2238,24 +2625,24 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
         {/* Map right-click context menu */}
         {ctxMenu && (() => {
           const close = () => setCtxMenu(null);
-          const ic = (ch: string) => <span style={{ display: "inline-block", width: 18, textAlign: "center", color: "#64748b", flexShrink: 0 }}>{ch}</span>;
+          const ic = (ch: string) => <span style={{ display: "inline-block", width: 18, textAlign: "center", color: "#83786c", flexShrink: 0 }}>{ch}</span>;
           const noIc = () => <span style={{ display: "inline-block", width: 18, flexShrink: 0 }} />;
           const miBtnStyle: React.CSSProperties = {
             display: "flex", alignItems: "center", gap: 0,
             width: "100%", textAlign: "left", background: "none", border: "none",
-            color: "#e2e8f0", padding: "5px 12px 5px 8px", fontSize: 12, cursor: "pointer",
+            color: "#ebe9e7", padding: "5px 12px 5px 8px", fontSize: 12, cursor: "pointer",
             whiteSpace: "nowrap",
           };
           const miHov = (e: React.MouseEvent<HTMLButtonElement>) => { e.currentTarget.style.background = `rgba(${EDEN_TEAL},0.18)`; };
           const miLve = (e: React.MouseEvent<HTMLButtonElement>) => { e.currentTarget.style.background = ""; };
-          const div = <div style={{ height: 1, background: "#1e293b", margin: "3px 0" }} />;
+          const div = <div style={{ height: 1, background: "#312c28", margin: "3px 0" }} />;
           const menuY = Math.min(ctxMenu.y, window.innerHeight - 260);
           return (
             <div
               style={{
                 position: "fixed", top: menuY, left: ctxMenu.x, zIndex: 9000, minWidth: 210,
                 padding: "4px 0",
-                background: "linear-gradient(180deg, rgba(20,30,48,.95) 0%, rgba(10,16,28,.95) 100%)",
+                background: "linear-gradient(180deg, rgba(34,29,25,.95) 0%, rgba(20,17,14,.95) 100%)",
                 backdropFilter: "blur(12px)", WebkitBackdropFilter: "blur(12px)",
                 border: "1px solid rgba(255,255,255,.12)",
                 borderRadius: 6,
@@ -2265,7 +2652,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
               onContextMenu={e => e.preventDefault()}
             >
               <button style={miBtnStyle} onMouseEnter={miHov} onMouseLeave={miLve}
-                onClick={() => { close(); invoke<[number,number]>("set_spawn_pos", { px: Math.round(ctxMenu.wx), py: Math.round(ctxMenu.wy) }).then(([px, py]) => setSpawnPos({ px, py })).catch(e => setError(String(e))); }}>
+                onClick={() => { close(); invoke<[number,number]>("set_spawn_pos", { px: Math.round(ctxMenu.wx), py: Math.round(ctxMenu.wy) }).then(([px, py]) => { setSpawnPos({ px, py }); setEditEpoch(e => e + 1); }).catch(e => setError(String(e))); }}>
                 {ic("⌂")} Set Spawn Here
               </button>
               {div}
@@ -2296,15 +2683,15 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
                 </button>
               </>}
               {div}
-              <button style={{ ...miBtnStyle, color: tool === "select" ? "#93c5fd" : "#e2e8f0" }} onMouseEnter={miHov} onMouseLeave={miLve}
+              <button style={{ ...miBtnStyle, color: tool === "select" ? "#93c5fd" : "#ebe9e7" }} onMouseEnter={miHov} onMouseLeave={miLve}
                 onClick={() => { close(); setTool("select"); }}>
                 {noIc()} Select Tool
               </button>
-              <button style={{ ...miBtnStyle, color: tool === "pen" ? "#f9a8d4" : "#e2e8f0" }} onMouseEnter={miHov} onMouseLeave={miLve}
+              <button style={{ ...miBtnStyle, color: tool === "pen" ? "#f9a8d4" : "#ebe9e7" }} onMouseEnter={miHov} onMouseLeave={miLve}
                 onClick={() => { close(); setTool("pen"); }}>
                 {noIc()} Pen Tool
               </button>
-              <button style={{ ...miBtnStyle, color: tool === "pan" ? "#93c5fd" : "#e2e8f0" }} onMouseEnter={miHov} onMouseLeave={miLve}
+              <button style={{ ...miBtnStyle, color: tool === "pan" ? "#93c5fd" : "#ebe9e7" }} onMouseEnter={miHov} onMouseLeave={miLve}
                 onClick={() => { close(); setTool("pan"); }}>
                 {noIc()} Pan Tool
               </button>
@@ -2319,9 +2706,9 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           <div key={toast.id} style={{
             position: "fixed", bottom: 30, left: "50%", transform: "translateX(-50%)",
             zIndex: 200, padding: "8px 16px", borderRadius: 6,
-            background: "linear-gradient(180deg, rgb(24,30,42) 0%, rgb(15,19,27) 100%)",
+            background: "linear-gradient(180deg, rgb(36,33,30) 0%, rgb(23,21,19) 100%)",
             boxShadow: `inset 0 1px 0 rgba(255,255,255,.06), 0 8px 20px rgba(0,0,0,.4), 0 0 0 1px rgba(${EDEN_TEAL},.25)`,
-            color: "#e2e8f0", fontSize: 12, whiteSpace: "nowrap", pointerEvents: "none",
+            color: "#ebe9e7", fontSize: 12, whiteSpace: "nowrap", pointerEvents: "none",
             animation: "eden-toast-in .15s ease-out",
           }}>
             {toast.text}
@@ -2334,13 +2721,13 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
   return (
     <div style={{
       display: "flex", height: "100vh",
-      background: `radial-gradient(600px 240px at 50% 0%, rgba(${EDEN_TEAL},.16) 0%, rgba(0,0,0,0) 100%), #0c1013`,
+      background: `radial-gradient(600px 240px at 50% 0%, rgba(${EDEN_TEAL},.16) 0%, rgba(0,0,0,0) 100%), #130f0c`,
     }}>
       {/* Left panel */}
       <div style={{
         width: 560, minWidth: 400, display: "flex", flexDirection: "column",
         alignItems: "center", justifyContent: "center", padding: "48px 56px",
-        gap: 0, background: "linear-gradient(180deg, rgb(24,30,42) 0%, rgb(17,22,31) 100%)",
+        gap: 0, background: "linear-gradient(180deg, rgb(36,33,30) 0%, rgb(24,20,17) 100%)",
         boxShadow: "inset -1px 0 0 rgba(255,255,255,.05), inset 0 0 40px rgba(0,0,0,.35)",
       }}>
         {/* App icon */}
@@ -2357,7 +2744,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           <span style={{ fontWeight: 800, color: "#ffffff", textShadow: "0 -1px 0 rgba(0,0,0,.5)" }}>Vuenc</span>
           <span style={{ fontWeight: 400, color: EDEN_TEAL_READABLE, textShadow: "0 -1px 0 rgba(0,0,0,.5)" }}>Edit</span>
         </div>
-        <div style={{ fontSize: 13, color: "#4b5568", marginBottom: 28, marginTop: 6 }}>v{appVersion}</div>
+        <div style={{ fontSize: 13, color: "#625a51", marginBottom: 28, marginTop: 6 }}>v{appVersion}</div>
 
         {/* Action buttons */}
         <div style={{ display: "flex", flexDirection: "column", gap: 10, width: "100%", maxWidth: 480 }}>
@@ -2376,8 +2763,8 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           >
             <span style={{ fontSize: 28, lineHeight: 1 }}>✏️</span>
             <div>
-              <div style={{ fontSize: 15, fontWeight: 700, color: "#e2e8f0" }}>New World</div>
-              <div style={{ fontSize: 13, color: "#94a3b8", marginTop: 2 }}>Create a new world file</div>
+              <div style={{ fontSize: 15, fontWeight: 700, color: "#ebe9e7" }}>New World</div>
+              <div style={{ fontSize: 13, color: "#afa69d", marginTop: 2 }}>Create a new world file</div>
             </div>
           </button>
 
@@ -2396,10 +2783,10 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           >
             <span style={{ fontSize: 28, lineHeight: 1 }}>🗂️</span>
             <div>
-              <div style={{ fontSize: 15, fontWeight: 700, color: "#e2e8f0" }}>
+              <div style={{ fontSize: 15, fontWeight: 700, color: "#ebe9e7" }}>
                 {loading ? "Loading…" : "Open World"}
               </div>
-              <div style={{ fontSize: 13, color: "#94a3b8", marginTop: 2 }}>Open a local world file</div>
+              <div style={{ fontSize: 13, color: "#afa69d", marginTop: 2 }}>Open a local world file</div>
             </div>
           </button>
 
@@ -2418,8 +2805,8 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           >
             <span style={{ fontSize: 28, lineHeight: 1 }}>🔍</span>
             <div>
-              <div style={{ fontSize: 15, fontWeight: 700, color: "#e2e8f0" }}>Browse Worlds</div>
-              <div style={{ fontSize: 13, color: "#94a3b8", marginTop: 2 }}>Browse shared worlds</div>
+              <div style={{ fontSize: 15, fontWeight: 700, color: "#ebe9e7" }}>Browse Worlds</div>
+              <div style={{ fontSize: 13, color: "#afa69d", marginTop: 2 }}>Browse shared worlds</div>
             </div>
           </button>
 
@@ -2429,13 +2816,13 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
             style={{
               display: "flex", alignItems: "center", gap: 14,
               background: "none", border: "none",
-              boxShadow: "inset 0 0 0 1px #1e2333",
+              boxShadow: "inset 0 0 0 1px #2d2824",
               borderRadius: 8, padding: "9px 16px",
               cursor: "pointer", textAlign: "left", width: "100%",
-              color: "#64748b", transition: "box-shadow .1s, color .1s",
+              color: "#83786c", transition: "box-shadow .1s, color .1s",
             }}
             onMouseEnter={e => { (e.currentTarget as HTMLElement).style.boxShadow = `inset 0 0 0 1px rgba(${EDEN_TEAL},.5)`; (e.currentTarget as HTMLElement).style.color = EDEN_TEAL_READABLE; }}
-            onMouseLeave={e => { (e.currentTarget as HTMLElement).style.boxShadow = "inset 0 0 0 1px #1e2333"; (e.currentTarget as HTMLElement).style.color = "#64748b"; }}
+            onMouseLeave={e => { (e.currentTarget as HTMLElement).style.boxShadow = "inset 0 0 0 1px #2d2824"; (e.currentTarget as HTMLElement).style.color = "#83786c"; }}
           >
             <span style={{ fontSize: 16, lineHeight: 1 }}>⚙</span>
             <span style={{ fontSize: 13 }}>Settings</span>
@@ -2450,8 +2837,8 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
 
         {/* Attribution footer */}
         <div style={{
-          marginTop: "auto", paddingTop: 20, borderTop: "1px solid #1e2333",
-          fontSize: 11, color: "#4b5568", lineHeight: 1.6, textAlign: "center",
+          marginTop: "auto", paddingTop: 20, borderTop: "1px solid #2d2824",
+          fontSize: 11, color: "#625a51", lineHeight: 1.6, textAlign: "center",
           width: "100%", maxWidth: 480,
         }}>
           <p style={{ margin: "0 0 4px" }}>
@@ -2469,11 +2856,11 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           <button
             onClick={() => setShowAbout(true)}
             style={{
-              background: "none", border: "none", color: "#4b5568",
+              background: "none", border: "none", color: "#625a51",
               fontSize: 11, cursor: "pointer", padding: 0, textDecoration: "underline",
             }}
             onMouseEnter={e => (e.currentTarget.style.color = EDEN_TEAL_READABLE)}
-            onMouseLeave={e => (e.currentTarget.style.color = "#4b5568")}
+            onMouseLeave={e => (e.currentTarget.style.color = "#625a51")}
           >
             About VuencEdit…
           </button>
@@ -2491,6 +2878,13 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
             setShowSlicePanels(s.defaultQuadView);
             setEnable3dPane(s.default3dPane);
             setSaveCompressed(s.defaultSaveCompressed);
+            setFogEnabled(s.enableFog);
+            setSunT(s.sunT);
+            setSunTDisplay(s.sunT);
+            setLampRadius(s.lampRadius);
+            setLampRadiusDisplay(s.lampRadius);
+            setRenderDistance(s.renderDistance);
+            setFlySpeed(s.flySpeed);
             if (s.templatePath !== templatePath) setTemplatePath(s.templatePath);
             if (s.texturePackPath !== texturePackPath) {
               if (s.texturePackPath) loadTexturePackFile(s.texturePackPath);
@@ -2503,16 +2897,16 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
       {/* Right panel — recent worlds */}
       <div style={{
         flex: 1, display: "flex", flexDirection: "column", overflow: "hidden",
-        background: "linear-gradient(180deg, rgb(24,28,39) 0%, rgb(15,18,26) 100%)",
+        background: "linear-gradient(180deg, rgb(34,29,25) 0%, rgb(24,20,17) 100%)",
       }}>
-        <div style={{ padding: "20px 24px 10px", borderBottom: "1px solid #1e2333", boxShadow: "inset 0 1px 0 rgba(255,255,255,.04)" }}>
-          <span style={{ fontSize: 11, fontWeight: 600, letterSpacing: "0.08em", color: "#4b5568", textTransform: "uppercase" }}>
+        <div style={{ padding: "20px 24px 10px", borderBottom: "1px solid #2d2824", boxShadow: "inset 0 1px 0 rgba(255,255,255,.04)" }}>
+          <span style={{ fontSize: 11, fontWeight: 600, letterSpacing: "0.08em", color: "#625a51", textTransform: "uppercase" }}>
             Recent Worlds
           </span>
         </div>
         {recentWorlds.length === 0 ? (
           <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center" }}>
-            <span style={{ color: "#4b5568", fontSize: 15 }}>No Recent Worlds</span>
+            <span style={{ color: "#625a51", fontSize: 15 }}>No Recent Worlds</span>
           </div>
         ) : (
           <div style={{ flex: 1, overflowY: "auto" }}>
@@ -2524,7 +2918,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
                 style={{
                   display: "flex", alignItems: "center", gap: 14,
                   width: "100%", textAlign: "left", background: "none",
-                  border: "none", borderBottom: i < recentWorlds.length - 1 ? "1px solid #1e2333" : "none",
+                  border: "none", borderBottom: i < recentWorlds.length - 1 ? "1px solid #2d2824" : "none",
                   padding: "14px 24px", cursor: loading ? "not-allowed" : "pointer",
                   opacity: loading ? 0.5 : 1,
                 }}
@@ -2534,14 +2928,14 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
               >
                 <span style={{ fontSize: 22, lineHeight: 1, flexShrink: 0 }}>🌍</span>
                 <div style={{ flex: 1, minWidth: 0 }}>
-                  <div style={{ fontSize: 14, fontWeight: 600, color: "#e2e8f0", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  <div style={{ fontSize: 14, fontWeight: 600, color: "#ebe9e7", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                     {r.name}
                   </div>
-                  <div style={{ fontSize: 11, color: "#4b5568", marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", direction: "rtl", textAlign: "left" }}>
+                  <div style={{ fontSize: 11, color: "#625a51", marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", direction: "rtl", textAlign: "left" }}>
                     {r.path}
                   </div>
                 </div>
-                <span style={{ fontSize: 11, color: "#475569", flexShrink: 0 }}>{timeAgo(r.timestamp)}</span>
+                <span style={{ fontSize: 11, color: "#61584f", flexShrink: 0 }}>{timeAgo(r.timestamp)}</span>
               </button>
             ))}
           </div>

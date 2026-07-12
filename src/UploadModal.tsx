@@ -23,7 +23,7 @@ const radioLabel: React.CSSProperties = {
   alignItems: "center",
   gap: 6,
   cursor: "pointer",
-  color: "#e2e8f0",
+  color: "#ebe9e7",
   fontSize: 13,
 };
 
@@ -91,7 +91,7 @@ export default function UploadModal({ sourcePath, onClose }: Props) {
       <div
         style={glassPanel({
           padding: "18px 24px 20px", width: 400, maxWidth: "95vw",
-          display: "flex", flexDirection: "column", gap: 14, color: "#e2e8f0",
+          display: "flex", flexDirection: "column", gap: 14, color: "#ebe9e7",
         })}
       >
         {/* Header */}
@@ -100,14 +100,14 @@ export default function UploadModal({ sourcePath, onClose }: Props) {
           <button
             onClick={onClose}
             onMouseEnter={e => (e.currentTarget.style.color = EDEN_TEAL_READABLE)}
-            onMouseLeave={e => (e.currentTarget.style.color = "#475569")}
-            style={{ background: "none", border: "none", color: "#475569", fontSize: 20, cursor: "pointer", lineHeight: 1, transition: "color .1s" }}
+            onMouseLeave={e => (e.currentTarget.style.color = "#61584f")}
+            style={{ background: "none", border: "none", color: "#61584f", fontSize: 20, cursor: "pointer", lineHeight: 1, transition: "color .1s" }}
           >×</button>
         </div>
 
         {/* Server selection */}
         <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-          <span style={{ fontSize: 11, color: "#475569", textTransform: "uppercase", letterSpacing: "0.06em" }}>Server</span>
+          <span style={{ fontSize: 11, color: "#61584f", textTransform: "uppercase", letterSpacing: "0.06em" }}>Server</span>
           <div style={{ display: "flex", gap: 16 }}>
             <label style={radioLabel}>
               <input
@@ -132,7 +132,7 @@ export default function UploadModal({ sourcePath, onClose }: Props) {
               Legacy
             </label>
           </div>
-          <span style={{ fontSize: 10, color: "#64748b", lineHeight: 1.5 }}>
+          <span style={{ fontSize: 10, color: "#83786c", lineHeight: 1.5 }}>
             Uploads use plain HTTP — the world file, its name, and the preview travel unencrypted.
             Don't upload anything private.
           </span>
@@ -140,9 +140,9 @@ export default function UploadModal({ sourcePath, onClose }: Props) {
 
         {/* World file */}
         <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-          <span style={{ fontSize: 11, color: "#475569", textTransform: "uppercase", letterSpacing: "0.06em" }}>World File</span>
+          <span style={{ fontSize: 11, color: "#61584f", textTransform: "uppercase", letterSpacing: "0.06em" }}>World File</span>
           {sourcePath ? (
-            <span style={{ color: "#94a3b8", fontSize: 13, wordBreak: "break-all" }}>
+            <span style={{ color: "#afa69d", fontSize: 13, wordBreak: "break-all" }}>
               {sourcePath.split(/[\\/]/).pop() ?? sourcePath}
             </span>
           ) : (
@@ -154,7 +154,7 @@ export default function UploadModal({ sourcePath, onClose }: Props) {
 
         {/* Preview image */}
         <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-          <span style={{ fontSize: 11, color: "#475569", textTransform: "uppercase", letterSpacing: "0.06em" }}>Preview Image (required)</span>
+          <span style={{ fontSize: 11, color: "#61584f", textTransform: "uppercase", letterSpacing: "0.06em" }}>Preview Image (required)</span>
           <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
             <button onClick={choosePng} style={btn}>
               Choose PNG…
@@ -179,7 +179,7 @@ export default function UploadModal({ sourcePath, onClose }: Props) {
 
           {uploading && (
             <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-              <div style={{ flex: 1, background: "#1e293b", borderRadius: 4, height: 6, overflow: "hidden" }}>
+              <div style={{ flex: 1, background: "#312c28", borderRadius: 4, height: 6, overflow: "hidden" }}>
                 <div style={{
                   height: "100%",
                   background: `linear-gradient(90deg, rgb(${EDEN_TEAL}) 0%, ${EDEN_TEAL_READABLE} 100%)`,
@@ -187,7 +187,7 @@ export default function UploadModal({ sourcePath, onClose }: Props) {
                   transition: "width 0.3s",
                 }} />
               </div>
-              <span style={{ color: "#94a3b8", fontSize: 12, minWidth: 36 }}>{uploadProgress}%</span>
+              <span style={{ color: "#afa69d", fontSize: 12, minWidth: 36 }}>{uploadProgress}%</span>
             </div>
           )}
 

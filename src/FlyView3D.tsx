@@ -5,9 +5,64 @@ import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import type { AtlasData } from "./texturePack";
 import type { WorldMeta } from "./types";
-import { chromeButton } from "./designTokens";
+import { chromeButton, glassMenuPanel } from "./designTokens";
+import { skyFogColor } from "./blockDefs";
 
-interface ChunkGeom { positions: string; colors: string; uvs: string; vertex_count: number }
+// Fog distance scales with the render distance slider (chunk radius × 16 blocks/chunk) so terrain
+// fades out at the edge of what's actually streamed in, instead of a fixed distance that either
+// clips well inside the loaded radius (short) or never fades (long, at high render distance).
+const fogDistances = (radiusChunks: number) => {
+  const far = Math.max(20, radiusChunks * 16 * 0.9);
+  const near = far * 0.3;
+  return { near, far };
+};
+
+// Patch a MeshDepthMaterial (used as a mesh's customDepthMaterial in the shadow pass) so the
+// transparent stream casts *patterned* shadows in GPU mode: discard shadow-pass fragments whose
+// vertex alpha is below 0.75. The transparent stream carries RGBA vertex colours (water .50,
+// glass .50, flower .25, fence .90), so this passes light straight through water/glass/flower (no
+// shadow, as before) while fence casts. A textured variant additionally sets `map` + `alphaTest`
+// (below) so the fence weave tile's own transparent texels punch a lattice into its shadow.
+// Three.js converts the injected `attribute`/`varying` GLSL1 keywords to GLSL3 in/out for WebGL2.
+const patchDepthAlpha = (m: THREE.MeshDepthMaterial) => {
+  m.onBeforeCompile = (shader) => {
+    shader.vertexShader = shader.vertexShader
+      .replace("#include <common>", "#include <common>\nattribute vec4 color;\nvarying float vDepthAlpha;")
+      .replace("#include <begin_vertex>", "#include <begin_vertex>\nvDepthAlpha = color.a;");
+    shader.fragmentShader = shader.fragmentShader
+      .replace("#include <common>", "#include <common>\nvarying float vDepthAlpha;")
+      .replace("#include <clipping_planes_fragment>", "#include <clipping_planes_fragment>\nif ( vDepthAlpha < 0.75 ) discard;");
+  };
+};
+
+const rgbToHex = (c: readonly [number, number, number]) =>
+  "#" + c.map(v => Math.round(THREE.MathUtils.clamp(v, 0, 255)).toString(16).padStart(2, "0")).join("");
+
+const hexToRgb = (hex: string): [number, number, number] => {
+  const n = parseInt(hex.slice(1), 16);
+  return [(n >> 16) & 0xff, (n >> 8) & 0xff, n & 0xff];
+};
+
+// A sensible light-blue default for the 3D pane's sky/fog color — Minecraft's clear-sky blue,
+// used until the user picks a custom color or reverts to the world's own (often muddy) sky paint.
+const DEFAULT_SKY_COLOR = "#8cbeff";
+
+interface ChunkGeom {
+  positions: string; colors: string; uvs: string; vertex_count: number;
+  // Transparent stream (water/glass/fence/new-flower) — colors are RGBA (itemSize 4), not RGB.
+  positions_t: string; colors_t: string; uvs_t: string; vertex_count_t: number;
+  // Emissive stream — lamp-block faces, RGB. Populated only in GPU (flat) mode; drawn unlit so lamps
+  // stay fullbright under the lit Lambert material. Empty otherwise.
+  positions_e: string; colors_e: string; uvs_e: string; vertex_count_e: number;
+}
+/** A lamp light for the experimental GPU night path — Eden local block coords (voxel centre) + colour 0..1. */
+interface LampLight { x: number; y: number; z: number; r: number; g: number; b: number }
+/** Cap on live GPU-night point lights. MeshLambertMaterial forward-lights each one in-shader, so this
+ *  is the experimental perf ceiling; the nearest N lamps to the camera are assigned. */
+const MAX_NIGHT_LIGHTS = 16;
+/** Max world-unit radius the GPU shadow map covers around the camera. Beyond this, terrain doesn't
+ *  self-shadow — trades distant shadows (mostly fog-hidden) for texel density on near ones. */
+const SHADOW_MAX_REACH = 320;
 // World-scale 3D fly-through viewport — the 4th quad-view pane.
 //
 // Coordinate mapping: Eden (X east, Y south, Z up) → Three.js (x = wx, y = wz, z = wy).
@@ -25,13 +80,63 @@ interface ChunkGeom { positions: string; colors: string; uvs: string; vertex_cou
 interface EditBounds { x: number; y: number; w: number; h: number }
 
 const LOAD_RADIUS = 5;   // chunks loaded around the camera (in chunk units)
+const MAX_RENDER_DISTANCE = 32; // slider ceiling (chunk radius)
+const RENDER_DISTANCE_WARN_THRESHOLD = 16; // above this, chunk count grows enough to warn
 const STREAM_MS = 150;   // throttle for the load/dispose sweep
 const MAX_DPR = 1.5;     // cap device-pixel-ratio — Retina (2×) quadruples fragment load for ~no gain
+// Hard cap on resident vertex count (opaque + transparent streams combined) regardless of render
+// distance. At MAX_RENDER_DISTANCE=32 a fully-loaded disc is ~3200 chunks — with no cap that's
+// unbounded GPU memory (a dense world can be 10K+ verts/chunk). Once resident geometry crosses this,
+// the streaming queue stops pulling new chunks until eviction (moving the camera) frees headroom.
+const VERTEX_BUDGET = 30_000_000;
 
 export interface FlyView3DRef {
   /** Move the camera to a world XY position (keeps current height). */
   teleport: (wx: number, wy: number) => void;
 }
+
+/** A voxel hit returned by the Rust `pick_block` command. Coords/normal are Eden world coords. */
+export interface PickResult {
+  x: number; y: number; z: number;
+  block_type: number;
+  paint: number;
+  nx: number; ny: number; nz: number;
+}
+
+/** What a click in the 3D pane does. Derived from App's active tool, not owned by this pane. */
+export type Interact3D = "none" | "select" | "build";
+
+/** How far a pick ray reaches, in blocks. Rust clamps to PICK_MAX_DIST regardless. */
+/// `<input>` types that never accept typed text, so a keydown targeting one is a real shortcut,
+/// not the user writing into a field. Range in particular keeps focus after a slider drag.
+const NON_TEXT_INPUT_TYPES = new Set(["range", "checkbox", "radio", "button", "submit", "reset", "color", "file"]);
+
+/// The three camera modes.
+///   orbit — OrbitControls; drag to rotate around a target, cursor visible. (inspection)
+///   fly   — WASD move + hold-drag to look, cursor visible. Never grabs pointer lock, so it works
+///           even in webviews that refuse it — this is the reliable walk-around mode.
+///   look  — WASD move + free mouselook, cursor hidden (Minecraft-style). Requests pointer lock;
+///           if the webview refuses it, degrades to cursor-hidden relative-motion look.
+/// Both `fly` and `look` are "walking" modes and share the WASD/pitch/yaw controller.
+type CamMode = "orbit" | "fly" | "look";
+/// Z and the pill button both advance through this cycle. Ordered so the first Z press from orbit
+/// lands in `look` (the headline mouselook mode the user reaches for), then `fly`, then back.
+const CAM_MODE_CYCLE: Record<CamMode, CamMode> = { orbit: "look", look: "fly", fly: "orbit" };
+const CAM_MODE_LABEL: Record<CamMode, string> = { orbit: "3D", look: "LOOK", fly: "FLY" };
+
+/// Tint strength of an overlay box's interior. High enough to shade the enclosed blocks, low
+/// enough to still read their colour through it.
+const OVERLAY_FILL_OPACITY = 0.14;
+/// Opacity of the see-through edge pass. Kept well under 1 so an occluded edge still reads as
+/// occluded rather than floating in front of the terrain.
+const OVERLAY_XRAY_OPACITY = 0.3;
+
+const PICK_DIST = 256;
+/** Hover-highlight repick cadence. ~30Hz — one ~1ms IPC round-trip per tick is well inside budget. */
+const PICK_HOVER_MS = 33;
+/** A pointerdown/up pair inside this many px and ms is a click, not a look-drag or an orbit drag. */
+const CLICK_SLOP_PX = 4;
+const CLICK_SLOP_MS = 250;
 
 /** A wireframe box overlay in Eden world coordinates (Three.js coords are derived internally). */
 export interface Overlay3D {
@@ -42,11 +147,36 @@ export interface Overlay3D {
   color: number;
 }
 
+type HudData = { x: number; y: number; z: number; heading: string };
+interface CoordHudRef { set: (d: HudData | null) => void }
+
+/// Self-contained leaf for the camera-coords readout. The render loop pushes into it imperatively
+/// (~10 Hz) so a moving camera re-renders only this <div>, not the whole 3D pane. Same pattern as
+/// App's FpsCounter.
+const CoordHud = forwardRef<CoordHudRef>(function CoordHud(_props, ref) {
+  const [hud, setHud] = useState<HudData | null>(null);
+  useImperativeHandle(ref, () => ({ set: setHud }), []);
+  if (!hud) return null;
+  return (
+    <div style={{
+      position: "absolute", bottom: 6, left: 6, zIndex: 1, pointerEvents: "none",
+      padding: "2px 7px", borderRadius: 4, fontSize: 9, fontVariantNumeric: "tabular-nums",
+      background: "rgba(31,28,26,0.7)", border: "1px solid rgba(131,120,108,0.3)", color: "#afa69d",
+    }}>
+      X {hud.x} · Y {hud.y} · Z {hud.z} · {hud.heading}
+    </div>
+  );
+});
+
 const FlyView3D = forwardRef<FlyView3DRef, {
   world: WorldMeta; editEpoch?: number; lastEdit?: EditBounds | null;
   /** Initial camera target in Eden local block coords (x = east, y = south). Spawns the camera
    *  over real geometry; falls back to the world centre when null/undefined. */
   spawnAt?: { x: number; y: number } | null;
+  /** Increments once per world load (distinct from spawnAt changing for other reasons, like the
+   *  user setting a spawn point mid-session). The re-centre effect keys off this — not spawnAt's
+   *  coordinates — so setting a spawn point or clearing it while flying doesn't yank the camera. */
+  worldLoadToken?: number;
   onFlyModeChange?: (active: boolean) => void;
   onCameraMove?: (wx: number, wy: number) => void;
   overlays3d?: Overlay3D[] | null;
@@ -54,20 +184,113 @@ const FlyView3D = forwardRef<FlyView3DRef, {
   texturePack?: AtlasData | null;
   /** Increments whenever the texture pack changes (loaded/unloaded/toggled). */
   texEpoch?: number;
+  /** Distance fog fading terrain to the sky color, matching the game's look. Default true. */
+  fogEnabled?: boolean;
+  /** Night lighting preview — dims ambient, lights up Lamp blocks within reach. Default false. */
+  nightLighting?: boolean;
+  /** Directional sun-raycast shadow preview. Default false. */
+  shadows3d?: boolean;
+  /** Simulated sun position driving the shadow direction: 0=sunrise, 0.5=noon, 1=sunset. Default 0.5. */
+  sunT?: number;
+  /** Lamp light radius (blocks) for night lighting. Default 5 (the legacy LAMP_LIGHT_RADIUS constant). */
+  lampRadius?: number;
+  /** Increments whenever nightLighting/shadows3d/sunT changes, forcing a chunk-mesh reload. */
+  lightEpoch?: number;
+  /** Persisted render-distance (chunk radius) to seed the R slider from. Default LOAD_RADIUS. */
+  initialRenderDistance?: number;
+  /** Persisted fly-speed multiplier to seed from. Default 1. */
+  initialFlySpeed?: number;
+  /** Fired (debounced by the parent) when the user changes render distance, so it can be persisted. */
+  onRenderDistanceChange?: (n: number) => void;
+  /** Fired when the user changes fly speed (wheel), so it can be persisted. */
+  onFlySpeedChange?: (n: number) => void;
+  /** True while any App-level modal dialog is open — the fly-mode "Z" toggle and WASD movement keys
+   *  are suppressed so typing in a modal's text field never engages the fly camera. */
+  anyModalOpen?: boolean;
+  /** What a click does in this pane. "select" → onPickSelect; "build" → onPickBreak/onPickPlace. */
+  interact3d?: Interact3D;
+  /** Left click in "select" mode: the voxel under the cursor. App owns the two-click state machine. */
+  onPickSelect?: (x: number, y: number, z: number) => void;
+  /** Left click in "build" mode: the voxel to clear. */
+  onPickBreak?: (x: number, y: number, z: number) => void;
+  /** Right click in "build" mode: the empty voxel against the picked face, where a block goes. */
+  onPickPlace?: (x: number, y: number, z: number) => void;
+  /** Data-URL swatch of the armed fill block, shown in the corner while building. */
+  armedSwatch?: string | null;
+  /** Human-readable name of the armed fill block, shown next to the swatch. */
+  armedLabel?: string;
+  /** Opt-in real GPU shadow map: switches chunk meshes to a lit material + a directional sun with a
+   *  shadow map, and fetches flat (unshaded) geometry. Overrides the baked night/shadow preview.
+   *  Makes sunT free (moving the sun just repositions the light — no chunk reload). Default false. */
+  gpuShadows?: boolean;
 }>(function FlyView3D({
-  world, editEpoch = 0, lastEdit = null, spawnAt = null, onFlyModeChange, onCameraMove, overlays3d = null,
-  texturePack = null, texEpoch = 0,
+  world, editEpoch = 0, lastEdit = null, spawnAt = null, worldLoadToken = 0, onFlyModeChange, onCameraMove, overlays3d = null,
+  texturePack = null, texEpoch = 0, fogEnabled = true,
+  nightLighting = false, shadows3d = false, sunT = 0.5, lampRadius = 5, lightEpoch = 0,
+  initialRenderDistance, initialFlySpeed, onRenderDistanceChange, onFlySpeedChange, anyModalOpen = false,
+  interact3d = "none", onPickSelect, onPickBreak, onPickPlace, armedSwatch = null, armedLabel = "",
+  gpuShadows = false,
 }, ref) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const [flyMode, setFlyMode] = useState(false);
+  const [camMode, setCamMode] = useState<CamMode>("orbit");
+  const camModeRef = useRef<CamMode>("orbit");
+  // True in any walking mode (fly or look) — gates WASD, the crosshair, wheel-speed, and picking,
+  // all of which behave identically in both. `camModeRef` is only consulted where the two differ
+  // (pointer lock + cursor hiding). Kept as a boolean ref to avoid churning every gate site.
   const flyModeRef = useRef(false);
   const hoverRef = useRef(false);      // pointer over this pane — gates the Z fly-toggle
-  const speedMultRef = useRef(1);      // wheel-adjustable fly-speed multiplier
-  const [flySpeed, setFlySpeed] = useState(1);
-  const [loadRadius, setLoadRadius] = useState(LOAD_RADIUS);
-  const loadRadiusRef = useRef(LOAD_RADIUS);
+  const wrapRef = useRef<HTMLDivElement | null>(null);
+  // Set by the scene effect; lets the pill button and Z key advance the camera mode.
+  const cycleModeRef = useRef<(() => void) | null>(null);
+  const speedMultRef = useRef(initialFlySpeed ?? 1);   // wheel-adjustable fly-speed multiplier
+  const [flySpeed, setFlySpeed] = useState(initialFlySpeed ?? 1);
+  const [loadRadius, setLoadRadius] = useState(initialRenderDistance ?? LOAD_RADIUS);
+  const loadRadiusRef = useRef(initialRenderDistance ?? LOAD_RADIUS);
+  const [distanceWarnOpen, setDistanceWarnOpen] = useState(false);
   const [loadingCount, setLoadingCount] = useState(0);
   const setLoadingCountRef = useRef(setLoadingCount);
+  const [budgetLimited, setBudgetLimited] = useState(false);
+  const setBudgetLimitedRef = useRef(setBudgetLimited);
+
+  const onRenderDistanceChangeRef = useRef(onRenderDistanceChange);
+  onRenderDistanceChangeRef.current = onRenderDistanceChange;
+  const onFlySpeedChangeRef = useRef(onFlySpeedChange);
+  onFlySpeedChangeRef.current = onFlySpeedChange;
+
+  // initialRenderDistance/initialFlySpeed only seed useState's initial value — they don't otherwise
+  // propagate, so a Settings reload/reset that changes the persisted value out from under this pane
+  // (Settings modal Save/Reset) would silently desync the slider from what's actually persisted.
+  // Harmless to also fire on mount/on the pane's own onChange round-trip: it sets the same value
+  // that's already current, which React no-ops.
+  useEffect(() => {
+    if (initialRenderDistance == null) return;
+    loadRadiusRef.current = initialRenderDistance;
+    setLoadRadius(initialRenderDistance);
+  }, [initialRenderDistance]);
+  useEffect(() => {
+    if (initialFlySpeed == null) return;
+    speedMultRef.current = initialFlySpeed;
+    setFlySpeed(initialFlySpeed);
+  }, [initialFlySpeed]);
+
+  // Camera position/heading HUD (Eden coords), refreshed at the ~10fps broadcast cadence.
+  const hudRef = useRef<CoordHudRef | null>(null);
+
+  // Lamp/shadow reach, fetched once from Rust so the edit-sync reload radius below can't drift out
+  // of sync with export.rs's LAMP_LIGHT_RADIUS/SHADOW_RAY_STEPS constants. Seeded with those same
+  // values as a fallback in case the fetch hasn't landed yet (a stale/undersized radius for one
+  // frame is harmless — the next edit reloads correctly once the fetch resolves).
+  const lightConstantsRef = useRef({ lampLightRadius: 5.0, shadowRayScan: 24 });
+  useEffect(() => {
+    let cancelled = false;
+    invoke<{ lamp_light_radius: number; shadow_ray_steps: number }>("get_light_constants")
+      .then((c) => {
+        if (cancelled) return;
+        lightConstantsRef.current = { lampLightRadius: c.lamp_light_radius, shadowRayScan: c.shadow_ray_steps };
+      })
+      .catch(() => { /* fall back to the seeded defaults */ });
+    return () => { cancelled = true; };
+  }, []);
 
   const mapW = world.width_chunks * 16;
   const mapH = world.height_chunks * 16;
@@ -77,6 +300,19 @@ const FlyView3D = forwardRef<FlyView3DRef, {
   onFlyModeChangeRef.current = onFlyModeChange;
   const onCameraMoveRef = useRef(onCameraMove);
   onCameraMoveRef.current = onCameraMove;
+  const anyModalOpenRef = useRef(anyModalOpen);
+  anyModalOpenRef.current = anyModalOpen;
+
+  // Picking props read through refs: the scene effect subscribes once and must see the live values
+  // without tearing down the renderer every time the user switches tool or fill block.
+  const interact3dRef = useRef(interact3d);
+  interact3dRef.current = interact3d;
+  const onPickSelectRef = useRef(onPickSelect);
+  onPickSelectRef.current = onPickSelect;
+  const onPickBreakRef = useRef(onPickBreak);
+  onPickBreakRef.current = onPickBreak;
+  const onPickPlaceRef = useRef(onPickPlace);
+  onPickPlaceRef.current = onPickPlace;
 
   const overlays3dRef = useRef(overlays3d);
   useEffect(() => { overlays3dRef.current = overlays3d; }, [overlays3d]);
@@ -85,8 +321,61 @@ const FlyView3D = forwardRef<FlyView3DRef, {
   const spawnAtRef = useRef(spawnAt);
   spawnAtRef.current = spawnAt;
 
+  // In-pane fog on/off override (null = follow the fogEnabled prop / Settings default). Lets the user
+  // flip fog without opening Settings; the Settings default still applies on load.
+  const [fogOverride, setFogOverride] = useState<boolean | null>(null);
+  const effectiveFogEnabled = fogOverride ?? fogEnabled;
+  const fogEnabledRef = useRef(effectiveFogEnabled);
+  fogEnabledRef.current = effectiveFogEnabled;
+
+  // Night lighting / shadow preview toggles — read via refs by startFetch (defined once per world
+  // mount), same pattern as fogEnabledRef.
+  const nightLightingRef = useRef(nightLighting);
+  nightLightingRef.current = nightLighting;
+  const shadows3dRef = useRef(shadows3d);
+  shadows3dRef.current = shadows3d;
+  const sunTRef = useRef(sunT);
+  sunTRef.current = sunT;
+  const lampRadiusRef = useRef(lampRadius);
+  lampRadiusRef.current = lampRadius;
+  const gpuShadowsRef = useRef(gpuShadows);
+  gpuShadowsRef.current = gpuShadows;
+
+  // Fog model: soft = exponential (FogExp2, hazier / more fog-like, the default); hard = linear.
+  const [fogSoft, setFogSoft] = useState(true);
+  const fogSoftRef = useRef(fogSoft);
+  fogSoftRef.current = fogSoft;
+
+  // Antialiasing toggle — off by default (supersampling has a real GPU cost). Independent of pane
+  // maximize state; the renderer's own `antialias` flag can't be toggled live (would need a full
+  // context recreate), so this bumps DPR to 2 for supersample-style smoothing instead.
+  const [antialias, setAntialias] = useState(false);
+
+  // Editor-only fog/sky color override — never written back to world.sky (the file's saved sky
+  // color table). Defaults to a Minecraft-like light blue rather than the world's own (often muddy)
+  // sky paint; the ↺ button reverts to the world's actual sky color on request.
+  const [fogColorOverride, setFogColorOverride] = useState<string | null>(DEFAULT_SKY_COLOR);
+  // Night lighting darkens the fog/clear color toward the same ambient level baked into block
+  // colors server-side, so distant terrain doesn't fade into a bright daytime sky while lit dim.
+  const effectiveFogColor = (): readonly [number, number, number] => {
+    const [r, g, b] = fogColorOverride ? hexToRgb(fogColorOverride) : skyFogColor(world.sky);
+    return nightLighting ? [r * 0.35, g * 0.35, b * 0.35] : [r, g, b];
+  };
+  const fogColorRef = useRef(effectiveFogColor());
+  fogColorRef.current = effectiveFogColor();
+
   // Texture pack refs — updated by a dedicated effect, read by startFetch inside the scene closure.
   const texMatRef = useRef<THREE.MeshBasicMaterial | null>(null);
+  // Textured variant for the transparent stream (water/glass/fence) — same atlas, `transparent: true`
+  // so both the block's own alpha (transparent_alpha, baked into vertex colour) and the atlas tile's
+  // own PNG alpha (e.g. a glass cutout) composite correctly.
+  const texMatTRef = useRef<THREE.MeshBasicMaterial | null>(null);
+  // Lit (Lambert) textured variants, used only in GPU-shadow mode (built alongside the Basic ones).
+  const texMatLRef = useRef<THREE.MeshLambertMaterial | null>(null);
+  const texMatLTRef = useRef<THREE.MeshLambertMaterial | null>(null);
+  // Textured custom depth material for the transparent stream's patterned shadow (fence weave). Built
+  // in the texture effect (needs the atlas); the untextured fallback lives in the scene closure.
+  const depthMatTexRef = useRef<THREE.MeshDepthMaterial | null>(null);
   const atlasTexRef = useRef<THREE.DataTexture | null>(null);
 
   // Stable refs so the effect can be re-run only on world change, while edit-sync and fly-mode
@@ -99,6 +388,15 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     resetCamera: () => void;
     teleport: (wx: number, wy: number) => void;
     setOverlays: (ovs: Overlay3D[] | null) => void;
+    setFog: (enabled: boolean, color: readonly [number, number, number]) => void;
+    setMaxDpr: (max: number) => void;
+    setGpuShadows: (on: boolean) => void;
+    /** Re-apply scene light state for the current (gpuShadows, nightLighting) combo — no chunk reload. */
+    updateGpuLighting: () => void;
+    /** Re-query lamp point lights around the camera (GPU night only). */
+    refreshNightLights: () => void;
+    refresh: () => void;
+    clearHighlight: () => void;
   } | null>(null);
 
   useImperativeHandle(ref, () => ({
@@ -107,7 +405,8 @@ const FlyView3D = forwardRef<FlyView3DRef, {
 
   useEffect(() => {
     const canvas = canvasRef.current;
-    if (!canvas) return;
+    const wrap = wrapRef.current;
+    if (!canvas || !wrap) return;
 
     let renderer: THREE.WebGLRenderer;
     try {
@@ -119,7 +418,6 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       // message to the error boundary instead of a cryptic THREE internal stack.
       throw new Error(`WebGL unavailable in this environment. (${(e as Error)?.message ?? e})`);
     }
-    renderer.setClearColor(0x0a0f1e);
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, MAX_DPR));
 
     // Guard the remainder of init: if anything throws after the context exists, release it before
@@ -150,6 +448,70 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     // (obj_geometry_region SH_TOP/BOT/E/W/N/S constants).  MeshBasicMaterial renders vertex colours
     // directly with no normal calculations, eliminating the computeVertexNormals CPU spike and the
     // normal attribute buffer (~⅓ of geometry RAM).
+
+    // ---- Gradient sky dome ----
+    // A large inverted sphere painted with a fixed vertical gradient (#c5d5eb horizon → #347ee3
+    // zenith) that follows the camera, so the background reads as sky rather than a flat wall — and
+    // stays visible when fog is off. `fog:false` keeps the dome itself unfogged. The gradient is
+    // independent of the fog/sky color, which only drives the renderer clear color and terrain fog.
+    const skyUniforms = {
+      topColor: { value: new THREE.Color(0x347ee3) },
+      bottomColor: { value: new THREE.Color(0xc5d5eb) },
+      offset: { value: 0.0 },
+      exponent: { value: 0.7 },
+    };
+    const skyMat = new THREE.ShaderMaterial({
+      uniforms: skyUniforms,
+      side: THREE.BackSide,
+      depthWrite: false,
+      fog: false,
+      vertexShader: `
+        varying vec3 vWorldPos;
+        void main() {
+          vec4 wp = modelMatrix * vec4(position, 1.0);
+          vWorldPos = wp.xyz;
+          gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+        }`,
+      fragmentShader: `
+        uniform vec3 topColor;
+        uniform vec3 bottomColor;
+        uniform float offset;
+        uniform float exponent;
+        varying vec3 vWorldPos;
+        void main() {
+          float h = normalize(vWorldPos - cameraPosition).y;
+          float t = pow(clamp((h + offset), 0.0, 1.0), exponent);
+          gl_FragColor = vec4(mix(bottomColor, topColor, t), 1.0);
+        }`,
+    });
+    const skyDome = new THREE.Mesh(new THREE.SphereGeometry(4000, 24, 12), skyMat);
+    skyDome.renderOrder = -1; // draw first, behind everything
+    scene.add(skyDome);
+
+    // Fog fades distant terrain to the sky color, matching the game's fog. The renderer's clear color
+    // is set to match so empty sky beyond geometry blends seamlessly with the fog (the sky dome itself
+    // keeps its own fixed gradient regardless). Soft = exponential (FogExp2, hazier); hard = linear.
+    // Camera far plane stays at 100000 (untouched) — fog gives the faded look without capping
+    // visibility/editing range.
+    const setFog = (enabled: boolean, color: readonly [number, number, number]) => {
+      const hex = (color[0] << 16) | (color[1] << 8) | color[2];
+      renderer.setClearColor(hex);
+      if (enabled) {
+        const { near, far } = fogDistances(loadRadiusRef.current);
+        scene.fog = fogSoftRef.current
+          ? new THREE.FogExp2(hex, 2.2 / far)
+          : new THREE.Fog(hex, near, far);
+      } else {
+        scene.fog = null;
+      }
+      invalidate();
+    };
+    setFog(fogEnabledRef.current, fogColorRef.current);
+
+    const setMaxDpr = (max: number) => {
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, max));
+      resize();
+    };
 
     const cx = mapW / 2, cy = mapH / 2;
     // Camera spawn target — over real geometry when provided (sparse worlds), else world centre.
@@ -200,23 +562,210 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     // DoubleSide kept: the face winding was designed for the old coordinate convention and is not
     // uniformly outward-facing yet, so FrontSide would drop some faces.
     const mat = new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide });
+    // Transparent stream material (water/glass/fence/new-flower). `transparent: true` lets the
+    // per-vertex alpha (baked from `transparent_alpha()` server-side) blend; `depthWrite: false`
+    // avoids one translucent face occluding another behind it via the depth buffer (standard
+    // practice for alpha-blended geometry — mirrors the game keeping ATLAS2 blocks in a separate
+    // pass from the opaque ATLAS1 buffer).
+    const matT = new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide, transparent: true, depthWrite: false });
 
-    // ---- Per-chunk mesh cache ----
-    const meshes = new Map<string, THREE.Mesh>();
-    const inflight = new Set<string>();
-    const key = (cx: number, cy: number) => `${cx},${cy}`;
+    // ---- Opt-in GPU shadow map (H5) ---------------------------------------------------------
+    // When gpuShadows is on, chunk meshes use a LIT material (Lambert) and the scene gets an ambient
+    // + directional (sun) light with a shadow map; geometry is fetched flat (gpu:true → Rust bakes no
+    // SH_* shading), so Three.js owns all shading. The payoff: moving the sun (sunT) is free — it just
+    // repositions the light, no chunk reload, unlike the baked raymarch which rebuilt every mesh.
+    // vertexColors still carries the block/paint colour; Lambert multiplies it by the computed light.
+    // `flatShading: true` derives flat per-face normals in-shader from the position derivatives, so we
+    // don't run `computeVertexNormals()` on the CPU per chunk (its single biggest GPU-mode load cost)
+    // nor carry a normal attribute. Voxel faces are exactly the flat-shading case, so this is visually
+    // identical to per-vertex normals on this non-indexed geometry.
+    const matL = new THREE.MeshLambertMaterial({ vertexColors: true, side: THREE.DoubleSide, flatShading: true });
+    const matLT = new THREE.MeshLambertMaterial({ vertexColors: true, side: THREE.DoubleSide, transparent: true, depthWrite: false, flatShading: true });
 
-    const disposeMesh = (k: string) => {
-      const m = meshes.get(k);
-      if (!m) return;
-      scene.remove(m);
-      m.geometry.dispose();
-      meshes.delete(k);
+    // Untextured custom depth material for the transparent stream's shadow pass (see patchDepthAlpha):
+    // fence casts, water/glass/flower don't. Without a texture pack the fence shadow is solid (no
+    // weave) — still an improvement over the previous no-shadow-at-all. The textured variant with the
+    // weave lattice is built in the texture effect (depthMatTexRef).
+    const depthMatT = new THREE.MeshDepthMaterial({ depthPacking: THREE.RGBADepthPacking });
+    patchDepthAlpha(depthMatT);
+
+    const ambient = new THREE.AmbientLight(0xffffff, 0); // intensities set by applyGpuLighting()
+    const sun = new THREE.DirectionalLight(0xffffff, 0);
+    sun.castShadow = true;
+    sun.shadow.mapSize.set(2048, 2048);
+    sun.shadow.bias = -0.0006;           // pull the depth test back a hair to kill shadow acne on flats
+    sun.shadow.normalBias = 0.6;         // and along steep faces (voxels have large flat facets)
+    sun.shadow.radius = 3;               // PCFSoft blur kernel — softer shadow edges than the default 1
+    {
+      const sc = sun.shadow.camera as THREE.OrthographicCamera;
+      sc.near = 1; sc.far = 6000;        // wide range; the ortho box (left/right/top/bottom) tracks the camera
+    }
+    scene.add(ambient, sun, sun.target);
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+
+    // Sun disc — a bright billboarded sprite placed up-sun, just inside the sky dome, so the light
+    // has a visible source. Occluded by terrain (drawn with depth test); `fog:false` keeps it crisp.
+    // Only shown in GPU-shadow mode (the mode with a real directional sun). Its colour warms toward
+    // orange at low sun (sunrise/sunset), matching the sun light tint.
+    const sunDiscMat = new THREE.SpriteMaterial({ color: 0xfff2c0, fog: false, transparent: true, depthWrite: false });
+    const sunDisc = new THREE.Sprite(sunDiscMat);
+    sunDisc.scale.setScalar(260);
+    sunDisc.renderOrder = 1;
+    sunDisc.visible = false;
+    scene.add(sunDisc);
+    const sunColorScratch = new THREE.Color();
+    const WHITE = new THREE.Color(0xffffff);
+
+    // Experimental GPU night lighting: a fixed pool of point lights placed at the nearest lamp blocks
+    // (queried from the Rust lamp index via get_lamps_near). Only active when GPU shadows + night are
+    // both on; the Lambert chunk material forward-lights each one. Off (invisible, zero intensity)
+    // otherwise so the pool never costs anything in day/GPU-shadow mode.
+    const nightLights: THREE.PointLight[] = [];
+    for (let i = 0; i < MAX_NIGHT_LIGHTS; i++) {
+      const pl = new THREE.PointLight(0xffffff, 0, 0);
+      pl.visible = false;
+      scene.add(pl);
+      nightLights.push(pl);
+    }
+
+    // Unit vector pointing toward the sun in THREE space, from sunT. Mirrors Rust's `sun_direction`
+    // (elevation eases 15°..80°..15° via sin(pi·t); azimuth 0..pi east→west), mapped Eden(x,y,z)→
+    // THREE(x,z,y). Used to place the directional light; sunT changes are then just a light move.
+    const sunDirThree = (t: number, out: THREE.Vector3) => {
+      const az = Math.PI * t;
+      const el = (15 * Math.PI) / 180 + Math.sin(Math.PI * t) * ((65 * Math.PI) / 180);
+      return out.set(Math.cos(el) * Math.cos(az), Math.sin(el), Math.cos(el) * Math.sin(az)).normalize();
+    };
+    const sunDirScratch = new THREE.Vector3();
+
+    // Apply the scene's light state for the current (gpuShadows, nightLighting) combo. Meshes are
+    // rebuilt by reloadAllChunks() separately (material + normals + castShadow differ per mode).
+    //  • GPU + night → GPU night: dim ambient/sun, sun disc off, point-light pool drives the lamps.
+    //  • GPU alone    → day sun: bright ambient + directional sun + shadow map + sun disc.
+    //  • no GPU       → baked mode: scene lights off (shading is in vertex colours).
+    const applyGpuLighting = () => {
+      const gpu = gpuShadowsRef.current;
+      const night = nightLightingRef.current;
+      const gpuNight = gpu && night;
+      renderer.shadowMap.enabled = gpu;
+      if (gpuNight) {
+        ambient.intensity = 0.18; sun.intensity = 0.25; sunDisc.visible = false;
+      } else if (gpu) {
+        ambient.intensity = 1.5; sun.intensity = 2.0; sunDisc.visible = true;
+      } else {
+        ambient.intensity = 0; sun.intensity = 0; sunDisc.visible = false;
+      }
+      if (!gpuNight) {
+        for (const pl of nightLights) { pl.visible = false; pl.intensity = 0; }
+      } else {
+        lastNightQueryPos.set(1e9, 0, 0); // force a re-query on the next frame/trigger
+        updateNightLights();
+      }
       invalidate();
     };
 
-    // Sentinel mesh marking an empty chunk (avoids refetching air-only chunks every sweep).
-    const EMPTY = new THREE.Mesh();
+    // Query the nearest lamp blocks around the camera and assign them to the point-light pool. Runs
+    // only in GPU-night mode; throttled by camera movement (from frame()) and fired on enable/edit.
+    let nightQueryPending = false;
+    const lastNightQueryPos = new THREE.Vector3(1e9, 0, 0);
+    const updateNightLights = () => {
+      if (nightQueryPending) return;
+      if (!(gpuShadowsRef.current && nightLightingRef.current)) return;
+      nightQueryPending = true;
+      lastNightQueryPos.copy(camera.position);
+      // Eden coords: THREE(x,y,z) → Eden(x, z, y). Query a generous radius so lamps just off-screen
+      // still light the near terrain; the pool caps how many actually render.
+      const ex = camera.position.x, ey = camera.position.z, ez = camera.position.y;
+      const queryR = Math.max(48, loadRadiusRef.current * 16);
+      invoke<LampLight[]>("get_lamps_near", { x: ex, y: ey, z: ez, radius: queryR })
+        .then((lamps) => {
+          if (disposed) return;
+          // Read the slider value here (not before the await) so a mid-flight drag isn't stale.
+          const lampR = lampRadiusRef.current;
+          // Physical falloff (decay=2, inverse-square). `distance` is the hard cutoff — set it well
+          // beyond the nominal lamp radius so the falloff curve isn't clipped right at the edge
+          // (a distance==lampR cutoff with 2/d brightness was the "only lit at point-blank range"
+          // bug). intensity = lampR²·K makes the brightness AT distance lampR read ~K regardless of
+          // the radius (intensity/d² = K at d=lampR), so the slider grows reach, not just brightness.
+          const K = 0.4;
+          for (let i = 0; i < MAX_NIGHT_LIGHTS; i++) {
+            const pl = nightLights[i];
+            const l = lamps[i];
+            if (l) {
+              pl.position.set(l.x, l.z, l.y); // Eden → THREE
+              pl.color.setRGB(l.r, l.g, l.b);
+              pl.distance = lampR * 4;
+              pl.decay = 2;
+              pl.intensity = lampR * lampR * K;
+              pl.visible = true;
+            } else {
+              pl.visible = false;
+              pl.intensity = 0;
+            }
+          }
+          invalidate();
+        })
+        .catch(() => { /* no world / no lamps */ })
+        .finally(() => { nightQueryPending = false; });
+    };
+    applyGpuLighting();
+
+    // Pick the chunk-mesh material for the current mode. GPU mode → Lambert (textured if a pack row
+    // exists); baked mode → the unlit Basic materials.
+    const pickMat = (transparent: boolean, hasUV: boolean): THREE.Material => {
+      if (gpuShadowsRef.current) {
+        if (transparent) return (hasUV && texMatLTRef.current) ? texMatLTRef.current : matLT;
+        return (hasUV && texMatLRef.current) ? texMatLRef.current : matL;
+      }
+      if (transparent) return (hasUV && texMatTRef.current) ? texMatTRef.current : matT;
+      return (hasUV && texMatRef.current) ? texMatRef.current : mat;
+    };
+
+    // ---- Per-chunk mesh cache ----
+    const meshes = new Map<string, THREE.Mesh>();
+    const meshesT = new Map<string, THREE.Mesh>();
+    // Emissive stream — lamp-block faces in GPU mode, drawn unlit so lamps stay fullbright. Empty in
+    // baked mode (Rust routes lamp faces into the opaque stream then).
+    const meshesE = new Map<string, THREE.Mesh>();
+    const inflight = new Set<string>();
+    const key = (cx: number, cy: number) => `${cx},${cy}`;
+
+    // Marks a chunk "fetched" when its geometry came back entirely air/transparent, so the sweep
+    // doesn't keep refetching it. A plain key set — not a shared sentinel mesh, which would need
+    // `.dispose()`d every time an empty chunk is evicted despite never being added to the scene.
+    const emptyChunks = new Set<string>();
+    const isResident = (k: string) => meshes.has(k) || meshesE.has(k) || emptyChunks.has(k);
+
+    // Running total of resident vertices (opaque + transparent streams) — cheaper than summing over
+    // all meshes on every pump() call, and drives the H6 vertex budget below.
+    let residentVerts = 0;
+    let budgetLimited = false;
+
+    const disposeMesh = (k: string) => {
+      const m = meshes.get(k);
+      if (m) {
+        residentVerts -= m.geometry.attributes.position?.count ?? 0;
+        scene.remove(m);
+        m.geometry.dispose();
+        meshes.delete(k);
+      }
+      const mt = meshesT.get(k);
+      if (mt) {
+        residentVerts -= mt.geometry.attributes.position?.count ?? 0;
+        scene.remove(mt);
+        mt.geometry.dispose();
+        meshesT.delete(k);
+      }
+      const me = meshesE.get(k);
+      if (me) {
+        residentVerts -= me.geometry.attributes.position?.count ?? 0;
+        scene.remove(me);
+        me.geometry.dispose();
+        meshesE.delete(k);
+      }
+      emptyChunks.delete(k);
+      invalidate();
+    };
 
     // Bounded-concurrency fetch queue. The streaming sweep can need ~100 chunks; firing them all at
     // once floods the IPC bridge and the world mutex (each get_chunk_geometry locks it), tanking fps.
@@ -231,42 +780,122 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     let active = 0;
     let queue: { cx: number; cy: number }[] = [];
 
+    // Monotonic generation counter + per-key stale set: a fetch that resolves after its chunk was
+    // force-reloaded (edit) or the whole cache was invalidated (texture/lighting toggle) must not
+    // install its result — it may predate the change it's racing against. `fetchGen` invalidates
+    // every in-flight fetch at once (reloadAllChunks); `staleKeys` invalidates one specific in-flight
+    // fetch (reloadChunk) without bumping the generation for everything else.
+    let fetchGen = 0;
+    const staleKeys = new Set<string>();
+
     const startFetch = (cxk: number, cyk: number) => {
       const k = key(cxk, cyk);
-      if (inflight.has(k) || meshes.has(k)) return;
+      if (inflight.has(k) || isResident(k)) return;
       inflight.add(k);
       active++;
       setLoadingCountRef.current(inflight.size);
-      invoke<ChunkGeom>("get_chunk_geometry", { cx: cxk, cy: cyk })
+      const gen = fetchGen;
+      invoke<ChunkGeom>("get_chunk_geometry", { cx: cxk, cy: cyk, night: nightLightingRef.current, shadows: shadows3dRef.current, sunT: sunTRef.current, gpu: gpuShadowsRef.current, lampRadius: lampRadiusRef.current })
         .then((g) => {
           if (disposed) return;
+          if (gen !== fetchGen || staleKeys.has(k)) return; // stale — dropped; finally{} requeues if needed
           disposeMesh(k); // replace any existing mesh (reload path)
-          if (g.vertex_count === 0) { meshes.set(k, EMPTY); return; }
-          const geom = new THREE.BufferGeometry();
-          geom.setAttribute("position", new THREE.BufferAttribute(decodeF32(g.positions), 3));
-          geom.setAttribute("color", new THREE.BufferAttribute(decodeF32(g.colors), 3));
-          // Add UV attribute when the pack is loaded (uvs is non-empty base64 string).
-          const hasUVs = g.uvs && g.uvs.length > 0;
-          if (hasUVs) {
-            geom.setAttribute("uv", new THREE.BufferAttribute(decodeF32(g.uvs), 2));
+          if (g.vertex_count > 0) {
+            const geom = new THREE.BufferGeometry();
+            geom.setAttribute("position", new THREE.BufferAttribute(decodeF32(g.positions), 3));
+            geom.setAttribute("color", new THREE.BufferAttribute(decodeF32(g.colors), 3));
+            // Add UV attribute when the pack is loaded (uvs is non-empty base64 string).
+            const hasUVs = g.uvs && g.uvs.length > 0;
+            if (hasUVs) {
+              geom.setAttribute("uv", new THREE.BufferAttribute(decodeF32(g.uvs), 2));
+            }
+            // No CPU normals: baked mode is unlit (shading is in the vertex colours), and GPU mode's
+            // Lambert materials use `flatShading` (normals derived in-shader). Voxel faces are exactly
+            // the flat-shading case, so this is visually identical to per-vertex normals here.
+            geom.computeBoundingSphere(); // cheap frustum-cull test per frame
+            const mesh = new THREE.Mesh(geom, pickMat(false, !!hasUVs));
+            mesh.castShadow = mesh.receiveShadow = gpuShadowsRef.current;
+            scene.add(mesh);
+            meshes.set(k, mesh);
+            residentVerts += g.vertex_count;
+          } else {
+            // Marks the chunk "fetched" even when it's air (or all-transparent, e.g. an all-water
+            // chunk went entirely into meshesT) — `isResident(k)` is what stops it from being refetched.
+            emptyChunks.add(k);
           }
-          // No computeVertexNormals — MeshBasicMaterial ignores normals; shading is baked into colours.
-          geom.computeBoundingSphere(); // cheap frustum-cull test per frame
-          const meshMat = (hasUVs && texMatRef.current) ? texMatRef.current : mat;
-          const mesh = new THREE.Mesh(geom, meshMat);
-          scene.add(mesh);
-          meshes.set(k, mesh);
+          if (g.vertex_count_t > 0) {
+            const geomT = new THREE.BufferGeometry();
+            geomT.setAttribute("position", new THREE.BufferAttribute(decodeF32(g.positions_t), 3));
+            // RGBA (itemSize 4) — Three.js reads a 4-component color attribute as vertex alpha too.
+            geomT.setAttribute("color", new THREE.BufferAttribute(decodeF32(g.colors_t), 4));
+            const hasUVsT = g.uvs_t && g.uvs_t.length > 0;
+            if (hasUVsT) {
+              geomT.setAttribute("uv", new THREE.BufferAttribute(decodeF32(g.uvs_t), 2));
+            }
+            geomT.computeBoundingSphere();
+            const meshT = new THREE.Mesh(geomT, pickMat(true, !!hasUVsT));
+            // Transparent blocks receive shadows, and in GPU mode also cast *patterned* ones via a
+            // customDepthMaterial (patchDepthAlpha): water/glass/flower discard in the shadow pass so
+            // light passes straight through (no shadow, as before), while fence casts — its weave tile
+            // punches a lattice when a texture pack is loaded (textured depth variant), else a solid
+            // fence shadow. A plain opaque castShadow would wrongly shadow-block glass and water.
+            meshT.receiveShadow = gpuShadowsRef.current;
+            meshT.castShadow = gpuShadowsRef.current;
+            meshT.customDepthMaterial = (hasUVsT && depthMatTexRef.current) ? depthMatTexRef.current : depthMatT;
+            scene.add(meshT);
+            meshesT.set(k, meshT);
+            residentVerts += g.vertex_count_t;
+          }
+          // Emissive stream (lamp faces, GPU mode only). Drawn with the UNLIT Basic material so lamps
+          // stay fullbright under the scene's dim night ambient — matching the baked path and the game.
+          // castShadow (lamps are solid); receiveShadow off (fullbright anyway). No normals needed
+          // (Basic is unlit; the shadow depth pass doesn't consume them meaningfully here).
+          if (g.vertex_count_e > 0) {
+            const geomE = new THREE.BufferGeometry();
+            geomE.setAttribute("position", new THREE.BufferAttribute(decodeF32(g.positions_e), 3));
+            geomE.setAttribute("color", new THREE.BufferAttribute(decodeF32(g.colors_e), 3));
+            const hasUVsE = g.uvs_e && g.uvs_e.length > 0;
+            if (hasUVsE) {
+              geomE.setAttribute("uv", new THREE.BufferAttribute(decodeF32(g.uvs_e), 2));
+            }
+            geomE.computeBoundingSphere();
+            const emissiveMat = (hasUVsE && texMatRef.current) ? texMatRef.current : mat;
+            const meshE = new THREE.Mesh(geomE, emissiveMat);
+            meshE.castShadow = true;
+            meshE.receiveShadow = false;
+            scene.add(meshE);
+            meshesE.set(k, meshE);
+            residentVerts += g.vertex_count_e;
+          }
           invalidate();
         })
         .catch(() => { /* no world / out of range */ })
-        .finally(() => { inflight.delete(k); active--; pump(); setLoadingCountRef.current(inflight.size); });
+        .finally(() => {
+          inflight.delete(k);
+          active--;
+          const wasStale = staleKeys.delete(k);
+          if (disposed) return;
+          if (wasStale) queue.unshift({ cx: cxk, cy: cyk }); // requeue immediately — its result was dropped
+          pump();
+          setLoadingCountRef.current(inflight.size);
+        });
     };
 
     const pump = () => {
+      // H6: once resident geometry crosses the vertex budget, stop pulling new chunks — the queue
+      // stays populated and resumes once eviction (moving the camera) frees headroom. Only calls
+      // setState on an actual transition so this doesn't re-render every pump() (called on every
+      // fetch completion).
+      const overBudget = residentVerts >= VERTEX_BUDGET;
+      if (overBudget !== budgetLimited) {
+        budgetLimited = overBudget;
+        setBudgetLimitedRef.current(overBudget);
+      }
+      if (overBudget) return;
       while (active < maxConcurrent() && queue.length) {
         const it = queue.shift()!;
         const k = key(it.cx, it.cy);
-        if (inflight.has(k) || meshes.has(k)) continue;
+        if (inflight.has(k) || isResident(k)) continue;
         startFetch(it.cx, it.cy);
       }
     };
@@ -286,43 +915,49 @@ const FlyView3D = forwardRef<FlyView3DRef, {
           const dx = cx2 - ccx, dy = cy - ccy;
           const d2 = dx * dx + dy * dy;
           if (d2 > r * r) continue;
-          if (meshes.has(key(cx2, cy)) || inflight.has(key(cx2, cy))) continue;
+          if (isResident(key(cx2, cy)) || inflight.has(key(cx2, cy))) continue;
           needed.push({ cx: cx2, cy, d2 });
         }
       }
       needed.sort((a, b) => a.d2 - b.d2);
       queue = needed;
       pump();
-      // Dispose far chunks (keep a small hysteresis margin).
-      const drop = r + 2;
-      for (const k of [...meshes.keys()]) {
+      // Dispose far chunks (keep a small hysteresis margin). Euclidean, matching the loading disc
+      // above (d2 <= r*r) — a Chebyshev/square test here would let chunks up to ~1.41r+2.8 away
+      // survive (the corners of the square), roughly doubling the resident set at large r.
+      const dropSq = (r + 2) * (r + 2);
+      for (const k of new Set([...meshes.keys(), ...emptyChunks])) {
         const [kx, ky] = k.split(",").map(Number);
-        if (Math.abs(kx - ccx) > drop || Math.abs(ky - ccy) > drop) {
-          if (meshes.get(k) === EMPTY) meshes.delete(k);
-          else disposeMesh(k);
+        const dx = kx - ccx, dy = ky - ccy;
+        if (dx * dx + dy * dy > dropSq) {
+          disposeMesh(k);
         }
       }
     };
 
-    // Forced reload (edit-sync): drop the cached mesh and re-queue it at the front for immediate fetch.
+    // Forced reload (edit-sync): drop the cached mesh and re-queue it at the front for immediate
+    // fetch. If a fetch for this chunk is already in flight, its (possibly pre-edit) result must not
+    // land — mark it stale so the .finally{} in startFetch drops it and requeues instead.
     const reloadChunk = (cxk: number, cyk: number) => {
       const k = key(cxk, cyk);
-      if (meshes.get(k) === EMPTY) meshes.delete(k);
-      else disposeMesh(k);
+      if (inflight.has(k)) {
+        staleKeys.add(k);
+        return; // requeued by startFetch's finally{} once the stale fetch resolves
+      }
+      disposeMesh(k);
       queue.unshift({ cx: cxk, cy: cyk });
       pump();
     };
 
-    // Reload all chunks — called when texture pack changes so meshes are rebuilt with new material.
+    // Reload all chunks — called when the texture pack or night/shadow lighting changes so meshes
+    // are rebuilt with the new material/lighting. Bumps `fetchGen` so any fetch already in flight
+    // (issued under the old pack/lighting) is dropped by startFetch instead of installing stale
+    // geometry; it naturally gets re-requested by the next streamSweep tick once its inflight entry
+    // clears (no explicit unshift needed here — everything is about to be re-swept anyway).
     const reloadAllChunks = () => {
-      // Leave in-flight fetches alone: zeroing `active`/`inflight` here lets their
-      // .finally push `active` negative, breaking the concurrency cap. They resolve
-      // against the current texMatRef, so their results are still valid.
+      fetchGen++;
       queue = [];
-      for (const k of [...meshes.keys()]) {
-        if (meshes.get(k) === EMPTY) meshes.delete(k);
-        else disposeMesh(k);
-      }
+      for (const k of new Set([...meshes.keys(), ...emptyChunks])) disposeMesh(k);
       streamSweep();
     };
 
@@ -336,51 +971,60 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     let lookDrag = false;
     let lastMx = 0, lastMy = 0;
 
-    const enterFly = () => {
-      // Seed yaw/pitch from the current look direction.
-      const dir = new THREE.Vector3();
-      camera.getWorldDirection(dir);
-      yaw = Math.atan2(-dir.x, -dir.z);
-      pitch = Math.asin(THREE.MathUtils.clamp(dir.y, -1, 1));
-      controls.enabled = false;
-      onFlyModeChangeRef.current?.(true);
-      // Best-effort pointer lock (free-look). Swallow rejection — drag-to-look covers the fallback.
-      const p = canvas.requestPointerLock() as unknown as Promise<void> | undefined;
-      if (p && typeof p.catch === "function") p.catch(() => {});
-      // CRITICAL: wake the render loop. The pane renders on demand, and the loop only self-sustains
-      // once a frame is already executing (frame() sets keepGoing while flying). If the scene was idle
-      // when fly mode engaged, nothing would schedule a frame — WASD/look would be silently dead until
-      // some unrelated event (a stream tick, resize) happened to invalidate. This made fly mode "stick".
-      invalidate();
-    };
-    const exitFly = () => {
-      controls.enabled = true;
-      lookDrag = false;
-      keys.clear(); // drop any held movement keys so the camera doesn't drift after exit
-      if (document.pointerLockElement === canvas) document.exitPointerLock();
-      flyModeRef.current = false;
-      setFlyMode(false);
-      onFlyModeChangeRef.current?.(false);
-    };
+    // Grab/release the OS cursor for look mode via the Tauri window (see set_cursor_lock in lib.rs).
+    // Fire-and-forget; swallow errors (e.g. no window focus) — the CSS `cursor:none` still applies.
+    const setNativeCursorLock = (locked: boolean) => { void invoke("set_cursor_lock", { locked }).catch(() => {}); };
 
-    const onPointerLockChange = () => {
-      // Fired only on real lock transitions. Acquire → element === canvas (stay). Release via Esc →
-      // element === null (exit). A silent lock *failure* raises pointerlockerror instead (handled
-      // below) and never fires this, so the drag-to-look fallback survives.
-      if (flyModeRef.current && document.pointerLockElement !== canvas) exitFly();
+    // Single transition function for every camera-mode change (Z key, pill button, Esc, reset).
+    const applyMode = (next: CamMode) => {
+      const prev = camModeRef.current;
+      if (next === prev) return;
+      const wasWalking = prev !== "orbit";
+      const nowWalking = next !== "orbit";
+
+      // Seed yaw/pitch from the live look direction the first time we leave orbit, so the view
+      // doesn't jump when mouselook/fly takes over.
+      if (!wasWalking && nowWalking) {
+        const dir = new THREE.Vector3();
+        camera.getWorldDirection(dir);
+        yaw = Math.atan2(-dir.x, -dir.z);
+        pitch = Math.asin(THREE.MathUtils.clamp(dir.y, -1, 1));
+        controls.enabled = false;
+      }
+
+      // Look mode grabs the OS cursor (frozen + hidden app-wide) until it exits; the other modes
+      // release it. Delta events keep flowing on macOS so mouselook still steers (see set_cursor_lock).
+      if (next === "look") setNativeCursorLock(true);
+      else if (prev === "look") setNativeCursorLock(false);
+
+      if (!nowWalking) {
+        controls.enabled = true;
+        lookDrag = false;
+        keys.clear(); // drop held movement keys so the camera doesn't drift after exit
+      }
+
+      camModeRef.current = next;
+      setCamMode(next);
+      flyModeRef.current = nowWalking;
+      if (wasWalking !== nowWalking) onFlyModeChangeRef.current?.(nowWalking);
+
+      // CRITICAL: wake the render loop. The pane renders on demand and the loop only self-sustains
+      // once a frame is executing (frame() sets keepGoing while walking). Without this, entering a
+      // walking mode from an idle scene leaves WASD/look silently dead until an unrelated event fires.
+      if (nowWalking) invalidate();
     };
-    document.addEventListener("pointerlockchange", onPointerLockChange);
-    // Lock refused (common in webviews): stay in fly mode — drag-to-look takes over.
-    const onPointerLockError = () => { /* keep fly mode; fall back to drag-to-look */ };
-    document.addEventListener("pointerlockerror", onPointerLockError);
+    const cycleMode = () => applyMode(CAM_MODE_CYCLE[camModeRef.current]);
+    cycleModeRef.current = cycleMode;
 
     const onMouseMove = (e: MouseEvent) => {
       if (!flyModeRef.current) return;
-      const locked = document.pointerLockElement === canvas;
       let dx: number, dy: number;
-      if (locked) {
+      if (camModeRef.current === "look") {
+        // Look mode: free mouselook from relative mouse motion. The OS cursor is grabbed, so the
+        // cursor is frozen but delta events keep arriving.
         dx = e.movementX; dy = e.movementY;
       } else if (lookDrag) {
+        // Fly mode: look only while a button is held.
         dx = e.clientX - lastMx; dy = e.clientY - lastMy;
         lastMx = e.clientX; lastMy = e.clientY;
       } else return;
@@ -391,9 +1035,11 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     };
     document.addEventListener("mousemove", onMouseMove);
 
-    // Drag-to-look fallback: press on the canvas in fly mode (when not pointer-locked) to look.
+    // Drag-to-look: press on the canvas in *fly* mode to look (look mode uses the grabbed cursor's
+    // continuous motion instead). Left button only (button 0) — capturing button 2 is unreliable in
+    // macOS WKWebView (see CLAUDE.md's MapCanvas note) and conflicts with right-click-to-place.
     const onCanvasDown = (e: PointerEvent) => {
-      if (!flyModeRef.current || document.pointerLockElement === canvas) return;
+      if (camModeRef.current !== "fly" || e.button !== 0) return;
       lookDrag = true; lastMx = e.clientX; lastMy = e.clientY;
       canvas.setPointerCapture(e.pointerId);
     };
@@ -401,30 +1047,197 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     canvas.addEventListener("pointerdown", onCanvasDown);
     canvas.addEventListener("pointerup", onCanvasUp);
 
+    // ---- Voxel picking (select / build) ------------------------------------------------------
+    //
+    // The ray is cast in Rust (`pick_block`, a voxel DDA over the world bytes), not with
+    // THREE.Raycaster: the raycaster would test every triangle of every loaded chunk mesh — millions
+    // at a large render distance — whereas the DDA visits ~50 voxels and needs no resident geometry
+    // (it can even pick a chunk the streamer hasn't loaded yet).
+    //
+    // Three.js (x, y, z) ↔ Eden (x = east, y = south, z = up) is the sign-free permutation
+    // (ex, ez, ey) that `obj_geometry_region` emits with. Direction transforms identically to
+    // position since the map is a pure axis swap. (Note: export.rs's `ov()` — the OBJ *file* writer —
+    // negates Y; that mapping does not apply here.)
+    const threeToEden = (v: THREE.Vector3) => ({ x: v.x, y: v.z, z: v.y });
+
+    const rayFwd = new THREE.Vector3();
+    const rayNdc = new THREE.Vector3();
+    /** Ray for the current cursor: the crosshair while flying, else the pointer position. */
+    const cursorRay = (clientX: number, clientY: number) => {
+      const o = threeToEden(camera.position);
+      if (flyModeRef.current) {
+        camera.getWorldDirection(rayFwd);
+      } else {
+        const r = canvas.getBoundingClientRect();
+        rayNdc.set(((clientX - r.left) / r.width) * 2 - 1, -((clientY - r.top) / r.height) * 2 + 1, 0.5);
+        rayNdc.unproject(camera);
+        rayFwd.copy(rayNdc).sub(camera.position).normalize();
+      }
+      const d = threeToEden(rayFwd);
+      return { ox: o.x, oy: o.y, oz: o.z, dx: d.x, dy: d.y, dz: d.z };
+    };
+
+    const pick = async (clientX: number, clientY: number): Promise<PickResult | null> => {
+      const r = cursorRay(clientX, clientY);
+      try {
+        return await invoke<PickResult | null>("pick_block", { ...r, maxDist: PICK_DIST });
+      } catch {
+        return null; // no world loaded, or a degenerate ray — treat as a miss
+      }
+    };
+
+    // Hover highlight: a single reused wireframe cube moved to the picked voxel. Allocated once —
+    // rebuilding an EdgesGeometry per pointermove would churn GPU buffers at 30Hz.
+    const hlGeom = new THREE.EdgesGeometry(new THREE.BoxGeometry(1.002, 1.002, 1.002));
+    const hlMat = new THREE.LineBasicMaterial({ color: 0xffffff, depthTest: false, transparent: true, opacity: 0.9 });
+    const highlight = new THREE.LineSegments(hlGeom, hlMat);
+    highlight.renderOrder = 999;
+    highlight.visible = false;
+    scene.add(highlight);
+
+    // The Eden voxel a right-click (place) acts on, given the picked block. Build mode places
+    // against the hit face, so the target is the empty neighbour `hit + normal` — that's what the
+    // highlight previews and what a right-click fills. Select mode acts on the hit voxel itself.
+    const clickTarget = (p: PickResult) =>
+      interact3dRef.current === "build"
+        ? { x: p.x + p.nx, y: p.y + p.ny, z: p.z + p.nz }
+        : { x: p.x, y: p.y, z: p.z };
+
+    const setHighlight = (p: PickResult | null) => {
+      const want = !!p && interact3dRef.current !== "none";
+      if (!want) {
+        if (highlight.visible) { highlight.visible = false; invalidate(); }
+        return;
+      }
+      // Highlight the placement cell in build mode (one off the face being pointed at, so the
+      // preview sits where a right-click's block will actually land); the hit voxel itself in select
+      // mode. Eden voxel (x,y,z) spans [x,x+1); its centre in Three coords is (x+.5, z+.5, y+.5).
+      const t = clickTarget(p!);
+      highlight.position.set(t.x + 0.5, t.z + 0.5, t.y + 0.5);
+      // Green = placement (build), blue = select — matches the overlay box colours.
+      hlMat.color.setHex(interact3dRef.current === "build" ? 0x22c55e : 0x60a5fa);
+      highlight.visible = true;
+      invalidate();
+    };
+
+    // Latest cursor position, so the highlight can follow the crosshair while flying (where the
+    // pointer is locked and never moves) as well as the pointer while orbiting.
+    let cursorX = 0, cursorY = 0;
+    let lastPickT = 0;
+    let pickInflight = false;
+    const refreshHighlight = async () => {
+      // In fly mode the crosshair is the cursor and the pointer may be locked (no pointerenter/leave,
+      // no meaningful clientX/Y), so hover isn't a precondition there.
+      if (interact3dRef.current === "none" || !(flyModeRef.current || hoverRef.current)) { setHighlight(null); return; }
+      const now = performance.now();
+      if (pickInflight || now - lastPickT < PICK_HOVER_MS) return;
+      lastPickT = now;
+      pickInflight = true;
+      try {
+        setHighlight(await pick(cursorX, cursorY));
+      } finally {
+        pickInflight = false;
+      }
+    };
+
+    // Click vs drag. Left-drag is look (fly, pointer-lock refused) or orbit-rotate, so a click only
+    // counts if the pointer barely moved and the press was short. This keeps build/select working in
+    // the drag-to-look fallback, which matters because pointer lock is exactly what webviews refuse.
+    let downX = 0, downY = 0, downT = 0, downBtn = -1;
+    const onPickDown = (e: PointerEvent) => {
+      downX = e.clientX; downY = e.clientY; downT = performance.now(); downBtn = e.button;
+    };
+    const isClick = (e: PointerEvent) =>
+      e.button === downBtn &&
+      performance.now() - downT < CLICK_SLOP_MS &&
+      Math.abs(e.clientX - downX) <= CLICK_SLOP_PX &&
+      Math.abs(e.clientY - downY) <= CLICK_SLOP_PX;
+
+    // Left-click. Select mode → pick a selection corner. Build mode → BREAK the picked block.
+    const onPickUp = async (e: PointerEvent) => {
+      if (e.button !== 0 || interact3dRef.current === "none" || !isClick(e)) return;
+      const hit = await pick(e.clientX, e.clientY);
+      if (!hit) return;
+      if (interact3dRef.current === "select") { onPickSelectRef.current?.(hit.x, hit.y, hit.z); return; }
+      onPickBreakRef.current?.(hit.x, hit.y, hit.z);
+    };
+
+    // Right-click → PLACE at the highlighted cell (the previewed hit+normal), so what a click does
+    // matches what the highlight showed. Refuses to place inside the camera's own voxel (you'd entomb
+    // yourself with no obvious way out). Bound to `contextmenu`, NOT button-2 pointer events: button 2
+    // is unreliable in macOS WKWebView (MapCanvas hit the same — see its context-menu note).
+    // preventDefault also suppresses the OS/webview menu over the 3D pane.
+    const onPickContext = async (e: MouseEvent) => {
+      e.preventDefault();
+      if (interact3dRef.current !== "build") return;
+      const hit = await pick(e.clientX, e.clientY);
+      if (!hit) return;
+      const t = clickTarget(hit); // build → placement cell
+      const c = threeToEden(camera.position);
+      if (Math.floor(c.x) === t.x && Math.floor(c.y) === t.y && Math.floor(c.z) === t.z) return;
+      onPickPlaceRef.current?.(t.x, t.y, t.z);
+    };
+
+    const onPickMove = (e: PointerEvent) => {
+      cursorX = e.clientX; cursorY = e.clientY;
+      void refreshHighlight();
+    };
+    // Pointer lock can synthesize a pointerleave; while flying the crosshair still has a target.
+    const onPickLeave = () => { if (!flyModeRef.current) setHighlight(null); };
+
+    canvas.addEventListener("pointerdown", onPickDown);
+    canvas.addEventListener("pointerup", onPickUp);
+    canvas.addEventListener("pointermove", onPickMove);
+    canvas.addEventListener("pointerleave", onPickLeave);
+    canvas.addEventListener("contextmenu", onPickContext);
+
     // In fly mode the wheel adjusts move speed (orbit zoom is disabled then anyway).
     const onWheel = (e: WheelEvent) => {
       if (!flyModeRef.current) return;
       e.preventDefault();
       const f = e.deltaY < 0 ? 1.15 : 1 / 1.15;
       speedMultRef.current = THREE.MathUtils.clamp(speedMultRef.current * f, 0.1, 12);
-      setFlySpeed(Math.round(speedMultRef.current * 10) / 10);
+      const rounded = Math.round(speedMultRef.current * 10) / 10;
+      setFlySpeed(rounded);
+      onFlySpeedChangeRef.current?.(rounded);
     };
     canvas.addEventListener("wheel", onWheel, { passive: false });
 
-    // Hover tracking gates the Z fly-toggle to this pane.
+    // Hover tracking gates the Z fly-toggle to this pane. Bound to the wrapper, not the canvas: the
+    // HUD overlays (sliders, toggles, the fly pill) sit on top of the canvas, so moving onto one of
+    // them fired pointerleave and cleared hoverRef — after which Z no longer entered fly mode. These
+    // events don't bubble and ignore child transitions, so the wrapper sees one enter and one leave.
     const onEnter = () => { hoverRef.current = true; };
     const onLeave = () => { hoverRef.current = false; };
-    canvas.addEventListener("pointerenter", onEnter);
-    canvas.addEventListener("pointerleave", onLeave);
+    wrap.addEventListener("pointerenter", onEnter);
+    wrap.addEventListener("pointerleave", onLeave);
 
     const onKeyDown = (e: KeyboardEvent) => {
+      // Ignore while a modal dialog owns the keyboard, or while focus is in a text-entry field (world
+      // name, prefab name/search, …) — App's own shortcut handler guards on both of these, but this
+      // listener is a separate `window` subscription that didn't, so typing "z" in a text field with
+      // the pointer resting over the 3D pane used to toggle fly mode out from under the user.
+      //
+      // "Text entry" deliberately excludes range/checkbox/button inputs. Testing `tagName === "INPUT"`
+      // also matched this pane's own render-distance and fly-speed sliders, which keep focus after a
+      // drag — so once you touched a slider, Z was dead for the rest of the session and only a world
+      // reload (remounting the pane) brought it back.
+      const t = e.target as HTMLElement | null;
+      const tag = t?.tagName;
+      const typing =
+        tag === "TEXTAREA" ||
+        t?.isContentEditable === true ||
+        (tag === "INPUT" && !NON_TEXT_INPUT_TYPES.has((t as HTMLInputElement).type));
+      if (anyModalOpenRef.current || typing) return;
       if (e.key.toLowerCase() === "z" && !e.repeat && !e.metaKey && !e.ctrlKey) {
-        // Toggle fly mode. Entering requires the pointer to be over this pane (so Z while working in
-        // another quad-view pane is ignored); exiting always works.
-        if (flyModeRef.current) { exitFly(); e.preventDefault(); }
-        else if (hoverRef.current) { flyModeRef.current = true; setFlyMode(true); enterFly(); e.preventDefault(); }
+        // Z cycles camera mode (orbit → look → fly → orbit). Advancing *into* a walking mode from
+        // orbit requires the pointer to be over this pane (so Z while working in another quad-view
+        // pane is ignored); once walking, Z keeps cycling regardless of hover.
+        if (flyModeRef.current || hoverRef.current) { cycleMode(); e.preventDefault(); }
         return;
       }
+      // Esc leaves any walking mode back to orbit (releasing the OS cursor grab if look mode held it).
+      if (flyModeRef.current && e.key === "Escape") { applyMode("orbit"); e.preventDefault(); return; }
       if (!flyModeRef.current) return;
       keys.add(e.key.toLowerCase());
       // Swallow movement keys so they don't trigger app shortcuts.
@@ -434,9 +1247,10 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     window.addEventListener("keydown", onKeyDown);
     window.addEventListener("keyup", onKeyUp);
 
-    // Losing window focus (alt-tab, pointer-lock transitions, devtools) can swallow the keyup for a
-    // held direction key, leaving it stuck in the set so the camera drifts indefinitely. Clear on blur.
-    const onBlur = () => { keys.clear(); lookDrag = false; };
+    // Losing window focus (alt-tab, devtools) can swallow the keyup for a held direction key, leaving
+    // it stuck in the set so the camera drifts indefinitely. Clear on blur. Also drop out of look
+    // mode — a persistent OS cursor grab would otherwise freeze the cursor in whatever app we tab to.
+    const onBlur = () => { keys.clear(); lookDrag = false; if (camModeRef.current === "look") applyMode("orbit"); };
     window.addEventListener("blur", onBlur);
 
     const fwd = new THREE.Vector3();
@@ -450,6 +1264,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     let prev = performance.now();
     let disposed = false;
     let lastEmitT = 0;
+    let lastEmitExternalT = 0;
     let lastEmitEX = NaN, lastEmitEY = NaN;
 
     // Orbit-controls "change" wakes the loop whenever the user drags/zooms; damping keeps it alive
@@ -465,6 +1280,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     // Hoisted function declaration so `invalidate` (defined above) can reference `frame` safely.
     function frame() {
       rafPending = false;
+      if (disposed) return;
       const now = performance.now();
       const dt = Math.min(0.05, (now - prev) / 1000);
       prev = now;
@@ -494,14 +1310,83 @@ const FlyView3D = forwardRef<FlyView3DRef, {
         if (controls.update()) keepGoing = true; // orbit damping still settling
       }
 
-      // Throttled camera-position broadcast (~10fps) so the top-down map can show an icon.
+      // Sky dome follows the camera so it reads as infinitely far.
+      skyDome.position.copy(camera.position);
+
+      // GPU-shadow sun follows the camera: the directional light sits up-sun of the camera and its
+      // ortho shadow box is sized to the loaded radius, so shadows cover what's on screen and move
+      // with the viewer. sunT only changes the direction here — free, no chunk reload.
+      if (gpuShadowsRef.current) {
+        const t = sunTRef.current;
+        sunDirThree(t, sunDirScratch);
+        const reach = Math.max(64, loadRadiusRef.current * 16); // world units of loaded terrain
+        sun.target.position.copy(camera.position);
+        sun.position.copy(camera.position).addScaledVector(sunDirScratch, reach * 1.5);
+        const sc = sun.shadow.camera as THREE.OrthographicCamera;
+        // Clamp the shadow-box half-extent so texel density (mapSize / 2·half) doesn't collapse at
+        // high render distance. Covering the full loaded radius with one map makes near shadows
+        // blocky; distant shadows are barely visible through fog anyway, so cap the self-shadowing
+        // radius and let a bigger map keep the near ones crisp.
+        const half = Math.min(reach, SHADOW_MAX_REACH) * 1.1;
+        const wantMapSize = loadRadiusRef.current > 16 ? 4096 : 2048;
+        if (sun.shadow.mapSize.x !== wantMapSize) {
+          sun.shadow.mapSize.set(wantMapSize, wantMapSize);
+          sun.shadow.map?.dispose();
+          sun.shadow.map = null; // force three.js to reallocate the shadow map at the new size
+        }
+        if (sc.right !== half) {
+          sc.left = -half; sc.right = half; sc.top = half; sc.bottom = -half;
+          sc.far = reach * 4;
+          sc.updateProjectionMatrix();
+        }
+        // Warm the sun toward orange as it nears the horizon (sunrise/sunset). `sin(pi·t)` is 1 at
+        // noon, →0 at the ends; `warmth` is the complement. Tints both the light and the disc.
+        const warmth = 1 - Math.sin(Math.PI * t);
+        sunColorScratch.setRGB(1, 1 - 0.3 * warmth, 1 - 0.62 * warmth);
+        sun.color.copy(sunColorScratch);
+        sunDiscMat.color.copy(sunColorScratch).lerp(WHITE, 0.3);
+        // Tint the ambient fill toward the warm sun colour at low sun so the whole scene reads
+        // sunrise/sunset instead of a warm sun over cold-white fill. Subtle (max 35% lerp); at noon
+        // warmth→0 so ambient stays neutral white. Cheap per-frame colour lerp.
+        ambient.color.copy(WHITE).lerp(sunColorScratch, warmth * 0.35);
+        // Disc sits just inside the sky dome (radius 4000), following the camera along the sun dir.
+        sunDisc.position.copy(camera.position).addScaledVector(sunDirScratch, 3600);
+
+        // GPU night: re-query the nearest lamps once the camera has moved a few blocks. frame() only
+        // runs while something is animating, so an idle camera never polls — no permanent render loop.
+        if (nightLightingRef.current && camera.position.distanceToSquared(lastNightQueryPos) > 16) {
+          updateNightLights();
+        }
+      }
+
+      // While flying, the crosshair's target changes as the camera moves — with the pointer locked
+      // there's no pointermove to drive it, so repick from the loop. Self-throttled to PICK_HOVER_MS.
+      if (flyModeRef.current && interact3dRef.current !== "none") void refreshHighlight();
+
+      // Throttled HUD update (~10fps) — a self-contained re-render of this pane only, cheap.
       if (now - lastEmitT >= 100) {
         const ex = camera.position.x, ey = camera.position.z; // Three.js Z = Eden Y
+        // Compass heading from the camera's forward direction (Eden north = Three.js −Z).
+        camera.getWorldDirection(fwd);
+        const ang = Math.atan2(fwd.x, -fwd.z); // 0 = north(−Z), +x = east
+        const dirs = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"];
+        const heading = dirs[(Math.round(ang / (Math.PI / 4)) + 8) % 8];
+        // Pushed straight into the leaf HUD's own state — a setState here would re-render the whole
+        // pane (and everything its render creates) ~10× a second while the camera moves.
+        hudRef.current?.set({ x: Math.round(ex), y: Math.round(ey), z: Math.round(camera.position.y), heading });
+        lastEmitT = now;
+      }
+      // Throttled camera-position broadcast to the parent (~3fps) so the top-down map can draw the
+      // camera dot. Deliberately slower than the HUD above: this bubbles into App-level state
+      // (setCam3dPos), which re-renders MapCanvas/Ribbon/SelectionInspector/FlyView3D itself on every
+      // update — a coarse map-dot position doesn't need 10Hz for that cost.
+      if (now - lastEmitExternalT >= 300) {
+        const ex = camera.position.x, ey = camera.position.z;
         if (ex !== lastEmitEX || ey !== lastEmitEY) {
           lastEmitEX = ex; lastEmitEY = ey;
           onCameraMoveRef.current?.(ex, ey);
         }
-        lastEmitT = now;
+        lastEmitExternalT = now;
       }
 
       if (wasDirty || keepGoing) {
@@ -511,21 +1396,32 @@ const FlyView3D = forwardRef<FlyView3DRef, {
         viewProj.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
         frustum.setFromProjectionMatrix(viewProj);
         for (const m of meshes.values()) {
-          if (m === EMPTY || !m.geometry.boundingSphere) continue;
+          if (!m.geometry.boundingSphere) continue;
+          m.visible = frustum.intersectsObject(m);
+        }
+        for (const m of meshesT.values()) {
+          if (!m.geometry.boundingSphere) continue;
+          m.visible = frustum.intersectsObject(m);
+        }
+        for (const m of meshesE.values()) {
+          if (!m.geometry.boundingSphere) continue;
           m.visible = frustum.intersectsObject(m);
         }
         renderer.render(scene, camera);
       }
 
       // Reschedule if fly/damping need more frames, or if invalidate() fired during this frame.
-      if (keepGoing || dirty) {
+      // Guarded on !rafPending: controls.update() above can synchronously dispatch "change" →
+      // invalidate(), which already scheduled a callback for next tick — scheduling a second one
+      // here would double the in-flight callback count every tick until damping settles.
+      if ((keepGoing || dirty) && !rafPending) {
         rafPending = true;
         raf = requestAnimationFrame(frame);
       }
     }
 
     const resetCamera = () => {
-      if (flyModeRef.current) exitFly();
+      if (flyModeRef.current) applyMode("orbit");
       const s = spawnXY();
       camera.position.set(s.x, maxZ + 60, s.y + 110);
       controls.target.set(s.x, Math.min(maxZ, 28), s.y);
@@ -546,25 +1442,64 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       invalidate();
     };
 
-    // ---- Overlay wireframe boxes ----
-    const overlayHelpers: THREE.Box3Helper[] = [];
+    // ---- Overlay boxes (selection / paste / extrude ghosts) ----
+    //
+    // A bare Box3Helper is a 1px depth-tested wireframe: it disappears behind terrain, has no
+    // interior, and its hue washes out against a lit voxel field. Each overlay is instead a group
+    // of three passes:
+    //   1. a translucent tinted body, depth-tested, so the enclosed blocks read as shaded;
+    //   2. solid edges where the box is unoccluded;
+    //   3. dimmer "x-ray" edges with depthTest off, so the box is still legible through terrain
+    //      while the opacity difference still communicates what's in front of what.
+    const overlayObjs: THREE.Object3D[] = [];
+    const overlayDisposables: { dispose: () => void }[] = [];
 
     const clearOverlays = () => {
-      for (const h of overlayHelpers) { scene.remove(h); (h.geometry as THREE.BufferGeometry).dispose(); }
-      overlayHelpers.length = 0;
+      for (const o of overlayObjs) scene.remove(o);
+      for (const d of overlayDisposables) d.dispose();
+      overlayObjs.length = 0;
+      overlayDisposables.length = 0;
     };
 
     const setOverlays = (ovs: Overlay3D[] | null) => {
       clearOverlays();
       if (!ovs) { invalidate(); return; }
       for (const ov of ovs) {
-        const box = new THREE.Box3(
-          new THREE.Vector3(...ov.min),
-          new THREE.Vector3(...ov.max),
-        );
-        const helper = new THREE.Box3Helper(box, new THREE.Color(ov.color));
-        scene.add(helper);
-        overlayHelpers.push(helper);
+        const min = new THREE.Vector3(...ov.min);
+        const max = new THREE.Vector3(...ov.max);
+        const size = new THREE.Vector3().subVectors(max, min);
+        const group = new THREE.Group();
+        group.position.copy(min).addScaledVector(size, 0.5);
+
+        const boxGeom = new THREE.BoxGeometry(size.x, size.y, size.z);
+        const edgeGeom = new THREE.EdgesGeometry(boxGeom);
+
+        const fillMat = new THREE.MeshBasicMaterial({
+          color: ov.color, transparent: true, opacity: OVERLAY_FILL_OPACITY,
+          depthWrite: false, side: THREE.DoubleSide, fog: false, toneMapped: false,
+        });
+        const fill = new THREE.Mesh(boxGeom, fillMat);
+        fill.renderOrder = 997;
+        group.add(fill);
+
+        const edgeMat = new THREE.LineBasicMaterial({
+          color: ov.color, transparent: true, opacity: 1, fog: false, toneMapped: false,
+        });
+        const edges = new THREE.LineSegments(edgeGeom, edgeMat);
+        edges.renderOrder = 998;
+        group.add(edges);
+
+        const xrayMat = new THREE.LineBasicMaterial({
+          color: ov.color, transparent: true, opacity: OVERLAY_XRAY_OPACITY,
+          depthTest: false, depthWrite: false, fog: false, toneMapped: false,
+        });
+        const xray = new THREE.LineSegments(edgeGeom, xrayMat);
+        xray.renderOrder = 999;
+        group.add(xray);
+
+        scene.add(group);
+        overlayObjs.push(group);
+        overlayDisposables.push(boxGeom, edgeGeom, fillMat, edgeMat, xrayMat);
       }
       invalidate();
     };
@@ -572,30 +1507,66 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     // Apply any overlays that were already set before scene init (e.g. selection exists at world-load).
     setOverlays(overlays3dRef.current);
 
-    sceneApi.current = { scene, camera, reloadChunk, reloadAllChunks, resetCamera, teleport, setOverlays };
+    sceneApi.current = {
+      scene, camera, reloadChunk, reloadAllChunks, resetCamera, teleport, setOverlays, setFog, setMaxDpr,
+      // Flip the scene lighting, then rebuild every chunk mesh (material + normals + flat-vs-baked
+      // geometry all differ between modes).
+      setGpuShadows: () => { applyGpuLighting(); reloadAllChunks(); },
+      updateGpuLighting: () => applyGpuLighting(),
+      refreshNightLights: () => updateNightLights(),
+      refresh: () => invalidate(),
+      clearHighlight: () => setHighlight(null),
+    };
 
     return () => {
       disposed = true;
+      // If the pane unmounts while in a walking mode (e.g. closing the 3D pane or quad view via a
+      // click), notify the parent — otherwise its flyActiveRef never clears and every editor keyboard
+      // shortcut stays disabled for the rest of the session. Also release any OS cursor grab so it's
+      // never left frozen app-wide.
+      if (flyModeRef.current) {
+        flyModeRef.current = false;
+        if (camModeRef.current === "look") setNativeCursorLock(false);
+        onFlyModeChangeRef.current?.(false);
+      }
       cancelAnimationFrame(raf);
       clearInterval(sweepInterval);
       controls.removeEventListener("change", invalidate);
       ro.disconnect();
-      document.removeEventListener("pointerlockchange", onPointerLockChange);
-      document.removeEventListener("pointerlockerror", onPointerLockError);
       document.removeEventListener("mousemove", onMouseMove);
       canvas.removeEventListener("wheel", onWheel);
-      canvas.removeEventListener("pointerenter", onEnter);
-      canvas.removeEventListener("pointerleave", onLeave);
+      wrap.removeEventListener("pointerenter", onEnter);
+      wrap.removeEventListener("pointerleave", onLeave);
+      cycleModeRef.current = null;
       canvas.removeEventListener("pointerdown", onCanvasDown);
       canvas.removeEventListener("pointerup", onCanvasUp);
+      canvas.removeEventListener("pointerdown", onPickDown);
+      canvas.removeEventListener("pointerup", onPickUp);
+      canvas.removeEventListener("pointermove", onPickMove);
+      canvas.removeEventListener("pointerleave", onPickLeave);
+      canvas.removeEventListener("contextmenu", onPickContext);
       window.removeEventListener("keydown", onKeyDown);
       window.removeEventListener("keyup", onKeyUp);
       window.removeEventListener("blur", onBlur);
-      if (document.pointerLockElement === canvas) document.exitPointerLock();
-      for (const k of [...meshes.keys()]) disposeMesh(k);
+      for (const k of new Set([...meshes.keys(), ...meshesT.keys(), ...meshesE.keys()])) disposeMesh(k);
       clearOverlays();
+      scene.remove(highlight);
+      hlGeom.dispose();
+      hlMat.dispose();
       mat.dispose();
+      matT.dispose();
+      matL.dispose();
+      matLT.dispose();
+      depthMatT.dispose();
+      sunDiscMat.dispose();
+      sun.shadow.map?.dispose();
+      skyDome.geometry.dispose();
+      skyMat.dispose();
       if (texMatRef.current) { texMatRef.current.dispose(); texMatRef.current = null; }
+      if (texMatTRef.current) { texMatTRef.current.dispose(); texMatTRef.current = null; }
+      if (texMatLRef.current) { texMatLRef.current.dispose(); texMatLRef.current = null; }
+      if (texMatLTRef.current) { texMatLTRef.current.dispose(); texMatLTRef.current = null; }
+      if (depthMatTexRef.current) { depthMatTexRef.current.dispose(); depthMatTexRef.current = null; }
       if (atlasTexRef.current) { atlasTexRef.current.dispose(); atlasTexRef.current = null; }
       controls.dispose();
       // dispose() only — do NOT forceContextLoss() here. The renderer binds to the fixed <canvas>
@@ -623,31 +1594,84 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     sceneApi.current?.setOverlays(overlays3d ?? null);
   }, [overlays3d]);
 
-  // Re-centre over the spawn target when it changes. The init effect only re-runs on world-size
-  // change, so a new world of identical dimensions would otherwise keep the old viewpoint.
+  // Leaving select/build mode strands a visible highlight box on the last picked voxel — the pane's
+  // own pointer handlers no longer run to clear it. Drop it here instead.
+  useEffect(() => {
+    if (interact3d === "none") sceneApi.current?.clearHighlight();
+  }, [interact3d]);
+
+  // Fog toggle / model / sky-color sync — avoids a full scene teardown/rebuild.
+  useEffect(() => {
+    sceneApi.current?.setFog(effectiveFogEnabled, effectiveFogColor());
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- effectiveFogColor is derived inline, not stable
+  }, [effectiveFogEnabled, fogSoft, world.sky, fogColorOverride, nightLighting]);
+
+  // Antialiasing toggle: bump the pixel ratio (supersampling gives AA-like smoothing without
+  // recreating the renderer, which can't toggle `antialias` live).
+  useEffect(() => {
+    sceneApi.current?.setMaxDpr(antialias ? 2 : MAX_DPR);
+  }, [antialias]);
+
+  // Re-centre over the spawn target on a new world load. The init effect only re-runs on world-size
+  // change, so a new world of identical dimensions would otherwise keep the old viewpoint. Keyed on
+  // `worldLoadToken` (bumped once per load) rather than spawnAt's coordinates — spawnAt also changes
+  // when the user sets/clears a spawn point mid-session (H1: that must not yank the camera / kick
+  // fly mode out, since resetCamera() calls applyMode("orbit")). spawnAtRef (kept current unconditionally
+  // above) still supplies the actual coordinates resetCamera() reads.
   useEffect(() => {
     sceneApi.current?.resetCamera();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [spawnAt?.x, spawnAt?.y]);
+  }, [worldLoadToken]);
 
-  // Edit sync: reload chunk meshes overlapping the last edit's top-down bounds.
+  // Edit sync: reload chunk meshes overlapping the last edit's top-down bounds. When night lighting
+  // or shadows are on, a placed lamp (LAMP_LIGHT_RADIUS) or a new occluder (SHADOW_RAY_STEPS, the
+  // shadow raymarch distance) can visibly affect blocks in the *next* chunk over — reloading only the
+  // chunk(s) the edit's own bounds touch would leave a lit/shadowed seam at that boundary until the
+  // camera flies away and back. Expand the reload rect by that reach, converted to whole chunks.
   useEffect(() => {
     const api = sceneApi.current;
     if (!api || !lastEdit) return;
-    const cx0 = Math.floor(lastEdit.x / 16);
-    const cy0 = Math.floor(lastEdit.y / 16);
-    const cx1 = Math.floor((lastEdit.x + Math.max(0, lastEdit.w - 1)) / 16);
-    const cy1 = Math.floor((lastEdit.y + Math.max(0, lastEdit.h - 1)) / 16);
+    // Lamp reach uses the live slider value (not the const) so a wider lamp radius reloads the wider
+    // seam; shadow reach stays the raymarch constant.
+    const reach = Math.max(
+      nightLighting ? lampRadiusRef.current : 0,
+      shadows3d ? lightConstantsRef.current.shadowRayScan : 0,
+    );
+    const chunkPad = Math.ceil(reach / 16);
+    const cx0 = Math.floor(lastEdit.x / 16) - chunkPad;
+    const cy0 = Math.floor(lastEdit.y / 16) - chunkPad;
+    const cx1 = Math.floor((lastEdit.x + Math.max(0, lastEdit.w - 1)) / 16) + chunkPad;
+    const cy1 = Math.floor((lastEdit.y + Math.max(0, lastEdit.h - 1)) / 16) + chunkPad;
     for (let cy = cy0; cy <= cy1; cy++)
       for (let cx = cx0; cx <= cx1; cx++)
         api.reloadChunk(cx, cy);
+    // GPU night: a placed/broken lamp changes the point-light set — re-query around the camera.
+    if (gpuShadowsRef.current && nightLighting) api.refreshNightLights();
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [editEpoch]);
+
+  // Auto-close the render-distance warning popover once distance drops back under the threshold
+  // (the icon itself disappears in that case, so this just tidies internal state).
+  useEffect(() => {
+    if (loadRadius <= RENDER_DISTANCE_WARN_THRESHOLD) setDistanceWarnOpen(false);
+  }, [loadRadius]);
+
+  // Escape dismisses the warning popover — it had no keyboard dismissal at all before.
+  useEffect(() => {
+    if (!distanceWarnOpen) return;
+    const onEsc = (e: KeyboardEvent) => { if (e.key === "Escape") setDistanceWarnOpen(false); };
+    window.addEventListener("keydown", onEsc);
+    return () => window.removeEventListener("keydown", onEsc);
+  }, [distanceWarnOpen]);
 
   // Texture pack sync: rebuild the DataTexture + material when the pack changes.
   useEffect(() => {
     if (atlasTexRef.current) { atlasTexRef.current.dispose(); atlasTexRef.current = null; }
     if (texMatRef.current) { texMatRef.current.dispose(); texMatRef.current = null; }
+    if (texMatTRef.current) { texMatTRef.current.dispose(); texMatTRef.current = null; }
+    if (texMatLRef.current) { texMatLRef.current.dispose(); texMatLRef.current = null; }
+    if (texMatLTRef.current) { texMatLTRef.current.dispose(); texMatLTRef.current = null; }
+    if (depthMatTexRef.current) { depthMatTexRef.current.dispose(); depthMatTexRef.current = null; }
     if (texturePack) {
       const { rgba, tile, rows } = texturePack;
       const tex = new THREE.DataTexture(
@@ -663,6 +1687,25 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       texMatRef.current = new THREE.MeshBasicMaterial({
         map: tex, vertexColors: true, side: THREE.DoubleSide,
       });
+      // Shares the same atlas texture as the opaque material; `transparent: true` lets the tile's
+      // own PNG alpha (e.g. a glass cutout) and the block's per-vertex alpha both composite.
+      texMatTRef.current = new THREE.MeshBasicMaterial({
+        map: tex, vertexColors: true, side: THREE.DoubleSide, transparent: true, depthWrite: false,
+      });
+      // Lit (Lambert) variants for GPU-shadow mode, sharing the same atlas texture. `flatShading` so
+      // no CPU normal pass is needed (see matL above).
+      texMatLRef.current = new THREE.MeshLambertMaterial({
+        map: tex, vertexColors: true, side: THREE.DoubleSide, flatShading: true,
+      });
+      texMatLTRef.current = new THREE.MeshLambertMaterial({
+        map: tex, vertexColors: true, side: THREE.DoubleSide, transparent: true, depthWrite: false, flatShading: true,
+      });
+      // Textured depth variant for the transparent stream's shadow: `alphaTest` on the atlas tile so a
+      // fence weave's transparent texels punch a lattice into the shadow; the vertex-alpha discard
+      // (patchDepthAlpha) still keeps water/glass/flower from casting at all.
+      const dm = new THREE.MeshDepthMaterial({ depthPacking: THREE.RGBADepthPacking, map: tex, alphaTest: 0.5 });
+      patchDepthAlpha(dm);
+      depthMatTexRef.current = dm;
     }
   }, [texturePack]);
 
@@ -672,33 +1715,63 @@ const FlyView3D = forwardRef<FlyView3DRef, {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [texEpoch]);
 
+  // Reload all chunk meshes when the night-lighting/shadow preview toggles change — but NOT in
+  // GPU-shadow mode, where geometry is flat and independent of night/shadows/sunT. That's what makes
+  // sunT free there: the per-frame sun-follow moves the light; no reload is needed.
+  useEffect(() => {
+    if (!gpuShadowsRef.current) { sceneApi.current?.reloadAllChunks(); return; }
+    // GPU mode: geometry is flat regardless of night/shadows/sunT, so no chunk reload. Re-apply the
+    // scene light state (a night toggle or lamp-radius change flips the point-light pool) then repaint.
+    sceneApi.current?.updateGpuLighting();
+    sceneApi.current?.refresh();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [lightEpoch]);
+
+  // Flip GPU-shadow mode: swap scene lighting + rebuild meshes (material/normals/flat geometry differ).
+  useEffect(() => {
+    sceneApi.current?.setGpuShadows(gpuShadows);
+  }, [gpuShadows]);
+
   return (
-    <div style={{ position: "relative", width: "100%", height: "100%", background: "#0a0f1e" }}>
+    <div ref={wrapRef} style={{ position: "relative", width: "100%", height: "100%", background: "#0a0f1e" }}>
       {/* Mode hint — pill badge style (A5) */}
       <div style={{
         position: "absolute", top: 6, left: 6, zIndex: 1, pointerEvents: "none",
         display: "flex", alignItems: "center", gap: 6,
       }}>
-        <span style={{
-          padding: "2px 7px", borderRadius: 10, fontSize: 10, fontWeight: 600, letterSpacing: "0.05em",
-          background: flyMode ? "rgba(52,211,153,0.18)" : "rgba(100,116,139,0.18)",
-          border: `1px solid ${flyMode ? "rgba(52,211,153,0.45)" : "rgba(100,116,139,0.35)"}`,
-          color: flyMode ? "#34d399" : "#94a3b8",
-        }}>
-          {flyMode ? "FLY" : "3D"}
-        </span>
-        {flyMode ? (
+        {/* Clickable mirror of the Z key — click to cycle orbit → look → fly. A discoverable way
+            into mouselook, and a way back when Z is being swallowed by whatever holds focus. */}
+        <button
+          type="button"
+          title={`Camera: ${camMode === "look" ? "mouselook" : camMode === "fly" ? "fly" : "orbit"} — click or press Z to cycle`}
+          onClick={(e) => { e.currentTarget.blur(); cycleModeRef.current?.(); }}
+          style={{
+            padding: "2px 7px", borderRadius: 10, fontSize: 10, fontWeight: 600, letterSpacing: "0.05em",
+            background: camMode !== "orbit" ? "rgba(52,211,153,0.18)" : "rgba(131,120,108,0.18)",
+            border: `1px solid ${camMode !== "orbit" ? "rgba(52,211,153,0.45)" : "rgba(131,120,108,0.35)"}`,
+            color: camMode !== "orbit" ? "#34d399" : "#afa69d",
+            pointerEvents: "auto", cursor: "pointer",
+          }}
+        >
+          {CAM_MODE_LABEL[camMode]}
+        </button>
+        {camMode === "look" ? (
+          <span style={{ fontSize: 9, color: "#6ee7b7", pointerEvents: "none", lineHeight: 1.6 }}>
+            WASD move · Space/E up · Ctrl/Q down · Shift boost<br />
+            mouse look (free) · scroll speed · Z or Esc exit
+          </span>
+        ) : camMode === "fly" ? (
           <span style={{ fontSize: 9, color: "#6ee7b7", pointerEvents: "none", lineHeight: 1.6 }}>
             WASD move · Space/E up · Ctrl/Q down · Shift boost<br />
             drag look · scroll speed · Z or Esc exit
           </span>
         ) : (
-          <span style={{ fontSize: 9, color: "#475569", pointerEvents: "none" }}>
-            drag to orbit · scroll zoom · Z to fly
+          <span style={{ fontSize: 9, color: "#61584f", pointerEvents: "none" }}>
+            drag to orbit · scroll zoom · Z for mouselook
           </span>
         )}
         {/* Speed indicator (A6) */}
-        {flyMode && (
+        {camMode !== "orbit" && (
           <span style={{
             padding: "1px 5px", borderRadius: 4, fontSize: 9, fontWeight: 700,
             background: "rgba(52,211,153,0.12)", border: "1px solid rgba(52,211,153,0.3)",
@@ -710,10 +1783,22 @@ const FlyView3D = forwardRef<FlyView3DRef, {
         {loadingCount > 0 && (
           <span style={{
             padding: "1px 5px", borderRadius: 4, fontSize: 9,
-            background: "rgba(100,116,139,0.12)", border: "1px solid rgba(100,116,139,0.25)",
-            color: "#64748b",
+            background: "rgba(131,120,108,0.12)", border: "1px solid rgba(131,120,108,0.25)",
+            color: "#83786c",
           }}>
             loading {loadingCount}…
+          </span>
+        )}
+        {budgetLimited && (
+          <span
+            title={`Resident chunk geometry hit the ${(VERTEX_BUDGET / 1e6).toFixed(0)}M vertex budget — streaming is paused until you fly away from some of it to free headroom.`}
+            style={{
+              padding: "1px 5px", borderRadius: 4, fontSize: 9,
+              background: "rgba(239,68,68,0.12)", border: "1px solid rgba(239,68,68,0.3)",
+              color: "#ef4444",
+            }}
+          >
+            render distance limited by memory
           </span>
         )}
       </div>
@@ -724,36 +1809,151 @@ const FlyView3D = forwardRef<FlyView3DRef, {
           display: "flex", alignItems: "center", gap: 4,
           padding: "2px 6px", cursor: "default",
         })}>
-          <span style={{ fontSize: 9, color: "#64748b", userSelect: "none" }}>R</span>
+          <span style={{ fontSize: 9, color: "#83786c", userSelect: "none" }} aria-hidden="true">R</span>
           <input
-            type="range" min={2} max={15} step={1} value={loadRadius}
+            type="range" min={2} max={MAX_RENDER_DISTANCE} step={1} value={loadRadius}
             onChange={e => {
               const v = Number(e.target.value);
               loadRadiusRef.current = v;
               setLoadRadius(v);
+              onRenderDistanceChangeRef.current?.(v);
+              // Fog distance derives from render distance — refresh it live as the slider moves.
+              sceneApi.current?.setFog(fogEnabledRef.current, fogColorRef.current);
             }}
             title={`Render distance: ${loadRadius} chunks`}
-            style={{ width: 60, cursor: "pointer", accentColor: "#64748b" }}
+            aria-label={`Render distance: ${loadRadius} chunks`}
+            style={{ width: 60, cursor: "pointer", accentColor: "#83786c" }}
           />
-          <span style={{ fontSize: 9, color: "#94a3b8", minWidth: 14, textAlign: "right", userSelect: "none" }}>{loadRadius}</span>
+          <span style={{ fontSize: 9, color: "#afa69d", minWidth: 14, textAlign: "right", userSelect: "none" }} aria-hidden="true">{loadRadius}</span>
+          {loadRadius > RENDER_DISTANCE_WARN_THRESHOLD && (
+            <div style={{ position: "relative", display: "flex" }}>
+              <button
+                onClick={() => setDistanceWarnOpen(o => !o)}
+                title={`High render distance (${loadRadius} chunks) can hurt performance — click for details`}
+                aria-label={`High render distance warning: ${loadRadius} chunks — click for details`}
+                aria-expanded={distanceWarnOpen}
+                aria-controls="fly3d-distance-warning"
+                style={{
+                  display: "flex", alignItems: "center", justifyContent: "center",
+                  width: 13, height: 13, borderRadius: "50%", border: "none", padding: 0,
+                  background: "rgba(239,68,68,0.18)", color: "#ef4444", fontSize: 9, fontWeight: 700,
+                  cursor: "pointer", lineHeight: 1,
+                }}
+              >!</button>
+              {distanceWarnOpen && (
+                <div
+                  id="fly3d-distance-warning"
+                  role="tooltip"
+                  style={{
+                    ...glassMenuPanel,
+                    position: "absolute", top: 18, right: 0, zIndex: 10,
+                    width: 200, padding: 8, fontSize: 10, lineHeight: 1.4,
+                    color: "#dad6d2", fontWeight: 400,
+                  }}>
+                  High render distance ({loadRadius} chunks) streams and keeps far more chunk geometry
+                  in memory and on the GPU, which can drop frame rate — especially while flying. Lower
+                  it if you notice stutter.
+                </div>
+              )}
+            </div>
+          )}
         </div>
+        {/* Fog/sky color override — editor viewer preference only, never written to world.sky */}
+        <div style={chromeButton({
+          display: "flex", alignItems: "center", gap: 4,
+          padding: "2px 6px", cursor: "default",
+        })}>
+          {/* Fog on/off — local override of the Settings default, doesn't touch world.sky */}
+          <button
+            onClick={() => setFogOverride(!effectiveFogEnabled)}
+            title={effectiveFogEnabled ? "Fog on — click to disable" : "Fog off — click to enable"}
+            aria-label={effectiveFogEnabled ? "Fog on — click to disable" : "Fog off — click to enable"}
+            style={chromeButton({
+              padding: "1px 5px", fontSize: 9,
+              color: effectiveFogEnabled ? "#afa69d" : "#61584f",
+            })}
+          >Fog {effectiveFogEnabled ? "✓" : "✗"}</button>
+          {/* Fog model — soft (exponential haze) vs hard (linear cut) */}
+          {effectiveFogEnabled && (
+            <button
+              onClick={() => setFogSoft(s => !s)}
+              title={fogSoft ? "Soft fog (exponential) — click for hard/linear" : "Hard fog (linear) — click for soft/exponential"}
+              aria-label={fogSoft ? "Soft exponential fog — click to switch to hard linear fog" : "Hard linear fog — click to switch to soft exponential fog"}
+              style={chromeButton({ padding: "1px 5px", fontSize: 9, color: "#afa69d" })}
+            >{fogSoft ? "∿" : "│"}</button>
+          )}
+          <input
+            type="color"
+            value={rgbToHex(effectiveFogColor())}
+            onChange={e => setFogColorOverride(e.target.value)}
+            title="Fog / sky color (editor view only — not saved to the world file)"
+            aria-label="Fog and sky color (editor view only — not saved to the world file)"
+            style={{ width: 20, height: 16, padding: 0, border: "none", background: "none", cursor: "pointer" }}
+          />
+          {fogColorOverride && (
+            <button
+              onClick={() => setFogColorOverride(null)}
+              title="Reset to world sky color"
+              aria-label="Reset fog color to the world's own sky color"
+              style={chromeButton({ padding: "1px 5px", fontSize: 9, color: "#afa69d" })}
+            >↺</button>
+          )}
+        </div>
+        <button
+          onClick={() => setAntialias(a => !a)}
+          title={antialias ? "Antialiasing on — click to disable" : "Antialiasing off — click to enable (higher GPU cost)"}
+          aria-label={antialias ? "Antialiasing on — click to disable" : "Antialiasing off — click to enable (higher GPU cost)"}
+          style={chromeButton({ padding: "2px 7px", fontSize: 10, color: antialias ? "#afa69d" : "#61584f" })}
+        >AA {antialias ? "✓" : "✗"}</button>
         <button
           onClick={() => sceneApi.current?.resetCamera()}
           title="Reset camera to world overview"
-          style={chromeButton({ padding: "2px 7px", fontSize: 10, color: "#94a3b8" })}
+          aria-label="Reset camera to world overview"
+          style={chromeButton({ padding: "2px 7px", fontSize: 10, color: "#afa69d" })}
         >⌂ Reset</button>
       </div>
-      {flyMode && (
-        // Centre crosshair (fly mode hides the cursor via pointer-lock).
+      {camMode !== "orbit" && (
+        // Centre crosshair — the aim point for movement and for 3D picking in both walking modes.
         <div style={{
           position: "absolute", top: "50%", left: "50%", transform: "translate(-50%,-50%)",
           zIndex: 1, pointerEvents: "none", color: "rgba(52,211,153,0.8)",
           fontSize: 16, fontWeight: 400, lineHeight: 1,
         }}>+</div>
       )}
+      {/* Camera position / heading HUD (Eden coords) */}
+      <CoordHud ref={hudRef} />
+      {/* Armed-block swatch + interaction hint — so what a click will do is visible without
+          glancing back at the Ribbon's tool/fill pickers. */}
+      {interact3d !== "none" && (
+        <div style={{
+          position: "absolute", bottom: 6, right: 6, zIndex: 1, pointerEvents: "none",
+          display: "flex", alignItems: "center", gap: 6,
+          padding: "3px 7px", borderRadius: 4, fontSize: 9,
+          background: "rgba(31,28,26,0.7)", border: "1px solid rgba(131,120,108,0.3)", color: "#afa69d",
+        }}>
+          {interact3d === "build" && armedSwatch && (
+            <img src={armedSwatch} alt="" width={14} height={14} style={{ imageRendering: "pixelated", borderRadius: 2 }} />
+          )}
+          <span>
+            {interact3d === "select"
+              ? "click 2 corners to select"
+              : `L break · R place${armedLabel ? ` ${armedLabel}` : ""}`}
+          </span>
+        </div>
+      )}
       <canvas
         ref={canvasRef}
-        style={{ display: "block", width: "100%", height: "100%", touchAction: "none", cursor: flyMode ? "move" : "grab" }}
+        tabIndex={0}
+        role="img"
+        aria-label={camMode === "look"
+          ? "3D mouselook view. WASD to move, Space or E up, Control or Q down, Shift to boost, move the mouse to look, scroll to change speed, Z or Escape to exit."
+          : camMode === "fly"
+            ? "3D fly-through view. WASD to move, Space or E up, Control or Q down, Shift to boost, drag to look, scroll to change speed, Z or Escape to exit."
+            : "3D orbit view of the world. Drag to orbit, scroll to zoom, Z to enter mouselook."}
+        style={{
+          display: "block", width: "100%", height: "100%", touchAction: "none",
+          cursor: camMode === "look" ? "none" : camMode === "fly" ? "move" : "grab",
+        }}
         onContextMenu={(e) => e.preventDefault()}
       />
     </div>

@@ -316,7 +316,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     const ctx = canvas.getContext("2d")!;
     const { x: vx, y: vy, scale } = viewRef.current;
 
-    ctx.fillStyle = "#14141e";
+    ctx.fillStyle = "#1e1814";
     ctx.fillRect(0, 0, canvas.width, canvas.height);
 
     ctx.save();
@@ -356,7 +356,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
       const cx = canvas.width / 2;
       const cy = canvas.height / 2;
       ctx.font = "13px monospace";
-      ctx.fillStyle = "#94a3b8";
+      ctx.fillStyle = "#afa69d";
       ctx.textAlign = "center";
       ctx.fillText("Loading full map…", cx, cy - 12);
       ctx.textAlign = "left";
@@ -665,7 +665,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
         const lx = Math.round(drag.cx * scale + vx);
         const ly = Math.round(drag.cy * scale + vy);
         ctx.font = "bold 13px monospace";
-        ctx.fillStyle = drag.delta > 0 ? "#fbbf24" : drag.delta < 0 ? "#60a5fa" : "#94a3b8";
+        ctx.fillStyle = drag.delta > 0 ? "#fbbf24" : drag.delta < 0 ? "#60a5fa" : "#afa69d";
         ctx.textAlign = "center";
         ctx.fillText(`${drag.delta > 0 ? "+" : ""}${drag.delta}`, lx, ly - 8);
         ctx.textAlign = "left";
@@ -727,7 +727,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
         ? `X ${pos.x}  Y ${pos.y}  ·  ${zoomPct}%`
         : `${zoomPct}%`;
       ctx.font = "12px monospace";
-      ctx.fillStyle = "rgba(100,116,139,0.85)";
+      ctx.fillStyle = "rgba(131,120,108,0.85)";
       ctx.textAlign = "right";
       ctx.fillText(label, canvas.width - 12, canvas.height - 12);
       ctx.textAlign = "left";

@@ -45,7 +45,9 @@ Pre-built installers for macOS (Apple Silicon + Intel universal), Windows, and L
 - **Axonometric (axo) view** — isometric-style perspective with an adjustable depth skew
 - **Full map mode** — renders the entire world into a single canvas for lag-free pan/zoom
 - **Quad view** — a Hammer/Radiant-style four-pane editor: top-down map + front and side slice/ortho viewports + a live 3D pane, with movable cut-planes, marquee selection, and in-viewport drawing
-- **3D fly-through** — a streaming Three.js view of the whole world; orbit with the mouse or press **Z** for WASD free-look flight; the camera position is shown as a dot on the top-down map and can be teleported by click or via the right-click menu
+- **3D fly-through** — a streaming Three.js view of the whole world with three camera modes (Orbit, Fly, and Minecraft-style Mouselook — press **Z** or click the corner pill to cycle); the camera position is shown as a dot on the top-down map and can be teleported by click or via the right-click menu
+- **Build and select in 3D** — a dedicated 3D tab switches the pane into Build mode (left-click breaks, right-click places, with a highlight box previewing the target cell) or Select mode (click two blocks to define a selection box); both go through the normal undo/redo system and stay in sync with the map and slice viewports
+- **Lighting previews** *(experimental)* — night lighting (lamp blocks cast a coloured glow matching their paint) and directional sun shadows with a time-of-day slider; an optional GPU shadow-map mode adds real-time point lights, a warming sun disc, and shadows that respect glass/water/fences. All performance-heavy and off by default
 - **Elevation preview panel** — resizable front and side cross-section of the current selection, with optional draw support
 
 ### Selecting & inspecting
@@ -139,14 +141,14 @@ Most actions live on the **Ribbon** — a tabbed toolbar (Home / Selection / Vie
 10. **Copy / paste** — Copy captures the selection. Switch to Paste and click to place. Use the **Selection** tab toggles for *No Air*, *Terrain*, *Rotate 90°*, *Flip X/Y*, and *Repeat*; expand **Advanced paste** for scatter and array modes.
 11. **Draw** — activate a draw tool (Pen / Brush / Rect / Ellipse) from the **Home** tab or keyboard. Pick a block from the hotbar or the picker. Enable *Mask* to restrict painting to a specific block type.
 12. **Quad view** — **View** tab → *Quad View* opens the four-pane editor (top-down + front/side slices + 3D). Drag the violet cut-lines to move the slice planes; left-drag in a slice with the Select tool to marquee-select; draw directly in a slice with any draw tool.
-13. **3D fly-through** — in quad view, toggle the **3D Pane** on (**View** tab). Orbit with the mouse, or hover the pane and press **Z** for WASD free-look flight (Space/E up, Ctrl/Q down, Shift to boost, wheel to change speed; Esc or Z to exit).
+13. **3D fly-through** — in quad view, toggle the **3D Pane** on (**View** tab). Orbit with the mouse, or hover the pane and press **Z** (or click the corner pill) to cycle Orbit → Mouselook → Fly (Space/E up, Ctrl/Q down, Shift to boost, wheel to change speed; Esc or Z to exit). The **3D** ribbon tab (shown while the pane is open) switches it into Build (left-click breaks, right-click places) or Select mode, and holds the lighting-preview toggles.
 14. **Elevation panel** — enable in the inspector to see a front/side cross-section of the selection. Clicking in the panel places blocks at the exact Z level you click.
 15. **Axo view** — **View** tab → render mode *Axo* switches to an isometric perspective; drag the Skew slider to change it.
 16. **Texture pack** — **View** tab → *Texture Pack* → Load a ZIP of block PNGs to texture the 3D views and picker swatches.
 17. **Template overlay** — **View** tab → *Template Overlay* → point at the game's `Eden.eden` file to show surrounding terrain behind a sparse world. **File** tab → *Expand from Template* bakes that terrain into a new world file.
 18. **Import Schematic** — **File** tab → *Import Schematic* lets you bring in a Minecraft build, remap blocks, and paste it in.
 19. **Export** — **File** tab → *Export* writes PNG, OBJ (+MTL), or JSON. OBJ/JSON export the current selection if one is active, otherwise the full world.
-20. **Save** — *Save* writes changes back to the original file, *Save As* writes to a new file. Saves are atomic — an interrupted save (crash, power loss) can't corrupt the file — and closing a world or quitting warns you first if you have unsaved changes. Toggle *Compressed* to write a `.eden.zip`.
+20. **Save** — *Save* writes changes back to the original file, *Save As* writes to a new file. Saves are atomic — an interrupted save (crash, power loss) can't corrupt the file — and closing a world, opening a different one, or quitting all warn you first if you have unsaved changes. Toggle *Compressed* to write a `.eden.zip`.
 21. **Upload** — **File** tab → *Upload* lets you share the current world to the Eden servers. A PNG thumbnail is required.
 22. **Right-click** — right-click the map for a context menu: set spawn here, copy, paste here, fill/delete/clear selection, teleport the 3D camera, and quick tool switches.
 

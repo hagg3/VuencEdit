@@ -69,8 +69,8 @@ If you want GitHub Actions to build installers (macOS `.dmg`, Windows `.msi`/`.e
 
 ```bash
 cd ~/VuencEdit
-git tag v0.7.1            # replace with your version
-git push origin v0.7.1
+git tag v1.0.0            # replace with your version
+git push origin v1.0.0
 ```
 
 **What happens next (automatically):**

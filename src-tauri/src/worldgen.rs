@@ -664,7 +664,7 @@ pub(crate) fn decorate(gen: &mut WorldGen, heights: &[u16], cfg: &NaturalConfig)
             // Trees & cacti (reuse the editor's natural canopy generators).
             if cfg.tree_density_denom > 0 {
                 let h = hash2(wx, wy, cfg.seed ^ 0x7777);
-                if on == 8 && h % cfg.tree_density_denom == 0 {
+                if on == 8 && h.is_multiple_of(cfg.tree_density_denom) {
                     // Need vertical headroom for trunk + canopy.
                     if surf_z + 10 < gen.t_height as i32 {
                         let mut rng = Rng64::new(h | 1);
@@ -681,7 +681,7 @@ pub(crate) fn decorate(gen: &mut WorldGen, heights: &[u16], cfg: &NaturalConfig)
                     }
                     continue;
                 }
-                if b == 1 && on == 4 && h % (cfg.tree_density_denom * 2) == 0 {
+                if b == 1 && on == 4 && h.is_multiple_of(cfg.tree_density_denom * 2) {
                     place_cactus(gen, wx, wy, surf_z, h);
                     continue;
                 }
@@ -1548,7 +1548,7 @@ pub(crate) fn classic_decorate(gen: &mut WorldGen, heights: &[u16], cfg: &Classi
             for y in lo..=hi {
                 if gen.get(wx, wy, y) == 0 && gen.get(wx, wy, y - 1) == 3 {
                     let r = rng.next();
-                    let want_flower = cfg.flowers && r % CLASSIC_FLOWER_SPARSITY == 0;
+                    let want_flower = cfg.flowers && r.is_multiple_of(CLASSIC_FLOWER_SPARSITY);
                     // ~40% tall grass / weeds (≤ 50% of the surface), rest plain
                     // grass; flowers always stand on plain grass.
                     let base: u8 = if !want_flower && (r >> 20) % 5 < 2 { 11 } else { 8 };
@@ -1591,7 +1591,7 @@ pub(crate) fn place_classic_tree(gen: &mut WorldGen, x: i32, z: i32, y: i32, rng
                 if edge {
                     let corner = (i == x - 2 || i == x + 2) && (j == z - 2 || j == z + 2);
                     if corner && (k == k0 || k == k1 - 1) { continue; } // trim canopy corners
-                    if rng.next() % 2 != 0 { continue; }
+                    if !rng.next().is_multiple_of(2) { continue; }
                 }
                 gen.set(i, j, k, 5);
                 gen.set_paint(i, j, k, color);
@@ -1607,7 +1607,7 @@ pub(crate) fn classic_place_trees(gen: &mut WorldGen, heights: &[u16], cfg: &Cla
     let t = gen.t_height as i32;
     for wy in 0..bh as i32 {
         for wx in 0..bw as i32 {
-            if rng.next() % cfg.tree_spacing != 0 { continue; }
+            if !rng.next().is_multiple_of(cfg.tree_spacing) { continue; }
             let h = heights[(wy as usize) * bw + wx as usize] as i32;
             // Find the highest grass / weeds block near the surface.
             let top = (h + 1).min(t - 1);
@@ -1630,7 +1630,7 @@ pub(crate) fn place_classic_clouds(gen: &mut WorldGen, cfg: &ClassicConfig, rng:
     let t = gen.t_height as i32;
     for cy in 0..gen.hc {
         for cx in 0..gen.wc {
-            if rng.next() % 5 != 0 { continue; }
+            if !rng.next().is_multiple_of(5) { continue; }
             let num = (rng.next() % 4) + 4; // 4..7 blobs
             for _ in 0..num {
                 let x  = (rng.next() % 7) as i32;
@@ -1791,7 +1791,7 @@ pub(crate) fn write_world_file(
     }
     let mut header = vec![0u8; 192];
     header[32..36].copy_from_slice(&(ptr_table_offset as u32).to_le_bytes());
-    let nb = name.as_bytes().len().min(35);
+    let nb = name.len().min(35);
     header[40..40 + nb].copy_from_slice(&name.as_bytes()[..nb]);
     // version field at offset 92 (int, LE). Must be 1–1000 or the game applies
     // legacy block-ID conversion. The value also selects the column format the
@@ -1960,7 +1960,7 @@ pub(crate) fn tg2_make_tree(g: &mut Tg2Grid, x: i32, z: i32, y: i32, rng: &mut R
         let (nx,nz,ny)=(x+dx,z+dz,y+dy);
         if g.get(nx,nz,ny)==6 { continue; }
         if dx.abs()==2&&dz.abs()==2&&(dy==2*th_i/3||dy==th_i-1) { continue; }
-        if (dx.abs()==2||dz.abs()==2) && rng.next()%2==0 { continue; }
+        if (dx.abs()==2||dz.abs()==2) && rng.next().is_multiple_of(2) { continue; }
         g.put(nx,nz,ny,5,lc);
     }}}
 }
@@ -1973,7 +1973,7 @@ pub(crate) fn tg2_make_tree2(g: &mut Tg2Grid, x: i32, z: i32, y: i32, hh: i32, r
         let (nx,nz,ny)=(x+dx,z+dz,y+dy);
         if g.get(nx,nz,ny)==6 { continue; }
         if dx.abs()==2&&dz.abs()==2&&(dy==2*th_i/3||dy==th_i-1) { continue; }
-        if (dx.abs()==2||dz.abs()==2) && rng.next()%2==0 { continue; }
+        if (dx.abs()==2||dz.abs()==2) && rng.next().is_multiple_of(2) { continue; }
         g.put(nx,nz,ny,5,lc);
     }}}
 }
@@ -2049,7 +2049,7 @@ pub(crate) fn tg2_make_river_trees(g: &mut Tg2Grid, noise: &ClassicNoise, seed: 
     for x in (sx+4)..(ex-4) { for z in (sz+4)..(ez-4) {
         for y in 4..(th-g.sv(10)) {
             if g.get(x,z,y)==3&&g.get(x,z,y+1)==0 {
-                if rng.next()%70==0 { tg2_make_tree2(g,x,z,y,12,rng); }
+                if rng.next().is_multiple_of(70) { tg2_make_tree2(g,x,z,y,12,rng); }
                 break;
             }
         }
@@ -2069,8 +2069,8 @@ pub(crate) fn tg2_make_mountains(g: &mut Tg2Grid, noise: &ClassicNoise, seed: f6
     for x in sx..ex { for z in sz..ez {
         for y in snowlevel..th {
             let band=y-snowlevel;
-            let skip = if band<b4 { rng.next()%2==0 }
-                       else if band<b6 { rng.next()%2==0 && rng.next()%2==0 }
+            let skip = if band<b4 { rng.next().is_multiple_of(2) }
+                       else if band<b6 { rng.next().is_multiple_of(2) && rng.next().is_multiple_of(2) }
                        else { false };
             if skip { continue; }
             if g.get(x,z,y)==0&&y>0&&g.get(x,z,y-1)==2 {
@@ -2199,7 +2199,7 @@ pub(crate) fn tg2_make_beach(g: &mut Tg2Grid, noise: &ClassicNoise, seed: f64, r
     for x in (sx+4)..(ex-4) { for z in (sz+4)..(ez-4) {
         for y in sealevel..(th-g.sv(10)) {
             if g.get(x,z,y)==8&&g.get(x,z,y+1)==0 {
-                if rng.next()%90==0 { tg2_make_palm(g,x,z,y,4,rng); }
+                if rng.next().is_multiple_of(90) { tg2_make_palm(g,x,z,y,4,rng); }
                 break;
             }
         }
@@ -2207,7 +2207,7 @@ pub(crate) fn tg2_make_beach(g: &mut Tg2Grid, noise: &ClassicNoise, seed: f64, r
 }
 
 // makeDesert: flat sand with pyramid structures
-pub(crate) fn tg2_make_desert(g: &mut Tg2Grid, noise: &ClassicNoise, seed: f64, rng: &mut Rng64, sx: i32, sz: i32, ex: i32, ez: i32, pyramid_freq: u32) {
+pub(crate) fn tg2_make_desert(g: &mut Tg2Grid, _noise: &ClassicNoise, _seed: f64, rng: &mut Rng64, sx: i32, sz: i32, ex: i32, ez: i32, pyramid_freq: u32) {
     let th=g.t_height as i32;
     let h=th/2-g.sv(10); // flat (AMPLITUDE=0)
     let water_top=g.sea_level(17);
@@ -2274,7 +2274,7 @@ pub(crate) fn tg2_make_classic_gen(g: &mut Tg2Grid, noise: &ClassicNoise, seed: 
 // Structures
 pub(crate) fn tg2_make_pyramid(g: &mut Tg2Grid, cx: i32, cz: i32, h: i32) {
     let th=g.t_height as i32;
-    let mut starty=th-1; let mut found=false;
+    let starty=th-1; let mut found=false;
     'f: while starty>5 {
         for sx in (cx-h)..cx+h { for sz in (cz-h)..cz+h {
             let bt=g.get(sx,sz,starty);
@@ -2317,7 +2317,7 @@ pub(crate) fn tg2_make_pyramid2(g: &mut Tg2Grid, cx: i32, cz: i32, h: i32, _colo
     }
 }
 pub(crate) fn tg2_make_volcano(g: &mut Tg2Grid, cx: i32, cz: i32, base_y: i32, start_radius: i32, rng: &mut Rng64) {
-    let th=g.t_height as i32;
+    let _th=g.t_height as i32;
     let mut h=1i32;
     for radius in (1..=start_radius).rev() {
         h+=1; let w=5i32; let r2=radius+w;
@@ -2343,7 +2343,7 @@ pub(crate) fn tg2_make_sky_island(g: &mut Tg2Grid, cx: i32, cz: i32, r: i32, rng
             let ny=cy+y; if ny<=1||ny>=th { continue; }
             if y==-r/2 {
                 g.put(cx+x,cz+z,ny,8,0);
-                if x*x+z*z+y*y<(r-1)*(r-1)&&rng.next()%90==0 { tg2_make_palm(g,cx+x,cz+z,ny,4,rng); }
+                if x*x+z*z+y*y<(r-1)*(r-1)&&rng.next().is_multiple_of(90) { tg2_make_palm(g,cx+x,cz+z,ny,4,rng); }
             } else { g.put(cx+x,cz+z,ny,4,tg2_cc3(ny,1)); }
         }
     }}}
@@ -2424,7 +2424,7 @@ pub(crate) fn tg2_make_mix(g: &mut Tg2Grid, noise: &ClassicNoise, seed: f64, see
     for x in 2..gs/4-2 { for z in gs/2+2..3*gs/4-2 {
         for y in 1..th-1 {
             if (g.get(x,z,y)==8||g.get(x,z,y)==11)&&g.get(x,z,y+1)==0 {
-                if rng.next()%50==0 { tg2_make_tree(g,x,z,y+1,rng); }
+                if rng.next().is_multiple_of(50) { tg2_make_tree(g,x,z,y+1,rng); }
                 break;
             }
         }
@@ -2463,7 +2463,7 @@ pub(crate) fn tg2_make_mix(g: &mut Tg2Grid, noise: &ClassicNoise, seed: f64, see
     for x in 4..gs-4 { for z in 4..gs-4 {
         for y in 4..th-10 {
             if g.get(x,z,y)==8&&g.get(x,z,y+1)==0 {
-                if rng.next()%300==0 { tg2_make_tree2(g,x,z,y,12,rng); }
+                if rng.next().is_multiple_of(300) { tg2_make_tree2(g,x,z,y,12,rng); }
                 break;
             }
         }
@@ -2705,7 +2705,7 @@ pub(crate) fn generate_tg2_world(
     }
     if cfg.caves && cfg.terrain_type!=8 {
         report("Carving caves",0.70);
-        tg2_carve_caves(&mut g,&noise,seed as f64,cfg.tall_caves);
+        tg2_carve_caves(&mut g,&noise,seed,cfg.tall_caves);
     }
     if cfg.blend && cfg.terrain_type!=8 {
         report("Blending biomes",0.74);
@@ -2785,8 +2785,8 @@ pub(crate) fn preview_tg2_world(
     let noise=ClassicNoise::new(seed);
     let sf=seed as f64; let sf2=seed as f64+123.0;
     let cap=max_px.clamp(32,512) as usize;
-    let step=((gsize+cap-1)/cap).max(1);
-    let pw=(gsize+step-1)/step;
+    let step=gsize.div_ceil(cap).max(1);
+    let pw=gsize.div_ceil(step);
     let mut pixels=vec![0u8;pw*pw*4];
     let gs=gsize as i32;
     // Reflect the same vertical envelope the generator uses so the preview tracks

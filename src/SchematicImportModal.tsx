@@ -104,7 +104,7 @@ function edenBlockLabel(t: number): string {
 // ── Swatch ────────────────────────────────────────────────────────────────────
 
 function Swatch({ paint, size = 14 }: { paint: number; size?: number }) {
-  if (paint === 0) return <span style={{ color: "#64748b", fontSize: 11 }}>—</span>;
+  if (paint === 0) return <span style={{ color: "#83786c", fontSize: 11 }}>—</span>;
   const [r, g, b] = PAINT_COLORS[paint - 1] ?? [128, 128, 128];
   return (
     <span style={{
@@ -131,7 +131,7 @@ function BlockPicker({ current, onSelect, onClose }: {
       <button onClick={() => { onSelect(0); onClose(); }} style={{
         width: "100%", textAlign: "left",
         background: current === 0 ? "rgba(0,164,173,0.3)" : "none",
-        border: "none", color: "#94a3b8", padding: "2px 6px", fontSize: 11, cursor: "pointer",
+        border: "none", color: "#afa69d", padding: "2px 6px", fontSize: 11, cursor: "pointer",
       }}>Air (skip)</button>
       {BLOCK_DEFS.map(bd => (
         <button key={bd.type} onClick={() => { onSelect(bd.type); onClose(); }} title={bd.name}
@@ -167,8 +167,8 @@ function PaintPicker({ current, onSelect, onClose }: {
       <button onClick={() => { onSelect(0); onClose(); }} title="No paint" style={{
         width: 18, height: 18,
         background: current === 0 ? "rgba(0,164,173,0.4)" : "rgba(255,255,255,0.05)",
-        border: current === 0 ? "1px solid #00dde9" : "1px solid #334155",
-        borderRadius: 2, cursor: "pointer", fontSize: 9, color: "#64748b",
+        border: current === 0 ? "1px solid #00dde9" : "1px solid #4b443d",
+        borderRadius: 2, cursor: "pointer", fontSize: 9, color: "#83786c",
       }}>×</button>
       {PAINT_COLORS.map(([r, g, b], i) => {
         const p = i + 1;
@@ -221,7 +221,7 @@ function PreviewCanvas({ pixels, width, height }: { pixels: Uint8Array; width: n
       style={{
         width: Math.round(width * scale), height: Math.round(height * scale),
         imageRendering: "pixelated", display: "block",
-        border: "1px solid #1e293b", borderRadius: 4,
+        border: "1px solid #312c28", borderRadius: 4,
       }}
     />
   );
@@ -323,7 +323,7 @@ export default function SchematicImportModal({ info, path, onApply, onCancel, ap
       ? chromeButtonAccent(EDEN_TEAL, EDEN_TEAL_READABLE, {
           color: "#8beef5", padding: "3px 10px", fontSize: 11,
         })
-      : chromeButton({ color: "#94a3b8", padding: "3px 10px", fontSize: 11 });
+      : chromeButton({ color: "#afa69d", padding: "3px 10px", fontSize: 11 });
     return (
       <button onClick={() => setFilter(f)} style={style}>
         {label}{count !== undefined ? ` (${count})` : ""}
@@ -353,11 +353,11 @@ export default function SchematicImportModal({ info, path, onApply, onCancel, ap
             <div style={{ color: "#00dde9", fontWeight: 700, fontSize: 15, marginBottom: 5 }}>
               Import Minecraft {info.format === "litematic" ? "Litematica" : info.format === "schem" ? "Sponge Schematic" : "Schematic"}
             </div>
-            <div style={{ display: "flex", gap: 16, color: "#94a3b8", fontSize: 12, flexWrap: "wrap", alignItems: "center" }}>
+            <div style={{ display: "flex", gap: 16, color: "#afa69d", fontSize: 12, flexWrap: "wrap", alignItems: "center" }}>
               <span>MC: {info.mc_width}×{info.mc_length}×{info.mc_height}</span>
               <span>→ Eden: {info.eden_width}×{info.eden_height}×{info.eden_depth}</span>
               <span>{info.block_count.toLocaleString()} blocks</span>
-              <span style={{ color: "#64748b" }}>{info.unique_blocks.length} types</span>
+              <span style={{ color: "#83786c" }}>{info.unique_blocks.length} types</span>
             </div>
             {info.too_large && (
               <div style={{
@@ -372,12 +372,12 @@ export default function SchematicImportModal({ info, path, onApply, onCancel, ap
 
           {/* Substrate selector + filter bar */}
           <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
-            <span style={{ color: "#64748b", fontSize: 11 }}>Color blocks →</span>
+            <span style={{ color: "#83786c", fontSize: 11 }}>Color blocks →</span>
             <select
               value={colorSubstrate}
               onChange={e => handleSubstrateChange(Number(e.target.value))}
               style={{
-                ...recessedWell, background: "#0d1829", color: "#e2e8f0",
+                ...recessedWell, background: "#1e1b18", color: "#ebe9e7",
                 borderRadius: 4, padding: "2px 6px", fontSize: 11, cursor: "pointer",
               }}
             >
@@ -385,13 +385,13 @@ export default function SchematicImportModal({ info, path, onApply, onCancel, ap
                 <option key={o.type} value={o.type}>{o.label}</option>
               ))}
             </select>
-            <div style={{ width: 1, height: 16, background: "#1e293b", margin: "0 2px" }} />
+            <div style={{ width: 1, height: 16, background: "#312c28", margin: "0 2px" }} />
             {filterBtn("all", "All", rows.length)}
             {filterBtn("structural", "Structural", rows.filter(b => b.eden_type !== 0 && b.eden_paint === 0).length)}
             {filterBtn("color", "Color", rows.filter(b => b.eden_paint !== 0).length)}
             {filterBtn("unmapped", "Unmapped", nUnmapped)}
             <div style={{ flex: 1 }} />
-            <span style={{ color: "#64748b", fontSize: 11 }}>
+            <span style={{ color: "#83786c", fontSize: 11 }}>
               {nMapped} mapped · {nUnmapped} skipped
             </span>
           </div>
@@ -399,8 +399,8 @@ export default function SchematicImportModal({ info, path, onApply, onCancel, ap
           {/* Mapping table */}
           <div style={{ flex: 1, overflow: "auto", minHeight: 0, fontSize: 12 }}>
             <table style={{ width: "100%", borderCollapse: "collapse" }}>
-              <thead style={{ position: "sticky", top: 0, background: "#0d1829", zIndex: 1 }}>
-                <tr style={{ color: "#64748b", borderBottom: "1px solid #1e293b" }}>
+              <thead style={{ position: "sticky", top: 0, background: "#1e1b18", zIndex: 1 }}>
+                <tr style={{ color: "#83786c", borderBottom: "1px solid #312c28" }}>
                   <th style={{ textAlign: "left",  padding: "4px 8px", fontWeight: 600 }}>Minecraft Block</th>
                   <th style={{ textAlign: "right", padding: "4px 8px", fontWeight: 600 }}>Count</th>
                   <th style={{ textAlign: "left",  padding: "4px 8px", fontWeight: 600 }}>Eden Block</th>
@@ -415,14 +415,14 @@ export default function SchematicImportModal({ info, path, onApply, onCancel, ap
                   const isPaintOpen = openPop?.idx === origIdx && openPop.field === "paint";
                   return (
                     <tr key={b.mc_id} style={{
-                      borderBottom: "1px solid rgba(30,41,59,0.5)",
+                      borderBottom: "1px solid rgba(49,44,40,0.5)",
                       background: origIdx % 2 === 0 ? "rgba(255,255,255,0.02)" : "transparent",
                       opacity: isSkipped ? 0.45 : 1,
                     }}>
-                      <td style={{ padding: "3px 8px", color: "#e2e8f0" }}>
+                      <td style={{ padding: "3px 8px", color: "#ebe9e7" }}>
                         {mcBlockLabel(b.mc_id, info.format)}
                       </td>
-                      <td style={{ padding: "3px 8px", color: "#94a3b8", textAlign: "right",
+                      <td style={{ padding: "3px 8px", color: "#afa69d", textAlign: "right",
                           fontVariantNumeric: "tabular-nums" }}>
                         {b.count.toLocaleString()}
                       </td>
@@ -430,7 +430,7 @@ export default function SchematicImportModal({ info, path, onApply, onCancel, ap
                         <button
                           onClick={e => { e.stopPropagation(); setOpenPop(isTypeOpen ? null : { idx: origIdx, field: "type" }); }}
                           style={chromeButton({
-                            color: isSkipped ? "#64748b" : "#8beef5",
+                            color: isSkipped ? "#83786c" : "#8beef5",
                             padding: "1px 7px", fontSize: 11,
                             display: "flex", alignItems: "center", gap: 4,
                           })}
@@ -441,7 +441,7 @@ export default function SchematicImportModal({ info, path, onApply, onCancel, ap
                               borderRadius: 2, background: `rgb(${d.color.join(",")})` }} /> : null;
                           })()}
                           {edenBlockLabel(b.eden_type)}
-                          <span style={{ color: "#475569" }}>▾</span>
+                          <span style={{ color: "#61584f" }}>▾</span>
                         </button>
                         {isTypeOpen && (
                           <BlockPicker current={b.eden_type}
@@ -454,13 +454,13 @@ export default function SchematicImportModal({ info, path, onApply, onCancel, ap
                           <button
                             onClick={e => { e.stopPropagation(); setOpenPop(isPaintOpen ? null : { idx: origIdx, field: "paint" }); }}
                             style={chromeButton({
-                              color: "#e2e8f0",
+                              color: "#ebe9e7",
                               padding: "1px 7px", fontSize: 11,
                               display: "flex", alignItems: "center", gap: 4,
                             })}
                           >
                             <Swatch paint={b.eden_paint} />
-                            <span style={{ color: "#475569" }}>▾</span>
+                            <span style={{ color: "#61584f" }}>▾</span>
                           </button>
                         )}
                         {isPaintOpen && (
@@ -473,7 +473,7 @@ export default function SchematicImportModal({ info, path, onApply, onCancel, ap
                   );
                 })}
                 {filtered.length === 0 && (
-                  <tr><td colSpan={4} style={{ padding: 16, textAlign: "center", color: "#64748b" }}>
+                  <tr><td colSpan={4} style={{ padding: 16, textAlign: "center", color: "#83786c" }}>
                     No blocks match this filter.
                   </td></tr>
                 )}
@@ -483,7 +483,7 @@ export default function SchematicImportModal({ info, path, onApply, onCancel, ap
 
           {/* Preset bar */}
           <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
-            <span style={{ color: "#64748b", fontSize: 11 }}>Presets:</span>
+            <span style={{ color: "#83786c", fontSize: 11 }}>Presets:</span>
             <input
               value={presetName}
               onChange={e => setPresetName(e.target.value)}
@@ -491,11 +491,11 @@ export default function SchematicImportModal({ info, path, onApply, onCancel, ap
               placeholder="Name…"
               style={{
                 ...recessedWell,
-                width: 110, borderRadius: 4, color: "#e2e8f0", padding: "2px 7px", fontSize: 11, outline: "none",
+                width: 110, borderRadius: 4, color: "#ebe9e7", padding: "2px 7px", fontSize: 11, outline: "none",
               }}
             />
             <button onClick={handleSavePreset} disabled={!presetName.trim()} style={chromeButton({
-              color: presetName.trim() ? "#e2e8f0" : "#475569",
+              color: presetName.trim() ? "#ebe9e7" : "#61584f",
               padding: "2px 10px", fontSize: 11,
               cursor: presetName.trim() ? "pointer" : "not-allowed",
             })}>Save</button>
@@ -517,7 +517,7 @@ export default function SchematicImportModal({ info, path, onApply, onCancel, ap
                       <div key={p.name} style={{ display: "flex", alignItems: "center" }}>
                         <button onClick={() => handleLoadPreset(p)} style={{
                           flex: 1, textAlign: "left", background: "none", border: "none",
-                          color: "#e2e8f0", padding: "5px 12px", cursor: "pointer", fontSize: 12,
+                          color: "#ebe9e7", padding: "5px 12px", cursor: "pointer", fontSize: 12,
                         }}>{p.name}</button>
                         <button onClick={() => handleDeletePreset(p.name)} style={{
                           background: "none", border: "none", color: "#ef4444",
@@ -530,12 +530,12 @@ export default function SchematicImportModal({ info, path, onApply, onCancel, ap
               </div>
             )}
             <button onClick={resetToDefaults} style={chromeButton({
-              color: "#94a3b8", padding: "2px 10px", fontSize: 11,
+              color: "#afa69d", padding: "2px 10px", fontSize: 11,
             })}>Reset</button>
           </div>
 
           {/* Footer */}
-          <div style={{ color: "#475569", fontSize: 11 }}>
+          <div style={{ color: "#61584f", fontSize: 11 }}>
             Axis: MC X→Eden X, MC Z→Eden Y, MC Y→Eden Z. Use Rotate/Flip after paste to reorient.
           </div>
           <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", alignItems: "center" }}>
@@ -543,11 +543,11 @@ export default function SchematicImportModal({ info, path, onApply, onCancel, ap
               onClick={handlePreview}
               disabled={previewing}
               style={chromeButton({
-                color: previewing ? "#64748b" : "#94a3b8",
+                color: previewing ? "#83786c" : "#afa69d",
                 padding: "7px 14px", fontSize: 13, cursor: previewing ? "not-allowed" : "pointer",
               })}
             >{previewing ? "Loading…" : showPreview ? "Refresh Preview" : "Preview"}</button>
-            <button onClick={onCancel} style={chromeButton({ color: "#94a3b8", padding: "7px 18px", fontSize: 13 })}>Cancel</button>
+            <button onClick={onCancel} style={chromeButton({ color: "#afa69d", padding: "7px 18px", fontSize: 13 })}>Cancel</button>
             <button
               onClick={() => onApply(mapping)}
               disabled={applying}
@@ -565,7 +565,7 @@ export default function SchematicImportModal({ info, path, onApply, onCancel, ap
             display: "flex", flexDirection: "column", gap: 8, alignItems: "center",
             minWidth: 0, flexShrink: 0,
           }}>
-            <div style={{ color: "#64748b", fontSize: 11, alignSelf: "flex-start" }}>
+            <div style={{ color: "#83786c", fontSize: 11, alignSelf: "flex-start" }}>
               Top-down preview ({previewPixels.width}×{previewPixels.height})
             </div>
             <PreviewCanvas
@@ -576,7 +576,7 @@ export default function SchematicImportModal({ info, path, onApply, onCancel, ap
             <button
               onClick={() => { setShowPreview(false); setPreviewPixels(null); }}
               style={{
-                background: "none", border: "none", color: "#64748b",
+                background: "none", border: "none", color: "#83786c",
                 cursor: "pointer", fontSize: 11,
               }}
             >Hide preview</button>

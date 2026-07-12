@@ -13,6 +13,18 @@ export interface AppSettings {
   texturePackPath: string | null;
   /** Directory the Prefab Library panel scans for .epfab files. null = app-managed default (see get_default_prefab_dir). */
   prefabDirectory: string | null;
+  /** Distance fog in the 3D previews, matching the game's look. Default true (matches the game, which always fogs). */
+  enableFog: boolean;
+  /** 3D fly-view chunk render distance (radius in chunks). Persisted so it survives remounts. Default 5. */
+  renderDistance: number;
+  /** 3D fly-view fly-speed multiplier (wheel-adjustable in the pane). Persisted. Default 1. */
+  flySpeed: number;
+  // Night lighting / Shadows / GPU shadow map are NOT persisted: they're perf-heavy, session-only 3D
+  // view modes that always start off (Ribbon-only toggles; reset on world load/close in App.tsx).
+  /** Simulated sun position driving the shadow direction: 0=sunrise, 0.5=noon, 1=sunset. */
+  sunT: number;
+  /** Lamp light radius (blocks) for night lighting in the 3D fly-view. Default 5 (the legacy constant). */
+  lampRadius: number;
 }
 
 const DEFAULTS: AppSettings = {
@@ -22,6 +34,11 @@ const DEFAULTS: AppSettings = {
   templatePath: null,
   texturePackPath: null,
   prefabDirectory: null,
+  enableFog: true,
+  renderDistance: 5,
+  flySpeed: 1,
+  sunT: 0.5,
+  lampRadius: 5,
 };
 
 export function loadSettings(): AppSettings {
@@ -48,22 +65,22 @@ export function saveSettings(patch: Partial<AppSettings>) {
 }
 
 const modal: React.CSSProperties = glassPanel({
-  padding: "28px 32px", width: 480, borderRadius: 12, color: "#e2e8f0",
+  padding: "28px 32px", width: 480, borderRadius: 12, color: "#ebe9e7",
 });
 
 const sectionLabel: React.CSSProperties = {
   fontSize: 10, fontWeight: 700, letterSpacing: "0.1em",
-  color: "#475569", textTransform: "uppercase", marginBottom: 12,
+  color: "#61584f", textTransform: "uppercase", marginBottom: 12,
 };
 
 const row: React.CSSProperties = {
   display: "flex", alignItems: "center", justifyContent: "space-between",
-  padding: "10px 0", borderBottom: "1px solid #1e293b",
+  padding: "10px 0", borderBottom: "1px solid #312c28",
 };
 
 const labelCol: React.CSSProperties = { display: "flex", flexDirection: "column", gap: 2 };
-const labelText: React.CSSProperties = { fontSize: 14, color: "#e2e8f0" };
-const labelSub: React.CSSProperties = { fontSize: 12, color: "#64748b" };
+const labelText: React.CSSProperties = { fontSize: 14, color: "#ebe9e7" };
+const labelSub: React.CSSProperties = { fontSize: 12, color: "#83786c" };
 
 const expBadge: React.CSSProperties = {
   display: "inline-block", fontSize: 9, fontWeight: 700, letterSpacing: "0.06em",
@@ -80,7 +97,7 @@ function Toggle({ value, onChange }: { value: boolean; onChange: (v: boolean) =>
         width: 40, height: 22, borderRadius: 11, border: "none", cursor: "pointer",
         background: value
           ? `linear-gradient(180deg, rgba(${EDEN_TEAL},0.9) 0%, rgb(0,68,72) 100%)`
-          : "linear-gradient(180deg, rgb(51,65,85) 0%, rgb(38,48,64) 100%)",
+          : "linear-gradient(180deg, rgb(75,68,61) 0%, rgb(56,51,46) 100%)",
         boxShadow: "inset 0 0 0 1px rgba(0,0,0,.4)",
         position: "relative", flexShrink: 0,
         transition: "background 0.15s",
@@ -139,8 +156,8 @@ export default function SettingsModal({ onClose, onSave }: Props) {
           <button
             onClick={onClose}
             onMouseEnter={e => (e.currentTarget.style.color = EDEN_TEAL_READABLE)}
-            onMouseLeave={e => (e.currentTarget.style.color = "#64748b")}
-            style={{ background: "none", border: "none", color: "#64748b", fontSize: 20, cursor: "pointer", lineHeight: 1, transition: "color .1s" }}
+            onMouseLeave={e => (e.currentTarget.style.color = "#83786c")}
+            style={{ background: "none", border: "none", color: "#83786c", fontSize: 20, cursor: "pointer", lineHeight: 1, transition: "color .1s" }}
           >✕</button>
         </div>
 
@@ -158,7 +175,7 @@ export default function SettingsModal({ onClose, onSave }: Props) {
           <Toggle value={local.defaultQuadView} onChange={v => set("defaultQuadView", v)} />
         </div>
 
-        <div style={{ ...row, borderBottom: "none" }}>
+        <div style={row}>
           <div style={labelCol}>
             <span style={labelText}>
               Enable 3D pane by default
@@ -168,6 +185,18 @@ export default function SettingsModal({ onClose, onSave }: Props) {
           </div>
           <Toggle value={local.default3dPane} onChange={v => set("default3dPane", v)} />
         </div>
+
+        <div style={{ ...row, borderBottom: "none" }}>
+          <div style={labelCol}>
+            <span style={labelText}>Fog in 3D views</span>
+            <span style={labelSub}>Fades distant terrain like the game does; turn off to inspect far terrain</span>
+          </div>
+          <Toggle value={local.enableFog} onChange={v => set("enableFog", v)} />
+        </div>
+
+        {/* Night lighting / Shadows / GPU shadow map are perf-heavy, session-only view modes — they
+            live in the Ribbon's 3D/View Lighting group (⚡ badged) and always start off, so they're
+            deliberately not persisted defaults here. */}
 
         <div style={{ height: 20 }} />
 
@@ -191,7 +220,7 @@ export default function SettingsModal({ onClose, onSave }: Props) {
             }}>
               <div style={{
                 ...recessedWell,
-                flex: 1, fontSize: 12, color: local.templatePath ? "#94a3b8" : "#475569",
+                flex: 1, fontSize: 12, color: local.templatePath ? "#afa69d" : "#61584f",
                 borderRadius: 6,
                 padding: "5px 10px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
                 direction: "rtl", textAlign: "left",
@@ -210,7 +239,7 @@ export default function SettingsModal({ onClose, onSave }: Props) {
                 <button
                   onClick={() => set("templatePath", null)}
                   style={{
-                    background: "none", border: "none", color: "#475569",
+                    background: "none", border: "none", color: "#61584f",
                     fontSize: 16, cursor: "pointer", padding: "0 4px", lineHeight: 1, flexShrink: 0,
                   }}
                   title="Clear"
@@ -227,7 +256,7 @@ export default function SettingsModal({ onClose, onSave }: Props) {
             <div style={{ marginTop: 8, display: "flex", gap: 8, alignItems: "center" }}>
               <div style={{
                 ...recessedWell,
-                flex: 1, fontSize: 12, color: local.texturePackPath ? "#94a3b8" : "#475569",
+                flex: 1, fontSize: 12, color: local.texturePackPath ? "#afa69d" : "#61584f",
                 borderRadius: 6,
                 padding: "5px 10px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
                 direction: "rtl", textAlign: "left",
@@ -246,7 +275,7 @@ export default function SettingsModal({ onClose, onSave }: Props) {
                 <button
                   onClick={() => set("texturePackPath", null)}
                   style={{
-                    background: "none", border: "none", color: "#475569",
+                    background: "none", border: "none", color: "#61584f",
                     fontSize: 16, cursor: "pointer", padding: "0 4px", lineHeight: 1, flexShrink: 0,
                   }}
                   title="Clear"
@@ -263,7 +292,7 @@ export default function SettingsModal({ onClose, onSave }: Props) {
             <div style={{ marginTop: 8, display: "flex", gap: 8, alignItems: "center" }}>
               <div style={{
                 ...recessedWell,
-                flex: 1, fontSize: 12, color: local.prefabDirectory ? "#94a3b8" : "#475569",
+                flex: 1, fontSize: 12, color: local.prefabDirectory ? "#afa69d" : "#61584f",
                 borderRadius: 6,
                 padding: "5px 10px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
                 direction: "rtl", textAlign: "left",
@@ -282,7 +311,7 @@ export default function SettingsModal({ onClose, onSave }: Props) {
                 <button
                   onClick={() => set("prefabDirectory", null)}
                   style={{
-                    background: "none", border: "none", color: "#475569",
+                    background: "none", border: "none", color: "#61584f",
                     fontSize: 16, cursor: "pointer", padding: "0 4px", lineHeight: 1, flexShrink: 0,
                   }}
                   title="Clear"
@@ -296,7 +325,7 @@ export default function SettingsModal({ onClose, onSave }: Props) {
         <div style={{ display: "flex", justifyContent: "flex-end", gap: 10, marginTop: 28 }}>
           <button
             onClick={onClose}
-            style={chromeButton({ color: "#94a3b8", padding: "7px 18px", fontSize: 13 })}
+            style={chromeButton({ color: "#afa69d", padding: "7px 18px", fontSize: 13 })}
           >
             Cancel
           </button>

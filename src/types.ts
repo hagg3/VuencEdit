@@ -19,6 +19,7 @@ export interface WorldMeta {
   center_py: number | null;
   abs_min_x: number;
   abs_min_y: number;
+  sky: number;
 }
 
 export interface RecentWorld { path: string; name: string; timestamp: number; }

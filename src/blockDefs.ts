@@ -78,6 +78,15 @@ export const PAINT_COLORS: readonly (readonly [number, number, number])[] = [
   [  3,   3,   3],
 ] as const;
 
+/** Fog/background color for a world's sky index — matches the game's fog formula
+ *  (fogColor = clamp(skyColor - 0.2, 0, 1)) and its fallback (out-of-range → index 14). */
+export function skyFogColor(sky: number): readonly [number, number, number] {
+  const idx = (sky >= 1 && sky <= PAINT_COLORS.length) ? sky : 14;
+  const [r, g, b] = PAINT_COLORS[idx - 1];
+  const dim = (c: number) => Math.max(0, c - 0.2 * 255);
+  return [dim(r), dim(g), dim(b)];
+}
+
 // ── Canonical colour tables (single source of truth = Rust) ──────────────────
 //
 // These mirror BLOCK_RGB / PAINT_RGB / BLOCK_PAINT_SCALE in lib.rs. To end the

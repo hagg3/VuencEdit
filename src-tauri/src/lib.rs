@@ -81,6 +81,8 @@ pub struct WorldMeta {
     /// Used by the frontend to align template overlay coords. Eden.eden covers 4006..4185.
     pub abs_min_x: i32,
     pub abs_min_y: i32,
+    /// Sky color index (into the 54-entry paint palette) — used for grass tint and 3D-view fog color.
+    pub sky: u8,
 }
 
 // ── In-memory world state ────────────────────────────────────────────────────
@@ -215,6 +217,11 @@ pub(crate) struct WorldState {
     pub(crate) template_surface_cache: HashMap<(i32, i32), Box<[[u8; 4]; 256]>>,
     /// Optional texture pack loaded by the user (world-independent).
     pub(crate) texture_pack: Option<texturepack::TexturePack>,
+    /// Lazily-built lamp (block type 72) position index, keyed by chunk (cx,cy) → lamp world coords.
+    /// `None` until first needed (night lighting is opt-in); cleared on world load/close; kept current
+    /// by `with_edit`/`undo_edit`/`redo_edit` rescanning only the affected chunks. Enables an
+    /// O(lamps) gather instead of an O((16+2r)³) region scan, so the lamp radius can be a user slider.
+    pub(crate) lamp_index: Option<HashMap<(i32, i32), Vec<[i32; 3]>>>,
 }
 
 impl WorldState {
@@ -229,8 +236,99 @@ impl WorldState {
             template_dir: HashMap::new(),
             template_surface_cache: HashMap::new(),
             texture_pack: None,
+            lamp_index: None,
         }
     }
+}
+
+// ── Lamp spatial index ──────────────────────────────────────────────────────────
+//
+// Night lighting lights up Lamp blocks (type 72). Finding the lamps near a chunk used to be an
+// O((16+2r)³) voxel scan per chunk-geometry request, which is why the lamp radius was a hard-coded
+// constant. This chunk-keyed index gathers lamps by iterating actual lamp positions in the handful
+// of chunks within reach, so the radius can be a user slider (and it's the shared foundation the
+// experimental GPU night point-lights need too).
+
+/// Scan one populated chunk's voxels for Lamp blocks, returning their local block coords.
+fn scan_chunk_lamps(world: &LoadedWorld, cx: i32, cy: i32) -> Vec<[i32; 3]> {
+    let Some(&addr) = world.chunk_map.get(&(cx, cy)) else { return Vec::new() };
+    let max_z = world.num_bands * 16;
+    let mut out = Vec::new();
+    for lx in 0..16usize {
+        for ly in 0..16usize {
+            for z in 0..max_z {
+                let band = z / 16;
+                let lz = z % 16;
+                let bi = addr + band * 8192 + lx * 256 + ly * 16 + lz;
+                if bi < world.bytes.len() && world.bytes[bi] == LAMP_BLOCK_TYPE {
+                    let wx = (cx - world.min_x) * 16 + lx as i32;
+                    let wy = (cy - world.min_y) * 16 + ly as i32;
+                    out.push([wx, wy, z as i32]);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Build the full lamp index by scanning only populated chunks (sparse worlds store just edited
+/// chunks, so this is bounded by the actual world size, not the 180×180 template grid).
+pub(crate) fn build_lamp_index(world: &LoadedWorld) -> HashMap<(i32, i32), Vec<[i32; 3]>> {
+    let mut index = HashMap::new();
+    for &(cx, cy) in world.chunk_map.keys() {
+        let lamps = scan_chunk_lamps(world, cx, cy);
+        if !lamps.is_empty() {
+            index.insert((cx, cy), lamps);
+        }
+    }
+    index
+}
+
+/// Rescan the given chunks' lamp lists in place (place/remove a lamp → the index must follow, or
+/// night lighting goes stale). No-op if the index hasn't been built yet. `coords` are the same
+/// affected-chunk coords `with_edit`/undo/redo already compute for snapshots.
+fn refresh_lamp_index_chunks(ws: &mut WorldState, coords: &[(i16, i16)]) {
+    let Some(world) = ws.world.as_ref() else { return };
+    let Some(index) = ws.lamp_index.as_mut() else { return };
+    for &(cx, cy) in coords {
+        let key = (cx as i32, cy as i32);
+        let lamps = scan_chunk_lamps(world, key.0, key.1);
+        if lamps.is_empty() {
+            index.remove(&key);
+        } else {
+            index.insert(key, lamps);
+        }
+    }
+}
+
+/// Gather lamp positions (local block coords) within reach of a pixel-space region — every lamp
+/// that could light a voxel in `[sx1..=sx2] × [sy1..=sy2]` given `radius`. Collects from the chunks
+/// overlapping the region expanded by `ceil(radius/16)` chunks, then filters to the exact expanded
+/// box so the result matches the old inline voxel scan exactly (parity).
+pub(crate) fn lamps_in_region(
+    index: &HashMap<(i32, i32), Vec<[i32; 3]>>,
+    world: &LoadedWorld,
+    sx1: i32, sy1: i32, sx2: i32, sy2: i32,
+    radius: f32,
+) -> Vec<[i32; 3]> {
+    let r = radius.ceil() as i32;
+    let cr = r.div_euclid(16) + 1; // chunk-expansion margin, ceil(radius/16) plus a safety chunk
+    let cx_lo = sx1.div_euclid(16) + world.min_x - cr;
+    let cx_hi = sx2.div_euclid(16) + world.min_x + cr;
+    let cy_lo = sy1.div_euclid(16) + world.min_y - cr;
+    let cy_hi = sy2.div_euclid(16) + world.min_y + cr;
+    let mut out = Vec::new();
+    for cx in cx_lo..=cx_hi {
+        for cy in cy_lo..=cy_hi {
+            if let Some(v) = index.get(&(cx, cy)) {
+                out.extend_from_slice(v);
+            }
+        }
+    }
+    // Filter to the exact expanded xy box (z spans the full column for chunk geometry, so no z
+    // filter is needed) — makes this a drop-in match for the old `(sx1-r ..= sx2+r)` voxel scan.
+    out.retain(|p| p[0] >= sx1 - r && p[0] <= sx2 + r && p[1] >= sy1 - r && p[1] <= sy2 + r);
+    out
 }
 
 pub(crate) type AppState = Mutex<WorldState>;
@@ -763,31 +861,9 @@ fn load_world(path: String, state: tauri::State<'_, AppState>) -> Result<WorldMe
 
     timing_log!("[LOAD] start");
 
-    // Step 1: Brief lock — clear previous world so in-flight scans (render_selection_view,
-    // render_zslice) fail fast on their next lock attempt instead of blocking here.
-    timing_log!("[LOCK] acquire_start  cmd=load_world/step1  t=+{}µs", us());
-    let t_s1 = Instant::now();
-    let (_old_world, old_temp) = {
-        let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
-        let wait = t_s1.elapsed().as_micros();
-        let prev_undo: usize = ws.undo_stack.iter().flat_map(|e| e.chunks.iter()).map(chunk_snapshot_bytes).sum();
-        let prev_redo: usize = ws.redo_stack.iter().flat_map(|e| e.chunks.iter()).map(chunk_snapshot_bytes).sum();
-        timing_log!("[LOCK] acquired  cmd=load_world/step1  wait={}µs  prev_undo={}B  prev_redo={}B",
-            wait, prev_undo, prev_redo);
-        let t_held = Instant::now();
-        let taken = ws.world.take();  // pointer swap only — dealloc happens outside the lock
-        ws.clipboard = None;
-        ws.undo_stack.clear();
-        ws.redo_stack.clear();
-        let old_temp = ws.temp_path.take();
-        drop(ws);
-        timing_log!("[LOCK] released  cmd=load_world/step1  held={}µs  t=+{}µs", t_held.elapsed().as_micros(), us());
-        (taken, old_temp)
-    };
-    // _old_world (Option<LoadedWorld>) drops here, releasing the mmap before we delete the temp file.
-    if let Some(p) = old_temp { let _ = fs::remove_file(&p); }
-
-    // Step 2: File I/O + parse — no lock held.
+    // Step 1: File I/O + parse — no lock held, and critically, the previous world is left
+    // untouched until parsing succeeds. A corrupt/wrong-type file must not destroy the current
+    // session (it used to: the old world was cleared here before the file was even read).
     // Peek at 4 magic bytes to detect zip without reading the whole file.
     let mut magic = [0u8; 4];
     {
@@ -802,7 +878,7 @@ fn load_world(path: String, state: tauri::State<'_, AppState>) -> Result<WorldMe
         let cursor = std::io::Cursor::new(&raw);
         let mut archive = ZipArchive::new(cursor)
             .map_err(|e| format!("Invalid zip archive: {e}"))?;
-        if archive.len() == 0 { return Err("Zip archive contains no files".into()); }
+        if archive.is_empty() { return Err("Zip archive contains no files".into()); }
         let mut entry = archive.by_index(0)
             .map_err(|e| format!("Failed to read zip entry: {e}"))?;
         let temp_path = temp_world_path();
@@ -837,7 +913,16 @@ fn load_world(path: String, state: tauri::State<'_, AppState>) -> Result<WorldMe
     };
     timing_log!("[LOAD] file_mmap  bytes={}B  compressed={}  t=+{}µs", mmap.len(), was_compressed, us());
 
-    let loaded = parse_world_inner(mmap)?;
+    let loaded = match parse_world_inner(mmap) {
+        Ok(l) => l,
+        Err(e) => {
+            // Parsing failed after we already staged a temp copy (or decompressed one) — the
+            // current session's world is untouched, but the freshly staged temp would otherwise
+            // leak until the next launch's sweep_stale_temps(). Clean it up now.
+            if let Some(p) = maybe_temp { let _ = fs::remove_file(&p); }
+            return Err(e);
+        }
+    };
     timing_log!("[LOAD] parsed  {}×{} chunks  count={}  world_bytes={}B  t=+{}µs",
         loaded.w_chunks, loaded.h_chunks, loaded.chunk_map.len(), loaded.bytes.len(), us());
 
@@ -868,20 +953,35 @@ fn load_world(path: String, state: tauri::State<'_, AppState>) -> Result<WorldMe
         center_py: center.map(|(_, y)| y),
         abs_min_x: loaded.min_x,
         abs_min_y: loaded.min_y,
+        sky: loaded.sky,
     };
 
-    // Step 3: Install new world.
+    // Step 3: Swap in the new world and clear old session state (clipboard/undo/redo/lamp index/
+    // temp file) in the same locked section — parsing already succeeded, so this is the first
+    // point at which we commit to discarding the previous world.
     timing_log!("[LOCK] acquire_start  cmd=load_world/step3  t=+{}µs", us());
     let t_s3 = Instant::now();
-    {
+    let (_old_world, old_temp) = {
         let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
-        timing_log!("[LOCK] acquired  cmd=load_world/step3  wait={}µs", t_s3.elapsed().as_micros());
+        let wait = t_s3.elapsed().as_micros();
+        let prev_undo: usize = ws.undo_stack.iter().flat_map(|e| e.chunks.iter()).map(chunk_snapshot_bytes).sum();
+        let prev_redo: usize = ws.redo_stack.iter().flat_map(|e| e.chunks.iter()).map(chunk_snapshot_bytes).sum();
+        timing_log!("[LOCK] acquired  cmd=load_world/step3  wait={}µs  prev_undo={}B  prev_redo={}B",
+            wait, prev_undo, prev_redo);
         let t_held = Instant::now();
-        ws.world = Some(loaded);
+        let old_world = ws.world.replace(loaded);  // pointer swap only — dealloc happens outside the lock
+        ws.clipboard = None;
+        ws.undo_stack.clear();
+        ws.redo_stack.clear();
+        ws.lamp_index = None; // rebuilt lazily for the new world on first night-lit request
+        let old_temp = ws.temp_path.take();
         ws.temp_path = maybe_temp;
         drop(ws);
         timing_log!("[LOCK] released  cmd=load_world/step3  held={}µs  t=+{}µs", t_held.elapsed().as_micros(), us());
-    }
+        (old_world, old_temp)
+    };
+    // _old_world (Option<LoadedWorld>) drops here, releasing the mmap before we delete the temp file.
+    if let Some(p) = old_temp { let _ = fs::remove_file(&p); }
     timing_log!("[LOAD] end  total={}µs", us());
 
     Ok(meta)
@@ -949,12 +1049,6 @@ fn get_world_info(state: tauri::State<'_, AppState>) -> Result<WorldInfo, String
         abs_min_x: world.min_x, abs_min_y: world.min_y,
         spawn_px: spawn.map(|(x,_)| x), spawn_py: spawn.map(|(_,y)| y),
     })
-}
-
-#[tauri::command]
-fn save_png(path: String, data: String) -> Result<(), String> {
-    let bytes = STANDARD.decode(&data).map_err(|e| format!("Invalid base64 PNG data: {e}"))?;
-    fs::write(&path, &bytes).map_err(|e| format!("Failed to write PNG: {e}"))
 }
 
 /// Encode a row-major RGBA buffer to PNG bytes. Used by `export_png`; factored out so the encode
@@ -1054,6 +1148,9 @@ struct SelectionInfo {
 }
 
 fn validate_selection(x1: i32, y1: i32, x2: i32, y2: i32, z_min: i32, z_max: i32, max_z: i32) -> Result<(), String> {
+    if x1 < 0 || y1 < 0 {
+        return Err("Invalid XY bounds: x1/y1 must be >= 0".into());
+    }
     if x2 < x1 || y2 < y1 {
         return Err("Invalid XY bounds: x2/y2 must be >= x1/y1".into());
     }
@@ -1187,6 +1284,21 @@ fn decode_template_surface(data: &[u8], col_offset: usize, sky: u8) -> Option<Bo
 
 /// Load an Eden.eden template file. Parses its i32+i32+u64 directory (different from
 /// regular saves which use i16+u16+u32). Stores mmap + directory in WorldState.
+/// Grab/release the OS cursor at the window level for the 3D pane's mouselook camera.
+///
+/// WKWebView on macOS doesn't grant the browser Pointer Lock API, so we lock at the Tauri window
+/// layer instead — identical behaviour on macOS/Windows/Linux. macOS `set_cursor_grab` disassociates
+/// the cursor via `CGAssociateMouseAndMouseCursorPosition`, so mouse *delta* events keep flowing to
+/// JS (`movementX/Y`) even while the cursor is frozen — exactly what the look camera reads.
+/// `set_cursor_visible(false)` hides it across the whole app while grabbed. The frontend must always
+/// release (`locked:false`) on exit/blur/unmount, or the cursor stays frozen app-wide.
+#[tauri::command]
+fn set_cursor_lock(window: tauri::Window, locked: bool) -> Result<(), String> {
+    window.set_cursor_grab(locked).map_err(|e| e.to_string())?;
+    window.set_cursor_visible(!locked).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 #[tauri::command]
 fn load_eden_template(path: String, state: tauri::State<'_, AppState>) -> Result<u32, String> {
     let file = fs::File::open(&path).map_err(|e| format!("Cannot open template: {e}"))?;
@@ -1200,7 +1312,7 @@ fn load_eden_template(path: String, state: tauri::State<'_, AppState>) -> Result
         mmap[32..40].try_into().map_err(|_| "Bad header")?
     ) as usize;
 
-    if dir_offset >= mmap.len() || (mmap.len() - dir_offset) % 16 != 0 {
+    if dir_offset >= mmap.len() || !(mmap.len() - dir_offset).is_multiple_of(16) {
         return Err("Invalid template directory offset".into());
     }
 
@@ -1227,7 +1339,9 @@ fn load_eden_template(path: String, state: tauri::State<'_, AppState>) -> Result
 
 /// Render a top-down pixel patch from the Eden.eden template, aligned to the loaded world's
 /// coordinate space. Returns RGBA pixels; alpha=0 where no template chunk exists.
-#[tauri::command]
+/// Async: a first fetch over virgin template area can decode ~1,000 chunk columns (a 512px tile
+/// spans 32×32 chunks) inline — off the main thread so it doesn't serialize other IPC behind it.
+#[tauri::command(async)]
 fn fetch_template_tile(
     x1: i32, y1: i32, x2: i32, y2: i32,
     state: tauri::State<'_, AppState>,
@@ -1549,7 +1663,7 @@ fn render_selection_view(
                     if src + 8192 <= world.bytes.len() {
                         local_vec.extend_from_slice(&world.bytes[src..src + 8192]);
                     } else {
-                        local_vec.extend(std::iter::repeat(0u8).take(8192));
+                        local_vec.extend(std::iter::repeat_n(0u8, 8192));
                     }
                 }
                 local_map.insert((cx, cy), local_addr);
@@ -1568,7 +1682,7 @@ fn render_selection_view(
         };
         drop(ws);  // explicit drop — lock released here, before any scanning
         timing_log!("[LOCK] released  cmd=render_selection_view  held={}µs  cloned={}B  bands={}/{}  t=+{}µs",
-            t_held.elapsed().as_micros(), result.bytes.len(), bands_per_chunk, b_hi - b_lo + 1 + 0, us());
+            t_held.elapsed().as_micros(), result.bytes.len(), bands_per_chunk, (b_hi - b_lo + 1), us());
         result
     };
 
@@ -1752,7 +1866,7 @@ fn render_full_height_view(
                 if end <= world.bytes.len() {
                     local_vec.extend_from_slice(&world.bytes[addr..end]);
                 } else {
-                    local_vec.extend(std::iter::repeat(0u8).take(chunk_size));
+                    local_vec.extend(std::iter::repeat_n(0u8, chunk_size));
                 }
                 local_map.insert((cx, cy), local_addr);
             }
@@ -1837,8 +1951,8 @@ fn replace_blocks_inner(
                 let bi = addr + band * 8192 + lx * 256 + ly * 16 + lz;
                 let pi = bi + 4096;
                 if bi >= world.bytes.len() || pi >= world.bytes.len() { continue; }
-                let type_ok  = filter_block_type.map_or(true, |ft| world.bytes[bi] == ft);
-                let paint_ok = filter_paint.map_or(true,       |fp| world.bytes[pi] == fp);
+                let type_ok  = filter_block_type.is_none_or(|ft| world.bytes[bi] == ft);
+                let paint_ok = filter_paint.is_none_or(|fp| world.bytes[pi] == fp);
                 // passes==filter_invert means "skip": skip matching when normal, skip non-matching when inverted
                 if (type_ok && paint_ok) == filter_invert { continue; }
                 world.bytes[bi] = new_block_type;
@@ -2058,6 +2172,10 @@ where
         .collect();
     ws.world = Some(world);
 
+    // Keep the lamp index (if built) current: a placed/removed lamp in any touched chunk must update
+    // its bucket or night lighting goes stale. Reuses the affected set already computed for snapshots.
+    refresh_lamp_index_chunks(ws, &affected);
+
     if !pre_snap.is_empty() {
         push_undo(&mut ws.undo_stack, UndoEntry { operation: operation.into(), chunks: pre_snap });
         ws.redo_stack.clear();
@@ -2073,7 +2191,7 @@ fn delete_blocks(
     state: tauri::State<'_, AppState>,
 ) -> Result<EditResult, String> {
     let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
-    let max_z = ws.world.as_ref().map(|w| world_max_z(w)).unwrap_or(63);
+    let max_z = ws.world.as_ref().map(world_max_z).unwrap_or(63);
     validate_selection(x1, y1, x2, y2, z_min, z_max, max_z)?;
     let rect = (x1, y1, x2, y2);
     let label = format!("Delete {}×{}×{}", x2 - x1 + 1, y2 - y1 + 1, z_max - z_min + 1);
@@ -2103,7 +2221,7 @@ fn replace_blocks(
         }
     }
     let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
-    let max_z = ws.world.as_ref().map(|w| world_max_z(w)).unwrap_or(63);
+    let max_z = ws.world.as_ref().map(world_max_z).unwrap_or(63);
     validate_selection(x1, y1, x2, y2, z_min, z_max, max_z)?;
     let rect = (x1, y1, x2, y2);
     let label = format!("Replace {}×{}×{}", x2 - x1 + 1, y2 - y1 + 1, z_max - z_min + 1);
@@ -2145,7 +2263,7 @@ fn gradient_fill(
         return Err(format!("Invalid paint byte: must be 0–54 (got {paint1}, {paint2})"));
     }
     let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
-    let max_z = ws.world.as_ref().map(|w| world_max_z(w)).unwrap_or(63);
+    let max_z = ws.world.as_ref().map(world_max_z).unwrap_or(63);
     validate_selection(x1, y1, x2, y2, z_min, z_max, max_z)?;
     let rect = (x1, y1, x2, y2);
     let (dx, dy, dz) = ((x2 - x1).max(1) as f64, (y2 - y1).max(1) as f64, (z_max - z_min).max(1) as f64);
@@ -2175,16 +2293,21 @@ fn gradient_fill(
 /// For each block, if z is None the topmost non-air block at (x,y) is used (surface paint);
 /// if z is Some the block is placed at that exact z level.
 /// Positions outside existing chunk boundaries are silently skipped.
+///
+/// `z_offset` (a vertical nudge applied to every block) is optional — omitting it means "no
+/// nudge", which is what every exact-coordinate caller wants (slice viewports, elevation panel,
+/// 3D picking). It used to be required, and those callers all failed at runtime on the missing key.
 #[tauri::command]
 fn paint_blocks(
     blocks: Vec<PaintBlock>,
     block_type: u8,
     paint: u8,
-    z_offset: i32,
+    z_offset: Option<i32>,
     mask_type: Option<u8>,
     mask_paint: Option<u8>,
     state: tauri::State<'_, AppState>,
 ) -> Result<EditResult, String> {
+    let z_offset = z_offset.unwrap_or(0);
     if paint > 54 {
         return Err(format!("Invalid paint byte {paint}: must be 0–54"));
     }
@@ -2234,7 +2357,7 @@ fn paint_blocks(
             }
             set_block_abs(world, b.x, b.y, z, block_type, paint);
             // Auto-place paired top block for doors and portals.
-            if top_type != 0 && z + 1 <= max_z {
+            if top_type != 0 && z < max_z {
                 set_block_abs(world, b.x, b.y, z + 1, top_type, paint);
             }
         }
@@ -2317,6 +2440,7 @@ fn close_world(state: tauri::State<'_, AppState>) {
         ws.clipboard = None;
         ws.undo_stack.clear();
         ws.redo_stack.clear();
+        ws.lamp_index = None;
         (ws.world.take(), ws.temp_path.take())
     };
     drop(old_world); // release the mmap before deleting its backing temp file
@@ -2403,8 +2527,14 @@ fn discard_autosave(app: tauri::AppHandle) -> Result<(), String> {
 #[tauri::command]
 fn undo_edit(state: tauri::State<'_, AppState>) -> Result<EditResult, String> {
     let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
-    let entry = ws.undo_stack.pop_back().ok_or("Nothing to undo")?;
+    // Take the world first: if none is loaded, error out before popping the undo stack, so a
+    // stray call with no world can't silently discard an entry (harmless today since the stacks
+    // are cleared with the world, but fragile ordering otherwise).
     let mut world = ws.world.take().ok_or("No world loaded")?;
+    let entry = match ws.undo_stack.pop_back() {
+        Some(e) => e,
+        None => { ws.world = Some(world); return Err("Nothing to undo".into()); }
+    };
 
     let affected: Vec<(i16, i16)> = entry.chunks.iter().map(|s| (s.cx, s.cy)).collect();
     let redo_snaps = restore_and_invert(&mut world, &entry);
@@ -2412,6 +2542,7 @@ fn undo_edit(state: tauri::State<'_, AppState>) -> Result<EditResult, String> {
 
     let label = entry.operation.clone();
     ws.world = Some(world);
+    refresh_lamp_index_chunks(&mut ws, &affected);
     push_undo(&mut ws.redo_stack, UndoEntry { operation: entry.operation, chunks: redo_snaps });
 
     Ok(EditResult { patch, undo_depth: ws.undo_stack.len(), redo_depth: ws.redo_stack.len(), operation: label })
@@ -2420,8 +2551,11 @@ fn undo_edit(state: tauri::State<'_, AppState>) -> Result<EditResult, String> {
 #[tauri::command]
 fn redo_edit(state: tauri::State<'_, AppState>) -> Result<EditResult, String> {
     let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
-    let entry = ws.redo_stack.pop_back().ok_or("Nothing to redo")?;
     let mut world = ws.world.take().ok_or("No world loaded")?;
+    let entry = match ws.redo_stack.pop_back() {
+        Some(e) => e,
+        None => { ws.world = Some(world); return Err("Nothing to redo".into()); }
+    };
 
     let affected: Vec<(i16, i16)> = entry.chunks.iter().map(|s| (s.cx, s.cy)).collect();
     let undo_snaps = restore_and_invert(&mut world, &entry);
@@ -2429,6 +2563,7 @@ fn redo_edit(state: tauri::State<'_, AppState>) -> Result<EditResult, String> {
 
     let label = entry.operation.clone();
     ws.world = Some(world);
+    refresh_lamp_index_chunks(&mut ws, &affected);
     push_undo(&mut ws.undo_stack, UndoEntry { operation: entry.operation, chunks: undo_snaps });
 
     Ok(EditResult { patch, undo_depth: ws.undo_stack.len(), redo_depth: ws.redo_stack.len(), operation: label })
@@ -2445,7 +2580,7 @@ fn copy_selection(
     state: tauri::State<'_, AppState>,
 ) -> Result<ClipboardInfo, String> {
     let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
-    let max_z = ws.world.as_ref().map(|w| world_max_z(w)).unwrap_or(63);
+    let max_z = ws.world.as_ref().map(world_max_z).unwrap_or(63);
     validate_selection(x1, y1, x2, y2, z_min, z_max, max_z)?;
     let world = ws.world.as_ref().ok_or("No world loaded")?;
 
@@ -2998,7 +3133,7 @@ fn move_selection(
     state: tauri::State<'_, AppState>,
 ) -> Result<EditResult, String> {
     let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
-    let max_z = ws.world.as_ref().map(|w| world_max_z(w)).unwrap_or(63);
+    let max_z = ws.world.as_ref().map(world_max_z).unwrap_or(63);
     validate_selection(x1, y1, x2, y2, z_min, z_max, max_z)?;
     if dx == 0 && dy == 0 && dz == 0 {
         return Err("No movement".into());
@@ -3192,7 +3327,7 @@ pub(crate) fn place_pine_tree(world: &mut impl VoxelSink, wx: i32, wy: i32, z_ba
 }
 
 /// Tall conical pine tree with 7×7 base tiers (ported from TallPineTree).
-fn place_tall_pine_tree(world: &mut impl VoxelSink, wx: i32, wy: i32, z_base: i32, rng: &mut Rng64, leaf_paint: u8) {
+fn place_tall_pine_tree(world: &mut impl VoxelSink, wx: i32, wy: i32, z_base: i32, _rng: &mut Rng64, leaf_paint: u8) {
 
     // 11 leaf layers (dz 2..=12)
     for dz in 2..13i32 {
@@ -3287,9 +3422,11 @@ fn generate_trees(
         return Err("Invalid selection bounds".into());
     }
 
-    // Expand snapshot area by 3 to include chunks where leaves may spill over.
+    // Expand both the snapshot and the returned patch by 3 to include chunks where leaves may
+    // spill over — a patch limited to the bare selection would leave spilled leaves invisible on
+    // the map until an unrelated refetch.
     let snap_rect = ((x1 - 3).max(0), (y1 - 3).max(0), x2 + 3, y2 + 3);
-    let patch_rect = (x1, y1, x2, y2);
+    let patch_rect = snap_rect;
 
     let label = format!("Generate trees ({}×{})", x2 - x1 + 1, y2 - y1 + 1);
     with_edit(&mut ws, &label, snap_rect, patch_rect, |world| {
@@ -3396,8 +3533,8 @@ fn render_axo_region(
                 let sx = (px as f32 + sx_sgn * ski * 0.5 * dz as f32).round() as i32;
                 let sy = (py as f32 + sy_sgn * ski * dz as f32).round() as i32;
                 if sx < 0 || sx >= world_w || sy < 0 || sy >= world_h { continue; }
-                let cx = (sx / 16) as i32 + world.min_x;
-                let cy = (sy / 16) as i32 + world.min_y;
+                let cx = (sx / 16) + world.min_x;
+                let cy = (sy / 16) + world.min_y;
                 let lx = (sx % 16) as usize;
                 let ly = (sy % 16) as usize;
                 let &addr = match world.chunk_map.get(&(cx, cy)) { Some(a) => a, None => continue };
@@ -3649,7 +3786,7 @@ fn save_prefab(path: String, state: tauri::State<'_, AppState>) -> Result<(), St
     let ws = state.lock().unwrap_or_else(|p| p.into_inner());
     let cb = ws.clipboard.as_ref().ok_or("Clipboard is empty")?;
     let bytes = serialize_prefab(cb);
-    fs::write(&path, bytes).map_err(|e| format!("Failed to write prefab: {e}"))
+    atomic_write(std::path::Path::new(&path), &bytes)
 }
 
 #[tauri::command]
@@ -3744,7 +3881,7 @@ fn list_prefabs(dir: String) -> Result<Vec<PrefabEntry>, String> {
         let modified = file_mtime_ms(&path);
         out.push(PrefabEntry { name, path: path.to_string_lossy().into_owned(), width, height, depth, modified });
     }
-    out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    out.sort_by_key(|a| a.name.to_lowercase());
     Ok(out)
 }
 
@@ -3801,6 +3938,8 @@ fn render_prefab_thumbnail(path: String, state: tauri::State<'_, AppState>) -> R
 struct TexturePackInfo {
     rows: u32,
     tile: u32,
+    /// Number of full-color tiles N; a block's grayscale (painted) row = color_row + this offset.
+    gray_row_offset: u32,
     #[serde(serialize_with = "serialize_bytes_b64")]
     atlas: Vec<u8>,
     name_to_row: HashMap<String, u32>,
@@ -3815,6 +3954,7 @@ fn load_texture_pack(path: String, state: tauri::State<'_, AppState>) -> Result<
     let info = TexturePackInfo {
         rows: pack.atlas_rows,
         tile: pack.tile,
+        gray_row_offset: pack.gray_row_offset,
         atlas: pack.atlas_rgba.clone(),
         name_to_row: pack.name_to_row.clone(),
     };
@@ -4403,12 +4543,20 @@ fn scatter_paste(
         (cb.width, cb.height, cb.depth, cb.z_anchor, cb.block_types.clone(), cb.paints.clone())
     };
 
-    let rect = (x1, y1, x2, y2);
+    // Placement range clamps to 1 (all pastes land at x1/y1) when the clipboard is larger than the
+    // scatter box, so the actual paste footprint can extend past x2/y2. Widen the snapshot/patch
+    // rect to the true placement extent — otherwise chunks the paste touches beyond x2/y2 are
+    // never snapshotted (breaks undo) and never included in the returned patch (stale map tiles).
+    let range_x = (x2 - x1 - width + 2).max(1);
+    let range_y = (y2 - y1 - height + 2).max(1);
+    let max_px = x1 + range_x - 1;
+    let max_py = y1 + range_y - 1;
+    let rect = (x1, y1, x2.max(max_px + width - 1), y2.max(max_py + height - 1));
     let label = format!("Scatter paste ×{count}");
     with_edit(&mut ws, &label, rect, rect, |world| {
         let max_z = world_max_z(world);
-        let range_x = (x2 - x1 - width + 2).max(1) as u64;
-        let range_y = (y2 - y1 - height + 2).max(1) as u64;
+        let range_x = range_x as u64;
+        let range_y = range_y as u64;
         let mut rng = Rng64::new(if seed == 0 { 0xdeadbeef_cafebabe } else { seed });
 
         for _ in 0..count {
@@ -4461,44 +4609,6 @@ fn array_paste(
     })
 }
 
-// ── Find nearest block ────────────────────────────────────────────────────────
-
-#[derive(Serialize)]
-struct WorldPos { x: i32, y: i32 }
-
-/// Find the nearest surface block of a given type, searching outward from center.
-#[tauri::command]
-fn find_nearest_block(
-    center_x: i32, center_y: i32,
-    block_type: u8,
-    state: tauri::State<'_, AppState>,
-) -> Result<Option<WorldPos>, String> {
-    let ws = state.lock().unwrap_or_else(|p| p.into_inner());
-    let world = ws.world.as_ref().ok_or("No world loaded")?;
-    let ww = (world.w_chunks * 16) as i32;
-    let wh = (world.h_chunks * 16) as i32;
-    const MAX_RADIUS: i32 = 512;
-
-    for radius in 0..=MAX_RADIUS {
-        let x_lo = (center_x - radius).max(0);
-        let x_hi = (center_x + radius).min(ww - 1);
-        let y_lo = (center_y - radius).max(0);
-        let y_hi = (center_y + radius).min(wh - 1);
-        for y in y_lo..=y_hi {
-            for x in x_lo..=x_hi {
-                // Only scan the ring at this radius
-                if (y - center_y).abs() < radius && (x - center_x).abs() < radius { continue; }
-                if let Some(sz) = surface_z(world, x, y) {
-                    if read_block_abs(world, x, y, sz) == block_type {
-                        return Ok(Some(WorldPos { x, y }));
-                    }
-                }
-            }
-        }
-    }
-    Ok(None)
-}
-
 pub fn run() {
     sweep_stale_temps(); // clear staging temps leaked by a previous clean quit
     tauri::Builder::default()
@@ -4510,7 +4620,6 @@ pub fn run() {
             load_world,
             get_world_info,
             fetch_tile,
-            save_png,
             export_png,
             describe_selection,
             delete_blocks,
@@ -4561,12 +4670,15 @@ pub fn run() {
             magic_wand_select,
             scatter_paste,
             array_paste,
-            find_nearest_block,
             export_obj,
             export_json,
             export_vox,
             get_obj_geometry,
             get_chunk_geometry,
+            get_light_constants,
+            get_lamps_near,
+            pick_block,
+            set_cursor_lock,
             create_world,
             create_natural_world,
             preview_natural_world,
@@ -4675,7 +4787,7 @@ fn get_creatures(state: tauri::State<'_, AppState>) -> Result<Vec<CreatureInfo>,
         let s = &bytes[base..base + ENTITY_BYTES];
 
         let type_id = i32::from_le_bytes(s[28..32].try_into().unwrap());
-        if type_id < 0 || type_id > 6 { continue; } // −1 = empty slot
+        if !(0..=6).contains(&type_id) { continue; } // −1 = empty slot
 
         let pos_x   = f32::from_le_bytes(s[ 0.. 4].try_into().unwrap()); // Eden X
         let pos_z   = f32::from_le_bytes(s[ 8..12].try_into().unwrap()); // Eden Y (south)
@@ -5888,5 +6000,39 @@ mod tests {
         // Distinct shapes: at the midpoint, sphere bulges above and sharp dips below linear.
         assert!(falloff_dome(0.5, "sphere") > 0.5, "sphere rises fast off the rim");
         assert!(falloff_dome(0.5, "sharp") < 0.5, "sharp keeps a wide soft skirt");
+    }
+
+    /// build_lamp_index buckets each lamp under its chunk coord; an empty world → empty index.
+    #[test]
+    fn build_lamp_index_buckets_lamps_by_chunk() {
+        let empty = parse_world_inner(mmap_from_bytes(make_test_world())).expect("parse failed");
+        assert!(build_lamp_index(&empty).is_empty(), "world with no lamps → empty index");
+
+        let mut world = parse_world_inner(mmap_from_bytes(make_test_world())).expect("parse failed");
+        // Place a lamp (type 72) at lx=4, ly=6, z=5 in chunk (0,0).
+        world.bytes[blk(4, 6, 5)] = 72;
+        let index = build_lamp_index(&world);
+        assert_eq!(index.get(&(0, 0)), Some(&vec![[4, 6, 5]]), "lamp bucketed at its chunk with local coords");
+    }
+
+    /// refresh_lamp_index_chunks must follow a placed/removed lamp — the core correctness invariant
+    /// the with_edit/undo/redo hooks rely on.
+    #[test]
+    fn refresh_lamp_index_tracks_place_and_remove() {
+        let mut world = parse_world_inner(mmap_from_bytes(make_test_world())).expect("parse failed");
+        let mut ws = WorldState::new();
+        ws.world = Some(std::mem::replace(&mut world, parse_world_inner(mmap_from_bytes(make_test_world())).unwrap()));
+        ws.lamp_index = Some(build_lamp_index(ws.world.as_ref().unwrap()));
+        assert!(ws.lamp_index.as_ref().unwrap().is_empty(), "starts with no lamps");
+
+        // Place a lamp, then refresh chunk (0,0): it must appear.
+        ws.world.as_mut().unwrap().bytes[blk(4, 6, 5)] = 72;
+        refresh_lamp_index_chunks(&mut ws, &[(0, 0)]);
+        assert_eq!(ws.lamp_index.as_ref().unwrap().get(&(0, 0)), Some(&vec![[4, 6, 5]]), "placed lamp indexed after refresh");
+
+        // Break it (set to air), refresh again: the bucket must be removed.
+        ws.world.as_mut().unwrap().bytes[blk(4, 6, 5)] = 0;
+        refresh_lamp_index_chunks(&mut ws, &[(0, 0)]);
+        assert!(ws.lamp_index.as_ref().unwrap().get(&(0, 0)).is_none(), "removed lamp drops its chunk bucket");
     }
 }
