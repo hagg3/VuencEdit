@@ -39,7 +39,7 @@ pub(crate) struct WorldSearchResult {
 // ── Network commands ─────────────────────────────────────────────────────────
 
 /// Search the Eden world server. Returns worlds ordered as received from server.
-/// Fetches file sizes via parallel HEAD requests.
+/// Response body is plain text, one filename per line — no file sizes are fetched.
 #[tauri::command]
 pub(crate) async fn search_worlds(query: String, server: String) -> Result<Vec<WorldSearchResult>, String> {
     let srv = get_server(&server)?;
@@ -53,18 +53,23 @@ pub(crate) async fn search_worlds(query: String, server: String) -> Result<Vec<W
         .text().await
         .map_err(|e| e.to_string())?;
 
-    let lines: Vec<&str> = text.lines().collect();
+    // Scan for a `.eden` line immediately followed by its `.name` line rather than trusting a
+    // fixed stride-2 layout — one stray blank line in the response would otherwise desync every
+    // subsequent pair.
+    let lines: Vec<&str> = text.lines().map(str::trim).collect();
     let mut pairs: Vec<(String, String)> = Vec::new();
     let mut i = 0;
     while i + 1 < lines.len() {
-        let id_line = lines[i].trim();
-        let name_line = lines[i + 1].trim();
+        let id_line = lines[i];
+        let name_line = lines[i + 1];
         if id_line.ends_with(".eden") && name_line.ends_with(".name") {
             let id = id_line.trim_end_matches(".eden").to_string();
             let name = name_line.trim_end_matches(".name").to_string();
             pairs.push((id, name));
+            i += 2;
+        } else {
+            i += 1;
         }
-        i += 2;
     }
 
     let results: Vec<WorldSearchResult> = pairs
@@ -96,7 +101,16 @@ pub(crate) fn urlencoding_encode(s: &str) -> String {
     out
 }
 
+// Sanity cap on the decompressed world size — a legit 256z Eden.eden-scale world is well under
+// this. Guards against a hostile/misbehaving server response decompressing into something that
+// exhausts disk/RAM.
+const MAX_DOWNLOADED_WORLD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
 /// Download a world from the Eden server, streaming to disk with progress events.
+///
+/// The compressed response body is streamed straight into a temp file as it arrives (never
+/// buffered whole in RAM), then decompressed file→file through a size-capped reader so a
+/// malicious/misbehaving server can't OOM the process either during download or decompression.
 #[tauri::command]
 pub(crate) async fn download_world(
     app: tauri::AppHandle,
@@ -104,6 +118,8 @@ pub(crate) async fn download_world(
     server: String,
     dest_path: String,
 ) -> Result<(), String> {
+    use std::io::{Read, Write};
+
     let srv = get_server(&server)?;
     let url = format!("{}/{}.eden", srv.download_base_url, id);
     let client = reqwest::Client::builder()
@@ -120,32 +136,50 @@ pub(crate) async fn download_world(
 
     let total = response.content_length();
     let mut downloaded: u64 = 0;
-    let mut body: Vec<u8> = Vec::new();
+    let raw_tmp_path = format!("{}.download.tmp", dest_path);
+    let mut raw_file = fs::File::create(&raw_tmp_path)
+        .map_err(|e| format!("Failed to create temp download file: {e}"))?;
+    // First bytes only, to sniff gzip magic after the stream completes.
+    let mut head: Vec<u8> = Vec::new();
 
     while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
         downloaded += chunk.len() as u64;
-        body.extend_from_slice(&chunk);
+        if head.len() < 2 { head.extend(chunk.iter().take(2 - head.len())); }
+        raw_file.write_all(&chunk).map_err(|e| {
+            let _ = fs::remove_file(&raw_tmp_path);
+            format!("Write failed: {e}")
+        })?;
         let _ = app.emit("download-progress", serde_json::json!({
             "downloaded": downloaded,
             "total": total
         }));
     }
+    drop(raw_file);
+
+    let tmp_path = format!("{}.tmp", dest_path);
+    let cleanup = |paths: &[&str]| { for p in paths { let _ = fs::remove_file(p); } };
 
     // Server delivers worlds gzip-compressed; decompress to raw .eden before saving
     // so load_world can mmap it directly (it only handles zip-PK or raw).
-    let final_bytes: Vec<u8> = if body.starts_with(&[0x1f, 0x8b]) {
+    if head.starts_with(&[0x1f, 0x8b]) {
         use flate2::read::GzDecoder;
-        use std::io::Read;
-        let mut dec = GzDecoder::new(body.as_slice());
-        let mut out = Vec::new();
-        dec.read_to_end(&mut out).map_err(|e| format!("Decompression failed: {e}"))?;
-        out
+        let src = fs::File::open(&raw_tmp_path).map_err(|e| format!("Read failed: {e}"))?;
+        let mut dec = GzDecoder::new(std::io::BufReader::new(src)).take(MAX_DOWNLOADED_WORLD_BYTES + 1);
+        let mut out = fs::File::create(&tmp_path).map_err(|e| format!("Write failed: {e}"))?;
+        let n = std::io::copy(&mut dec, &mut out).map_err(|e| {
+            cleanup(&[&raw_tmp_path, &tmp_path]);
+            format!("Decompression failed: {e}")
+        })?;
+        drop(out);
+        cleanup(&[&raw_tmp_path]);
+        if n > MAX_DOWNLOADED_WORLD_BYTES {
+            cleanup(&[&tmp_path]);
+            return Err("Downloaded world is too large".into());
+        }
     } else {
-        body
-    };
+        fs::rename(&raw_tmp_path, &tmp_path).map_err(|e| format!("Rename failed: {e}"))?;
+    }
 
-    let tmp_path = format!("{}.tmp", dest_path);
-    fs::write(&tmp_path, &final_bytes).map_err(|e| format!("Write failed: {e}"))?;
     fs::rename(&tmp_path, &dest_path).map_err(|e| format!("Rename failed: {e}"))?;
 
     Ok(())

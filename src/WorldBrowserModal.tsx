@@ -167,7 +167,7 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
       <div
         style={glassPanel({
           padding: "18px 20px", width: 900, maxWidth: "96vw", maxHeight: "88vh",
-          display: "flex", flexDirection: "column", gap: 12, color: "#e2e8f0",
+          display: "flex", flexDirection: "column", gap: 12, color: "#ebe9e7",
         })}
       >
         {/* Header */}
@@ -176,8 +176,8 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
           <button
             onClick={onClose}
             onMouseEnter={e => (e.currentTarget.style.color = EDEN_TEAL_READABLE)}
-            onMouseLeave={e => (e.currentTarget.style.color = "#475569")}
-            style={{ background: "none", border: "none", color: "#475569", fontSize: 20, cursor: "pointer", lineHeight: 1, transition: "color .1s" }}
+            onMouseLeave={e => (e.currentTarget.style.color = "#61584f")}
+            style={{ background: "none", border: "none", color: "#61584f", fontSize: 20, cursor: "pointer", lineHeight: 1, transition: "color .1s" }}
           >×</button>
         </div>
 
@@ -202,7 +202,7 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
             style={{
               ...recessedWell,
               flex: 1,
-              color: "#e2e8f0",
+              color: "#ebe9e7",
               borderRadius: 6,
               padding: "5px 10px",
               fontSize: 13,
@@ -232,22 +232,22 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
           ] as const;
           const fi: React.CSSProperties = {
             ...recessedWell,
-            color: "#e2e8f0", borderRadius: 5, padding: "3px 7px", fontSize: 11,
+            color: "#ebe9e7", borderRadius: 5, padding: "3px 7px", fontSize: 11,
             colorScheme: "dark",
           } as React.CSSProperties;
           const fl: React.CSSProperties = {
-            fontSize: 9, color: "#475569", textTransform: "uppercase",
+            fontSize: 9, color: "#61584f", textTransform: "uppercase",
             letterSpacing: "0.06em", fontWeight: 600,
           };
           return (
-            <div style={{ borderTop: "1px solid #1e293b", borderBottom: "1px solid #1e293b", padding: "5px 0", display: "flex", flexDirection: "column", gap: 6 }}>
+            <div style={{ borderTop: "1px solid #312c28", borderBottom: "1px solid #312c28", padding: "5px 0", display: "flex", flexDirection: "column", gap: 6 }}>
               <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
                 <span style={fl}>Sort</span>
                 {sortModes.map(m => (
                   <button key={m.key} onClick={() => setSortBy(m.key)} style={{
                     background: sortBy === m.key ? "rgba(0,164,173,0.15)" : "transparent",
                     border: "1px solid " + (sortBy === m.key ? "#00dde9" : "transparent"),
-                    color: sortBy === m.key ? "#00dde9" : "#64748b",
+                    color: sortBy === m.key ? "#00dde9" : "#83786c",
                     padding: "2px 7px", borderRadius: 5, cursor: "pointer", fontSize: 11,
                     display: "flex", alignItems: "center", gap: 4,
                   }}>
@@ -262,7 +262,7 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
                   ...btn, fontSize: 11, padding: "2px 9px",
                   background: (activeFilters > 0 || showFilters) ? "rgba(0,164,173,0.1)" : btn.background,
                   boxShadow: activeFilters > 0 ? `inset 0 0 0 1px #00dde9, 0 .5px .5px rgba(255,255,255,.2)` : btn.boxShadow,
-                  color: activeFilters > 0 ? "#00dde9" : "#e2e8f0",
+                  color: activeFilters > 0 ? "#00dde9" : "#ebe9e7",
                 }}>
                   Filters{activeFilters > 0 ? ` (${activeFilters})` : ""}
                 </button>
@@ -272,7 +272,7 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
                   <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
                     <span style={fl}>Date</span>
                     <input type="date" value={fromDate} onChange={e => setFromDate(e.target.value)} style={fi} />
-                    <span style={{ color: "#475569", fontSize: 11 }}>→</span>
+                    <span style={{ color: "#61584f", fontSize: 11 }}>→</span>
                     <input type="date" value={toDate} onChange={e => setToDate(e.target.value)} style={fi} />
                   </div>
                   <label style={{ display: "flex", alignItems: "center", gap: 5, cursor: "pointer" }}>
@@ -294,7 +294,7 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
 
         {/* Filter count */}
         {results.length > 0 && filteredResults.length !== results.length && (
-          <div style={{ fontSize: 11, color: "#64748b", textAlign: "right" }}>
+          <div style={{ fontSize: 11, color: "#83786c", textAlign: "right" }}>
             Showing {filteredResults.length} of {results.length}
           </div>
         )}
@@ -307,10 +307,10 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
             {filteredResults.length > 0 ? (
               <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
                 <thead>
-                  <tr style={{ background: "#0d1829", borderBottom: "1px solid #1e293b", position: "sticky", top: 0, zIndex: 1 }}>
-                    <th style={{ textAlign: "left", padding: "6px 10px", color: "#475569", fontWeight: 600 }}>Name</th>
-                    <th style={{ textAlign: "left", padding: "6px 10px", color: "#475569", fontWeight: 600 }}>ID</th>
-                    <th style={{ textAlign: "left", padding: "6px 10px", color: "#475569", fontWeight: 600 }}>Date</th>
+                  <tr style={{ background: "#1e1b18", borderBottom: "1px solid #312c28", position: "sticky", top: 0, zIndex: 1 }}>
+                    <th style={{ textAlign: "left", padding: "6px 10px", color: "#61584f", fontWeight: 600 }}>Name</th>
+                    <th style={{ textAlign: "left", padding: "6px 10px", color: "#61584f", fontWeight: 600 }}>ID</th>
+                    <th style={{ textAlign: "left", padding: "6px 10px", color: "#61584f", fontWeight: 600 }}>Date</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -323,21 +323,21 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
                         style={{
                           background: isSelected ? "rgba(0,164,173,0.18)" : i % 2 === 0 ? "rgba(255,255,255,0.02)" : "transparent",
                           cursor: "pointer",
-                          borderBottom: "1px solid #1e293b",
+                          borderBottom: "1px solid #312c28",
                         }}
                       >
-                        <td style={{ padding: "6px 10px", color: isSelected ? "#00dde9" : "#e2e8f0" }}>
+                        <td style={{ padding: "6px 10px", color: isSelected ? "#00dde9" : "#ebe9e7" }}>
                           {isSelected ? "▶ " : "  "}{r.name}
                         </td>
-                        <td style={{ padding: "6px 10px", color: "#64748b", fontVariantNumeric: "tabular-nums" }}>{r.id}</td>
-                        <td style={{ padding: "6px 10px", color: "#94a3b8" }}>{formatDate(r.timestamp)}</td>
+                        <td style={{ padding: "6px 10px", color: "#83786c", fontVariantNumeric: "tabular-nums" }}>{r.id}</td>
+                        <td style={{ padding: "6px 10px", color: "#afa69d" }}>{formatDate(r.timestamp)}</td>
                       </tr>
                     );
                   })}
                 </tbody>
               </table>
             ) : (
-              <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: 120, color: "#475569", fontSize: 13 }}>
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: 120, color: "#61584f", fontSize: 13 }}>
                 {searching ? "Searching…" :
                  results.length > 0 ? "No results match your filters" :
                  error ?? "Search to browse worlds"}
@@ -351,7 +351,7 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
             {/* Preview image — fixed height */}
             <div style={{
               height: 200,
-              background: "#0d1829",
+              background: "#1e1b18",
               boxShadow: "inset 0 0 0 1px rgba(0,0,0,.4)",
               borderRadius: 8,
               overflow: "hidden",
@@ -363,13 +363,13 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
             }}>
               {/* Placeholder / error state */}
               {(previewStatus === "empty" || previewStatus === "error") && (
-                <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 8, color: "#1e293b" }}>
+                <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 8, color: "#312c28" }}>
                   <svg width="38" height="38" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.2">
                     <rect x="3" y="3" width="18" height="18" rx="2"/>
                     <circle cx="8.5" cy="8.5" r="1.5"/>
                     <polyline points="21 15 16 10 5 21"/>
                   </svg>
-                  <span style={{ fontSize: 11, color: "#334155" }}>
+                  <span style={{ fontSize: 11, color: "#4b443d" }}>
                     {previewStatus === "error" ? "No preview available" : "No world selected"}
                   </span>
                 </div>
@@ -405,7 +405,7 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
 
             {/* World details card */}
             <div style={{
-              background: "#0d1829",
+              background: "#1e1b18",
               boxShadow: "inset 0 0 0 1px rgba(0,0,0,.4)",
               borderRadius: 8,
               padding: "12px 14px",
@@ -416,22 +416,22 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
             }}>
               {selectedResult ? (
                 <>
-                  <div style={{ fontSize: 13, fontWeight: 600, color: "#e2e8f0", lineHeight: 1.3, wordBreak: "break-word" }}>
+                  <div style={{ fontSize: 13, fontWeight: 600, color: "#ebe9e7", lineHeight: 1.3, wordBreak: "break-word" }}>
                     {selectedResult.name}
                   </div>
 
                   <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-                    <span style={{ fontSize: 9, color: "#475569", textTransform: "uppercase", letterSpacing: "0.06em", fontWeight: 600 }}>Date</span>
-                    <span style={{ fontSize: 12, color: "#94a3b8" }}>{formatDate(selectedResult.timestamp)}</span>
+                    <span style={{ fontSize: 9, color: "#61584f", textTransform: "uppercase", letterSpacing: "0.06em", fontWeight: 600 }}>Date</span>
+                    <span style={{ fontSize: 12, color: "#afa69d" }}>{formatDate(selectedResult.timestamp)}</span>
                   </div>
 
                   <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-                    <span style={{ fontSize: 9, color: "#475569", textTransform: "uppercase", letterSpacing: "0.06em", fontWeight: 600 }}>ID</span>
-                    <span style={{ fontSize: 11, color: "#64748b", fontVariantNumeric: "tabular-nums" }}>{selectedResult.id}</span>
+                    <span style={{ fontSize: 9, color: "#61584f", textTransform: "uppercase", letterSpacing: "0.06em", fontWeight: 600 }}>ID</span>
+                    <span style={{ fontSize: 11, color: "#83786c", fontVariantNumeric: "tabular-nums" }}>{selectedResult.id}</span>
                   </div>
                 </>
               ) : (
-                <div style={{ fontSize: 12, color: "#334155", textAlign: "center", marginTop: 8 }}>
+                <div style={{ fontSize: 12, color: "#4b443d", textAlign: "center", marginTop: 8 }}>
                   Select a world to see details
                 </div>
               )}
@@ -461,7 +461,7 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
               {/* Progress bar */}
               {downloading && downloadProgress && (
                 <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                  <div style={{ flex: 1, background: "#1e293b", borderRadius: 4, height: 5, overflow: "hidden" }}>
+                  <div style={{ flex: 1, background: "#312c28", borderRadius: 4, height: 5, overflow: "hidden" }}>
                     <div style={{
                       height: "100%",
                       background: `linear-gradient(90deg, rgb(${EDEN_TEAL}) 0%, ${EDEN_TEAL_READABLE} 100%)`,
@@ -471,7 +471,7 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
                       transition: "width 0.2s",
                     }} />
                   </div>
-                  <span style={{ color: "#94a3b8", fontSize: 11, whiteSpace: "nowrap" }}>
+                  <span style={{ color: "#afa69d", fontSize: 11, whiteSpace: "nowrap" }}>
                     {downloadProgress.total
                       ? `${(downloadProgress.downloaded / 1_048_576).toFixed(1)} / ${(downloadProgress.total / 1_048_576).toFixed(1)} MB`
                       : `${(downloadProgress.downloaded / 1_048_576).toFixed(1)} MB`}

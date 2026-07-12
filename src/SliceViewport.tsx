@@ -332,10 +332,10 @@ export default function SliceViewport({ world, axis, editEpoch, lastEdit, onPain
       const a = effSel.lo - winOriginRef.current;       // slab col of selection start
       const b = effSel.hi - winOriginRef.current + 1;   // slab col just past selection end
       const slabBottom = y + slab.height * scale;
-      ctx.fillStyle = "rgba(8,12,24,0.6)";
+      ctx.fillStyle = "rgba(24,15,8,0.6)";
       if (a > 0) ctx.fillRect(x, y, a * scale, slab.height * scale);                       // left context
       if (b < slab.width) ctx.fillRect(x + b * scale, y, (slab.width - b) * scale, slab.height * scale); // right context
-      ctx.strokeStyle = "rgba(148,163,184,0.65)";
+      ctx.strokeStyle = "rgba(175,166,157,0.65)";
       ctx.lineWidth = 1;
       for (const c of [a, b]) {
         if (c <= 0 || c >= slab.width) continue;
@@ -444,7 +444,7 @@ export default function SliceViewport({ world, axis, editEpoch, lastEdit, onPain
       // Edge-hover grip cues + hint text (A1 / B3).
       const eh = edgeHoverRef.current;
       if (eh && slab) {
-        ctx.fillStyle = "rgba(148,163,184,0.85)";
+        ctx.fillStyle = "rgba(175,166,157,0.85)";
         if (eh === "z-max" || eh === "z-min") {
           const ez = eh === "z-max" ? selZ?.max : selZ?.min;
           if (ez != null) {
@@ -452,7 +452,7 @@ export default function SliceViewport({ world, axis, editEpoch, lastEdit, onPain
             for (let i = -1; i <= 1; i++) {
               ctx.beginPath(); ctx.arc(canvas.width / 2 + i * 8, ey, 3, 0, Math.PI * 2); ctx.fill();
             }
-            ctx.fillStyle = "rgba(148,163,184,0.7)";
+            ctx.fillStyle = "rgba(175,166,157,0.7)";
             ctx.font = "9px monospace";
             ctx.textBaseline = "middle";
             ctx.fillText("drag to resize Z", canvas.width / 2 + 16, ey);
@@ -464,7 +464,7 @@ export default function SliceViewport({ world, axis, editEpoch, lastEdit, onPain
             for (let i = -1; i <= 1; i++) {
               ctx.beginPath(); ctx.arc(ex, canvas.height / 2 + i * 8, 3, 0, Math.PI * 2); ctx.fill();
             }
-            ctx.fillStyle = "rgba(148,163,184,0.7)";
+            ctx.fillStyle = "rgba(175,166,157,0.7)";
             ctx.font = "9px monospace";
             ctx.textBaseline = "top";
             ctx.fillText(`drag to resize ${axis === "side" ? "Y" : "X"}`, ex + 6, canvas.height / 2 + 12);
@@ -476,7 +476,7 @@ export default function SliceViewport({ world, axis, editEpoch, lastEdit, onPain
 
     // Ortho mode hint.
     if (isOrtho) {
-      ctx.fillStyle = "rgba(100,116,139,0.6)";
+      ctx.fillStyle = "rgba(131,120,108,0.6)";
       ctx.font = "9px monospace";
       ctx.textBaseline = "bottom";
       ctx.fillText("ortho — paint disabled", 6, canvas.height - 4);
@@ -757,8 +757,8 @@ export default function SliceViewport({ world, axis, editEpoch, lastEdit, onPain
   const label = axis === "front" ? `Front  (Y=${curDepth})` : axis === "side" ? `Side  (X=${curDepth})` : `Top  (Z=${curDepth})`;
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", height: "100%", background: "#0a0f1e", color: "#cbd5e1", userSelect: "none", WebkitUserSelect: "none" }}>
-      <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "4px 8px", fontSize: 11, borderBottom: "1px solid #1e293b" }}>
+    <div style={{ display: "flex", flexDirection: "column", height: "100%", background: "#0a0f1e", color: "#dad6d2", userSelect: "none", WebkitUserSelect: "none" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "4px 8px", fontSize: 11, borderBottom: "1px solid #312c28" }}>
         <span style={{ fontWeight: 600 }}>{label}</span>
         <input
           type="range" min={0} max={depthMax} value={curDepth}
@@ -769,7 +769,7 @@ export default function SliceViewport({ world, axis, editEpoch, lastEdit, onPain
         <input
           type="number" min={0} max={depthMax} value={curDepth}
           onChange={(e) => setDepth(parseInt(e.target.value, 10) || 0)}
-          style={{ ...recessedWell, width: 56, background: "#1e293b", color: "#cbd5e1", borderRadius: 4 }}
+          style={{ ...recessedWell, width: 56, background: "#312c28", color: "#dad6d2", borderRadius: 4 }}
         />
         {selFull && axis !== "top" && (
           <button
@@ -781,7 +781,7 @@ export default function SliceViewport({ world, axis, editEpoch, lastEdit, onPain
                   fontSize: 10, fontWeight: 700, letterSpacing: "0.04em", flexShrink: 0,
                 })
               : chromeButton({
-                  color: "#64748b", padding: "1px 7px",
+                  color: "#83786c", padding: "1px 7px",
                   fontSize: 10, fontWeight: 700, letterSpacing: "0.04em", flexShrink: 0,
                 })}
           >
@@ -791,7 +791,7 @@ export default function SliceViewport({ world, axis, editEpoch, lastEdit, onPain
         <button
           onClick={fit}
           title="Fit slab to view"
-          style={chromeButton({ color: "#cbd5e1", padding: "1px 6px" })}
+          style={chromeButton({ color: "#dad6d2", padding: "1px 6px" })}
         >⊡</button>
       </div>
       {loading && (

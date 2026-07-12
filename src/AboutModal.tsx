@@ -41,11 +41,11 @@ export default function AboutModal({ version, onClose }: Props) {
           <span style={{ fontWeight: 800, color: "#ffffff", textShadow: "0 -1px 0 rgba(0,0,0,.5)" }}>Vuenc</span>
           <span style={{ fontWeight: 400, color: EDEN_TEAL_READABLE, textShadow: "0 -1px 0 rgba(0,0,0,.5)" }}>Edit</span>
         </div>
-        <div style={{ fontSize: 13, color: "#64748b", marginBottom: 28 }}>v{version}</div>
+        <div style={{ fontSize: 13, color: "#83786c", marginBottom: 28 }}>v{version}</div>
 
         <div style={{
-          fontSize: 13, color: "#94a3b8", lineHeight: 1.7, textAlign: "center",
-          borderTop: "1px solid #1e2333", paddingTop: 20, width: "100%",
+          fontSize: 13, color: "#afa69d", lineHeight: 1.7, textAlign: "center",
+          borderTop: "1px solid #2d2824", paddingTop: 20, width: "100%",
         }}>
           <p style={{ margin: "0 0 10px" }}>
             Based on{" "}

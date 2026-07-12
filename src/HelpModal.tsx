@@ -13,7 +13,7 @@ function Key({ children }: { children: React.ReactNode }) {
       padding: "1px 7px",
       fontSize: 11,
       fontFamily: "ui-monospace, 'SF Mono', monospace",
-      color: "#cbd5e1",
+      color: "#dad6d2",
       marginRight: 2,
       whiteSpace: "nowrap",
     }}>
@@ -28,7 +28,7 @@ function Row({ keys, action }: { keys: React.ReactNode; action: string }) {
       <td style={{ padding: "5px 20px 5px 0", whiteSpace: "nowrap", verticalAlign: "middle" }}>
         {keys}
       </td>
-      <td style={{ padding: "5px 0", color: "#94a3b8", fontSize: 13, verticalAlign: "middle" }}>
+      <td style={{ padding: "5px 0", color: "#afa69d", fontSize: 13, verticalAlign: "middle" }}>
         {action}
       </td>
     </tr>
@@ -41,7 +41,7 @@ function Section({ title }: { title: string }) {
       <td colSpan={2} style={{
         paddingTop: 16, paddingBottom: 3,
         fontSize: 10, fontWeight: 700,
-        color: "#475569", letterSpacing: "0.08em",
+        color: "#61584f", letterSpacing: "0.08em",
         textTransform: "uppercase",
       }}>
         {title}
@@ -94,40 +94,53 @@ function TileName({ name }: { name: string }) {
 
 function TexturePackHelp() {
   return (
-    <div style={{ fontSize: 13, color: "#94a3b8", lineHeight: 1.6 }}>
+    <div style={{ fontSize: 13, color: "#afa69d", lineHeight: 1.6 }}>
 
       {/* Format */}
       <div style={sectionHead}>Format</div>
       <p style={{ margin: "4px 0 10px" }}>
-        A texture pack is a <b style={{ color: "#e2e8f0" }}>.zip</b> file containing PNG images named
-        after the tile names below. Any size is accepted — tiles are resized to{" "}
-        <b style={{ color: "#e2e8f0" }}>32×32</b> internally (nearest-neighbour). Partial packs are
-        fine: any tile not present falls back to the flat block colour.
+        Two inputs are accepted:
+      </p>
+      <ul style={{ margin: "0 0 10px", paddingLeft: 18 }}>
+        <li>
+          A <b style={{ color: "#ebe9e7" }}>.zip</b> containing PNG images named after the tile
+          names below (may also bundle <code>atlas.png</code> / <code>atlas2.png</code>).
+        </li>
+        <li>
+          A game-style <b style={{ color: "#ebe9e7" }}>atlas image</b> (<code>atlas.png</code>) —
+          a vertical strip of square tiles in the original block-texture order. Load it directly.
+        </li>
+      </ul>
+      <p style={{ margin: "4px 0 10px" }}>
+        Any size is accepted — tiles are resized to <b style={{ color: "#ebe9e7" }}>32×32</b>{" "}
+        internally (nearest-neighbour). Partial packs are fine: any missing tile falls back to the
+        flat block colour.
       </p>
 
       {/* Loading */}
       <div style={sectionHead}>Loading</div>
       <p style={{ margin: "4px 0 10px" }}>
-        <b style={{ color: "#e2e8f0" }}>View tab → Load Texture Pack…</b> — or set a default path
-        in <b style={{ color: "#e2e8f0" }}>Settings</b> so it loads automatically on startup.
+        <b style={{ color: "#ebe9e7" }}>View tab → Load Texture Pack…</b> — or set a default path
+        in <b style={{ color: "#ebe9e7" }}>Settings</b> so it loads automatically on startup.
         Textures appear in the 3D fly-through, 3D selection preview, and block-picker swatches.
       </p>
 
       {/* Tinting */}
       <div style={sectionHead}>Colour tinting</div>
       <p style={{ margin: "4px 0 10px" }}>
-        Tiles are automatically converted to greyscale when the pack loads. At render time the
-        greyscale value is multiplied by the block's colour (unpainted = its natural colour from
-        the game; painted = the paint colour). This means you can author tiles in full colour —
-        the engine extracts brightness and applies the correct tint automatically. The same
-        stone texture will look grey unpainted and take on any paint colour when painted.
+        <b style={{ color: "#ebe9e7" }}>Unpainted</b> blocks show your tile in full colour, as
+        authored. <b style={{ color: "#ebe9e7" }}>Painted</b> blocks are modulated against a
+        brightness-normalized greyscale of the tile, so the paint colour reads cleanly instead of
+        double-tinting the tile's own colour — matching how the original game pairs each block's
+        full-colour and greyscale textures. Author tiles in full colour and both cases are handled
+        automatically.
       </p>
 
       {/* Tile names */}
       <div style={sectionHead}>Tile names</div>
       {TILE_GROUPS.map(g => (
         <div key={g.label} style={{ marginBottom: 8 }}>
-          <div style={{ fontSize: 10, fontWeight: 700, color: "#475569", letterSpacing: "0.07em", textTransform: "uppercase", marginBottom: 3 }}>
+          <div style={{ fontSize: 10, fontWeight: 700, color: "#61584f", letterSpacing: "0.07em", textTransform: "uppercase", marginBottom: 3 }}>
             {g.label}
           </div>
           <div style={{ display: "flex", flexWrap: "wrap", gap: 1 }}>
@@ -149,8 +162,8 @@ function TexturePackHelp() {
             ["Expansion blocks 82–111", "Side + bottom: blocktnt · Top: base material"],
           ].map(([block, faces]) => (
             <tr key={block}>
-              <td style={{ padding: "3px 16px 3px 0", color: "#e2e8f0", whiteSpace: "nowrap", verticalAlign: "top" }}>{block}</td>
-              <td style={{ padding: "3px 0", color: "#64748b", fontSize: 11 }}>{faces}</td>
+              <td style={{ padding: "3px 16px 3px 0", color: "#ebe9e7", whiteSpace: "nowrap", verticalAlign: "top" }}>{block}</td>
+              <td style={{ padding: "3px 0", color: "#83786c", fontSize: 11 }}>{faces}</td>
             </tr>
           ))}
         </tbody>
@@ -160,7 +173,7 @@ function TexturePackHelp() {
 }
 
 const sectionHead: React.CSSProperties = {
-  fontSize: 10, fontWeight: 700, color: "#475569",
+  fontSize: 10, fontWeight: 700, color: "#61584f",
   letterSpacing: "0.08em", textTransform: "uppercase",
   marginTop: 14, marginBottom: 2,
 };
@@ -173,7 +186,7 @@ export default function HelpModal({ onClose }: { onClose: () => void }) {
       <div
         style={glassPanel({
           padding: "18px 24px 20px", width: 480, maxHeight: "88vh",
-          overflowY: "auto", color: "#e2e8f0", display: "flex", flexDirection: "column",
+          overflowY: "auto", color: "#ebe9e7", display: "flex", flexDirection: "column",
         })}
       >
         {/* Header */}
@@ -186,7 +199,7 @@ export default function HelpModal({ onClose }: { onClose: () => void }) {
                 onClick={() => setTab(id)}
                 style={{
                   ...glassTab(tab === id),
-                  color: tab === id ? EDEN_TEAL_READABLE : "#475569",
+                  color: tab === id ? EDEN_TEAL_READABLE : "#61584f",
                   fontSize: 13, fontWeight: tab === id ? 600 : 400,
                   padding: "4px 10px", borderRadius: "4px 4px 0 0",
                 }}
@@ -198,9 +211,9 @@ export default function HelpModal({ onClose }: { onClose: () => void }) {
           <button
             onClick={onClose}
             onMouseEnter={e => (e.currentTarget.style.color = EDEN_TEAL_READABLE)}
-            onMouseLeave={e => (e.currentTarget.style.color = "#475569")}
+            onMouseLeave={e => (e.currentTarget.style.color = "#61584f")}
             style={{
-              background: "none", border: "none", color: "#475569",
+              background: "none", border: "none", color: "#61584f",
               fontSize: 20, lineHeight: 1, cursor: "pointer", padding: "0 2px", transition: "color .1s",
             }}
             title="Close"
@@ -243,8 +256,8 @@ export default function HelpModal({ onClose }: { onClose: () => void }) {
 
             <div style={{
               marginTop: 14, paddingTop: 12,
-              borderTop: "1px solid #1e293b",
-              fontSize: 11, color: "#475569", textAlign: "center",
+              borderTop: "1px solid #312c28",
+              fontSize: 11, color: "#61584f", textAlign: "center",
             }}>
               <Key>Esc</Key> or click outside to close
             </div>

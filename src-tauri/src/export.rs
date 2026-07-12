@@ -2,6 +2,7 @@
 use crate::colors::{block_color, transparent_alpha, BI_NOTSOLID, BI_RAMPORSIDE, BLOCK_INFO};
 use crate::{serialize_bytes_b64, world_max_z, AppState, LoadedWorld};
 use crate::texturepack;
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufWriter, Write};
@@ -25,6 +26,52 @@ pub(crate) fn get_block_at(world: &LoadedWorld, wx: i32, wy: i32, wz: i32) -> (u
         }
     }
     (0, 0)
+}
+
+/// Single-entry memo for the `chunk_map` lookup that dominates [`get_block_at`].
+///
+/// The geometry loops walk voxel by voxel, and each voxel also probes its six neighbours — so
+/// consecutive queries nearly always land in the same 16×16 chunk column, and the hash lookup is
+/// pure overhead. Caching the *resolved* result (including "no such chunk", which sparse worlds hit
+/// constantly) collapses that to one compare on the common path.
+///
+/// Uses `Cell` rather than `&mut` so the `&`-capturing lighting/shadow closures can share one
+/// cache. That makes it `!Sync`: it is for single-threaded scans only — do not hand it to rayon.
+pub(crate) struct ChunkCache<'w> {
+    world: &'w LoadedWorld,
+    last: Cell<Option<(i32, i32, Option<usize>)>>,
+}
+
+impl<'w> ChunkCache<'w> {
+    pub(crate) fn new(world: &'w LoadedWorld) -> Self {
+        Self { world, last: Cell::new(None) }
+    }
+
+    /// Identical in result to `get_block_at(self.world, wx, wy, wz)`.
+    #[inline]
+    pub(crate) fn get(&self, wx: i32, wy: i32, wz: i32) -> (u8, u8) {
+        let w = self.world;
+        if wz < 0 || wz as usize >= w.num_bands * 16 { return (0, 0); }
+        let cx = wx.div_euclid(16) + w.min_x;
+        let cy = wy.div_euclid(16) + w.min_y;
+        let addr = match self.last.get() {
+            Some((lcx, lcy, a)) if lcx == cx && lcy == cy => a,
+            _ => {
+                let a = w.chunk_map.get(&(cx, cy)).copied();
+                self.last.set(Some((cx, cy, a)));
+                a
+            }
+        };
+        let Some(addr) = addr else { return (0, 0) };
+        let lx = wx.rem_euclid(16) as usize;
+        let ly = wy.rem_euclid(16) as usize;
+        let bi = addr + (wz as usize / 16) * 8192 + lx * 256 + ly * 16 + (wz as usize % 16);
+        let pi = bi + 4096;
+        if bi < w.bytes.len() && pi < w.bytes.len() {
+            return (w.bytes[bi], w.bytes[pi]);
+        }
+        (0, 0)
+    }
 }
 
 /// True if this block fully occludes an adjacent face (not air, not notsolid, not ramp/wedge).
@@ -532,8 +579,8 @@ pub(crate) fn export_vox(
     let w_blocks     = (sx2 - sx1 + 1) as usize;
     let h_blocks     = (sy2 - sy1 + 1) as usize;
     let z_depth      = (sz2 - sz1 + 1) as usize; // always ≤ 256
-    let gx_count     = (w_blocks + 255) / 256;
-    let gy_count     = (h_blocks + 255) / 256;
+    let gx_count     = w_blocks.div_ceil(256);
+    let gy_count     = h_blocks.div_ceil(256);
     let total_models = (gx_count * gy_count) as f32;
 
     // Pass 2: build children buffer (SIZE+XYZI per sub-model, then RGBA) — 47–97%.
@@ -547,8 +594,8 @@ pub(crate) fn export_vox(
             let wx_end   = (wx_start + 255).min(sx2);
             let wy_start = sy1 + (gy * 256) as i32;
             let wy_end   = (wy_start + 255).min(sy2);
-            let model_w  = (wx_end - wx_start + 1) as i32;
-            let model_h  = (wy_end - wy_start + 1) as i32;
+            let model_w  = (wx_end - wx_start + 1);
+            let model_h  = (wy_end - wy_start + 1);
             let model_z  = z_depth as i32;
 
             let label = if total_models > 1.0 {
@@ -623,6 +670,29 @@ pub(crate) struct ObjGeometryResult {
     #[serde(serialize_with = "serialize_bytes_b64")]
     uvs: Vec<u8>,       // LE f32 pairs (u,v) per vertex; empty when no texture pack loaded
     vertex_count: u32,
+    // Blocks with `transparent_alpha()` (water/fence/glass/new-flower) — mirrors the game's
+    // second ATLAS2 vertex buffer, kept separate so the frontend can render them with their own
+    // `transparent:true` material instead of blending into the opaque draw call.
+    #[serde(serialize_with = "serialize_bytes_b64")]
+    positions_t: Vec<u8>,
+    #[serde(serialize_with = "serialize_bytes_b64")]
+    colors_t: Vec<u8>,  // LE f32 quadruplets (r,g,b,a 0..1) per vertex
+    #[serde(serialize_with = "serialize_bytes_b64")]
+    uvs_t: Vec<u8>,
+    vertex_count_t: u32,
+    // Emissive stream (RGB, like the opaque one) — populated only in `flat` (GPU-shadow) mode and
+    // only with `LAMP_BLOCK_TYPE` faces. Lamps must render fullbright in GPU mode: the flat opaque
+    // stream is shaded by Three.js's lit material + ambient, which would darken lamps like any other
+    // block, so the frontend draws these faces with an unlit `MeshBasicMaterial` instead. Empty (0)
+    // whenever `!flat` — OBJ/JSON export and `ThreeDPreview` pass `LightMode::default()`, so their
+    // output is byte-for-byte unchanged and lamp faces stay in the opaque stream as before.
+    #[serde(serialize_with = "serialize_bytes_b64")]
+    positions_e: Vec<u8>,
+    #[serde(serialize_with = "serialize_bytes_b64")]
+    colors_e: Vec<u8>,
+    #[serde(serialize_with = "serialize_bytes_b64")]
+    uvs_e: Vec<u8>,
+    vertex_count_e: u32,
 }
 
 #[tauri::command(async)]
@@ -644,25 +714,262 @@ pub(crate) fn get_obj_geometry(
         return Err(format!("Selection too large ({vol} blocks) — max 64×64×64 for 3D preview"));
     }
 
-    Ok(obj_geometry_region(world, ws.texture_pack.as_ref(), sx1, sy1, sx2, sy2, sz1, sz2))
+    Ok(obj_geometry_region(world, ws.texture_pack.as_ref(), sx1, sy1, sx2, sy2, sz1, sz2, &[], LightMode::default()))
+}
+
+/// Night-lighting/shadow preview toggles for `obj_geometry_region`. Both default off, reproducing
+/// today's flat fully-lit output exactly (OBJ/JSON export and `ThreeDPreview` always pass `default()`
+/// — only `FlyView3D`'s chunk streaming opts in).
+#[derive(Clone, Copy, Default)]
+pub(crate) struct LightMode {
+    pub night: bool,
+    pub shadows: bool,
+    /// Simulated sun position, 0=sunrise, 0.5=noon, 1=sunset (see `sun_direction`). Inert whenever
+    /// `shadows` is false; `f32::default()` = 0.0 keeps `LightMode::default()` unaffected.
+    pub sun_t: f32,
+    /// Emit **flat, unshaded** vertex colours (raw `block_color`, no per-face SH_* shading) for the
+    /// opt-in GPU-shadow path: Three.js then does the directional shading + shadow map from real
+    /// vertex normals, so baking any shading here would double up. Face *kind* (top/bottom/side, for
+    /// texture selection) is still derived from the SH_* constant — only the brightness multiply is
+    /// skipped. Mutually exclusive with `night`/`shadows` in practice (the frontend clears them).
+    pub flat: bool,
+    /// User-tunable lamp light radius (blocks). `<= 0.0` (the `Default`) falls back to the legacy
+    /// `LAMP_LIGHT_RADIUS` constant, so `LightMode::default()` output is byte-for-byte unchanged for
+    /// OBJ/JSON export and `ThreeDPreview`. Only `get_chunk_geometry` (FlyView3D) passes a live value.
+    pub lamp_radius: f32,
+}
+
+pub(crate) const LAMP_BLOCK_TYPE: u8 = 72; // TYPE_LIGHTBOX
+const LAMP_LIGHT_RADIUS: f32 = 5.0;
+const NIGHT_AMBIENT: f32 = 0.35;
+const SHADOW_RAY_STEPS: i32 = 24; // unit steps marched toward the sun per voxel
+
+#[derive(serde::Serialize)]
+pub(crate) struct LightConstants {
+    lamp_light_radius: f32,
+    shadow_ray_steps: i32,
+}
+
+/// Exposes `LAMP_LIGHT_RADIUS`/`SHADOW_RAY_STEPS` to the frontend so the edit-sync reload radius
+/// (FlyView3D: a placed lamp/block can affect neighboring chunks up to these distances away when
+/// night lighting or shadows are on) can't silently drift out of sync with the Rust constants.
+#[tauri::command]
+pub(crate) fn get_light_constants() -> LightConstants {
+    LightConstants { lamp_light_radius: LAMP_LIGHT_RADIUS, shadow_ray_steps: SHADOW_RAY_STEPS }
+}
+const SUN_SHADOW: f32 = 0.55; // hard shadow multiplier — stays well above black even combined
+                               // with the darkest per-face shade constant (SH_W=0.447)
+const SUN_LIT: f32 = 1.0;
+
+/// Unit vector pointing from a voxel toward the simulated sun. `sun_t` sweeps a half-arc
+/// (sunrise -> noon -> sunset): elevation eases 15°..80°..15° via `sin(pi*t)`, azimuth sweeps
+/// 0..pi (east->west) linearly. There's no night-side sun (no sky dome/moon-shadow concept here —
+/// "night" is a separate ambient toggle), so this deliberately never goes sub-horizon.
+fn sun_direction(sun_t: f32) -> [f32; 3] {
+    let az = std::f32::consts::PI * sun_t;
+    let el = 15.0f32.to_radians() + (std::f32::consts::PI * sun_t).sin() * 65.0f32.to_radians();
+    [el.cos() * az.cos(), el.cos() * az.sin(), el.sin()]
+}
+
+/// 3D DDA (Amanatides–Woo) — marches a ray from `(ox,oy,oz)` in direction `dir` (need not be
+/// normalized) up to `max_dist` world units, visiting every voxel the ray actually crosses. This is
+/// what makes it safe for a shallow ray: stepping by a fixed unit-length offset each iteration (the
+/// old approach) advances less than 1 unit along any single axis for a diagonal direction, so
+/// `floor()` can jump clean over a one-block-thick occluder (a fence post, a wall seen edge-on, a
+/// thin horizontal slab) between two samples. A DDA can't skip a voxel boundary — it steps exactly
+/// to the next one on whichever axis is nearest. `hit(x,y,z)` is called for each visited voxel in
+/// order; marching stops and returns that voxel's coords on the first `true`, or `None` if the ray
+/// exhausts `max_dist` unhit. Doesn't test the origin voxel itself — marching starts at its first
+/// exit boundary, matching the old code's "step before testing" behaviour.
+fn dda_march(ox: f32, oy: f32, oz: f32, dir: [f32; 3], max_dist: f32, mut hit: impl FnMut(i32, i32, i32) -> bool) -> Option<(i32, i32, i32)> {
+    let [dx, dy, dz] = dir;
+    let (mut x, mut y, mut z) = (ox.floor() as i32, oy.floor() as i32, oz.floor() as i32);
+    let step = |d: f32| -> i32 { if d > 0.0 { 1 } else if d < 0.0 { -1 } else { 0 } };
+    let (sx, sy, sz) = (step(dx), step(dy), step(dz));
+    let t_delta = |d: f32| -> f32 { if d != 0.0 { (1.0 / d).abs() } else { f32::INFINITY } };
+    let (tdx, tdy, tdz) = (t_delta(dx), t_delta(dy), t_delta(dz));
+    // Parametric distance from the origin to the first voxel boundary crossed on each axis.
+    let boundary = |p: f32, s: i32| -> f32 {
+        if s > 0 { p.floor() + 1.0 - p } else if s < 0 { p - p.floor() } else { f32::INFINITY }
+    };
+    let mut tmx = if sx != 0 { boundary(ox, sx) * tdx } else { f32::INFINITY };
+    let mut tmy = if sy != 0 { boundary(oy, sy) * tdy } else { f32::INFINITY };
+    let mut tmz = if sz != 0 { boundary(oz, sz) * tdz } else { f32::INFINITY };
+    let mut t = 0.0f32;
+    while t < max_dist {
+        if tmx < tmy && tmx < tmz {
+            x += sx; t = tmx; tmx += tdx;
+        } else if tmy < tmz {
+            y += sy; t = tmy; tmy += tdy;
+        } else {
+            z += sz; t = tmz; tmz += tdz;
+        }
+        if hit(x, y, z) { return Some((x, y, z)); }
+    }
+    None
+}
+
+/// The voxel a ray hit, plus the face it entered through as a unit normal in Eden coords
+/// (`nx/ny/nz`). `hit + normal` is the empty voxel adjacent to that face — i.e. where a block
+/// placed against it goes.
+#[derive(serde::Serialize)]
+pub(crate) struct PickResult {
+    pub x: i32, pub y: i32, pub z: i32,
+    pub block_type: u8,
+    pub paint: u8,
+    pub nx: i32, pub ny: i32, pub nz: i32,
+}
+
+/// Maximum ray length for `pick_block`, in blocks. Clamps a bad/hostile `max_dist` so a single
+/// pick can't march the whole world.
+const PICK_MAX_DIST: f32 = 512.0;
+
+/// Casts a ray through the voxel grid and returns the first non-air block it enters, or `None`.
+///
+/// Origin and direction are in **Eden** coords (X east, Y south, Z up) — the caller owns the
+/// Three.js↔Eden transform, so this stays a pure world-space query usable by any viewport.
+///
+/// Ramps and wedges (24..=55) pick as full cubes: the ray hits them at their voxel bounds, not at
+/// their true sloped surface. Eden's own placement does roughly this, and the alternative (exact
+/// prism/pyramid intersection per block type) buys very little for a picker whose result snaps to a
+/// voxel anyway. Non-solid blocks (water, glass, fence, flowers) are hits too — you can break and
+/// build against them, which matches what the block under the crosshair looks like.
+#[tauri::command(async)]
+pub(crate) fn pick_block(
+    state: tauri::State<'_, AppState>,
+    ox: f32, oy: f32, oz: f32,
+    dx: f32, dy: f32, dz: f32,
+    max_dist: f32,
+) -> Result<Option<PickResult>, String> {
+    let ws = state.lock().unwrap_or_else(|p| p.into_inner());
+    let world = ws.world.as_ref().ok_or("No world loaded")?;
+    pick_block_in(world, ox, oy, oz, dx, dy, dz, max_dist)
+}
+
+/// Lock-free core of [`pick_block`], so it can be tested against a bare `LoadedWorld`.
+pub(crate) fn pick_block_in(
+    world: &LoadedWorld,
+    ox: f32, oy: f32, oz: f32,
+    dx: f32, dy: f32, dz: f32,
+    max_dist: f32,
+) -> Result<Option<PickResult>, String> {
+    let len = (dx * dx + dy * dy + dz * dz).sqrt();
+    if !len.is_finite() || len < 1e-6 {
+        return Err("pick_block: degenerate ray direction".into());
+    }
+    if !ox.is_finite() || !oy.is_finite() || !oz.is_finite() {
+        return Err("pick_block: non-finite ray origin".into());
+    }
+    let dir = [dx / len, dy / len, dz / len];
+    let dist = max_dist.clamp(0.0, PICK_MAX_DIST);
+
+    // `dda_march` never tests the origin voxel, so the voxel preceding the first visited one is the
+    // origin voxel itself — seeding `prev` with it makes the entry normal correct even for a hit on
+    // the very first step.
+    let mut prev = (ox.floor() as i32, oy.floor() as i32, oz.floor() as i32);
+    let mut found: Option<(i32, i32, i32)> = None;
+    let hit = dda_march(ox, oy, oz, dir, dist, |vx, vy, vz| {
+        if get_block_at(world, vx, vy, vz).0 != 0 {
+            found = Some((vx, vy, vz));
+            true
+        } else {
+            prev = (vx, vy, vz);
+            false
+        }
+    });
+    let Some((x, y, z)) = hit.and(found) else { return Ok(None) };
+    let (bt, paint) = get_block_at(world, x, y, z);
+    Ok(Some(PickResult {
+        x, y, z,
+        block_type: bt,
+        paint,
+        nx: prev.0 - x, ny: prev.1 - y, nz: prev.2 - z,
+    }))
 }
 
 /// Face-culled cube/ramp/wedge geometry for an arbitrary world box, encoded as LE f32 position +
 /// colour triplets (Three.js Y-up coords). Shared by `get_obj_geometry` (64³ selection preview) and
 /// `get_chunk_geometry` (world-scale fly-through chunk streaming).
-pub(crate) fn obj_geometry_region(world: &LoadedWorld, pack: Option<&texturepack::TexturePack>, sx1: i32, sy1: i32, sx2: i32, sy2: i32, sz1: i32, sz2: i32) -> ObjGeometryResult {
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn obj_geometry_region(world: &LoadedWorld, pack: Option<&texturepack::TexturePack>, sx1: i32, sy1: i32, sx2: i32, sy2: i32, sz1: i32, sz2: i32, lamps: &[([i32; 3], [f32; 3])], mode: LightMode) -> ObjGeometryResult {
+    // Every block read below goes through the chunk-address memo. Single-threaded by construction
+    // (see ChunkCache) — this function is not parallelised.
+    let cache = ChunkCache::new(world);
+    let gb = |wx: i32, wy: i32, wz: i32| cache.get(wx, wy, wz);
+
     let mut pos_f: Vec<f32> = Vec::new();
     let mut col_f: Vec<f32> = Vec::new();
     let mut uv_f:  Vec<f32> = Vec::new();
+    // Transparent stream (water/glass/fence/new-flower) — same layout except colors are RGBA.
+    let mut pos_ft: Vec<f32> = Vec::new();
+    let mut col_ft: Vec<f32> = Vec::new();
+    let mut uv_ft:  Vec<f32> = Vec::new();
+    // Emissive stream (lamp blocks in flat/GPU mode) — RGB, drawn unlit by the frontend so lamps
+    // stay fullbright. Only populated when `mode.flat`.
+    let mut pos_ef: Vec<f32> = Vec::new();
+    let mut col_ef: Vec<f32> = Vec::new();
+    let mut uv_ef:  Vec<f32> = Vec::new();
+
+    // Lamp positions + light colour within reach of this region are supplied by the caller (only
+    // populated when night preview is on — day-lit/no-lamp regions pass an empty slice). The caller
+    // (`get_chunk_geometry`) gathers them from the chunk-keyed lamp spatial index rather than scanning
+    // the voxel volume, so the lamp radius can be a user slider without the scan going cubic in radius.
+    // Colour is the lamp block's own paint via the same `block_color` lookup normal painted blocks use
+    // (Lighting.mm `addlight` is passed `colorTable[getColorc(x,z,y)]` — the lamp's paint index into
+    // the shared paint table, not a dedicated lamp-colour table).
+    let lamp_radius = if mode.lamp_radius > 0.0 { mode.lamp_radius } else { LAMP_LIGHT_RADIUS };
+
+    let sun_dir = sun_direction(mode.sun_t);
+
+    // Per-block, per-channel light: Eden's `calcLight` adds each nearby lamp's `colorTable[paint]`
+    // (scaled by linear falloff) onto the ambient base independently per R/G/B channel (Terrain.mm
+    // `calcLight`/`addlight` keep a `Vector8 lightarray` — one accumulator per channel, not a single
+    // scalar), then clamps to [0, 1.5]. Keeping the channels separate is what makes a red lamp cast
+    // red light instead of just a brighter grey. Evaluated once per voxel (not per vertex) — a
+    // per-block approximation of the game's per-voxel lightarray grid. Lamp blocks themselves render
+    // fullbright, matching the game.
+    let light_at = |wx: i32, wy: i32, wz: i32, bt: u8| -> [f32; 3] {
+        if !mode.night || bt == LAMP_BLOCK_TYPE { return [1.0, 1.0, 1.0]; }
+        let mut l = [NIGHT_AMBIENT; 3];
+        for (&[lx, ly, lz], &color) in lamps.iter().map(|(p, c)| (p, c)) {
+            let dx = (wx - lx) as f32;
+            let dy = (wy - ly) as f32;
+            let dz = (wz - lz) as f32;
+            let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+            if dist < lamp_radius {
+                let contrib = 1.0 - dist / lamp_radius;
+                l[0] += contrib * color[0];
+                l[1] += contrib * color[1];
+                l[2] += contrib * color[2];
+            }
+        }
+        [l[0].clamp(0.0, 1.5), l[1].clamp(0.0, 1.5), l[2].clamp(0.0, 1.5)]
+    };
+
+    // Directional sun-raycast shadow: march a 3D DDA toward the sun (see `sun_direction`) for
+    // SHADOW_RAY_STEPS world units; if any voxel the ray actually crosses is solid/occluding, the
+    // origin voxel is in shadow. Hard two-tone (SUN_LIT/SUN_SHADOW) — no soft falloff. `sun_dir` is
+    // constant for the whole region, so it's computed once above rather than per voxel.
+    let shadow_at = |wx: i32, wy: i32, wz: i32| -> f32 {
+        if !mode.shadows { return 1.0; }
+        let hit = dda_march(
+            wx as f32 + 0.5, wy as f32 + 0.5, wz as f32 + 0.5,
+            sun_dir, SHADOW_RAY_STEPS as f32,
+            |vx, vy, vz| obj_occludes(gb(vx, vy, vz).0),
+        );
+        if hit.is_some() { SUN_SHADOW } else { SUN_LIT }
+    };
 
     // Directional face-shading baked into vertex colours — replaces normal-based lighting.
-    // Values approximate: sun from above + slightly east/south; fill from northwest.
+    // Magnitudes match the game's own fixed per-face shading table (cubeColors[] in
+    // Geometry.c: {216,140,191,114,153,255} normalized); there's no real directional sun to
+    // align to, just this fixed fake-AO pattern, so only the six magnitudes matter here.
     const SH_TOP: f32 = 1.00;
-    const SH_BOT: f32 = 0.45;
-    const SH_E:   f32 = 0.85; // east  (+X)
-    const SH_W:   f32 = 0.60; // west  (-X)
-    const SH_S:   f32 = 0.70; // south (+Y)
-    const SH_N:   f32 = 0.75; // north (-Y)
+    const SH_BOT: f32 = 0.60;
+    const SH_E:   f32 = 0.847; // east  (+X)
+    const SH_W:   f32 = 0.447; // west  (-X)
+    const SH_S:   f32 = 0.549; // south (+Y)
+    const SH_N:   f32 = 0.749; // north (-Y)
 
     // Detect face kind from shade constant so per-face textures work without touching every call site.
     // SH_TOP → top face (2), SH_BOT → bottom face (1), anything else → side face (0).
@@ -674,10 +981,11 @@ pub(crate) fn obj_geometry_region(world: &LoadedWorld, pack: Option<&texturepack
         }};
     }
 
-    // Push UV coords for a quad (6 verts: ABD, BCD) covering atlas row with v in [v0,v1].
+    // Push UV coords for a quad (6 verts: ABD, BCD) covering atlas row with v in [v0,v1], into a
+    // caller-chosen buffer (opaque `uv_f` or transparent `uv_ft`).
     macro_rules! push_quad_uv {
-        ($v0:expr, $v1:expr) => {
-            uv_f.extend_from_slice(&[
+        ($buf:expr, $v0:expr, $v1:expr) => {
+            $buf.extend_from_slice(&[
                 0.0, $v0,  1.0, $v0,  0.0, $v1,
                 1.0, $v0,  1.0, $v1,  0.0, $v1,
             ]);
@@ -685,38 +993,91 @@ pub(crate) fn obj_geometry_region(world: &LoadedWorld, pack: Option<&texturepack
     }
     // Push UV coords for a triangle covering the same atlas row.
     macro_rules! push_tri_uv {
-        ($v0:expr, $v1:expr) => {
-            uv_f.extend_from_slice(&[0.0, $v0,  1.0, $v0,  0.5, $v1]);
+        ($buf:expr, $v0:expr, $v1:expr) => {
+            $buf.extend_from_slice(&[0.0, $v0,  1.0, $v0,  0.5, $v1]);
         };
     }
 
+    // Per-channel colour after light + face shading, capped so light can brighten a shaded face back
+    // up to its flat paint colour but never past it — mirrors TerrainChunk.mm's
+    // `if(color>paint[coord]*255) color=paint[coord]*255` (light recovers full colour, it doesn't
+    // blow it out).
+    // Flat (GPU-shadow) mode skips the per-face SH_* shading and lamp/shadow multiplier entirely —
+    // Three.js supplies all lighting downstream. `$sh` is still passed to `face_kind!` in the macros
+    // for texture selection; only the brightness multiply here is neutralised.
+    let flat = mode.flat;
+    macro_rules! lit_rgb {
+        ($rgb2:expr, $sh:expr, $lm:expr) => {{
+            let rgb2 = $rgb2;
+            let sh: f32 = if flat { 1.0 } else { $sh };
+            let lm: [f32; 3] = if flat { [1.0, 1.0, 1.0] } else { $lm };
+            [
+                rgb2[0] as f32 / 255.0 * (sh * lm[0]).min(1.0),
+                rgb2[1] as f32 / 255.0 * (sh * lm[1]).min(1.0),
+                rgb2[2] as f32 / 255.0 * (sh * lm[2]).min(1.0),
+            ]
+        }};
+    }
+
     macro_rules! push_tri {
-        ($verts:expr, $rgb:expr, $sh:expr, $btype:expr, $bpaint:expr) => {{
+        ($verts:expr, $rgb:expr, $sh:expr, $lm:expr, $btype:expr, $bpaint:expr) => {{
             let fk = face_kind!($sh);
             let (rgb2, row_opt) = if let Some(p) = pack {
                 texturepack::face_color_and_row(p, $btype, $bpaint, fk, $rgb)
             } else { ($rgb, None) };
-            let (r,g,b) = (rgb2[0] as f32/255.0*$sh, rgb2[1] as f32/255.0*$sh, rgb2[2] as f32/255.0*$sh);
-            for (x,y,z) in $verts { pos_f.extend_from_slice(&[x,y,z]); col_f.extend_from_slice(&[r,g,b]); }
-            if let Some(p) = pack {
-                let ar = p.atlas_rows as f32;
-                let (v0, v1) = match row_opt { Some(row) => (row as f32/ar, (row+1) as f32/ar), None => (0.0, 1.0/ar) };
-                push_tri_uv!(v1, v0); // swap: $v0 arg → floor vertex, $v1 arg → apex; tile reads top→bottom
+            let [r,g,b] = lit_rgb!(rgb2, $sh, $lm);
+            if flat && $btype == LAMP_BLOCK_TYPE {
+                for (x,y,z) in $verts { pos_ef.extend_from_slice(&[x,y,z]); col_ef.extend_from_slice(&[r,g,b]); }
+                if let Some(p) = pack {
+                    let ar = p.atlas_rows as f32;
+                    let (v0, v1) = match row_opt { Some(row) => (row as f32/ar, (row+1) as f32/ar), None => (0.0, 1.0/ar) };
+                    push_tri_uv!(uv_ef, v1, v0);
+                }
+            } else if let Some(alpha) = transparent_alpha($btype) {
+                for (x,y,z) in $verts { pos_ft.extend_from_slice(&[x,y,z]); col_ft.extend_from_slice(&[r,g,b,alpha]); }
+                if let Some(p) = pack {
+                    let ar = p.atlas_rows as f32;
+                    let (v0, v1) = match row_opt { Some(row) => (row as f32/ar, (row+1) as f32/ar), None => (0.0, 1.0/ar) };
+                    push_tri_uv!(uv_ft, v1, v0);
+                }
+            } else {
+                for (x,y,z) in $verts { pos_f.extend_from_slice(&[x,y,z]); col_f.extend_from_slice(&[r,g,b]); }
+                if let Some(p) = pack {
+                    let ar = p.atlas_rows as f32;
+                    let (v0, v1) = match row_opt { Some(row) => (row as f32/ar, (row+1) as f32/ar), None => (0.0, 1.0/ar) };
+                    push_tri_uv!(uv_f, v1, v0); // swap: $v0 arg → floor vertex, $v1 arg → apex; tile reads top→bottom
+                }
             }
         }};
     }
     macro_rules! push_quad {
-        ($a:expr,$b:expr,$c:expr,$d:expr,$rgb:expr,$sh:expr,$btype:expr,$bpaint:expr) => {{
+        ($a:expr,$b:expr,$c:expr,$d:expr,$rgb:expr,$sh:expr,$lm:expr,$btype:expr,$bpaint:expr) => {{
             let fk = face_kind!($sh);
             let (rgb2, row_opt) = if let Some(p) = pack {
                 texturepack::face_color_and_row(p, $btype, $bpaint, fk, $rgb)
             } else { ($rgb, None) };
-            let (r,g,b_) = (rgb2[0] as f32/255.0*$sh, rgb2[1] as f32/255.0*$sh, rgb2[2] as f32/255.0*$sh);
-            for (x,y,z) in [$a,$b,$d, $b,$c,$d] { pos_f.extend_from_slice(&[x,y,z]); col_f.extend_from_slice(&[r,g,b_]); }
-            if let Some(p) = pack {
-                let ar = p.atlas_rows as f32;
-                let (v0, v1) = match row_opt { Some(row) => (row as f32/ar, (row+1) as f32/ar), None => (0.0, 1.0/ar) };
-                push_quad_uv!(v1, v0); // swap: $v0 arg → A/B vertices, $v1 arg → C/D vertices; tile reads top→bottom
+            let [r,g,b_] = lit_rgb!(rgb2, $sh, $lm);
+            if flat && $btype == LAMP_BLOCK_TYPE {
+                for (x,y,z) in [$a,$b,$d, $b,$c,$d] { pos_ef.extend_from_slice(&[x,y,z]); col_ef.extend_from_slice(&[r,g,b_]); }
+                if let Some(p) = pack {
+                    let ar = p.atlas_rows as f32;
+                    let (v0, v1) = match row_opt { Some(row) => (row as f32/ar, (row+1) as f32/ar), None => (0.0, 1.0/ar) };
+                    push_quad_uv!(uv_ef, v1, v0);
+                }
+            } else if let Some(alpha) = transparent_alpha($btype) {
+                for (x,y,z) in [$a,$b,$d, $b,$c,$d] { pos_ft.extend_from_slice(&[x,y,z]); col_ft.extend_from_slice(&[r,g,b_,alpha]); }
+                if let Some(p) = pack {
+                    let ar = p.atlas_rows as f32;
+                    let (v0, v1) = match row_opt { Some(row) => (row as f32/ar, (row+1) as f32/ar), None => (0.0, 1.0/ar) };
+                    push_quad_uv!(uv_ft, v1, v0);
+                }
+            } else {
+                for (x,y,z) in [$a,$b,$d, $b,$c,$d] { pos_f.extend_from_slice(&[x,y,z]); col_f.extend_from_slice(&[r,g,b_]); }
+                if let Some(p) = pack {
+                    let ar = p.atlas_rows as f32;
+                    let (v0, v1) = match row_opt { Some(row) => (row as f32/ar, (row+1) as f32/ar), None => (0.0, 1.0/ar) };
+                    push_quad_uv!(uv_f, v1, v0); // swap: $v0 arg → A/B vertices, $v1 arg → C/D vertices; tile reads top→bottom
+                }
             }
         }};
     }
@@ -724,9 +1085,46 @@ pub(crate) fn obj_geometry_region(world: &LoadedWorld, pack: Option<&texturepack
     for wz in sz1..=sz2 {
         for wy in sy1..=sy2 {
             for wx in sx1..=sx2 {
-                let (bt, paint) = get_block_at(world, wx, wy, wz);
+                let (bt, paint) = gb(wx, wy, wz);
                 if bt == 0 { continue; }
+
+                // A face is invisible if the neighbor fully occludes it, OR the neighbor is the same
+                // block type as this voxel — two adjacent water/glass/fence blocks (all BI_NOTSOLID,
+                // so `obj_occludes` alone says false) share a face that's never actually visible from
+                // either side, but without this they both still emit it. For a deep water column this
+                // is the difference between ~6 quads/block and 0 for every interior block.
+                let face_hidden = |nbt: u8| obj_occludes(nbt) || nbt == bt;
+
+                let is_ramp_or_wedge = matches!(bt, 24..=55);
+                // Ramp/wedge branches below do their own neighbor lookups (their diagonal face is
+                // unconditional, so there's no early-out for them); only plain cubes reuse these.
+                let (n_top, n_bot, n_s, n_n, n_e, n_w) = if is_ramp_or_wedge {
+                    (0, 0, 0, 0, 0, 0)
+                } else {
+                    (
+                        gb(wx, wy, wz + 1).0,
+                        gb(wx, wy, wz - 1).0,
+                        gb(wx, wy + 1, wz).0,
+                        gb(wx, wy - 1, wz).0,
+                        gb(wx + 1, wy, wz).0,
+                        gb(wx - 1, wy, wz).0,
+                    )
+                };
+                // Cheap early-out: a plain cube with every face hidden emits nothing, so skip the
+                // lamp/shadow lighting below entirely — that's the expensive part (O(lamps) per voxel
+                // plus a 24-step shadow raymarch), today paid by every voxel even when nothing is drawn.
+                if !is_ramp_or_wedge
+                    && face_hidden(n_top) && face_hidden(n_bot)
+                    && face_hidden(n_s) && face_hidden(n_n)
+                    && face_hidden(n_e) && face_hidden(n_w)
+                {
+                    continue;
+                }
+
                 let rgb = block_color(bt, paint, world.sky);
+                let base_lm = light_at(wx, wy, wz, bt);
+                let shadow = shadow_at(wx, wy, wz);
+                let lm = [base_lm[0] * shadow, base_lm[1] * shadow, base_lm[2] * shadow];
                 let (x0,x1f) = (wx as f32, wx as f32+1.0);
                 let (y0,y1f) = (wy as f32, wy as f32+1.0);
                 let (z0,z1f) = (wz as f32, wz as f32+1.0);
@@ -736,37 +1134,37 @@ pub(crate) fn obj_geometry_region(world: &LoadedWorld, pack: Option<&texturepack
 
                 if matches!(bt, 24..=39) {
                     let dir = (bt-24)%4;
-                    let ss = obj_occludes(get_block_at(world,wx,wy+1,wz).0);
-                    let sn = obj_occludes(get_block_at(world,wx,wy-1,wz).0);
-                    let se = obj_occludes(get_block_at(world,wx+1,wy,wz).0);
-                    let sw = obj_occludes(get_block_at(world,wx-1,wy,wz).0);
-                    if !obj_occludes(get_block_at(world,wx,wy,wz-1).0) {
-                        push_quad!(o(x0,y1f,z0),o(x1f,y1f,z0),o(x1f,y0,z0),o(x0,y0,z0),rgb,SH_BOT,bt,paint);
+                    let ss = obj_occludes(gb(wx,wy+1,wz).0);
+                    let sn = obj_occludes(gb(wx,wy-1,wz).0);
+                    let se = obj_occludes(gb(wx+1,wy,wz).0);
+                    let sw = obj_occludes(gb(wx-1,wy,wz).0);
+                    if !obj_occludes(gb(wx,wy,wz-1).0) {
+                        push_quad!(o(x0,y1f,z0),o(x1f,y1f,z0),o(x1f,y0,z0),o(x0,y0,z0),rgb,SH_BOT,lm,bt,paint);
                     }
                     match dir {
                         0 => {
-                            if !ss { push_quad!(o(x0,y1f,z0),o(x1f,y1f,z0),o(x1f,y1f,z1f),o(x0,y1f,z1f),rgb,SH_S,bt,paint); }
-                            if !sw { push_tri!([o(x0,y0,z0),o(x0,y1f,z0),o(x0,y1f,z1f)],rgb,SH_W,bt,paint); }
-                            if !se { push_tri!([o(x1f,y1f,z0),o(x1f,y0,z0),o(x1f,y1f,z1f)],rgb,SH_E,bt,paint); }
-                            push_quad!(o(x0,y0,z0),o(x1f,y0,z0),o(x1f,y1f,z1f),o(x0,y1f,z1f),rgb,SH_TOP,bt,paint);
+                            if !ss { push_quad!(o(x0,y1f,z0),o(x1f,y1f,z0),o(x1f,y1f,z1f),o(x0,y1f,z1f),rgb,SH_S,lm,bt,paint); }
+                            if !sw { push_tri!([o(x0,y0,z0),o(x0,y1f,z0),o(x0,y1f,z1f)],rgb,SH_W,lm,bt,paint); }
+                            if !se { push_tri!([o(x1f,y1f,z0),o(x1f,y0,z0),o(x1f,y1f,z1f)],rgb,SH_E,lm,bt,paint); }
+                            push_quad!(o(x0,y0,z0),o(x1f,y0,z0),o(x1f,y1f,z1f),o(x0,y1f,z1f),rgb,SH_TOP,lm,bt,paint);
                         }
                         1 => {
-                            if !sw { push_quad!(o(x0,y0,z0),o(x0,y1f,z0),o(x0,y1f,z1f),o(x0,y0,z1f),rgb,SH_W,bt,paint); }
-                            if !ss { push_tri!([o(x0,y1f,z0),o(x1f,y1f,z0),o(x0,y1f,z1f)],rgb,SH_S,bt,paint); }
-                            if !sn { push_tri!([o(x1f,y0,z0),o(x0,y0,z0),o(x0,y0,z1f)],rgb,SH_N,bt,paint); }
-                            push_quad!(o(x1f,y0,z0),o(x1f,y1f,z0),o(x0,y1f,z1f),o(x0,y0,z1f),rgb,SH_TOP,bt,paint);
+                            if !sw { push_quad!(o(x0,y0,z0),o(x0,y1f,z0),o(x0,y1f,z1f),o(x0,y0,z1f),rgb,SH_W,lm,bt,paint); }
+                            if !ss { push_tri!([o(x0,y1f,z0),o(x1f,y1f,z0),o(x0,y1f,z1f)],rgb,SH_S,lm,bt,paint); }
+                            if !sn { push_tri!([o(x1f,y0,z0),o(x0,y0,z0),o(x0,y0,z1f)],rgb,SH_N,lm,bt,paint); }
+                            push_quad!(o(x1f,y0,z0),o(x1f,y1f,z0),o(x0,y1f,z1f),o(x0,y0,z1f),rgb,SH_TOP,lm,bt,paint);
                         }
                         2 => {
-                            if !sn { push_quad!(o(x1f,y0,z0),o(x0,y0,z0),o(x0,y0,z1f),o(x1f,y0,z1f),rgb,SH_N,bt,paint); }
-                            if !se { push_tri!([o(x1f,y0,z0),o(x1f,y1f,z0),o(x1f,y0,z1f)],rgb,SH_E,bt,paint); }
-                            if !sw { push_tri!([o(x0,y1f,z0),o(x0,y0,z0),o(x0,y0,z1f)],rgb,SH_W,bt,paint); }
-                            push_quad!(o(x1f,y1f,z0),o(x0,y1f,z0),o(x0,y0,z1f),o(x1f,y0,z1f),rgb,SH_TOP,bt,paint);
+                            if !sn { push_quad!(o(x1f,y0,z0),o(x0,y0,z0),o(x0,y0,z1f),o(x1f,y0,z1f),rgb,SH_N,lm,bt,paint); }
+                            if !se { push_tri!([o(x1f,y0,z0),o(x1f,y1f,z0),o(x1f,y0,z1f)],rgb,SH_E,lm,bt,paint); }
+                            if !sw { push_tri!([o(x0,y1f,z0),o(x0,y0,z0),o(x0,y0,z1f)],rgb,SH_W,lm,bt,paint); }
+                            push_quad!(o(x1f,y1f,z0),o(x0,y1f,z0),o(x0,y0,z1f),o(x1f,y0,z1f),rgb,SH_TOP,lm,bt,paint);
                         }
                         _ => {
-                            if !se { push_quad!(o(x1f,y1f,z0),o(x1f,y0,z0),o(x1f,y0,z1f),o(x1f,y1f,z1f),rgb,SH_E,bt,paint); }
-                            if !sn { push_tri!([o(x1f,y0,z0),o(x0,y0,z0),o(x1f,y0,z1f)],rgb,SH_N,bt,paint); }
-                            if !ss { push_tri!([o(x0,y1f,z0),o(x1f,y1f,z0),o(x1f,y1f,z1f)],rgb,SH_S,bt,paint); }
-                            push_quad!(o(x0,y1f,z0),o(x0,y0,z0),o(x1f,y0,z1f),o(x1f,y1f,z1f),rgb,SH_TOP,bt,paint);
+                            if !se { push_quad!(o(x1f,y1f,z0),o(x1f,y0,z0),o(x1f,y0,z1f),o(x1f,y1f,z1f),rgb,SH_E,lm,bt,paint); }
+                            if !sn { push_tri!([o(x1f,y0,z0),o(x0,y0,z0),o(x1f,y0,z1f)],rgb,SH_N,lm,bt,paint); }
+                            if !ss { push_tri!([o(x0,y1f,z0),o(x1f,y1f,z0),o(x1f,y1f,z1f)],rgb,SH_S,lm,bt,paint); }
+                            push_quad!(o(x0,y1f,z0),o(x0,y0,z0),o(x1f,y0,z1f),o(x1f,y1f,z1f),rgb,SH_TOP,lm,bt,paint);
                         }
                     }
                 } else if matches!(bt, 40..=55) {
@@ -775,61 +1173,62 @@ pub(crate) fn obj_geometry_region(world: &LoadedWorld, pack: Option<&texturepack
                     // SE fills the NE-SE-SW triangle (cuts off the NW corner), etc.
                     // Two rectangular faces at the named sides + one diagonal 45° rectangular face.
                     let dir = (bt-40)%4;
-                    let ss = obj_occludes(get_block_at(world,wx,wy+1,wz).0);
-                    let sn = obj_occludes(get_block_at(world,wx,wy-1,wz).0);
-                    let se = obj_occludes(get_block_at(world,wx+1,wy,wz).0);
-                    let sw = obj_occludes(get_block_at(world,wx-1,wy,wz).0);
-                    let s_top = obj_occludes(get_block_at(world,wx,wy,wz+1).0);
-                    let s_bot = obj_occludes(get_block_at(world,wx,wy,wz-1).0);
+                    let ss = obj_occludes(gb(wx,wy+1,wz).0);
+                    let sn = obj_occludes(gb(wx,wy-1,wz).0);
+                    let se = obj_occludes(gb(wx+1,wy,wz).0);
+                    let sw = obj_occludes(gb(wx-1,wy,wz).0);
+                    let s_top = obj_occludes(gb(wx,wy,wz+1).0);
+                    let s_bot = obj_occludes(gb(wx,wy,wz-1).0);
                     match dir {
                         0 => { // SE: triangle NE(x1f,y0)-SE(x1f,y1f)-SW(x0,y1f). Diagonal NE↔SW faces NW.
-                            if !s_bot { push_tri!([o(x1f,y0,z0),o(x1f,y1f,z0),o(x0,y1f,z0)],rgb,SH_BOT,bt,paint); }
-                            if !s_top { push_tri!([o(x1f,y0,z1f),o(x0,y1f,z1f),o(x1f,y1f,z1f)],rgb,SH_TOP,bt,paint); }
-                            if !se { push_quad!(o(x1f,y0,z0),o(x1f,y1f,z0),o(x1f,y1f,z1f),o(x1f,y0,z1f),rgb,SH_E,bt,paint); }
-                            if !ss { push_quad!(o(x1f,y1f,z0),o(x0,y1f,z0),o(x0,y1f,z1f),o(x1f,y1f,z1f),rgb,SH_S,bt,paint); }
-                            push_quad!(o(x1f,y0,z0),o(x0,y1f,z0),o(x0,y1f,z1f),o(x1f,y0,z1f),rgb,(SH_N+SH_W)*0.5,bt,paint);
+                            if !s_bot { push_tri!([o(x1f,y0,z0),o(x1f,y1f,z0),o(x0,y1f,z0)],rgb,SH_BOT,lm,bt,paint); }
+                            if !s_top { push_tri!([o(x1f,y0,z1f),o(x0,y1f,z1f),o(x1f,y1f,z1f)],rgb,SH_TOP,lm,bt,paint); }
+                            if !se { push_quad!(o(x1f,y0,z0),o(x1f,y1f,z0),o(x1f,y1f,z1f),o(x1f,y0,z1f),rgb,SH_E,lm,bt,paint); }
+                            if !ss { push_quad!(o(x1f,y1f,z0),o(x0,y1f,z0),o(x0,y1f,z1f),o(x1f,y1f,z1f),rgb,SH_S,lm,bt,paint); }
+                            push_quad!(o(x1f,y0,z0),o(x0,y1f,z0),o(x0,y1f,z1f),o(x1f,y0,z1f),rgb,(SH_N+SH_W)*0.5,lm,bt,paint);
                         }
                         1 => { // SW: triangle NW(x0,y0)-SW(x0,y1f)-SE(x1f,y1f). Diagonal NW↔SE faces NE.
-                            if !s_bot { push_tri!([o(x0,y0,z0),o(x0,y1f,z0),o(x1f,y1f,z0)],rgb,SH_BOT,bt,paint); }
-                            if !s_top { push_tri!([o(x0,y0,z1f),o(x1f,y1f,z1f),o(x0,y1f,z1f)],rgb,SH_TOP,bt,paint); }
-                            if !sw { push_quad!(o(x0,y0,z0),o(x0,y1f,z0),o(x0,y1f,z1f),o(x0,y0,z1f),rgb,SH_W,bt,paint); }
-                            if !ss { push_quad!(o(x0,y1f,z0),o(x1f,y1f,z0),o(x1f,y1f,z1f),o(x0,y1f,z1f),rgb,SH_S,bt,paint); }
-                            push_quad!(o(x0,y0,z0),o(x1f,y1f,z0),o(x1f,y1f,z1f),o(x0,y0,z1f),rgb,(SH_N+SH_E)*0.5,bt,paint);
+                            if !s_bot { push_tri!([o(x0,y0,z0),o(x0,y1f,z0),o(x1f,y1f,z0)],rgb,SH_BOT,lm,bt,paint); }
+                            if !s_top { push_tri!([o(x0,y0,z1f),o(x1f,y1f,z1f),o(x0,y1f,z1f)],rgb,SH_TOP,lm,bt,paint); }
+                            if !sw { push_quad!(o(x0,y0,z0),o(x0,y1f,z0),o(x0,y1f,z1f),o(x0,y0,z1f),rgb,SH_W,lm,bt,paint); }
+                            if !ss { push_quad!(o(x0,y1f,z0),o(x1f,y1f,z0),o(x1f,y1f,z1f),o(x0,y1f,z1f),rgb,SH_S,lm,bt,paint); }
+                            push_quad!(o(x0,y0,z0),o(x1f,y1f,z0),o(x1f,y1f,z1f),o(x0,y0,z1f),rgb,(SH_N+SH_E)*0.5,lm,bt,paint);
                         }
                         2 => { // NW: triangle NE(x1f,y0)-NW(x0,y0)-SW(x0,y1f). Diagonal NE↔SW faces SE.
-                            if !s_bot { push_tri!([o(x1f,y0,z0),o(x0,y0,z0),o(x0,y1f,z0)],rgb,SH_BOT,bt,paint); }
-                            if !s_top { push_tri!([o(x1f,y0,z1f),o(x0,y1f,z1f),o(x0,y0,z1f)],rgb,SH_TOP,bt,paint); }
-                            if !sn { push_quad!(o(x1f,y0,z0),o(x0,y0,z0),o(x0,y0,z1f),o(x1f,y0,z1f),rgb,SH_N,bt,paint); }
-                            if !sw { push_quad!(o(x0,y0,z0),o(x0,y1f,z0),o(x0,y1f,z1f),o(x0,y0,z1f),rgb,SH_W,bt,paint); }
-                            push_quad!(o(x1f,y0,z0),o(x0,y1f,z0),o(x0,y1f,z1f),o(x1f,y0,z1f),rgb,(SH_S+SH_E)*0.5,bt,paint);
+                            if !s_bot { push_tri!([o(x1f,y0,z0),o(x0,y0,z0),o(x0,y1f,z0)],rgb,SH_BOT,lm,bt,paint); }
+                            if !s_top { push_tri!([o(x1f,y0,z1f),o(x0,y1f,z1f),o(x0,y0,z1f)],rgb,SH_TOP,lm,bt,paint); }
+                            if !sn { push_quad!(o(x1f,y0,z0),o(x0,y0,z0),o(x0,y0,z1f),o(x1f,y0,z1f),rgb,SH_N,lm,bt,paint); }
+                            if !sw { push_quad!(o(x0,y0,z0),o(x0,y1f,z0),o(x0,y1f,z1f),o(x0,y0,z1f),rgb,SH_W,lm,bt,paint); }
+                            push_quad!(o(x1f,y0,z0),o(x0,y1f,z0),o(x0,y1f,z1f),o(x1f,y0,z1f),rgb,(SH_S+SH_E)*0.5,lm,bt,paint);
                         }
                         _ => { // NE: triangle NW(x0,y0)-NE(x1f,y0)-SE(x1f,y1f). Diagonal NW↔SE faces SW.
-                            if !s_bot { push_tri!([o(x0,y0,z0),o(x1f,y0,z0),o(x1f,y1f,z0)],rgb,SH_BOT,bt,paint); }
-                            if !s_top { push_tri!([o(x0,y0,z1f),o(x1f,y1f,z1f),o(x1f,y0,z1f)],rgb,SH_TOP,bt,paint); }
-                            if !sn { push_quad!(o(x0,y0,z0),o(x1f,y0,z0),o(x1f,y0,z1f),o(x0,y0,z1f),rgb,SH_N,bt,paint); }
-                            if !se { push_quad!(o(x1f,y0,z0),o(x1f,y1f,z0),o(x1f,y1f,z1f),o(x1f,y0,z1f),rgb,SH_E,bt,paint); }
-                            push_quad!(o(x0,y0,z0),o(x1f,y1f,z0),o(x1f,y1f,z1f),o(x0,y0,z1f),rgb,(SH_S+SH_W)*0.5,bt,paint);
+                            if !s_bot { push_tri!([o(x0,y0,z0),o(x1f,y0,z0),o(x1f,y1f,z0)],rgb,SH_BOT,lm,bt,paint); }
+                            if !s_top { push_tri!([o(x0,y0,z1f),o(x1f,y1f,z1f),o(x1f,y0,z1f)],rgb,SH_TOP,lm,bt,paint); }
+                            if !sn { push_quad!(o(x0,y0,z0),o(x1f,y0,z0),o(x1f,y0,z1f),o(x0,y0,z1f),rgb,SH_N,lm,bt,paint); }
+                            if !se { push_quad!(o(x1f,y0,z0),o(x1f,y1f,z0),o(x1f,y1f,z1f),o(x1f,y0,z1f),rgb,SH_E,lm,bt,paint); }
+                            push_quad!(o(x0,y0,z0),o(x1f,y1f,z0),o(x1f,y1f,z1f),o(x0,y0,z1f),rgb,(SH_S+SH_W)*0.5,lm,bt,paint);
                         }
                     }
                 } else {
-                    // Cube with face culling
-                    if !obj_occludes(get_block_at(world,wx,wy,wz+1).0) {
-                        push_quad!(o(x0,y0,z1f),o(x1f,y0,z1f),o(x1f,y1f,z1f),o(x0,y1f,z1f),rgb,SH_TOP,bt,paint);
+                    // Cube with face culling — reuses the neighbor lookups + face_hidden (occludes OR
+                    // same block type) computed above, so water/glass/fence don't emit interior faces.
+                    if !face_hidden(n_top) {
+                        push_quad!(o(x0,y0,z1f),o(x1f,y0,z1f),o(x1f,y1f,z1f),o(x0,y1f,z1f),rgb,SH_TOP,lm,bt,paint);
                     }
-                    if !obj_occludes(get_block_at(world,wx,wy,wz-1).0) {
-                        push_quad!(o(x0,y1f,z0),o(x1f,y1f,z0),o(x1f,y0,z0),o(x0,y0,z0),rgb,SH_BOT,bt,paint);
+                    if !face_hidden(n_bot) {
+                        push_quad!(o(x0,y1f,z0),o(x1f,y1f,z0),o(x1f,y0,z0),o(x0,y0,z0),rgb,SH_BOT,lm,bt,paint);
                     }
-                    if !obj_occludes(get_block_at(world,wx,wy+1,wz).0) {
-                        push_quad!(o(x0,y1f,z0),o(x1f,y1f,z0),o(x1f,y1f,z1f),o(x0,y1f,z1f),rgb,SH_S,bt,paint);
+                    if !face_hidden(n_s) {
+                        push_quad!(o(x0,y1f,z0),o(x1f,y1f,z0),o(x1f,y1f,z1f),o(x0,y1f,z1f),rgb,SH_S,lm,bt,paint);
                     }
-                    if !obj_occludes(get_block_at(world,wx,wy-1,wz).0) {
-                        push_quad!(o(x1f,y0,z0),o(x0,y0,z0),o(x0,y0,z1f),o(x1f,y0,z1f),rgb,SH_N,bt,paint);
+                    if !face_hidden(n_n) {
+                        push_quad!(o(x1f,y0,z0),o(x0,y0,z0),o(x0,y0,z1f),o(x1f,y0,z1f),rgb,SH_N,lm,bt,paint);
                     }
-                    if !obj_occludes(get_block_at(world,wx+1,wy,wz).0) {
-                        push_quad!(o(x1f,y1f,z0),o(x1f,y0,z0),o(x1f,y0,z1f),o(x1f,y1f,z1f),rgb,SH_E,bt,paint);
+                    if !face_hidden(n_e) {
+                        push_quad!(o(x1f,y1f,z0),o(x1f,y0,z0),o(x1f,y0,z1f),o(x1f,y1f,z1f),rgb,SH_E,lm,bt,paint);
                     }
-                    if !obj_occludes(get_block_at(world,wx-1,wy,wz).0) {
-                        push_quad!(o(x0,y0,z0),o(x0,y1f,z0),o(x0,y1f,z1f),o(x0,y0,z1f),rgb,SH_W,bt,paint);
+                    if !face_hidden(n_w) {
+                        push_quad!(o(x0,y0,z0),o(x0,y1f,z0),o(x0,y1f,z1f),o(x0,y0,z1f),rgb,SH_W,lm,bt,paint);
                     }
                 }
             }
@@ -840,25 +1239,491 @@ pub(crate) fn obj_geometry_region(world: &LoadedWorld, pack: Option<&texturepack
     let positions: Vec<u8> = pos_f.iter().flat_map(|f| f.to_le_bytes()).collect();
     let colors: Vec<u8> = col_f.iter().flat_map(|f| f.to_le_bytes()).collect();
     let uvs: Vec<u8> = uv_f.iter().flat_map(|f| f.to_le_bytes()).collect();
-    ObjGeometryResult { positions, colors, uvs, vertex_count }
+
+    let vertex_count_t = (pos_ft.len()/3) as u32;
+    let positions_t: Vec<u8> = pos_ft.iter().flat_map(|f| f.to_le_bytes()).collect();
+    let colors_t: Vec<u8> = col_ft.iter().flat_map(|f| f.to_le_bytes()).collect();
+    let uvs_t: Vec<u8> = uv_ft.iter().flat_map(|f| f.to_le_bytes()).collect();
+
+    let vertex_count_e = (pos_ef.len()/3) as u32;
+    let positions_e: Vec<u8> = pos_ef.iter().flat_map(|f| f.to_le_bytes()).collect();
+    let colors_e: Vec<u8> = col_ef.iter().flat_map(|f| f.to_le_bytes()).collect();
+    let uvs_e: Vec<u8> = uv_ef.iter().flat_map(|f| f.to_le_bytes()).collect();
+
+    ObjGeometryResult {
+        positions, colors, uvs, vertex_count,
+        positions_t, colors_t, uvs_t, vertex_count_t,
+        positions_e, colors_e, uvs_e, vertex_count_e,
+    }
 }
 
 /// Face-culled geometry for a single chunk (16×16 XY × full Z). For the 3D fly-through pane, which
 /// streams meshes per chunk near the camera.
 #[tauri::command(async)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn get_chunk_geometry(
     state: tauri::State<'_, AppState>,
     cx: i32, cy: i32,
+    night: bool, shadows: bool, sun_t: f32,
+    gpu: Option<bool>,
+    lamp_radius: Option<f32>,
 ) -> Result<ObjGeometryResult, String> {
-    let ws = state.lock().unwrap_or_else(|p| p.into_inner());
-    let world = ws.world.as_ref().ok_or("No world loaded")?;
-    // Defensive: only serve chunks inside the world's chunk grid. Out-of-range indices already scan
-    // to all-air (empty geometry), but bailing early avoids the wasted 16×16×Z probe and documents
-    // the frontend contract (local 0-based chunk indices).
-    if cx < 0 || cy < 0 || cx as u32 >= world.w_chunks || cy as u32 >= world.h_chunks {
-        return Ok(ObjGeometryResult { positions: Vec::new(), colors: Vec::new(), uvs: Vec::new(), vertex_count: 0 });
+    // `mut` so the lamp spatial index can be built lazily on the first night-lit request.
+    let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
+    let empty = || ObjGeometryResult {
+        positions: Vec::new(), colors: Vec::new(), uvs: Vec::new(), vertex_count: 0,
+        positions_t: Vec::new(), colors_t: Vec::new(), uvs_t: Vec::new(), vertex_count_t: 0,
+        positions_e: Vec::new(), colors_e: Vec::new(), uvs_e: Vec::new(), vertex_count_e: 0,
+    };
+    {
+        let world = ws.world.as_ref().ok_or("No world loaded")?;
+        // Defensive: only serve chunks inside the world's chunk grid. Out-of-range indices already scan
+        // to all-air (empty geometry), but bailing early avoids the wasted 16×16×Z probe and documents
+        // the frontend contract (local 0-based chunk indices).
+        if cx < 0 || cy < 0 || cx as u32 >= world.w_chunks || cy as u32 >= world.h_chunks {
+            return Ok(empty());
+        }
+        // Early-out on an unpopulated chunk. Eden only saves edited chunks, so on sparse worlds most
+        // chunks streamed by the fly-through pane's radius sweep are entirely unwritten — without this
+        // check they'd still pay the full 16×16×maxZ scan (~460K get_block_at lookups) just to discover
+        // every voxel is air. This is the single biggest win available for fly-mode hitching on sparse
+        // worlds; it does not affect worlds with contiguous chunk coverage (chunk_map hit on the first try).
+        if !world.chunk_map.contains_key(&(cx + world.min_x, cy + world.min_y)) {
+            return Ok(empty());
+        }
     }
+    // GPU-shadow mode emits flat colours (Three.js lights it); it overrides the baked night/shadow
+    // toggles, which would otherwise double-shade. Baked night lamps are only gathered when night is
+    // on and we're NOT in flat/GPU mode (GPU night uses real point lights on the frontend instead).
+    let flat = gpu.unwrap_or(false);
+    let baked_night = night && !flat;
+    let lamp_r = lamp_radius.unwrap_or(LAMP_LIGHT_RADIUS).clamp(1.0, 64.0);
     let sx1 = cx * 16; let sy1 = cy * 16;
-    Ok(obj_geometry_region(world, ws.texture_pack.as_ref(), sx1, sy1, sx1 + 15, sy1 + 15, 0, world_max_z(world)))
+
+    // Build the lamp index lazily on first baked-night use (opt-in feature shouldn't tax every load).
+    if baked_night && ws.lamp_index.is_none() {
+        let idx = crate::build_lamp_index(ws.world.as_ref().unwrap());
+        ws.lamp_index = Some(idx);
+    }
+
+    let world = ws.world.as_ref().unwrap();
+    // Gather lamps within reach of this chunk from the spatial index (O(lamps), not an O((16+2r)³)
+    // voxel scan), resolving each lamp's colour from its own paint.
+    let lamps: Vec<([i32; 3], [f32; 3])> = if baked_night {
+        let index = ws.lamp_index.as_ref().unwrap();
+        crate::lamps_in_region(index, world, sx1, sy1, sx1 + 15, sy1 + 15, lamp_r)
+            .into_iter()
+            .map(|p| {
+                let (_, paint) = get_block_at(world, p[0], p[1], p[2]);
+                let rgb = block_color(LAMP_BLOCK_TYPE, paint, world.sky);
+                (p, [rgb[0] as f32 / 255.0, rgb[1] as f32 / 255.0, rgb[2] as f32 / 255.0])
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let mode = LightMode {
+        night: baked_night,
+        shadows: shadows && !flat,
+        sun_t: sun_t.clamp(0.0, 1.0),
+        flat,
+        lamp_radius: lamp_r,
+    };
+    Ok(obj_geometry_region(world, ws.texture_pack.as_ref(), sx1, sy1, sx1 + 15, sy1 + 15, 0, world_max_z(world), &lamps, mode))
+}
+
+/// One lamp light for the experimental GPU night path (real `THREE.PointLight`s). Position is in
+/// Eden local block coords (voxel centre); the frontend maps Eden(x,y,z)→THREE(x,z,y). Colour is the
+/// lamp's own paint, normalized 0..1.
+#[derive(serde::Serialize)]
+pub(crate) struct LampLight {
+    pub x: f32, pub y: f32, pub z: f32,
+    pub r: f32, pub g: f32, pub b: f32,
+}
+
+/// Returns the lamp blocks within `radius` blocks of a point, nearest-first (capped), for the GPU
+/// night path. Reads the chunk-keyed lamp index (built lazily), so this is O(nearby lamps) rather
+/// than a voxel scan. The frontend assigns the nearest N to a fixed pool of point lights.
+#[tauri::command(async)]
+pub(crate) fn get_lamps_near(
+    state: tauri::State<'_, AppState>,
+    x: f32, y: f32, z: f32, radius: f32,
+) -> Result<Vec<LampLight>, String> {
+    let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
+    if ws.world.is_none() { return Err("No world loaded".into()); }
+    let radius = radius.clamp(1.0, 512.0);
+    if ws.lamp_index.is_none() {
+        let idx = crate::build_lamp_index(ws.world.as_ref().unwrap());
+        ws.lamp_index = Some(idx);
+    }
+    let world = ws.world.as_ref().unwrap();
+    let index = ws.lamp_index.as_ref().unwrap();
+    let sx = x.floor() as i32;
+    let sy = y.floor() as i32;
+    let mut lamps: Vec<(f32, LampLight)> = crate::lamps_in_region(index, world, sx, sy, sx, sy, radius)
+        .into_iter()
+        .filter_map(|p| {
+            let dx = p[0] as f32 + 0.5 - x;
+            let dy = p[1] as f32 + 0.5 - y;
+            let dz = p[2] as f32 + 0.5 - z;
+            let d2 = dx * dx + dy * dy + dz * dz;
+            if d2 > radius * radius { return None; }
+            let (_, paint) = get_block_at(world, p[0], p[1], p[2]);
+            let rgb = block_color(LAMP_BLOCK_TYPE, paint, world.sky);
+            Some((d2, LampLight {
+                x: p[0] as f32 + 0.5, y: p[1] as f32 + 0.5, z: p[2] as f32 + 0.5,
+                r: rgb[0] as f32 / 255.0, g: rgb[1] as f32 / 255.0, b: rgb[2] as f32 / 255.0,
+            }))
+        })
+        .collect();
+    lamps.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    // Server-side cap — the frontend pool is smaller still, but bounding here keeps the IPC payload
+    // tiny even on a lamp-dense world.
+    const SERVER_CAP: usize = 64;
+    lamps.truncate(SERVER_CAP);
+    Ok(lamps.into_iter().map(|(_, l)| l).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use memmap2::MmapMut;
+
+    /// Minimal single-chunk world (same layout as lib.rs's `make_test_world`, duplicated here since
+    /// that helper lives in a `mod tests` private to lib.rs).
+    fn make_test_world() -> LoadedWorld {
+        const HEADER: usize = 4096;
+        const CHUNK: usize = 32768;
+        const ENTRY: usize = 16;
+        let chunk_off: u32 = HEADER as u32;
+        let ptr_off: u32 = (HEADER + CHUNK) as u32;
+        let mut b = vec![0u8; HEADER + CHUNK + ENTRY];
+        b[32..36].copy_from_slice(&ptr_off.to_le_bytes());
+        b[40..49].copy_from_slice(b"TestWorld");
+        let pe = HEADER + CHUNK;
+        b[pe..pe + 2].copy_from_slice(&0i16.to_le_bytes());
+        b[pe + 4..pe + 6].copy_from_slice(&0i16.to_le_bytes());
+        b[pe + 8..pe + 12].copy_from_slice(&chunk_off.to_le_bytes());
+        let mut m = MmapMut::map_anon(b.len()).expect("anon mmap");
+        m.copy_from_slice(&b);
+        crate::parse_world_inner(m).expect("parse failed")
+    }
+
+    /// Old-style voxel scan for lamps within `radius` of a region — the pre-index reference the
+    /// production path (`get_chunk_geometry`) used to run inline. Kept in the test module both to
+    /// build the lamp slice `obj_geometry_region` now expects and as the parity baseline for the
+    /// index-based gather (`lamps_in_region`).
+    fn scan_lamps(world: &LoadedWorld, sx1: i32, sy1: i32, sx2: i32, sy2: i32, sz1: i32, sz2: i32, radius: f32) -> Vec<([i32; 3], [f32; 3])> {
+        let cache = ChunkCache::new(world);
+        let r = radius.ceil() as i32;
+        let mut found = Vec::new();
+        for wz in (sz1 - r).max(0)..=(sz2 + r) {
+            for wy in (sy1 - r)..=(sy2 + r) {
+                for wx in (sx1 - r)..=(sx2 + r) {
+                    let (bt, paint) = cache.get(wx, wy, wz);
+                    if bt == LAMP_BLOCK_TYPE {
+                        let rgb = block_color(bt, paint, world.sky);
+                        found.push(([wx, wy, wz], [rgb[0] as f32 / 255.0, rgb[1] as f32 / 255.0, rgb[2] as f32 / 255.0]));
+                    }
+                }
+            }
+        }
+        found
+    }
+
+    /// A block's side-face color (any face other than top/bottom) under a given `LightMode`,
+    /// found by matching the shading multiplier used for side faces (SH_S etc, all < 1.0 and != SH_BOT).
+    fn side_face_color(world: &LoadedWorld, x: i32, y: i32, z: i32, z2: i32, mode: LightMode) -> [f32; 3] {
+        let radius = if mode.lamp_radius > 0.0 { mode.lamp_radius } else { LAMP_LIGHT_RADIUS };
+        let lamps = if mode.night { scan_lamps(world, x, y, x, y, z, z2, radius) } else { Vec::new() };
+        let g = obj_geometry_region(world, None, x, y, x, y, z, z2, &lamps, mode);
+        let floats: Vec<f32> = g.colors.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
+        // Plain-cube push order (see the `else` branch in obj_geometry_region): top, bottom, south,
+        // north, east, west quads, 6 vertices × 3 floats each. South is the 3rd quad (index 2).
+        let quad_floats = 6 * 3;
+        let south_start = 2 * quad_floats;
+        [floats[south_start], floats[south_start + 1], floats[south_start + 2]]
+    }
+
+    #[test]
+    fn night_lighting_dims_and_lamps_dont_darken_faster_than_ambient() {
+        let mut world = make_test_world();
+        // Probe stone column at (3,5,0..1); lamp block directly above at z=3 (distance 3 < radius 5).
+        let block = |lx: usize, ly: usize, z: i32| -> usize {
+            let band = (z / 16) as usize;
+            let lz = (z % 16) as usize;
+            4096 + band * 8192 + lx * 256 + ly * 16 + lz
+        };
+        world.bytes[block(3, 5, 0)] = 2; // Stone
+        world.bytes[block(3, 5, 3)] = LAMP_BLOCK_TYPE;
+
+        let day = side_face_color(&world, 3, 5, 0, 0, LightMode::default());
+        let night = side_face_color(&world, 3, 5, 0, 0, LightMode { night: true, shadows: false, sun_t: 0.0, flat: false, lamp_radius: 0.0 });
+
+        for c in 0..3 {
+            assert!(night[c] < day[c], "night lighting should dim an unlit block relative to full daylight");
+            assert!(night[c] > 0.0, "ambient + lamp contribution should keep the block above pure black");
+        }
+    }
+
+    #[test]
+    fn lamp_light_is_tinted_by_the_lamp_paint_not_a_separate_colour_table() {
+        let mut world = make_test_world();
+        let block = |lx: usize, ly: usize, z: i32| -> usize {
+            let band = (z / 16) as usize;
+            let lz = (z % 16) as usize;
+            4096 + band * 8192 + lx * 256 + ly * 16 + lz
+        };
+        let paint = |lx: usize, ly: usize, z: i32| -> usize {
+            let band = (z / 16) as usize;
+            let lz = (z % 16) as usize;
+            4096 + band * 8192 + lx * 256 + ly * 16 + lz + 4096
+        };
+        world.bytes[block(3, 5, 0)] = 2; // Stone probe
+        world.bytes[block(3, 5, 3)] = LAMP_BLOCK_TYPE;
+        world.bytes[paint(3, 5, 3)] = 1; // PAINT_RGB[1] = [255,170,170] — red-dominant
+
+        let night = side_face_color(&world, 3, 5, 0, 0, LightMode { night: true, shadows: false, sun_t: 0.0, flat: false, lamp_radius: 0.0 });
+
+        // A red-dominant lamp should tint the probe's lit colour red-dominant too: the red channel
+        // should gain more (relative to its unlit value) than green/blue. Checked via the raw ratio
+        // rather than absolute values since face shading differs per channel only through `lm`.
+        assert!(night[0] > night[1] && night[0] > night[2],
+            "red-painted lamp should cast red-dominant light, got {night:?}");
+    }
+
+    #[test]
+    fn flat_mode_routes_lamp_faces_to_the_emissive_stream() {
+        let mut world = make_test_world();
+        let block = |lx: usize, ly: usize, z: i32| -> usize {
+            let band = (z / 16) as usize;
+            let lz = (z % 16) as usize;
+            4096 + band * 8192 + lx * 256 + ly * 16 + lz
+        };
+        world.bytes[block(3, 5, 0)] = LAMP_BLOCK_TYPE; // isolated lamp in air → all 6 faces emit
+
+        // Non-flat (baked default): lamp faces stay in the opaque stream; the emissive stream is
+        // untouched, so OBJ/JSON export and ThreeDPreview see byte-identical output.
+        let baked = obj_geometry_region(&world, None, 3, 5, 3, 5, 0, 0, &[], LightMode::default());
+        assert_eq!(baked.vertex_count_e, 0, "default (non-flat) mode must not populate the emissive stream");
+        assert!(baked.vertex_count > 0, "lamp faces belong to the opaque stream in non-flat mode");
+        assert_eq!(baked.vertex_count_t, 0, "a lamp is opaque — nothing in the transparent stream");
+
+        // Flat (GPU) mode: the same lamp faces move to the emissive stream; the opaque stream is empty.
+        let flat = obj_geometry_region(&world, None, 3, 5, 3, 5, 0, 0, &[], LightMode { flat: true, ..Default::default() });
+        assert!(flat.vertex_count_e > 0, "flat mode must route lamp faces into the emissive stream");
+        assert_eq!(flat.vertex_count, 0, "no non-lamp opaque faces expected for an isolated lamp");
+        assert_eq!(flat.vertex_count_e, baked.vertex_count, "same lamp geometry, just a different stream");
+    }
+
+    #[test]
+    fn shadows_darken_a_block_directly_under_an_overhang_at_high_noon() {
+        let mut world = make_test_world();
+        let block = |lx: usize, ly: usize, z: i32| -> usize {
+            let band = (z / 16) as usize;
+            let lz = (z % 16) as usize;
+            4096 + band * 8192 + lx * 256 + ly * 16 + lz
+        };
+        world.bytes[block(3, 5, 0)] = 2; // probe
+        for z in 1..=10 { world.bytes[block(3, 5, z)] = 2; } // solid overhang directly above
+
+        let unshadowed = side_face_color(&world, 3, 5, 0, 0, LightMode::default());
+        // sun_t=0.5 -> near-overhead (elevation ~80deg), closest analogue to the old vertical scan.
+        let shadowed = side_face_color(&world, 3, 5, 0, 0, LightMode { night: false, shadows: true, sun_t: 0.5, flat: false, lamp_radius: 0.0 });
+
+        for c in 0..3 {
+            assert!(shadowed[c] < unshadowed[c], "a block under a solid overhang should be darker at high noon");
+            assert!(shadowed[c] > 0.0, "shadowed colour must have a floor above pure black");
+        }
+    }
+
+    #[test]
+    fn low_sun_angle_does_not_darken_a_block_with_no_lateral_occluders() {
+        let mut world = make_test_world();
+        let block = |lx: usize, ly: usize, z: i32| -> usize {
+            let band = (z / 16) as usize;
+            let lz = (z % 16) as usize;
+            4096 + band * 8192 + lx * 256 + ly * 16 + lz
+        };
+        world.bytes[block(3, 5, 0)] = 2; // isolated probe, nothing else around
+
+        let unshadowed = side_face_color(&world, 3, 5, 0, 0, LightMode::default());
+        // sun_t=0.0 -> sunrise, low angle, nothing along the ray to occlude it.
+        let lit_at_sunrise = side_face_color(&world, 3, 5, 0, 0, LightMode { night: false, shadows: true, sun_t: 0.0, flat: false, lamp_radius: 0.0 });
+
+        assert_eq!(lit_at_sunrise, unshadowed, "an isolated block with no occluders along the ray should stay fully lit");
+    }
+
+    #[test]
+    fn shadowed_colour_is_never_pure_black() {
+        let mut world = make_test_world();
+        let block = |lx: usize, ly: usize, z: i32| -> usize {
+            let band = (z / 16) as usize;
+            let lz = (z % 16) as usize;
+            4096 + band * 8192 + lx * 256 + ly * 16 + lz
+        };
+        world.bytes[block(3, 5, 0)] = 2;
+        for z in 1..=10 { world.bytes[block(3, 5, z)] = 2; }
+
+        let shadowed = side_face_color(&world, 3, 5, 0, 0, LightMode { night: false, shadows: true, sun_t: 0.5, flat: false, lamp_radius: 0.0 });
+        for c in 0..3 {
+            assert!(shadowed[c] > 0.05, "shadowed voxel colour must stay well above pure black, got {shadowed:?}");
+        }
+    }
+
+    #[test]
+    fn sun_direction_is_overhead_at_noon_and_low_angle_at_sunrise_sunset() {
+        let noon = sun_direction(0.5);
+        assert!(noon[2] > 0.9, "sun should be nearly straight up at t=0.5, got {noon:?}");
+        let sunrise = sun_direction(0.0);
+        assert!(sunrise[2] < 0.3, "sun should be low-angle at t=0.0, got {sunrise:?}");
+        let sunset = sun_direction(1.0);
+        assert!(sunset[2] < 0.3, "sun should be low-angle at t=1.0, got {sunset:?}");
+    }
+
+    /// Raw block-byte index for the test world's single chunk.
+    fn tb(lx: usize, ly: usize, z: i32) -> usize {
+        4096 + (z / 16) as usize * 8192 + lx * 256 + ly * 16 + (z % 16) as usize
+    }
+
+    /// The index-based lamp gather (`lamps_in_region`) must return exactly the same lamp positions
+    /// as the old inline voxel scan for a given radius, and a larger radius must never drop lamps
+    /// the smaller one found (it can only widen the box).
+    #[test]
+    fn lamps_in_region_matches_full_scan_and_radius_only_widens() {
+        let mut world = make_test_world();
+        // Two lamps in the single chunk, plus a decoy stone block that must not be picked up.
+        world.bytes[tb(2, 3, 4)] = LAMP_BLOCK_TYPE;
+        world.bytes[tb(10, 12, 20)] = LAMP_BLOCK_TYPE;
+        world.bytes[tb(6, 6, 6)] = 2; // stone decoy
+
+        let index = crate::build_lamp_index(&world);
+        // build_lamp_index buckets by absolute chunk coord (0,0 here).
+        assert_eq!(index.get(&(0, 0)).map(|v| v.len()), Some(2), "both lamps land in chunk (0,0)");
+
+        let region = (0, 0, 15, 15);
+        for &radius in &[1.0f32, 5.0, 12.0, 40.0] {
+            let mut from_index = crate::lamps_in_region(&index, &world, region.0, region.1, region.2, region.3, radius);
+            let mut from_scan: Vec<[i32; 3]> = scan_lamps(&world, region.0, region.1, region.2, region.3, 0, world_max_z(&world), radius)
+                .into_iter().map(|(p, _)| p).collect();
+            from_index.sort();
+            from_scan.sort();
+            assert_eq!(from_index, from_scan, "index gather must match the old voxel scan at radius {radius}");
+        }
+    }
+
+    /// Regression: `obj_geometry_region` night output with index-gathered lamps must be byte-identical
+    /// to the old scan-gathered lamps at the legacy radius 5 (the refactor is a pure speedup).
+    #[test]
+    fn night_geometry_unchanged_between_index_and_scan_gather() {
+        let mut world = make_test_world();
+        world.bytes[tb(3, 5, 0)] = 2; // stone probe
+        world.bytes[tb(3, 5, 3)] = LAMP_BLOCK_TYPE;
+        world.bytes[tb(3, 5, 3) + 4096] = 1; // red-ish paint on the lamp
+
+        let mode = LightMode { night: true, shadows: false, sun_t: 0.0, flat: false, lamp_radius: 5.0 };
+
+        // Old path: scan the region for lamps.
+        let scan = scan_lamps(&world, 0, 0, 15, 15, 0, world_max_z(&world), 5.0);
+        let g_scan = obj_geometry_region(&world, None, 0, 0, 15, 15, 0, world_max_z(&world), &scan, mode);
+
+        // New path: gather from the index and resolve colours exactly as get_chunk_geometry does.
+        let index = crate::build_lamp_index(&world);
+        let idx_lamps: Vec<([i32; 3], [f32; 3])> = crate::lamps_in_region(&index, &world, 0, 0, 15, 15, 5.0)
+            .into_iter().map(|p| {
+                let (_, paint) = get_block_at(&world, p[0], p[1], p[2]);
+                let rgb = block_color(LAMP_BLOCK_TYPE, paint, world.sky);
+                (p, [rgb[0] as f32 / 255.0, rgb[1] as f32 / 255.0, rgb[2] as f32 / 255.0])
+            }).collect();
+        let g_idx = obj_geometry_region(&world, None, 0, 0, 15, 15, 0, world_max_z(&world), &idx_lamps, mode);
+
+        assert_eq!(g_scan.colors, g_idx.colors, "night vertex colours must be identical (index vs scan gather)");
+        assert_eq!(g_scan.positions, g_idx.positions, "geometry positions must be identical");
+    }
+
+    /// The memo must be a pure speedup: same answer as the uncached reader for every probe,
+    /// including out-of-bounds Z, negative coords, and columns with no chunk at all (the case a
+    /// naive "cache the address" memo gets wrong by not caching the *absence* of a chunk).
+    #[test]
+    fn chunk_cache_agrees_with_the_uncached_block_reader() {
+        let mut world = make_test_world();
+        world.bytes[tb(3, 5, 2)] = 2;
+        world.bytes[tb(3, 5, 2) + 4096] = 7; // a paint byte, so we compare both halves of the tuple
+        world.bytes[tb(0, 0, 0)] = 1;
+        world.bytes[tb(15, 15, 17)] = 4; // crosses into the second band
+
+        let cache = ChunkCache::new(&world);
+        // Deliberately interleave in-chunk and out-of-chunk probes so a stale memo would show up.
+        for wz in [-1, 0, 2, 17, 63, 64, 9999] {
+            for wy in [-17, -1, 0, 5, 15, 16, 33] {
+                for wx in [-17, -1, 0, 3, 15, 16, 33] {
+                    assert_eq!(
+                        cache.get(wx, wy, wz),
+                        get_block_at(&world, wx, wy, wz),
+                        "mismatch at ({wx},{wy},{wz})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pick_block_hits_the_first_solid_voxel_and_reports_the_entry_face() {
+        let mut world = make_test_world();
+        world.bytes[tb(3, 5, 2)] = 2; // Stone
+
+        // Ray from above, straight down: enters through the top face (+Z normal).
+        let hit = pick_block_in(&world, 3.5, 5.5, 9.0, 0.0, 0.0, -1.0, 32.0).unwrap().expect("expected a hit");
+        assert_eq!((hit.x, hit.y, hit.z), (3, 5, 2));
+        assert_eq!(hit.block_type, 2);
+        assert_eq!((hit.nx, hit.ny, hit.nz), (0, 0, 1), "downward ray must enter the top face");
+
+        // Ray from the west, heading east: enters through the -X face.
+        let hit = pick_block_in(&world, 0.5, 5.5, 2.5, 1.0, 0.0, 0.0, 32.0).unwrap().expect("expected a hit");
+        assert_eq!((hit.x, hit.y, hit.z), (3, 5, 2));
+        assert_eq!((hit.nx, hit.ny, hit.nz), (-1, 0, 0), "eastward ray must enter the west face");
+
+        // `hit + normal` is the empty voxel a placed block would occupy.
+        assert_eq!(get_block_at(&world, hit.x + hit.nx, hit.y + hit.ny, hit.z + hit.nz).0, 0);
+    }
+
+    #[test]
+    fn pick_block_misses_return_none_and_respect_max_dist() {
+        let mut world = make_test_world();
+        world.bytes[tb(3, 5, 2)] = 2;
+
+        // Parallel ray that never crosses the block.
+        assert!(pick_block_in(&world, 0.5, 0.5, 8.5, 1.0, 0.0, 0.0, 32.0).unwrap().is_none());
+        // Aimed correctly but stopped short: the block is ~6 units below the origin.
+        assert!(pick_block_in(&world, 3.5, 5.5, 9.0, 0.0, 0.0, -1.0, 2.0).unwrap().is_none());
+        // Same ray, enough distance.
+        assert!(pick_block_in(&world, 3.5, 5.5, 9.0, 0.0, 0.0, -1.0, 32.0).unwrap().is_some());
+    }
+
+    #[test]
+    fn pick_block_hits_a_voxel_the_origin_is_already_touching() {
+        let mut world = make_test_world();
+        world.bytes[tb(3, 5, 2)] = 2;
+        // Origin sits in the air voxel directly above; the very first DDA step lands on the block,
+        // so `prev` must still resolve to the origin voxel rather than an uninitialised one.
+        let hit = pick_block_in(&world, 3.5, 5.5, 3.01, 0.0, 0.0, -1.0, 4.0).unwrap().expect("expected a hit");
+        assert_eq!((hit.x, hit.y, hit.z), (3, 5, 2));
+        assert_eq!((hit.nx, hit.ny, hit.nz), (0, 0, 1));
+    }
+
+    #[test]
+    fn pick_block_rejects_a_degenerate_ray_direction() {
+        let world = make_test_world();
+        assert!(pick_block_in(&world, 3.5, 5.5, 9.0, 0.0, 0.0, 0.0, 32.0).is_err());
+    }
+
+    #[test]
+    fn pick_block_hits_non_solid_blocks_like_water_and_glass() {
+        let mut world = make_test_world();
+        world.bytes[tb(3, 5, 2)] = 20; // Water — BI_NOTSOLID, so `obj_occludes` is false for it
+        let hit = pick_block_in(&world, 3.5, 5.5, 9.0, 0.0, 0.0, -1.0, 32.0).unwrap().expect("water is pickable");
+        assert_eq!(hit.block_type, 20);
+    }
 }
 

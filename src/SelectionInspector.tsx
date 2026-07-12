@@ -22,14 +22,14 @@ const panelStyle: React.CSSProperties = {
   position: "absolute",
   top: 108,
   right: 12,
-  background: "linear-gradient(180deg, rgba(20,30,48,.92) 0%, rgba(8,14,26,.92) 100%)",
+  background: "linear-gradient(180deg, rgba(34,29,25,.92) 0%, rgba(20,17,14,.92) 100%)",
   backdropFilter: "blur(10px)", WebkitBackdropFilter: "blur(10px)",
   border: "1px solid rgba(255,255,255,.12)",
   boxShadow: "inset 0 1px 0 rgba(255,255,255,.08), 0 8px 20px rgba(0,0,0,.5)",
   borderRadius: 7,
   padding: "8px 10px",
   fontSize: 12,
-  color: "#e2e8f0",
+  color: "#ebe9e7",
   width: 210,
   display: "flex",
   flexDirection: "column",
@@ -82,7 +82,7 @@ export default function SelectionInspector({ selection: sel, clipboard, quadMode
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
 
-    ctx.fillStyle = "#080f1e";
+    ctx.fillStyle = "#151311";
     ctx.fillRect(0, 0, CW, CH);
 
     if (previewData && previewData.width > 0 && previewData.height > 0) {
@@ -126,7 +126,7 @@ export default function SelectionInspector({ selection: sel, clipboard, quadMode
     boxShadow: view === v
       ? `inset 0 0 0 1px ${EDEN_TEAL_READABLE}, 0 .5px .5px rgba(255,255,255,.15)`
       : "inset 0 0 0 1px rgba(0,0,0,.5)",
-    color: view === v ? EDEN_TEAL_READABLE : "#64748b",
+    color: view === v ? EDEN_TEAL_READABLE : "#83786c",
     borderRadius: 3,
   });
 
@@ -138,8 +138,8 @@ export default function SelectionInspector({ selection: sel, clipboard, quadMode
           onClick={() => setOrthoOpen(v => !v)}
           style={{ display: "flex", alignItems: "center", gap: 5, cursor: "pointer", userSelect: "none" }}
         >
-          <span style={{ color: "#475569", fontSize: 9 }}>{orthoOpen ? "▼" : "▶"}</span>
-          <span style={{ color: "#94a3b8", fontWeight: 700, fontSize: 10, letterSpacing: "0.08em" }}>ORTHO VIEW</span>
+          <span style={{ color: "#61584f", fontSize: 9 }}>{orthoOpen ? "▼" : "▶"}</span>
+          <span style={{ color: "#afa69d", fontWeight: 700, fontSize: 10, letterSpacing: "0.08em" }}>ORTHO VIEW</span>
         </div>
         {orthoOpen && (<>
           <div style={{ display: "flex", gap: 3 }}>
@@ -160,13 +160,13 @@ export default function SelectionInspector({ selection: sel, clipboard, quadMode
                         ? "linear-gradient(180deg, rgba(168,85,247,0.35) 0%, rgba(168,85,247,0.10) 100%)"
                         : "linear-gradient(180deg, rgba(255,255,255,0.05) 0%, rgba(255,255,255,0.02) 100%)",
                       boxShadow: axoDir === d ? "inset 0 0 0 1px #a855f7, 0 .5px .5px rgba(255,255,255,.15)" : "inset 0 0 0 1px rgba(0,0,0,.5)",
-                      color: axoDir === d ? "#d8b4fe" : "#64748b", borderRadius: 3,
+                      color: axoDir === d ? "#d8b4fe" : "#83786c", borderRadius: 3,
                     }}
                   >{label}</button>
                 ))}
               </div>
               <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
-                <span style={{ color: "#64748b", fontSize: 10, whiteSpace: "nowrap" }}>Depth</span>
+                <span style={{ color: "#83786c", fontSize: 10, whiteSpace: "nowrap" }}>Depth</span>
                 <input type="range" min={0.05} max={0.5} step={0.01} value={axoSki}
                   onChange={e => setAxoSki(parseFloat(e.target.value))}
                   style={{ flex: 1, accentColor: "#a855f7" }} />

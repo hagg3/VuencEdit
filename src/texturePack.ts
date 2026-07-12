@@ -5,12 +5,15 @@ export interface AtlasData {
   rgba: Uint8Array;
   tile: number;
   rows: number;
+  /** Number of full-color tiles N; a block's grayscale (painted) row = colorRow + this. */
+  grayRowOffset: number;
   nameToRow: Record<string, number>;
 }
 
 export interface TexturePackRaw {
   rows: number;
   tile: number;
+  gray_row_offset: number;
   atlas: string;          // base64 RGBA
   name_to_row: Record<string, number>;
 }
@@ -20,6 +23,7 @@ export function decodeAtlas(raw: TexturePackRaw): AtlasData {
     rgba: decodeU8(raw.atlas),
     tile: raw.tile,
     rows: raw.rows,
+    grayRowOffset: raw.gray_row_offset,
     nameToRow: raw.name_to_row,
   };
 }
@@ -122,8 +126,12 @@ export function tintedSwatch(
   const texName = BLOCK_TOP_TEX[blockType] ?? null;
   if (!texName) { swatchCache.set(key, null); return null; }
 
-  const row = atlas.nameToRow[texName];
-  if (row === undefined) { swatchCache.set(key, null); return null; }
+  const colorRow = atlas.nameToRow[texName];
+  if (colorRow === undefined) { swatchCache.set(key, null); return null; }
+
+  // Painted blocks sample the grayscale modulation row so paint × gray reads clean, matching the
+  // 3D views (face_color_and_row in texturepack.rs). Unpainted → the full-color row.
+  const row = paint !== 0 ? colorRow + atlas.grayRowOffset : colorRow;
 
   const { tile, rgba } = atlas;
   const imgData = new ImageData(tile, tile);
@@ -132,7 +140,7 @@ export function tintedSwatch(
     for (let x = 0; x < tile; x++) {
       const src = ((yStart + y) * tile + x) * 4;
       const dst = (y * tile + x) * 4;
-      // Atlas tiles are already grayscale; copy lum + alpha
+      // Copy full-color tile pixel + alpha (multiplied by block tint below)
       imgData.data[dst]     = rgba[src];
       imgData.data[dst + 1] = rgba[src + 1];
       imgData.data[dst + 2] = rgba[src + 2];
@@ -140,7 +148,7 @@ export function tintedSwatch(
     }
   }
 
-  // Multiply grayscale tile by block color (same as GPU does in 3D views)
+  // Multiply full-color tile by block tint (same GL_MODULATE as the 3D views)
   const [tr, tg, tb] = resolveColor(blockType, paint);
   for (let i = 0; i < imgData.data.length; i += 4) {
     imgData.data[i]     = Math.round(imgData.data[i]     * tr / 255);

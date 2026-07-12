@@ -37,7 +37,7 @@ export default function BlockPaintPicker({
 
       {/* ── Block column ── */}
       <div style={{ display: "flex", flexDirection: "column", gap: 3, ...(isFill ? {} : { flexShrink: 0 }) }}>
-        <span style={{ color: "#64748b", fontSize: 11 }}>Block</span>
+        <span style={{ color: "#83786c", fontSize: 11 }}>Block</span>
 
         {/* Air (fill) / Any (filter) */}
         <div
@@ -46,11 +46,11 @@ export default function BlockPaintPicker({
           style={{
             fontSize: 10, textAlign: "center", cursor: "pointer",
             padding: "1px 0", borderRadius: 2, userSelect: "none",
-            border: (isFill ? bt === 0 : bt === null) ? "1px solid #00dde9" : "1px solid #334155",
+            border: (isFill ? bt === 0 : bt === null) ? "1px solid #00dde9" : "1px solid #4b443d",
             background: (isFill ? bt === 0 : bt === null)
               ? gradTeal(0.25)
               : isFill ? "rgba(0,0,0,0.3)" : "rgba(255,255,255,0.04)",
-            color: (isFill ? bt === 0 : bt === null) ? EDEN_TEAL_READABLE : "#475569",
+            color: (isFill ? bt === 0 : bt === null) ? EDEN_TEAL_READABLE : "#61584f",
           }}
         >{isFill ? "Air" : "Any"}</div>
 
@@ -146,15 +146,15 @@ export default function BlockPaintPicker({
           const family = RAMP_FAMILIES.find((f) => f.base === base);
           return (
             <div style={{ display: "flex", alignItems: "center", gap: 3, marginTop: 1 }}>
-              <span style={{ color: "#64748b", fontSize: 9, minWidth: 20 }}>Dir</span>
+              <span style={{ color: "#83786c", fontSize: 9, minWidth: 20 }}>Dir</span>
               {RAMP_DIRS.map((dir, i) => {
                 const active = rampDirIndex(bt) === i;
                 return (
                   <button key={dir} onClick={() => onBlockTypeChange(base + i)} style={{
                     width: 22, padding: "1px 0", fontSize: 10, cursor: "pointer",
                     background: active ? gradTeal(0.35) : "rgba(255,255,255,0.04)",
-                    border: `1px solid ${active ? "#00dde9" : "#334155"}`,
-                    color: active ? EDEN_TEAL_READABLE : "#64748b", borderRadius: 3,
+                    border: `1px solid ${active ? "#00dde9" : "#4b443d"}`,
+                    color: active ? EDEN_TEAL_READABLE : "#83786c", borderRadius: 3,
                   }} title={`${family?.name} facing ${["South","West","North","East"][i]}`}>{dir}</button>
                 );
               })}
@@ -168,15 +168,15 @@ export default function BlockPaintPicker({
           const family = WEDGE_FAMILIES.find((f) => f.base === base);
           return (
             <div style={{ display: "flex", alignItems: "center", gap: 3, marginTop: 1 }}>
-              <span style={{ color: "#64748b", fontSize: 9, minWidth: 20 }}>Apex</span>
+              <span style={{ color: "#83786c", fontSize: 9, minWidth: 20 }}>Apex</span>
               {WEDGE_DIRS.map((dir, i) => {
                 const active = rampDirIndex(bt) === i;
                 return (
                   <button key={dir} onClick={() => onBlockTypeChange(base + i)} style={{
                     width: 26, padding: "1px 0", fontSize: 10, cursor: "pointer",
                     background: active ? gradTeal(0.35) : "rgba(255,255,255,0.04)",
-                    border: `1px solid ${active ? "#00dde9" : "#334155"}`,
-                    color: active ? EDEN_TEAL_READABLE : "#64748b", borderRadius: 3,
+                    border: `1px solid ${active ? "#00dde9" : "#4b443d"}`,
+                    color: active ? EDEN_TEAL_READABLE : "#83786c", borderRadius: 3,
                   }} title={`${family?.name} apex at ${["SE","SW","NW","NE"][i]}`}>{dir}</button>
                 );
               })}
@@ -187,15 +187,15 @@ export default function BlockPaintPicker({
         {/* Door orientation selector */}
         {bt !== null && doorFamilyBase(bt) !== null && (
           <div style={{ display: "flex", alignItems: "center", gap: 3, marginTop: 1 }}>
-            <span style={{ color: "#64748b", fontSize: 9, minWidth: 20 }}>Dir</span>
+            <span style={{ color: "#83786c", fontSize: 9, minWidth: 20 }}>Dir</span>
             {DOOR_PORTAL_DIRS.map((dir, i) => {
               const active = bt - 66 === i;
               return (
                 <button key={dir} onClick={() => onBlockTypeChange(66 + i)} style={{
                   width: 22, padding: "1px 0", fontSize: 10, cursor: "pointer",
                   background: active ? gradTeal(0.35) : "rgba(255,255,255,0.04)",
-                  border: `1px solid ${active ? "#00dde9" : "#334155"}`,
-                  color: active ? EDEN_TEAL_READABLE : "#64748b", borderRadius: 3,
+                  border: `1px solid ${active ? "#00dde9" : "#4b443d"}`,
+                  color: active ? EDEN_TEAL_READABLE : "#83786c", borderRadius: 3,
                 }} title={`Door facing ${["South","West","North","East"][i]}`}>{dir}</button>
               );
             })}
@@ -205,15 +205,15 @@ export default function BlockPaintPicker({
         {/* Portal orientation selector */}
         {bt !== null && portalFamilyBase(bt) !== null && (
           <div style={{ display: "flex", alignItems: "center", gap: 3, marginTop: 1 }}>
-            <span style={{ color: "#64748b", fontSize: 9, minWidth: 20 }}>Dir</span>
+            <span style={{ color: "#83786c", fontSize: 9, minWidth: 20 }}>Dir</span>
             {DOOR_PORTAL_DIRS.map((dir, i) => {
               const active = bt - 75 === i;
               return (
                 <button key={dir} onClick={() => onBlockTypeChange(75 + i)} style={{
                   width: 22, padding: "1px 0", fontSize: 10, cursor: "pointer",
                   background: active ? gradTeal(0.35) : "rgba(255,255,255,0.04)",
-                  border: `1px solid ${active ? "#00dde9" : "#334155"}`,
-                  color: active ? EDEN_TEAL_READABLE : "#64748b", borderRadius: 3,
+                  border: `1px solid ${active ? "#00dde9" : "#4b443d"}`,
+                  color: active ? EDEN_TEAL_READABLE : "#83786c", borderRadius: 3,
                 }} title={`Portal facing ${["South","West","North","East"][i]}`}>{dir}</button>
               );
             })}
@@ -227,7 +227,7 @@ export default function BlockPaintPicker({
               value={bt}
               onChange={e => onBlockTypeChange(Number(e.target.value))}
               style={{
-                ...recessedWell, background: "#0d1829", color: "#e2e8f0",
+                ...recessedWell, background: "#1e1b18", color: "#ebe9e7",
                 fontSize: 10, borderRadius: 3, padding: "1px 3px", width: "100%", cursor: "pointer",
               }}
             >
@@ -282,11 +282,11 @@ export default function BlockPaintPicker({
         </div>
       </div>
 
-      <div style={{ width: 1, background: "#1e293b", alignSelf: "stretch", ...(isFill ? {} : { flexShrink: 0 }) }} />
+      <div style={{ width: 1, background: "#312c28", alignSelf: "stretch", ...(isFill ? {} : { flexShrink: 0 }) }} />
 
       {/* ── Paint column ── */}
       <div style={{ display: "flex", flexDirection: "column", gap: 3, ...(isFill ? {} : { flexShrink: 0 }) }}>
-        <span style={{ color: "#64748b", fontSize: 11 }}>Paint</span>
+        <span style={{ color: "#83786c", fontSize: 11 }}>Paint</span>
         <div style={{ display: "flex", gap: 3 }}>
           {/* "Any paint" toggle (filter mode only) */}
           {!isFill && (
@@ -296,11 +296,11 @@ export default function BlockPaintPicker({
               style={{
                 width: 18, height: 18, flexShrink: 0,
                 borderRadius: 2, cursor: "pointer", boxSizing: "border-box",
-                border: paint === null ? "2px solid #fff" : "2px solid #334155",
+                border: paint === null ? "2px solid #fff" : "2px solid #4b443d",
                 outline: paint === null ? "1px solid #00dde9" : "none", outlineOffset: 1,
                 display: "flex", alignItems: "center", justifyContent: "center",
                 background: paint === null ? gradTeal(0.25) : "rgba(255,255,255,0.04)",
-                color: paint === null ? EDEN_TEAL_READABLE : "#475569",
+                color: paint === null ? EDEN_TEAL_READABLE : "#61584f",
                 fontSize: 9, lineHeight: 1, userSelect: "none",
               }}
             >Any</div>
@@ -312,10 +312,10 @@ export default function BlockPaintPicker({
             style={{
               width: 18, height: 18, flexShrink: 0,
               background: "transparent", borderRadius: 2, cursor: "pointer", boxSizing: "border-box",
-              border: paint === 0 ? "2px solid #fff" : "2px solid #334155",
+              border: paint === 0 ? "2px solid #fff" : "2px solid #4b443d",
               outline: paint === 0 ? "1px solid #00dde9" : "none", outlineOffset: 1,
               display: "flex", alignItems: "center", justifyContent: "center",
-              color: "#475569", fontSize: 11, lineHeight: 1,
+              color: "#61584f", fontSize: 11, lineHeight: 1,
             }}
           >✕</div>
           {/* 9-per-row paint grid */}
@@ -345,7 +345,7 @@ export default function BlockPaintPicker({
       {/* ── Fill-mode extras: preview swatch + fill button + block name ── */}
       {isFill && (
         <>
-          <div style={{ width: 1, background: "#1e293b", alignSelf: "stretch" }} />
+          <div style={{ width: 1, background: "#312c28", alignSelf: "stretch" }} />
           <div style={{ display: "flex", flexDirection: "column", gap: 4, justifyContent: "flex-end", alignSelf: "flex-end" }}>
             <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
               <div
@@ -369,7 +369,7 @@ export default function BlockPaintPicker({
                 >Fill Selection</button>
               )}
             </div>
-            <div style={{ color: "#94a3b8", fontSize: 11, whiteSpace: "nowrap" }}>
+            <div style={{ color: "#afa69d", fontSize: 11, whiteSpace: "nowrap" }}>
               {blockDisplayName(bt ?? 0)}{(paint ?? 0) > 0 ? <span style={{ color: EDEN_TEAL_READABLE }}> #{paint}</span> : ""}
             </div>
           </div>

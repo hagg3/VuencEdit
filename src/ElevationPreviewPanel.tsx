@@ -83,7 +83,7 @@ function drawSection(
   ctx.rect(0, yStart, sectionW, availH);
   ctx.clip();
 
-  ctx.fillStyle = "#080f1e";
+  ctx.fillStyle = "#151311";
   ctx.fillRect(0, yStart, sectionW, availH);
 
   let scale = 1, dw = 0, dh = 0, ox = 0, oy = yStart;
@@ -294,7 +294,7 @@ export default function ElevationPreviewPanel({
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
 
-    ctx.fillStyle = "#080f1e";
+    ctx.fillStyle = "#151311";
     ctx.fillRect(0, 0, canvasW, canvasH);
 
     const topH = Math.floor(canvasH / 2);
@@ -317,7 +317,7 @@ export default function ElevationPreviewPanel({
     ctx.fillStyle = "#86efac";
     ctx.fillText("SIDE", 3, topH + 3);
     // Divider line between sections
-    ctx.strokeStyle = "rgba(148,163,184,0.3)";
+    ctx.strokeStyle = "rgba(175,166,157,0.3)";
     ctx.lineWidth = 1;
     ctx.beginPath(); ctx.moveTo(0, topH); ctx.lineTo(canvasW, topH); ctx.stroke();
     ctx.textBaseline = "middle";
@@ -326,13 +326,13 @@ export default function ElevationPreviewPanel({
     // Z-edge grip indicator (A1)
     if (hoverZEdge) {
       const gy = hoverZEdge.y;
-      ctx.fillStyle = "rgba(148,163,184,0.85)";
+      ctx.fillStyle = "rgba(175,166,157,0.85)";
       for (let i = -1; i <= 1; i++) {
         ctx.beginPath();
         ctx.arc(canvasW / 2 + i * 7, gy, 2.5, 0, Math.PI * 2);
         ctx.fill();
       }
-      ctx.fillStyle = "rgba(148,163,184,0.75)";
+      ctx.fillStyle = "rgba(175,166,157,0.75)";
       ctx.font = "8px monospace";
       ctx.textAlign = "left";
       ctx.fillText("drag to resize Z", canvasW / 2 + 14, gy);
@@ -383,13 +383,13 @@ export default function ElevationPreviewPanel({
   return (
     <div style={{
       position: "absolute",
-      bottom: 16, right: 12,
-      background: "rgba(5,12,26,0.85)",
-      border: "1px solid #1e40af",
+      bottom: 26, right: 12, // clears the 20px app status bar fixed to the window bottom
+      background: "rgba(26,14,5,0.85)",
+      border: "1px solid #71665c",
       borderRadius: 7,
       padding: "8px 10px",
       fontSize: 12,
-      color: "#e2e8f0",
+      color: "#ebe9e7",
       width: canvasW,
       display: "flex",
       flexDirection: "column",
@@ -402,7 +402,7 @@ export default function ElevationPreviewPanel({
           position: "absolute", top: 2, left: 2,
           width: 14, height: 14, cursor: "nwse-resize",
           display: "flex", alignItems: "center", justifyContent: "center",
-          color: "#475569", fontSize: 9, lineHeight: 1, borderRadius: 2,
+          color: "#61584f", fontSize: 9, lineHeight: 1, borderRadius: 2,
         }}
         onPointerDown={(e) => {
           resizeDragRef.current = { startX: e.clientX, startY: e.clientY, startW: canvasW, startH: canvasH };
@@ -443,7 +443,7 @@ export default function ElevationPreviewPanel({
             onChange={e => setShowContext(e.target.checked)}
             style={{ accentColor: "#3b82f6" }}
           />
-          <span style={{ color: "#64748b", fontSize: 10, whiteSpace: "nowrap" }}>± context cols</span>
+          <span style={{ color: "#83786c", fontSize: 10, whiteSpace: "nowrap" }}>± context cols</span>
         </label>
       </div>
 
@@ -453,7 +453,7 @@ export default function ElevationPreviewPanel({
         height={canvasH}
         style={{
           display: "block", width: canvasW, height: canvasH,
-          borderRadius: 4, border: "1px solid #1a2744",
+          borderRadius: 4, border: "1px solid #342f2a",
           cursor: canvasCursor !== "default" ? canvasCursor : drawActive ? "crosshair" : zoom > 1 ? "grab" : "default",
         }}
         title={`Elevation view — front (top) + side (bottom), ±${CONTEXT_BLOCKS} context blocks, z${sel.z_min}–${sel.z_max} highlighted. Scroll to zoom, drag to pan.`}

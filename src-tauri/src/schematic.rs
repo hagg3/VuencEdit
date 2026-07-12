@@ -5,6 +5,23 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::fs;
 
+// Cap decompressed size for untrusted schematic/litematic/schem gzip payloads — mirrors the
+// prefab decoder's take(MAX+1) pattern so a small gzip bomb can't OOM the process. 512 MB is
+// generous headroom above any real-world MCEdit/litematic export.
+const MAX_SCHEMATIC_DECOMPRESSED: u64 = 512 * 1024 * 1024;
+
+fn gunzip_capped(raw: &[u8]) -> Result<Vec<u8>, String> {
+    use flate2::read::GzDecoder;
+    use std::io::Read;
+    let mut out = Vec::new();
+    GzDecoder::new(raw).take(MAX_SCHEMATIC_DECOMPRESSED + 1).read_to_end(&mut out)
+        .map_err(|e| format!("gzip: {e}"))?;
+    if out.len() as u64 > MAX_SCHEMATIC_DECOMPRESSED {
+        return Err("Schematic file is too large".into());
+    }
+    Ok(out)
+}
+
 // ── Minecraft Schematic / Litematica Import ──────────────────────────────────
 
 pub(crate) const SC_PAINT_COLORS: [[u8; 3]; 54] = [
@@ -88,10 +105,11 @@ pub(crate) fn mc_to_eden(id: u8, meta: u8) -> (u8, u8) {
         3 => (3, 0),
         4 | 48 => (10, 18), // Cobblestone / Mossy Cobblestone → Dark Stone + paint 18
         5 => (7, 0),
-        6 | 37 | 38 | 39 | 40 | 50 | 51 | 55..=69 | 75 | 76 | 77 | 84 | 90 | 92 | 93..=96 |
+        6 | 37 | 38 | 39 | 40 | 50 | 51 | 55 | 57..=66 | 68 | 69 | 75 | 76 | 77 | 84 | 90 | 92 |
+        93 | 94 | 96 |
         97 | 101 | 102 | 117 | 118 | 119 | 120 | 122 | 123 | 124 | 127 | 129 |
         131 | 132 | 140 | 141 | 142 | 143 | 144 | 147 | 148 | 149 | 150 | 151 | 152 |
-        175 | 176 | 177 | 178 | 193..=197 | 198..=207 => (0, 0),
+        175 | 176 | 177 | 178 | 193..=197 | 198..=202 | 204..=207 => (0, 0),
         7 => (1, 36), // Bedrock → Cobblestone block + paint 36
         8 | 9 => (20, 0),
         10 | 11 => (23, 0),
@@ -102,7 +120,7 @@ pub(crate) fn mc_to_eden(id: u8, meta: u8) -> (u8, u8) {
         18 | 161 => (5, 0),
         19 => (4, 0),
         20 => (58, 0),
-        27 | 28 | 29 | 30 | 31 | 32 | 33 | 34 => (0, 0),
+        27..=34 => (0, 0),
         35 => mc_dye_to_eden(4, meta),
         36 => (0, 0),
         41 => (4, sc_closest_paint(255, 215,   0)),
@@ -279,7 +297,14 @@ impl NbtVal {
     fn get(&self, key: &str) -> Option<&NbtVal> { self.as_compound()?.get(key) }
 }
 
+const NBT_MAX_DEPTH: u8 = 64;
+
 pub(crate) fn nbt_parse_val(d: &[u8], pos: &mut usize, tag: u8) -> Option<NbtVal> {
+    nbt_parse_val_d(d, pos, tag, 0)
+}
+
+fn nbt_parse_val_d(d: &[u8], pos: &mut usize, tag: u8, depth: u8) -> Option<NbtVal> {
+    if depth > NBT_MAX_DEPTH { return None; }
     match tag {
         1 => Some(NbtVal::Byte(nbt_read_u8(d, pos)? as i8)),
         2 => Some(NbtVal::Short(nbt_read_be_i16(d, pos)?)),
@@ -315,7 +340,7 @@ pub(crate) fn nbt_parse_val(d: &[u8], pos: &mut usize, tag: u8) -> Option<NbtVal
             // Cap the preallocation: a hostile count must not drive a huge Vec::with_capacity. The
             // loop is still bounded by the actual data (each element read is bounds-checked).
             let mut list = Vec::with_capacity((n as usize).min(1024));
-            for _ in 0..n { list.push(nbt_parse_val(d, pos, et)?); }
+            for _ in 0..n { list.push(nbt_parse_val_d(d, pos, et, depth + 1)?); }
             Some(NbtVal::List(list))
         }
         10 => {
@@ -324,7 +349,7 @@ pub(crate) fn nbt_parse_val(d: &[u8], pos: &mut usize, tag: u8) -> Option<NbtVal
                 let t = nbt_read_u8(d, pos)?;
                 if t == 0 { break; }
                 let k = nbt_read_nbt_string(d, pos)?;
-                let v = nbt_parse_val(d, pos, t)?;
+                let v = nbt_parse_val_d(d, pos, t, depth + 1)?;
                 map.insert(k, v);
             }
             Some(NbtVal::Compound(map))
@@ -387,18 +412,14 @@ pub(crate) fn unpack_state(states: &[i64], index: usize, bits: u32) -> u32 {
 }
 
 pub(crate) fn parse_litematic_bytes(raw: &[u8]) -> Result<Vec<LitematicRegion>, String> {
-    use flate2::read::GzDecoder;
-    use std::io::Read;
-    let mut dec = GzDecoder::new(raw);
-    let mut d = Vec::new();
-    dec.read_to_end(&mut d).map_err(|e| format!("gzip: {e}"))?;
+    let d = gunzip_capped(raw)?;
 
     let root = nbt_parse_root(&d).ok_or("NBT parse failed")?;
     let regions_nbt = root.get("Regions").ok_or("Missing Regions")?;
     let regions_map = regions_nbt.as_compound().ok_or("Regions not a compound")?;
 
     let mut out = Vec::new();
-    for (_, rv) in regions_map {
+    for rv in regions_map.values() {
         let r = rv.as_compound().ok_or("Region not compound")?;
 
         let get_xyz = |key: &str| -> (i32, i32, i32) {
@@ -445,9 +466,9 @@ pub(crate) struct MappingEntry {
     eden_paint: u8,
 }
 
-pub(crate) fn apply_mapping_lookup<'a>(
-    overrides: &'a [MappingEntry],
-) -> HashMap<&'a str, (u8, u8)> {
+pub(crate) fn apply_mapping_lookup(
+    overrides: &[MappingEntry],
+) -> HashMap<&str, (u8, u8)> {
     overrides.iter().map(|e| (e.mc_id.as_str(), (e.eden_type, e.eden_paint))).collect()
 }
 
@@ -554,11 +575,7 @@ pub(crate) struct ParsedSchem {
 }
 
 pub(crate) fn parse_schem_bytes(raw: &[u8]) -> Result<ParsedSchem, String> {
-    use flate2::read::GzDecoder;
-    use std::io::Read;
-    let mut dec = GzDecoder::new(raw);
-    let mut d = Vec::new();
-    dec.read_to_end(&mut d).map_err(|e| format!("gzip: {e}"))?;
+    let d = gunzip_capped(raw)?;
     let root = nbt_parse_root(&d).ok_or("NBT parse failed")?;
 
     let width  = root.get("Width") .and_then(|v| v.as_int()).ok_or("Missing Width")?;
@@ -624,11 +641,7 @@ pub(crate) struct ParsedSchematic {
 }
 
 pub(crate) fn parse_schematic_bytes(raw: &[u8]) -> Result<ParsedSchematic, String> {
-    use flate2::read::GzDecoder;
-    use std::io::Read;
-    let mut dec = GzDecoder::new(raw);
-    let mut d = Vec::new();
-    dec.read_to_end(&mut d).map_err(|e| format!("gzip: {e}"))?;
+    let d = gunzip_capped(raw)?;
     let pos = &mut 0usize;
     if nbt_read_u8(&d, pos).ok_or("truncated")? != 10 { return Err("not compound root".into()); }
     nbt_skip_nbt_string(&d, pos).ok_or("root name")?;
@@ -719,7 +732,7 @@ pub(crate) fn import_schematic_info(path: String) -> Result<SchematicInfo, Strin
         for r in &regions {
             let palette_sz = r.palette.len();
             if palette_sz == 0 { continue; }
-            let bits = (usize::BITS - (palette_sz.saturating_sub(1)).leading_zeros()).max(4) as u32;
+            let bits = (usize::BITS - (palette_sz.saturating_sub(1)).leading_zeros()).max(4);
             let ax = r.size_x.unsigned_abs() as usize;
             let ay = r.size_y.unsigned_abs() as usize;
             let az = r.size_z.unsigned_abs() as usize;
@@ -844,7 +857,7 @@ pub(crate) fn import_schematic_apply(
                                 r.size_z.unsigned_abs() as usize);
             let palette_sz = r.palette.len();
             if palette_sz == 0 { continue; }
-            let bits = (usize::BITS - (palette_sz.saturating_sub(1)).leading_zeros()).max(4) as u32;
+            let bits = (usize::BITS - (palette_sz.saturating_sub(1)).leading_zeros()).max(4);
             let off_x = (r.pos_x - gmin_x) as usize;
             let off_y = (r.pos_y - gmin_y) as usize;
             let off_z = (r.pos_z - gmin_z) as usize;

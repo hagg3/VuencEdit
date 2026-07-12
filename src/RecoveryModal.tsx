@@ -23,7 +23,7 @@ export default function RecoveryModal({
 }) {
   const modal = glassPanel({
     padding: "22px 26px", minWidth: 380, maxWidth: 460,
-    color: "#e2e8f0", fontSize: 13,
+    color: "#ebe9e7", fontSize: 13,
   });
   return (
     <Modal onClose={onDiscard} zIndex={9500} labelledBy="recovery-title" closeOnEsc={!recovering} closeOnBackdrop={!recovering}>
@@ -31,13 +31,13 @@ export default function RecoveryModal({
         <h2 id="recovery-title" style={{ margin: "0 0 12px", fontSize: 15, fontWeight: 700, color: EDEN_TEAL_READABLE }}>
           Recover unsaved work?
         </h2>
-        <p style={{ margin: "0 0 8px", color: "#cbd5e1", lineHeight: 1.5 }}>
+        <p style={{ margin: "0 0 8px", color: "#dad6d2", lineHeight: 1.5 }}>
           Eden World Editor found autosaved changes from a previous session that wasn't saved before closing.
         </p>
         <div style={{ background: "rgba(0,0,0,0.25)", borderRadius: 6, padding: "8px 12px", margin: "0 0 16px", fontFamily: "monospace", fontSize: 12 }}>
-          <div><span style={{ color: "#64748b" }}>World: </span>{info.world_name || "(unnamed)"}</div>
-          <div><span style={{ color: "#64748b" }}>Autosaved: </span>{timeAgoShort(info.timestamp)}</div>
-          {info.source_path && <div style={{ color: "#64748b", wordBreak: "break-all" }}>{info.source_path}</div>}
+          <div><span style={{ color: "#83786c" }}>World: </span>{info.world_name || "(unnamed)"}</div>
+          <div><span style={{ color: "#83786c" }}>Autosaved: </span>{timeAgoShort(info.timestamp)}</div>
+          {info.source_path && <div style={{ color: "#83786c", wordBreak: "break-all" }}>{info.source_path}</div>}
         </div>
         <div style={{ display: "flex", justifyContent: "flex-end", gap: 10 }}>
           <button
