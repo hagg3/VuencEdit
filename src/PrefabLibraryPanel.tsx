@@ -2,7 +2,7 @@ import { useEffect, useState, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { openPath } from "@tauri-apps/plugin-opener";
 import { decodeU8 } from "./codec";
-import { EDEN_TEAL_READABLE, glassPanel, chromeButton } from "./designTokens";
+import { EDEN_TEAL_READABLE, glassPanel, chromeButton, accentRing } from "./designTokens";
 import type { ClipboardInfo, PreviewDataRaw } from "./types";
 
 interface PrefabEntry {
@@ -56,7 +56,9 @@ export default function PrefabLibraryPanel({
   onClose, onArmPaste, onSaveAs, refreshToken, topPx,
 }: {
   onClose: () => void;
-  onArmPaste: () => void;
+  /** Receives the loaded prefab's ClipboardInfo — App must set clipboard state from it,
+   *  or paste mode arms with no ghost/dimensions and the first click lands blind. */
+  onArmPaste: (info: ClipboardInfo) => void;
   /** Native "save anywhere" fallback — wired to App's savePrefabAs(). */
   onSaveAs: () => void;
   /** Bumped by App after a prefab is saved into the library so the gallery re-lists. */
@@ -106,9 +108,18 @@ export default function PrefabLibraryPanel({
       setEntries(list);
       // Seed thumbnails from cache so unchanged files paint instantly; the loader fetches the rest.
       const seeded: Record<string, string | null> = {};
+      const live = new Set<string>();
       for (const e of list) {
-        const cached = thumbCacheRef.current.get(`${e.path}::${e.modified}`);
+        const key = `${e.path}::${e.modified}`;
+        live.add(key);
+        const cached = thumbCacheRef.current.get(key);
         if (cached !== undefined) seeded[e.path] = cached;
+      }
+      // Evict data URLs for entries no longer in the listing — deleted, renamed, edited (the mtime
+      // is part of the key), or from a previously-browsed folder. The cache is keyed by
+      // `path::mtime` and never expired otherwise, so a long session over a big library only grew.
+      for (const key of thumbCacheRef.current.keys()) {
+        if (!live.has(key)) thumbCacheRef.current.delete(key);
       }
       setThumbs(seeded);
     } catch (e) {
@@ -169,8 +180,8 @@ export default function PrefabLibraryPanel({
 
   async function handleClick(entry: PrefabEntry) {
     try {
-      await invoke<ClipboardInfo>("load_prefab", { path: entry.path });
-      onArmPaste();
+      const info = await invoke<ClipboardInfo>("load_prefab", { path: entry.path });
+      onArmPaste(info);
     } catch (e) {
       setError(String(e));
     }
@@ -380,7 +391,7 @@ export default function PrefabLibraryPanel({
           Open Folder
         </button>
       </div>
-      <button onClick={onSaveAs} style={chromeButton({ padding: "5px 10px", fontSize: 11, borderColor: "#4ade80", color: "#86efac" })}>
+      <button onClick={onSaveAs} style={chromeButton({ padding: "5px 10px", fontSize: 11, ...accentRing("#4ade80"), color: "#86efac" })}>
         Save Selection As…
       </button>
     </div>

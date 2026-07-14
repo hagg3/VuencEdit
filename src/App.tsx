@@ -12,7 +12,7 @@ import { getVersion } from "@tauri-apps/api/app";
 import { open, save, ask } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import MapCanvas, { type Tool, type SelectionBounds, type PixelPatch, type MapCanvasRef } from "./MapCanvas";
+import MapCanvas, { KEY_ZOOM_STEP, TOOL_LABELS, type Tool, type SelectionBounds, type PixelPatch, type MapCanvasRef } from "./MapCanvas";
 import SelectionInspector from "./SelectionInspector";
 import ElevationPreviewPanel from "./ElevationPreviewPanel";
 import SliceViewport from "./SliceViewport";
@@ -30,7 +30,7 @@ import WorldInfoModal from "./WorldInfoModal";
 import RecoveryModal from "./RecoveryModal";
 import PrefabLibraryPanel, { resolvePrefabDir } from "./PrefabLibraryPanel";
 import Modal from "./Modal";
-import { glassPanel, chromeButton } from "./designTokens";
+import { glassPanel, chromeButton, accentRing } from "./designTokens";
 import { decodeAtlas, tintedSwatch, type AtlasData, type TexturePackRaw, clearSwatchCache } from "./texturePack";
 import { blockDisplayName, applyBlockTables, type BlockTables } from "./blockDefs";
 import appIcon from "./assets/app-icon.png";
@@ -39,6 +39,14 @@ import "./App.css";
 // Quad-view divider positions (column/row split fractions), persisted so a layout the user tuned
 // survives reloads. Clamped to 0.15–0.85 so no cell can be dragged to nothing.
 const STATUS_BAR_HEIGHT = 20; // px reserved at the bottom of the window for statusBarEl
+
+// Toasts (see pushToast). Errors linger ~3× longer than status blips — they carry a message the
+// user may need to read, not just an acknowledgement of something they just did.
+type ToastKind = "info" | "error";
+type Toast = { id: number; text: string; kind: ToastKind };
+const INFO_TOAST_MS = 2500;
+const ERROR_TOAST_MS = 8000;
+const MAX_TOASTS = 4;
 const QUAD_SPLITS_KEY = "eden_quad_splits";
 const clampSplit = (v: number) => Math.min(0.85, Math.max(0.15, v));
 
@@ -181,18 +189,53 @@ function App() {
   // mismatch on plain Save — avoids re-toasting on every ⌘S while the mismatch is unresolved.
   const lastExtWarnRef = useRef<string | null>(null);
 
-  // Toast: brief status-summary popup after named edit/undo/redo operations (E5).
-  const [toast, setToast] = useState<{ text: string; id: number } | null>(null);
+  // Toasts: transient popups, stacked bottom-centre above the status bar. Two kinds —
+  // "info" (status summaries after named edit/undo/redo operations, E5) and "error" (every async
+  // failure). Errors used to be a single persistent bottom-right banner that overlapped the status
+  // bar, silently overwrote its predecessor, and looked identical whether it came from the user's
+  // own action or a background autosave tick. As toasts they stack, are red, and auto-dismiss —
+  // slower than info toasts, and hovering one holds it open so a long message can be read.
+  const [toasts, setToasts] = useState<Toast[]>([]);
   const toastIdRef = useRef(0);
-  const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const showToast = useCallback((text: string) => {
-    const id = ++toastIdRef.current;
-    setToast({ text, id });
-    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
-    toastTimerRef.current = setTimeout(() => {
-      setToast(t => (t?.id === id ? null : t));
-    }, 2500);
+  const toastTimersRef = useRef(new Map<number, ReturnType<typeof setTimeout>>());
+
+  const dismissToast = useCallback((id: number) => {
+    const t = toastTimersRef.current.get(id);
+    if (t) { clearTimeout(t); toastTimersRef.current.delete(id); }
+    setToasts((list) => list.filter((x) => x.id !== id));
   }, []);
+
+  const armToastTimer = useCallback((id: number, ms: number) => {
+    const prev = toastTimersRef.current.get(id);
+    if (prev) clearTimeout(prev);
+    toastTimersRef.current.set(id, setTimeout(() => dismissToast(id), ms));
+  }, [dismissToast]);
+
+  const pushToast = useCallback((text: string, kind: ToastKind) => {
+    const id = ++toastIdRef.current;
+    // Cap the stack — a failing background tick could otherwise queue toasts indefinitely.
+    setToasts((list) => [...list.slice(-(MAX_TOASTS - 1)), { id, text, kind }]);
+    armToastTimer(id, kind === "error" ? ERROR_TOAST_MS : INFO_TOAST_MS);
+    return id;
+  }, [armToastTimer]);
+
+  useEffect(() => {
+    const timers = toastTimersRef.current;
+    return () => { for (const t of timers.values()) clearTimeout(t); };
+  }, []);
+
+  const showToast = useCallback((text: string) => { pushToast(text, "info"); }, [pushToast]);
+
+  /**
+   * Report an async failure. Shows a red toast, and records the message in `error` — which the
+   * splash/launcher screen (the `!world` branch, where there is no toast layer) renders inline.
+   * Every `catch` in App goes through this; don't call `setError` directly.
+   */
+  const reportError = useCallback((e: unknown) => {
+    const msg = String(e);
+    setError(msg);
+    pushToast(msg, "error");
+  }, [pushToast]);
 
   const [renderMode, setRenderMode] = useState<"tiled" | "full" | "axo">("tiled");
   const [axoSkew, setAxoSkew] = useState(0.2);
@@ -460,6 +503,10 @@ function App() {
   const viewModeRef = useRef<"topdown" | "zslice">("topdown");
   useEffect(() => { viewModeRef.current = viewMode; }, [viewMode]);
 
+  // Read by the global Escape handler, which is registered once with `[]`-ish deps.
+  const ctxMenuRef = useRef<typeof ctxMenu>(null);
+  useEffect(() => { ctxMenuRef.current = ctxMenu; }, [ctxMenu]);
+
   // Dismiss context menu on any outside click.
   // Delay registration to avoid macOS right-click pointerdown firing after contextmenu.
   useEffect(() => {
@@ -584,10 +631,10 @@ function App() {
     const timer = setTimeout(() => {
       invoke<SelectionInfo>("describe_selection", { ...rawBounds, zMin, zMax })
         .then(setSelection)
-        .catch((e) => setError(String(e)));
+        .catch((e) => reportError(e));
     }, 80);
     return () => clearTimeout(timer);
-  }, [rawBounds, zMin, zMax]);
+  }, [rawBounds, zMin, zMax, reportError]);
 
   // Fetch top-down clipboard preview whenever clipboard changes.
   useEffect(() => {
@@ -607,7 +654,7 @@ function App() {
         treeTypes, density, leafPaints, smartPlacement,
       });
       await applyEditResult(result);
-    } catch (e) { setError(String(e)); }
+    } catch (e) { reportError(e); }
   }
 
   async function handleExtrude(ignoreAir: boolean) {
@@ -619,7 +666,7 @@ function App() {
         axis: extrudeAxis, count: extrudeCount, ignoreAir,
       });
       await applyEditResult(result);
-    } catch (e) { setError(String(e)); }
+    } catch (e) { reportError(e); }
   }
 
   const applyEditResult = useCallback(async (raw: EditResultRaw, kind: "edit" | "undo" | "redo" = "edit") => {
@@ -695,7 +742,7 @@ function App() {
       lastAutosavedEpochRef.current = editEpochRef.current;
       savedEpochRef.current = editEpochRef.current;
     } catch (e) {
-      setError(String(e));
+      reportError(e);
     } finally {
       setLoading(false);
     }
@@ -721,7 +768,7 @@ function App() {
         useTemplate: showTemplateOverlay && templateLoaded && viewMode !== "zslice",
       });
     } catch (e) {
-      setError(String(e));
+      reportError(e);
     } finally {
       setExporting(false);
       setExportProgress(null);
@@ -746,7 +793,7 @@ function App() {
     try {
       await invoke("export_obj", { path: savePath, x1, y1, x2, y2, zMin, zMax });
     } catch (e) {
-      setError(String(e));
+      reportError(e);
     } finally {
       setExportingObj(false);
     }
@@ -770,7 +817,7 @@ function App() {
     try {
       await invoke("export_json", { path: savePath, x1, y1, x2, y2, zMin, zMax });
     } catch (e) {
-      setError(String(e));
+      reportError(e);
     } finally {
       setExportingJson(false);
     }
@@ -796,7 +843,7 @@ function App() {
     try {
       await invoke("export_vox", { path: savePath, x1, y1, x2, y2, zMin, zMax });
     } catch (e) {
-      setError(String(e));
+      reportError(e);
     } finally {
       setExportingVox(false);
       setVoxProgress(null);
@@ -815,9 +862,9 @@ function App() {
       setClipboard(info);
       setTool("paste");
     } catch (e) {
-      setError(String(e));
+      reportError(e);
     }
-  }, [rawBounds, zMin, zMax]);
+  }, [rawBounds, zMin, zMax, reportError]);
 
   // Move the current selection (and its contents) by (dx, dy) in one gesture — arrow-key
   // nudge (E2). Reads live selection/z-range via refs so this stays []-stable for the
@@ -852,7 +899,7 @@ function App() {
         await applyEditResult(result);
         setRawBounds({ x1: bounds.x1 + dx, y1: bounds.y1 + dy, x2: bounds.x2 + dx, y2: bounds.y2 + dy });
       } catch (e) {
-        setError(String(e));
+        reportError(e);
       }
       const pending = nudgePendingRef.current;
       if (!pending) break;
@@ -860,7 +907,7 @@ function App() {
       dx = pending.dx; dy = pending.dy;
     }
     nudgeBusyRef.current = false;
-  }, [applyEditResult]);
+  }, [applyEditResult, reportError]);
 
   // Entry point for both arrow-key nudge and drag-to-move: moves just the selection box by
   // default (E2 — off by default per user feedback), or the box + its blocks when the
@@ -880,7 +927,7 @@ function App() {
       const info = await invoke<ClipboardInfo>("rotate_clipboard");
       setClipboard(info);
     } catch (e) {
-      setError(String(e));
+      reportError(e);
     }
   }
 
@@ -889,7 +936,7 @@ function App() {
       const info = await invoke<ClipboardInfo>("mirror_clipboard_x");
       setClipboard(info);
     } catch (e) {
-      setError(String(e));
+      reportError(e);
     }
   }
 
@@ -898,7 +945,7 @@ function App() {
       const info = await invoke<ClipboardInfo>("mirror_clipboard_y");
       setClipboard(info);
     } catch (e) {
-      setError(String(e));
+      reportError(e);
     }
   }
 
@@ -927,7 +974,7 @@ function App() {
       if (!persistPaste) setTool("pan");
       await applyEditResult(result);
     } catch (e) {
-      setError(String(e));
+      reportError(e);
     }
   }
 
@@ -970,7 +1017,7 @@ function App() {
         trackRecentBlock(result.block_type, result.paint);
       }
     } catch (e) {
-      setError(String(e));
+      reportError(e);
     }
     // One-shot: return to previous draw tool
     const prev = prevToolRef.current;
@@ -1024,7 +1071,7 @@ function App() {
         trackRecentBlock(fillBlockType, fillPaint);
       }
     } catch (e) {
-      setError(String(e));
+      reportError(e);
     }
   }
 
@@ -1065,11 +1112,16 @@ function App() {
         wx, wy, matchPaint: wandMatchPaint,
       });
       if (rect) setRawBounds(rect);
-    } catch (e) { setError(String(e)); }
+    } catch (e) { reportError(e); }
   }
 
   async function handleScatterPaste(_pos: { x: number; y: number }) {
-    if (!rawBounds) return;
+    // The selection rect *is* scatter's placement region. Reachable with no selection if the user
+    // armed scatter and then cleared it, so say so instead of eating the click.
+    if (!rawBounds) {
+      showToast("Scatter needs a selection to place copies into");
+      return;
+    }
     try {
       const result = await invoke<EditResultRaw>("scatter_paste", {
         x1: rawBounds.x1, y1: rawBounds.y1, x2: rawBounds.x2, y2: rawBounds.y2,
@@ -1077,7 +1129,7 @@ function App() {
         elevationOffset: pasteElevationOffset, ignoreAir: pasteIgnoreAir,
       });
       await applyEditResult(result);
-    } catch (e) { setError(String(e)); }
+    } catch (e) { reportError(e); }
   }
 
   async function handleArrayPaste(pos: { x: number; y: number }) {
@@ -1090,7 +1142,7 @@ function App() {
       });
       await applyEditResult(result);
       if (!persistPaste) setTool("pan");
-    } catch (e) { setError(String(e)); }
+    } catch (e) { reportError(e); }
   }
 
   async function handleDrawElevation(x: number, y: number, z: number) {
@@ -1100,7 +1152,7 @@ function App() {
       });
       await applyEditResult(result);
     } catch (e) {
-      setError(String(e));
+      reportError(e);
     }
   }
 
@@ -1137,7 +1189,7 @@ function App() {
     try {
       const result = await invoke<EditResultRaw>("paint_blocks", { blocks: [{ x, y, z }], blockType: 0, paint: 0, zOffset: 0 });
       await applyEditResult(result);
-    } catch (e) { setError(String(e)); }
+    } catch (e) { reportError(e); }
   }
 
   /** Place the 3D tab's armed block in the empty voxel against the picked face. */
@@ -1148,7 +1200,7 @@ function App() {
         blocks: [{ x, y, z }], blockType: build3dBlock, paint: build3dPaint, zOffset: 0,
       });
       await applyEditResult(result);
-    } catch (e) { setError(String(e)); }
+    } catch (e) { reportError(e); }
   }
 
   // Batch paint at exact world cells (one undo entry). Used by the slice viewports.
@@ -1161,7 +1213,7 @@ function App() {
       await applyEditResult(result);
       trackRecentBlock(fillBlockType, fillPaint);
     } catch (e) {
-      setError(String(e));
+      reportError(e);
     }
   }
 
@@ -1205,11 +1257,11 @@ function App() {
       savedEpochRef.current = editEpochRef.current;
       invoke("discard_autosave").catch(() => {});
     } catch (e) {
-      setError(String(e));
+      reportError(e);
     } finally {
       setSaving(false);
     }
-  }, [saveCompressed, showToast]);
+  }, [saveCompressed, showToast, reportError]);
 
   const saveWorldAs = useCallback(async () => {
     const chosen = await save({
@@ -1286,14 +1338,21 @@ function App() {
       savedEpochRef.current = -1;
       setRecoveryInfo(null);
     } catch (e) {
-      setError(String(e));
+      reportError(e);
     } finally {
       setRecovering(false);
     }
   }
 
+  // Destroys the autosave sidecar. Only reachable from RecoveryModal's explicit
+  // Discard → confirm; Esc/backdrop go to dismissRecovery instead (C1).
   async function discardRecovery() {
     try { await invoke("discard_autosave"); } catch { /* best effort */ }
+    setRecoveryInfo(null);
+  }
+
+  // Closes the prompt without touching the sidecar — it's re-offered on next launch.
+  function dismissRecovery() {
     setRecoveryInfo(null);
   }
 
@@ -1327,6 +1386,13 @@ function App() {
       }
       if (!world) return;
       if (e.key === "Escape") {
+        // The context menu is the frontmost transient surface — it steps back first, before
+        // paste locks / 3D picks / the tool itself.
+        if (ctxMenuRef.current) {
+          e.preventDefault();
+          setCtxMenu(null);
+          return;
+        }
         if (lockedPastePosRef.current) {
           e.preventDefault();
           setLockedPastePos(null);
@@ -1430,10 +1496,29 @@ function App() {
         if (sourcePath) saveWorld(sourcePath);
         else saveWorldAs();
       }
+      // Selection conventions every creative tool shares.
+      if (k === "a") {
+        e.preventDefault();
+        setRawBounds({ x1: 0, y1: 0, x2: world.width_chunks * 16 - 1, y2: world.height_chunks * 16 - 1 });
+      }
+      if (k === "d") { e.preventDefault(); setRawBounds(null); }
+      // Zoom: ⌘0 fit map, ⌘+/⌘− step, ⌘⇧0 zoom to selection. (⌘= is the unshifted "+" key.)
+      if (k === "0" && e.shiftKey) {
+        e.preventDefault();
+        if (rawBounds) mapCanvasRef.current?.zoomToBox(rawBounds.x1, rawBounds.y1, rawBounds.x2, rawBounds.y2);
+      } else if (k === "0") {
+        e.preventDefault();
+        mapCanvasRef.current?.resetView();
+      }
+      if (k === "=" || k === "+") { e.preventDefault(); mapCanvasRef.current?.zoomBy(KEY_ZOOM_STEP); }
+      if (k === "-" || k === "_") { e.preventDefault(); mapCanvasRef.current?.zoomBy(1 / KEY_ZOOM_STEP); }
+      // macOS conventions: ⌘, opens Settings, ⌘W closes the world (both guarded like their menu items).
+      if (k === ",") { e.preventDefault(); setShowSettings(true); }
+      if (k === "w") { e.preventDefault(); void closeWorldRef.current(); }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [world, showHelp, handleUndo, handleRedo, clipboard, sourcePath, copySelection, saveWorld, saveWorldAs, nudgeSelection]);
+  }, [world, showHelp, handleUndo, handleRedo, clipboard, sourcePath, copySelection, saveWorld, saveWorldAs, nudgeSelection, rawBounds]);
 
   // Menu close effects handled inside Ribbon component
 
@@ -1447,7 +1532,7 @@ function App() {
       setTexturePackPath(path);
       setTexEpoch(e => e + 1);
       saveSettings({ texturePackPath: path });
-    } catch (e) { setError(String(e)); }
+    } catch (e) { reportError(e); }
   }
 
   async function openTexturePackFile() {
@@ -1463,7 +1548,7 @@ function App() {
   }
 
   function unloadTexturePack() {
-    invoke("unload_texture_pack").catch(e => setError(String(e)));
+    invoke("unload_texture_pack").catch(e => reportError(e));
     clearSwatchCache();
     setTexturePackInfo(null);
     setTexturePackPath(null);
@@ -1484,7 +1569,7 @@ function App() {
       setTemplatePath(path);
       setShowTemplateOverlay(true);
       saveSettings({ templatePath: path });
-    } catch (e) { setError(String(e)); }
+    } catch (e) { reportError(e); }
   }
 
   async function openTemplateFile() {
@@ -1522,7 +1607,7 @@ function App() {
       });
       setExpandResult({ chunksAdded: res.chunks_added, totalChunks: res.total_chunks });
     } catch (e) {
-      if (String(e) !== "Cancelled") setError(String(e));
+      if (String(e) !== "Cancelled") reportError(e);
     } finally {
       setExpandInProgress(false);
       setExpandProgress(100);
@@ -1541,7 +1626,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
   // deliberately avoiding the native NSSavePanel, which hangs ~30s on macOS Sonoma (ViewBridge
   // XPC stall). "Save As…" (below) still offers the native picker for saving to any folder.
   function openPrefabNameModal() {
-    if (!clipboard) { setError("Copy a selection first, then save it as a prefab."); return; }
+    if (!clipboard) { reportError("Copy a selection first, then save it as a prefab."); return; }
     setPrefabNameInput(world?.name?.trim() || "prefab");
     setPrefabOverwrite(false);
     setPrefabNameModal(true);
@@ -1567,7 +1652,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
       setPrefabNameModal(false);
       showToast(`Saved prefab “${safe}”`);
     } catch (e) {
-      setError(String(e));
+      reportError(e);
     } finally {
       setPrefabSaving(false);
     }
@@ -1575,7 +1660,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
 
   // Native "save anywhere" fallback. Kept for users who want prefabs outside the library folder.
   async function savePrefabAs() {
-    if (!clipboard) { setError("Copy a selection first, then save it as a prefab."); return; }
+    if (!clipboard) { reportError("Copy a selection first, then save it as a prefab."); return; }
     const path = await save({
       filters: [{ name: "Eden Prefab", extensions: ["epfab"] }],
       defaultPath: `${world?.name ?? "prefab"}.epfab`,
@@ -1583,7 +1668,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
     if (!path) return;
     await invoke("save_prefab", { path })
       .then(() => setPrefabRefreshToken((t) => t + 1))
-      .catch((e) => setError(String(e)));
+      .catch((e) => reportError(e));
   }
 
   async function loadPrefab() {
@@ -1593,7 +1678,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
     });
     if (!path || typeof path !== "string") return;
     const info = await invoke<ClipboardInfo>("load_prefab", { path })
-      .catch((e: unknown) => { setError(String(e)); return null; });
+      .catch((e: unknown) => { reportError(e); return null; });
     if (!info) return;
     setClipboard(info);
     setTool("paste");
@@ -1606,7 +1691,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
     });
     if (!path || typeof path !== "string") return;
     const info = await invoke<SchematicInfo>("import_schematic_info", { path })
-      .catch((e: unknown) => { setError(String(e)); return null; });
+      .catch((e: unknown) => { reportError(e); return null; });
     if (!info) return;
     setSchematicPath(path);
     setSchematicInfo(info);
@@ -1624,7 +1709,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
       setSchematicInfo(null);
       setSchematicPath(null);
     } catch (e) {
-      setError(String(e));
+      reportError(e);
     } finally {
       setSchematicApplying(false);
     }
@@ -1642,7 +1727,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
         : await invoke<EditResultRaw>("delete_blocks", { ...rawBounds, zMin, zMax });
       await applyEditResult(result);
     } catch (e) {
-      setError(String(e));
+      reportError(e);
     }
   }
 
@@ -1659,7 +1744,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
       });
       await applyEditResult(result);
     } catch (e) {
-      setError(String(e));
+      reportError(e);
     }
   }
 
@@ -1674,7 +1759,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
       });
       await applyEditResult(result);
     } catch (e) {
-      setError(String(e));
+      reportError(e);
     }
   }
 
@@ -1687,6 +1772,11 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
     const v = Math.max(0, Math.min(world?.max_z ?? 63, parseInt(raw, 10) || 0));
     setZMax(Math.max(v, zMin));
   }
+
+  // ⌘W reaches closeWorld through this ref: it's a plain (non-memoized) function, so depending on
+  // it directly would re-register the global keydown listener on every render.
+  const closeWorldRef = useRef<() => void | Promise<void>>(() => {});
+  closeWorldRef.current = closeWorld;
 
   async function closeWorld() {
     if (isDirty()) {
@@ -1726,7 +1816,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
       // doesn't otherwise bump editEpoch — without this, the change is silently lost if the user
       // closes without saving (the unsaved-changes prompt only fires when dirty).
       setEditEpoch(e => e + 1);
-    } catch (e) { setError(String(e)); }
+    } catch (e) { reportError(e); }
   }
 
   async function onRenameBlur(trimmed: string) {
@@ -1735,7 +1825,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
         await invoke("rename_world", { name: trimmed });
         setWorld(w => w ? { ...w, name: trimmed } : null);
         setEditEpoch(e => e + 1); // header write outside with_edit — see setSpawnAtSelection
-      } catch (e) { setError(String(e)); }
+      } catch (e) { reportError(e); }
     }
     setRenamingWorld(false);
   }
@@ -1814,7 +1904,9 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
       fontVariantNumeric: "tabular-nums",
     }}>
       <div style={{ padding: "0 10px", borderRight: "1px solid #322d28", whiteSpace: "nowrap", color: "#70665b" }}>
-        {tool === "brush" ? `Brush ${brushSize}px` : tool === "pen" ? "Pen" : tool === "spray" ? "Spray" : tool === "line" ? "Line" : tool === "rect" ? "Rect" : tool === "ellipse" ? "Ellipse" : tool === "polygon" ? "Polygon" : tool === "fill" ? "Fill" : tool === "eyedropper" ? "Eyedropper" : tool === "wand" ? "Wand" : tool === "paste" ? (pasteMode !== "normal" ? `Paste (${pasteMode})` : "Paste") : tool === "select" ? "Select" : tool === "smooth" ? "Smooth" : tool === "noise" ? "Noise" : tool === "flatten" ? "Flatten" : tool === "erode" ? "Erode" : tool === "thermal" ? "Thermal" : tool === "hydro" ? "Hydro Erode" : tool === "stamp" ? "Retexture" : tool === "grab" ? "Grab" : tool === "raise" ? "Raise" : tool === "lower" ? "Lower" : "Pan"}
+        {tool === "brush" ? `Brush ${brushSize}px`
+          : tool === "paste" && pasteMode !== "normal" ? `Paste (${pasteMode})`
+          : TOOL_LABELS[tool]}
       </div>
       <div style={{ padding: "0 10px", borderRight: "1px solid #322d28", color: "#4b443d", whiteSpace: "nowrap" }}>
         {world.name}
@@ -1853,6 +1945,17 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
         <div style={{ padding: "0 8px", borderRight: "1px solid #322d28", whiteSpace: "nowrap",
           color: "#a78bfa", background: "rgba(167,139,250,0.07)" }}>
           Mask: {blockDisplayName(maskBlockType)}{maskPaint !== null ? ` #${maskPaint}` : ""}
+        </div>
+      )}
+      {/* Two-click paste is otherwise signalled only by the ghost turning green → amber, which is
+          easy to miss — this is the "why did nothing paste?" moment. */}
+      {tool === "paste" && (
+        <div style={{ padding: "0 8px", borderRight: "1px solid #322d28", whiteSpace: "nowrap",
+          color: lockedPastePos ? "#fcd34d" : "#86efac",
+          background: lockedPastePos ? "rgba(245,158,11,0.07)" : "rgba(34,197,94,0.06)" }}>
+          {lockedPastePos
+            ? "Position locked — click again to stamp, Esc to unlock"
+            : "Click the map to lock the paste position"}
         </div>
       )}
       <div style={{ flex: 1 }} />
@@ -2310,7 +2413,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
         {showPrefabLibrary && (
           <PrefabLibraryPanel
             onClose={() => setShowPrefabLibrary(false)}
-            onArmPaste={() => setTool("paste")}
+            onArmPaste={(info) => { setClipboard(info); setTool("paste"); }}
             onSaveAs={savePrefabAs}
             refreshToken={prefabRefreshToken}
             topPx={effectiveRibbonHeight + 4}
@@ -2368,7 +2471,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
                   disabled={!prefabNameInput.trim() || prefabSaving}
                   style={chromeButton({
                     padding: "6px 14px", fontSize: 12,
-                    borderColor: prefabOverwrite ? "#fbbf24" : "#4ade80",
+                    ...accentRing(prefabOverwrite ? "#fbbf24" : "#4ade80"),
                     color: prefabOverwrite ? "#fcd34d" : "#86efac",
                     opacity: !prefabNameInput.trim() || prefabSaving ? 0.5 : 1,
                   })}
@@ -2447,30 +2550,11 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           </div>
         )}
 
-        {error && (
-          <div style={{
-            position: "absolute", bottom: 16, right: 12,
-            background: "rgba(0,0,0,0.7)", color: "#f87171",
-            padding: "6px 12px", borderRadius: 6, fontSize: 13, maxWidth: 360,
-            display: "flex", alignItems: "flex-start", gap: 8,
-          }}>
-            <span style={{ flex: 1 }}>{error}</span>
-            <button
-              onClick={() => setError(null)}
-              title="Dismiss"
-              style={{
-                background: "none", border: "none", color: "#f87171", cursor: "pointer",
-                fontSize: 14, lineHeight: "16px", padding: 0, opacity: 0.7,
-              }}
-            >✕</button>
-          </div>
-        )}
-
         {showHelp && <HelpModal onClose={() => setShowHelp(false)} />}
         {showAbout && <AboutModal version={appVersion} onClose={() => setShowAbout(false)} />}
         {showWorldInfo && <WorldInfoModal onClose={() => setShowWorldInfo(false)} />}
         {recoveryInfo && (
-          <RecoveryModal info={recoveryInfo} recovering={recovering} onRecover={recoverAutosave} onDiscard={discardRecovery} />
+          <RecoveryModal info={recoveryInfo} recovering={recovering} onRecover={recoverAutosave} onDiscard={discardRecovery} onDismiss={dismissRecovery} />
         )}
         {showSettings && (
           <SettingsModal
@@ -2652,7 +2736,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
               onContextMenu={e => e.preventDefault()}
             >
               <button style={miBtnStyle} onMouseEnter={miHov} onMouseLeave={miLve}
-                onClick={() => { close(); invoke<[number,number]>("set_spawn_pos", { px: Math.round(ctxMenu.wx), py: Math.round(ctxMenu.wy) }).then(([px, py]) => { setSpawnPos({ px, py }); setEditEpoch(e => e + 1); }).catch(e => setError(String(e))); }}>
+                onClick={() => { close(); invoke<[number,number]>("set_spawn_pos", { px: Math.round(ctxMenu.wx), py: Math.round(ctxMenu.wy) }).then(([px, py]) => { setSpawnPos({ px, py }); setEditEpoch(e => e + 1); }).catch(e => reportError(e)); }}>
                 {ic("⌂")} Set Spawn Here
               </button>
               {div}
@@ -2702,16 +2786,53 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
         {/* Status bar */}
         {statusBarEl}
 
-        {toast && (
-          <div key={toast.id} style={{
-            position: "fixed", bottom: 30, left: "50%", transform: "translateX(-50%)",
-            zIndex: 200, padding: "8px 16px", borderRadius: 6,
-            background: "linear-gradient(180deg, rgb(36,33,30) 0%, rgb(23,21,19) 100%)",
-            boxShadow: `inset 0 1px 0 rgba(255,255,255,.06), 0 8px 20px rgba(0,0,0,.4), 0 0 0 1px rgba(${EDEN_TEAL},.25)`,
-            color: "#ebe9e7", fontSize: 12, whiteSpace: "nowrap", pointerEvents: "none",
-            animation: "eden-toast-in .15s ease-out",
+        {/* Toast stack — sits clear of the status bar (STATUS_BAR_HEIGHT), newest at the bottom. */}
+        {toasts.length > 0 && (
+          <div style={{
+            position: "fixed", bottom: STATUS_BAR_HEIGHT + 10, left: "50%", transform: "translateX(-50%)",
+            zIndex: 200, display: "flex", flexDirection: "column", alignItems: "center", gap: 6,
           }}>
-            {toast.text}
+            {toasts.map((t) => {
+              const isErr = t.kind === "error";
+              return (
+                <div
+                  key={t.id}
+                  // Errors are dismissable and hold open while hovered so a long message can be
+                  // read; info toasts are pure status blips and stay click-through.
+                  onMouseEnter={isErr ? () => {
+                    const timer = toastTimersRef.current.get(t.id);
+                    if (timer) { clearTimeout(timer); toastTimersRef.current.delete(t.id); }
+                  } : undefined}
+                  onMouseLeave={isErr ? () => armToastTimer(t.id, ERROR_TOAST_MS) : undefined}
+                  style={{
+                    padding: "8px 16px", borderRadius: 6,
+                    background: isErr
+                      ? "linear-gradient(180deg, rgb(58,28,26) 0%, rgb(38,19,17) 100%)"
+                      : "linear-gradient(180deg, rgb(36,33,30) 0%, rgb(23,21,19) 100%)",
+                    boxShadow: `inset 0 1px 0 rgba(255,255,255,.06), 0 8px 20px rgba(0,0,0,.4), 0 0 0 1px ${isErr ? "rgba(248,113,113,.45)" : `rgba(${EDEN_TEAL},.25)`}`,
+                    color: isErr ? "#fca5a5" : "#ebe9e7",
+                    fontSize: 12, maxWidth: 460,
+                    whiteSpace: isErr ? "normal" : "nowrap",
+                    pointerEvents: isErr ? "auto" : "none",
+                    display: "flex", alignItems: "flex-start", gap: 8,
+                    animation: "eden-toast-in .15s ease-out",
+                  }}
+                >
+                  <span style={{ flex: 1 }}>{t.text}</span>
+                  {isErr && (
+                    <button
+                      onClick={() => dismissToast(t.id)}
+                      title="Dismiss"
+                      aria-label="Dismiss error"
+                      style={{
+                        background: "none", border: "none", color: "#fca5a5", cursor: "pointer",
+                        fontSize: 14, lineHeight: "16px", padding: 0, opacity: 0.7,
+                      }}
+                    >✕</button>
+                  )}
+                </div>
+              );
+            })}
           </div>
         )}
       </div>
@@ -2869,7 +2990,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
 
       {showAbout && <AboutModal version={appVersion} onClose={() => setShowAbout(false)} />}
       {recoveryInfo && (
-        <RecoveryModal info={recoveryInfo} recovering={recovering} onRecover={recoverAutosave} onDiscard={discardRecovery} />
+        <RecoveryModal info={recoveryInfo} recovering={recovering} onRecover={recoverAutosave} onDiscard={discardRecovery} onDismiss={dismissRecovery} />
       )}
       {showSettings && (
         <SettingsModal

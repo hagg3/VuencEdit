@@ -1086,8 +1086,13 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       }
     };
 
-    // Hover highlight: a single reused wireframe cube moved to the picked voxel. Allocated once —
+    // Hover highlight: reused wireframe cubes moved to the picked voxel. Allocated once —
     // rebuilding an EdgesGeometry per pointermove would churn GPU buffers at 30Hz.
+    //
+    // Build mode has *two* click targets, so it draws two boxes: left-click breaks the block being
+    // aimed at (white), right-click places against that face, in the neighbouring cell (green).
+    // A single box can only ever preview one of them, which reads as "the click didn't do what the
+    // outline said". Select mode uses the primary box alone, on the hit voxel.
     const hlGeom = new THREE.EdgesGeometry(new THREE.BoxGeometry(1.002, 1.002, 1.002));
     const hlMat = new THREE.LineBasicMaterial({ color: 0xffffff, depthTest: false, transparent: true, opacity: 0.9 });
     const highlight = new THREE.LineSegments(hlGeom, hlMat);
@@ -1095,28 +1100,44 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     highlight.visible = false;
     scene.add(highlight);
 
+    // The break target (build mode only) — dimmer than the placement box so the two read as
+    // primary/secondary rather than two equal boxes.
+    const hlBreakMat = new THREE.LineBasicMaterial({ color: 0xf8fafc, depthTest: false, transparent: true, opacity: 0.55 });
+    const breakHighlight = new THREE.LineSegments(hlGeom, hlBreakMat);
+    breakHighlight.renderOrder = 999;
+    breakHighlight.visible = false;
+    scene.add(breakHighlight);
+
     // The Eden voxel a right-click (place) acts on, given the picked block. Build mode places
     // against the hit face, so the target is the empty neighbour `hit + normal` — that's what the
-    // highlight previews and what a right-click fills. Select mode acts on the hit voxel itself.
+    // green box previews and what a right-click fills. Select mode acts on the hit voxel itself.
     const clickTarget = (p: PickResult) =>
       interact3dRef.current === "build"
         ? { x: p.x + p.nx, y: p.y + p.ny, z: p.z + p.nz }
         : { x: p.x, y: p.y, z: p.z };
 
+    // Eden voxel (x,y,z) spans [x,x+1); its centre in Three coords is (x+.5, z+.5, y+.5).
+    const placeBox = (box: THREE.LineSegments, x: number, y: number, z: number) =>
+      box.position.set(x + 0.5, z + 0.5, y + 0.5);
+
     const setHighlight = (p: PickResult | null) => {
       const want = !!p && interact3dRef.current !== "none";
       if (!want) {
-        if (highlight.visible) { highlight.visible = false; invalidate(); }
+        if (highlight.visible || breakHighlight.visible) {
+          highlight.visible = false;
+          breakHighlight.visible = false;
+          invalidate();
+        }
         return;
       }
-      // Highlight the placement cell in build mode (one off the face being pointed at, so the
-      // preview sits where a right-click's block will actually land); the hit voxel itself in select
-      // mode. Eden voxel (x,y,z) spans [x,x+1); its centre in Three coords is (x+.5, z+.5, y+.5).
+      const build = interact3dRef.current === "build";
       const t = clickTarget(p!);
-      highlight.position.set(t.x + 0.5, t.z + 0.5, t.y + 0.5);
+      placeBox(highlight, t.x, t.y, t.z);
       // Green = placement (build), blue = select — matches the overlay box colours.
-      hlMat.color.setHex(interact3dRef.current === "build" ? 0x22c55e : 0x60a5fa);
+      hlMat.color.setHex(build ? 0x22c55e : 0x60a5fa);
       highlight.visible = true;
+      if (build) placeBox(breakHighlight, p!.x, p!.y, p!.z);
+      breakHighlight.visible = build;
       invalidate();
     };
 
@@ -1551,8 +1572,10 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       for (const k of new Set([...meshes.keys(), ...meshesT.keys(), ...meshesE.keys()])) disposeMesh(k);
       clearOverlays();
       scene.remove(highlight);
+      scene.remove(breakHighlight);
       hlGeom.dispose();
       hlMat.dispose();
+      hlBreakMat.dispose();
       mat.dispose();
       matT.dispose();
       matL.dispose();

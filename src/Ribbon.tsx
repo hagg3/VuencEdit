@@ -5,10 +5,12 @@ import { invoke } from "@tauri-apps/api/core";
 import type { Tool, SelectionBounds } from "./MapCanvas";
 import type { SelectionInfo, ClipboardInfo, ExtrudeAxis, WorldMeta, RecentWorld } from "./types";
 import BlockPaintPicker from "./BlockPaintPicker";
+import NumberField from "./NumberField";
+import { timeAgo } from "./useRecentWorlds";
 import { BLOCK_DEFS, resolveColor, blockDisplayName } from "./blockDefs";
 import { tintedSwatch } from "./texturePack";
 import appIcon from "./assets/app-icon.png";
-import { EDEN_TEAL, EDEN_TEAL_READABLE, recessedWell } from "./designTokens";
+import { EDEN_TEAL, EDEN_TEAL_READABLE, recessedWell, accentRing } from "./designTokens";
 export { EDEN_TEAL, EDEN_TEAL_READABLE } from "./designTokens";
 
 export const RIBBON_HEIGHT_COLLAPSED = 32;
@@ -168,18 +170,6 @@ export interface RibbonProps {
   collapsed: boolean; onCollapse: (v: boolean) => void;
 }
 
-function timeAgo(ts: number): string {
-  const s = Math.floor((Date.now() - ts) / 1000);
-  if (s < 60) return "just now";
-  const m = Math.floor(s / 60);
-  if (m < 60) return `${m}m ago`;
-  const h = Math.floor(m / 60);
-  if (h < 24) return `${h}h ago`;
-  const d = Math.floor(h / 24);
-  if (d < 7) return `${d}d ago`;
-  if (d < 31) return `${Math.floor(d / 7)}w ago`;
-  return new Date(ts).toLocaleDateString(undefined, { month: "short", day: "numeric" });
-}
 
 // ── shared styles ──────────────────────────────────────────────────────────────
 // Dense adaptation of the "X Design System" glass/chrome language: gradient
@@ -360,13 +350,21 @@ export default function Ribbon(p: RibbonProps) {
   const toggledOnce = useRef(new Set<string>());
   function toggleStyle(id: string, active: boolean, accent?: string): React.CSSProperties {
     if (active) { toggledOnce.current.add(id); return rbActive(accent); }
-    if (toggledOnce.current.has(id)) return { ...rb, borderColor: "rgba(255,255,255,0.38)", color: "#afa69d" };
+    if (toggledOnce.current.has(id)) return { ...rb, ...accentRing("rgba(255,255,255,0.38)"), color: "#afa69d" };
     return rb;
   }
 
   // Clipboard axo preview
   const [clipAxoPixels, setClipAxoPixels] = useState<{width:number;height:number;pixels:Uint8Array}|null>(null);
   const clipAxoCanvasRef = useRef<HTMLCanvasElement>(null);
+
+  // World rename. Escape sets `renameCancelled` so the blur it triggers doesn't commit the edit —
+  // previously "cancelling" relied on the unmount racing the blur handler, and if blur won, the
+  // rename went through anyway. `renameHint` surfaces the character filter (the input silently
+  // dropped anything outside [A-Za-z0-9' ], so typed dashes/underscores just vanished).
+  const renameCancelledRef = useRef(false);
+  const [renameHint, setRenameHint] = useState(false);
+  const RENAME_ALLOWED = /[A-Za-z0-9' ]/;
 
   // Resize drag
   const resizeDragRef = useRef<{startY:number;startH:number}|null>(null);
@@ -552,15 +550,39 @@ export default function Ribbon(p: RibbonProps) {
         <div style={{ ...rbGroup, minWidth: 130 }}>
           <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
             {p.renamingWorld ? (
-              <input
-                ref={p.renameInputRef}
-                value={p.renameInput}
-                onChange={e => p.setRenameInput(e.target.value.split("").filter(c => /[A-Za-z0-9' ]/.test(c)).join("").slice(0, 32))}
-                onKeyDown={e => { if (e.key === "Enter") e.currentTarget.blur(); if (e.key === "Escape") p.setRenamingWorld(false); }}
-                onBlur={() => p.onRenameBlur(p.renameInput.trim())}
-                style={{ background: "rgba(255,255,255,0.08)", border: "1px solid #3b82f6", borderRadius: 3, color: "#ebe9e7", fontSize: 12, fontWeight: 700, padding: "1px 5px", outline: "none", width: 120 }}
-                autoFocus
-              />
+              <>
+                <input
+                  ref={p.renameInputRef}
+                  value={p.renameInput}
+                  title="Letters, numbers, spaces and apostrophes — max 32 characters"
+                  onChange={e => {
+                    const raw = e.target.value;
+                    const clean = raw.split("").filter(c => RENAME_ALLOWED.test(c)).join("").slice(0, 32);
+                    setRenameHint(clean !== raw);
+                    p.setRenameInput(clean);
+                  }}
+                  onKeyDown={e => {
+                    if (e.key === "Enter") e.currentTarget.blur();
+                    if (e.key === "Escape") {
+                      renameCancelledRef.current = true; // consumed by onBlur below
+                      setRenameHint(false);
+                      p.setRenamingWorld(false);
+                    }
+                  }}
+                  onBlur={() => {
+                    setRenameHint(false);
+                    if (renameCancelledRef.current) { renameCancelledRef.current = false; return; }
+                    p.onRenameBlur(p.renameInput.trim());
+                  }}
+                  style={{ background: "rgba(255,255,255,0.08)", border: "1px solid #3b82f6", borderRadius: 3, color: "#ebe9e7", fontSize: 12, fontWeight: 700, padding: "1px 5px", outline: "none", width: 120 }}
+                  autoFocus
+                />
+                {renameHint && (
+                  <span style={{ color: "#f59e0b", fontSize: 9, lineHeight: 1.2, maxWidth: 120 }}>
+                    letters, numbers, spaces, ’ only
+                  </span>
+                )}
+              </>
             ) : (
               <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
                 <div onClick={() => { p.setRenameInput(p.world?.name ?? ""); p.setRenamingWorld(true); }}
@@ -613,8 +635,8 @@ export default function Ribbon(p: RibbonProps) {
         <div style={{ ...rbGroup, opacity: hasSelection ? 1 : 0.38, pointerEvents: hasSelection ? "auto" : "none" }}>
           <div style={{ display: "flex", gap: 2 }}>
             <button onClick={p.copySelection} style={rb}>Copy</button>
-            <button onClick={p.deleteBlocks} style={{ ...rb, borderColor: "#ef4444", color: "#fca5a5" }} title="Fill with air">Delete</button>
-            <button onClick={p.fillSelection} style={{ ...rb, borderColor: "#f59e0b", color: "#fcd34d" }}>Fill</button>
+            <button onClick={p.deleteBlocks} style={{ ...rb, ...accentRing("#ef4444"), color: "#fca5a5" }} title="Fill with air">Delete</button>
+            <button onClick={p.fillSelection} style={{ ...rb, ...accentRing("#f59e0b"), color: "#fcd34d" }}>Fill</button>
           </div>
           <div style={{ display: "flex", gap: 2 }}>
             <button onClick={() => p.setRawBounds(b => b ? { x1: b.x1-1, y1: b.y1-1, x2: b.x2+1, y2: b.y2+1 } : null)} style={rb}>Grow</button>
@@ -628,7 +650,7 @@ export default function Ribbon(p: RibbonProps) {
         {/* Clipboard quick actions — grayed when no clipboard */}
         <div style={{ ...rbGroup, opacity: hasClipboard ? 1 : 0.38, pointerEvents: hasClipboard ? "auto" : "none" }}>
           <button onClick={() => p.setTool("paste")}
-            style={p.tool === "paste" ? rbActive("#22c55e") : { ...rb, borderColor: "#22c55e", color: "#86efac" }}>
+            style={p.tool === "paste" ? rbActive("#22c55e") : { ...rb, ...accentRing("#22c55e"), color: "#86efac" }}>
             ▣ Paste Mode
           </button>
           <div style={{ display: "flex", gap: 2 }}>
@@ -725,7 +747,7 @@ export default function Ribbon(p: RibbonProps) {
             </button>
             <button onClick={armEyedropper}
               title="Eyedropper — sample a block from the map (I)"
-              style={{ ...(p.tool === "eyedropper" ? {...rbActive("#67e8f9"), borderColor:"#67e8f9", color:"#a5f3fc"} : rb), display: "flex", alignItems: "center" }}>
+              style={{ ...(p.tool === "eyedropper" ? {...rbActive("#67e8f9"), ...accentRing("#67e8f9"), color:"#a5f3fc"} : rb), display: "flex", alignItems: "center" }}>
               💉 Pick<span style={kbdBadge}>I</span>
             </button>
           </div>
@@ -1057,7 +1079,7 @@ export default function Ribbon(p: RibbonProps) {
                 ...rb,
                 opacity: p.selection ? 1 : 0.4,
                 cursor: p.selection ? "pointer" : "not-allowed",
-                ...(p.selection ? { borderColor: "#4ade80", color: "#86efac" } : {}),
+                ...(p.selection ? { ...accentRing("#4ade80"), color: "#86efac" } : {}),
               }}
               title={p.selection ? `Plant trees at ${p.treeDensity}% density` : "Make a selection first"}>
               {treeGenerating ? "Generating…" : "🌲 Plant Trees"}
@@ -1124,12 +1146,12 @@ export default function Ribbon(p: RibbonProps) {
         <div style={rbDivider} />
         <div style={rbGroup}>
           <button onClick={() => p.setShowSlicePanels(!p.showSlicePanels)}
-            style={{ ...rb, display: "flex", gap: 4, alignItems: "center", ...(p.showSlicePanels ? { background: "rgba(168,85,247,0.18)", borderColor: "#a855f7", color: "#d8b4fe" } : {}) }}>
+            style={{ ...rb, display: "flex", gap: 4, alignItems: "center", ...(p.showSlicePanels ? { background: "rgba(168,85,247,0.18)", ...accentRing("#a855f7"), color: "#d8b4fe" } : {}) }}>
             ◫ Quad View <span style={expBadge}>exp</span>
           </button>
           {p.showSlicePanels && (
             <button onClick={() => p.setEnable3dPane(!p.enable3dPane)}
-              style={{ ...rb, display: "flex", gap: 4, alignItems: "center", ...(p.enable3dPane ? { background: "rgba(245,158,11,0.18)", borderColor: "#f59e0b", color: "#fcd34d" } : {}) }}>
+              style={{ ...rb, display: "flex", gap: 4, alignItems: "center", ...(p.enable3dPane ? { background: "rgba(245,158,11,0.18)", ...accentRing("#f59e0b"), color: "#fcd34d" } : {}) }}>
               3D Pane <span style={expBadge}>exp</span>
             </button>
           )}
@@ -1227,7 +1249,7 @@ export default function Ribbon(p: RibbonProps) {
       <button onClick={() => p.setMode3d(m)} style={p.mode3d === m ? rbActive(accent) : rb}
         title={m === "off" ? "Camera only — click/drag orbits or flies" :
                m === "select" ? "Click two blocks to define a 3D selection box" :
-               "Left-click places the build block against a face; right-click breaks a block"}>
+               "Left-click breaks the block you're aiming at; right-click places the build block against that face"}>
         {label}
       </button>
     );
@@ -1341,8 +1363,8 @@ export default function Ribbon(p: RibbonProps) {
 
         <div style={rbGroup}>
           <div style={{ display: "flex", gap: 2 }}>
-            <button onClick={p.copySelection} style={{ ...rb, borderColor: "#7dd3fc", color: "#bfdbfe" }}>Copy</button>
-            <button onClick={p.deleteBlocks} style={{ ...rb, borderColor: "#ef4444", color: "#fca5a5" }} title="Fill selection with air">Delete</button>
+            <button onClick={p.copySelection} style={{ ...rb, ...accentRing("#7dd3fc"), color: "#bfdbfe" }}>Copy</button>
+            <button onClick={p.deleteBlocks} style={{ ...rb, ...accentRing("#ef4444"), color: "#fca5a5" }} title="Fill selection with air">Delete</button>
           </div>
           <div style={{ display: "flex", gap: 2 }}>
             <button onClick={() => p.setRawBounds(b => b ? {x1:b.x1-1,y1:b.y1-1,x2:b.x2+1,y2:b.y2+1} : null)} style={rb} title="Grow by 1">Grow</button>
@@ -1364,7 +1386,7 @@ export default function Ribbon(p: RibbonProps) {
             <span style={{ color:"#61584f",fontSize:9 }}>▾</span>
           </button>
           <button onClick={p.fillSelection} disabled={!p.rawBounds}
-            style={{ ...rb, opacity: p.rawBounds ? 1 : 0.35, cursor: p.rawBounds ? "pointer" : "not-allowed", borderColor: "#f59e0b", color: "#fcd34d" }}>
+            style={{ ...rb, opacity: p.rawBounds ? 1 : 0.35, cursor: p.rawBounds ? "pointer" : "not-allowed", ...accentRing("#f59e0b"), color: "#fcd34d" }}>
             Fill Selection
           </button>
           <div style={rbGroupLabel}>Fill</div>
@@ -1393,7 +1415,7 @@ export default function Ribbon(p: RibbonProps) {
               style={p.gradientIncludeAir ? rbActive("#f59e0b") : { ...rb, padding: "2px 6px" }}>+Air</button>
           </div>
           <button onClick={p.applyGradientFill} disabled={!p.rawBounds}
-            style={{ ...rb, opacity: p.rawBounds ? 1 : 0.35, cursor: p.rawBounds ? "pointer" : "not-allowed", borderColor: "#f59e0b", color: "#fcd34d" }}>
+            style={{ ...rb, opacity: p.rawBounds ? 1 : 0.35, cursor: p.rawBounds ? "pointer" : "not-allowed", ...accentRing("#f59e0b"), color: "#fcd34d" }}>
             Gradient Fill
           </button>
           <div style={rbGroupLabel}>Gradient</div>
@@ -1416,7 +1438,7 @@ export default function Ribbon(p: RibbonProps) {
             <button onClick={() => { p.setFilterBlockType(null); p.setFilterPaint(null); p.setFilterInvert(false); }} style={rb}>Clear</button>
           </div>
           <button onClick={p.deleteBlocks} disabled={!p.rawBounds}
-            style={{ ...rb, opacity: p.rawBounds ? 1 : 0.35, cursor: p.rawBounds ? "pointer" : "not-allowed", borderColor: "#ef4444", color: "#fca5a5" }}>
+            style={{ ...rb, opacity: p.rawBounds ? 1 : 0.35, cursor: p.rawBounds ? "pointer" : "not-allowed", ...accentRing("#ef4444"), color: "#fca5a5" }}>
             {p.filterBlockType !== null ? (p.filterInvert ? "Delete except filter" : "Delete filtered") : "Delete all"}
           </button>
           <div style={rbGroupLabel}>Replace</div>
@@ -1439,15 +1461,15 @@ export default function Ribbon(p: RibbonProps) {
           </div>
           <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
             <span style={{ color: "#61584f", fontSize: 10 }}>×</span>
-            <input type="number" min={0} max={20} value={p.extrudeCount} title="0 = preview off"
-              onChange={e => p.setExtrudeCount(Math.max(0, Math.min(20, parseInt(e.target.value, 10) || 0)))}
+            <NumberField min={0} max={20} value={p.extrudeCount} title="0 = preview off"
+              onChange={p.setExtrudeCount} aria-label="Extrude copies"
               style={{ ...zInp, width: 36 }} />
             <label style={{ display: "flex", alignItems: "center", gap: 3, cursor: "pointer" }}>
               <input type="checkbox" checked={extrudeIgnoreAir} onChange={e => setExtrudeIgnoreAir(e.target.checked)} style={{ accentColor: "#3b82f6" }} />
               <span style={{ color: "#83786c", fontSize: 10 }}>skip air</span>
             </label>
             <button onClick={() => p.onExtrude(extrudeIgnoreAir)} disabled={!sel || p.extrudeCount === 0}
-              style={{ ...rb, opacity: (sel && p.extrudeCount > 0) ? 1 : 0.35, borderColor: "#3b82f6", color: "#93c5fd", fontWeight: 600 }}>
+              style={{ ...rb, opacity: (sel && p.extrudeCount > 0) ? 1 : 0.35, ...accentRing("#3b82f6"), color: "#93c5fd", fontWeight: 600 }}>
               Extrude {p.extrudeAxis}
             </button>
           </div>
@@ -1484,8 +1506,8 @@ export default function Ribbon(p: RibbonProps) {
             <div style={{ color: "#4ade80", fontSize: 11 }}>Click map to place</div>
           )}
           <div style={{ display: "flex", gap: 2 }}>
-            <button onClick={p.onSavePrefab} style={{ ...rb, borderColor: "#4ade80", color: "#86efac", fontSize: 10 }}>Save Prefab…</button>
-            <button onClick={p.onSavePrefabAs} title="Save to any folder (native dialog)" style={{ ...rb, borderColor: "#4ade80", color: "#86efac", fontSize: 10 }}>As…</button>
+            <button onClick={p.onSavePrefab} style={{ ...rb, ...accentRing("#4ade80"), color: "#86efac", fontSize: 10 }}>Save Prefab…</button>
+            <button onClick={p.onSavePrefabAs} title="Save to any folder (native dialog)" style={{ ...rb, ...accentRing("#4ade80"), color: "#86efac", fontSize: 10 }}>As…</button>
           </div>
           <div style={rbGroupLabel}>Clipboard</div>
         </div>
@@ -1496,7 +1518,7 @@ export default function Ribbon(p: RibbonProps) {
           <div style={{ display: "flex", gap: 2 }}>
             {p.lockedPastePos && (
               <button onClick={() => { const pos = p.lockedPastePos!; p.pasteAt(pos); p.setLockedPastePos(null); }}
-                style={{ ...rb, borderColor: "#22c55e", color: "#86efac" }}>Confirm</button>
+                style={{ ...rb, ...accentRing("#22c55e"), color: "#86efac" }}>Confirm</button>
             )}
             {p.lockedPastePos && <button onClick={() => p.setLockedPastePos(null)} style={rb}>Unlock</button>}
             <button onClick={() => p.setTool("pan")} style={rb}>Cancel</button>
@@ -1508,7 +1530,7 @@ export default function Ribbon(p: RibbonProps) {
             {p.pasteTerrain && <button onClick={() => p.setPasteTerrainAbove(!p.pasteTerrainAbove)} style={toggleStyle("pasteTerrainAbove", p.pasteTerrainAbove, "#fb923c")}>{p.pasteTerrainAbove ? "Above" : "At surf"}</button>}
             <span style={{ display: "flex", alignItems: "center", gap: 3 }}>
               <span style={{ color: "#83786c", fontSize: 10 }}>Z</span>
-              <input type="number" value={p.pasteElevationOffset} onChange={e => p.setPasteElevationOffset(Number(e.target.value))} style={{ ...zInp, width: 44 }} />
+              <NumberField value={p.pasteElevationOffset} onChange={p.setPasteElevationOffset} aria-label="Paste elevation offset" style={{ ...zInp, width: 44 }} />
             </span>
           </div>
           <div style={rbGroupLabel}>Place</div>
@@ -1517,10 +1539,10 @@ export default function Ribbon(p: RibbonProps) {
 
         {/* Transform */}
         <div style={rbGroup}>
-          <button onClick={p.rotateClipboard} style={{ ...rb, borderColor: "#a78bfa", color: "#ddd6fe" }}>↻ Rotate 90°</button>
+          <button onClick={p.rotateClipboard} style={{ ...rb, ...accentRing("#a78bfa"), color: "#ddd6fe" }}>↻ Rotate 90°</button>
           <div style={{ display: "flex", gap: 2 }}>
-            <button onClick={p.mirrorClipboardX} style={{ ...rb, borderColor: "#a78bfa", color: "#ddd6fe" }}>↔ Flip X</button>
-            <button onClick={p.mirrorClipboardY} style={{ ...rb, borderColor: "#a78bfa", color: "#ddd6fe" }}>↕ Flip Y</button>
+            <button onClick={p.mirrorClipboardX} style={{ ...rb, ...accentRing("#a78bfa"), color: "#ddd6fe" }}>↔ Flip X</button>
+            <button onClick={p.mirrorClipboardY} style={{ ...rb, ...accentRing("#a78bfa"), color: "#ddd6fe" }}>↕ Flip Y</button>
           </div>
           <div style={rbGroupLabel}>Transform</div>
         </div>
@@ -1529,30 +1551,43 @@ export default function Ribbon(p: RibbonProps) {
         {/* Paste mode */}
         <div style={rbGroup}>
           <div style={{ display: "flex", gap: 2 }}>
-            {(["normal","scatter","array"] as const).map(m => (
-              <button key={m} onClick={() => p.setPasteMode(m)} style={p.pasteMode === m ? rbActive("#7dd3fc") : rb}>
-                {m === "normal" ? "1×" : m === "scatter" ? "Scatter" : "Array"}
-              </button>
-            ))}
+            {(["normal","scatter","array"] as const).map(m => {
+              // Scatter distributes N copies *inside a selection rectangle* — with no selection it
+              // has nowhere to place, and clicking the map would silently do nothing.
+              const needsSel = m === "scatter" && !p.rawBounds;
+              return (
+                <button
+                  key={m}
+                  onClick={() => p.setPasteMode(m)}
+                  disabled={needsSel}
+                  title={needsSel ? "Scatter needs a selection to place copies into — select a region first" : undefined}
+                  style={p.pasteMode === m
+                    ? rbActive("#7dd3fc")
+                    : { ...rb, opacity: needsSel ? 0.4 : 1, cursor: needsSel ? "not-allowed" : "pointer" }}
+                >
+                  {m === "normal" ? "1×" : m === "scatter" ? "Scatter" : "Array"}
+                </button>
+              );
+            })}
           </div>
           {p.pasteMode === "scatter" && (
             <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
               <span style={{ color: "#83786c", fontSize: 10 }}>Count</span>
-              <input type="number" min={1} max={100} value={p.scatterCount}
-                onChange={e => p.setScatterCount(Math.max(1, parseInt(e.target.value,10)||1))}
+              <NumberField min={1} max={100} value={p.scatterCount}
+                onChange={p.setScatterCount} aria-label="Scatter count"
                 style={{ ...zInp, width: 44 }} />
             </div>
           )}
           {p.pasteMode === "array" && (
             <div style={{ display: "flex", alignItems: "center", gap: 3, flexWrap: "wrap", maxWidth: 200 }}>
               <span style={{ color:"#83786c",fontSize:10 }}>Cols</span>
-              <input type="number" min={1} max={20} value={p.arrayCols} onChange={e => p.setArrayCols(Math.max(1,parseInt(e.target.value,10)||1))} style={{ ...zInp, width: 38 }} />
+              <NumberField min={1} max={20} value={p.arrayCols} onChange={p.setArrayCols} aria-label="Array columns" style={{ ...zInp, width: 38 }} />
               <span style={{ color:"#83786c",fontSize:10 }}>Rows</span>
-              <input type="number" min={1} max={20} value={p.arrayRows} onChange={e => p.setArrayRows(Math.max(1,parseInt(e.target.value,10)||1))} style={{ ...zInp, width: 38 }} />
+              <NumberField min={1} max={20} value={p.arrayRows} onChange={p.setArrayRows} aria-label="Array rows" style={{ ...zInp, width: 38 }} />
               <span style={{ color:"#83786c",fontSize:10 }}>SpX</span>
-              <input type="number" min={0} value={p.arraySpacingX} onChange={e => p.setArraySpacingX(Math.max(0,parseInt(e.target.value,10)||0))} style={{ ...zInp, width: 38 }} />
+              <NumberField min={0} value={p.arraySpacingX} onChange={p.setArraySpacingX} aria-label="Array X spacing" style={{ ...zInp, width: 38 }} />
               <span style={{ color:"#83786c",fontSize:10 }}>SpY</span>
-              <input type="number" min={0} value={p.arraySpacingY} onChange={e => p.setArraySpacingY(Math.max(0,parseInt(e.target.value,10)||0))} style={{ ...zInp, width: 38 }} />
+              <NumberField min={0} value={p.arraySpacingY} onChange={p.setArraySpacingY} aria-label="Array Y spacing" style={{ ...zInp, width: 38 }} />
             </div>
           )}
           <div style={rbGroupLabel}>Mode</div>
@@ -1877,7 +1912,18 @@ export default function Ribbon(p: RibbonProps) {
             {canScrollLeft && (
               <button onClick={() => ribbonScroll(-1)} style={{ ...scrollBtnStyle, left: 0, background: "linear-gradient(to right, #2e2a25 60%, transparent)" }}>◄</button>
             )}
-            <div ref={ribbonBodyRef} style={{
+            <div
+              ref={ribbonBodyRef}
+              // The ribbon body scrolls horizontally, but a trackpad/mouse wheel produces deltaY —
+              // so without this, scrolling over an overflowing ribbon did nothing unless you knew
+              // to hold Shift. Map vertical wheel to horizontal scroll, as tab strips normally do.
+              onWheel={(e) => {
+                const el = e.currentTarget;
+                if (el.scrollWidth <= el.clientWidth) return;
+                if (Math.abs(e.deltaY) <= Math.abs(e.deltaX)) return; // genuine horizontal gesture
+                el.scrollLeft += e.deltaY;
+              }}
+              style={{
               height: "100%",
               background: "linear-gradient(to bottom, #2e2a25, #091526)",
               boxShadow: "inset 0 1px 0 rgba(255,255,255,.06), inset 0 0 24px rgba(0,0,0,.35)",

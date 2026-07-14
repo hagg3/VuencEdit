@@ -29,16 +29,67 @@ export function zoomAtPoint(
 }
 
 /**
+ * HiDPI: the backing store of every 2D pane is sized `cssPx × dpr` so lines, selection outlines
+ * and in-canvas text are crisp on Retina instead of being drawn at 1× and upscaled. Capped at 2
+ * for the same reason FlyView3D caps its own DPR — past that, the fill cost grows quadratically
+ * for no visible gain.
+ *
+ * Drawing code stays in CSS pixels: `beginFrame()` installs the dpr scale as the base transform,
+ * and `cssWidth`/`cssHeight` give the CSS-px size of the canvas (never read `canvas.width`
+ * directly for layout math — that's device pixels).
+ */
+export const MAX_CANVAS_DPR = 2;
+
+/** dpr the canvas's backing store was actually sized with (may lag window.devicePixelRatio
+ *  by one resize when a window is dragged between displays — `resizeCanvasToContainer` fixes it up). */
+const canvasDprs = new WeakMap<HTMLCanvasElement, number>();
+
+function targetDpr(): number {
+  return Math.min(Math.max(1, window.devicePixelRatio || 1), MAX_CANVAS_DPR);
+}
+
+export function canvasDpr(canvas: HTMLCanvasElement): number {
+  return canvasDprs.get(canvas) ?? 1;
+}
+
+/** CSS-pixel width of a canvas sized by `resizeCanvasToContainer`. */
+export function cssWidth(canvas: HTMLCanvasElement): number {
+  return canvas.width / canvasDpr(canvas);
+}
+
+/** CSS-pixel height of a canvas sized by `resizeCanvasToContainer`. */
+export function cssHeight(canvas: HTMLCanvasElement): number {
+  return canvas.height / canvasDpr(canvas);
+}
+
+/**
+ * Resets a context to the base HiDPI transform and returns the canvas's CSS-pixel size. Call once
+ * at the top of `draw()`; everything after it draws in CSS pixels as before.
+ */
+export function beginFrame(
+  ctx: CanvasRenderingContext2D,
+  canvas: HTMLCanvasElement,
+): { w: number; h: number } {
+  const dpr = canvasDpr(canvas);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return { w: canvas.width / dpr, h: canvas.height / dpr };
+}
+
+/**
  * Sizes a canvas's backing store to match its laid-out CSS box (not the window), so it works
- * both full-screen and inside a quad-view grid cell. Returns whether the size actually changed.
+ * both full-screen and inside a quad-view grid cell, scaled by the device pixel ratio. Returns
+ * whether the size actually changed. The element's CSS box is left to the layout (100%/flex) —
+ * only the backing store is touched.
  */
 export function resizeCanvasToContainer(canvas: HTMLCanvasElement): boolean {
   const r = canvas.getBoundingClientRect();
-  const w = Math.max(1, Math.floor(r.width));
-  const h = Math.max(1, Math.floor(r.height));
-  if (canvas.width !== w || canvas.height !== h) {
+  const dpr = targetDpr();
+  const w = Math.max(1, Math.round(Math.floor(r.width) * dpr));
+  const h = Math.max(1, Math.round(Math.floor(r.height) * dpr));
+  if (canvas.width !== w || canvas.height !== h || canvasDprs.get(canvas) !== dpr) {
     canvas.width = w;
     canvas.height = h;
+    canvasDprs.set(canvas, dpr);
     return true;
   }
   return false;

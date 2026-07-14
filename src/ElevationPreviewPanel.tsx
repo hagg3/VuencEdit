@@ -2,6 +2,13 @@ import { decodeU8 } from "./codec";
 import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { SelectionInfo, PreviewDataRaw, PreviewData } from "./types";
+import { MAX_CANVAS_DPR } from "./viewportUtils";
+
+/** HiDPI backing store for this panel's canvas — see viewportUtils. The element keeps its CSS
+ *  size (canvasW × canvasH); only the backing store and the base transform are scaled. */
+function elevDpr(): number {
+  return Math.min(Math.max(1, window.devicePixelRatio || 1), MAX_CANVAS_DPR);
+}
 
 interface Props {
   selection: SelectionInfo;
@@ -293,6 +300,8 @@ export default function ElevationPreviewPanel({
     if (!canvas) return;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
+    // Draw in CSS pixels (canvasW/canvasH) against the dpr-scaled backing store.
+    ctx.setTransform(elevDpr(), 0, 0, elevDpr(), 0, 0);
 
     ctx.fillStyle = "#151311";
     ctx.fillRect(0, 0, canvasW, canvasH);
@@ -449,8 +458,8 @@ export default function ElevationPreviewPanel({
 
       <canvas
         ref={canvasRef}
-        width={canvasW}
-        height={canvasH}
+        width={Math.round(canvasW * elevDpr())}
+        height={Math.round(canvasH * elevDpr())}
         style={{
           display: "block", width: canvasW, height: canvasH,
           borderRadius: 4, border: "1px solid #342f2a",

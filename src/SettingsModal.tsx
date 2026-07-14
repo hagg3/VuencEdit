@@ -89,10 +89,16 @@ const expBadge: React.CSSProperties = {
   textTransform: "uppercase", lineHeight: "14px",
 };
 
-function Toggle({ value, onChange }: { value: boolean; onChange: (v: boolean) => void }) {
+/** ARIA switch: a bare <button> announces as "button" with no on/off state, so screen readers
+ *  couldn't tell whether a setting was enabled. `label` names it (the visible text sits in a
+ *  sibling row, not inside the control). */
+function Toggle({ value, onChange, label }: { value: boolean; onChange: (v: boolean) => void; label?: string }) {
   return (
     <button
       onClick={() => onChange(!value)}
+      role="switch"
+      aria-checked={value}
+      aria-label={label}
       style={{
         width: 40, height: 22, borderRadius: 11, border: "none", cursor: "pointer",
         background: value
@@ -121,6 +127,7 @@ interface Props {
 
 export default function SettingsModal({ onClose, onSave }: Props) {
   const [local, setLocal] = useState<AppSettings>(() => loadSettings());
+  const [resetHint, setResetHint] = useState(false);
 
   function set<K extends keyof AppSettings>(key: K, value: AppSettings[K]) {
     setLocal(s => ({ ...s, [key]: value }));
@@ -132,7 +139,15 @@ export default function SettingsModal({ onClose, onSave }: Props) {
   }
 
   async function browseTexturePack() {
-    const selected = await open({ filters: [{ name: "Texture Pack", extensions: ["zip"] }] });
+    // Same filters as the Ribbon's own picker — the loader detects zip-vs-atlas by content, and a
+    // bare atlas.png is a supported pack, so a .zip-only filter hid half the valid inputs.
+    const selected = await open({
+      filters: [
+        { name: "Texture Pack or Atlas", extensions: ["zip", "png", "jpg", "jpeg", "bmp"] },
+        { name: "Zip Pack", extensions: ["zip"] },
+        { name: "Atlas Image", extensions: ["png", "jpg", "jpeg", "bmp"] },
+      ],
+    });
     if (selected && !Array.isArray(selected)) set("texturePackPath", selected);
   }
 
@@ -172,7 +187,7 @@ export default function SettingsModal({ onClose, onSave }: Props) {
             </span>
             <span style={labelSub}>Opens the editor in 4-pane layout (Top + Front + Side + 3D)</span>
           </div>
-          <Toggle value={local.defaultQuadView} onChange={v => set("defaultQuadView", v)} />
+          <Toggle value={local.defaultQuadView} onChange={v => set("defaultQuadView", v)} label="Default to Quad view" />
         </div>
 
         <div style={row}>
@@ -183,7 +198,7 @@ export default function SettingsModal({ onClose, onSave }: Props) {
             </span>
             <span style={labelSub}>Streams 3D geometry — can be slow on large worlds</span>
           </div>
-          <Toggle value={local.default3dPane} onChange={v => set("default3dPane", v)} />
+          <Toggle value={local.default3dPane} onChange={v => set("default3dPane", v)} label="Enable 3D pane by default" />
         </div>
 
         <div style={{ ...row, borderBottom: "none" }}>
@@ -191,7 +206,7 @@ export default function SettingsModal({ onClose, onSave }: Props) {
             <span style={labelText}>Fog in 3D views</span>
             <span style={labelSub}>Fades distant terrain like the game does; turn off to inspect far terrain</span>
           </div>
-          <Toggle value={local.enableFog} onChange={v => set("enableFog", v)} />
+          <Toggle value={local.enableFog} onChange={v => set("enableFog", v)} label="Fog in 3D views" />
         </div>
 
         {/* Night lighting / Shadows / GPU shadow map are perf-heavy, session-only view modes — they
@@ -208,7 +223,7 @@ export default function SettingsModal({ onClose, onSave }: Props) {
             <span style={labelText}>Save compressed by default</span>
             <span style={labelSub}>New worlds save as .zip; overridden by the loaded world's format</span>
           </div>
-          <Toggle value={local.defaultSaveCompressed} onChange={v => set("defaultSaveCompressed", v)} />
+          <Toggle value={local.defaultSaveCompressed} onChange={v => set("defaultSaveCompressed", v)} label="Save compressed by default" />
         </div>
 
         <div style={{ ...row, borderBottom: "none", alignItems: "flex-start", paddingTop: 12 }}>
@@ -322,7 +337,21 @@ export default function SettingsModal({ onClose, onSave }: Props) {
         </div>
 
         {/* Footer */}
-        <div style={{ display: "flex", justifyContent: "flex-end", gap: 10, marginTop: 28 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 28 }}>
+          {/* Restores every persisted setting — including the ones only reachable from the 3D pane's
+              own sliders (render distance, fly speed, sun position, lamp radius), which had no
+              Settings row and so no way back to their defaults. Staged like any other edit: it
+              doesn't persist until Save. */}
+          <button
+            onClick={() => { setLocal({ ...DEFAULTS }); setResetHint(true); }}
+            style={chromeButton({ color: "#afa69d", padding: "7px 18px", fontSize: 13 })}
+          >
+            Reset to defaults
+          </button>
+          {resetHint && (
+            <span style={{ color: "#f59e0b", fontSize: 11 }}>Defaults restored — Save to apply</span>
+          )}
+          <div style={{ flex: 1 }} />
           <button
             onClick={onClose}
             style={chromeButton({ color: "#afa69d", padding: "7px 18px", fontSize: 13 })}

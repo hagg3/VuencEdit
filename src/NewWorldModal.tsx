@@ -3,8 +3,9 @@ import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { save } from "@tauri-apps/plugin-dialog";
-import { EDEN_TEAL, EDEN_TEAL_READABLE, glassPanel, chromeButton, chromeButtonAccent, recessedWell } from "./designTokens";
+import { EDEN_TEAL, EDEN_TEAL_READABLE, glassPanel, chromeButton, chromeButtonAccent, recessedWell, accentRing } from "./designTokens";
 import Modal from "./Modal";
+import NumberField from "./NumberField";
 
 interface GenProgress { phase: string; pct: number; }
 interface PreviewRaw { width: number; height: number; pixels: string; }
@@ -52,8 +53,9 @@ export default function NewWorldModal({ onClose, onCreated }: Props) {
   const [preview,      setPreview]      = useState<Preview | null>(null);
   const [previewing,   setPreviewing]   = useState(false);
   const unlistenRef = useRef<(() => void) | null>(null);
+  const mountedRef = useRef(true);
 
-  useEffect(() => () => { unlistenRef.current?.(); }, []);
+  useEffect(() => () => { mountedRef.current = false; unlistenRef.current?.(); }, []);
 
   // Flat
   const [stoneDepth, setStoneDepth] = useState(15);
@@ -221,7 +223,7 @@ export default function NewWorldModal({ onClose, onCreated }: Props) {
           clouds: cloudsEnabled,
         });
       }
-      onCreated(savePath);
+      if (mountedRef.current) onCreated(savePath); // don't open a world into an unmounted modal
     } catch (e) {
       setError(String(e));
       setCreating(false);
@@ -365,14 +367,14 @@ export default function NewWorldModal({ onClose, onCreated }: Props) {
           <div style={{ display: "flex", gap: 10, alignItems: "flex-end" }}>
             <div style={{ flex: 1 }}>
               <div style={{ color: "#61584f", fontSize: 11, marginBottom: 3 }}>Width</div>
-              <input type="number" min={1} max={128} value={widthChunks} style={inp}
-                onChange={e => setWidthChunks(Math.max(1, Math.min(128, parseInt(e.target.value) || 1)))} />
+              <NumberField min={1} max={128} value={widthChunks} style={inp}
+                onChange={setWidthChunks} aria-label="World width in chunks" />
             </div>
             <div style={{ color: "#4b443d", paddingBottom: 8 }}>×</div>
             <div style={{ flex: 1 }}>
               <div style={{ color: "#61584f", fontSize: 11, marginBottom: 3 }}>Height</div>
-              <input type="number" min={1} max={128} value={heightChunks} style={inp}
-                onChange={e => setHeightChunks(Math.max(1, Math.min(128, parseInt(e.target.value) || 1)))} />
+              <NumberField min={1} max={128} value={heightChunks} style={inp}
+                onChange={setHeightChunks} aria-label="World height in chunks" />
             </div>
             <div style={{ color: "#61584f", fontSize: 12, paddingBottom: 10, whiteSpace: "nowrap" }}>
               = {widthChunks * 16}×{heightChunks * 16}
@@ -448,9 +450,9 @@ export default function NewWorldModal({ onClose, onCreated }: Props) {
           <div>
             <div style={label}>SEED</div>
             <div style={{ display: "flex", gap: 6 }}>
-              <input type="number" min={1} value={seed} style={{ ...inp, flex: 1 }}
-                onChange={e => setSeed(Math.max(1, parseInt(e.target.value) || 1))} />
-              <button onClick={randomiseSeed} style={{ ...btnBase, background: "rgba(99,102,241,0.2)", borderColor: "#6366f1", color: "#a5b4fc", whiteSpace: "nowrap" }}>
+              <NumberField min={1} value={seed} style={{ ...inp, flex: 1 }}
+                onChange={setSeed} aria-label="Seed" />
+              <button onClick={randomiseSeed} style={{ ...btnBase, background: "rgba(99,102,241,0.2)", ...accentRing("#6366f1"), color: "#a5b4fc", whiteSpace: "nowrap" }}>
                 🎲 Random
               </button>
             </div>
@@ -713,7 +715,7 @@ export default function NewWorldModal({ onClose, onCreated }: Props) {
             <button onClick={previewNatural} disabled={previewing} style={{
               ...btnBase, width: "100%", fontWeight: 600,
               background: previewing ? "rgba(99,102,241,0.25)" : "rgba(99,102,241,0.2)",
-              borderColor: "#6366f1", color: "#a5b4fc",
+              ...accentRing("#6366f1"), color: "#a5b4fc",
               cursor: previewing ? "wait" : "pointer",
             }}>
               {previewing ? "Rendering preview…" : preview ? "↻ Refresh preview" : "👁 Preview terrain"}
@@ -745,9 +747,9 @@ export default function NewWorldModal({ onClose, onCreated }: Props) {
           <div>
             <div style={label}>SEED</div>
             <div style={{ display: "flex", gap: 6 }}>
-              <input type="number" min={1} value={seed} style={{ ...inp, flex: 1 }}
-                onChange={e => setSeed(Math.max(1, parseInt(e.target.value) || 1))} />
-              <button onClick={randomiseSeed} style={{ ...btnBase, background: "rgba(167,139,250,0.2)", borderColor: "#a78bfa", color: "#ddd6fe", whiteSpace: "nowrap" }}>
+              <NumberField min={1} value={seed} style={{ ...inp, flex: 1 }}
+                onChange={setSeed} aria-label="Seed" />
+              <button onClick={randomiseSeed} style={{ ...btnBase, background: "rgba(167,139,250,0.2)", ...accentRing("#a78bfa"), color: "#ddd6fe", whiteSpace: "nowrap" }}>
                 🎲 Random
               </button>
             </div>
@@ -886,14 +888,33 @@ export default function NewWorldModal({ onClose, onCreated }: Props) {
             <input type="range" min={5} max={180} value={tg2SizeChunks}
               onChange={e => setTg2SizeChunks(+e.target.value)}
               style={{ width: "100%", accentColor: "#f59e0b" }} />
-            <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, color: "#61584f", marginTop: 2 }}>
-              <span>80</span><span>256</span><span>640</span><span>1280</span><span>2880</span>
+            {/* Ticks positioned at their real value on the 5–180 chunk track. Spacing these evenly
+                (as a flex row) put "256" at the 25% mark when 256 blocks = 16 chunks actually lives
+                at ~6% — every intermediate label pointed at the wrong place on the slider. */}
+            <div style={{ position: "relative", height: 14, fontSize: 11, color: "#61584f", marginTop: 2 }}>
+              {[80, 256, 640, 1280, 2880].map((blocks) => {
+                const chunks = blocks / 16;
+                const pct = ((chunks - 5) / (180 - 5)) * 100;
+                return (
+                  <span
+                    key={blocks}
+                    style={{
+                      position: "absolute", left: `${pct}%`,
+                      // Clamp the end labels inside the track instead of overhanging it.
+                      transform: pct <= 1 ? "none" : pct >= 99 ? "translateX(-100%)" : "translateX(-50%)",
+                      whiteSpace: "nowrap",
+                    }}
+                  >
+                    {blocks}
+                  </span>
+                );
+              })}
             </div>
             <button
               onClick={() => setTg2SizeChunks(180)}
               style={{ ...btnBase, marginTop: 5, fontSize: 11.5, padding: "3px 10px",
                 background: tg2SizeChunks === 180 ? "rgba(245,158,11,0.25)" : "rgba(245,158,11,0.08)",
-                borderColor: tg2SizeChunks === 180 ? "#f59e0b" : "rgba(245,158,11,0.3)",
+                ...accentRing(tg2SizeChunks === 180 ? "#f59e0b" : "rgba(245,158,11,0.3)"),
                 color: tg2SizeChunks === 180 ? "#fcd34d" : "#92400e" }}>
               Default (2880×2880 — canonical Eden template size)
             </button>
@@ -903,10 +924,10 @@ export default function NewWorldModal({ onClose, onCreated }: Props) {
           <div>
             <div style={label}>SEED</div>
             <div style={{ display: "flex", gap: 6 }}>
-              <input type="number" min={1} value={tg2Seed} style={{ ...inp, flex: 1 }}
-                onChange={e => setTg2Seed(Math.max(1, parseInt(e.target.value) || 1))} />
+              <NumberField min={1} value={tg2Seed} style={{ ...inp, flex: 1 }}
+                onChange={setTg2Seed} aria-label="Seed" />
               <button onClick={() => setTg2Seed(Math.floor(Math.random() * 999_999) + 1)}
-                style={{ ...btnBase, background: "rgba(245,158,11,0.2)", borderColor: "#f59e0b", color: "#fcd34d", whiteSpace: "nowrap" }}>
+                style={{ ...btnBase, background: "rgba(245,158,11,0.2)", ...accentRing("#f59e0b"), color: "#fcd34d", whiteSpace: "nowrap" }}>
                 🎲 Random
               </button>
             </div>
@@ -1054,7 +1075,7 @@ export default function NewWorldModal({ onClose, onCreated }: Props) {
           {/* Preview */}
           <div>
             <button onClick={previewTg2} disabled={tg2Previewing}
-              style={{ ...btnBase, background: "rgba(245,158,11,0.15)", borderColor: "#f59e0b", color: "#fcd34d", width: "100%", marginBottom: 8 }}>
+              style={{ ...btnBase, background: "rgba(245,158,11,0.15)", ...accentRing("#f59e0b"), color: "#fcd34d", width: "100%", marginBottom: 8 }}>
               {tg2Previewing ? "Generating preview…" : "Preview Terrain"}
             </button>
             {tg2Preview && (
@@ -1135,7 +1156,18 @@ export default function NewWorldModal({ onClose, onCreated }: Props) {
 
         {/* Action buttons */}
         <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
-          <button onClick={onClose} style={{ ...btnBase, background: "transparent", boxShadow: "none", color: "#83786c" }}>
+          {/* Disabled mid-generation, matching the already-blocked Esc/backdrop: closing the modal
+              doesn't stop the backend, and the still-live handleCreate would call onCreated() —
+              opening the world the user thought they'd cancelled. */}
+          <button
+            onClick={onClose}
+            disabled={creating}
+            title={creating ? "World generation is running and can't be cancelled" : undefined}
+            style={{
+              ...btnBase, background: "transparent", boxShadow: "none", color: "#83786c",
+              opacity: creating ? 0.4 : 1, cursor: creating ? "not-allowed" : "pointer",
+            }}
+          >
             Cancel
           </button>
           <button

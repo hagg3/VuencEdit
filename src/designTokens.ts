@@ -47,6 +47,19 @@ export function chromeButtonAccent(rgb: string, accent: string, extra?: CSSPrope
   };
 }
 
+/**
+ * Accent hairline for a `chromeButton`. ⚠️ Chrome buttons set `border: none` and draw their
+ * outline as an inset box-shadow, so a `borderColor: "#f59e0b"` override spread over one is
+ * *inert* — it styles a border that isn't there. Spread this instead:
+ *   `{ ...rb, ...accentRing("#f59e0b"), color: "#fcd34d" }`
+ */
+export function accentRing(accent: string, extra?: CSSProperties): CSSProperties {
+  return {
+    boxShadow: `inset 0 0 0 1px ${accent}, 0 .5px .5px rgba(255,255,255,.2)`,
+    ...extra,
+  };
+}
+
 // Recessed "well" chrome for text inputs / selects.
 export const recessedWell: CSSProperties = {
   background: "rgba(0,0,0,0.35)", border: "none",

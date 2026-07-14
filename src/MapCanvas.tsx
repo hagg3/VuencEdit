@@ -2,11 +2,24 @@ import { useEffect, useRef, useCallback, forwardRef, useImperativeHandle } from 
 import { invoke } from "@tauri-apps/api/core";
 import { brushFootprint, bresenhamLine, linePixels, polygonPixels, rectPixels, ellipsePixels, type WP, type BrushShape, type FillMode } from "./drawTools";
 import { type WorldMeta, type PixelPatch, type PixelPatchRaw } from "./types";
-import { zoomAtPoint, resizeCanvasToContainer, makeSeqGuard, putPatchPixels } from "./viewportUtils";
+import { zoomAtPoint, resizeCanvasToContainer, makeSeqGuard, putPatchPixels, beginFrame, cssWidth, cssHeight } from "./viewportUtils";
 
 export type { PixelPatch } from "./types";
 
 export type Tool = "pan" | "select" | "wand" | "paste" | "pen" | "brush" | "spray" | "line" | "rect" | "ellipse" | "polygon" | "smooth" | "noise" | "flatten" | "erode" | "thermal" | "hydro" | "stamp" | "grab" | "raise" | "lower" | "fill" | "eyedropper";
+
+/**
+ * Display name per tool — the single source of truth for the status bar and any other caption.
+ * A `Record<Tool, …>` (not a ternary chain) so adding a Tool is a compile error until it's named.
+ */
+export const TOOL_LABELS: Record<Tool, string> = {
+  pan: "Pan", select: "Select", wand: "Wand", paste: "Paste",
+  pen: "Pen", brush: "Brush", spray: "Spray", line: "Line",
+  rect: "Rect", ellipse: "Ellipse", polygon: "Polygon",
+  smooth: "Smooth", noise: "Noise", flatten: "Flatten", erode: "Erode",
+  thermal: "Thermal", hydro: "Hydro Erode", stamp: "Retexture", grab: "Grab",
+  raise: "Raise", lower: "Lower", fill: "Fill", eyedropper: "Eyedropper",
+};
 
 /** Sculpt tools that paint a swept disc footprint (everything except the drag-controlled "grab"). */
 const SCULPT_STROKE_TOOLS: readonly Tool[] = ["smooth", "noise", "flatten", "erode", "thermal", "hydro", "stamp", "raise", "lower"];
@@ -31,6 +44,12 @@ const TILE_BUFFER = 1;
 /** Maximum simultaneous in-flight tile fetches. Prevents IPC channel saturation. */
 const MAX_CONCURRENT = 4;
 
+/** Zoom bounds, shared by the wheel handler and the keyboard zoom (zoomBy/zoomToBox). */
+const MIN_SCALE = 0.25;
+const MAX_SCALE = 32;
+/** Per-step zoom factor for ⌘+ / ⌘− (coarser than the wheel's 1.1, which fires many times a drag). */
+export const KEY_ZOOM_STEP = 1.25;
+
 export interface MapCanvasRef {
   /** Write top-down pixel patch directly into the affected tiles/canvas (top-down mode edit). */
   applyPatch: (patch: PixelPatch) => void;
@@ -38,6 +57,10 @@ export interface MapCanvasRef {
   refetchRegion: (x1: number, y1: number, x2: number, y2: number) => void;
   /** Zoom-to-fit: scale + center the view so the entire world fits in the viewport. */
   resetView: () => void;
+  /** Zoom by a multiplicative factor about the viewport centre (keyboard zoom: ⌘+ / ⌘−). */
+  zoomBy: (factor: number) => void;
+  /** Scale + centre the view on a world-space box, with a little margin (⌘⇧Z… "zoom to selection"). */
+  zoomToBox: (x1: number, y1: number, x2: number, y2: number) => void;
 }
 
 interface WorldPoint { x: number; y: number }
@@ -316,8 +339,12 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     const ctx = canvas.getContext("2d")!;
     const { x: vx, y: vy, scale } = viewRef.current;
 
+    // Base HiDPI transform: the backing store is dpr× the CSS box, so everything below draws in
+    // CSS pixels against `cw`/`ch` (never canvas.width/height, which are device pixels).
+    const { w: cw, h: ch } = beginFrame(ctx, canvas);
+
     ctx.fillStyle = "#1e1814";
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.fillRect(0, 0, cw, ch);
 
     ctx.save();
     ctx.translate(vx, vy);
@@ -353,14 +380,14 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     // Progress bar while full-map or axo is loading (screen coords, outside world transform)
     const loadProgress = fullProgressRef.current;
     if ((renderModeRef.current === "full" || renderModeRef.current === "axo") && loadProgress !== null) {
-      const cx = canvas.width / 2;
-      const cy = canvas.height / 2;
+      const cx = cw / 2;
+      const cy = ch / 2;
       ctx.font = "13px monospace";
       ctx.fillStyle = "#afa69d";
       ctx.textAlign = "center";
       ctx.fillText("Loading full map…", cx, cy - 12);
       ctx.textAlign = "left";
-      const barW = Math.min(300, canvas.width * 0.5);
+      const barW = Math.min(300, cw * 0.5);
       const barH = 6;
       const barX = cx - barW / 2;
       const barY = cy + 2;
@@ -510,11 +537,11 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
         ctx.strokeStyle = "rgba(168,85,247,0.8)";
         if (sl.x != null) {
           const sx = Math.round((sl.x + 0.5) * scale + vx) + 0.5;
-          ctx.beginPath(); ctx.moveTo(sx, 0); ctx.lineTo(sx, canvas.height); ctx.stroke();
+          ctx.beginPath(); ctx.moveTo(sx, 0); ctx.lineTo(sx, ch); ctx.stroke();
         }
         if (sl.y != null) {
           const sy = Math.round((sl.y + 0.5) * scale + vy) + 0.5;
-          ctx.beginPath(); ctx.moveTo(0, sy); ctx.lineTo(canvas.width, sy); ctx.stroke();
+          ctx.beginPath(); ctx.moveTo(0, sy); ctx.lineTo(cw, sy); ctx.stroke();
         }
         ctx.restore();
       }
@@ -729,7 +756,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
       ctx.font = "12px monospace";
       ctx.fillStyle = "rgba(131,120,108,0.85)";
       ctx.textAlign = "right";
-      ctx.fillText(label, canvas.width - 12, canvas.height - 12);
+      ctx.fillText(label, cw - 12, ch - 12);
       ctx.textAlign = "left";
     }
   }, []);
@@ -927,8 +954,8 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
         y2: Math.min(mH - 1, (ty + 1) * TILE - 1),
       });
     }
-    const cxW = (canvas.width  / 2 - vx) / scale;
-    const cyW = (canvas.height / 2 - vy) / scale;
+    const cxW = (cssWidth(canvas)  / 2 - vx) / scale;
+    const cyW = (cssHeight(canvas) / 2 - vy) / scale;
     jobs.sort((a, b) => {
       const da = (a.x1 + TILE / 2 - cxW) ** 2 + (a.y1 + TILE / 2 - cyW) ** 2;
       const db = (b.x1 + TILE / 2 - cxW) ** 2 + (b.y1 + TILE / 2 - cyW) ** 2;
@@ -1014,11 +1041,42 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
       if (!canvas) return;
       const mW = mapWRef.current;
       const mH = mapHRef.current;
-      const scale = Math.min(canvas.width / mW, canvas.height / mH) * 0.9;
+      const cw = cssWidth(canvas), ch = cssHeight(canvas);
+      const scale = Math.min(cw / mW, ch / mH) * 0.9;
       viewRef.current = {
         scale,
-        x: (canvas.width  - mW * scale) / 2,
-        y: (canvas.height - mH * scale) / 2,
+        x: (cw - mW * scale) / 2,
+        y: (ch - mH * scale) / 2,
+      };
+      ensureTiles();
+    },
+    zoomBy(factor: number) {
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+      // Same anchored-zoom math as the wheel handler, anchored at the viewport centre rather than
+      // the cursor (a keyboard zoom has no cursor to zoom toward).
+      const cw = cssWidth(canvas), ch = cssHeight(canvas);
+      const v = viewRef.current;
+      const next = Math.max(MIN_SCALE, Math.min(MAX_SCALE, v.scale * factor));
+      if (next === v.scale) return;
+      viewRef.current = {
+        scale: next,
+        x: cw / 2 - (cw / 2 - v.x) * (next / v.scale),
+        y: ch / 2 - (ch / 2 - v.y) * (next / v.scale),
+      };
+      ensureTiles();
+    },
+    zoomToBox(x1: number, y1: number, x2: number, y2: number) {
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+      const bw = Math.max(1, x2 - x1 + 1);
+      const bh = Math.max(1, y2 - y1 + 1);
+      const cw = cssWidth(canvas), ch = cssHeight(canvas);
+      const scale = Math.max(MIN_SCALE, Math.min(MAX_SCALE, Math.min(cw / bw, ch / bh) * 0.85));
+      viewRef.current = {
+        scale,
+        x: cw / 2 - (x1 + bw / 2) * scale,
+        y: ch / 2 - (y1 + bh / 2) * scale,
       };
       ensureTiles();
     },
@@ -1026,14 +1084,19 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
 
   // ── Effects ───────────────────────────────────────────────────────────────
 
+  // Deliberately dep-less: these mirror props into refs the imperative draw path reads, and must
+  // re-run whenever App re-renders us for *any* reason (a prop the draw reads may have changed
+  // without being listed). They go through scheduleDraw, not draw — a synchronous draw here would
+  // repaint the whole canvas once per React render, bypassing the rAF coalescing every other hot
+  // path in this file uses (App re-renders on cursor/camera ticks that don't change the map).
   useEffect(() => {
     committedSelRef.current = committedSelection;
-    draw();
+    scheduleDraw();
   });
   useEffect(() => {
     pastePreviewRef.current = pastePreview;
     if (!pastePreview) pasteHoverRef.current = null;
-    draw();
+    scheduleDraw();
   });
   useEffect(() => {
     if (!clipboardPreviewPixels) { clipboardImgRef.current = null; return; }
@@ -1051,8 +1114,8 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     const canvas = canvasRef.current;
     if (!canvas) return;
     viewRef.current = {
-      x: (canvas.width  - mapW * 2) / 2,
-      y: (canvas.height - mapH * 2) / 2,
+      x: (cssWidth(canvas)  - mapW * 2) / 2,
+      y: (cssHeight(canvas) - mapH * 2) / 2,
       scale: 2,
     };
     dragRef.current = null;
@@ -1109,6 +1172,38 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     ro.observe(canvas);
     return () => ro.disconnect();
   }, [ensureTiles]);
+
+  /**
+   * Terrain pixels under a selection, at 1 px per block, for the "Move: Box + Contents" drag
+   * ghost. Read from the offscreen tile/full-map sources — NOT the composited canvas, which
+   * already has the blue selection fill and its outlines painted on top from the previous frame;
+   * snapshotting that baked the overlay into the dragged preview and read as a rendering glitch.
+   * Axo is a skewed projection with no 1:1 world mapping, so it gets outline-only dragging.
+   */
+  const snapshotSelectionPixels = useCallback((sel: SelectionBounds): HTMLCanvasElement | null => {
+    const w = sel.x2 - sel.x1 + 1;
+    const h = sel.y2 - sel.y1 + 1;
+    if (w <= 0 || h <= 0 || renderModeRef.current === "axo") return null;
+    const off = document.createElement("canvas");
+    off.width = w;
+    off.height = h;
+    const octx = off.getContext("2d");
+    if (!octx) return null;
+    octx.imageSmoothingEnabled = false;
+    if (renderModeRef.current === "full") {
+      const fc = fullCanvasRef.current;
+      if (!fc) return null;
+      octx.drawImage(fc, sel.x1, sel.y1, w, h, 0, 0, w, h);
+      return off;
+    }
+    for (const [key, tile] of tileCacheRef.current) {
+      const comma = key.indexOf(",");
+      const tx = parseInt(key.slice(0, comma)) * TILE;
+      const ty = parseInt(key.slice(comma + 1)) * TILE;
+      octx.drawImage(tile, tx - sel.x1, ty - sel.y1);
+    }
+    return off;
+  }, []);
 
   // ── Pointer / wheel handlers ──────────────────────────────────────────────
 
@@ -1197,23 +1292,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
           // Click-drag inside the committed selection (not on a resize edge) moves it with
           // its contents (E2) instead of starting a new marquee.
           (e.target as HTMLCanvasElement).style.cursor = "move";
-          let ghost: HTMLCanvasElement | null = null;
-          if (moveWithContentsRef.current) {
-            // Snapshot the selection's current on-screen pixels before any drag overlay is
-            // drawn, so it can be shown as a moving preview of what will actually relocate.
-            const src = canvasRef.current;
-            const { x: vx0, y: vy0, scale: s0 } = viewRef.current;
-            const rx = Math.round(sel.x1 * s0 + vx0);
-            const ry = Math.round(sel.y1 * s0 + vy0);
-            const rw = Math.round((sel.x2 - sel.x1 + 1) * s0);
-            const rh = Math.round((sel.y2 - sel.y1 + 1) * s0);
-            if (src && rw > 0 && rh > 0) {
-              const off = document.createElement("canvas");
-              off.width = rw; off.height = rh;
-              off.getContext("2d")?.drawImage(src, rx, ry, rw, rh, 0, 0, rw, rh);
-              ghost = off;
-            }
-          }
+          const ghost = moveWithContentsRef.current ? snapshotSelectionPixels(sel) : null;
           dragRef.current = { kind: "moveSel", origin: { ...sel }, start: wpIn, dx: 0, dy: 0, ghost };
           draw();
           return;
@@ -1362,8 +1441,17 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
           x2: Math.max(drag.start.x, wp.x), y2: Math.max(drag.start.y, wp.y),
         });
       } else if (drag?.kind === "moveSel") {
-        drag.dx = Math.round(wp.x - drag.start.x);
-        drag.dy = Math.round(wp.y - drag.start.y);
+        const mdx = Math.round(wp.x - drag.start.x);
+        const mdy = Math.round(wp.y - drag.start.y);
+        // Shift = axis-lock to whichever direction dominates, the convention in every creative tool.
+        if (e.shiftKey) {
+          const horizontal = Math.abs(mdx) >= Math.abs(mdy);
+          drag.dx = horizontal ? mdx : 0;
+          drag.dy = horizontal ? 0 : mdy;
+        } else {
+          drag.dx = mdx;
+          drag.dy = mdy;
+        }
       } else if (drag?.kind === "cam3d-drag") {
         onSetCamera3dRef.current?.(wp.x, wp.y);
       } else if (toolRef.current === "paste") {
@@ -1510,7 +1598,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     const handler = (e: WheelEvent) => {
       e.preventDefault();
       const lp = toLocal(e.clientX, e.clientY);
-      viewRef.current = zoomAtPoint(viewRef.current, lp.x, lp.y, e.deltaY, { min: 0.25, max: 32, factor: 1.1 });
+      viewRef.current = zoomAtPoint(viewRef.current, lp.x, lp.y, e.deltaY, { min: MIN_SCALE, max: MAX_SCALE, factor: 1.1 });
       scheduleEnsureTiles(); // rAF-coalesced; loads new tiles in tiled mode, just draws in full mode
     };
     canvas.addEventListener("wheel", handler, { passive: false });
