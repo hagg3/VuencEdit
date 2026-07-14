@@ -40,8 +40,36 @@ body {
   to { transform: rotate(360deg); }
 }
 
-/* Edit-summary toast fade/slide-in (App.tsx) */
+/* Toast fade/slide-in (App.tsx). The toast stack owns the -50% centring transform, so an
+   individual toast must only animate its own Y — a translate(-50%) here would shift each toast
+   left by half its width. */
 @keyframes eden-toast-in {
-  from { opacity: 0; transform: translate(-50%, 6px); }
-  to   { opacity: 1; transform: translate(-50%, 0); }
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: none; }
+}
+
+/* Keyboard focus should be visible app-wide, not just in the ribbon — modals, panels, and the
+   canvas chrome are all reachable by Tab. :focus-visible only fires for keyboard focus, so this
+   never draws a ring on a mouse click. */
+:focus-visible {
+  outline: 2px solid #00dde9;
+  outline-offset: 1px;
+  border-radius: 3px;
+}
+
+/* Respect the OS "reduce motion" setting: motion becomes instant, but *indicators* keep moving —
+   a blanket `animation: none` would freeze the loading spinner, which communicates progress rather
+   than decorating it. So: kill transitions (toggle knobs, hovers, progress-bar widths) and flatten
+   the toast slide to a plain fade, and leave eden-spin alone. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+  @keyframes eden-toast-in {
+    from { opacity: 0; }
+    to   { opacity: 1; }
+  }
 }

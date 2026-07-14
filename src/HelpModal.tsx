@@ -225,31 +225,56 @@ export default function HelpModal({ onClose }: { onClose: () => void }) {
             <table style={{ borderCollapse: "collapse", width: "100%" }}>
               <tbody>
                 <Section title="Navigation" />
-                <Row keys={<>Scroll</>}                                      action="Zoom in / out" />
-                <Row keys={<><Key>Home</Key></>}                             action="Fit map to window" />
+                <Row keys={<>Scroll</>}                                      action="Zoom in / out (toward cursor)" />
+                <Row keys={<><Key>⌘</Key><Key>+</Key> / <Key>⌘</Key><Key>−</Key></>} action="Zoom in / out (viewport centre)" />
+                <Row keys={<><Key>⌘</Key><Key>0</Key> / <Key>Home</Key></>}  action="Fit map to window" />
+                <Row keys={<><Key>⌘</Key><Key>⇧</Key><Key>0</Key></>}       action="Zoom to selection" />
                 <Row keys={<>Middle drag</>}                                  action="Pan" />
 
                 <Section title="Tools" />
                 <Row keys={<><Key>P</Key></>}                                action="Pen" />
                 <Row keys={<><Key>B</Key></>}                                action="Brush" />
+                <Row keys={<><Key>L</Key></>}                                action="Line" />
                 <Row keys={<><Key>R</Key></>}                                action="Rect" />
                 <Row keys={<><Key>E</Key></>}                                action="Ellipse" />
+                <Row keys={<><Key>G</Key></>}                                action="Polygon / lasso — click vertices, click the first again (or double-click) to close" />
                 <Row keys={<><Key>F</Key></>}                                action="Fill bucket" />
+                <Row keys={<><Key>I</Key></>}                                action="Eyedropper — pick the block under the cursor" />
                 <Row keys={<><Key>W</Key></>}                                action="Magic Wand — flood-select matching surface blocks (type+colour toggle in toolbar)" />
-                <Row keys={<><Key>1</Key>–<Key>5</Key></>}                   action="Brush size (1 / 3 / 5 / 7 / 9)" />
+
+                <Section title="Blocks" />
+                <Row keys={<><Key>1</Key>–<Key>5</Key></>}                   action="Pinned hotbar slots" />
+                <Row keys={<><Key>6</Key>–<Key>0</Key></>}                   action="Recently-used hotbar slots" />
 
                 <Section title="Editing" />
                 <Row keys={<><Key>⌘</Key><Key>Z</Key></>}                   action="Undo" />
                 <Row keys={<><Key>⌘</Key><Key>⇧</Key><Key>Z</Key> / <Key>⌘</Key><Key>Y</Key></>} action="Redo" />
+                <Row keys={<><Key>⌘</Key><Key>C</Key></>}                   action="Copy selection" />
+                <Row keys={<><Key>⌘</Key><Key>V</Key></>}                   action="Arm paste" />
+                <Row keys={<><Key>⌘</Key><Key>A</Key></>}                   action="Select whole world" />
+                <Row keys={<><Key>⌘</Key><Key>D</Key></>}                   action="Deselect" />
+                <Row keys={<>Arrows</>}                                       action="Nudge selection" />
+                <Row keys={<>Drag inside selection</>}                         action="Move it (hold ⇧ to lock to one axis)" />
 
                 <Section title="Paste mode" />
-                <Row keys={<>Click</>}                                        action="Lock paste position" />
+                <Row keys={<>Click</>}                                        action="Lock paste position (ghost turns amber)" />
                 <Row keys={<>Click again / Confirm</>}                        action="Stamp paste" />
                 <Row keys={<><Key>.</Key></>}                                 action="Repeat paste one step in same direction" />
                 <Row keys={<><Key>Esc</Key></>}                               action="Unlock position → exit paste mode" />
 
+                <Section title="3D pane" />
+                <Row keys={<><Key>Z</Key></>}                                action="Cycle camera: orbit → mouselook → fly" />
+                <Row keys={<>WASD / Space / Ctrl</>}                          action="Move while walking (Shift to boost, wheel for speed)" />
+                <Row keys={<>Left-click</>}                                   action="Build mode: break the block you're aiming at" />
+                <Row keys={<>Right-click</>}                                  action="Build mode: place the build block against that face" />
+
+                <Section title="File" />
+                <Row keys={<><Key>⌘</Key><Key>S</Key></>}                   action="Save" />
+                <Row keys={<><Key>⌘</Key><Key>W</Key></>}                   action="Close world" />
+                <Row keys={<><Key>⌘</Key><Key>,</Key></>}                   action="Settings" />
+
                 <Section title="General" />
-                <Row keys={<><Key>Esc</Key></>}                               action="Exit current tool / clear selection" />
+                <Row keys={<><Key>Esc</Key></>}                               action="Step back: context menu → paste lock → tool → selection" />
                 <Row keys={<><Key>?</Key></>}                                 action="Toggle this panel" />
               </tbody>
             </table>

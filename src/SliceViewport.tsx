@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { brushFootprint, rectPixels, ellipsePixels, type BrushShape, type WP } from "./drawTools";
 import { chromeButton, chromeButtonAccent, recessedWell } from "./designTokens";
 import type { PixelPatchRaw } from "./types";
-import { zoomAtPoint, resizeCanvasToContainer, makeSeqGuard, putPatchPixels } from "./viewportUtils";
+import { zoomAtPoint, resizeCanvasToContainer, makeSeqGuard, putPatchPixels, beginFrame, cssWidth, cssHeight } from "./viewportUtils";
 
 // Front slab = constant world-Y plane (horizontal axis = X, vertical = Z; row 0 = highest Z).
 // Side slab  = constant world-X plane (horizontal axis = Y, vertical = Z; row 0 = highest Z).
@@ -97,6 +97,25 @@ export default function SliceViewport({ world, axis, editEpoch, lastEdit, onPain
     const c = Math.max(0, Math.min(depthMax, d));
     if (onDepthChange) onDepthChange(c); else setLocalDepth(c);
   }, [depthMax, onDepthChange]);
+
+  // Depth slider display/commit split (same idiom as App's zSliceDisplay/commitZSlice): every
+  // committed depth re-renders the whole plane over IPC, so scrubbing on raw `onChange` fired a
+  // full strip-tiled refetch per drag pixel. The slider tracks `dragDepth` while held and commits
+  // once on release; `null` means "not dragging — show the committed depth".
+  const [dragDepth, setDragDepth] = useState<number | null>(null);
+  const dragDepthRef = useRef<number | null>(null);
+  const shownDepth = dragDepth ?? curDepth;
+  const previewDepth = useCallback((d: number) => {
+    const c = Math.max(0, Math.min(depthMax, d));
+    dragDepthRef.current = c;
+    setDragDepth(c);
+  }, [depthMax]);
+  const commitDragDepth = useCallback(() => {
+    const d = dragDepthRef.current;
+    dragDepthRef.current = null;
+    setDragDepth(null);
+    if (d !== null) setDepth(d);
+  }, [setDepth]);
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const slabRef = useRef<HTMLCanvasElement | null>(null); // offscreen slab canvas
@@ -287,7 +306,7 @@ export default function SliceViewport({ world, axis, editEpoch, lastEdit, onPain
     if (selScoped || freeWinW >= planeW) return;
     const canvas = canvasRef.current; if (!canvas) return;
     const { x, scale } = viewRef.current;
-    const centerWorld = (canvas.width / 2 - x) / scale + winOriginRef.current;
+    const centerWorld = (cssWidth(canvas) / 2 - x) / scale + winOriginRef.current;
     const desired = Math.max(0, Math.min(planeW - freeWinW, Math.round(centerWorld - freeWinW / 2)));
     if (desired !== winOriginRef.current && Math.abs(desired - winOriginRef.current) >= 16) {
       // shift view.x so the same world column stays under the cursor after the origin moves
@@ -301,9 +320,11 @@ export default function SliceViewport({ world, axis, editEpoch, lastEdit, onPain
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext("2d")!;
+    // Base HiDPI transform — everything below is in CSS pixels (`cw`/`ch`), never canvas.width.
+    const { w: cw, h: ch } = beginFrame(ctx, canvas);
     ctx.imageSmoothingEnabled = false;
     ctx.fillStyle = "#0a0f1e";
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.fillRect(0, 0, cw, ch);
 
     // Choose which offscreen canvas to display.
     const isOrtho = orthoModeRef.current && orthoSlabRef.current != null && axis !== "top";
@@ -401,14 +422,14 @@ export default function SliceViewport({ world, axis, editEpoch, lastEdit, onPain
     if (crossCol != null && crossCol >= 0 && crossCol < slab.width) {
       const sx = x + (crossCol + 0.5) * scale;
       ctx.strokeStyle = "rgba(168,85,247,0.7)";
-      ctx.beginPath(); ctx.moveTo(sx, 0); ctx.lineTo(sx, canvas.height); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(sx, 0); ctx.lineTo(sx, ch); ctx.stroke();
     }
     if (crossV != null) {
       const row = activeVToRow(crossV); // image row for that vertical-axis world coord
       if (row >= 0 && row < slab.height) {
         const sy = y + (row + 0.5) * scale;
         ctx.strokeStyle = "rgba(56,189,248,0.7)";
-        ctx.beginPath(); ctx.moveTo(0, sy); ctx.lineTo(canvas.width, sy); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(0, sy); ctx.lineTo(cw, sy); ctx.stroke();
       }
     }
 
@@ -450,24 +471,24 @@ export default function SliceViewport({ world, axis, editEpoch, lastEdit, onPain
           if (ez != null) {
             const ey = eh === "z-max" ? y + (maxZ - ez) * scale : y + (maxZ - ez + 1) * scale;
             for (let i = -1; i <= 1; i++) {
-              ctx.beginPath(); ctx.arc(canvas.width / 2 + i * 8, ey, 3, 0, Math.PI * 2); ctx.fill();
+              ctx.beginPath(); ctx.arc(cw / 2 + i * 8, ey, 3, 0, Math.PI * 2); ctx.fill();
             }
             ctx.fillStyle = "rgba(175,166,157,0.7)";
             ctx.font = "9px monospace";
             ctx.textBaseline = "middle";
-            ctx.fillText("drag to resize Z", canvas.width / 2 + 16, ey);
+            ctx.fillText("drag to resize Z", cw / 2 + 16, ey);
           }
         } else if (eh === "h-lo" || eh === "h-hi") {
           const hw = eh === "h-lo" ? selRange?.lo : selRange != null ? selRange.hi + 1 : null;
           if (hw != null) {
             const ex = x + (hw - winOriginRef.current) * scale;
             for (let i = -1; i <= 1; i++) {
-              ctx.beginPath(); ctx.arc(ex, canvas.height / 2 + i * 8, 3, 0, Math.PI * 2); ctx.fill();
+              ctx.beginPath(); ctx.arc(ex, ch / 2 + i * 8, 3, 0, Math.PI * 2); ctx.fill();
             }
             ctx.fillStyle = "rgba(175,166,157,0.7)";
             ctx.font = "9px monospace";
             ctx.textBaseline = "top";
-            ctx.fillText(`drag to resize ${axis === "side" ? "Y" : "X"}`, ex + 6, canvas.height / 2 + 12);
+            ctx.fillText(`drag to resize ${axis === "side" ? "Y" : "X"}`, ex + 6, ch / 2 + 12);
             ctx.textBaseline = "middle";
           }
         }
@@ -479,7 +500,7 @@ export default function SliceViewport({ world, axis, editEpoch, lastEdit, onPain
       ctx.fillStyle = "rgba(131,120,108,0.6)";
       ctx.font = "9px monospace";
       ctx.textBaseline = "bottom";
-      ctx.fillText("ortho — paint disabled", 6, canvas.height - 4);
+      ctx.fillText("ortho — paint disabled", 6, ch - 4);
     }
   }, [crossH, crossV, axis, maxZ, selRange, selZ, extrudeCount, extrudeAxis, isPaste]);
 
@@ -488,11 +509,12 @@ export default function SliceViewport({ world, axis, editEpoch, lastEdit, onPain
     const canvas = canvasRef.current;
     const slab = (orthoModeRef.current && orthoSlabRef.current) ? orthoSlabRef.current : slabRef.current;
     if (!canvas || !slab) return;
-    const s = Math.max(0.25, Math.min(32, Math.min(canvas.width / slab.width, canvas.height / slab.height)));
+    const cw = cssWidth(canvas), ch = cssHeight(canvas);
+    const s = Math.max(0.25, Math.min(32, Math.min(cw / slab.width, ch / slab.height)));
     viewRef.current = {
       scale: s,
-      x: (canvas.width - slab.width * s) / 2,
-      y: (canvas.height - slab.height * s) / 2,
+      x: (cw - slab.width * s) / 2,
+      y: (ch - slab.height * s) / 2,
     };
     draw();
   }, [draw]);
@@ -754,21 +776,26 @@ export default function SliceViewport({ world, axis, editEpoch, lastEdit, onPain
     return () => canvas.removeEventListener("wheel", handler);
   }, [draw]);
 
-  const label = axis === "front" ? `Front  (Y=${curDepth})` : axis === "side" ? `Side  (X=${curDepth})` : `Top  (Z=${curDepth})`;
+  const label = axis === "front" ? `Front  (Y=${shownDepth})` : axis === "side" ? `Side  (X=${shownDepth})` : `Top  (Z=${shownDepth})`;
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%", background: "#0a0f1e", color: "#dad6d2", userSelect: "none", WebkitUserSelect: "none" }}>
       <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "4px 8px", fontSize: 11, borderBottom: "1px solid #312c28" }}>
         <span style={{ fontWeight: 600 }}>{label}</span>
         <input
-          type="range" min={0} max={depthMax} value={curDepth}
-          onChange={(e) => setDepth(parseInt(e.target.value, 10))}
+          type="range" min={0} max={depthMax} value={shownDepth}
+          onChange={(e) => previewDepth(parseInt(e.target.value, 10))}
+          onPointerUp={commitDragDepth}
+          onKeyUp={commitDragDepth}
+          onBlur={commitDragDepth}
           style={{ flex: 1 }}
           title={orthoMode ? "Depth slider moves the crosshair in ortho mode" : undefined}
         />
         <input
-          type="number" min={0} max={depthMax} value={curDepth}
-          onChange={(e) => setDepth(parseInt(e.target.value, 10) || 0)}
+          type="number" min={0} max={depthMax} value={shownDepth}
+          onChange={(e) => previewDepth(parseInt(e.target.value, 10) || 0)}
+          onBlur={commitDragDepth}
+          onKeyDown={(e) => { if (e.key === "Enter") commitDragDepth(); }}
           style={{ ...recessedWell, width: 56, background: "#312c28", color: "#dad6d2", borderRadius: 4 }}
         />
         {selFull && axis !== "top" && (

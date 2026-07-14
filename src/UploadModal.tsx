@@ -86,7 +86,9 @@ export default function UploadModal({ sourcePath, onClose }: Props) {
   const imageFilename = imagePath ? imagePath.split(/[\\/]/).pop() ?? imagePath : null;
 
   return (
+    // Blocked mid-upload — dismissing wouldn't cancel the request, it would just hide it.
     <Modal onClose={onClose} zIndex={1000} label="Upload World"
+      closeOnEsc={!uploading} closeOnBackdrop={!uploading}
       backdropStyle={{ background: "rgba(0,0,0,0.75)" }}>
       <div
         style={glassPanel({
@@ -99,9 +101,12 @@ export default function UploadModal({ sourcePath, onClose }: Props) {
           <span style={{ fontSize: 14, fontWeight: 600 }}>Upload World</span>
           <button
             onClick={onClose}
+            disabled={uploading}
+            title={uploading ? "An upload is in progress" : "Close"}
+            aria-label="Close"
             onMouseEnter={e => (e.currentTarget.style.color = EDEN_TEAL_READABLE)}
             onMouseLeave={e => (e.currentTarget.style.color = "#61584f")}
-            style={{ background: "none", border: "none", color: "#61584f", fontSize: 20, cursor: "pointer", lineHeight: 1, transition: "color .1s" }}
+            style={{ background: "none", border: "none", color: "#61584f", fontSize: 20, cursor: uploading ? "not-allowed" : "pointer", opacity: uploading ? 0.4 : 1, lineHeight: 1, transition: "color .1s" }}
           >×</button>
         </div>
 

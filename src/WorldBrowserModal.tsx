@@ -82,9 +82,12 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
   const [toDate, setToDate] = useState("");
   const [hideJunk, setHideJunk] = useState(false);
   const unlistenRef = useRef<(() => void) | null>(null);
+  // Gates onOpenWorld: even with dismissal blocked mid-download, the parent can still unmount us,
+  // and a world-switch firing into a dead modal would be a surprise world change for the user.
+  const mountedRef = useRef(true);
 
   useEffect(() => {
-    return () => { unlistenRef.current?.(); };
+    return () => { mountedRef.current = false; unlistenRef.current?.(); };
   }, []);
 
   // Reset preview whenever selection or server changes
@@ -133,7 +136,7 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
       await invoke("download_world", { id: selectedId, server, destPath });
       unlisten();
       unlistenRef.current = null;
-      if (openAfter) onOpenWorld(destPath);
+      if (openAfter && mountedRef.current) onOpenWorld(destPath);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -162,7 +165,11 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
     : null;
 
   return (
+    // Dismissal is blocked while a download runs: closing wouldn't stop it, and "Save & Open"
+    // would still fire onOpenWorld when it lands — switching worlds (and raising an unsaved-changes
+    // prompt) long after the user thought they'd backed out.
     <Modal onClose={onClose} zIndex={1000} label="World Browser"
+      closeOnEsc={!downloading} closeOnBackdrop={!downloading}
       backdropStyle={{ background: "rgba(0,0,0,0.75)" }}>
       <div
         style={glassPanel({
@@ -175,9 +182,12 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
           <span style={{ fontSize: 14, fontWeight: 600 }}>World Browser</span>
           <button
             onClick={onClose}
+            disabled={downloading}
+            title={downloading ? "A download is in progress" : "Close"}
+            aria-label="Close"
             onMouseEnter={e => (e.currentTarget.style.color = EDEN_TEAL_READABLE)}
             onMouseLeave={e => (e.currentTarget.style.color = "#61584f")}
-            style={{ background: "none", border: "none", color: "#61584f", fontSize: 20, cursor: "pointer", lineHeight: 1, transition: "color .1s" }}
+            style={{ background: "none", border: "none", color: "#61584f", fontSize: 20, cursor: downloading ? "not-allowed" : "pointer", opacity: downloading ? 0.4 : 1, lineHeight: 1, transition: "color .1s" }}
           >×</button>
         </div>
 
