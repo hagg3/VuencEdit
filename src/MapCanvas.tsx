@@ -2,27 +2,65 @@ import { useEffect, useRef, useCallback, forwardRef, useImperativeHandle } from 
 import { invoke } from "@tauri-apps/api/core";
 import { brushFootprint, bresenhamLine, linePixels, polygonPixels, rectPixels, ellipsePixels, type WP, type BrushShape, type FillMode } from "./drawTools";
 import { type WorldMeta, type PixelPatch, type PixelPatchRaw } from "./types";
-import { zoomAtPoint, resizeCanvasToContainer, makeSeqGuard, putPatchPixels, beginFrame, cssWidth, cssHeight } from "./viewportUtils";
+import { zoomAtPoint, resizeCanvasToContainer, makeSeqGuard, putPatchPixels, beginFrame, cssWidth, cssHeight, isTypingTarget } from "./viewportUtils";
+import { maskOutline, type OutlinePt } from "./maskUtils";
 
 export type { PixelPatch } from "./types";
 
-export type Tool = "pan" | "select" | "wand" | "paste" | "pen" | "brush" | "spray" | "line" | "rect" | "ellipse" | "polygon" | "smooth" | "noise" | "flatten" | "erode" | "thermal" | "hydro" | "stamp" | "grab" | "raise" | "lower" | "fill" | "eyedropper";
+export type Tool = "pan" | "select" | "wand" | "lasso" | "paste" | "pen" | "brush" | "spray" | "line" | "rect" | "ellipse" | "polygon" | "smooth" | "noise" | "flatten" | "erode" | "thermal" | "hydro" | "stamp" | "grab" | "raise" | "lower" | "terrace" | "sharpen" | "slope" | "smear" | "fill" | "eyedropper";
 
 /**
  * Display name per tool — the single source of truth for the status bar and any other caption.
  * A `Record<Tool, …>` (not a ternary chain) so adding a Tool is a compile error until it's named.
  */
 export const TOOL_LABELS: Record<Tool, string> = {
-  pan: "Pan", select: "Select", wand: "Wand", paste: "Paste",
+  pan: "Pan", select: "Select", wand: "Wand", lasso: "Lasso", paste: "Paste",
   pen: "Pen", brush: "Brush", spray: "Spray", line: "Line",
   rect: "Rect", ellipse: "Ellipse", polygon: "Polygon",
   smooth: "Smooth", noise: "Noise", flatten: "Flatten", erode: "Erode",
   thermal: "Thermal", hydro: "Hydro Erode", stamp: "Retexture", grab: "Grab",
-  raise: "Raise", lower: "Lower", fill: "Fill", eyedropper: "Eyedropper",
+  raise: "Raise", lower: "Lower", terrace: "Terrace", sharpen: "Sharpen",
+  slope: "Slope", smear: "Smear", fill: "Fill", eyedropper: "Eyedropper",
+};
+
+/**
+ * One-line "how do I use this" caption per tool, shown in the status bar (App.tsx). Only tools whose
+ * core gesture isn't obvious from clicking around get an entry — Pen and Brush don't need telling.
+ * Lives next to TOOL_LABELS so a new Tool's hint is written where its name is.
+ */
+export const TOOL_HINTS: Partial<Record<Tool, string>> = {
+  polygon: "Click to add points · click the first point (or double-click) to close · Esc cancels",
+  lasso: "Drag to trace a freeform selection · release to close · Esc cancels",
+  grab: "Press on the terrain and drag up / down to raise or lower it",
+  wand: "Click a block to flood-select everything matching it on the surface",
+  eyedropper: "Click a block to make it the active block",
+  line: "Drag from one point to another",
+  rect: "Drag to size the rectangle",
+  ellipse: "Drag to size the ellipse",
+  flatten: "The first block you press on sets the height everything else is levelled to",
+  slope: "The first block you press on anchors the tilted plane (set Slope X/Y in the Falloff group)",
+  smear: "Drag across terrain to pull height along with the brush, like wet paint",
+};
+
+/**
+ * Idle cursor per tool. Most drawing/sculpt tools share "crosshair" (precision matters more than
+ * a distinct glyph there), but a few have a genuinely different gesture and get their own cursor:
+ * pan grabs the map, paste stamps a copy, wand/eyedropper pick a specific block, grab drags
+ * vertically. Selection-edge/move-hover cursors are still computed live in draw() (they depend on
+ * where over the selection the pointer is, not just the armed tool).
+ */
+export const TOOL_CURSOR: Record<Tool, string> = {
+  pan: "grab", paste: "copy", wand: "cell", lasso: "crosshair", eyedropper: "cell", grab: "ns-resize",
+  select: "crosshair", pen: "crosshair", brush: "crosshair", spray: "crosshair",
+  line: "crosshair", rect: "crosshair", ellipse: "crosshair", polygon: "crosshair",
+  smooth: "crosshair", noise: "crosshair", flatten: "crosshair", erode: "crosshair",
+  thermal: "crosshair", hydro: "crosshair", stamp: "crosshair",
+  raise: "crosshair", lower: "crosshair", terrace: "crosshair", sharpen: "crosshair",
+  slope: "crosshair", smear: "crosshair", fill: "crosshair",
 };
 
 /** Sculpt tools that paint a swept disc footprint (everything except the drag-controlled "grab"). */
-const SCULPT_STROKE_TOOLS: readonly Tool[] = ["smooth", "noise", "flatten", "erode", "thermal", "hydro", "stamp", "raise", "lower"];
+const SCULPT_STROKE_TOOLS: readonly Tool[] = ["smooth", "noise", "flatten", "erode", "thermal", "hydro", "stamp", "raise", "lower", "terrace", "sharpen", "slope", "smear"];
 const isSculptStroke = (t: Tool): boolean => SCULPT_STROKE_TOOLS.includes(t);
 
 export interface DrawConfig {
@@ -30,9 +68,30 @@ export interface DrawConfig {
   brushShape: BrushShape;
   fillMode: FillMode;
   sculptRadius: number;
+  sculptSoftness: number;    // 0 = hard edge, 1 = full radial dome — mirrors the Rust falloff
+  sculptProfile: "smooth" | "linear" | "sphere" | "sharp";
   sculptAccumulate: boolean;
   sprayDensity: number;      // 0..1 — fraction of footprint cells placed per spray stamp
   strokeStabilizer: boolean; // low-pass the freehand pointer path (Photoshop-style)
+}
+
+/** Mirrors `falloff_dome` in lib.rs — same four profile curves on normalised depth `t` (0=rim, 1=core). */
+function falloffDome(t: number, profile: DrawConfig["sculptProfile"]): number {
+  t = Math.max(0, Math.min(1, t));
+  switch (profile) {
+    case "linear": return t;
+    case "sphere": return Math.sqrt(t * (2 - t));
+    case "sharp":  return t * t;
+    default:       return t * t * (3 - 2 * t); // "smooth"
+  }
+}
+
+/** Per-cell brush weight at radial distance `d` from the stamp centre — mirrors the Rust per-stamp
+ *  falloff so the cursor preview matches what a stamp will actually do. */
+function sculptWeightAt(d: number, radius: number, softness: number, profile: DrawConfig["sculptProfile"]): number {
+  if (softness <= 0) return 1;
+  const dome = falloffDome(1 - d / Math.max(1, radius), profile);
+  return Math.max(0, Math.min(1, (1 - softness) + dome * softness));
 }
 
 /** World pixels per tile side. Each tile is fetched independently via IPC. */
@@ -70,13 +129,19 @@ type DragOp =
   | { kind: "select"; start: WorldPoint; end: WorldPoint }
   | { kind: "resizeEdge"; edge: "x1" | "x2" | "y1" | "y2"; live: SelectionBounds }
   | { kind: "moveSel"; origin: SelectionBounds; start: WorldPoint; dx: number; dy: number; ghost: HTMLCanvasElement | null }
-  | { kind: "draw-stroke"; pts: Set<string>; lastWX: number; lastWY: number; startWX: number; startWY: number }
+  | { kind: "draw-stroke"; pts: Set<string>; lastWX: number; lastWY: number; startWX: number; startWY: number; live?: boolean }
   | { kind: "sculpt-grab"; pts: Set<string>; cx: number; cy: number; downClientY: number; delta: number }
   | { kind: "draw-shape"; tool: "rect" | "ellipse" | "line"; start: WP; end: WP }
+  | { kind: "lasso"; pts: WP[] }
   | { kind: "cam3d-drag" }
   | null;
 
 const EDGE_HIT_PX = 6;
+// Always-drawn resize grips on the selection edges (see the selection overlay in draw()). Sized to
+// read as a grabbable handle at a glance — a thinner bar was technically visible but still easy to
+// miss, which defeats the point of drawing it at rest at all.
+const GRIP_LEN = 20;
+const GRIP_W   = 6;
 
 /** Draw-stroke tools that freehand-stamp a footprint along the pointer path. */
 const FREEHAND_TOOLS: readonly Tool[] = ["pen", "brush", "spray"];
@@ -131,6 +196,10 @@ interface Props {
   tool: Tool;
   viewMode: "topdown" | "zslice";
   zSliceZ: number;
+  /** Cutaway cap currently applied in the backend, or null. Not used for drawing — `fetch_tile`
+   *  already renders capped — it's purely a cache-invalidation key: when it changes, every tile
+   *  must be refetched. App only advances it once `set_view_cap` has resolved. */
+  viewCapZ?: number | null;
   committedSelection: SelectionBounds | null;
   onSelectionChange: (bounds: SelectionBounds | null) => void;
   pastePreview: { width: number; height: number } | null;
@@ -144,8 +213,15 @@ interface Props {
   lockedPastePos?: { x: number; y: number } | null;
   /** Draw tool configuration — only read when tool is pen/brush/rect/ellipse. */
   drawConfig?: DrawConfig;
-  /** Called when a draw stroke or shape is committed with the list of world positions, the z override (null = surface), the pointer-down anchor column (sculpt tools), and (grab tool) the drag-controlled vertical delta in blocks. */
-  onDrawStroke?: (pts: [number, number][], zOverride: number | null, anchor?: [number, number], grabDelta?: number) => void | Promise<void>;
+  /** Called when a draw stroke or shape is committed with the list of world positions, the z override (null = surface), the pointer-down anchor column (sculpt tools), (grab tool) the drag-controlled vertical delta in blocks, a group id coalescing one stroke's stamps into one undo entry, and (smear tool) the per-tick drag delta in blocks to pull height from. */
+  onDrawStroke?: (pts: [number, number][], zOverride: number | null, anchor?: [number, number], grabDelta?: number, groupId?: number, smear?: [number, number]) => void | Promise<void>;
+  /** Live-brush sculpt (Row 6): a batch of stamp centres for one flush, the stamp radius, the stroke's
+   *  group id, and the anchor column captured at pointer-down (used by flatten/slope). Fired repeatedly
+   *  during a live stroke; the backend applies the centres sequentially into one grouped undo entry. */
+  onSculptStroke?: (stampCenters: [number, number][], stampRadius: number, groupId: number, anchor: [number, number]) => void | Promise<void>;
+  /** Escape mid-stroke: revert the whole live sculpt stroke. MapCanvas awaits any in-flight flush first,
+   *  then calls this exactly once so App's undo path (with its depth/toast plumbing) stays authoritative. */
+  onCancelStroke?: () => void | Promise<void>;
   /** Current z-slice level — used as z override when drawing in z-slice mode. */
   drawZOverride?: number | null;
   /** When set, draws ghost copies of the selection on X or Y axis before the user commits. */
@@ -156,6 +232,12 @@ interface Props {
   onCursorMove?: (wx: number, wy: number) => void;
   /** Called when the wand tool clicks a world coordinate. */
   onMagicWand?: (wx: number, wy: number) => void;
+  /** Called when a lasso drag is released, with the ordered world-space path. */
+  onLassoSelect?: (pts: [number, number][]) => void;
+  /** Active shaped-selection footprint (wand/lasso), decoded from get_selection_mask. When its bbox
+   *  matches the committed selection exactly, the selection overlay fills only the set cells instead
+   *  of the whole box. */
+  selectionMask?: { x1: number; y1: number; x2: number; y2: number; bits: Uint8Array } | null;
   /** Spawn/home position in editor pixel coords — drawn as a marker on the map. */
   spawnPos?: { px: number; py: number } | null;
   /** Creature list from get_creatures() — drawn as coloured dots when non-empty. */
@@ -185,11 +267,11 @@ interface Props {
 type TileJob = { key: string; x1: number; y1: number; x2: number; y2: number };
 
 const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
-  { world, worldEpoch, tool, viewMode, zSliceZ,
+  { world, worldEpoch, tool, viewMode, zSliceZ, viewCapZ = null,
     committedSelection, onSelectionChange, pastePreview, clipboardPreviewPixels, onPasteAt,
     renderMode, axoSkew = 0.2, lockedPastePos = null,
-    drawConfig, onDrawStroke, drawZOverride = null,
-    extrudePreview = null, lastPasteDelta = null, onCursorMove, onMagicWand,
+    drawConfig, onDrawStroke, onSculptStroke, onCancelStroke, drawZOverride = null,
+    extrudePreview = null, lastPasteDelta = null, onCursorMove, onMagicWand, onLassoSelect, selectionMask = null,
     spawnPos = null, creatures = [],
     pasteElevationOffset = 0, onEyedropper, sliceLines = null,
     cameraPos3d = null, onSetCamera3d,
@@ -226,6 +308,19 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   const accumTimerRef = useRef<number | null>(null);
   const accumFiredRef = useRef(false);
   const accumBusyRef = useRef(false); // a tick's async edit is still in flight — skip overlaps
+  // Live-brush sculpt (Row 6): stamp centres queued since the last flush, the last centre we emitted
+  // (spacing origin), the fractional distance carried between pointer-move segments, the anchor column
+  // captured at pointer-down (flatten/slope), and the cancel/settle plumbing for Escape mid-stroke.
+  const pendingStampsRef = useRef<[number, number][]>([]);
+  const lastStampPosRef = useRef<WP | null>(null);
+  const stampDistAccumRef = useRef(0);
+  const strokeAnchorRef = useRef<[number, number]>([0, 0]);
+  const strokeCancelledRef = useRef(false);
+  const sculptFlushPromiseRef = useRef<Promise<void> | null>(null);
+  // Smear: forced-timer sculpt tool with no swept-path meaning of its own — each tick needs the
+  // drag delta *since the previous tick*, not since stroke-start, so it advects continuously
+  // rather than jumping the full drag distance in one commit.
+  const smearLastPosRef = useRef<WP | null>(null);
   // Polygon tool: click-accumulated vertices (committed on click-near-start / double-click).
   const polyVertsRef = useRef<WP[]>([]);
   // Stroke stabilizer: fractional low-passed pointer position that the freehand stamp follows.
@@ -237,6 +332,14 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   const viewModeRef     = useRef(viewMode);
   const zSliceZRef      = useRef(zSliceZ);
   const committedSelRef = useRef<SelectionBounds | null>(committedSelection);
+  const selectionMaskRef = useRef(selectionMask);
+  // Offscreen w×h bitmap (violet where a cell is set) + traced contour loops, cached by mask identity
+  // so draw() just blits the fill and strokes the outline instead of recomputing them each frame.
+  const maskCanvasCacheRef = useRef<{ mask: typeof selectionMask; canvas: HTMLCanvasElement; outline: OutlinePt[][] } | null>(null);
+  // Which selection edge the cursor is currently over — lights up that edge's grip in draw().
+  const hoverEdgeRef = useRef<"x1" | "x2" | "y1" | "y2" | null>(null);
+  // Cursor is over the 3D camera dot — brightens its grab-ring and shows the drag caption.
+  const camHoverRef = useRef(false);
   const pastePreviewRef = useRef(pastePreview);
   const pasteHoverRef   = useRef<WorldPoint | null>(null);
   const cursorPosRef    = useRef<WorldPoint | null>(null);
@@ -245,12 +348,15 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   const lockedPastePosRef = useRef(lockedPastePos);
   const drawConfigRef     = useRef(drawConfig);
   const onDrawStrokeRef   = useRef(onDrawStroke);
+  const onSculptStrokeRef = useRef(onSculptStroke);
+  const onCancelStrokeRef = useRef(onCancelStroke);
   const drawZOverrideRef  = useRef(drawZOverride);
   const extrudePreviewRef = useRef(extrudePreview);
   const lastPasteDeltaRef = useRef(lastPasteDelta);
   const onCursorMoveRef   = useRef(onCursorMove);
   const onMapContextMenuRef = useRef(onMapContextMenu);
   const onMagicWandRef      = useRef(onMagicWand);
+  const onLassoSelectRef    = useRef(onLassoSelect);
   const spawnPosRef         = useRef(spawnPos);
   const creaturesRef        = useRef(creatures);
   const sliceLinesRef       = useRef(sliceLines);
@@ -261,6 +367,38 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   const onSelectDragUpdateRef = useRef(onSelectDragUpdate);
   const onMoveSelectionRef = useRef(onMoveSelection);
   const moveWithContentsRef = useRef(moveWithContents);
+  // Monotonic per-stroke id: bumped once at every stroke/gesture start (draw-stroke, sculpt-grab)
+  // and threaded through every onDrawStroke call of that stroke (timer ticks + the final commit) so
+  // grouped sculpt stamps coalesce into a single undo unit. See lib.rs's grouped-undo contract.
+  const strokeIdRef = useRef(0);
+
+  // Live-brush sculpt flush (Row 6): drain the queued stamp centres into a single batched
+  // `onSculptStroke` call. Flush discipline is the proven `accumBusyRef` one — exactly one call in
+  // flight; each carries every centre queued since the last flush, so a slow backend self-throttles
+  // into fewer, bigger batches rather than a queue backlog. A stroke cancelled by Escape drops any
+  // pending stamps and never re-drains. Held in a ref so it can self-reschedule from its own `finally`.
+  const flushSculptRef = useRef<(strokeId: number) => void>(() => {});
+  flushSculptRef.current = (strokeId: number) => {
+    if (accumBusyRef.current || strokeCancelledRef.current) return;
+    const cfg = drawConfigRef.current;
+    const send = onSculptStrokeRef.current;
+    if (!cfg || !send) return;
+    const batch = pendingStampsRef.current;
+    if (batch.length === 0) return;
+    pendingStampsRef.current = [];
+    accumBusyRef.current = true;
+    accumFiredRef.current = true;
+    const p = Promise.resolve(send(batch, cfg.sculptRadius, strokeId, strokeAnchorRef.current))
+      .finally(() => {
+        accumBusyRef.current = false;
+        sculptFlushPromiseRef.current = null;
+        // Drain anything queued while this call was in flight (unless the stroke was cancelled).
+        if (!strokeCancelledRef.current && pendingStampsRef.current.length > 0) {
+          flushSculptRef.current(strokeId);
+        }
+      });
+    sculptFlushPromiseRef.current = p;
+  };
 
   useEffect(() => {
     toolRef.current = tool;
@@ -270,11 +408,15 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     // branch of handleDrawStroke, which reads the current tool. No draw() call here (it isn't
     // declared yet); a tool change re-renders MapCanvas and the no-deps draw effect below repaints.
     const d = dragRef.current;
-    if (d && (d.kind === "draw-stroke" || d.kind === "sculpt-grab" || d.kind === "draw-shape")) {
+    if (d && (d.kind === "draw-stroke" || d.kind === "sculpt-grab" || d.kind === "draw-shape" || d.kind === "lasso")) {
       dragRef.current = null;
       if (accumTimerRef.current !== null) { clearInterval(accumTimerRef.current); accumTimerRef.current = null; }
       accumFiredRef.current = false;
       accumBusyRef.current = false;
+      // A live sculpt stroke abandoned by a tool swap: block any queued flush and drop pending stamps.
+      // The already-committed stamps stay (the stroke is simply ended early, like releasing the mouse).
+      strokeCancelledRef.current = true;
+      pendingStampsRef.current = [];
     }
     // Leaving the polygon tool abandons an unclosed polygon.
     if (tool !== "polygon") polyVertsRef.current = [];
@@ -284,12 +426,16 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   useEffect(() => { lockedPastePosRef.current = lockedPastePos; }, [lockedPastePos]);
   useEffect(() => { drawConfigRef.current = drawConfig; }, [drawConfig]);
   useEffect(() => { onDrawStrokeRef.current = onDrawStroke; }, [onDrawStroke]);
+  useEffect(() => { onSculptStrokeRef.current = onSculptStroke; }, [onSculptStroke]);
+  useEffect(() => { onCancelStrokeRef.current = onCancelStroke; }, [onCancelStroke]);
   useEffect(() => { drawZOverrideRef.current = drawZOverride; }, [drawZOverride]);
   useEffect(() => { extrudePreviewRef.current = extrudePreview; }, [extrudePreview]);
   useEffect(() => { lastPasteDeltaRef.current = lastPasteDelta; }, [lastPasteDelta]);
   useEffect(() => { onCursorMoveRef.current = onCursorMove; }, [onCursorMove]);
   useEffect(() => { onMapContextMenuRef.current = onMapContextMenu; }, [onMapContextMenu]);
   useEffect(() => { onMagicWandRef.current     = onMagicWand;         }, [onMagicWand]);
+  useEffect(() => { onLassoSelectRef.current   = onLassoSelect;       }, [onLassoSelect]);
+  useEffect(() => { selectionMaskRef.current   = selectionMask;       }, [selectionMask]);
   useEffect(() => { spawnPosRef.current        = spawnPos;            }, [spawnPos]);
   useEffect(() => { creaturesRef.current       = creatures;           }, [creatures]);
   useEffect(() => { sliceLinesRef.current      = sliceLines;           }, [sliceLines]);
@@ -431,14 +577,89 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
         ctx.drawImage(drag.ghost, rx, ry, rw, rh);
         ctx.globalAlpha = 1;
       }
-      ctx.fillStyle   = "rgba(59, 130, 246, 0.18)";
-      ctx.fillRect(rx, ry, rw, rh);
-      ctx.strokeStyle = "rgba(255, 255, 255, 0.9)";
-      ctx.lineWidth   = 2;
-      ctx.strokeRect(rx + 0.5, ry + 0.5, rw - 1, rh - 1);
-      ctx.strokeStyle = "rgba(59, 130, 246, 1)";
-      ctx.lineWidth   = 1;
-      ctx.strokeRect(rx + 2.5, ry + 2.5, rw - 5, rh - 5);
+      // Shaped selection (wand/lasso): fill only the mask's set cells instead of the whole box, but
+      // only while idle — the mask's bbox is frozen to the rect it was built for, so mid-drag states
+      // (marquee/resize/move) would show a stale, misaligned footprint.
+      const mask = !drag ? selectionMaskRef.current : null;
+      const maskMatches = mask && mask.x1 === wx1 && mask.y1 === wy1 && mask.x2 === wx2 && mask.y2 === wy2;
+      if (maskMatches && mask) {
+        let cached = maskCanvasCacheRef.current;
+        if (!cached || cached.mask !== mask) {
+          const mw = mask.x2 - mask.x1 + 1, mh = mask.y2 - mask.y1 + 1;
+          const off = document.createElement("canvas");
+          off.width = mw; off.height = mh;
+          const octx = off.getContext("2d")!;
+          const img = octx.createImageData(mw, mh);
+          for (let i = 0; i < mw * mh; i++) {
+            const set = (mask.bits[i >> 3] >> (i & 7)) & 1;
+            if (set) {
+              img.data[i * 4] = 168; img.data[i * 4 + 1] = 85; img.data[i * 4 + 2] = 247; img.data[i * 4 + 3] = 110;
+            }
+          }
+          octx.putImageData(img, 0, 0);
+          cached = { mask, canvas: off, outline: maskOutline(mask) };
+          maskCanvasCacheRef.current = cached;
+        }
+        ctx.imageSmoothingEnabled = false;
+        ctx.drawImage(cached.canvas, rx, ry, rw, rh);
+        ctx.imageSmoothingEnabled = true;
+        // Stroke the shape's actual contour (grid-corner loops → screen space) instead of the bbox
+        // rectangle, so the outline hugs the wand/lasso footprint. Same white-underlay + blue idiom.
+        const strokeOutline = (color: string, width: number) => {
+          ctx.strokeStyle = color;
+          ctx.lineWidth = width;
+          ctx.beginPath();
+          for (const loop of cached.outline) {
+            for (let i = 0; i < loop.length; i++) {
+              const sx = loop[i].x * scale + vx;
+              const sy = loop[i].y * scale + vy;
+              if (i === 0) ctx.moveTo(sx, sy); else ctx.lineTo(sx, sy);
+            }
+            ctx.closePath();
+          }
+          ctx.stroke();
+        };
+        strokeOutline("rgba(255, 255, 255, 0.9)", 2);
+        strokeOutline("rgba(59, 130, 246, 1)", 1);
+      } else {
+        ctx.fillStyle   = "rgba(59, 130, 246, 0.18)";
+        ctx.fillRect(rx, ry, rw, rh);
+        ctx.strokeStyle = "rgba(255, 255, 255, 0.9)";
+        ctx.lineWidth   = 2;
+        ctx.strokeRect(rx + 0.5, ry + 0.5, rw - 1, rh - 1);
+        ctx.strokeStyle = "rgba(59, 130, 246, 1)";
+        ctx.lineWidth   = 1;
+        ctx.strokeRect(rx + 2.5, ry + 2.5, rw - 5, rh - 5);
+      }
+
+      // Resize grips. These used to exist only as a 6px hover hit-zone and a cursor change, so a
+      // resizable selection looked exactly like a fixed one — nobody discovered the gesture. Drawn
+      // always (dim), lit up on hover. Suppressed while dragging: the drag itself is the feedback,
+      // and a marquee-in-progress has no edges to grab yet.
+      const grip = dragRef.current?.kind === "select" ? null : hoverEdgeRef.current;
+      const showGrips = !dragRef.current || dragRef.current.kind === "resizeEdge";
+      if (showGrips && rw > 3 * GRIP_LEN && rh > 3 * GRIP_LEN) {
+        const mx = rx + rw / 2, my = ry + rh / 2;
+        const bars: [("x1"|"x2"|"y1"|"y2"), number, number, number, number][] = [
+          ["x1", rx - GRIP_W / 2,  my - GRIP_LEN / 2, GRIP_W,   GRIP_LEN],
+          ["x2", rx + rw - GRIP_W / 2, my - GRIP_LEN / 2, GRIP_W, GRIP_LEN],
+          ["y1", mx - GRIP_LEN / 2, ry - GRIP_W / 2,  GRIP_LEN, GRIP_W],
+          ["y2", mx - GRIP_LEN / 2, ry + rh - GRIP_W / 2, GRIP_LEN, GRIP_W],
+        ];
+        for (const [edge, gx, gy, gw, gh] of bars) {
+          const on = grip === edge;
+          // Dark drop-shadow behind the bar so it reads against sand/snow/cloud as well as grass —
+          // a plain white bar disappeared on light terrain, which was half of why these were still
+          // hard to spot even after they were drawn at rest.
+          ctx.fillStyle = "rgba(0,0,0,0.5)";
+          ctx.fillRect(gx - 1, gy - 1, gw + 2, gh + 2);
+          ctx.fillStyle   = on ? "#ffffff" : "rgba(255,255,255,0.85)";
+          ctx.strokeStyle = on ? "#60a5fa" : "rgba(37,99,235,0.95)";
+          ctx.lineWidth   = 1;
+          ctx.fillRect(gx, gy, gw, gh);
+          ctx.strokeRect(gx + 0.5, gy + 0.5, gw - 1, gh - 1);
+        }
+      }
     }
 
     // X/Y extrude ghost — dashed sky-blue copies of the selection along X or Y
@@ -524,6 +745,28 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
         ctx.arc(cpx, cpy, 2.5, 0, Math.PI * 2);
         ctx.fillStyle = "#fff";
         ctx.fill();
+        // The dot is draggable (it teleports the 3D camera), but nothing said so — the only cue was
+        // a cursor change *after* you'd already hovered it. A dashed grab-ring at rest, plus a
+        // caption once hovered.
+        if (onSetCamera3dRef.current) {
+          ctx.setLineDash([3, 3]);
+          ctx.strokeStyle = camHoverRef.current ? "rgba(52,211,153,0.95)" : "rgba(52,211,153,0.45)";
+          ctx.lineWidth = 1;
+          ctx.beginPath();
+          ctx.arc(cpx, cpy, 12, 0, Math.PI * 2);
+          ctx.stroke();
+          ctx.setLineDash([]);
+          if (camHoverRef.current) {
+            ctx.font = "10px monospace";
+            ctx.textBaseline = "middle";
+            const label = "drag to move the 3D camera";
+            const tw = ctx.measureText(label).width;
+            ctx.fillStyle = "rgba(0,0,0,0.6)";
+            ctx.fillRect(cpx + 15, cpy - 8, tw + 8, 16);
+            ctx.fillStyle = "#6ee7b7";
+            ctx.fillText(label, cpx + 19, cpy + 0.5);
+          }
+        }
         ctx.restore();
       }
     }
@@ -676,7 +919,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
       const paintPt = (wx: number, wy: number) => {
         ctx.fillRect(Math.round(wx * scale + vx), Math.round(wy * scale + vy), gs, gs);
       };
-      if (drag?.kind === "draw-stroke") {
+      if (drag?.kind === "draw-stroke" && !drag.live) {
         ctx.fillStyle = "rgba(56,189,248,0.55)";
         for (const key of drag.pts) {
           const ci = key.indexOf(",");
@@ -711,6 +954,17 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
           ctx.strokeRect(Math.round(bx1 * scale + vx) + 0.5, Math.round(by1 * scale + vy) + 0.5,
             Math.round((bx2 - bx1 + 1) * scale), Math.round((by2 - by1 + 1) * scale));
         }
+      } else if (drag?.kind === "lasso" && drag.pts.length > 0) {
+        // Lasso-in-progress: freehand path traced so far, closed back to the start with a rubber band.
+        const toS = (p: WP) => ({ x: Math.round(p.x * scale + vx) + gs / 2, y: Math.round(p.y * scale + vy) + gs / 2 });
+        ctx.strokeStyle = "rgba(168,85,247,0.9)";
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        const s0 = toS(drag.pts[0]);
+        ctx.moveTo(s0.x, s0.y);
+        for (let i = 1; i < drag.pts.length; i++) { const s = toS(drag.pts[i]); ctx.lineTo(s.x, s.y); }
+        ctx.lineTo(s0.x, s0.y);
+        ctx.stroke();
       } else if (drawTool === "polygon" && polyVertsRef.current.length > 0) {
         // Polygon-in-progress: vertices + edges + rubber-band to cursor.
         const verts = polyVertsRef.current;
@@ -730,18 +984,51 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
           ctx.fillStyle = i === 0 ? "#22c55e" : "#38bdf8";
           ctx.beginPath(); ctx.arc(s.x, s.y, i === 0 ? 4 : 3, 0, Math.PI * 2); ctx.fill();
         }
-      } else if (!drag && (isFreehand(drawTool) || drawTool === "grab" || isSculptStroke(drawTool) || drawTool === "fill") && cfg) {
-        // Cursor preview when hovering (not dragging)
+      } else if ((!drag || (drag.kind === "draw-stroke" && drag.live)) && (isFreehand(drawTool) || drawTool === "grab" || isSculptStroke(drawTool) || drawTool === "fill") && cfg) {
+        // Cursor preview when hovering (not dragging), and during a live sculpt stroke (the swept
+        // ghost is suppressed there — the patch round-trip is the real feedback, this is just the brush).
         const pos = cursorPosRef.current;
         if (pos) {
           const isSculpt = drawTool === "grab" || isSculptStroke(drawTool);
-          const pts = isSculpt
-            ? brushFootprint(pos, cfg.sculptRadius * 2 + 1, "circ")
-            : (drawTool === "pen" || drawTool === "fill")
+          if (isSculpt) {
+            // Falloff-aware brush preview: per-cell alpha from the same dome math the backend
+            // applies per stamp, so the ghost actually predicts what a click will do — replaces
+            // the old flat-orange-disc (CLAUDE.md's audit flagged this as no-feedback-at-all).
+            const { sculptRadius: radius, sculptSoftness: softness, sculptProfile: profile } = cfg;
+            const ringX = pos.x * scale + vx + gs / 2, ringY = pos.y * scale + vy + gs / 2;
+            if (gs < 2) {
+              // Too zoomed out for per-cell alpha to read — draw rings only: outer radius, and
+              // (when soft) an inner full-strength ring at the flat-weight-1 core.
+              const ring = (r: number, alpha: number) => {
+                ctx.strokeStyle = `rgba(251,146,60,${alpha})`;
+                ctx.lineWidth = 1;
+                ctx.beginPath();
+                ctx.arc(ringX, ringY, r * scale, 0, Math.PI * 2);
+                ctx.stroke();
+              };
+              ring(radius, 0.85);
+              if (softness > 0) ring(radius * (1 - softness), 0.45);
+            } else {
+              const pts = brushFootprint(pos, radius * 2 + 1, "circ");
+              for (const p of pts) {
+                const d = Math.hypot(p.x - pos.x, p.y - pos.y);
+                const w = sculptWeightAt(d, radius, softness, profile);
+                ctx.fillStyle = `rgba(251,146,60,${(0.55 * w).toFixed(3)})`;
+                paintPt(p.x, p.y);
+              }
+              ctx.strokeStyle = "rgba(251,146,60,0.85)";
+              ctx.lineWidth = 1;
+              ctx.beginPath();
+              ctx.arc(ringX, ringY, radius * scale, 0, Math.PI * 2);
+              ctx.stroke();
+            }
+          } else {
+            const pts = (drawTool === "pen" || drawTool === "fill")
               ? [pos]
               : brushFootprint(pos, cfg.brushSize, cfg.brushShape);
-          ctx.fillStyle = isSculpt ? "rgba(251,146,60,0.45)" : drawTool === "fill" ? "rgba(52,211,153,0.55)" : "rgba(56,189,248,0.4)";
-          for (const p of pts) paintPt(p.x, p.y);
+            ctx.fillStyle = drawTool === "fill" ? "rgba(52,211,153,0.55)" : "rgba(56,189,248,0.4)";
+            for (const p of pts) paintPt(p.x, p.y);
+          }
         }
       }
     }
@@ -1123,7 +1410,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [worldEpoch]);
 
-  // Invalidate everything when view mode, z-level, or world changes
+  // Invalidate everything when view mode, z-level, cutaway cap, or world changes
   useEffect(() => {
     viewModeRef.current = viewMode;
     zSliceZRef.current  = zSliceZ;
@@ -1134,7 +1421,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     queueRef.current = [];
     fullCanvasRef.current = null;
     ensureTiles();
-  }, [viewMode, zSliceZ, worldEpoch, ensureTiles]);
+  }, [viewMode, zSliceZ, viewCapZ, worldEpoch, ensureTiles]);
 
   // Invalidate everything when render mode changes
   useEffect(() => {
@@ -1194,13 +1481,32 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
       const fc = fullCanvasRef.current;
       if (!fc) return null;
       octx.drawImage(fc, sel.x1, sel.y1, w, h, 0, 0, w, h);
-      return off;
+    } else {
+      for (const [key, tile] of tileCacheRef.current) {
+        const comma = key.indexOf(",");
+        const tx = parseInt(key.slice(0, comma)) * TILE;
+        const ty = parseInt(key.slice(comma + 1)) * TILE;
+        octx.drawImage(tile, tx - sel.x1, ty - sel.y1);
+      }
     }
-    for (const [key, tile] of tileCacheRef.current) {
-      const comma = key.indexOf(",");
-      const tx = parseInt(key.slice(0, comma)) * TILE;
-      const ty = parseInt(key.slice(comma + 1)) * TILE;
-      octx.drawImage(tile, tx - sel.x1, ty - sel.y1);
+    // Shaped selection: punch the ghost down to the mask so holes reveal the map beneath during a
+    // move-drag. Build a fresh binary-alpha stencil (not the violet overlay cache) and keep only
+    // masked pixels via destination-in. Only when the mask's bbox exactly matches this selection.
+    const mask = selectionMaskRef.current;
+    if (mask && mask.x1 === sel.x1 && mask.y1 === sel.y1 && mask.x2 === sel.x2 && mask.y2 === sel.y2) {
+      const stencil = document.createElement("canvas");
+      stencil.width = w; stencil.height = h;
+      const sctx = stencil.getContext("2d");
+      if (sctx) {
+        const img = sctx.createImageData(w, h);
+        for (let i = 0; i < w * h; i++) {
+          if ((mask.bits[i >> 3] >> (i & 7)) & 1) img.data[i * 4 + 3] = 255; // opaque where selected
+        }
+        sctx.putImageData(img, 0, 0);
+        octx.globalCompositeOperation = "destination-in";
+        octx.drawImage(stencil, 0, 0);
+        octx.globalCompositeOperation = "source-over";
+      }
     }
     return off;
   }, []);
@@ -1214,17 +1520,53 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     if (verts.length >= 2 && onDrawStrokeRef.current) {
       const mode: FillMode = drawConfigRef.current?.fillMode ?? "fill";
       const pts = polygonPixels(verts, mode);
-      if (pts.length > 0) onDrawStrokeRef.current(pts.map(p => [p.x, p.y]), drawZOverrideRef.current);
+      strokeIdRef.current++; // one polygon fill = one undo group
+      if (pts.length > 0) onDrawStrokeRef.current(pts.map(p => [p.x, p.y]), drawZOverrideRef.current, undefined, undefined, strokeIdRef.current);
     }
     draw();
   }, [draw]);
 
-  // Escape cancels an in-progress polygon (before it reaches App's global Escape handler).
+  // Escape cancels an in-progress polygon, or an in-progress drag (marquee select, rect/ellipse/
+  // line shape, selection move, selection edge resize) before it reaches App's global Escape
+  // handler. Gated on !typing for the same reason App's Escape is: Escape in the world-name field
+  // is "revert my edit", not "throw away the gesture I'm halfway through".
   useEffect(() => {
+    const CANCELLABLE_DRAGS: Exclude<DragOp, null>["kind"][] = ["select", "draw-shape", "moveSel", "resizeEdge", "sculpt-grab", "lasso"];
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape" && polyVertsRef.current.length > 0) {
+      if (e.key !== "Escape" || isTypingTarget(e.target)) return;
+      if (polyVertsRef.current.length > 0) {
         e.stopPropagation();
         polyVertsRef.current = [];
+        draw();
+        return;
+      }
+      const drag = dragRef.current;
+      // Live-brush sculpt: cancel = stop stamping, drop pending, and undo the whole grouped stroke.
+      // Set the cancel flag first (blocks any queued flush), then wait for the in-flight flush to
+      // settle before firing exactly one undo — otherwise a late flush would land after the undo.
+      if (drag?.kind === "draw-stroke" && drag.live) {
+        e.stopPropagation();
+        strokeCancelledRef.current = true;
+        pendingStampsRef.current = [];
+        if (accumTimerRef.current !== null) { clearInterval(accumTimerRef.current); accumTimerRef.current = null; }
+        dragRef.current = null;
+        const fired = accumFiredRef.current;
+        accumFiredRef.current = false;
+        const canvas = canvasRef.current;
+        if (canvas) canvas.style.cursor = TOOL_CURSOR[toolRef.current];
+        draw();
+        if (fired) {
+          const inflight = sculptFlushPromiseRef.current;
+          Promise.resolve(inflight).finally(() => { onCancelStrokeRef.current?.(); });
+        }
+        return;
+      }
+      if (drag && CANCELLABLE_DRAGS.includes(drag.kind)) {
+        e.stopPropagation();
+        dragRef.current = null;
+        if (drag.kind === "select" || drag.kind === "moveSel") onSelectDragUpdateRef.current?.(null);
+        const canvas = canvasRef.current;
+        if (canvas) canvas.style.cursor = TOOL_CURSOR[toolRef.current];
         draw();
       }
     };
@@ -1270,6 +1612,12 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
       onMagicWandRef.current?.(wp.x, wp.y);
       return;
     }
+    if (toolRef.current === "lasso") {
+      const wp = screenToWorld(e.clientX, e.clientY);
+      dragRef.current = { kind: "lasso", pts: [wp] };
+      draw();
+      return;
+    }
     if (toolRef.current === "eyedropper") {
       const wp = screenToWorld(e.clientX, e.clientY);
       onEyedropperRef.current?.(wp.x, wp.y);
@@ -1288,7 +1636,15 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
           return;
         }
         const wpIn = screenToWorld(e.clientX, e.clientY);
-        if (wpIn.x >= sel.x1 && wpIn.x <= sel.x2 && wpIn.y >= sel.y1 && wpIn.y <= sel.y2) {
+        // Shaped selection: a click on a hole in the traced footprint is outside the shape, so it
+        // starts a fresh marquee (consistent with clicking outside the box) rather than a move.
+        const mask = selectionMaskRef.current;
+        let inHole = false;
+        if (mask && mask.x1 === sel.x1 && mask.y1 === sel.y1 && mask.x2 === sel.x2 && mask.y2 === sel.y2) {
+          const bi = (wpIn.y - mask.y1) * (mask.x2 - mask.x1 + 1) + (wpIn.x - mask.x1);
+          inHole = !((mask.bits[bi >> 3] >> (bi & 7)) & 1);
+        }
+        if (!inHole && wpIn.x >= sel.x1 && wpIn.x <= sel.x2 && wpIn.y >= sel.y1 && wpIn.y <= sel.y2) {
           // Click-drag inside the committed selection (not on a resize edge) moves it with
           // its contents (E2) instead of starting a new marquee.
           (e.target as HTMLCanvasElement).style.cursor = "move";
@@ -1310,6 +1666,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
       const cfg = drawConfigRef.current;
       const disc = cfg ? brushFootprint(wp, cfg.sculptRadius * 2 + 1, "circ") : [wp];
       const pts = new Set<string>(disc.map(p => `${p.x},${p.y}`));
+      strokeIdRef.current++; // grab is a single-commit stroke, but still its own undo group
       dragRef.current = { kind: "sculpt-grab", pts, cx: wp.x, cy: wp.y, downClientY: e.clientY, delta: 0 };
       draw();
     } else if (toolRef.current === "polygon") {
@@ -1332,31 +1689,67 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
       const wp = screenToWorld(e.clientX, e.clientY);
       const cfg = drawConfigRef.current;
       const isSculpt = isSculptStroke(toolRef.current);
+      strokeIdRef.current++; // new stroke → new undo group (shared by every stamp of this stroke)
+      const strokeId = strokeIdRef.current;
       smoothPosRef.current = { x: wp.x, y: wp.y }; // stabilizer origin
-      const footprint = stampFootprint(wp, toolRef.current, cfg);
+      // Live-brush sculpt (Row 6): the primary model when Live brush is ON — every sculpt tool except
+      // smear (which keeps its own per-tick advect path). OFF = legacy one-shot swept commit.
+      const liveSculpt = isSculpt && cfg?.sculptAccumulate === true && toolRef.current !== "smear";
+      const footprint = liveSculpt ? [] : stampFootprint(wp, toolRef.current, cfg);
       const pts = new Set<string>(footprint.map(p => `${p.x},${p.y}`));
-      dragRef.current = { kind: "draw-stroke", pts, lastWX: wp.x, lastWY: wp.y, startWX: wp.x, startWY: wp.y };
-      // Hold-to-build / spray: re-stamp the current cursor footprint on a timer. Each tick is
-      // its own edit (own undo step), like an airbrush.
+      dragRef.current = { kind: "draw-stroke", pts, lastWX: wp.x, lastWY: wp.y, startWX: wp.x, startWY: wp.y, live: liveSculpt };
       accumFiredRef.current = false;
       accumBusyRef.current = false;
       if (accumTimerRef.current !== null) { clearInterval(accumTimerRef.current); accumTimerRef.current = null; }
-      const wantTimer = toolRef.current === "spray"
-        || (isSculpt && cfg?.sculptAccumulate && toolRef.current !== "flatten");
-      if (wantTimer) {
-        const anchor: [number, number] = [wp.x, wp.y];
-        const timerTool = toolRef.current;
+      if (liveSculpt) {
+        // Stamp on pointer-down, emit more by spacing on pointer-move, re-stamp in place on dwell —
+        // the standard brush-engine model. Centres batch through flushSculptRef (one call in flight).
+        pendingStampsRef.current = [];
+        stampDistAccumRef.current = 0;
+        lastStampPosRef.current = { x: wp.x, y: wp.y };
+        strokeAnchorRef.current = [wp.x, wp.y]; // flatten/slope converge toward this plane
+        strokeCancelledRef.current = false;
+        sculptFlushPromiseRef.current = null;
+        pendingStampsRef.current.push([wp.x, wp.y]);
+        flushSculptRef.current(strokeId);
+        // Dwell timer: while the cursor sits on the last stamped cell, keep re-stamping it (airbrush).
         accumTimerRef.current = window.setInterval(() => {
+          if (strokeCancelledRef.current) return;
           const cur = cursorPosRef.current;
-          const c = drawConfigRef.current;
-          if (!cur || !c || !onDrawStrokeRef.current || accumBusyRef.current) return;
-          const fp = stampFootprint(cur, timerTool, c);
-          if (fp.length === 0) return;
-          accumFiredRef.current = true;
-          accumBusyRef.current = true;
-          Promise.resolve(onDrawStrokeRef.current(fp.map(p => [p.x, p.y]), drawZOverrideRef.current, anchor))
-            .finally(() => { accumBusyRef.current = false; });
+          const lastS = lastStampPosRef.current;
+          if (!cur || !lastS || cur.x !== lastS.x || cur.y !== lastS.y) return;
+          pendingStampsRef.current.push([cur.x, cur.y]);
+          flushSculptRef.current(strokeId);
         }, 140);
+      } else {
+        // Legacy hold-to-build / spray / smear timer. Sculpt with Live brush OFF is a one-shot swept
+        // commit (no timer); Spray and Smear force a per-tick timer regardless (each tick its own edit).
+        const wantTimer = toolRef.current === "spray" || toolRef.current === "smear";
+        if (wantTimer) {
+          const anchor: [number, number] = [wp.x, wp.y];
+          const timerTool = toolRef.current;
+          smearLastPosRef.current = timerTool === "smear" ? { x: wp.x, y: wp.y } : null;
+          accumTimerRef.current = window.setInterval(() => {
+            const cur = cursorPosRef.current;
+            const c = drawConfigRef.current;
+            if (!cur || !c || !onDrawStrokeRef.current || accumBusyRef.current) return;
+            let smear: [number, number] | undefined;
+            if (timerTool === "smear") {
+              const last = smearLastPosRef.current;
+              if (!last) return;
+              const dx = Math.round(cur.x - last.x), dy = Math.round(cur.y - last.y);
+              if (dx === 0 && dy === 0) return; // no movement this tick — nothing to smear
+              smearLastPosRef.current = { x: cur.x, y: cur.y };
+              smear = [dx, dy];
+            }
+            const fp = stampFootprint(cur, timerTool, c);
+            if (fp.length === 0) return;
+            accumFiredRef.current = true;
+            accumBusyRef.current = true;
+            Promise.resolve(onDrawStrokeRef.current(fp.map(p => [p.x, p.y]), drawZOverrideRef.current, anchor, undefined, strokeId, smear))
+              .finally(() => { accumBusyRef.current = false; });
+          }, 140);
+        }
       }
       draw();
     } else if (toolRef.current === "fill") {
@@ -1367,6 +1760,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
       draw();
     } else if (isShapeTool(toolRef.current)) {
       const wp = screenToWorld(e.clientX, e.clientY);
+      strokeIdRef.current++; // one shape = one undo group
       dragRef.current = { kind: "draw-shape", tool: toolRef.current as "rect" | "ellipse" | "line", start: wp, end: wp };
       draw();
     } else {
@@ -1391,8 +1785,10 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
         const { x: vx2, y: vy2, scale: s2 } = viewRef.current;
         const iconX = cp.x * s2 + vx2, iconY = cp.y * s2 + vy2;
         const dx = lp.x - iconX, dy = lp.y - iconY;
+        const over = dx * dx + dy * dy <= 144;
+        if (over !== camHoverRef.current) { camHoverRef.current = over; scheduleDraw(); }
         const canvas = canvasRef.current;
-        if (canvas) canvas.style.cursor = (dx * dx + dy * dy <= 144) ? "move" : "";
+        if (canvas) canvas.style.cursor = over ? "move" : "";
       }
     }
     if (drag?.kind === "pan") {
@@ -1411,6 +1807,44 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
         // Up-drag raises, down-drag lowers. 1 block per ~6 screen px, scaled by zoom.
         const pxPerBlock = Math.max(3, viewRef.current.scale * 0.9);
         drag.delta = Math.round((drag.downClientY - e.clientY) / pxPerBlock);
+      } else if (drag?.kind === "draw-stroke" && drag.live) {
+        // Live-brush sculpt: emit a stamp centre every `spacing` cells of travel along the path,
+        // then batch-flush. The dwell timer handles a stationary cursor; this handles the drag.
+        const cfg = drawConfigRef.current;
+        if (strokeCancelledRef.current) return;
+        const spacing = Math.max(1, Math.round((cfg?.sculptRadius ?? 4) * 0.5));
+        // Stabilizer low-passes the centre path (audit §I asked to extend it to sculpt strokes).
+        let target = wp;
+        if (cfg?.strokeStabilizer && smoothPosRef.current) {
+          const s = smoothPosRef.current;
+          s.x += (wp.x - s.x) * 0.35;
+          s.y += (wp.y - s.y) * 0.35;
+          target = { x: Math.round(s.x), y: Math.round(s.y) };
+        }
+        // Walk from the *previous cursor* (not the last stamp) so incremental travel is counted once;
+        // `stampDistAccumRef` carries the sub-spacing remainder between moves, and we subtract spacing
+        // per emit (rather than zeroing) to keep stamps evenly spaced across move boundaries.
+        const from = { x: drag.lastWX, y: drag.lastWY };
+        const line = bresenhamLine(from, target);
+        let acc = stampDistAccumRef.current;
+        let prev = from;
+        let emitted = false;
+        for (const lp of line) {
+          acc += Math.hypot(lp.x - prev.x, lp.y - prev.y);
+          prev = lp;
+          if (acc >= spacing) {
+            pendingStampsRef.current.push([lp.x, lp.y]);
+            lastStampPosRef.current = { x: lp.x, y: lp.y };
+            acc -= spacing;
+            emitted = true;
+          }
+        }
+        stampDistAccumRef.current = acc;
+        drag.lastWX = target.x;
+        drag.lastWY = target.y;
+        if (emitted) flushSculptRef.current(strokeIdRef.current);
+        scheduleDraw();
+        return;
       } else if (drag?.kind === "draw-stroke") {
         const cfg = drawConfigRef.current;
         // While a hold-to-build / spray timer is running, don't grow the swept set (the timer
@@ -1440,6 +1874,13 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
           x1: Math.min(drag.start.x, wp.x), y1: Math.min(drag.start.y, wp.y),
           x2: Math.max(drag.start.x, wp.x), y2: Math.max(drag.start.y, wp.y),
         });
+      } else if (drag?.kind === "lasso") {
+        // Append the next point only once the cursor has moved into a new integer cell — freehand
+        // drags fire many pointermoves per cell, and polygonPixels only needs the distinct path.
+        const last = drag.pts[drag.pts.length - 1];
+        if (!last || Math.round(last.x) !== Math.round(wp.x) || Math.round(last.y) !== Math.round(wp.y)) {
+          drag.pts.push(wp);
+        }
       } else if (drag?.kind === "moveSel") {
         const mdx = Math.round(wp.x - drag.start.x);
         const mdy = Math.round(wp.y - drag.start.y);
@@ -1464,10 +1905,12 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
           if (sel !== null) {
             const lp = toLocal(e.clientX, e.clientY);
             const edge = hitTestEdge(lp.x, lp.y, sel, viewRef.current);
+            if (edge !== hoverEdgeRef.current) { hoverEdgeRef.current = edge; scheduleDraw(); }
             if (edge === "x1" || edge === "x2") canvas.style.cursor = "ew-resize";
             else if (edge === "y1" || edge === "y2") canvas.style.cursor = "ns-resize";
             else canvas.style.cursor = "crosshair";
           } else {
+            if (hoverEdgeRef.current) { hoverEdgeRef.current = null; scheduleDraw(); }
             canvas.style.cursor = "crosshair";
           }
         }
@@ -1492,7 +1935,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     if (drag?.kind === "resizeEdge") {
       dragRef.current = null;
       const canvas = canvasRef.current;
-      if (canvas) canvas.style.cursor = "crosshair";
+      if (canvas) canvas.style.cursor = TOOL_CURSOR[toolRef.current];
       // Only commit if the selection wasn't cancelled by Escape mid-drag
       if (committedSelRef.current !== null) {
         onSelChangeRef.current({ ...drag.live });
@@ -1516,7 +1959,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     if (drag?.kind === "moveSel") {
       dragRef.current = null;
       const canvas = canvasRef.current;
-      if (canvas) canvas.style.cursor = "crosshair";
+      if (canvas) canvas.style.cursor = TOOL_CURSOR[toolRef.current];
       if (drag.dx !== 0 || drag.dy !== 0) {
         onMoveSelectionRef.current?.(drag.dx, drag.dy);
       }
@@ -1531,8 +1974,26 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
           const ci = k.indexOf(",");
           return [parseInt(k.slice(0, ci)), parseInt(k.slice(ci + 1))] as [number, number];
         });
-        onDrawStrokeRef.current(pts, drawZOverrideRef.current, [drag.cx, drag.cy], drag.delta);
+        onDrawStrokeRef.current(pts, drawZOverrideRef.current, [drag.cx, drag.cy], drag.delta, strokeIdRef.current);
       }
+      return;
+    }
+    if (drag?.kind === "draw-stroke" && drag.live) {
+      // Live-brush sculpt: emit a final stamp at the release point (spacing may have left a gap),
+      // flush the remainder, and end the stroke. The dwell timer stops here.
+      dragRef.current = null;
+      if (accumTimerRef.current !== null) { clearInterval(accumTimerRef.current); accumTimerRef.current = null; }
+      accumFiredRef.current = false;
+      if (!strokeCancelledRef.current) {
+        const end = screenToWorld(e.clientX, e.clientY);
+        const lastS = lastStampPosRef.current;
+        if (!lastS || end.x !== lastS.x || end.y !== lastS.y) {
+          pendingStampsRef.current.push([end.x, end.y]);
+          lastStampPosRef.current = { x: end.x, y: end.y };
+        }
+        flushSculptRef.current(strokeIdRef.current);
+      }
+      draw();
       return;
     }
     if (drag?.kind === "draw-stroke") {
@@ -1557,7 +2018,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
           const ci = k.indexOf(",");
           return [parseInt(k.slice(0, ci)), parseInt(k.slice(ci + 1))] as [number, number];
         });
-        onDrawStrokeRef.current(pts, drawZOverrideRef.current, [drag.startWX, drag.startWY]);
+        onDrawStrokeRef.current(pts, drawZOverrideRef.current, [drag.startWX, drag.startWY], undefined, strokeIdRef.current);
       }
       return;
     }
@@ -1571,8 +2032,16 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
           : drag.tool === "line" ? linePixels(drag.start, end, cfg.brushSize, cfg.brushShape)
           : ellipsePixels(drag.start, end, cfg.fillMode);
         if (pts.length > 0) {
-          onDrawStrokeRef.current(pts.map(p => [p.x, p.y]), drawZOverrideRef.current);
+          onDrawStrokeRef.current(pts.map(p => [p.x, p.y]), drawZOverrideRef.current, undefined, undefined, strokeIdRef.current);
         }
+      }
+      return;
+    }
+    if (drag?.kind === "lasso") {
+      dragRef.current = null;
+      draw();
+      if (drag.pts.length >= 3) {
+        onLassoSelectRef.current?.(drag.pts.map(p => [p.x, p.y]));
       }
       return;
     }
@@ -1584,7 +2053,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   const onPointerLeave = useCallback(() => {
     cursorPosRef.current = null;
     const canvas = canvasRef.current;
-    if (canvas) canvas.style.cursor = toolRef.current === "pan" ? "grab" : "crosshair";
+    if (canvas) canvas.style.cursor = TOOL_CURSOR[toolRef.current];
     draw();
   }, [draw]);
 
@@ -1608,7 +2077,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   return (
     <canvas
       ref={canvasRef}
-      style={{ display: "block", width: "100%", height: "100%", cursor: tool === "pan" ? "grab" : tool === "eyedropper" ? "cell" : "crosshair" }}
+      style={{ display: "block", width: "100%", height: "100%", cursor: TOOL_CURSOR[tool] }}
       onPointerDown={onPointerDown}
       onPointerMove={onPointerMove}
       onPointerUp={onPointerUp}

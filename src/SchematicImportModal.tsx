@@ -247,6 +247,9 @@ export default function SchematicImportModal({ info, path, onApply, onCancel, ap
   const [showPresets, setShowPresets] = useState(false);
   const [previewPixels, setPreviewPixels] = useState<{ pixels: Uint8Array; width: number; height: number } | null>(null);
   const [previewing, setPreviewing] = useState(false);
+  const [previewError, setPreviewError] = useState<string | null>(null);
+  // Name of the preset whose delete button is armed for confirmation (null = none).
+  const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
   const [showPreview, setShowPreview] = useState(false);
 
   const closePopover = useCallback(() => setOpenPop(null), []);
@@ -274,13 +277,15 @@ export default function SchematicImportModal({ info, path, onApply, onCancel, ap
 
   async function handlePreview() {
     setPreviewing(true);
+    setPreviewError(null);
     try {
       await invoke("import_schematic_apply", { path, mapping });
       const raw = await invoke<{ width: number; height: number; pixels: string }>("render_clipboard_preview");
       setPreviewPixels({ pixels: decodeU8(raw.pixels), width: raw.width, height: raw.height });
       setShowPreview(true);
     } catch (e) {
-      console.error("Preview failed:", e);
+      // Was console-only: the button just stopped saying "Loading…" and nothing else happened.
+      setPreviewError(String(e));
     } finally {
       setPreviewing(false);
     }
@@ -372,7 +377,7 @@ export default function SchematicImportModal({ info, path, onApply, onCancel, ap
 
           {/* Substrate selector + filter bar */}
           <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
-            <span style={{ color: "#83786c", fontSize: 11 }}>Color blocks →</span>
+            <span title="Choose which Eden block type stands in for the imported blocks' color data (imported blocks carry only color, not a real Eden block type)" style={{ color: "#83786c", fontSize: 11 }}>Color blocks →</span>
             <select
               value={colorSubstrate}
               onChange={e => handleSubstrateChange(Number(e.target.value))}
@@ -519,10 +524,22 @@ export default function SchematicImportModal({ info, path, onApply, onCancel, ap
                           flex: 1, textAlign: "left", background: "none", border: "none",
                           color: "#ebe9e7", padding: "5px 12px", cursor: "pointer", fontSize: 12,
                         }}>{p.name}</button>
-                        <button onClick={() => handleDeletePreset(p.name)} style={{
-                          background: "none", border: "none", color: "#ef4444",
-                          padding: "5px 10px", cursor: "pointer", fontSize: 12,
-                        }}>×</button>
+                        {/* Two-step delete: one misclick on a bare × used to destroy a preset with
+                            no confirm and no undo. Clicking away re-arms the guard. */}
+                        {confirmDelete === p.name ? (
+                          <>
+                            <button onClick={() => { handleDeletePreset(p.name); setConfirmDelete(null); }}
+                              title={`Delete preset “${p.name}”`} aria-label={`Confirm delete preset ${p.name}`}
+                              style={{ background: "none", border: "none", color: "#ef4444", padding: "5px 6px", cursor: "pointer", fontSize: 12 }}>✓</button>
+                            <button onClick={() => setConfirmDelete(null)}
+                              title="Keep this preset" aria-label="Cancel delete"
+                              style={{ background: "none", border: "none", color: "#83786c", padding: "5px 8px 5px 0", cursor: "pointer", fontSize: 12 }}>✕</button>
+                          </>
+                        ) : (
+                          <button onClick={() => setConfirmDelete(p.name)}
+                            title={`Delete preset “${p.name}”`} aria-label={`Delete preset ${p.name}`}
+                            style={{ background: "none", border: "none", color: "#ef4444", padding: "5px 10px", cursor: "pointer", fontSize: 12 }}>×</button>
+                        )}
                       </div>
                     ))}
                   </div>
@@ -539,6 +556,13 @@ export default function SchematicImportModal({ info, path, onApply, onCancel, ap
             Axis: MC X→Eden X, MC Z→Eden Y, MC Y→Eden Z. Use Rotate/Flip after paste to reorient.
           </div>
           <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", alignItems: "center" }}>
+            {previewError && (
+              <div role="alert" style={{
+                flex: 1, color: "#fca5a5", background: "rgba(239,68,68,0.08)",
+                border: "1px solid rgba(239,68,68,0.3)", borderRadius: 4,
+                padding: "5px 8px", fontSize: 11, overflow: "hidden", textOverflow: "ellipsis",
+              }}>Preview failed: {previewError}</div>
+            )}
             <button
               onClick={handlePreview}
               disabled={previewing}

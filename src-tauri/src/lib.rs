@@ -163,6 +163,12 @@ fn chunk_snapshot_bytes(s: &ChunkSnapshot) -> usize {
 pub(crate) struct UndoEntry {
     pub(crate) operation: String,
     pub(crate) chunks: Vec<ChunkSnapshot>,
+    /// Stroke-grouping marker. Sequential edits that share a `Some(g)` id undo/redo as one
+    /// logical unit (a sculpt stroke = many timer-stamp edits). `None` = a standalone edit
+    /// (every command except grouped sculpt stamps). Not a delta-merge — the chunk deltas stay
+    /// separate; only undo/redo coalescing and the group count key off this. See
+    /// `count_undo_groups`, `with_edit_grouped`, `undo_edit_inner`/`redo_edit_inner`.
+    pub(crate) group: Option<u64>,
 }
 
 // ── Clipboard ─────────────────────────────────────────────────────────────────
@@ -178,6 +184,24 @@ pub(crate) struct Clipboard {
     /// Flat [dz * height * width + dy * width + dx]
     pub(crate) block_types: Vec<u8>,
     pub(crate) paints: Vec<u8>,
+    /// Optional per-column footprint (a copy from a non-rectangular selection): a row-major
+    /// `width*height` bitset, bit `dy*width+dx` set = that column pastes. `None` = full box (today's
+    /// behaviour). This is deliberately separate from `ignore_air`: air (bt 0) is a real, pasteable
+    /// value, so "outside the shape" and "an air voxel" must not collide. The dense block/paint
+    /// arrays are still full `width*height*depth` — the mask only gates which columns get written.
+    /// Rotated/mirrored in lockstep with the data (`rotate_clipboard_inner` et al.); persisted by
+    /// prefab save (a shaped clipboard writes `EPFAB\x02` with a footprint section; rectangular
+    /// clipboards stay on `EPFAB\x01`).
+    pub(crate) mask: Option<Vec<u8>>,
+}
+
+impl Clipboard {
+    fn info(&self) -> ClipboardInfo {
+        ClipboardInfo {
+            width: self.width, height: self.height, depth: self.depth,
+            z_anchor: self.z_anchor, masked: self.mask.is_some(),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -186,6 +210,72 @@ pub(crate) struct ClipboardInfo {
     pub(crate) height: i32,
     pub(crate) depth: i32,
     pub(crate) z_anchor: i32,
+    /// True when the clipboard carries a non-rectangular footprint (paste skips unmasked columns).
+    pub(crate) masked: bool,
+}
+
+/// Test a linear bit in a row-major bitset (used for clipboard footprints and selection masks).
+#[inline]
+fn bit_set(bits: &[u8], i: usize) -> bool {
+    bits.get(i >> 3).is_some_and(|b| b & (1u8 << (i & 7)) != 0)
+}
+
+/// Non-rectangular selection footprint (magic-wand shape, lasso). Absolute-world bounding box
+/// (`x1..=x2`, `y1..=y2`) plus a row-major bitset — `width*height` bits, bit set = that column is
+/// selected. It's 2D (per-column), like the selection itself; z range still comes from the slider.
+/// Memory is `w·h/8` bytes: 200×200 ≈ 5 KB, 1000×1000 ≈ 122 KB — negligible, no compression.
+///
+/// Lives on `WorldState` (same pattern as `view_cap_z`) so mask-aware edit commands read it off
+/// state instead of growing a base64 IPC param on ~13 signatures.
+///
+/// ⚠️ **Fail-safe contract (corruption-critical).** A command applies the mask ONLY when the rect
+/// the frontend passed *exactly* equals this bbox (`matches_rect`). Any mismatch → the edit behaves
+/// rect-only, exactly as before masks existed, so a stale mask can never mis-filter an unrelated
+/// selection; worst case is a silent fall-back to current behaviour. This is defense-in-depth: the
+/// frontend is *also* expected to `clear_selection_mask` on every selection reshape (it keys the
+/// clear off a per-rect diff), but the backend never trusts that — it re-checks the rect every edit.
+/// Cleared on world load/close (see `load_world`/`close_world`).
+#[derive(Clone)]
+pub(crate) struct SelectionMask {
+    pub(crate) x1: i32,
+    pub(crate) y1: i32,
+    pub(crate) x2: i32,
+    pub(crate) y2: i32,
+    /// Row-major bitset over the bbox, `ceil(width*height/8)` bytes. Bit `(y-y1)*width+(x-x1)`.
+    pub(crate) bits: Vec<u8>,
+}
+
+impl SelectionMask {
+    #[inline]
+    fn width(&self) -> i32 { self.x2 - self.x1 + 1 }
+
+    /// The fail-safe rule: does this mask's bbox exactly equal the rect the caller passed?
+    #[inline]
+    fn matches_rect(&self, x1: i32, y1: i32, x2: i32, y2: i32) -> bool {
+        self.x1 == x1 && self.y1 == y1 && self.x2 == x2 && self.y2 == y2
+    }
+
+    /// Is absolute column `(x, y)` inside the footprint AND its bit set? Out-of-bbox → false.
+    #[inline]
+    pub(crate) fn contains(&self, x: i32, y: i32) -> bool {
+        if x < self.x1 || x > self.x2 || y < self.y1 || y > self.y2 { return false; }
+        let idx = ((y - self.y1) * self.width() + (x - self.x1)) as usize;
+        self.bits.get(idx >> 3).is_some_and(|b| b & (1u8 << (idx & 7)) != 0)
+    }
+
+    /// Number of set (selected) cells — for honest selection stats.
+    fn count(&self) -> u32 {
+        self.bits.iter().map(|b| b.count_ones()).sum()
+    }
+}
+
+/// Resolve the mask an edit should honour, given the selection rect the frontend passed.
+/// Returns an owned clone (5–122 KB) ONLY when a stored mask's bbox exactly matches the rect, so
+/// the caller can then `world.take()` (mutably borrowing `ws`) while still holding the mask across
+/// the edit closure. `None` → the command runs rect-only, its original behaviour. This is the single
+/// place the fail-safe rect-equality rule is applied; every mask-aware command funnels through it.
+pub(crate) fn active_mask(ws: &WorldState, x1: i32, y1: i32, x2: i32, y2: i32) -> Option<SelectionMask> {
+    ws.selection_mask.as_ref().filter(|m| m.matches_rect(x1, y1, x2, y2)).cloned()
 }
 
 /// A single block position for the paint_blocks command.
@@ -195,6 +285,24 @@ struct PaintBlock {
     x: i32,
     y: i32,
     z: Option<i32>,
+}
+
+/// Per-stroke float height workspace for live 2D sculpting (row 6). A sculpt stroke is a run of
+/// `sculpt_terrain` calls sharing one `group_id`; integer heights would round away the sub-block
+/// deltas of a soft/airbrush stamp on every call, freezing low-weight rim columns against a fixed
+/// BAYER threshold. `fheight` caches each touched column's *precise* float height across the whole
+/// stroke: mode math reads/writes it, and only its dithered round is committed to the world, so
+/// fractions accumulate and a 0.3-weight column crosses the next integer every ~3 stamps.
+///
+/// ⚠️ It is a cache of "world height + residual" and is stale the instant the world changes under
+/// it by anything that isn't this stroke. Invalidation (clear to `None`) is owned by four choke
+/// points and MUST stay exhaustive: `with_edit_inner` on any group mismatch (incl. `None` — every
+/// non-sculpt edit), `undo_edit_inner`/`redo_edit_inner`, `load_world`'s swap, and `close_world`.
+/// Keyed by a monotonic `group_id` that can never be reused, so an abandoned session (stroke
+/// released with no further calls) is safe to leave until the next non-matching edit reaps it.
+pub(crate) struct SculptSession {
+    pub(crate) group_id: u64,
+    pub(crate) fheight: HashMap<(i32, i32), f64>,
 }
 
 pub(crate) struct WorldState {
@@ -222,6 +330,19 @@ pub(crate) struct WorldState {
     /// by `with_edit`/`undo_edit`/`redo_edit` rescanning only the affected chunks. Enables an
     /// O(lamps) gather instead of an O((16+2r)³) region scan, so the lamp radius can be a user slider.
     pub(crate) lamp_index: Option<HashMap<(i32, i32), Vec<[i32; 3]>>>,
+    /// Cutaway view: when Some(cap), every top-down render and every surface-consulting edit path
+    /// behaves as if the world ended at z == cap — the map shows the cave interior, and drawing /
+    /// terrain-paste / the cursor readout target the highest block *at or below* the cap. `None`
+    /// (the default) = normal "true surface" behaviour. Cleared on world load/close.
+    pub(crate) view_cap_z: Option<i32>,
+    /// Live-sculpt-stroke float height workspace (see `SculptSession`). `None` between strokes.
+    /// Invalidated at the four choke points enumerated on `SculptSession`.
+    pub(crate) sculpt_session: Option<SculptSession>,
+    /// Active non-rectangular selection footprint (see `SelectionMask`). `None` = plain rectangular
+    /// selection (the default). Set by `magic_wand_select` / `set_selection_mask`; cleared by
+    /// `clear_selection_mask` and on world load/close. Edit commands only honour it when its bbox
+    /// exactly matches the rect they were passed (`active_mask`).
+    pub(crate) selection_mask: Option<SelectionMask>,
 }
 
 impl WorldState {
@@ -237,6 +358,9 @@ impl WorldState {
             template_surface_cache: HashMap::new(),
             texture_pack: None,
             lamp_index: None,
+            view_cap_z: None,
+            sculpt_session: None,
+            selection_mask: None,
         }
     }
 }
@@ -461,7 +585,11 @@ struct PixelPatch {
 
 /// Re-render just the sub-rectangle [px1,px2] × [py1,py2] of the top-down map.
 /// Bounds are clamped to [0, world_W-1] × [0, world_H-1].
-fn render_pixels_patch(world: &LoadedWorld, px1: i32, py1: i32, px2: i32, py2: i32) -> PixelPatch {
+///
+/// `cap` is the cutaway ceiling (`WorldState::view_cap_z`): blocks above it are treated as absent,
+/// so the map draws whatever is directly under the cap plane (cave roofs vanish, floors show).
+/// `None` = normal render.
+fn render_pixels_patch(world: &LoadedWorld, px1: i32, py1: i32, px2: i32, py2: i32, cap: Option<i32>) -> PixelPatch {
     let world_w = (world.w_chunks * 16) as i32;
     let world_h = (world.h_chunks * 16) as i32;
     let x1 = px1.clamp(0, world_w - 1) as u32;
@@ -485,7 +613,13 @@ fn render_pixels_patch(world: &LoadedWorld, px1: i32, py1: i32, px2: i32, py2: i
             let mut top_bt = 0u8; let mut top_paint = 0u8;
             let mut under_bt = 0u8; let mut under_paint = 0u8;
             'outer: for band in (0..world.num_bands).rev() {
+                if let Some(c) = cap {
+                    if (band * 16) as i32 > c { continue; }
+                }
                 for z in (0..16usize).rev() {
+                    if let Some(c) = cap {
+                        if (band * 16 + z) as i32 > c { continue; }
+                    }
                     let bi = addr + band * 8192 + lx * 256 + ly * 16 + z;
                     let pi = bi + 4096;
                     if bi >= world.bytes.len() || pi >= world.bytes.len() { continue; }
@@ -671,7 +805,7 @@ fn render_xslice_patch_inner(world: &LoadedWorld, sx: i32, py1: i32, pz1: i32, p
 /// Compute the pixel-space bounding box of a set of chunk coordinates and
 /// return a freshly rendered top-down patch for that rectangle.
 /// Used by undo/redo where the affected region is known only as chunk coords.
-fn patch_from_chunk_coords(world: &LoadedWorld, chunks: &[(i16, i16)]) -> PixelPatch {
+fn patch_from_chunk_coords(world: &LoadedWorld, chunks: &[(i16, i16)], cap: Option<i32>) -> PixelPatch {
     if chunks.is_empty() {
         return PixelPatch { x: 0, y: 0, width: 1, height: 1, pixels: vec![30, 30, 30, 255] };
     }
@@ -679,7 +813,7 @@ fn patch_from_chunk_coords(world: &LoadedWorld, chunks: &[(i16, i16)]) -> PixelP
     let py1 = chunks.iter().map(|&(_, cy)| (cy as i32 - world.min_y) * 16).min().unwrap();
     let px2 = chunks.iter().map(|&(cx, _)| (cx as i32 - world.min_x) * 16 + 15).max().unwrap();
     let py2 = chunks.iter().map(|&(_, cy)| (cy as i32 - world.min_y) * 16 + 15).max().unwrap();
-    render_pixels_patch(world, px1, py1, px2, py2)
+    render_pixels_patch(world, px1, py1, px2, py2, cap)
 }
 
 // ── Orthographic selection preview ────────────────────────────────────────────
@@ -701,6 +835,7 @@ fn render_view_front(
     world: &LoadedWorld,
     x1: i32, x2: i32, y1: i32, y2: i32, z_min: i32, z_max: i32,
     b_lo: usize,
+    mask: Option<&SelectionMask>,
 ) -> (u32, u32, Vec<u8>) {
     let pw = (x2 - x1 + 1) as u32;
     let ph = (z_max - z_min + 1) as u32;
@@ -729,6 +864,9 @@ fn render_view_front(
                     Some(&addr) => {
                         let base = addr + z_off + lx_256;   // constant for this chunk×x×z
                         while y <= chunk_y_end {
+                            // Shaped selection: an unmasked (x,y) column is see-through, so a
+                            // masked block on a chunk row behind it shows correctly.
+                            if mask.is_some_and(|m| !m.contains(x, y)) { y += 1; continue; }
                             let bi = base + (y & 15) as usize * 16;
                             let pi = bi + 4096;
                             if bi < bytes_len && pi < bytes_len {
@@ -757,6 +895,7 @@ fn render_view_side(
     world: &LoadedWorld,
     x1: i32, x2: i32, y1: i32, y2: i32, z_min: i32, z_max: i32,
     b_lo: usize,
+    mask: Option<&SelectionMask>,
 ) -> (u32, u32, Vec<u8>) {
     let pw = (y2 - y1 + 1) as u32;
     let ph = (z_max - z_min + 1) as u32;
@@ -784,6 +923,9 @@ fn render_view_side(
                     Some(&addr) => {
                         let base = addr + z_off + ly_16;    // constant for this chunk×y×z
                         while x <= chunk_x_end {
+                            // Shaped selection: an unmasked (x,y) column is see-through so a
+                            // masked block behind it along X shows correctly.
+                            if mask.is_some_and(|m| !m.contains(x, y)) { x += 1; continue; }
                             let bi = base + (x & 15) as usize * 256;
                             let pi = bi + 4096;
                             if bi < bytes_len && pi < bytes_len {
@@ -813,6 +955,7 @@ fn render_view_top(
     world: &LoadedWorld,
     x1: i32, x2: i32, y1: i32, y2: i32, z_min: i32, z_max: i32,
     b_lo: usize,
+    mask: Option<&SelectionMask>,
 ) -> (u32, u32, Vec<u8>) {
     let pw = (x2 - x1 + 1) as u32;
     let ph = (y2 - y1 + 1) as u32;
@@ -829,6 +972,9 @@ fn render_view_top(
             let cy   = y / 16 + world.min_y;
             let row  = (y - y1) as usize;
             let out  = (row * pw as usize + col) * 4;
+            // Shaped selection: an unmasked (x,y) column isn't part of the selection, so it stays
+            // VOID — the top view shows the actual footprint, not the enclosing bbox.
+            if mask.is_some_and(|m| !m.contains(x, y)) { continue; }
             if let Some(&addr) = world.chunk_map.get(&(cx, cy)) {
                 let base = addr + lx_256 + (y & 15) as usize * 16;     // constant for this x,y
                 for z in (z_min..=z_max).rev() {
@@ -904,7 +1050,9 @@ fn load_world(path: String, state: tauri::State<'_, AppState>) -> Result<WorldMe
         // undefined behaviour of writing over a still-mmapped file on Unix. map_copy stays
         // copy-on-write, so edits live in RAM and the temp is only the evictable read-backing store.
         let temp_path = temp_world_path();
-        fs::copy(&path, &temp_path).map_err(|e| format!("Failed to stage world file: {e}"))?;
+        fs::copy(&path, &temp_path).map_err(|e| format!(
+            "Failed to stage world file: {e}. Opening a world creates a private working copy; check available space for another copy on the system temporary-files drive."
+        ))?;
         let file = fs::File::open(&temp_path).map_err(|e| format!("Failed to open staged file: {e}"))?;
         // SAFETY: temp file is private, written by us, and stays alive for the duration of the mmap.
         let mmap = unsafe { MmapOptions::new().map_copy(&file) }
@@ -974,6 +1122,9 @@ fn load_world(path: String, state: tauri::State<'_, AppState>) -> Result<WorldMe
         ws.undo_stack.clear();
         ws.redo_stack.clear();
         ws.lamp_index = None; // rebuilt lazily for the new world on first night-lit request
+        ws.view_cap_z = None; // cutaway is per-world; the frontend also resets viewMode on load
+        ws.sculpt_session = None; // any in-flight live-sculpt workspace belongs to the old world
+        ws.selection_mask = None; // a wand/lasso shape belongs to the old world's coordinates
         let old_temp = ws.temp_path.take();
         ws.temp_path = maybe_temp;
         drop(ws);
@@ -1112,6 +1263,7 @@ fn export_png(
 ) -> Result<(), String> {
     let (w, h, buf) = {
         let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
+        let cap = ws.view_cap_z;
         let (w, h) = {
             let world = ws.world.as_ref().ok_or("No world loaded")?;
             ((world.w_chunks * 16) as i32, (world.h_chunks * 16) as i32)
@@ -1123,7 +1275,9 @@ fn export_png(
                 if z < 0 || z > max_z { return Err(format!("Z must be 0–{max_z}, got {z}")); }
                 render_zslice_patch_inner(world, z, 0, 0, w - 1, h - 1).pixels
             } else {
-                render_pixels_patch(world, 0, 0, w - 1, h - 1).pixels
+                // Cutaway is a top-down render with the cap applied, so the exported PNG matches
+                // what's on screen without the frontend passing a separate view name.
+                render_pixels_patch(world, 0, 0, w - 1, h - 1, cap).pixels
             }
         };
         if use_template && view != "zslice" && ws.template_bytes.is_some() {
@@ -1145,6 +1299,8 @@ struct SelectionInfo {
     width: i32,  // x2 - x1 + 1
     height: i32, // y2 - y1 + 1
     depth: i32,  // z_max - z_min + 1
+    cell_count: Option<i32>, // Some(popcount) when a shaped mask matches this rect
+    masked: bool,
 }
 
 fn validate_selection(x1: i32, y1: i32, x2: i32, y2: i32, z_min: i32, z_max: i32, max_z: i32) -> Result<(), String> {
@@ -1170,9 +1326,11 @@ fn describe_selection(
 ) -> Result<SelectionInfo, String> {
     // Validate against the loaded world's real z ceiling (63 for 64z, 255 for 256z) rather than a
     // hardcoded 255 — otherwise a z range a 64z world can't hold would validate here.
-    let max_z = {
+    let (max_z, cell_count) = {
         let ws = state.lock().unwrap_or_else(|p| p.into_inner());
-        ws.world.as_ref().map(world_max_z).unwrap_or(255)
+        let max_z = ws.world.as_ref().map(world_max_z).unwrap_or(255);
+        let cell_count = active_mask(&ws, x1, y1, x2, y2).map(|m| m.count() as i32);
+        (max_z, cell_count)
     };
     validate_selection(x1, y1, x2, y2, z_min, z_max, max_z)?;
     Ok(SelectionInfo {
@@ -1180,6 +1338,8 @@ fn describe_selection(
         width:  x2 - x1 + 1,
         height: y2 - y1 + 1,
         depth:  z_max - z_min + 1,
+        masked: cell_count.is_some(),
+        cell_count,
     })
 }
 
@@ -1562,7 +1722,24 @@ fn fetch_tile(
 ) -> Result<PixelPatch, String> {
     let ws = state.lock().unwrap_or_else(|p| p.into_inner());
     let world = ws.world.as_ref().ok_or("No world loaded")?;
-    Ok(render_pixels_patch(world, x1, y1, x2, y2))
+    Ok(render_pixels_patch(world, x1, y1, x2, y2, ws.view_cap_z))
+}
+
+/// Set (or clear) the cutaway ceiling. `None` restores the normal "true surface" view.
+/// Every top-down render and every surface-consulting edit path reads this off `WorldState`,
+/// so the frontend only has to set it once per mode/slider change (then refetch its tiles).
+#[tauri::command]
+fn set_view_cap(cap: Option<i32>, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
+    let cap = match cap {
+        None => None,
+        Some(c) => {
+            let world = ws.world.as_ref().ok_or("No world loaded")?;
+            Some(c.clamp(0, world_max_z(world)))
+        }
+    };
+    ws.view_cap_z = cap;
+    Ok(())
 }
 
 /// Return a z-slice patch for just the rectangle (x1,y1)–(x2,y2) at level z.
@@ -1636,6 +1813,7 @@ fn render_selection_view(
 
     timing_log!("[LOCK] acquire_start  cmd=render_selection_view  t=+{}µs", us());
     let t_lock = Instant::now();
+    let mut sel_mask: Option<SelectionMask> = None;
     let scan_world = {
         let ws = state.lock().unwrap_or_else(|p| p.into_inner());
         let wait = t_lock.elapsed().as_micros();
@@ -1644,6 +1822,8 @@ fn render_selection_view(
 
         let world = ws.world.as_ref().ok_or("No world loaded")?;
         validate_selection(x1, y1, x2, y2, z_min, z_max, world_max_z(world))?;
+        // Resolve the shaped-selection mask while we still hold the lock (fail-safe: exact bbox).
+        sel_mask = active_mask(&ws, x1, y1, x2, y2);
 
         let cx_lo = x1 / 16 + world.min_x;
         let cx_hi = x2 / 16 + world.min_x;
@@ -1688,10 +1868,11 @@ fn render_selection_view(
 
     timing_log!("[SCAN] start  cmd=render_selection_view  t=+{}µs", us());
     let t_scan = Instant::now();
+    let mask = sel_mask.as_ref();
     let (width, height, pixels) = match view.as_str() {
-        "front" => render_view_front(&scan_world, x1, x2, y1, y2, z_min, z_max, b_lo),
-        "side"  => render_view_side(&scan_world, x1, x2, y1, y2, z_min, z_max, b_lo),
-        _       => render_view_top(&scan_world, x1, x2, y1, y2, z_min, z_max, b_lo),
+        "front" => render_view_front(&scan_world, x1, x2, y1, y2, z_min, z_max, b_lo, mask),
+        "side"  => render_view_side(&scan_world, x1, x2, y1, y2, z_min, z_max, b_lo, mask),
+        _       => render_view_top(&scan_world, x1, x2, y1, y2, z_min, z_max, b_lo, mask),
     };
     timing_log!("[SCAN] end  cmd=render_selection_view  elapsed={}ms  result={}×{}", t_scan.elapsed().as_millis(), width, height);
     timing_log!("[PREVIEW] end  cmd=render_selection_view  pixels={}B  total={}ms", pixels.len(), t0.elapsed().as_millis());
@@ -1902,9 +2083,11 @@ fn delete_blocks_inner(
     world: &mut LoadedWorld,
     x1: i32, y1: i32, x2: i32, y2: i32,
     z_min: i32, z_max: i32,
+    mask: Option<&SelectionMask>,
 ) {
     for px in x1..=x2 {
         for py in y1..=y2 {
+            if let Some(m) = mask { if !m.contains(px, py) { continue; } }
             let chunk_cx = px / 16 + world.min_x;
             let chunk_cy = py / 16 + world.min_y;
             let lx = (px % 16) as usize;
@@ -1934,9 +2117,11 @@ fn replace_blocks_inner(
     filter_block_type: Option<u8>,
     filter_paint: Option<u8>,
     filter_invert: bool,
+    mask: Option<&SelectionMask>,
 ) {
     for px in x1..=x2 {
         for py in y1..=y2 {
+            if let Some(m) = mask { if !m.contains(px, py) { continue; } }
             let chunk_cx = px / 16 + world.min_x;
             let chunk_cy = py / 16 + world.min_y;
             let lx = (px % 16) as usize;
@@ -2150,6 +2335,46 @@ fn with_edit<F>(
 where
     F: FnOnce(&mut LoadedWorld) -> Result<(), String>,
 {
+    with_edit_inner(ws, operation, snap_rect, patch_rect, None, edit)
+}
+
+/// Group-tagged sibling of `with_edit`: identical, but stamps the resulting `UndoEntry` with
+/// `group` so a run of these (one sculpt stroke = many timer stamps) coalesces on undo/redo.
+/// Only `sculpt_terrain` uses this; every other editing command goes through `with_edit` (group
+/// `None`). Both funnel into `with_edit_inner` so there is one owner of the take/reinstall sequence.
+fn with_edit_grouped<F>(
+    ws: &mut WorldState,
+    operation: &str,
+    snap_rect: (i32, i32, i32, i32),
+    patch_rect: (i32, i32, i32, i32),
+    group: Option<u64>,
+    edit: F,
+) -> Result<EditResult, String>
+where
+    F: FnOnce(&mut LoadedWorld) -> Result<(), String>,
+{
+    with_edit_inner(ws, operation, snap_rect, patch_rect, group, edit)
+}
+
+fn with_edit_inner<F>(
+    ws: &mut WorldState,
+    operation: &str,
+    snap_rect: (i32, i32, i32, i32),
+    patch_rect: (i32, i32, i32, i32),
+    group: Option<u64>,
+    edit: F,
+) -> Result<EditResult, String>
+where
+    F: FnOnce(&mut LoadedWorld) -> Result<(), String>,
+{
+    // Invalidate the live-sculpt float workspace whenever this edit isn't the stroke that owns it
+    // (a different group, or `None` = any non-sculpt command). This is the single choke point every
+    // one of the 11 editing commands funnels through, so foreign edits can't leave `fheight` stale.
+    if ws.sculpt_session.as_ref().map(|s| s.group_id) != group {
+        ws.sculpt_session = None;
+    }
+
+    let cap = ws.view_cap_z;
     let mut world = ws.world.take().ok_or("No world loaded")?;
 
     let (sx1, sy1, sx2, sy2) = snap_rect;
@@ -2166,7 +2391,7 @@ where
     }
 
     let (px1, py1, px2, py2) = patch_rect;
-    let patch = render_pixels_patch(&world, px1, py1, px2, py2);
+    let patch = render_pixels_patch(&world, px1, py1, px2, py2, cap);
     let pre_snap: Vec<ChunkSnapshot> = pre_full.into_iter()
         .filter_map(|(cx, cy, pre)| diff_chunk(&world, cx, cy, &pre))
         .collect();
@@ -2177,11 +2402,32 @@ where
     refresh_lamp_index_chunks(ws, &affected);
 
     if !pre_snap.is_empty() {
-        push_undo(&mut ws.undo_stack, UndoEntry { operation: operation.into(), chunks: pre_snap });
+        push_undo(&mut ws.undo_stack, UndoEntry { operation: operation.into(), chunks: pre_snap, group });
         ws.redo_stack.clear();
     }
 
-    Ok(EditResult { patch, undo_depth: ws.undo_stack.len(), redo_depth: ws.redo_stack.len(), operation: operation.into() })
+    Ok(EditResult {
+        patch,
+        undo_depth: count_undo_groups(&ws.undo_stack),
+        redo_depth: count_undo_groups(&ws.redo_stack),
+        operation: operation.into(),
+    })
+}
+
+/// Count logical undo/redo units: contiguous entries sharing the same `Some(g)` group collapse to
+/// one; `None`-group entries always count individually (never coalesce, including with each other).
+/// This is what the Ribbon's undo/redo indicators reflect — strokes, not per-stamp edits.
+fn count_undo_groups(stack: &VecDeque<UndoEntry>) -> usize {
+    let mut count = 0usize;
+    let mut prev: Option<u64> = None;
+    for entry in stack {
+        match (entry.group, prev) {
+            (Some(g), Some(pg)) if g == pg => {} // same contiguous group → already counted
+            _ => count += 1,
+        }
+        prev = entry.group;
+    }
+    count
 }
 
 #[tauri::command]
@@ -2194,9 +2440,12 @@ fn delete_blocks(
     let max_z = ws.world.as_ref().map(world_max_z).unwrap_or(63);
     validate_selection(x1, y1, x2, y2, z_min, z_max, max_z)?;
     let rect = (x1, y1, x2, y2);
+    // Non-rectangular selection: honour a wand/lasso mask whose bbox matches this rect, so Delete
+    // only clears the shaped cells. No match → rect-only, exactly as before (see `active_mask`).
+    let mask = active_mask(&ws, x1, y1, x2, y2);
     let label = format!("Delete {}×{}×{}", x2 - x1 + 1, y2 - y1 + 1, z_max - z_min + 1);
     with_edit(&mut ws, &label, rect, rect, |world| {
-        delete_blocks_inner(world, x1, y1, x2, y2, z_min, z_max);
+        delete_blocks_inner(world, x1, y1, x2, y2, z_min, z_max, mask.as_ref());
         Ok(())
     })
 }
@@ -2224,9 +2473,11 @@ fn replace_blocks(
     let max_z = ws.world.as_ref().map(world_max_z).unwrap_or(63);
     validate_selection(x1, y1, x2, y2, z_min, z_max, max_z)?;
     let rect = (x1, y1, x2, y2);
+    // Fill / filtered-delete also honour the shaped selection (see `active_mask`).
+    let mask = active_mask(&ws, x1, y1, x2, y2);
     let label = format!("Replace {}×{}×{}", x2 - x1 + 1, y2 - y1 + 1, z_max - z_min + 1);
     with_edit(&mut ws, &label, rect, rect, |world| {
-        replace_blocks_inner(world, x1, y1, x2, y2, z_min, z_max, new_block_type, new_paint, filter_block_type, filter_paint, filter_invert);
+        replace_blocks_inner(world, x1, y1, x2, y2, z_min, z_max, new_block_type, new_paint, filter_block_type, filter_paint, filter_invert, mask.as_ref());
         Ok(())
     })
 }
@@ -2266,27 +2517,46 @@ fn gradient_fill(
     let max_z = ws.world.as_ref().map(world_max_z).unwrap_or(63);
     validate_selection(x1, y1, x2, y2, z_min, z_max, max_z)?;
     let rect = (x1, y1, x2, y2);
-    let (dx, dy, dz) = ((x2 - x1).max(1) as f64, (y2 - y1).max(1) as f64, (z_max - z_min).max(1) as f64);
+    // Non-rectangular selection: gate on the shaped footprint. The gradient fraction is still
+    // measured over the full bbox (below) — the mask only clips which columns receive it, so the
+    // colour ramp stays consistent with the visible selection box. No match → rect-only.
+    let mask = active_mask(&ws, x1, y1, x2, y2);
     let label = format!("Gradient {}×{}×{}", x2 - x1 + 1, y2 - y1 + 1, z_max - z_min + 1);
     with_edit(&mut ws, &label, rect, rect, |world| {
-        for z in z_min..=z_max {
-            for y in y1..=y2 {
-                for x in x1..=x2 {
-                    if !include_air && read_block_abs(world, x, y, z) == 0 { continue; }
-                    // Position along the gradient: 0 at the A end, 1 at the B end.
-                    let f = match axis.as_str() {
-                        "x" => (x - x1) as f64 / dx,
-                        "z" => (z - z_min) as f64 / dz,
-                        _   => (y - y1) as f64 / dy,
-                    };
-                    let dith = (BAYER8[x.rem_euclid(8) as usize][y.rem_euclid(8) as usize] as f64 + 0.5) / 64.0;
-                    let (bt, pt) = if f < dith { (bt1, paint1) } else { (bt2, paint2) };
-                    set_block_abs(world, x, y, z, bt, pt);
-                }
-            }
-        }
+        gradient_fill_inner(world, x1, y1, x2, y2, z_min, z_max, bt1, paint1, bt2, paint2, &axis, include_air, mask.as_ref());
         Ok(())
     })
+}
+
+/// Core of `gradient_fill`: blend block A→B across an axis with an 8×8 Bayer dither, gated by an
+/// optional shaped-selection mask. The gradient fraction is measured over the full bbox — the mask
+/// only clips which columns receive it, so the colour ramp stays consistent with the selection box.
+#[allow(clippy::too_many_arguments)]
+fn gradient_fill_inner(
+    world: &mut LoadedWorld,
+    x1: i32, y1: i32, x2: i32, y2: i32, z_min: i32, z_max: i32,
+    bt1: u8, paint1: u8, bt2: u8, paint2: u8,
+    axis: &str, include_air: bool, mask: Option<&SelectionMask>,
+) {
+    let (dx, dy, dz) = ((x2 - x1).max(1) as f64, (y2 - y1).max(1) as f64, (z_max - z_min).max(1) as f64);
+    for z in z_min..=z_max {
+        for y in y1..=y2 {
+            for x in x1..=x2 {
+                // Mask-before-air, mirroring paste: outside the shape is never touched.
+                if mask.is_some_and(|m| !m.contains(x, y)) { continue; }
+                if !include_air && read_block_abs(world, x, y, z) == 0 { continue; }
+                // Position along the gradient: 0 at the A end, 1 at the B end.
+                let f = match axis {
+                    "x" => (x - x1) as f64 / dx,
+                    "z" => (z - z_min) as f64 / dz,
+                    _   => (y - y1) as f64 / dy,
+                };
+                let dith = (BAYER8[x.rem_euclid(8) as usize][y.rem_euclid(8) as usize] as f64 + 0.5) / 64.0;
+                let (bt, pt) = if f < dith { (bt1, paint1) } else { (bt2, paint2) };
+                set_block_abs(world, x, y, z, bt, pt);
+            }
+        }
+    }
 }
 
 /// Paint a batch of blocks in one operation — one undo entry for the whole stroke.
@@ -2328,6 +2598,9 @@ fn paint_blocks(
     let is_portal = (75..=78).contains(&block_type);
     let top_type: u8 = if is_door { 70 } else if is_portal { 79 } else { 0 };
 
+    // In cutaway view the "surface" a z-less paint targets is the highest block under the cap —
+    // so drawing underground behaves exactly like drawing on the true surface.
+    let cap = ws.view_cap_z;
     let label = format!("Paint {} block{}", blocks.len(), if blocks.len() == 1 { "" } else { "s" });
     with_edit(&mut ws, &label, rect, rect, |world| {
         let max_z = world_max_z(world);
@@ -2337,7 +2610,7 @@ fn paint_blocks(
                     if z < 0 || z > max_z { continue; }
                     z
                 }
-                None => match surface_z(world, b.x, b.y) {
+                None => match surface_z_capped(world, b.x, b.y, cap) {
                     Some(z) => {
                         // Doors/portals float one block above ground; top goes two above.
                         let elev = if is_door || is_portal { z_offset + 1 } else { z_offset };
@@ -2441,6 +2714,9 @@ fn close_world(state: tauri::State<'_, AppState>) {
         ws.undo_stack.clear();
         ws.redo_stack.clear();
         ws.lamp_index = None;
+        ws.view_cap_z = None;
+        ws.sculpt_session = None;
+        ws.selection_mask = None;
         (ws.world.take(), ws.temp_path.take())
     };
     drop(old_world); // release the mmap before deleting its backing temp file
@@ -2527,6 +2803,26 @@ fn discard_autosave(app: tauri::AppHandle) -> Result<(), String> {
 #[tauri::command]
 fn undo_edit(state: tauri::State<'_, AppState>) -> Result<EditResult, String> {
     let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
+    undo_edit_inner(&mut ws)
+}
+
+#[tauri::command]
+fn redo_edit(state: tauri::State<'_, AppState>) -> Result<EditResult, String> {
+    let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
+    redo_edit_inner(&mut ws)
+}
+
+/// Undo one logical unit: pop+restore the top `UndoEntry`; if it carries a group id, keep
+/// popping+restoring while the new stack top shares that id (a whole sculpt stroke). Each popped
+/// entry's inverse is pushed onto `redo_stack` immediately in the same iteration (carrying the
+/// same group tag) — because the stack holds a group's stamps in chronological order (stampN on
+/// top) and we pop back-to-front, the resulting redo order replays forward correctly with no
+/// explicit reordering. See `test_grouped_undo_round_trip`.
+fn undo_edit_inner(ws: &mut WorldState) -> Result<EditResult, String> {
+    // Undo bypasses `with_edit_inner`, so it must clear the live-sculpt workspace itself — undoing
+    // the very stroke that owns the session is the dangerous case (its `fheight` would now describe
+    // heights the world no longer has). See `SculptSession`.
+    ws.sculpt_session = None;
     // Take the world first: if none is loaded, error out before popping the undo stack, so a
     // stray call with no world can't silently discard an entry (harmless today since the stacks
     // are cleared with the world, but fragile ordering otherwise).
@@ -2535,38 +2831,70 @@ fn undo_edit(state: tauri::State<'_, AppState>) -> Result<EditResult, String> {
         Some(e) => e,
         None => { ws.world = Some(world); return Err("Nothing to undo".into()); }
     };
-
-    let affected: Vec<(i16, i16)> = entry.chunks.iter().map(|s| (s.cx, s.cy)).collect();
-    let redo_snaps = restore_and_invert(&mut world, &entry);
-    let patch = patch_from_chunk_coords(&world, &affected);
-
+    let group = entry.group;
     let label = entry.operation.clone();
-    ws.world = Some(world);
-    refresh_lamp_index_chunks(&mut ws, &affected);
-    push_undo(&mut ws.redo_stack, UndoEntry { operation: entry.operation, chunks: redo_snaps });
+    let mut affected: Vec<(i16, i16)> = Vec::new();
 
-    Ok(EditResult { patch, undo_depth: ws.undo_stack.len(), redo_depth: ws.redo_stack.len(), operation: label })
+    let mut current = Some(entry);
+    while let Some(entry) = current.take() {
+        for s in &entry.chunks { affected.push((s.cx, s.cy)); }
+        let redo_snaps = restore_and_invert(&mut world, &entry);
+        push_undo(&mut ws.redo_stack, UndoEntry { operation: entry.operation, chunks: redo_snaps, group: entry.group });
+        // Continue only for a group whose next entry down matches the same id.
+        if let Some(g) = group {
+            if ws.undo_stack.back().map(|e| e.group) == Some(Some(g)) {
+                current = ws.undo_stack.pop_back();
+            }
+        }
+    }
+
+    let patch = patch_from_chunk_coords(&world, &affected, ws.view_cap_z);
+    ws.world = Some(world);
+    refresh_lamp_index_chunks(ws, &affected);
+
+    Ok(EditResult {
+        patch,
+        undo_depth: count_undo_groups(&ws.undo_stack),
+        redo_depth: count_undo_groups(&ws.redo_stack),
+        operation: label,
+    })
 }
 
-#[tauri::command]
-fn redo_edit(state: tauri::State<'_, AppState>) -> Result<EditResult, String> {
-    let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
+/// Redo one logical unit — exact mirror of `undo_edit_inner`, popping from `redo_stack` and
+/// pushing inverses onto `undo_stack`.
+fn redo_edit_inner(ws: &mut WorldState) -> Result<EditResult, String> {
+    ws.sculpt_session = None; // bypasses with_edit_inner — clear the live-sculpt workspace (see SculptSession)
     let mut world = ws.world.take().ok_or("No world loaded")?;
     let entry = match ws.redo_stack.pop_back() {
         Some(e) => e,
         None => { ws.world = Some(world); return Err("Nothing to redo".into()); }
     };
-
-    let affected: Vec<(i16, i16)> = entry.chunks.iter().map(|s| (s.cx, s.cy)).collect();
-    let undo_snaps = restore_and_invert(&mut world, &entry);
-    let patch = patch_from_chunk_coords(&world, &affected);
-
+    let group = entry.group;
     let label = entry.operation.clone();
-    ws.world = Some(world);
-    refresh_lamp_index_chunks(&mut ws, &affected);
-    push_undo(&mut ws.undo_stack, UndoEntry { operation: entry.operation, chunks: undo_snaps });
+    let mut affected: Vec<(i16, i16)> = Vec::new();
 
-    Ok(EditResult { patch, undo_depth: ws.undo_stack.len(), redo_depth: ws.redo_stack.len(), operation: label })
+    let mut current = Some(entry);
+    while let Some(entry) = current.take() {
+        for s in &entry.chunks { affected.push((s.cx, s.cy)); }
+        let undo_snaps = restore_and_invert(&mut world, &entry);
+        push_undo(&mut ws.undo_stack, UndoEntry { operation: entry.operation, chunks: undo_snaps, group: entry.group });
+        if let Some(g) = group {
+            if ws.redo_stack.back().map(|e| e.group) == Some(Some(g)) {
+                current = ws.redo_stack.pop_back();
+            }
+        }
+    }
+
+    let patch = patch_from_chunk_coords(&world, &affected, ws.view_cap_z);
+    ws.world = Some(world);
+    refresh_lamp_index_chunks(ws, &affected);
+
+    Ok(EditResult {
+        patch,
+        undo_depth: count_undo_groups(&ws.undo_stack),
+        redo_depth: count_undo_groups(&ws.redo_stack),
+        operation: label,
+    })
 }
 
 // ── Copy / Paste commands ──────────────────────────────────────────────────────
@@ -2617,8 +2945,15 @@ fn copy_selection(
         }
     }
 
-    ws.clipboard = Some(Clipboard { width, height, depth, z_anchor: z_min, block_types, paints });
-    Ok(ClipboardInfo { width, height, depth, z_anchor: z_min })
+    // A shaped selection copies its footprint into the clipboard so paste reproduces the shape, not
+    // the box. The mask's bitset layout (row-major over the bbox, bit (y-y1)*w+(x-x1)) is exactly the
+    // clipboard's per-column layout (dy*width+dx), so the bits transfer verbatim. `active_mask`
+    // applies the rect-equality fail-safe; a mismatched/absent mask → full-box copy as before.
+    let mask = active_mask(&ws, x1, y1, x2, y2).map(|m| m.bits);
+    let cb = Clipboard { width, height, depth, z_anchor: z_min, block_types, paints, mask };
+    let info = cb.info();
+    ws.clipboard = Some(cb);
+    Ok(info)
 }
 
 /// Rotate a directional block ID 90° clockwise.
@@ -2696,6 +3031,13 @@ fn mirror_ramp_id_y(bt: u8) -> u8 {
 /// Returns the z of the topmost non-air block at pixel position (px, py),
 /// or None if the column has no chunk or is entirely air.
 pub(crate) fn surface_z(world: &LoadedWorld, px: i32, py: i32) -> Option<i32> {
+    surface_z_capped(world, px, py, None)
+}
+
+/// `surface_z` with a cutaway ceiling: the topmost non-air block at or below `cap`. With `cap`
+/// set, "the surface" becomes the floor of whatever cavity the cap plane cuts into, which is what
+/// makes drawing / terrain-paste / the cursor readout work underground exactly as they do on top.
+pub(crate) fn surface_z_capped(world: &LoadedWorld, px: i32, py: i32, cap: Option<i32>) -> Option<i32> {
     if px < 0 || py < 0 { return None; }
     let cx = px / 16 + world.min_x;
     let cy = py / 16 + world.min_y;
@@ -2703,7 +3045,13 @@ pub(crate) fn surface_z(world: &LoadedWorld, px: i32, py: i32) -> Option<i32> {
     let lx = (px % 16) as usize;
     let ly = (py % 16) as usize;
     for band in (0..world.num_bands).rev() {
+        if let Some(c) = cap {
+            if (band * 16) as i32 > c { continue; }
+        }
         for lz in (0..16usize).rev() {
+            if let Some(c) = cap {
+                if (band * 16 + lz) as i32 > c { continue; }
+            }
             let bi = addr + band * 8192 + lx * 256 + ly * 16 + lz;
             if bi >= world.bytes.len() { continue; }
             if world.bytes[bi] != 0 {
@@ -2753,7 +3101,8 @@ struct PickedBlock { block_type: u8, paint: u8 }
 fn get_cursor_block(state: tauri::State<'_, AppState>, wx: i32, wy: i32) -> Option<[i32; 3]> {
     let ws = state.lock().unwrap_or_else(|p| p.into_inner());
     let world = ws.world.as_ref()?;
-    let z = surface_z(world, wx, wy)?;
+    // Report the block the cutaway view is actually showing (and that a z-less draw would hit).
+    let z = surface_z_capped(world, wx, wy, ws.view_cap_z)?;
     let (bt, paint) = get_block_at(world, wx, wy, z);
     Some([z, bt as i32, paint as i32])
 }
@@ -2764,7 +3113,7 @@ fn get_cursor_block(state: tauri::State<'_, AppState>, wx: i32, wy: i32) -> Opti
 fn pick_block_surface(state: tauri::State<'_, AppState>, wx: i32, wy: i32) -> Result<PickedBlock, String> {
     let ws = state.lock().unwrap_or_else(|p| p.into_inner());
     let world = ws.world.as_ref().ok_or("no world")?;
-    let z = surface_z(world, wx, wy).unwrap_or(0);
+    let z = surface_z_capped(world, wx, wy, ws.view_cap_z).unwrap_or(0);
     let (bt, paint) = get_block_at(world, wx, wy, z);
     Ok(PickedBlock { block_type: bt, paint })
 }
@@ -2783,6 +3132,21 @@ fn rotate_clipboard_inner(cb: &mut Clipboard) {
     let vol = new_w * new_h * depth;
     let mut new_types = vec![0u8; vol];
     let mut new_paints = vec![0u8; vol];
+    // Transform the footprint mask with the SAME (dx,dy)→(ndx,ndy) map as the data (dropping dz —
+    // the mask is per-column), or corruption results: a paste would skip the wrong columns.
+    let new_mask = cb.mask.as_ref().map(|old| {
+        let mut nm = vec![0u8; (new_w * new_h).div_ceil(8)];
+        for dy in 0..old_h {
+            for dx in 0..old_w {
+                if bit_set(old, dy * old_w + dx) {
+                    let (ndx, ndy) = (dy, old_w - 1 - dx);
+                    let ni = ndy * new_w + ndx;
+                    nm[ni >> 3] |= 1u8 << (ni & 7);
+                }
+            }
+        }
+        nm
+    });
     for dz in 0..depth {
         for dy in 0..old_h {
             for dx in 0..old_w {
@@ -2799,6 +3163,7 @@ fn rotate_clipboard_inner(cb: &mut Clipboard) {
     cb.height = new_h as i32;
     cb.block_types = new_types;
     cb.paints = new_paints;
+    cb.mask = new_mask;
 }
 
 #[tauri::command]
@@ -2806,7 +3171,7 @@ fn rotate_clipboard(state: tauri::State<'_, AppState>) -> Result<ClipboardInfo, 
     let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
     let cb = ws.clipboard.as_mut().ok_or("Clipboard is empty")?;
     rotate_clipboard_inner(cb);
-    Ok(ClipboardInfo { width: cb.width, height: cb.height, depth: cb.depth, z_anchor: cb.z_anchor })
+    Ok(cb.info())
 }
 
 fn mirror_clipboard_x_inner(cb: &mut Clipboard) {
@@ -2816,6 +3181,18 @@ fn mirror_clipboard_x_inner(cb: &mut Clipboard) {
     let vol = w * h * depth;
     let mut new_types = vec![0u8; vol];
     let mut new_paints = vec![0u8; vol];
+    if let Some(old) = cb.mask.as_ref() {
+        let mut nm = vec![0u8; (w * h).div_ceil(8)];
+        for dy in 0..h {
+            for dx in 0..w {
+                if bit_set(old, dy * w + dx) {
+                    let ni = dy * w + (w - 1 - dx);
+                    nm[ni >> 3] |= 1u8 << (ni & 7);
+                }
+            }
+        }
+        cb.mask = Some(nm);
+    }
     for dz in 0..depth {
         for dy in 0..h {
             for dx in 0..w {
@@ -2838,7 +3215,7 @@ fn mirror_clipboard_x(state: tauri::State<'_, AppState>) -> Result<ClipboardInfo
     let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
     let cb = ws.clipboard.as_mut().ok_or("Clipboard is empty")?;
     mirror_clipboard_x_inner(cb);
-    Ok(ClipboardInfo { width: cb.width, height: cb.height, depth: cb.depth, z_anchor: cb.z_anchor })
+    Ok(cb.info())
 }
 
 fn mirror_clipboard_y_inner(cb: &mut Clipboard) {
@@ -2848,6 +3225,18 @@ fn mirror_clipboard_y_inner(cb: &mut Clipboard) {
     let vol = w * h * depth;
     let mut new_types = vec![0u8; vol];
     let mut new_paints = vec![0u8; vol];
+    if let Some(old) = cb.mask.as_ref() {
+        let mut nm = vec![0u8; (w * h).div_ceil(8)];
+        for dy in 0..h {
+            for dx in 0..w {
+                if bit_set(old, dy * w + dx) {
+                    let ni = (h - 1 - dy) * w + dx;
+                    nm[ni >> 3] |= 1u8 << (ni & 7);
+                }
+            }
+        }
+        cb.mask = Some(nm);
+    }
     for dz in 0..depth {
         for dy in 0..h {
             for dx in 0..w {
@@ -2870,7 +3259,7 @@ fn mirror_clipboard_y(state: tauri::State<'_, AppState>) -> Result<ClipboardInfo
     let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
     let cb = ws.clipboard.as_mut().ok_or("Clipboard is empty")?;
     mirror_clipboard_y_inner(cb);
-    Ok(ClipboardInfo { width: cb.width, height: cb.height, depth: cb.depth, z_anchor: cb.z_anchor })
+    Ok(cb.info())
 }
 
 /// Paste the clipboard at world pixel position (paste_x, paste_y).
@@ -2889,10 +3278,10 @@ fn paste_at(
     let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
 
     // Clone clipboard data before taking world to avoid borrow conflict.
-    let (width, height, depth, z_anchor, block_types, paints) = {
+    let (width, height, depth, z_anchor, block_types, paints, mask) = {
         let cb = ws.clipboard.as_ref().ok_or("Clipboard is empty")?;
         (cb.width, cb.height, cb.depth, cb.z_anchor,
-         cb.block_types.clone(), cb.paints.clone())
+         cb.block_types.clone(), cb.paints.clone(), cb.mask.clone())
     };
 
     let x2_paste = paste_x + width  - 1;
@@ -2917,6 +3306,9 @@ fn paste_at(
                 for dx in 0..width {
                     let px = paste_x + dx;
                     if px < 0 { continue; }
+                    // Non-rectangular clipboard: skip columns outside the footprint before anything
+                    // else, so a shaped copy stamps its shape, not the box. Distinct from ignore_air.
+                    if let Some(m) = &mask { if !bit_set(m, (dy * width + dx) as usize) { continue; } }
                     let chunk_cx = px / 16 + world.min_x;
                     let lx       = (px % 16) as usize;
                     let &addr = match world.chunk_map.get(&(chunk_cx, chunk_cy)) {
@@ -2950,10 +3342,10 @@ fn paste_terrain(
 ) -> Result<EditResult, String> {
     let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
 
-    let (width, height, depth, block_types, paints) = {
+    let (width, height, depth, block_types, paints, mask) = {
         let cb = ws.clipboard.as_ref().ok_or("Clipboard is empty")?;
         (cb.width, cb.height, cb.depth,
-         cb.block_types.clone(), cb.paints.clone())
+         cb.block_types.clone(), cb.paints.clone(), cb.mask.clone())
     };
 
     let x2_paste = paste_x + width  - 1;
@@ -2962,6 +3354,7 @@ fn paste_terrain(
     let snap_rect = (paste_x.max(0), paste_y.max(0), x2_paste, y2_paste);
     let patch_rect = (paste_x, paste_y, x2_paste, y2_paste);
     let surf_nudge: i32 = if above_surface { 1 } else { 0 };
+    let cap = ws.view_cap_z; // cutaway: follow the sub-cap surface (cave floor), not the true surface
 
     let label = format!("Paste (terrain) {width}×{height}×{depth}");
     with_edit(&mut ws, &label, snap_rect, patch_rect, |world| {
@@ -2974,6 +3367,8 @@ fn paste_terrain(
             for dx in 0..width {
                 let px = paste_x + dx;
                 if px < 0 { continue; }
+                // Shaped clipboard: skip whole columns outside the footprint.
+                if let Some(m) = &mask { if !bit_set(m, (dy * width + dx) as usize) { continue; } }
                 let chunk_cx = px / 16 + world.min_x;
                 let lx       = (px % 16) as usize;
                 let &addr = match world.chunk_map.get(&(chunk_cx, chunk_cy)) {
@@ -2982,7 +3377,7 @@ fn paste_terrain(
                 };
                 // Read surface before writing this column — other columns' writes never
                 // affect (px, py) since each (dx, dy) maps to a unique world position.
-                let surf = match surface_z(world, px, py) {
+                let surf = match surface_z_capped(world, px, py, cap) {
                     Some(z) => z,
                     None    => continue, // all-air column — skip
                 };
@@ -3022,6 +3417,11 @@ fn extrude_selection(
 ) -> Result<EditResult, String> {
     let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
     if count <= 0 { return Err("count must be at least 1".into()); }
+
+    // Non-rectangular selection: gate on the *source* footprint (mask only exists over the source
+    // bbox). z± stacks the shape in place; x±/y± repeats the translated shape — each copy leaves
+    // its unmasked cells untouched. Never evaluated at destination coords. No match → rect-only.
+    let mask = active_mask(&ws, x1, y1, x2, y2);
 
     // Pre-buffer source blocks under borrow, then release before taking world.
     let (max_z, src_types, src_paints, width, height, depth) = {
@@ -3076,48 +3476,63 @@ fn extrude_selection(
 
     let label = format!("Extrude {axis} ×{count}");
     with_edit(&mut ws, &label, rect, rect, |world| {
-        for k in 1..=count {
-            let (dx_step, dy_step, dz_step) = match axis.as_str() {
-                "x+" => ( k * width,   0,        0),
-                "x-" => (-k * width,   0,        0),
-                "y+" => ( 0,  k * height,        0),
-                "y-" => ( 0, -k * height,        0),
-                "z-" => ( 0,  0,       -k * depth),
-                _    => ( 0,  0,        k * depth), // "z+"
-            };
+        extrude_write(world, x1, y1, &src_types, &src_paints, width, height, depth, z_min, max_z, &axis, count, ignore_air, mask.as_ref());
+        Ok(())
+    })
+}
 
-            for dz in 0..depth {
-                let tz = z_min + dz + dz_step;
-                if tz < 0 || tz > max_z { continue; }
-                let band = (tz as usize) / 16;
-                let lz   = (tz as usize) % 16;
-                for dy in 0..height {
-                    let ty = y1 + dy + dy_step;
-                    if ty < 0 { continue; }
-                    let chunk_cy = ty / 16 + world.min_y;
-                    let ly       = (ty % 16) as usize;
-                    for dx in 0..width {
-                        let tx = x1 + dx + dx_step;
-                        if tx < 0 { continue; }
-                        let chunk_cx = tx / 16 + world.min_x;
-                        let lx       = (tx % 16) as usize;
-                        let idx      = (dz * height * width + dy * width + dx) as usize;
-                        let src_bt   = src_types[idx];
-                        if ignore_air && src_bt == 0 { continue; }
-                        let &addr = match world.chunk_map.get(&(chunk_cx, chunk_cy)) {
-                            None    => continue,
-                            Some(a) => a,
-                        };
-                        let bi = addr + band * 8192 + lx * 256 + ly * 16 + lz;
-                        let pi = bi + 4096;
-                        if bi < world.bytes.len() { world.bytes[bi] = src_bt; }
-                        if pi < world.bytes.len() { world.bytes[pi] = src_paints[idx]; }
-                    }
+/// Writes the N extrude copies of a pre-buffered source volume. The mask (if any) gates on the
+/// *source* cell `(x1+dx, y1+dy)` — the shape is what repeats — and is never evaluated at
+/// destination coords (it only exists over the source bbox).
+#[allow(clippy::too_many_arguments)]
+fn extrude_write(
+    world: &mut LoadedWorld,
+    x1: i32, y1: i32, src_types: &[u8], src_paints: &[u8],
+    width: i32, height: i32, depth: i32, z_min: i32, max_z: i32,
+    axis: &str, count: i32, ignore_air: bool, mask: Option<&SelectionMask>,
+) {
+    for k in 1..=count {
+        let (dx_step, dy_step, dz_step) = match axis {
+            "x+" => ( k * width,   0,        0),
+            "x-" => (-k * width,   0,        0),
+            "y+" => ( 0,  k * height,        0),
+            "y-" => ( 0, -k * height,        0),
+            "z-" => ( 0,  0,       -k * depth),
+            _    => ( 0,  0,        k * depth), // "z+"
+        };
+
+        for dz in 0..depth {
+            let tz = z_min + dz + dz_step;
+            if tz < 0 || tz > max_z { continue; }
+            let band = (tz as usize) / 16;
+            let lz   = (tz as usize) % 16;
+            for dy in 0..height {
+                let ty = y1 + dy + dy_step;
+                if ty < 0 { continue; }
+                let chunk_cy = ty / 16 + world.min_y;
+                let ly       = (ty % 16) as usize;
+                for dx in 0..width {
+                    let tx = x1 + dx + dx_step;
+                    if tx < 0 { continue; }
+                    let chunk_cx = tx / 16 + world.min_x;
+                    let lx       = (tx % 16) as usize;
+                    // Gate on the source cell (x1+dx, y1+dy) — the shape is what repeats.
+                    if mask.is_some_and(|m| !m.contains(x1 + dx, y1 + dy)) { continue; }
+                    let idx      = (dz * height * width + dy * width + dx) as usize;
+                    let src_bt   = src_types[idx];
+                    if ignore_air && src_bt == 0 { continue; }
+                    let &addr = match world.chunk_map.get(&(chunk_cx, chunk_cy)) {
+                        None    => continue,
+                        Some(a) => a,
+                    };
+                    let bi = addr + band * 8192 + lx * 256 + ly * 16 + lz;
+                    let pi = bi + 4096;
+                    if bi < world.bytes.len() { world.bytes[bi] = src_bt; }
+                    if pi < world.bytes.len() { world.bytes[pi] = src_paints[idx]; }
                 }
             }
         }
-        Ok(())
-    })
+    }
 }
 
 /// Moves the selection's contents by (dx, dy, dz) in one gesture: reads the source volume,
@@ -3146,7 +3561,13 @@ fn move_selection(
     let snap_rect = (x1.min(x1d), y1.min(y1d), x2.max(x2d), y2.max(y2d));
     let label = format!("Move {width}×{height}×{depth}");
 
-    with_edit(&mut ws, &label, snap_rect, snap_rect, |world| {
+    // A shaped selection moves only its footprint (dragging the box was the wand bug's twin). The
+    // mask is per-column, so the same local `(lx,ly)` gate applies to both the source clear and the
+    // destination write; `mask.contains` reads absolute *source* coords `(x1+lx, y1+ly)`.
+    let mask = active_mask(&ws, x1, y1, x2, y2);
+    let masked = mask.is_some();
+
+    let result = with_edit(&mut ws, &label, snap_rect, snap_rect, |world| {
         let n = (width * height * depth) as usize;
         let mut buf_bt = vec![0u8; n];
         let mut buf_paint = vec![0u8; n];
@@ -3159,9 +3580,12 @@ fn move_selection(
                 }
             }
         }
+        // Clear the (masked) source first, then write the (masked) dest — so an overlapping move
+        // never clears a cell it just wrote. Both passes gate on the same source-column predicate.
         for lz in 0..depth {
             for ly in 0..height {
                 for lx in 0..width {
+                    if let Some(m) = &mask { if !m.contains(x1 + lx, y1 + ly) { continue; } }
                     set_block_abs(world, x1 + lx, y1 + ly, z_min + lz, 0, 0);
                 }
             }
@@ -3171,13 +3595,26 @@ fn move_selection(
             if tz < 0 || tz > max_z { continue; }
             for ly in 0..height {
                 for lx in 0..width {
+                    if let Some(m) = &mask { if !m.contains(x1 + lx, y1 + ly) { continue; } }
                     let idx = (lz * height * width + ly * width + lx) as usize;
                     set_block_abs(world, x1d + lx, y1d + ly, tz, buf_bt[idx], buf_paint[idx]);
                 }
             }
         }
         Ok(())
-    })
+    })?;
+
+    // Shape-preserving move: the selection box shifts by (dx,dy) on the frontend, so shift the stored
+    // mask's bbox to match (bits and z are unchanged — the mask is a 2D footprint). The frontend
+    // updates `selectionMaskRectRef` to the same shifted rect so its clear-on-reshape effect sees a
+    // match and leaves this shifted mask in place. `with_edit` never touches `selection_mask`, so
+    // it's still present here. Only when a mask was actually active (rect matched).
+    if masked {
+        if let Some(m) = ws.selection_mask.as_mut() {
+            m.x1 += dx; m.y1 += dy; m.x2 += dx; m.y2 += dy;
+        }
+    }
+    Ok(result)
 }
 
 // ── Tree generation ───────────────────────────────────────────────────────────
@@ -3421,6 +3858,9 @@ fn generate_trees(
     if x2 < x1 || y2 < y1 {
         return Err("Invalid selection bounds".into());
     }
+    // Non-rectangular selection: only plant inside the shaped footprint. Canopy spill outside the
+    // mask is accepted, same as the existing ±3 rect spill. No match → rect-only.
+    let mask = active_mask(&ws, x1, y1, x2, y2);
 
     // Expand both the snapshot and the returned patch by 3 to include chunks where leaves may
     // spill over — a patch limited to the bare selection would leave spilled leaves invisible on
@@ -3430,62 +3870,76 @@ fn generate_trees(
 
     let label = format!("Generate trees ({}×{})", x2 - x1 + 1, y2 - y1 + 1);
     with_edit(&mut ws, &label, snap_rect, patch_rect, |world| {
-        let max_z = world_max_z(world);
-        let mut rng = Rng64::new(seed);
-        let density_num = (density.clamp(0.0, 1.0) * 1_000_000.0) as u64;
-
-        for wx in x1..=x2 {
-            for wy in y1..=y2 {
-                if !rng.prob(density_num, 1_000_000) { continue; }
-
-                let sz = match surface_z(world, wx, wy) { Some(z) => z, None => continue };
-
-                // Read surface block type to check plantability.
-                let surf_bt = {
-                    let cx = wx.div_euclid(16) + world.min_x;
-                    let cy = wy.div_euclid(16) + world.min_y;
-                    if let Some(&addr) = world.chunk_map.get(&(cx, cy)) {
-                        let lx   = wx.rem_euclid(16) as usize;
-                        let ly   = wy.rem_euclid(16) as usize;
-                        let band = sz as usize / 16;
-                        let lz   = sz as usize % 16;
-                        let bi   = addr + band * 8192 + lx * 256 + ly * 16 + lz;
-                        if bi < world.bytes.len() { world.bytes[bi] } else { 0 }
-                    } else { 0 }
-                };
-
-                if smart_placement {
-                    if !matches!(surf_bt, 3 | 8) { continue; }
-                } else if !is_plantable(surf_bt) { continue; }
-
-                let z_base = sz + 1;
-                if z_base > max_z { continue; }
-
-                let chosen_type = &tree_types[rng.range(0, tree_types.len() as i32 - 1) as usize];
-                match chosen_type.as_str() {
-                    "normal"    => {
-                        let trunk_h = rng.range(3, 8);
-                        let lp = pick_leaf_paint(&leaf_paints, &NORMAL_LEAF_PAINTS, &mut rng);
-                        place_normal_tree(world, wx, wy, z_base, trunk_h, lp);
-                    }
-                    "terrain"   => {
-                        let lp = pick_leaf_paint(&leaf_paints, &NORMAL_LEAF_PAINTS, &mut rng);
-                        place_terrain_tree(world, wx, wy, z_base, &mut rng, lp);
-                    }
-                    "pine"      => {
-                        let lp = pick_leaf_paint(&leaf_paints, &PINE_LEAF_PAINTS, &mut rng);
-                        place_pine_tree(world, wx, wy, z_base, &mut rng, Some(lp));
-                    }
-                    "tall_pine" => {
-                        let lp = pick_leaf_paint(&leaf_paints, &PINE_LEAF_PAINTS, &mut rng);
-                        place_tall_pine_tree(world, wx, wy, z_base, &mut rng, lp);
-                    }
-                    _ => {}
-                }
-            }
-        }
+        generate_trees_inner(world, x1, y1, x2, y2, &tree_types, density, &leaf_paints, seed, smart_placement, mask.as_ref());
         Ok(())
     })
+}
+
+/// Core of `generate_trees`: scatter trees across the XY footprint, gated by an optional
+/// shaped-selection mask (only plant inside the shape; canopy spill outside is accepted, same as the
+/// existing ±3 rect spill).
+#[allow(clippy::too_many_arguments)]
+fn generate_trees_inner(
+    world: &mut LoadedWorld,
+    x1: i32, y1: i32, x2: i32, y2: i32,
+    tree_types: &[String], density: f32, leaf_paints: &[u8], seed: u64,
+    smart_placement: bool, mask: Option<&SelectionMask>,
+) {
+    let max_z = world_max_z(world);
+    let mut rng = Rng64::new(seed);
+    let density_num = (density.clamp(0.0, 1.0) * 1_000_000.0) as u64;
+
+    for wx in x1..=x2 {
+        for wy in y1..=y2 {
+            if mask.is_some_and(|m| !m.contains(wx, wy)) { continue; }
+            if !rng.prob(density_num, 1_000_000) { continue; }
+
+            let sz = match surface_z(world, wx, wy) { Some(z) => z, None => continue };
+
+            // Read surface block type to check plantability.
+            let surf_bt = {
+                let cx = wx.div_euclid(16) + world.min_x;
+                let cy = wy.div_euclid(16) + world.min_y;
+                if let Some(&addr) = world.chunk_map.get(&(cx, cy)) {
+                    let lx   = wx.rem_euclid(16) as usize;
+                    let ly   = wy.rem_euclid(16) as usize;
+                    let band = sz as usize / 16;
+                    let lz   = sz as usize % 16;
+                    let bi   = addr + band * 8192 + lx * 256 + ly * 16 + lz;
+                    if bi < world.bytes.len() { world.bytes[bi] } else { 0 }
+                } else { 0 }
+            };
+
+            if smart_placement {
+                if !matches!(surf_bt, 3 | 8) { continue; }
+            } else if !is_plantable(surf_bt) { continue; }
+
+            let z_base = sz + 1;
+            if z_base > max_z { continue; }
+
+            let chosen_type = &tree_types[rng.range(0, tree_types.len() as i32 - 1) as usize];
+            match chosen_type.as_str() {
+                "normal"    => {
+                    let trunk_h = rng.range(3, 8);
+                    let lp = pick_leaf_paint(leaf_paints, &NORMAL_LEAF_PAINTS, &mut rng);
+                    place_normal_tree(world, wx, wy, z_base, trunk_h, lp);
+                }
+                "terrain"   => {
+                    let lp = pick_leaf_paint(leaf_paints, &NORMAL_LEAF_PAINTS, &mut rng);
+                    place_terrain_tree(world, wx, wy, z_base, &mut rng, lp);
+                }
+                "pine"      => {
+                    let lp = pick_leaf_paint(leaf_paints, &PINE_LEAF_PAINTS, &mut rng);
+                    place_pine_tree(world, wx, wy, z_base, &mut rng, Some(lp));
+                }
+                "tall_pine" => {
+                    let lp = pick_leaf_paint(leaf_paints, &PINE_LEAF_PAINTS, &mut rng);
+                    place_tall_pine_tree(world, wx, wy, z_base, &mut rng, lp);
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 /// Top-down render of the current clipboard (highest non-air block per column).
@@ -3581,6 +4035,10 @@ fn render_axo_clipboard(ski: f32, dir: u8, state: tauri::State<'_, AppState>) ->
     let ws  = state.lock().unwrap_or_else(|p| p.into_inner());
     let sky = ws.world.as_ref().map(|w| w.sky).unwrap_or(0);
     let cb  = ws.clipboard.as_ref().ok_or("Clipboard is empty")?;
+    Ok(render_axo_clipboard_inner(cb, sky, ski, dir))
+}
+
+fn render_axo_clipboard_inner(cb: &Clipboard, sky: u8, ski: f32, dir: u8) -> PreviewData {
     let (cw, ch, cd) = (cb.width, cb.height, cb.depth);
 
     let mut pixels = vec![30u8; (cw * ch * 4) as usize];
@@ -3602,6 +4060,8 @@ fn render_axo_clipboard(ski: f32, dir: u8, state: tauri::State<'_, AppState>) ->
                 let sx = (px as f32 + sx_sgn * ski * 0.5 * dz as f32).round() as i32;
                 let sy = (py as f32 + sy_sgn * ski * dz as f32).round() as i32;
                 if sx < 0 || sx >= cw || sy < 0 || sy >= ch { continue; }
+                // Shaped clipboard: unmasked columns are see-through so the axo ghost matches paste.
+                if cb.mask.as_ref().is_some_and(|m| !bit_set(m, (sy * cw + sx) as usize)) { continue; }
                 let idx = (cb_layer * ch * cw + sy * cw + sx) as usize;
                 if idx >= cb.block_types.len() { continue; }
                 let bt = cb.block_types[idx];
@@ -3633,7 +4093,7 @@ fn render_axo_clipboard(ski: f32, dir: u8, state: tauri::State<'_, AppState>) ->
         }
     }
 
-    Ok(PreviewData { width: cw as u32, height: ch as u32, pixels })
+    PreviewData { width: cw as u32, height: ch as u32, pixels }
 }
 
 /// Used to show a block preview inside the paste ghost box.
@@ -3653,10 +4113,19 @@ fn render_clipboard_preview_inner(cb: &Clipboard, sky: u8) -> PreviewData {
     let (w, h, d) = (cb.width, cb.height, cb.depth);
     const VOID: [u8; 4] = [20, 20, 35, 255];
     let mut pixels = vec![0u8; (w * h * 4) as usize];
-    for p in pixels.chunks_exact_mut(4) { p.copy_from_slice(&VOID); }
+    // Shaped clipboard: leave unmasked columns fully transparent (alpha 0) so the paste ghost
+    // shows only the traced footprint — masked-but-air columns keep the dark VOID look. A None
+    // mask (prefab thumbnails, rectangular copies) fills the whole box with VOID as before.
+    if cb.mask.is_none() {
+        for p in pixels.chunks_exact_mut(4) { p.copy_from_slice(&VOID); }
+    }
     for dy in 0..h {
         for dx in 0..w {
             let col = (dy * w + dx) as usize;
+            if let Some(m) = &cb.mask {
+                if !bit_set(m, col) { continue; } // outside footprint → stays alpha 0
+                pixels[col * 4..col * 4 + 4].copy_from_slice(&VOID); // masked → dark VOID base
+            }
             for dz in (0..d).rev() { // highest dz = topmost z layer
                 let idx = (dz * h * w + dy * w + dx) as usize;
                 let bt  = cb.block_types[idx];
@@ -3684,6 +4153,10 @@ fn render_clipboard_elevation_preview(
     let ws  = state.lock().unwrap_or_else(|p| p.into_inner());
     let sky = ws.world.as_ref().map(|w| w.sky).unwrap_or(0);
     let cb  = ws.clipboard.as_ref().ok_or("Clipboard is empty")?;
+    Ok(render_clipboard_elevation_preview_inner(cb, sky, &view))
+}
+
+fn render_clipboard_elevation_preview_inner(cb: &Clipboard, sky: u8, view: &str) -> PreviewData {
     let (w, h, d) = (cb.width as usize, cb.height as usize, cb.depth as usize);
     let is_front = view != "side";
     let img_w = if is_front { w } else { h };
@@ -3692,15 +4165,19 @@ fn render_clipboard_elevation_preview(
     for dz in 0..d {
         let row = d - 1 - dz; // row 0 = top = highest z
         for col in 0..img_w {
+            // Shaped clipboard: an unmasked column is treated as air so the ghost's silhouette
+            // matches the paste footprint (front idx dy*w+col, side idx col*w+dx). None ⇒ no gate.
             let result = if is_front {
                 // col = dx, scan dy front-to-back
                 (0..h).find_map(|dy| {
+                    if cb.mask.as_ref().is_some_and(|m| !bit_set(m, dy * w + col)) { return None; }
                     let bt = cb.block_types[dz * h * w + dy * w + col];
                     if bt != 0 { Some((bt, cb.paints[dz * h * w + dy * w + col])) } else { None }
                 })
             } else {
                 // col = dy, scan dx left-to-right
                 (0..w).find_map(|dx| {
+                    if cb.mask.as_ref().is_some_and(|m| !bit_set(m, col * w + dx)) { return None; }
                     let bt = cb.block_types[dz * h * w + col * w + dx];
                     if bt != 0 { Some((bt, cb.paints[dz * h * w + col * w + dx])) } else { None }
                 })
@@ -3712,7 +4189,7 @@ fn render_clipboard_elevation_preview(
             }
         }
     }
-    Ok(PreviewData { width: img_w as u32, height: img_h as u32, pixels })
+    PreviewData { width: img_w as u32, height: img_h as u32, pixels }
 }
 
 // ── Prefab serialization ───────────────────────────────────────────────────────
@@ -3721,13 +4198,24 @@ fn serialize_prefab(cb: &Clipboard) -> Vec<u8> {
     use flate2::{write::GzEncoder, Compression};
     use std::io::Write;
     let n = (cb.width * cb.height * cb.depth) as usize;
-    let mut raw = Vec::with_capacity(22 + 2 * n);
-    raw.extend_from_slice(b"EPFAB\x01");
+    // A shaped prefab uses EPFAB\x02, appending a per-column footprint after the dense arrays.
+    // Rectangular prefabs stay on EPFAB\x01 byte-for-byte, so existing files and older builds are
+    // unaffected (the format is forward-compatible only, which is fine for a private tool).
+    let mask_bytes: Option<&[u8]> = cb.mask.as_deref();
+    let version: u8 = if mask_bytes.is_some() { 2 } else { 1 };
+    let mut raw = Vec::with_capacity(22 + 2 * n + mask_bytes.map_or(0, |m| 1 + m.len()));
+    raw.extend_from_slice(b"EPFAB");
+    raw.push(version);
     for v in [cb.width, cb.height, cb.depth, cb.z_anchor] {
         raw.extend_from_slice(&v.to_le_bytes());
     }
     raw.extend_from_slice(&cb.block_types);
     raw.extend_from_slice(&cb.paints);
+    if let Some(m) = mask_bytes {
+        // Flag byte reserves room for a future maskless EPFAB\x02 (flag 0); today it's always 1.
+        raw.push(1u8);
+        raw.extend_from_slice(m);
+    }
     let mut enc = GzEncoder::new(Vec::new(), Compression::best());
     enc.write_all(&raw).unwrap();
     enc.finish().unwrap()
@@ -3737,9 +4225,10 @@ fn deserialize_prefab(data: &[u8]) -> Result<Clipboard, String> {
     use std::borrow::Cow;
     // Auto-detect gzip (new compressed format) vs raw (legacy uncompressed).
     // Cap the decompressed size so a tiny "gzip bomb" .epfab can't expand to gigabytes. The largest
-    // legitimate prefab is 22-byte header + 2 bytes per voxel at the MAX_CELLS cap below.
+    // legitimate prefab is 22-byte header + 2 bytes per voxel + an optional 1-byte flag and a
+    // width*height footprint bitset (≤ voxels/8, and ≤ MAX_CELLS/8 in the worst case).
     const MAX_CELLS: i64 = 64 * 1024 * 1024; // 64M voxels
-    const MAX_DECOMPRESSED: u64 = 22 + 2 * MAX_CELLS as u64;
+    const MAX_DECOMPRESSED: u64 = 22 + 2 * MAX_CELLS as u64 + 1 + MAX_CELLS as u64 / 8;
     let raw: Cow<[u8]> = if data.starts_with(&[0x1f, 0x8b]) {
         use flate2::read::GzDecoder;
         use std::io::Read;
@@ -3754,8 +4243,12 @@ fn deserialize_prefab(data: &[u8]) -> Result<Clipboard, String> {
         Cow::Borrowed(data)
     };
     let data = raw.as_ref();
-    if data.len() < 22 || &data[0..6] != b"EPFAB\x01" {
+    if data.len() < 22 || &data[0..5] != b"EPFAB" {
         return Err("Not a valid .epfab file".into());
+    }
+    let version = data[5];
+    if version != 1 && version != 2 {
+        return Err("Unsupported .epfab version".into());
     }
     let width    = i32::from_le_bytes(data[6..10].try_into().unwrap());
     let height   = i32::from_le_bytes(data[10..14].try_into().unwrap());
@@ -3774,10 +4267,25 @@ fn deserialize_prefab(data: &[u8]) -> Result<Clipboard, String> {
     if data.len() < 22 + 2 * n {
         return Err("Corrupt or truncated .epfab file".into());
     }
+    // EPFAB\x02 appends a per-column footprint: a 1-byte presence flag + a row-major width*height
+    // bitset. v1 has no such section and stays rectangular (mask None). A malformed/short mask is
+    // treated as "no shape" rather than an error — the prefab is still a valid full-box paste.
+    let mask = if version == 2 {
+        let mask_len = (width as usize * height as usize).div_ceil(8);
+        let flag_off = 22 + 2 * n;
+        if data.len() >= flag_off + 1 + mask_len && data[flag_off] == 1 {
+            Some(data[flag_off + 1..flag_off + 1 + mask_len].to_vec())
+        } else {
+            None
+        }
+    } else {
+        None // .epfab v1 is rectangular — prefabs drop any shape (see Clipboard::mask)
+    };
     Ok(Clipboard {
         width, height, depth, z_anchor,
         block_types: data[22..22 + n].to_vec(),
         paints:      data[22 + n..22 + 2 * n].to_vec(),
+        mask,
     })
 }
 
@@ -3793,10 +4301,7 @@ fn save_prefab(path: String, state: tauri::State<'_, AppState>) -> Result<(), St
 fn load_prefab(path: String, state: tauri::State<'_, AppState>) -> Result<ClipboardInfo, String> {
     let data = fs::read(&path).map_err(|e| format!("Failed to read prefab: {e}"))?;
     let cb   = deserialize_prefab(&data)?;
-    let info = ClipboardInfo {
-        width: cb.width, height: cb.height,
-        depth: cb.depth, z_anchor: cb.z_anchor,
-    };
+    let info = cb.info();
     let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
     ws.clipboard = Some(cb);
     Ok(info)
@@ -3859,7 +4364,8 @@ fn read_prefab_header(path: &std::path::Path) -> Option<(i32, i32, i32)> {
         // would fail and drop it from the gallery, so read the raw header directly.
         fs::File::open(path).ok()?.read_exact(&mut header).ok()?;
     }
-    if &header[0..6] != b"EPFAB\x01" { return None; }
+    // Accept both the rectangular v1 and the shaped v2 header (dims sit at identical offsets).
+    if &header[0..5] != b"EPFAB" || !matches!(header[5], 1 | 2) { return None; }
     let width  = i32::from_le_bytes(header[6..10].try_into().ok()?);
     let height = i32::from_le_bytes(header[10..14].try_into().ok()?);
     let depth  = i32::from_le_bytes(header[14..18].try_into().ok()?);
@@ -4067,22 +4573,60 @@ const SCULPT_KERNEL: [((i32, i32), f64); 8] = [
 
 // ── Sculpt terrain command ────────────────────────────────────────────────────
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, Clone)]
 struct SculptPoint { x: i32, y: i32 }
 
 /// Sculpt terrain at brush positions.
 /// mode: "smooth" | "noise" | "flatten" | "erode" | "thermal" | "raise" | "lower"
 ///      | "grab" (drag-controlled displacement, `grab_delta`)
 ///      | "hydro" (droplet hydraulic erosion) | "stamp" (retexture surface by slope/height)
+///      | "terrace" (quantize height to `strength`-block steps)
+///      | "sharpen" (unsharp mask — pushes columns away from their neighbour average)
+///      | "slope" (planar flatten tilted by `slope_dx/slope_dy`, rise per block, around the
+///        anchor column — a Flatten with tilt; excluded from the frontend's hold-to-build timer
+///        for the same reason Flatten is: it converges in one shot from its anchor)
+///      | "smear" (lateral height advection: pulls each column's height from `smear_dx/smear_dy`
+///        blocks behind the drag direction, so terrain drags along with the brush)
 ///
-/// `softness` (0..1) applies a radial falloff derived from a distance field over the swept
-/// footprint: 0 = hard flat edges (legacy behaviour), 1 = a full dome that tapers the effect
-/// to nothing at the brush rim. `profile` picks the dome curve (smooth/linear/sphere/sharp).
-/// `anchor_x/anchor_y` is the pointer-down column — Flatten levels everything to that height.
+/// `softness` (0..1) applies a radial falloff. By default it derives from a distance field over
+/// the swept footprint (BFS silhouette dome): 0 = hard flat edges (legacy behaviour), 1 = a full
+/// dome tapering the effect to nothing at the brush rim. `profile` picks the dome curve
+/// (smooth/linear/sphere/sharp). `anchor_x/anchor_y` is the pointer-down column — Flatten (and
+/// Slope) levels everything to/around that height.
+///
+/// **Per-stamp radial falloff:** when `stamp_cx/stamp_cy/stamp_radius` are all supplied (3D-pane
+/// stamps, 2D hold-to-build timer ticks — anything with a single well-defined brush centre), the
+/// BFS is skipped and the weight is a clean Euclidean dome around that centre. When they're absent
+/// (2D one-shot click-drag strokes, shape fills) the BFS silhouette dome is used unchanged.
+///
+/// **Backend footprint generation:** if `points` is `None`/empty *and* a stamp centre+radius are
+/// given, the disc footprint is generated here (frontend needn't ship a point list per timer tick)
+/// — the same squared-distance disc as the frontend's `brushFootprint("circ")`.
+///
+/// `use_cap` (default `true`): when `false`, the true uncapped surface is sculpted regardless of
+/// the 2D cutaway cap (the 3D pane isn't clipped by cutaway). `group_id` tags every stamp of one
+/// stroke so they undo/redo as a single unit (see `with_edit_grouped`).
+///
+/// Round a precise float height to the integer committed to the world. Soft brushes (`softness > 0`)
+/// dither the fractional part against the BAYER8 ordered-dither threshold (the same table
+/// `gradient_fill` uses) indexed by the column's world `(x, y)`, so a falloff isn't quantized into
+/// concentric terraces; hard brushes round exactly (audit's explicit risk note). Shared by the
+/// live-stroke float-workspace commit and the legacy per-call blend.
+fn round_dither(raw: f64, softness: f64, x: i32, y: i32) -> i32 {
+    if softness <= 0.0 {
+        raw.round() as i32
+    } else {
+        let base = raw.floor();
+        let frac = raw - base;
+        let dith = (BAYER8[x.rem_euclid(8) as usize][y.rem_euclid(8) as usize] as f64 + 0.5) / 64.0;
+        if frac >= dith { (base + 1.0) as i32 } else { base as i32 }
+    }
+}
+
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 fn sculpt_terrain(
-    points: Vec<SculptPoint>,
+    points: Option<Vec<SculptPoint>>,
     mode: String,
     strength: i32,
     seed: u64,
@@ -4095,15 +4639,130 @@ fn sculpt_terrain(
     grab_delta: Option<i32>,
     anchor_x: Option<i32>,
     anchor_y: Option<i32>,
+    stamp_cx: Option<i32>,
+    stamp_cy: Option<i32>,
+    stamp_radius: Option<i32>,
+    use_cap: Option<bool>,
+    group_id: Option<u64>,
+    slope_dx: Option<f64>,
+    slope_dy: Option<f64>,
+    smear_dx: Option<i32>,
+    smear_dy: Option<i32>,
+    stamp_centers: Option<Vec<[i32; 2]>>,
+    clip_rect: Option<[i32; 4]>,
+    strength_f: Option<f64>,
     state: tauri::State<'_, AppState>,
 ) -> Result<EditResult, String> {
-    if points.is_empty() { return Err("No points".into()); }
-    let strength = strength.clamp(1, 8);
-
     let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
+
+    // Live-stroke batching (row 6): a live 2D stroke ships every stamp centre queued since the last
+    // flush in one call. Apply them sequentially — each sees the previous stamp's committed result,
+    // the shared `group_id` keeps them one undo group, and the float session accumulates residuals
+    // across them — then return a single patch over the union of all stamp discs so every change
+    // reaches the frontend in one apply. Equivalent (byte-for-byte) to N separate same-group calls.
+    if let Some(centers) = stamp_centers.filter(|c| !c.is_empty()) {
+        let r = stamp_radius.unwrap_or(0).max(0);
+        let cap = if use_cap.unwrap_or(true) { ws.view_cap_z } else { None };
+        let (mut ux1, mut uy1, mut ux2, mut uy2) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
+        let mut last: Option<EditResult> = None;
+        for c in &centers {
+            let res = sculpt_terrain_inner(
+                &mut ws, None, mode.clone(), strength, seed, block_type, paint, freq,
+                noise_mode.clone(), softness, profile.clone(), grab_delta, anchor_x, anchor_y,
+                Some(c[0]), Some(c[1]), Some(r), use_cap, group_id, slope_dx, slope_dy, smear_dx,
+                smear_dy, clip_rect, strength_f,
+            )?;
+            ux1 = ux1.min(c[0] - r); uy1 = uy1.min(c[1] - r);
+            ux2 = ux2.max(c[0] + r); uy2 = uy2.max(c[1] + r);
+            last = Some(res);
+        }
+        let mut res = last.ok_or("No stamps")?;
+        if let Some(world) = ws.world.as_ref() {
+            res.patch = render_pixels_patch(world, ux1, uy1, ux2, uy2, cap);
+        }
+        return Ok(res);
+    }
+
+    sculpt_terrain_inner(
+        &mut ws, points, mode, strength, seed, block_type, paint, freq, noise_mode, softness,
+        profile, grab_delta, anchor_x, anchor_y, stamp_cx, stamp_cy, stamp_radius, use_cap, group_id,
+        slope_dx, slope_dy, smear_dx, smear_dy, clip_rect, strength_f,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sculpt_terrain_inner(
+    ws: &mut WorldState,
+    points: Option<Vec<SculptPoint>>,
+    mode: String,
+    strength: i32,
+    seed: u64,
+    block_type: Option<u8>,
+    paint: Option<u8>,
+    freq: Option<f64>,
+    noise_mode: Option<String>,
+    softness: Option<f64>,
+    profile: Option<String>,
+    grab_delta: Option<i32>,
+    anchor_x: Option<i32>,
+    anchor_y: Option<i32>,
+    stamp_cx: Option<i32>,
+    stamp_cy: Option<i32>,
+    stamp_radius: Option<i32>,
+    use_cap: Option<bool>,
+    group_id: Option<u64>,
+    slope_dx: Option<f64>,
+    slope_dy: Option<f64>,
+    smear_dx: Option<i32>,
+    smear_dy: Option<i32>,
+    // Row 6: `clip_rect` = server-side selection mask (cells outside get weight 0, i.e. skipped);
+    // `strength_f` = fractional per-stamp strength override for delta modes (the float workspace
+    // makes it meaningful — UI still ships the integer 1–8 slider). `stamp_centers` batching is
+    // handled one level up in the `sculpt_terrain` command (sequential same-group stamps).
+    clip_rect: Option<[i32; 4]>,
+    strength_f: Option<f64>,
+) -> Result<EditResult, String> {
+    let strength = strength.clamp(1, 8);
+    // Fractional strength for additive modes when supplied, else the integer slider value.
+    let strength_eff = strength_f.map(|f| f.clamp(0.0, 64.0)).unwrap_or(strength as f64);
+
+    // A "dial" stamp is one with a single well-defined centre + radius. It drives both the
+    // per-stamp radial falloff (below) and backend disc-footprint generation.
+    let dial: Option<(i32, i32, i32)> = match (stamp_cx, stamp_cy, stamp_radius) {
+        (Some(cx), Some(cy), Some(r)) => Some((cx, cy, r)),
+        _ => None,
+    };
+
+    // Resolve the footprint. Explicit non-empty points win; otherwise generate a filled disc from
+    // the stamp centre/radius (same `(dx² + dy²) <= (r + 0.5)²` convention as the frontend's
+    // `brushFootprint(size = r*2+1, "circ")` so 2D and 3D disc sizes match). No points and no dial
+    // → the historical "No points" error.
+    let points: Vec<SculptPoint> = match points {
+        Some(p) if !p.is_empty() => p,
+        _ => match dial {
+            Some((cx, cy, r)) => {
+                let r = r.max(0);
+                let rr = (r as f64 + 0.5).powi(2);
+                let mut pts = Vec::new();
+                for dy in -r..=r {
+                    for dx in -r..=r {
+                        if ((dx * dx + dy * dy) as f64) <= rr {
+                            pts.push(SculptPoint { x: cx + dx, y: cy + dy });
+                        }
+                    }
+                }
+                pts
+            }
+            None => return Err("No points".into()),
+        },
+    };
+    if points.is_empty() { return Err("No points".into()); }
 
     // Pre-read all heights and surface blocks while we have a shared ref. Smooth/erode/
     // thermal read the full 8-neighbourhood, so widen the pre-read beyond the footprint.
+    // Cutaway: normally sculpt the exposed sub-cap surface; `use_cap: false` (3D pane, which is not
+    // clipped by cutaway) ignores the cap and targets the true surface.
+    let cap = if use_cap.unwrap_or(true) { ws.view_cap_z } else { None };
     let height_map: HashMap<(i32, i32), (i32, u8, u8)> = {
         let world = ws.world.as_ref().ok_or("No world loaded")?;
         let mut all_pts = std::collections::HashSet::new();
@@ -4115,7 +4774,7 @@ fn sculpt_terrain(
         }
         all_pts.into_iter()
             .filter_map(|(x, y)| {
-                surface_z(world, x, y).map(|z| {
+                surface_z_capped(world, x, y, cap).map(|z| {
                     let bt    = read_block_abs(world, x, y, z);
                     let paint = read_paint_abs(world, x, y, z);
                     ((x, y), (z, bt, paint))
@@ -4124,11 +4783,25 @@ fn sculpt_terrain(
             .collect()
     };
 
-    // Radial falloff weights: distance field (8-connected BFS inward from the footprint
-    // boundary) → normalised smoothstep dome, blended toward a flat edge by `softness`.
+    // Radial falloff weights. Dial stamps use a clean Euclidean dome around the stamp centre;
+    // otherwise a distance field (8-connected BFS inward from the footprint boundary) → normalised
+    // dome, blended toward a flat edge by `softness`.
     let softness = softness.unwrap_or(0.0).clamp(0.0, 1.0);
-    let weight_of: HashMap<(i32, i32), f64> = if softness <= 0.0 {
-        HashMap::new() // empty → weight 1.0 everywhere (hard edges)
+    let profile = profile.unwrap_or_else(|| "smooth".into());
+    let weight: Box<dyn Fn(i32, i32) -> f64> = if let Some((scx, scy, srad)) = dial {
+        // Per-stamp radial dome: literal Euclidean distance from the stamp centre, not graph
+        // distance to the silhouette edge. weight = (1-softness) + dome*softness, clamped [0,1].
+        let r = srad.max(1) as f64;
+        let s = softness;
+        let prof = profile.clone();
+        Box::new(move |x, y| {
+            if s <= 0.0 { return 1.0; }
+            let d = (((x - scx) as f64).powi(2) + ((y - scy) as f64).powi(2)).sqrt();
+            let dome = falloff_dome(1.0 - (d / r).min(1.0), &prof);
+            ((1.0 - s) + dome * s).clamp(0.0, 1.0)
+        })
+    } else if softness <= 0.0 {
+        Box::new(|_x, _y| 1.0) // hard edges
     } else {
         let members: HashSet<(i32, i32)> = points.iter().map(|p| (p.x, p.y)).collect();
         let mut dist: HashMap<(i32, i32), i32> = HashMap::new();
@@ -4147,16 +4820,25 @@ fn sculpt_terrain(
                 }
             }
         }
-        let prof = profile.as_deref().unwrap_or("smooth");
         let max_dist = (*dist.values().max().unwrap_or(&1)).max(1) as f64;
-        members.iter().map(|&(x, y)| {
+        let weight_of: HashMap<(i32, i32), f64> = members.iter().map(|&(x, y)| {
             let d = *dist.get(&(x, y)).unwrap_or(&(max_dist as i32)) as f64;
-            let dome = falloff_dome(d / max_dist, prof);
+            let dome = falloff_dome(d / max_dist, &profile);
             ((x, y), (1.0 - softness) + dome * softness)
-        }).collect()
+        }).collect();
+        Box::new(move |x, y| *weight_of.get(&(x, y)).unwrap_or(&1.0))
     };
-    let weight = |x: i32, y: i32| -> f64 {
-        if softness <= 0.0 { 1.0 } else { *weight_of.get(&(x, y)).unwrap_or(&1.0) }
+
+    // Server-side selection clip: a cell outside `clip_rect` gets weight 0, so blend leaves it at
+    // its current height (no-op) — a true per-cell mask that supersedes the frontend point-filter
+    // for the batched live path and upgrades the 3D pane's crude centre-in-bounds drop.
+    let weight: Box<dyn Fn(i32, i32) -> f64> = if let Some([cx1, cy1, cx2, cy2]) = clip_rect {
+        let inner = weight;
+        Box::new(move |x, y| {
+            if x >= cx1 && x <= cx2 && y >= cy1 && y <= cy2 { inner(x, y) } else { 0.0 }
+        })
+    } else {
+        weight
     };
 
     let (mut x_min, mut y_min, mut x_max, mut y_max) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
@@ -4168,38 +4850,73 @@ fn sculpt_terrain(
 
     let mode_label = mode.chars().next().map(|c| c.to_uppercase().to_string() + &mode[1..]).unwrap_or_else(|| mode.clone());
     let label = format!("{mode_label} ({} pts)", points.len());
-    with_edit(&mut ws, &label, rect, rect, |world| {
+    // Live-stroke float workspace (row 6). Pull the session owned by this stroke's `group_id` (or
+    // start fresh); mode math blends into `session.fheight` so sub-block deltas accumulate across
+    // stamps instead of being rounded away every call — the fix for the reinforcing-dither stripes
+    // a repeated soft stamp used to leave. Taken out of `ws` here so the edit closure can borrow it
+    // mutably alongside `world` (which `with_edit_inner` takes out of `ws`); written back after.
+    // `with_edit_inner`'s own group-mismatch clear is a no-op while it's taken (already `None`).
+    let mut session = match ws.sculpt_session.take() {
+        Some(s) if Some(s.group_id) == group_id => s,
+        _ => SculptSession { group_id: group_id.unwrap_or(0), fheight: HashMap::new() },
+    };
+    let result = with_edit_grouped(ws, &label, rect, rect, group_id, |world| {
         let max_z = world_max_z(world);
-        // Weighted blend of `cur` toward `target` by the column's radial weight, rounded.
-        let blend = |cur: i32, target: i32, w: f64| -> i32 {
-            (cur as f64 + (target - cur) as f64 * w).round() as i32
+        // Blend `cur` toward the float `target` by the column's radial weight, accumulating the
+        // precise result in the per-stroke float workspace and committing its dithered round. The
+        // workspace seeds from `cur` (the world's current integer height) only on a column's FIRST
+        // touch this stroke; later stamps read the retained float, so a 0.3-weight rim column gains
+        // 0.3/stamp and crosses the next integer every ~3 stamps regardless of its fixed BAYER
+        // threshold. Additive modes pass `target = cur + delta`; convergent modes pass the plane/
+        // average target — both are the same `fh + (target - fh) * w` step.
+        let mut blend = |cur: i32, target: f64, w: f64, x: i32, y: i32| -> i32 {
+            let fh = session.fheight.entry((x, y)).or_insert(cur as f64);
+            let raw = *fh + (target - *fh) * w;
+            *fh = raw;
+            round_dither(raw, softness, x, y)
         };
         match mode.as_str() {
             "smooth" => {
-                // Wider weighted kernel: 8-connected, cardinals weight 1, diagonals √½,
-                // centre weight 1. Missing neighbours (world edge / no surface) drop out of
-                // the average ("fix edges") instead of pulling toward zero.
+                // Iterated 8-connected averaging (cardinals 1, diagonals √½, centre 1). Runs
+                // `strength` Jacobi passes over a local working copy seeded from `height_map`: each
+                // pass reads the *previous* pass's heights (never values updated within the same
+                // pass), so the result is independent of iteration order over `points`. Only the
+                // final heights are committed to the world (sculpt_column bakes in surface-layering
+                // side effects we don't want repeated per pass). Missing neighbours (world edge /
+                // no surface) drop out of the average at every pass ("fix edges"); neighbours in
+                // height_map but outside `points` act as fixed boundaries.
+                // Passes run in float now (no per-pass rounding); the radial weight and the
+                // float-workspace accumulation apply once at commit.
+                let mut work: HashMap<(i32, i32), f64> =
+                    height_map.iter().map(|(&k, &(z, _, _))| (k, z as f64)).collect();
+                for _ in 0..strength {
+                    let prev = work.clone();
+                    for p in &points {
+                        let Some(&cur_f) = prev.get(&(p.x, p.y)) else { continue };
+                        let mut hsum = cur_f;
+                        let mut wsum = 1.0;
+                        for ((dx, dy), k) in SCULPT_KERNEL {
+                            if let Some(&v) = prev.get(&(p.x + dx, p.y + dy)) {
+                                hsum += v * k;
+                                wsum += k;
+                            }
+                        }
+                        if wsum <= 1.0 { continue; }
+                        work.insert((p.x, p.y), hsum / wsum);
+                    }
+                }
                 for p in &points {
                     let Some(&(cur_z, surf_bt, surf_paint)) = height_map.get(&(p.x, p.y)) else { continue };
-                    let mut hsum = cur_z as f64;
-                    let mut wsum = 1.0;
-                    for ((dx, dy), k) in SCULPT_KERNEL {
-                        if let Some(v) = height_map.get(&(p.x + dx, p.y + dy)) {
-                            hsum += v.0 as f64 * k;
-                            wsum += k;
-                        }
-                    }
-                    if wsum <= 1.0 { continue; }
-                    let avg = (hsum / wsum).round() as i32;
-                    let target = blend(cur_z, avg, weight(p.x, p.y));
-                    sculpt_column(world, p.x, p.y, cur_z, target, max_z, surf_bt, surf_paint, block_type, paint);
+                    let smoothed = *work.get(&(p.x, p.y)).unwrap_or(&(cur_z as f64));
+                    let final_z = blend(cur_z, smoothed, weight(p.x, p.y), p.x, p.y);
+                    sculpt_column(world, p.x, p.y, cur_z, final_z, max_z, surf_bt, surf_paint, block_type, paint);
                 }
             }
             "raise" | "lower" => {
                 let sign = if mode == "raise" { 1 } else { -1 };
                 for p in &points {
                     let Some(&(cur_z, surf_bt, surf_paint)) = height_map.get(&(p.x, p.y)) else { continue };
-                    let target = cur_z + blend(0, sign * strength, weight(p.x, p.y));
+                    let target = blend(cur_z, cur_z as f64 + sign as f64 * strength_eff, weight(p.x, p.y), p.x, p.y);
                     sculpt_column(world, p.x, p.y, cur_z, target, max_z, surf_bt, surf_paint, block_type, paint);
                 }
             }
@@ -4223,9 +4940,10 @@ fn sculpt_terrain(
                         // fbm2 ∈ [-1,1] → gentle rolling ups and downs
                         fbm2(fx, fy, 4) * amp
                     };
-                    let delta = (raw * weight(p.x, p.y)).round() as i32;
-                    if delta != 0 {
-                        sculpt_column(world, p.x, p.y, cur_z, cur_z + delta, max_z, surf_bt, surf_paint, block_type, paint);
+                    // Weight + float-workspace accumulation via blend; `raw` is the full displacement.
+                    let target = blend(cur_z, cur_z as f64 + raw, weight(p.x, p.y), p.x, p.y);
+                    if target != cur_z {
+                        sculpt_column(world, p.x, p.y, cur_z, target, max_z, surf_bt, surf_paint, block_type, paint);
                     }
                 }
             }
@@ -4244,7 +4962,7 @@ fn sculpt_terrain(
                 let Some(target_z) = target_z else { return Err("No surface".into()) };
                 for p in &points {
                     let Some(&(cur_z, surf_bt, surf_paint)) = height_map.get(&(p.x, p.y)) else { continue };
-                    let target = blend(cur_z, target_z, weight(p.x, p.y));
+                    let target = blend(cur_z, target_z as f64, weight(p.x, p.y), p.x, p.y);
                     sculpt_column(world, p.x, p.y, cur_z, target, max_z, surf_bt, surf_paint, block_type, paint);
                 }
             }
@@ -4257,7 +4975,7 @@ fn sculpt_terrain(
                     if let Some(mn) = min_n {
                         if cur_z > mn {
                             let eroded = (cur_z - strength).max(mn);
-                            let target = blend(cur_z, eroded, weight(p.x, p.y));
+                            let target = blend(cur_z, eroded as f64, weight(p.x, p.y), p.x, p.y);
                             sculpt_column(world, p.x, p.y, cur_z, target, max_z, surf_bt, surf_paint, block_type, paint);
                         }
                     }
@@ -4279,7 +4997,7 @@ fn sculpt_terrain(
                             // Shed half the excess (rounded up), never below the neighbour.
                             let drop = ((excess as f64 * 0.5).ceil() as i32).clamp(1, cur_z - mn);
                             let eroded = cur_z - drop;
-                            let target = blend(cur_z, eroded, weight(p.x, p.y));
+                            let target = blend(cur_z, eroded as f64, weight(p.x, p.y), p.x, p.y);
                             sculpt_column(world, p.x, p.y, cur_z, target, max_z, surf_bt, surf_paint, block_type, paint);
                         }
                     }
@@ -4293,63 +5011,178 @@ fn sculpt_terrain(
                 if d == 0 { return Ok(()); }
                 for p in &points {
                     let Some(&(cur_z, surf_bt, surf_paint)) = height_map.get(&(p.x, p.y)) else { continue };
-                    let target = cur_z + blend(0, d, weight(p.x, p.y));
+                    let target = blend(cur_z, (cur_z + d) as f64, weight(p.x, p.y), p.x, p.y);
                     sculpt_column(world, p.x, p.y, cur_z, target, max_z, surf_bt, surf_paint, block_type, paint);
                 }
             }
             "hydro" => {
-                // Droplet-based hydraulic erosion over the footprint. Each droplet flows
-                // downhill, eroding where the slope is steep and depositing where it flattens,
-                // carving channels and softening peaks. Operates on a local heightmap built
-                // from `height_map`; droplets stop when they leave the sampled region.
+                // Beyer-style droplet hydraulic erosion (the standard SebLague formulation).
+                // Droplets flow in *continuous* float position, steered by the bilinear-interpolated
+                // height gradient with inertia; they erode downhill — spread over an erosion-radius
+                // brush so channels are dendritic gullies, not 1-wide staircase trenches — and drop
+                // sediment onto the four bilinear corner nodes where the flow slows or climbs.
+                //
+                // The simulation runs over a workspace expanded HYDRO_MARGIN cells past the footprint
+                // (read fresh from the world, since the shared `height_map` is only footprint + its
+                // 8-ring): droplets that wander off the brush erode into that margin instead of dying
+                // unnaturally at the footprint boundary. Only footprint columns are committed — any
+                // change that lands in the margin is discarded.
+                const HYDRO_INERTIA: f64 = 0.05;
+                const HYDRO_SEDIMENT_CAPACITY_FACTOR: f64 = 4.0;
+                const HYDRO_MIN_SEDIMENT_CAPACITY: f64 = 0.01;
+                const HYDRO_ERODE_SPEED: f64 = 0.3;
+                const HYDRO_DEPOSIT_SPEED: f64 = 0.3;
+                const HYDRO_EVAPORATE_SPEED: f64 = 0.02;
+                const HYDRO_GRAVITY: f64 = 4.0;
+                const HYDRO_MAX_LIFETIME: i32 = 32;
+                const HYDRO_INITIAL_WATER: f64 = 1.0;
+                const HYDRO_INITIAL_SPEED: f64 = 1.0;
+                const HYDRO_EROSION_RADIUS: i32 = 3;
+                const HYDRO_MARGIN: i32 = 16;
+
+                let ws_x0 = x_min - HYDRO_MARGIN;
+                let ws_y0 = y_min - HYDRO_MARGIN;
+                let ws_w = (x_max - x_min + 1 + 2 * HYDRO_MARGIN) as usize;
+                let ws_h = (y_max - y_min + 1 + 2 * HYDRO_MARGIN) as usize;
+
+                // Dense workspace heightmap in float; `None` = no surface / outside the world, which
+                // stops any droplet that reaches it. Read directly from the world (see comment above).
+                let world_ref: &LoadedWorld = world;
+                let mut hmap: Vec<Option<f64>> = Vec::with_capacity(ws_w * ws_h);
+                for gy in 0..ws_h {
+                    for gx in 0..ws_w {
+                        let wx = ws_x0 + gx as i32;
+                        let wy = ws_y0 + gy as i32;
+                        hmap.push(surface_z_capped(world_ref, wx, wy, cap).map(|z| z as f64));
+                    }
+                }
+
+                // Grid accessors take `&hmap`/`&mut hmap` explicitly so they never hold a borrow
+                // across the droplet loop's own mutations.
+                let node_at = |hmap: &[Option<f64>], gx: i32, gy: i32| -> Option<f64> {
+                    if gx < 0 || gy < 0 || gx >= ws_w as i32 || gy >= ws_h as i32 { return None; }
+                    hmap[gy as usize * ws_w + gx as usize]
+                };
+                let modify = |hmap: &mut [Option<f64>], gx: i32, gy: i32, d: f64| {
+                    if gx < 0 || gy < 0 || gx >= ws_w as i32 || gy >= ws_h as i32 { return; }
+                    if let Some(h) = hmap[gy as usize * ws_w + gx as usize].as_mut() { *h += d; }
+                };
+
+                // Radial erosion brush: weight = max(0, radius - dist), normalised to sum 1. Precomputed
+                // once (offsets are droplet-independent).
+                let erosion_brush: Vec<(i32, i32, f64)> = {
+                    let r = HYDRO_EROSION_RADIUS;
+                    let mut v = Vec::new();
+                    let mut total = 0.0f64;
+                    for dy in -r..=r {
+                        for dx in -r..=r {
+                            let w = (r as f64 - ((dx * dx + dy * dy) as f64).sqrt()).max(0.0);
+                            if w > 0.0 { v.push((dx, dy, w)); total += w; }
+                        }
+                    }
+                    for e in v.iter_mut() { e.2 /= total; }
+                    v
+                };
+
+                // Rng64 has no float method; derive a uniform [0,1) from its top 53 bits.
+                let rand01 = |rng: &mut Rng64| -> f64 { (rng.next() >> 11) as f64 / (1u64 << 53) as f64 };
+
                 let n_droplets = points.len() * (strength as usize) / 2 + points.len();
-                let mut hmap: HashMap<(i32, i32), f64> =
-                    height_map.iter().map(|(&k, &(z, _, _))| (k, z as f64)).collect();
                 let mut rng = Rng64::new(seed ^ 0x9E37_79B9_7F4A_7C15);
                 let member: Vec<(i32, i32)> = points.iter().map(|p| (p.x, p.y)).collect();
                 for _ in 0..n_droplets {
-                    let start = member[(rng.next() as usize) % member.len()];
-                    let (mut px, mut py) = (start.0 as f64, start.1 as f64);
+                    // Random continuous start within the footprint disc (a member node + sub-cell jitter).
+                    let (sx, sy) = member[(rng.next() as usize) % member.len()];
+                    let mut px = (sx - ws_x0) as f64 + rand01(&mut rng);
+                    let mut py = (sy - ws_y0) as f64 + rand01(&mut rng);
+                    let (mut dir_x, mut dir_y) = (0.0f64, 0.0f64);
+                    let mut speed = HYDRO_INITIAL_SPEED;
+                    let mut water = HYDRO_INITIAL_WATER;
                     let mut sediment = 0.0f64;
-                    let mut water = 1.0f64;
-                    for _ in 0..24 {
-                        let (cx, cy) = (px.floor() as i32, py.floor() as i32);
-                        let Some(&h) = hmap.get(&(cx, cy)) else { break };
-                        // Steepest-descent direction among 8 neighbours present in the map.
-                        let mut best = (0i32, 0i32);
-                        let mut lowest = h;
-                        for ((dx, dy), _) in SCULPT_KERNEL {
-                            if let Some(&nh) = hmap.get(&(cx + dx, cy + dy)) {
-                                if nh < lowest { lowest = nh; best = (dx, dy); }
-                            }
-                        }
-                        let drop = h - lowest;
-                        if best == (0, 0) || drop <= 0.0 {
-                            // Sink: deposit remaining sediment and stop.
-                            *hmap.get_mut(&(cx, cy)).unwrap() += sediment;
-                            break;
-                        }
-                        // Capacity scales with slope & remaining water; erode or deposit.
-                        let capacity = (drop * water * 0.5).max(0.01);
-                        if sediment > capacity {
-                            let dep = (sediment - capacity) * 0.5;
-                            *hmap.get_mut(&(cx, cy)).unwrap() += dep;
-                            sediment -= dep;
+
+                    for _ in 0..HYDRO_MAX_LIFETIME {
+                        let (nx, ny) = (px.floor() as i32, py.floor() as i32);
+                        let (u, v) = (px - nx as f64, py - ny as f64);
+                        let (Some(h00), Some(h10), Some(h01), Some(h11)) = (
+                            node_at(&hmap, nx, ny),     node_at(&hmap, nx + 1, ny),
+                            node_at(&hmap, nx, ny + 1), node_at(&hmap, nx + 1, ny + 1),
+                        ) else { break };
+                        let grad_x = (h10 - h00) * (1.0 - v) + (h11 - h01) * v;
+                        let grad_y = (h01 - h00) * (1.0 - u) + (h11 - h10) * u;
+                        let height_here = h00 * (1.0 - u) * (1.0 - v) + h10 * u * (1.0 - v)
+                            + h01 * (1.0 - u) * v + h11 * u * v;
+
+                        // Blend the running direction (inertia) with the downhill gradient, then
+                        // normalise to a unit step. Flat + stalled → random unit dir so it explores.
+                        dir_x = dir_x * HYDRO_INERTIA - grad_x * (1.0 - HYDRO_INERTIA);
+                        dir_y = dir_y * HYDRO_INERTIA - grad_y * (1.0 - HYDRO_INERTIA);
+                        let len = (dir_x * dir_x + dir_y * dir_y).sqrt();
+                        if len <= 1e-8 {
+                            let ang = rand01(&mut rng) * std::f64::consts::TAU;
+                            dir_x = ang.cos();
+                            dir_y = ang.sin();
                         } else {
-                            let ero = ((capacity - sediment) * 0.3).min(drop * 0.5);
-                            *hmap.get_mut(&(cx, cy)).unwrap() -= ero;
-                            sediment += ero;
+                            dir_x /= len;
+                            dir_y /= len;
                         }
-                        px += best.0 as f64;
-                        py += best.1 as f64;
-                        water *= 0.98;
+
+                        let (old_px, old_py) = (px, py);
+                        px += dir_x;
+                        py += dir_y;
+
+                        // Sample the new height (bilinear); leaving the workspace stops the droplet.
+                        let (mx, my) = (px.floor() as i32, py.floor() as i32);
+                        let (mu, mv) = (px - mx as f64, py - my as f64);
+                        let (Some(n00), Some(n10), Some(n01), Some(n11)) = (
+                            node_at(&hmap, mx, my),     node_at(&hmap, mx + 1, my),
+                            node_at(&hmap, mx, my + 1), node_at(&hmap, mx + 1, my + 1),
+                        ) else { break };
+                        let new_height = n00 * (1.0 - mu) * (1.0 - mv) + n10 * mu * (1.0 - mv)
+                            + n01 * (1.0 - mu) * mv + n11 * mu * mv;
+                        let delta_height = new_height - height_here;
+
+                        let capacity = (-delta_height * speed * water * HYDRO_SEDIMENT_CAPACITY_FACTOR)
+                            .max(HYDRO_MIN_SEDIMENT_CAPACITY);
+
+                        let (onx, ony) = (old_px.floor() as i32, old_py.floor() as i32);
+                        let (ou, ov) = (old_px - onx as f64, old_py - ony as f64);
+                        if delta_height > 0.0 || sediment > capacity {
+                            // Deposit onto the four bilinear corners at the OLD position. Uphill: fill
+                            // the pit, capped by carried sediment; else shed the over-capacity excess.
+                            let amount = if delta_height > 0.0 {
+                                delta_height.min(sediment)
+                            } else {
+                                (sediment - capacity) * HYDRO_DEPOSIT_SPEED
+                            };
+                            sediment -= amount;
+                            modify(&mut hmap, onx,     ony,     amount * (1.0 - ou) * (1.0 - ov));
+                            modify(&mut hmap, onx + 1, ony,     amount * ou * (1.0 - ov));
+                            modify(&mut hmap, onx,     ony + 1, amount * (1.0 - ou) * ov);
+                            modify(&mut hmap, onx + 1, ony + 1, amount * ou * ov);
+                        } else {
+                            // Erode, spread across the radial brush at the OLD position (never take
+                            // more than the height drop). Cells outside the workspace drop out.
+                            let amount = ((capacity - sediment) * HYDRO_ERODE_SPEED).min(-delta_height);
+                            for &(dx, dy, bw) in &erosion_brush {
+                                modify(&mut hmap, onx + dx, ony + dy, -amount * bw);
+                            }
+                            sediment += amount;
+                        }
+
+                        // deltaHeight is negative when descending → this speeds the droplet up; max(0)
+                        // guards a NaN sqrt when climbing sharply. Evaporate, then stop if dry.
+                        speed = (speed * speed + delta_height * HYDRO_GRAVITY).max(0.0).sqrt();
+                        water *= 1.0 - HYDRO_EVAPORATE_SPEED;
+                        if water < 0.01 { break; }
                     }
                 }
-                // Commit eroded heights back, blended by the radial weight.
+
+                // Commit final workspace heights back — footprint columns only (see arm comment).
                 for p in &points {
                     let Some(&(cur_z, surf_bt, surf_paint)) = height_map.get(&(p.x, p.y)) else { continue };
-                    let new_h = hmap.get(&(p.x, p.y)).copied().unwrap_or(cur_z as f64).round() as i32;
-                    let target = blend(cur_z, new_h, weight(p.x, p.y));
+                    let new_h = node_at(&hmap, p.x - ws_x0, p.y - ws_y0)
+                        .unwrap_or(cur_z as f64).round() as i32;
+                    let target = blend(cur_z, new_h as f64, weight(p.x, p.y), p.x, p.y);
                     sculpt_column(world, p.x, p.y, cur_z, target, max_z, surf_bt, surf_paint, block_type, paint);
                 }
             }
@@ -4366,10 +5199,90 @@ fn sculpt_terrain(
                     set_block_abs(world, p.x, p.y, cur_z, new_bt, 0);
                 }
             }
+            "terrace" => {
+                // Quantize each column's height to N-block steps (Strength doubles as step size).
+                let step = strength.max(1);
+                for p in &points {
+                    let Some(&(cur_z, surf_bt, surf_paint)) = height_map.get(&(p.x, p.y)) else { continue };
+                    let terraced = ((cur_z as f64 / step as f64).round() as i32) * step;
+                    let target = blend(cur_z, terraced as f64, weight(p.x, p.y), p.x, p.y);
+                    sculpt_column(world, p.x, p.y, cur_z, target, max_z, surf_bt, surf_paint, block_type, paint);
+                }
+            }
+            "sharpen" => {
+                // Unsharp mask: push each column away from its 8-neighbour average — the inverse
+                // of Smooth. Strength (1..8) scales how much of the deviation from the local
+                // average gets amplified back in.
+                let amount = strength as f64 / 8.0;
+                for p in &points {
+                    let Some(&(cur_z, surf_bt, surf_paint)) = height_map.get(&(p.x, p.y)) else { continue };
+                    let mut hsum = cur_z as f64;
+                    let mut wsum = 1.0;
+                    for ((dx, dy), k) in SCULPT_KERNEL {
+                        if let Some(v) = height_map.get(&(p.x + dx, p.y + dy)) {
+                            hsum += v.0 as f64 * k;
+                            wsum += k;
+                        }
+                    }
+                    if wsum <= 1.0 { continue; }
+                    let avg = hsum / wsum;
+                    let sharpened = (cur_z as f64 + (cur_z as f64 - avg) * amount).round() as i32;
+                    let target = blend(cur_z, sharpened as f64, weight(p.x, p.y), p.x, p.y);
+                    sculpt_column(world, p.x, p.y, cur_z, target, max_z, surf_bt, surf_paint, block_type, paint);
+                }
+            }
+            "slope" => {
+                // Planar flatten: level toward an angled plane through the anchor column, tilted
+                // by slope_dx/slope_dy (rise per block along X/Y). Requires an anchor, same as
+                // Flatten — a flat (0-tilt) plane through the anchor is exactly Flatten's result.
+                let (sdx, sdy) = (slope_dx.unwrap_or(0.0), slope_dy.unwrap_or(0.0));
+                let anchor = anchor_x.zip(anchor_y);
+                let anchor_z = anchor.and_then(|(ax, ay)| height_map.get(&(ax, ay)).map(|v| v.0));
+                let Some(anchor_z) = anchor_z else { return Err("No surface".into()) };
+                let (ax, ay) = anchor.unwrap();
+                for p in &points {
+                    let Some(&(cur_z, surf_bt, surf_paint)) = height_map.get(&(p.x, p.y)) else { continue };
+                    let plane_z = anchor_z as f64 + sdx * (p.x - ax) as f64 + sdy * (p.y - ay) as f64;
+                    let target = blend(cur_z, plane_z, weight(p.x, p.y), p.x, p.y);
+                    sculpt_column(world, p.x, p.y, cur_z, target, max_z, surf_bt, surf_paint, block_type, paint);
+                }
+            }
+            "smear" => {
+                // Lateral height advection: pull each column's height from a position offset
+                // opposite the drag direction, so terrain drags along with the brush like wet
+                // paint. Sources are read fresh from the world (pre-mutation) for the whole
+                // footprint first — points may overlap each other's sources within one stamp.
+                let (sdx, sdy) = (smear_dx.unwrap_or(0), smear_dy.unwrap_or(0));
+                if sdx == 0 && sdy == 0 { return Ok(()); }
+                // Explicit shared reborrow: the `.map` closure only needs read access, and capturing
+                // `world` (a `&mut LoadedWorld`) directly would move the unique borrow into the
+                // closure, leaving it unusable for `sculpt_column` below.
+                let world_ref: &LoadedWorld = world;
+                let sources: Vec<Option<(i32, u8, u8)>> = points.iter().map(|p| {
+                    let (sx, sy) = (p.x - sdx, p.y - sdy);
+                    surface_z_capped(world_ref, sx, sy, cap).map(|z| {
+                        (z, read_block_abs(world_ref, sx, sy, z), read_paint_abs(world_ref, sx, sy, z))
+                    })
+                }).collect();
+                for (p, src) in points.iter().zip(sources.iter()) {
+                    let Some(&(cur_z, surf_bt, surf_paint)) = height_map.get(&(p.x, p.y)) else { continue };
+                    let Some((src_z, _, _)) = *src else { continue };
+                    let target = blend(cur_z, src_z as f64, weight(p.x, p.y), p.x, p.y);
+                    sculpt_column(world, p.x, p.y, cur_z, target, max_z, surf_bt, surf_paint, block_type, paint);
+                }
+            }
             _ => {}
         }
         Ok(())
-    })
+    });
+    // Persist the float workspace only for a real (grouped) live stroke — a one-shot call (group
+    // `None`: shape fills, Live-brush-OFF) has no successor stamp to accumulate into, so its session
+    // is discarded and behaves exactly like the old per-call round. A foreign edit or undo/redo will
+    // reap a persisted session at one of the invalidation choke points (see `SculptSession`).
+    if group_id.is_some() {
+        ws.sculpt_session = Some(session);
+    }
+    result
 }
 
 // ── Fill surface (flood fill) ─────────────────────────────────────────────────
@@ -4443,49 +5356,132 @@ struct SelectRect { x1: i32, y1: i32, x2: i32, y2: i32 }
 
 /// Flood-fill select connected surface region matching (wx,wy).
 /// When match_paint is false, only block type is compared (ignores paint colour).
-/// Returns the bounding box of the selected region.
+/// Returns the bounding box of the selected region AND stores the exact matched footprint as the
+/// active `SelectionMask` (keyed to that bbox), so a subsequent Delete/Fill affects only the shaped
+/// cells — not the whole box, which was the long-standing "wand selects unrelated cells" bug (the
+/// BFS already visited the true shape; it just used to be discarded once the bbox was computed).
 #[tauri::command]
 fn magic_wand_select(
     wx: i32, wy: i32,
     match_paint: bool,
     state: tauri::State<'_, AppState>,
 ) -> Result<Option<SelectRect>, String> {
-    let ws = state.lock().unwrap_or_else(|p| p.into_inner());
-    let world = ws.world.as_ref().ok_or("No world loaded")?;
-    let seed_z     = match surface_z(world, wx, wy) { Some(z) => z, None => return Ok(None) };
-    let seed_bt    = read_block_abs(world, wx, wy, seed_z);
-    let seed_paint = read_paint_abs(world, wx, wy, seed_z);
-    if seed_bt == 0 { return Ok(None); }
+    let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
 
-    let ww = (world.w_chunks * 16) as i32;
-    let wh = (world.h_chunks * 16) as i32;
-    const MAX_CELLS: u32 = 50_000;
+    // Phase A: run the BFS under an immutable world borrow, collecting every *matched* cell (not the
+    // whole `visited` frontier, which includes rejected neighbours). Then drop the borrow so Phase B
+    // can install the mask on `ws`.
+    let outcome: Option<(SelectRect, Vec<(i32, i32)>)> = {
+        let world = ws.world.as_ref().ok_or("No world loaded")?;
+        let seed_z     = match surface_z(world, wx, wy) { Some(z) => z, None => return Ok(None) };
+        let seed_bt    = read_block_abs(world, wx, wy, seed_z);
+        let seed_paint = read_paint_abs(world, wx, wy, seed_z);
+        if seed_bt == 0 { return Ok(None); }
 
-    let mut visited: std::collections::HashSet<(i32, i32)> = std::collections::HashSet::new();
-    let mut queue:   VecDeque<(i32, i32)> = VecDeque::new();
-    let (mut x_min, mut y_min, mut x_max, mut y_max) = (wx, wy, wx, wy);
-    let mut count = 0u32;
+        let ww = (world.w_chunks * 16) as i32;
+        let wh = (world.h_chunks * 16) as i32;
+        const MAX_CELLS: u32 = 50_000;
 
-    queue.push_back((wx, wy));
-    visited.insert((wx, wy));
+        let mut visited: std::collections::HashSet<(i32, i32)> = std::collections::HashSet::new();
+        let mut queue:   VecDeque<(i32, i32)> = VecDeque::new();
+        let mut matched: Vec<(i32, i32)> = Vec::new();
+        let (mut x_min, mut y_min, mut x_max, mut y_max) = (wx, wy, wx, wy);
+        let mut count = 0u32;
 
-    while let Some((x, y)) = queue.pop_front() {
-        if count >= MAX_CELLS { break; }
-        let Some(sz) = surface_z(world, x, y) else { continue };
-        if read_block_abs(world, x, y, sz) != seed_bt { continue; }
-        if match_paint && read_paint_abs(world, x, y, sz) != seed_paint { continue; }
-        x_min = x_min.min(x); y_min = y_min.min(y);
-        x_max = x_max.max(x); y_max = y_max.max(y);
-        count += 1;
-        for (dx, dy) in [(-1i32,0i32),(1,0),(0,-1),(0,1)] {
-            let nx = x + dx; let ny = y + dy;
-            if nx < 0 || ny < 0 || nx >= ww || ny >= wh { continue; }
-            if visited.insert((nx, ny)) { queue.push_back((nx, ny)); }
+        queue.push_back((wx, wy));
+        visited.insert((wx, wy));
+
+        while let Some((x, y)) = queue.pop_front() {
+            if count >= MAX_CELLS { break; }
+            let Some(sz) = surface_z(world, x, y) else { continue };
+            if read_block_abs(world, x, y, sz) != seed_bt { continue; }
+            if match_paint && read_paint_abs(world, x, y, sz) != seed_paint { continue; }
+            matched.push((x, y));
+            x_min = x_min.min(x); y_min = y_min.min(y);
+            x_max = x_max.max(x); y_max = y_max.max(y);
+            count += 1;
+            for (dx, dy) in [(-1i32,0i32),(1,0),(0,-1),(0,1)] {
+                let nx = x + dx; let ny = y + dy;
+                if nx < 0 || ny < 0 || nx >= ww || ny >= wh { continue; }
+                if visited.insert((nx, ny)) { queue.push_back((nx, ny)); }
+            }
         }
-    }
 
-    if count == 0 { return Ok(None); }
-    Ok(Some(SelectRect { x1: x_min, y1: y_min, x2: x_max, y2: y_max }))
+        if count == 0 { None }
+        else { Some((SelectRect { x1: x_min, y1: y_min, x2: x_max, y2: y_max }, matched)) }
+    };
+
+    // Phase B: nothing matched → leave any existing mask alone and report no selection.
+    let (rect, matched) = match outcome {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+
+    // Rasterise the matched cells into a bitset over the bbox and install it as the active mask.
+    let w = rect.x2 - rect.x1 + 1;
+    let h = rect.y2 - rect.y1 + 1;
+    let mut bits = vec![0u8; ((w * h + 7) / 8) as usize];
+    for (x, y) in matched {
+        let idx = ((y - rect.y1) * w + (x - rect.x1)) as usize;
+        bits[idx >> 3] |= 1u8 << (idx & 7);
+    }
+    ws.selection_mask = Some(SelectionMask { x1: rect.x1, y1: rect.y1, x2: rect.x2, y2: rect.y2, bits });
+
+    Ok(Some(rect))
+}
+
+/// Install an explicit non-rectangular selection footprint (used by the lasso tool). `bits_b64` is a
+/// base64 row-major bitset over the bbox — `ceil(width*height/8)` bytes, bit `(y-y1)*width+(x-x1)`.
+/// Rejects a size that doesn't match the bbox so a malformed payload can't produce an under-read
+/// mask (`contains` would then silently treat missing bytes as unselected — a rejection is clearer).
+#[tauri::command]
+fn set_selection_mask(
+    x1: i32, y1: i32, x2: i32, y2: i32,
+    bits_b64: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    if x2 < x1 || y2 < y1 {
+        return Err("Invalid mask bbox: x2/y2 must be >= x1/y1".into());
+    }
+    let bits = STANDARD.decode(bits_b64.as_bytes()).map_err(|e| format!("Bad mask base64: {e}"))?;
+    let w = (x2 - x1 + 1) as usize;
+    let h = (y2 - y1 + 1) as usize;
+    let need = w.saturating_mul(h).div_ceil(8);
+    if bits.len() != need {
+        return Err(format!("Mask size mismatch: got {} bytes, need {} for {w}×{h}", bits.len(), need));
+    }
+    let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
+    ws.selection_mask = Some(SelectionMask { x1, y1, x2, y2, bits });
+    Ok(())
+}
+
+/// Drop the active non-rectangular selection footprint. The frontend calls this on any selection
+/// reshape (new marquee, edge resize, select-all, 3D two-click, clear) so a stale wand/lasso shape
+/// never lingers; edits then behave rect-only. (The backend also re-checks the rect every edit, so
+/// this is defense-in-depth, not the sole guard — see `SelectionMask`.)
+#[tauri::command]
+fn clear_selection_mask(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
+    ws.selection_mask = None;
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct SelectionMaskInfo {
+    x1: i32, y1: i32, x2: i32, y2: i32,
+    /// Row-major bitset over the bbox, base64 — decode with `decodeU8` (codec.ts).
+    #[serde(serialize_with = "serialize_bytes_b64")]
+    bits: Vec<u8>,
+}
+
+/// Return the active non-rectangular selection footprint (bbox + base64 bitset), or `None` when the
+/// selection is a plain rectangle. The map-canvas overlay decodes this to fill only the shaped cells.
+#[tauri::command]
+fn get_selection_mask(state: tauri::State<'_, AppState>) -> Result<Option<SelectionMaskInfo>, String> {
+    let ws = state.lock().unwrap_or_else(|p| p.into_inner());
+    Ok(ws.selection_mask.as_ref().map(|m| SelectionMaskInfo {
+        x1: m.x1, y1: m.y1, x2: m.x2, y2: m.y2, bits: m.bits.clone(),
+    }))
 }
 
 // ── Scatter / Array paste ─────────────────────────────────────────────────────
@@ -4498,6 +5494,7 @@ fn paste_clipboard_at(
     width: i32, height: i32, depth: i32, z_anchor: i32,
     elevation_offset: i32, ignore_air: bool,
     max_z: i32,
+    mask: Option<&[u8]>,
 ) {
     for dz in 0..depth {
         let tz = z_anchor + elevation_offset + dz;
@@ -4510,6 +5507,8 @@ fn paste_clipboard_at(
             let ly = (ty % 16) as usize;
             for dx in 0..width {
                 let tx = px + dx; if tx < 0 { continue; }
+                // Shaped clipboard: unmasked columns don't stamp (scatter/array honour the shape too).
+                if let Some(m) = mask { if !bit_set(m, (dy * width + dx) as usize) { continue; } }
                 let chunk_cx = tx / 16 + world.min_x;
                 let lx = (tx % 16) as usize;
                 let idx = (dz * height * width + dy * width + dx) as usize;
@@ -4538,9 +5537,9 @@ fn scatter_paste(
     let count = count.clamp(1, 100);
     let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
 
-    let (width, height, depth, z_anchor, block_types, paints) = {
+    let (width, height, depth, z_anchor, block_types, paints, mask) = {
         let cb = ws.clipboard.as_ref().ok_or("Clipboard is empty")?;
-        (cb.width, cb.height, cb.depth, cb.z_anchor, cb.block_types.clone(), cb.paints.clone())
+        (cb.width, cb.height, cb.depth, cb.z_anchor, cb.block_types.clone(), cb.paints.clone(), cb.mask.clone())
     };
 
     // Placement range clamps to 1 (all pastes land at x1/y1) when the clipboard is larger than the
@@ -4563,7 +5562,7 @@ fn scatter_paste(
             let px = x1 + (rng.next() % range_x) as i32;
             let py = y1 + (rng.next() % range_y) as i32;
             paste_clipboard_at(world, px, py, &block_types, &paints,
-                width, height, depth, z_anchor, elevation_offset, ignore_air, max_z);
+                width, height, depth, z_anchor, elevation_offset, ignore_air, max_z, mask.as_deref());
         }
         Ok(())
     })
@@ -4583,9 +5582,9 @@ fn array_paste(
     let rows = rows.clamp(1, 20);
     let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
 
-    let (width, height, depth, z_anchor, block_types, paints) = {
+    let (width, height, depth, z_anchor, block_types, paints, mask) = {
         let cb = ws.clipboard.as_ref().ok_or("Clipboard is empty")?;
-        (cb.width, cb.height, cb.depth, cb.z_anchor, cb.block_types.clone(), cb.paints.clone())
+        (cb.width, cb.height, cb.depth, cb.z_anchor, cb.block_types.clone(), cb.paints.clone(), cb.mask.clone())
     };
 
     let step_x = if spacing_x > 0 { spacing_x } else { width };
@@ -4602,7 +5601,7 @@ fn array_paste(
                 let px = origin_x + col * step_x;
                 let py = origin_y + row * step_y;
                 paste_clipboard_at(world, px, py, &block_types, &paints,
-                    width, height, depth, z_anchor, elevation_offset, ignore_air, max_z);
+                    width, height, depth, z_anchor, elevation_offset, ignore_air, max_z, mask.as_deref());
             }
         }
         Ok(())
@@ -4620,6 +5619,7 @@ pub fn run() {
             load_world,
             get_world_info,
             fetch_tile,
+            set_view_cap,
             export_png,
             describe_selection,
             delete_blocks,
@@ -4668,6 +5668,9 @@ pub fn run() {
             sculpt_terrain,
             fill_surface,
             magic_wand_select,
+            set_selection_mask,
+            clear_selection_mask,
+            get_selection_mask,
             scatter_paste,
             array_paste,
             export_obj,
@@ -4895,7 +5898,7 @@ mod tests {
         assert_eq!(world.bytes[blk(7, 2, 32)], 8, "bystander pre-delete");
 
         // ── delete column (px=3, py=5), full z range ───────────────────────
-        delete_blocks_inner(&mut world, 3, 5, 3, 5, 0, 63);
+        delete_blocks_inner(&mut world, 3, 5, 3, 5, 0, 63, None);
 
         assert_eq!(world.bytes[blk(3, 5,  0)], 0, "Wood post-delete");
         assert_eq!(world.bytes[blk(3, 5, 17)], 0, "Stone post-delete");
@@ -4958,15 +5961,15 @@ mod tests {
             ChunkDelta::Full(_) => panic!("single-byte edit should not fall back to Full"),
         }
 
-        let entry = UndoEntry { operation: "test".into(), chunks: vec![snap] };
+        let entry = UndoEntry { operation: "test".into(), chunks: vec![snap], group: None };
         let redo_chunks = restore_and_invert(&mut world, &entry);
         assert_eq!(world.bytes[target], original_val, "undo must restore the original byte");
 
-        let redo_entry = UndoEntry { operation: "test".into(), chunks: redo_chunks };
+        let redo_entry = UndoEntry { operation: "test".into(), chunks: redo_chunks, group: None };
         let undo_again_chunks = restore_and_invert(&mut world, &redo_entry);
         assert_eq!(world.bytes[target], 99, "redo must restore the edited byte");
 
-        restore_and_invert(&mut world, &UndoEntry { operation: "test".into(), chunks: undo_again_chunks });
+        restore_and_invert(&mut world, &UndoEntry { operation: "test".into(), chunks: undo_again_chunks, group: None });
         assert_eq!(world.bytes[target], original_val, "second undo must restore the original byte again");
 
         // ── Dense case: overwrite the whole file so diff_chunk falls back to Full ──────────
@@ -4977,7 +5980,7 @@ mod tests {
             ChunkDelta::Full(_) => {}
             ChunkDelta::Sparse(pairs) => panic!("dense edit should fall back to Full, got Sparse({} entries)", pairs.len()),
         }
-        restore_and_invert(&mut world, &UndoEntry { operation: "test".into(), chunks: vec![snap2] });
+        restore_and_invert(&mut world, &UndoEntry { operation: "test".into(), chunks: vec![snap2], group: None });
         assert_eq!(&world.bytes[HEADER..HEADER + 32768], &pre_full2[0].2[..],
             "Full-delta undo must restore the whole chunk");
     }
@@ -4989,7 +5992,7 @@ mod tests {
         let world = parse_world_inner(mmap_from_bytes(make_test_world())).expect("parse failed");
         let w = (world.w_chunks * 16) as i32;
         let h = (world.h_chunks * 16) as i32;
-        let patch = render_pixels_patch(&world, 0, 0, w - 1, h - 1);
+        let patch = render_pixels_patch(&world, 0, 0, w - 1, h - 1, None);
         let png = encode_rgba_png(&patch.pixels, w as u32, h as u32).expect("encode failed");
         assert_eq!(&png[..8], &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A], "PNG magic");
         let img = image::load_from_memory(&png).expect("decode failed");
@@ -5026,6 +6029,28 @@ mod tests {
         assert_eq!(at(&side, 5, 46).3, 255, "stone present at z17 (row 46)");
         assert_eq!(at(&side, 5, 15).3, 255, "dirt present at z48 (row 15)");
         assert_eq!(at(&side, 0, 0), (20, 20, 35, 255), "void background");
+    }
+
+    /// Cutaway view: a cap hides everything above it, so both the top-down render and the
+    /// surface lookup (which is what a z-less draw targets) see the highest block *at or below*
+    /// the cap. The fixture column (3,5) has wood@z0, stone@z17, dirt@z48.
+    #[test]
+    fn test_cutaway_cap_render_and_surface() {
+        let world = parse_world_inner(mmap_from_bytes(make_test_world())).expect("parse failed");
+
+        assert_eq!(surface_z(&world, 3, 5), Some(48), "uncapped surface = the true top block");
+        assert_eq!(surface_z_capped(&world, 3, 5, Some(63)), Some(48), "cap above everything = no change");
+        assert_eq!(surface_z_capped(&world, 3, 5, Some(30)), Some(17), "cap below dirt exposes the stone");
+        assert_eq!(surface_z_capped(&world, 3, 5, Some(10)), Some(0), "cap below stone exposes the wood");
+        assert_eq!(surface_z_capped(&world, 3, 5, Some(0)), Some(0), "cap at the bottom block still finds it");
+
+        let px = |p: &PixelPatch| -> [u8; 3] { [p.pixels[0], p.pixels[1], p.pixels[2]] };
+        let uncapped = render_pixels_patch(&world, 3, 5, 3, 5, None);
+        let capped   = render_pixels_patch(&world, 3, 5, 3, 5, Some(30));
+        let dirt  = block_color(3, 0, world.sky);
+        let stone = block_color(2, 5, world.sky); // the fixture's stone is painted (paint 5)
+        assert_eq!(px(&uncapped), dirt,  "normal render shows the top block (dirt)");
+        assert_eq!(px(&capped),   stone, "cutaway render shows the block under the cap (stone)");
     }
 
     /// Backup semantics: first save to an existing path creates path.bak;
@@ -5864,7 +6889,7 @@ mod tests {
             0, 0,
             3, 4,
         ];
-        Clipboard { width: 2, height: 3, depth: 1, z_anchor: 10, block_types, paints }
+        Clipboard { width: 2, height: 3, depth: 1, z_anchor: 10, block_types, paints, mask: None }
     }
 
     /// rotate_clipboard_inner: dimensions swap (w,h)->(h,w), content transform
@@ -6034,5 +7059,871 @@ mod tests {
         ws.world.as_mut().unwrap().bytes[blk(4, 6, 5)] = 0;
         refresh_lamp_index_chunks(&mut ws, &[(0, 0)]);
         assert!(ws.lamp_index.as_ref().unwrap().get(&(0, 0)).is_none(), "removed lamp drops its chunk bucket");
+    }
+
+    // ── Sculpt engine (Pass 1) test fixtures ──────────────────────────────────────
+
+    /// A single-chunk (0,0) test world whose every column (lx,ly) is filled with `surf_bt` from
+    /// z=1 up to `height(lx,ly)` (clamped 1..=63) — a real varied surface for sculpt tests, unlike
+    /// the degenerate single-column `make_test_world`.
+    fn make_bumpy_world<F: Fn(usize, usize) -> i32>(surf_bt: u8, height: F) -> Vec<u8> {
+        const HEADER: usize = 4096;
+        const CHUNK: usize = 32768;
+        const ENTRY: usize = 16;
+        let chunk_off: u32 = HEADER as u32;
+        let ptr_off: u32 = (HEADER + CHUNK) as u32;
+        let mut b = vec![0u8; HEADER + CHUNK + ENTRY];
+        b[32..36].copy_from_slice(&ptr_off.to_le_bytes());
+        b[40..49].copy_from_slice(b"BumpyTest");
+        let block = |lx: usize, ly: usize, z: i32| -> usize {
+            HEADER + (z / 16) as usize * 8192 + lx * 256 + ly * 16 + (z % 16) as usize
+        };
+        for lx in 0..16 {
+            for ly in 0..16 {
+                let h = height(lx, ly).clamp(1, 63);
+                for z in 1..=h { b[block(lx, ly, z)] = surf_bt; }
+            }
+        }
+        let pe = HEADER + CHUNK;
+        b[pe..pe + 2].copy_from_slice(&0i16.to_le_bytes());
+        b[pe + 4..pe + 6].copy_from_slice(&0i16.to_le_bytes());
+        b[pe + 8..pe + 12].copy_from_slice(&chunk_off.to_le_bytes());
+        b
+    }
+
+    fn ws_with(bytes: Vec<u8>) -> WorldState {
+        let mut ws = WorldState::new();
+        ws.world = Some(parse_world_inner(mmap_from_bytes(bytes)).expect("parse"));
+        ws
+    }
+
+    fn world_bytes(ws: &WorldState) -> Vec<u8> {
+        ws.world.as_ref().unwrap().bytes.to_vec()
+    }
+
+    /// Filled disc footprint matching the backend's/frontend's `(dx² + dy²) <= (r + 0.5)²`.
+    fn disc_points(cx: i32, cy: i32, r: i32) -> Vec<SculptPoint> {
+        let rr = (r as f64 + 0.5).powi(2);
+        let mut v = Vec::new();
+        for dy in -r..=r {
+            for dx in -r..=r {
+                if ((dx * dx + dy * dy) as f64) <= rr { v.push(SculptPoint { x: cx + dx, y: cy + dy }); }
+            }
+        }
+        v
+    }
+
+    fn surf(ws: &WorldState, x: i32, y: i32) -> i32 {
+        surface_z_capped(ws.world.as_ref().unwrap(), x, y, None).unwrap()
+    }
+
+    /// Convenience wrapper: a "raise"/"smooth" sculpt stamp with explicit points, all the newer
+    /// params defaulted, so each test only spells out what it varies.
+    #[allow(clippy::too_many_arguments)]
+    fn sculpt(
+        ws: &mut WorldState, points: Option<Vec<SculptPoint>>, mode: &str, strength: i32,
+        softness: f64, stamp: Option<(i32, i32, i32)>, group: Option<u64>,
+    ) -> EditResult {
+        let (scx, scy, srad) = match stamp {
+            Some((a, b, c)) => (Some(a), Some(b), Some(c)),
+            None => (None, None, None),
+        };
+        sculpt_terrain_inner(
+            ws, points, mode.into(), strength, 0, None, None, None, None,
+            Some(softness), Some("smooth".into()), None, None, None, scx, scy, srad, None, group,
+            None, None, None, None, None, None,
+        ).expect("sculpt")
+    }
+
+    /// Row 6 — the per-stroke float workspace accumulates sub-block deltas across same-group stamps
+    /// instead of rounding them away every call. A soft brush over a flat plateau: the centre
+    /// (weight 1) rises by exactly `strength` per stamp, and — the actual fix — EVERY rim column
+    /// with a non-zero weight rises over the stroke rather than a fixed BAYER threshold freezing
+    /// roughly half of them (the reinforcing-dither stripe pathology).
+    #[test]
+    fn test_residual_accumulates_sub_block_deltas() {
+        let mut ws = ws_with(make_bumpy_world(8, |_, _| 20)); // dead-flat grass plateau at z=20
+        let (cx, cy, r) = (7, 7, 5);
+        let n = 10;
+        let gid = Some(4242u64);
+        for _ in 0..n {
+            sculpt(&mut ws, None, "raise", 1, 1.0, Some((cx, cy, r)), gid);
+        }
+        // Centre: weight 1 → +1/stamp, exactly n.
+        assert_eq!(surf(&ws, cx, cy) - 20, n, "centre rises strength·n with no rounding loss");
+
+        // Every interior rim column (within the disc, weight > 0) must have risen — none frozen.
+        let mut risen = 0;
+        let mut total = 0;
+        for dy in -r..=r {
+            for dx in -r..=r {
+                let d2 = dx * dx + dy * dy;
+                // Interior columns whose weight·n is comfortably ≥ 1 (d ≤ 3, so weight ≳ 0.35);
+                // the outermost ring legitimately rounds to 0 (weight → 0 at the dome edge).
+                if d2 == 0 || d2 > 9 { continue; }
+                total += 1;
+                let rise = surf(&ws, cx + dx, cy + dy) - 20;
+                assert!(rise > 0, "column ({dx},{dy}) frozen — residuals not accumulating");
+                assert!(rise <= n, "column ({dx},{dy}) rose {rise} > strength·n");
+                risen += 1;
+            }
+        }
+        assert_eq!(risen, total, "no interior column may be frozen by a fixed dither threshold");
+    }
+
+    /// Row 6 — `clip_rect` masks stamp cells server-side: a hard raise stamp straddling the rect
+    /// lifts only the columns inside it; columns in the disc but outside the rect are untouched.
+    #[test]
+    fn test_clip_rect_masks_stamp_cells() {
+        let mut ws = ws_with(make_bumpy_world(8, |_, _| 20));
+        // Disc centred at (8,8) r=4; clip to x >= 8 only. Hard brush (softness 0) so weight is 1
+        // inside and the mask is the only thing that can zero a column.
+        sculpt_terrain_inner(
+            &mut ws, None, "raise".into(), 5, 0, None, None, None, None,
+            Some(0.0), Some("smooth".into()), None, None, None, Some(8), Some(8), Some(4), None,
+            Some(9), None, None, None, None, Some([8, 0, 100, 100]), None,
+        ).expect("clipped raise");
+        assert_eq!(surf(&ws, 9, 8) - 20, 5, "column inside the clip rect rises by strength");
+        assert_eq!(surf(&ws, 8, 8) - 20, 5, "column on the clip edge (x==8) is inside and rises");
+        assert_eq!(surf(&ws, 6, 8), 20, "column left of the clip rect is masked (unchanged)");
+        assert_eq!(surf(&ws, 5, 8), 20, "another masked column, still pristine");
+    }
+
+    /// Row 6 — the float session is reaped by a foreign edit through `with_edit`. After the delete,
+    /// a same-group stamp must re-seed from the post-delete surface, not resurrect stale heights.
+    #[test]
+    fn test_sculpt_session_cleared_by_foreign_edit() {
+        let mut ws = ws_with(make_bumpy_world(8, |_, _| 20));
+        let gid = Some(555u64);
+        sculpt(&mut ws, None, "raise", 4, 0.0, Some((8, 8, 3)), gid);
+        assert!(ws.sculpt_session.is_some(), "a grouped stroke opens a session");
+        assert_eq!(ws.sculpt_session.as_ref().unwrap().group_id, 555);
+
+        // Foreign edit (group None) through the shared choke point → session must clear.
+        with_edit(&mut ws, "delete", (0, 0, 15, 15), (0, 0, 15, 15), |world| {
+            delete_blocks_inner(world, 0, 0, 15, 15, 0, 255, None);
+            Ok(())
+        }).expect("delete");
+        assert!(ws.sculpt_session.is_none(), "a non-sculpt edit reaps the stale session");
+
+        // The just-deleted footprint has no surface; a fresh same-group stamp re-seeds from the
+        // post-delete world (there's nothing to raise), never from the pre-delete fheight cache.
+        let before = world_bytes(&ws);
+        sculpt(&mut ws, None, "raise", 4, 0.0, Some((8, 8, 3)), gid);
+        assert_eq!(world_bytes(&ws), before, "no surface after delete → nothing resurrected");
+    }
+
+    /// Row 6 — undo reaps the session (it bypasses `with_edit_inner`). Undoing the owning stroke
+    /// then stamping again same-group equals a fresh single stamp on the pristine world.
+    #[test]
+    fn test_sculpt_session_cleared_by_undo() {
+        let base = make_bumpy_world(8, |_, _| 20);
+        let gid = Some(321u64);
+
+        // Reference: one fresh stamp on a pristine world.
+        let mut refws = ws_with(base.clone());
+        sculpt(&mut refws, None, "raise", 4, 0.0, Some((8, 8, 3)), gid);
+        let reference = world_bytes(&refws);
+
+        // Stamp, undo (reaps session), stamp again same group — must match the reference exactly.
+        let mut ws = ws_with(base.clone());
+        sculpt(&mut ws, None, "raise", 4, 0.0, Some((8, 8, 3)), gid);
+        assert!(ws.sculpt_session.is_some());
+        undo_edit_inner(&mut ws).expect("undo");
+        assert!(ws.sculpt_session.is_none(), "undo reaps the session it belonged to");
+        sculpt(&mut ws, None, "raise", 4, 0.0, Some((8, 8, 3)), gid);
+        assert_eq!(world_bytes(&ws), reference, "post-undo stamp re-seeds, no residual carryover");
+    }
+
+    // ── Non-rectangular selection (SelectionMask) ─────────────────────────────────
+
+    /// A mask covering exactly the cells in `x1..=x2, y1..=y2` for which `pred(x,y)` holds.
+    fn mask_from<F: Fn(i32, i32) -> bool>(x1: i32, y1: i32, x2: i32, y2: i32, pred: F) -> SelectionMask {
+        let w = x2 - x1 + 1;
+        let h = y2 - y1 + 1;
+        let mut bits = vec![0u8; ((w * h + 7) / 8) as usize];
+        for y in y1..=y2 {
+            for x in x1..=x2 {
+                if pred(x, y) {
+                    let idx = ((y - y1) * w + (x - x1)) as usize;
+                    bits[idx >> 3] |= 1u8 << (idx & 7);
+                }
+            }
+        }
+        SelectionMask { x1, y1, x2, y2, bits }
+    }
+
+    /// The bitset addressing round-trips: `contains` matches the predicate, is false outside the
+    /// bbox, and `count` equals the number of set cells.
+    #[test]
+    fn test_selection_mask_contains_and_count() {
+        let m = mask_from(0, 0, 3, 3, |x, y| x == y); // main diagonal of a 4×4 box
+        assert_eq!(m.count(), 4);
+        assert!(m.contains(0, 0) && m.contains(2, 2) && m.contains(3, 3));
+        assert!(!m.contains(1, 0) && !m.contains(0, 3), "off-diagonal cells are unset");
+        assert!(!m.contains(4, 4) && !m.contains(-1, -1), "outside the bbox is never contained");
+    }
+
+    /// The corruption-critical fail-safe: `active_mask` yields the mask ONLY on an exact bbox match,
+    /// so a stale mask can never mis-filter a selection that has since been reshaped.
+    #[test]
+    fn test_active_mask_fail_safe_rect_equality() {
+        let mut ws = ws_with(make_bumpy_world(8, |_, _| 20));
+        ws.selection_mask = Some(mask_from(2, 2, 5, 5, |x, y| x == y));
+        assert!(active_mask(&ws, 2, 2, 5, 5).is_some(), "exact bbox match resolves the mask");
+        assert!(active_mask(&ws, 2, 2, 5, 6).is_none(), "wrong y2 → rect-only fallback");
+        assert!(active_mask(&ws, 1, 2, 5, 5).is_none(), "wrong x1 → rect-only fallback");
+        assert!(active_mask(&ws, 0, 0, 15, 15).is_none(), "unrelated rect → rect-only fallback");
+        assert!(active_mask(&ws, 2, 2, 5, 5).is_some(), "resolving does not consume the mask");
+    }
+
+    /// A masked delete clears only the shaped cells; unmasked columns inside the same bounding box
+    /// survive — the headline "wand deletes the whole box" fix, at the `_inner` level.
+    #[test]
+    fn test_delete_blocks_respects_mask() {
+        let mut ws = ws_with(make_bumpy_world(8, |_, _| 20)); // every column solid z=1..20
+        let mask = mask_from(4, 4, 7, 7, |x, y| x - 4 == y - 4); // diagonal of the 4×4 box
+        delete_blocks_inner(ws.world.as_mut().unwrap(), 4, 4, 7, 7, 0, 63, Some(&mask));
+        let w = ws.world.as_ref().unwrap();
+        assert_eq!(surface_z_capped(w, 4, 4, None), None, "masked diagonal column is cleared to air");
+        assert_eq!(surface_z_capped(w, 7, 7, None), None, "far masked column is cleared too");
+        assert_eq!(surface_z_capped(w, 5, 4, None), Some(20), "unmasked column inside bbox is untouched");
+        assert_eq!(surface_z_capped(w, 4, 7, None), Some(20), "unmasked bbox corner is untouched");
+    }
+
+    /// A masked fill (`replace_blocks_inner`) re-skins only shaped cells; unmasked cells keep their
+    /// original block. Guards the second edit command that reads the mask.
+    #[test]
+    fn test_replace_blocks_respects_mask() {
+        let mut ws = ws_with(make_bumpy_world(8, |_, _| 20)); // grass (bt 8)
+        let mask = mask_from(4, 4, 7, 7, |x, _| x == 4); // just the left edge column of the box
+        // Fill z=20 only with brick (bt 13, paint 0), no filter.
+        replace_blocks_inner(ws.world.as_mut().unwrap(), 4, 4, 7, 7, 20, 20, 13, 0, None, None, false, Some(&mask));
+        let w = ws.world.as_ref().unwrap();
+        assert_eq!(read_block_abs(w, 4, 5, 20), 13, "masked cell became brick");
+        assert_eq!(read_block_abs(w, 5, 5, 20), 8, "unmasked cell kept grass");
+    }
+
+    /// A masked move relocates only the shaped cells and clears only those source cells; unmasked
+    /// cells inside the bbox (both source and dest) are left exactly as they were.
+    #[test]
+    fn test_move_selection_respects_mask() {
+        let mut ws = ws_with(make_bumpy_world(8, |_, _| 20)); // grass col height 20 everywhere
+        // Mark the block just below the surface so we can identify moved material: set (4,4,10)=stone.
+        set_block_abs(ws.world.as_mut().unwrap(), 4, 4, 10, 2, 0);
+        let mask = mask_from(4, 4, 5, 5, |x, y| x == 4 && y == 4); // only the single corner column
+        // Move the shaped selection +3 in x (dz=0). Reuse the inner move logic via the closure body:
+        // build buf, clear masked source, write masked dest.
+        let (x1, y1) = (4, 4);
+        let (width, height, depth) = (2i32, 2i32, 11i32); // z 0..=10
+        with_edit(&mut ws, "move", (4, 4, 8, 5), (4, 4, 8, 5), |world| {
+            let n = (width * height * depth) as usize;
+            let mut buf_bt = vec![0u8; n];
+            let mut buf_paint = vec![0u8; n];
+            for lz in 0..depth { for ly in 0..height { for lx in 0..width {
+                let idx = (lz * height * width + ly * width + lx) as usize;
+                buf_bt[idx] = read_block_abs(world, x1 + lx, y1 + ly, lz);
+                buf_paint[idx] = read_paint_abs(world, x1 + lx, y1 + ly, lz);
+            }}}
+            for lz in 0..depth { for ly in 0..height { for lx in 0..width {
+                if !mask.contains(x1 + lx, y1 + ly) { continue; }
+                set_block_abs(world, x1 + lx, y1 + ly, lz, 0, 0);
+            }}}
+            for lz in 0..depth { for ly in 0..height { for lx in 0..width {
+                if !mask.contains(x1 + lx, y1 + ly) { continue; }
+                let idx = (lz * height * width + ly * width + lx) as usize;
+                set_block_abs(world, x1 + 3 + lx, y1 + ly, lz, buf_bt[idx], buf_paint[idx]);
+            }}}
+            Ok(())
+        }).expect("masked move");
+        let w = ws.world.as_ref().unwrap();
+        assert_eq!(read_block_abs(w, 4, 4, 10), 0, "masked source column cleared");
+        assert_eq!(read_block_abs(w, 7, 4, 10), 2, "stone moved +3 to the masked dest");
+        assert_eq!(read_block_abs(w, 5, 4, 10), 8, "unmasked neighbour inside bbox untouched");
+    }
+
+    /// A shaped copy stores its footprint, and paste through the shared helper skips unmasked
+    /// columns — a copied L-shape stamps an L, not a filled box.
+    #[test]
+    fn test_masked_clipboard_paste_skips_unmasked() {
+        // Clipboard footprint: 2×2, only the diagonal (0,0) and (1,1) set.
+        let block_types = vec![13u8, 13, 13, 13]; // all brick
+        let paints = vec![0u8; 4];
+        let mut bits = vec![0u8; 1];
+        bits[0] |= 1 << 0; // (dy0,dx0) idx 0
+        bits[0] |= 1 << 3; // (dy1,dx1) idx 3
+        let cb = Clipboard { width: 2, height: 2, depth: 1, z_anchor: 30, block_types, paints, mask: Some(bits) };
+        assert!(cb.info().masked, "info reflects the footprint");
+
+        let mut ws = ws_with(make_bumpy_world(8, |_, _| 20));
+        let mask = cb.mask.clone();
+        with_edit(&mut ws, "paste", (10, 10, 11, 11), (10, 10, 11, 11), |world| {
+            paste_clipboard_at(world, 10, 10, &cb.block_types, &cb.paints,
+                cb.width, cb.height, cb.depth, cb.z_anchor, 0, false, world_max_z(world), mask.as_deref());
+            Ok(())
+        }).expect("masked paste");
+        let w = ws.world.as_ref().unwrap();
+        assert_eq!(read_block_abs(w, 10, 10, 30), 13, "diagonal cell (0,0) stamped");
+        assert_eq!(read_block_abs(w, 11, 11, 30), 13, "diagonal cell (1,1) stamped");
+        assert_eq!(read_block_abs(w, 11, 10, 30), 0, "off-diagonal (1,0) skipped — shape preserved");
+        assert_eq!(read_block_abs(w, 10, 11, 30), 0, "off-diagonal (0,1) skipped");
+    }
+
+    /// Rotating a shaped clipboard 90° CW transforms the footprint with the SAME map as the data, so
+    /// the mask still lines up with the blocks it gates.
+    #[test]
+    fn test_rotate_clipboard_transforms_mask() {
+        // 2(w)×3(h) footprint, only the top-left column (dy0,dx0) set.
+        let mut bits = vec![0u8; 1];
+        bits[0] |= 1 << 0;
+        let mut cb = Clipboard {
+            width: 2, height: 3, depth: 1, z_anchor: 0,
+            block_types: vec![0u8; 6], paints: vec![0u8; 6], mask: Some(bits),
+        };
+        rotate_clipboard_inner(&mut cb);
+        // After CW: new dims 3(w)×2(h). Old (dx0,dy0) → (ndx=dy=0, ndy=old_w-1-dx=1). New idx = ndy*new_w+ndx = 1*3+0 = 3.
+        assert_eq!(cb.width, 3);
+        assert_eq!(cb.height, 2);
+        let m = cb.mask.unwrap();
+        assert!(bit_set(&m, 3), "the one set column rotated to its new position");
+        assert_eq!(m.iter().map(|b| b.count_ones()).sum::<u32>(), 1, "exactly one cell still set");
+    }
+
+    /// A shaped clipboard survives a prefab serialize→deserialize round trip: EPFAB\x02 carries the
+    /// footprint so a saved prefab pastes the shape, not its bounding box.
+    #[test]
+    fn test_prefab_round_trip_preserves_mask() {
+        // 3(w)×2(h)×1(d) all brick; L-shaped footprint (drop the top-right cell dx2,dy0).
+        let n = 6;
+        let mut bits = vec![0u8; 1];
+        for i in 0..6 { if i != 2 { bits[0] |= 1 << i; } }
+        let cb = Clipboard {
+            width: 3, height: 2, depth: 1, z_anchor: 42,
+            block_types: (0..n).map(|i| 13 + i as u8).collect(),
+            paints: (0..n).map(|i| i as u8).collect(),
+            mask: Some(bits.clone()),
+        };
+        let round = deserialize_prefab(&serialize_prefab(&cb)).expect("round-trips");
+        assert_eq!(round.width, 3);
+        assert_eq!(round.height, 2);
+        assert_eq!(round.z_anchor, 42);
+        assert_eq!(round.block_types, cb.block_types, "block data intact");
+        assert_eq!(round.paints, cb.paints, "paint data intact");
+        assert_eq!(round.mask, Some(bits), "footprint survived the round trip");
+        assert!(round.info().masked, "reloaded prefab reports as shaped");
+    }
+
+    /// A rectangular clipboard still writes the legacy EPFAB\x01 format (older builds keep reading
+    /// it), and reloads with no mask.
+    #[test]
+    fn test_prefab_rectangular_stays_v1() {
+        let cb = Clipboard {
+            width: 2, height: 2, depth: 1, z_anchor: 0,
+            block_types: vec![13u8; 4], paints: vec![0u8; 4], mask: None,
+        };
+        let bytes = serialize_prefab(&cb);
+        // Decompress to inspect the version byte.
+        use flate2::read::GzDecoder;
+        use std::io::Read;
+        let mut raw = Vec::new();
+        GzDecoder::new(&bytes[..]).read_to_end(&mut raw).unwrap();
+        assert_eq!(&raw[0..6], b"EPFAB\x01", "maskless prefab stays on v1");
+        let round = deserialize_prefab(&bytes).expect("round-trips");
+        assert_eq!(round.mask, None, "no footprint on a rectangular prefab");
+    }
+
+    /// Shaped-selection consistency pass — a masked clipboard's top-down paste ghost leaves unmasked
+    /// columns fully transparent (alpha 0), so the preview shows only the footprint; a `None` mask
+    /// keeps the full VOID box (prefab-thumbnail parity).
+    #[test]
+    fn test_clipboard_preview_hides_unmasked_cells() {
+        // 2×2×1, all brick, diagonal footprint (0,0)+(1,1).
+        let mut bits = vec![0u8; 1];
+        bits[0] |= 1 << 0; bits[0] |= 1 << 3;
+        let cb = Clipboard { width: 2, height: 2, depth: 1, z_anchor: 0,
+            block_types: vec![13u8; 4], paints: vec![0u8; 4], mask: Some(bits) };
+        let pd = render_clipboard_preview_inner(&cb, 0);
+        let a = |dx: usize, dy: usize| pd.pixels[(dy * 2 + dx) * 4 + 3];
+        assert_eq!(a(0, 0), 255, "masked block column is opaque");
+        assert_eq!(a(1, 1), 255, "far masked block column is opaque");
+        assert_eq!(a(1, 0), 0, "unmasked column stays transparent (alpha 0)");
+        assert_eq!(a(0, 1), 0, "unmasked column stays transparent");
+
+        // None mask ⇒ every column filled (VOID for the air columns), matching prefab thumbnails.
+        let cb2 = Clipboard { mask: None, ..cb };
+        let pd2 = render_clipboard_preview_inner(&cb2, 0);
+        for i in 0..4 { assert_eq!(pd2.pixels[i * 4 + 3], 255, "None mask fills the whole box"); }
+    }
+
+    /// The front/side clipboard elevation ghost treats an unmasked column as air, so its silhouette
+    /// matches the shaped paste instead of the full box.
+    #[test]
+    fn test_clipboard_elevation_preview_respects_mask() {
+        // 2(w)×1(h)×1(d): only column dx0 masked. Front view is 2 wide, 1 tall.
+        let mut bits = vec![0u8; 1];
+        bits[0] |= 1 << 0; // (dy0,dx0)
+        let cb = Clipboard { width: 2, height: 1, depth: 1, z_anchor: 0,
+            block_types: vec![13u8, 13], paints: vec![0u8; 2], mask: Some(bits) };
+        let pd = render_clipboard_elevation_preview_inner(&cb, 0, "front");
+        assert_eq!(pd.width, 2);
+        assert_eq!(pd.pixels[3], 255, "masked column (dx0) shows the block");
+        assert_eq!(pd.pixels[4 + 3], 0, "unmasked column (dx1) reads as air");
+    }
+
+    /// The axo clipboard ghost (SelectionInspector 3D tab) skips unmasked columns.
+    #[test]
+    fn test_axo_clipboard_respects_mask() {
+        // 2×2×1 all brick, only (0,0) masked. ski=0 ⇒ no parallax, straight top-down sample.
+        let mut bits = vec![0u8; 1];
+        bits[0] |= 1 << 0;
+        let cb = Clipboard { width: 2, height: 2, depth: 1, z_anchor: 0,
+            block_types: vec![13u8; 4], paints: vec![0u8; 4], mask: Some(bits) };
+        let pd = render_axo_clipboard_inner(&cb, 0, 0.0, 0);
+        // Background is [30,30,30,255]; a rendered brick column differs from that.
+        let is_bg = |dx: usize, dy: usize| {
+            let o = (dy * 2 + dx) * 4;
+            pd.pixels[o] == 30 && pd.pixels[o + 1] == 30 && pd.pixels[o + 2] == 30
+        };
+        assert!(!is_bg(0, 0), "masked column renders a block");
+        assert!(is_bg(1, 0), "unmasked column stays background");
+        assert!(is_bg(0, 1), "unmasked column stays background");
+    }
+
+    /// The ortho front/side selection view (SliceViewport + SelectionInspector) skips unmasked
+    /// columns, so a masked block *behind* an unmasked column shows through correctly.
+    #[test]
+    fn test_render_selection_view_masks_columns() {
+        // Two adjacent columns at x=4 (front, tall grass to z=20) and x=5 (behind, brick at z=5).
+        // Build so that scanning y reaches x-column blocks; use render_view_front over a 2-wide rect.
+        let mut ws = ws_with(make_bumpy_world(8, |lx, _| if lx == 4 { 20 } else { 0 }));
+        // Put a distinct brick at (5,4,15) — an unmasked (4,4) column must let it show behind.
+        set_block_abs(ws.world.as_mut().unwrap(), 5, 4, 15, 13, 0);
+        let world = ws.world.as_ref().unwrap();
+        // Mask covers the 2×1 rect (4,4)-(5,4) but only selects x=5 (drop the front x=4 column).
+        let mask = mask_from(4, 4, 5, 4, |x, _| x == 5);
+
+        // Front view: pw = 2 (x4,x5), ph over z 0..=20. Column 0 = x4 (masked out → see-through),
+        // column 1 = x5 (masked in). With x4 masked out, the brick behind at x5,z15 renders in col 1.
+        let (pw, _ph, px_masked) = render_view_front(world, 4, 5, 4, 4, 0, 20, 0, Some(&mask));
+        assert_eq!(pw, 2);
+        // Unmasked path: x4 column is a solid grass wall to z=20, occluding nothing behind it in
+        // its own column — but col 0 (x4) should be VOID since x4 is masked *out*.
+        // Row for z=20 is row 0; col 0 pixel:
+        let row_z = |z: i32| (20 - z) as usize;
+        let px = |col: usize, z: i32| { let o = (row_z(z) * pw as usize + col) * 4; [px_masked[o], px_masked[o+1], px_masked[o+2]] };
+        assert_eq!(px(0, 20), [20, 20, 35], "masked-out front column is VOID (see-through)");
+        assert_ne!(px(1, 15), [20, 20, 35], "masked block behind shows through in its column");
+
+        // None mask ⇒ front column x4 renders its grass wall (not VOID) at z=20.
+        let (_pw2, _ph2, px_none) = render_view_front(world, 4, 5, 4, 4, 0, 20, 0, None);
+        let o = (row_z(20) * 2) * 4;
+        assert_ne!([px_none[o], px_none[o+1], px_none[o+2]], [20, 20, 35], "None mask renders the full box");
+    }
+
+    /// The top-down ortho view hides unmasked columns (leaves them VOID) so the floating inspector
+    /// shows the actual footprint, not the enclosing bounding box. Regression for "the top view
+    /// still shows everything in the nearest rectangle".
+    #[test]
+    fn test_render_view_top_masks_columns() {
+        let mut ws = ws_with(make_bumpy_world(8, |_, _| 20)); // every column solid grass to z=20
+        let world = ws.world.as_ref().unwrap();
+        // 2×2 rect (4,4)-(5,5); select only the main diagonal (4,4) and (5,5).
+        let mask = mask_from(4, 4, 5, 5, |x, y| x - 4 == y - 4);
+        let (pw, ph, px_masked) = render_view_top(world, 4, 5, 4, 5, 0, 20, 0, Some(&mask));
+        assert_eq!((pw, ph), (2, 2));
+        let px = |col: usize, row: usize| { let o = (row * pw as usize + col) * 4; [px_masked[o], px_masked[o+1], px_masked[o+2]] };
+        assert_ne!(px(0, 0), [20, 20, 35], "masked-in (4,4) renders its surface block");
+        assert_ne!(px(1, 1), [20, 20, 35], "masked-in (5,5) renders its surface block");
+        assert_eq!(px(1, 0), [20, 20, 35], "unmasked (5,4) is VOID");
+        assert_eq!(px(0, 1), [20, 20, 35], "unmasked (4,5) is VOID");
+
+        // None mask ⇒ the whole 2×2 box renders (no VOID columns).
+        let (_pw2, _ph2, px_none) = render_view_top(world, 4, 5, 4, 5, 0, 20, 0, None);
+        for i in 0..4 { let o = i * 4; assert_ne!([px_none[o], px_none[o+1], px_none[o+2]], [20, 20, 35], "None mask fills every column"); }
+    }
+
+    /// A masked gradient re-skins only shaped columns; unmasked columns inside the bbox keep their
+    /// original block.
+    #[test]
+    fn test_gradient_fill_respects_mask() {
+        let mut ws = ws_with(make_bumpy_world(8, |_, _| 20)); // grass (bt 8) to z=20
+        let mask = mask_from(4, 4, 7, 7, |x, _| x == 4); // left edge column only
+        gradient_fill_inner(ws.world.as_mut().unwrap(), 4, 4, 7, 7, 20, 20, 13, 0, 14, 0, "x", false, Some(&mask));
+        let w = ws.world.as_ref().unwrap();
+        assert!(matches!(read_block_abs(w, 4, 5, 20), 13 | 14), "masked column re-skinned");
+        assert_eq!(read_block_abs(w, 5, 5, 20), 8, "unmasked column kept grass");
+    }
+
+    /// A masked extrude repeats the *shape*: gating is on the source cell, so an x+ copy translates
+    /// only the masked source columns and leaves unmasked destination cells untouched.
+    #[test]
+    fn test_extrude_selection_respects_mask() {
+        let mut ws = ws_with(make_bumpy_world(0, |_, _| 0)); // empty world
+        // Source 2×2 at (4,4); mark only (4,4,10)=stone. Mask selects only that one column.
+        set_block_abs(ws.world.as_mut().unwrap(), 4, 4, 10, 2, 0);
+        set_block_abs(ws.world.as_mut().unwrap(), 5, 4, 10, 3, 0); // dirt in the unmasked column
+        let (width, height, depth) = (2i32, 2i32, 11i32);
+        let mut src_types = vec![0u8; (width * height * depth) as usize];
+        let mut src_paints = vec![0u8; (width * height * depth) as usize];
+        {
+            let world = ws.world.as_ref().unwrap();
+            for dz in 0..depth { for dy in 0..height { for dx in 0..width {
+                let idx = (dz * height * width + dy * width + dx) as usize;
+                src_types[idx] = read_block_abs(world, 4 + dx, 4 + dy, dz);
+                src_paints[idx] = read_paint_abs(world, 4 + dx, 4 + dy, dz);
+            }}}
+        }
+        let mask = mask_from(4, 4, 5, 5, |x, y| x == 4 && y == 4);
+        with_edit(&mut ws, "extrude", (4, 4, 7, 5), (4, 4, 7, 5), |world| {
+            extrude_write(world, 4, 4, &src_types, &src_paints, width, height, depth, 0, 63, "x+", 1, false, Some(&mask));
+            Ok(())
+        }).expect("masked extrude");
+        let w = ws.world.as_ref().unwrap();
+        assert_eq!(read_block_abs(w, 6, 4, 10), 2, "masked source column extruded +2 (stone)");
+        assert_eq!(read_block_abs(w, 7, 4, 10), 0, "unmasked source column not extruded (no dirt copy)");
+    }
+
+    /// A masked tree pass only plants inside the shape. density=1.0 + smart placement over grass;
+    /// the unmasked column stays bare (only surface grass), the masked column grows a trunk above it.
+    #[test]
+    fn test_generate_trees_respects_mask() {
+        let mut ws = ws_with(make_bumpy_world(8, |_, _| 20)); // grass surface z=20 everywhere
+        let mask = mask_from(4, 4, 7, 7, |x, y| x == 4 && y == 4);
+        generate_trees_inner(ws.world.as_mut().unwrap(), 4, 4, 7, 7,
+            &["normal".to_string()], 1.0, &[], 42, true, Some(&mask));
+        let w = ws.world.as_ref().unwrap();
+        // A normal tree places a trunk (bt 6) above the surface at the planted column.
+        assert_eq!(read_block_abs(w, 4, 4, 21), 6, "masked column grew a trunk");
+        assert_eq!(read_block_abs(w, 6, 6, 21), 0, "unmasked column stayed bare above the surface");
+    }
+
+    /// A `set_selection_mask` payload of the wrong length is rejected rather than silently producing
+    /// an under-read mask. (Exercises the byte-count guard without a Tauri State harness by mirroring
+    /// its size math.)
+    #[test]
+    fn test_mask_size_guard_math() {
+        // 4×4 bbox needs ceil(16/8) = 2 bytes.
+        let w = 4usize; let h = 4usize;
+        assert_eq!(w.saturating_mul(h).div_ceil(8), 2);
+        // 200×200 needs 5000 bytes.
+        assert_eq!(200usize.saturating_mul(200).div_ceil(8), 5000);
+    }
+
+    /// Task 1 — N overlapping grouped raise stamps undo/redo as ONE unit, byte-exactly, and depths
+    /// count groups not stamps; an ungrouped edit stays its own single group (regression guard).
+    #[test]
+    fn test_grouped_undo_round_trip() {
+        let mut ws = ws_with(make_bumpy_world(2, |lx, ly| 12 + ((lx + ly) % 5) as i32));
+        let before = world_bytes(&ws);
+
+        // 4 overlapping raise stamps sharing one group id.
+        let gid = Some(777u64);
+        for &(cx, cy) in &[(6, 6), (7, 6), (6, 7), (7, 7)] {
+            sculpt(&mut ws, Some(disc_points(cx, cy, 2)), "raise", 3, 0.0, None, gid);
+        }
+        let after = world_bytes(&ws);
+        assert_ne!(before, after, "stamps must change the world");
+        assert_eq!(ws.undo_stack.len(), 4, "each stamp is its own raw undo entry");
+        assert_eq!(count_undo_groups(&ws.undo_stack), 1, "same-group stamps collapse to one group");
+
+        // undo → redo → undo → redo, byte-identical every time (exercises the ordering reasoning).
+        for _ in 0..2 {
+            let r = undo_edit_inner(&mut ws).expect("undo");
+            assert_eq!(world_bytes(&ws), before, "one undo restores the whole stroke");
+            assert_eq!(r.undo_depth, 0, "undo drops exactly one group (was 1 → 0)");
+            let r2 = redo_edit_inner(&mut ws).expect("redo");
+            assert_eq!(world_bytes(&ws), after, "one redo restores the whole stroke");
+            assert_eq!(r2.undo_depth, 1, "redo restores the one group");
+            assert_eq!(ws.undo_stack.len(), 4, "redo restores all 4 raw entries");
+        }
+
+        // Regression: a lone ungrouped edit is exactly one entry / one group and round-trips.
+        undo_edit_inner(&mut ws).expect("undo the group");
+        assert_eq!(world_bytes(&ws), before);
+        let base = world_bytes(&ws);
+        let r = sculpt(&mut ws, Some(disc_points(3, 3, 1)), "raise", 2, 0.0, None, None);
+        assert_eq!(ws.undo_stack.len(), 1, "ungrouped edit = one entry");
+        assert_eq!(r.undo_depth, 1, "ungrouped edit = one group");
+        let post = world_bytes(&ws);
+        assert_ne!(base, post);
+        undo_edit_inner(&mut ws).expect("undo ungrouped");
+        assert_eq!(world_bytes(&ws), base, "ungrouped undo = single entry");
+        redo_edit_inner(&mut ws).expect("redo ungrouped");
+        assert_eq!(world_bytes(&ws), post);
+        assert_eq!(ws.undo_stack.len(), 1);
+    }
+
+    /// Task 2 — per-stamp radial (dial) falloff vs BFS silhouette dome for one isolated disc stamp.
+    /// The two use different distance metrics (8-connected graph distance to the silhouette edge vs
+    /// continuous Euclidean distance from the centre), so the weight fields aren't bit-identical;
+    /// we assert the resulting per-column heights agree within a small tolerance and that both are
+    /// centre-higher-than-rim monotone. Tolerance = 1 block, made attainable by using a modest
+    /// strength (2) so the whole dome spans only ~2 blocks — the max possible disagreement between
+    /// two near-equal weight fields after integer rounding is then one quantization step.
+    #[test]
+    fn test_dial_vs_bfs_falloff_parity() {
+        let (cx, cy, r) = (8, 8, 4);
+        let base = make_bumpy_world(2, |_, _| 15);
+
+        // (a) BFS path: explicit disc points, no stamp centre.
+        let mut ws_a = ws_with(base.clone());
+        sculpt(&mut ws_a, Some(disc_points(cx, cy, r)), "raise", 2, 1.0, None, None);
+        // (b) dial path: no points, stamp centre + radius → backend generates the disc.
+        let mut ws_b = ws_with(base.clone());
+        sculpt(&mut ws_b, None, "raise", 2, 1.0, Some((cx, cy, r)), None);
+
+        for p in &disc_points(cx, cy, r) {
+            let ha = surf(&ws_a, p.x, p.y);
+            let hb = surf(&ws_b, p.x, p.y);
+            assert!((ha - hb).abs() <= 1, "column ({},{}) BFS={ha} dial={hb} differ by >1", p.x, p.y);
+        }
+        // Monotonicity: centre rises strictly more than the rim, both paths.
+        assert!(surf(&ws_a, cx, cy) > surf(&ws_a, cx + r, cy), "BFS centre must exceed rim");
+        assert!(surf(&ws_b, cx, cy) > surf(&ws_b, cx + r, cy), "dial centre must exceed rim");
+        // Dial rim weight is exactly 0 (d == radius) → rim height unchanged.
+        assert_eq!(surf(&ws_b, cx + r, cy), 15, "dial rim (weight 0) leaves terrain untouched");
+    }
+
+    /// Task 4.1 — dithering is deterministic (pure function of (x,y), no hidden RNG) and is fully
+    /// bypassed at softness == 0 (hard brushes round exactly).
+    #[test]
+    fn test_dither_determinism_and_hard_bypass() {
+        let base = make_bumpy_world(2, |lx, ly| 12 + ((lx * 3 + ly) % 7) as i32);
+        let disc = disc_points(8, 8, 5);
+
+        // Two identical soft raise calls from the same start → byte-identical.
+        let mut ws1 = ws_with(base.clone());
+        let mut ws2 = ws_with(base.clone());
+        sculpt(&mut ws1, Some(disc.clone()), "raise", 5, 0.6, None, None);
+        sculpt(&mut ws2, Some(disc.clone()), "raise", 5, 0.6, None, None);
+        assert_eq!(world_bytes(&ws1), world_bytes(&ws2),
+            "identical soft-sculpt calls must be byte-identical (dither is deterministic)");
+
+        // softness == 0 → weight 1 everywhere, plain round, no dither: every column rises by exactly
+        // `strength`. A dithered path would give ±1 here.
+        let base_ws = ws_with(base.clone());
+        let mut ws3 = ws_with(base.clone());
+        sculpt(&mut ws3, Some(disc.clone()), "raise", 5, 0.0, None, None);
+        for p in &disc {
+            assert_eq!(surf(&ws3, p.x, p.y), surf(&base_ws, p.x, p.y) + 5,
+                "hard raise adds exactly strength with no dither at ({},{})", p.x, p.y);
+        }
+    }
+
+    /// Task 4.2 — Smooth iterates `strength` times, so strength 3 flattens a cone toward the local
+    /// average strictly more than strength 1 (from the same input each time).
+    #[test]
+    fn test_smooth_strength_flattens_more() {
+        // A smooth cone peak (avoids the checkerboard pattern that makes undamped Jacobi oscillate
+        // and the linear ramp that is a smoothing fixed point).
+        let cone = |lx: usize, ly: usize| -> i32 {
+            let (dx, dy) = (lx as i32 - 8, ly as i32 - 8);
+            let d = ((dx * dx + dy * dy) as f64).sqrt();
+            15 + (6.0 - d).max(0.0).round() as i32
+        };
+        let base = make_bumpy_world(2, cone);
+        let disc = disc_points(8, 8, 3);
+
+        let range_after = |strength: i32| -> i32 {
+            let mut ws = ws_with(base.clone());
+            sculpt(&mut ws, Some(disc.clone()), "smooth", strength, 0.0, None, None);
+            let hs: Vec<i32> = disc.iter().map(|p| surf(&ws, p.x, p.y)).collect();
+            hs.iter().max().unwrap() - hs.iter().min().unwrap()
+        };
+        let r1 = range_after(1);
+        let r3 = range_after(3);
+        assert!(r3 < r1, "strength 3 smooth must flatten more than strength 1 (r1={r1}, r3={r3})");
+    }
+
+    /// Terrace quantizes every column to the nearest `strength`-block step.
+    #[test]
+    fn test_terrace_quantizes_to_step() {
+        let base = make_bumpy_world(2, |lx, ly| 10 + ((lx * 3 + ly) % 11) as i32);
+        let disc = disc_points(8, 8, 5);
+        let step = 4;
+        let mut ws = ws_with(base.clone());
+        sculpt(&mut ws, Some(disc.clone()), "terrace", step, 0.0, None, None);
+        for p in &disc {
+            let h = surf(&ws, p.x, p.y);
+            assert_eq!(h.rem_euclid(step), 0, "column ({},{}) height {h} isn't a multiple of step {step}", p.x, p.y);
+        }
+    }
+
+    /// Sharpen is the inverse of Smooth: it must widen (not narrow) the height range of a cone.
+    #[test]
+    fn test_sharpen_widens_range() {
+        let cone = |lx: usize, ly: usize| -> i32 {
+            let (dx, dy) = (lx as i32 - 8, ly as i32 - 8);
+            let d = ((dx * dx + dy * dy) as f64).sqrt();
+            15 + (6.0 - d).max(0.0).round() as i32
+        };
+        let base = make_bumpy_world(2, cone);
+        let disc = disc_points(8, 8, 3);
+        let range_before = {
+            let ws = ws_with(base.clone());
+            let hs: Vec<i32> = disc.iter().map(|p| surf(&ws, p.x, p.y)).collect();
+            hs.iter().max().unwrap() - hs.iter().min().unwrap()
+        };
+        let mut ws = ws_with(base.clone());
+        sculpt(&mut ws, Some(disc.clone()), "sharpen", 8, 0.0, None, None);
+        let range_after = {
+            let hs: Vec<i32> = disc.iter().map(|p| surf(&ws, p.x, p.y)).collect();
+            hs.iter().max().unwrap() - hs.iter().min().unwrap()
+        };
+        assert!(range_after > range_before,
+            "sharpen must widen the height range (before={range_before}, after={range_after})");
+    }
+
+    /// Slope levels toward an angled plane through the anchor: with slope_dx=1 (1 block of rise
+    /// per block of X run), a column `dx` blocks east of the anchor lands at `anchor_z + dx`, and
+    /// the anchor column itself is untouched (it's on the plane already).
+    #[test]
+    fn test_slope_tilts_plane_from_anchor() {
+        let base = make_bumpy_world(2, |_, _| 15);
+        let mut ws = ws_with(base);
+        let (ax, ay) = (8, 8);
+        let disc = disc_points(ax, ay, 4);
+        sculpt_terrain_inner(
+            &mut ws, Some(disc.clone()), "slope".into(), 1, 0, None, None, None, None,
+            Some(0.0), Some("smooth".into()), None, Some(ax), Some(ay), None, None, None, None, None,
+            Some(1.0), Some(0.0), None, None, None, None,
+        ).expect("slope");
+        assert_eq!(surf(&ws, ax, ay), 15, "anchor column sits on its own plane, unchanged");
+        assert_eq!(surf(&ws, ax + 3, ay), 18, "3 blocks east at slope_dx=1 → anchor height + 3");
+        assert_eq!(surf(&ws, ax - 2, ay), 13, "2 blocks west at slope_dx=1 → anchor height - 2");
+    }
+
+    /// Smear pulls each column's height from `smear_dx/smear_dy` blocks behind it — a flat-out
+    /// step (a cliff) shifts sideways by the smear vector within the brushed footprint, and a
+    /// zero vector is a no-op (nothing to smear without a drag direction).
+    #[test]
+    fn test_smear_advects_height_along_drag() {
+        // A cliff: x < 8 is low (10), x >= 8 is high (20).
+        let base = make_bumpy_world(2, |lx, _| if lx < 8 { 10 } else { 20 });
+        let disc = disc_points(8, 8, 3);
+
+        // Zero vector: no-op regardless of softness.
+        let mut ws0 = ws_with(base.clone());
+        let before = world_bytes(&ws0);
+        sculpt_terrain_inner(
+            &mut ws0, Some(disc.clone()), "smear".into(), 1, 0, None, None, None, None,
+            Some(0.0), Some("smooth".into()), None, None, None, None, None, None, None, None,
+            None, None, Some(0), Some(0), None, None,
+        ).expect("smear no-op");
+        assert_eq!(world_bytes(&ws0), before, "zero smear vector must not touch the world");
+
+        // Pull from 2 blocks east (source x+2) with a hard brush: every column in the footprint
+        // takes on its source's height exactly.
+        let mut ws = ws_with(base.clone());
+        sculpt_terrain_inner(
+            &mut ws, Some(disc.clone()), "smear".into(), 1, 0, None, None, None, None,
+            Some(0.0), Some("smooth".into()), None, None, None, None, None, None, None, None,
+            None, None, Some(-2), Some(0), None, None,
+        ).expect("smear");
+        // Column x=6 (low side) pulls from x=8 (high side, source = p.x - smear_dx = 6 - (-2) = 8)
+        assert_eq!(surf(&ws, 6, 8), 20, "column at x=6 pulls its source height from x=8");
+        // Column x=10 (high side) pulls from x=12, also high — unaffected in value.
+        assert_eq!(surf(&ws, 10, 8), 20, "column at x=10 pulls its source height from x=12 (same band)");
+    }
+
+    /// Hydro is deterministic: two identical droplet simulations (same seed, same world, same
+    /// params) produce byte-identical results — the RNG-driven start jitter/exploration is seeded.
+    #[test]
+    fn test_hydro_determinism() {
+        let base = make_bumpy_world(2, |lx, ly| 12 + ((lx * 3 + ly) % 7) as i32);
+        let disc = disc_points(8, 8, 5);
+        let mut ws1 = ws_with(base.clone());
+        let mut ws2 = ws_with(base.clone());
+        sculpt(&mut ws1, Some(disc.clone()), "hydro", 4, 0.0, None, None);
+        sculpt(&mut ws2, Some(disc.clone()), "hydro", 4, 0.0, None, None);
+        assert_eq!(world_bytes(&ws1), world_bytes(&ws2),
+            "identical hydro calls must be byte-identical (seeded droplet sim is deterministic)");
+    }
+
+    /// Hydro actually erodes: running it over a broad peak shrinks the peak-to-valley height range
+    /// within the footprint (the peak erodes down and/or valleys fill), vs the untouched world.
+    #[test]
+    fn test_hydro_erodes_a_peak() {
+        // A broad cone peak so many droplets engage the slope.
+        let cone = |lx: usize, ly: usize| -> i32 {
+            let (dx, dy) = (lx as i32 - 8, ly as i32 - 8);
+            let d = ((dx * dx + dy * dy) as f64).sqrt();
+            15 + (24.0 - 4.0 * d).max(0.0).round() as i32
+        };
+        let base = make_bumpy_world(2, cone);
+        let disc = disc_points(8, 8, 5);
+
+        let range = |ws: &WorldState| -> i32 {
+            let hs: Vec<i32> = disc.iter().map(|p| surf(ws, p.x, p.y)).collect();
+            hs.iter().max().unwrap() - hs.iter().min().unwrap()
+        };
+        let before_ws = ws_with(base.clone());
+        let range_before = range(&before_ws);
+
+        let mut ws = ws_with(base.clone());
+        sculpt(&mut ws, Some(disc.clone()), "hydro", 4, 0.0, None, None);
+        let range_after = range(&ws);
+
+        assert!(range_after < range_before,
+            "hydro must reduce the footprint height range (before {range_before}, after {range_after})");
+    }
+
+    /// Commit stays inside the footprint: even though the droplet workspace extends 16 cells past the
+    /// brush, a column strictly outside the footprint's bounding box is byte-identical afterwards,
+    /// while a column inside it changed. This is the regression guard that makes the wider workspace
+    /// safe (§4 "commit inside footprint only").
+    #[test]
+    fn test_hydro_commit_stays_in_footprint() {
+        // Column's full block+paint byte column (all 64 z levels), single-chunk layout.
+        let col_bytes = |bytes: &[u8], lx: usize, ly: usize| -> Vec<u8> {
+            let mut v = Vec::with_capacity(128);
+            for z in 0..64usize {
+                let off = 4096 + (z / 16) * 8192 + lx * 256 + ly * 16 + (z % 16);
+                v.push(bytes[off]);
+                v.push(bytes[off + 4096]);
+            }
+            v
+        };
+        let cone = |lx: usize, ly: usize| -> i32 {
+            let (dx, dy) = (lx as i32 - 8, ly as i32 - 8);
+            let d = ((dx * dx + dy * dy) as f64).sqrt();
+            15 + (18.0 - 3.0 * d).max(0.0).round() as i32
+        };
+        let base = make_bumpy_world(2, cone);
+        let before = base.clone();
+
+        // Footprint bbox is x,y ∈ 5..=11. (2,2) is outside it but well inside the workspace
+        // (footprint − 16 .. footprint + 16); (8,8) is the centre and must change.
+        let mut ws = ws_with(base.clone());
+        sculpt(&mut ws, Some(disc_points(8, 8, 3)), "hydro", 4, 0.0, None, None);
+        let after = world_bytes(&ws);
+
+        assert_eq!(col_bytes(&before, 2, 2), col_bytes(&after, 2, 2),
+            "a column outside the footprint bbox must be untouched by hydro's wider workspace");
+        assert_ne!(col_bytes(&before, 8, 8), col_bytes(&after, 8, 8),
+            "the footprint centre must actually be eroded (otherwise the guard proves nothing)");
+    }
+
+    /// Erosion radius ≥ 2: a single hydro stamp's erosion is spread over a radial brush, so a stamp
+    /// changes a contiguous neighbourhood of columns, not a 1-wide line (the audit's flaw (3)).
+    #[test]
+    fn test_hydro_erosion_spreads_across_columns() {
+        let cone = |lx: usize, ly: usize| -> i32 {
+            let (dx, dy) = (lx as i32 - 8, ly as i32 - 8);
+            let d = ((dx * dx + dy * dy) as f64).sqrt();
+            15 + (20.0 - 4.0 * d).max(0.0).round() as i32
+        };
+        let base = make_bumpy_world(2, cone);
+        let before_ws = ws_with(base.clone());
+        let disc = disc_points(8, 8, 4);
+
+        let mut ws = ws_with(base.clone());
+        sculpt(&mut ws, Some(disc.clone()), "hydro", 4, 0.0, None, None);
+
+        let changed = disc.iter()
+            .filter(|p| surf(&ws, p.x, p.y) != surf(&before_ws, p.x, p.y))
+            .count();
+        assert!(changed >= 2,
+            "erosion-radius brush must change more than one column (changed {changed})");
     }
 }

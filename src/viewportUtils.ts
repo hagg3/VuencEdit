@@ -119,3 +119,16 @@ export function putPatchPixels(ctx: CanvasRenderingContext2D, raw: PixelPatchRaw
   const img = new ImageData(new Uint8ClampedArray(pixels), raw.width, raw.height);
   ctx.putImageData(img, dx, dy);
 }
+
+// ── keyboard-target guard ─────────────────────────────────────────────────────
+// A bare-key shortcut (P/B/S/Space/Escape/…) must not fire while the user is typing. Testing
+// `tagName === "INPUT"` alone is wrong: it also matches the range/checkbox controls in the Ribbon
+// and the 3D pane, which keep focus after a drag — touch a slider and every bare-key shortcut goes
+// dead until something else is clicked. Only *text-entry* targets suppress shortcuts.
+const NON_TEXT_INPUT_TYPES = new Set(["range", "checkbox", "radio", "button", "submit", "reset", "color", "file"]);
+export function isTypingTarget(t: EventTarget | null): boolean {
+  const el = t as HTMLElement | null;
+  const tag = el?.tagName;
+  return tag === "TEXTAREA" || el?.isContentEditable === true ||
+    (tag === "INPUT" && !NON_TEXT_INPUT_TYPES.has((el as HTMLInputElement).type));
+}

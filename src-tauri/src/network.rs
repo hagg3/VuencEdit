@@ -1,5 +1,5 @@
 //! Eden game-server integration: world search, download, and upload.
-use std::fs;
+use std::{fs, io::{Read, Write}};
 use tauri::Emitter;
 
 // ── Eden server configuration ────────────────────────────────────────────────
@@ -101,10 +101,39 @@ pub(crate) fn urlencoding_encode(s: &str) -> String {
     out
 }
 
-// Sanity cap on the decompressed world size — a legit 256z Eden.eden-scale world is well under
-// this. Guards against a hostile/misbehaving server response decompressing into something that
-// exhausts disk/RAM.
-const MAX_DOWNLOADED_WORLD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+// Server worlds can legitimately be 10 GiB when a large 256z map is densely populated. Keep a
+// ceiling above that for forward headroom, but retain a finite bound against hostile responses
+// and gzip bombs. The same limit applies to the downloaded response and its decompressed form.
+const MAX_DOWNLOADED_WORLD_BYTES: u64 = 12 * 1024 * 1024 * 1024;
+const MAX_DOWNLOADED_WORLD_GIB: u64 = MAX_DOWNLOADED_WORLD_BYTES / (1024 * 1024 * 1024);
+
+/// Copy a stream while limiting output without writing a byte beyond `max_bytes`.
+/// Returns `Ok(false)` when there is more input after the permitted output.
+fn copy_capped<R: Read, W: Write>(reader: &mut R, writer: &mut W, max_bytes: u64) -> std::io::Result<bool> {
+    let mut buf = [0u8; 64 * 1024];
+    let mut written = 0u64;
+    loop {
+        let remaining_plus_probe = max_bytes.saturating_sub(written).saturating_add(1);
+        let read_len = remaining_plus_probe.min(buf.len() as u64) as usize;
+        let read = reader.read(&mut buf[..read_len])?;
+        if read == 0 { return Ok(true); }
+        let remaining = max_bytes.saturating_sub(written);
+        if read as u64 > remaining {
+            if remaining > 0 { writer.write_all(&buf[..remaining as usize])?; }
+            return Ok(false);
+        }
+        writer.write_all(&buf[..read])?;
+        written += read as u64;
+    }
+}
+
+fn size_limit_error(stage: &str) -> String {
+    format!("Downloaded world {stage} exceeds the {MAX_DOWNLOADED_WORLD_GIB} GiB safety limit")
+}
+
+fn write_error(stage: &str, error: std::io::Error) -> String {
+    format!("Failed to {stage}: {error}. Check available disk space and file permissions")
+}
 
 /// Download a world from the Eden server, streaming to disk with progress events.
 ///
@@ -118,8 +147,6 @@ pub(crate) async fn download_world(
     server: String,
     dest_path: String,
 ) -> Result<(), String> {
-    use std::io::{Read, Write};
-
     let srv = get_server(&server)?;
     let url = format!("{}/{}.eden", srv.download_base_url, id);
     let client = reqwest::Client::builder()
@@ -135,20 +162,36 @@ pub(crate) async fn download_world(
     }
 
     let total = response.content_length();
+    if total.is_some_and(|bytes| bytes > MAX_DOWNLOADED_WORLD_BYTES) {
+        return Err(size_limit_error("response"));
+    }
     let mut downloaded: u64 = 0;
     let raw_tmp_path = format!("{}.download.tmp", dest_path);
     let mut raw_file = fs::File::create(&raw_tmp_path)
-        .map_err(|e| format!("Failed to create temp download file: {e}"))?;
+        .map_err(|e| write_error("create temporary download file", e))?;
     // First bytes only, to sniff gzip magic after the stream completes.
     let mut head: Vec<u8> = Vec::new();
 
-    while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
-        downloaded += chunk.len() as u64;
-        if head.len() < 2 { head.extend(chunk.iter().take(2 - head.len())); }
-        raw_file.write_all(&chunk).map_err(|e| {
+    while let Some(chunk) = match response.chunk().await {
+        Ok(chunk) => chunk,
+        Err(e) => {
+            drop(raw_file);
             let _ = fs::remove_file(&raw_tmp_path);
-            format!("Write failed: {e}")
-        })?;
+            return Err(format!("Download failed: {e}"));
+        }
+    } {
+        downloaded = downloaded.saturating_add(chunk.len() as u64);
+        if downloaded > MAX_DOWNLOADED_WORLD_BYTES {
+            drop(raw_file);
+            let _ = fs::remove_file(&raw_tmp_path);
+            return Err(size_limit_error("response"));
+        }
+        if head.len() < 2 { head.extend(chunk.iter().take(2 - head.len())); }
+        if let Err(e) = raw_file.write_all(&chunk) {
+            drop(raw_file);
+            let _ = fs::remove_file(&raw_tmp_path);
+            return Err(write_error("write temporary download file", e));
+        }
         let _ = app.emit("download-progress", serde_json::json!({
             "downloaded": downloaded,
             "total": total
@@ -163,18 +206,21 @@ pub(crate) async fn download_world(
     // so load_world can mmap it directly (it only handles zip-PK or raw).
     if head.starts_with(&[0x1f, 0x8b]) {
         use flate2::read::GzDecoder;
-        let src = fs::File::open(&raw_tmp_path).map_err(|e| format!("Read failed: {e}"))?;
-        let mut dec = GzDecoder::new(std::io::BufReader::new(src)).take(MAX_DOWNLOADED_WORLD_BYTES + 1);
-        let mut out = fs::File::create(&tmp_path).map_err(|e| format!("Write failed: {e}"))?;
-        let n = std::io::copy(&mut dec, &mut out).map_err(|e| {
-            cleanup(&[&raw_tmp_path, &tmp_path]);
-            format!("Decompression failed: {e}")
-        })?;
+        let src = fs::File::open(&raw_tmp_path).map_err(|e| format!("Failed to read temporary download file: {e}"))?;
+        let mut dec = GzDecoder::new(std::io::BufReader::new(src));
+        let mut out = fs::File::create(&tmp_path).map_err(|e| write_error("create decompressed world file", e))?;
+        let copy_result = copy_capped(&mut dec, &mut out, MAX_DOWNLOADED_WORLD_BYTES);
         drop(out);
-        cleanup(&[&raw_tmp_path]);
-        if n > MAX_DOWNLOADED_WORLD_BYTES {
-            cleanup(&[&tmp_path]);
-            return Err("Downloaded world is too large".into());
+        match copy_result {
+            Ok(true) => cleanup(&[&raw_tmp_path]),
+            Ok(false) => {
+                cleanup(&[&raw_tmp_path, &tmp_path]);
+                return Err(size_limit_error("after decompression"));
+            }
+            Err(e) => {
+                cleanup(&[&raw_tmp_path, &tmp_path]);
+                return Err(write_error("decompress downloaded world", e));
+            }
         }
     } else {
         fs::rename(&raw_tmp_path, &tmp_path).map_err(|e| format!("Rename failed: {e}"))?;
@@ -183,6 +229,28 @@ pub(crate) async fn download_world(
     fs::rename(&tmp_path, &dest_path).map_err(|e| format!("Rename failed: {e}"))?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::copy_capped;
+    use std::io::Cursor;
+
+    #[test]
+    fn copy_capped_accepts_input_at_the_limit() {
+        let mut input = Cursor::new(vec![1, 2, 3, 4]);
+        let mut output = Vec::new();
+        assert!(copy_capped(&mut input, &mut output, 4).unwrap());
+        assert_eq!(output, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn copy_capped_rejects_input_past_the_limit_without_writing_the_extra_byte() {
+        let mut input = Cursor::new(vec![1, 2, 3, 4, 5]);
+        let mut output = Vec::new();
+        assert!(!copy_capped(&mut input, &mut output, 4).unwrap());
+        assert_eq!(output, vec![1, 2, 3, 4]);
+    }
 }
 
 /// Upload a world file + PNG preview to the Eden server.

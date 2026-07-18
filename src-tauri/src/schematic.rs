@@ -494,7 +494,7 @@ pub(crate) fn schematic_to_clipboard(
         }
     }
     Clipboard { width: eden_w as i32, height: eden_h as i32, depth: eden_d as i32,
-        z_anchor: 0, block_types, paints }
+        z_anchor: 0, block_types, paints, mask: None }
 }
 
 // ── NBT parser (minimal, for MCEdit .schematic only) ─────────────────────────
@@ -886,7 +886,7 @@ pub(crate) fn import_schematic_apply(
             }
         }
         Clipboard { width: mc_w as i32, height: mc_l as i32, depth: mc_h as i32,
-            z_anchor: 0, block_types: bt, paints: pt }
+            z_anchor: 0, block_types: bt, paints: pt, mask: None }
     } else if is_schem(&path) {
         // ── Sponge .schem ───────────────────────────────────────────────────
         let sc = parse_schem_bytes(&raw)?;
@@ -919,7 +919,7 @@ pub(crate) fn import_schematic_apply(
         })
     };
 
-    let info = ClipboardInfo { width: cb.width, height: cb.height, depth: cb.depth, z_anchor: cb.z_anchor };
+    let info = ClipboardInfo { width: cb.width, height: cb.height, depth: cb.depth, z_anchor: cb.z_anchor, masked: cb.mask.is_some() };
     state.lock().unwrap_or_else(|p| p.into_inner()).clipboard = Some(cb);
     Ok(info)
 }

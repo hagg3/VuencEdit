@@ -3,7 +3,7 @@ import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { save } from "@tauri-apps/plugin-dialog";
-import { EDEN_TEAL, EDEN_TEAL_READABLE, glassPanel, chromeButton, chromeButtonAccent, recessedWell, accentRing } from "./designTokens";
+import { EDEN_TEAL, EDEN_TEAL_READABLE, glassPanel, chromeButton, chromeButtonAccent, recessedWell, accentRing, expBadge } from "./designTokens";
 import Modal from "./Modal";
 import NumberField from "./NumberField";
 
@@ -343,14 +343,14 @@ export default function NewWorldModal({ onClose, onCreated }: Props) {
             <button style={typeBtn(terrainType === "flat")}    onClick={() => setTerrainType("flat")}>Flat</button>
             <button style={{ ...typeBtn(terrainType === "natural"), display: "inline-flex", alignItems: "center", justifyContent: "center", gap: 5 }} onClick={() => setTerrainType("natural")}>
               Natural
-              <span style={{ fontSize: 9, color: "#f59e0b", background: "rgba(245,158,11,0.12)", border: "1px solid rgba(245,158,11,0.3)", borderRadius: 3, padding: "0 3px", lineHeight: "14px" }}>exp</span>
+              <span style={expBadge({ fontSize: 9 })}>exp</span>
             </button>
             <button style={typeBtn(terrainType === "classic")} onClick={() => setTerrainType("classic")}>
               Classic
             </button>
-            <button style={{ ...typeBtn(terrainType === "tg2"), display: "inline-flex", alignItems: "center", justifyContent: "center", gap: 5 }} onClick={() => setTerrainType("tg2")}>
+            <button title="Tg2 — a port of Eden 2.0's TerrainGen2 generator: biome-based worlds (plains, mountains, desert, ponies, etc.) with structures and sky islands" style={{ ...typeBtn(terrainType === "tg2"), display: "inline-flex", alignItems: "center", justifyContent: "center", gap: 5 }} onClick={() => setTerrainType("tg2")}>
               Tg2
-              <span style={{ fontSize: 9, color: "#f59e0b", background: "rgba(245,158,11,0.12)", border: "1px solid rgba(245,158,11,0.3)", borderRadius: 3, padding: "0 3px", lineHeight: "14px" }}>exp</span>
+              <span style={expBadge({ fontSize: 9 })}>exp</span>
             </button>
           </div>
         </div>
@@ -386,8 +386,8 @@ export default function NewWorldModal({ onClose, onCreated }: Props) {
         <div>
           <div style={label}>HEIGHT FORMAT</div>
           <div style={{ display: "flex", gap: 6 }}>
-            <button style={fmtBtn(!extendedZ)} onClick={() => handleFormatChange(false)}>Legacy 64z</button>
-            <button style={fmtBtn(extendedZ)}  onClick={() => handleFormatChange(true)}>New Dawn 256z</button>
+            <button title="Original Eden format — worlds up to 64 blocks tall" style={fmtBtn(!extendedZ)} onClick={() => handleFormatChange(false)}>Legacy 64z</button>
+            <button title="Newer Eden format — worlds up to 256 blocks tall" style={fmtBtn(extendedZ)}  onClick={() => handleFormatChange(true)}>New Dawn 256z</button>
           </div>
         </div>
 
@@ -1003,7 +1003,7 @@ export default function NewWorldModal({ onClose, onCreated }: Props) {
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
                 <span style={{ ...label, display: "flex", alignItems: "center", gap: 6 }}>
                   TERRAIN AMPLITUDE
-                  <span style={{ fontSize: 9, color: "#f59e0b", background: "rgba(245,158,11,0.12)", border: "1px solid rgba(245,158,11,0.3)", borderRadius: 3, padding: "0 3px", lineHeight: "14px" }}>Exp</span>
+                  <span style={expBadge({ fontSize: 9 })}>Exp</span>
                 </span>
                 <span style={{ color: "#ebe9e7", fontSize: 13 }}>{tg2Amplitude.toFixed(1)}×</span>
               </div>
@@ -1047,7 +1047,7 @@ export default function NewWorldModal({ onClose, onCreated }: Props) {
                 <label htmlFor="tg2-blend" style={{ color: "#fcd34d", fontSize: 13, fontWeight: 600, cursor: "pointer" }}>
                   Blend biome seams
                 </label>
-                <span style={{ marginLeft: "auto", fontSize: 9, color: "#f59e0b", background: "rgba(245,158,11,0.12)", border: "1px solid rgba(245,158,11,0.3)", borderRadius: 3, padding: "0 3px", lineHeight: "14px" }}>exp</span>
+                <span style={expBadge({ marginLeft: "auto", fontSize: 9 })}>exp</span>
               </div>
               <div style={{ color: "#83786c", fontSize: 11, marginTop: 6 }}>
                 Builds gentle talus slopes between zones so they meet naturally
@@ -1173,6 +1173,10 @@ export default function NewWorldModal({ onClose, onCreated }: Props) {
           <button
             onClick={handleCreate}
             disabled={!valid || creating}
+            title={creating ? "Generating…"
+              : name.trim().length === 0 ? "Give the world a name first"
+              : !valid ? `Surface Z must be at most ${maxZ}`
+              : undefined}
             style={chromeButtonAccent(EDEN_TEAL, EDEN_TEAL_READABLE, {
               padding: "8px 22px", fontWeight: 600, color: "#fff",
               opacity: valid && !creating ? 1 : 0.5,

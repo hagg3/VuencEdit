@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { save } from "@tauri-apps/plugin-dialog";
-import { EDEN_TEAL, EDEN_TEAL_READABLE, glassPanel, chromeButton, chromeButtonAccent, recessedWell, spinnerStyle } from "./designTokens";
+import { EDEN_TEAL, EDEN_TEAL_READABLE, glassPanel, chromeButton, chromeButtonAccent, recessedWell, spinnerStyle, expBadge } from "./designTokens";
 import Modal from "./Modal";
 
 interface WorldSearchResult {
@@ -68,6 +68,16 @@ const btnActive: React.CSSProperties = chromeButtonAccent(EDEN_TEAL, EDEN_TEAL_R
 
 export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
   const [server, setServer] = useState<"current" | "legacy">("current");
+  // True once a search has come back — distinguishes "no matches" from "you haven't searched yet".
+  const [searched, setSearched] = useState(false);
+  const switchServer = (s: "current" | "legacy") => {
+    if (s === server) return;
+    setServer(s);
+    setResults([]);
+    setSelectedId(null);
+    setSearched(false);
+    setError(null);
+  };
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<WorldSearchResult[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -87,6 +97,9 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
   const mountedRef = useRef(true);
 
   useEffect(() => {
+    // Strict Mode runs a development-only setup → cleanup → setup cycle. Re-arm the guard in
+    // setup so that cycle does not make every later Save & Open silently skip its callback.
+    mountedRef.current = true;
     return () => { mountedRef.current = false; unlistenRef.current?.(); };
   }, []);
 
@@ -104,7 +117,9 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
     try {
       const res = await invoke<WorldSearchResult[]>("search_worlds", { query: query.trim(), server });
       setResults(res);
-      if (res.length === 0) setError("No results found.");
+      setSearched(true);
+      // "No results" is an empty state, not an error: routing it through setError painted it red
+      // *and* rendered it twice (once in the table's empty slot, once in the sidebar error line).
     } catch (e) {
       setError(String(e));
     } finally {
@@ -191,12 +206,13 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
           >×</button>
         </div>
 
-        {/* Server tabs */}
+        {/* Server tabs. Switching servers drops the previous server's results — they belong to a
+            different host, so their thumbnails 404 and downloading one hits the wrong endpoint. */}
         <div style={{ display: "flex", gap: 6 }}>
-          <button onClick={() => setServer("current")} style={server === "current" ? btnActive : btn}>
+          <button onClick={() => switchServer("current")} style={server === "current" ? btnActive : btn}>
             Current Server
           </button>
-          <button onClick={() => setServer("legacy")} style={server === "legacy" ? btnActive : btn}>
+          <button onClick={() => switchServer("legacy")} style={server === "legacy" ? btnActive : btn}>
             Legacy Server
           </button>
         </div>
@@ -263,7 +279,7 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
                   }}>
                     {m.label}
                     {m.key === "quality" && (
-                      <span style={{ fontSize: 9, color: "#f59e0b", background: "rgba(245,158,11,0.12)", border: "1px solid rgba(245,158,11,0.3)", borderRadius: 3, padding: "0 3px", lineHeight: "14px" }}>exp</span>
+                      <span style={expBadge({ fontSize: 9 })}>exp</span>
                     )}
                   </button>
                 ))}
@@ -288,7 +304,7 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
                   <label style={{ display: "flex", alignItems: "center", gap: 5, cursor: "pointer" }}>
                     <input type="checkbox" checked={hideJunk} onChange={e => setHideJunk(e.target.checked)} />
                     <span style={fl}>Hide junk</span>
-                    <span style={{ fontSize: 9, color: "#f59e0b", background: "rgba(245,158,11,0.12)", border: "1px solid rgba(245,158,11,0.3)", borderRadius: 3, padding: "0 3px", lineHeight: "14px" }}>exp</span>
+                    <span style={expBadge({ fontSize: 9 })}>exp</span>
                   </label>
                   {activeFilters > 0 && (
                     <button onClick={() => { setFromDate(""); setToDate(""); setHideJunk(false); }}
@@ -350,7 +366,8 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
               <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: 120, color: "#61584f", fontSize: 13 }}>
                 {searching ? "Searching…" :
                  results.length > 0 ? "No results match your filters" :
-                 error ?? "Search to browse worlds"}
+                 searched ? "No worlds found — try a different search term" :
+                 "Search to browse worlds"}
               </div>
             )}
           </div>
