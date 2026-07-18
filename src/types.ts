@@ -54,6 +54,15 @@ export interface SelectionInfo {
   x1: number; y1: number; x2: number; y2: number;
   z_min: number; z_max: number;
   width: number; height: number; depth: number;
+  /** Popcount of the shaped mask when one matches this rect exactly; null for a plain box selection. */
+  cell_count: number | null;
+  masked: boolean;
+}
+
+/** get_selection_mask raw IPC shape — `bits` is base64, decode with decodeU8 before use. */
+export interface SelectionMaskInfoRaw {
+  x1: number; y1: number; x2: number; y2: number;
+  bits: string;
 }
 
 export interface ClipboardInfo {
@@ -61,6 +70,8 @@ export interface ClipboardInfo {
   height: number;
   depth: number;
   z_anchor: number;
+  /** True when the clipboard carries a non-rectangular footprint (paste skips unmasked columns). */
+  masked: boolean;
 }
 
 export type ExtrudeAxis = "z+" | "z-" | "x+" | "x-" | "y+" | "y-";

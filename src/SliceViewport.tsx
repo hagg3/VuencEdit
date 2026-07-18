@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { brushFootprint, rectPixels, ellipsePixels, type BrushShape, type WP } from "./drawTools";
 import { chromeButton, chromeButtonAccent, recessedWell } from "./designTokens";
 import type { PixelPatchRaw } from "./types";
-import { zoomAtPoint, resizeCanvasToContainer, makeSeqGuard, putPatchPixels, beginFrame, cssWidth, cssHeight } from "./viewportUtils";
+import { zoomAtPoint, resizeCanvasToContainer, makeSeqGuard, putPatchPixels, beginFrame, cssWidth, cssHeight, isTypingTarget } from "./viewportUtils";
 
 // Front slab = constant world-Y plane (horizontal axis = X, vertical = Z; row 0 = highest Z).
 // Side slab  = constant world-X plane (horizontal axis = Y, vertical = Z; row 0 = highest Z).
@@ -53,13 +53,20 @@ interface Props {
   /** Drag the selection's left/right divider to resize its horizontal range (X for front, Y for side).
    *  lo/hi are world coords along the slab's horizontal axis. */
   onHRangeChange?: (lo: number, hi: number) => void;
+  /** Cutaway cap Z (null = not in cutaway). Front/side slabs draw a line at it and dim everything
+   *  above, so the plane the top-down map is cutting at is visible in elevation too. Overlay only —
+   *  the slab pixels themselves are unchanged (you can still see, and paint, what's above). */
+  viewCapZ?: number | null;
   /** Select tool active: left-drag draws a marquee that creates a new selection. */
   selectMode?: boolean;
   /** Commit a marquee selection. hLo/hHi = horizontal world axis (X front / Y side); zLo/zHi = Z. */
   onSelect?: (hLo: number, hHi: number, zLo: number, zHi: number) => void;
+  /** Surface a one-off explanation to the user (App shows it as a toast). Used when ortho mode
+   *  auto-enables and quietly takes painting away. */
+  onNotice?: (msg: string) => void;
 }
 
-export default function SliceViewport({ world, axis, editEpoch, lastEdit, onPaint, brush, tool, fill, depth, onDepthChange, crossH, crossV, selRange, selZ, selFull, extrudeCount = 0, extrudeAxis = "z+", isPaste = false, onZRangeChange, onHRangeChange, selectMode = false, onSelect }: Props) {
+export default function SliceViewport({ world, axis, editEpoch, lastEdit, onPaint, brush, tool, fill, depth, onDepthChange, crossH, crossV, selRange, selZ, selFull, extrudeCount = 0, extrudeAxis = "z+", isPaste = false, onZRangeChange, onHRangeChange, viewCapZ = null, selectMode = false, onSelect, onNotice }: Props) {
   const worldW = world.width_chunks * 16;
   const worldH = world.height_chunks * 16;
   const maxZ = world.max_z;
@@ -147,6 +154,14 @@ export default function SliceViewport({ world, axis, editEpoch, lastEdit, onPain
   const [orthoMode, setOrthoMode] = useState(false);
   const orthoModeRef = useRef(false);
   orthoModeRef.current = orthoMode;
+  // Kept in a ref so the auto-enable effect doesn't re-run (and re-toast) when App re-renders with
+  // a fresh callback identity.
+  const onNoticeRef = useRef(onNotice);
+  onNoticeRef.current = onNotice;
+  // draw() reads the paint handler through a ref so a new callback identity from App doesn't
+  // rebuild the whole draw closure.
+  const onPaintRef = useRef(onPaint);
+  onPaintRef.current = onPaint;
   // Keep a ref so stable callbacks (draw, doOrthoFetch) can read the latest selFull without
   // it appearing in their dep arrays (which would cause spurious fetch cascades).
   const selFullRef = useRef(selFull);
@@ -171,8 +186,9 @@ export default function SliceViewport({ world, axis, editEpoch, lastEdit, onPain
     } else if (!hadSelFullRef.current) {
       hadSelFullRef.current = true;
       setOrthoMode(true);
+      if (onPaint) onNoticeRef.current?.("Ortho view turned on — the front/side panes now show the selection's facade, and painting in them is off. Toggle ORTHO off in the pane header to paint again.");
     }
-  }, [hasSelFull]);
+  }, [hasSelFull, onPaint]);
 
   // Reset the free-scroll window when switching axis. (Re-fitting is handled when the fetched slab's
   // dimensions actually change — see the fetch handler below — so zoom is preserved on depth/edit refetch.)
@@ -433,6 +449,26 @@ export default function SliceViewport({ world, axis, editEpoch, lastEdit, onPain
       }
     }
 
+    // Cutaway cap: dim everything above the cap plane + draw the plane itself. Front/side only —
+    // the top viewport's vertical axis is Y, not Z, so a Z cap has no line to draw there.
+    if (viewCapZ != null && axis !== "top") {
+      const capRow = activeVToRow(viewCapZ);          // row holding the cap block itself
+      const capY = y + (capRow + 1) * scale;          // screen y of the plane just above it
+      if (capY > 0) {
+        ctx.fillStyle = "rgba(10,8,20,0.45)";
+        ctx.fillRect(0, 0, cw, Math.min(capY, ch));   // hidden-by-cutaway region
+        ctx.save();
+        ctx.strokeStyle = "rgba(167,139,250,0.9)";
+        ctx.setLineDash([5, 3]);
+        ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.moveTo(0, capY + 0.5); ctx.lineTo(cw, capY + 0.5); ctx.stroke();
+        ctx.restore();
+        ctx.fillStyle = "rgba(221,214,254,0.9)";
+        ctx.font = "9px monospace";
+        ctx.fillText(`cap z${viewCapZ}`, 4, Math.max(9, capY - 3));
+      }
+    }
+
     // Live rect/ellipse drag ghost and marquee are slab-mode only (painting disabled in ortho).
     if (!isOrtho) {
       const sh = shapeRef.current;
@@ -462,47 +498,84 @@ export default function SliceViewport({ world, axis, editEpoch, lastEdit, onPain
         ctx.setLineDash([]);
       }
 
-      // Edge-hover grip cues + hint text (A1 / B3).
+      // Resize grips on the z-band edges and the selection dividers. Drawn *always* (dim), lit up
+      // with a hint caption on hover — previously they only existed inside a 5px hover hit-zone, so
+      // there was nothing on screen to suggest these edges could be dragged at all.
       const eh = edgeHoverRef.current;
-      if (eh && slab) {
-        ctx.fillStyle = "rgba(175,166,157,0.85)";
-        if (eh === "z-max" || eh === "z-min") {
-          const ez = eh === "z-max" ? selZ?.max : selZ?.min;
-          if (ez != null) {
-            const ey = eh === "z-max" ? y + (maxZ - ez) * scale : y + (maxZ - ez + 1) * scale;
-            for (let i = -1; i <= 1; i++) {
-              ctx.beginPath(); ctx.arc(cw / 2 + i * 8, ey, 3, 0, Math.PI * 2); ctx.fill();
-            }
-            ctx.fillStyle = "rgba(175,166,157,0.7)";
-            ctx.font = "9px monospace";
-            ctx.textBaseline = "middle";
-            ctx.fillText("drag to resize Z", cw / 2 + 16, ey);
+      if (slab) {
+        const dots = (gx: number, gy: number, vertical: boolean, on: boolean) => {
+          ctx.fillStyle = on ? "rgba(226,222,217,0.95)" : "rgba(175,166,157,0.42)";
+          for (let i = -1; i <= 1; i++) {
+            ctx.beginPath();
+            ctx.arc(vertical ? gx : gx + i * 8, vertical ? gy + i * 8 : gy, on ? 3 : 2.5, 0, Math.PI * 2);
+            ctx.fill();
           }
-        } else if (eh === "h-lo" || eh === "h-hi") {
-          const hw = eh === "h-lo" ? selRange?.lo : selRange != null ? selRange.hi + 1 : null;
-          if (hw != null) {
+        };
+        const hint = (text: string, hx: number, hy: number, baseline: CanvasTextBaseline) => {
+          ctx.fillStyle = "rgba(175,166,157,0.7)";
+          ctx.font = "9px monospace";
+          ctx.textBaseline = baseline;
+          ctx.fillText(text, hx, hy);
+          ctx.textBaseline = "middle";
+        };
+        // Z-band top/bottom edges.
+        if (onZRangeChange && selZ && axis !== "top") {
+          for (const which of ["z-max", "z-min"] as const) {
+            const ez = which === "z-max" ? selZ.max : selZ.min;
+            const ey = which === "z-max" ? y + (maxZ - ez) * scale : y + (maxZ - ez + 1) * scale;
+            if (ey < -8 || ey > ch + 8) continue;
+            const on = eh === which;
+            dots(cw / 2, ey, false, on);
+            if (on) hint("drag to resize Z", cw / 2 + 16, ey, "middle");
+          }
+        }
+        // Selection left/right dividers.
+        if (onHRangeChange && selRange && axis !== "top") {
+          for (const which of ["h-lo", "h-hi"] as const) {
+            const hw = which === "h-lo" ? selRange.lo : selRange.hi + 1;
             const ex = x + (hw - winOriginRef.current) * scale;
-            for (let i = -1; i <= 1; i++) {
-              ctx.beginPath(); ctx.arc(ex, ch / 2 + i * 8, 3, 0, Math.PI * 2); ctx.fill();
-            }
-            ctx.fillStyle = "rgba(175,166,157,0.7)";
-            ctx.font = "9px monospace";
-            ctx.textBaseline = "top";
-            ctx.fillText(`drag to resize ${axis === "side" ? "Y" : "X"}`, ex + 6, ch / 2 + 12);
-            ctx.textBaseline = "middle";
+            if (ex < -8 || ex > cw + 8) continue;
+            const on = eh === which;
+            dots(ex, ch / 2, true, on);
+            if (on) hint(`drag to resize ${axis === "side" ? "Y" : "X"}`, ex + 6, ch / 2 + 12, "top");
           }
         }
       }
     }
 
-    // Ortho mode hint.
-    if (isOrtho) {
-      ctx.fillStyle = "rgba(131,120,108,0.6)";
+    // Slab-mode gesture caption. Painting straight into an elevation slab, and marquee-selecting a
+    // plane, are both completely invisible affordances — the pane looks like a read-only preview.
+    if (!isOrtho && (onPaintRef.current || selectMode)) {
+      const label = onPaintRef.current
+        ? "drag to paint · alt / middle-drag to pan"
+        : "drag to select · alt / middle-drag to pan";
       ctx.font = "9px monospace";
-      ctx.textBaseline = "bottom";
-      ctx.fillText("ortho — paint disabled", 6, ch - 4);
+      ctx.fillStyle = "rgba(0,0,0,0.45)";
+      const tw = ctx.measureText(label).width;
+      ctx.fillRect(4, ch - 17, tw + 8, 14);
+      ctx.fillStyle = "rgba(175,166,157,0.8)";
+      ctx.textBaseline = "middle";
+      ctx.fillText(label, 8, ch - 10);
     }
-  }, [crossH, crossV, axis, maxZ, selRange, selZ, extrudeCount, extrudeAxis, isPaste]);
+
+    // Ortho mode hint. Ortho auto-enables the moment a selection appears, and it silently turns
+    // painting off — a 9px 60%-alpha caption was not enough of a reason for "why can't I paint?".
+    // Drawn as an amber pill in the corner, matching the ORTHO toggle it points at.
+    if (isOrtho) {
+      const label = "ORTHO view — painting off · toggle ORTHO off to paint";
+      ctx.font = "10px monospace";
+      const tw = ctx.measureText(label).width;
+      const px = 6, py = ch - 20, pw = tw + 12, phh = 16;
+      ctx.fillStyle = "rgba(245,158,11,0.16)";
+      ctx.fillRect(px, py, pw, phh);
+      ctx.strokeStyle = "rgba(245,158,11,0.5)";
+      ctx.lineWidth = 1;
+      ctx.strokeRect(px + 0.5, py + 0.5, pw - 1, phh - 1);
+      ctx.fillStyle = "#fcd34d";
+      ctx.textBaseline = "middle";
+      ctx.fillText(label, px + 6, py + phh / 2 + 0.5);
+    }
+  }, [crossH, crossV, axis, maxZ, selRange, selZ, extrudeCount, extrudeAxis, isPaste, viewCapZ, selectMode, onZRangeChange, onHRangeChange]);
 
   // Fit the whole slab into the canvas (contain) and center it.
   const fit = useCallback(() => {
@@ -758,6 +831,26 @@ export default function SliceViewport({ world, axis, editEpoch, lastEdit, onPain
       }
     }
   };
+  // Escape cancels an in-progress drag (z-band edge, H divider, marquee select, paint shape/stroke)
+  // — mirrors MapCanvas's polygon/drag Escape handling. Gated on !typing so Escape in a text field
+  // elsewhere in the app isn't swallowed here.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape" || isTypingTarget(e.target)) return;
+      if (zDragRef.current || hDragRef.current || marqueeRef.current || shapeRef.current || strokeRef.current) {
+        e.stopPropagation();
+        zDragRef.current = null;
+        hDragRef.current = null; hPreviewRef.current = null;
+        marqueeRef.current = null;
+        shapeRef.current = null;
+        strokeRef.current = null;
+        draw();
+      }
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [draw]);
+
   // Native (non-passive) wheel listener so preventDefault suppresses the webview's page-scroll /
   // pinch-zoom (React's synthetic onWheel is passive, so its preventDefault is a no-op).
   // NB: do NOT refetch on zoom — the slab is cached offscreen and just redrawn at the new scale.
@@ -801,7 +894,7 @@ export default function SliceViewport({ world, axis, editEpoch, lastEdit, onPain
         {selFull && axis !== "top" && (
           <button
             onClick={() => setOrthoMode(m => !m)}
-            title={orthoMode ? "Ortho projection — click to switch to slab view (enables painting)" : "Slab view — click to switch to ortho projection"}
+            title={orthoMode ? "Ortho view is ON — showing the selection's facade. Toggle off for the slab view, where you can paint." : "Slab view — click to turn ortho view on (shows the selection's facade; painting is off)"}
             style={orthoMode
               ? chromeButtonAccent("99,102,241", "#818cf8", {
                   color: "#a5b4fc", padding: "1px 7px",

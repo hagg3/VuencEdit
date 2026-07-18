@@ -4,9 +4,11 @@ import { invoke } from "@tauri-apps/api/core";
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import type { AtlasData } from "./texturePack";
+import { isTypingTarget } from "./viewportUtils";
 import type { WorldMeta } from "./types";
 import { chromeButton, glassMenuPanel } from "./designTokens";
 import { skyFogColor } from "./blockDefs";
+import { maskPrismPositions, type OutlinePt, type MaskRect } from "./maskUtils";
 
 // Fog distance scales with the render distance slider (chunk radius × 16 blocks/chunk) so terrain
 // fades out at the edge of what's actually streamed in, instead of a fixed distance that either
@@ -81,6 +83,10 @@ interface EditBounds { x: number; y: number; w: number; h: number }
 
 const LOAD_RADIUS = 5;   // chunks loaded around the camera (in chunk units)
 const MAX_RENDER_DISTANCE = 32; // slider ceiling (chunk radius)
+// rad/px at sensitivity multiplier 1. Raised from the old hardcoded 0.0025 (look mode) — that base
+// felt too slow by default; the Settings sliders scale from here (0.25x-4x range).
+const LOOK_SENS_BASE = 0.006;
+const DRAG_SENS_BASE = 0.0025;
 const RENDER_DISTANCE_WARN_THRESHOLD = 16; // above this, chunk count grows enough to warn
 const STREAM_MS = 150;   // throttle for the load/dispose sweep
 const MAX_DPR = 1.5;     // cap device-pixel-ratio — Retina (2×) quadruples fragment load for ~no gain
@@ -104,12 +110,34 @@ export interface PickResult {
 }
 
 /** What a click in the 3D pane does. Derived from App's active tool, not owned by this pane. */
-export type Interact3D = "none" | "select" | "build";
+export type Interact3D = "none" | "select" | "build" | "sculpt";
+
+/// In-pane VIEW/SELECT/BUILD/SCULPT segmented pill — a quiet mirror of the Ribbon 3D tab's mode
+/// picker (both write App's mode3d). Segmented, not a cycle: a stray click must never land on the
+/// terrain-editing BUILD/SCULPT modes. VIEW = "none" (camera only); BUILD amber and SCULPT amber
+/// to flag the armed edit modes; neither has a bare-key binding (click-only power features).
+const INTERACT_SEGMENTS: { mode: Interact3D; label: string; accent: string; title: string }[] = [
+  { mode: "none", label: "VIEW", accent: "#afa69d", title: "View only — clicks don't edit" },
+  { mode: "select", label: "SELECT", accent: "#3b82f6", title: "Select mode — click two voxels to make a 3D selection" },
+  { mode: "build", label: "BUILD", accent: "#f59e0b", title: "Build mode — left-click breaks, right-click places the armed block" },
+  { mode: "sculpt", label: "SCULPT", accent: "#fb923c", title: "Sculpt mode — press and hold left to sculpt terrain under the cursor" },
+];
+
+/// Display names for the ten sculpt tools, for the in-pane armed-hint readout. (The ribbon owns the
+/// canonical picker; this is just a label so the pane doesn't show a bare tool id.)
+const SCULPT_TOOL_LABELS: Record<string, string> = {
+  raise: "Raise", lower: "Lower", grab: "Grab", smooth: "Smooth", flatten: "Flatten",
+  noise: "Noise", erode: "Erode", thermal: "Thermal", hydro: "Hydro", stamp: "Retexture",
+  terrace: "Terrace", sharpen: "Sharpen", slope: "Slope", smear: "Smear",
+};
+/// Amber sculpt-brush colour (matches the Ribbon sculpt affordances / 2D sculpt ghost).
+const SCULPT_BRUSH_HEX = 0xfb923c;
+/// 3D sculpt hold-timer cadence (ms) — mirrors MapCanvas's 140 ms airbrush/spray timer.
+const SCULPT_TICK_MS = 140;
+/// Grab tool: screen px of vertical drag per block of displacement (matches the 2D sculpt-grab ratio).
+const SCULPT_GRAB_PX_PER_BLOCK = 6;
 
 /** How far a pick ray reaches, in blocks. Rust clamps to PICK_MAX_DIST regardless. */
-/// `<input>` types that never accept typed text, so a keydown targeting one is a real shortcut,
-/// not the user writing into a field. Range in particular keeps focus after a slider drag.
-const NON_TEXT_INPUT_TYPES = new Set(["range", "checkbox", "radio", "button", "submit", "reset", "color", "file"]);
 
 /// The three camera modes.
 ///   orbit — OrbitControls; drag to rotate around a target, cursor visible. (inspection)
@@ -131,6 +159,24 @@ const OVERLAY_FILL_OPACITY = 0.14;
 /// occluded rather than floating in front of the terrain.
 const OVERLAY_XRAY_OPACITY = 0.3;
 
+/**
+ * Wrap {@link maskPrismPositions} (the pure vertex math) into Three geometry for a shaped-selection
+ * prism — see {@link Overlay3D.shape}. Walls hug the true footprint boundary (no internal faces to
+ * double-blend) and the edge lines come straight from the contour, so the unindexed fill soup never
+ * leaks internal diagonals into the wireframe.
+ */
+function buildMaskPrismGeometry(
+  loops: OutlinePt[][], caps: MaskRect[], zBottom: number, zTop: number,
+): { fill: THREE.BufferGeometry; edges: THREE.BufferGeometry } {
+  const pos = maskPrismPositions(loops, caps, zBottom, zTop);
+  const fill = new THREE.BufferGeometry();
+  fill.setAttribute("position", new THREE.Float32BufferAttribute(pos.fill, 3));
+  fill.computeVertexNormals();
+  const edges = new THREE.BufferGeometry();
+  edges.setAttribute("position", new THREE.Float32BufferAttribute(pos.edges, 3));
+  return { fill, edges };
+}
+
 const PICK_DIST = 256;
 /** Hover-highlight repick cadence. ~30Hz — one ~1ms IPC round-trip per tick is well inside budget. */
 const PICK_HOVER_MS = 33;
@@ -145,6 +191,14 @@ export interface Overlay3D {
   /** Three.js max corner: [eden_x, eden_z, eden_y] */
   max: [number, number, number];
   color: number;
+  /** Which parts to draw. Default "full" = translucent fill + wireframe edges (single-box overlays). */
+  style?: "full" | "fill" | "edges";
+  /** When set, the overlay is an extruded prism of this XY footprint (grid-corner contour `loops`,
+   *  solid `caps` rects for the top/bottom faces) between Eden z `zBottom`..`zTop`, instead of the
+   *  min/max box. This is how a shaped wand/lasso selection renders: one seam-free prism whose walls
+   *  sit only on the true boundary, so there are no internal coincident faces to double-blend.
+   *  `min`/`max` are ignored while `shape` is set (kept for the bbox fallback). */
+  shape?: { loops: OutlinePt[][]; caps: MaskRect[]; zBottom: number; zTop: number };
 }
 
 type HudData = { x: number; y: number; z: number; heading: string };
@@ -204,6 +258,12 @@ const FlyView3D = forwardRef<FlyView3DRef, {
   onRenderDistanceChange?: (n: number) => void;
   /** Fired when the user changes fly speed (wheel), so it can be persisted. */
   onFlySpeedChange?: (n: number) => void;
+  /** Mouse-look sensitivity multiplier in grabbed-cursor LOOK mode. Default 1. */
+  lookSensitivity?: number;
+  /** Mouse-look sensitivity multiplier for fly-mode drag-to-look. Default 1. */
+  dragSensitivity?: number;
+  /** Flips pitch direction (mouse up = look down) in both look and drag-to-look. Default false. */
+  invertY?: boolean;
   /** True while any App-level modal dialog is open — the fly-mode "Z" toggle and WASD movement keys
    *  are suppressed so typing in a modal's text field never engages the fly camera. */
   anyModalOpen?: boolean;
@@ -219,6 +279,23 @@ const FlyView3D = forwardRef<FlyView3DRef, {
   armedSwatch?: string | null;
   /** Human-readable name of the armed fill block, shown next to the swatch. */
   armedLabel?: string;
+  /** Sets what a click does in this pane (the in-pane VIEW/SELECT/BUILD/SCULPT pill). Mirrors the
+   *  Ribbon 3D tab's mode picker — both write App's mode3d, so they stay in sync. */
+  onSetInteract3d?: (m: Interact3D) => void;
+  /** Active sculpt tool id (App's shared `tool` — one of the ten sculpt names) while in sculpt mode.
+   *  Used to branch grab vs the timer-stamp path and to label the armed-hint readout. */
+  sculptTool?: string;
+  /** Live sculpt brush radius (blocks). Drives both the per-stamp radius and the brush-disc cursor
+   *  size; read fresh per stamp so a mid-stroke `[`/`]` resize takes effect immediately. */
+  sculptRadius?: number;
+  /** Live sculpt strength — shown in the armed-hint readout only. */
+  sculptStrength?: number;
+  /** Fires one sculpt stamp at a picked surface column. App reads the rest of the brush params
+   *  (mode/strength/softness/profile/noise) from its own shared sculpt state and applies `use_cap:false`. */
+  onSculptStamp3d?: (opts: {
+    stampCx: number; stampCy: number; stampRadius: number; groupId: number;
+    anchor?: [number, number]; grabDelta?: number; smear?: [number, number];
+  }) => void | Promise<void>;
   /** Opt-in real GPU shadow map: switches chunk meshes to a lit material + a directional sun with a
    *  shadow map, and fetches flat (unshaded) geometry. Overrides the baked night/shadow preview.
    *  Makes sunT free (moving the sun just repositions the light — no chunk reload). Default false. */
@@ -228,7 +305,10 @@ const FlyView3D = forwardRef<FlyView3DRef, {
   texturePack = null, texEpoch = 0, fogEnabled = true,
   nightLighting = false, shadows3d = false, sunT = 0.5, lampRadius = 5, lightEpoch = 0,
   initialRenderDistance, initialFlySpeed, onRenderDistanceChange, onFlySpeedChange, anyModalOpen = false,
+  lookSensitivity = 1, dragSensitivity = 1, invertY = false,
   interact3d = "none", onPickSelect, onPickBreak, onPickPlace, armedSwatch = null, armedLabel = "",
+  onSetInteract3d,
+  sculptTool = "raise", sculptRadius = 6, sculptStrength = 2, onSculptStamp3d,
   gpuShadows = false,
 }, ref) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -303,6 +383,15 @@ const FlyView3D = forwardRef<FlyView3DRef, {
   const anyModalOpenRef = useRef(anyModalOpen);
   anyModalOpenRef.current = anyModalOpen;
 
+  // Read via refs (like the picking props below) so a Settings change applies live without
+  // tearing down/remounting the scene effect.
+  const lookSensitivityRef = useRef(lookSensitivity);
+  lookSensitivityRef.current = lookSensitivity;
+  const dragSensitivityRef = useRef(dragSensitivity);
+  dragSensitivityRef.current = dragSensitivity;
+  const invertYRef = useRef(invertY);
+  invertYRef.current = invertY;
+
   // Picking props read through refs: the scene effect subscribes once and must see the live values
   // without tearing down the renderer every time the user switches tool or fill block.
   const interact3dRef = useRef(interact3d);
@@ -313,6 +402,18 @@ const FlyView3D = forwardRef<FlyView3DRef, {
   onPickBreakRef.current = onPickBreak;
   const onPickPlaceRef = useRef(onPickPlace);
   onPickPlaceRef.current = onPickPlace;
+
+  // Sculpt props read through refs by the scene closure (live values without a scene teardown).
+  const sculptToolRef = useRef(sculptTool);
+  sculptToolRef.current = sculptTool;
+  const sculptRadiusRef = useRef(sculptRadius);
+  sculptRadiusRef.current = sculptRadius;
+  const onSculptStamp3dRef = useRef(onSculptStamp3d);
+  onSculptStamp3dRef.current = onSculptStamp3d;
+
+  // Grab tool's live vertical-drag displacement, shown in the armed-hint readout. null when no grab
+  // drag is active. Set imperatively from the scene closure's pointer handlers.
+  const [grabReadout, setGrabReadout] = useState<number | null>(null);
 
   const overlays3dRef = useRef(overlays3d);
   useEffect(() => { overlays3dRef.current = overlays3d; }, [overlays3d]);
@@ -397,6 +498,10 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     refreshNightLights: () => void;
     refresh: () => void;
     clearHighlight: () => void;
+    /** Cancel any live sculpt hold-timer/grab stroke and hide the brush-disc cursor. */
+    clearSculpt: () => void;
+    /** Enable/disable OrbitControls' LEFT mouse action (disabled while sculpt mode owns left-drag). */
+    setOrbitLeftEnabled: (enabled: boolean) => void;
   } | null>(null);
 
   useImperativeHandle(ref, () => ({
@@ -540,6 +645,14 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     const controls = new OrbitControls(camera, renderer.domElement);
     controls.enableDamping = true;
     controls.dampingFactor = 0.1;
+    // Snapshot the controls' original LEFT-button action so sculpt mode can disable left-drag orbit
+    // (setting it to null makes OrbitControls' onMouseDown fall through to STATE.NONE — verified in
+    // three's source) and restore *exactly* this value on leaving sculpt, rather than hardcoding
+    // THREE.MOUSE.ROTATE. Middle/right buttons keep orbiting/panning throughout.
+    const origLeftButton = controls.mouseButtons.LEFT;
+    const setOrbitLeftEnabled = (enabled: boolean) => {
+      controls.mouseButtons.LEFT = enabled ? origLeftButton : null;
+    };
     {
       const s = spawnXY();
       controls.target.set(s.x, Math.min(maxZ, 28), s.y);
@@ -1018,19 +1131,20 @@ const FlyView3D = forwardRef<FlyView3DRef, {
 
     const onMouseMove = (e: MouseEvent) => {
       if (!flyModeRef.current) return;
-      let dx: number, dy: number;
+      let dx: number, dy: number, s: number;
       if (camModeRef.current === "look") {
         // Look mode: free mouselook from relative mouse motion. The OS cursor is grabbed, so the
         // cursor is frozen but delta events keep arriving.
         dx = e.movementX; dy = e.movementY;
+        s = LOOK_SENS_BASE * lookSensitivityRef.current;
       } else if (lookDrag) {
         // Fly mode: look only while a button is held.
         dx = e.clientX - lastMx; dy = e.clientY - lastMy;
         lastMx = e.clientX; lastMy = e.clientY;
+        s = DRAG_SENS_BASE * dragSensitivityRef.current;
       } else return;
-      const s = 0.0025;
       yaw -= dx * s;
-      pitch -= dy * s;
+      pitch -= (invertYRef.current ? -dy : dy) * s;
       pitch = THREE.MathUtils.clamp(pitch, -Math.PI / 2 + 0.01, Math.PI / 2 - 0.01);
     };
     document.addEventListener("mousemove", onMouseMove);
@@ -1039,7 +1153,10 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     // continuous motion instead). Left button only (button 0) — capturing button 2 is unreliable in
     // macOS WKWebView (see CLAUDE.md's MapCanvas note) and conflicts with right-click-to-place.
     const onCanvasDown = (e: PointerEvent) => {
-      if (camModeRef.current !== "fly" || e.button !== 0) return;
+      // Sculpt mode claims the left button in every camera mode (including fly), so drag-to-look is
+      // unavailable while sculpt is armed — the user has look mode + WASD instead. (Documented in the
+      // pane's fly-mode hint text.) This is the deliberate tradeoff the sculpt plan accepts.
+      if (camModeRef.current !== "fly" || e.button !== 0 || interact3dRef.current === "sculpt") return;
       lookDrag = true; lastMx = e.clientX; lastMy = e.clientY;
       canvas.setPointerCapture(e.pointerId);
     };
@@ -1108,6 +1225,89 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     breakHighlight.visible = false;
     scene.add(breakHighlight);
 
+    // ---- Sculpt brush-disc cursor ----------------------------------------------------------------
+    // A flat amber disc laid on top of the hover-picked surface column, sized to the sculpt radius.
+    // NOT routed through the box-overlay system (that's corner-keyed min/max) — a dedicated object.
+    // Built once (unit radius 1) and repositioned/rescaled per repick, following the same three-pass
+    // convention as the overlay boxes: translucent fill body + solid edge ring + dim x-ray ring.
+    // Accepted MVP limitation: a flat disc clips into steep slopes (terrain-draped decal deferred).
+    const brushGroup = new THREE.Group();
+    brushGroup.renderOrder = 999;
+    brushGroup.visible = false;
+    const brushFillGeom = new THREE.CircleGeometry(1, 48);
+    brushFillGeom.rotateX(-Math.PI / 2); // lay flat in the XZ plane (disc normal = +Y, world-up)
+    const brushFillMat = new THREE.MeshBasicMaterial({
+      color: SCULPT_BRUSH_HEX, transparent: true, opacity: OVERLAY_FILL_OPACITY,
+      depthWrite: false, side: THREE.DoubleSide, fog: false, toneMapped: false,
+    });
+    brushGroup.add(new THREE.Mesh(brushFillGeom, brushFillMat));
+    // Edge ring — a closed line loop of unit-radius points in the same XZ plane.
+    const ringPts: THREE.Vector3[] = [];
+    for (let i = 0; i <= 48; i++) {
+      const a = (i / 48) * Math.PI * 2;
+      ringPts.push(new THREE.Vector3(Math.cos(a), 0, Math.sin(a)));
+    }
+    const brushRingGeom = new THREE.BufferGeometry().setFromPoints(ringPts);
+    const brushRingMat = new THREE.LineBasicMaterial({
+      color: SCULPT_BRUSH_HEX, transparent: true, opacity: 1, fog: false, toneMapped: false,
+    });
+    brushGroup.add(new THREE.Line(brushRingGeom, brushRingMat));
+    const brushRingXrayMat = new THREE.LineBasicMaterial({
+      color: SCULPT_BRUSH_HEX, transparent: true, opacity: OVERLAY_XRAY_OPACITY,
+      depthTest: false, depthWrite: false, fog: false, toneMapped: false,
+    });
+    brushGroup.add(new THREE.Line(brushRingGeom, brushRingXrayMat));
+    scene.add(brushGroup);
+
+    // Position the brush disc on the top face of the picked column (Eden voxel top = Three-Y z+1),
+    // nudged up slightly to avoid z-fighting with the terrain mesh, and scale it to the radius.
+    const placeBrush = (p: PickResult | null) => {
+      const want = !!p && interact3dRef.current === "sculpt";
+      if (!want) {
+        if (brushGroup.visible) { brushGroup.visible = false; invalidate(); }
+        return;
+      }
+      const r = Math.max(0.5, sculptRadiusRef.current);
+      brushGroup.position.set(p!.x + 0.5, p!.z + 1.03, p!.y + 0.5); // voxel-centre XZ, top-face Y
+      brushGroup.scale.set(r, 1, r);
+      brushGroup.visible = true;
+      invalidate();
+    };
+
+    // ---- Sculpt stroke controller (press-and-hold, not click-based) -------------------------------
+    // Unlike build/select's isClick/CLICK_SLOP model, a sculpt stroke is a held gesture: on left-down
+    // we start a timer that re-picks the surface and fires a stamp each tick (skip-if-busy, mirroring
+    // MapCanvas's 140 ms airbrush), and fire one final stamp on release. Grab is special-cased with no
+    // timer (vertical drag sets a displacement, single commit on release), matching the 2D sculpt-grab.
+    let sculptGroupSeq = Math.floor(Date.now()); // per-stroke group ids; seeded high so 2D's small
+    //                                              strokeIdRef ids never collide with these.
+    let sculptTimer: number | null = null;
+    let sculptBusy = false;   // a stamp's async edit is in flight — skip overlapping ticks
+    let sculptActive = false; // a hold-timer stroke is live
+    let sculptGroupId = 0;
+    let sculptAnchor: [number, number] | null = null; // stroke-start column (flatten/stamp read it)
+    // Smear: like the 2D timer, each tick needs the drag delta *since the previous tick* — the
+    // hit column from the previous pick, not the stroke-start anchor.
+    let sculptSmearLastPos: [number, number] | null = null;
+    // Grab state (no timer).
+    let sculptGrab = false;
+    let sculptGrabPick: PickResult | null = null;
+    let sculptGrabGroup = 0;
+    let sculptGrabDownY = 0;
+    let sculptGrabDelta = 0;
+
+    const cancelSculptStroke = () => {
+      if (sculptTimer !== null) { clearInterval(sculptTimer); sculptTimer = null; }
+      sculptActive = false;
+      sculptBusy = false;
+      sculptAnchor = null;
+      sculptSmearLastPos = null;
+      sculptGrab = false;
+      sculptGrabPick = null;
+      sculptGrabDelta = 0;
+      setGrabReadout(null);
+    };
+
     // The Eden voxel a right-click (place) acts on, given the picked block. Build mode places
     // against the hit face, so the target is the empty neighbour `hit + normal` — that's what the
     // green box previews and what a right-click fills. Select mode acts on the hit voxel itself.
@@ -1147,15 +1347,22 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     let lastPickT = 0;
     let pickInflight = false;
     const refreshHighlight = async () => {
+      const mode = interact3dRef.current;
       // In fly mode the crosshair is the cursor and the pointer may be locked (no pointerenter/leave,
       // no meaningful clientX/Y), so hover isn't a precondition there.
-      if (interact3dRef.current === "none" || !(flyModeRef.current || hoverRef.current)) { setHighlight(null); return; }
+      if (mode === "none" || !(flyModeRef.current || hoverRef.current)) { setHighlight(null); placeBrush(null); return; }
+      // Freeze the brush disc at the grab column while a grab drag is in progress (the pointer is
+      // moving vertically to set the displacement, not to re-aim).
+      if (mode === "sculpt" && sculptGrab) return;
       const now = performance.now();
       if (pickInflight || now - lastPickT < PICK_HOVER_MS) return;
       lastPickT = now;
       pickInflight = true;
       try {
-        setHighlight(await pick(cursorX, cursorY));
+        const p = await pick(cursorX, cursorY);
+        // Sculpt shows the amber brush disc; select/build show the wireframe box. Never both.
+        if (mode === "sculpt") { placeBrush(p); setHighlight(null); }
+        else { setHighlight(p); placeBrush(null); }
       } finally {
         pickInflight = false;
       }
@@ -1175,12 +1382,19 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       Math.abs(e.clientY - downY) <= CLICK_SLOP_PX;
 
     // Left-click. Select mode → pick a selection corner. Build mode → BREAK the picked block.
+    // Sculpt mode's left button is a press-and-hold gesture owned by the sculpt controller, so this
+    // click handler must NOT fall through to break — an explicit build-only guard replaces the old
+    // "not select ⇒ build" assumption now that "sculpt" is a fourth mode.
     const onPickUp = async (e: PointerEvent) => {
       if (e.button !== 0 || interact3dRef.current === "none" || !isClick(e)) return;
+      if (interact3dRef.current === "select") {
+        const hit = await pick(e.clientX, e.clientY);
+        if (hit) onPickSelectRef.current?.(hit.x, hit.y, hit.z);
+        return;
+      }
+      if (interact3dRef.current !== "build") return; // sculpt (or anything else): never breaks
       const hit = await pick(e.clientX, e.clientY);
-      if (!hit) return;
-      if (interact3dRef.current === "select") { onPickSelectRef.current?.(hit.x, hit.y, hit.z); return; }
-      onPickBreakRef.current?.(hit.x, hit.y, hit.z);
+      if (hit) onPickBreakRef.current?.(hit.x, hit.y, hit.z);
     };
 
     // Right-click → PLACE at the highlighted cell (the previewed hit+normal), so what a click does
@@ -1204,7 +1418,105 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       void refreshHighlight();
     };
     // Pointer lock can synthesize a pointerleave; while flying the crosshair still has a target.
-    const onPickLeave = () => { if (!flyModeRef.current) setHighlight(null); };
+    const onPickLeave = () => { if (!flyModeRef.current) { setHighlight(null); placeBrush(null); } };
+
+    // Fire one sculpt stamp at a picked column through App's dispatch (which reads the rest of the
+    // brush params and applies use_cap:false). Radius is read fresh here so a mid-stroke [ / ] resize
+    // takes effect on the very next stamp.
+    const emitStamp = (hit: PickResult, groupId: number, anchor: [number, number] | null, grabDelta?: number, smear?: [number, number]) =>
+      Promise.resolve(onSculptStamp3dRef.current?.({
+        stampCx: hit.x, stampCy: hit.y, stampRadius: sculptRadiusRef.current,
+        groupId, anchor: anchor ?? undefined, grabDelta, smear,
+      }));
+
+    const onSculptDown = async (e: PointerEvent) => {
+      if (e.button !== 0 || interact3dRef.current !== "sculpt") return;
+      canvas.setPointerCapture(e.pointerId);
+      const groupId = ++sculptGroupSeq;
+      if (sculptToolRef.current === "grab") {
+        // Grab: capture the fixed column + start Y; vertical drag sets the displacement; single
+        // commit on release. No timer (matches the 2D sculpt-grab DragOp).
+        const hit = await pick(e.clientX, e.clientY);
+        if (disposed || interact3dRef.current !== "sculpt") return;
+        if (!hit) return;
+        sculptGrab = true;
+        sculptGrabPick = hit;
+        sculptGrabGroup = groupId;
+        sculptGrabDownY = e.clientY;
+        sculptGrabDelta = 0;
+        setGrabReadout(0);
+        return;
+      }
+      sculptActive = true;
+      sculptBusy = false;
+      sculptGroupId = groupId;
+      // Anchor = stroke-start column, fixed for the whole stroke (flatten/stamp read it; harmless for
+      // the others). Captured once here so it never drifts to the live cursor on later ticks.
+      const first = await pick(e.clientX, e.clientY);
+      if (disposed || !sculptActive) return;
+      sculptAnchor = first ? [first.x, first.y] : null;
+      sculptSmearLastPos = sculptToolRef.current === "smear" && first ? [first.x, first.y] : null;
+      // Hold-timer: re-pick + stamp each tick. Busy is set *before* the async pick so two ticks can't
+      // both slip past the guard during the pick's await window.
+      sculptTimer = window.setInterval(() => {
+        if (!sculptActive || sculptBusy) return;
+        sculptBusy = true;
+        (async () => {
+          const hit = await pick(cursorX, cursorY); // crosshair while flying, pointer otherwise
+          if (disposed || !sculptActive || !hit) return;
+          let smear: [number, number] | undefined;
+          if (sculptToolRef.current === "smear") {
+            const last = sculptSmearLastPos;
+            if (!last) return;
+            const dx = hit.x - last[0], dy = hit.y - last[1];
+            if (dx === 0 && dy === 0) return; // no movement this tick — nothing to smear
+            sculptSmearLastPos = [hit.x, hit.y];
+            smear = [dx, dy];
+          }
+          await emitStamp(hit, sculptGroupId, sculptAnchor, undefined, smear);
+        })().finally(() => { sculptBusy = false; });
+      }, SCULPT_TICK_MS);
+    };
+
+    const onSculptMove = (e: PointerEvent) => {
+      // Only grab needs a dedicated move handler; the brush-disc hover repick rides onPickMove →
+      // refreshHighlight (which also keeps cursorX/cursorY fresh for the hold-timer picks).
+      if (!sculptGrab) return;
+      // Up-drag raises, down-drag lowers, ~1 block per SCULPT_GRAB_PX_PER_BLOCK px (2D grab ratio).
+      sculptGrabDelta = Math.round((sculptGrabDownY - e.clientY) / SCULPT_GRAB_PX_PER_BLOCK);
+      setGrabReadout(sculptGrabDelta);
+    };
+
+    const onSculptUp = (e: PointerEvent) => {
+      if (e.button !== 0) return;
+      if (sculptGrab) {
+        const hit = sculptGrabPick, delta = sculptGrabDelta, gid = sculptGrabGroup;
+        sculptGrab = false; sculptGrabPick = null; sculptGrabDelta = 0;
+        setGrabReadout(null);
+        if (hit && delta !== 0) void emitStamp(hit, gid, [hit.x, hit.y], delta);
+        return;
+      }
+      if (!sculptActive) return;
+      sculptActive = false;
+      if (sculptTimer !== null) { clearInterval(sculptTimer); sculptTimer = null; }
+      const gid = sculptGroupId, anchor = sculptAnchor;
+      sculptBusy = false;
+      sculptAnchor = null;
+      sculptSmearLastPos = null;
+      // Final stamp at the exact release position — captures the release even if the last timer tick
+      // was stale (or the stroke was too short for any tick to fire). Skipped when nothing was hit.
+      // (For Smear specifically this final stamp carries no drag delta and is a safe no-op — same
+      // as the 2D quick-click fallback — since there's no "last tick position" left to diff against.)
+      void (async () => {
+        const hit = await pick(e.clientX, e.clientY);
+        if (disposed || !hit) return;
+        await emitStamp(hit, gid, anchor);
+      })();
+    };
+
+    canvas.addEventListener("pointerdown", onSculptDown);
+    canvas.addEventListener("pointermove", onSculptMove);
+    canvas.addEventListener("pointerup", onSculptUp);
 
     canvas.addEventListener("pointerdown", onPickDown);
     canvas.addEventListener("pointerup", onPickUp);
@@ -1243,13 +1555,10 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       // also matched this pane's own render-distance and fly-speed sliders, which keep focus after a
       // drag — so once you touched a slider, Z was dead for the rest of the session and only a world
       // reload (remounting the pane) brought it back.
-      const t = e.target as HTMLElement | null;
-      const tag = t?.tagName;
-      const typing =
-        tag === "TEXTAREA" ||
-        t?.isContentEditable === true ||
-        (tag === "INPUT" && !NON_TEXT_INPUT_TYPES.has((t as HTMLInputElement).type));
-      if (anyModalOpenRef.current || typing) return;
+      if (anyModalOpenRef.current || isTypingTarget(e.target)) return;
+      // Escape cancels a live sculpt hold/grab stroke in ANY camera mode (the fly-mode Escape below
+      // only fires while walking). Doesn't return — App's own Escape handling still runs.
+      if (e.key === "Escape") cancelSculptStroke();
       if (e.key.toLowerCase() === "z" && !e.repeat && !e.metaKey && !e.ctrlKey) {
         // Z cycles camera mode (orbit → look → fly → orbit). Advancing *into* a walking mode from
         // orbit requires the pointer to be over this pane (so Z while working in another quad-view
@@ -1271,7 +1580,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     // Losing window focus (alt-tab, devtools) can swallow the keyup for a held direction key, leaving
     // it stuck in the set so the camera drifts indefinitely. Clear on blur. Also drop out of look
     // mode — a persistent OS cursor grab would otherwise freeze the cursor in whatever app we tab to.
-    const onBlur = () => { keys.clear(); lookDrag = false; if (camModeRef.current === "look") applyMode("orbit"); };
+    const onBlur = () => { keys.clear(); lookDrag = false; cancelSculptStroke(); if (camModeRef.current === "look") applyMode("orbit"); };
     window.addEventListener("blur", onBlur);
 
     const fwd = new THREE.Vector3();
@@ -1486,41 +1795,60 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       clearOverlays();
       if (!ovs) { invalidate(); return; }
       for (const ov of ovs) {
-        const min = new THREE.Vector3(...ov.min);
-        const max = new THREE.Vector3(...ov.max);
-        const size = new THREE.Vector3().subVectors(max, min);
+        const style = ov.style ?? "full";
         const group = new THREE.Group();
-        group.position.copy(min).addScaledVector(size, 0.5);
 
-        const boxGeom = new THREE.BoxGeometry(size.x, size.y, size.z);
-        const edgeGeom = new THREE.EdgesGeometry(boxGeom);
+        // A shaped selection is one extruded prism (absolute coords, group at origin); everything
+        // else is the centred box overlay (group positioned at the box centre).
+        let fillGeom: THREE.BufferGeometry;
+        let edgeGeom: THREE.BufferGeometry;
+        if (ov.shape) {
+          const built = buildMaskPrismGeometry(ov.shape.loops, ov.shape.caps, ov.shape.zBottom, ov.shape.zTop);
+          fillGeom = built.fill;
+          edgeGeom = built.edges;
+          overlayDisposables.push(fillGeom, edgeGeom);
+        } else {
+          const min = new THREE.Vector3(...ov.min);
+          const max = new THREE.Vector3(...ov.max);
+          const size = new THREE.Vector3().subVectors(max, min);
+          group.position.copy(min).addScaledVector(size, 0.5);
+          const boxGeom = new THREE.BoxGeometry(size.x, size.y, size.z);
+          fillGeom = boxGeom;
+          edgeGeom = new THREE.EdgesGeometry(boxGeom);
+          overlayDisposables.push(boxGeom, edgeGeom);
+        }
 
-        const fillMat = new THREE.MeshBasicMaterial({
-          color: ov.color, transparent: true, opacity: OVERLAY_FILL_OPACITY,
-          depthWrite: false, side: THREE.DoubleSide, fog: false, toneMapped: false,
-        });
-        const fill = new THREE.Mesh(boxGeom, fillMat);
-        fill.renderOrder = 997;
-        group.add(fill);
+        if (style !== "edges") {
+          const fillMat = new THREE.MeshBasicMaterial({
+            color: ov.color, transparent: true, opacity: OVERLAY_FILL_OPACITY,
+            depthWrite: false, side: THREE.DoubleSide, fog: false, toneMapped: false,
+          });
+          const fill = new THREE.Mesh(fillGeom, fillMat);
+          fill.renderOrder = 997;
+          group.add(fill);
+          overlayDisposables.push(fillMat);
+        }
 
-        const edgeMat = new THREE.LineBasicMaterial({
-          color: ov.color, transparent: true, opacity: 1, fog: false, toneMapped: false,
-        });
-        const edges = new THREE.LineSegments(edgeGeom, edgeMat);
-        edges.renderOrder = 998;
-        group.add(edges);
+        if (style !== "fill") {
+          const edgeMat = new THREE.LineBasicMaterial({
+            color: ov.color, transparent: true, opacity: 1, fog: false, toneMapped: false,
+          });
+          const edges = new THREE.LineSegments(edgeGeom, edgeMat);
+          edges.renderOrder = 998;
+          group.add(edges);
 
-        const xrayMat = new THREE.LineBasicMaterial({
-          color: ov.color, transparent: true, opacity: OVERLAY_XRAY_OPACITY,
-          depthTest: false, depthWrite: false, fog: false, toneMapped: false,
-        });
-        const xray = new THREE.LineSegments(edgeGeom, xrayMat);
-        xray.renderOrder = 999;
-        group.add(xray);
+          const xrayMat = new THREE.LineBasicMaterial({
+            color: ov.color, transparent: true, opacity: OVERLAY_XRAY_OPACITY,
+            depthTest: false, depthWrite: false, fog: false, toneMapped: false,
+          });
+          const xray = new THREE.LineSegments(edgeGeom, xrayMat);
+          xray.renderOrder = 999;
+          group.add(xray);
+          overlayDisposables.push(edgeMat, xrayMat); // edgeGeom already tracked above
+        }
 
         scene.add(group);
         overlayObjs.push(group);
-        overlayDisposables.push(boxGeom, edgeGeom, fillMat, edgeMat, xrayMat);
       }
       invalidate();
     };
@@ -1537,6 +1865,8 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       refreshNightLights: () => updateNightLights(),
       refresh: () => invalidate(),
       clearHighlight: () => setHighlight(null),
+      clearSculpt: () => { cancelSculptStroke(); placeBrush(null); },
+      setOrbitLeftEnabled,
     };
 
     return () => {
@@ -1550,6 +1880,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
         if (camModeRef.current === "look") setNativeCursorLock(false);
         onFlyModeChangeRef.current?.(false);
       }
+      cancelSculptStroke();
       cancelAnimationFrame(raf);
       clearInterval(sweepInterval);
       controls.removeEventListener("change", invalidate);
@@ -1561,6 +1892,9 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       cycleModeRef.current = null;
       canvas.removeEventListener("pointerdown", onCanvasDown);
       canvas.removeEventListener("pointerup", onCanvasUp);
+      canvas.removeEventListener("pointerdown", onSculptDown);
+      canvas.removeEventListener("pointermove", onSculptMove);
+      canvas.removeEventListener("pointerup", onSculptUp);
       canvas.removeEventListener("pointerdown", onPickDown);
       canvas.removeEventListener("pointerup", onPickUp);
       canvas.removeEventListener("pointermove", onPickMove);
@@ -1573,9 +1907,15 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       clearOverlays();
       scene.remove(highlight);
       scene.remove(breakHighlight);
+      scene.remove(brushGroup);
       hlGeom.dispose();
       hlMat.dispose();
       hlBreakMat.dispose();
+      brushFillGeom.dispose();
+      brushFillMat.dispose();
+      brushRingGeom.dispose();
+      brushRingMat.dispose();
+      brushRingXrayMat.dispose();
       mat.dispose();
       matT.dispose();
       matL.dispose();
@@ -1617,10 +1957,17 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     sceneApi.current?.setOverlays(overlays3d ?? null);
   }, [overlays3d]);
 
-  // Leaving select/build mode strands a visible highlight box on the last picked voxel — the pane's
-  // own pointer handlers no longer run to clear it. Drop it here instead.
+  // Mode-change bookkeeping (keyed on interact3d, so it re-runs every time the user cycles in/out of
+  // sculpt via the pill or the ribbon, not just once):
+  //  • leaving a box mode (select/build) strands a highlight box → clear it;
+  //  • leaving sculpt strands the brush disc and could leave a live hold/grab stroke → clear both;
+  //  • sculpt owns the orbit LEFT button (so left-drag sculpts instead of orbiting) → toggle it.
   useEffect(() => {
-    if (interact3d === "none") sceneApi.current?.clearHighlight();
+    const api = sceneApi.current;
+    if (!api) return;
+    if (interact3d !== "select" && interact3d !== "build") api.clearHighlight();
+    if (interact3d !== "sculpt") api.clearSculpt();
+    api.setOrbitLeftEnabled(interact3d !== "sculpt");
   }, [interact3d]);
 
   // Fog toggle / model / sky-color sync — avoids a full scene teardown/rebuild.
@@ -1786,11 +2133,13 @@ const FlyView3D = forwardRef<FlyView3DRef, {
         ) : camMode === "fly" ? (
           <span style={{ fontSize: 9, color: "#6ee7b7", pointerEvents: "none", lineHeight: 1.6 }}>
             WASD move · Space/E up · Ctrl/Q down · Shift boost<br />
-            drag look · scroll speed · Z or Esc exit
+            {interact3d === "sculpt"
+              ? "left = sculpt (drag-look off) · Z→look to move+aim · scroll speed"
+              : "drag look · scroll speed · Z or Esc exit"}
           </span>
         ) : (
           <span style={{ fontSize: 9, color: "#61584f", pointerEvents: "none" }}>
-            drag to orbit · scroll zoom · Z for mouselook
+            drag to orbit · scroll zoom · Z cycles mouselook → fly → orbit
           </span>
         )}
         {/* Speed indicator (A6) */}
@@ -1945,25 +2294,61 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       )}
       {/* Camera position / heading HUD (Eden coords) */}
       <CoordHud ref={hudRef} />
-      {/* Armed-block swatch + interaction hint — so what a click will do is visible without
-          glancing back at the Ribbon's tool/fill pickers. */}
-      {interact3d !== "none" && (
+      {/* In-pane interaction pill + armed-block hint (bottom-right). The VIEW/SELECT/BUILD pill is a
+          quiet mirror of the Ribbon 3D tab's mode picker (both write mode3d); the hint below shows
+          what a click will do without glancing back at the Ribbon. Container is pointer-transparent
+          so only the pill buttons capture clicks — the canvas stays interactive around them. */}
+      <div style={{
+        position: "absolute", bottom: 6, right: 6, zIndex: 1, pointerEvents: "none",
+        display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4,
+      }}>
         <div style={{
-          position: "absolute", bottom: 6, right: 6, zIndex: 1, pointerEvents: "none",
-          display: "flex", alignItems: "center", gap: 6,
-          padding: "3px 7px", borderRadius: 4, fontSize: 9,
-          background: "rgba(31,28,26,0.7)", border: "1px solid rgba(131,120,108,0.3)", color: "#afa69d",
+          display: "flex", gap: 2, pointerEvents: "auto",
+          background: "rgba(31,28,26,0.7)", border: "1px solid rgba(131,120,108,0.3)", borderRadius: 6, padding: 2,
         }}>
-          {interact3d === "build" && armedSwatch && (
-            <img src={armedSwatch} alt="" width={14} height={14} style={{ imageRendering: "pixelated", borderRadius: 2 }} />
-          )}
-          <span>
-            {interact3d === "select"
-              ? "click 2 corners to select"
-              : `L break · R place${armedLabel ? ` ${armedLabel}` : ""}`}
-          </span>
+          {INTERACT_SEGMENTS.map((seg) => {
+            const active = interact3d === seg.mode;
+            return (
+              <button
+                key={seg.mode}
+                type="button"
+                title={seg.title}
+                aria-pressed={active}
+                onClick={(e) => { e.currentTarget.blur(); onSetInteract3d?.(seg.mode); }}
+                style={{
+                  padding: "2px 8px", borderRadius: 4, fontSize: 9, fontWeight: 700, letterSpacing: "0.05em",
+                  cursor: "pointer",
+                  background: active ? `${seg.accent}2b` : "transparent",
+                  border: `1px solid ${active ? seg.accent + "80" : "transparent"}`,
+                  color: active ? seg.accent : "#83786c",
+                }}
+              >{seg.label}</button>
+            );
+          })}
         </div>
-      )}
+        {interact3d !== "none" && (
+          <div style={{
+            display: "flex", alignItems: "center", gap: 6, pointerEvents: "none",
+            padding: "3px 7px", borderRadius: 4, fontSize: 9,
+            background: "rgba(31,28,26,0.7)", border: "1px solid rgba(131,120,108,0.3)",
+            color: interact3d === "sculpt" ? "#fdba74" : "#afa69d",
+          }}>
+            {interact3d === "build" && armedSwatch && (
+              <img src={armedSwatch} alt="" width={14} height={14} style={{ imageRendering: "pixelated", borderRadius: 2 }} />
+            )}
+            <span>
+              {interact3d === "select"
+                ? "click 2 corners to select"
+                : interact3d === "sculpt"
+                  ? `${SCULPT_TOOL_LABELS[sculptTool] ?? "Sculpt"} · r${sculptRadius}${
+                      grabReadout != null
+                        ? ` · Δ${grabReadout > 0 ? "+" : ""}${grabReadout}`
+                        : ` · str${sculptStrength}`}`
+                  : `L break · R place${armedLabel ? ` ${armedLabel}` : ""}`}
+            </span>
+          </div>
+        )}
+      </div>
       <canvas
         ref={canvasRef}
         tabIndex={0}

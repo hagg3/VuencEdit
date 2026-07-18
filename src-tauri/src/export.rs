@@ -714,7 +714,11 @@ pub(crate) fn get_obj_geometry(
         return Err(format!("Selection too large ({vol} blocks) — max 64×64×64 for 3D preview"));
     }
 
-    Ok(obj_geometry_region(world, ws.texture_pack.as_ref(), sx1, sy1, sx2, sy2, sz1, sz2, &[], LightMode::default()))
+    // Shaped selection: honour the wand/lasso footprint so the floating 3D preview matches paste.
+    // Normalized rect (sx1..sx2, sy1..sy2) is what ThreeDPreview sends, so active_mask's exact-bbox
+    // check lines up; a mismatch degrades to the full box.
+    let mask = crate::active_mask(&ws, sx1, sy1, sx2, sy2);
+    Ok(obj_geometry_region(world, ws.texture_pack.as_ref(), sx1, sy1, sx2, sy2, sz1, sz2, &[], LightMode::default(), mask.as_ref()))
 }
 
 /// Night-lighting/shadow preview toggles for `obj_geometry_region`. Both default off, reproducing
@@ -891,11 +895,19 @@ pub(crate) fn pick_block_in(
 /// colour triplets (Three.js Y-up coords). Shared by `get_obj_geometry` (64³ selection preview) and
 /// `get_chunk_geometry` (world-scale fly-through chunk streaming).
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn obj_geometry_region(world: &LoadedWorld, pack: Option<&texturepack::TexturePack>, sx1: i32, sy1: i32, sx2: i32, sy2: i32, sz1: i32, sz2: i32, lamps: &[([i32; 3], [f32; 3])], mode: LightMode) -> ObjGeometryResult {
+pub(crate) fn obj_geometry_region(world: &LoadedWorld, pack: Option<&texturepack::TexturePack>, sx1: i32, sy1: i32, sx2: i32, sy2: i32, sz1: i32, sz2: i32, lamps: &[([i32; 3], [f32; 3])], mode: LightMode, mask: Option<&crate::SelectionMask>) -> ObjGeometryResult {
     // Every block read below goes through the chunk-address memo. Single-threaded by construction
     // (see ChunkCache) — this function is not parallelised.
     let cache = ChunkCache::new(world);
-    let gb = |wx: i32, wy: i32, wz: i32| cache.get(wx, wy, wz);
+    // Shaped selection (3D preview): an unmasked column reads as air here, so both emission and
+    // occlusion see the hole through the single block-getter — side faces at hole edges emit
+    // correctly without a separate emission-loop gate. `None` (FlyView3D streaming, export) is a
+    // no-op. Fail-safe is upstream: `get_obj_geometry` resolves the mask via `active_mask` (exact
+    // bbox), so a mismatched selection never reaches here masked.
+    let gb = |wx: i32, wy: i32, wz: i32| {
+        if mask.is_some_and(|m| !m.contains(wx, wy)) { return (0u8, 0u8); }
+        cache.get(wx, wy, wz)
+    };
 
     let mut pos_f: Vec<f32> = Vec::new();
     let mut col_f: Vec<f32> = Vec::new();
@@ -1330,7 +1342,7 @@ pub(crate) fn get_chunk_geometry(
         flat,
         lamp_radius: lamp_r,
     };
-    Ok(obj_geometry_region(world, ws.texture_pack.as_ref(), sx1, sy1, sx1 + 15, sy1 + 15, 0, world_max_z(world), &lamps, mode))
+    Ok(obj_geometry_region(world, ws.texture_pack.as_ref(), sx1, sy1, sx1 + 15, sy1 + 15, 0, world_max_z(world), &lamps, mode, None)) // FlyView3D streaming stays unmasked
 }
 
 /// One lamp light for the experimental GPU night path (real `THREE.PointLight`s). Position is in
@@ -1437,7 +1449,7 @@ mod tests {
     fn side_face_color(world: &LoadedWorld, x: i32, y: i32, z: i32, z2: i32, mode: LightMode) -> [f32; 3] {
         let radius = if mode.lamp_radius > 0.0 { mode.lamp_radius } else { LAMP_LIGHT_RADIUS };
         let lamps = if mode.night { scan_lamps(world, x, y, x, y, z, z2, radius) } else { Vec::new() };
-        let g = obj_geometry_region(world, None, x, y, x, y, z, z2, &lamps, mode);
+        let g = obj_geometry_region(world, None, x, y, x, y, z, z2, &lamps, mode, None);
         let floats: Vec<f32> = g.colors.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
         // Plain-cube push order (see the `else` branch in obj_geometry_region): top, bottom, south,
         // north, east, west quads, 6 vertices × 3 floats each. South is the 3rd quad (index 2).
@@ -1505,16 +1517,49 @@ mod tests {
 
         // Non-flat (baked default): lamp faces stay in the opaque stream; the emissive stream is
         // untouched, so OBJ/JSON export and ThreeDPreview see byte-identical output.
-        let baked = obj_geometry_region(&world, None, 3, 5, 3, 5, 0, 0, &[], LightMode::default());
+        let baked = obj_geometry_region(&world, None, 3, 5, 3, 5, 0, 0, &[], LightMode::default(), None);
         assert_eq!(baked.vertex_count_e, 0, "default (non-flat) mode must not populate the emissive stream");
         assert!(baked.vertex_count > 0, "lamp faces belong to the opaque stream in non-flat mode");
         assert_eq!(baked.vertex_count_t, 0, "a lamp is opaque — nothing in the transparent stream");
 
         // Flat (GPU) mode: the same lamp faces move to the emissive stream; the opaque stream is empty.
-        let flat = obj_geometry_region(&world, None, 3, 5, 3, 5, 0, 0, &[], LightMode { flat: true, ..Default::default() });
+        let flat = obj_geometry_region(&world, None, 3, 5, 3, 5, 0, 0, &[], LightMode { flat: true, ..Default::default() }, None);
         assert!(flat.vertex_count_e > 0, "flat mode must route lamp faces into the emissive stream");
         assert_eq!(flat.vertex_count, 0, "no non-lamp opaque faces expected for an isolated lamp");
         assert_eq!(flat.vertex_count_e, baked.vertex_count, "same lamp geometry, just a different stream");
+    }
+
+    /// Shaped-selection 3D preview: an unmasked column reads as air through the single block-getter,
+    /// so it contributes no geometry, and the masked neighbour's face toward the hole now emits
+    /// (the hole is treated as air for occlusion too). `None` renders the full box.
+    #[test]
+    fn test_obj_geometry_respects_mask() {
+        let mut world = make_test_world();
+        let block = |lx: usize, ly: usize, z: i32| -> usize {
+            let band = (z / 16) as usize;
+            let lz = (z % 16) as usize;
+            4096 + band * 8192 + lx * 256 + ly * 16 + lz
+        };
+        world.bytes[block(3, 5, 0)] = 2; // stone
+        world.bytes[block(4, 5, 0)] = 2; // stone (adjacent in +x)
+
+        // Full box (no mask): both cubes present; the shared face between them is culled.
+        let full = obj_geometry_region(&world, None, 3, 5, 4, 5, 0, 0, &[], LightMode::default(), None);
+
+        // Mask over bbox (3,5)-(4,5), only column (3,5) set.
+        let mask = crate::SelectionMask { x1: 3, y1: 5, x2: 4, y2: 5, bits: vec![0b01] };
+        let masked = obj_geometry_region(&world, None, 3, 5, 4, 5, 0, 0, &[], LightMode::default(), Some(&mask));
+
+        assert!(masked.vertex_count > 0, "masked cell still emits geometry");
+        assert!(masked.vertex_count < full.vertex_count, "the unmasked cube is gone");
+
+        // Masking the neighbour exposes the +x face that was culled while it was solid: the surviving
+        // cube renders exactly like a genuinely isolated one. Build that reference from a world whose
+        // only solid block is (3,5,0), so its +x neighbour really is air.
+        let mut lone_world = make_test_world();
+        lone_world.bytes[block(3, 5, 0)] = 2;
+        let isolated = obj_geometry_region(&lone_world, None, 3, 5, 3, 5, 0, 0, &[], LightMode::default(), None);
+        assert_eq!(masked.vertex_count, isolated.vertex_count, "hole-facing side face emits (full cube)");
     }
 
     #[test]
@@ -1626,7 +1671,7 @@ mod tests {
 
         // Old path: scan the region for lamps.
         let scan = scan_lamps(&world, 0, 0, 15, 15, 0, world_max_z(&world), 5.0);
-        let g_scan = obj_geometry_region(&world, None, 0, 0, 15, 15, 0, world_max_z(&world), &scan, mode);
+        let g_scan = obj_geometry_region(&world, None, 0, 0, 15, 15, 0, world_max_z(&world), &scan, mode, None);
 
         // New path: gather from the index and resolve colours exactly as get_chunk_geometry does.
         let index = crate::build_lamp_index(&world);
@@ -1636,7 +1681,7 @@ mod tests {
                 let rgb = block_color(LAMP_BLOCK_TYPE, paint, world.sky);
                 (p, [rgb[0] as f32 / 255.0, rgb[1] as f32 / 255.0, rgb[2] as f32 / 255.0])
             }).collect();
-        let g_idx = obj_geometry_region(&world, None, 0, 0, 15, 15, 0, world_max_z(&world), &idx_lamps, mode);
+        let g_idx = obj_geometry_region(&world, None, 0, 0, 15, 15, 0, world_max_z(&world), &idx_lamps, mode, None);
 
         assert_eq!(g_scan.colors, g_idx.colors, "night vertex colours must be identical (index vs scan gather)");
         assert_eq!(g_scan.positions, g_idx.positions, "geometry positions must be identical");

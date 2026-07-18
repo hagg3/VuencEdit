@@ -92,6 +92,32 @@ export function glassTab(active: boolean, accent = `rgb(${EDEN_TEAL})`, accentRg
   };
 }
 
+// Experimental-feature badge ("exp") — amber. One shared style so every "exp" tag
+// across the app (Ribbon, New World, World Browser, app menu) renders identically.
+export function expBadge(extra?: CSSProperties): CSSProperties {
+  return {
+    fontSize: 8, color: "#f59e0b", background: "rgba(245,158,11,0.12)",
+    border: "1px solid rgba(245,158,11,0.3)", borderRadius: 3, padding: "0 3px", lineHeight: "14px",
+    ...extra,
+  };
+}
+
+// Perf-heavy feature badge ("⚡") — red-tinted, distinct from `expBadge` so a GPU/CPU-costly
+// toggle (night lighting, shadows) reads differently from a merely-experimental one.
+export function perfBadge(extra?: CSSProperties): CSSProperties {
+  return {
+    fontSize: 8, color: "#f87171", background: "rgba(248,113,113,0.12)",
+    border: "1px solid rgba(248,113,113,0.35)", borderRadius: 3, padding: "0 3px", lineHeight: "14px",
+    ...extra,
+  };
+}
+
+// Work-in-progress badge ("WIP") — same amber family as `expBadge` (WIP is a variant of
+// "not finished", not a different concept) but its own label so the two aren't conflated.
+export function wipBadge(extra?: CSSProperties): CSSProperties {
+  return expBadge(extra);
+}
+
 // Shared teal-tinted loading spinner style — pairs with the `eden-spin`
 // keyframe in App.css. Render as `<div style={spinnerStyle(20)} />` for any
 // inline/overlay loading state instead of ad-hoc divs.

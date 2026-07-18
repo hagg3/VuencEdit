@@ -42,6 +42,7 @@ Pre-built installers for macOS (Apple Silicon + Intel universal), Windows, and L
 ### Viewing & navigation
 - **Zoomable, pannable top-down map** of any Eden world file
 - **Z-slice mode** — step through horizontal layers one at a time with a slider
+- **Cutaway view** — pick a height cap and everything above it disappears, so the map shows the cave or interior below instead of the roof; drawing, sculpting, and the eyedropper all target the exposed surface
 - **Axonometric (axo) view** — isometric-style perspective with an adjustable depth skew
 - **Full map mode** — renders the entire world into a single canvas for lag-free pan/zoom
 - **Quad view** — a Hammer/Radiant-style four-pane editor: top-down map + front and side slice/ortho viewports + a live 3D pane, with movable cut-planes, marquee selection, and in-viewport drawing
@@ -58,10 +59,19 @@ Pre-built installers for macOS (Apple Silicon + Intel universal), Windows, and L
 
 ### Editing
 - **Fill / replace / delete** — fill a region with any block, replace one material with another, or selectively delete blocks with an optional filter
-- **Draw tools** — Pen, Brush, Rectangle, and Ellipse paint blocks directly on the map; brush size (1/3/5/7/9) and shape (square/circle), plus fill/hollow rect and ellipse
+- **Draw tools** — Pen, Brush, Spray, Line, Rectangle, Ellipse, and Polygon/lasso paint blocks directly on the map; brush size (1–9) and shape (square/circle), fill/hollow rect and ellipse, and a stroke stabilizer to smooth out hand jitter on freehand strokes
+- **Gradient fill** — blend from the fill block to a second block across X, Y, or Z with a clean ordered-dither pattern (no banding) — great for cliff striations or smooth material transitions
 - **Draw mask** — restrict painting to cells whose current block type (and optionally paint) matches a chosen target
 - **Hotbar** — 5 pinned + 5 recent block+paint combos for fast switching; hover a recent swatch to pin it
-- **Undo / redo** with multi-level history and a 256 MB budget cap
+- **Undo / redo** with multi-level history and a 256 MB budget cap; a held sculpt or spray stroke undoes/redoes as a single step no matter how long you held it
+
+### Terrain sculpting *(experimental)*
+- **14 brush-based sculpt tools** — Raise, Lower, Grab, Smooth, Flatten, Slope (a tilted Flatten), Noise (coherent hills/mountains), Erode, Thermal, Hydro (realistic branching water erosion), Stamp/Retexture, Terrace, Sharpen, and Smear (drags terrain along with the cursor like wet paint)
+- **Soft, per-stamp brush falloff** with four profiles (smooth/linear/sphere/sharp) and a live falloff-aware cursor showing the brush's real strength gradient and radius
+- **Hold-to-build** — hold the mouse down to sculpt continuously, like an airbrush, instead of a single click
+- **Modifier keys** — hold Ctrl/⌘ to invert Raise↔Lower mid-stroke, hold Shift to temporarily switch to Smooth; `[`/`]` resize the brush and Shift+`[`/`]` adjusts strength, all without leaving the tool you're using
+- **Sculpt right inside the 3D view** — the 3D pane's Camera/Select/Build control gains a fourth mode, Sculpt, so you can shape terrain while orbiting, flying, or in mouselook, previewed as a brush disc at the surface under your cursor
+- **Selection-clipped sculpting** — optionally restrict a stroke to the current selection
 
 ### Copy, paste & prefabs
 - **Copy / paste** any volume; paste with optional *No Air*, *Terrain-align*, *Rotate 90°*, *Flip X/Y*, and *Repeat* modes
@@ -139,7 +149,8 @@ Most actions live on the **Ribbon** — a tabbed toolbar (Home / Selection / Vie
 8. **Generate trees** — with a selection active, expand the **TREES** section in the inspector to place deciduous, terrain, pine, or tall-pine trees at a given density.
 9. **Extrude** — expand the **EXTRUDE** section to repeat the selection along an axis.
 10. **Copy / paste** — Copy captures the selection. Switch to Paste and click to place. Use the **Selection** tab toggles for *No Air*, *Terrain*, *Rotate 90°*, *Flip X/Y*, and *Repeat*; expand **Advanced paste** for scatter and array modes.
-11. **Draw** — activate a draw tool (Pen / Brush / Rect / Ellipse) from the **Home** tab or keyboard. Pick a block from the hotbar or the picker. Enable *Mask* to restrict painting to a specific block type.
+11. **Draw** — activate a draw tool (Pen / Brush / Spray / Line / Rect / Ellipse / Polygon) from the **Home** tab or keyboard. Pick a block from the hotbar or the picker. Enable *Mask* to restrict painting to a specific block type.
+11a. **Sculpt** — pick a sculpt tool from the **Home** tab's Sculpt group (or the **3D** tab while the fly-through pane is open) and drag over the map to shape terrain. Adjust Strength/Radius/Softness and hold the mouse for continuous hold-to-build sculpting; `[`/`]` resize the brush live.
 12. **Quad view** — **View** tab → *Quad View* opens the four-pane editor (top-down + front/side slices + 3D). Drag the violet cut-lines to move the slice planes; left-drag in a slice with the Select tool to marquee-select; draw directly in a slice with any draw tool.
 13. **3D fly-through** — in quad view, toggle the **3D Pane** on (**View** tab). Orbit with the mouse, or hover the pane and press **Z** (or click the corner pill) to cycle Orbit → Mouselook → Fly (Space/E up, Ctrl/Q down, Shift to boost, wheel to change speed; Esc or Z to exit). The **3D** ribbon tab (shown while the pane is open) switches it into Build (left-click breaks, right-click places) or Select mode, and holds the lighting-preview toggles.
 14. **Elevation panel** — enable in the inspector to see a front/side cross-section of the selection. Clicking in the panel places blocks at the exact Z level you click.
@@ -166,9 +177,14 @@ Most actions live on the **Ribbon** — a tabbed toolbar (Home / Selection / Vie
 | WASD / Space / Ctrl | Move while in fly mode (Shift to boost) |
 | P | Pen draw tool |
 | B | Brush draw tool |
+| L | Line draw tool |
 | R | Rectangle draw tool |
 | E | Ellipse draw tool |
+| G | Polygon/lasso draw tool |
 | W | Magic Wand tool |
+| [ / ] | Sculpt brush radius down / up (Shift = strength) |
+| Ctrl/Cmd (hold, sculpting) | Invert Raise ↔ Lower for the stroke |
+| Shift (hold, sculpting) | Temporarily switch to Smooth |
 | ? | Keyboard shortcut reference |
 
 ---

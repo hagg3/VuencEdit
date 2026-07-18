@@ -1,8 +1,9 @@
-import { decodeU8 } from "./codec";
+import { decodeU8, encodeU8 } from "./codec";
+import { polygonPixels } from "./drawTools";
 import {
   type WorldMeta,
   type EditResultRaw, type PreviewDataRaw,
-  type SelectionInfo, type ClipboardInfo, type ExtrudeAxis, type AutosaveInfo,
+  type SelectionInfo, type ClipboardInfo, type ExtrudeAxis, type AutosaveInfo, type SelectionMaskInfoRaw,
 } from "./types";
 import { useRecentWorlds, timeAgo } from "./useRecentWorlds";
 import { useState, useCallback, useEffect, useRef, useMemo, useImperativeHandle, forwardRef } from "react";
@@ -12,7 +13,7 @@ import { getVersion } from "@tauri-apps/api/app";
 import { open, save, ask } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import MapCanvas, { KEY_ZOOM_STEP, TOOL_LABELS, type Tool, type SelectionBounds, type PixelPatch, type MapCanvasRef } from "./MapCanvas";
+import MapCanvas, { KEY_ZOOM_STEP, TOOL_LABELS, TOOL_HINTS, type Tool, type SelectionBounds, type PixelPatch, type MapCanvasRef } from "./MapCanvas";
 import SelectionInspector from "./SelectionInspector";
 import ElevationPreviewPanel from "./ElevationPreviewPanel";
 import SliceViewport from "./SliceViewport";
@@ -24,15 +25,18 @@ import WorldBrowserModal from "./WorldBrowserModal";
 import UploadModal from "./UploadModal";
 import NewWorldModal from "./NewWorldModal";
 import SchematicImportModal, { type SchematicInfo, type MappingEntry } from "./SchematicImportModal";
-import Ribbon, { RIBBON_HEIGHT_COLLAPSED, TAB_BAR_HEIGHT, DEFAULT_BODY_HEIGHT, EDEN_TEAL, EDEN_TEAL_READABLE } from "./Ribbon";
+import Ribbon, { RIBBON_HEIGHT_COLLAPSED, TAB_BAR_HEIGHT, DEFAULT_BODY_HEIGHT, EDEN_TEAL, EDEN_TEAL_READABLE, type RibbonTab, type MapViewMode } from "./Ribbon";
+import QuickActionsBar from "./QuickActionsBar";
 import SettingsModal, { loadSettings, saveSettings, type AppSettings } from "./SettingsModal";
 import WorldInfoModal from "./WorldInfoModal";
 import RecoveryModal from "./RecoveryModal";
 import PrefabLibraryPanel, { resolvePrefabDir } from "./PrefabLibraryPanel";
 import Modal from "./Modal";
-import { glassPanel, chromeButton, accentRing } from "./designTokens";
+import { glassPanel, chromeButton, accentRing, expBadge } from "./designTokens";
 import { decodeAtlas, tintedSwatch, type AtlasData, type TexturePackRaw, clearSwatchCache } from "./texturePack";
 import { blockDisplayName, applyBlockTables, type BlockTables } from "./blockDefs";
+import { isTypingTarget } from "./viewportUtils";
+import { decomposeMask, maskOutline } from "./maskUtils";
 import appIcon from "./assets/app-icon.png";
 import "./App.css";
 
@@ -50,17 +54,26 @@ const MAX_TOASTS = 4;
 const QUAD_SPLITS_KEY = "eden_quad_splits";
 const clampSplit = (v: number) => Math.min(0.85, Math.max(0.15, v));
 
-// Input types that aren't text entry — a focused range/checkbox/etc. shouldn't suppress single-key
-// shortcuts. Testing `tagName === "INPUT"` alone also matches Ribbon sliders (brush size, sun angle,
-// …), which keep focus after a drag: touch one and P/B/R/E/W/F/1–0 go dead until something else is
-// clicked. Mirrors FlyView3D's NON_TEXT_INPUT_TYPES fix for the identical bug in that pane.
-const NON_TEXT_INPUT_TYPES = new Set(["range", "checkbox", "radio", "button", "submit", "reset", "color", "file"]);
-const isTypingTarget = (t: EventTarget | null): boolean => {
-  const el = t as HTMLElement | null;
-  const tag = el?.tagName;
-  return tag === "TEXTAREA" || el?.isContentEditable === true ||
-    (tag === "INPUT" && !NON_TEXT_INPUT_TYPES.has((el as HTMLInputElement).type));
-};
+// Hotbar persistence. Stored as a fixed-length array of `{type,paint}|null` so a pinned slot keeps
+// its index across restarts; unknown/garbage entries decode to null rather than throwing.
+const HOTBAR_PINNED_KEY = "eden_hotbar_pinned";
+const HOTBAR_RECENT_KEY = "eden_hotbar_recent";
+type HotbarSlot = { type: number; paint: number } | null;
+function loadHotbar(key: string, len: number): HotbarSlot[] {
+  const out: HotbarSlot[] = Array(len).fill(null);
+  try {
+    const parsed = JSON.parse(localStorage.getItem(key) ?? "[]");
+    if (!Array.isArray(parsed)) return out;
+    for (let i = 0; i < Math.min(len, parsed.length); i++) {
+      const b = parsed[i];
+      if (b && Number.isFinite(b.type) && Number.isFinite(b.paint)) out[i] = { type: b.type, paint: b.paint };
+    }
+  } catch { /* corrupt entry → empty hotbar */ }
+  return out;
+}
+function saveHotbar(key: string, slots: readonly HotbarSlot[]) {
+  try { localStorage.setItem(key, JSON.stringify(slots)); } catch { /* quota / private mode */ }
+}
 function loadQuadSplits(): { col: number; row: number } {
   try {
     const p = JSON.parse(localStorage.getItem(QUAD_SPLITS_KEY) ?? "{}");
@@ -165,6 +178,11 @@ function App() {
     try { return parseInt(localStorage.getItem("ribbon_body_height") ?? String(DEFAULT_BODY_HEIGHT), 10) || DEFAULT_BODY_HEIGHT; } catch { return DEFAULT_BODY_HEIGHT; }
   });
   const effectiveRibbonHeight = ribbonCollapsed ? RIBBON_HEIGHT_COLLAPSED : TAB_BAR_HEIGHT + ribbonBodyHeight + 4;
+  const [showQuickActions, setShowQuickActions] = useState(() => loadSettings().showQuickActions);
+  // Set once by the Ribbon on mount (see its `registerTabSetter` prop) so the Quick Actions bar's
+  // "More…" can jump to the Selection tab without lifting the Ribbon's tab state into App.
+  const ribbonTabSetterRef = useRef<((t: RibbonTab) => void) | null>(null);
+  const registerRibbonTabSetter = useCallback((fn: (t: RibbonTab) => void) => { ribbonTabSetterRef.current = fn; }, []);
   const [undoDepth, setUndoDepth] = useState(0);
   const [redoDepth, setRedoDepth] = useState(0);
 
@@ -176,6 +194,8 @@ function App() {
   const lastCursorCellRef = useRef<{ cx: number; cy: number } | null>(null);
   const [tool, setTool] = useState<Tool>("pan");
   const prevToolRef = useRef<Tool>("pan");
+  // Tool to re-arm when the Space hold-to-pan key is released (null = not holding).
+  const spaceReturnToolRef = useRef<Tool | null>(null);
   const [wandMatchPaint, setWandMatchPaint] = useState(true);
   // E2: off by default — dragging/nudging the selection moves only the box, not its blocks.
   const [moveWithContents, setMoveWithContents] = useState(false);
@@ -225,6 +245,14 @@ function App() {
   }, []);
 
   const showToast = useCallback((text: string) => { pushToast(text, "info"); }, [pushToast]);
+  // Both slabs auto-enable ortho on the same selection, and it'd fire again on every later
+  // selection — one explanation per session is enough.
+  const sliceNoticeShownRef = useRef(false);
+  const sliceNotice = useCallback((text: string) => {
+    if (sliceNoticeShownRef.current) return;
+    sliceNoticeShownRef.current = true;
+    showToast(text);
+  }, [showToast]);
 
   /**
    * Report an async failure. Shows a red toast, and records the message in `error` — which the
@@ -274,6 +302,11 @@ function App() {
   // directional sun + shadow map in FlyView3D. Independent of nightLighting/shadows3d; when on it
   // overrides them. Doesn't drive lightEpoch reloads: FlyView3D rebuilds meshes off the prop change.
   const [gpuShadows, setGpuShadows] = useState(false);
+  // resetHeavyLighting() is a plain function called from load/close paths that don't re-run on every
+  // render — it reads the live values through refs rather than a stale closure.
+  const nightLightingRef = useRef(false); nightLightingRef.current = nightLighting;
+  const shadows3dRef     = useRef(false); shadows3dRef.current     = shadows3d;
+  const gpuShadowsRef    = useRef(false); gpuShadowsRef.current    = gpuShadows;
   const [sunT, setSunT] = useState(() => loadSettings().sunT);
   // sunTDisplay is the Ribbon slider's visual value while the user is dragging (same pattern as
   // zSliceDisplay/commitZSlice) — only the committed sunT triggers the (expensive) chunk reload.
@@ -286,7 +319,13 @@ function App() {
   useEffect(() => { setLightEpoch(e => e + 1); }, [nightLighting, shadows3d, sunT, lampRadius]);
   // Force the perf-heavy 3D lighting modes off — called on every world load/close so none of them
   // carry over to a different world (they're Ribbon-only session toggles, never persisted).
+  // Turning these off on every world load/close is deliberate (they're perf-heavy and must never
+  // silently carry into a new world), but doing it silently reads as the toggle being broken —
+  // say so, and only when one was actually on.
   function resetHeavyLighting() {
+    if (nightLightingRef.current || shadows3dRef.current || gpuShadowsRef.current) {
+      showToast("3D lighting (Night / Shadows / GPU Shadows) turned off for the new world — re-enable it in the 3D tab");
+    }
     setNightLighting(false);
     setShadows3d(false);
     setGpuShadows(false);
@@ -304,6 +343,12 @@ function App() {
   // Persisted 3D fly-view render distance + fly speed (seed FlyView3D; written back as the user adjusts).
   const [renderDistance, setRenderDistance] = useState(() => loadSettings().renderDistance);
   const [flySpeed, setFlySpeed] = useState(() => loadSettings().flySpeed);
+  // Persisted mouse-look tuning — only editable from Settings (no in-pane slider), so these only
+  // need to flow one direction: seed on load, reapply on Settings Save/Reset.
+  const [lookSensitivity, setLookSensitivity] = useState(() => loadSettings().lookSensitivity);
+  const [dragSensitivity, setDragSensitivity] = useState(() => loadSettings().dragSensitivity);
+  const [invertY, setInvertY] = useState(() => loadSettings().invertY);
+  const [autosaveIntervalMin, setAutosaveIntervalMin] = useState(() => loadSettings().autosaveIntervalMin);
   // Debounces the localStorage write only (state stays live so the slider/HUD track immediately) —
   // dragging the render-distance slider fires an onChange per pixel, and saveSettings() does a full
   // loadSettings() (JSON.parse) + JSON.stringify round-trip; without this a drag gesture does dozens
@@ -424,20 +469,32 @@ function App() {
   const [sculptRadius, setSculptRadius] = useState(6); // brush radius in blocks (dedicated; not draw brush size)
   const [sculptSoftness, setSculptSoftness] = useState(0.6); // 0 = hard edges, 1 = full radial dome
   const [sculptProfile, setSculptProfile] = useState<"smooth" | "linear" | "sphere" | "sharp">("smooth");
-  const [sculptAccumulate, setSculptAccumulate] = useState(false); // hold-to-build (airbrush)
+  const [sculptAccumulate, setSculptAccumulate] = useState(true); // Live brush (Row 6): live batched stamps, default ON
   const [sculptClipToSelection, setSculptClipToSelection] = useState(false); // constrain strokes to selection
   const [noiseMode, setNoiseMode] = useState<"hills" | "mountains">("hills");
   const [noiseFeatureSize, setNoiseFeatureSize] = useState(24); // blocks per feature; freq = 1/size
+  // Slope tool: plane tilt as a percent grade (rise per 100 blocks of run) along each axis; sent
+  // to the backend as a fraction (value/100 = rise per block).
+  const [slopeGradeX, setSlopeGradeX] = useState(20);
+  const [slopeGradeY, setSlopeGradeY] = useState(0);
   const sculptSeedRef = useRef(Math.floor(Math.random() * 0xFFFFFFFF));
+  // Live modifier state for sculpt strokes (Ctrl/⌘ = invert raise↔lower, Shift = temporary Smooth).
+  // Read fresh per stamp inside applySculpt (not captured at stroke-start) so a modifier change
+  // mid-hold takes effect on the very next stamp, matching the bracket-key radius/strength resize.
+  const sculptModRef = useRef({ ctrl: false, shift: false });
 
   // Mask
   const [maskEnabled,   setMaskEnabled]   = useState(false);
   const [maskBlockType, setMaskBlockType] = useState<number | null>(null);
   const [maskPaint,     setMaskPaint]     = useState<number | null>(null);
 
-  // Hotbar: 5 pinned + 5 recent block+paint combos
-  const [pinnedBlocks, setPinnedBlocks] = useState<({type: number; paint: number} | null)[]>(Array(5).fill(null));
-  const [recentBlocks, setRecentBlocks] = useState<{type: number; paint: number}[]>([]);
+  // Hotbar: 5 pinned + 5 recent block+paint combos (both persisted — pinning a favourite and
+  // losing it on restart was a beta complaint).
+  const [pinnedBlocks, setPinnedBlocks] = useState<({type: number; paint: number} | null)[]>(() => loadHotbar(HOTBAR_PINNED_KEY, 5));
+  const [recentBlocks, setRecentBlocks] = useState<{type: number; paint: number}[]>(
+    () => loadHotbar(HOTBAR_RECENT_KEY, 5).filter((b): b is { type: number; paint: number } => b !== null));
+  useEffect(() => { saveHotbar(HOTBAR_PINNED_KEY, pinnedBlocks); }, [pinnedBlocks]);
+  useEffect(() => { saveHotbar(HOTBAR_RECENT_KEY, recentBlocks); }, [recentBlocks]);
   const [hotbarHover, setHotbarHover] = useState<string | null>(null);
 
 
@@ -494,14 +551,37 @@ function App() {
   // Async invokes that captured a prior epoch discard their result on resolution.
   const loadEpochRef = useRef(0);
 
-  const [viewMode, setViewMode] = useState<"topdown" | "zslice">("topdown");
-  // zSliceZ is the committed level passed to MapCanvas (triggers tile refetch).
+  const [viewMode, setViewMode] = useState<MapViewMode>("topdown");
+  // zSliceZ is the committed level passed to MapCanvas (triggers tile refetch). In cutaway mode the
+  // same value is the cap Z — one slider, two meanings (see the Ribbon's View tab).
   // zSliceDisplay is the slider's visual value while the user is dragging.
   const [zSliceZ, setZSliceZ] = useState(32);
   const [zSliceDisplay, setZSliceDisplay] = useState(32);
 
-  const viewModeRef = useRef<"topdown" | "zslice">("topdown");
+  const viewModeRef = useRef<MapViewMode>("topdown");
   useEffect(() => { viewModeRef.current = viewMode; }, [viewMode]);
+
+  // The cutaway cap *as the backend currently has it* (`set_view_cap`), not as the UI wants it.
+  // The distinction matters: MapCanvas is a child, so its cache-invalidation effect would run
+  // before ours and refetch tiles under the old cap. Setting this only after the invoke resolves
+  // makes it a safe refetch trigger — the backend is guaranteed to already be capped.
+  const [viewCapZ, setViewCapZ] = useState<number | null>(null);
+  useEffect(() => {
+    if (!world) { setViewCapZ(null); return; }
+    const want = viewMode === "cutaway" ? zSliceZ : null;
+    let cancelled = false;
+    invoke("set_view_cap", { cap: want })
+      .then(() => {
+        if (cancelled) return;
+        setViewCapZ(want);
+        // The cutaway ceiling is also a selection ceiling — otherwise copy/fill/extrude would
+        // silently reach into the roof the user just hid.
+        if (want !== null) setZMax(z => Math.min(z, want));
+      })
+      .catch(reportError);
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [world, viewMode, zSliceZ]);
 
   // Read by the global Escape handler, which is registered once with `[]`-ish deps.
   const ctxMenuRef = useRef<typeof ctxMenu>(null);
@@ -536,6 +616,17 @@ function App() {
   const [rawBounds, setRawBounds] = useState<SelectionBounds | null>(null);
   const rawBoundsRef = useRef<SelectionBounds | null>(null);
   useEffect(() => { rawBoundsRef.current = rawBounds; }, [rawBounds]);
+  // Non-rectangular selection (magic wand / lasso). The mask itself lives on the Rust WorldState;
+  // the frontend only needs to (a) know one is active for UI, and (b) drop it the instant the
+  // selection is reshaped by anything other than the wand/lasso. `selectionMaskRectRef` records the
+  // exact rect the backend mask applies to; a single effect below clears the mask whenever the
+  // committed rect diverges from it, which covers every setRawBounds site (marquee, edge-resize,
+  // move, select-all, 3D two-click, clear) without touching each one. The Rust side ALSO re-checks
+  // the rect on every edit, so a missed clear degrades to rect-only, never to a corrupt edit.
+  const [hasSelectionMask, setHasSelectionMask] = useState(false);
+  const selectionMaskRectRef = useRef<SelectionBounds | null>(null);
+  // Canvas overlay data source (Phase E): bbox + decoded bitset for the active shaped selection.
+  const [selectionMaskOverlay, setSelectionMaskOverlay] = useState<{ x1: number; y1: number; x2: number; y2: number; bits: Uint8Array } | null>(null);
   // Live marquee dims while dragging a new selection (before commit/describe_selection round-trip).
   const [dragSelectRect, setDragSelectRect] = useState<SelectionBounds | null>(null);
   const [zMin, setZMin] = useState(0);
@@ -557,7 +648,7 @@ function App() {
   // ribbon tab owns this. "off" = camera only; "select" = two-click box select; "build" = place
   // (left-click) / break (right-click). `build3dBlock`/`build3dPaint` is the 3D tab's own armed block,
   // separate from the map's fill block, so 3D building has an independent picker.
-  const [mode3d, setMode3d] = useState<"off" | "select" | "build">("off");
+  const [mode3d, setMode3d] = useState<"off" | "select" | "build" | "sculpt">("off");
   const [build3dBlock, setBuild3dBlock] = useState(2); // Stone
   const [build3dPaint, setBuild3dPaint] = useState(0);
 
@@ -576,7 +667,22 @@ function App() {
     const selRect = dragSelectRect ?? rawBounds;
     if (selRect) {
       const { x1, y1, x2, y2 } = selRect;
-      ovs.push({ min: [x1, zMin, y1], max: [x2 + 1, zMax + 1, y2 + 1], color: 0x3b82f6 });
+      // Shaped selection: if a wand/lasso mask is committed for exactly this rect, render its
+      // footprint as one extruded prism — walls traced along the true boundary (no internal faces to
+      // double-blend) with coplanar top/bottom caps from the decomposed rects — instead of a solid
+      // box. A highly fragmented mask (decomposeMask → null) or a stale/absent mask falls back to the
+      // plain full bbox overlay.
+      const mo = selectionMaskOverlay;
+      const maskMatches = !dragSelectRect && mo && mo.x1 === x1 && mo.y1 === y1 && mo.x2 === x2 && mo.y2 === y2;
+      const caps = maskMatches && mo ? decomposeMask(mo) : null;
+      if (caps && mo) {
+        ovs.push({
+          min: [x1, zMin, y1], max: [x2 + 1, zMax + 1, y2 + 1], color: 0x3b82f6, style: "full",
+          shape: { loops: maskOutline(mo), caps, zBottom: zMin, zTop: zMax + 1 },
+        });
+      } else {
+        ovs.push({ min: [x1, zMin, y1], max: [x2 + 1, zMax + 1, y2 + 1], color: 0x3b82f6 });
+      }
       if (!dragSelectRect && extrudeOpen && extrudeCount > 0) {
         const w = x2 - x1 + 1, h = y2 - y1 + 1, d = zMax - zMin + 1;
         for (let i = 1; i <= extrudeCount; i++) {
@@ -605,7 +711,7 @@ function App() {
       });
     }
     return ovs.length > 0 ? ovs : null;
-  }, [showSlicePanels, enable3dPane, rawBounds, dragSelectRect, zMin, zMax, extrudeOpen, extrudeAxis, extrudeCount, lockedPastePos, clipboard, pasteElevationOffset, pick3dFirst]);
+  }, [showSlicePanels, enable3dPane, rawBounds, dragSelectRect, zMin, zMax, extrudeOpen, extrudeAxis, extrudeCount, lockedPastePos, clipboard, pasteElevationOffset, pick3dFirst, selectionMaskOverlay]);
 
   // When a selection is made, snap the Front/Side slice planes to its centre so the slabs show the
   // selection by default (mirrors what the elevation preview shows). Only fires on selection change,
@@ -635,6 +741,33 @@ function App() {
     }, 80);
     return () => clearTimeout(timer);
   }, [rawBounds, zMin, zMax, reportError]);
+
+  // Single choke point for dropping the backend selection mask: whenever the committed rect no
+  // longer equals the rect the mask was built for (any reshape, move, or clear), the wand/lasso
+  // shape is stale — drop it so edits go back to plain rect behaviour. The wand/lasso handlers set
+  // `selectionMaskRectRef` to their rect before this runs, so their own commit doesn't self-clear.
+  useEffect(() => {
+    const mr = selectionMaskRectRef.current;
+    if (!mr) return; // no mask active → nothing to guard
+    const rb = rawBounds;
+    const stillMatches = rb && rb.x1 === mr.x1 && rb.y1 === mr.y1 && rb.x2 === mr.x2 && rb.y2 === mr.y2;
+    if (!stillMatches) {
+      selectionMaskRectRef.current = null;
+      setHasSelectionMask(false);
+      invoke("clear_selection_mask").catch((e) => reportError(e));
+    }
+  }, [rawBounds, reportError]);
+
+  // Canvas overlay data for the shaped selection (wand/lasso). Refetched whenever the mask flips on,
+  // and whenever the committed rect changes while a mask is active — the move path shifts the mask's
+  // bbox server-side without changing its bits, so the bbox alone can drift out from under a stale
+  // fetch otherwise.
+  useEffect(() => {
+    if (!hasSelectionMask || !rawBounds) { setSelectionMaskOverlay(null); return; }
+    invoke<SelectionMaskInfoRaw | null>("get_selection_mask")
+      .then(raw => setSelectionMaskOverlay(raw ? { ...raw, bits: decodeU8(raw.bits) } : null))
+      .catch(() => setSelectionMaskOverlay(null));
+  }, [hasSelectionMask, rawBounds]);
 
   // Fetch top-down clipboard preview whenever clipboard changes.
   useEffect(() => {
@@ -670,7 +803,8 @@ function App() {
   }
 
   const applyEditResult = useCallback(async (raw: EditResultRaw, kind: "edit" | "undo" | "redo" = "edit") => {
-    if (viewModeRef.current === "topdown") {
+    // Cutaway is a top-down render — the patch Rust returns is already capped, so it applies directly.
+    if (viewModeRef.current !== "zslice") {
       if (renderModeRef.current === "axo") {
         // Axo projection: flat patch positions don't match axo pixel positions, force full re-render.
         // Read via ref: this runs from []-memoized undo/redo callbacks where `world` is stale.
@@ -750,7 +884,7 @@ function App() {
 
   async function exportPng() {
     if (!world) return;
-    const suffix = viewMode === "zslice" ? `_z${zSliceZ}` : "";
+    const suffix = viewMode === "zslice" ? `_z${zSliceZ}` : viewMode === "cutaway" ? `_cut${zSliceZ}` : "";
     const savePath = await save({
       filters: [{ name: "PNG Image", extensions: ["png"] }],
       defaultPath: `${world.name}${suffix}.png`,
@@ -763,9 +897,11 @@ function App() {
       // string, and a base64 string in the JS heap (≈4× the map size) before this IPC hop.
       await invoke("export_png", {
         path: savePath,
+        // Cutaway exports as a top-down render; Rust applies the cap it already holds, so the PNG
+        // matches what's on screen.
         view: viewMode === "zslice" ? "zslice" : "topdown",
         z: zSliceZ,
-        useTemplate: showTemplateOverlay && templateLoaded && viewMode !== "zslice",
+        useTemplate: showTemplateOverlay && templateLoaded && viewMode === "topdown",
       });
     } catch (e) {
       reportError(e);
@@ -897,7 +1033,12 @@ function App() {
           ...bounds, zMin: zMinRef.current, zMax: zMaxRef.current, dx, dy, dz: 0,
         });
         await applyEditResult(result);
-        setRawBounds({ x1: bounds.x1 + dx, y1: bounds.y1 + dy, x2: bounds.x2 + dx, y2: bounds.y2 + dy });
+        const moved = { x1: bounds.x1 + dx, y1: bounds.y1 + dy, x2: bounds.x2 + dx, y2: bounds.y2 + dy };
+        // Shape-preserving move: move_selection shifted the backend mask's bbox by (dx,dy) when one
+        // was active. Track it here (before setRawBounds fires the clear-on-reshape effect) so the
+        // shifted mask survives; if no mask is active the ref is null and this is a no-op.
+        if (selectionMaskRectRef.current) selectionMaskRectRef.current = moved;
+        setRawBounds(moved);
       } catch (e) {
         reportError(e);
       }
@@ -1024,33 +1165,117 @@ function App() {
     setTool(prev === "eyedropper" ? "pen" : prev);
   }
 
-  async function handleDrawStroke(pts: [number, number][], zOverride: number | null, anchor?: [number, number], grabDelta?: number) {
+  // Single sculpt dispatch shared by the 2D map (explicit `points`) and the 3D pane (backend-generated
+  // disc via `stampCx/cy/radius`). Every param `sculpt_terrain` accepts flows through here; the 2D
+  // path is a pure extraction of the old inline call (behaviour byte-for-byte unchanged: it always
+  // ships `points`, leaves the stamp/useCap fields null → the backend takes exactly the old branch).
+  async function applySculpt(opts: {
+    points?: { x: number; y: number }[];
+    stampCx?: number; stampCy?: number; stampRadius?: number;
+    stampCenters?: [number, number][];
+    anchor?: [number, number];
+    grabDelta?: number;
+    groupId?: number;
+    tool?: Tool;
+    useCap?: boolean;
+    smear?: [number, number];
+  }) {
+    let t = opts.tool ?? appToolRef.current;
+    // Ctrl/⌘-invert and Shift-temporary-smooth, read fresh per stamp (not captured at stroke-start)
+    // so a modifier change mid-hold applies to the very next stamp. Grab is excluded: it's a
+    // fixed-column vertical-drag gesture with no footprint/points, and forcing it into "smooth"
+    // would silently discard grab_delta rather than doing anything sensible.
+    if (t !== "grab") {
+      const mods = sculptModRef.current;
+      if (mods.shift) t = "smooth";
+      else if (mods.ctrl) {
+        if (t === "raise") t = "lower";
+        else if (t === "lower") t = "raise";
+      }
+    }
+    // sculptClipToSelection: for the 2D points path, filter the swept cells; for the 3D stamp path
+    // (no explicit points) the equivalent is to drop the stamp entirely when its centre is outside
+    // the selection. Both are frontend-only, mirroring the pre-refactor behaviour.
+    let points = opts.points;
+    if (points) {
+      if (sculptClipToSelection && rawBounds) {
+        const { x1, y1, x2, y2 } = rawBounds;
+        points = points.filter(p => p.x >= x1 && p.x <= x2 && p.y >= y1 && p.y <= y2);
+        if (points.length === 0) return;
+      }
+    } else if (opts.stampCx != null && opts.stampCy != null) {
+      if (sculptClipToSelection && rawBounds) {
+        const { x1, y1, x2, y2 } = rawBounds;
+        if (opts.stampCx < x1 || opts.stampCx > x2 || opts.stampCy < y1 || opts.stampCy > y2) return;
+      }
+    }
+    const seed = (t === "noise" || t === "hydro") ? sculptSeedRef.current : 0;
+    if (t === "noise" || t === "hydro") sculptSeedRef.current = ((sculptSeedRef.current * 1664525 + 1013904223) >>> 0);
+    try {
+      const result = await invoke<EditResultRaw>("sculpt_terrain", {
+        points: points ?? null,
+        stampCx: opts.stampCx ?? null,
+        stampCy: opts.stampCy ?? null,
+        stampRadius: opts.stampRadius ?? null,
+        mode: t, strength: sculptStrength, seed,
+        blockType: fillBlockType || null,
+        paint: fillPaint || null,
+        freq: 1 / Math.max(4, noiseFeatureSize),
+        noiseMode,
+        softness: sculptSoftness,
+        profile: sculptProfile,
+        grabDelta: opts.grabDelta ?? null,
+        anchorX: opts.anchor ? opts.anchor[0] : null,
+        anchorY: opts.anchor ? opts.anchor[1] : null,
+        groupId: opts.groupId ?? null,
+        useCap: opts.useCap ?? null, // null → backend default (true); 3D passes false
+        slopeDx: slopeGradeX / 100, slopeDy: slopeGradeY / 100,
+        smearDx: opts.smear ? opts.smear[0] : null,
+        smearDy: opts.smear ? opts.smear[1] : null,
+        // Row 6: server-side selection clip (per-cell mask) — sent alongside the legacy point/
+        // centre filter above; the backend weight-0's cells outside the rect. `stampCenters`/
+        // `strengthF` are the live-batch hooks (frontend controller not wired yet — Step 3).
+        clipRect: (sculptClipToSelection && rawBounds)
+          ? [rawBounds.x1, rawBounds.y1, rawBounds.x2, rawBounds.y2]
+          : null,
+        // Row 6 live brush: batched stamp centres for this flush. The backend applies them
+        // sequentially into one grouped-undo entry and returns a single union patch. When present,
+        // the legacy points/centre path is unused — per-cell clip comes from `clipRect` above.
+        stampCenters: opts.stampCenters ?? null,
+        strengthF: null,
+      });
+      await applyEditResult(result);
+    } catch (e) { reportError(e); }
+  }
+
+  /** One 3D sculpt stamp (from FlyView3D). Backend generates the disc; the 3D view is not cut by the
+   *  2D cutaway cap, so use_cap:false. Tool/strength/softness/etc come from the shared sculpt state. */
+  async function handleSculptStamp3d(opts: {
+    stampCx: number; stampCy: number; stampRadius: number; groupId: number;
+    anchor?: [number, number]; grabDelta?: number; smear?: [number, number];
+  }) {
+    await applySculpt({
+      stampCx: opts.stampCx, stampCy: opts.stampCy, stampRadius: opts.stampRadius,
+      anchor: opts.anchor, grabDelta: opts.grabDelta, groupId: opts.groupId, smear: opts.smear,
+      tool: appToolRef.current, useCap: false,
+    });
+  }
+
+  /** Live-brush sculpt (Row 6): one flush of a 2D stroke — a batch of stamp centres sharing the
+   *  stroke's group id. Delegates to the shared applySculpt funnel (Ctrl-invert/Shift-smooth + clip). */
+  async function handleSculptStroke(stampCenters: [number, number][], stampRadius: number, groupId: number, anchor: [number, number]) {
+    await applySculpt({ stampCenters, stampRadius, anchor, groupId, tool: appToolRef.current });
+  }
+
+  async function handleDrawStroke(pts: [number, number][], zOverride: number | null, anchor?: [number, number], grabDelta?: number, groupId?: number, smear?: [number, number]) {
     const t = appToolRef.current;
     try {
-      if (t === "smooth" || t === "noise" || t === "flatten" || t === "erode" || t === "thermal" || t === "hydro" || t === "stamp" || t === "grab" || t === "raise" || t === "lower") {
-        // Optionally constrain the stroke to the active selection (sculpt mask).
-        let stroke = pts;
-        if (sculptClipToSelection && rawBounds) {
-          const { x1, y1, x2, y2 } = rawBounds;
-          stroke = pts.filter(([x, y]) => x >= x1 && x <= x2 && y >= y1 && y <= y2);
-          if (stroke.length === 0) return;
-        }
-        const points = stroke.map(([x, y]) => ({ x, y }));
-        const seed = (t === "noise" || t === "hydro") ? sculptSeedRef.current : 0;
-        if (t === "noise" || t === "hydro") sculptSeedRef.current = ((sculptSeedRef.current * 1664525 + 1013904223) >>> 0);
-        const result = await invoke<EditResultRaw>("sculpt_terrain", {
-          points, mode: t, strength: sculptStrength, seed,
-          blockType: fillBlockType || null,
-          paint: fillPaint || null,
-          freq: 1 / Math.max(4, noiseFeatureSize),
-          noiseMode,
-          softness: sculptSoftness,
-          profile: sculptProfile,
-          grabDelta: grabDelta ?? null,
-          anchorX: anchor ? anchor[0] : null,
-          anchorY: anchor ? anchor[1] : null,
+      if (t === "smooth" || t === "noise" || t === "flatten" || t === "erode" || t === "thermal" || t === "hydro" || t === "stamp" || t === "grab" || t === "raise" || t === "lower"
+          || t === "terrace" || t === "sharpen" || t === "slope" || t === "smear") {
+        await applySculpt({
+          points: pts.map(([x, y]) => ({ x, y })),
+          anchor, grabDelta, groupId, smear, tool: t,
         });
-        await applyEditResult(result);
       } else if (t === "fill") {
         if (pts.length === 0) return;
         const [x, y] = pts[0];
@@ -1111,7 +1336,42 @@ function App() {
       const rect = await invoke<{ x1: number; y1: number; x2: number; y2: number } | null>("magic_wand_select", {
         wx, wy, matchPaint: wandMatchPaint,
       });
-      if (rect) setRawBounds(rect);
+      if (rect) {
+        // magic_wand_select stored the shaped footprint as the backend mask, keyed to this exact
+        // rect. Record it BEFORE committing rawBounds so the mask-clearing effect sees a match and
+        // leaves it in place; a later reshape of this selection will then clear it.
+        selectionMaskRectRef.current = rect;
+        setHasSelectionMask(true);
+        setRawBounds(rect);
+      }
+    } catch (e) { reportError(e); }
+  }
+
+  async function handleLassoSelect(pathPts: [number, number][]) {
+    try {
+      const verts = pathPts.map(([x, y]) => ({ x, y }));
+      const filled = polygonPixels(verts, "fill");
+      if (filled.length === 0) return;
+      let x1 = Infinity, y1 = Infinity, x2 = -Infinity, y2 = -Infinity;
+      for (const p of filled) {
+        if (p.x < x1) x1 = p.x; if (p.x > x2) x2 = p.x;
+        if (p.y < y1) y1 = p.y; if (p.y > y2) y2 = p.y;
+      }
+      x1 = Math.max(0, x1); y1 = Math.max(0, y1);
+      const width = x2 - x1 + 1, height = y2 - y1 + 1;
+      // Row-major bitset over the bbox, bit (y-y1)*width + (x-x1) — must match set_selection_mask's
+      // expected layout on the Rust side exactly (it validates byte length against width*height).
+      const bits = new Uint8Array(Math.ceil((width * height) / 8));
+      for (const p of filled) {
+        if (p.x < x1 || p.x > x2 || p.y < y1 || p.y > y2) continue;
+        const bitIdx = (p.y - y1) * width + (p.x - x1);
+        bits[bitIdx >> 3] |= 1 << (bitIdx & 7);
+      }
+      await invoke("set_selection_mask", { x1, y1, x2, y2, bitsB64: encodeU8(bits) });
+      const rect = { x1, y1, x2, y2 };
+      selectionMaskRectRef.current = rect;
+      setHasSelectionMask(true);
+      setRawBounds(rect);
     } catch (e) { reportError(e); }
   }
 
@@ -1158,11 +1418,24 @@ function App() {
 
   // ---- 3D pane picking -----------------------------------------------------------------------
   // Driven by the 3D ribbon tab's own mode (mode3d), independent of the map's Draw/Select tools.
-  const interact3d: Interact3D = mode3d === "build" ? "build" : mode3d === "select" ? "select" : "none";
+  const interact3d: Interact3D =
+    mode3d === "build" ? "build" : mode3d === "select" ? "select" : mode3d === "sculpt" ? "sculpt" : "none";
 
   // Leaving select mode abandons a half-finished two-click selection — otherwise the lone armed
   // corner would silently complete a selection on the first click after switching back.
   useEffect(() => { if (interact3d !== "select") setPick3dFirst(null); }, [interact3d]);
+
+  // Entering 3D sculpt mode with a non-sculpt tool armed (e.g. pan) would leave the pane's sculpt
+  // controller reading a nonsense tool. Default to Raise. Reuses the shared `tool` union/state — 3D
+  // sculpting has no separate tool state — so this also arms the 2D sculpt tool, by design.
+  useEffect(() => {
+    if (mode3d !== "sculpt") return;
+    const t = appToolRef.current;
+    const isSculpt = t === "smooth" || t === "noise" || t === "flatten" || t === "erode" ||
+      t === "thermal" || t === "hydro" || t === "stamp" || t === "grab" || t === "raise" || t === "lower" ||
+      t === "terrace" || t === "sharpen" || t === "slope" || t === "smear";
+    if (!isSculpt) setTool("raise");
+  }, [mode3d]);
 
   // The 3D pane only exists in quad view with the 3D pane enabled; reset its mode to camera-only when
   // it's not showing, so a stale build/select mode doesn't linger when the pane comes back.
@@ -1281,13 +1554,13 @@ function App() {
     setSourcePath(finalPath);
   }, [sourcePath, saveWorld, saveCompressed]);
 
-  // Timer-based autosave: every 3 minutes, if a world is loaded and has unsaved edits
-  // (editEpoch moved since the last autosave/save), snapshot it to a sidecar file so a
-  // crash doesn't lose everything since the last manual save. Does not touch sourcePath
-  // or the undo stack — purely a safety-net copy on disk.
+  // Timer-based autosave: every `autosaveIntervalMin` minutes (Settings → Editor; default 3), if a
+  // world is loaded and has unsaved edits (editEpoch moved since the last autosave/save), snapshot
+  // it to a sidecar file so a crash doesn't lose everything since the last manual save. Does not
+  // touch sourcePath or the undo stack — purely a safety-net copy on disk. 0 disables it.
   useEffect(() => {
-    if (!world) return;
-    const AUTOSAVE_MS = 3 * 60 * 1000;
+    if (!world || autosaveIntervalMin <= 0) return;
+    const AUTOSAVE_MS = autosaveIntervalMin * 60 * 1000;
     const id = setInterval(() => {
       if (editEpochRef.current === lastAutosavedEpochRef.current) return;
       const epoch = editEpochRef.current;
@@ -1296,7 +1569,7 @@ function App() {
         .catch((e) => console.warn("Autosave failed:", e));
     }, AUTOSAVE_MS);
     return () => clearInterval(id);
-  }, [world, sourcePath]);
+  }, [world, sourcePath, autosaveIntervalMin]);
 
   // Startup check: was there a pending autosave from a session that never cleanly saved?
   useEffect(() => {
@@ -1364,6 +1637,27 @@ function App() {
   const anyModalOpenRef = useRef(false);
   useEffect(() => { anyModalOpenRef.current = anyModalOpen; }, [anyModalOpen]);
 
+  // Live Ctrl/⌘-invert and Shift-temporary-smooth modifier tracking for sculpt strokes (read by
+  // applySculpt on every stamp — see sculptModRef's declaration). Tracks the modifier keys' own
+  // press/release directly rather than deriving from a specific shortcut's keydown, so it stays
+  // correct even when no other shortcut fires; resets on blur since a modifier released while the
+  // window is unfocused (e.g. alt-tabbing mid-stroke) never reaches a keyup here otherwise.
+  useEffect(() => {
+    const track = (e: KeyboardEvent) => {
+      if (e.key === "Control" || e.key === "Meta") sculptModRef.current.ctrl = e.type === "keydown";
+      if (e.key === "Shift") sculptModRef.current.shift = e.type === "keydown";
+    };
+    const onBlur = () => { sculptModRef.current = { ctrl: false, shift: false }; };
+    window.addEventListener("keydown", track);
+    window.addEventListener("keyup", track);
+    window.addEventListener("blur", onBlur);
+    return () => {
+      window.removeEventListener("keydown", track);
+      window.removeEventListener("keyup", track);
+      window.removeEventListener("blur", onBlur);
+    };
+  }, []);
+
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       // While the 3D fly camera is active, it owns unmodified keys (WASD/space/ctrl/shift) for
@@ -1385,7 +1679,7 @@ function App() {
         return;
       }
       if (!world) return;
-      if (e.key === "Escape") {
+      if (e.key === "Escape" && !typing) {
         // The context menu is the frontmost transient surface — it steps back first, before
         // paste locks / 3D picks / the tool itself.
         if (ctxMenuRef.current) {
@@ -1406,9 +1700,10 @@ function App() {
           return;
         }
         const t = appToolRef.current;
-        if (t === "paste" || t === "wand" || t === "pen" || t === "brush" || t === "spray" || t === "line" || t === "rect" || t === "ellipse" || t === "polygon" ||
+        if (t === "paste" || t === "wand" || t === "lasso" || t === "pen" || t === "brush" || t === "spray" || t === "line" || t === "rect" || t === "ellipse" || t === "polygon" ||
             t === "smooth" || t === "noise" || t === "flatten" || t === "erode" || t === "thermal" ||
-            t === "hydro" || t === "stamp" || t === "grab" || t === "raise" || t === "lower" || t === "fill" || t === "eyedropper") {
+            t === "hydro" || t === "stamp" || t === "grab" || t === "raise" || t === "lower" ||
+            t === "terrace" || t === "sharpen" || t === "slope" || t === "smear" || t === "fill" || t === "eyedropper") {
           e.preventDefault();
           setTool("pan");
         } else {
@@ -1417,13 +1712,29 @@ function App() {
         }
         return;
       }
-      if (e.key === "Home") {
+      if (e.key === "Home" && !typing) {
         e.preventDefault();
         mapCanvasRef.current?.resetView();
         return;
       }
       // Draw tool shortcuts (only when not typing in an input)
       if (!typing && !e.metaKey && !e.ctrlKey) {
+        // Space = hold-to-pan (the Ribbon has advertised it in a tooltip since the toolbar rewrite,
+        // but it was never wired). The armed tool is restored on keyup; `e.repeat` guards against
+        // auto-repeat overwriting spaceReturnToolRef with "pan" itself.
+        if (e.key === " " && !e.repeat) {
+          // Space is also how you activate a focused button/checkbox with the keyboard — swallowing
+          // it here would make every ribbon control keyboard-dead.
+          const tag = (e.target as HTMLElement | null)?.tagName;
+          if (tag === "BUTTON" || tag === "SELECT" || tag === "A" || tag === "INPUT") return;
+          e.preventDefault();
+          if (appToolRef.current !== "pan") {
+            spaceReturnToolRef.current = appToolRef.current;
+            setTool("pan");
+          }
+          return;
+        }
+        if (e.key === "s" || e.key === "S") { e.preventDefault(); setTool("select"); return; }
         if (e.key === "p" || e.key === "P") { e.preventDefault(); setTool("pen"); return; }
         if (e.key === "b" || e.key === "B") { e.preventDefault(); setTool("brush"); return; }
         if (e.key === "l" || e.key === "L") { e.preventDefault(); setTool("line"); return; }
@@ -1432,6 +1743,7 @@ function App() {
         if (e.key === "g" || e.key === "G") { e.preventDefault(); setTool("polygon"); return; }
         if (e.key === "f" || e.key === "F") { e.preventDefault(); setTool("fill"); return; }
         if (e.key === "w" || e.key === "W") { e.preventDefault(); setTool("wand"); return; }
+        if (e.key === "k" || e.key === "K") { e.preventDefault(); setTool("lasso"); return; }
         if (e.key === "i" || e.key === "I") {
           e.preventDefault();
           prevToolRef.current = appToolRef.current === "eyedropper" ? "pen" : appToolRef.current;
@@ -1469,6 +1781,14 @@ function App() {
           }
           return;
         }
+        // PgUp/PgDn raise/lower the armed paste; Shift = ±5. The ghost's z±N label follows live,
+        // which is the whole point — the offset used to be a number buried in the Selection tab.
+        if ((e.key === "PageUp" || e.key === "PageDown") && appToolRef.current === "paste" && clipboard) {
+          e.preventDefault();
+          const step = (e.shiftKey ? 5 : 1) * (e.key === "PageUp" ? 1 : -1);
+          setPasteElevationOffset(o => o + step);
+          return;
+        }
         // Arrow keys nudge the selection (and its contents) by 1 block; Shift = 10.
         if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(e.key)
             && appToolRef.current === "select" && rawBoundsRef.current) {
@@ -1477,6 +1797,19 @@ function App() {
           const dx = e.key === "ArrowLeft" ? -step : e.key === "ArrowRight" ? step : 0;
           const dy = e.key === "ArrowUp" ? -step : e.key === "ArrowDown" ? step : 0;
           nudgeSelection(dx, dy);
+          return;
+        }
+        // Sculpt radius/strength: `[`/`]` resize the brush, Shift+`[`/`]` adjusts strength instead.
+        // Brackets avoid every wheel conflict (wheel is zoom on the map, fly-speed in the 3D pane).
+        const st = appToolRef.current;
+        const isSculptToolKey = st === "smooth" || st === "noise" || st === "flatten" || st === "erode" ||
+          st === "thermal" || st === "hydro" || st === "stamp" || st === "grab" || st === "raise" || st === "lower" ||
+          st === "terrace" || st === "sharpen" || st === "slope" || st === "smear";
+        if (isSculptToolKey && (e.key === "[" || e.key === "]")) {
+          e.preventDefault();
+          const dir = e.key === "]" ? 1 : -1;
+          if (e.shiftKey) setSculptStrength(s => Math.max(1, Math.min(8, s + dir)));
+          else setSculptRadius(r => Math.max(1, Math.min(32, r + dir)));
           return;
         }
       }
@@ -1491,11 +1824,15 @@ function App() {
         e.preventDefault();
         if (clipboard) setTool("paste");
       }
+      // ⌘⇧S = Save As (the File menu has always shown this accelerator). Without the shiftKey test
+      // it silently performed a plain Save over the current file.
       if (k === "s") {
         e.preventDefault();
-        if (sourcePath) saveWorld(sourcePath);
-        else saveWorldAs();
+        if (e.shiftKey || !sourcePath) saveWorldAs();
+        else saveWorld(sourcePath);
       }
+      if (k === "n") { e.preventDefault(); setShowNewWorld(true); }
+      if (k === "o") { e.preventDefault(); void openFileRef.current(); }
       // Selection conventions every creative tool shares.
       if (k === "a") {
         e.preventDefault();
@@ -1516,8 +1853,23 @@ function App() {
       if (k === ",") { e.preventDefault(); setShowSettings(true); }
       if (k === "w") { e.preventDefault(); void closeWorldRef.current(); }
     };
+    // Space is hold-to-pan: releasing it restores whatever tool was armed. `blur` releases the hold
+    // too — otherwise alt-tabbing mid-hold swallows the keyup and strands the user in Pan.
+    const releaseSpacePan = () => {
+      const back = spaceReturnToolRef.current;
+      if (!back) return;
+      spaceReturnToolRef.current = null;
+      setTool(back);
+    };
+    const onKeyUp = (e: KeyboardEvent) => { if (e.key === " ") releaseSpacePan(); };
     window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
+    window.addEventListener("keyup", onKeyUp);
+    window.addEventListener("blur", releaseSpacePan);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("keyup", onKeyUp);
+      window.removeEventListener("blur", releaseSpacePan);
+    };
   }, [world, showHelp, handleUndo, handleRedo, clipboard, sourcePath, copySelection, saveWorld, saveWorldAs, nudgeSelection, rawBounds]);
 
   // Menu close effects handled inside Ribbon component
@@ -1778,6 +2130,30 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
   const closeWorldRef = useRef<() => void | Promise<void>>(() => {});
   closeWorldRef.current = closeWorld;
 
+  const openFileAtRef = useRef(openFileAt);
+  openFileAtRef.current = openFileAt;
+
+  // Drag-and-drop a .eden/.zip world file onto the window — many users try this first. Tauri's
+  // native drag-drop (dragDropEnabled, on by default) replaces the browser's own HTML5 drag events,
+  // so this goes through onDragDropEvent rather than a React onDrop handler. Reuses openFileAt's
+  // existing unsaved-changes guard — same funnel as Recent Worlds / World Browser / File▾ Open.
+  useEffect(() => {
+    const win = getCurrentWindow();
+    const unlisten = win.onDragDropEvent((event) => {
+      if (event.payload.type !== "drop") return;
+      const path = event.payload.paths.find((p) => /\.(eden|zip)$/i.test(p));
+      if (!path) {
+        showToast("Drop a .eden or .zip world file to open it.");
+        return;
+      }
+      void openFileAtRef.current(path);
+    });
+    return () => { unlisten.then((f) => f()); };
+  }, [showToast]);
+  // Same for ⌘O → openFile (also a plain function declaration).
+  const openFileRef = useRef<() => void | Promise<void>>(() => {});
+  openFileRef.current = openFile;
+
   async function closeWorld() {
     if (isDirty()) {
       const ok = await ask("You have unsaved changes. Close this world and discard them?", {
@@ -1842,10 +2218,12 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           width: clipboard.width,
           height: clipboard.height,
           depth: clipboard.depth,
+          cell_count: null,
+          masked: false,
         }
       : null;
 
-  const isSculptTool = tool === "smooth" || tool === "noise" || tool === "flatten" || tool === "erode" || tool === "thermal" || tool === "hydro" || tool === "stamp" || tool === "grab" || tool === "raise" || tool === "lower";
+  const isSculptTool = tool === "smooth" || tool === "noise" || tool === "flatten" || tool === "erode" || tool === "thermal" || tool === "hydro" || tool === "stamp" || tool === "grab" || tool === "raise" || tool === "lower" || tool === "terrace" || tool === "sharpen" || tool === "slope" || tool === "smear";
   const isDrawTool = tool === "pen" || tool === "brush" || tool === "spray" || tool === "line" || tool === "rect" || tool === "ellipse" || tool === "polygon" || isSculptTool || tool === "fill";
 
   const mapPaneEl = world ? (
@@ -1854,8 +2232,11 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
       world={world}
       worldEpoch={worldEpoch}
       tool={tool}
-      viewMode={viewMode}
+      // Cutaway *is* the top-down view, just capped — the cap lives in the backend and reaches
+      // MapCanvas only as `viewCapZ`, a refetch key (see the set_view_cap effect).
+      viewMode={viewMode === "cutaway" ? "topdown" : viewMode}
       zSliceZ={zSliceZ}
+      viewCapZ={viewCapZ}
       committedSelection={rawBounds}
       onSelectionChange={handleSelectionChange}
       pastePreview={clipboard && tool === "paste"
@@ -1867,8 +2248,10 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
       renderMode={renderMode}
       axoSkew={axoSkew}
       sliceLines={showSlicePanels ? { x: sliceSideX, y: sliceFrontY } : null}
-      drawConfig={{ brushSize, brushShape, fillMode: drawFilled ? "fill" : "outline", sculptRadius, sculptAccumulate, sprayDensity, strokeStabilizer }}
+      drawConfig={{ brushSize, brushShape, fillMode: drawFilled ? "fill" : "outline", sculptRadius, sculptSoftness, sculptProfile, sculptAccumulate, sprayDensity, strokeStabilizer }}
       onDrawStroke={handleDrawStroke}
+      onSculptStroke={handleSculptStroke}
+      onCancelStroke={handleUndo}
       drawZOverride={viewMode === "zslice" ? zSliceZ : null}
       extrudePreview={
         extrudeOpen && extrudeCount > 0 && rawBounds && (extrudeAxis.startsWith("x") || extrudeAxis.startsWith("y"))
@@ -1878,13 +2261,17 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
       lastPasteDelta={lastPasteDelta}
       onCursorMove={handleCursorMove}
       onMagicWand={handleMagicWand}
+      onLassoSelect={handleLassoSelect}
+      selectionMask={selectionMaskOverlay}
       spawnPos={spawnPos}
       creatures={[]}
       pasteElevationOffset={pasteElevationOffset}
       onEyedropper={handleEyedropper}
       cameraPos3d={showSlicePanels && enable3dPane ? cam3dPos : null}
       onSetCamera3d={showSlicePanels && enable3dPane ? (wx, wy) => flyView3dRef.current?.teleport(wx, wy) : undefined}
-      showTemplateOverlay={showTemplateOverlay && templateLoaded}
+      // Off in cutaway: the template is a surface map, so overlaying it under a cutaway would put
+      // roof-level terrain behind the cave interior you're trying to see.
+      showTemplateOverlay={showTemplateOverlay && templateLoaded && viewMode === "topdown"}
       onMapContextMenu={(wx, wy, x, y) => setCtxMenu({ wx, wy, x, y })}
       onSelectDragUpdate={setDragSelectRect}
       onMoveSelection={nudgeSelection}
@@ -1913,7 +2300,12 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
       </div>
       <div style={{ padding: "0 10px", borderRight: "1px solid #322d28", whiteSpace: "nowrap" }}>
         {world.width_chunks * 16}×{world.height_chunks * 16}
-        <span style={{ color: world.max_z === 255 ? "#6d28d9" : "#453f38", marginLeft: 6 }}>
+        <span
+          title={world.max_z === 255
+            ? "New Dawn (256z) format — worlds up to 256 blocks tall"
+            : "Legacy (64z) format — worlds up to 64 blocks tall"}
+          style={{ color: world.max_z === 255 ? "#6d28d9" : "#453f38", marginLeft: 6 }}
+        >
           {world.max_z === 255 ? "256z" : "64z"}
         </span>
       </div>
@@ -1928,6 +2320,11 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
       ) : selection && (
         <div style={{ padding: "0 10px", borderRight: "1px solid #322d28", color: "#70665b", whiteSpace: "nowrap" }}>
           Sel <span style={{ color: "#83786c" }}>{selection.width}×{selection.height}</span>
+          {selection.masked && selection.cell_count != null && (
+            <span style={{ color: "#a855f7", marginLeft: 5 }} title="Shaped selection — edits affect only the wand/lasso footprint, not the whole box">
+              ◆ shaped ({selection.cell_count.toLocaleString()} cells)
+            </span>
+          )}
           {" · Z "}<span style={{ color: "#70665b" }}>{selection.z_min}–{selection.z_max}</span>
         </div>
       )}
@@ -1935,10 +2332,22 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
         ↩ <span style={{ color: "#4b443d" }}>{undoDepth}</span>
         {"  "}↪ <span style={{ color: "#4b443d" }}>{redoDepth}</span>
       </div>
+      {/* The filter's only other Clear button lives in the Selection tab, which disappears with the
+          selection — deselect and the filter (which still gates deletes) became unclearable. */}
       {filterBlockType !== null && (
-        <div style={{ padding: "0 8px", borderRight: "1px solid #322d28", whiteSpace: "nowrap",
+        <div style={{ padding: "0 4px 0 8px", borderRight: "1px solid #322d28", whiteSpace: "nowrap",
+          display: "flex", alignItems: "center", gap: 4,
           color: "#f59e0b", background: "rgba(245,158,11,0.07)" }}>
-          Filter: {blockDisplayName(filterBlockType)}{filterPaint !== null ? ` #${filterPaint}` : ""}{filterInvert ? " (inv)" : ""}
+          <span>Filter: {blockDisplayName(filterBlockType)}{filterPaint !== null ? ` #${filterPaint}` : ""}{filterInvert ? " (inv)" : ""}</span>
+          <button
+            onClick={() => { setFilterBlockType(null); setFilterPaint(null); setFilterInvert(false); }}
+            title="Clear the replace filter"
+            aria-label="Clear replace filter"
+            style={{ background: "none", border: "none", cursor: "pointer", color: "#f59e0b",
+              padding: "0 3px", fontSize: 11, lineHeight: 1, opacity: 0.75 }}
+            onMouseEnter={e => { e.currentTarget.style.opacity = "1"; }}
+            onMouseLeave={e => { e.currentTarget.style.opacity = "0.75"; }}
+          >✕</button>
         </div>
       )}
       {maskEnabled && maskBlockType !== null && (
@@ -1956,6 +2365,19 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           {lockedPastePos
             ? "Position locked — click again to stamp, Esc to unlock"
             : "Click the map to lock the paste position"}
+        </div>
+      )}
+      {/* Same idea, extended to the other gestures with no on-screen affordance: the polygon's
+          close-the-loop click, Grab's vertical drag, and the fact that a selection can be dragged
+          and resized at all. */}
+      {tool !== "paste" && TOOL_HINTS[tool] && (
+        <div style={{ padding: "0 8px", borderRight: "1px solid #322d28", whiteSpace: "nowrap", color: "#83786c" }}>
+          {TOOL_HINTS[tool]}
+        </div>
+      )}
+      {tool === "select" && rawBounds && (
+        <div style={{ padding: "0 8px", borderRight: "1px solid #322d28", whiteSpace: "nowrap", color: "#83786c" }}>
+          Drag an edge grip to resize · drag inside to move {moveWithContents ? "the blocks" : "the box only"} · arrows nudge
         </div>
       )}
       <div style={{ flex: 1 }} />
@@ -2004,7 +2426,9 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
       extrudeCount: sliceExtrudeCount,
       extrudeAxis,
       isPaste: sliceIsPaste,
+      onNotice: sliceNotice,
       onZRangeChange: sliceZResize,
+      viewCapZ,
       selectMode: sliceSelectMode,
     };
     // Quad-view grid templates. Normally fraction-driven from the split sliders; when a pane is
@@ -2099,10 +2523,18 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
                       initialFlySpeed={flySpeed}
                       onRenderDistanceChange={(n) => { setRenderDistance(n); saveSettingsDebounced({ renderDistance: n }); }}
                       onFlySpeedChange={(n) => { setFlySpeed(n); saveSettingsDebounced({ flySpeed: n }); }}
+                      lookSensitivity={lookSensitivity}
+                      dragSensitivity={dragSensitivity}
+                      invertY={invertY}
                       interact3d={interact3d}
+                      onSetInteract3d={(m) => setMode3d(m === "none" ? "off" : m)}
                       onPickSelect={handlePick3dSelect}
                       onPickBreak={handlePick3dBreak}
                       onPickPlace={handlePick3dPlace}
+                      sculptTool={tool}
+                      sculptRadius={sculptRadius}
+                      sculptStrength={sculptStrength}
+                      onSculptStamp3d={handleSculptStamp3d}
                       armedSwatch={texturePackInfo ? tintedSwatch(build3dBlock, build3dPaint, texturePackInfo) : null}
                       armedLabel={blockDisplayName(build3dBlock)}
                     />
@@ -2125,7 +2557,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
                 }}>
                   <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, fontWeight: 600, letterSpacing: "0.04em" }}>
                     3D FLY-THROUGH
-                    <span style={{ fontSize: 9, color: "#f59e0b", background: "rgba(245,158,11,0.12)", border: "1px solid rgba(245,158,11,0.3)", borderRadius: 3, padding: "0 3px", lineHeight: "14px" }}>exp</span>
+                    <span style={expBadge({ fontSize: 9 })}>exp</span>
                   </div>
                   <button
                     onClick={() => setEnable3dPane(true)}
@@ -2224,6 +2656,10 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           setNoiseMode={setNoiseMode}
           noiseFeatureSize={noiseFeatureSize}
           setNoiseFeatureSize={setNoiseFeatureSize}
+          slopeGradeX={slopeGradeX}
+          setSlopeGradeX={setSlopeGradeX}
+          slopeGradeY={slopeGradeY}
+          setSlopeGradeY={setSlopeGradeY}
           prevToolRef={prevToolRef}
           fillBlockType={fillBlockType}
           fillPaint={fillPaint}
@@ -2391,6 +2827,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           setSmartPlacement={setSmartPlacement}
           onGenerateTrees={handleGenerateTrees}
           collapsed={ribbonCollapsed}
+          registerTabSetter={registerRibbonTabSetter}
           onCollapse={(v) => { setRibbonCollapsed(v); try { localStorage.setItem("ribbon_collapsed", String(v)); } catch {} }}
           ribbonBodyHeight={ribbonBodyHeight}
           onBodyHeightChange={(h) => {
@@ -2562,12 +2999,17 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
             onSave={(s) => {
               setSaveCompressed(s.defaultSaveCompressed);
               setFogEnabled(s.enableFog);
+              setShowQuickActions(s.showQuickActions);
               setSunT(s.sunT);
               setSunTDisplay(s.sunT);
               setLampRadius(s.lampRadius);
               setLampRadiusDisplay(s.lampRadius);
               setRenderDistance(s.renderDistance);
               setFlySpeed(s.flySpeed);
+              setLookSensitivity(s.lookSensitivity);
+              setDragSensitivity(s.dragSensitivity);
+              setInvertY(s.invertY);
+              setAutosaveIntervalMin(s.autosaveIntervalMin);
               if (s.templatePath !== templatePath) setTemplatePath(s.templatePath);
               if (s.texturePackPath !== texturePackPath) {
                 if (s.texturePackPath) loadTexturePackFile(s.texturePackPath);
@@ -2782,6 +3224,37 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
             </div>
           );
         })()}
+
+        {/* Quick Actions — floating bar under the ribbon. ⚠️ Must stay inside the `world` branch:
+            App has a second return for the splash screen, where this would never render. */}
+        {showQuickActions && (
+          <QuickActionsBar
+            top={effectiveRibbonHeight + 8}
+            rawBounds={rawBounds}
+            clipboard={clipboard}
+            onCopy={copySelection}
+            onFill={fillSelection}
+            onDelete={() => deleteBlocks()}
+            onDeselect={() => setRawBounds(null)}
+            onPaste={() => setTool("paste")}
+            pasteLocked={lockedPastePos != null && !persistPaste}
+            onConfirmPaste={() => {
+              if (lockedPastePos) { pasteAt(lockedPastePos); setLockedPastePos(null); }
+            }}
+            pasteElevationOffset={pasteElevationOffset}
+            setPasteElevationOffset={setPasteElevationOffset}
+            onRotate={rotateClipboard}
+            onMirrorX={mirrorClipboardX}
+            onMirrorY={mirrorClipboardY}
+            onClearPaste={() => {
+              setClipboard(null);
+              setLockedPastePos(null);
+              setPasteElevationOffset(0);
+              setTool(t => (t === "paste" ? "pan" : t));
+            }}
+            onMore={() => ribbonTabSetterRef.current?.("selection")}
+          />
+        )}
 
         {/* Status bar */}
         {statusBarEl}
@@ -3000,12 +3473,17 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
             setEnable3dPane(s.default3dPane);
             setSaveCompressed(s.defaultSaveCompressed);
             setFogEnabled(s.enableFog);
+            setShowQuickActions(s.showQuickActions);
             setSunT(s.sunT);
             setSunTDisplay(s.sunT);
             setLampRadius(s.lampRadius);
             setLampRadiusDisplay(s.lampRadius);
             setRenderDistance(s.renderDistance);
             setFlySpeed(s.flySpeed);
+            setLookSensitivity(s.lookSensitivity);
+            setDragSensitivity(s.dragSensitivity);
+            setInvertY(s.invertY);
+            setAutosaveIntervalMin(s.autosaveIntervalMin);
             if (s.templatePath !== templatePath) setTemplatePath(s.templatePath);
             if (s.texturePackPath !== texturePackPath) {
               if (s.texturePackPath) loadTexturePackFile(s.texturePackPath);

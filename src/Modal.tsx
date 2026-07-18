@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, type RefObject } from "react";
 import { glassBackdrop } from "./designTokens";
 
 interface ModalProps {
@@ -22,38 +22,23 @@ const FOCUSABLE =
   'a[href],button:not([disabled]),textarea:not([disabled]),input:not([disabled]),select:not([disabled]),[tabindex]:not([tabindex="-1"])';
 
 /**
- * Shared modal shell (Q4): one backdrop, Escape-to-close, focus trap, initial
- * focus, and `role="dialog"` ARIA for every modal. Children provide their own
- * `glassPanel` — Modal only owns the backdrop + a11y behaviours.
+ * Focus trap + initial focus for a dialog-like panel, without Modal's full-screen backdrop.
+ * Shared by Modal (below) and any non-modal dockable panel that still wants real keyboard a11y
+ * (e.g. PrefabLibraryPanel — a floating panel meant to coexist with the map, not block it, so it
+ * can't use Modal's centered/backdropped shell, but the Tab-cycling logic is identical and
+ * fiddly enough to be worth not re-deriving).
  */
-export default function Modal({
-  onClose,
-  children,
-  zIndex = 9000,
-  labelledBy,
-  label,
-  closeOnBackdrop = true,
-  closeOnEsc = true,
-  backdropStyle,
-}: ModalProps) {
-  const panelRef = useRef<HTMLDivElement>(null);
-
-  // Escape-to-close + focus trap. Registered on the panel so nested modals
-  // (higher zIndex) don't double-handle a single keypress.
+export function useFocusTrap(ref: RefObject<HTMLElement | null>, focusOnMount = true) {
   useEffect(() => {
-    const el = panelRef.current;
+    const el = ref.current;
     if (!el) return;
 
-    // Initial focus: first focusable child, else the panel itself.
-    const first = el.querySelector<HTMLElement>(FOCUSABLE);
-    (first ?? el).focus();
+    if (focusOnMount) {
+      const first = el.querySelector<HTMLElement>(FOCUSABLE);
+      (first ?? el).focus();
+    }
 
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape" && closeOnEsc) {
-        e.stopPropagation();
-        onClose();
-        return;
-      }
       if (e.key !== "Tab") return;
       const items = Array.from(el.querySelectorAll<HTMLElement>(FOCUSABLE)).filter(
         (n) => n.offsetParent !== null || n === document.activeElement,
@@ -74,6 +59,40 @@ export default function Modal({
       }
     };
 
+    el.addEventListener("keydown", onKey);
+    return () => el.removeEventListener("keydown", onKey);
+  }, [ref, focusOnMount]);
+}
+
+/**
+ * Shared modal shell (Q4): one backdrop, Escape-to-close, focus trap, initial
+ * focus, and `role="dialog"` ARIA for every modal. Children provide their own
+ * `glassPanel` — Modal only owns the backdrop + a11y behaviours.
+ */
+export default function Modal({
+  onClose,
+  children,
+  zIndex = 9000,
+  labelledBy,
+  label,
+  closeOnBackdrop = true,
+  closeOnEsc = true,
+  backdropStyle,
+}: ModalProps) {
+  const panelRef = useRef<HTMLDivElement>(null);
+  useFocusTrap(panelRef);
+
+  // Escape-to-close. Registered on the panel so nested modals (higher zIndex) don't double-handle
+  // a single keypress.
+  useEffect(() => {
+    const el = panelRef.current;
+    if (!el || !closeOnEsc) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.stopPropagation();
+        onClose();
+      }
+    };
     el.addEventListener("keydown", onKey);
     return () => el.removeEventListener("keydown", onKey);
   }, [onClose, closeOnEsc]);

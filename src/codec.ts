@@ -9,6 +9,18 @@ export function decodeU8(b64: string): Uint8Array {
   return arr;
 }
 
+/** Encode a byte array to base64 for IPC payloads flowing JS → Rust (e.g. a lasso selection
+ *  bitset for `set_selection_mask`). Inverse of `decodeU8`; chunked so a large buffer doesn't blow
+ *  the argument limit of `String.fromCharCode(...spread)`. */
+export function encodeU8(bytes: Uint8Array): string {
+  let bin = "";
+  const CHUNK = 0x8000;
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    bin += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+  }
+  return btoa(bin);
+}
+
 export function decodeF32(b64: string): Float32Array {
   const bytes = decodeU8(b64);
   // Length in floats via (n >> 2) guards against a payload whose byteLength
