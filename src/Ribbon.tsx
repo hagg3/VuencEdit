@@ -10,7 +10,7 @@ import { timeAgo } from "./useRecentWorlds";
 import { BLOCK_DEFS, resolveColor, blockDisplayName } from "./blockDefs";
 import { tintedSwatch } from "./texturePack";
 import appIcon from "./assets/app-icon.png";
-import { EDEN_TEAL, EDEN_TEAL_READABLE, recessedWell, accentRing } from "./designTokens";
+import { EDEN_TEAL, EDEN_TEAL_READABLE, recessedWell, accentRing, expBadge, perfBadge, wipBadge } from "./designTokens";
 export { EDEN_TEAL, EDEN_TEAL_READABLE } from "./designTokens";
 
 export const RIBBON_HEIGHT_COLLAPSED = 32;
@@ -18,6 +18,10 @@ export const TAB_BAR_HEIGHT = 32;
 export const DEFAULT_BODY_HEIGHT = 96;
 
 export type RibbonTab = "home" | "draw" | "insert" | "view" | "selection" | "paste" | "3d";
+
+/** Top-down map view modes. "cutaway" renders (and targets edits) as if the world ended at the
+ *  cap Z — the way to work on caves/interiors without the roof in the way. */
+export type MapViewMode = "topdown" | "zslice" | "cutaway";
 
 export interface RibbonProps {
   world: WorldMeta | null;
@@ -50,6 +54,8 @@ export interface RibbonProps {
   sculptClipToSelection: boolean; setSculptClipToSelection: (v: boolean) => void;
   noiseMode: "hills" | "mountains"; setNoiseMode: (v: "hills" | "mountains") => void;
   noiseFeatureSize: number; setNoiseFeatureSize: (v: number) => void;
+  slopeGradeX: number; setSlopeGradeX: (v: number) => void;
+  slopeGradeY: number; setSlopeGradeY: (v: number) => void;
   prevToolRef: React.RefObject<Tool>;
   fillBlockType: number; fillPaint: number;
   setFillBlockType: (v: number) => void; setFillPaint: (v: number) => void;
@@ -67,7 +73,7 @@ export interface RibbonProps {
   zMin: number; zMax: number;
   handleZMin: (v: string) => void; handleZMax: (v: string) => void;
   // View
-  viewMode: "topdown" | "zslice"; setViewMode: (v: "topdown" | "zslice") => void;
+  viewMode: MapViewMode; setViewMode: (v: MapViewMode) => void;
   zSliceZ: number; zSliceDisplay: number;
   setZSliceDisplay: (v: number) => void; commitZSlice: (v: number) => void;
   followSurface: boolean; setFollowSurface: (v: boolean) => void;
@@ -76,7 +82,7 @@ export interface RibbonProps {
   showSlicePanels: boolean; setShowSlicePanels: (v: boolean) => void;
   enable3dPane: boolean; setEnable3dPane: (v: boolean) => void;
   // 3D fly-view interaction (the contextual "3D" tab). Decoupled from the map's Draw/Select tools.
-  mode3d: "off" | "select" | "build"; setMode3d: (v: "off" | "select" | "build") => void;
+  mode3d: "off" | "select" | "build" | "sculpt"; setMode3d: (v: "off" | "select" | "build" | "sculpt") => void;
   build3dBlock: number; build3dPaint: number;
   setBuild3dBlock: (v: number) => void; setBuild3dPaint: (v: number) => void;
   nightLighting: boolean; setNightLighting: (v: boolean) => void;
@@ -168,6 +174,9 @@ export interface RibbonProps {
   onBodyHeightChange: (h: number) => void;
   // Collapse
   collapsed: boolean; onCollapse: (v: boolean) => void;
+  /** Called once on mount with a setter for the active tab, so outside chrome (the Quick Actions
+   *  bar's "More…") can switch tabs without lifting `activeTab` out of the Ribbon. */
+  registerTabSetter?: (fn: (t: RibbonTab) => void) => void;
 }
 
 
@@ -225,24 +234,31 @@ const rbDivider: React.CSSProperties = {
   width: 1, background: "#403b35", alignSelf: "stretch", margin: "4px 2px",
   boxShadow: "1px 0 0 rgba(255,255,255,0.03)",
 };
+
+// The fourteen sculpt tools, rendered as a compact 5-col icon grid (3 rows). Module-scope so both
+// the Draw tab's Sculpt group and the 3D tab's sculptGroup() share one source of truth.
+const SCULPT_ALL_TOOLS: { id: Tool; icon: string; short: string; name: string }[] = [
+  { id: "raise",   icon: "▲", short: "Raise",     name: "Raise — drag to pull up" },
+  { id: "lower",   icon: "▼", short: "Lower",     name: "Lower — drag to dig down" },
+  { id: "grab",    icon: "✥", short: "Grab",      name: "Grab — drag up/down to pull terrain" },
+  { id: "smooth",  icon: "〰", short: "Smooth",    name: "Smooth — average heights" },
+  { id: "flatten", icon: "▬", short: "Flatten",   name: "Flatten — level to click height" },
+  { id: "slope",   icon: "◺", short: "Slope",     name: "Slope — flatten to a tilted plane (set Slope X/Y in Falloff)" },
+  { id: "smear",   icon: "➜", short: "Smear",     name: "Smear — drag to pull height along with the brush" },
+  { id: "terrace", icon: "☰", short: "Terrace",   name: "Terrace — quantize height into Strength-block steps" },
+  { id: "sharpen", icon: "◆", short: "Sharpen",   name: "Sharpen — crisps terrain, the inverse of Smooth" },
+  { id: "noise",   icon: "⛰", short: "Noise",     name: "Noise — coherent hills/mountains" },
+  { id: "erode",   icon: "◣", short: "Erode",     name: "Erode — drop toward lowest neighbour" },
+  { id: "thermal", icon: "♨", short: "Thermal",   name: "Thermal — talus-angle erosion" },
+  { id: "hydro",   icon: "≈", short: "Hydro",     name: "Hydro — droplet hydraulic erosion" },
+  { id: "stamp",   icon: "▦", short: "Retexture", name: "Retexture — repaint surface by slope" },
+];
 const zInp: React.CSSProperties = {
   width: 46, background: "rgba(0,0,0,0.35)", border: "none",
   boxShadow: "inset 0 0 0 1px rgba(0,0,0,.4), inset 0 2px 3px rgba(0,0,0,.35)",
   color: "#ebe9e7", borderRadius: 3, padding: "1px 4px", fontSize: 11,
   textAlign: "center", outline: "none",
 };
-const expBadge: React.CSSProperties = {
-  fontSize: 8, color: "#f59e0b", background: "rgba(245,158,11,0.12)",
-  border: "1px solid rgba(245,158,11,0.3)", borderRadius: 3, padding: "0 3px", lineHeight: "14px",
-};
-
-// Marks a control whose feature is GPU/CPU-intensive (may reduce framerate). Distinct red tint + a
-// ⚡ glyph so it reads differently from the amber `exp` (experimental) badge.
-const perfBadge: React.CSSProperties = {
-  fontSize: 8, color: "#f87171", background: "rgba(248,113,113,0.12)",
-  border: "1px solid rgba(248,113,113,0.35)", borderRadius: 3, padding: "0 3px", lineHeight: "14px",
-};
-
 // Inline SVG cursor for Pan button
 function PanCursorIcon() {
   return (
@@ -288,7 +304,7 @@ const LEAF_COLORS: [number, string, string][] = [
 // ── Picker portal ──────────────────────────────────────────────────────────────
 
 interface PickerState {
-  type: "block-draw" | "block-fill" | "filter" | "gradient-to";
+  type: "block-draw" | "block-fill" | "filter" | "gradient-to" | "build-3d";
   top: number; left: number;
 }
 
@@ -296,6 +312,9 @@ export default function Ribbon(p: RibbonProps) {
   const [activeTab, setActiveTab] = useState<RibbonTab>("home");
   const activeTabRef = useRef<RibbonTab>("home");
   useEffect(() => { activeTabRef.current = activeTab; }, [activeTab]);
+
+  const registerTabSetter = p.registerTabSetter;
+  useEffect(() => { registerTabSetter?.(setActiveTab); }, [registerTabSetter]);
 
   // Dropdown menus
   const [appMenuOpen, setAppMenuOpen] = useState(false);
@@ -394,7 +413,7 @@ export default function Ribbon(p: RibbonProps) {
   // Auto-tab: draw tool → Draw tab
   const prevToolRef2 = useRef<Tool | null>(null);
   useEffect(() => {
-    const drawTools = ["pen","brush","spray","line","rect","ellipse","polygon","smooth","noise","flatten","erode","thermal","hydro","stamp","grab","raise","lower","fill"];
+    const drawTools = ["pen","brush","spray","line","rect","ellipse","polygon","smooth","noise","flatten","erode","thermal","hydro","stamp","grab","raise","lower","terrace","sharpen","slope","smear","fill"];
     const wasDrawTool = drawTools.includes(prevToolRef2.current ?? "");
     const isNowDraw = drawTools.includes(p.tool);
     if (isNowDraw && !wasDrawTool) setActiveTab("draw");
@@ -492,6 +511,15 @@ export default function Ribbon(p: RibbonProps) {
   }
 
   const swatchColor = resolveColor(p.fillBlockType, p.fillPaint);
+
+  /** CSS `background` for a block+paint chip: the texture-pack tile when a pack is loaded,
+   *  otherwise the flat block colour (same fallback the pickers use). */
+  const swatchBg = (bt: number, paint: number): string => {
+    const url = p.texturePack ? tintedSwatch(bt, paint, p.texturePack) : null;
+    if (url) return `url(${url}) center/cover`;
+    const [r, g, b] = resolveColor(bt, paint);
+    return `rgb(${r},${g},${b})`;
+  };
 
   // ── tab style ──────────────────────────────────────────────────────────────
 
@@ -598,7 +626,12 @@ export default function Ribbon(p: RibbonProps) {
               </div>
             )}
             <div style={{ color: "#61584f", fontSize: 10 }}>{p.world ? `${p.world.width_chunks}×${p.world.height_chunks} chunks` : ""}</div>
-            <div style={{ fontSize: 10, color: p.world?.max_z === 255 ? "#a78bfa" : "#61584f" }}>
+            <div
+              title={p.world?.max_z === 255
+                ? "New Dawn (256z) format — worlds up to 256 blocks tall"
+                : p.world?.max_z === 63 ? "Legacy (64z) format — worlds up to 64 blocks tall" : undefined}
+              style={{ fontSize: 10, color: p.world?.max_z === 255 ? "#a78bfa" : "#61584f" }}
+            >
               {p.world?.max_z === 63 ? "Legacy 64z" : p.world?.max_z === 255 ? "New Dawn 256z" : ""}
             </div>
           </div>
@@ -621,6 +654,7 @@ export default function Ribbon(p: RibbonProps) {
             </button>
             <button onClick={() => p.setTool("select")} style={p.tool === "select" ? rbActive() : rb} title="Select (S)">⬚ Select</button>
             <button onClick={() => p.setTool("wand")} style={p.tool === "wand" ? rbActive("#a78bfa") : rb} title="Magic Wand (W)">⁂ Wand</button>
+            <button onClick={() => p.setTool("lasso")} style={p.tool === "lasso" ? rbActive("#a855f7") : rb} title="Lasso — drag a freeform selection (K)">◌ Lasso</button>
           </div>
           {p.tool === "wand" && (
             <button onClick={() => p.setWandMatchPaint(!p.wandMatchPaint)} style={p.wandMatchPaint ? rbActive("#a855f7") : rb}>
@@ -682,19 +716,9 @@ export default function Ribbon(p: RibbonProps) {
     const drawToolIcons: Record<string,string> = { pen:"✏", brush:"⬟", spray:"❉", line:"╱", rect:"□", ellipse:"○", polygon:"⬠" };
     const drawToolNames: Record<string,string> = { pen:"Pen", brush:"Brush", spray:"Spray", line:"Line", rect:"Rect", ellipse:"Ellipse", polygon:"Polygon" };
     const drawToolKeys: Record<string,string> = { pen:"P", brush:"B", spray:"", line:"L", rect:"R", ellipse:"E", polygon:"G" };
-    // All sculpt tools rendered uniformly as a compact icon grid (5 cols × 2 rows).
-    const sculptAllTools: { id: Tool; icon: string; short: string; name: string }[] = [
-      { id: "raise",   icon: "▲", short: "Raise",     name: "Raise — drag to pull up" },
-      { id: "lower",   icon: "▼", short: "Lower",     name: "Lower — drag to dig down" },
-      { id: "grab",    icon: "✥", short: "Grab",      name: "Grab — drag up/down to pull terrain" },
-      { id: "smooth",  icon: "〰", short: "Smooth",    name: "Smooth — average heights" },
-      { id: "flatten", icon: "▬", short: "Flatten",   name: "Flatten — level to click height" },
-      { id: "noise",   icon: "⛰", short: "Noise",     name: "Noise — coherent hills/mountains" },
-      { id: "erode",   icon: "◣", short: "Erode",     name: "Erode — drop toward lowest neighbour" },
-      { id: "thermal", icon: "♨", short: "Thermal",   name: "Thermal — talus-angle erosion" },
-      { id: "hydro",   icon: "≈", short: "Hydro",     name: "Hydro — droplet hydraulic erosion" },
-      { id: "stamp",   icon: "▦", short: "Retexture", name: "Retexture — repaint surface by slope" },
-    ];
+    // All sculpt tools rendered uniformly as a compact icon grid (5 cols × 3 rows). Shared with the
+    // 3D tab's sculptGroup() via the module-scope SCULPT_ALL_TOOLS.
+    const sculptAllTools = SCULPT_ALL_TOOLS;
     const activeSculptTool = sculptAllTools.find(t => t.id === p.tool);
     const kbdBadge: React.CSSProperties = {
       fontSize: 8, fontFamily: "ui-monospace,'SF Mono',monospace", color: "#61584f",
@@ -868,7 +892,7 @@ export default function Ribbon(p: RibbonProps) {
               {(p.tool === "pen" || p.tool === "brush" || p.tool === "spray") && (<>
                 <div style={{ width: 6 }} />
                 <button onClick={() => p.setStrokeStabilizer(!p.strokeStabilizer)}
-                  title="Stabilizer — smooth out hand jitter on freehand strokes"
+                  title="Stabilizer — smooths out hand jitter on freehand strokes (pen/brush/spray). The brush trails slightly behind the cursor while drawing — that lag is the smoothing, not lag/lag-spike."
                   style={p.strokeStabilizer ? rbActive("#f472b6") : rb}>{p.strokeStabilizer ? "Stabilize ✓" : "Stabilize"}</button>
               </>)}
             </div>
@@ -877,7 +901,7 @@ export default function Ribbon(p: RibbonProps) {
           <div style={rbDivider} />
         </>)}
 
-        {/* Sculpt tools — compact icon grid (5 cols × 2 rows) so the group stays ≤3 rows tall */}
+        {/* Sculpt tools — compact icon grid (5 cols × 3 rows), fitting the group's ≤3-row budget */}
         <div style={rbGroup}>
           <div style={{ display: "grid", gridTemplateColumns: "repeat(5, auto)", gap: 3 }}>
             {sculptAllTools.map(t => (
@@ -892,16 +916,17 @@ export default function Ribbon(p: RibbonProps) {
                         alignSelf: "stretch", fontWeight: 600, minHeight: 13, letterSpacing: "0.02em" }}>
             {activeSculptTool ? activeSculptTool.short : "pick a tool"}
           </div>
-          <div style={rbGroupLabel}>Sculpt <span style={{ ...expBadge, marginLeft: 2 }}>exp</span></div>
+          <div style={rbGroupLabel}>Sculpt <span style={expBadge({ marginLeft: 2 })}>exp</span></div>
         </div>
         <div style={rbDivider} />
 
         {/* Sculpt brush parameters — strength / radius / softness + falloff profile */}
         <div style={rbGroup}>
           <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
-            <span style={{ color: "#83786c", fontSize: 10, minWidth: 46 }}>Strength</span>
+            <span style={{ color: "#83786c", fontSize: 10, minWidth: 46 }}>{p.tool === "terrace" ? "Step" : "Strength"}</span>
             <input type="range" min={1} max={8} step={1} value={p.sculptStrength}
               onChange={e => p.setSculptStrength(Number(e.target.value))}
+              title={p.tool === "terrace" ? "Terrace step height, in blocks" : undefined}
               style={{ width: 72, accentColor: "#fb923c", cursor: "pointer" }} />
             <span style={{ color: "#fdba74", fontSize: 11, fontVariantNumeric: "tabular-nums", minWidth: 10 }}>{p.sculptStrength}</span>
           </div>
@@ -937,9 +962,11 @@ export default function Ribbon(p: RibbonProps) {
             ))}
           </div>
           <button onClick={() => p.setSculptAccumulate(!p.sculptAccumulate)}
-            title="Hold-to-build — keep applying while the mouse is held (airbrush)"
+            title={p.sculptAccumulate
+              ? "Live brush ON — terrain deforms live as you drag; stamps build up on dwell (airbrush). Esc reverts the whole stroke."
+              : "Live brush OFF — legacy one-shot: the swept stroke commits as a single uniform shape on release."}
             style={p.sculptAccumulate ? rbActive("#fb923c") : rb}>
-            {p.sculptAccumulate ? "Hold-build ✓" : "Hold-build"}
+            {p.sculptAccumulate ? "Live brush ✓" : "Live brush"}
           </button>
           <button onClick={() => p.setSculptClipToSelection(!p.sculptClipToSelection)}
             title="Constrain sculpt strokes to the active selection"
@@ -965,6 +992,31 @@ export default function Ribbon(p: RibbonProps) {
             <span style={{ color: "#fdba74", fontSize: 10, fontVariantNumeric: "tabular-nums", minWidth: 14 }}>{p.noiseFeatureSize}</span>
           </div>
           <div style={rbGroupLabel}>Noise</div>
+        </div>
+        <div style={rbDivider} />
+        </>)}
+
+        {/* Slope tilt — only meaningful for the Slope tool. Percent grade (rise per 100 blocks
+            of run) along each axis; the anchor is still the first block you press on. */}
+        {p.tool === "slope" && (<>
+        <div style={rbGroup}>
+          <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+            <span style={{ color: "#83786c", fontSize: 10, minWidth: 30 }}>Slope X</span>
+            <input type="range" min={-100} max={100} step={5} value={p.slopeGradeX}
+              onChange={e => p.setSlopeGradeX(Number(e.target.value))}
+              title="Tilt along X — rise in blocks per 100 blocks of run"
+              style={{ width: 72, accentColor: "#fb923c", cursor: "pointer" }} />
+            <span style={{ color: "#fdba74", fontSize: 10, fontVariantNumeric: "tabular-nums", minWidth: 24 }}>{p.slopeGradeX}%</span>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+            <span style={{ color: "#83786c", fontSize: 10, minWidth: 30 }}>Slope Y</span>
+            <input type="range" min={-100} max={100} step={5} value={p.slopeGradeY}
+              onChange={e => p.setSlopeGradeY(Number(e.target.value))}
+              title="Tilt along Y — rise in blocks per 100 blocks of run"
+              style={{ width: 72, accentColor: "#fb923c", cursor: "pointer" }} />
+            <span style={{ color: "#fdba74", fontSize: 10, fontVariantNumeric: "tabular-nums", minWidth: 24 }}>{p.slopeGradeY}%</span>
+          </div>
+          <div style={rbGroupLabel}>Slope</div>
         </div>
         <div style={rbDivider} />
         </>)}
@@ -1007,7 +1059,7 @@ export default function Ribbon(p: RibbonProps) {
         <div style={rbDivider} />
         <div style={rbGroup}>
           <button onClick={p.importSchematic} style={{ ...rb, display: "flex", alignItems: "center", gap: 4 }}>
-            Import Schematic… <span style={expBadge}>exp</span>
+            Import Schematic… <span style={expBadge()}>exp</span>
           </button>
           <div style={rbGroupLabel}>Import</div>
         </div>
@@ -1100,26 +1152,35 @@ export default function Ribbon(p: RibbonProps) {
           <div style={{ display: "flex", gap: 2 }}>
             <button onClick={() => p.setViewMode("topdown")} style={p.viewMode === "topdown" ? rbActive() : rb}>⊞ Top-down</button>
             <button onClick={() => p.setViewMode("zslice")} style={p.viewMode === "zslice" ? rbActive() : rb}>Z-Slice</button>
+            <button onClick={() => p.setViewMode("cutaway")}
+              title="Cutaway — hide everything above the cap Z. Drawing, terrain paste and the cursor readout all target the exposed surface below it, so underground work behaves like surface work."
+              style={p.viewMode === "cutaway" ? rbActive("#a78bfa") : rb}>◪ Cutaway</button>
           </div>
           <button onClick={p.onFitMap} style={rb}>⊡ Fit Map</button>
           <div style={rbGroupLabel}>Map View</div>
         </div>
-        {p.viewMode === "zslice" && (<>
+        {/* One slider, two meanings: the z-slice level, or the cutaway ceiling. */}
+        {(p.viewMode === "zslice" || p.viewMode === "cutaway") && (<>
           <div style={rbDivider} />
           <div style={rbGroup}>
             <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
               <input type="range" min={0} max={p.world?.max_z ?? 63} value={p.zSliceDisplay}
+                aria-label={p.viewMode === "cutaway" ? "Cutaway cap Z" : "Z-slice level"}
                 onChange={e => p.setZSliceDisplay(Number(e.target.value))}
                 onPointerUp={e => p.commitZSlice(Number((e.target as HTMLInputElement).value))}
                 onKeyUp={e => p.commitZSlice(Number((e.target as HTMLInputElement).value))}
-                style={{ width: 120, accentColor: "#3b82f6", cursor: "pointer" }} />
-              <span style={{ color: "#7dd3fc", fontVariantNumeric: "tabular-nums", fontSize: 12, minWidth: 22 }}>{p.zSliceDisplay}</span>
+                style={{ width: 120, accentColor: p.viewMode === "cutaway" ? "#a78bfa" : "#3b82f6", cursor: "pointer" }} />
+              <span style={{ color: p.viewMode === "cutaway" ? "#ddd6fe" : "#7dd3fc", fontVariantNumeric: "tabular-nums", fontSize: 12, minWidth: 22 }}>{p.zSliceDisplay}</span>
             </div>
-            <label style={{ display: "flex", alignItems: "center", gap: 4, cursor: "pointer" }}>
-              <input type="checkbox" checked={p.followSurface} onChange={e => p.setFollowSurface(e.target.checked)} style={{ accentColor: "#3b82f6" }} />
-              <span style={{ color: "#83786c", fontSize: 10 }}>Follow surface</span>
-            </label>
-            <div style={rbGroupLabel}>Z-Slice Level</div>
+            {p.viewMode === "zslice" ? (
+              <label style={{ display: "flex", alignItems: "center", gap: 4, cursor: "pointer" }}>
+                <input type="checkbox" checked={p.followSurface} onChange={e => p.setFollowSurface(e.target.checked)} style={{ accentColor: "#3b82f6" }} />
+                <span style={{ color: "#83786c", fontSize: 10 }}>Follow surface</span>
+              </label>
+            ) : (
+              <span style={{ color: "#83786c", fontSize: 10 }}>Everything above is hidden</span>
+            )}
+            <div style={rbGroupLabel}>{p.viewMode === "cutaway" ? "Cap Z" : "Z-Slice Level"}</div>
           </div>
         </>)}
         <div style={rbDivider} />
@@ -1147,12 +1208,12 @@ export default function Ribbon(p: RibbonProps) {
         <div style={rbGroup}>
           <button onClick={() => p.setShowSlicePanels(!p.showSlicePanels)}
             style={{ ...rb, display: "flex", gap: 4, alignItems: "center", ...(p.showSlicePanels ? { background: "rgba(168,85,247,0.18)", ...accentRing("#a855f7"), color: "#d8b4fe" } : {}) }}>
-            ◫ Quad View <span style={expBadge}>exp</span>
+            ◫ Quad View <span style={expBadge()}>exp</span>
           </button>
           {p.showSlicePanels && (
             <button onClick={() => p.setEnable3dPane(!p.enable3dPane)}
               style={{ ...rb, display: "flex", gap: 4, alignItems: "center", ...(p.enable3dPane ? { background: "rgba(245,158,11,0.18)", ...accentRing("#f59e0b"), color: "#fcd34d" } : {}) }}>
-              3D Pane <span style={expBadge}>exp</span>
+              3D Pane <span style={expBadge()}>exp</span>
             </button>
           )}
           <div style={rbGroupLabel}>Layout</div>
@@ -1162,7 +1223,7 @@ export default function Ribbon(p: RibbonProps) {
           <div style={rbDivider} />
           <div style={rbGroup}>
             <button onClick={p.openTemplateFile} style={{ ...rb, display: "flex", gap: 4, alignItems: "center" }}>
-              {p.templateLoaded ? "Change Template…" : "Load Eden Template…"} <span style={expBadge}>exp</span>
+              {p.templateLoaded ? "Change Template…" : "Load Eden Template…"} <span style={expBadge()}>exp</span>
               {p.templateLoaded && <span style={{ color: "#4ade80", fontSize: 10 }}>✓</span>}
             </button>
             {p.templateLoaded && (
@@ -1186,7 +1247,7 @@ export default function Ribbon(p: RibbonProps) {
       <div style={rbGroup}>
         <button onClick={p.openTexturePackFile} style={{ ...rb, display: "flex", gap: 4, alignItems: "center" }}>
           {p.texturePackLoaded ? "Change Pack…" : "Load Texture Pack…"}
-          <span style={expBadge}>exp</span>
+          <span style={expBadge()}>exp</span>
           {p.texturePackLoaded && <span style={{ color: "#4ade80", fontSize: 10 }}>✓</span>}
         </button>
         {p.texturePackLoaded && (
@@ -1205,20 +1266,21 @@ export default function Ribbon(p: RibbonProps) {
         <button onClick={() => p.setNightLighting(!p.nightLighting)}
           title="Lamp point-lighting for the 3D pane. Performance-intensive: rebuilds all loaded chunk geometry with a per-voxel lamp pass (in GPU mode, forward-lights up to 16 point lights instead)."
           style={p.nightLighting ? rbActive("#facc15") : rb}>
-          Night Lighting <span style={expBadge}>exp</span> <span style={perfBadge}>⚡</span>
+          Night Lighting <span style={expBadge()}>exp</span> <span style={perfBadge()}>⚡</span>
         </button>
         <button onClick={() => p.setShadows3d(!p.shadows3d)}
           disabled={p.gpuShadows}
           title={p.gpuShadows ? "Overridden by GPU Shadows" : "Baked sun shadows. Performance-intensive: a per-voxel sun raymarch runs on every chunk rebuild, and moving the Sun slider reloads all loaded chunks."}
           style={p.shadows3d && !p.gpuShadows ? rbActive("#facc15") : { ...rb, opacity: p.gpuShadows ? 0.4 : 1 }}>
-          Shadows <span style={expBadge}>exp</span> <span style={perfBadge}>⚡</span>
+          Shadows <span style={expBadge()}>exp</span> <span style={perfBadge()}>⚡</span>
         </button>
         <button onClick={() => p.setGpuShadows(!p.gpuShadows)}
           title="Real GPU shadow map (lit material + directional sun). Performance-intensive: a 2048–4096² shadow map is rendered every frame and every mesh casts/receives; cost rises sharply with render distance. Overrides the baked Night/Shadows previews; the Sun slider is free (no reload)."
           style={p.gpuShadows ? rbActive("#38bdf8") : rb}>
-          GPU Shadows <span style={expBadge}>exp</span> <span style={perfBadge}>⚡</span>
+          GPU Shadows <span style={expBadge()}>exp</span> <span style={perfBadge()}>⚡</span>
         </button>
-        <div style={{ display: "flex", alignItems: "center", gap: 4, opacity: sunActive ? 1 : 0.4 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 4, opacity: sunActive ? 1 : 0.4 }}
+          title={sunActive ? "Sun angle: 0 = sunrise, 0.5 = noon, 1 = sunset" : "Turn on Shadows or GPU Shadows — the sun angle only affects shadowed lighting"}>
           <span style={{ color: "#afa69d", fontSize: 10 }}>Sun</span>
           <input type="range" min={0} max={1} step={0.01} value={p.sunTDisplay}
             disabled={!sunActive}
@@ -1228,7 +1290,7 @@ export default function Ribbon(p: RibbonProps) {
             style={{ width: 80, accentColor: p.gpuShadows ? "#38bdf8" : "#facc15", cursor: sunActive ? "pointer" : "default" }} />
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 4, opacity: p.nightLighting ? 1 : 0.4 }}
-          title="Lamp light radius (blocks) for night lighting">
+          title={p.nightLighting ? "Lamp light radius, in blocks" : "Turn on Night Lighting — lamps only cast light at night"}>
           <span style={{ color: "#afa69d", fontSize: 10 }}>Lamp&nbsp;R {Math.round(p.lampRadiusDisplay)}</span>
           <input type="range" min={2} max={32} step={1} value={p.lampRadiusDisplay}
             disabled={!p.nightLighting}
@@ -1242,35 +1304,108 @@ export default function Ribbon(p: RibbonProps) {
     );
   }
 
+  // Sculpt tool picker + brush params — shared renderer used by the 3D tab (SCULPT mode). Same shape
+  // as the Draw tab's Sculpt + Brush groups, reusing the module-scope SCULPT_ALL_TOOLS and the shared
+  // sculpt state so 2D and 3D sculpting are one brush. Amber (#fb923c) matches the Draw-tab affordance.
+  function sculptGroup() {
+    const activeSculptTool = SCULPT_ALL_TOOLS.find(t => t.id === p.tool);
+    return (
+      <>
+        <div style={rbGroup}>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(5, auto)", gap: 3 }}>
+            {SCULPT_ALL_TOOLS.map(t => (
+              <button key={t.id} onClick={() => p.setTool(t.id)} title={t.name}
+                style={{ ...(p.tool === t.id ? rbActive("#fb923c") : rb), padding: "2px 7px", fontSize: 13, lineHeight: "18px" }}>
+                {t.icon}
+              </button>
+            ))}
+          </div>
+          <div style={{ fontSize: 10, color: activeSculptTool ? "#fdba74" : "#61584f", textAlign: "center",
+                        alignSelf: "stretch", fontWeight: 600, minHeight: 13, letterSpacing: "0.02em" }}>
+            {activeSculptTool ? activeSculptTool.short : "pick a tool"}
+          </div>
+          <div style={rbGroupLabel}>Sculpt <span style={expBadge({ marginLeft: 2 })}>exp</span></div>
+        </div>
+        <div style={rbDivider} />
+        <div style={rbGroup}>
+          <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+            <span style={{ color: "#83786c", fontSize: 10, minWidth: 46 }}>{p.tool === "terrace" ? "Step" : "Strength"}</span>
+            <input type="range" min={1} max={8} step={1} value={p.sculptStrength}
+              onChange={e => p.setSculptStrength(Number(e.target.value))}
+              style={{ width: 72, accentColor: "#fb923c", cursor: "pointer" }} />
+            <span style={{ color: "#fdba74", fontSize: 11, fontVariantNumeric: "tabular-nums", minWidth: 10 }}>{p.sculptStrength}</span>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+            <span style={{ color: "#83786c", fontSize: 10, minWidth: 46 }}>Radius</span>
+            <input type="range" min={1} max={32} step={1} value={p.sculptRadius}
+              onChange={e => p.setSculptRadius(Number(e.target.value))}
+              title="Brush radius in blocks"
+              style={{ width: 72, accentColor: "#fb923c", cursor: "pointer" }} />
+            <span style={{ color: "#fdba74", fontSize: 11, fontVariantNumeric: "tabular-nums", minWidth: 14 }}>{p.sculptRadius}</span>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+            <span style={{ color: "#83786c", fontSize: 10, minWidth: 46 }}>Softness</span>
+            <input type="range" min={0} max={100} step={5} value={Math.round(p.sculptSoftness * 100)}
+              onChange={e => p.setSculptSoftness(Number(e.target.value) / 100)}
+              title="Radial falloff — 0 = hard edges, 100 = full dome (soft rim)"
+              style={{ width: 72, accentColor: "#fb923c", cursor: "pointer" }} />
+            <span style={{ color: "#fdba74", fontSize: 11, fontVariantNumeric: "tabular-nums", minWidth: 24 }}>{Math.round(p.sculptSoftness * 100)}%</span>
+          </div>
+          <div style={rbGroupLabel}>Brush</div>
+        </div>
+      </>
+    );
+  }
+
   // Contextual "3D" tab — building + lighting + textures for the fly-through pane. Only rendered
   // while the fly-view is showing (quad view + 3D pane enabled).
   function renderThreeDTab() {
-    const modeBtn = (m: "off" | "select" | "build", label: string, accent: string) => (
+    const modeBtn = (m: "off" | "select" | "build" | "sculpt", label: string, accent: string) => (
       <button onClick={() => p.setMode3d(m)} style={p.mode3d === m ? rbActive(accent) : rb}
         title={m === "off" ? "Camera only — click/drag orbits or flies" :
                m === "select" ? "Click two blocks to define a 3D selection box" :
-               "Left-click breaks the block you're aiming at; right-click places the build block against that face"}>
+               m === "build" ? "Left-click breaks the block you're aiming at; right-click places the build block against that face" :
+               "Press and hold left to sculpt terrain under the cursor/crosshair"}>
         {label}
       </button>
     );
     return (
       <div style={{ display: "flex", alignItems: "stretch", height: "100%" }}>
         <div style={rbGroup}>
-          <div style={{ display: "flex", gap: 4 }}>
+          <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
             {modeBtn("off", "◎ Camera", "#afa69d")}
             {modeBtn("select", "▣ Select", "#60a5fa")}
             {modeBtn("build", "✏ Build", "#22c55e")}
+            {modeBtn("sculpt", "⛰ Sculpt", "#fb923c")}
           </div>
           <div style={rbGroupLabel}>3D Mode</div>
         </div>
         <div style={rbDivider} />
-        <div style={{ ...rbGroup, opacity: p.mode3d === "build" ? 1 : 0.5 }}>
-          <BlockPaintPicker mode="fill" blockType={p.build3dBlock} paint={p.build3dPaint}
-            onBlockTypeChange={bt => { if (bt !== null) p.setBuild3dBlock(bt); }}
-            onPaintChange={paint => p.setBuild3dPaint(paint ?? 0)}
-            texturePack={p.texturePack} />
-          <div style={rbGroupLabel}>Build Block</div>
-        </div>
+        {p.mode3d === "sculpt" ? (
+          // Sculpt mode: the shared sculpt tool picker + brush params (same as the Draw tab). Replaces
+          // the Build Block group, which is irrelevant while sculpting.
+          sculptGroup()
+        ) : (
+          /* Compact swatch button → anchored popover (same machinery as the gradient-to picker).
+             The inline picker overflowed the 96 px ribbon body. Dimmed unless in build mode. */
+          <div style={{ ...rbGroup, opacity: p.mode3d === "build" ? 1 : 0.5 }}>
+            <button onClick={(e) => togglePicker(e, "build-3d")}
+              title="Block placed by right-click in 3D build mode"
+              style={{ ...rb, display: "flex", gap: 6, alignItems: "center", background: openPicker?.type === "build-3d" ? "rgba(255,255,255,0.1)" : rb.background }}>
+              <span style={{
+                width: 14, height: 14, borderRadius: 3, flexShrink: 0,
+                boxShadow: "inset 0 0 0 1px rgba(0,0,0,.5)",
+                background: swatchBg(p.build3dBlock, p.build3dPaint),
+                imageRendering: p.texturePack ? "pixelated" : undefined,
+              }} />
+              <span style={{ maxWidth: 84, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 11 }}>
+                {blockDisplayName(p.build3dBlock)}{p.build3dPaint > 0 ? ` #${p.build3dPaint}` : ""}
+              </span>
+              <span style={{ color: "#61584f", fontSize: 9 }}>▾</span>
+            </button>
+            <div style={rbGroupLabel}>Build Block</div>
+          </div>
+        )}
         <div style={rbDivider} />
         {lightingGroup()}
         <div style={rbDivider} />
@@ -1386,6 +1521,7 @@ export default function Ribbon(p: RibbonProps) {
             <span style={{ color:"#61584f",fontSize:9 }}>▾</span>
           </button>
           <button onClick={p.fillSelection} disabled={!p.rawBounds}
+            title={p.rawBounds ? "Fill the selection with the active block" : "Make a selection first"}
             style={{ ...rb, opacity: p.rawBounds ? 1 : 0.35, cursor: p.rawBounds ? "pointer" : "not-allowed", ...accentRing("#f59e0b"), color: "#fcd34d" }}>
             Fill Selection
           </button>
@@ -1415,6 +1551,7 @@ export default function Ribbon(p: RibbonProps) {
               style={p.gradientIncludeAir ? rbActive("#f59e0b") : { ...rb, padding: "2px 6px" }}>+Air</button>
           </div>
           <button onClick={p.applyGradientFill} disabled={!p.rawBounds}
+            title={p.rawBounds ? "Blend the active block into the target block across the selection" : "Make a selection first"}
             style={{ ...rb, opacity: p.rawBounds ? 1 : 0.35, cursor: p.rawBounds ? "pointer" : "not-allowed", ...accentRing("#f59e0b"), color: "#fcd34d" }}>
             Gradient Fill
           </button>
@@ -1438,6 +1575,7 @@ export default function Ribbon(p: RibbonProps) {
             <button onClick={() => { p.setFilterBlockType(null); p.setFilterPaint(null); p.setFilterInvert(false); }} style={rb}>Clear</button>
           </div>
           <button onClick={p.deleteBlocks} disabled={!p.rawBounds}
+            title={p.rawBounds ? "Delete blocks in the selection (respects the replace filter)" : "Make a selection first"}
             style={{ ...rb, opacity: p.rawBounds ? 1 : 0.35, cursor: p.rawBounds ? "pointer" : "not-allowed", ...accentRing("#ef4444"), color: "#fca5a5" }}>
             {p.filterBlockType !== null ? (p.filterInvert ? "Delete except filter" : "Delete filtered") : "Delete all"}
           </button>
@@ -1468,7 +1606,11 @@ export default function Ribbon(p: RibbonProps) {
               <input type="checkbox" checked={extrudeIgnoreAir} onChange={e => setExtrudeIgnoreAir(e.target.checked)} style={{ accentColor: "#3b82f6" }} />
               <span style={{ color: "#83786c", fontSize: 10 }}>skip air</span>
             </label>
+            {/* Count defaults to 0, so this button starts disabled — say so, or it reads as broken. */}
             <button onClick={() => p.onExtrude(extrudeIgnoreAir)} disabled={!sel || p.extrudeCount === 0}
+              title={!sel ? "Make a selection first"
+                : p.extrudeCount === 0 ? "Set the number of copies above 0"
+                : `Repeat the selection ${p.extrudeCount}× along ${p.extrudeAxis}`}
               style={{ ...rb, opacity: (sel && p.extrudeCount > 0) ? 1 : 0.35, ...accentRing("#3b82f6"), color: "#93c5fd", fontWeight: 600 }}>
               Extrude {p.extrudeAxis}
             </button>
@@ -1653,7 +1795,7 @@ export default function Ribbon(p: RibbonProps) {
           {appMenuOpen && (
             <div style={{ ...dropStyle, left: 0, minWidth: 170 }}>
               <button style={mi} onMouseEnter={miHover} onMouseLeave={miLeave} onClick={() => { setAppMenuOpen(false); p.setShowSettings(true); }}>⚙ Settings…</button>
-              <button style={mi} onMouseEnter={miHover} onMouseLeave={miLeave} onClick={() => { setAppMenuOpen(false); p.setShowHelp(true); }}>? Help <span style={{ fontSize: 9, color: "#f59e0b", background: "rgba(245,158,11,0.12)", border: "1px solid rgba(245,158,11,0.3)", borderRadius: 3, padding: "0 4px", marginLeft: 4, verticalAlign: "middle", lineHeight: "14px" }}>WIP</span></button>
+              <button style={mi} onMouseEnter={miHover} onMouseLeave={miLeave} onClick={() => { setAppMenuOpen(false); p.setShowHelp(true); }}>? Help <span style={wipBadge({ fontSize: 9, padding: "0 4px", marginLeft: 4, verticalAlign: "middle" })}>WIP</span></button>
               <button style={mi} onMouseEnter={miHover} onMouseLeave={miLeave} onClick={() => { setAppMenuOpen(false); p.setShowAbout(true); }}>ℹ About VuencEdit</button>
               <div style={{ height: 1, background: "#312c28", margin: "3px 0" }} />
               <button style={{ ...mi, color: "#f87171" }} onMouseEnter={miHover} onMouseLeave={miLeave} onClick={() => { setAppMenuOpen(false); p.closeWorld(); }}>✕ Close World</button>
@@ -1706,6 +1848,7 @@ export default function Ribbon(p: RibbonProps) {
               )}
               <div style={{ height: 1, background: "#312c28", margin: "3px 0" }} />
               <button style={{ ...mi, display: "flex", justifyContent: "space-between", opacity: (!p.sourcePath || p.saving) ? 0.35 : 1, cursor: (!p.sourcePath || p.saving) ? "not-allowed" : "pointer" }}
+                title={!p.sourcePath ? "This world has never been saved to a file — use Save As…" : undefined}
                 onMouseEnter={miHover} onMouseLeave={miLeave}
                 onClick={() => { if (!p.sourcePath || p.saving) return; setFileMenuOpen(false); p.saveWorld(p.sourcePath); }}>
                 {p.saving ? "Saving…" : "Save"} <span style={miShortcut}>⌘S</span>
@@ -1732,7 +1875,7 @@ export default function Ribbon(p: RibbonProps) {
                   {p.world && (
                     <button style={{ ...mi, paddingLeft: 20, display: "flex", alignItems: "center", gap: 4 }} onMouseEnter={miHover} onMouseLeave={miLeave}
                       onClick={() => { if (p.exportingObj) return; setFileMenuOpen(false); setShowExportSub(false); p.exportObj(); }}>
-                      {p.exportingObj ? "Exporting…" : "Export OBJ…"} <span style={expBadge}>exp</span>
+                      {p.exportingObj ? "Exporting…" : "Export OBJ…"} <span style={expBadge()}>exp</span>
                     </button>
                   )}
                   {p.world && (
@@ -1745,7 +1888,7 @@ export default function Ribbon(p: RibbonProps) {
               )}
               {p.world && <button style={mi} onMouseEnter={miHover} onMouseLeave={miLeave} onClick={() => { setFileMenuOpen(false); p.loadPrefab(); }}>Load Prefab</button>}
               {p.world && <button style={{ ...mi, display: "flex", alignItems: "center", gap: 4 }} onMouseEnter={miHover} onMouseLeave={miLeave} onClick={() => { setFileMenuOpen(false); p.importSchematic(); }}>
-                Import Schematic… <span style={expBadge}>exp</span>
+                Import Schematic… <span style={expBadge()}>exp</span>
               </button>}
               <div style={{ height: 1, background: "#312c28", margin: "3px 0" }} />
               {p.world && p.templateLoaded && (
@@ -1973,6 +2116,11 @@ export default function Ribbon(p: RibbonProps) {
               onBlockTypeChange={bt => { if (bt !== null) p.setFillBlockType(bt); }}
               onPaintChange={paint => p.setFillPaint(paint ?? 0)}
               onFill={p.fillSelection} selectionExists={!!p.rawBounds}
+              texturePack={p.texturePack} />
+          ) : openPicker.type === "build-3d" ? (
+            <BlockPaintPicker mode="fill" blockType={p.build3dBlock} paint={p.build3dPaint}
+              onBlockTypeChange={bt => { if (bt !== null) p.setBuild3dBlock(bt); }}
+              onPaintChange={paint => p.setBuild3dPaint(paint ?? 0)}
               texturePack={p.texturePack} />
           ) : openPicker.type === "gradient-to" ? (
             <BlockPaintPicker mode="fill" blockType={p.gradientToBlock} paint={p.gradientToPaint}

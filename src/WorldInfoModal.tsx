@@ -88,7 +88,13 @@ export default function WorldInfoModal({ onClose }: { onClose: () => void }) {
           <div style={section}>
             <div style={sectionLabel}>Identity</div>
             <Row k="Name" v={info.name || "—"} />
-            <Row k="Format" v={info.max_z === 255 ? "New Dawn 256z" : "Legacy 64z"} />
+            <Row k="Format" v={
+              <span title={info.max_z === 255
+                ? "New Dawn (256z) format — worlds up to 256 blocks tall"
+                : "Legacy (64z) format — worlds up to 64 blocks tall"}>
+                {info.max_z === 255 ? "New Dawn 256z" : "Legacy 64z"}
+              </span>
+            } />
             <Row k="Version" v={info.version} />
             <Row k="Level seed" v={info.level_seed === 0 ? <span style={{ color: "#61584f" }}>0 (unset)</span> : info.level_seed} />
           </div>

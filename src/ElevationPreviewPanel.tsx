@@ -332,19 +332,30 @@ export default function ElevationPreviewPanel({
     ctx.textBaseline = "middle";
     ctx.textAlign = "left";
 
-    // Z-edge grip indicator (A1)
-    if (hoverZEdge) {
-      const gy = hoverZEdge.y;
-      ctx.fillStyle = "rgba(175,166,157,0.85)";
-      for (let i = -1; i <= 1; i++) {
-        ctx.beginPath();
-        ctx.arc(canvasW / 2 + i * 7, gy, 2.5, 0, Math.PI * 2);
-        ctx.fill();
+    // Z-edge resize grips. Drawn at rest (dim) in both sections so the gesture is visible without
+    // first hovering the 5px hit-zone; the hovered one brightens and gains the hint caption.
+    if (onZRangeChange) {
+      const drawGrip = (gy: number, on: boolean) => {
+        ctx.fillStyle = on ? "rgba(226,222,217,0.95)" : "rgba(175,166,157,0.4)";
+        for (let i = -1; i <= 1; i++) {
+          ctx.beginPath();
+          ctx.arc(canvasW / 2 + i * 7, gy, on ? 2.5 : 2, 0, Math.PI * 2);
+          ctx.fill();
+        }
+        if (on) {
+          ctx.fillStyle = "rgba(175,166,157,0.75)";
+          ctx.font = "8px monospace";
+          ctx.textAlign = "left";
+          ctx.fillText("drag to resize Z", canvasW / 2 + 14, gy);
+        }
+      };
+      for (const layout of [frontLayoutRef.current, sideLayoutRef.current]) {
+        const { oy, scale } = layout;
+        for (const gy of [oy + (maxZ - sel.z_max) * scale, oy + (maxZ - sel.z_min + 1) * scale]) {
+          if (gy < 0 || gy > canvasH) continue;
+          drawGrip(gy, hoverZEdge != null && Math.abs(hoverZEdge.y - gy) < 0.5);
+        }
       }
-      ctx.fillStyle = "rgba(175,166,157,0.75)";
-      ctx.font = "8px monospace";
-      ctx.textAlign = "left";
-      ctx.fillText("drag to resize Z", canvasW / 2 + 14, gy);
       ctx.textAlign = "left";
     }
 
@@ -407,11 +418,12 @@ export default function ElevationPreviewPanel({
     }}>
       {/* Resize handle */}
       <div
+        title="Drag to resize"
         style={{
           position: "absolute", top: 2, left: 2,
           width: 14, height: 14, cursor: "nwse-resize",
           display: "flex", alignItems: "center", justifyContent: "center",
-          color: "#61584f", fontSize: 9, lineHeight: 1, borderRadius: 2,
+          color: "#61584f", fontSize: 11, lineHeight: 1, borderRadius: 2,
         }}
         onPointerDown={(e) => {
           resizeDragRef.current = { startX: e.clientX, startY: e.clientY, startW: canvasW, startH: canvasH };
@@ -427,7 +439,7 @@ export default function ElevationPreviewPanel({
           setCanvasH(Math.max(MIN_H, Math.min(MAX_H, drag.startH + dy)));
         }}
         onPointerUp={() => { resizeDragRef.current = null; }}
-      >◤</div>
+      >⤡</div>
 
       <div style={{ display: "flex", alignItems: "center", paddingLeft: 14 }}>
         <span style={{ color: "#93c5fd", fontWeight: 700, fontSize: 10, letterSpacing: "0.08em" }}>ELEVATION VIEW</span>

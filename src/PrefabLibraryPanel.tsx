@@ -3,6 +3,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { openPath } from "@tauri-apps/plugin-opener";
 import { decodeU8 } from "./codec";
 import { EDEN_TEAL_READABLE, glassPanel, chromeButton, accentRing } from "./designTokens";
+import { useFocusTrap } from "./Modal";
+import { isTypingTarget } from "./viewportUtils";
 import type { ClipboardInfo, PreviewDataRaw } from "./types";
 
 interface PrefabEntry {
@@ -88,6 +90,30 @@ export default function PrefabLibraryPanel({
 
   useEffect(() => { localStorage.setItem(SORT_LS, sort); }, [sort]);
   useEffect(() => { localStorage.setItem(VIEW_LS, view); }, [view]);
+
+  // Keyboard a11y: Tab-cycling is trapped like a real dialog (Modal's own logic, shared via
+  // useFocusTrap), but this panel is dockable rather than modal — it's meant to stay open while
+  // the user clicks around the map to place a paste — so it deliberately does NOT auto-steal focus
+  // on open the way Modal does.
+  const panelRef = useRef<HTMLDivElement>(null);
+  useFocusTrap(panelRef, false);
+
+  // Escape steps back one state at a time, same convention as the rest of the app (context menu →
+  // paste lock → tool → selection): cancel an in-progress rename or delete-confirm before closing
+  // the whole panel, so an accidental Escape while renaming doesn't also dismiss the gallery.
+  useEffect(() => {
+    const el = panelRef.current;
+    if (!el) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape" || (isTypingTarget(e.target) && renaming === null)) return;
+      e.stopPropagation();
+      if (renaming !== null) { setRenaming(null); return; }
+      if (confirmDelete !== null) { setConfirmDelete(null); return; }
+      onClose();
+    };
+    el.addEventListener("keydown", onKey);
+    return () => el.removeEventListener("keydown", onKey);
+  }, [onClose, renaming, confirmDelete]);
 
   const cacheKey = (e: PrefabEntry) => `${e.path}::${e.modified}`;
 
@@ -268,10 +294,11 @@ export default function PrefabLibraryPanel({
   };
 
   return (
-    <div style={panelStyle}>
+    <div ref={panelRef} role="dialog" aria-label="Prefab Library" tabIndex={-1} style={panelStyle}>
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
         <span style={{ fontWeight: 700, color: EDEN_TEAL_READABLE, fontSize: 12 }}>Prefab Library</span>
         <button onClick={onClose}
+          title="Close the prefab library" aria-label="Close prefab library"
           style={{ background: "none", border: "none", color: "#83786c", fontSize: 14, cursor: "pointer", lineHeight: 1 }}
         >×</button>
       </div>
