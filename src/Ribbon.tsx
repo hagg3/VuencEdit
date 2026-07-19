@@ -74,8 +74,9 @@ export interface RibbonProps {
   handleZMin: (v: string) => void; handleZMax: (v: string) => void;
   // View
   viewMode: MapViewMode; setViewMode: (v: MapViewMode) => void;
-  zSliceZ: number; zSliceDisplay: number;
-  setZSliceDisplay: (v: number) => void; commitZSlice: (v: number) => void;
+  // Committed slice level; the drag-time display value is Ribbon-local state (synced from this),
+  // so dragging the slider re-renders only the Ribbon, not all of App. Same for sunT/lampRadius below.
+  zSliceZ: number; commitZSlice: (v: number) => void;
   followSurface: boolean; setFollowSurface: (v: boolean) => void;
   renderMode: "tiled" | "full" | "axo"; setRenderMode: (v: "tiled" | "full" | "axo") => void;
   axoSkew: number; setAxoSkew: (v: number) => void;
@@ -83,13 +84,13 @@ export interface RibbonProps {
   enable3dPane: boolean; setEnable3dPane: (v: boolean) => void;
   // 3D fly-view interaction (the contextual "3D" tab). Decoupled from the map's Draw/Select tools.
   mode3d: "off" | "select" | "build" | "sculpt"; setMode3d: (v: "off" | "select" | "build" | "sculpt") => void;
-  build3dBlock: number; build3dPaint: number;
-  setBuild3dBlock: (v: number) => void; setBuild3dPaint: (v: number) => void;
+  /** Auto-orient directional blocks (ramps/wedges/doors) to the player's facing when placing in 3D build. */
+  autoOrient3d: boolean; setAutoOrient3d: (v: boolean) => void;
   nightLighting: boolean; setNightLighting: (v: boolean) => void;
   shadows3d: boolean; setShadows3d: (v: boolean) => void;
   gpuShadows: boolean; setGpuShadows: (v: boolean) => void;
-  sunTDisplay: number; setSunTDisplay: (v: number) => void; commitSunT: (v: number) => void;
-  lampRadiusDisplay: number; setLampRadiusDisplay: (v: number) => void; commitLampRadius: (v: number) => void;
+  sunT: number; commitSunT: (v: number) => void;
+  lampRadius: number; commitLampRadius: (v: number) => void;
   onFitMap: () => void;
   // Template
   templateLoaded: boolean; templatePath: string | null;
@@ -157,7 +158,8 @@ export interface RibbonProps {
   recentWorlds: RecentWorld[];
   openFile: () => void; openFileAt: (path: string) => void;
   saveWorld: (path: string) => void; saveWorldAs: () => void;
-  exportPng: () => void; exportObj: () => void; exportJson: () => void;
+  exportPng: () => void; exportObj: () => void; exportJson: () => void; exportVmf: () => void;
+  enableExperimentalExport: boolean;
   loadPrefab: () => void; importSchematic: () => void;
   showPrefabLibrary: boolean; onTogglePrefabLibrary: () => void;
   moveWithContents: boolean; setMoveWithContents: (fn: (v: boolean) => boolean) => void;
@@ -316,6 +318,22 @@ export default function Ribbon(p: RibbonProps) {
   const registerTabSetter = p.registerTabSetter;
   useEffect(() => { registerTabSetter?.(setActiveTab); }, [registerTabSetter]);
 
+  // Drag-time display values for the z-slice / sun-angle / lamp-radius sliders. These live here (not
+  // in App) so dragging a slider re-renders only the Ribbon subtree; the (expensive) committed value
+  // change flows on pointer-up via commit*. Each mirrors its committed prop, re-syncing whenever App
+  // changes the committed value out-of-band (world load reset, follow-surface, Settings apply) via a
+  // render-phase reset (React's recommended derived-state pattern — no effect, no wasted second pass,
+  // and each tracks its own prop so a commit to one slider never yanks another mid-drag).
+  const [zSliceDisplay, setZSliceDisplay] = useState(p.zSliceZ);
+  const [prevZSlice, setPrevZSlice] = useState(p.zSliceZ);
+  if (prevZSlice !== p.zSliceZ) { setPrevZSlice(p.zSliceZ); setZSliceDisplay(p.zSliceZ); }
+  const [sunTDisplay, setSunTDisplay] = useState(p.sunT);
+  const [prevSunT, setPrevSunT] = useState(p.sunT);
+  if (prevSunT !== p.sunT) { setPrevSunT(p.sunT); setSunTDisplay(p.sunT); }
+  const [lampRadiusDisplay, setLampRadiusDisplay] = useState(p.lampRadius);
+  const [prevLampRadius, setPrevLampRadius] = useState(p.lampRadius);
+  if (prevLampRadius !== p.lampRadius) { setPrevLampRadius(p.lampRadius); setLampRadiusDisplay(p.lampRadius); }
+
   // Dropdown menus
   const [appMenuOpen, setAppMenuOpen] = useState(false);
   const [fileMenuOpen, setFileMenuOpen] = useState(false);
@@ -327,6 +345,21 @@ export default function Ribbon(p: RibbonProps) {
   // Unified picker portal state
   const [openPicker, setOpenPicker] = useState<PickerState | null>(null);
   const pickerPortalRef = useRef<HTMLDivElement>(null);
+
+  // Clamp the picker portal into the viewport after mount — its size varies by picker type/content
+  // and isn't known until rendered, so this measures and nudges it back on-screen (same pattern as
+  // App's context-menu clamp). Converges to a no-op on the re-run its own repositioning triggers.
+  useEffect(() => {
+    if (!openPicker) return;
+    const el = pickerPortalRef.current;
+    if (!el) return;
+    const r = el.getBoundingClientRect();
+    const nx = r.right > window.innerWidth ? Math.max(0, window.innerWidth - r.width - 4) : openPicker.left;
+    const ny = r.bottom > window.innerHeight ? Math.max(0, window.innerHeight - r.height - 4) : openPicker.top;
+    if (nx !== openPicker.left || ny !== openPicker.top) {
+      setOpenPicker(p => p && { ...p, left: nx, top: ny });
+    }
+  }, [openPicker]);
 
   // Ribbon body scroll arrows
   const ribbonBodyRef = useRef<HTMLDivElement>(null);
@@ -402,6 +435,21 @@ export default function Ribbon(p: RibbonProps) {
     document.addEventListener("mousedown", handler);
     return () => document.removeEventListener("mousedown", handler);
   }, [openPicker]);
+
+  // Escape closes menus/picker before App's global shortcut handler sees it (capture phase).
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      if (appMenuOpen || fileMenuOpen || openPicker) {
+        setAppMenuOpen(false);
+        setFileMenuOpen(false); setShowRecentSub(false); setShowExportSub(false);
+        setOpenPicker(null);
+        e.stopPropagation();
+      }
+    };
+    window.addEventListener("keydown", handler, true);
+    return () => window.removeEventListener("keydown", handler, true);
+  }, [appMenuOpen, fileMenuOpen, openPicker]);
 
   // Picker toggle helpers
   function togglePicker(e: React.MouseEvent, type: PickerState["type"]) {
@@ -567,6 +615,83 @@ export default function Ribbon(p: RibbonProps) {
     boxShadow: "0 10px 28px rgba(0,0,0,0.75), inset 0 1px 0 rgba(255,255,255,.06)",
   };
 
+  // ── shared hotbar (pinned + recent) — used by both the Draw tab's Palette group and the 3D
+  // tab's Build Block group, since Phase 1 unified the 2D fill block and the 3D armed block. ──
+  const hotbarIsActive = (b: {type:number;paint:number}) => b.type === p.fillBlockType && b.paint === p.fillPaint;
+  const hotbarSlotBase: React.CSSProperties = {
+    width: 24, height: 24, borderRadius: 3, cursor: "pointer", flexShrink: 0,
+    position: "relative", display: "flex", alignItems: "center", justifyContent: "center",
+  };
+  const hotbarCornerBadge: React.CSSProperties = {
+    position: "absolute", top: 0, right: 0, width: 10, height: 10,
+    borderRadius: "0 3px 0 3px", background: "rgba(0,0,0,0.75)", display: "flex",
+    alignItems: "center", justifyContent: "center", fontSize: 8, color: "#ebe9e7", zIndex: 1,
+  };
+  const hotbarLetterOverlay = (bt: number) => {
+    const l = blockDisplayName(bt)[0]?.toUpperCase() ?? "";
+    return l ? <span style={{ position:"absolute",bottom:1,left:2,fontSize:7,fontWeight:700,color:"rgba(255,255,255,0.7)",textShadow:"0 0 2px rgba(0,0,0,0.9)",pointerEvents:"none",userSelect:"none" }}>{l}</span> : null;
+  };
+  function hotbarPinToSlot(b: {type:number;paint:number}) {
+    p.setPinnedBlocks(prev => {
+      const n = [...prev];
+      const i = n.findIndex(s => s === null);
+      if (i !== -1) { n[i] = b; return n; }
+      n[4] = b; return n;
+    });
+  }
+  function hotbarGroup() {
+    return (
+      <div style={{
+        display: "flex", alignItems: "center", gap: 3,
+        background: "rgba(255,255,255,0.03)", border: "1px solid #312c28",
+        borderRadius: 4, padding: "3px 4px",
+        borderBottom: "1px solid rgba(255,255,255,0.06)",
+      }}>
+        <span style={{ color: "#4b443d", fontSize: 8, fontWeight: 700, letterSpacing: "0.05em", userSelect: "none" }}>PINNED</span>
+        {p.pinnedBlocks.map((b, i) => {
+          const key = `pinned-${i}`;
+          const hovered = p.hotbarHover === key;
+          const active = b ? hotbarIsActive(b) : false;
+          const [r, g, bl] = b ? resolveColor(b.type, b.paint) : [30, 40, 60];
+          const swUrl = b && p.texturePack ? tintedSwatch(b.type, b.paint, p.texturePack) : null;
+          return (
+            <div key={i} style={{ ...hotbarSlotBase, width: 26, height: 26, background: b ? `rgb(${r},${g},${bl})` : "rgba(255,255,255,0.03)", backgroundImage: swUrl ? `url(${swUrl})` : undefined, backgroundSize: "cover", border: active ? "2px solid #fff" : b ? "1px solid rgba(255,255,255,0.18)" : "1px dashed #4b443d", outline: active ? "1px solid #a78bfa" : "none", outlineOffset: 1 }}
+              title={b ? `${blockDisplayName(b.type)}${b.paint > 0 ? ` p${b.paint}` : ""} · key ${i+1}` : `Empty pin slot ${i+1}`}
+              onClick={() => b && (p.setFillBlockType(b.type), p.setFillPaint(b.paint))}
+              onMouseEnter={() => p.setHotbarHover(key)} onMouseLeave={() => p.setHotbarHover(null)}>
+              <span style={{ position:"absolute",top:0,left:2,fontSize:6,color:"rgba(255,255,255,0.35)",lineHeight:1,pointerEvents:"none",userSelect:"none" }}>{i+1}</span>
+              {b && hotbarLetterOverlay(b.type)}
+              {hovered && b && <div style={hotbarCornerBadge} onClick={e => { e.stopPropagation(); p.setPinnedBlocks(prev => { const n=[...prev]; n[i]=null; return n; }); p.setHotbarHover(null); }} title="Unpin">×</div>}
+            </div>
+          );
+        })}
+        <div style={{ width: 1, background: "#312c28", alignSelf: "stretch", margin: "0 2px" }} />
+        <span style={{ color: "#4b443d", fontSize: 8, fontWeight: 700, letterSpacing: "0.05em", userSelect: "none" }}>RECENT</span>
+        {p.recentBlocks.length === 0
+          ? <span style={{ color: "#312c28", fontSize: 10, fontStyle: "italic" }}>none</span>
+          : p.recentBlocks.map((b, i) => {
+            const key = `recent-${i}`;
+            const hovered = p.hotbarHover === key;
+            const active = hotbarIsActive(b);
+            const [r, g, bl] = resolveColor(b.type, b.paint);
+            const alreadyPinned = p.pinnedBlocks.some(pb => pb && pb.type === b.type && pb.paint === b.paint);
+            const swUrl2 = p.texturePack ? tintedSwatch(b.type, b.paint, p.texturePack) : null;
+            return (
+              <div key={i} style={{ ...hotbarSlotBase, width: 26, height: 26, background: `rgb(${r},${g},${bl})`, backgroundImage: swUrl2 ? `url(${swUrl2})` : undefined, backgroundSize: "cover", border: active ? "2px solid #fff" : "1px solid rgba(255,255,255,0.18)", outline: active ? "1px solid #f472b6" : "none", outlineOffset: 1, opacity: alreadyPinned ? 0.5 : 1 }}
+                title={`${blockDisplayName(b.type)}${b.paint > 0 ? ` p${b.paint}` : ""} · key ${i+6}`}
+                onClick={() => { p.setFillBlockType(b.type); p.setFillPaint(b.paint); }}
+                onMouseEnter={() => p.setHotbarHover(key)} onMouseLeave={() => p.setHotbarHover(null)}>
+                <span style={{ position:"absolute",top:0,left:2,fontSize:6,color:"rgba(255,255,255,0.35)",lineHeight:1,pointerEvents:"none",userSelect:"none" }}>{i+6}</span>
+                {hotbarLetterOverlay(b.type)}
+                {hovered && !alreadyPinned && <div style={hotbarCornerBadge} onClick={e => { e.stopPropagation(); hotbarPinToSlot(b); p.setHotbarHover(null); }} title="Pin">↑</div>}
+              </div>
+            );
+          })
+        }
+      </div>
+    );
+  }
+
   // ── tab content renderers ──────────────────────────────────────────────────
 
   function renderHomeTab() {
@@ -725,32 +850,10 @@ export default function Ribbon(p: RibbonProps) {
       background: "rgba(255,255,255,0.07)", border: "1px solid rgba(255,255,255,0.12)",
       borderRadius: 2, padding: "0 2px", lineHeight: "12px", marginLeft: 3, flexShrink: 0,
     };
-    const isActive = (b: {type:number;paint:number}) => b.type === p.fillBlockType && b.paint === p.fillPaint;
     const activeSwatchUrl = p.texturePack ? tintedSwatch(p.fillBlockType, p.fillPaint, p.texturePack) : null;
     // Defined before the JSX so the prevToolRef mutation doesn't trip react-hooks/immutability
     // (mutating a value read earlier in JSX is disallowed).
     const armEyedropper = () => { p.prevToolRef.current = p.tool === "eyedropper" ? "pen" : p.tool as Tool; p.setTool("eyedropper"); };
-    const slotBase: React.CSSProperties = {
-      width: 24, height: 24, borderRadius: 3, cursor: "pointer", flexShrink: 0,
-      position: "relative", display: "flex", alignItems: "center", justifyContent: "center",
-    };
-    const cornerBadge: React.CSSProperties = {
-      position: "absolute", top: 0, right: 0, width: 10, height: 10,
-      borderRadius: "0 3px 0 3px", background: "rgba(0,0,0,0.75)", display: "flex",
-      alignItems: "center", justifyContent: "center", fontSize: 8, color: "#ebe9e7", zIndex: 1,
-    };
-    const letterOverlay = (bt: number) => {
-      const l = blockDisplayName(bt)[0]?.toUpperCase() ?? "";
-      return l ? <span style={{ position:"absolute",bottom:1,left:2,fontSize:7,fontWeight:700,color:"rgba(255,255,255,0.7)",textShadow:"0 0 2px rgba(0,0,0,0.9)",pointerEvents:"none",userSelect:"none" }}>{l}</span> : null;
-    };
-    function pinToSlot(b: {type:number;paint:number}) {
-      p.setPinnedBlocks(prev => {
-        const n = [...prev];
-        const i = n.findIndex(s => s === null);
-        if (i !== -1) { n[i] = b; return n; }
-        n[4] = b; return n;
-      });
-    }
     return (
       <div style={{ display: "flex", alignItems: "stretch", height: "100%" }}>
         <div style={{ ...rbGroup, minWidth: 150 }}>
@@ -800,54 +903,7 @@ export default function Ribbon(p: RibbonProps) {
             </button>
             {/* Quick gallery: pinned + recent, plus Browse-all button */}
             <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
-              <div style={{
-                display: "flex", alignItems: "center", gap: 3,
-                background: "rgba(255,255,255,0.03)", border: "1px solid #312c28",
-                borderRadius: 4, padding: "3px 4px",
-                borderBottom: "1px solid rgba(255,255,255,0.06)",
-              }}>
-            <span style={{ color: "#4b443d", fontSize: 8, fontWeight: 700, letterSpacing: "0.05em", userSelect: "none" }}>PINNED</span>
-            {p.pinnedBlocks.map((b, i) => {
-              const key = `pinned-${i}`;
-              const hovered = p.hotbarHover === key;
-              const active = b ? isActive(b) : false;
-              const [r, g, bl] = b ? resolveColor(b.type, b.paint) : [30, 40, 60];
-              const swUrl = b && p.texturePack ? tintedSwatch(b.type, b.paint, p.texturePack) : null;
-              return (
-                <div key={i} style={{ ...slotBase, width: 26, height: 26, background: b ? `rgb(${r},${g},${bl})` : "rgba(255,255,255,0.03)", backgroundImage: swUrl ? `url(${swUrl})` : undefined, backgroundSize: "cover", border: active ? "2px solid #fff" : b ? "1px solid rgba(255,255,255,0.18)" : "1px dashed #4b443d", outline: active ? "1px solid #a78bfa" : "none", outlineOffset: 1 }}
-                  title={b ? `${blockDisplayName(b.type)}${b.paint > 0 ? ` p${b.paint}` : ""} · key ${i+1}` : `Empty pin slot ${i+1}`}
-                  onClick={() => b && (p.setFillBlockType(b.type), p.setFillPaint(b.paint))}
-                  onMouseEnter={() => p.setHotbarHover(key)} onMouseLeave={() => p.setHotbarHover(null)}>
-                  <span style={{ position:"absolute",top:0,left:2,fontSize:6,color:"rgba(255,255,255,0.35)",lineHeight:1,pointerEvents:"none",userSelect:"none" }}>{i+1}</span>
-                  {b && letterOverlay(b.type)}
-                  {hovered && b && <div style={cornerBadge} onClick={e => { e.stopPropagation(); p.setPinnedBlocks(prev => { const n=[...prev]; n[i]=null; return n; }); p.setHotbarHover(null); }} title="Unpin">×</div>}
-                </div>
-              );
-            })}
-            <div style={{ width: 1, background: "#312c28", alignSelf: "stretch", margin: "0 2px" }} />
-            <span style={{ color: "#4b443d", fontSize: 8, fontWeight: 700, letterSpacing: "0.05em", userSelect: "none" }}>RECENT</span>
-            {p.recentBlocks.length === 0
-              ? <span style={{ color: "#312c28", fontSize: 10, fontStyle: "italic" }}>none</span>
-              : p.recentBlocks.map((b, i) => {
-                const key = `recent-${i}`;
-                const hovered = p.hotbarHover === key;
-                const active = isActive(b);
-                const [r, g, bl] = resolveColor(b.type, b.paint);
-                const alreadyPinned = p.pinnedBlocks.some(pb => pb && pb.type === b.type && pb.paint === b.paint);
-                const swUrl2 = p.texturePack ? tintedSwatch(b.type, b.paint, p.texturePack) : null;
-                return (
-                  <div key={i} style={{ ...slotBase, width: 26, height: 26, background: `rgb(${r},${g},${bl})`, backgroundImage: swUrl2 ? `url(${swUrl2})` : undefined, backgroundSize: "cover", border: active ? "2px solid #fff" : "1px solid rgba(255,255,255,0.18)", outline: active ? "1px solid #f472b6" : "none", outlineOffset: 1, opacity: alreadyPinned ? 0.5 : 1 }}
-                    title={`${blockDisplayName(b.type)}${b.paint > 0 ? ` p${b.paint}` : ""} · key ${i+6}`}
-                    onClick={() => { p.setFillBlockType(b.type); p.setFillPaint(b.paint); }}
-                    onMouseEnter={() => p.setHotbarHover(key)} onMouseLeave={() => p.setHotbarHover(null)}>
-                    <span style={{ position:"absolute",top:0,left:2,fontSize:6,color:"rgba(255,255,255,0.35)",lineHeight:1,pointerEvents:"none",userSelect:"none" }}>{i+6}</span>
-                    {letterOverlay(b.type)}
-                    {hovered && !alreadyPinned && <div style={cornerBadge} onClick={e => { e.stopPropagation(); pinToSlot(b); p.setHotbarHover(null); }} title="Pin">↑</div>}
-                  </div>
-                );
-              })
-            }
-              </div>
+              {hotbarGroup()}
               <button onClick={(e) => togglePicker(e, "block-draw")}
                 title="Browse all blocks & paints"
                 style={{ ...rb, display: "flex", gap: 4, alignItems: "center", justifyContent: "center", padding: "2px 8px", background: openPicker?.type === "block-draw" ? "rgba(255,255,255,0.1)" : rb.background }}>
@@ -1164,13 +1220,13 @@ export default function Ribbon(p: RibbonProps) {
           <div style={rbDivider} />
           <div style={rbGroup}>
             <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-              <input type="range" min={0} max={p.world?.max_z ?? 63} value={p.zSliceDisplay}
+              <input type="range" min={0} max={p.world?.max_z ?? 63} value={zSliceDisplay}
                 aria-label={p.viewMode === "cutaway" ? "Cutaway cap Z" : "Z-slice level"}
-                onChange={e => p.setZSliceDisplay(Number(e.target.value))}
+                onChange={e => setZSliceDisplay(Number(e.target.value))}
                 onPointerUp={e => p.commitZSlice(Number((e.target as HTMLInputElement).value))}
                 onKeyUp={e => p.commitZSlice(Number((e.target as HTMLInputElement).value))}
                 style={{ width: 120, accentColor: p.viewMode === "cutaway" ? "#a78bfa" : "#3b82f6", cursor: "pointer" }} />
-              <span style={{ color: p.viewMode === "cutaway" ? "#ddd6fe" : "#7dd3fc", fontVariantNumeric: "tabular-nums", fontSize: 12, minWidth: 22 }}>{p.zSliceDisplay}</span>
+              <span style={{ color: p.viewMode === "cutaway" ? "#ddd6fe" : "#7dd3fc", fontVariantNumeric: "tabular-nums", fontSize: 12, minWidth: 22 }}>{zSliceDisplay}</span>
             </div>
             {p.viewMode === "zslice" ? (
               <label style={{ display: "flex", alignItems: "center", gap: 4, cursor: "pointer" }}>
@@ -1282,19 +1338,19 @@ export default function Ribbon(p: RibbonProps) {
         <div style={{ display: "flex", alignItems: "center", gap: 4, opacity: sunActive ? 1 : 0.4 }}
           title={sunActive ? "Sun angle: 0 = sunrise, 0.5 = noon, 1 = sunset" : "Turn on Shadows or GPU Shadows — the sun angle only affects shadowed lighting"}>
           <span style={{ color: "#afa69d", fontSize: 10 }}>Sun</span>
-          <input type="range" min={0} max={1} step={0.01} value={p.sunTDisplay}
+          <input type="range" min={0} max={1} step={0.01} value={sunTDisplay}
             disabled={!sunActive}
-            onChange={e => p.setSunTDisplay(parseFloat(e.target.value))}
+            onChange={e => setSunTDisplay(parseFloat(e.target.value))}
             onPointerUp={e => p.commitSunT(parseFloat((e.target as HTMLInputElement).value))}
             onKeyUp={e => p.commitSunT(parseFloat((e.target as HTMLInputElement).value))}
             style={{ width: 80, accentColor: p.gpuShadows ? "#38bdf8" : "#facc15", cursor: sunActive ? "pointer" : "default" }} />
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 4, opacity: p.nightLighting ? 1 : 0.4 }}
           title={p.nightLighting ? "Lamp light radius, in blocks" : "Turn on Night Lighting — lamps only cast light at night"}>
-          <span style={{ color: "#afa69d", fontSize: 10 }}>Lamp&nbsp;R {Math.round(p.lampRadiusDisplay)}</span>
-          <input type="range" min={2} max={32} step={1} value={p.lampRadiusDisplay}
+          <span style={{ color: "#afa69d", fontSize: 10 }}>Lamp&nbsp;R {Math.round(lampRadiusDisplay)}</span>
+          <input type="range" min={2} max={32} step={1} value={lampRadiusDisplay}
             disabled={!p.nightLighting}
-            onChange={e => p.setLampRadiusDisplay(parseFloat(e.target.value))}
+            onChange={e => setLampRadiusDisplay(parseFloat(e.target.value))}
             onPointerUp={e => p.commitLampRadius(parseFloat((e.target as HTMLInputElement).value))}
             onKeyUp={e => p.commitLampRadius(parseFloat((e.target as HTMLInputElement).value))}
             style={{ width: 72, accentColor: "#facc15", cursor: p.nightLighting ? "pointer" : "default" }} />
@@ -1389,23 +1445,32 @@ export default function Ribbon(p: RibbonProps) {
           /* Compact swatch button → anchored popover (same machinery as the gradient-to picker).
              The inline picker overflowed the 96 px ribbon body. Dimmed unless in build mode. */
           <div style={{ ...rbGroup, opacity: p.mode3d === "build" ? 1 : 0.5 }}>
-            <button onClick={(e) => togglePicker(e, "build-3d")}
-              title="Block placed by right-click in 3D build mode"
-              style={{ ...rb, display: "flex", gap: 6, alignItems: "center", background: openPicker?.type === "build-3d" ? "rgba(255,255,255,0.1)" : rb.background }}>
-              <span style={{
-                width: 14, height: 14, borderRadius: 3, flexShrink: 0,
-                boxShadow: "inset 0 0 0 1px rgba(0,0,0,.5)",
-                background: swatchBg(p.build3dBlock, p.build3dPaint),
-                imageRendering: p.texturePack ? "pixelated" : undefined,
-              }} />
-              <span style={{ maxWidth: 84, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 11 }}>
-                {blockDisplayName(p.build3dBlock)}{p.build3dPaint > 0 ? ` #${p.build3dPaint}` : ""}
-              </span>
-              <span style={{ color: "#61584f", fontSize: 9 }}>▾</span>
-            </button>
+            <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+              <button onClick={(e) => togglePicker(e, "build-3d")}
+                title="Block placed by right-click in 3D build mode (shared with the 2D fill block)"
+                style={{ ...rb, display: "flex", gap: 6, alignItems: "center", background: openPicker?.type === "build-3d" ? "rgba(255,255,255,0.1)" : rb.background }}>
+                <span style={{
+                  width: 14, height: 14, borderRadius: 3, flexShrink: 0,
+                  boxShadow: "inset 0 0 0 1px rgba(0,0,0,.5)",
+                  background: swatchBg(p.fillBlockType, p.fillPaint),
+                  imageRendering: p.texturePack ? "pixelated" : undefined,
+                }} />
+                <span style={{ maxWidth: 84, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 11 }}>
+                  {blockDisplayName(p.fillBlockType)}{p.fillPaint > 0 ? ` #${p.fillPaint}` : ""}
+                </span>
+                <span style={{ color: "#61584f", fontSize: 9 }}>▾</span>
+              </button>
+              <button onClick={() => p.setAutoOrient3d(!p.autoOrient3d)}
+                title="Auto-orient ramps, wedges and doors to your facing direction when placing. When off, blocks keep the orientation picked here."
+                style={p.autoOrient3d ? rbActive("#22c55e") : rb}>
+                ↻ Auto-orient {p.autoOrient3d ? "on" : "off"}
+              </button>
+            </div>
             <div style={rbGroupLabel}>Build Block</div>
           </div>
         )}
+        {p.mode3d !== "sculpt" && <div style={rbDivider} />}
+        {p.mode3d !== "sculpt" && hotbarGroup()}
         <div style={rbDivider} />
         {lightingGroup()}
         <div style={rbDivider} />
@@ -1483,13 +1548,13 @@ export default function Ribbon(p: RibbonProps) {
           <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
             <div style={{ display: "flex", alignItems: "center", gap: 3 }}>
               <span style={{ color: "#afa69d", fontSize: 10, minWidth: 22 }}>Min</span>
-              <input type="number" min={0} max={maxZ} value={p.zMin}
-                onChange={e => p.handleZMin(e.target.value)} style={zInp} />
+              <NumberField min={0} max={maxZ} value={p.zMin} aria-label="Z Min"
+                onChange={n => p.handleZMin(String(n))} style={zInp} />
             </div>
             <div style={{ display: "flex", alignItems: "center", gap: 3 }}>
               <span style={{ color: "#60a5fa", fontSize: 10, minWidth: 22 }}>Max</span>
-              <input type="number" min={0} max={maxZ} value={p.zMax}
-                onChange={e => p.handleZMax(e.target.value)} style={zInp} />
+              <NumberField min={0} max={maxZ} value={p.zMax} aria-label="Z Max"
+                onChange={n => p.handleZMax(String(n))} style={zInp} />
             </div>
           </div>
           <div style={rbGroupLabel}>Z Range · {zHi - zLo + 1} levels</div>
@@ -1872,7 +1937,7 @@ export default function Ribbon(p: RibbonProps) {
                     onClick={() => { if (p.exporting) return; setFileMenuOpen(false); setShowExportSub(false); p.exportPng(); }}>
                     {p.exporting ? "Exporting…" : "Export PNG"}
                   </button>
-                  {p.world && (
+                  {p.world && p.enableExperimentalExport && (
                     <button style={{ ...mi, paddingLeft: 20, display: "flex", alignItems: "center", gap: 4 }} onMouseEnter={miHover} onMouseLeave={miLeave}
                       onClick={() => { if (p.exportingObj) return; setFileMenuOpen(false); setShowExportSub(false); p.exportObj(); }}>
                       {p.exportingObj ? "Exporting…" : "Export OBJ…"} <span style={expBadge()}>exp</span>
@@ -1882,6 +1947,12 @@ export default function Ribbon(p: RibbonProps) {
                     <button style={{ ...mi, paddingLeft: 20 }} onMouseEnter={miHover} onMouseLeave={miLeave}
                       onClick={() => { if (p.exportingJson) return; setFileMenuOpen(false); setShowExportSub(false); p.exportJson(); }}>
                       {p.exportingJson ? "Exporting…" : "Export JSON…"}
+                    </button>
+                  )}
+                  {p.world && p.enableExperimentalExport && (
+                    <button style={{ ...mi, paddingLeft: 20, display: "flex", alignItems: "center", gap: 4 }} onMouseEnter={miHover} onMouseLeave={miLeave}
+                      onClick={() => { setFileMenuOpen(false); setShowExportSub(false); p.exportVmf(); }}>
+                      Export VMF (Hammer)… <span style={expBadge()}>exp</span>
                     </button>
                   )}
                 </div>
@@ -2118,9 +2189,9 @@ export default function Ribbon(p: RibbonProps) {
               onFill={p.fillSelection} selectionExists={!!p.rawBounds}
               texturePack={p.texturePack} />
           ) : openPicker.type === "build-3d" ? (
-            <BlockPaintPicker mode="fill" blockType={p.build3dBlock} paint={p.build3dPaint}
-              onBlockTypeChange={bt => { if (bt !== null) p.setBuild3dBlock(bt); }}
-              onPaintChange={paint => p.setBuild3dPaint(paint ?? 0)}
+            <BlockPaintPicker mode="fill" blockType={p.fillBlockType} paint={p.fillPaint}
+              onBlockTypeChange={bt => { if (bt !== null) p.setFillBlockType(bt); }}
+              onPaintChange={paint => p.setFillPaint(paint ?? 0)}
               texturePack={p.texturePack} />
           ) : openPicker.type === "gradient-to" ? (
             <BlockPaintPicker mode="fill" blockType={p.gradientToBlock} paint={p.gradientToPaint}

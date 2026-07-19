@@ -223,6 +223,55 @@ export function rampDirIndex(blockType: number): number {
   return blockType & 3;
 }
 
+// ── Facing-based auto-orientation (3D build mode) ─────────────────────────────
+//
+// Eden world axes: +X = East, +Y = South, +Z = up (see FlyView3D's threeToEden
+// note). Ramp/wedge/door orientation is baked into the block ID (no metadata byte):
+//   Ramps  24–39: base+0=S, +1=W, +2=N, +3=E  — offset = high-edge direction.
+//   Wedges 40–55: base+0=SE, +1=SW, +2=NW, +3=NE — offset = the solid right-angle
+//                 corner (verified against export.rs `emit_wedge`: e.g. the SE wedge
+//                 fills the East+South faces, right angle at the SE corner).
+//   Doors  66–69 / Portals 75–78: base+0=S, +1=W, +2=N, +3=E (same as ramps).
+//
+// `yaw` is the horizontal look direction in Eden coords, `Math.atan2(dx, dy)` of the
+// Eden facing vector (dx = +east, dy = +south): yaw 0 = looking South (+Y),
+// +π/2 = East (+X), ±π = North (−Y), −π/2 = West (−X).
+
+/** Ramp/door offset for the cardinal the facing vector points along (0=S,1=W,2=N,3=E). */
+function facingCardinalOffset(dx: number, dy: number): number {
+  if (Math.abs(dy) >= Math.abs(dx)) return dy >= 0 ? 0 /* S */ : 2 /* N */;
+  return dx >= 0 ? 3 /* E */ : 1 /* W */;
+}
+
+/** Wedge offset for the diagonal quadrant the facing vector points into (0=SE,1=SW,2=NW,3=NE). */
+function facingDiagonalOffset(dx: number, dy: number): number {
+  const southish = dy >= 0, eastish = dx >= 0;
+  return southish ? (eastish ? 0 /* SE */ : 1 /* SW */) : (eastish ? 3 /* NE */ : 2 /* NW */);
+}
+
+/**
+ * Re-orient a directional block so it faces the player's look direction (`yaw`, see above).
+ * - Ramps (24–39): high edge points away from the player, so the ramp ascends ahead of you
+ *   as you walk up to it (facing South ⇒ base+0 = S).
+ * - Wedges (40–55): the solid right-angle corner points away from the player (nearest diagonal).
+ * - Doors (66–69) / Portals (75–78): face toward the player (opposite cardinal, Minecraft
+ *   door convention).
+ * Every other block type is returned unchanged.
+ */
+export function orientBlockToFacing(blockType: number, yaw: number): number {
+  const dx = Math.sin(yaw), dy = Math.cos(yaw);
+  const rbase = rampFamilyBase(blockType);
+  if (rbase !== null) return rbase + facingCardinalOffset(dx, dy);
+  const wbase = wedgeFamilyBase(blockType);
+  if (wbase !== null) return wbase + facingDiagonalOffset(dx, dy);
+  // Doors/portals face the player: opposite of the facing cardinal ((offset+2)&3).
+  const dbase = doorFamilyBase(blockType);
+  if (dbase !== null) return dbase + ((facingCardinalOffset(dx, dy) + 2) & 3);
+  const pbase = portalFamilyBase(blockType);
+  if (pbase !== null) return pbase + ((facingCardinalOffset(dx, dy) + 2) & 3);
+  return blockType;
+}
+
 /** Display name for any block type, including non-representative ramp/wedge variants. */
 export function blockDisplayName(blockType: number): string {
   if (blockType === 0) return "Air";

@@ -23,6 +23,7 @@ import HelpModal from "./HelpModal";
 import AboutModal from "./AboutModal";
 import WorldBrowserModal from "./WorldBrowserModal";
 import UploadModal from "./UploadModal";
+import VmfExportModal, { type VmfExportBounds } from "./VmfExportModal";
 import NewWorldModal from "./NewWorldModal";
 import SchematicImportModal, { type SchematicInfo, type MappingEntry } from "./SchematicImportModal";
 import Ribbon, { RIBBON_HEIGHT_COLLAPSED, TAB_BAR_HEIGHT, DEFAULT_BODY_HEIGHT, EDEN_TEAL, EDEN_TEAL_READABLE, type RibbonTab, type MapViewMode } from "./Ribbon";
@@ -34,7 +35,7 @@ import PrefabLibraryPanel, { resolvePrefabDir } from "./PrefabLibraryPanel";
 import Modal from "./Modal";
 import { glassPanel, chromeButton, accentRing, expBadge } from "./designTokens";
 import { decodeAtlas, tintedSwatch, type AtlasData, type TexturePackRaw, clearSwatchCache } from "./texturePack";
-import { blockDisplayName, applyBlockTables, type BlockTables } from "./blockDefs";
+import { blockDisplayName, resolveColor, applyBlockTables, orientBlockToFacing, type BlockTables } from "./blockDefs";
 import { isTypingTarget } from "./viewportUtils";
 import { decomposeMask, maskOutline } from "./maskUtils";
 import appIcon from "./assets/app-icon.png";
@@ -152,6 +153,44 @@ const CursorHud = forwardRef<CursorHudHandle>((_props, ref) => {
   );
 });
 
+type SelStatusHudHandle = { setDrag: (rect: SelectionBounds | null) => void };
+
+// Status-bar selection readout. While a marquee drag is in progress it owns the live dimensions in
+// its own state (fed imperatively via setDrag), so the pointer-move-rate updates re-render only this
+// leaf instead of App (and everything App renders). When no drag is active it falls back to the
+// committed selection passed as a prop (which changes only on commit — infrequent). Same leaf pattern
+// as CursorHud/FpsCounter.
+const SelStatusHud = forwardRef<SelStatusHudHandle, { selection: SelectionInfo | null; zMin: number; zMax: number }>(
+  ({ selection, zMin, zMax }, ref) => {
+    const [drag, setDrag] = useState<SelectionBounds | null>(null);
+    useImperativeHandle(ref, () => ({ setDrag: (r) => setDrag(r) }), []);
+    if (drag) {
+      return (
+        <div style={{ padding: "0 10px", borderRight: "1px solid #322d28", color: EDEN_TEAL_READABLE, whiteSpace: "nowrap" }}>
+          Sel <span style={{ color: EDEN_TEAL_READABLE }}>
+            {Math.round(drag.x2 - drag.x1) + 1}×{Math.round(drag.y2 - drag.y1) + 1}
+          </span>
+          {" · Z "}<span style={{ color: "#70665b" }}>{zMin}–{zMax}</span>
+        </div>
+      );
+    }
+    if (selection) {
+      return (
+        <div style={{ padding: "0 10px", borderRight: "1px solid #322d28", color: "#70665b", whiteSpace: "nowrap" }}>
+          Sel <span style={{ color: "#83786c" }}>{selection.width}×{selection.height}</span>
+          {selection.masked && selection.cell_count != null && (
+            <span style={{ color: "#a855f7", marginLeft: 5 }} title="Shaped selection — edits affect only the wand/lasso footprint, not the whole box">
+              ◆ shaped ({selection.cell_count.toLocaleString()} cells)
+            </span>
+          )}
+          {" · Z "}<span style={{ color: "#70665b" }}>{selection.z_min}–{selection.z_max}</span>
+        </div>
+      );
+    }
+    return null;
+  }
+);
+
 function App() {
   const [world, setWorld] = useState<WorldMeta | null>(null);
   // Live mirror of `world` for []-memoized callbacks (undo/redo → applyEditResult).
@@ -168,6 +207,7 @@ function App() {
   const [exportingJson, setExportingJson] = useState(false);
   const [exportingVox, setExportingVox] = useState(false);
   const [voxProgress, setVoxProgress] = useState<{ phase: string; pct: number } | null>(null);
+  const [vmfExportBounds, setVmfExportBounds] = useState<VmfExportBounds | null>(null);
   const [saving, setSaving] = useState(false);
   const [saveCompressed, setSaveCompressed] = useState(() => loadSettings().defaultSaveCompressed);
   const { recentWorlds, addRecentWorld } = useRecentWorlds();
@@ -202,6 +242,8 @@ function App() {
   const moveWithContentsRef = useRef(false);
   useEffect(() => { moveWithContentsRef.current = moveWithContents; }, [moveWithContents]);
   const [sourcePath, setSourcePath] = useState<string | null>(null);
+  const sourcePathRef = useRef<string | null>(null);
+  useEffect(() => { sourcePathRef.current = sourcePath; }, [sourcePath]);
   const [recoveryInfo, setRecoveryInfo] = useState<AutosaveInfo | null>(null);
   const [recovering, setRecovering] = useState(false);
   const lastAutosavedEpochRef = useRef(-1);
@@ -235,7 +277,12 @@ function App() {
     const id = ++toastIdRef.current;
     // Cap the stack — a failing background tick could otherwise queue toasts indefinitely.
     setToasts((list) => [...list.slice(-(MAX_TOASTS - 1)), { id, text, kind }]);
-    armToastTimer(id, kind === "error" ? ERROR_TOAST_MS : INFO_TOAST_MS);
+    // Info toasts are one-line status summaries — a fixed 2.5s is fine for "Filled 40 blocks" but
+    // cuts off mid-read for a longer one. Scale mildly with length past a baseline, capped so a
+    // very long message doesn't linger forever (error toasts already stay parked on hover).
+    const ms = kind === "error" ? ERROR_TOAST_MS
+      : Math.min(INFO_TOAST_MS * 2.4, INFO_TOAST_MS + Math.max(0, text.length - 30) * 35);
+    armToastTimer(id, ms);
     return id;
   }, [armToastTimer]);
 
@@ -307,14 +354,12 @@ function App() {
   const nightLightingRef = useRef(false); nightLightingRef.current = nightLighting;
   const shadows3dRef     = useRef(false); shadows3dRef.current     = shadows3d;
   const gpuShadowsRef    = useRef(false); gpuShadowsRef.current    = gpuShadows;
+  // Committed sun angle. The drag-time display value lives in the Ribbon (see its zSliceDisplay/
+  // sunTDisplay/lampRadiusDisplay local state) so a slider drag re-renders only the Ribbon subtree;
+  // only the committed value here triggers the (expensive) chunk reload / lightEpoch bump.
   const [sunT, setSunT] = useState(() => loadSettings().sunT);
-  // sunTDisplay is the Ribbon slider's visual value while the user is dragging (same pattern as
-  // zSliceDisplay/commitZSlice) — only the committed sunT triggers the (expensive) chunk reload.
-  const [sunTDisplay, setSunTDisplay] = useState(() => loadSettings().sunT);
-  // Lamp light radius (blocks) for night lighting. Same display/commit split as sunT so dragging the
-  // Ribbon slider doesn't reload every chunk per pixel — only the committed value bumps lightEpoch.
+  // Lamp light radius (blocks) for night lighting. Same committed-only pattern as sunT.
   const [lampRadius, setLampRadius] = useState(() => loadSettings().lampRadius);
-  const [lampRadiusDisplay, setLampRadiusDisplay] = useState(() => loadSettings().lampRadius);
   const [lightEpoch, setLightEpoch] = useState(0);
   useEffect(() => { setLightEpoch(e => e + 1); }, [nightLighting, shadows3d, sunT, lampRadius]);
   // Force the perf-heavy 3D lighting modes off — called on every world load/close so none of them
@@ -332,12 +377,10 @@ function App() {
   }
   function commitSunT(t: number) {
     setSunT(t);
-    setSunTDisplay(t);
     saveSettings({ sunT: t });
   }
   function commitLampRadius(r: number) {
     setLampRadius(r);
-    setLampRadiusDisplay(r);
     saveSettings({ lampRadius: r });
   }
   // Persisted 3D fly-view render distance + fly speed (seed FlyView3D; written back as the user adjusts).
@@ -349,6 +392,8 @@ function App() {
   const [dragSensitivity, setDragSensitivity] = useState(() => loadSettings().dragSensitivity);
   const [invertY, setInvertY] = useState(() => loadSettings().invertY);
   const [autosaveIntervalMin, setAutosaveIntervalMin] = useState(() => loadSettings().autosaveIntervalMin);
+  const [autoOrient3d, setAutoOrient3d] = useState(() => loadSettings().autoOrient3d);
+  const [enableExperimentalExport, setEnableExperimentalExport] = useState(() => loadSettings().enableExperimentalExport);
   // Debounces the localStorage write only (state stays live so the slider/HUD track immediately) —
   // dragging the render-distance slider fires an onChange per pixel, and saveSettings() does a full
   // loadSettings() (JSON.parse) + JSON.stringify round-trip; without this a drag gesture does dozens
@@ -358,10 +403,35 @@ function App() {
     if (saveSettingsDebounceRef.current) clearTimeout(saveSettingsDebounceRef.current);
     saveSettingsDebounceRef.current = setTimeout(() => saveSettings(patch), 250);
   }
+  // Shared SettingsModal onSave handler — splash screen and in-editor Settings modals both need
+  // the full set of setters applied identically (they drifted once when only one site was updated).
+  function applySettings(s: AppSettings) {
+    setShowSlicePanels(s.defaultQuadView);
+    setEnable3dPane(s.default3dPane);
+    setSaveCompressed(s.defaultSaveCompressed);
+    setFogEnabled(s.enableFog);
+    setShowQuickActions(s.showQuickActions);
+    setSunT(s.sunT);
+    setLampRadius(s.lampRadius);
+    setRenderDistance(s.renderDistance);
+    setFlySpeed(s.flySpeed);
+    setLookSensitivity(s.lookSensitivity);
+    setDragSensitivity(s.dragSensitivity);
+    setInvertY(s.invertY);
+    setAutosaveIntervalMin(s.autosaveIntervalMin);
+    setAutoOrient3d(s.autoOrient3d);
+    setEnableExperimentalExport(s.enableExperimentalExport);
+    if (s.templatePath !== templatePath) setTemplatePath(s.templatePath);
+    if (s.texturePackPath !== texturePackPath) {
+      if (s.texturePackPath) loadTexturePackFile(s.texturePackPath);
+      else unloadTexturePack();
+    }
+  }
   // Quad-view split fractions (0.15–0.85) + which pane is maximized (session-only). Splits persisted.
   const [quadColSplit, setQuadColSplit] = useState(() => loadQuadSplits().col);
   const [quadRowSplit, setQuadRowSplit] = useState(() => loadQuadSplits().row);
   const [maximizedPane, setMaximizedPane] = useState<"map" | "front" | "side" | "3d" | null>(null);
+  const [hoverSplit, setHoverSplit] = useState<"col" | "row" | "both" | null>(null);
   const quadGridRef = useRef<HTMLDivElement>(null);
   const quadDragRef = useRef<null | "col" | "row" | "both">(null);
   const flyActiveRef = useRef(false); // true while FlyView3D fly mode is active — blocks global shortcuts
@@ -424,6 +494,8 @@ function App() {
   const renameInputRef = useRef<HTMLInputElement>(null);
 
   const [clipboard, setClipboard] = useState<ClipboardInfo | null>(null);
+  const clipboardRef = useRef<ClipboardInfo | null>(null);
+  useEffect(() => { clipboardRef.current = clipboard; }, [clipboard]);
   const [pasteElevationOffset, setPasteElevationOffset] = useState(0);
   const [pasteIgnoreAir, setPasteIgnoreAir] = useState(false);
   const [persistPaste, setPersistPaste] = useState(false);
@@ -495,7 +567,26 @@ function App() {
     () => loadHotbar(HOTBAR_RECENT_KEY, 5).filter((b): b is { type: number; paint: number } => b !== null));
   useEffect(() => { saveHotbar(HOTBAR_PINNED_KEY, pinnedBlocks); }, [pinnedBlocks]);
   useEffect(() => { saveHotbar(HOTBAR_RECENT_KEY, recentBlocks); }, [recentBlocks]);
+  const pinnedBlocksRef = useRef(pinnedBlocks);
+  useEffect(() => { pinnedBlocksRef.current = pinnedBlocks; }, [pinnedBlocks]);
+  const recentBlocksRef = useRef(recentBlocks);
+  useEffect(() => { recentBlocksRef.current = recentBlocks; }, [recentBlocks]);
   const [hotbarHover, setHotbarHover] = useState<string | null>(null);
+
+  /** 10-slot hotbar data for the 3D pane's in-build overlay (5 pinned + 5 recent, matching the
+   *  digit-key ordering) — same block+paint source as the Ribbon hotbar, precomputed into a plain
+   *  {type,paint,css,label} shape so FlyView3D doesn't need its own resolveColor/tintedSwatch import. */
+  const hotbar3dSlots = useMemo(() => {
+    const swatchCss = (type: number, paint: number): string => {
+      const url = texturePackInfo ? tintedSwatch(type, paint, texturePackInfo) : null;
+      if (url) return `url(${url}) center/cover`;
+      const [r, g, b] = resolveColor(type, paint);
+      return `rgb(${r},${g},${b})`;
+    };
+    const pinned = pinnedBlocks.map(b => b ? { type: b.type, paint: b.paint, css: swatchCss(b.type, b.paint), label: blockDisplayName(b.type) } : null);
+    const recent = recentBlocks.map(b => ({ type: b.type, paint: b.paint, css: swatchCss(b.type, b.paint), label: blockDisplayName(b.type) }));
+    return [...pinned, ...recent.slice(0, 5)];
+  }, [pinnedBlocks, recentBlocks, texturePackInfo]);
 
 
   // Paste mode: normal | scatter | array
@@ -553,10 +644,9 @@ function App() {
 
   const [viewMode, setViewMode] = useState<MapViewMode>("topdown");
   // zSliceZ is the committed level passed to MapCanvas (triggers tile refetch). In cutaway mode the
-  // same value is the cap Z — one slider, two meanings (see the Ribbon's View tab).
-  // zSliceDisplay is the slider's visual value while the user is dragging.
+  // same value is the cap Z — one slider, two meanings (see the Ribbon's View tab). The slider's
+  // drag-time visual value is Ribbon-local (zSliceDisplay there), synced from this committed value.
   const [zSliceZ, setZSliceZ] = useState(32);
-  const [zSliceDisplay, setZSliceDisplay] = useState(32);
 
   const viewModeRef = useRef<MapViewMode>("topdown");
   useEffect(() => { viewModeRef.current = viewMode; }, [viewMode]);
@@ -586,6 +676,21 @@ function App() {
   // Read by the global Escape handler, which is registered once with `[]`-ish deps.
   const ctxMenuRef = useRef<typeof ctxMenu>(null);
   useEffect(() => { ctxMenuRef.current = ctxMenu; }, [ctxMenu]);
+
+  // Clamp the context menu into the window after mount — item count is conditional (Copy/Paste
+  // only show with a selection/clipboard), so a hard-coded height estimate drifts. Measures the
+  // rendered menu and nudges it back on-screen; re-runs (harmlessly, converging to a no-op) after
+  // the nudge since it changes ctxMenu itself.
+  const ctxMenuElRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!ctxMenu) return;
+    const el = ctxMenuElRef.current;
+    if (!el) return;
+    const r = el.getBoundingClientRect();
+    const nx = r.right > window.innerWidth ? Math.max(0, window.innerWidth - r.width - 4) : ctxMenu.x;
+    const ny = r.bottom > window.innerHeight ? Math.max(0, window.innerHeight - r.height - 4) : ctxMenu.y;
+    if (nx !== ctxMenu.x || ny !== ctxMenu.y) setCtxMenu(m => m && { ...m, x: nx, y: ny });
+  }, [ctxMenu]);
 
   // Dismiss context menu on any outside click.
   // Delay registration to avoid macOS right-click pointerdown firing after contextmenu.
@@ -628,7 +733,32 @@ function App() {
   // Canvas overlay data source (Phase E): bbox + decoded bitset for the active shaped selection.
   const [selectionMaskOverlay, setSelectionMaskOverlay] = useState<{ x1: number; y1: number; x2: number; y2: number; bits: Uint8Array } | null>(null);
   // Live marquee dims while dragging a new selection (before commit/describe_selection round-trip).
+  // `dragSelectRect` state now feeds ONLY the 3D wireframe overlay (`overlays3d`), which is inert
+  // unless the quad + 3D pane are both up — so we skip the App re-render entirely when they're not,
+  // and rAF-throttle it when they are. The status-bar dimensions readout is fed imperatively into the
+  // SelStatusHud leaf instead (no App re-render per pointer-move). See handleSelectDragUpdate below.
   const [dragSelectRect, setDragSelectRect] = useState<SelectionBounds | null>(null);
+  const selStatusHudRef = useRef<SelStatusHudHandle>(null);
+  const marqueeRafRef = useRef<number | null>(null);
+  const marqueePendingRef = useRef<SelectionBounds | null>(null);
+  const handleSelectDragUpdate = (rect: SelectionBounds | null) => {
+    selStatusHudRef.current?.setDrag(rect);
+    if (rect === null) {
+      marqueePendingRef.current = null;
+      if (marqueeRafRef.current != null) { cancelAnimationFrame(marqueeRafRef.current); marqueeRafRef.current = null; }
+      setDragSelectRect(prev => (prev === null ? prev : null));
+      return;
+    }
+    // dragSelectRect only drives the live 3D wireframe box; nothing else consumes it.
+    if (!showSlicePanels || !enable3dPane) return;
+    marqueePendingRef.current = rect;
+    if (marqueeRafRef.current == null) {
+      marqueeRafRef.current = requestAnimationFrame(() => {
+        marqueeRafRef.current = null;
+        setDragSelectRect(marqueePendingRef.current);
+      });
+    }
+  };
   const [zMin, setZMin] = useState(0);
   const [zMax, setZMax] = useState(63);
   const zMinRef = useRef(0);
@@ -646,11 +776,9 @@ function App() {
 
   // 3D fly-view interaction, fully decoupled from the Draw/Select editor tools: the contextual "3D"
   // ribbon tab owns this. "off" = camera only; "select" = two-click box select; "build" = place
-  // (left-click) / break (right-click). `build3dBlock`/`build3dPaint` is the 3D tab's own armed block,
-  // separate from the map's fill block, so 3D building has an independent picker.
+  // (left-click) / break (right-click). Build mode's armed block is the same fillBlockType/fillPaint
+  // as the 2D map (and the shared hotbar), so switching between 2D and 3D building carries no state.
   const [mode3d, setMode3d] = useState<"off" | "select" | "build" | "sculpt">("off");
-  const [build3dBlock, setBuild3dBlock] = useState(2); // Stone
-  const [build3dPaint, setBuild3dPaint] = useState(0);
 
   // 3D wireframe overlays for the fly-through pane: selection (blue), extrude copies (amber), paste (green).
   const overlays3d = useMemo<Overlay3D[] | null>(() => {
@@ -867,7 +995,6 @@ function App() {
       setRedoDepth(0);
       setViewMode("topdown");
       setZSliceZ(32);
-      setZSliceDisplay(32);
       setClipboard(null);
       resetHeavyLighting();
       setSaveCompressed(data.was_compressed);
@@ -959,6 +1086,21 @@ function App() {
     }
   }
 
+  // VMF export is selection-scale only (Source caps a map at 8,192 brushes; whole-world export
+  // is a footgun, not a feature) — opening the modal without a selection would just let the user
+  // hit the brush-count guard after already filling out options, so the guard fires up front.
+  function exportVmf() {
+    if (!world) return;
+    if (!selection) {
+      showToast("Select a region first — VMF export works on a selection, not the whole world");
+      return;
+    }
+    setVmfExportBounds({
+      x1: selection.x1, y1: selection.y1, x2: selection.x2, y2: selection.y2,
+      zMin: selection.z_min, zMax: selection.z_max,
+    });
+  }
+
   // VOX export hidden pending better test coverage — prefixed to silence TS unused warning
   const _exportVox = async () => {
     if (!world) return;
@@ -988,7 +1130,6 @@ function App() {
 
   function commitZSlice(z: number) {
     setZSliceZ(z);
-    setZSliceDisplay(z);
   }
 
   const copySelection = useCallback(async () => {
@@ -1056,8 +1197,17 @@ function App() {
   const nudgeSelection = useCallback((dx: number, dy: number) => {
     if (!moveWithContentsRef.current) {
       const bounds = rawBoundsRef.current;
-      if (!bounds) return;
-      setRawBounds({ x1: bounds.x1 + dx, y1: bounds.y1 + dy, x2: bounds.x2 + dx, y2: bounds.y2 + dy });
+      const w = worldRef.current;
+      if (!bounds || !w) return;
+      // Box-only move (no backend call, unlike the moveWithContents path below) — clamp to world
+      // bounds so repeated arrow-nudges can't push the selection off the map entirely.
+      const mapMaxX = w.width_chunks * 16 - 1, mapMaxY = w.height_chunks * 16 - 1;
+      const clampDx = Math.max(-bounds.x1, Math.min(mapMaxX - bounds.x2, dx));
+      const clampDy = Math.max(-bounds.y1, Math.min(mapMaxY - bounds.y2, dy));
+      setRawBounds({
+        x1: bounds.x1 + clampDx, y1: bounds.y1 + clampDy,
+        x2: bounds.x2 + clampDx, y2: bounds.y2 + clampDy,
+      });
       return;
     }
     nudgeSelectionContents(dx, dy);
@@ -1325,7 +1475,7 @@ function App() {
     cursorMoveThrottleRef.current = setTimeout(() => {
       cursorMoveThrottleRef.current = null;
       invoke<number | null>("get_surface_z", { x: wx, y: wy })
-        .then(z => { if (z !== null && followSurfaceRef.current) { setZSliceZ(z); setZSliceDisplay(z); } })
+        .then(z => { if (z !== null && followSurfaceRef.current) { setZSliceZ(z); } })
         .catch(() => {});
     }, 50);
   }
@@ -1465,15 +1615,30 @@ function App() {
     } catch (e) { reportError(e); }
   }
 
-  /** Place the 3D tab's armed block in the empty voxel against the picked face. */
-  async function handlePick3dPlace(x: number, y: number, z: number) {
-    if (build3dBlock === 0) return; // "Air" as the armed block would be a no-op place
+  /** Place the armed block (shared with the 2D fill block/hotbar) in the empty voxel against the
+   *  picked face. `yaw` is the player's Eden look direction at click time; with Auto-orient on it
+   *  rotates directional blocks (ramps/wedges/doors) to face the player. */
+  async function handlePick3dPlace(x: number, y: number, z: number, yaw: number) {
+    if (fillBlockType === 0) return; // "Air" as the armed block would be a no-op place
+    const blockType = autoOrient3d ? orientBlockToFacing(fillBlockType, yaw) : fillBlockType;
     try {
       const result = await invoke<EditResultRaw>("paint_blocks", {
-        blocks: [{ x, y, z }], blockType: build3dBlock, paint: build3dPaint, zOffset: 0,
+        blocks: [{ x, y, z }], blockType, paint: fillPaint, zOffset: 0,
       });
       await applyEditResult(result);
+      trackRecentBlock(fillBlockType, fillPaint);
     } catch (e) { reportError(e); }
+  }
+
+  /** Middle-click in the 3D pane's build mode: mirrors the 2D eyedropper. Picks the exact block
+   *  (orientation included) — auto-orient re-derives a fresh facing on the next placement unless
+   *  the user has toggled it off, in which case the picked orientation is placed verbatim. */
+  function handlePick3dEyedrop(blockType: number, paint: number) {
+    if (blockType === 0) return;
+    setFillBlockType(blockType);
+    setFillPaint(paint);
+    trackRecentBlock(blockType, paint);
+    showToast(`Picked ${blockDisplayName(blockType)}`);
   }
 
   // Batch paint at exact world cells (one undo entry). Used by the slice viewports.
@@ -1494,15 +1659,19 @@ function App() {
     try {
       const result = await invoke<EditResultRaw>("undo_edit");
       await applyEditResult(result, "undo");
-    } catch { /* stack empty — ignore */ }
-  }, [applyEditResult]);
+    } catch (e) {
+      if (e !== "Nothing to undo") reportError(e);
+    }
+  }, [applyEditResult, reportError]);
 
   const handleRedo = useCallback(async () => {
     try {
       const result = await invoke<EditResultRaw>("redo_edit");
       await applyEditResult(result, "redo");
-    } catch { /* stack empty — ignore */ }
-  }, [applyEditResult]);
+    } catch (e) {
+      if (e !== "Nothing to redo") reportError(e);
+    }
+  }, [applyEditResult, reportError]);
 
   const saveWorld = useCallback(async (path: string) => {
     setSaving(true);
@@ -1550,6 +1719,15 @@ function App() {
     const finalPath = (ext === "eden" || ext === "zip") && ext !== expectedExt
       ? `${chosen.slice(0, dot)}.${expectedExt}`
       : chosen;
+    // The native Save dialog only confirmed overwrite for `chosen` — if extension correction
+    // above rewrote the path, `finalPath` names a different file the user never confirmed.
+    if (finalPath !== chosen && await invoke<boolean>("prefab_exists", { path: finalPath })) {
+      const ok = await ask(
+        `${finalPath.slice(finalPath.lastIndexOf("/") + 1)} already exists. Overwrite it?`,
+        { title: "Confirm overwrite", kind: "warning" },
+      );
+      if (!ok) return;
+    }
     await saveWorld(finalPath);
     setSourcePath(finalPath);
   }, [sourcePath, saveWorld, saveCompressed]);
@@ -1564,12 +1742,14 @@ function App() {
     const id = setInterval(() => {
       if (editEpochRef.current === lastAutosavedEpochRef.current) return;
       const epoch = editEpochRef.current;
-      invoke("autosave_world", { sourcePath })
+      invoke("autosave_world", { sourcePath: sourcePathRef.current })
         .then(() => { lastAutosavedEpochRef.current = epoch; })
         .catch((e) => console.warn("Autosave failed:", e));
     }, AUTOSAVE_MS);
     return () => clearInterval(id);
-  }, [world, sourcePath, autosaveIntervalMin]);
+    // sourcePath deliberately excluded — read via sourcePathRef so a Save As mid-interval doesn't
+    // reset the timer and delay the next autosave tick indefinitely.
+  }, [world, autosaveIntervalMin]);
 
   // Startup check: was there a pending autosave from a session that never cleanly saved?
   useEffect(() => {
@@ -1585,6 +1765,17 @@ function App() {
     const unlisten = win.onCloseRequested(async (event) => {
       if (!isDirty()) return; // clean — let the close proceed
       event.preventDefault();
+      // Best-effort autosave before the confirm prompt: the periodic timer never gets to fire on
+      // quit (the window closes before its next tick), so without this a "Quit and discard" decline
+      // followed by a crash mid-relaunch could lose everything since the last periodic tick instead
+      // of just what changed since this attempt.
+      if (editEpochRef.current !== lastAutosavedEpochRef.current) {
+        const epoch = editEpochRef.current;
+        try {
+          await invoke("autosave_world", { sourcePath: sourcePathRef.current });
+          lastAutosavedEpochRef.current = epoch;
+        } catch (e) { console.warn("Autosave-on-quit failed:", e); }
+      }
       const ok = await ask("You have unsaved changes. Quit and discard them?", {
         title: "Unsaved changes", kind: "warning",
       });
@@ -1633,7 +1824,8 @@ function App() {
   // When one is up it owns the keyboard, so editor shortcuts must not fire underneath it.
   const anyModalOpen =
     showAbout || showSettings || showWorldInfo || showWorldBrowser || showUploadModal ||
-    showNewWorld || !!schematicInfo || showExpandModal || !!recoveryInfo || prefabNameModal;
+    showNewWorld || !!schematicInfo || showExpandModal || !!recoveryInfo || prefabNameModal ||
+    !!vmfExportBounds;
   const anyModalOpenRef = useRef(false);
   useEffect(() => { anyModalOpenRef.current = anyModalOpen; }, [anyModalOpen]);
 
@@ -1660,6 +1852,25 @@ function App() {
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
+      // Hotbar digits (1-5 pinned, 6-0 recent) work even while the 3D fly camera is active — WASD/
+      // space/ctrl/shift are the only keys the fly controller actually needs, so digits jump ahead
+      // of the fly-camera gate below and arm a block for 3D build mode without leaving the pane.
+      if (world && !isTypingTarget(e.target) && !e.metaKey && !e.ctrlKey && !anyModalOpenRef.current && !showHelp) {
+        if (["1","2","3","4","5"].includes(e.key)) {
+          const idx = parseInt(e.key) - 1;
+          e.preventDefault();
+          const b = pinnedBlocksRef.current[idx];
+          if (b) { setFillBlockType(b.type); setFillPaint(b.paint); }
+          return;
+        }
+        if (["6","7","8","9","0"].includes(e.key)) {
+          const idx = e.key === "0" ? 4 : parseInt(e.key) - 6;
+          e.preventDefault();
+          const b = recentBlocksRef.current[idx];
+          if (b) { setFillBlockType(b.type); setFillPaint(b.paint); }
+          return;
+        }
+      }
       // While the 3D fly camera is active, it owns unmodified keys (WASD/space/ctrl/shift) for
       // movement — don't fire editor shortcuts for those. But the fly controller never consumes
       // Cmd-combos, so let ⌘Z/⌘S/etc. through instead of leaving them dead until the pane exits.
@@ -1723,10 +1934,15 @@ function App() {
         // but it was never wired). The armed tool is restored on keyup; `e.repeat` guards against
         // auto-repeat overwriting spaceReturnToolRef with "pan" itself.
         if (e.key === " " && !e.repeat) {
-          // Space is also how you activate a focused button/checkbox with the keyboard — swallowing
-          // it here would make every ribbon control keyboard-dead.
-          const tag = (e.target as HTMLElement | null)?.tagName;
-          if (tag === "BUTTON" || tag === "SELECT" || tag === "A" || tag === "INPUT") return;
+          // Space is also how you activate a focused button/checkbox/link with the keyboard —
+          // swallowing it here would make those controls keyboard-dead. Text-like inputs are
+          // already excluded above via `typing`; a focused range slider (tag INPUT, type "range")
+          // isn't "typing" and should still hold-to-pan, so this only excludes the tags/types where
+          // Space has its own native activation behavior.
+          const target = e.target as HTMLElement | null;
+          const tag = target?.tagName;
+          if (tag === "BUTTON" || tag === "SELECT" || tag === "A") return;
+          if (tag === "INPUT" && (target as HTMLInputElement).type !== "range") return;
           e.preventDefault();
           if (appToolRef.current !== "pan") {
             spaceReturnToolRef.current = appToolRef.current;
@@ -1750,27 +1966,8 @@ function App() {
           setTool("eyedropper");
           return;
         }
-        // Number keys 1-5 = pinned hotbar slots; 6-0 = recent hotbar slots
-        if (["1","2","3","4","5"].includes(e.key)) {
-          const idx = parseInt(e.key) - 1;
-          e.preventDefault();
-          setPinnedBlocks(prev => {
-            const b = prev[idx];
-            if (b) { setFillBlockType(b.type); setFillPaint(b.paint); }
-            return prev;
-          });
-          return;
-        }
-        if (["6","7","8","9","0"].includes(e.key)) {
-          const idx = e.key === "0" ? 4 : parseInt(e.key) - 6;
-          e.preventDefault();
-          setRecentBlocks(prev => {
-            const b = prev[idx];
-            if (b) { setFillBlockType(b.type); setFillPaint(b.paint); }
-            return prev;
-          });
-          return;
-        }
+        // Hotbar digits (1-5/6-0) are now handled unconditionally near the top of onKeyDown, above
+        // the fly-camera gate, so they work in 3D build mode too — see the comment there.
         // `.` = repeat last paste one step further in the same direction
         if (e.key === "." && appToolRef.current === "paste") {
           const pos   = lastPastePosRef.current;
@@ -1783,7 +1980,7 @@ function App() {
         }
         // PgUp/PgDn raise/lower the armed paste; Shift = ±5. The ghost's z±N label follows live,
         // which is the whole point — the offset used to be a number buried in the Selection tab.
-        if ((e.key === "PageUp" || e.key === "PageDown") && appToolRef.current === "paste" && clipboard) {
+        if ((e.key === "PageUp" || e.key === "PageDown") && appToolRef.current === "paste" && clipboardRef.current) {
           e.preventDefault();
           const step = (e.shiftKey ? 5 : 1) * (e.key === "PageUp" ? 1 : -1);
           setPasteElevationOffset(o => o + step);
@@ -1822,14 +2019,14 @@ function App() {
       if (k === "c") { e.preventDefault(); copySelection(); }
       if (k === "v") {
         e.preventDefault();
-        if (clipboard) setTool("paste");
+        if (clipboardRef.current) setTool("paste");
       }
       // ⌘⇧S = Save As (the File menu has always shown this accelerator). Without the shiftKey test
       // it silently performed a plain Save over the current file.
       if (k === "s") {
         e.preventDefault();
-        if (e.shiftKey || !sourcePath) saveWorldAs();
-        else saveWorld(sourcePath);
+        if (e.shiftKey || !sourcePathRef.current) saveWorldAs();
+        else saveWorld(sourcePathRef.current);
       }
       if (k === "n") { e.preventDefault(); setShowNewWorld(true); }
       if (k === "o") { e.preventDefault(); void openFileRef.current(); }
@@ -1842,7 +2039,8 @@ function App() {
       // Zoom: ⌘0 fit map, ⌘+/⌘− step, ⌘⇧0 zoom to selection. (⌘= is the unshifted "+" key.)
       if (k === "0" && e.shiftKey) {
         e.preventDefault();
-        if (rawBounds) mapCanvasRef.current?.zoomToBox(rawBounds.x1, rawBounds.y1, rawBounds.x2, rawBounds.y2);
+        const rb = rawBoundsRef.current;
+        if (rb) mapCanvasRef.current?.zoomToBox(rb.x1, rb.y1, rb.x2, rb.y2);
       } else if (k === "0") {
         e.preventDefault();
         mapCanvasRef.current?.resetView();
@@ -1870,7 +2068,9 @@ function App() {
       window.removeEventListener("keyup", onKeyUp);
       window.removeEventListener("blur", releaseSpacePan);
     };
-  }, [world, showHelp, handleUndo, handleRedo, clipboard, sourcePath, copySelection, saveWorld, saveWorldAs, nudgeSelection, rawBounds]);
+    // clipboard/sourcePath/rawBounds deliberately excluded — read via clipboardRef/sourcePathRef/
+    // rawBoundsRef so this handler doesn't re-register on every selection or clipboard change (L2).
+  }, [world, showHelp, handleUndo, handleRedo, copySelection, saveWorld, saveWorldAs, nudgeSelection]);
 
   // Menu close effects handled inside Ribbon component
 
@@ -2273,7 +2473,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
       // roof-level terrain behind the cave interior you're trying to see.
       showTemplateOverlay={showTemplateOverlay && templateLoaded && viewMode === "topdown"}
       onMapContextMenu={(wx, wy, x, y) => setCtxMenu({ wx, wy, x, y })}
-      onSelectDragUpdate={setDragSelectRect}
+      onSelectDragUpdate={handleSelectDragUpdate}
       onMoveSelection={nudgeSelection}
       moveWithContents={moveWithContents}
     />
@@ -2310,24 +2510,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
         </span>
       </div>
       <CursorHud ref={cursorHudRef} />
-      {dragSelectRect ? (
-        <div style={{ padding: "0 10px", borderRight: "1px solid #322d28", color: EDEN_TEAL_READABLE, whiteSpace: "nowrap" }}>
-          Sel <span style={{ color: EDEN_TEAL_READABLE }}>
-            {Math.round(dragSelectRect.x2 - dragSelectRect.x1) + 1}×{Math.round(dragSelectRect.y2 - dragSelectRect.y1) + 1}
-          </span>
-          {" · Z "}<span style={{ color: "#70665b" }}>{zMin}–{zMax}</span>
-        </div>
-      ) : selection && (
-        <div style={{ padding: "0 10px", borderRight: "1px solid #322d28", color: "#70665b", whiteSpace: "nowrap" }}>
-          Sel <span style={{ color: "#83786c" }}>{selection.width}×{selection.height}</span>
-          {selection.masked && selection.cell_count != null && (
-            <span style={{ color: "#a855f7", marginLeft: 5 }} title="Shaped selection — edits affect only the wand/lasso footprint, not the whole box">
-              ◆ shaped ({selection.cell_count.toLocaleString()} cells)
-            </span>
-          )}
-          {" · Z "}<span style={{ color: "#70665b" }}>{selection.z_min}–{selection.z_max}</span>
-        </div>
-      )}
+      <SelStatusHud ref={selStatusHudRef} selection={selection} zMin={zMin} zMax={zMax} />
       <div style={{ padding: "0 10px", borderRight: "1px solid #322d28", whiteSpace: "nowrap" }}>
         ↩ <span style={{ color: "#4b443d" }}>{undoDepth}</span>
         {"  "}↪ <span style={{ color: "#4b443d" }}>{redoDepth}</span>
@@ -2344,7 +2527,8 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
             title="Clear the replace filter"
             aria-label="Clear replace filter"
             style={{ background: "none", border: "none", cursor: "pointer", color: "#f59e0b",
-              padding: "0 3px", fontSize: 11, lineHeight: 1, opacity: 0.75 }}
+              minWidth: 18, minHeight: 18, display: "flex", alignItems: "center", justifyContent: "center",
+              fontSize: 11, lineHeight: 1, opacity: 0.75 }}
             onMouseEnter={e => { e.currentTarget.style.opacity = "1"; }}
             onMouseLeave={e => { e.currentTarget.style.opacity = "0.75"; }}
           >✕</button>
@@ -2531,12 +2715,16 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
                       onPickSelect={handlePick3dSelect}
                       onPickBreak={handlePick3dBreak}
                       onPickPlace={handlePick3dPlace}
+                      onPickEyedrop={handlePick3dEyedrop}
                       sculptTool={tool}
                       sculptRadius={sculptRadius}
                       sculptStrength={sculptStrength}
                       onSculptStamp3d={handleSculptStamp3d}
-                      armedSwatch={texturePackInfo ? tintedSwatch(build3dBlock, build3dPaint, texturePackInfo) : null}
-                      armedLabel={blockDisplayName(build3dBlock)}
+                      armedSwatch={texturePackInfo ? tintedSwatch(fillBlockType, fillPaint, texturePackInfo) : null}
+                      armedLabel={blockDisplayName(fillBlockType)}
+                      hotbarSlots={hotbar3dSlots}
+                      activeBlock={{ type: fillBlockType, paint: fillPaint }}
+                      onHotbarSelect={(type, paint) => { setFillBlockType(type); setFillPaint(paint); }}
                     />
                   </ErrorBoundary>
                   <button
@@ -2580,27 +2768,40 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
               <>
                 <div
                   onPointerDown={beginQuadDrag("col")}
+                  onMouseEnter={() => setHoverSplit("col")}
+                  onMouseLeave={() => setHoverSplit(s => s === "col" ? null : s)}
                   title="Drag to resize columns"
                   style={{
                     position: "absolute", top: 0, bottom: 0, left: `${quadColSplit * 100}%`,
                     width: 8, marginLeft: -4, cursor: "col-resize", zIndex: 4,
+                    display: "flex", justifyContent: "center",
                   }}
-                />
+                >
+                  <div style={{ width: 1, height: "100%", background: hoverSplit === "col" ? "rgba(230,224,216,0.55)" : "rgba(230,224,216,0.18)" }} />
+                </div>
                 <div
                   onPointerDown={beginQuadDrag("row")}
+                  onMouseEnter={() => setHoverSplit("row")}
+                  onMouseLeave={() => setHoverSplit(s => s === "row" ? null : s)}
                   title="Drag to resize rows"
                   style={{
                     position: "absolute", left: 0, right: 0, top: `${quadRowSplit * 100}%`,
                     height: 8, marginTop: -4, cursor: "row-resize", zIndex: 4,
+                    display: "flex", alignItems: "center",
                   }}
-                />
+                >
+                  <div style={{ height: 1, width: "100%", background: hoverSplit === "row" ? "rgba(230,224,216,0.55)" : "rgba(230,224,216,0.18)" }} />
+                </div>
                 <div
                   onPointerDown={beginQuadDrag("both")}
+                  onMouseEnter={() => setHoverSplit("both")}
+                  onMouseLeave={() => setHoverSplit(s => s === "both" ? null : s)}
                   title="Drag to resize all panes"
                   style={{
                     position: "absolute", left: `${quadColSplit * 100}%`, top: `${quadRowSplit * 100}%`,
                     width: 14, height: 14, marginLeft: -7, marginTop: -7, cursor: "move", zIndex: 5,
-                    borderRadius: 3, background: "rgba(49,44,40,0.9)", border: "1px solid #61584f",
+                    borderRadius: 3, background: hoverSplit === "both" ? "rgba(73,66,60,0.95)" : "rgba(49,44,40,0.9)",
+                    border: "1px solid #61584f",
                   }}
                 />
               </>
@@ -2683,8 +2884,6 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           viewMode={viewMode}
           setViewMode={setViewMode}
           zSliceZ={zSliceZ}
-          zSliceDisplay={zSliceDisplay}
-          setZSliceDisplay={setZSliceDisplay}
           commitZSlice={commitZSlice}
           followSurface={followSurface}
           setFollowSurface={setFollowSurface}
@@ -2698,21 +2897,17 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           setEnable3dPane={setEnable3dPane}
           mode3d={mode3d}
           setMode3d={setMode3d}
-          build3dBlock={build3dBlock}
-          build3dPaint={build3dPaint}
-          setBuild3dBlock={setBuild3dBlock}
-          setBuild3dPaint={setBuild3dPaint}
+          autoOrient3d={autoOrient3d}
+          setAutoOrient3d={(v) => { setAutoOrient3d(v); saveSettingsDebounced({ autoOrient3d: v }); }}
           nightLighting={nightLighting}
           setNightLighting={setNightLighting}
           shadows3d={shadows3d}
           setShadows3d={setShadows3d}
           gpuShadows={gpuShadows}
           setGpuShadows={setGpuShadows}
-          sunTDisplay={sunTDisplay}
-          setSunTDisplay={setSunTDisplay}
+          sunT={sunT}
           commitSunT={commitSunT}
-          lampRadiusDisplay={lampRadiusDisplay}
-          setLampRadiusDisplay={setLampRadiusDisplay}
+          lampRadius={lampRadius}
           commitLampRadius={commitLampRadius}
           onFitMap={() => mapCanvasRef.current?.resetView()}
           templateLoaded={templateLoaded}
@@ -2793,6 +2988,8 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           exportPng={exportPng}
           exportObj={exportObj}
           exportJson={exportJson}
+          exportVmf={exportVmf}
+          enableExperimentalExport={enableExperimentalExport}
           loadPrefab={loadPrefab}
           importSchematic={importSchematic}
           showPrefabLibrary={showPrefabLibrary}
@@ -2936,7 +3133,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           />
         )}
 
-        {(exporting || exportingObj || exportingJson || loading) && (
+        {(exporting || exportingObj || exportingJson || exportingVox || loading) && (
           <div style={{
             position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center",
             background: "rgba(0,0,0,0.45)", zIndex: 200, pointerEvents: "none",
@@ -2950,12 +3147,20 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
                   <div style={{ color: "#ebe9e7", fontSize: 14, marginBottom: 12 }}>
                     Exporting PNG… {exportProgress !== null ? `${Math.round(exportProgress * 100)}%` : ""}
                   </div>
-                  <div style={{ background: "#312c28", borderRadius: 4, height: 6, overflow: "hidden" }}>
-                    <div style={{
-                      background: "#f59e0b", height: "100%", borderRadius: 4,
-                      width: `${Math.round((exportProgress ?? 0) * 100)}%`,
-                      transition: "width 0.1s ease",
-                    }} />
+                  <div style={{ background: "#312c28", borderRadius: 4, height: 6, overflow: "hidden", position: "relative" }}>
+                    {exportProgress !== null ? (
+                      <div style={{
+                        background: "#f59e0b", height: "100%", borderRadius: 4,
+                        width: `${Math.round(exportProgress * 100)}%`,
+                        transition: "width 0.1s ease",
+                      }} />
+                    ) : (
+                      <div style={{
+                        position: "absolute", inset: 0, width: "30%",
+                        background: "linear-gradient(90deg, transparent, #f59e0b, transparent)",
+                        animation: "eden-shimmer 1.1s ease-in-out infinite",
+                      }} />
+                    )}
                   </div>
                 </>
               ) : exportingObj ? (
@@ -2996,26 +3201,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
         {showSettings && (
           <SettingsModal
             onClose={() => setShowSettings(false)}
-            onSave={(s) => {
-              setSaveCompressed(s.defaultSaveCompressed);
-              setFogEnabled(s.enableFog);
-              setShowQuickActions(s.showQuickActions);
-              setSunT(s.sunT);
-              setSunTDisplay(s.sunT);
-              setLampRadius(s.lampRadius);
-              setLampRadiusDisplay(s.lampRadius);
-              setRenderDistance(s.renderDistance);
-              setFlySpeed(s.flySpeed);
-              setLookSensitivity(s.lookSensitivity);
-              setDragSensitivity(s.dragSensitivity);
-              setInvertY(s.invertY);
-              setAutosaveIntervalMin(s.autosaveIntervalMin);
-              if (s.templatePath !== templatePath) setTemplatePath(s.templatePath);
-              if (s.texturePackPath !== texturePackPath) {
-                if (s.texturePackPath) loadTexturePackFile(s.texturePackPath);
-                else unloadTexturePack();
-              }
-            }}
+            onSave={applySettings}
           />
         )}
 
@@ -3029,6 +3215,13 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           <UploadModal
             sourcePath={sourcePath}
             onClose={() => setShowUploadModal(false)}
+          />
+        )}
+        {vmfExportBounds && world && (
+          <VmfExportModal
+            worldName={world.name}
+            bounds={vmfExportBounds}
+            onClose={() => setVmfExportBounds(null)}
           />
         )}
         {showNewWorld && (
@@ -3162,11 +3355,11 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           const miHov = (e: React.MouseEvent<HTMLButtonElement>) => { e.currentTarget.style.background = `rgba(${EDEN_TEAL},0.18)`; };
           const miLve = (e: React.MouseEvent<HTMLButtonElement>) => { e.currentTarget.style.background = ""; };
           const div = <div style={{ height: 1, background: "#312c28", margin: "3px 0" }} />;
-          const menuY = Math.min(ctxMenu.y, window.innerHeight - 260);
           return (
             <div
+              ref={ctxMenuElRef}
               style={{
-                position: "fixed", top: menuY, left: ctxMenu.x, zIndex: 9000, minWidth: 210,
+                position: "fixed", top: ctxMenu.y, left: ctxMenu.x, zIndex: 9000, minWidth: 210,
                 padding: "4px 0",
                 background: "linear-gradient(180deg, rgba(34,29,25,.95) 0%, rgba(20,17,14,.95) 100%)",
                 backdropFilter: "blur(12px)", WebkitBackdropFilter: "blur(12px)",
@@ -3299,7 +3492,9 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
                       aria-label="Dismiss error"
                       style={{
                         background: "none", border: "none", color: "#fca5a5", cursor: "pointer",
-                        fontSize: 14, lineHeight: "16px", padding: 0, opacity: 0.7,
+                        fontSize: 14, lineHeight: 1, padding: 0, opacity: 0.7,
+                        minWidth: 24, minHeight: 24, display: "flex", alignItems: "center", justifyContent: "center",
+                        marginTop: -4, marginRight: -6, marginBottom: -4,
                       }}
                     >✕</button>
                   )}
@@ -3468,28 +3663,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
       {showSettings && (
         <SettingsModal
           onClose={() => setShowSettings(false)}
-          onSave={(s) => {
-            setShowSlicePanels(s.defaultQuadView);
-            setEnable3dPane(s.default3dPane);
-            setSaveCompressed(s.defaultSaveCompressed);
-            setFogEnabled(s.enableFog);
-            setShowQuickActions(s.showQuickActions);
-            setSunT(s.sunT);
-            setSunTDisplay(s.sunT);
-            setLampRadius(s.lampRadius);
-            setLampRadiusDisplay(s.lampRadius);
-            setRenderDistance(s.renderDistance);
-            setFlySpeed(s.flySpeed);
-            setLookSensitivity(s.lookSensitivity);
-            setDragSensitivity(s.dragSensitivity);
-            setInvertY(s.invertY);
-            setAutosaveIntervalMin(s.autosaveIntervalMin);
-            if (s.templatePath !== templatePath) setTemplatePath(s.templatePath);
-            if (s.texturePackPath !== texturePackPath) {
-              if (s.texturePackPath) loadTexturePackFile(s.texturePackPath);
-              else unloadTexturePack();
-            }
-          }}
+          onSave={applySettings}
         />
       )}
 

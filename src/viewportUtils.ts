@@ -19,7 +19,13 @@ export function zoomAtPoint(
   deltaY: number,
   opts: { min: number; max: number; factor: number },
 ): ViewTransform {
-  const f = deltaY < 0 ? opts.factor : 1 / opts.factor;
+  // Scale the zoom step by wheel delta magnitude — a fast wheel flick or big trackpad swipe should
+  // zoom further per event than a slow single notch, instead of the old fixed step regardless of
+  // deltaY. `factor` is calibrated as the zoom multiplier at a typical one-notch deltaY (~100),
+  // clamped so one event can't blow past a reasonable range (fast flicks, big trackpad deltas).
+  const k = Math.log(opts.factor) / 100;
+  const rawF = Math.exp(-deltaY * k);
+  const f = Math.max(1 / (opts.factor * 3), Math.min(opts.factor * 3, rawF));
   const newScale = Math.max(opts.min, Math.min(opts.max, view.scale * f));
   return {
     scale: newScale,
