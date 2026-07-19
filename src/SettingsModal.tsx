@@ -36,6 +36,10 @@ export interface AppSettings {
   invertY: boolean;
   /** Autosave interval in minutes. 0 disables autosave. Default 3 (the old hardcoded AUTOSAVE_MS). */
   autosaveIntervalMin: number;
+  /** Auto-orient ramps/wedges/doors to the player's facing when placing in 3D build mode. Default true. */
+  autoOrient3d: boolean;
+  /** Shows OBJ/VMF export menu items. Both are buggy/unfinished; off by default so most users never see them. */
+  enableExperimentalExport: boolean;
   /** Bumped when a default changes in a way that must be pushed onto existing installs (see loadSettings). */
   settingsVersion: number;
 }
@@ -60,6 +64,8 @@ const DEFAULTS: AppSettings = {
   dragSensitivity: 1,
   invertY: false,
   autosaveIntervalMin: 3,
+  autoOrient3d: true,
+  enableExperimentalExport: false,
   settingsVersion: SETTINGS_VERSION,
 };
 
@@ -291,11 +297,22 @@ export default function SettingsModal({ onClose, onSave }: Props) {
                 </div>
               </div>
 
-              <div style={{ ...row, borderBottom: "none" }}>
+              <div style={row}>
                 <Checkbox value={local.showQuickActions} onChange={v => set("showQuickActions", v)} label="Quick Actions bar" />
                 <div style={labelCol}>
                   <span style={labelText}>Quick Actions bar</span>
                   <span style={labelSub}>Floating copy/fill/paste + paste Z-offset bar, shown while a selection or clipboard exists</span>
+                </div>
+              </div>
+
+              <div style={{ ...row, borderBottom: "none" }}>
+                <Checkbox value={local.enableExperimentalExport} onChange={v => set("enableExperimentalExport", v)} label="Experimental exports (OBJ/VMF)" />
+                <div style={labelCol}>
+                  <span style={labelText}>
+                    Experimental exports (OBJ/VMF)
+                    <span style={expBadge({ marginLeft: 7, verticalAlign: "middle" })}>exp</span>
+                  </span>
+                  <span style={labelSub}>Shows File → Export OBJ… and Export VMF (Hammer)… — both are still buggy</span>
                 </div>
               </div>
             </>

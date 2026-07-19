@@ -246,13 +246,19 @@ function ToolsHelp() {
         </tbody>
       </table>
       <p style={{ margin: "4px 0 10px" }}>
-        <b style={{ color: "#ebe9e7" }}>Build mode</b> (3D tab → Camera/Select/Build) arms a block
-        you pick there — independent of the map's fill block. While in Build,{" "}
-        <b style={{ color: "#ebe9e7" }}>left-click breaks</b> the block you're aiming at and{" "}
-        <b style={{ color: "#ebe9e7" }}>right-click places</b> the armed block against that face —
-        the same convention as most block-building games. Two highlight boxes show which block each
-        click acts on. <b style={{ color: "#ebe9e7" }}>Select mode</b> lets you click two corners to
-        make a 3D box selection, same as dragging one on the map.
+        <b style={{ color: "#ebe9e7" }}>Build mode</b> (3D tab → Camera/Select/Build) arms the same
+        block as the map's fill block/hotbar — set it from either place and it stays in sync,
+        including the <Key>1</Key>–<Key>0</Key> digit keys and an in-pane hotbar strip while
+        building. While in Build, <b style={{ color: "#ebe9e7" }}>left-click breaks</b> the block
+        you're aiming at and <b style={{ color: "#ebe9e7" }}>right-click places</b> the armed block
+        against that face — the same convention as most block-building games. Holding either button
+        down repeats break/place at the crosshair every ~220ms instead of single clicks (release, or
+        drag past a few pixels, to stop). <b style={{ color: "#ebe9e7" }}>Middle-click</b> picks the
+        block under the cursor as the new armed block, mirroring the map's eyedropper. Ramps, wedges,
+        and doors auto-orient to face you as you place them (3D tab → Build Block → Auto-orient
+        toggle turns this off to use the picker's manual Dir/Apex buttons instead). Two highlight
+        boxes show which block each click acts on. <b style={{ color: "#ebe9e7" }}>Select mode</b>{" "}
+        lets you click two corners to make a 3D box selection, same as dragging one on the map.
       </p>
       <p style={{ margin: "4px 0 10px" }}>
         <b style={{ color: "#ebe9e7" }}>Sculpt mode</b> (3D tab → Camera/Select/Build/Sculpt) sculpts
@@ -351,8 +357,8 @@ export default function HelpModal({ onClose }: { onClose: () => void }) {
                 <Row keys={<>Hold <Key>⇧</Key></>}                            action="Temporary Smooth — overrides the armed tool while held (any sculpt tool except Grab)" />
 
                 <Section title="Blocks" />
-                <Row keys={<><Key>1</Key>–<Key>5</Key></>}                   action="Pinned hotbar slots" />
-                <Row keys={<><Key>6</Key>–<Key>0</Key></>}                   action="Recently-used hotbar slots" />
+                <Row keys={<><Key>1</Key>–<Key>5</Key></>}                   action="Pinned hotbar slots — also works in the 3D pane's Build mode" />
+                <Row keys={<><Key>6</Key>–<Key>0</Key></>}                   action="Recently-used hotbar slots — also works in the 3D pane's Build mode" />
 
                 <Section title="Editing" />
                 <Row keys={<><Key>⌘</Key><Key>Z</Key></>}                   action="Undo" />
