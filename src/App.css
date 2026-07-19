@@ -48,6 +48,13 @@ body {
   to   { opacity: 1; transform: none; }
 }
 
+/* Indeterminate progress fill (PNG export has no progress events to drive a real bar — a shimmer
+   at least reads as "working", not "stuck at 0%" like a permanently-empty determinate bar did). */
+@keyframes eden-shimmer {
+  0%   { transform: translateX(-100%); }
+  100% { transform: translateX(350%); }
+}
+
 /* Keyboard focus should be visible app-wide, not just in the ribbon — modals, panels, and the
    canvas chrome are all reachable by Tab. :focus-visible only fires for keyboard focus, so this
    never draws a ring on a mouse click. */

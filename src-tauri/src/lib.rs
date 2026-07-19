@@ -3,12 +3,14 @@ mod export;
 mod network;
 mod schematic;
 mod texturepack;
+mod vmf_export;
 mod worldgen;
 
 use colors::*;
 use export::*;
 use network::*;
 use schematic::*;
+use vmf_export::{estimate_vmf, export_vmf};
 use worldgen::*;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use memmap2::{Mmap, MmapMut, MmapOptions};
@@ -2430,7 +2432,7 @@ fn count_undo_groups(stack: &VecDeque<UndoEntry>) -> usize {
     count
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn delete_blocks(
     x1: i32, y1: i32, x2: i32, y2: i32,
     z_min: i32, z_max: i32,
@@ -2450,7 +2452,7 @@ fn delete_blocks(
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn replace_blocks(
     x1: i32, y1: i32, x2: i32, y2: i32,
     z_min: i32, z_max: i32,
@@ -2499,7 +2501,7 @@ const BAYER8: [[u8; 8]; 8] = [
 /// Fill a selection with a dithered gradient between block A and block B along an axis —
 /// e.g. grass→stone across a slope. Only replaces existing (non-air) blocks by default so
 /// the terrain's shape is preserved (a re-skin); `include_air` also fills gaps.
-#[tauri::command]
+#[tauri::command(async)]
 #[allow(clippy::too_many_arguments)]
 fn gradient_fill(
     x1: i32, y1: i32, x2: i32, y2: i32,
@@ -2567,7 +2569,7 @@ fn gradient_fill_inner(
 /// `z_offset` (a vertical nudge applied to every block) is optional — omitting it means "no
 /// nudge", which is what every exact-coordinate caller wants (slice viewports, elevation panel,
 /// 3D picking). It used to be required, and those callers all failed at runtime on the missing key.
-#[tauri::command]
+#[tauri::command(async)]
 fn paint_blocks(
     blocks: Vec<PaintBlock>,
     block_type: u8,
@@ -2800,13 +2802,13 @@ fn discard_autosave(app: tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn undo_edit(state: tauri::State<'_, AppState>) -> Result<EditResult, String> {
     let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
     undo_edit_inner(&mut ws)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn redo_edit(state: tauri::State<'_, AppState>) -> Result<EditResult, String> {
     let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
     redo_edit_inner(&mut ws)
@@ -2901,7 +2903,7 @@ fn redo_edit_inner(ws: &mut WorldState) -> Result<EditResult, String> {
 
 /// Capture all blocks in the selection volume into the in-memory clipboard.
 /// No world mutation; no undo entry. Returns clipboard dimensions for the frontend.
-#[tauri::command]
+#[tauri::command(async)]
 fn copy_selection(
     x1: i32, y1: i32, x2: i32, y2: i32,
     z_min: i32, z_max: i32,
@@ -3268,7 +3270,7 @@ fn mirror_clipboard_y(state: tauri::State<'_, AppState>) -> Result<ClipboardInfo
 /// ignore_air = true skips clipboard voxels with block type 0 (air).
 /// Blocks outside existing chunk boundaries are silently clipped.
 /// Follows the full chunk-scoped undo contract.
-#[tauri::command]
+#[tauri::command(async)]
 fn paste_at(
     paste_x: i32, paste_y: i32,
     elevation_offset: i32,
@@ -3332,7 +3334,7 @@ fn paste_at(
 /// is placed at `surface_z + (if above_surface { 1 } else { 0 }) + elevation_offset`.
 /// Columns with no surface (all air or outside world) are skipped.
 /// Follows the same chunk-scoped undo contract as paste_at.
-#[tauri::command]
+#[tauri::command(async)]
 fn paste_terrain(
     paste_x: i32, paste_y: i32,
     elevation_offset: i32,
@@ -3406,7 +3408,7 @@ fn paste_terrain(
 /// count: number of copies (not counting the original), 1–20.
 /// ignore_air: if true, source air blocks are not written (gaps preserved).
 /// All copies land in a single undo entry.
-#[tauri::command]
+#[tauri::command(async)]
 fn extrude_selection(
     x1: i32, y1: i32, x2: i32, y2: i32,
     z_min: i32, z_max: i32,
@@ -3540,7 +3542,7 @@ fn extrude_write(
 /// a manual cut+paste. Cells vacated by the move that fall inside the destination are simply
 /// overwritten by the subsequent write, so overlapping moves (e.g. nudging by 1) are safe:
 /// the whole source is captured into an in-memory buffer before anything is mutated.
-#[tauri::command]
+#[tauri::command(async)]
 fn move_selection(
     x1: i32, y1: i32, x2: i32, y2: i32,
     z_min: i32, z_max: i32,
@@ -3824,7 +3826,7 @@ fn pick_leaf_paint(user: &[u8], default: &[u8], rng: &mut Rng64) -> u8 {
 /// existing foliage are skipped. `seed` = None uses a random timestamp-based seed.
 /// `tree_types` may include multiple types; each column picks one randomly.
 /// `leaf_paints` is the user's chosen paint pool; empty = type-appropriate defaults.
-#[tauri::command]
+#[tauri::command(async)]
 fn generate_trees(
     x1: i32, y1: i32, x2: i32, y2: i32,
     tree_types: Vec<String>,
@@ -4623,7 +4625,7 @@ fn round_dither(raw: f64, softness: f64, x: i32, y: i32) -> i32 {
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 #[allow(clippy::too_many_arguments)]
 fn sculpt_terrain(
     points: Option<Vec<SculptPoint>>,
@@ -5288,7 +5290,7 @@ fn sculpt_terrain_inner(
 // ── Fill surface (flood fill) ─────────────────────────────────────────────────
 
 /// Flood-fill connected surface blocks of the same type as the seed position.
-#[tauri::command]
+#[tauri::command(async)]
 fn fill_surface(
     wx: i32, wy: i32,
     new_type: u8, new_paint: u8,
@@ -5360,7 +5362,7 @@ struct SelectRect { x1: i32, y1: i32, x2: i32, y2: i32 }
 /// active `SelectionMask` (keyed to that bbox), so a subsequent Delete/Fill affects only the shaped
 /// cells — not the whole box, which was the long-standing "wand selects unrelated cells" bug (the
 /// BFS already visited the true shape; it just used to be discarded once the bbox was computed).
-#[tauri::command]
+#[tauri::command(async)]
 fn magic_wand_select(
     wx: i32, wy: i32,
     match_paint: bool,
@@ -5525,7 +5527,7 @@ fn paste_clipboard_at(
 }
 
 /// Paste clipboard at `count` random positions within the bounding box.
-#[tauri::command]
+#[tauri::command(async)]
 fn scatter_paste(
     x1: i32, y1: i32, x2: i32, y2: i32,
     count: i32,
@@ -5569,7 +5571,7 @@ fn scatter_paste(
 }
 
 /// Paste clipboard in a cols × rows grid with given spacing.
-#[tauri::command]
+#[tauri::command(async)]
 fn array_paste(
     origin_x: i32, origin_y: i32,
     cols: i32, rows: i32,
@@ -5676,6 +5678,8 @@ pub fn run() {
             export_obj,
             export_json,
             export_vox,
+            export_vmf,
+            estimate_vmf,
             get_obj_geometry,
             get_chunk_geometry,
             get_light_constants,

@@ -183,6 +183,10 @@ const PICK_HOVER_MS = 33;
 /** A pointerdown/up pair inside this many px and ms is a click, not a look-drag or an orbit drag. */
 const CLICK_SLOP_PX = 4;
 const CLICK_SLOP_MS = 250;
+/** Held break/place: delay before the first repeat (must exceed CLICK_SLOP_MS so a quick click never
+ *  races the repeat timer), then the steady repeat interval. Mirrors the sculpt hold-timer's cadence. */
+const BUILD_REPEAT_DELAY_MS = 300;
+const BUILD_REPEAT_MS = 220;
 
 /** A wireframe box overlay in Eden world coordinates (Three.js coords are derived internally). */
 export interface Overlay3D {
@@ -273,12 +277,25 @@ const FlyView3D = forwardRef<FlyView3DRef, {
   onPickSelect?: (x: number, y: number, z: number) => void;
   /** Left click in "build" mode: the voxel to clear. */
   onPickBreak?: (x: number, y: number, z: number) => void;
-  /** Right click in "build" mode: the empty voxel against the picked face, where a block goes. */
-  onPickPlace?: (x: number, y: number, z: number) => void;
+  /** Right click in "build" mode: the empty voxel against the picked face, where a block goes.
+   *  `yaw` is the player's horizontal look direction in Eden coords (atan2(dx, dy), 0 = South),
+   *  so App can auto-orient directional blocks to face the player. */
+  onPickPlace?: (x: number, y: number, z: number, yaw: number) => void;
+  /** Middle click in "build" mode: pick the block/paint under the cursor as the new armed block
+   *  (mirrors the 2D eyedropper). Not offered in "select"/"sculpt" — keeps scope to build mode. */
+  onPickEyedrop?: (blockType: number, paint: number) => void;
   /** Data-URL swatch of the armed fill block, shown in the corner while building. */
   armedSwatch?: string | null;
   /** Human-readable name of the armed fill block, shown next to the swatch. */
   armedLabel?: string;
+  /** In-pane hotbar overlay data (build mode only), 10 slots: index 0-4 pinned (null = empty pin
+   *  slot, digit key 1-5), index 5-9 recent (digit key 6-0). Precomputed by App so this component
+   *  doesn't need its own resolveColor/tintedSwatch import. */
+  hotbarSlots?: ({ type: number; paint: number; css: string; label: string } | null)[];
+  /** Currently-armed block+paint, to ring-highlight the matching hotbar slot. */
+  activeBlock?: { type: number; paint: number };
+  /** Click a hotbar slot to arm it (mirrors the Ribbon hotbar / digit keys). */
+  onHotbarSelect?: (type: number, paint: number) => void;
   /** Sets what a click does in this pane (the in-pane VIEW/SELECT/BUILD/SCULPT pill). Mirrors the
    *  Ribbon 3D tab's mode picker — both write App's mode3d, so they stay in sync. */
   onSetInteract3d?: (m: Interact3D) => void;
@@ -306,7 +323,8 @@ const FlyView3D = forwardRef<FlyView3DRef, {
   nightLighting = false, shadows3d = false, sunT = 0.5, lampRadius = 5, lightEpoch = 0,
   initialRenderDistance, initialFlySpeed, onRenderDistanceChange, onFlySpeedChange, anyModalOpen = false,
   lookSensitivity = 1, dragSensitivity = 1, invertY = false,
-  interact3d = "none", onPickSelect, onPickBreak, onPickPlace, armedSwatch = null, armedLabel = "",
+  interact3d = "none", onPickSelect, onPickBreak, onPickPlace, onPickEyedrop, armedSwatch = null, armedLabel = "",
+  hotbarSlots, activeBlock, onHotbarSelect,
   onSetInteract3d,
   sculptTool = "raise", sculptRadius = 6, sculptStrength = 2, onSculptStamp3d,
   gpuShadows = false,
@@ -402,6 +420,8 @@ const FlyView3D = forwardRef<FlyView3DRef, {
   onPickBreakRef.current = onPickBreak;
   const onPickPlaceRef = useRef(onPickPlace);
   onPickPlaceRef.current = onPickPlace;
+  const onPickEyedropRef = useRef(onPickEyedrop);
+  onPickEyedropRef.current = onPickEyedrop;
 
   // Sculpt props read through refs by the scene closure (live values without a scene teardown).
   const sculptToolRef = useRef(sculptTool);
@@ -1194,6 +1214,20 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       return { ox: o.x, oy: o.y, oz: o.z, dx: d.x, dy: d.y, dz: d.z };
     };
 
+    // Player's horizontal look direction (Eden yaw, atan2(dx, dy), 0 = South) for auto-orienting
+    // placed blocks. Uses the pick ray's horizontal component so it works in both orbit (pointer
+    // ray) and look (camera-forward) modes; when the ray is near-vertical (looking straight
+    // down/up, no meaningful heading) it falls back to the camera-forward horizontal.
+    const placeYaw = (clientX: number, clientY: number): number => {
+      const r = cursorRay(clientX, clientY);
+      let dx = r.dx, dy = r.dy;
+      if (Math.hypot(dx, dy) < 1e-3) {
+        camera.getWorldDirection(rayFwd);
+        dx = rayFwd.x; dy = rayFwd.z; // Eden (dx, dy) = Three (x, z)
+      }
+      return Math.atan2(dx, dy);
+    };
+
     const pick = async (clientX: number, clientY: number): Promise<PickResult | null> => {
       const r = cursorRay(clientX, clientY);
       try {
@@ -1372,8 +1406,68 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     // counts if the pointer barely moved and the press was short. This keeps build/select working in
     // the drag-to-look fallback, which matters because pointer lock is exactly what webviews refuse.
     let downX = 0, downY = 0, downT = 0, downBtn = -1;
+
+    // Hold-to-repeat break/place (build mode only). A short press still resolves through the
+    // click-gated onPickUp/onPickContext below; BUILD_REPEAT_DELAY_MS is chosen > CLICK_SLOP_MS so
+    // the two paths never both fire for the same gesture (by the time the repeat delay elapses, a
+    // quick click's own pointerup has already missed the click-slop time window).
+    let buildRepeatDelayTimer: number | null = null;
+    let buildRepeatTimer: number | null = null;
+    let buildRepeatButton = -1; // 0 = break (left), 2 = place (right)
+    let buildRepeatLastCell: string | null = null; // skip no-op repeats of the same voxel this hold
+    let buildRepeatFired = false; // guards onPickContext from double-placing after a held repeat
+
+    const stopBuildRepeat = () => {
+      if (buildRepeatDelayTimer !== null) { clearTimeout(buildRepeatDelayTimer); buildRepeatDelayTimer = null; }
+      if (buildRepeatTimer !== null) { clearInterval(buildRepeatTimer); buildRepeatTimer = null; }
+      buildRepeatButton = -1;
+      buildRepeatLastCell = null;
+    };
+
+    // Each repeat tick re-picks the live crosshair (frozen while flying, live cursor while orbiting)
+    // and cancels itself the moment the pointer has drifted past click-slop since mouse-down — that's
+    // the signal a drag became an orbit-rotate instead of a held break/place, so we back off and let
+    // OrbitControls own the gesture.
+    const buildRepeatTick = async () => {
+      if (interact3dRef.current !== "build") { stopBuildRepeat(); return; }
+      if (Math.abs(cursorX - downX) > CLICK_SLOP_PX || Math.abs(cursorY - downY) > CLICK_SLOP_PX) { stopBuildRepeat(); return; }
+      const hit = await pick(cursorX, cursorY);
+      if (disposed || !hit) return;
+      if (buildRepeatButton === 0) {
+        const key = `${hit.x},${hit.y},${hit.z}`;
+        if (key === buildRepeatLastCell) return;
+        buildRepeatLastCell = key;
+        buildRepeatFired = true;
+        onPickBreakRef.current?.(hit.x, hit.y, hit.z);
+      } else if (buildRepeatButton === 2) {
+        const t = clickTarget(hit);
+        const c = threeToEden(camera.position);
+        if (Math.floor(c.x) === t.x && Math.floor(c.y) === t.y && Math.floor(c.z) === t.z) return;
+        const key = `${t.x},${t.y},${t.z}`;
+        if (key === buildRepeatLastCell) return;
+        buildRepeatLastCell = key;
+        buildRepeatFired = true;
+        onPickPlaceRef.current?.(t.x, t.y, t.z, placeYaw(cursorX, cursorY));
+      }
+    };
+
     const onPickDown = (e: PointerEvent) => {
       downX = e.clientX; downY = e.clientY; downT = performance.now(); downBtn = e.button;
+      // Suppress the browser's middle-click autoscroll icon; only relevant in build mode (eyedropper).
+      if (e.button === 1 && interact3dRef.current === "build") e.preventDefault();
+      // Break (left) is reliable in WKWebView; place (right) is attempted the same way but the
+      // guaranteed fallback is the `contextmenu` handler below (button-2 pointer events are
+      // unreliable there — see its comment).
+      if ((e.button === 0 || e.button === 2) && interact3dRef.current === "build") {
+        buildRepeatButton = e.button;
+        buildRepeatLastCell = null;
+        buildRepeatFired = false;
+        buildRepeatDelayTimer = window.setTimeout(() => {
+          buildRepeatDelayTimer = null;
+          void buildRepeatTick();
+          buildRepeatTimer = window.setInterval(() => { void buildRepeatTick(); }, BUILD_REPEAT_MS);
+        }, BUILD_REPEAT_DELAY_MS);
+      }
     };
     const isClick = (e: PointerEvent) =>
       e.button === downBtn &&
@@ -1386,7 +1480,17 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     // click handler must NOT fall through to break — an explicit build-only guard replaces the old
     // "not select ⇒ build" assumption now that "sculpt" is a fourth mode.
     const onPickUp = async (e: PointerEvent) => {
-      if (e.button !== 0 || interact3dRef.current === "none" || !isClick(e)) return;
+      if ((e.button === 0 || e.button === 2) && buildRepeatButton === e.button) stopBuildRepeat();
+      if (interact3dRef.current === "none" || !isClick(e)) return;
+      // Middle click in build mode: eyedropper (pick block+paint under the cursor). Build-only —
+      // select/sculpt don't offer it, matching the plan's scope cut.
+      if (e.button === 1) {
+        if (interact3dRef.current !== "build") return;
+        const hit = await pick(e.clientX, e.clientY);
+        if (hit) onPickEyedropRef.current?.(hit.block_type, hit.paint);
+        return;
+      }
+      if (e.button !== 0) return;
       if (interact3dRef.current === "select") {
         const hit = await pick(e.clientX, e.clientY);
         if (hit) onPickSelectRef.current?.(hit.x, hit.y, hit.z);
@@ -1401,16 +1505,19 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     // matches what the highlight showed. Refuses to place inside the camera's own voxel (you'd entomb
     // yourself with no obvious way out). Bound to `contextmenu`, NOT button-2 pointer events: button 2
     // is unreliable in macOS WKWebView (MapCanvas hit the same — see its context-menu note).
-    // preventDefault also suppresses the OS/webview menu over the 3D pane.
+    // preventDefault also suppresses the OS/webview menu over the 3D pane. `contextmenu` fires after
+    // pointerup, so if the held-repeat timer above already placed at least once this gesture, this is
+    // swallowed instead of placing a second block.
     const onPickContext = async (e: MouseEvent) => {
       e.preventDefault();
       if (interact3dRef.current !== "build") return;
+      if (buildRepeatFired) { buildRepeatFired = false; return; }
       const hit = await pick(e.clientX, e.clientY);
       if (!hit) return;
       const t = clickTarget(hit); // build → placement cell
       const c = threeToEden(camera.position);
       if (Math.floor(c.x) === t.x && Math.floor(c.y) === t.y && Math.floor(c.z) === t.z) return;
-      onPickPlaceRef.current?.(t.x, t.y, t.z);
+      onPickPlaceRef.current?.(t.x, t.y, t.z, placeYaw(e.clientX, e.clientY));
     };
 
     const onPickMove = (e: PointerEvent) => {
@@ -1580,7 +1687,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     // Losing window focus (alt-tab, devtools) can swallow the keyup for a held direction key, leaving
     // it stuck in the set so the camera drifts indefinitely. Clear on blur. Also drop out of look
     // mode — a persistent OS cursor grab would otherwise freeze the cursor in whatever app we tab to.
-    const onBlur = () => { keys.clear(); lookDrag = false; cancelSculptStroke(); if (camModeRef.current === "look") applyMode("orbit"); };
+    const onBlur = () => { keys.clear(); lookDrag = false; cancelSculptStroke(); stopBuildRepeat(); if (camModeRef.current === "look") applyMode("orbit"); };
     window.addEventListener("blur", onBlur);
 
     const fwd = new THREE.Vector3();
@@ -1864,7 +1971,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       updateGpuLighting: () => applyGpuLighting(),
       refreshNightLights: () => updateNightLights(),
       refresh: () => invalidate(),
-      clearHighlight: () => setHighlight(null),
+      clearHighlight: () => { setHighlight(null); stopBuildRepeat(); },
       clearSculpt: () => { cancelSculptStroke(); placeBrush(null); },
       setOrbitLeftEnabled,
     };
@@ -1881,6 +1988,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
         onFlyModeChangeRef.current?.(false);
       }
       cancelSculptStroke();
+      stopBuildRepeat();
       cancelAnimationFrame(raf);
       clearInterval(sweepInterval);
       controls.removeEventListener("change", invalidate);
@@ -2294,6 +2402,35 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       )}
       {/* Camera position / heading HUD (Eden coords) */}
       <CoordHud ref={hudRef} />
+      {/* In-pane hotbar (bottom-centre, build mode only) — 5 pinned + 5 recent, mirrors the Ribbon
+          hotbar and the 1-5/6-0 digit keys so the active slot never needs a glance back at the Ribbon. */}
+      {interact3d === "build" && hotbarSlots && hotbarSlots.length > 0 && (
+        <div style={{
+          position: "absolute", bottom: 6, left: "50%", transform: "translateX(-50%)", zIndex: 1,
+          display: "flex", gap: 3, pointerEvents: "auto",
+          background: "rgba(31,28,26,0.7)", border: "1px solid rgba(131,120,108,0.3)", borderRadius: 6, padding: 3,
+        }}>
+          {hotbarSlots.map((b, i) => {
+            const active = !!b && !!activeBlock && b.type === activeBlock.type && b.paint === activeBlock.paint;
+            const digit = i < 5 ? String(i + 1) : String((i + 1) % 10);
+            return (
+              <div
+                key={i}
+                title={b ? `${b.label}${b.paint > 0 ? ` p${b.paint}` : ""} · key ${digit}` : `Empty pin slot ${digit}`}
+                onClick={() => b && onHotbarSelect?.(b.type, b.paint)}
+                style={{
+                  width: 22, height: 22, borderRadius: 3, cursor: b ? "pointer" : "default", flexShrink: 0,
+                  position: "relative", background: b ? b.css : "rgba(255,255,255,0.03)",
+                  border: active ? "2px solid #fff" : b ? "1px solid rgba(255,255,255,0.18)" : "1px dashed #4b443d",
+                  outline: active ? `1px solid ${i < 5 ? "#a78bfa" : "#f472b6"}` : "none", outlineOffset: 1,
+                }}
+              >
+                <span style={{ position: "absolute", top: 0, left: 2, fontSize: 6, color: "rgba(255,255,255,0.35)", lineHeight: 1, pointerEvents: "none", userSelect: "none" }}>{digit}</span>
+              </div>
+            );
+          })}
+        </div>
+      )}
       {/* In-pane interaction pill + armed-block hint (bottom-right). The VIEW/SELECT/BUILD pill is a
           quiet mirror of the Ribbon 3D tab's mode picker (both write mode3d); the hint below shows
           what a click will do without glancing back at the Ribbon. Container is pointer-transparent

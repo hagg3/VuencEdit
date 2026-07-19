@@ -127,7 +127,7 @@ interface WorldPoint { x: number; y: number }
 type DragOp =
   | { kind: "pan"; startX: number; startY: number; viewX: number; viewY: number }
   | { kind: "select"; start: WorldPoint; end: WorldPoint }
-  | { kind: "resizeEdge"; edge: "x1" | "x2" | "y1" | "y2"; live: SelectionBounds }
+  | { kind: "resizeEdge"; edge: ResizeEdge; live: SelectionBounds }
   | { kind: "moveSel"; origin: SelectionBounds; start: WorldPoint; dx: number; dy: number; ghost: HTMLCanvasElement | null }
   | { kind: "draw-stroke"; pts: Set<string>; lastWX: number; lastWY: number; startWX: number; startWY: number; live?: boolean }
   | { kind: "sculpt-grab"; pts: Set<string>; cx: number; cy: number; downClientY: number; delta: number }
@@ -137,6 +137,13 @@ type DragOp =
   | null;
 
 const EDGE_HIT_PX = 6;
+
+/** CSS cursor for a resize edge/corner hit-test result. */
+function resizeCursor(edge: ResizeEdge): string {
+  if (edge === "x1y1" || edge === "x2y2") return "nwse-resize";
+  if (edge === "x1y2" || edge === "x2y1") return "nesw-resize";
+  return edge === "x1" || edge === "x2" ? "ew-resize" : "ns-resize";
+}
 // Always-drawn resize grips on the selection edges (see the selection overlay in draw()). Sized to
 // read as a grabbable handle at a glance — a thinner bar was technically visible but still easy to
 // miss, which defeats the point of drawing it at rest at all.
@@ -162,11 +169,13 @@ function stampFootprint(p: WP, tool: Tool, cfg: DrawConfig | undefined): WP[] {
   return tool === "spray" ? sprayFilter(fp, cfg.sprayDensity) : fp;
 }
 
+type ResizeEdge = "x1" | "x2" | "y1" | "y2" | "x1y1" | "x1y2" | "x2y1" | "x2y2";
+
 function hitTestEdge(
   sx: number, sy: number,
   sel: SelectionBounds,
   view: { x: number; y: number; scale: number },
-): "x1" | "x2" | "y1" | "y2" | null {
+): ResizeEdge | null {
   const { x: vx, y: vy, scale } = view;
   const rx = Math.round(sel.x1 * scale + vx);
   const ry = Math.round(sel.y1 * scale + vy);
@@ -179,6 +188,11 @@ function hitTestEdge(
   const nearB = Math.abs(sy - (ry + rh)) <= H;
   const inX   = sx >= rx - H && sx <= rx + rw + H;
   const inY   = sy >= ry - H && sy <= ry + rh + H;
+  // Corners take priority over plain edges — near a corner should resize both axes at once.
+  if (nearL && nearT) return "x1y1";
+  if (nearL && nearB) return "x1y2";
+  if (nearR && nearT) return "x2y1";
+  if (nearR && nearB) return "x2y2";
   if (nearL && inY) return "x1";
   if (nearR && inY) return "x2";
   if (nearT && inX) return "y1";
@@ -303,6 +317,11 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   const fullProgressRef   = useRef<number | null>(null);
 
   const dragRef = useRef<DragOp>(null);
+  // Set true whenever a gesture's pointerdown actually landed on this canvas. Guards the
+  // paste-on-pointerup branch below: without it, a gesture that started on other chrome (e.g. a
+  // slider) and was released by dragging over the canvas would fire an accidental paste, since a
+  // native pointerup with no capture set targets whatever's under the cursor at release.
+  const pointerDownOnCanvasRef = useRef(false);
   // Hold-to-build: interval id while a sculpt stroke re-stamps the cursor; flag = a tick fired
   // (so pointer-up skips the final one-shot stroke to avoid a double application).
   const accumTimerRef = useRef<number | null>(null);
@@ -337,7 +356,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   // so draw() just blits the fill and strokes the outline instead of recomputing them each frame.
   const maskCanvasCacheRef = useRef<{ mask: typeof selectionMask; canvas: HTMLCanvasElement; outline: OutlinePt[][] } | null>(null);
   // Which selection edge the cursor is currently over — lights up that edge's grip in draw().
-  const hoverEdgeRef = useRef<"x1" | "x2" | "y1" | "y2" | null>(null);
+  const hoverEdgeRef = useRef<ResizeEdge | null>(null);
   // Cursor is over the 3D camera dot — brightens its grab-ring and shows the drag caption.
   const camHoverRef = useRef(false);
   const pastePreviewRef = useRef(pastePreview);
@@ -658,6 +677,24 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
           ctx.lineWidth   = 1;
           ctx.fillRect(gx, gy, gw, gh);
           ctx.strokeRect(gx + 0.5, gy + 0.5, gw - 1, gh - 1);
+        }
+        // Corner grips: a small square centred exactly on each corner, resizing both axes at once.
+        const CS = 9;
+        const corners: [ResizeEdge, number, number][] = [
+          ["x1y1", rx, ry],
+          ["x2y1", rx + rw, ry],
+          ["x1y2", rx, ry + rh],
+          ["x2y2", rx + rw, ry + rh],
+        ];
+        for (const [edge, cx, cy] of corners) {
+          const on = grip === edge;
+          ctx.fillStyle = "rgba(0,0,0,0.5)";
+          ctx.fillRect(cx - CS / 2 - 1, cy - CS / 2 - 1, CS + 2, CS + 2);
+          ctx.fillStyle   = on ? "#ffffff" : "rgba(255,255,255,0.85)";
+          ctx.strokeStyle = on ? "#60a5fa" : "rgba(37,99,235,0.95)";
+          ctx.lineWidth   = 1;
+          ctx.fillRect(cx - CS / 2, cy - CS / 2, CS, CS);
+          ctx.strokeRect(cx - CS / 2 + 0.5, cy - CS / 2 + 0.5, CS - 1, CS - 1);
         }
       }
     }
@@ -1069,14 +1106,17 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     const myEpoch = tileEpoch.current.peek();
     pendingRef.current.add(key);
     try {
-      let raw: PixelPatchRaw;
-      if (viewModeRef.current === "zslice") {
-        raw = await invoke<PixelPatchRaw>("render_zslice_patch", {
-          z: zSliceZRef.current, x1, y1, x2, y2,
-        });
-      } else {
-        raw = await invoke<PixelPatchRaw>("fetch_tile", { x1, y1, x2, y2 });
-      }
+      const tilePromise = viewModeRef.current === "zslice"
+        ? invoke<PixelPatchRaw>("render_zslice_patch", { z: zSliceZRef.current, x1, y1, x2, y2 })
+        : invoke<PixelPatchRaw>("fetch_tile", { x1, y1, x2, y2 });
+
+      // Fire the template overlay fetch concurrently with the base tile rather than after it.
+      const wantTemplate = showTemplateOverlayRef.current && viewModeRef.current !== "zslice" && !templateTileCacheRef.current.has(key);
+      const templatePromise = wantTemplate
+        ? invoke<PixelPatchRaw>("fetch_template_tile", { x1, y1, x2, y2 }).catch(() => null)
+        : Promise.resolve(null);
+
+      const [raw, traw] = await Promise.all([tilePromise, templatePromise]);
       if (tileEpoch.current.isStale(myEpoch)) return;
       const tc  = document.createElement("canvas");
       tc.width  = raw.width;
@@ -1084,17 +1124,11 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
       putPatchPixels(tc.getContext("2d")!, raw);
       tileCacheRef.current.set(key, tc);
 
-      // Also fetch template tile for overlay if enabled and in topdown mode
-      if (showTemplateOverlayRef.current && viewModeRef.current !== "zslice" && !templateTileCacheRef.current.has(key)) {
-        try {
-          const traw = await invoke<PixelPatchRaw>("fetch_template_tile", { x1, y1, x2, y2 });
-          if (!tileEpoch.current.isStale(myEpoch)) {
-            const ttc = document.createElement("canvas");
-            ttc.width = traw.width; ttc.height = traw.height;
-            putPatchPixels(ttc.getContext("2d")!, traw);
-            templateTileCacheRef.current.set(key, ttc);
-          }
-        } catch { /* template fetch failure is non-fatal */ }
+      if (traw) {
+        const ttc = document.createElement("canvas");
+        ttc.width = traw.width; ttc.height = traw.height;
+        putPatchPixels(ttc.getContext("2d")!, traw);
+        templateTileCacheRef.current.set(key, ttc);
       }
 
       draw();
@@ -1204,11 +1238,11 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     const ty0 = Math.max(0, Math.floor(Math.max(0, -vy) / scale / TILE) - TILE_BUFFER);
     const tx1 = Math.min(
       Math.ceil(mW / TILE),
-      Math.ceil((canvas.width - vx) / scale / TILE) + TILE_BUFFER,
+      Math.ceil((cssWidth(canvas) - vx) / scale / TILE) + TILE_BUFFER,
     );
     const ty1 = Math.min(
       Math.ceil(mH / TILE),
-      Math.ceil((canvas.height - vy) / scale / TILE) + TILE_BUFFER,
+      Math.ceil((cssHeight(canvas) - vy) / scale / TILE) + TILE_BUFFER,
     );
 
     const needed = new Set<string>();
@@ -1329,7 +1363,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
       const mW = mapWRef.current;
       const mH = mapHRef.current;
       const cw = cssWidth(canvas), ch = cssHeight(canvas);
-      const scale = Math.min(cw / mW, ch / mH) * 0.9;
+      const scale = Math.max(MIN_SCALE, Math.min(MAX_SCALE, Math.min(cw / mW, ch / mH) * 0.9));
       viewRef.current = {
         scale,
         x: (cw - mW * scale) / 2,
@@ -1577,6 +1611,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   const onPointerDown = useCallback((e: React.PointerEvent) => {
     // Refresh the cached rect at the start of each gesture (toLocal reads it for the duration).
     rectRef.current = (e.target as HTMLCanvasElement).getBoundingClientRect();
+    pointerDownOnCanvasRef.current = true;
     if (e.button === 1) {
       (e.target as HTMLCanvasElement).setPointerCapture(e.pointerId);
       e.preventDefault();
@@ -1629,7 +1664,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
         const lp = toLocal(e.clientX, e.clientY);
         const edge = hitTestEdge(lp.x, lp.y, sel, viewRef.current);
         if (edge !== null) {
-          const cur = edge === "x1" || edge === "x2" ? "ew-resize" : "ns-resize";
+          const cur = resizeCursor(edge);
           (e.target as HTMLCanvasElement).style.cursor = cur;
           dragRef.current = { kind: "resizeEdge", edge, live: { ...sel } };
           draw();
@@ -1797,12 +1832,11 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
       scheduleEnsureTiles(); // includes draw(); rAF-coalesced, see scheduleEnsureTiles
     } else {
       if (drag?.kind === "resizeEdge") {
-        switch (drag.edge) {
-          case "x1": drag.live.x1 = Math.min(wp.x, drag.live.x2); break;
-          case "x2": drag.live.x2 = Math.max(wp.x, drag.live.x1); break;
-          case "y1": drag.live.y1 = Math.min(wp.y, drag.live.y2); break;
-          case "y2": drag.live.y2 = Math.max(wp.y, drag.live.y1); break;
-        }
+        const e2 = drag.edge;
+        if (e2 === "x1" || e2 === "x1y1" || e2 === "x1y2") drag.live.x1 = Math.min(wp.x, drag.live.x2);
+        if (e2 === "x2" || e2 === "x2y1" || e2 === "x2y2") drag.live.x2 = Math.max(wp.x, drag.live.x1);
+        if (e2 === "y1" || e2 === "x1y1" || e2 === "x2y1") drag.live.y1 = Math.min(wp.y, drag.live.y2);
+        if (e2 === "y2" || e2 === "x1y2" || e2 === "x2y2") drag.live.y2 = Math.max(wp.y, drag.live.y1);
       } else if (drag?.kind === "sculpt-grab") {
         // Up-drag raises, down-drag lowers. 1 block per ~6 screen px, scaled by zoom.
         const pxPerBlock = Math.max(3, viewRef.current.scale * 0.9);
@@ -1906,9 +1940,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
             const lp = toLocal(e.clientX, e.clientY);
             const edge = hitTestEdge(lp.x, lp.y, sel, viewRef.current);
             if (edge !== hoverEdgeRef.current) { hoverEdgeRef.current = edge; scheduleDraw(); }
-            if (edge === "x1" || edge === "x2") canvas.style.cursor = "ew-resize";
-            else if (edge === "y1" || edge === "y2") canvas.style.cursor = "ns-resize";
-            else canvas.style.cursor = "crosshair";
+            canvas.style.cursor = edge !== null ? resizeCursor(edge) : "crosshair";
           } else {
             if (hoverEdgeRef.current) { hoverEdgeRef.current = null; scheduleDraw(); }
             canvas.style.cursor = "crosshair";
@@ -1921,6 +1953,10 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
 
   const onPointerUp = useCallback((e: React.PointerEvent) => {
     const drag = dragRef.current;
+    // This pointerup ends the current gesture chain either way — capture whether it started on
+    // the canvas for the paste check below, then reset for the next gesture.
+    const startedOnCanvas = pointerDownOnCanvasRef.current;
+    pointerDownOnCanvasRef.current = false;
     if (drag?.kind === "pan") {
       dragRef.current = null;
       return;
@@ -1947,12 +1983,18 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
       const end = screenToWorld(e.clientX, e.clientY);
       dragRef.current = null;
       onSelectDragUpdateRef.current?.(null);
-      onSelChangeRef.current({
-        x1: Math.min(drag.start.x, end.x),
-        y1: Math.min(drag.start.y, end.y),
-        x2: Math.max(drag.start.x, end.x),
-        y2: Math.max(drag.start.y, end.y),
-      });
+      // A bare click (drag never left the starting cell) shouldn't commit a 1x1 selection —
+      // deselect instead, so it doesn't yank the ribbon to the Selection tab.
+      if (drag.start.x === end.x && drag.start.y === end.y) {
+        onSelChangeRef.current(null);
+      } else {
+        onSelChangeRef.current({
+          x1: Math.min(drag.start.x, end.x),
+          y1: Math.min(drag.start.y, end.y),
+          x2: Math.max(drag.start.x, end.x),
+          y2: Math.max(drag.start.y, end.y),
+        });
+      }
       draw();
       return;
     }
@@ -2045,7 +2087,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
       }
       return;
     }
-    if (toolRef.current === "paste") {
+    if (toolRef.current === "paste" && startedOnCanvas) {
       onPasteAtRef.current(screenToWorld(e.clientX, e.clientY));
     }
   }, [draw, screenToWorld]);
