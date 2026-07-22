@@ -2640,6 +2640,96 @@ fn paint_blocks(
     })
 }
 
+/// Pure BFS helper behind the B2 face-fill bucket (kept separate from the command so it's unit-
+/// testable without a tauri `State`/mutex — mirrors how the editing commands split into `_inner`
+/// logic elsewhere in this file). Flood-fills the contiguous, coplanar run of same-type (optionally
+/// same-paint) blocks sharing the clicked face — a paint-bucket confined to one face plane in 3D,
+/// instead of the whole 2D top-down surface `magic_wand_select` covers. `(x,y,z)` is the solid seed
+/// block; `(nx,ny,nz)` is its clicked face normal (exactly one of the three is ±1, matching
+/// `pick_block`'s output) and fixes which axis the flood-fill holds constant. A cell only joins the
+/// run if its own face along that same normal is exposed (not a solid neighbour) — this keeps the
+/// fill on one continuous visible wall/floor/ceiling instead of leaking around a corner into a
+/// differently-facing run of the same block type. Returns an empty Vec if the seed itself is air.
+fn find_connected_face_cells(
+    world: &LoadedWorld,
+    x: i32, y: i32, z: i32,
+    nx: i32, ny: i32, nz: i32,
+    match_paint: bool,
+    max_cells: u32,
+) -> Vec<(i32, i32, i32)> {
+    let seed_bt = read_block_abs(world, x, y, z);
+    if seed_bt == 0 { return Vec::new(); }
+    let seed_paint = read_paint_abs(world, x, y, z);
+
+    let ww = (world.w_chunks * 16) as i32;
+    let wh = (world.h_chunks * 16) as i32;
+    let max_z = world_max_z(world);
+    let in_bounds = |cx: i32, cy: i32, cz: i32| cx >= 0 && cy >= 0 && cz >= 0 && cx < ww && cy < wh && cz <= max_z;
+
+    // The two in-plane neighbour steps — whichever two axes the face normal is NOT aligned to.
+    let steps: [(i32, i32, i32); 4] = if nx != 0 {
+        [(0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)]
+    } else if ny != 0 {
+        [(1, 0, 0), (-1, 0, 0), (0, 0, 1), (0, 0, -1)]
+    } else {
+        [(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0)]
+    };
+
+    let mut visited: std::collections::HashSet<(i32, i32, i32)> = std::collections::HashSet::new();
+    let mut queue: VecDeque<(i32, i32, i32)> = VecDeque::new();
+    let mut matched: Vec<(i32, i32, i32)> = Vec::new();
+    let mut count = 0u32;
+    queue.push_back((x, y, z));
+    visited.insert((x, y, z));
+
+    while let Some((cx, cy, cz)) = queue.pop_front() {
+        if count >= max_cells { break; }
+        if !in_bounds(cx, cy, cz) { continue; }
+        if read_block_abs(world, cx, cy, cz) != seed_bt { continue; }
+        if match_paint && read_paint_abs(world, cx, cy, cz) != seed_paint { continue; }
+        let (fx, fy, fz) = (cx + nx, cy + ny, cz + nz);
+        let face_exposed = !in_bounds(fx, fy, fz) || read_block_abs(world, fx, fy, fz) == 0;
+        if !face_exposed { continue; }
+        matched.push((cx, cy, cz));
+        count += 1;
+        for (dx, dy, dz) in steps {
+            let n = (cx + dx, cy + dy, cz + dz);
+            if visited.insert(n) { queue.push_back(n); }
+        }
+    }
+    matched
+}
+
+/// B2 (3D fly-view face-fill bucket) command: runs `find_connected_face_cells` under the world
+/// lock, then re-skins the run to `(block_type, paint)` (or clears it to air when `block_type` is 0)
+/// through `paint_blocks`, so undo/redo and the chunk-mesh edit sync come for free.
+#[tauri::command(async)]
+fn fill_connected_face(
+    x: i32, y: i32, z: i32,
+    nx: i32, ny: i32, nz: i32,
+    match_paint: bool,
+    block_type: u8,
+    paint: u8,
+    state: tauri::State<'_, AppState>,
+) -> Result<EditResult, String> {
+    if paint > 54 {
+        return Err(format!("Invalid paint byte {paint}: must be 0–54"));
+    }
+    const MAX_CELLS: u32 = 4_000;
+
+    let matched: Vec<(i32, i32, i32)> = {
+        let ws = state.lock().unwrap_or_else(|p| p.into_inner());
+        let world = ws.world.as_ref().ok_or("No world loaded")?;
+        if read_block_abs(world, x, y, z) == 0 { return Err("No block at that face".into()); }
+        find_connected_face_cells(world, x, y, z, nx, ny, nz, match_paint, MAX_CELLS)
+    };
+
+    if matched.is_empty() {
+        return Err("Nothing to fill".into());
+    }
+    let blocks: Vec<PaintBlock> = matched.into_iter().map(|(x, y, z)| PaintBlock { x, y, z: Some(z) }).collect();
+    paint_blocks(blocks, block_type, paint, None, None, None, state)
+}
 
 /// Move the player spawn/home position to the given editor-coordinate pixel (px, py).
 /// Height is resolved to one block above the surface. The change is written to the in-memory
@@ -2800,6 +2890,39 @@ fn discard_autosave(app: tauri::AppHandle) -> Result<(), String> {
     let _ = fs::remove_file(&data_path);
     let _ = fs::remove_file(&meta_path);
     Ok(())
+}
+
+#[derive(serde::Serialize)]
+struct UndoStackInfo {
+    undo: Vec<String>,
+    redo: Vec<String>,
+}
+
+/// Collapses a stack's entries into one label per logical operation (a grouped sculpt stroke's
+/// stamps share one `group` id and one `operation` string, so they collapse to a single label),
+/// mirroring `count_undo_groups`'s notion of a "unit". Oldest first, most-recent last.
+fn undo_stack_labels(stack: &VecDeque<UndoEntry>) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut prev: Option<u64> = None;
+    for entry in stack {
+        match (entry.group, prev) {
+            (Some(g), Some(pg)) if g == pg => {} // same contiguous group, already represented
+            _ => out.push(entry.operation.clone()),
+        }
+        prev = entry.group;
+    }
+    out
+}
+
+/// Read-only projection of the undo/redo stacks for the sidebar's History tab — labels only, no
+/// chunk data, so it's cheap to poll after every edit.
+#[tauri::command]
+fn list_undo_stack(state: tauri::State<'_, AppState>) -> Result<UndoStackInfo, String> {
+    let ws = state.lock().unwrap_or_else(|p| p.into_inner());
+    Ok(UndoStackInfo {
+        undo: undo_stack_labels(&ws.undo_stack),
+        redo: undo_stack_labels(&ws.redo_stack),
+    })
 }
 
 #[tauri::command(async)]
@@ -5628,6 +5751,7 @@ pub fn run() {
             replace_blocks,
             gradient_fill,
             paint_blocks,
+            fill_connected_face,
             save_world,
             close_world,
             autosave_world,
@@ -5636,6 +5760,7 @@ pub fn run() {
             discard_autosave,
             undo_edit,
             redo_edit,
+            list_undo_stack,
             copy_selection,
             rotate_clipboard,
             mirror_clipboard_x,
@@ -5987,6 +6112,34 @@ mod tests {
         restore_and_invert(&mut world, &UndoEntry { operation: "test".into(), chunks: vec![snap2], group: None });
         assert_eq!(&world.bytes[HEADER..HEADER + 32768], &pre_full2[0].2[..],
             "Full-delta undo must restore the whole chunk");
+    }
+
+    /// B2 face-fill bucket: `find_connected_face_cells` must follow a contiguous same-type run
+    /// across the clicked face's plane, stop at a differently-typed or disconnected cell, and — the
+    /// case that distinguishes it from a flat 2D flood-fill — refuse to cross into a same-type cell
+    /// whose own face (along the same normal) isn't exposed, since that's a different visible run.
+    #[test]
+    fn test_face_fill_connected_cells() {
+        let mut world = parse_world_inner(mmap_from_bytes(make_test_world())).expect("parse failed");
+
+        // A 3-cell Stone floor at z=10, all with an exposed top face (air at z=11) — one connected run.
+        for lx in 3..=5 {
+            world.bytes[blk(lx, 5, 10)] = 2; // Stone
+        }
+        // Disconnected Stone cell elsewhere — must NOT be swept in.
+        world.bytes[blk(10, 10, 10)] = 2;
+        // Adjacent Stone cell (lx=6) whose top face is covered by another block — same type, but not
+        // the same visible face, so the BFS must stop before it even though it's 4-connected in-plane.
+        world.bytes[blk(6, 5, 10)] = 2;
+        world.bytes[blk(6, 5, 11)] = 2;
+
+        let mut cells = find_connected_face_cells(&world, 3, 5, 10, 0, 0, 1, false, 4_000);
+        cells.sort();
+        assert_eq!(cells, vec![(3, 5, 10), (4, 5, 10), (5, 5, 10)],
+            "must follow the exposed-top-face run and stop at the covered-face and disconnected cells");
+
+        // Seed on air → no match (defensive; the command layer also rejects this before calling in).
+        assert!(find_connected_face_cells(&world, 0, 0, 0, 0, 0, 1, false, 4_000).is_empty());
     }
 
     /// export_png's encoder must produce a valid PNG of the right dimensions from a rendered
@@ -7655,6 +7808,27 @@ mod tests {
         redo_edit_inner(&mut ws).expect("redo ungrouped");
         assert_eq!(world_bytes(&ws), post);
         assert_eq!(ws.undo_stack.len(), 1);
+    }
+
+    #[test]
+    fn test_undo_stack_labels_collapse_groups() {
+        let mut ws = ws_with(make_bumpy_world(2, |lx, ly| 12 + ((lx + ly) % 5) as i32));
+
+        // 4 stamps sharing one group id must collapse to a single label.
+        let gid = Some(42u64);
+        for &(cx, cy) in &[(6, 6), (7, 6), (6, 7), (7, 7)] {
+            sculpt(&mut ws, Some(disc_points(cx, cy, 2)), "raise", 3, 0.0, None, gid);
+        }
+        assert_eq!(ws.undo_stack.len(), 4);
+        assert_eq!(undo_stack_labels(&ws.undo_stack).len(), 1, "same-group stamps collapse to one label");
+
+        // A subsequent ungrouped edit is its own separate label, appended after the group.
+        sculpt(&mut ws, Some(disc_points(3, 3, 1)), "raise", 2, 0.0, None, None);
+        assert_eq!(undo_stack_labels(&ws.undo_stack).len(), 2, "group + ungrouped edit = 2 labels");
+
+        assert!(undo_stack_labels(&ws.redo_stack).is_empty());
+        undo_edit_inner(&mut ws).expect("undo ungrouped");
+        assert_eq!(undo_stack_labels(&ws.redo_stack).len(), 1, "the undone edit reappears as one redo label");
     }
 
     /// Task 2 — per-stamp radial (dial) falloff vs BFS silhouette dome for one isolated disc stamp.

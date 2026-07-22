@@ -14,8 +14,7 @@ import { open, save, ask } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import MapCanvas, { KEY_ZOOM_STEP, TOOL_LABELS, TOOL_HINTS, type Tool, type SelectionBounds, type PixelPatch, type MapCanvasRef } from "./MapCanvas";
-import SelectionInspector from "./SelectionInspector";
-import ElevationPreviewPanel from "./ElevationPreviewPanel";
+import Sidebar, { type SidebarTab } from "./Sidebar";
 import SliceViewport from "./SliceViewport";
 import FlyView3D, { type FlyView3DRef, type Overlay3D, type Interact3D } from "./FlyView3D";
 import ErrorBoundary from "./ErrorBoundary";
@@ -31,7 +30,7 @@ import QuickActionsBar from "./QuickActionsBar";
 import SettingsModal, { loadSettings, saveSettings, type AppSettings } from "./SettingsModal";
 import WorldInfoModal from "./WorldInfoModal";
 import RecoveryModal from "./RecoveryModal";
-import PrefabLibraryPanel, { resolvePrefabDir } from "./PrefabLibraryPanel";
+import { resolvePrefabDir } from "./PrefabLibraryPanel";
 import Modal from "./Modal";
 import { glassPanel, chromeButton, accentRing, expBadge } from "./designTokens";
 import { decodeAtlas, tintedSwatch, type AtlasData, type TexturePackRaw, clearSwatchCache } from "./texturePack";
@@ -219,6 +218,12 @@ function App() {
   });
   const effectiveRibbonHeight = ribbonCollapsed ? RIBBON_HEIGHT_COLLAPSED : TAB_BAR_HEIGHT + ribbonBodyHeight + 4;
   const [showQuickActions, setShowQuickActions] = useState(() => loadSettings().showQuickActions);
+  // Docked right sidebar (Inspector/Prefabs/Elevation/History) — see Sidebar.tsx. Width persists via
+  // the same debounced-localStorage pattern as other drag-driven values (see saveSettingsDebounced).
+  const [sidebarOpen, setSidebarOpen] = useState(() => loadSettings().sidebarOpen);
+  const [sidebarWidth, setSidebarWidth] = useState(() => loadSettings().sidebarWidth);
+  const [sidebarTab, setSidebarTab] = useState<SidebarTab>(() => loadSettings().sidebarTab);
+  const sidebarInsetPx = sidebarOpen ? sidebarWidth : 0;
   // Set once by the Ribbon on mount (see its `registerTabSetter` prop) so the Quick Actions bar's
   // "More…" can jump to the Selection tab without lifting the Ribbon's tab state into App.
   const ribbonTabSetterRef = useRef<((t: RibbonTab) => void) | null>(null);
@@ -318,7 +323,6 @@ function App() {
   const [showAbout, setShowAbout] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [showWorldInfo, setShowWorldInfo] = useState(false);
-  const [showPrefabLibrary, setShowPrefabLibrary] = useState(false);
   const [prefabNameModal, setPrefabNameModal] = useState(false);
   const [prefabNameInput, setPrefabNameInput] = useState("");
   const [prefabSaving, setPrefabSaving] = useState(false);
@@ -780,6 +784,15 @@ function App() {
   // as the 2D map (and the shared hotbar), so switching between 2D and 3D building carries no state.
   const [mode3d, setMode3d] = useState<"off" | "select" | "build" | "sculpt">("off");
 
+  // The committed selection box, reduced to the shape the 3D pane's transform gizmo wants. Kept as
+  // its own small memo (not derived from `overlays3d`, which also carries paste/extrude ghosts and
+  // recomputes on a much wider dep list) so the gizmo-sync effect in FlyView3D only re-fires on an
+  // actual bounds change.
+  const selection3d = useMemo(
+    () => (rawBounds ? { x1: rawBounds.x1, y1: rawBounds.y1, x2: rawBounds.x2, y2: rawBounds.y2, zMin, zMax } : null),
+    [rawBounds, zMin, zMax],
+  );
+
   // 3D wireframe overlays for the fly-through pane: selection (blue), extrude copies (amber), paste (green).
   const overlays3d = useMemo<Overlay3D[] | null>(() => {
     if (!showSlicePanels || !enable3dPane) return null;
@@ -1213,6 +1226,36 @@ function App() {
     nudgeSelectionContents(dx, dy);
   }, [nudgeSelectionContents]);
 
+  /** 3D gizmo face-resize, or an arrow-move while its Region⇄Blocks toggle is set to Region: the
+   *  selection box itself changed, no backend edit — same as any other region-only bounds commit. */
+  const handleGizmoRegionChange = useCallback((b: { x1: number; y1: number; x2: number; y2: number; zMin: number; zMax: number }) => {
+    setRawBounds({ x1: b.x1, y1: b.y1, x2: b.x2, y2: b.y2 });
+    setZMin(b.zMin);
+    setZMax(b.zMax);
+  }, []);
+
+  /** 3D gizmo arrow-move while its toggle is set to Blocks: relocate the selection's contents via the
+   *  undoable `move_selection` backend command, then shift rawBounds/zMin/zMax by the same delta —
+   *  mirrors `nudgeSelectionContents` above (including the shape-preserving mask-rect bookkeeping),
+   *  generalized to a 3-axis delta since the gizmo's Z arrow can move a selection up/down too. */
+  const handleGizmoMoveBlocks = useCallback(async (dx: number, dy: number, dz: number) => {
+    const bounds = rawBoundsRef.current;
+    if (!bounds) return;
+    try {
+      const result = await invoke<EditResultRaw>("move_selection", {
+        ...bounds, zMin: zMinRef.current, zMax: zMaxRef.current, dx, dy, dz,
+      });
+      await applyEditResult(result);
+      const moved = { x1: bounds.x1 + dx, y1: bounds.y1 + dy, x2: bounds.x2 + dx, y2: bounds.y2 + dy };
+      if (selectionMaskRectRef.current) selectionMaskRectRef.current = moved;
+      setRawBounds(moved);
+      setZMin(z => z + dz);
+      setZMax(z => z + dz);
+    } catch (e) {
+      reportError(e);
+    }
+  }, [applyEditResult, reportError]);
+
   async function rotateClipboard() {
     try {
       const info = await invoke<ClipboardInfo>("rotate_clipboard");
@@ -1627,6 +1670,49 @@ function App() {
       });
       await applyEditResult(result);
       trackRecentBlock(fillBlockType, fillPaint);
+    } catch (e) { reportError(e); }
+  }
+
+  /** B1 build-shape (line/box) commit: the whole run in one `with_edit` call, one undo step. Mirrors
+   *  handlePick3dBreak/Place above, generalized to a cell list. */
+  async function handlePick3dBreakBatch(cells: [number, number, number][]) {
+    if (cells.length === 0) return;
+    try {
+      const result = await invoke<EditResultRaw>("paint_blocks", {
+        blocks: cells.map(([x, y, z]) => ({ x, y, z })), blockType: 0, paint: 0, zOffset: 0,
+      });
+      await applyEditResult(result);
+    } catch (e) { reportError(e); }
+  }
+  async function handlePick3dPlaceBatch(cells: [number, number, number][], yaw: number) {
+    if (cells.length === 0 || fillBlockType === 0) return;
+    const blockType = autoOrient3d ? orientBlockToFacing(fillBlockType, yaw) : fillBlockType;
+    try {
+      const result = await invoke<EditResultRaw>("paint_blocks", {
+        blocks: cells.map(([x, y, z]) => ({ x, y, z })), blockType, paint: fillPaint, zOffset: 0,
+      });
+      await applyEditResult(result);
+      trackRecentBlock(fillBlockType, fillPaint);
+    } catch (e) { reportError(e); }
+  }
+
+  /** B2 face-fill bucket: flood-fills the coplanar same-type run behind a clicked wall face, then
+   *  either clears it ("break") or re-skins it with the armed block ("place") — one `with_edit`
+   *  call either way, so undo/redo come for free. `wandMatchPaint` (2D magic wand's own setting) is
+   *  reused rather than adding a second paint-match toggle just for this pane. */
+  async function handlePick3dFillFace(
+    x: number, y: number, z: number, nx: number, ny: number, nz: number,
+    mode: "break" | "place", yaw?: number,
+  ) {
+    if (mode === "place" && fillBlockType === 0) return; // Air armed = no-op, matches other place handlers
+    const blockType = mode === "break" ? 0 : (autoOrient3d && yaw != null ? orientBlockToFacing(fillBlockType, yaw) : fillBlockType);
+    const paint = mode === "break" ? 0 : fillPaint;
+    try {
+      const result = await invoke<EditResultRaw>("fill_connected_face", {
+        x, y, z, nx, ny, nz, matchPaint: wandMatchPaint, blockType, paint,
+      });
+      await applyEditResult(result);
+      if (mode === "place") trackRecentBlock(fillBlockType, fillPaint);
     } catch (e) { reportError(e); }
   }
 
@@ -2642,7 +2728,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           // Quad view: the real top-down map (top-left) + Front / Side slices + 3D placeholder.
           // Top strip is left clear for the floating menu/toolbar chrome.
           <div ref={quadGridRef} style={{
-            position: "absolute", top: effectiveRibbonHeight, left: 0, right: 0, bottom: STATUS_BAR_HEIGHT,
+            position: "absolute", top: effectiveRibbonHeight, left: 0, right: sidebarInsetPx, bottom: STATUS_BAR_HEIGHT,
             display: "grid", gridTemplateColumns: quadCols, gridTemplateRows: quadRows,
             gap: 2, background: "#0a0f1e",
           }}>
@@ -2716,12 +2802,22 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
                       onPickBreak={handlePick3dBreak}
                       onPickPlace={handlePick3dPlace}
                       onPickEyedrop={handlePick3dEyedrop}
+                      onPickBreakBatch={handlePick3dBreakBatch}
+                      onPickPlaceBatch={handlePick3dPlaceBatch}
+                      onPickFillFace={handlePick3dFillFace}
+                      selectionBounds3d={selection3d}
+                      onGizmoRegionChange={handleGizmoRegionChange}
+                      onGizmoMoveBlocks={handleGizmoMoveBlocks}
+                      moveWithContents={moveWithContents}
+                      setMoveWithContents={setMoveWithContents}
                       sculptTool={tool}
                       sculptRadius={sculptRadius}
                       sculptStrength={sculptStrength}
                       onSculptStamp3d={handleSculptStamp3d}
                       armedSwatch={texturePackInfo ? tintedSwatch(fillBlockType, fillPaint, texturePackInfo) : null}
                       armedLabel={blockDisplayName(fillBlockType)}
+                      armedBlockType={fillBlockType}
+                      autoOrient3d={autoOrient3d}
                       hotbarSlots={hotbar3dSlots}
                       activeBlock={{ type: fillBlockType, paint: fillPaint }}
                       onHotbarSelect={(type, paint) => { setFillBlockType(type); setFillPaint(paint); }}
@@ -2807,7 +2903,15 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
               </>
             )}
           </div>
-        ) : mapPaneEl}
+        ) : (
+          // Non-quad mode: reserve the sidebar's width so the canvas paints in the remaining
+          // region instead of under it. MapCanvas's ResizeObserver watches the canvas element
+          // itself, so shrinking this wrapper's width is a resize, not a rewrite (see Sidebar.tsx
+          // / CLAUDE.md's docked-sidebar layout note).
+          <div style={{ position: "absolute", top: 0, left: 0, bottom: 0, right: sidebarInsetPx }}>
+            {mapPaneEl}
+          </div>
+        )}
 
 
         <Ribbon
@@ -2992,8 +3096,17 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           enableExperimentalExport={enableExperimentalExport}
           loadPrefab={loadPrefab}
           importSchematic={importSchematic}
-          showPrefabLibrary={showPrefabLibrary}
-          onTogglePrefabLibrary={() => setShowPrefabLibrary(v => !v)}
+          showPrefabLibrary={sidebarOpen && sidebarTab === "prefabs"}
+          onTogglePrefabLibrary={() => {
+            if (sidebarOpen && sidebarTab === "prefabs") {
+              setSidebarOpen(false);
+              saveSettings({ sidebarOpen: false });
+            } else {
+              setSidebarOpen(true);
+              setSidebarTab("prefabs");
+              saveSettings({ sidebarOpen: true, sidebarTab: "prefabs" });
+            }
+          }}
           moveWithContents={moveWithContents}
           setMoveWithContents={setMoveWithContents}
           setShowNewWorld={setShowNewWorld}
@@ -3034,25 +3147,33 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           }}
         />
 
-        {/* Right panel: Selection Inspector (ortho view only) */}
-        {selection && (
-          <SelectionInspector
-            selection={selection}
-            clipboard={clipboard}
-            quadMode={showSlicePanels}
-            topPx={effectiveRibbonHeight + (showSlicePanels ? 40 : 4)}
-          />
-        )}
-
-        {showPrefabLibrary && (
-          <PrefabLibraryPanel
-            onClose={() => setShowPrefabLibrary(false)}
-            onArmPaste={(info) => { setClipboard(info); setTool("paste"); }}
-            onSaveAs={savePrefabAs}
-            refreshToken={prefabRefreshToken}
-            topPx={effectiveRibbonHeight + 4}
-          />
-        )}
+        {/* Docked right sidebar: Inspector / Prefabs / Elevation / History tabs — see Sidebar.tsx. */}
+        <Sidebar
+          open={sidebarOpen}
+          onOpenChange={(v) => { setSidebarOpen(v); saveSettings({ sidebarOpen: v }); }}
+          width={sidebarWidth}
+          onWidthChange={(w) => { setSidebarWidth(w); saveSettingsDebounced({ sidebarWidth: w }); }}
+          tab={sidebarTab}
+          onTabChange={(t) => { setSidebarTab(t); saveSettings({ sidebarTab: t }); }}
+          topPx={effectiveRibbonHeight}
+          bottomPx={STATUS_BAR_HEIGHT}
+          selection={selection}
+          clipboard={clipboard}
+          quadMode={showSlicePanels}
+          onArmPaste={(info) => { setClipboard(info); setTool("paste"); }}
+          onSavePrefabAs={savePrefabAs}
+          prefabRefreshToken={prefabRefreshToken}
+          elevationSelection={pastePreviewSelection ?? selection}
+          maxZ={world.max_z}
+          extrudeCount={pastePreviewSelection ? 0 : (extrudeOpen && extrudeCount > 0 ? extrudeCount : 0)}
+          extrudeAxis={extrudeAxis}
+          isPastePreview={pastePreviewSelection !== null}
+          editEpoch={editEpoch}
+          drawActive={["pen","brush","rect","ellipse"].includes(tool)}
+          onDrawElevation={handleDrawElevation}
+          onZRangeChange={pastePreviewSelection ? undefined : (zMin, zMax) => { setZMin(zMin); setZMax(zMax); }}
+          worldEpoch={worldEpoch}
+        />
 
         {prefabNameModal && (
           <Modal
@@ -3115,22 +3236,6 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
               </div>
             </div>
           </Modal>
-        )}
-
-        {/* Bottom-right panel: full-height elevation view — opt-in; redundant in quad view (the slabs
-            now carry its overlays), so it's suppressed while quad view is open. */}
-        {!showSlicePanels && (pastePreviewSelection || selection) && (
-          <ElevationPreviewPanel
-            selection={pastePreviewSelection ?? selection!}
-            maxZ={world.max_z}
-            extrudeCount={pastePreviewSelection ? 0 : (extrudeOpen && extrudeCount > 0 ? extrudeCount : 0)}
-            extrudeAxis={extrudeAxis}
-            isPastePreview={pastePreviewSelection !== null}
-            editEpoch={editEpoch}
-            drawActive={["pen","brush","rect","ellipse"].includes(tool)}
-            onDrawElevation={handleDrawElevation}
-            onZRangeChange={pastePreviewSelection ? undefined : (zMin, zMax) => { setZMin(zMin); setZMax(zMax); }}
-          />
         )}
 
         {(exporting || exportingObj || exportingJson || exportingVox || loading) && (
@@ -3400,6 +3505,10 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
                   onClick={() => { close(); flyView3dRef.current?.teleport(ctxMenu.wx, ctxMenu.wy); }}>
                   {noIc()} Teleport 3D Camera Here
                 </button>
+                {cam3dPos && <button style={miBtnStyle} onMouseEnter={miHov} onMouseLeave={miLve}
+                  onClick={() => { close(); mapCanvasRef.current?.centerOn(cam3dPos.x, cam3dPos.y); }}>
+                  {noIc()} Center Map on 3D Camera
+                </button>}
               </>}
               {div}
               <button style={{ ...miBtnStyle, color: tool === "select" ? "#93c5fd" : "#ebe9e7" }} onMouseEnter={miHov} onMouseLeave={miLve}
@@ -3423,6 +3532,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
         {showQuickActions && (
           <QuickActionsBar
             top={effectiveRibbonHeight + 8}
+            rightInset={sidebarInsetPx}
             rawBounds={rawBounds}
             clipboard={clipboard}
             onCopy={copySelection}

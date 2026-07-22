@@ -120,6 +120,8 @@ export interface MapCanvasRef {
   zoomBy: (factor: number) => void;
   /** Scale + centre the view on a world-space box, with a little margin (⌘⇧Z… "zoom to selection"). */
   zoomToBox: (x1: number, y1: number, x2: number, y2: number) => void;
+  /** Recentre the view on a world-space point, keeping the current zoom level ("Center Map on 3D Camera"). */
+  centerOn: (wx: number, wy: number) => void;
 }
 
 interface WorldPoint { x: number; y: number }
@@ -1399,6 +1401,15 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
         x: cw / 2 - (x1 + bw / 2) * scale,
         y: ch / 2 - (y1 + bh / 2) * scale,
       };
+      ensureTiles();
+    },
+    centerOn(wx: number, wy: number) {
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+      // Recenter only — keep the current zoom level, unlike zoomToBox/resetView.
+      const cw = cssWidth(canvas), ch = cssHeight(canvas);
+      const v = viewRef.current;
+      viewRef.current = { scale: v.scale, x: cw / 2 - wx * v.scale, y: ch / 2 - wy * v.scale };
       ensureTiles();
     },
   }), [draw, ensureTiles, loadFullCanvas]);

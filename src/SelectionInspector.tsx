@@ -3,51 +3,144 @@ import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { SelectionInfo, ClipboardInfo, PreviewDataRaw, PreviewData } from "./types";
 import { EDEN_TEAL_READABLE } from "./designTokens";
+import ElevationPreviewPanel from "./ElevationPreviewPanel";
 
 type PreviewView = "front" | "side" | "top" | "axo";
 
 interface Props {
-  selection: SelectionInfo;
+  /** Sidebar tab is always mounted, unlike the old floating panel which only mounted while a
+   *  selection existed — null renders the empty state instead. */
+  selection: SelectionInfo | null;
   clipboard: ClipboardInfo | null;
   quadMode: boolean;
-  /** Override the panel's top offset (px). */
-  topPx?: number;
+
+  // Elevation view — folded in from the old standalone Elevation tab.
+  elevationSelection: SelectionInfo | null;
+  elevationWidth: number;
+  maxZ: number;
+  extrudeCount: number;
+  extrudeAxis: string;
+  isPastePreview: boolean;
+  editEpoch: number;
+  drawActive: boolean;
+  onDrawElevation: (x: number, y: number, z: number) => void;
+  onZRangeChange?: (zMin: number, zMax: number) => void;
 }
 
 const CW = 190;
 const CH = 120;
 const LABEL_H = 16;
+const CLIP_PREV_W = 140;
+const CLIP_PREV_H = 140;
 
 const panelStyle: React.CSSProperties = {
-  position: "absolute",
-  top: 108,
-  right: 12,
-  background: "linear-gradient(180deg, rgba(34,29,25,.92) 0%, rgba(20,17,14,.92) 100%)",
-  backdropFilter: "blur(10px)", WebkitBackdropFilter: "blur(10px)",
-  border: "1px solid rgba(255,255,255,.12)",
-  boxShadow: "inset 0 1px 0 rgba(255,255,255,.08), 0 8px 20px rgba(0,0,0,.5)",
-  borderRadius: 7,
-  padding: "8px 10px",
-  fontSize: 12,
-  color: "#ebe9e7",
-  width: 210,
   display: "flex",
   flexDirection: "column",
   gap: 6,
+  fontSize: 12,
+  color: "#ebe9e7",
   userSelect: "none",
 };
 
-export default function SelectionInspector({ selection: sel, clipboard, quadMode, topPx }: Props) {
+/** Selection info — moved here from the Selection ribbon tab's "Info" group: dimensions,
+ *  X/Y bounds, block count, and (if shaped) the mask cell count. */
+function SelectionInfoBlock({ sel }: { sel: SelectionInfo }) {
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 11 }}>
+      <div style={{ display: "flex", gap: 4, fontVariantNumeric: "tabular-nums" }}>
+        {[["W", sel.width], ["H", sel.height], ["D", sel.depth]].map(([l, v]) => (
+          <div key={l as string} style={{ textAlign: "center", background: "rgba(255,255,255,0.04)", borderRadius: 3, padding: "2px 6px", minWidth: 30 }}>
+            <div style={{ color: "#83786c", fontSize: 8 }}>{l}</div>
+            <div style={{ color: l === "D" ? "#7dd3fc" : "#ebe9e7", fontSize: 12, fontWeight: 700 }}>{v}</div>
+          </div>
+        ))}
+      </div>
+      <div style={{ fontVariantNumeric: "tabular-nums", fontSize: 10, color: "#83786c", lineHeight: 1.3 }}>
+        <div>X {sel.x1}–{sel.x2}  Y {sel.y1}–{sel.y2}</div>
+        <div style={{ color: "#61584f" }}>
+          {sel.width * sel.height * sel.depth} blocks
+          {sel.masked && sel.cell_count != null ? ` — ◆ shaped (${sel.cell_count} cells)` : ""}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** Clipboard info + top-down preview — mirrored here from the Clipboard ribbon tab (kept there too). */
+function ClipboardInfoBlock({ clipboard }: { clipboard: ClipboardInfo }) {
+  const [pixels, setPixels] = useState<{ width: number; height: number; pixels: Uint8Array } | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+
+  useEffect(() => {
+    invoke<{ width: number; height: number; pixels: string }>("render_clipboard_preview")
+      .then((raw) => setPixels({ width: raw.width, height: raw.height, pixels: decodeU8(raw.pixels) }))
+      .catch(() => setPixels(null));
+  }, [clipboard]);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    ctx.fillStyle = "#151311";
+    ctx.fillRect(0, 0, CLIP_PREV_W, CLIP_PREV_H);
+    if (pixels && pixels.width > 0 && pixels.height > 0) {
+      const off = document.createElement("canvas");
+      off.width = pixels.width;
+      off.height = pixels.height;
+      const offCtx = off.getContext("2d")!;
+      const img = offCtx.createImageData(pixels.width, pixels.height);
+      img.data.set(pixels.pixels);
+      offCtx.putImageData(img, 0, 0);
+      const scale = Math.min(CLIP_PREV_W / pixels.width, CLIP_PREV_H / pixels.height);
+      const dw = Math.round(pixels.width * scale);
+      const dh = Math.round(pixels.height * scale);
+      ctx.imageSmoothingEnabled = false;
+      ctx.drawImage(off, Math.round((CLIP_PREV_W - dw) / 2), Math.round((CLIP_PREV_H - dh) / 2), dw, dh);
+    }
+  }, [pixels]);
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+      <div style={{ color: "#afa69d", fontWeight: 700, fontSize: 10, letterSpacing: "0.08em" }}>CLIPBOARD</div>
+      <div style={{ fontSize: 11 }}>
+        <span style={{ color: "#86efac", fontVariantNumeric: "tabular-nums", fontWeight: 700 }}>
+          {clipboard.width}×{clipboard.height}×{clipboard.depth}
+        </span>
+        <span style={{ color: "#4ade80", fontSize: 10, marginLeft: 6 }}>
+          z{clipboard.z_anchor}–{clipboard.z_anchor + clipboard.depth - 1}
+        </span>
+        {clipboard.masked && <span style={{ color: "#4ade80", fontSize: 10, marginLeft: 6 }}>◆ shaped</span>}
+      </div>
+      <canvas
+        ref={canvasRef}
+        width={CLIP_PREV_W}
+        height={CLIP_PREV_H}
+        style={{ display: "block", width: CLIP_PREV_W, height: CLIP_PREV_H, borderRadius: 4, border: "none", boxShadow: "inset 0 0 0 1px rgba(0,0,0,.4)" }}
+        title="Clipboard top-down preview"
+      />
+    </div>
+  );
+}
+
+export default function SelectionInspector({
+  selection: sel, clipboard, quadMode,
+  elevationSelection, elevationWidth, maxZ, extrudeCount, extrudeAxis, isPastePreview,
+  editEpoch, drawActive, onDrawElevation, onZRangeChange,
+}: Props) {
+  void quadMode;
   const [view, setView] = useState<PreviewView>("front");
   const [previewData, setPreviewData] = useState<PreviewData | null>(null);
-  const [orthoOpen, setOrthoOpen] = useState(!quadMode);
+  // Ortho view is always auto-expanded now (previously collapsed by default in quad mode).
+  const [orthoOpen, setOrthoOpen] = useState(true);
+  const [elevationOpen, setElevationOpen] = useState(true);
   const [axoSki, setAxoSki] = useState(0.2);
   const [axoDir, setAxoDir] = useState(0);
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
   // Fetch orthographic preview (front/side/top).
   useEffect(() => {
-    if (view === "axo") return;
+    if (!sel || view === "axo") return;
     const timer = setTimeout(() => {
       invoke<PreviewDataRaw>("render_selection_view", {
         x1: sel.x1, y1: sel.y1, x2: sel.x2, y2: sel.y2,
@@ -59,11 +152,11 @@ export default function SelectionInspector({ selection: sel, clipboard, quadMode
     }, 150);
     return () => clearTimeout(timer);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sel.x1, sel.y1, sel.x2, sel.y2, sel.z_min, sel.z_max, view]);
+  }, [sel?.x1, sel?.y1, sel?.x2, sel?.y2, sel?.z_min, sel?.z_max, view]);
 
   // Fetch axo preview — clipboard contents if available, else selection footprint.
   useEffect(() => {
-    if (view !== "axo") return;
+    if (!sel || view !== "axo") return;
     const timer = setTimeout(() => {
       const p = clipboard
         ? invoke<PreviewDataRaw>("render_axo_clipboard", { ski: axoSki, dir: axoDir })
@@ -73,10 +166,11 @@ export default function SelectionInspector({ selection: sel, clipboard, quadMode
     }, 150);
     return () => clearTimeout(timer);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sel.x1, sel.y1, sel.x2, sel.y2, clipboard?.width, clipboard?.height, clipboard?.depth, view, axoSki, axoDir]);
+  }, [sel?.x1, sel?.y1, sel?.x2, sel?.y2, clipboard?.width, clipboard?.height, clipboard?.depth, view, axoSki, axoDir]);
 
   // Render preview onto canvas.
   useEffect(() => {
+    if (!sel) return;
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext("2d");
@@ -116,7 +210,7 @@ export default function SelectionInspector({ selection: sel, clipboard, quadMode
       3, CH - LABEL_H / 2,
     );
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [previewData, view, sel.x1, sel.y1, sel.x2, sel.y2, sel.z_min, sel.z_max, axoDir, axoSki]);
+  }, [previewData, view, sel?.x1, sel?.y1, sel?.x2, sel?.y2, sel?.z_min, sel?.z_max, axoDir, axoSki]);
 
   const tabBtn = (v: PreviewView): React.CSSProperties => ({
     flex: 1, padding: "2px 0", fontSize: 11, cursor: "pointer", border: "none",
@@ -130,8 +224,19 @@ export default function SelectionInspector({ selection: sel, clipboard, quadMode
     borderRadius: 3,
   });
 
+  if (!sel) {
+    return (
+      <div style={panelStyle}>
+        <div style={{ color: "#61584f", fontSize: 11, textAlign: "center", padding: "16px 4px" }}>
+          No selection. Drag on the map (Select tool) or use the Wand/Lasso to inspect a region here.
+        </div>
+      </div>
+    );
+  }
+
   return (
-    <div style={topPx != null ? { ...panelStyle, top: topPx } : panelStyle}>
+    <div style={panelStyle}>
+      <SelectionInfoBlock sel={sel} />
       {/* Collapsible ortho view */}
       <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
         <div
@@ -185,6 +290,39 @@ export default function SelectionInspector({ selection: sel, clipboard, quadMode
           />
         </>)}
       </div>
+
+      {/* Collapsible elevation view — folded in from the old standalone Elevation tab. */}
+      <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+        <div
+          onClick={() => setElevationOpen(v => !v)}
+          style={{ display: "flex", alignItems: "center", gap: 5, cursor: "pointer", userSelect: "none" }}
+        >
+          <span style={{ color: "#61584f", fontSize: 9 }}>{elevationOpen ? "▼" : "▶"}</span>
+          <span style={{ color: "#afa69d", fontWeight: 700, fontSize: 10, letterSpacing: "0.08em" }}>ELEVATION VIEW</span>
+        </div>
+        {elevationOpen && (
+          elevationSelection ? (
+            <ElevationPreviewPanel
+              selection={elevationSelection}
+              maxZ={maxZ}
+              width={elevationWidth}
+              extrudeCount={extrudeCount}
+              extrudeAxis={extrudeAxis}
+              isPastePreview={isPastePreview}
+              editEpoch={editEpoch}
+              drawActive={drawActive}
+              onDrawElevation={onDrawElevation}
+              onZRangeChange={onZRangeChange}
+            />
+          ) : (
+            <div style={{ color: "#61584f", fontSize: 11, textAlign: "center", padding: "8px 4px" }}>
+              No selection. Make a selection to see its front/side elevation.
+            </div>
+          )
+        )}
+      </div>
+
+      {clipboard && <ClipboardInfoBlock clipboard={clipboard} />}
     </div>
   );
 }
