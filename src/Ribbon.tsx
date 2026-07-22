@@ -1489,25 +1489,6 @@ export default function Ribbon(p: RibbonProps) {
     const trackGrad = `linear-gradient(to right, #4b443d 0%, #4b443d ${lo}%, #3b82f6 ${lo}%, #3b82f6 ${hi}%, #4b443d ${hi}%, #4b443d 100%)`;
     return (
       <div style={{ display: "flex", alignItems: "stretch", height: "100%" }}>
-        {sel && (<>
-          <div style={rbGroup}>
-            <div style={{ display: "flex", gap: 4, fontVariantNumeric: "tabular-nums" }}>
-              {[["W", sel.width], ["H", sel.height], ["D", sel.depth]].map(([l, v]) => (
-                <div key={l as string} style={{ textAlign: "center", background: "rgba(255,255,255,0.04)", borderRadius: 3, padding: "2px 6px", minWidth: 30 }}>
-                  <div style={{ color: "#83786c", fontSize: 8 }}>{l}</div>
-                  <div style={{ color: l === "D" ? "#7dd3fc" : "#ebe9e7", fontSize: 12, fontWeight: 700 }}>{v}</div>
-                </div>
-              ))}
-            </div>
-            <div style={{ fontVariantNumeric: "tabular-nums", fontSize: 10, color: "#61584f", lineHeight: 1.3 }}>
-              <div>X {sel.x1}–{sel.x2}  Y {sel.y1}–{sel.y2}</div>
-              <div style={{ color: "#4b443d" }}>{sel.width * sel.height * sel.depth} blocks</div>
-            </div>
-            <div style={rbGroupLabel}>Info</div>
-          </div>
-          <div style={rbDivider} />
-        </>)}
-
         <div style={rbGroup}>
           <button
             onClick={() => p.setMoveWithContents(v => !v)}

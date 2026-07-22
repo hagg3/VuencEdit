@@ -2,7 +2,7 @@ import { useEffect, useState, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { openPath } from "@tauri-apps/plugin-opener";
 import { decodeU8 } from "./codec";
-import { EDEN_TEAL_READABLE, glassPanel, chromeButton, accentRing } from "./designTokens";
+import { chromeButton, accentRing } from "./designTokens";
 import { useFocusTrap } from "./Modal";
 import { isTypingTarget } from "./viewportUtils";
 import type { ClipboardInfo, PreviewDataRaw } from "./types";
@@ -55,7 +55,7 @@ const iconBtn: React.CSSProperties = {
 };
 
 export default function PrefabLibraryPanel({
-  onClose, onArmPaste, onSaveAs, refreshToken, topPx,
+  onClose, onArmPaste, onSaveAs, refreshToken,
 }: {
   onClose: () => void;
   /** Receives the loaded prefab's ClipboardInfo — App must set clipboard state from it,
@@ -65,7 +65,6 @@ export default function PrefabLibraryPanel({
   onSaveAs: () => void;
   /** Bumped by App after a prefab is saved into the library so the gallery re-lists. */
   refreshToken?: number;
-  topPx?: number;
 }) {
   const [dir, setDir] = useState<string | null>(null);
   const [entries, setEntries] = useState<PrefabEntry[]>([]);
@@ -282,11 +281,10 @@ export default function PrefabLibraryPanel({
     />
   );
 
-  const panelStyle: React.CSSProperties = glassPanel({
-    position: "fixed", top: topPx ?? 108, left: 12, width: 232, maxHeight: "72vh",
-    padding: "10px 10px 8px", display: "flex", flexDirection: "column", gap: 8,
-    color: "#ebe9e7", fontSize: 12, zIndex: 60,
-  });
+  const panelStyle: React.CSSProperties = {
+    display: "flex", flexDirection: "column", gap: 8,
+    color: "#ebe9e7", fontSize: 12, height: "100%", minHeight: 0,
+  };
 
   const selectStyle: React.CSSProperties = {
     background: "rgba(0,0,0,0.4)", border: "1px solid #4b443d", borderRadius: 5,
@@ -294,14 +292,7 @@ export default function PrefabLibraryPanel({
   };
 
   return (
-    <div ref={panelRef} role="dialog" aria-label="Prefab Library" tabIndex={-1} style={panelStyle}>
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-        <span style={{ fontWeight: 700, color: EDEN_TEAL_READABLE, fontSize: 12 }}>Prefab Library</span>
-        <button onClick={onClose}
-          title="Close the prefab library" aria-label="Close prefab library"
-          style={{ background: "none", border: "none", color: "#83786c", fontSize: 14, cursor: "pointer", lineHeight: 1 }}
-        >×</button>
-      </div>
+    <div ref={panelRef} role="region" aria-label="Prefab Library" tabIndex={-1} style={panelStyle}>
       <div style={{ fontSize: 10, color: "#61584f", wordBreak: "break-all" }}>{dir ?? "…"}</div>
       {entries.length > 0 && (
         <>

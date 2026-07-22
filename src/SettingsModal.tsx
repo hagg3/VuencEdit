@@ -40,12 +40,18 @@ export interface AppSettings {
   autoOrient3d: boolean;
   /** Shows OBJ/VMF export menu items. Both are buggy/unfinished; off by default so most users never see them. */
   enableExperimentalExport: boolean;
+  /** Docked right sidebar (Inspector/Prefabs/History tabs — Elevation folded into Inspector) open on load. Default true. */
+  sidebarOpen: boolean;
+  /** Docked sidebar width in px, drag-resizable ~200–420. Default 260. */
+  sidebarWidth: number;
+  /** Docked sidebar's active tab on load. Default "inspector". */
+  sidebarTab: "inspector" | "prefabs" | "history";
   /** Bumped when a default changes in a way that must be pushed onto existing installs (see loadSettings). */
   settingsVersion: number;
 }
 
 /** Current settings schema version. Bump + add a case to `migrate()` when a stored default must change. */
-const SETTINGS_VERSION = 2;
+const SETTINGS_VERSION = 4;
 
 const DEFAULTS: AppSettings = {
   defaultQuadView: true,
@@ -66,6 +72,9 @@ const DEFAULTS: AppSettings = {
   autosaveIntervalMin: 3,
   autoOrient3d: true,
   enableExperimentalExport: false,
+  sidebarOpen: true,
+  sidebarWidth: 260,
+  sidebarTab: "inspector",
   settingsVersion: SETTINGS_VERSION,
 };
 
@@ -82,6 +91,10 @@ function migrate(s: Record<string, unknown>): boolean {
   // needed — the raised look-mode base rate lives in FlyView3D's LOOK_SENS_BASE constant, not a
   // stored setting, so existing installs get the snappier feel automatically once the `{...DEFAULTS,
   // ...parsed}` merge supplies the new fields. The version bump just marks the schema current.
+  // v2 → v3: added sidebarOpen/sidebarWidth/sidebarTab (docked right sidebar). No forced value
+  // needed — the `{...DEFAULTS, ...parsed}` merge supplies the new fields for existing installs.
+  // v3 → v4: the Elevation tab was folded into Inspector — remap installs parked on it.
+  if (from < 4 && s.sidebarTab === "elevation") s.sidebarTab = "inspector";
   s.settingsVersion = SETTINGS_VERSION;
   return true;
 }
