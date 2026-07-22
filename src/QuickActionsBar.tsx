@@ -31,6 +31,11 @@ const divider: React.CSSProperties = {
 export interface QuickActionsBarProps {
   /** Vertical offset (px from the top of the window) — App owns the ribbon height. */
   top: number;
+  /** Width (px) reserved by the docked sidebar on the right, 0 when collapsed/closed. The bar
+   *  centers on the window by default, so once the map is inset by this amount the pill must shift
+   *  left by half of it to stay centered over the (now narrower) map instead of sliding its
+   *  rightmost controls under the sidebar. */
+  rightInset: number;
   rawBounds: SelectionBounds | null;
   clipboard: ClipboardInfo | null;
   onCopy: () => void;
@@ -65,7 +70,7 @@ export default function QuickActionsBar(p: QuickActionsBarProps) {
 
   return (
     <div style={glassPanel({
-      position: "fixed", top: p.top, left: "50%", transform: "translateX(-50%)",
+      position: "fixed", top: p.top, left: `calc(50% - ${p.rightInset / 2}px)`, transform: "translateX(-50%)",
       zIndex: 60, display: "flex", alignItems: "center", gap: 6,
       padding: "5px 8px", borderRadius: 8,
       boxShadow: "inset 0 1px 0 rgba(255,255,255,.06), 0 8px 22px rgba(0,0,0,.55)",

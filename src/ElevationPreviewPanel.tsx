@@ -13,6 +13,9 @@ function elevDpr(): number {
 interface Props {
   selection: SelectionInfo;
   maxZ: number;
+  /** Docked into the sidebar tab body now — width tracks the sidebar's own resizable width
+   *  instead of a free corner-drag, so this panel no longer owns its width. */
+  width: number;
   extrudeCount?: number;
   extrudeAxis?: string;
   isPastePreview?: boolean;
@@ -29,11 +32,8 @@ interface Props {
 
 const CONTEXT_BLOCKS = 7;
 const LABEL_H = 14;
-const INIT_W  = 240;
 const INIT_H  = 240;
-const MIN_W   = 140;
 const MIN_H   = 120;
-const MAX_W   = 800;
 const MAX_H   = 700;
 
 // Layout tracks the rendered position of the image for hit-testing and overlays.
@@ -216,7 +216,7 @@ function drawSection(
 const Z_EDGE_HIT = 5; // pixels proximity to trigger z-resize handle
 
 export default function ElevationPreviewPanel({
-  selection: sel, maxZ,
+  selection: sel, maxZ, width,
   extrudeCount = 0, extrudeAxis = "z+",
   isPastePreview = false, editEpoch = 0,
   drawActive = false, onDrawElevation,
@@ -227,7 +227,7 @@ export default function ElevationPreviewPanel({
   const [sideData,      setSideData]      = useState<PreviewData | null>(null);
   const [clipFrontData, setClipFrontData] = useState<PreviewData | null>(null);
   const [clipSideData,  setClipSideData]  = useState<PreviewData | null>(null);
-  const [canvasW, setCanvasW] = useState(INIT_W);
+  const canvasW = width;
   const [canvasH, setCanvasH] = useState(INIT_H);
   const [showContext, setShowContext] = useState(true);
   const [hoverZEdge, setHoverZEdge] = useState<{ y: number; edge: "z_max" | "z_min" } | null>(null);
@@ -246,7 +246,8 @@ export default function ElevationPreviewPanel({
   const sideLayoutRef   = useRef<Layout>({ ox: 0, oy: 0, scale: 1 });
   const drawViewRef     = useRef<"front" | "side">("front");
   const drawStrokeRef   = useRef<{ x: number; y: number; z: number }[]>([]);
-  const resizeDragRef   = useRef<{ startX: number; startY: number; startW: number; startH: number } | null>(null);
+  // Height-only resize (drag the bottom edge) — width now tracks the sidebar's own width.
+  const resizeDragRef   = useRef<{ startY: number; startH: number } | null>(null);
   const viewDragRef     = useRef<{ section: "front"|"side"; startX: number; startY: number; startPanX: number; startPanY: number } | null>(null);
   const zResizeDragRef  = useRef<{ edge: "z_max" | "z_min"; startY: number; startZ: number; scale: number } | null>(null);
   const [canvasCursor, setCanvasCursor] = useState<string>("default");
@@ -402,12 +403,7 @@ export default function ElevationPreviewPanel({
 
   return (
     <div style={{
-      position: "absolute",
-      bottom: 26, right: 12, // clears the 20px app status bar fixed to the window bottom
-      background: "rgba(26,14,5,0.85)",
-      border: "1px solid #71665c",
-      borderRadius: 7,
-      padding: "8px 10px",
+      position: "relative",
       fontSize: 12,
       color: "#ebe9e7",
       width: canvasW,
@@ -416,32 +412,7 @@ export default function ElevationPreviewPanel({
       gap: 6,
       userSelect: "none",
     }}>
-      {/* Resize handle */}
-      <div
-        title="Drag to resize"
-        style={{
-          position: "absolute", top: 2, left: 2,
-          width: 14, height: 14, cursor: "nwse-resize",
-          display: "flex", alignItems: "center", justifyContent: "center",
-          color: "#61584f", fontSize: 11, lineHeight: 1, borderRadius: 2,
-        }}
-        onPointerDown={(e) => {
-          resizeDragRef.current = { startX: e.clientX, startY: e.clientY, startW: canvasW, startH: canvasH };
-          (e.target as HTMLElement).setPointerCapture(e.pointerId);
-          e.preventDefault();
-        }}
-        onPointerMove={(e) => {
-          const drag = resizeDragRef.current;
-          if (!drag) return;
-          const dx = drag.startX - e.clientX;
-          const dy = drag.startY - e.clientY;
-          setCanvasW(Math.max(MIN_W, Math.min(MAX_W, drag.startW + dx)));
-          setCanvasH(Math.max(MIN_H, Math.min(MAX_H, drag.startH + dy)));
-        }}
-        onPointerUp={() => { resizeDragRef.current = null; }}
-      >⤡</div>
-
-      <div style={{ display: "flex", alignItems: "center", paddingLeft: 14 }}>
+      <div style={{ display: "flex", alignItems: "center" }}>
         <span style={{ color: "#93c5fd", fontWeight: 700, fontSize: 10, letterSpacing: "0.08em" }}>ELEVATION VIEW</span>
         {zoom !== 1.0 && (
           <button
@@ -602,6 +573,29 @@ export default function ElevationPreviewPanel({
         }}
         onPointerLeave={() => { setCanvasCursor("default"); setHoverZEdge(null); }}
       />
+
+      {/* Height-only resize handle (bottom edge) — width tracks the sidebar's own width now. */}
+      <div
+        title="Drag to resize height"
+        style={{
+          position: "absolute", left: 0, right: 0, bottom: -4, height: 8, cursor: "ns-resize",
+          display: "flex", alignItems: "center", justifyContent: "center",
+        }}
+        onPointerDown={(e) => {
+          resizeDragRef.current = { startY: e.clientY, startH: canvasH };
+          (e.target as HTMLElement).setPointerCapture(e.pointerId);
+          e.preventDefault();
+        }}
+        onPointerMove={(e) => {
+          const drag = resizeDragRef.current;
+          if (!drag) return;
+          const dy = e.clientY - drag.startY;
+          setCanvasH(Math.max(MIN_H, Math.min(MAX_H, drag.startH + dy)));
+        }}
+        onPointerUp={() => { resizeDragRef.current = null; }}
+      >
+        <div style={{ width: 28, height: 3, borderRadius: 2, background: "rgba(175,166,157,0.4)" }} />
+      </div>
     </div>
   );
 }

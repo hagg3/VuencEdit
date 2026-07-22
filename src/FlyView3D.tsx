@@ -7,7 +7,7 @@ import type { AtlasData } from "./texturePack";
 import { isTypingTarget } from "./viewportUtils";
 import type { WorldMeta } from "./types";
 import { chromeButton, glassMenuPanel } from "./designTokens";
-import { skyFogColor } from "./blockDefs";
+import { skyFogColor, rampFamilyBase, wedgeFamilyBase, rampDirIndex, orientBlockToFacing } from "./blockDefs";
 import { maskPrismPositions, type OutlinePt, type MaskRect } from "./maskUtils";
 
 // Fog distance scales with the render distance slider (chunk radius × 16 blocks/chunk) so terrain
@@ -83,6 +83,10 @@ interface EditBounds { x: number; y: number; w: number; h: number }
 
 const LOAD_RADIUS = 5;   // chunks loaded around the camera (in chunk units)
 const MAX_RENDER_DISTANCE = 32; // slider ceiling (chunk radius)
+const RD_MIN = 2;               // slider floor (chunk radius)
+// The slider maps 1:1 to chunk radius (step = 1 chunk). The old quadratic remap gave the low range
+// more pixels but made the top half jump several chunks per pixel (e.g. 16→20 in one nudge), which
+// read as "dodgy". A plain linear integer domain is fully predictable — one notch = one chunk.
 // rad/px at sensitivity multiplier 1. Raised from the old hardcoded 0.0025 (look mode) — that base
 // felt too slow by default; the Settings sliders scale from here (0.25x-4x range).
 const LOOK_SENS_BASE = 0.006;
@@ -107,6 +111,12 @@ export interface PickResult {
   block_type: number;
   paint: number;
   nx: number; ny: number; nz: number;
+}
+
+/** A 3D selection box in Eden world coords — the shape App's `rawBounds`+`zMin`/`zMax` reduce to.
+ *  Drives the Select-mode transform gizmo (see "3D selection gizmo" below). */
+export interface SelectionBounds3D {
+  x1: number; y1: number; x2: number; y2: number; zMin: number; zMax: number;
 }
 
 /** What a click in the 3D pane does. Derived from App's active tool, not owned by this pane. */
@@ -177,6 +187,121 @@ function buildMaskPrismGeometry(
   return { fill, edges };
 }
 
+/** What the Build sub-toolbar's "shape" toggle does to a click (B1/B2). "single" is today's plain
+ *  click-to-break/click-to-place; "line"/"box" arm a start cell on the first click and commit a
+ *  batched run of cells (one `with_edit` call, one undo step) on the second; "fill" is a one-click
+ *  paint-bucket confined to the clicked face's plane (backend flood-fill, see `fill_connected_face`). */
+type BuildShape = "single" | "line" | "box" | "fill";
+/** Safety cap on a box-shape's cell count (mirrors magic_wand_select's 50k BFS cap) — a careless
+ *  two corners at world-scale apart would otherwise try to paint millions of blocks in one IPC call. */
+const MAX_BUILD_SHAPE_CELLS = 50_000;
+
+/** 3D Bresenham — the voxel run between two Eden cells (inclusive both ends). */
+function bresenham3D(x0: number, y0: number, z0: number, x1: number, y1: number, z1: number): [number, number, number][] {
+  const pts: [number, number, number][] = [];
+  const dx = Math.abs(x1 - x0), dy = Math.abs(y1 - y0), dz = Math.abs(z1 - z0);
+  const xs = x1 > x0 ? 1 : -1, ys = y1 > y0 ? 1 : -1, zs = z1 > z0 ? 1 : -1;
+  let x = x0, y = y0, z = z0;
+  if (dx >= dy && dx >= dz) {
+    let p1 = 2 * dy - dx, p2 = 2 * dz - dx;
+    for (let i = 0; i <= dx; i++) {
+      pts.push([x, y, z]);
+      if (p1 >= 0) { y += ys; p1 -= 2 * dx; }
+      if (p2 >= 0) { z += zs; p2 -= 2 * dx; }
+      p1 += 2 * dy; p2 += 2 * dz; x += xs;
+    }
+  } else if (dy >= dx && dy >= dz) {
+    let p1 = 2 * dx - dy, p2 = 2 * dz - dy;
+    for (let i = 0; i <= dy; i++) {
+      pts.push([x, y, z]);
+      if (p1 >= 0) { x += xs; p1 -= 2 * dy; }
+      if (p2 >= 0) { z += zs; p2 -= 2 * dy; }
+      p1 += 2 * dx; p2 += 2 * dz; y += ys;
+    }
+  } else {
+    let p1 = 2 * dy - dz, p2 = 2 * dx - dz;
+    for (let i = 0; i <= dz; i++) {
+      pts.push([x, y, z]);
+      if (p1 >= 0) { y += ys; p1 -= 2 * dz; }
+      if (p2 >= 0) { x += xs; p2 -= 2 * dz; }
+      p1 += 2 * dy; p2 += 2 * dx; z += zs;
+    }
+  }
+  return pts;
+}
+
+/** Every cell in the inclusive 3D box between two Eden corners, or null if it would exceed the
+ *  MAX_BUILD_SHAPE_CELLS safety cap (caller drops the gesture rather than truncating silently into a
+ *  half-built box). */
+function boxCells(x0: number, y0: number, z0: number, x1: number, y1: number, z1: number): [number, number, number][] | null {
+  const xlo = Math.min(x0, x1), xhi = Math.max(x0, x1);
+  const ylo = Math.min(y0, y1), yhi = Math.max(y0, y1);
+  const zlo = Math.min(z0, z1), zhi = Math.max(z0, z1);
+  const count = (xhi - xlo + 1) * (yhi - ylo + 1) * (zhi - zlo + 1);
+  if (count > MAX_BUILD_SHAPE_CELLS) return null;
+  const pts: [number, number, number][] = [];
+  for (let x = xlo; x <= xhi; x++)
+    for (let y = ylo; y <= yhi; y++)
+      for (let z = zlo; z <= zhi; z++)
+        pts.push([x, y, z]);
+  return pts;
+}
+
+/** B3 ramp/wedge placement preview: local unit-cell corner points (0..1, Three coords — x=Eden x,
+ *  y=up=Eden z, z=Eden y) for a ramp's sloped-top triangular prism, per the orientation convention
+ *  documented (and verified against `emit_wedge`/`emit_ramp`) in blockDefs.ts: `dir` 0=S/1=W/2=N/3=E
+ *  is the HIGH edge — full height there, tapering to zero at the opposite edge. Returns the 6 prism
+ *  corners as [cap-at-low-extrusion-end (A,B,C), cap-at-high-extrusion-end (D,E,F)] — B/E are the
+ *  low-height right-angle corners of each triangular end cap.
+ */
+function rampPrismCorners(dir: 0 | 1 | 2 | 3): THREE.Vector3[] {
+  const V = (x: number, y: number, z: number) => new THREE.Vector3(x, y, z);
+  switch (dir) {
+    case 0: return [V(0, 0, 0), V(0, 0, 1), V(0, 1, 1), V(1, 0, 0), V(1, 0, 1), V(1, 1, 1)]; // S: high at z=1
+    case 2: return [V(0, 0, 1), V(0, 0, 0), V(0, 1, 0), V(1, 0, 1), V(1, 0, 0), V(1, 1, 0)]; // N: high at z=0
+    case 1: return [V(1, 0, 0), V(0, 0, 0), V(0, 1, 0), V(1, 0, 1), V(0, 0, 1), V(0, 1, 1)]; // W: high at x=0
+    default: return [V(0, 0, 0), V(1, 0, 0), V(1, 1, 0), V(0, 0, 1), V(1, 0, 1), V(1, 1, 1)]; // E: high at x=1
+  }
+}
+
+/** B3 wedge placement preview: local unit-cell footprint triangle (in the x,z plane), extruded
+ *  through the full height (y 0..1) — a wedge is a constant-cross-section triangular prism, unlike
+ *  a ramp's height taper. `dir` 0=SE/1=SW/2=NW/3=NE names the solid right-angle corner (verified
+ *  against `emit_wedge`, see blockDefs.ts's `orientBlockToFacing` doc comment). Returns [P1,P2,P3]
+ *  at y=0 — P1 is the right-angle corner. */
+function wedgeFootprintCorners(dir: 0 | 1 | 2 | 3): [THREE.Vector2, THREE.Vector2, THREE.Vector2] {
+  const V = (x: number, z: number) => new THREE.Vector2(x, z);
+  switch (dir) {
+    case 0: return [V(1, 1), V(0, 1), V(1, 0)]; // SE: right angle at (x=1,z=1)
+    case 1: return [V(0, 1), V(1, 1), V(0, 0)]; // SW
+    case 2: return [V(0, 0), V(1, 0), V(0, 1)]; // NW
+    default: return [V(1, 0), V(0, 0), V(1, 1)]; // NE
+  }
+}
+
+/** Builds the 9-edge (18-point) wireframe of a ramp or wedge prism in local unit-cell space, for a
+ *  THREE.LineSegments' position attribute. */
+function prismWireframePoints(kind: "ramp" | "wedge", dir: 0 | 1 | 2 | 3): Float32Array {
+  let a: THREE.Vector3, b: THREE.Vector3, c: THREE.Vector3, d: THREE.Vector3, e: THREE.Vector3, f: THREE.Vector3;
+  if (kind === "ramp") {
+    [a, b, c, d, e, f] = rampPrismCorners(dir);
+  } else {
+    const [p1, p2, p3] = wedgeFootprintCorners(dir);
+    a = new THREE.Vector3(p1.x, 0, p1.y); b = new THREE.Vector3(p2.x, 0, p2.y); c = new THREE.Vector3(p3.x, 0, p3.y);
+    d = new THREE.Vector3(p1.x, 1, p1.y); e = new THREE.Vector3(p2.x, 1, p2.y); f = new THREE.Vector3(p3.x, 1, p3.y);
+  }
+  const edges: [THREE.Vector3, THREE.Vector3][] = [
+    [a, b], [b, c], [c, a], // cap 1
+    [d, e], [e, f], [f, d], // cap 2
+    [a, d], [b, e], [c, f], // connecting
+  ];
+  const out = new Float32Array(edges.length * 6);
+  edges.forEach(([p, q], i) => {
+    out.set([p.x, p.y, p.z, q.x, q.y, q.z], i * 6);
+  });
+  return out;
+}
+
 const PICK_DIST = 256;
 /** Hover-highlight repick cadence. ~30Hz — one ~1ms IPC round-trip per tick is well inside budget. */
 const PICK_HOVER_MS = 33;
@@ -205,12 +330,49 @@ export interface Overlay3D {
   shape?: { loops: OutlinePt[][]; caps: MaskRect[]; zBottom: number; zTop: number };
 }
 
-type HudData = { x: number; y: number; z: number; heading: string };
+type HudData = { x: number; y: number; z: number; heading: string; boost: "sprint" | "crawl" | null; angleDeg: number };
 interface CoordHudRef { set: (d: HudData | null) => void }
+
+/// Axis compass (D2) — a passive dial tracking camera yaw. The ring (N/E/S/W) rotates opposite the
+/// camera's heading so the fixed centre arrow (always "up" on screen = the camera's forward) reads
+/// against it, like a minimap compass. Kept inside the same leaf/set() as the coord readout so a
+/// turning camera doesn't cost a second imperative channel or a second re-render source.
+const CompassDial = ({ angleDeg }: { angleDeg: number }) => {
+  const pt = (deg: number, label: string, dim: boolean) => {
+    const rad = (deg * Math.PI) / 180;
+    const r = 8;
+    return (
+      <span key={label} style={{
+        position: "absolute", left: `calc(50% + ${Math.sin(rad) * r}px)`, top: `calc(50% - ${Math.cos(rad) * r}px)`,
+        transform: "translate(-50%,-50%)", fontSize: 7, fontWeight: dim ? 400 : 700,
+        color: dim ? "#61584f" : "#dad6d2",
+      }}>{label}</span>
+    );
+  };
+  return (
+    <div title="Camera heading" style={{
+      position: "relative", width: 22, height: 22, borderRadius: "50%", flexShrink: 0,
+      background: "rgba(0,0,0,0.25)", border: "1px solid rgba(131,120,108,0.35)",
+    }}>
+      <div style={{ position: "absolute", inset: 0, transform: `rotate(${-angleDeg}deg)` }}>
+        {pt(0, "N", false)}
+        {pt(90, "E", true)}
+        {pt(180, "S", true)}
+        {pt(270, "W", true)}
+      </div>
+      {/* Fixed forward arrow — doesn't rotate; represents "up on screen = where the camera looks". */}
+      <span style={{
+        position: "absolute", left: "50%", top: 2, transform: "translateX(-50%)",
+        fontSize: 8, color: "#34d399", lineHeight: 1,
+      }}>▲</span>
+    </div>
+  );
+};
 
 /// Self-contained leaf for the camera-coords readout. The render loop pushes into it imperatively
 /// (~10 Hz) so a moving camera re-renders only this <div>, not the whole 3D pane. Same pattern as
-/// App's FpsCounter.
+/// App's FpsCounter. Also carries the live SPRINT/CRAWL badge and the compass angle — both change far
+/// too often to route through App-visible React state.
 const CoordHud = forwardRef<CoordHudRef>(function CoordHud(_props, ref) {
   const [hud, setHud] = useState<HudData | null>(null);
   useImperativeHandle(ref, () => ({ set: setHud }), []);
@@ -220,8 +382,17 @@ const CoordHud = forwardRef<CoordHudRef>(function CoordHud(_props, ref) {
       position: "absolute", bottom: 6, left: 6, zIndex: 1, pointerEvents: "none",
       padding: "2px 7px", borderRadius: 4, fontSize: 9, fontVariantNumeric: "tabular-nums",
       background: "rgba(31,28,26,0.7)", border: "1px solid rgba(131,120,108,0.3)", color: "#afa69d",
+      display: "flex", alignItems: "center", gap: 6,
     }}>
-      X {hud.x} · Y {hud.y} · Z {hud.z} · {hud.heading}
+      <CompassDial angleDeg={hud.angleDeg} />
+      <span>X {hud.x} · Y {hud.y} · Z {hud.z} · {hud.heading}</span>
+      {hud.boost && (
+        <span style={{
+          padding: "0 4px", borderRadius: 3, fontWeight: 700, letterSpacing: "0.04em",
+          color: hud.boost === "sprint" ? "#34d399" : "#60a5fa",
+          background: hud.boost === "sprint" ? "rgba(52,211,153,0.15)" : "rgba(96,165,250,0.15)",
+        }}>{hud.boost === "sprint" ? "SPRINT" : "CRAWL"}</span>
+      )}
     </div>
   );
 });
@@ -284,10 +455,42 @@ const FlyView3D = forwardRef<FlyView3DRef, {
   /** Middle click in "build" mode: pick the block/paint under the cursor as the new armed block
    *  (mirrors the 2D eyedropper). Not offered in "select"/"sculpt" — keeps scope to build mode. */
   onPickEyedrop?: (blockType: number, paint: number) => void;
+  /** Build shape ≠ "single" (B1): commits a batched break/place run — the whole line/box in one
+   *  `with_edit` call, one undo step. */
+  onPickBreakBatch?: (cells: [number, number, number][]) => void;
+  onPickPlaceBatch?: (cells: [number, number, number][], yaw: number) => void;
+  /** Build shape "fill" (B2): a one-click face-fill bucket. `(x,y,z)` is the clicked wall's solid
+   *  seed block, `(nx,ny,nz)` its face normal — the backend flood-fills the coplanar same-type run
+   *  behind that face and re-skins ("place") or clears ("break") it in one `with_edit` call. */
+  onPickFillFace?: (x: number, y: number, z: number, nx: number, ny: number, nz: number, mode: "break" | "place", yaw?: number) => void;
+  /** Current 3D selection box (Eden coords), or null/undefined. Auto-shows the Select-mode transform
+   *  gizmo (centre move-cube + 3 axis-move arrows + 3 plane-resize squares + 6 face-resize handles)
+   *  whenever `interact3d==="select"` and this is non-null. */
+  selectionBounds3d?: SelectionBounds3D | null;
+  /** Commits a gizmo face-resize, or an arrow-move while the pane's Region⇄Blocks toggle is set to
+   *  Region: the whole selection region moved/resized with no backend edit (App just writes
+   *  rawBounds/zMin/zMax, mirroring the existing box-only arrow-nudge path). */
+  onGizmoRegionChange?: (b: SelectionBounds3D) => void;
+  /** Commits a gizmo arrow-move while the toggle is set to Blocks: relocates the selection's contents
+   *  via the undoable `move_selection` backend command (App applies the EditResult and shifts
+   *  rawBounds/zMin/zMax by the same delta). Resize (face handles) is always region-only. */
+  onGizmoMoveBlocks?: (dx: number, dy: number, dz: number) => void;
+  /** Shared "move box + contents" toggle (App state, mirrored from the Selection ribbon tab). When
+   *  true a gizmo arrow-move relocates the selection's blocks (undoable); when false it moves the
+   *  region only. The in-pane ⇄ pill flips this same state, so 2D and 3D stay in lock-step. */
+  moveWithContents?: boolean;
+  setMoveWithContents?: (fn: (v: boolean) => boolean) => void;
   /** Data-URL swatch of the armed fill block, shown in the corner while building. */
   armedSwatch?: string | null;
   /** Human-readable name of the armed fill block, shown next to the swatch. */
   armedLabel?: string;
+  /** Raw armed block type id (unoriented) — drives the B3 ramp/wedge placement preview, which needs
+   *  the numeric id (not just the display swatch/label) to detect ramp/wedge families and resolve
+   *  their oriented variant the same way `handlePick3dPlace` will. */
+  armedBlockType?: number;
+  /** Whether auto-orient is on (mirrors App's `autoOrient3d` setting) — the placement preview shows
+   *  the oriented shape auto-orient would place, or the raw armed variant verbatim when off. */
+  autoOrient3d?: boolean;
   /** In-pane hotbar overlay data (build mode only), 10 slots: index 0-4 pinned (null = empty pin
    *  slot, digit key 1-5), index 5-9 recent (digit key 6-0). Precomputed by App so this component
    *  doesn't need its own resolveColor/tintedSwatch import. */
@@ -324,6 +527,10 @@ const FlyView3D = forwardRef<FlyView3DRef, {
   initialRenderDistance, initialFlySpeed, onRenderDistanceChange, onFlySpeedChange, anyModalOpen = false,
   lookSensitivity = 1, dragSensitivity = 1, invertY = false,
   interact3d = "none", onPickSelect, onPickBreak, onPickPlace, onPickEyedrop, armedSwatch = null, armedLabel = "",
+  onPickBreakBatch, onPickPlaceBatch, onPickFillFace,
+  armedBlockType = 0, autoOrient3d = true,
+  selectionBounds3d = null, onGizmoRegionChange, onGizmoMoveBlocks,
+  moveWithContents = false, setMoveWithContents,
   hotbarSlots, activeBlock, onHotbarSelect,
   onSetInteract3d,
   sculptTool = "raise", sculptRadius = 6, sculptStrength = 2, onSculptStamp3d,
@@ -345,6 +552,9 @@ const FlyView3D = forwardRef<FlyView3DRef, {
   const [loadRadius, setLoadRadius] = useState(initialRenderDistance ?? LOAD_RADIUS);
   const loadRadiusRef = useRef(initialRenderDistance ?? LOAD_RADIUS);
   const [distanceWarnOpen, setDistanceWarnOpen] = useState(false);
+  // Controls legend popover (D1) — a discoverable, always-available reminder for every pane binding,
+  // including the ones with no on-canvas affordance (Alt-crawl, Esc drag-cancel precedence, etc.).
+  const [legendOpen, setLegendOpen] = useState(false);
   const [loadingCount, setLoadingCount] = useState(0);
   const setLoadingCountRef = useRef(setLoadingCount);
   const [budgetLimited, setBudgetLimited] = useState(false);
@@ -422,7 +632,39 @@ const FlyView3D = forwardRef<FlyView3DRef, {
   onPickPlaceRef.current = onPickPlace;
   const onPickEyedropRef = useRef(onPickEyedrop);
   onPickEyedropRef.current = onPickEyedrop;
+  const onPickBreakBatchRef = useRef(onPickBreakBatch);
+  onPickBreakBatchRef.current = onPickBreakBatch;
+  const onPickPlaceBatchRef = useRef(onPickPlaceBatch);
+  onPickPlaceBatchRef.current = onPickPlaceBatch;
+  const onPickFillFaceRef = useRef(onPickFillFace);
+  onPickFillFaceRef.current = onPickFillFace;
+  const armedBlockTypeRef = useRef(armedBlockType);
+  armedBlockTypeRef.current = armedBlockType;
+  const autoOrient3dRef = useRef(autoOrient3d);
+  autoOrient3dRef.current = autoOrient3d;
 
+  // Build shape toggle (B1) — pane-local (no App state needed; a shape gesture reduces to the same
+  // batched place/break callbacks either way). Toggle-only, no keyboard modifier (stays clash-free
+  // per the shortcut audit — Alt/Ctrl/Shift are all already spoken for in this pane).
+  const [buildShape, setBuildShape] = useState<BuildShape>("single");
+  const buildShapeRef = useRef(buildShape);
+  buildShapeRef.current = buildShape;
+  // Whether a line/box gesture's start cell is currently armed — read by the build-mode hint text.
+  // Low-frequency (flips twice per gesture), so a plain setState re-render here is fine.
+  const [buildShapeArmed, setBuildShapeArmed] = useState(false);
+
+  // Gizmo props/state read through refs by the scene closure (see "3D selection gizmo" below).
+  const selectionBounds3dRef = useRef(selectionBounds3d);
+  selectionBounds3dRef.current = selectionBounds3d;
+  const onGizmoRegionChangeRef = useRef(onGizmoRegionChange);
+  onGizmoRegionChangeRef.current = onGizmoRegionChange;
+  const onGizmoMoveBlocksRef = useRef(onGizmoMoveBlocks);
+  onGizmoMoveBlocksRef.current = onGizmoMoveBlocks;
+  // Region⇄Blocks toggle for gizmo arrow-moves is the SHARED App `moveWithContents` state (also
+  // driven by the Selection ribbon tab's Move: Box/Contents pill) — mirrored into a ref so the scene
+  // closure reads it live. `moveWithContents === true` ⇒ arrow-move relocates blocks (undoable).
+  const moveWithContentsRef = useRef(moveWithContents);
+  moveWithContentsRef.current = moveWithContents;
   // Sculpt props read through refs by the scene closure (live values without a scene teardown).
   const sculptToolRef = useRef(sculptTool);
   sculptToolRef.current = sculptTool;
@@ -441,6 +683,12 @@ const FlyView3D = forwardRef<FlyView3DRef, {
   // Read via ref so the spawn target can update (new world) without tearing down the scene.
   const spawnAtRef = useRef(spawnAt);
   spawnAtRef.current = spawnAt;
+
+  // Floor grid visibility (D3) — pane-local, default on. World-bounds box + axes stay on regardless;
+  // the grid is the noisiest of the three at a glance, so it's the one worth an opt-out.
+  const [gridVisible, setGridVisible] = useState(true);
+  const gridVisibleRef = useRef(gridVisible);
+  gridVisibleRef.current = gridVisible;
 
   // In-pane fog on/off override (null = follow the fogEnabled prop / Settings default). Lets the user
   // flip fog without opening Settings; the Settings default still applies on load.
@@ -511,6 +759,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     setOverlays: (ovs: Overlay3D[] | null) => void;
     setFog: (enabled: boolean, color: readonly [number, number, number]) => void;
     setMaxDpr: (max: number) => void;
+    setGridVisible: (v: boolean) => void;
     setGpuShadows: (on: boolean) => void;
     /** Re-apply scene light state for the current (gpuShadows, nightLighting) combo — no chunk reload. */
     updateGpuLighting: () => void;
@@ -522,6 +771,11 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     clearSculpt: () => void;
     /** Enable/disable OrbitControls' LEFT mouse action (disabled while sculpt mode owns left-drag). */
     setOrbitLeftEnabled: (enabled: boolean) => void;
+    /** Cancel a live line/box build-shape gesture (armed start cell, no commit). */
+    clearBuildShape: () => void;
+    /** Show/hide + (re)lay out the Select-mode transform gizmo. No-op while a drag is in progress
+     *  (the live preview box owns the visual until release). */
+    setGizmoSelection: (mode: Interact3D, b: SelectionBounds3D | null) => void;
   } | null>(null);
 
   useImperativeHandle(ref, () => ({
@@ -647,6 +901,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
 
     const grid = new THREE.GridHelper(Math.max(mapW, mapH), Math.max(world.width_chunks, world.height_chunks));
     grid.position.set(cx, 0, cy);
+    grid.visible = gridVisibleRef.current;
     scene.add(grid);
     scene.add(new THREE.AxesHelper(24));
 
@@ -1103,6 +1358,9 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     // button and move) — pointer lock can be silently refused in the webview, so we never depend on it.
     let lookDrag = false;
     let lastMx = 0, lastMy = 0;
+    // The OS cursor recentring on grab fires one large synthetic movementX/Y delta — without this
+    // flag that first event whips the view around instead of doing nothing.
+    let lookJustEngaged = false;
 
     // Grab/release the OS cursor for look mode via the Tauri window (see set_cursor_lock in lib.rs).
     // Fire-and-forget; swallow errors (e.g. no window focus) — the CSS `cursor:none` still applies.
@@ -1127,10 +1385,16 @@ const FlyView3D = forwardRef<FlyView3DRef, {
 
       // Look mode grabs the OS cursor (frozen + hidden app-wide) until it exits; the other modes
       // release it. Delta events keep flowing on macOS so mouselook still steers (see set_cursor_lock).
-      if (next === "look") setNativeCursorLock(true);
+      if (next === "look") { setNativeCursorLock(true); lookJustEngaged = true; }
       else if (prev === "look") setNativeCursorLock(false);
 
       if (!nowWalking) {
+        // OrbitControls re-aims at `controls.target` the moment it re-enables, and that target is
+        // still wherever it was left before flying — usually far behind the camera now, producing a
+        // hard snap. Re-sync it to a point ahead of the camera's current facing first.
+        const dir = new THREE.Vector3();
+        camera.getWorldDirection(dir);
+        controls.target.copy(camera.position).addScaledVector(dir, 10);
         controls.enabled = true;
         lookDrag = false;
         keys.clear(); // drop held movement keys so the camera doesn't drift after exit
@@ -1154,7 +1418,9 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       let dx: number, dy: number, s: number;
       if (camModeRef.current === "look") {
         // Look mode: free mouselook from relative mouse motion. The OS cursor is grabbed, so the
-        // cursor is frozen but delta events keep arriving.
+        // cursor is frozen but delta events keep arriving. The grab's first event carries a large
+        // synthetic recentring delta (OS cursor warp) — swallow exactly that one.
+        if (lookJustEngaged) { lookJustEngaged = false; return; }
         dx = e.movementX; dy = e.movementY;
         s = LOOK_SENS_BASE * lookSensitivityRef.current;
       } else if (lookDrag) {
@@ -1259,6 +1525,26 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     breakHighlight.visible = false;
     scene.add(breakHighlight);
 
+    // B3 ramp/wedge placement preview — 8 static wireframes (4 ramp dirs + 4 wedge dirs) built once;
+    // one shared LineSegments swaps `.geometry` onto whichever is needed per hover tick (cheap, no
+    // rebuild) instead of the plain cube, whenever the armed block resolves (after auto-orient, if
+    // on) to a ramp/wedge. Shares `hlMat` with the cube highlight — never shown at the same time, so
+    // the one shared green/blue color state is never ambiguous.
+    const rampPreviewGeoms = ([0, 1, 2, 3] as const).map((d) => {
+      const g = new THREE.BufferGeometry();
+      g.setAttribute("position", new THREE.BufferAttribute(prismWireframePoints("ramp", d), 3));
+      return g;
+    });
+    const wedgePreviewGeoms = ([0, 1, 2, 3] as const).map((d) => {
+      const g = new THREE.BufferGeometry();
+      g.setAttribute("position", new THREE.BufferAttribute(prismWireframePoints("wedge", d), 3));
+      return g;
+    });
+    const placeShapeHighlight = new THREE.LineSegments(rampPreviewGeoms[0], hlMat);
+    placeShapeHighlight.renderOrder = 999;
+    placeShapeHighlight.visible = false;
+    scene.add(placeShapeHighlight);
+
     // ---- Sculpt brush-disc cursor ----------------------------------------------------------------
     // A flat amber disc laid on top of the hover-picked surface column, sized to the sculpt radius.
     // NOT routed through the box-overlay system (that's corner-keyed min/max) — a dedicated object.
@@ -1354,22 +1640,43 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     const placeBox = (box: THREE.LineSegments, x: number, y: number, z: number) =>
       box.position.set(x + 0.5, z + 0.5, y + 0.5);
 
-    const setHighlight = (p: PickResult | null) => {
+    const setHighlight = (p: PickResult | null, yaw: number = 0) => {
       const want = !!p && interact3dRef.current !== "none";
       if (!want) {
-        if (highlight.visible || breakHighlight.visible) {
+        if (highlight.visible || breakHighlight.visible || placeShapeHighlight.visible) {
           highlight.visible = false;
           breakHighlight.visible = false;
+          placeShapeHighlight.visible = false;
           invalidate();
         }
         return;
       }
       const build = interact3dRef.current === "build";
       const t = clickTarget(p!);
-      placeBox(highlight, t.x, t.y, t.z);
-      // Green = placement (build), blue = select — matches the overlay box colours.
+      // Green = placement (build), blue = select — matches the overlay box colours. Shared by the
+      // cube and the ramp/wedge shape preview below (never shown at the same time).
       hlMat.color.setHex(build ? 0x22c55e : 0x60a5fa);
-      highlight.visible = true;
+
+      // B3: preview the oriented ramp/wedge shape that would actually be placed here — auto-orient's
+      // resolved variant when on, the armed block verbatim when off — instead of a plain cube.
+      let shapeGeom: THREE.BufferGeometry | null = null;
+      if (build) {
+        const previewType = autoOrient3dRef.current
+          ? orientBlockToFacing(armedBlockTypeRef.current, yaw)
+          : armedBlockTypeRef.current;
+        if (rampFamilyBase(previewType) !== null) shapeGeom = rampPreviewGeoms[rampDirIndex(previewType)];
+        else if (wedgeFamilyBase(previewType) !== null) shapeGeom = wedgePreviewGeoms[rampDirIndex(previewType)];
+      }
+      if (shapeGeom) {
+        placeShapeHighlight.geometry = shapeGeom;
+        placeShapeHighlight.position.set(t.x, t.z, t.y); // cell origin — prism verts already span 0..1
+        placeShapeHighlight.visible = true;
+        highlight.visible = false;
+      } else {
+        placeBox(highlight, t.x, t.y, t.z);
+        highlight.visible = true;
+        placeShapeHighlight.visible = false;
+      }
       if (build) placeBox(breakHighlight, p!.x, p!.y, p!.z);
       breakHighlight.visible = build;
       invalidate();
@@ -1396,7 +1703,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
         const p = await pick(cursorX, cursorY);
         // Sculpt shows the amber brush disc; select/build show the wireframe box. Never both.
         if (mode === "sculpt") { placeBrush(p); setHighlight(null); }
-        else { setHighlight(p); placeBrush(null); }
+        else { setHighlight(p, placeYaw(cursorX, cursorY)); placeBrush(null); }
       } finally {
         pickInflight = false;
       }
@@ -1451,14 +1758,59 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       }
     };
 
+    // ---- Build shape: line / box (B1) --------------------------------------------------------------
+    // A dedicated amber wireframe box marks the armed start cell — reuses hlGeom (unit cube edges,
+    // already built above) with its own material so it doesn't fight the hover highlight's colour.
+    const shapeAnchorMat = new THREE.LineBasicMaterial({ color: 0xf59e0b, depthTest: false, transparent: true, opacity: 0.85 });
+    const shapeAnchorBox = new THREE.LineSegments(hlGeom, shapeAnchorMat);
+    shapeAnchorBox.renderOrder = 999;
+    shapeAnchorBox.visible = false;
+    scene.add(shapeAnchorBox);
+
+    let buildShapeAnchor: { x: number; y: number; z: number; kind: "break" | "place" } | null = null;
+    const clearBuildShapeAnchor = () => {
+      const wasArmed = buildShapeAnchor !== null;
+      buildShapeAnchor = null;
+      shapeAnchorBox.visible = false;
+      if (wasArmed) setBuildShapeArmed(false);
+      invalidate();
+    };
+    // First click on a shape gesture arms the start cell; the second (of the same kind) commits the
+    // whole run in one batched callback. A click of the OTHER kind (e.g. right-place after a
+    // left-break was armed) restarts the gesture at the new point instead of erroring.
+    const handleBuildShapeClick = (x: number, y: number, z: number, kind: "break" | "place", yaw: number) => {
+      if (!buildShapeAnchor || buildShapeAnchor.kind !== kind) {
+        buildShapeAnchor = { x, y, z, kind };
+        placeBox(shapeAnchorBox, x, y, z);
+        shapeAnchorBox.visible = true;
+        setBuildShapeArmed(true);
+        invalidate();
+        return;
+      }
+      const a = buildShapeAnchor;
+      const cells = buildShapeRef.current === "line"
+        ? bresenham3D(a.x, a.y, a.z, x, y, z)
+        : boxCells(a.x, a.y, a.z, x, y, z);
+      clearBuildShapeAnchor();
+      if (!cells) return; // over the safety cap — dropped, matching magic_wand_select's own cap behaviour
+      if (kind === "break") onPickBreakBatchRef.current?.(cells);
+      else onPickPlaceBatchRef.current?.(cells, yaw);
+    };
+
     const onPickDown = (e: PointerEvent) => {
+      // Idempotent re-arm: a missed release (pointerup off-canvas, pointercancel, focus loss) would
+      // otherwise leave the previous hold-repeat interval running forever while this one starts a
+      // second, compounding into runaway break/place. Always clear any stale timer before arming.
+      stopBuildRepeat();
       downX = e.clientX; downY = e.clientY; downT = performance.now(); downBtn = e.button;
       // Suppress the browser's middle-click autoscroll icon; only relevant in build mode (eyedropper).
       if (e.button === 1 && interact3dRef.current === "build") e.preventDefault();
       // Break (left) is reliable in WKWebView; place (right) is attempted the same way but the
       // guaranteed fallback is the `contextmenu` handler below (button-2 pointer events are
-      // unreliable there — see its comment).
-      if ((e.button === 0 || e.button === 2) && interact3dRef.current === "build") {
+      // unreliable there — see its comment). Hold-to-repeat only applies to plain single-voxel
+      // building — a line/box gesture is a deliberate two-click arm+commit, not a hold.
+      if ((e.button === 0 || e.button === 2) && interact3dRef.current === "build" && buildShapeRef.current === "single") {
+        canvas.setPointerCapture(e.pointerId); // guarantees pointerup lands here, even released off-canvas
         buildRepeatButton = e.button;
         buildRepeatLastCell = null;
         buildRepeatFired = false;
@@ -1469,6 +1821,9 @@ const FlyView3D = forwardRef<FlyView3DRef, {
         }, BUILD_REPEAT_DELAY_MS);
       }
     };
+    // Safety net for a missed pointerup (webview-issued pointercancel, e.g. from an OS gesture or
+    // focus loss mid-press) — without this the repeat interval above would run forever.
+    const onPickCancel = () => stopBuildRepeat();
     const isClick = (e: PointerEvent) =>
       e.button === downBtn &&
       performance.now() - downT < CLICK_SLOP_MS &&
@@ -1481,6 +1836,9 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     // "not select ⇒ build" assumption now that "sculpt" is a fourth mode.
     const onPickUp = async (e: PointerEvent) => {
       if ((e.button === 0 || e.button === 2) && buildRepeatButton === e.button) stopBuildRepeat();
+      // A click that started on a gizmo handle (see "3D selection gizmo" below) must never also
+      // fall through to select mode's two-click corner-pick, even when the press barely moved.
+      if (gizmoConsumedClick) { gizmoConsumedClick = false; return; }
       if (interact3dRef.current === "none" || !isClick(e)) return;
       // Middle click in build mode: eyedropper (pick block+paint under the cursor). Build-only —
       // select/sculpt don't offer it, matching the plan's scope cut.
@@ -1498,7 +1856,16 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       }
       if (interact3dRef.current !== "build") return; // sculpt (or anything else): never breaks
       const hit = await pick(e.clientX, e.clientY);
-      if (hit) onPickBreakRef.current?.(hit.x, hit.y, hit.z);
+      if (!hit) return;
+      if (buildShapeRef.current === "fill") {
+        onPickFillFaceRef.current?.(hit.x, hit.y, hit.z, hit.nx, hit.ny, hit.nz, "break");
+        return;
+      }
+      if (buildShapeRef.current !== "single") {
+        handleBuildShapeClick(hit.x, hit.y, hit.z, "break", 0);
+        return;
+      }
+      onPickBreakRef.current?.(hit.x, hit.y, hit.z);
     };
 
     // Right-click → PLACE at the highlighted cell (the previewed hit+normal), so what a click does
@@ -1514,10 +1881,22 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       if (buildRepeatFired) { buildRepeatFired = false; return; }
       const hit = await pick(e.clientX, e.clientY);
       if (!hit) return;
+      // Fill re-skins the clicked wall in place (the seed IS the solid hit cell) — no offset-into-
+      // empty-neighbour math and no camera-occupancy guard (the seed being solid already rules out
+      // the camera standing inside it).
+      if (buildShapeRef.current === "fill") {
+        onPickFillFaceRef.current?.(hit.x, hit.y, hit.z, hit.nx, hit.ny, hit.nz, "place", placeYaw(e.clientX, e.clientY));
+        return;
+      }
       const t = clickTarget(hit); // build → placement cell
       const c = threeToEden(camera.position);
       if (Math.floor(c.x) === t.x && Math.floor(c.y) === t.y && Math.floor(c.z) === t.z) return;
-      onPickPlaceRef.current?.(t.x, t.y, t.z, placeYaw(e.clientX, e.clientY));
+      const yaw = placeYaw(e.clientX, e.clientY);
+      if (buildShapeRef.current !== "single") {
+        handleBuildShapeClick(t.x, t.y, t.z, "place", yaw);
+        return;
+      }
+      onPickPlaceRef.current?.(t.x, t.y, t.z, yaw);
     };
 
     const onPickMove = (e: PointerEvent) => {
@@ -1627,6 +2006,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
 
     canvas.addEventListener("pointerdown", onPickDown);
     canvas.addEventListener("pointerup", onPickUp);
+    canvas.addEventListener("pointercancel", onPickCancel);
     canvas.addEventListener("pointermove", onPickMove);
     canvas.addEventListener("pointerleave", onPickLeave);
     canvas.addEventListener("contextmenu", onPickContext);
@@ -1663,9 +2043,10 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       // drag — so once you touched a slider, Z was dead for the rest of the session and only a world
       // reload (remounting the pane) brought it back.
       if (anyModalOpenRef.current || isTypingTarget(e.target)) return;
-      // Escape cancels a live sculpt hold/grab stroke in ANY camera mode (the fly-mode Escape below
-      // only fires while walking). Doesn't return — App's own Escape handling still runs.
-      if (e.key === "Escape") cancelSculptStroke();
+      // Escape cancels a live sculpt hold/grab stroke, or a live gizmo drag, in ANY camera mode (the
+      // fly-mode Escape below only fires while walking). Doesn't return — App's own Escape handling
+      // still runs, mirroring the sculpt-cancel precedence already established here.
+      if (e.key === "Escape") { cancelSculptStroke(); cancelGizmoDrag(); clearBuildShapeAnchor(); }
       if (e.key.toLowerCase() === "z" && !e.repeat && !e.metaKey && !e.ctrlKey) {
         // Z cycles camera mode (orbit → look → fly → orbit). Advancing *into* a walking mode from
         // orbit requires the pointer to be over this pane (so Z while working in another quad-view
@@ -1678,7 +2059,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       if (!flyModeRef.current) return;
       keys.add(e.key.toLowerCase());
       // Swallow movement keys so they don't trigger app shortcuts.
-      if (["w", "a", "s", "d", "e", "q", " ", "control", "shift"].includes(e.key.toLowerCase())) e.preventDefault();
+      if (["w", "a", "s", "d", "e", "q", " ", "control", "shift", "alt"].includes(e.key.toLowerCase())) e.preventDefault();
     };
     const onKeyUp = (e: KeyboardEvent) => { keys.delete(e.key.toLowerCase()); };
     window.addEventListener("keydown", onKeyDown);
@@ -1687,7 +2068,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     // Losing window focus (alt-tab, devtools) can swallow the keyup for a held direction key, leaving
     // it stuck in the set so the camera drifts indefinitely. Clear on blur. Also drop out of look
     // mode — a persistent OS cursor grab would otherwise freeze the cursor in whatever app we tab to.
-    const onBlur = () => { keys.clear(); lookDrag = false; cancelSculptStroke(); stopBuildRepeat(); if (camModeRef.current === "look") applyMode("orbit"); };
+    const onBlur = () => { keys.clear(); lookDrag = false; cancelSculptStroke(); stopBuildRepeat(); cancelGizmoDrag(); clearBuildShapeAnchor(); if (camModeRef.current === "look") applyMode("orbit"); };
     window.addEventListener("blur", onBlur);
 
     const fwd = new THREE.Vector3();
@@ -1703,6 +2084,23 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     let lastEmitT = 0;
     let lastEmitExternalT = 0;
     let lastEmitEX = NaN, lastEmitEY = NaN;
+
+    // ---- Smooth camera transitions (C2) ------------------------------------------------------------
+    // Tweens a programmatic camera jump (teleport, reset) instead of snapping — only while orbiting;
+    // WASD/look already own the camera continuously while flying, so a jump there stays instant (a
+    // tween would just fight the live movement). Eased ease-out-cubic over TWEEN_MS.
+    const TWEEN_MS = 250;
+    let camTween: { fromPos: THREE.Vector3; toPos: THREE.Vector3; fromTarget: THREE.Vector3; toTarget: THREE.Vector3; t0: number } | null = null;
+    const startCamTween = (toPos: THREE.Vector3, toTarget: THREE.Vector3) => {
+      if (flyModeRef.current) {
+        camera.position.copy(toPos);
+        controls.target.copy(toTarget);
+        controls.update();
+        return;
+      }
+      camTween = { fromPos: camera.position.clone(), toPos: toPos.clone(), fromTarget: controls.target.clone(), toTarget: toTarget.clone(), t0: performance.now() };
+      invalidate();
+    };
 
     // Orbit-controls "change" wakes the loop whenever the user drags/zooms; damping keeps it alive
     // until inertia settles (controls.update() returns false), then it goes fully idle.
@@ -1727,12 +2125,23 @@ const FlyView3D = forwardRef<FlyView3DRef, {
 
       let keepGoing = false;
 
+      if (camTween) {
+        const t = Math.min(1, (now - camTween.t0) / TWEEN_MS);
+        const e = 1 - (1 - t) ** 3; // ease-out cubic
+        camera.position.lerpVectors(camTween.fromPos, camTween.toPos, e);
+        controls.target.lerpVectors(camTween.fromTarget, camTween.toTarget, e);
+        if (t >= 1) camTween = null; else keepGoing = true;
+      }
+
       if (flyModeRef.current) {
         euler.set(pitch, yaw, 0);
         camera.quaternion.setFromEuler(euler);
         camera.getWorldDirection(fwd);
         right.crossVectors(fwd, WORLD_UP).normalize();
-        const boost = keys.has("shift") ? 3.5 : 1;
+        // Sprint (Shift, existing) / Crawl (Alt, precision movement) — Alt is free in this pane (Ctrl
+        // is already down-move, Shift is sprint), so it's the clash-free choice for a slow/precise
+        // mode. Shift takes priority if both are somehow held.
+        const boost = keys.has("shift") ? 3.5 : keys.has("alt") ? 0.25 : 1;
         const speed = Math.max(12, maxZ * 0.6) * boost * speedMultRef.current * dt;
         const move = new THREE.Vector3();
         if (keys.has("w")) move.add(fwd);
@@ -1808,9 +2217,13 @@ const FlyView3D = forwardRef<FlyView3DRef, {
         const ang = Math.atan2(fwd.x, -fwd.z); // 0 = north(−Z), +x = east
         const dirs = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"];
         const heading = dirs[(Math.round(ang / (Math.PI / 4)) + 8) % 8];
+        const boost: "sprint" | "crawl" | null = keys.has("shift") ? "sprint" : keys.has("alt") ? "crawl" : null;
         // Pushed straight into the leaf HUD's own state — a setState here would re-render the whole
         // pane (and everything its render creates) ~10× a second while the camera moves.
-        hudRef.current?.set({ x: Math.round(ex), y: Math.round(ey), z: Math.round(camera.position.y), heading });
+        hudRef.current?.set({
+          x: Math.round(ex), y: Math.round(ey), z: Math.round(camera.position.y), heading, boost,
+          angleDeg: (ang * 180) / Math.PI,
+        });
         lastEmitT = now;
       }
       // Throttled camera-position broadcast to the parent (~3fps) so the top-down map can draw the
@@ -1860,9 +2273,10 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     const resetCamera = () => {
       if (flyModeRef.current) applyMode("orbit");
       const s = spawnXY();
-      camera.position.set(s.x, maxZ + 60, s.y + 110);
-      controls.target.set(s.x, Math.min(maxZ, 28), s.y);
-      controls.update();
+      startCamTween(
+        new THREE.Vector3(s.x, maxZ + 60, s.y + 110),
+        new THREE.Vector3(s.x, Math.min(maxZ, 28), s.y),
+      );
       streamSweep(); // re-prioritise chunk streaming around the new viewpoint
       invalidate();
     };
@@ -1870,11 +2284,9 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     // Teleport camera to an Eden world XY position, keeping the current height.
     // Force an immediate chunk sweep so old far-away chunks are cleared right away.
     const teleport = (wx: number, wy: number) => {
-      camera.position.x = wx;
-      camera.position.z = wy; // Three.js Z = Eden Y
-      controls.target.x = wx;
-      controls.target.z = wy;
-      controls.update();
+      const toPos = camera.position.clone(); toPos.x = wx; toPos.z = wy; // Three.js Z = Eden Y
+      const toTarget = controls.target.clone(); toTarget.x = wx; toTarget.z = wy;
+      startCamTween(toPos, toTarget);
       streamSweep(); // immediate sweep without waiting for the next interval tick
       invalidate();
     };
@@ -1963,8 +2375,391 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     // Apply any overlays that were already set before scene init (e.g. selection exists at world-load).
     setOverlays(overlays3dRef.current);
 
+    // ---- 3D selection gizmo (Select mode transform handles) ---------------------------------------
+    // Hand-rolled, not THREE's TransformControls: its scale gizmo is center-symmetric (can't extend a
+    // single face) and its snap/aesthetic model fights the voxel grid + this file's raw-Three picking
+    // conventions. Auto-shown whenever interact3d==="select" and a selection exists (setGizmoSelection,
+    // driven by an effect on [interact3d, selectionBounds3d]).
+    //
+    // Axiom-style transform gizmo:
+    //  • a light-gray CENTER cube — grab it to slide the whole box on the ground plane (Eden x,y);
+    //  • 3 shaft+cone ARROWS (R=x, G=up, B=Eden-y) stemming from the center — single-axis whole-box move;
+    //  • 3 flat PLANE squares between the arrow pairs — move the whole box on that plane (2 axes at once);
+    //  • 6 small face handles — resize a single face along its axis.
+    // Resize (face handles) is always region-only (never touches blocks). Center/arrow/plane MOVE honours
+    // the shared Region⇄Blocks toggle (moveWithContents): region-only, or relocate contents via move_selection.
+    // (No rotation rings — selection rotation has no backend yet.)
+    //
+    // Drag math: on pointerdown, build a drag plane. For a 1-axis handle (arrow/face) the plane contains
+    // the dragged axis, oriented to face the camera as closely as possible (normal = the camera→handle
+    // vector's component perpendicular to the axis); the ray∩plane projected onto the axis gives a
+    // well-conditioned 1D drag regardless of view angle. For a 2-axis handle (center/plane) the plane is
+    // fixed by the handle's normal axis through the box center, and the ray∩plane projects onto both
+    // in-plane axes. Deltas round to whole voxels.
+    const GIZMO_HANDLE_SIZE = 0.9;
+    // The inner move gizmo (centre cube + arrows + plane squares) is a FIXED size at the box centre —
+    // the arrows don't stretch to the selection's faces (only the 6 face-resize handles sit on faces).
+    const GIZMO_ARROW_REACH = 5.5;       // cone-tip distance from centre (fixed, world units)
+    const GIZMO_CONE_H = 1.4;            // arrow cone height (world units)
+    const GIZMO_SHAFT_R = 0.14;          // arrow shaft cylinder radius
+    const GIZMO_PLANE_OFF = 2.2;         // plane-square offset from centre along each in-plane axis
+    const GIZMO_PLANE_SZ = 1.5;          // plane-square edge length
+    const GIZMO_CENTER_SIZE = 1.5;       // centre move-cube edge length
+    const GIZMO_FACE_COLOR = 0xfbbf24;
+    const GIZMO_CENTER_COLOR = 0xd4d0c8; // light gray, like Axiom's centre cube
+    const GIZMO_ARROW_COLORS: Record<"x" | "y" | "z", number> = { x: 0xef4444, y: 0x22c55e, z: 0x60a5fa };
+
+    type GizmoAxis = "x" | "y" | "z";
+    // kind: face=single-face resize · arrow=single-axis move · plane=2-axis resize · center=ground move.
+    // role (arrows only) distinguishes the cone tip from the scaling shaft in layout.
+    // planeNormal/planeA/planeB (planes only): the plane's normal axis + its two spanning/resize axes.
+    interface GizmoHandleMeta {
+      kind: "face" | "arrow" | "plane" | "center";
+      axis: GizmoAxis; sign: 1 | -1; role?: "cone" | "shaft";
+      planeNormal?: GizmoAxis; planeA?: GizmoAxis; planeB?: GizmoAxis;
+    }
+    const axisVec3 = (axis: GizmoAxis) =>
+      axis === "x" ? new THREE.Vector3(1, 0, 0) : axis === "y" ? new THREE.Vector3(0, 1, 0) : new THREE.Vector3(0, 0, 1);
+    // ConeGeometry/CylinderGeometry both point +Y by default — rotate to point outward along `axis`.
+    const orientToAxis = (m: THREE.Object3D, axis: GizmoAxis) => {
+      if (axis === "x") m.rotation.set(0, 0, -Math.PI / 2);
+      else if (axis === "z") m.rotation.set(Math.PI / 2, 0, 0);
+      else m.rotation.set(0, 0, 0);
+    };
+
+    const gizmoGroup = new THREE.Group();
+    gizmoGroup.visible = false;
+    gizmoGroup.renderOrder = 1000;
+    scene.add(gizmoGroup);
+    const gizmoHandles: THREE.Mesh[] = [];
+    const gizmoHandleMeta = new Map<THREE.Mesh, GizmoHandleMeta>();
+    const gizmoDisposables: { dispose: () => void }[] = [];
+
+    const addHandle = (m: THREE.Mesh, meta: GizmoHandleMeta) => {
+      m.renderOrder = 1000;
+      gizmoHandleMeta.set(m, meta);
+      gizmoHandles.push(m);
+      gizmoGroup.add(m);
+    };
+    // Shared MeshBasicMaterial per axis colour (arrows/planes reuse them).
+    const gizmoAxisMat: Record<GizmoAxis, THREE.MeshBasicMaterial> = {
+      x: new THREE.MeshBasicMaterial({ color: GIZMO_ARROW_COLORS.x, depthTest: false, transparent: true, opacity: 0.95, fog: false, toneMapped: false }),
+      y: new THREE.MeshBasicMaterial({ color: GIZMO_ARROW_COLORS.y, depthTest: false, transparent: true, opacity: 0.95, fog: false, toneMapped: false }),
+      z: new THREE.MeshBasicMaterial({ color: GIZMO_ARROW_COLORS.z, depthTest: false, transparent: true, opacity: 0.95, fog: false, toneMapped: false }),
+    };
+    gizmoDisposables.push(gizmoAxisMat.x, gizmoAxisMat.y, gizmoAxisMat.z);
+
+    // 6 single-face resize handles (small boxes at each face centre).
+    const gizmoFaceGeom = new THREE.BoxGeometry(GIZMO_HANDLE_SIZE, GIZMO_HANDLE_SIZE, GIZMO_HANDLE_SIZE);
+    const gizmoFaceMat = new THREE.MeshBasicMaterial({
+      color: GIZMO_FACE_COLOR, depthTest: false, transparent: true, opacity: 0.95, fog: false, toneMapped: false,
+    });
+    gizmoDisposables.push(gizmoFaceGeom, gizmoFaceMat);
+    const faceAxes: { axis: GizmoAxis; sign: 1 | -1 }[] = [
+      { axis: "x", sign: -1 }, { axis: "x", sign: 1 },
+      { axis: "y", sign: -1 }, { axis: "y", sign: 1 },
+      { axis: "z", sign: -1 }, { axis: "z", sign: 1 },
+    ];
+    for (const fa of faceAxes) addHandle(new THREE.Mesh(gizmoFaceGeom, gizmoFaceMat), { kind: "face", axis: fa.axis, sign: fa.sign });
+
+    // 3 arrows = cone tip + scaling shaft, both stemming from the centre cube.
+    const gizmoConeGeom = new THREE.ConeGeometry(0.5, GIZMO_CONE_H, 14);
+    const gizmoShaftGeom = new THREE.CylinderGeometry(GIZMO_SHAFT_R, GIZMO_SHAFT_R, 1, 10); // unit height; scaled in layout
+    gizmoDisposables.push(gizmoConeGeom, gizmoShaftGeom);
+    for (const axis of ["x", "y", "z"] as GizmoAxis[]) {
+      addHandle(new THREE.Mesh(gizmoConeGeom, gizmoAxisMat[axis]), { kind: "arrow", axis, sign: 1, role: "cone" });
+      addHandle(new THREE.Mesh(gizmoShaftGeom, gizmoAxisMat[axis]), { kind: "arrow", axis, sign: 1, role: "shaft" });
+    }
+
+    // 3 plane-resize squares (flat, coloured by the plane's normal axis).
+    const gizmoPlaneGeom = new THREE.PlaneGeometry(GIZMO_PLANE_SZ, GIZMO_PLANE_SZ);
+    gizmoDisposables.push(gizmoPlaneGeom);
+    const planeDefs: { normal: GizmoAxis; a: GizmoAxis; b: GizmoAxis }[] = [
+      { normal: "y", a: "x", b: "z" }, // ground plane (green): moves in x + Eden-y
+      { normal: "x", a: "y", b: "z" }, // side plane (red): moves in up + Eden-y
+      { normal: "z", a: "x", b: "y" }, // side plane (blue): moves in x + up
+    ];
+    for (const pd of planeDefs) {
+      const mat = new THREE.MeshBasicMaterial({
+        color: GIZMO_ARROW_COLORS[pd.normal], depthTest: false, transparent: true, opacity: 0.5,
+        side: THREE.DoubleSide, fog: false, toneMapped: false,
+      });
+      gizmoDisposables.push(mat);
+      addHandle(new THREE.Mesh(gizmoPlaneGeom, mat), { kind: "plane", axis: pd.normal, sign: 1, planeNormal: pd.normal, planeA: pd.a, planeB: pd.b });
+    }
+
+    // Centre move-cube (light gray) — grab to slide the whole box on the ground plane.
+    const gizmoCenterGeom = new THREE.BoxGeometry(GIZMO_CENTER_SIZE, GIZMO_CENTER_SIZE, GIZMO_CENTER_SIZE);
+    const gizmoCenterMat = new THREE.MeshBasicMaterial({
+      color: GIZMO_CENTER_COLOR, depthTest: false, transparent: true, opacity: 0.92, fog: false, toneMapped: false,
+    });
+    gizmoDisposables.push(gizmoCenterGeom, gizmoCenterMat);
+    addHandle(new THREE.Mesh(gizmoCenterGeom, gizmoCenterMat), { kind: "center", axis: "y", sign: 1 });
+
+    // Live drag preview: a unit box transformed per-frame (position/scale), not rebuilt — a resize
+    // drag can fire this every pointermove and rebuilding BoxGeometry that often would churn GPU
+    // buffers for no reason. Same three-pass convention as the overlay boxes (fill + edges + x-ray).
+    const gizmoPreviewGroup = new THREE.Group();
+    gizmoPreviewGroup.visible = false;
+    gizmoPreviewGroup.renderOrder = 997;
+    scene.add(gizmoPreviewGroup);
+    const unitBoxGeom = new THREE.BoxGeometry(1, 1, 1);
+    const unitEdgesGeom = new THREE.EdgesGeometry(unitBoxGeom);
+    gizmoDisposables.push(unitBoxGeom, unitEdgesGeom);
+    const gizmoPreviewFillMat = new THREE.MeshBasicMaterial({
+      color: GIZMO_FACE_COLOR, transparent: true, opacity: OVERLAY_FILL_OPACITY,
+      depthWrite: false, side: THREE.DoubleSide, fog: false, toneMapped: false,
+    });
+    const gizmoPreviewEdgeMat = new THREE.LineBasicMaterial({ color: GIZMO_FACE_COLOR, transparent: true, opacity: 1, fog: false, toneMapped: false });
+    const gizmoPreviewXrayMat = new THREE.LineBasicMaterial({
+      color: GIZMO_FACE_COLOR, transparent: true, opacity: OVERLAY_XRAY_OPACITY,
+      depthTest: false, depthWrite: false, fog: false, toneMapped: false,
+    });
+    gizmoDisposables.push(gizmoPreviewFillMat, gizmoPreviewEdgeMat, gizmoPreviewXrayMat);
+    gizmoPreviewGroup.add(new THREE.Mesh(unitBoxGeom, gizmoPreviewFillMat));
+    gizmoPreviewGroup.add(new THREE.LineSegments(unitEdgesGeom, gizmoPreviewEdgeMat));
+    gizmoPreviewGroup.add(new THREE.LineSegments(unitEdgesGeom, gizmoPreviewXrayMat));
+
+    const gizmoBoxMinMax = (b: SelectionBounds3D) => ({
+      min: new THREE.Vector3(b.x1, b.zMin, b.y1),
+      max: new THREE.Vector3(b.x2 + 1, b.zMax + 1, b.y2 + 1),
+    });
+    const setGizmoPreviewBox = (b: SelectionBounds3D) => {
+      const { min, max } = gizmoBoxMinMax(b);
+      const size = new THREE.Vector3().subVectors(max, min);
+      gizmoPreviewGroup.position.copy(min).addScaledVector(size, 0.5);
+      gizmoPreviewGroup.scale.copy(size);
+    };
+    // Position every handle on the current (idle) selection box.
+    const layoutGizmoHandles = (b: SelectionBounds3D) => {
+      const { min, max } = gizmoBoxMinMax(b);
+      const center = min.clone().add(max).multiplyScalar(0.5);
+      const half = max.clone().sub(min).multiplyScalar(0.5);
+      const halfOf = (axis: GizmoAxis) => (axis === "x" ? half.x : axis === "y" ? half.y : half.z);
+      for (const m of gizmoHandles) {
+        const meta = gizmoHandleMeta.get(m)!;
+        const axisVec = axisVec3(meta.axis);
+        m.scale.set(1, 1, 1);
+        if (meta.kind === "face") {
+          m.position.copy(center).addScaledVector(axisVec, halfOf(meta.axis) * meta.sign);
+          m.rotation.set(0, 0, 0);
+        } else if (meta.kind === "arrow") {
+          const tip = GIZMO_ARROW_REACH; // fixed cone-tip distance from centre (doesn't scale with the box)
+          if (meta.role === "shaft") {
+            const shaftLen = Math.max(0.1, tip - GIZMO_CONE_H * 0.5);
+            m.position.copy(center).addScaledVector(axisVec, shaftLen * 0.5);
+            m.scale.set(1, shaftLen, 1); // unit-height cylinder → world length
+          } else {
+            m.position.copy(center).addScaledVector(axisVec, tip);
+          }
+          orientToAxis(m, meta.axis);
+        } else if (meta.kind === "plane") {
+          m.position.copy(center)
+            .addScaledVector(axisVec3(meta.planeA!), GIZMO_PLANE_OFF)
+            .addScaledVector(axisVec3(meta.planeB!), GIZMO_PLANE_OFF);
+          // PlaneGeometry's normal is +Z by default; rotate so it lies in the plane whose normal is planeNormal.
+          if (meta.planeNormal === "y") m.rotation.set(-Math.PI / 2, 0, 0);
+          else if (meta.planeNormal === "x") m.rotation.set(0, Math.PI / 2, 0);
+          else m.rotation.set(0, 0, 0);
+        } else { // center
+          m.position.copy(center);
+          m.rotation.set(0, 0, 0);
+        }
+      }
+    };
+
+    const gizmoRaycaster = new THREE.Raycaster();
+    const gizmoNdc = (clientX: number, clientY: number) => {
+      const r = canvas.getBoundingClientRect();
+      return new THREE.Vector2(((clientX - r.left) / r.width) * 2 - 1, -((clientY - r.top) / r.height) * 2 + 1);
+    };
+    const pickGizmoHandle = (clientX: number, clientY: number): THREE.Mesh | null => {
+      if (!gizmoGroup.visible) return null;
+      gizmoRaycaster.setFromCamera(gizmoNdc(clientX, clientY), camera);
+      const hits = gizmoRaycaster.intersectObjects(gizmoHandles, false);
+      return hits.length > 0 ? (hits[0].object as THREE.Mesh) : null;
+    };
+
+    let gizmoDragging = false;
+    let gizmoDragHandle: GizmoHandleMeta | null = null;
+    let gizmoDragStartBounds: SelectionBounds3D | null = null;
+    let gizmoDragControlsWasEnabled = true;
+    const gizmoDragPlane = new THREE.Plane();
+    const gizmoDragAxisVec = new THREE.Vector3();
+    let gizmoDragAnchorProj = 0;
+    // 2-axis (center/plane) drag state: two in-plane axes + their intersection-reference projections.
+    let gizmoDrag2d = false;
+    const gizmoDrag2dAxisA = new THREE.Vector3();
+    const gizmoDrag2dAxisB = new THREE.Vector3();
+    let gizmoDrag2dAxes: [GizmoAxis, GizmoAxis] = ["x", "z"];
+    let gizmoDrag2dRefA = 0;
+    let gizmoDrag2dRefB = 0;
+    // Set on a handle-hit pointerdown; consumed (and cleared) by onPickUp so the same click never
+    // also completes a two-click corner-pick, even when the press barely moved.
+    let gizmoConsumedClick = false;
+
+    const cancelGizmoDrag = () => {
+      if (!gizmoDragging) return;
+      gizmoDragging = false;
+      gizmoDragHandle = null;
+      gizmoDragStartBounds = null;
+      gizmoDrag2d = false;
+      gizmoPreviewGroup.visible = false;
+      controls.enabled = gizmoDragControlsWasEnabled;
+      invalidate();
+    };
+
+    const onGizmoPointerDown = (e: PointerEvent) => {
+      if (interact3dRef.current !== "select" || e.button !== 0) return;
+      const hitMesh = pickGizmoHandle(e.clientX, e.clientY);
+      if (!hitMesh) return;
+      const bounds = selectionBounds3dRef.current;
+      if (!bounds) return;
+      const meta = gizmoHandleMeta.get(hitMesh)!;
+      gizmoConsumedClick = true;
+      gizmoDragging = true;
+      gizmoDragHandle = meta;
+      gizmoDragStartBounds = { ...bounds };
+      gizmoDragControlsWasEnabled = controls.enabled;
+      controls.enabled = false;
+      canvas.setPointerCapture(e.pointerId);
+
+      gizmoDrag2d = meta.kind === "center" || meta.kind === "plane";
+      if (gizmoDrag2d) {
+        // Fixed drag plane (normal = the handle's normal axis) through the box centre; project the
+        // ray∩plane onto both in-plane axes, referenced to the pointerdown intersection so both
+        // deltas start at 0. Center = ground plane (normal up); plane square = its own normal axis.
+        const normalAxis: GizmoAxis = meta.kind === "center" ? "y" : meta.planeNormal!;
+        gizmoDrag2dAxes = meta.kind === "center" ? ["x", "z"] : [meta.planeA!, meta.planeB!];
+        gizmoDrag2dAxisA.copy(axisVec3(gizmoDrag2dAxes[0]));
+        gizmoDrag2dAxisB.copy(axisVec3(gizmoDrag2dAxes[1]));
+        const { min, max } = gizmoBoxMinMax(bounds);
+        const boxCenter = min.clone().add(max).multiplyScalar(0.5);
+        gizmoDragPlane.setFromNormalAndCoplanarPoint(axisVec3(normalAxis), boxCenter);
+        gizmoRaycaster.setFromCamera(gizmoNdc(e.clientX, e.clientY), camera);
+        const pt = new THREE.Vector3();
+        if (gizmoRaycaster.ray.intersectPlane(gizmoDragPlane, pt)) {
+          gizmoDrag2dRefA = pt.dot(gizmoDrag2dAxisA);
+          gizmoDrag2dRefB = pt.dot(gizmoDrag2dAxisB);
+        } else { gizmoDrag2dRefA = boxCenter.dot(gizmoDrag2dAxisA); gizmoDrag2dRefB = boxCenter.dot(gizmoDrag2dAxisB); }
+      } else {
+        const axisVec = axisVec3(meta.axis);
+        gizmoDragAxisVec.copy(axisVec);
+        const anchor = hitMesh.position.clone();
+        const camToHandle = anchor.clone().sub(camera.position).normalize();
+        let normal = camToHandle.clone().sub(axisVec.clone().multiplyScalar(camToHandle.dot(axisVec)));
+        if (normal.lengthSq() < 1e-6) {
+          // Looking nearly straight down the axis — that plane choice degenerates. Fall back to a
+          // plane containing the axis and world-up (or world-right when the axis IS world-up).
+          normal = meta.axis === "y" ? new THREE.Vector3(1, 0, 0) : new THREE.Vector3(0, 1, 0);
+          normal.sub(axisVec.clone().multiplyScalar(normal.dot(axisVec)));
+        }
+        normal.normalize();
+        gizmoDragPlane.setFromNormalAndCoplanarPoint(normal, anchor);
+        gizmoDragAnchorProj = anchor.dot(axisVec);
+      }
+
+      setGizmoPreviewBox(bounds);
+      gizmoPreviewGroup.visible = true;
+      invalidate();
+    };
+
+    // Translate the whole box along `axis` by `delta` voxels, clamped to world bounds.
+    const moveWholeAxis = (next: SelectionBounds3D, start: SelectionBounds3D, axis: GizmoAxis, delta: number) => {
+      if (axis === "x") { const d = THREE.MathUtils.clamp(delta, -start.x1, (mapW - 1) - start.x2); next.x1 = start.x1 + d; next.x2 = start.x2 + d; }
+      else if (axis === "y") { const d = THREE.MathUtils.clamp(delta, -start.zMin, maxZ - start.zMax); next.zMin = start.zMin + d; next.zMax = start.zMax + d; }
+      else { const d = THREE.MathUtils.clamp(delta, -start.y1, (mapH - 1) - start.y2); next.y1 = start.y1 + d; next.y2 = start.y2 + d; }
+    };
+
+    const gizmoIntersectPt = new THREE.Vector3();
+    const onGizmoPointerMove = (e: PointerEvent) => {
+      if (!gizmoDragging || !gizmoDragHandle || !gizmoDragStartBounds) return;
+      gizmoRaycaster.setFromCamera(gizmoNdc(e.clientX, e.clientY), camera);
+      if (!gizmoRaycaster.ray.intersectPlane(gizmoDragPlane, gizmoIntersectPt)) return;
+      const start = gizmoDragStartBounds;
+      const meta = gizmoDragHandle;
+
+      if (gizmoDrag2d) {
+        // Both center-cube and plane-square handles TRANSLATE the whole box on their plane (the outer
+        // face cubes own resizing). Center = ground plane; each plane square = its own plane (incl.
+        // the two vertical ones), giving 2-axis moves the single arrows can't.
+        const dA = Math.round(gizmoIntersectPt.dot(gizmoDrag2dAxisA) - gizmoDrag2dRefA);
+        const dB = Math.round(gizmoIntersectPt.dot(gizmoDrag2dAxisB) - gizmoDrag2dRefB);
+        const next: SelectionBounds3D = { ...start };
+        moveWholeAxis(next, start, gizmoDrag2dAxes[0], dA);
+        moveWholeAxis(next, start, gizmoDrag2dAxes[1], dB);
+        setGizmoPreviewBox(next);
+        invalidate();
+        return;
+      }
+
+      const delta = Math.round(gizmoIntersectPt.dot(gizmoDragAxisVec) - gizmoDragAnchorProj);
+      const next: SelectionBounds3D = { ...start };
+      if (meta.kind === "face") {
+        if (meta.axis === "x") {
+          if (meta.sign === -1) next.x1 = THREE.MathUtils.clamp(start.x1 + delta, 0, start.x2);
+          else next.x2 = THREE.MathUtils.clamp(start.x2 + delta, start.x1, mapW - 1);
+        } else if (meta.axis === "y") {
+          if (meta.sign === -1) next.zMin = THREE.MathUtils.clamp(start.zMin + delta, 0, start.zMax);
+          else next.zMax = THREE.MathUtils.clamp(start.zMax + delta, start.zMin, maxZ);
+        } else {
+          if (meta.sign === -1) next.y1 = THREE.MathUtils.clamp(start.y1 + delta, 0, start.y2);
+          else next.y2 = THREE.MathUtils.clamp(start.y2 + delta, start.y1, mapH - 1);
+        }
+      } else if (meta.axis === "x") {
+        const dx = THREE.MathUtils.clamp(delta, -start.x1, (mapW - 1) - start.x2);
+        next.x1 = start.x1 + dx; next.x2 = start.x2 + dx;
+      } else if (meta.axis === "y") {
+        const dz = THREE.MathUtils.clamp(delta, -start.zMin, maxZ - start.zMax);
+        next.zMin = start.zMin + dz; next.zMax = start.zMax + dz;
+      } else {
+        const dy = THREE.MathUtils.clamp(delta, -start.y1, (mapH - 1) - start.y2);
+        next.y1 = start.y1 + dy; next.y2 = start.y2 + dy;
+      }
+      setGizmoPreviewBox(next);
+      invalidate();
+    };
+
+    const onGizmoPointerUp = (e: PointerEvent) => {
+      if (!gizmoDragging || !gizmoDragHandle || !gizmoDragStartBounds || e.button !== 0) return;
+      const meta = gizmoDragHandle;
+      const start = gizmoDragStartBounds;
+      // Recover the committed bounds from the preview group's current transform — it was updated in
+      // lockstep with `next` on every pointermove, so this stays in perfect agreement with what was
+      // last shown, without redoing the per-axis clamp math here.
+      const size = gizmoPreviewGroup.scale;
+      const min = gizmoPreviewGroup.position.clone().addScaledVector(size, -0.5);
+      const next: SelectionBounds3D = {
+        x1: Math.round(min.x), zMin: Math.round(min.y), y1: Math.round(min.z),
+        x2: Math.round(min.x + size.x) - 1, zMax: Math.round(min.y + size.y) - 1, y2: Math.round(min.z + size.z) - 1,
+      };
+      gizmoDragging = false;
+      gizmoDragHandle = null;
+      gizmoDragStartBounds = null;
+      gizmoDrag2d = false;
+      gizmoPreviewGroup.visible = false;
+      controls.enabled = gizmoDragControlsWasEnabled;
+      if (interact3dRef.current === "select") layoutGizmoHandles(next);
+      invalidate();
+      // Resize (face handles) is always region-only. Move (arrow/center/plane) honours the shared
+      // Region⇄Blocks toggle: region-only, or relocate the contents via move_selection.
+      const isResize = meta.kind === "face";
+      if (isResize || !moveWithContentsRef.current) {
+        onGizmoRegionChangeRef.current?.(next);
+      } else {
+        const dx = next.x1 - start.x1, dy = next.y1 - start.y1, dz = next.zMin - start.zMin;
+        if (dx !== 0 || dy !== 0 || dz !== 0) onGizmoMoveBlocksRef.current?.(dx, dy, dz);
+      }
+    };
+
+    canvas.addEventListener("pointerdown", onGizmoPointerDown);
+    canvas.addEventListener("pointermove", onGizmoPointerMove);
+    canvas.addEventListener("pointerup", onGizmoPointerUp);
+    canvas.addEventListener("pointercancel", cancelGizmoDrag);
+
     sceneApi.current = {
       scene, camera, reloadChunk, reloadAllChunks, resetCamera, teleport, setOverlays, setFog, setMaxDpr,
+      setGridVisible: (v) => { grid.visible = v; invalidate(); },
       // Flip the scene lighting, then rebuild every chunk mesh (material + normals + flat-vs-baked
       // geometry all differ between modes).
       setGpuShadows: () => { applyGpuLighting(); reloadAllChunks(); },
@@ -1973,8 +2768,19 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       refresh: () => invalidate(),
       clearHighlight: () => { setHighlight(null); stopBuildRepeat(); },
       clearSculpt: () => { cancelSculptStroke(); placeBrush(null); },
+      clearBuildShape: () => clearBuildShapeAnchor(),
       setOrbitLeftEnabled,
+      setGizmoSelection: (mode, b) => {
+        if (gizmoDragging) return; // don't fight a live drag — it owns the visual until release
+        if (mode === "select" && b) { gizmoGroup.visible = true; layoutGizmoHandles(b); }
+        else gizmoGroup.visible = false;
+        invalidate();
+      },
     };
+
+    // Apply initial gizmo state — a selection may already exist when the pane mounts (quad view /
+    // 3D pane toggled on with a selection already committed from the 2D map).
+    sceneApi.current.setGizmoSelection(interact3dRef.current, selectionBounds3dRef.current ?? null);
 
     return () => {
       disposed = true;
@@ -2005,9 +2811,14 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       canvas.removeEventListener("pointerup", onSculptUp);
       canvas.removeEventListener("pointerdown", onPickDown);
       canvas.removeEventListener("pointerup", onPickUp);
+      canvas.removeEventListener("pointercancel", onPickCancel);
       canvas.removeEventListener("pointermove", onPickMove);
       canvas.removeEventListener("pointerleave", onPickLeave);
       canvas.removeEventListener("contextmenu", onPickContext);
+      canvas.removeEventListener("pointerdown", onGizmoPointerDown);
+      canvas.removeEventListener("pointermove", onGizmoPointerMove);
+      canvas.removeEventListener("pointerup", onGizmoPointerUp);
+      canvas.removeEventListener("pointercancel", cancelGizmoDrag);
       window.removeEventListener("keydown", onKeyDown);
       window.removeEventListener("keyup", onKeyUp);
       window.removeEventListener("blur", onBlur);
@@ -2015,10 +2826,18 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       clearOverlays();
       scene.remove(highlight);
       scene.remove(breakHighlight);
+      scene.remove(placeShapeHighlight);
       scene.remove(brushGroup);
+      scene.remove(shapeAnchorBox);
+      scene.remove(gizmoGroup);
+      scene.remove(gizmoPreviewGroup);
+      for (const d of gizmoDisposables) d.dispose();
+      for (const g of rampPreviewGeoms) g.dispose();
+      for (const g of wedgePreviewGeoms) g.dispose();
       hlGeom.dispose();
       hlMat.dispose();
       hlBreakMat.dispose();
+      shapeAnchorMat.dispose();
       brushFillGeom.dispose();
       brushFillMat.dispose();
       brushRingGeom.dispose();
@@ -2075,8 +2894,15 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     if (!api) return;
     if (interact3d !== "select" && interact3d !== "build") api.clearHighlight();
     if (interact3d !== "sculpt") api.clearSculpt();
+    if (interact3d !== "build") api.clearBuildShape();
     api.setOrbitLeftEnabled(interact3d !== "sculpt");
   }, [interact3d]);
+
+  // Gizmo sync: show/hide + relay out the Select-mode transform handles whenever the mode or the
+  // selection box changes (resize/move commits update selectionBounds3d, which lands here too).
+  useEffect(() => {
+    sceneApi.current?.setGizmoSelection(interact3d, selectionBounds3d ?? null);
+  }, [interact3d, selectionBounds3d]);
 
   // Fog toggle / model / sky-color sync — avoids a full scene teardown/rebuild.
   useEffect(() => {
@@ -2089,6 +2915,11 @@ const FlyView3D = forwardRef<FlyView3DRef, {
   useEffect(() => {
     sceneApi.current?.setMaxDpr(antialias ? 2 : MAX_DPR);
   }, [antialias]);
+
+  // Floor grid visibility toggle (D3).
+  useEffect(() => {
+    sceneApi.current?.setGridVisible(gridVisible);
+  }, [gridVisible]);
 
   // Re-centre over the spawn target on a new world load. The init effect only re-runs on world-size
   // change, so a new world of identical dimensions would otherwise keep the old viewpoint. Keyed on
@@ -2141,6 +2972,14 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     window.addEventListener("keydown", onEsc);
     return () => window.removeEventListener("keydown", onEsc);
   }, [distanceWarnOpen]);
+
+  // Escape dismisses the controls legend (D1) the same way.
+  useEffect(() => {
+    if (!legendOpen) return;
+    const onEsc = (e: KeyboardEvent) => { if (e.key === "Escape") setLegendOpen(false); };
+    window.addEventListener("keydown", onEsc);
+    return () => window.removeEventListener("keydown", onEsc);
+  }, [legendOpen]);
 
   // Texture pack sync: rebuild the DataTexture + material when the pack changes.
   useEffect(() => {
@@ -2281,6 +3120,61 @@ const FlyView3D = forwardRef<FlyView3DRef, {
             render distance limited by memory
           </span>
         )}
+        {/* Controls legend (D1) — the authoritative, always-available reference for every pane
+            binding, including the ones with no on-canvas affordance. */}
+        <div style={{ position: "relative", display: "flex", pointerEvents: "auto" }}>
+          <button
+            type="button"
+            onClick={() => setLegendOpen(o => !o)}
+            title="Controls legend"
+            aria-label="Show 3D pane controls legend"
+            aria-expanded={legendOpen}
+            aria-controls="fly3d-controls-legend"
+            style={{
+              display: "flex", alignItems: "center", justifyContent: "center",
+              width: 14, height: 14, borderRadius: "50%", border: "1px solid rgba(131,120,108,0.4)",
+              background: legendOpen ? "rgba(131,120,108,0.3)" : "rgba(131,120,108,0.12)",
+              color: "#afa69d", fontSize: 9, fontWeight: 700, cursor: "pointer", padding: 0, lineHeight: 1,
+            }}
+          >?</button>
+          {legendOpen && (
+            <div
+              id="fly3d-controls-legend"
+              role="dialog"
+              aria-label="3D pane controls legend"
+              style={{
+                ...glassMenuPanel,
+                position: "absolute", top: 18, left: 0, zIndex: 10,
+                width: 300, maxHeight: 420, overflowY: "auto",
+                padding: 10, fontSize: 10, lineHeight: 1.5, color: "#dad6d2", fontWeight: 400,
+              }}>
+              <div style={{ fontWeight: 700, color: "#fff", marginBottom: 4 }}>Camera</div>
+              <div>Z / click pill — cycle Orbit → Look → Fly → Orbit</div>
+              <div>Orbit — drag to rotate, scroll to zoom</div>
+              <div>Look / Fly — WASD move · Space/E up · Ctrl/Q down</div>
+              <div>Shift — sprint (3.5×) · Alt — crawl / precision (0.25×)</div>
+              <div>Look — free mouselook · Fly — drag to look</div>
+              <div>Scroll — adjust fly speed · Esc — exit to Orbit</div>
+              <div style={{ fontWeight: 700, color: "#fff", margin: "6px 0 4px" }}>Select mode</div>
+              <div>Click 2 corners (no gizmo hit) — make/replace a 3D selection</div>
+              <div>Drag the gray center cube — slide the whole box on the ground</div>
+              <div>Drag a colored arrow — move the box along that axis</div>
+              <div>Drag a colored plane square — move the box on that plane (2 axes)</div>
+              <div>Drag a small face box — resize that one side (region only)</div>
+              <div>⇄ Region/Blocks toggle — a MOVE edits the region only, or relocates its
+                blocks (undoable) — resize is always region-only</div>
+              <div>Esc mid-drag — cancel the gizmo drag, no change committed</div>
+              <div style={{ fontWeight: 700, color: "#fff", margin: "6px 0 4px" }}>Build mode</div>
+              <div>Left click/hold — break · Right click/hold — place</div>
+              <div>Middle click — eyedropper (pick block+paint)</div>
+              <div>1–5 / 6–0 — hotbar pinned/recent slots (works while flying)</div>
+              <div style={{ fontWeight: 700, color: "#fff", margin: "6px 0 4px" }}>Sculpt mode</div>
+              <div>Left press+hold — sculpt under the cursor (Grab: vertical drag)</div>
+              <div>[ / ] — brush radius · Shift+[ / Shift+] — strength</div>
+              <div>Esc — cancel the in-progress stroke</div>
+            </div>
+          )}
+        </div>
       </div>
       {/* Camera reset button (A4) */}
       <div style={{ position: "absolute", top: 6, right: 6, zIndex: 1, display: "flex", alignItems: "center", gap: 6 }}>
@@ -2291,7 +3185,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
         })}>
           <span style={{ fontSize: 9, color: "#83786c", userSelect: "none" }} aria-hidden="true">R</span>
           <input
-            type="range" min={2} max={MAX_RENDER_DISTANCE} step={1} value={loadRadius}
+            type="range" min={RD_MIN} max={MAX_RENDER_DISTANCE} step={1} value={loadRadius}
             onChange={e => {
               const v = Number(e.target.value);
               loadRadiusRef.current = v;
@@ -2302,7 +3196,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
             }}
             title={`Render distance: ${loadRadius} chunks`}
             aria-label={`Render distance: ${loadRadius} chunks`}
-            style={{ width: 60, cursor: "pointer", accentColor: "#83786c" }}
+            style={{ width: 150, cursor: "pointer", accentColor: "#83786c" }}
           />
           <span style={{ fontSize: 9, color: "#afa69d", minWidth: 14, textAlign: "right", userSelect: "none" }} aria-hidden="true">{loadRadius}</span>
           {loadRadius > RENDER_DISTANCE_WARN_THRESHOLD && (
@@ -2386,6 +3280,12 @@ const FlyView3D = forwardRef<FlyView3DRef, {
           style={chromeButton({ padding: "2px 7px", fontSize: 10, color: antialias ? "#afa69d" : "#61584f" })}
         >AA {antialias ? "✓" : "✗"}</button>
         <button
+          onClick={() => setGridVisible(v => !v)}
+          title={gridVisible ? "Floor grid on — click to hide" : "Floor grid off — click to show"}
+          aria-label={gridVisible ? "Floor grid on — click to hide" : "Floor grid off — click to show"}
+          style={chromeButton({ padding: "2px 7px", fontSize: 10, color: gridVisible ? "#afa69d" : "#61584f" })}
+        >Grid {gridVisible ? "✓" : "✗"}</button>
+        <button
           onClick={() => sceneApi.current?.resetCamera()}
           title="Reset camera to world overview"
           aria-label="Reset camera to world overview"
@@ -2463,6 +3363,57 @@ const FlyView3D = forwardRef<FlyView3DRef, {
             );
           })}
         </div>
+        {/* Build shape toggle (B1) — Single is today's plain click; Line/Box arm a start cell on the
+            first click and commit the whole run on the second (Esc cancels the armed anchor). */}
+        {interact3d === "build" && (
+          <div style={{
+            display: "flex", gap: 2, pointerEvents: "auto",
+            background: "rgba(31,28,26,0.7)", border: "1px solid rgba(131,120,108,0.3)", borderRadius: 6, padding: 2,
+          }}>
+            {(["single", "line", "box", "fill"] as BuildShape[]).map((s) => {
+              const active = buildShape === s;
+              const title = s === "single" ? "Single voxel — plain click to break/place"
+                : s === "fill" ? "Fill bucket — click a wall face to flood-fill the connected same-type run (L clears it, R re-skins it)"
+                : `${s === "line" ? "Line" : "Box"} — click a start cell, then click the end cell to commit the whole run`;
+              const label = s === "single" ? "◽" : s === "line" ? "Line" : s === "box" ? "Box" : "Fill";
+              return (
+                <button
+                  key={s}
+                  type="button"
+                  title={title}
+                  aria-pressed={active}
+                  onClick={(e) => { e.currentTarget.blur(); setBuildShape(s); }}
+                  style={{
+                    padding: "2px 7px", borderRadius: 4, fontSize: 9, fontWeight: 700, letterSpacing: "0.03em",
+                    cursor: "pointer",
+                    background: active ? "rgba(245,158,11,0.2)" : "transparent",
+                    border: `1px solid ${active ? "rgba(245,158,11,0.5)" : "transparent"}`,
+                    color: active ? "#f59e0b" : "#83786c",
+                  }}
+                >{label}</button>
+              );
+            })}
+          </div>
+        )}
+        {/* Gizmo Region⇄Blocks toggle — only meaningful while the transform gizmo is showing (Select
+            mode with a selection). Resize (face handles) is always region-only; this only decides
+            what an axis-move ARROW does. */}
+        {interact3d === "select" && selectionBounds3d && (
+          <button
+            type="button"
+            onClick={(e) => { e.currentTarget.blur(); setMoveWithContents?.(v => !v); }}
+            title={!moveWithContents
+              ? "Gizmo arrows move the selection region only (2D/slab views follow). Click to switch to moving its blocks (undoable). Same toggle as the Selection tab's Move: Box/Contents."
+              : "Gizmo arrows relocate the selection's blocks (undoable move_selection). Click to switch to moving the region only. Same toggle as the Selection tab's Move: Box/Contents."}
+            style={{
+              padding: "2px 8px", borderRadius: 4, fontSize: 9, fontWeight: 700, letterSpacing: "0.03em",
+              pointerEvents: "auto", cursor: "pointer",
+              background: moveWithContents ? "rgba(251,191,36,0.18)" : "rgba(131,120,108,0.18)",
+              border: `1px solid ${moveWithContents ? "rgba(251,191,36,0.5)" : "rgba(131,120,108,0.35)"}`,
+              color: moveWithContents ? "#fbbf24" : "#83786c",
+            }}
+          >⇄ {moveWithContents ? "Blocks" : "Region"}</button>
+        )}
         {interact3d !== "none" && (
           <div style={{
             display: "flex", alignItems: "center", gap: 6, pointerEvents: "none",
@@ -2481,7 +3432,11 @@ const FlyView3D = forwardRef<FlyView3DRef, {
                       grabReadout != null
                         ? ` · Δ${grabReadout > 0 ? "+" : ""}${grabReadout}`
                         : ` · str${sculptStrength}`}`
-                  : `L break · R place${armedLabel ? ` ${armedLabel}` : ""}`}
+                  : buildShape === "fill"
+                    ? `click a wall — L clear · R fill${armedLabel ? ` ${armedLabel}` : ""}`
+                    : buildShape !== "single"
+                      ? `${buildShapeArmed ? "click end cell to commit" : `click start cell (${buildShape})`}${armedLabel ? ` · ${armedLabel}` : ""}`
+                      : `L break · R place${armedLabel ? ` ${armedLabel}` : ""}`}
             </span>
           </div>
         )}
