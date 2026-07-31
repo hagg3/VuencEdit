@@ -92,6 +92,20 @@ const RD_MIN = 2;               // slider floor (chunk radius)
 const LOOK_SENS_BASE = 0.006;
 const DRAG_SENS_BASE = 0.0025;
 const RENDER_DISTANCE_WARN_THRESHOLD = 16; // above this, chunk count grows enough to warn
+// Piecewise slider-position ↔ chunk-radius mapping: positions 0…14 map 1:1 to chunks RD_MIN(2)…16
+// (the range where frame rate is cheap to buy), then two slider positions per chunk from 17…32 (the
+// range where frame rate falls off a cliff) — so the same physical drag distance buys half as much
+// render distance past 16. The stored/persisted value stays in chunks; only the <input> position uses
+// this domain, so `RENDER_DISTANCE_WARN_THRESHOLD` and everything else that reads `loadRadius` is
+// unaffected.
+function radiusToPos(r: number): number {
+  if (r <= 16) return r - RD_MIN;
+  return 15 + (r - 17) * 2;
+}
+function posToRadius(pos: number): number {
+  if (pos <= 14) return RD_MIN + pos;
+  return Math.min(MAX_RENDER_DISTANCE, 17 + Math.floor((pos - 15) / 2));
+}
 const STREAM_MS = 150;   // throttle for the load/dispose sweep
 const MAX_DPR = 1.5;     // cap device-pixel-ratio — Retina (2×) quadruples fragment load for ~no gain
 // Hard cap on resident vertex count (opaque + transparent streams combined) regardless of render
@@ -120,7 +134,7 @@ export interface SelectionBounds3D {
 }
 
 /** What a click in the 3D pane does. Derived from App's active tool, not owned by this pane. */
-export type Interact3D = "none" | "select" | "build" | "sculpt";
+export type Interact3D = "none" | "select" | "build" | "sculpt" | "floodfill";
 
 /// In-pane VIEW/SELECT/BUILD/SCULPT segmented pill — a quiet mirror of the Ribbon 3D tab's mode
 /// picker (both write App's mode3d). Segmented, not a cycle: a stray click must never land on the
@@ -129,6 +143,7 @@ export type Interact3D = "none" | "select" | "build" | "sculpt";
 const INTERACT_SEGMENTS: { mode: Interact3D; label: string; accent: string; title: string }[] = [
   { mode: "none", label: "VIEW", accent: "#afa69d", title: "View only — clicks don't edit" },
   { mode: "select", label: "SELECT", accent: "#3b82f6", title: "Select mode — click two voxels to make a 3D selection" },
+  { mode: "floodfill", label: "FILL", accent: "#38bdf8", title: "Flood Fill — click a block face to fill connected air across and down with the armed block" },
   { mode: "build", label: "BUILD", accent: "#f59e0b", title: "Build mode — left-click breaks, right-click places the armed block" },
   { mode: "sculpt", label: "SCULPT", accent: "#fb923c", title: "Sculpt mode — press and hold left to sculpt terrain under the cursor" },
 ];
@@ -446,6 +461,9 @@ const FlyView3D = forwardRef<FlyView3DRef, {
   interact3d?: Interact3D;
   /** Left click in "select" mode: the voxel under the cursor. App owns the two-click state machine. */
   onPickSelect?: (x: number, y: number, z: number) => void;
+  /** Left click in "floodfill" mode: the picked block face + its normal. App flood-fills the
+   *  connected air cell against that face (`hit + normal`) as the start cell. */
+  onPickFloodFill?: (x: number, y: number, z: number, nx: number, ny: number, nz: number) => void;
   /** Left click in "build" mode: the voxel to clear. */
   onPickBreak?: (x: number, y: number, z: number) => void;
   /** Right click in "build" mode: the empty voxel against the picked face, where a block goes.
@@ -526,7 +544,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
   nightLighting = false, shadows3d = false, sunT = 0.5, lampRadius = 5, lightEpoch = 0,
   initialRenderDistance, initialFlySpeed, onRenderDistanceChange, onFlySpeedChange, anyModalOpen = false,
   lookSensitivity = 1, dragSensitivity = 1, invertY = false,
-  interact3d = "none", onPickSelect, onPickBreak, onPickPlace, onPickEyedrop, armedSwatch = null, armedLabel = "",
+  interact3d = "none", onPickSelect, onPickFloodFill, onPickBreak, onPickPlace, onPickEyedrop, armedSwatch = null, armedLabel = "",
   onPickBreakBatch, onPickPlaceBatch, onPickFillFace,
   armedBlockType = 0, autoOrient3d = true,
   selectionBounds3d = null, onGizmoRegionChange, onGizmoMoveBlocks,
@@ -626,6 +644,8 @@ const FlyView3D = forwardRef<FlyView3DRef, {
   interact3dRef.current = interact3d;
   const onPickSelectRef = useRef(onPickSelect);
   onPickSelectRef.current = onPickSelect;
+  const onPickFloodFillRef = useRef(onPickFloodFill);
+  onPickFloodFillRef.current = onPickFloodFill;
   const onPickBreakRef = useRef(onPickBreak);
   onPickBreakRef.current = onPickBreak;
   const onPickPlaceRef = useRef(onPickPlace);
@@ -1854,6 +1874,11 @@ const FlyView3D = forwardRef<FlyView3DRef, {
         if (hit) onPickSelectRef.current?.(hit.x, hit.y, hit.z);
         return;
       }
+      if (interact3dRef.current === "floodfill") {
+        const hit = await pick(e.clientX, e.clientY);
+        if (hit) onPickFloodFillRef.current?.(hit.x, hit.y, hit.z, hit.nx, hit.ny, hit.nz);
+        return;
+      }
       if (interact3dRef.current !== "build") return; // sculpt (or anything else): never breaks
       const hit = await pick(e.clientX, e.clientY);
       if (!hit) return;
@@ -2892,7 +2917,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
   useEffect(() => {
     const api = sceneApi.current;
     if (!api) return;
-    if (interact3d !== "select" && interact3d !== "build") api.clearHighlight();
+    if (interact3d !== "select" && interact3d !== "build" && interact3d !== "floodfill") api.clearHighlight();
     if (interact3d !== "sculpt") api.clearSculpt();
     if (interact3d !== "build") api.clearBuildShape();
     api.setOrbitLeftEnabled(interact3d !== "sculpt");
@@ -3176,8 +3201,13 @@ const FlyView3D = forwardRef<FlyView3DRef, {
           )}
         </div>
       </div>
-      {/* Camera reset button (A4) */}
-      <div style={{ position: "absolute", top: 6, right: 6, zIndex: 1, display: "flex", alignItems: "center", gap: 6 }}>
+      {/* Camera reset button (A4) — faded to stay out of the way of the viewport, full opacity on hover
+          so the render-distance number and fog swatch are still legible when you look at this row. */}
+      <div
+        style={{ position: "absolute", top: 6, right: 6, zIndex: 1, display: "flex", alignItems: "center", gap: 6, opacity: 0.5, transition: "opacity .12s" }}
+        onMouseEnter={e => { e.currentTarget.style.opacity = "1"; }}
+        onMouseLeave={e => { e.currentTarget.style.opacity = "0.5"; }}
+      >
         {/* Render distance slider */}
         <div style={chromeButton({
           display: "flex", alignItems: "center", gap: 4,
@@ -3185,9 +3215,9 @@ const FlyView3D = forwardRef<FlyView3DRef, {
         })}>
           <span style={{ fontSize: 9, color: "#83786c", userSelect: "none" }} aria-hidden="true">R</span>
           <input
-            type="range" min={RD_MIN} max={MAX_RENDER_DISTANCE} step={1} value={loadRadius}
+            type="range" min={0} max={radiusToPos(MAX_RENDER_DISTANCE)} step={1} value={radiusToPos(loadRadius)}
             onChange={e => {
-              const v = Number(e.target.value);
+              const v = posToRadius(Number(e.target.value));
               loadRadiusRef.current = v;
               setLoadRadius(v);
               onRenderDistanceChangeRef.current?.(v);

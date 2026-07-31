@@ -83,7 +83,7 @@ export interface RibbonProps {
   showSlicePanels: boolean; setShowSlicePanels: (v: boolean) => void;
   enable3dPane: boolean; setEnable3dPane: (v: boolean) => void;
   // 3D fly-view interaction (the contextual "3D" tab). Decoupled from the map's Draw/Select tools.
-  mode3d: "off" | "select" | "build" | "sculpt"; setMode3d: (v: "off" | "select" | "build" | "sculpt") => void;
+  mode3d: "off" | "select" | "build" | "sculpt" | "floodfill"; setMode3d: (v: "off" | "select" | "build" | "sculpt" | "floodfill") => void;
   /** Auto-orient directional blocks (ramps/wedges/doors) to the player's facing when placing in 3D build. */
   autoOrient3d: boolean; setAutoOrient3d: (v: boolean) => void;
   nightLighting: boolean; setNightLighting: (v: boolean) => void;
@@ -151,6 +151,16 @@ export interface RibbonProps {
   leafPaints: number[]; setLeafPaints: (v: number[]) => void;
   smartPlacement: boolean; setSmartPlacement: (v: boolean) => void;
   onGenerateTrees: (treeTypes: string[], density: number, leafPaints: number[], smartPlacement: boolean) => void;
+  // Fluid Flow Toolkit
+  fluidBase: 20 | 23; setFluidBase: (b: 20 | 23) => void;
+  fluidIncludeExisting: boolean; setFluidIncludeExisting: (v: boolean) => void;
+  onSimulateFlow: () => void;
+  poolFillTargetZ: number; setPoolFillTargetZ: (z: number) => void;
+  floodFillLimit: number; setFloodFillLimit: (v: number) => void;
+  wavyWavelength: number; setWavyWavelength: (v: number) => void;
+  wavyAmplitude: number; setWavyAmplitude: (v: number) => void;
+  wavyMode: "existing" | "fill"; setWavyMode: (v: "existing" | "fill") => void;
+  onGenerateWavySurface: () => void;
   // File ops
   sourcePath: string | null; saving: boolean;
   exporting: boolean; exportingObj: boolean; exportingJson: boolean;
@@ -222,6 +232,12 @@ const rbActive = (accent = "#3b82f6"): React.CSSProperties => {
     color: textColor,
   };
 };
+/** One disabled recipe for buttons that no-op without a selection/clipboard/etc. Spread first so a
+ *  caller's `accentRing`/`color` (the enabled-state accent) still wins when `enabled` is true. Always
+ *  pair with a `title` explaining *why* it's disabled — this only handles the visual/cursor half. */
+const rbDisabled = (enabled: boolean): React.CSSProperties => ({
+  ...rb, opacity: enabled ? 1 : 0.35, cursor: enabled ? "pointer" : "not-allowed",
+});
 const rbGroup: React.CSSProperties = {
   display: "flex", flexDirection: "column", alignItems: "flex-start", gap: 3,
   padding: "5px 10px 4px", position: "relative", minWidth: 0, flexShrink: 0,
@@ -560,15 +576,6 @@ export default function Ribbon(p: RibbonProps) {
 
   const swatchColor = resolveColor(p.fillBlockType, p.fillPaint);
 
-  /** CSS `background` for a block+paint chip: the texture-pack tile when a pack is loaded,
-   *  otherwise the flat block colour (same fallback the pickers use). */
-  const swatchBg = (bt: number, paint: number): string => {
-    const url = p.texturePack ? tintedSwatch(bt, paint, p.texturePack) : null;
-    if (url) return `url(${url}) center/cover`;
-    const [r, g, b] = resolveColor(bt, paint);
-    return `rgb(${r},${g},${b})`;
-  };
-
   // ── tab style ──────────────────────────────────────────────────────────────
 
   const tabStyle = (id: RibbonTab, accent = "#3b82f6"): React.CSSProperties => {
@@ -616,7 +623,7 @@ export default function Ribbon(p: RibbonProps) {
   };
 
   // ── shared hotbar (pinned + recent) — used by both the Draw tab's Palette group and the 3D
-  // tab's Build Block group, since Phase 1 unified the 2D fill block and the 3D armed block. ──
+  // tab's Palette group, since Phase 1 unified the 2D fill block and the 3D armed block. ──
   const hotbarIsActive = (b: {type:number;paint:number}) => b.type === p.fillBlockType && b.paint === p.fillPaint;
   const hotbarSlotBase: React.CSSProperties = {
     width: 24, height: 24, borderRadius: 3, cursor: "pointer", flexShrink: 0,
@@ -688,6 +695,44 @@ export default function Ribbon(p: RibbonProps) {
             );
           })
         }
+      </div>
+    );
+  }
+
+  // Shared active-block group — a large swatch + name, the hotbar (pinned+recent), and a "Browse
+  // all blocks" button. Used by both the Draw tab's Palette group and the 3D tab's Palette
+  // group (Phase 1 unified the 2D fill block and the 3D armed block into one fillBlockType/fillPaint
+  // pair) so the two surfaces can't drift into two different looks for the same job.
+  function paletteGroup({ label, pickerKey, extraRow, dim }: { label: string; pickerKey: PickerState["type"]; extraRow?: React.ReactNode; dim?: boolean }) {
+    const swatchUrl = p.texturePack ? tintedSwatch(p.fillBlockType, p.fillPaint, p.texturePack) : null;
+    return (
+      <div style={{ ...rbGroup, opacity: dim ? 0.5 : 1 }}>
+        <div style={{ display: "flex", alignItems: "flex-start", gap: 8 }}>
+          {/* Active block — large swatch, opens the full picker */}
+          <button onClick={(e) => togglePicker(e, pickerKey)}
+            title="Active block — click to browse all blocks & paints"
+            style={{ ...rb, display: "flex", flexDirection: "column", alignItems: "center", gap: 3, padding: "4px 6px", background: openPicker?.type === pickerKey ? "rgba(255,255,255,0.1)" : rb.background }}>
+            <div style={{ width: 38, height: 38, borderRadius: 3, flexShrink: 0, border: "1px solid rgba(255,255,255,0.22)", background: swatchUrl ? `url(${swatchUrl}) center/cover` : `rgb(${swatchColor[0]},${swatchColor[1]},${swatchColor[2]})`, imageRendering: swatchUrl ? "pixelated" : undefined }} />
+            <span style={{ fontSize: 10, maxWidth: 68, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "#dad6d2" }}>
+              {blockDisplayName(p.fillBlockType)}{p.fillPaint > 0 ? ` #${p.fillPaint}` : ""}
+            </span>
+          </button>
+          {/* Quick gallery: pinned + recent, plus Browse-all button. With an extra row (3D tab's
+              Auto-orient), Browse shares that row at half width instead of stacking a 3rd line —
+              keeps the group inside the ribbon's fixed row budget. */}
+          <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+            {hotbarGroup()}
+            <div style={{ display: "flex", gap: 3 }}>
+              <button onClick={(e) => togglePicker(e, pickerKey)}
+                title="Browse all blocks & paints"
+                style={{ ...rb, flex: extraRow ? 1 : undefined, display: "flex", gap: 4, alignItems: "center", justifyContent: "center", padding: extraRow ? "2px 4px" : "2px 8px", background: openPicker?.type === pickerKey ? "rgba(255,255,255,0.1)" : rb.background }}>
+                {extraRow ? "Browse" : "Browse all blocks"}<span style={{ color: "#61584f", fontSize: 9 }}>▾</span>
+              </button>
+              {extraRow}
+            </div>
+          </div>
+        </div>
+        <div style={rbGroupLabel}>{label}</div>
       </div>
     );
   }
@@ -826,7 +871,7 @@ export default function Ribbon(p: RibbonProps) {
             {p.spawnPos ? `(${Math.round(p.spawnPos.px)}, ${Math.round(p.spawnPos.py)})` : "unset"}
           </div>
           <button onClick={p.onSetSpawnAtSelection} disabled={!p.selection}
-            style={{ ...rb, opacity: p.selection ? 1 : 0.35, cursor: p.selection ? "pointer" : "not-allowed" }}
+            style={{ ...rbDisabled(!!p.selection) }}
             title={p.selection ? "Set spawn at selection centre" : "Make a selection first"}>
             ⌂ Set Spawn
           </button>
@@ -850,7 +895,6 @@ export default function Ribbon(p: RibbonProps) {
       background: "rgba(255,255,255,0.07)", border: "1px solid rgba(255,255,255,0.12)",
       borderRadius: 2, padding: "0 2px", lineHeight: "12px", marginLeft: 3, flexShrink: 0,
     };
-    const activeSwatchUrl = p.texturePack ? tintedSwatch(p.fillBlockType, p.fillPaint, p.texturePack) : null;
     // Defined before the JSX so the prevToolRef mutation doesn't trip react-hooks/immutability
     // (mutating a value read earlier in JSX is disallowed).
     const armEyedropper = () => { p.prevToolRef.current = p.tool === "eyedropper" ? "pen" : p.tool as Tool; p.setTool("eyedropper"); };
@@ -879,83 +923,77 @@ export default function Ribbon(p: RibbonProps) {
             </button>
           </div>
           {/* Active-tool caption — mirrors the sculpt group so the icons aren't ambiguous. */}
-          <div style={{ fontSize: 10, color: "#f9a8d4", textAlign: "center", alignSelf: "stretch",
-                        fontWeight: 600, minHeight: 13 }}>
-            {drawToolNames[p.tool] ?? (p.tool === "fill" ? "Fill" : p.tool === "eyedropper" ? "Pick" : "")}
-          </div>
+          {(() => {
+            const toolsCaptionName = drawToolNames[p.tool] ?? (p.tool === "fill" ? "Fill" : p.tool === "eyedropper" ? "Pick" : null);
+            return (
+              <div style={{ fontSize: 10, color: toolsCaptionName ? "#f9a8d4" : "#61584f", textAlign: "center",
+                            alignSelf: "stretch", fontWeight: 600, minHeight: 13, letterSpacing: "0.02em" }}>
+                {toolsCaptionName ?? "pick a tool"}
+              </div>
+            );
+          })()}
           <div style={rbGroupLabel}>Tools</div>
         </div>
         <div style={rbDivider} />
 
+        {/* Shape & Mode — sits right next to Tools (not at the tail) since it configures the tool
+            just picked to its left. Always mounted so neighbouring groups never shift; rows/controls
+            that don't apply to the current tool are greyed + inert instead of disappearing. */}
+        {(() => {
+          const isDrawShapeTool = p.tool === "brush" || (!p.isSculptTool && p.tool !== "fill" && p.tool !== "eyedropper");
+          const showSize = p.tool === "brush" || p.tool === "spray" || p.tool === "line";
+          const showStabilize = p.tool === "pen" || p.tool === "brush" || p.tool === "spray";
+          const dim = (enabled: boolean): React.CSSProperties => ({ opacity: enabled ? 1 : 0.35, pointerEvents: enabled ? "auto" : "none" });
+          return (<>
+            <div style={{ ...rbGroup, opacity: isDrawShapeTool ? 1 : 0.5 }}>
+              <div style={{ display: "flex", gap: 2, alignItems: "center", minWidth: 176, ...dim(showSize) }}>
+                {p.tool === "spray" ? (
+                  <>
+                    <span style={{ color: "#83786c", fontSize: 10, minWidth: 46 }}>Density</span>
+                    <input type="range" min={5} max={100} step={5} value={Math.round(p.sprayDensity * 100)}
+                      onChange={e => p.setSprayDensity(Number(e.target.value) / 100)}
+                      title="Fraction of the brush footprint sprayed per stamp (hold to build up)"
+                      style={{ width: 72, accentColor: "#f472b6", cursor: "pointer" }} />
+                    <span style={{ color: "#f9a8d4", fontSize: 11, fontVariantNumeric: "tabular-nums", minWidth: 24 }}>{Math.round(p.sprayDensity * 100)}%</span>
+                  </>
+                ) : (
+                  <>
+                    {([1,3,5,7,9] as const).map(s => (
+                      <button key={s} onClick={() => p.setBrushSize(s)}
+                        style={p.brushSize === s ? rbActive("#f472b6") : { ...rb, padding: "2px 6px" }}>{s}</button>
+                    ))}
+                    <div style={{ width: 4 }} />
+                    <button onClick={() => p.setBrushShape("sq")} title="Square brush" style={p.brushShape === "sq" ? rbActive("#f472b6") : rb}>■</button>
+                    <button onClick={() => p.setBrushShape("circ")} title="Round brush" style={p.brushShape === "circ" ? rbActive("#f472b6") : rb}>●</button>
+                  </>
+                )}
+              </div>
+              {/* Fill/Hollow stacked above Surface/+1 Above — each pair keeps its own row so the
+                  group stays narrow (fits in collapsed ribbon height) instead of spreading wide. */}
+              <div style={{ display: "flex", flexDirection: "column", gap: 2, width: "100%", ...dim(isDrawShapeTool) }}>
+                <div style={{ display: "flex", gap: 2 }}>
+                  <button onClick={() => p.setDrawFilled(true)} style={{ ...(p.drawFilled ? rbActive("#f472b6") : rb), padding: "2px 6px", flex: 1 }}>Fill</button>
+                  <button onClick={() => p.setDrawFilled(false)} style={{ ...(!p.drawFilled ? rbActive("#f472b6") : rb), padding: "2px 6px", flex: 1 }}>Hollow</button>
+                </div>
+                <div style={{ display: "flex", gap: 2 }}>
+                  <button onClick={() => p.setDrawAbove(false)} style={{ ...(!p.drawAbove ? rbActive("#f472b6") : rb), padding: "2px 6px", flex: 1 }}>Surface</button>
+                  <button onClick={() => p.setDrawAbove(true)} style={{ ...(p.drawAbove ? rbActive("#fcd34d") : rb), padding: "2px 6px", flex: 1 }}>+1 Above</button>
+                </div>
+              </div>
+              <button onClick={() => p.setStrokeStabilizer(!p.strokeStabilizer)}
+                title="Stabilizer — smooths out hand jitter on freehand strokes (pen/brush/spray). The brush trails slightly behind the cursor while drawing — that lag is the smoothing, not lag/lag-spike."
+                style={{ ...(p.strokeStabilizer ? rbActive("#f472b6") : rb), width: "100%", ...dim(showStabilize) }}>{p.strokeStabilizer ? "Stabilize ✓" : "Stabilize"}</button>
+              <div style={rbGroupLabel}>Shape &amp; Mode</div>
+            </div>
+            <div style={rbDivider} />
+          </>);
+        })()}
+
         {/* Palette — active block + quick gallery; Browse opens the full picker flyout.
             Placed here (only fixed-width Tools to its left) so it never shifts as
             contextual option groups appear/disappear to its right. */}
-        <div style={rbGroup}>
-          <div style={{ display: "flex", alignItems: "flex-start", gap: 8 }}>
-            {/* Active block — large swatch, opens the full picker */}
-            <button onClick={(e) => togglePicker(e, "block-draw")}
-              title="Active block — click to browse all blocks & paints"
-              style={{ ...rb, display: "flex", flexDirection: "column", alignItems: "center", gap: 3, padding: "4px 6px", background: openPicker?.type === "block-draw" ? "rgba(255,255,255,0.1)" : rb.background }}>
-              <div style={{ width: 38, height: 38, borderRadius: 3, flexShrink: 0, border: "1px solid rgba(255,255,255,0.22)", background: activeSwatchUrl ? `url(${activeSwatchUrl}) center/cover` : `rgb(${swatchColor[0]},${swatchColor[1]},${swatchColor[2]})`, imageRendering: activeSwatchUrl ? "pixelated" : undefined }} />
-              <span style={{ fontSize: 10, maxWidth: 68, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "#dad6d2" }}>
-                {blockDisplayName(p.fillBlockType)}{p.fillPaint > 0 ? ` #${p.fillPaint}` : ""}
-              </span>
-            </button>
-            {/* Quick gallery: pinned + recent, plus Browse-all button */}
-            <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
-              {hotbarGroup()}
-              <button onClick={(e) => togglePicker(e, "block-draw")}
-                title="Browse all blocks & paints"
-                style={{ ...rb, display: "flex", gap: 4, alignItems: "center", justifyContent: "center", padding: "2px 8px", background: openPicker?.type === "block-draw" ? "rgba(255,255,255,0.1)" : rb.background }}>
-                Browse all blocks<span style={{ color: "#61584f", fontSize: 9 }}>▾</span>
-              </button>
-            </div>
-          </div>
-          <div style={rbGroupLabel}>Palette</div>
-        </div>
+        {paletteGroup({ label: "Palette", pickerKey: "block-draw" })}
         <div style={rbDivider} />
-
-        {/* Shape & Mode — contextual; kept to the RIGHT of Palette so Palette never shifts */}
-        {(p.tool === "brush" || (!p.isSculptTool && p.tool !== "fill" && p.tool !== "eyedropper")) && (<>
-          <div style={rbGroup}>
-            {(p.tool === "brush" || p.tool === "spray" || p.tool === "line") && (
-              <div style={{ display: "flex", gap: 2, alignItems: "center" }}>
-                {([1,3,5,7,9] as const).map(s => (
-                  <button key={s} onClick={() => p.setBrushSize(s)}
-                    style={p.brushSize === s ? rbActive("#f472b6") : { ...rb, padding: "2px 6px" }}>{s}</button>
-                ))}
-                <div style={{ width: 4 }} />
-                <button onClick={() => p.setBrushShape("sq")} title="Square brush" style={p.brushShape === "sq" ? rbActive("#f472b6") : rb}>■</button>
-                <button onClick={() => p.setBrushShape("circ")} title="Round brush" style={p.brushShape === "circ" ? rbActive("#f472b6") : rb}>●</button>
-              </div>
-            )}
-            {p.tool === "spray" && (
-              <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
-                <span style={{ color: "#83786c", fontSize: 10, minWidth: 46 }}>Density</span>
-                <input type="range" min={5} max={100} step={5} value={Math.round(p.sprayDensity * 100)}
-                  onChange={e => p.setSprayDensity(Number(e.target.value) / 100)}
-                  title="Fraction of the brush footprint sprayed per stamp (hold to build up)"
-                  style={{ width: 72, accentColor: "#f472b6", cursor: "pointer" }} />
-                <span style={{ color: "#f9a8d4", fontSize: 11, fontVariantNumeric: "tabular-nums", minWidth: 24 }}>{Math.round(p.sprayDensity * 100)}%</span>
-              </div>
-            )}
-            <div style={{ display: "flex", gap: 2, alignItems: "center" }}>
-              <button onClick={() => p.setDrawFilled(true)} style={p.drawFilled ? rbActive("#f472b6") : rb}>Fill</button>
-              <button onClick={() => p.setDrawFilled(false)} style={!p.drawFilled ? rbActive("#f472b6") : rb}>Hollow</button>
-              <div style={{ width: 6 }} />
-              <button onClick={() => p.setDrawAbove(false)} style={!p.drawAbove ? rbActive("#f472b6") : rb}>Surface</button>
-              <button onClick={() => p.setDrawAbove(true)} style={p.drawAbove ? rbActive("#fcd34d") : rb}>+1 Above</button>
-              {(p.tool === "pen" || p.tool === "brush" || p.tool === "spray") && (<>
-                <div style={{ width: 6 }} />
-                <button onClick={() => p.setStrokeStabilizer(!p.strokeStabilizer)}
-                  title="Stabilizer — smooths out hand jitter on freehand strokes (pen/brush/spray). The brush trails slightly behind the cursor while drawing — that lag is the smoothing, not lag/lag-spike."
-                  style={p.strokeStabilizer ? rbActive("#f472b6") : rb}>{p.strokeStabilizer ? "Stabilize ✓" : "Stabilize"}</button>
-              </>)}
-            </div>
-            <div style={rbGroupLabel}>Shape &amp; Mode</div>
-          </div>
-          <div style={rbDivider} />
-        </>)}
 
         {/* Sculpt tools — compact icon grid (5 cols × 3 rows), fitting the group's ≤3-row budget */}
         <div style={rbGroup}>
@@ -1033,50 +1071,6 @@ export default function Ribbon(p: RibbonProps) {
         </div>
         <div style={rbDivider} />
 
-        {/* Noise shape — only meaningful for the Noise tool */}
-        {p.tool === "noise" && (<>
-        <div style={rbGroup}>
-          <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
-            <button onClick={() => p.setNoiseMode("hills")} style={p.noiseMode === "hills" ? rbActive("#fb923c") : { ...rb, padding: "2px 8px" }}>Hills</button>
-            <button onClick={() => p.setNoiseMode("mountains")} style={p.noiseMode === "mountains" ? rbActive("#fb923c") : { ...rb, padding: "2px 8px" }}>Mtns</button>
-          </div>
-          <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
-            <span style={{ color: "#83786c", fontSize: 10, minWidth: 30 }}>Size</span>
-            <input type="range" min={6} max={80} step={2} value={p.noiseFeatureSize}
-              onChange={e => p.setNoiseFeatureSize(Number(e.target.value))}
-              style={{ width: 72, accentColor: "#fb923c", cursor: "pointer" }} />
-            <span style={{ color: "#fdba74", fontSize: 10, fontVariantNumeric: "tabular-nums", minWidth: 14 }}>{p.noiseFeatureSize}</span>
-          </div>
-          <div style={rbGroupLabel}>Noise</div>
-        </div>
-        <div style={rbDivider} />
-        </>)}
-
-        {/* Slope tilt — only meaningful for the Slope tool. Percent grade (rise per 100 blocks
-            of run) along each axis; the anchor is still the first block you press on. */}
-        {p.tool === "slope" && (<>
-        <div style={rbGroup}>
-          <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
-            <span style={{ color: "#83786c", fontSize: 10, minWidth: 30 }}>Slope X</span>
-            <input type="range" min={-100} max={100} step={5} value={p.slopeGradeX}
-              onChange={e => p.setSlopeGradeX(Number(e.target.value))}
-              title="Tilt along X — rise in blocks per 100 blocks of run"
-              style={{ width: 72, accentColor: "#fb923c", cursor: "pointer" }} />
-            <span style={{ color: "#fdba74", fontSize: 10, fontVariantNumeric: "tabular-nums", minWidth: 24 }}>{p.slopeGradeX}%</span>
-          </div>
-          <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
-            <span style={{ color: "#83786c", fontSize: 10, minWidth: 30 }}>Slope Y</span>
-            <input type="range" min={-100} max={100} step={5} value={p.slopeGradeY}
-              onChange={e => p.setSlopeGradeY(Number(e.target.value))}
-              title="Tilt along Y — rise in blocks per 100 blocks of run"
-              style={{ width: 72, accentColor: "#fb923c", cursor: "pointer" }} />
-            <span style={{ color: "#fdba74", fontSize: 10, fontVariantNumeric: "tabular-nums", minWidth: 24 }}>{p.slopeGradeY}%</span>
-          </div>
-          <div style={rbGroupLabel}>Slope</div>
-        </div>
-        <div style={rbDivider} />
-        </>)}
-
         <div style={rbGroup}>
           <button onClick={() => p.setMaskEnabled(!p.maskEnabled)} style={p.maskEnabled ? rbActive("#a78bfa") : rb}>
             {p.maskEnabled ? "Mask ✓" : "Mask"}
@@ -1100,6 +1094,54 @@ export default function Ribbon(p: RibbonProps) {
           )}
           <div style={rbGroupLabel}>Mask</div>
         </div>
+
+        {/* Contextual groups below live at the TAIL of the tab (never before Palette/Sculpt/
+            Brush/Falloff/Mask) so those groups stay pixel-stable across every tool switch.
+            (Shape & Mode used to live here too — moved next to Tools, see renderShapeModeGroup.) */}
+
+        {/* Noise shape — only meaningful for the Noise tool */}
+        {p.tool === "noise" && (<>
+        <div style={rbDivider} />
+        <div style={rbGroup}>
+          <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+            <button onClick={() => p.setNoiseMode("hills")} style={p.noiseMode === "hills" ? rbActive("#fb923c") : { ...rb, padding: "2px 8px" }}>Hills</button>
+            <button onClick={() => p.setNoiseMode("mountains")} style={p.noiseMode === "mountains" ? rbActive("#fb923c") : { ...rb, padding: "2px 8px" }}>Mtns</button>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+            <span style={{ color: "#83786c", fontSize: 10, minWidth: 30 }}>Size</span>
+            <input type="range" min={6} max={80} step={2} value={p.noiseFeatureSize}
+              onChange={e => p.setNoiseFeatureSize(Number(e.target.value))}
+              style={{ width: 72, accentColor: "#fb923c", cursor: "pointer" }} />
+            <span style={{ color: "#fdba74", fontSize: 10, fontVariantNumeric: "tabular-nums", minWidth: 14 }}>{p.noiseFeatureSize}</span>
+          </div>
+          <div style={rbGroupLabel}>Noise</div>
+        </div>
+        </>)}
+
+        {/* Slope tilt — only meaningful for the Slope tool. Percent grade (rise per 100 blocks
+            of run) along each axis; the anchor is still the first block you press on. */}
+        {p.tool === "slope" && (<>
+        <div style={rbDivider} />
+        <div style={rbGroup}>
+          <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+            <span style={{ color: "#83786c", fontSize: 10, minWidth: 30 }}>Slope X</span>
+            <input type="range" min={-100} max={100} step={5} value={p.slopeGradeX}
+              onChange={e => p.setSlopeGradeX(Number(e.target.value))}
+              title="Tilt along X — rise in blocks per 100 blocks of run"
+              style={{ width: 72, accentColor: "#fb923c", cursor: "pointer" }} />
+            <span style={{ color: "#fdba74", fontSize: 10, fontVariantNumeric: "tabular-nums", minWidth: 24 }}>{p.slopeGradeX}%</span>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+            <span style={{ color: "#83786c", fontSize: 10, minWidth: 30 }}>Slope Y</span>
+            <input type="range" min={-100} max={100} step={5} value={p.slopeGradeY}
+              onChange={e => p.setSlopeGradeY(Number(e.target.value))}
+              title="Tilt along Y — rise in blocks per 100 blocks of run"
+              style={{ width: 72, accentColor: "#fb923c", cursor: "pointer" }} />
+            <span style={{ color: "#fdba74", fontSize: 10, fontVariantNumeric: "tabular-nums", minWidth: 24 }}>{p.slopeGradeY}%</span>
+          </div>
+          <div style={rbGroupLabel}>Slope</div>
+        </div>
+        </>)}
       </div>
     );
   }
@@ -1184,9 +1226,7 @@ export default function Ribbon(p: RibbonProps) {
                 finally { setTreeGenerating(false); }
               }}
               style={{
-                ...rb,
-                opacity: p.selection ? 1 : 0.4,
-                cursor: p.selection ? "pointer" : "not-allowed",
+                ...rbDisabled(!!p.selection),
                 ...(p.selection ? { ...accentRing("#4ade80"), color: "#86efac" } : {}),
               }}
               title={p.selection ? `Plant trees at ${p.treeDensity}% density` : "Make a selection first"}>
@@ -1215,30 +1255,6 @@ export default function Ribbon(p: RibbonProps) {
           <button onClick={p.onFitMap} style={rb}>⊡ Fit Map</button>
           <div style={rbGroupLabel}>Map View</div>
         </div>
-        {/* One slider, two meanings: the z-slice level, or the cutaway ceiling. */}
-        {(p.viewMode === "zslice" || p.viewMode === "cutaway") && (<>
-          <div style={rbDivider} />
-          <div style={rbGroup}>
-            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-              <input type="range" min={0} max={p.world?.max_z ?? 63} value={zSliceDisplay}
-                aria-label={p.viewMode === "cutaway" ? "Cutaway cap Z" : "Z-slice level"}
-                onChange={e => setZSliceDisplay(Number(e.target.value))}
-                onPointerUp={e => p.commitZSlice(Number((e.target as HTMLInputElement).value))}
-                onKeyUp={e => p.commitZSlice(Number((e.target as HTMLInputElement).value))}
-                style={{ width: 120, accentColor: p.viewMode === "cutaway" ? "#a78bfa" : "#3b82f6", cursor: "pointer" }} />
-              <span style={{ color: p.viewMode === "cutaway" ? "#ddd6fe" : "#7dd3fc", fontVariantNumeric: "tabular-nums", fontSize: 12, minWidth: 22 }}>{zSliceDisplay}</span>
-            </div>
-            {p.viewMode === "zslice" ? (
-              <label style={{ display: "flex", alignItems: "center", gap: 4, cursor: "pointer" }}>
-                <input type="checkbox" checked={p.followSurface} onChange={e => p.setFollowSurface(e.target.checked)} style={{ accentColor: "#3b82f6" }} />
-                <span style={{ color: "#83786c", fontSize: 10 }}>Follow surface</span>
-              </label>
-            ) : (
-              <span style={{ color: "#83786c", fontSize: 10 }}>Everything above is hidden</span>
-            )}
-            <div style={rbGroupLabel}>{p.viewMode === "cutaway" ? "Cap Z" : "Z-Slice Level"}</div>
-          </div>
-        </>)}
         <div style={rbDivider} />
         <div style={rbGroup}>
           <div style={{ display: "flex", gap: 2 }}>
@@ -1293,6 +1309,32 @@ export default function Ribbon(p: RibbonProps) {
         </>
         <div style={rbDivider} />
         {textureGroup()}
+
+        {/* One slider, two meanings: the z-slice level, or the cutaway ceiling. Contextual — lives
+            at the tail of the tab so Map View/Render/Layout/Template/Textures stay pixel-stable. */}
+        {(p.viewMode === "zslice" || p.viewMode === "cutaway") && (<>
+          <div style={rbDivider} />
+          <div style={rbGroup}>
+            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+              <input type="range" min={0} max={p.world?.max_z ?? 63} value={zSliceDisplay}
+                aria-label={p.viewMode === "cutaway" ? "Cutaway cap Z" : "Z-slice level"}
+                onChange={e => setZSliceDisplay(Number(e.target.value))}
+                onPointerUp={e => p.commitZSlice(Number((e.target as HTMLInputElement).value))}
+                onKeyUp={e => p.commitZSlice(Number((e.target as HTMLInputElement).value))}
+                style={{ width: 120, accentColor: p.viewMode === "cutaway" ? "#a78bfa" : "#3b82f6", cursor: "pointer" }} />
+              <span style={{ color: p.viewMode === "cutaway" ? "#ddd6fe" : "#7dd3fc", fontVariantNumeric: "tabular-nums", fontSize: 12, minWidth: 22 }}>{zSliceDisplay}</span>
+            </div>
+            {p.viewMode === "zslice" ? (
+              <label style={{ display: "flex", alignItems: "center", gap: 4, cursor: "pointer" }}>
+                <input type="checkbox" checked={p.followSurface} onChange={e => p.setFollowSurface(e.target.checked)} style={{ accentColor: "#3b82f6" }} />
+                <span style={{ color: "#83786c", fontSize: 10 }}>Follow surface</span>
+              </label>
+            ) : (
+              <span style={{ color: "#83786c", fontSize: 10 }}>Everything above is hidden</span>
+            )}
+            <div style={rbGroupLabel}>{p.viewMode === "cutaway" ? "Cap Z" : "Z-Slice Level"}</div>
+          </div>
+        </>)}
       </div>
     );
   }
@@ -1416,10 +1458,11 @@ export default function Ribbon(p: RibbonProps) {
   // Contextual "3D" tab — building + lighting + textures for the fly-through pane. Only rendered
   // while the fly-view is showing (quad view + 3D pane enabled).
   function renderThreeDTab() {
-    const modeBtn = (m: "off" | "select" | "build" | "sculpt", label: string, accent: string) => (
+    const modeBtn = (m: "off" | "select" | "build" | "sculpt" | "floodfill", label: string, accent: string) => (
       <button onClick={() => p.setMode3d(m)} style={p.mode3d === m ? rbActive(accent) : rb}
         title={m === "off" ? "Camera only — click/drag orbits or flies" :
                m === "select" ? "Click two blocks to define a 3D selection box" :
+               m === "floodfill" ? "Click a block face to flood the connected air across and down with the armed block" :
                m === "build" ? "Left-click breaks the block you're aiming at; right-click places the build block against that face" :
                "Press and hold left to sculpt terrain under the cursor/crosshair"}>
         {label}
@@ -1431,46 +1474,54 @@ export default function Ribbon(p: RibbonProps) {
           <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
             {modeBtn("off", "◎ Camera", "#afa69d")}
             {modeBtn("select", "▣ Select", "#60a5fa")}
+            {modeBtn("floodfill", "▨ Flood Fill", "#38bdf8")}
             {modeBtn("build", "✏ Build", "#22c55e")}
             {modeBtn("sculpt", "⛰ Sculpt", "#fb923c")}
           </div>
           <div style={rbGroupLabel}>3D Mode</div>
         </div>
         <div style={rbDivider} />
-        {p.mode3d === "sculpt" ? (
-          // Sculpt mode: the shared sculpt tool picker + brush params (same as the Draw tab). Replaces
-          // the Build Block group, which is irrelevant while sculpting.
-          sculptGroup()
-        ) : (
-          /* Compact swatch button → anchored popover (same machinery as the gradient-to picker).
-             The inline picker overflowed the 96 px ribbon body. Dimmed unless in build mode. */
-          <div style={{ ...rbGroup, opacity: p.mode3d === "build" ? 1 : 0.5 }}>
-            <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-              <button onClick={(e) => togglePicker(e, "build-3d")}
-                title="Block placed by right-click in 3D build mode (shared with the 2D fill block)"
-                style={{ ...rb, display: "flex", gap: 6, alignItems: "center", background: openPicker?.type === "build-3d" ? "rgba(255,255,255,0.1)" : rb.background }}>
-                <span style={{
-                  width: 14, height: 14, borderRadius: 3, flexShrink: 0,
-                  boxShadow: "inset 0 0 0 1px rgba(0,0,0,.5)",
-                  background: swatchBg(p.fillBlockType, p.fillPaint),
-                  imageRendering: p.texturePack ? "pixelated" : undefined,
-                }} />
-                <span style={{ maxWidth: 84, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 11 }}>
-                  {blockDisplayName(p.fillBlockType)}{p.fillPaint > 0 ? ` #${p.fillPaint}` : ""}
-                </span>
-                <span style={{ color: "#61584f", fontSize: 9 }}>▾</span>
-              </button>
-              <button onClick={() => p.setAutoOrient3d(!p.autoOrient3d)}
-                title="Auto-orient ramps, wedges and doors to your facing direction when placing. When off, blocks keep the orientation picked here."
-                style={p.autoOrient3d ? rbActive("#22c55e") : rb}>
-                ↻ Auto-orient {p.autoOrient3d ? "on" : "off"}
-              </button>
+        {/* Fixed minWidth so the mode-specific slot below never drags Lighting/Textures sideways as
+            it switches between Flood Fill / Palette (paletteGroup) / Sculpt (two groups). */}
+        <div style={{ display: "flex", alignItems: "stretch", minWidth: 380 }}>
+          {p.mode3d === "floodfill" ? (
+            // Flood Fill mode: pick the Limit here, then click a block face in the pane. The armed
+            // block is whatever Palette/hotbar holds — no separate picker needed.
+            <div style={rbGroup}>
+              <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+                <span style={{ color: "#83786c", fontSize: 10 }}>Limit</span>
+                <input type="range" min={50} max={10000} step={50} value={p.floodFillLimit}
+                  onChange={e => p.setFloodFillLimit(Number(e.target.value))}
+                  title="Maximum air cells filled per click"
+                  style={{ width: 90, accentColor: "#38bdf8", cursor: "pointer" }} />
+                <span style={{ color: "#7dd3fc", fontSize: 11, fontVariantNumeric: "tabular-nums", minWidth: 34, textAlign: "right" }}>{p.floodFillLimit}</span>
+              </div>
+              <NumberField min={1} max={200000} value={p.floodFillLimit}
+                onChange={p.setFloodFillLimit} aria-label="Flood fill limit" style={{ ...zInp, width: 60 }} />
+              <div style={{ color: "#83786c", fontSize: 10, maxWidth: 220, lineHeight: 1.3 }}>
+                Click a block face in the 3D pane — fills air across and down from it with the armed block (Palette/hotbar).
+              </div>
+              <div style={rbGroupLabel}>Flood Fill <span style={expBadge()}>exp</span></div>
             </div>
-            <div style={rbGroupLabel}>Build Block</div>
-          </div>
-        )}
-        {p.mode3d !== "sculpt" && <div style={rbDivider} />}
-        {p.mode3d !== "sculpt" && hotbarGroup()}
+          ) : p.mode3d === "sculpt" ? (
+            // Sculpt mode: the shared sculpt tool picker + brush params (same as the Draw tab). Replaces
+            // the Palette group, which is irrelevant while sculpting.
+            sculptGroup()
+          ) : (
+            // Palette — identical to the Draw tab's Palette group (paletteGroup), plus an
+            // Auto-orient toggle sharing the Browse row. Dimmed unless in build mode.
+            paletteGroup({
+              label: "Palette", pickerKey: "build-3d", dim: p.mode3d !== "build",
+              extraRow: (
+                <button onClick={() => p.setAutoOrient3d(!p.autoOrient3d)}
+                  title="Auto-orient ramps, wedges and doors to your facing direction when placing. When off, blocks keep the orientation picked here."
+                  style={{ ...(p.autoOrient3d ? rbActive("#22c55e") : rb), flex: 1, padding: "2px 4px" }}>
+                  ↻ Auto-orient{p.autoOrient3d ? " ✓" : ""}
+                </button>
+              ),
+            })
+          )}
+        </div>
         <div style={rbDivider} />
         {lightingGroup()}
         <div style={rbDivider} />
@@ -1487,6 +1538,12 @@ export default function Ribbon(p: RibbonProps) {
     const lo = (zLo / maxZ) * 100;
     const hi = (zHi / maxZ) * 100;
     const trackGrad = `linear-gradient(to right, #4b443d 0%, #4b443d ${lo}%, #3b82f6 ${lo}%, #3b82f6 ${hi}%, #4b443d ${hi}%, #4b443d 100%)`;
+    // Defined before the JSX so the prevToolRef mutation doesn't trip react-hooks/immutability
+    // (mutating a value read earlier in JSX is disallowed) — mirrors the Draw tab's armEyedropper.
+    const armPoolFill = () => {
+      p.prevToolRef.current = p.tool === "poolfill" ? "select" : p.tool as Tool;
+      p.setTool(p.tool === "poolfill" ? "select" : "poolfill");
+    };
     return (
       <div style={{ display: "flex", alignItems: "stretch", height: "100%" }}>
         <div style={rbGroup}>
@@ -1568,7 +1625,7 @@ export default function Ribbon(p: RibbonProps) {
           </button>
           <button onClick={p.fillSelection} disabled={!p.rawBounds}
             title={p.rawBounds ? "Fill the selection with the active block" : "Make a selection first"}
-            style={{ ...rb, opacity: p.rawBounds ? 1 : 0.35, cursor: p.rawBounds ? "pointer" : "not-allowed", ...accentRing("#f59e0b"), color: "#fcd34d" }}>
+            style={{ ...rbDisabled(!!p.rawBounds), ...accentRing("#f59e0b"), color: "#fcd34d" }}>
             Fill Selection
           </button>
           <div style={rbGroupLabel}>Fill</div>
@@ -1598,7 +1655,7 @@ export default function Ribbon(p: RibbonProps) {
           </div>
           <button onClick={p.applyGradientFill} disabled={!p.rawBounds}
             title={p.rawBounds ? "Blend the active block into the target block across the selection" : "Make a selection first"}
-            style={{ ...rb, opacity: p.rawBounds ? 1 : 0.35, cursor: p.rawBounds ? "pointer" : "not-allowed", ...accentRing("#f59e0b"), color: "#fcd34d" }}>
+            style={{ ...rbDisabled(!!p.rawBounds), ...accentRing("#f59e0b"), color: "#fcd34d" }}>
             Gradient Fill
           </button>
           <div style={rbGroupLabel}>Gradient</div>
@@ -1622,7 +1679,7 @@ export default function Ribbon(p: RibbonProps) {
           </div>
           <button onClick={p.deleteBlocks} disabled={!p.rawBounds}
             title={p.rawBounds ? "Delete blocks in the selection (respects the replace filter)" : "Make a selection first"}
-            style={{ ...rb, opacity: p.rawBounds ? 1 : 0.35, cursor: p.rawBounds ? "pointer" : "not-allowed", ...accentRing("#ef4444"), color: "#fca5a5" }}>
+            style={{ ...rbDisabled(!!p.rawBounds), ...accentRing("#ef4444"), color: "#fca5a5" }}>
             {p.filterBlockType !== null ? (p.filterInvert ? "Delete except filter" : "Delete filtered") : "Delete all"}
           </button>
           <div style={rbGroupLabel}>Replace</div>
@@ -1657,11 +1714,67 @@ export default function Ribbon(p: RibbonProps) {
               title={!sel ? "Make a selection first"
                 : p.extrudeCount === 0 ? "Set the number of copies above 0"
                 : `Repeat the selection ${p.extrudeCount}× along ${p.extrudeAxis}`}
-              style={{ ...rb, opacity: (sel && p.extrudeCount > 0) ? 1 : 0.35, ...accentRing("#3b82f6"), color: "#93c5fd", fontWeight: 600 }}>
+              style={{ ...rbDisabled(!!sel && p.extrudeCount > 0), ...accentRing("#3b82f6"), color: "#93c5fd", fontWeight: 600 }}>
               Extrude {p.extrudeAxis}
             </button>
           </div>
           <div style={rbGroupLabel}>Extrude</div>
+        </div>
+        <div style={rbDivider} />
+
+        {/* Fluid Flow Toolkit — Simulate Flow / Pool Fill / Wavy Surface, all built on the ported
+            Liquids.mm flow rule (see lib.rs "Fluid Flow Toolkit"). The base toggle is shared. */}
+        <div style={{ ...rbGroup, minWidth: 340 }}>
+          <div style={{ display: "flex", gap: 2 }}>
+            <button onClick={() => p.setFluidBase(20)} style={p.fluidBase === 20 ? rbActive("#3b82f6") : rb}>💧 Water</button>
+            <button onClick={() => p.setFluidBase(23)} style={p.fluidBase === 23 ? rbActive("#f59e0b") : rb}>🌋 Lava</button>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+            <button onClick={p.onSimulateFlow} disabled={!sel}
+              title={sel ? "Grow flow from every full source block already in the selection" : "Make a selection first"}
+              style={{ ...rbDisabled(!!sel), ...accentRing("#3b82f6"), color: "#93c5fd" }}>
+              Simulate Flow
+            </button>
+            <label style={{ display: "flex", alignItems: "center", gap: 3, cursor: "pointer" }}>
+              <input type="checkbox" checked={p.fluidIncludeExisting} onChange={e => p.setFluidIncludeExisting(e.target.checked)} style={{ accentColor: "#3b82f6" }} />
+              <span style={{ color: "#83786c", fontSize: 10, whiteSpace: "nowrap" }}>resume partials</span>
+            </label>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+            <button
+              onClick={armPoolFill}
+              disabled={!sel}
+              title={sel ? "Click a floor cell in the selection to bucket-fill the basin (uses the current Z-slice level as the floor's Z)" : "Make a selection first"}
+              style={p.tool === "poolfill" ? rbActive("#3b82f6") : rbDisabled(!!sel)}>
+              {p.tool === "poolfill" ? "Click floor…" : "Pool Fill"}
+            </button>
+            <span style={{ color: "#83786c", fontSize: 10 }}>to Z</span>
+            <NumberField min={0} max={p.world?.max_z ?? 63} value={p.poolFillTargetZ}
+              onChange={p.setPoolFillTargetZ} aria-label="Pool fill target Z" style={{ ...zInp, width: 36 }} />
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+            <button onClick={() => p.setWavyMode(p.wavyMode === "existing" ? "fill" : "existing")}
+              title={p.wavyMode === "existing" ? "Re-skin columns that already have this fluid on top" : "Also flood dry columns one block above the terrain"}
+              style={{ ...rb, padding: "2px 6px" }}>
+              {p.wavyMode === "existing" ? "Existing" : "Fill"}
+            </button>
+            <span style={{ color: "#83786c", fontSize: 10 }}>λ</span>
+            <input type="range" min={2} max={32} value={p.wavyWavelength}
+              onChange={e => p.setWavyWavelength(parseInt(e.target.value))}
+              style={{ width: 40, accentColor: "#3b82f6" }} />
+            <span style={{ color: "#83786c", fontSize: 10 }}>amp</span>
+            <input type="range" min={0} max={100} value={Math.round(p.wavyAmplitude * 100)}
+              onChange={e => p.setWavyAmplitude(parseInt(e.target.value) / 100)}
+              style={{ width: 40, accentColor: "#3b82f6" }} />
+            <button onClick={p.onGenerateWavySurface} disabled={!sel}
+              title={sel ? "Stamp a procedural ¾/½/¼ ripple pattern across the selection" : "Make a selection first"}
+              style={{ ...rbDisabled(!!sel), ...accentRing("#3b82f6"), color: "#93c5fd" }}>
+              Wavy Surface
+            </button>
+          </div>
+          <div style={rbGroupLabel}>
+            💧 Fluids <span style={expBadge()}>exp</span> {!sel && <span style={{ color: "#f59e0b", opacity: 0.7 }}>(no selection)</span>}
+          </div>
         </div>
       </div>
     );
@@ -1994,7 +2107,7 @@ export default function Ribbon(p: RibbonProps) {
             transition: "background .1s",
           }}>
           <span>↩</span>
-          {p.undoDepth > 0 && <span style={{ fontSize: 9, fontVariantNumeric: "tabular-nums", color: "#61584f", minWidth: 10 }}>{p.undoDepth}</span>}
+          <span style={{ fontSize: 9, fontVariantNumeric: "tabular-nums", color: "#61584f", width: 16, textAlign: "right" }}>{p.undoDepth > 0 ? p.undoDepth : ""}</span>
         </button>
         <button title={`Redo (⌘⇧Z) · ${p.redoDepth} available`}
           onClick={p.handleRedo} disabled={p.redoDepth === 0}
@@ -2011,7 +2124,7 @@ export default function Ribbon(p: RibbonProps) {
             transition: "background .1s",
           }}>
           <span>↪</span>
-          {p.redoDepth > 0 && <span style={{ fontSize: 9, fontVariantNumeric: "tabular-nums", color: "#61584f", minWidth: 10 }}>{p.redoDepth}</span>}
+          <span style={{ fontSize: 9, fontVariantNumeric: "tabular-nums", color: "#61584f", width: 16, textAlign: "right" }}>{p.redoDepth > 0 ? p.redoDepth : ""}</span>
         </button>
 
         <div style={{ width: 1, background: "#322d28", margin: "6px 4px 4px", alignSelf: "stretch" }} />
