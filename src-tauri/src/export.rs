@@ -1,6 +1,6 @@
 //! Static geometry export: OBJ, JSON block dump, and MagicaVoxel .vox.
 use crate::colors::{block_color, transparent_alpha, BI_NOTSOLID, BI_RAMPORSIDE, BLOCK_INFO};
-use crate::{serialize_bytes_b64, world_max_z, AppState, LoadedWorld};
+use crate::{fluid_base, fluid_level, serialize_bytes_b64, world_max_z, AppState, LoadedWorld};
 use crate::texturepack;
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
@@ -14,14 +14,14 @@ pub(crate) fn get_block_at(world: &LoadedWorld, wx: i32, wy: i32, wz: i32) -> (u
     if wz < 0 || wz as usize >= world.num_bands * 16 { return (0, 0); }
     let cx = wx.div_euclid(16) + world.min_x;
     let cy = wy.div_euclid(16) + world.min_y;
-    if let Some(&addr) = world.chunk_map.get(&(cx, cy)) {
+    if let Some((addr, cend)) = world.chunk_range(cx, cy) {
         let lx = wx.rem_euclid(16) as usize;
         let ly = wy.rem_euclid(16) as usize;
         let band = wz as usize / 16;
         let lz   = wz as usize % 16;
         let bi = addr + band * 8192 + lx * 256 + ly * 16 + lz;
         let pi = bi + 4096;
-        if bi < world.bytes.len() && pi < world.bytes.len() {
+        if pi < cend {
             return (world.bytes[bi], world.bytes[pi]);
         }
     }
@@ -39,7 +39,7 @@ pub(crate) fn get_block_at(world: &LoadedWorld, wx: i32, wy: i32, wz: i32) -> (u
 /// cache. That makes it `!Sync`: it is for single-threaded scans only — do not hand it to rayon.
 pub(crate) struct ChunkCache<'w> {
     world: &'w LoadedWorld,
-    last: Cell<Option<(i32, i32, Option<usize>)>>,
+    last: Cell<Option<(i32, i32, Option<(usize, usize)>)>>,
 }
 
 impl<'w> ChunkCache<'w> {
@@ -54,20 +54,20 @@ impl<'w> ChunkCache<'w> {
         if wz < 0 || wz as usize >= w.num_bands * 16 { return (0, 0); }
         let cx = wx.div_euclid(16) + w.min_x;
         let cy = wy.div_euclid(16) + w.min_y;
-        let addr = match self.last.get() {
-            Some((lcx, lcy, a)) if lcx == cx && lcy == cy => a,
+        let range = match self.last.get() {
+            Some((lcx, lcy, r)) if lcx == cx && lcy == cy => r,
             _ => {
-                let a = w.chunk_map.get(&(cx, cy)).copied();
-                self.last.set(Some((cx, cy, a)));
-                a
+                let r = w.chunk_range(cx, cy);
+                self.last.set(Some((cx, cy, r)));
+                r
             }
         };
-        let Some(addr) = addr else { return (0, 0) };
+        let Some((addr, cend)) = range else { return (0, 0) };
         let lx = wx.rem_euclid(16) as usize;
         let ly = wy.rem_euclid(16) as usize;
         let bi = addr + (wz as usize / 16) * 8192 + lx * 256 + ly * 16 + (wz as usize % 16);
         let pi = bi + 4096;
-        if bi < w.bytes.len() && pi < w.bytes.len() {
+        if pi < cend {
             return (w.bytes[bi], w.bytes[pi]);
         }
         (0, 0)
@@ -1222,25 +1222,73 @@ pub(crate) fn obj_geometry_region(world: &LoadedWorld, pack: Option<&texturepack
                         }
                     }
                 } else {
-                    // Cube with face culling — reuses the neighbor lookups + face_hidden (occludes OR
-                    // same block type) computed above, so water/glass/fence don't emit interior faces.
-                    if !face_hidden(n_top) {
-                        push_quad!(o(x0,y0,z1f),o(x1f,y0,z1f),o(x1f,y1f,z1f),o(x0,y1f,z1f),rgb,SH_TOP,lm,bt,paint);
+                    // Cube with face culling. Non-fluids reuse the occludes-or-same-type rule; fluids
+                    // get extra care so a mass of *mixed-level* water (e.g. Simulate Flow output) no
+                    // longer emits stacked interior quads that z-fight through the translucent material:
+                    //  • a lateral face against a same-base fluid is culled up to that neighbour's
+                    //    surface height, leaving only the exposed step sliver (or nothing when covered);
+                    //  • a cell with fluid directly above is "submerged" — it renders full height with
+                    //    no top face, exactly like an interior block of a pool.
+                    // Partial fluids (¾/½/¼, levels 3/2/1) that ARE the surface still sit at a level/4
+                    // top (the wavy-water look, mirroring TerrainChunk.mm). Non-fluids: ztop == z1f,
+                    // base_fluid None, so the branch collapses to plain occludes-or-same-type culling.
+                    let base_fluid = fluid_base(bt);
+                    let fl = fluid_level(bt);
+                    let submerged = base_fluid.is_some_and(|bf| fluid_base(n_top) == Some(bf));
+                    let ztop = if fl > 0 && fl < 4 && !submerged { z0 + fl as f32 / 4.0 } else { z1f };
+                    // Block directly above each lateral neighbour — only fluids need it (to tell a
+                    // submerged neighbour, which reaches full height, from a partial surface one).
+                    let (nab_s, nab_n, nab_e, nab_w) = if base_fluid.is_some() {
+                        (gb(wx, wy + 1, wz + 1).0, gb(wx, wy - 1, wz + 1).0,
+                         gb(wx + 1, wy, wz + 1).0, gb(wx - 1, wy, wz + 1).0)
+                    } else { (0, 0, 0, 0) };
+
+                    // Surface height of a same-base fluid neighbour, in this cell's z units — how far up
+                    // it occludes the shared face. A submerged neighbour (fluid above it) reaches z1f.
+                    let neigh_surf = |ncell: u8, nabove: u8| -> f32 {
+                        match fluid_level(ncell) {
+                            0 => z0,
+                            4 => z1f,
+                            nfl => if fluid_base(nabove) == fluid_base(ncell) { z1f } else { z0 + nfl as f32 / 4.0 },
+                        }
+                    };
+                    // (hidden?, face-bottom-z) for a lateral neighbour block `ncell` with `nabove` on top.
+                    let lat = |ncell: u8, nabove: u8| -> (bool, f32) {
+                        if obj_occludes(ncell) || ncell == bt { return (true, z0); }
+                        if let Some(bf) = base_fluid {
+                            if fluid_base(ncell) == Some(bf) {
+                                let s = neigh_surf(ncell, nabove);
+                                return (s >= ztop, s.min(ztop));
+                            }
+                        }
+                        (false, z0)
+                    };
+
+                    let top_hidden = obj_occludes(n_top) || n_top == bt
+                        || base_fluid.is_some_and(|bf| fluid_base(n_top) == Some(bf));
+                    if !top_hidden {
+                        push_quad!(o(x0,y0,ztop),o(x1f,y0,ztop),o(x1f,y1f,ztop),o(x0,y1f,ztop),rgb,SH_TOP,lm,bt,paint);
                     }
-                    if !face_hidden(n_bot) {
+                    let bot_hidden = obj_occludes(n_bot) || n_bot == bt
+                        || base_fluid.is_some_and(|bf| fluid_base(n_bot) == Some(bf));
+                    if !bot_hidden {
                         push_quad!(o(x0,y1f,z0),o(x1f,y1f,z0),o(x1f,y0,z0),o(x0,y0,z0),rgb,SH_BOT,lm,bt,paint);
                     }
-                    if !face_hidden(n_s) {
-                        push_quad!(o(x0,y1f,z0),o(x1f,y1f,z0),o(x1f,y1f,z1f),o(x0,y1f,z1f),rgb,SH_S,lm,bt,paint);
+                    let (h_s, zb_s) = lat(n_s, nab_s);
+                    if !h_s {
+                        push_quad!(o(x0,y1f,zb_s),o(x1f,y1f,zb_s),o(x1f,y1f,ztop),o(x0,y1f,ztop),rgb,SH_S,lm,bt,paint);
                     }
-                    if !face_hidden(n_n) {
-                        push_quad!(o(x1f,y0,z0),o(x0,y0,z0),o(x0,y0,z1f),o(x1f,y0,z1f),rgb,SH_N,lm,bt,paint);
+                    let (h_n, zb_n) = lat(n_n, nab_n);
+                    if !h_n {
+                        push_quad!(o(x1f,y0,zb_n),o(x0,y0,zb_n),o(x0,y0,ztop),o(x1f,y0,ztop),rgb,SH_N,lm,bt,paint);
                     }
-                    if !face_hidden(n_e) {
-                        push_quad!(o(x1f,y1f,z0),o(x1f,y0,z0),o(x1f,y0,z1f),o(x1f,y1f,z1f),rgb,SH_E,lm,bt,paint);
+                    let (h_e, zb_e) = lat(n_e, nab_e);
+                    if !h_e {
+                        push_quad!(o(x1f,y1f,zb_e),o(x1f,y0,zb_e),o(x1f,y0,ztop),o(x1f,y1f,ztop),rgb,SH_E,lm,bt,paint);
                     }
-                    if !face_hidden(n_w) {
-                        push_quad!(o(x0,y0,z0),o(x0,y1f,z0),o(x0,y1f,z1f),o(x0,y0,z1f),rgb,SH_W,lm,bt,paint);
+                    let (h_w, zb_w) = lat(n_w, nab_w);
+                    if !h_w {
+                        push_quad!(o(x0,y0,zb_w),o(x0,y1f,zb_w),o(x0,y1f,ztop),o(x0,y0,ztop),rgb,SH_W,lm,bt,paint);
                     }
                 }
             }

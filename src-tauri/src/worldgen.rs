@@ -1781,16 +1781,11 @@ pub(crate) fn write_world_file(
     use std::io::Write;
     let n_chunks = chunks.len();
     let ptr_table_offset = 192 + chunk_size * n_chunks;
-    // Chunk data offsets and the directory pointer are stored as u32 in the file
-    // format, so the whole chunk region must fit under 4 GiB. Guard against a
-    // silently-corrupt file (the dialog caps dimensions, but be defensive).
-    if ptr_table_offset > u32::MAX as usize {
-        return Err(format!(
-            "World too large: {n_chunks} chunks × {chunk_size} B exceed the 4 GB file-offset limit. Use a smaller size or the 64z format."
-        ));
-    }
+    // Chunk data offsets and the directory pointer are 64-bit in the file format (u64 at header
+    // byte 32; u64 at directory-entry bytes [8..16]) — see `decode_dir_entry` in lib.rs — so there
+    // is no 4 GiB ceiling here. The dialog caps dimensions well below that regardless.
     let mut header = vec![0u8; 192];
-    header[32..36].copy_from_slice(&(ptr_table_offset as u32).to_le_bytes());
+    header[32..40].copy_from_slice(&(ptr_table_offset as u64).to_le_bytes());
     let nb = name.len().min(35);
     header[40..40 + nb].copy_from_slice(&name.as_bytes()[..nb]);
     // version field at offset 92 (int, LE). Must be 1–1000 or the game applies
@@ -1815,11 +1810,9 @@ pub(crate) fn write_world_file(
     for cy in 0..height_chunks {
         for cx in 0..width_chunks {
             let idx    = (cy * width_chunks + cx) as usize;
-            let offset = (192 + idx * chunk_size) as u32;
-            let entry  = &mut ptr_table[idx * 16..(idx + 1) * 16];
-            entry[0..2].copy_from_slice(&((start_cx + cx as i32) as i16).to_le_bytes());
-            entry[4..6].copy_from_slice(&((start_cy + cy as i32) as i16).to_le_bytes());
-            entry[8..12].copy_from_slice(&offset.to_le_bytes());
+            let offset = (192 + idx * chunk_size) as u64;
+            ptr_table[idx * 16..(idx + 1) * 16].copy_from_slice(
+                &crate::encode_dir_entry(start_cx + cx as i32, start_cy + cy as i32, offset));
         }
     }
 

@@ -63,16 +63,74 @@ Located at `directory_offset`. **16 bytes per entry** in a regular save:
 
 | Bytes | Type | Meaning |
 |-------|------|---------|
-| `[0..2]` | i16 | chunk X |
-| `[2..4]` | — | pad |
-| `[4..6]` | i16 | chunk Y |
-| `[6..8]` | — | pad |
-| `[8..12]` | u32 | data offset (byte offset of this chunk's block data) |
-| `[12..16]` | — | pad |
+| `[0..4]` | i32 | chunk X |
+| `[4..8]` | i32 | chunk Y |
+| `[8..16]` | u64 | data offset (byte offset of this chunk's block data) |
 
-> ⚠️ The bundled `Eden.eden` **template** uses a *different* 16-byte directory
-> layout: `{ i32 x, i32 z, u64 offset }`. See the [Eden.eden Template](#edeneden-template)
-> section — do not confuse the two.
+Decoded by `decode_dir_entry` (`lib.rs`), the single source of truth for this
+layout on the read path; written by its inverse `encode_dir_entry`, which both
+writers (`write_world_file`, `expand_world_from_template`) go through.
+
+> **This is the same layout the bundled `Eden.eden` template uses** — see the
+> [Eden.eden Template](#edeneden-template) section. Earlier revisions of this doc
+> described the two as different formats (`{i16 x, pad, i16 y, pad, u32 off, pad}`
+> for saves vs. `{i32 x, i32 z, u64 off}` for the template). They are not: the
+> narrow reading is what the two source references (`MROB.txt`, the C# manipulator)
+> derived from small worlds, where the extra bytes were always zero and so looked
+> like padding.
+>
+> ⚠️ **The offset is 64-bit, and it matters.** Reading only its low word resolves
+> every chunk stored past the 4 GiB mark to `true_offset − 2³²`, landing misaligned
+> inside two unrelated chunks — the "mosaic" corruption diagnosed in
+> `DIAGNOSE/DIAGNOSIS.md` (two real >4 GiB worlds, ~10–14 % of chunks affected),
+> fixed 2026-07-29. Byte `[12..16]` is the offset's high word, `0` below 4 GiB and
+> `1` above, *not* padding.
+>
+> The **writers** were widened to match on **2026-07-31**. They previously emitted
+> i16 coords + u32 offsets, which is byte-compatible with this layout for the
+> positive, sub-4 GiB values they produce — but *not* for a negative chunk
+> coordinate (the i16 sign bits wouldn't extend across the pad), and it forced
+> "Expand from Template" to cap its output at 4 GB. Both now share
+> `encode_dir_entry`, that cap is gone, and the header's `directory_offset` is
+> written as the full u64 at `[32..40]`.
+>
+> The gate on that change was whether *the game's own reader* honors the full
+> 64-bit field ("Eden writes 64-bit offsets" was proven by the two sample worlds;
+> "Eden reads them" was not). It's now confirmed from the game's source
+> (`~/emod`, its 2.1/64z-era build): `ColumnIndex.chunk_offset` and the header's
+> `directory_offset` are both `unsigned long long`, and every seek goes through
+> `-[NSFileHandle seekToFileOffset:]` with no narrowing cast anywhere in the
+> offset arithmetic. **Residual risk of record:** that source is the 64z-era
+> build; the shipped 256z binary is closed-source and shares the identical 16-byte
+> entry layout, so the evidence transfers as strong but indirect. A >4 GiB
+> expand-then-load-in-game test would be the direct proof.
+
+### Per-chunk spans — a chunk is not always `chunk_size` long
+
+A chunk's data runs from its directory offset until whatever comes next in the
+file: the next chunk's offset, the directory itself, or EOF. Almost always that
+distance is exactly `chunk_size`, and the nominal window is the real one.
+
+**Not always.** Each of the two real >4 GiB worlds in `DIAGNOSE/DIAGNOSIS.md`
+(§1.9) contains exactly one place where consecutive chunk offsets differ by
+**107,072** instead of 131,072 — the two chunks overlap by 24,000 bytes, verified
+byte-identical. A reader that assumes `chunk_size` reads 24,000 bytes of its
+neighbour (roughly z ≥ 209 of that column); a *writer* that assumes it corrupts
+the neighbour, which is an "edit writes outside the chunk boundary" vector
+independent of the u64 offset bug and not fixed by it.
+
+`parse_world_inner` therefore derives every chunk's real span after the offsets
+are known and stores the short ones in `LoadedWorld.chunk_span` (a parallel map
+keyed like `chunk_map`; absent key = full `chunk_size`, so it is empty for every
+well-formed world, and non-empty parses log a warning). **The rule for all code
+touching block bytes: bound with `LoadedWorld::chunk_range(cx, cy) -> (addr,
+end)`, not `bytes.len()`.** That covers the render/edit/copy/paste loops,
+`set_block_abs`/`read_block_abs`/`read_paint_abs`, `get_block_at` and its
+`ChunkCache`, and the undo trio (`snapshot_chunks_full`, `diff_chunk`,
+`restore_and_invert`) — a nominal-size snapshot would otherwise pull a
+neighbour's bytes into the delta and write them back on undo. The `render_view_*`
+ortho/elevation renderers are the one exception, and only because their callers
+copy chunks into a scan buffer with short spans zero-padded first.
 
 **Sparse storage:** normal worlds only save *edited* chunks. Most of the map is
 absent from the directory, which is why the top-down view of a normal Eden world
@@ -163,8 +221,10 @@ RLE-compressed chunks** in a **180×180 grid** at absolute coords **4006–4185*
 (centered at 4096). This editor can overlay it behind sparse worlds and bake it
 into a full world file (see [10 — Features](./10-features.md) for the UI/commands).
 
-**Directory format (distinct from regular saves):** `{ i32 x, i32 z, u64 offset }`
-= 16 B/entry, parsed from `directory_offset`.
+**Directory format:** `{ i32 x, i32 z, u64 offset }` = 16 B/entry, parsed from
+`directory_offset` — **the same layout regular saves use** (see [Chunk pointer
+table](#chunk-pointer-table-directory)). `load_eden_template` decoded this
+correctly from the start; the world reader is what was narrower, until 2026-07-29.
 
 **Per-column RLE:** 4 sub-chunks, each a 2-byte **big-endian** payload size
 followed by triplets `(block:u8, paint:u8, count:u8)` where `count ∈ 1..=127`.
@@ -189,7 +249,8 @@ Backend decode helpers:
 - `decode_template_column(data, col_offset)` — full raw 32 KB decode, used only by
   `expand_world_from_template`.
 
-**Expand output** writes standard-save directory format (i16 cx/cy), copying user
+**Expand output** writes i16 cx/cy + u32 offsets into the 16-byte entry (see the
+writer caveat under [Chunk pointer table](#chunk-pointer-table-directory)), copying user
 chunks (raw) + template chunks (RLE-decoded, **padded to `chunk_size` for 256z
 worlds** — a bare 32 KB write would desync every later offset → corrupt file).
 

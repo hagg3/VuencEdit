@@ -7,7 +7,7 @@ import { maskOutline, type OutlinePt } from "./maskUtils";
 
 export type { PixelPatch } from "./types";
 
-export type Tool = "pan" | "select" | "wand" | "lasso" | "paste" | "pen" | "brush" | "spray" | "line" | "rect" | "ellipse" | "polygon" | "smooth" | "noise" | "flatten" | "erode" | "thermal" | "hydro" | "stamp" | "grab" | "raise" | "lower" | "terrace" | "sharpen" | "slope" | "smear" | "fill" | "eyedropper";
+export type Tool = "pan" | "select" | "wand" | "lasso" | "paste" | "pen" | "brush" | "spray" | "line" | "rect" | "ellipse" | "polygon" | "smooth" | "noise" | "flatten" | "erode" | "thermal" | "hydro" | "stamp" | "grab" | "raise" | "lower" | "terrace" | "sharpen" | "slope" | "smear" | "fill" | "eyedropper" | "poolfill";
 
 /**
  * Display name per tool — the single source of truth for the status bar and any other caption.
@@ -21,6 +21,7 @@ export const TOOL_LABELS: Record<Tool, string> = {
   thermal: "Thermal", hydro: "Hydro Erode", stamp: "Retexture", grab: "Grab",
   raise: "Raise", lower: "Lower", terrace: "Terrace", sharpen: "Sharpen",
   slope: "Slope", smear: "Smear", fill: "Fill", eyedropper: "Eyedropper",
+  poolfill: "Pool Fill",
 };
 
 /**
@@ -40,6 +41,7 @@ export const TOOL_HINTS: Partial<Record<Tool, string>> = {
   flatten: "The first block you press on sets the height everything else is levelled to",
   slope: "The first block you press on anchors the tilted plane (set Slope X/Y in the Falloff group)",
   smear: "Drag across terrain to pull height along with the brush, like wet paint",
+  poolfill: "Click an empty (air) floor cell inside the selection to bucket-fill the basin",
 };
 
 /**
@@ -56,7 +58,7 @@ export const TOOL_CURSOR: Record<Tool, string> = {
   smooth: "crosshair", noise: "crosshair", flatten: "crosshair", erode: "crosshair",
   thermal: "crosshair", hydro: "crosshair", stamp: "crosshair",
   raise: "crosshair", lower: "crosshair", terrace: "crosshair", sharpen: "crosshair",
-  slope: "crosshair", smear: "crosshair", fill: "crosshair",
+  slope: "crosshair", smear: "crosshair", fill: "crosshair", poolfill: "cell",
 };
 
 /** Sculpt tools that paint a swept disc footprint (everything except the drag-controlled "grab"). */
@@ -262,6 +264,8 @@ interface Props {
   pasteElevationOffset?: number;
   /** Called when eyedropper tool clicks a world coordinate. */
   onEyedropper?: (wx: number, wy: number) => void;
+  /** Called when the Pool Fill tool clicks a world coordinate (the basin floor cell). */
+  onPoolFillPick?: (wx: number, wy: number) => void;
   /** Slice-viewport cut lines: vertical at world X, horizontal at world Y (the slab depths). */
   sliceLines?: { x: number | null; y: number | null } | null;
   /** 3D fly-camera world XY position — drawn as a teal dot on the map. */
@@ -289,7 +293,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     drawConfig, onDrawStroke, onSculptStroke, onCancelStroke, drawZOverride = null,
     extrudePreview = null, lastPasteDelta = null, onCursorMove, onMagicWand, onLassoSelect, selectionMask = null,
     spawnPos = null, creatures = [],
-    pasteElevationOffset = 0, onEyedropper, sliceLines = null,
+    pasteElevationOffset = 0, onEyedropper, onPoolFillPick, sliceLines = null,
     cameraPos3d = null, onSetCamera3d,
     showTemplateOverlay = false, onMapContextMenu, onSelectDragUpdate, onMoveSelection, moveWithContents = false }: Props,
   ref,
@@ -383,6 +387,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   const sliceLinesRef       = useRef(sliceLines);
   const pasteElevOffsetRef  = useRef(pasteElevationOffset);
   const onEyedropperRef     = useRef(onEyedropper);
+  const onPoolFillPickRef   = useRef(onPoolFillPick);
   const cameraPos3dRef      = useRef(cameraPos3d ?? null);
   const onSetCamera3dRef    = useRef(onSetCamera3d);
   const onSelectDragUpdateRef = useRef(onSelectDragUpdate);
@@ -462,6 +467,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   useEffect(() => { sliceLinesRef.current      = sliceLines;           }, [sliceLines]);
   useEffect(() => { pasteElevOffsetRef.current = pasteElevationOffset; }, [pasteElevationOffset]);
   useEffect(() => { onEyedropperRef.current    = onEyedropper;        }, [onEyedropper]);
+  useEffect(() => { onPoolFillPickRef.current  = onPoolFillPick;      }, [onPoolFillPick]);
   useEffect(() => { cameraPos3dRef.current     = cameraPos3d ?? null; }, [cameraPos3d]);
   useEffect(() => { onSetCamera3dRef.current   = onSetCamera3d;       }, [onSetCamera3d]);
   useEffect(() => { onSelectDragUpdateRef.current = onSelectDragUpdate; }, [onSelectDragUpdate]);
@@ -1667,6 +1673,11 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     if (toolRef.current === "eyedropper") {
       const wp = screenToWorld(e.clientX, e.clientY);
       onEyedropperRef.current?.(wp.x, wp.y);
+      return;
+    }
+    if (toolRef.current === "poolfill") {
+      const wp = screenToWorld(e.clientX, e.clientY);
+      onPoolFillPickRef.current?.(wp.x, wp.y);
       return;
     }
     if (toolRef.current === "select") {

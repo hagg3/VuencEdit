@@ -397,6 +397,7 @@ function App() {
   const [invertY, setInvertY] = useState(() => loadSettings().invertY);
   const [autosaveIntervalMin, setAutosaveIntervalMin] = useState(() => loadSettings().autosaveIntervalMin);
   const [autoOrient3d, setAutoOrient3d] = useState(() => loadSettings().autoOrient3d);
+  const [floodFillLimit, setFloodFillLimit] = useState(() => loadSettings().floodFillLimit);
   const [enableExperimentalExport, setEnableExperimentalExport] = useState(() => loadSettings().enableExperimentalExport);
   // Debounces the localStorage write only (state stays live so the slider/HUD track immediately) —
   // dragging the render-distance slider fires an onChange per pixel, and saveSettings() does a full
@@ -424,6 +425,7 @@ function App() {
     setInvertY(s.invertY);
     setAutosaveIntervalMin(s.autosaveIntervalMin);
     setAutoOrient3d(s.autoOrient3d);
+    setFloodFillLimit(s.floodFillLimit);
     setEnableExperimentalExport(s.enableExperimentalExport);
     if (s.templatePath !== templatePath) setTemplatePath(s.templatePath);
     if (s.texturePackPath !== texturePackPath) {
@@ -609,6 +611,14 @@ function App() {
   const [leafPaints, setLeafPaints] = useState<number[]>([0, 22, 31, 40]);
   const [smartPlacement, setSmartPlacement] = useState(true);
 
+  // Fluid Flow Toolkit state (Ribbon's Selection tab "Fluids" group)
+  const [fluidBase, setFluidBase] = useState<20 | 23>(20); // 20 water, 23 lava
+  const [fluidIncludeExisting, setFluidIncludeExisting] = useState(false);
+  const [poolFillTargetZ, setPoolFillTargetZ] = useState(32);
+  const [wavyWavelength, setWavyWavelength] = useState(8);
+  const [wavyAmplitude, setWavyAmplitude] = useState(0.8);
+  const [wavyMode, setWavyMode] = useState<"existing" | "fill">("existing");
+
   // Repeat-paste trail: track last paste position + step vector for path preview and `.` shortcut.
   const [lastPasteDelta, setLastPasteDelta] = useState<{ dx: number; dy: number } | null>(null);
   const lastPastePosRef   = useRef<{ x: number; y: number } | null>(null);
@@ -782,7 +792,7 @@ function App() {
   // ribbon tab owns this. "off" = camera only; "select" = two-click box select; "build" = place
   // (left-click) / break (right-click). Build mode's armed block is the same fillBlockType/fillPaint
   // as the 2D map (and the shared hotbar), so switching between 2D and 3D building carries no state.
-  const [mode3d, setMode3d] = useState<"off" | "select" | "build" | "sculpt">("off");
+  const [mode3d, setMode3d] = useState<"off" | "select" | "build" | "sculpt" | "floodfill">("off");
 
   // The committed selection box, reduced to the shape the 3D pane's transform gizmo wants. Kept as
   // its own small memo (not derived from `overlays3d`, which also carries paste/extrude ghosts and
@@ -938,6 +948,49 @@ function App() {
         x1: selection.x1, y1: selection.y1, x2: selection.x2, y2: selection.y2,
         zMin: selection.z_min, zMax: selection.z_max,
         axis: extrudeAxis, count: extrudeCount, ignoreAir,
+      });
+      await applyEditResult(result);
+    } catch (e) { reportError(e); }
+  }
+
+  // ── Fluid Flow Toolkit ────────────────────────────────────────────────────
+
+  async function handleSimulateFlow() {
+    if (!selection) return;
+    try {
+      const result = await invoke<EditResultRaw>("simulate_flow", {
+        x1: selection.x1, y1: selection.y1, x2: selection.x2, y2: selection.y2,
+        zMin: selection.z_min, zMax: selection.z_max,
+        includeExistingSources: fluidIncludeExisting, base: fluidBase,
+      });
+      await applyEditResult(result);
+    } catch (e) { reportError(e); }
+  }
+
+  /** Pool Fill's armed click ("poolfill" tool) — the click picks the basin floor cell; the current
+   *  Z-slice level supplies its Z (2D top-down clicks can't carry a Z of their own), and the current
+   *  selection bounds the flood so a leak can't run away across the whole world. */
+  async function handlePoolFillPick(wx: number, wy: number) {
+    const prev = prevToolRef.current;
+    setTool(prev === "poolfill" ? "select" : prev);
+    if (!selection) { reportError("Make a selection around the basin first."); return; }
+    try {
+      const result = await invoke<EditResultRaw>("pool_fill", {
+        x1: selection.x1, y1: selection.y1, x2: selection.x2, y2: selection.y2,
+        clickX: wx, clickY: wy, clickZ: zSliceZRef.current,
+        targetZ: poolFillTargetZ, base: fluidBase, paint: 0,
+      });
+      await applyEditResult(result);
+    } catch (e) { reportError(e); }
+  }
+
+  async function handleGenerateWavySurface() {
+    if (!selection) return;
+    try {
+      const result = await invoke<EditResultRaw>("generate_wavy_surface", {
+        x1: selection.x1, y1: selection.y1, x2: selection.x2, y2: selection.y2,
+        base: fluidBase, paint: 0,
+        wavelength: wavyWavelength, amplitude: wavyAmplitude, mode: wavyMode,
       });
       await applyEditResult(result);
     } catch (e) { reportError(e); }
@@ -1612,7 +1665,8 @@ function App() {
   // ---- 3D pane picking -----------------------------------------------------------------------
   // Driven by the 3D ribbon tab's own mode (mode3d), independent of the map's Draw/Select tools.
   const interact3d: Interact3D =
-    mode3d === "build" ? "build" : mode3d === "select" ? "select" : mode3d === "sculpt" ? "sculpt" : "none";
+    mode3d === "build" ? "build" : mode3d === "select" ? "select" : mode3d === "sculpt" ? "sculpt"
+    : mode3d === "floodfill" ? "floodfill" : "none";
 
   // Leaving select mode abandons a half-finished two-click selection — otherwise the lone armed
   // corner would silently complete a selection on the first click after switching back.
@@ -1647,6 +1701,26 @@ function App() {
     setZMin(Math.min(first.z, z));
     setZMax(Math.max(first.z, z));
     setPick3dFirst(null);
+    // Surface the Selection tab so the just-made 3D selection's stats/actions are immediately in reach.
+    // The Ribbon's own auto-tab effect only fires on a null→non-null rawBounds transition, so it misses
+    // the common case of refining an already-existing selection from the 3D pane — push it explicitly.
+    ribbonTabSetterRef.current?.("selection");
+  }
+
+  /** Flood Fill from the 3D pane: the picked voxel is a solid face; the air cell against the clicked
+   *  face (`hit + normal`) is the start cell. Spreads through air only, across and down (never up),
+   *  bounded by `floodFillLimit`. No selection or target Z needed — the Limit is the only safety
+   *  bound. One `flood_fill_3d` → `with_edit` call, so it's one undo. */
+  async function handlePick3dFloodFill(x: number, y: number, z: number, nx: number, ny: number, nz: number) {
+    const ax = x + nx, ay = y + ny, az = z + nz; // air cell against the clicked face = start cell
+    try {
+      const result = await invoke<EditResultRaw>("flood_fill_3d", {
+        startX: ax, startY: ay, startZ: az,
+        blockType: fillBlockType, paint: fillPaint, limit: floodFillLimit,
+      });
+      await applyEditResult(result);
+      trackRecentBlock(fillBlockType, fillPaint);
+    } catch (e) { reportError(e); }
   }
 
   /** Break: clear the picked voxel. Goes through paint_blocks → with_edit, so undo/redo and the
@@ -2000,7 +2074,7 @@ function App() {
         if (t === "paste" || t === "wand" || t === "lasso" || t === "pen" || t === "brush" || t === "spray" || t === "line" || t === "rect" || t === "ellipse" || t === "polygon" ||
             t === "smooth" || t === "noise" || t === "flatten" || t === "erode" || t === "thermal" ||
             t === "hydro" || t === "stamp" || t === "grab" || t === "raise" || t === "lower" ||
-            t === "terrace" || t === "sharpen" || t === "slope" || t === "smear" || t === "fill" || t === "eyedropper") {
+            t === "terrace" || t === "sharpen" || t === "slope" || t === "smear" || t === "fill" || t === "eyedropper" || t === "poolfill") {
           e.preventDefault();
           setTool("pan");
         } else {
@@ -2553,6 +2627,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
       creatures={[]}
       pasteElevationOffset={pasteElevationOffset}
       onEyedropper={handleEyedropper}
+      onPoolFillPick={handlePoolFillPick}
       cameraPos3d={showSlicePanels && enable3dPane ? cam3dPos : null}
       onSetCamera3d={showSlicePanels && enable3dPane ? (wx, wy) => flyView3dRef.current?.teleport(wx, wy) : undefined}
       // Off in cutaway: the template is a surface map, so overlaying it under a cutaway would put
@@ -2799,6 +2874,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
                       interact3d={interact3d}
                       onSetInteract3d={(m) => setMode3d(m === "none" ? "off" : m)}
                       onPickSelect={handlePick3dSelect}
+                      onPickFloodFill={handlePick3dFloodFill}
                       onPickBreak={handlePick3dBreak}
                       onPickPlace={handlePick3dPlace}
                       onPickEyedrop={handlePick3dEyedrop}
@@ -3003,6 +3079,8 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           setMode3d={setMode3d}
           autoOrient3d={autoOrient3d}
           setAutoOrient3d={(v) => { setAutoOrient3d(v); saveSettingsDebounced({ autoOrient3d: v }); }}
+          floodFillLimit={floodFillLimit}
+          setFloodFillLimit={(v) => { setFloodFillLimit(v); saveSettingsDebounced({ floodFillLimit: v }); }}
           nightLighting={nightLighting}
           setNightLighting={setNightLighting}
           shadows3d={shadows3d}
@@ -3136,6 +3214,20 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           smartPlacement={smartPlacement}
           setSmartPlacement={setSmartPlacement}
           onGenerateTrees={handleGenerateTrees}
+          fluidBase={fluidBase}
+          setFluidBase={setFluidBase}
+          fluidIncludeExisting={fluidIncludeExisting}
+          setFluidIncludeExisting={setFluidIncludeExisting}
+          onSimulateFlow={handleSimulateFlow}
+          poolFillTargetZ={poolFillTargetZ}
+          setPoolFillTargetZ={setPoolFillTargetZ}
+          wavyWavelength={wavyWavelength}
+          setWavyWavelength={setWavyWavelength}
+          wavyAmplitude={wavyAmplitude}
+          setWavyAmplitude={setWavyAmplitude}
+          wavyMode={wavyMode}
+          setWavyMode={setWavyMode}
+          onGenerateWavySurface={handleGenerateWavySurface}
           collapsed={ribbonCollapsed}
           registerTabSetter={registerRibbonTabSetter}
           onCollapse={(v) => { setRibbonCollapsed(v); try { localStorage.setItem("ribbon_collapsed", String(v)); } catch {} }}
@@ -3146,6 +3238,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
             try { localStorage.setItem("ribbon_body_height", String(clamped)); } catch {}
           }}
         />
+
 
         {/* Docked right sidebar: Inspector / Prefabs / Elevation / History tabs — see Sidebar.tsx. */}
         <Sidebar

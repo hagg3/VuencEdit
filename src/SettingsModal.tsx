@@ -38,6 +38,8 @@ export interface AppSettings {
   autosaveIntervalMin: number;
   /** Auto-orient ramps/wedges/doors to the player's facing when placing in 3D build mode. Default true. */
   autoOrient3d: boolean;
+  /** 3D pane Flood Fill mode's max air cells filled per click. Default 1000. */
+  floodFillLimit: number;
   /** Shows OBJ/VMF export menu items. Both are buggy/unfinished; off by default so most users never see them. */
   enableExperimentalExport: boolean;
   /** Docked right sidebar (Inspector/Prefabs/History tabs — Elevation folded into Inspector) open on load. Default true. */
@@ -71,6 +73,7 @@ const DEFAULTS: AppSettings = {
   invertY: false,
   autosaveIntervalMin: 3,
   autoOrient3d: true,
+  floodFillLimit: 1000,
   enableExperimentalExport: false,
   sidebarOpen: true,
   sidebarWidth: 260,
