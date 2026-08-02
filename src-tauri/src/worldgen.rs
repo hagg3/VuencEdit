@@ -1037,6 +1037,39 @@ pub(crate) fn gen_progress_reporter(app: tauri::AppHandle) -> impl FnMut(&str, f
     }
 }
 
+/// Parameters shared by every flat-chunk fill, independent of world dimensions — used both by
+/// `create_world` (whole new file) and `materialize_flat_chunks` (infill of arbitrary chunk
+/// coords into an existing file), so the two can never drift out of sync on what "flat" means.
+#[derive(Clone, Copy)]
+pub(crate) struct FlatChunkParams {
+    pub(crate) chunk_size: usize,
+    pub(crate) stone_depth: u8,
+    pub(crate) dirt_depth: u8,
+    pub(crate) surface_z: u32,
+}
+
+/// Fill one flat-world chunk's block-type data. Flat terrain has no cross-chunk state (no noise,
+/// no neighbour reads), so this is addressable for any `(cx, cy)` independent of every other
+/// chunk — safe to call for non-contiguous coordinates, which `materialize_flat_chunks` relies on.
+pub(crate) fn generate_flat_chunk(_cx: i32, _cy: i32, params: &FlatChunkParams) -> Vec<u8> {
+    let mut data = vec![0u8; params.chunk_size];
+    let set = |d: &mut Vec<u8>, z: u32, bt: u8| {
+        let band = (z as usize) / 16;
+        let z_in = (z as usize) % 16;
+        for lx in 0..16usize {
+            for ly in 0..16usize {
+                let bi = band * 8192 + lx * 256 + ly * 16 + z_in;
+                if bi < d.len() { d[bi] = bt; }
+            }
+        }
+    };
+    set(&mut data, 0, 1);
+    for z in 1..=params.stone_depth as u32 { set(&mut data, z, 2); }
+    for z in (1 + params.stone_depth as u32)..(1 + params.stone_depth as u32 + params.dirt_depth as u32) { set(&mut data, z, 3); }
+    set(&mut data, params.surface_z, 8);
+    data
+}
+
 /// Generate a flat world file at `path`.
 // Runs off the main thread (world generation takes seconds) so the UI doesn't freeze.
 #[tauri::command(async)]
@@ -1062,6 +1095,7 @@ pub(crate) fn create_world(
 
     let chunk_size = if extended_z { 131_072usize } else { 32_768usize };
     let n_chunks   = (width_chunks * height_chunks) as usize;
+    let params = FlatChunkParams { chunk_size, stone_depth, dirt_depth, surface_z };
 
     pub(crate) const CENTER_CHUNK: i32 = 4096;
     let start_cx = CENTER_CHUNK;
@@ -1069,23 +1103,8 @@ pub(crate) fn create_world(
 
     let mut chunks: Vec<Vec<u8>> = Vec::with_capacity(n_chunks);
     for cy in 0..height_chunks {
-        for _cx in 0..width_chunks {
-            let mut data = vec![0u8; chunk_size];
-            let set = |d: &mut Vec<u8>, z: u32, bt: u8| {
-                let band = (z as usize) / 16;
-                let z_in = (z as usize) % 16;
-                for lx in 0..16usize {
-                    for ly in 0..16usize {
-                        let bi = band * 8192 + lx * 256 + ly * 16 + z_in;
-                        if bi < d.len() { d[bi] = bt; }
-                    }
-                }
-            };
-            set(&mut data, 0, 1);
-            for z in 1..=stone_depth as u32 { set(&mut data, z, 2); }
-            for z in (1 + stone_depth as u32)..(1 + stone_depth as u32 + dirt_depth as u32) { set(&mut data, z, 3); }
-            set(&mut data, surface_z, 8);
-            chunks.push(data);
+        for cx in 0..width_chunks {
+            chunks.push(generate_flat_chunk(start_cx + cx as i32, start_cy + cy as i32, &params));
         }
         report("Filling chunks", 0.90 * ((cy + 1) as f32 / height_chunks as f32));
     }

@@ -55,7 +55,12 @@ export default function NewWorldModal({ onClose, onCreated }: Props) {
   const unlistenRef = useRef<(() => void) | null>(null);
   const mountedRef = useRef(true);
 
-  useEffect(() => () => { mountedRef.current = false; unlistenRef.current?.(); }, []);
+  useEffect(() => {
+    // StrictMode double-invokes this effect on mount (mount→cleanup→mount); the cleanup below
+    // must not leave mountedRef stuck at false for the real, still-mounted instance.
+    mountedRef.current = true;
+    return () => { mountedRef.current = false; unlistenRef.current?.(); };
+  }, []);
 
   // Flat
   const [stoneDepth, setStoneDepth] = useState(15);

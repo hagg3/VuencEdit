@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { brushFootprint, rectPixels, ellipsePixels, type BrushShape, type WP } from "./drawTools";
 import { chromeButton, chromeButtonAccent, recessedWell } from "./designTokens";
 import type { PixelPatchRaw } from "./types";
-import { zoomAtPoint, resizeCanvasToContainer, makeSeqGuard, putPatchPixels, beginFrame, cssWidth, cssHeight, isTypingTarget } from "./viewportUtils";
+import { zoomAtPoint, resizeCanvasToContainer, makeSeqGuard, putPatchPixels, beginFrame, cssWidth, cssHeight, isTypingTarget, chunkToWorld } from "./viewportUtils";
 
 // Front slab = constant world-Y plane (horizontal axis = X, vertical = Z; row 0 = highest Z).
 // Side slab  = constant world-X plane (horizontal axis = Y, vertical = Z; row 0 = highest Z).
@@ -67,8 +67,8 @@ interface Props {
 }
 
 export default function SliceViewport({ world, axis, editEpoch, lastEdit, onPaint, brush, tool, fill, depth, onDepthChange, crossH, crossV, selRange, selZ, selFull, extrudeCount = 0, extrudeAxis = "z+", isPaste = false, onZRangeChange, onHRangeChange, viewCapZ = null, selectMode = false, onSelect, onNotice }: Props) {
-  const worldW = world.width_chunks * 16;
-  const worldH = world.height_chunks * 16;
+  const worldW = chunkToWorld(world.width_chunks);
+  const worldH = chunkToWorld(world.height_chunks);
   const maxZ = world.max_z;
 
   // Horizontal axis world extent: X for front/top, Y for side. Vertical axis: Z (front/side, flipped

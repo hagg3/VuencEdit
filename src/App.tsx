@@ -13,7 +13,8 @@ import { getVersion } from "@tauri-apps/api/app";
 import { open, save, ask } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import MapCanvas, { KEY_ZOOM_STEP, TOOL_LABELS, TOOL_HINTS, type Tool, type SelectionBounds, type PixelPatch, type MapCanvasRef } from "./MapCanvas";
+import MapCanvas, { KEY_ZOOM_STEP, TOOL_LABELS, TOOL_HINTS, type Tool, type SelectionBounds, type PixelPatch, type MapCanvasRef, type MaterializeSelectionBounds } from "./MapCanvas";
+import MaterializeModal from "./MaterializeModal";
 import Sidebar, { type SidebarTab } from "./Sidebar";
 import SliceViewport from "./SliceViewport";
 import FlyView3D, { type FlyView3DRef, type Overlay3D, type Interact3D } from "./FlyView3D";
@@ -35,7 +36,7 @@ import Modal from "./Modal";
 import { glassPanel, chromeButton, accentRing, expBadge } from "./designTokens";
 import { decodeAtlas, tintedSwatch, type AtlasData, type TexturePackRaw, clearSwatchCache } from "./texturePack";
 import { blockDisplayName, resolveColor, applyBlockTables, orientBlockToFacing, type BlockTables } from "./blockDefs";
-import { isTypingTarget } from "./viewportUtils";
+import { isTypingTarget, chunkToWorld } from "./viewportUtils";
 import { decomposeMask, maskOutline } from "./maskUtils";
 import appIcon from "./assets/app-icon.png";
 import "./App.css";
@@ -239,6 +240,8 @@ function App() {
   const lastCursorCellRef = useRef<{ cx: number; cy: number } | null>(null);
   const [tool, setTool] = useState<Tool>("pan");
   const prevToolRef = useRef<Tool>("pan");
+  const [materializeSelection, setMaterializeSelection] = useState<MaterializeSelectionBounds | null>(null);
+  const [showMaterializeModal, setShowMaterializeModal] = useState(false);
   // Tool to re-arm when the Space hold-to-pan key is released (null = not holding).
   const spaceReturnToolRef = useRef<Tool | null>(null);
   const [wandMatchPaint, setWandMatchPaint] = useState(true);
@@ -364,8 +367,12 @@ function App() {
   const [sunT, setSunT] = useState(() => loadSettings().sunT);
   // Lamp light radius (blocks) for night lighting. Same committed-only pattern as sunT.
   const [lampRadius, setLampRadius] = useState(() => loadSettings().lampRadius);
+  // Legacy vs Modern/New Dawn lamp falloff (see FlyView3D's LightingProfile / export.rs's
+  // LightingProfile). Independent of lampRadius — the profile picks the falloff curve *and* the
+  // radius a switch snaps to; the slider can still override the radius afterward.
+  const [lightingProfile, setLightingProfile] = useState<"legacy" | "modern">(() => loadSettings().lightingProfile);
   const [lightEpoch, setLightEpoch] = useState(0);
-  useEffect(() => { setLightEpoch(e => e + 1); }, [nightLighting, shadows3d, sunT, lampRadius]);
+  useEffect(() => { setLightEpoch(e => e + 1); }, [nightLighting, shadows3d, sunT, lampRadius, lightingProfile]);
   // Force the perf-heavy 3D lighting modes off — called on every world load/close so none of them
   // carry over to a different world (they're Ribbon-only session toggles, never persisted).
   // Turning these off on every world load/close is deliberate (they're perf-heavy and must never
@@ -386,6 +393,16 @@ function App() {
   function commitLampRadius(r: number) {
     setLampRadius(r);
     saveSettings({ lampRadius: r });
+  }
+  // Switching profile snaps the radius to that profile's default (spec'd behavior) — the user can
+  // still drag Lamp R afterward to override it, same as picking a fresh baseline.
+  const LEGACY_LAMP_RADIUS = 4;
+  const MODERN_LAMP_RADIUS = 14;
+  function commitLightingProfile(profile: "legacy" | "modern") {
+    setLightingProfile(profile);
+    const r = profile === "modern" ? MODERN_LAMP_RADIUS : LEGACY_LAMP_RADIUS;
+    setLampRadius(r);
+    saveSettings({ lightingProfile: profile, lampRadius: r });
   }
   // Persisted 3D fly-view render distance + fly speed (seed FlyView3D; written back as the user adjusts).
   const [renderDistance, setRenderDistance] = useState(() => loadSettings().renderDistance);
@@ -418,6 +435,7 @@ function App() {
     setShowQuickActions(s.showQuickActions);
     setSunT(s.sunT);
     setLampRadius(s.lampRadius);
+    setLightingProfile(s.lightingProfile);
     setRenderDistance(s.renderDistance);
     setFlySpeed(s.flySpeed);
     setLookSensitivity(s.lookSensitivity);
@@ -555,6 +573,17 @@ function App() {
   // to the backend as a fraction (value/100 = rise per block).
   const [slopeGradeX, setSlopeGradeX] = useState(20);
   const [slopeGradeY, setSlopeGradeY] = useState(0);
+  // Rock/Carve tools (volumetric): ignore Strength/Softness (see RockParams in lib.rs). Defaults
+  // mirror the backend's own `RockParams::default()`. Shared by both tools — same field, one fuses
+  // rock into the terrain, the other cuts it away.
+  const [rockNoisiness, setRockNoisiness] = useState(0.4);
+  const [rockNoiseRadius, setRockNoiseRadius] = useState(12);
+  const [rockSmoothing, setRockSmoothing] = useState(1);
+  const [rockMeld, setRockMeld] = useState(1); // fillet radius ("Blend")
+  const [rockFlatten, setRockFlatten] = useState(0.55);
+  const [rockSink, setRockSink] = useState(0.35);
+  const [rockDrape, setRockDrape] = useState(0.75);
+  const [rockStrata, setRockStrata] = useState(0.5);
   const sculptSeedRef = useRef(Math.floor(Math.random() * 0xFFFFFFFF));
   // Live modifier state for sculpt strokes (Ctrl/⌘ = invert raise↔lower, Shift = temporary Smooth).
   // Read fresh per stamp inside applySculpt (not captured at stroke-start) so a modifier change
@@ -1003,7 +1032,7 @@ function App() {
         // Axo projection: flat patch positions don't match axo pixel positions, force full re-render.
         // Read via ref: this runs from []-memoized undo/redo callbacks where `world` is stale.
         const w = worldRef.current;
-        if (w) mapCanvasRef.current?.refetchRegion(0, 0, w.width_chunks * 16, w.height_chunks * 16);
+        if (w) mapCanvasRef.current?.refetchRegion(0, 0, chunkToWorld(w.width_chunks), chunkToWorld(w.height_chunks));
       } else {
         const patch: PixelPatch = { ...raw.patch, pixels: decodeU8(raw.patch.pixels) };
         mapCanvasRef.current?.applyPatch(patch);
@@ -1037,13 +1066,10 @@ function App() {
     await openFileAt(selected);
   }
 
-  async function openFileAt(path: string, opts?: { skipRecent?: boolean }) {
-    if (world && isDirty()) {
-      const ok = await ask("You have unsaved changes. Open a new world and discard them?", {
-        title: "Unsaved changes", kind: "warning",
-      });
-      if (!ok) return;
-    }
+  // Core "swap the session onto this world file" logic, shared by the normal Open flow and the
+  // materialize-tool auto-reload — the latter skips openFileAt's isDirty confirm because the
+  // materialize modal's own confirm step already warns "save your work first" before the write.
+  async function swapToWorldFile(path: string, opts?: { skipRecent?: boolean }) {
     const myEpoch = ++loadEpochRef.current;
     setLoading(true);
     setError(null);
@@ -1054,6 +1080,7 @@ function App() {
       setWorldEpoch((e) => e + 1);
       setSourcePath(path);
       setRawBounds(null);
+      setMaterializeSelection(null);
       setZMin(0);
       setZMax(data.max_z);
       setTool("pan");
@@ -1073,6 +1100,16 @@ function App() {
     } finally {
       setLoading(false);
     }
+  }
+
+  async function openFileAt(path: string, opts?: { skipRecent?: boolean }) {
+    if (world && isDirty()) {
+      const ok = await ask("You have unsaved changes. Open a new world and discard them?", {
+        title: "Unsaved changes", kind: "warning",
+      });
+      if (!ok) return;
+    }
+    await swapToWorldFile(path, opts);
   }
 
   async function exportPng() {
@@ -1114,8 +1151,8 @@ function App() {
     if (!savePath) return;
     const x1 = selection ? selection.x1 : 0;
     const y1 = selection ? selection.y1 : 0;
-    const x2 = selection ? selection.x2 : world.width_chunks * 16 - 1;
-    const y2 = selection ? selection.y2 : world.height_chunks * 16 - 1;
+    const x2 = selection ? selection.x2 : chunkToWorld(world.width_chunks) - 1;
+    const y2 = selection ? selection.y2 : chunkToWorld(world.height_chunks) - 1;
     const zMin = selection ? selection.z_min : 0;
     const zMax = selection ? selection.z_max : world.max_z;
     setExportingObj(true);
@@ -1138,8 +1175,8 @@ function App() {
     if (!savePath) return;
     const x1 = selection ? selection.x1 : 0;
     const y1 = selection ? selection.y1 : 0;
-    const x2 = selection ? selection.x2 : world.width_chunks * 16 - 1;
-    const y2 = selection ? selection.y2 : world.height_chunks * 16 - 1;
+    const x2 = selection ? selection.x2 : chunkToWorld(world.width_chunks) - 1;
+    const y2 = selection ? selection.y2 : chunkToWorld(world.height_chunks) - 1;
     const zMin = selection ? selection.z_min : 0;
     const zMax = selection ? selection.z_max : world.max_z;
     setExportingJson(true);
@@ -1178,8 +1215,8 @@ function App() {
     if (!savePath) return;
     const x1 = selection ? selection.x1 : 0;
     const y1 = selection ? selection.y1 : 0;
-    const x2 = selection ? selection.x2 : world.width_chunks * 16 - 1;
-    const y2 = selection ? selection.y2 : world.height_chunks * 16 - 1;
+    const x2 = selection ? selection.x2 : chunkToWorld(world.width_chunks) - 1;
+    const y2 = selection ? selection.y2 : chunkToWorld(world.height_chunks) - 1;
     const zMin = selection ? selection.z_min : 0;
     const zMax = selection ? selection.z_max : world.max_z;
     setExportingVox(true);
@@ -1267,7 +1304,7 @@ function App() {
       if (!bounds || !w) return;
       // Box-only move (no backend call, unlike the moveWithContents path below) — clamp to world
       // bounds so repeated arrow-nudges can't push the selection off the map entirely.
-      const mapMaxX = w.width_chunks * 16 - 1, mapMaxY = w.height_chunks * 16 - 1;
+      const mapMaxX = chunkToWorld(w.width_chunks) - 1, mapMaxY = chunkToWorld(w.height_chunks) - 1;
       const clampDx = Math.max(-bounds.x1, Math.min(mapMaxX - bounds.x2, dx));
       const clampDy = Math.max(-bounds.y1, Math.min(mapMaxY - bounds.y2, dy));
       setRawBounds({
@@ -1489,6 +1526,10 @@ function App() {
         // the legacy points/centre path is unused — per-cell clip comes from `clipRect` above.
         stampCenters: opts.stampCenters ?? null,
         strengthF: null,
+        rock: (t === "rock" || t === "carve") ? {
+          noisiness: rockNoisiness, noiseRadius: rockNoiseRadius, smoothing: rockSmoothing,
+          meld: rockMeld, flatten: rockFlatten, sink: rockSink, drape: rockDrape, strata: rockStrata,
+        } : null,
       });
       await applyEditResult(result);
     } catch (e) { reportError(e); }
@@ -1517,7 +1558,7 @@ function App() {
     const t = appToolRef.current;
     try {
       if (t === "smooth" || t === "noise" || t === "flatten" || t === "erode" || t === "thermal" || t === "hydro" || t === "stamp" || t === "grab" || t === "raise" || t === "lower"
-          || t === "terrace" || t === "sharpen" || t === "slope" || t === "smear") {
+          || t === "terrace" || t === "sharpen" || t === "slope" || t === "smear" || t === "rock" || t === "carve") {
         await applySculpt({
           points: pts.map(([x, y]) => ({ x, y })),
           anchor, grabDelta, groupId, smear, tool: t,
@@ -1680,7 +1721,7 @@ function App() {
     const t = appToolRef.current;
     const isSculpt = t === "smooth" || t === "noise" || t === "flatten" || t === "erode" ||
       t === "thermal" || t === "hydro" || t === "stamp" || t === "grab" || t === "raise" || t === "lower" ||
-      t === "terrace" || t === "sharpen" || t === "slope" || t === "smear";
+      t === "terrace" || t === "sharpen" || t === "slope" || t === "smear" || t === "rock" || t === "carve";
     if (!isSculpt) setTool("raise");
   }, [mode3d]);
 
@@ -2074,7 +2115,7 @@ function App() {
         if (t === "paste" || t === "wand" || t === "lasso" || t === "pen" || t === "brush" || t === "spray" || t === "line" || t === "rect" || t === "ellipse" || t === "polygon" ||
             t === "smooth" || t === "noise" || t === "flatten" || t === "erode" || t === "thermal" ||
             t === "hydro" || t === "stamp" || t === "grab" || t === "raise" || t === "lower" ||
-            t === "terrace" || t === "sharpen" || t === "slope" || t === "smear" || t === "fill" || t === "eyedropper" || t === "poolfill") {
+            t === "terrace" || t === "sharpen" || t === "slope" || t === "smear" || t === "rock" || t === "carve" || t === "fill" || t === "eyedropper" || t === "poolfill") {
           e.preventDefault();
           setTool("pan");
         } else {
@@ -2161,7 +2202,7 @@ function App() {
         const st = appToolRef.current;
         const isSculptToolKey = st === "smooth" || st === "noise" || st === "flatten" || st === "erode" ||
           st === "thermal" || st === "hydro" || st === "stamp" || st === "grab" || st === "raise" || st === "lower" ||
-          st === "terrace" || st === "sharpen" || st === "slope" || st === "smear";
+          st === "terrace" || st === "sharpen" || st === "slope" || st === "smear" || st === "rock" || st === "carve";
         if (isSculptToolKey && (e.key === "[" || e.key === "]")) {
           e.preventDefault();
           const dir = e.key === "]" ? 1 : -1;
@@ -2193,7 +2234,7 @@ function App() {
       // Selection conventions every creative tool shares.
       if (k === "a") {
         e.preventDefault();
-        setRawBounds({ x1: 0, y1: 0, x2: world.width_chunks * 16 - 1, y2: world.height_chunks * 16 - 1 });
+        setRawBounds({ x1: 0, y1: 0, x2: chunkToWorld(world.width_chunks) - 1, y2: chunkToWorld(world.height_chunks) - 1 });
       }
       if (k === "d") { e.preventDefault(); setRawBounds(null); }
       // Zoom: ⌘0 fit map, ⌘+/⌘− step, ⌘⇧0 zoom to selection. (⌘= is the unshifted "+" key.)
@@ -2332,6 +2373,10 @@ function App() {
 
 const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
     setRawBounds(bounds);
+  }, []);
+
+  const handleMaterializeSelectionChange = useCallback((bounds: MaterializeSelectionBounds | null) => {
+    setMaterializeSelection(bounds);
   }, []);
 
   // Default "Save Prefab" opens an in-app name modal that writes into the prefab library folder —
@@ -2531,6 +2576,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
     setWorld(null);
     setSourcePath(null);
     setRawBounds(null);
+    setMaterializeSelection(null);
     setClipboard(null);
     setUndoDepth(0);
     setRedoDepth(0);
@@ -2583,7 +2629,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
         }
       : null;
 
-  const isSculptTool = tool === "smooth" || tool === "noise" || tool === "flatten" || tool === "erode" || tool === "thermal" || tool === "hydro" || tool === "stamp" || tool === "grab" || tool === "raise" || tool === "lower" || tool === "terrace" || tool === "sharpen" || tool === "slope" || tool === "smear";
+  const isSculptTool = tool === "smooth" || tool === "noise" || tool === "flatten" || tool === "erode" || tool === "thermal" || tool === "hydro" || tool === "stamp" || tool === "grab" || tool === "raise" || tool === "lower" || tool === "terrace" || tool === "sharpen" || tool === "slope" || tool === "smear" || tool === "rock" || tool === "carve";
   const isDrawTool = tool === "pen" || tool === "brush" || tool === "spray" || tool === "line" || tool === "rect" || tool === "ellipse" || tool === "polygon" || isSculptTool || tool === "fill";
 
   const mapPaneEl = world ? (
@@ -2637,6 +2683,8 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
       onSelectDragUpdate={handleSelectDragUpdate}
       onMoveSelection={nudgeSelection}
       moveWithContents={moveWithContents}
+      committedMaterializeSelection={materializeSelection}
+      onMaterializeSelectionChange={handleMaterializeSelectionChange}
     />
   ) : null;
 
@@ -2660,7 +2708,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
         {world.name}
       </div>
       <div style={{ padding: "0 10px", borderRight: "1px solid #322d28", whiteSpace: "nowrap" }}>
-        {world.width_chunks * 16}×{world.height_chunks * 16}
+        {chunkToWorld(world.width_chunks)}×{chunkToWorld(world.height_chunks)}
         <span
           title={world.max_z === 255
             ? "New Dawn (256z) format — worlds up to 256 blocks tall"
@@ -2672,6 +2720,15 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
       </div>
       <CursorHud ref={cursorHudRef} />
       <SelStatusHud ref={selStatusHudRef} selection={selection} zMin={zMin} zMax={zMax} />
+      {tool === "materialize" && materializeSelection && (() => {
+        const { cx1, cy1, cx2, cy2 } = materializeSelection;
+        const nChunks = (cx2 - cx1 + 1) * (cy2 - cy1 + 1);
+        return (
+          <div style={{ padding: "0 10px", borderRight: "1px solid #322d28", color: "#d97706", whiteSpace: "nowrap" }}>
+            ▦ {nChunks.toLocaleString()} chunk{nChunks === 1 ? "" : "s"} selected
+          </div>
+        );
+      })()}
       <div style={{ padding: "0 10px", borderRight: "1px solid #322d28", whiteSpace: "nowrap" }}>
         ↩ <span style={{ color: "#4b443d" }}>{undoDepth}</span>
         {"  "}↪ <span style={{ color: "#4b443d" }}>{redoDepth}</span>
@@ -2862,6 +2919,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
                       shadows3d={shadows3d}
                       sunT={sunT}
                       lampRadius={lampRadius}
+                      lightingProfile={lightingProfile}
                       gpuShadows={gpuShadows}
                       lightEpoch={lightEpoch}
                       initialRenderDistance={renderDistance}
@@ -3005,6 +3063,8 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           isSculptTool={isSculptTool}
           wandMatchPaint={wandMatchPaint}
           setWandMatchPaint={setWandMatchPaint}
+          materializeSelection={materializeSelection}
+          onOpenMaterializeModal={() => setShowMaterializeModal(true)}
           undoDepth={undoDepth}
           redoDepth={redoDepth}
           handleUndo={handleUndo}
@@ -3041,6 +3101,22 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           setSlopeGradeX={setSlopeGradeX}
           slopeGradeY={slopeGradeY}
           setSlopeGradeY={setSlopeGradeY}
+          rockNoisiness={rockNoisiness}
+          setRockNoisiness={setRockNoisiness}
+          rockNoiseRadius={rockNoiseRadius}
+          setRockNoiseRadius={setRockNoiseRadius}
+          rockSmoothing={rockSmoothing}
+          setRockSmoothing={setRockSmoothing}
+          rockMeld={rockMeld}
+          setRockMeld={setRockMeld}
+          rockFlatten={rockFlatten}
+          setRockFlatten={setRockFlatten}
+          rockSink={rockSink}
+          setRockSink={setRockSink}
+          rockDrape={rockDrape}
+          setRockDrape={setRockDrape}
+          rockStrata={rockStrata}
+          setRockStrata={setRockStrata}
           prevToolRef={prevToolRef}
           fillBlockType={fillBlockType}
           fillPaint={fillPaint}
@@ -3091,6 +3167,8 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           commitSunT={commitSunT}
           lampRadius={lampRadius}
           commitLampRadius={commitLampRadius}
+          lightingProfile={lightingProfile}
+          commitLightingProfile={commitLightingProfile}
           onFitMap={() => mapCanvasRef.current?.resetView()}
           templateLoaded={templateLoaded}
           templatePath={templatePath}
@@ -3439,6 +3517,20 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
         )}
 
         {/* Sky Editor and Creature Viewer panels — implemented, hidden pending testing */}
+
+        {/* Materialize ungenerated chunk space modal */}
+        {showMaterializeModal && world && materializeSelection && (
+          <MaterializeModal
+            world={world}
+            bounds={materializeSelection}
+            onClose={() => setShowMaterializeModal(false)}
+            onMaterialized={async (path) => {
+              await swapToWorldFile(path, { skipRecent: true });
+              setMaterializeSelection(null);
+              setShowMaterializeModal(false);
+            }}
+          />
+        )}
 
         {/* Expand from Template modal */}
         {showExpandModal && (

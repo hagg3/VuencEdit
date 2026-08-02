@@ -2,12 +2,16 @@ import { useEffect, useRef, useCallback, forwardRef, useImperativeHandle } from 
 import { invoke } from "@tauri-apps/api/core";
 import { brushFootprint, bresenhamLine, linePixels, polygonPixels, rectPixels, ellipsePixels, type WP, type BrushShape, type FillMode } from "./drawTools";
 import { type WorldMeta, type PixelPatch, type PixelPatchRaw } from "./types";
-import { zoomAtPoint, resizeCanvasToContainer, makeSeqGuard, putPatchPixels, beginFrame, cssWidth, cssHeight, isTypingTarget } from "./viewportUtils";
+import { zoomAtPoint, resizeCanvasToContainer, makeSeqGuard, putPatchPixels, beginFrame, cssWidth, cssHeight, isTypingTarget, chunkToWorld, worldToChunk, CHUNK_SIZE_BLOCKS } from "./viewportUtils";
 import { maskOutline, type OutlinePt } from "./maskUtils";
 
 export type { PixelPatch } from "./types";
 
-export type Tool = "pan" | "select" | "wand" | "lasso" | "paste" | "pen" | "brush" | "spray" | "line" | "rect" | "ellipse" | "polygon" | "smooth" | "noise" | "flatten" | "erode" | "thermal" | "hydro" | "stamp" | "grab" | "raise" | "lower" | "terrace" | "sharpen" | "slope" | "smear" | "fill" | "eyedropper" | "poolfill";
+export type Tool = "pan" | "select" | "wand" | "lasso" | "paste" | "pen" | "brush" | "spray" | "line" | "rect" | "ellipse" | "polygon" | "smooth" | "noise" | "flatten" | "erode" | "thermal" | "hydro" | "stamp" | "grab" | "raise" | "lower" | "terrace" | "sharpen" | "slope" | "smear" | "rock" | "carve" | "fill" | "eyedropper" | "poolfill" | "materialize";
+
+/** Ceiling on chunks per materialize operation — mirrors `MAX_MATERIALIZE_CHUNKS` in lib.rs. Used
+ *  both to bound the materialize-select tool's loosened drag clamp and by the confirm-dialog copy. */
+export const MAX_MATERIALIZE_CHUNKS = 16_384;
 
 /**
  * Display name per tool — the single source of truth for the status bar and any other caption.
@@ -20,8 +24,8 @@ export const TOOL_LABELS: Record<Tool, string> = {
   smooth: "Smooth", noise: "Noise", flatten: "Flatten", erode: "Erode",
   thermal: "Thermal", hydro: "Hydro Erode", stamp: "Retexture", grab: "Grab",
   raise: "Raise", lower: "Lower", terrace: "Terrace", sharpen: "Sharpen",
-  slope: "Slope", smear: "Smear", fill: "Fill", eyedropper: "Eyedropper",
-  poolfill: "Pool Fill",
+  slope: "Slope", smear: "Smear", rock: "Rock", carve: "Carve", fill: "Fill", eyedropper: "Eyedropper",
+  poolfill: "Pool Fill", materialize: "Materialize",
 };
 
 /**
@@ -42,6 +46,9 @@ export const TOOL_HINTS: Partial<Record<Tool, string>> = {
   slope: "The first block you press on anchors the tilted plane (set Slope X/Y in the Falloff group)",
   smear: "Drag across terrain to pull height along with the brush, like wet paint",
   poolfill: "Click an empty (air) floor cell inside the selection to bucket-fill the basin",
+  materialize: "Drag to select ungenerated chunk space — holes inside the map or growth beyond its edge — then Materialize to write it as real terrain",
+  rock: "Click to place a rock mass fused into the terrain — ignores Strength/Softness, tune it in the Rock group",
+  carve: "Click to cut a filleted depression into the terrain — ignores Strength/Softness, tune it in the Rock group",
 };
 
 /**
@@ -58,11 +65,12 @@ export const TOOL_CURSOR: Record<Tool, string> = {
   smooth: "crosshair", noise: "crosshair", flatten: "crosshair", erode: "crosshair",
   thermal: "crosshair", hydro: "crosshair", stamp: "crosshair",
   raise: "crosshair", lower: "crosshair", terrace: "crosshair", sharpen: "crosshair",
-  slope: "crosshair", smear: "crosshair", fill: "crosshair", poolfill: "cell",
+  slope: "crosshair", smear: "crosshair", rock: "crosshair", carve: "crosshair", fill: "crosshair", poolfill: "cell",
+  materialize: "crosshair",
 };
 
 /** Sculpt tools that paint a swept disc footprint (everything except the drag-controlled "grab"). */
-const SCULPT_STROKE_TOOLS: readonly Tool[] = ["smooth", "noise", "flatten", "erode", "thermal", "hydro", "stamp", "raise", "lower", "terrace", "sharpen", "slope", "smear"];
+const SCULPT_STROKE_TOOLS: readonly Tool[] = ["smooth", "noise", "flatten", "erode", "thermal", "hydro", "stamp", "raise", "lower", "terrace", "sharpen", "slope", "smear", "rock", "carve"];
 const isSculptStroke = (t: Tool): boolean => SCULPT_STROKE_TOOLS.includes(t);
 
 export interface DrawConfig {
@@ -108,6 +116,23 @@ const MAX_CONCURRENT = 4;
 /** Zoom bounds, shared by the wheel handler and the keyboard zoom (zoomBy/zoomToBox). */
 const MIN_SCALE = 0.25;
 const MAX_SCALE = 32;
+
+/** Scale at which the whole `mW × mH` map fits inside a `cw × ch` viewport, with a small margin. */
+function fitScale(cw: number, ch: number, mW: number, mH: number, margin = 0.9): number {
+  return Math.min(MAX_SCALE, Math.min(cw / Math.max(1, mW), ch / Math.max(1, mH)) * margin);
+}
+
+/** Effective lower zoom bound: `MIN_SCALE`, but never *above* the scale that fits the whole world.
+ *  Clamping up to a flat 0.25 is what made "fit the map" silently stop fitting on a world whose
+ *  bbox needs a smaller scale than that — it centred on the bbox's geometric middle at a zoom far
+ *  too tight to ever include the terrain, i.e. a blank map with no obvious way back out. */
+function minScaleFor(cw: number, ch: number, mW: number, mH: number): number {
+  return Math.min(MIN_SCALE, fitScale(cw, ch, mW, mH));
+}
+
+/** Floor for the *initial* on-load view scale — see the worldEpoch effect below. Keeps a world with
+ *  a huge nominal bbox from defaulting to a whole-map view that loads every visible tile at once. */
+const DEFAULT_LOAD_MIN_SCALE = 0.5;
 /** Per-step zoom factor for ⌘+ / ⌘− (coarser than the wheel's 1.1, which fires many times a drag). */
 export const KEY_ZOOM_STEP = 1.25;
 
@@ -138,6 +163,7 @@ type DragOp =
   | { kind: "draw-shape"; tool: "rect" | "ellipse" | "line"; start: WP; end: WP }
   | { kind: "lasso"; pts: WP[] }
   | { kind: "cam3d-drag" }
+  | { kind: "materialize-select"; start: WorldPoint; end: WorldPoint }
   | null;
 
 const EDGE_HIT_PX = 6;
@@ -206,6 +232,14 @@ function hitTestEdge(
 
 export interface SelectionBounds {
   x1: number; y1: number; x2: number; y2: number;
+}
+
+/** Chunk-coordinate rect selected by the materialize tool, in **absolute** chunk coordinates — the
+ *  same space the backend's `chunk_map` is keyed by (a real Eden world sits near 4050,4150), NOT
+ *  local 0-based chunk indices. It may extend outside the current bbox, i.e. below `abs_min_x/y` or
+ *  past `abs_min_x + width_chunks` (that's the whole point: it addresses ungenerated space). */
+export interface MaterializeSelectionBounds {
+  cx1: number; cy1: number; cx2: number; cy2: number;
 }
 
 interface Props {
@@ -282,6 +316,10 @@ interface Props {
   onMoveSelection?: (dx: number, dy: number) => void;
   /** When true, a drag-move captures a snapshot of the selection's current pixels and shows it as a semi-transparent ghost following the drag (content will actually move on drop). When false, only the outline is dragged (E2 "Move: Box Only" default). */
   moveWithContents?: boolean;
+  /** Committed materialize-select rect (chunk coordinates), or null. Mirrors `committedSelection`. */
+  committedMaterializeSelection?: MaterializeSelectionBounds | null;
+  /** Called when a materialize-select drag commits (or is cleared) with the chunk-coordinate rect. */
+  onMaterializeSelectionChange?: (bounds: MaterializeSelectionBounds | null) => void;
 }
 
 type TileJob = { key: string; x1: number; y1: number; x2: number; y2: number };
@@ -295,7 +333,8 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     spawnPos = null, creatures = [],
     pasteElevationOffset = 0, onEyedropper, onPoolFillPick, sliceLines = null,
     cameraPos3d = null, onSetCamera3d,
-    showTemplateOverlay = false, onMapContextMenu, onSelectDragUpdate, onMoveSelection, moveWithContents = false }: Props,
+    showTemplateOverlay = false, onMapContextMenu, onSelectDragUpdate, onMoveSelection, moveWithContents = false,
+    committedMaterializeSelection = null, onMaterializeSelectionChange }: Props,
   ref,
 ) {
   const canvasRef  = useRef<HTMLCanvasElement>(null);
@@ -351,6 +390,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   // Stroke stabilizer: fractional low-passed pointer position that the freehand stamp follows.
   const smoothPosRef = useRef<{ x: number; y: number } | null>(null);
   useEffect(() => () => { if (accumTimerRef.current !== null) clearInterval(accumTimerRef.current); }, []);
+  useEffect(() => () => { if (materializeFetchTimerRef.current !== null) window.clearTimeout(materializeFetchTimerRef.current); }, []);
 
   // Stable refs for values read inside callbacks (avoids re-registering handlers)
   const toolRef         = useRef<Tool>(tool);
@@ -393,6 +433,12 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   const onSelectDragUpdateRef = useRef(onSelectDragUpdate);
   const onMoveSelectionRef = useRef(onMoveSelection);
   const moveWithContentsRef = useRef(moveWithContents);
+  const committedMaterializeSelRef = useRef<MaterializeSelectionBounds | null>(committedMaterializeSelection);
+  const onMaterializeSelectionChangeRef = useRef(onMaterializeSelectionChange);
+  // "cx,cy" → occupied, populated by chunk_occupancy queries scoped to the active/committed
+  // materialize-select rect (not the whole viewport — see the plan's scope note in draw()).
+  const materializeOccupancyRef = useRef<Map<string, boolean>>(new Map());
+  const materializeFetchTimerRef = useRef<number | null>(null);
   // Monotonic per-stroke id: bumped once at every stroke/gesture start (draw-stroke, sculpt-grab)
   // and threaded through every onDrawStroke call of that stroke (timer ticks + the final commit) so
   // grouped sculpt stamps coalesce into a single undo unit. See lib.rs's grouped-undo contract.
@@ -473,16 +519,33 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   useEffect(() => { onSelectDragUpdateRef.current = onSelectDragUpdate; }, [onSelectDragUpdate]);
   useEffect(() => { onMoveSelectionRef.current = onMoveSelection; }, [onMoveSelection]);
   useEffect(() => { moveWithContentsRef.current = moveWithContents; }, [moveWithContents]);
+  useEffect(() => { committedMaterializeSelRef.current = committedMaterializeSelection; }, [committedMaterializeSelection]);
+  useEffect(() => { onMaterializeSelectionChangeRef.current = onMaterializeSelectionChange; }, [onMaterializeSelectionChange]);
   const showTemplateOverlayRef = useRef(showTemplateOverlay);
   // Keep ref in sync; cache clear + redraw happen in the post-draw effect below
   useEffect(() => { showTemplateOverlayRef.current = showTemplateOverlay; }, [showTemplateOverlay]);
 
-  const mapW = world.width_chunks * 16;
-  const mapH = world.height_chunks * 16;
+  const mapW = chunkToWorld(world.width_chunks);
+  const mapH = chunkToWorld(world.height_chunks);
   // Refs so draw/ensureTiles (stable callbacks with [] deps) can read current dimensions
   const mapWRef = useRef(mapW);
   const mapHRef = useRef(mapH);
   useEffect(() => { mapWRef.current = mapW; mapHRef.current = mapH; }, [mapW, mapH]);
+
+  // Absolute chunk coordinate of world pixel (0,0). Every chunk index `worldToChunk()` derives from
+  // a world-pixel coordinate is *local* — relative to the world's bbox origin — but the backend's
+  // `chunk_map` (and therefore `chunk_occupancy` / `materialize_flat_chunks`) is keyed by absolute
+  // chunk coordinates, which on a real Eden world sit around (4050, 4150), not (0, 0). Mixing the
+  // two silently addresses a completely different region: it makes every occupancy probe report
+  // "ungenerated", and makes materialize write its chunks thousands of chunks away from the world,
+  // ballooning the reloaded world's bbox to ~4000×4200 chunks (blank 2D map + tile-fetch crawl).
+  // `MaterializeSelectionBounds` is therefore defined in ABSOLUTE chunk coords, converted here.
+  const absCx0Ref = useRef(world.abs_min_x);
+  const absCy0Ref = useRef(world.abs_min_y);
+  useEffect(() => {
+    absCx0Ref.current = world.abs_min_x;
+    absCy0Ref.current = world.abs_min_y;
+  }, [world.abs_min_x, world.abs_min_y]);
 
   // Convert clientX/clientY (viewport coords) to canvas-local coords. The canvas is no longer
   // guaranteed to fill the window at origin (0,0) — in quad/multi-viewport mode it lives in a
@@ -503,6 +566,22 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
       y: Math.max(0, Math.min(mapH - 1, Math.floor((l.y - y) / scale))),
     };
   }, [mapW, mapH, toLocal]);
+
+  // Loosened clamp used only by the materialize-select tool — every other tool keeps the hard
+  // [0, mapW-1] clamp above so it can never address negative/beyond-bounds coordinates. The margin
+  // here is generous but bounded (independent of MAX_MATERIALIZE_CHUNKS, which caps the *area* the
+  // user can actually commit — this just stops a stray drag from producing pathological coordinates).
+  const MATERIALIZE_MARGIN_CHUNKS = 512;
+  const screenToWorldLoose = useCallback((sx: number, sy: number): WorldPoint => {
+    const { x, y, scale } = viewRef.current;
+    const l = toLocal(sx, sy);
+    const margin = MATERIALIZE_MARGIN_CHUNKS * CHUNK_SIZE_BLOCKS;
+    return {
+      x: Math.max(-margin, Math.min(mapW - 1 + margin, Math.floor((l.x - x) / scale))),
+      y: Math.max(-margin, Math.min(mapH - 1 + margin, Math.floor((l.y - y) / scale))),
+    };
+  }, [mapW, mapH, toLocal]);
+
 
   // ── draw ──────────────────────────────────────────────────────────────────
 
@@ -704,6 +783,69 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
           ctx.fillRect(cx - CS / 2, cy - CS / 2, CS, CS);
           ctx.strokeRect(cx - CS / 2 + 0.5, cy - CS / 2 + 0.5, CS - 1, CS - 1);
         }
+      }
+    }
+
+    // Materialize-select overlay: distinguishes occupied chunks (unshaded), in-bounds holes (amber
+    // ghost fill, same tone family as the template overlay), and beyond-current-bbox growth space
+    // (lighter dashed tint — trivially always unoccupied, no chunk_occupancy round trip needed for it).
+    {
+      const mdrag = dragRef.current;
+      // Absolute chunk coords throughout (see absCx0Ref) — converted back to local for pixel math.
+      const acx0 = absCx0Ref.current, acy0 = absCy0Ref.current;
+      let mcx1 = 0, mcy1 = 0, mcx2 = 0, mcy2 = 0, hasMat = false;
+      if (mdrag?.kind === "materialize-select") {
+        mcx1 = worldToChunk(Math.min(mdrag.start.x, mdrag.end.x)) + acx0;
+        mcy1 = worldToChunk(Math.min(mdrag.start.y, mdrag.end.y)) + acy0;
+        mcx2 = worldToChunk(Math.max(mdrag.start.x, mdrag.end.x)) + acx0;
+        mcy2 = worldToChunk(Math.max(mdrag.start.y, mdrag.end.y)) + acy0;
+        hasMat = true;
+      } else if (!mdrag && committedMaterializeSelRef.current) {
+        ({ cx1: mcx1, cy1: mcy1, cx2: mcx2, cy2: mcy2 } = committedMaterializeSelRef.current);
+        hasMat = true;
+      }
+      if (hasMat) {
+        const nChunksM = (mcx2 - mcx1 + 1) * (mcy2 - mcy1 + 1);
+        // From the refs, not `world.*` — draw() is a []-dep callback, so a captured `world` would
+        // still be the world that was loaded when this canvas first mounted.
+        const wChunks = worldToChunk(mapWRef.current), hChunks = worldToChunk(mapHRef.current);
+        // Per-chunk tint is capped separately from MAX_MATERIALIZE_CHUNKS — it's a draw-cost guard
+        // (one fillRect per chunk cell), not a correctness one; a selection past this still commits
+        // fine, it just shows only the outline until narrowed.
+        if (nChunksM <= 4096) {
+          for (let cy = mcy1; cy <= mcy2; cy++) {
+            for (let cx = mcx1; cx <= mcx2; cx++) {
+              const lcx = cx - acx0, lcy = cy - acy0;
+              const beyond = lcx < 0 || lcy < 0 || lcx >= wChunks || lcy >= hChunks;
+              const wx = chunkToWorld(lcx), wy = chunkToWorld(lcy);
+              const rx = Math.round(wx * scale + vx), ry = Math.round(wy * scale + vy);
+              const rw = Math.round(CHUNK_SIZE_BLOCKS * scale), rh = Math.round(CHUNK_SIZE_BLOCKS * scale);
+              if (beyond) {
+                ctx.fillStyle = "rgba(96, 165, 250, 0.12)";
+                ctx.fillRect(rx, ry, rw, rh);
+                ctx.save();
+                ctx.setLineDash([4, 3]);
+                ctx.strokeStyle = "rgba(96, 165, 250, 0.5)";
+                ctx.lineWidth = 1;
+                ctx.strokeRect(rx + 0.5, ry + 0.5, rw - 1, rh - 1);
+                ctx.restore();
+              } else if (materializeOccupancyRef.current.get(`${cx},${cy}`) === false) {
+                ctx.fillStyle = "rgba(217, 119, 6, 0.30)";
+                ctx.fillRect(rx, ry, rw, rh);
+              }
+            }
+          }
+        }
+        const rx = Math.round(chunkToWorld(mcx1 - acx0) * scale + vx);
+        const ry = Math.round(chunkToWorld(mcy1 - acy0) * scale + vy);
+        const rw = Math.round(chunkToWorld(mcx2 - mcx1 + 1) * scale);
+        const rh = Math.round(chunkToWorld(mcy2 - mcy1 + 1) * scale);
+        ctx.strokeStyle = "rgba(255, 255, 255, 0.9)";
+        ctx.lineWidth = 2;
+        ctx.strokeRect(rx + 0.5, ry + 0.5, rw - 1, rh - 1);
+        ctx.strokeStyle = "rgba(217, 119, 6, 1)";
+        ctx.lineWidth = 1;
+        ctx.strokeRect(rx + 2.5, ry + 2.5, rw - 5, rh - 5);
       }
     }
 
@@ -1106,6 +1248,30 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     });
   }, [draw]);
 
+  // Debounced chunk_occupancy fetch behind the materialize-select overlay — merges results into
+  // materializeOccupancyRef and redraws. Never rejects a later result as "stale": each response only
+  // ever writes the keys it queried, so out-of-order completions can't corrupt the cache.
+  const fetchMaterializeOccupancy = useCallback((cx1: number, cy1: number, cx2: number, cy2: number) => {
+    invoke<number[]>("chunk_occupancy", { x1: cx1, y1: cy1, x2: cx2, y2: cy2 })
+      .then((flags) => {
+        const w = cx2 - cx1 + 1;
+        for (let cy = cy1; cy <= cy2; cy++) {
+          for (let cx = cx1; cx <= cx2; cx++) {
+            materializeOccupancyRef.current.set(`${cx},${cy}`, flags[(cy - cy1) * w + (cx - cx1)] === 1);
+          }
+        }
+        scheduleDraw();
+      })
+      .catch(() => {});
+  }, [scheduleDraw]);
+  const scheduleMaterializeOccupancyFetch = useCallback((cx1: number, cy1: number, cx2: number, cy2: number) => {
+    if (materializeFetchTimerRef.current !== null) window.clearTimeout(materializeFetchTimerRef.current);
+    materializeFetchTimerRef.current = window.setTimeout(() => {
+      materializeFetchTimerRef.current = null;
+      fetchMaterializeOccupancy(cx1, cy1, cx2, cy2);
+    }, 120);
+  }, [fetchMaterializeOccupancy]);
+
   // ── loadTile ──────────────────────────────────────────────────────────────
 
   const loadTile = useCallback(async (
@@ -1371,7 +1537,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
       const mW = mapWRef.current;
       const mH = mapHRef.current;
       const cw = cssWidth(canvas), ch = cssHeight(canvas);
-      const scale = Math.max(MIN_SCALE, Math.min(MAX_SCALE, Math.min(cw / mW, ch / mH) * 0.9));
+      const scale = fitScale(cw, ch, mW, mH);
       viewRef.current = {
         scale,
         x: (cw - mW * scale) / 2,
@@ -1386,7 +1552,8 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
       // the cursor (a keyboard zoom has no cursor to zoom toward).
       const cw = cssWidth(canvas), ch = cssHeight(canvas);
       const v = viewRef.current;
-      const next = Math.max(MIN_SCALE, Math.min(MAX_SCALE, v.scale * factor));
+      const next = Math.max(minScaleFor(cw, ch, mapWRef.current, mapHRef.current),
+                            Math.min(MAX_SCALE, v.scale * factor));
       if (next === v.scale) return;
       viewRef.current = {
         scale: next,
@@ -1401,7 +1568,8 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
       const bw = Math.max(1, x2 - x1 + 1);
       const bh = Math.max(1, y2 - y1 + 1);
       const cw = cssWidth(canvas), ch = cssHeight(canvas);
-      const scale = Math.max(MIN_SCALE, Math.min(MAX_SCALE, Math.min(cw / bw, ch / bh) * 0.85));
+      const scale = Math.max(minScaleFor(cw, ch, mapWRef.current, mapHRef.current),
+                             fitScale(cw, ch, bw, bh, 0.85));
       viewRef.current = {
         scale,
         x: cw / 2 - (x1 + bw / 2) * scale,
@@ -1451,12 +1619,26 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
+    const cw = cssWidth(canvas), ch = cssHeight(canvas);
+    // Fit-to-bbox (same formula as the imperative resetView()), not a fixed scale=2 — a world whose
+    // nominal bbox is much bigger than its populated area (every real Eden world with thin explored
+    // strips, and now also any materialize-tool selection that reaches beyond the old bounds) would
+    // otherwise center the view on empty space at a zoom level far too tight to ever land on terrain.
+    // But raw fitScale() has no floor, so a *huge* world (nominal bbox spanning thousands of chunks)
+    // fits at a tiny scale that shows the whole map and forces every visible tile to load at once —
+    // the lag-on-load regression this clamp fixes. DEFAULT_LOAD_MIN_SCALE keeps the initial view from
+    // zooming out past a sane tile budget; explicit Home/Fit still goes through the real fitScale via
+    // the imperative resetView() below, so a user who *wants* the full map is never blocked from it.
+    const scale = Math.min(2, Math.max(fitScale(cw, ch, mapW, mapH), DEFAULT_LOAD_MIN_SCALE));
     viewRef.current = {
-      x: (cssWidth(canvas)  - mapW * 2) / 2,
-      y: (cssHeight(canvas) - mapH * 2) / 2,
-      scale: 2,
+      x: (cw - mapW * scale) / 2,
+      y: (ch - mapH * scale) / 2,
+      scale,
     };
     dragRef.current = null;
+    // Occupancy is per-world: the same absolute chunk coord is occupied in one world and a hole in
+    // the next, so carrying the cache across a load would mis-tint the overlay.
+    materializeOccupancyRef.current.clear();
     onSelChangeRef.current(null);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [worldEpoch]);
@@ -1582,7 +1764,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   // handler. Gated on !typing for the same reason App's Escape is: Escape in the world-name field
   // is "revert my edit", not "throw away the gesture I'm halfway through".
   useEffect(() => {
-    const CANCELLABLE_DRAGS: Exclude<DragOp, null>["kind"][] = ["select", "draw-shape", "moveSel", "resizeEdge", "sculpt-grab", "lasso"];
+    const CANCELLABLE_DRAGS: Exclude<DragOp, null>["kind"][] = ["select", "draw-shape", "moveSel", "resizeEdge", "sculpt-grab", "lasso", "materialize-select"];
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== "Escape" || isTypingTarget(e.target)) return;
       if (polyVertsRef.current.length > 0) {
@@ -1618,6 +1800,14 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
         if (drag.kind === "select" || drag.kind === "moveSel") onSelectDragUpdateRef.current?.(null);
         const canvas = canvasRef.current;
         if (canvas) canvas.style.cursor = TOOL_CURSOR[toolRef.current];
+        draw();
+        return;
+      }
+      // No active drag: Escape on the materialize tool clears a committed selection, mirroring the
+      // step-back cascade for every other armed/gated mode.
+      if (!drag && toolRef.current === "materialize" && committedMaterializeSelRef.current) {
+        e.stopPropagation();
+        onMaterializeSelectionChangeRef.current?.(null);
         draw();
       }
     };
@@ -1678,6 +1868,12 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     if (toolRef.current === "poolfill") {
       const wp = screenToWorld(e.clientX, e.clientY);
       onPoolFillPickRef.current?.(wp.x, wp.y);
+      return;
+    }
+    if (toolRef.current === "materialize") {
+      const wp = screenToWorldLoose(e.clientX, e.clientY);
+      dragRef.current = { kind: "materialize-select", start: wp, end: wp };
+      draw();
       return;
     }
     if (toolRef.current === "select") {
@@ -1827,7 +2023,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
         viewX: viewRef.current.x, viewY: viewRef.current.y,
       };
     }
-  }, [draw, screenToWorld]);
+  }, [draw, screenToWorld, screenToWorldLoose]);
 
   const onPointerMove = useCallback((e: React.PointerEvent) => {
     const wp = screenToWorld(e.clientX, e.clientY);
@@ -1949,6 +2145,17 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
           drag.dx = mdx;
           drag.dy = mdy;
         }
+      } else if (drag?.kind === "materialize-select") {
+        const wpLoose = screenToWorldLoose(e.clientX, e.clientY);
+        drag.end = wpLoose;
+        // Absolute chunk coords — chunk_occupancy queries the backend's chunk_map directly.
+        const cx1 = worldToChunk(Math.min(drag.start.x, wpLoose.x)) + absCx0Ref.current;
+        const cy1 = worldToChunk(Math.min(drag.start.y, wpLoose.y)) + absCy0Ref.current;
+        const cx2 = worldToChunk(Math.max(drag.start.x, wpLoose.x)) + absCx0Ref.current;
+        const cy2 = worldToChunk(Math.max(drag.start.y, wpLoose.y)) + absCy0Ref.current;
+        if ((cx2 - cx1 + 1) * (cy2 - cy1 + 1) <= MAX_MATERIALIZE_CHUNKS) {
+          scheduleMaterializeOccupancyFetch(cx1, cy1, cx2, cy2);
+        }
       } else if (drag?.kind === "cam3d-drag") {
         onSetCamera3dRef.current?.(wp.x, wp.y);
       } else if (toolRef.current === "paste") {
@@ -1971,7 +2178,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
       }
       scheduleDraw();
     }
-  }, [scheduleDraw, scheduleEnsureTiles, screenToWorld]);
+  }, [scheduleDraw, scheduleEnsureTiles, screenToWorld, screenToWorldLoose, scheduleMaterializeOccupancyFetch]);
 
   const onPointerUp = useCallback((e: React.PointerEvent) => {
     const drag = dragRef.current;
@@ -1981,6 +2188,25 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     pointerDownOnCanvasRef.current = false;
     if (drag?.kind === "pan") {
       dragRef.current = null;
+      return;
+    }
+    if (drag?.kind === "materialize-select") {
+      const end = screenToWorldLoose(e.clientX, e.clientY);
+      dragRef.current = null;
+      if (drag.start.x === end.x && drag.start.y === end.y) {
+        onMaterializeSelectionChangeRef.current?.(null);
+      } else {
+        // Absolute chunk coords — see absCx0Ref; these go straight to the backend commands.
+        const cx1 = worldToChunk(Math.min(drag.start.x, end.x)) + absCx0Ref.current;
+        const cy1 = worldToChunk(Math.min(drag.start.y, end.y)) + absCy0Ref.current;
+        const cx2 = worldToChunk(Math.max(drag.start.x, end.x)) + absCx0Ref.current;
+        const cy2 = worldToChunk(Math.max(drag.start.y, end.y)) + absCy0Ref.current;
+        onMaterializeSelectionChangeRef.current?.({ cx1, cy1, cx2, cy2 });
+        if ((cx2 - cx1 + 1) * (cy2 - cy1 + 1) <= MAX_MATERIALIZE_CHUNKS) {
+          fetchMaterializeOccupancy(cx1, cy1, cx2, cy2);
+        }
+      }
+      draw();
       return;
     }
     if (drag?.kind === "cam3d-drag") {
@@ -2112,7 +2338,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     if (toolRef.current === "paste" && startedOnCanvas) {
       onPasteAtRef.current(screenToWorld(e.clientX, e.clientY));
     }
-  }, [draw, screenToWorld]);
+  }, [draw, screenToWorld, screenToWorldLoose, fetchMaterializeOccupancy]);
 
   const onPointerLeave = useCallback(() => {
     cursorPosRef.current = null;
@@ -2131,7 +2357,10 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     const handler = (e: WheelEvent) => {
       e.preventDefault();
       const lp = toLocal(e.clientX, e.clientY);
-      viewRef.current = zoomAtPoint(viewRef.current, lp.x, lp.y, e.deltaY, { min: MIN_SCALE, max: MAX_SCALE, factor: 1.1 });
+      // Lower bound follows the fit scale so a world too big for MIN_SCALE can still be zoomed
+      // back out to its full extent instead of getting stuck mid-way (see minScaleFor).
+      const min = minScaleFor(cssWidth(canvas), cssHeight(canvas), mapWRef.current, mapHRef.current);
+      viewRef.current = zoomAtPoint(viewRef.current, lp.x, lp.y, e.deltaY, { min, max: MAX_SCALE, factor: 1.1 });
       scheduleEnsureTiles(); // rAF-coalesced; loads new tiles in tiled mode, just draws in full mode
     };
     canvas.addEventListener("wheel", handler, { passive: false });

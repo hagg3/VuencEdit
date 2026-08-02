@@ -199,6 +199,8 @@ function ToolsHelp() {
             ["Noise", "Adds coherent hills or ridged mountains (Hills/Mtns + feature size)"],
             ["Erode / Thermal / Hydro", "Progressively rougher erosion — talus slides, then simulated water flow"],
             ["Stamp / Retexture", "Repaints the surface by steepness (flat→grass, mid→dirt, steep→stone) without changing height"],
+            ["Rock", "Stamps a volumetric rock mass fused into the terrain with a smooth fillet (not a heightmap offset) — ignores Strength/Softness, has its own Rock options group"],
+            ["Carve", "Rock's inverse — cuts a filleted depression, deleting only sky-connected material so it can't open a floating roof or a sealed cave — ignores Strength/Softness"],
           ].map(([mode, desc]) => (
             <tr key={mode}>
               <td style={{ padding: "3px 16px 3px 0", color: "#ebe9e7", whiteSpace: "nowrap", verticalAlign: "top" }}>{mode}</td>
