@@ -23,8 +23,13 @@ export interface AppSettings {
   // view modes that always start off (Ribbon-only toggles; reset on world load/close in App.tsx).
   /** Simulated sun position driving the shadow direction: 0=sunrise, 0.5=noon, 1=sunset. */
   sunT: number;
-  /** Lamp light radius (blocks) for night lighting in the 3D fly-view. Default 5 (the legacy constant). */
+  /** Lamp light radius (blocks) for night lighting in the 3D fly-view. Default 4 (the Legacy profile's default). */
   lampRadius: number;
+  /** Which shipped lamp-lighting behaviour the falloff curve follows: "legacy" (original 64z client,
+   *  ~4-tile pool, steep falloff) or "modern" ("New Dawn"/256z, ~14-tile pool, gradual falloff).
+   *  Switching profiles snaps `lampRadius` to that profile's default (see App.tsx commitLightingProfile).
+   *  Default "legacy". */
+  lightingProfile: "legacy" | "modern";
   /** Floating Quick Actions bar under the ribbon while a selection or clipboard exists. Default true. */
   showQuickActions: boolean;
   /** Mouse-look sensitivity multiplier in grabbed-cursor LOOK mode. Default 1 (see FlyView3D's
@@ -53,7 +58,7 @@ export interface AppSettings {
 }
 
 /** Current settings schema version. Bump + add a case to `migrate()` when a stored default must change. */
-const SETTINGS_VERSION = 4;
+const SETTINGS_VERSION = 5;
 
 const DEFAULTS: AppSettings = {
   defaultQuadView: true,
@@ -66,7 +71,8 @@ const DEFAULTS: AppSettings = {
   renderDistance: 5,
   flySpeed: 1,
   sunT: 0.5,
-  lampRadius: 5,
+  lampRadius: 4,
+  lightingProfile: "legacy",
   showQuickActions: true,
   lookSensitivity: 1,
   dragSensitivity: 1,
@@ -98,6 +104,10 @@ function migrate(s: Record<string, unknown>): boolean {
   // needed — the `{...DEFAULTS, ...parsed}` merge supplies the new fields for existing installs.
   // v3 → v4: the Elevation tab was folded into Inspector — remap installs parked on it.
   if (from < 4 && s.sidebarTab === "elevation") s.sidebarTab = "inspector";
+  // v4 → v5: added the Legacy/Modern lighting profile toggle; the Legacy default radius moved from 5
+  // to 4 to match the real original-client pool size. Only snap installs still parked on the old
+  // untouched default — anyone who dragged the Lamp R slider keeps their chosen value.
+  if (from < 5 && s.lampRadius === 5) s.lampRadius = 4;
   s.settingsVersion = SETTINGS_VERSION;
   return true;
 }
@@ -403,8 +413,29 @@ export default function SettingsModal({ onClose, onSave }: Props) {
                 format={v => `${Math.round(v)} blocks`}
                 onChange={v => set("lampRadius", Math.round(v))}
               />
+              <div style={{ height: 8 }} />
+
+              <div style={row}>
+                <div style={labelCol}>
+                  <span style={labelText}>Lighting profile</span>
+                  <span style={labelSub}>Legacy (~4-tile, steep falloff) vs Modern/New Dawn (~14-tile, gradual falloff). Switching snaps Lamp radius to that profile's default.</span>
+                </div>
+                <div style={{ display: "flex", gap: 4, marginLeft: "auto" }}>
+                  <button
+                    onClick={() => { set("lightingProfile", "legacy"); set("lampRadius", 4); }}
+                    style={local.lightingProfile === "legacy" ? chromeButtonAccent(EDEN_TEAL, `rgb(${EDEN_TEAL})`, { padding: "4px 10px", fontSize: 12 }) : chromeButton({ padding: "4px 10px", fontSize: 12 })}>
+                    Legacy
+                  </button>
+                  <button
+                    onClick={() => { set("lightingProfile", "modern"); set("lampRadius", 14); }}
+                    style={local.lightingProfile === "modern" ? chromeButtonAccent(EDEN_TEAL, `rgb(${EDEN_TEAL})`, { padding: "4px 10px", fontSize: 12 }) : chromeButton({ padding: "4px 10px", fontSize: 12 })}>
+                    New Dawn
+                  </button>
+                </div>
+              </div>
+
               <div style={{ ...labelSub, marginTop: 4 }}>
-                These four are also editable from the 3D pane / Ribbon directly — surfaced here so Reset to defaults has somewhere visible to reset them to.
+                These are also editable from the 3D pane / Ribbon directly — surfaced here so Reset to defaults has somewhere visible to reset them to.
               </div>
             </>
           )}

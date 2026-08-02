@@ -2,7 +2,7 @@ import { decodeU8 } from "./codec";
 import { useState, useRef, useEffect } from "react";
 import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
-import type { Tool, SelectionBounds } from "./MapCanvas";
+import type { Tool, SelectionBounds, MaterializeSelectionBounds } from "./MapCanvas";
 import type { SelectionInfo, ClipboardInfo, ExtrudeAxis, WorldMeta, RecentWorld } from "./types";
 import BlockPaintPicker from "./BlockPaintPicker";
 import NumberField from "./NumberField";
@@ -36,6 +36,9 @@ export interface RibbonProps {
   tool: Tool; setTool: (t: Tool) => void;
   isDrawTool: boolean; isSculptTool: boolean;
   wandMatchPaint: boolean; setWandMatchPaint: (v: boolean) => void;
+  // Materialize (ungenerated chunk space → real flat terrain)
+  materializeSelection: MaterializeSelectionBounds | null;
+  onOpenMaterializeModal: () => void;
   // Undo/Redo
   undoDepth: number; redoDepth: number;
   handleUndo: () => void; handleRedo: () => void;
@@ -56,6 +59,14 @@ export interface RibbonProps {
   noiseFeatureSize: number; setNoiseFeatureSize: (v: number) => void;
   slopeGradeX: number; setSlopeGradeX: (v: number) => void;
   slopeGradeY: number; setSlopeGradeY: (v: number) => void;
+  rockNoisiness: number; setRockNoisiness: (v: number) => void;
+  rockNoiseRadius: number; setRockNoiseRadius: (v: number) => void;
+  rockSmoothing: number; setRockSmoothing: (v: number) => void;
+  rockMeld: number; setRockMeld: (v: number) => void;
+  rockFlatten: number; setRockFlatten: (v: number) => void;
+  rockSink: number; setRockSink: (v: number) => void;
+  rockDrape: number; setRockDrape: (v: number) => void;
+  rockStrata: number; setRockStrata: (v: number) => void;
   prevToolRef: React.RefObject<Tool>;
   fillBlockType: number; fillPaint: number;
   setFillBlockType: (v: number) => void; setFillPaint: (v: number) => void;
@@ -91,6 +102,9 @@ export interface RibbonProps {
   gpuShadows: boolean; setGpuShadows: (v: boolean) => void;
   sunT: number; commitSunT: (v: number) => void;
   lampRadius: number; commitLampRadius: (v: number) => void;
+  /** Legacy (~4-tile, steep) vs Modern/"New Dawn" (~14-tile, gradual) lamp falloff. Separate from the
+   *  Lamp R slider — switching profile snaps the radius to that profile's default. */
+  lightingProfile: "legacy" | "modern"; commitLightingProfile: (v: "legacy" | "modern") => void;
   onFitMap: () => void;
   // Template
   templateLoaded: boolean; templatePath: string | null;
@@ -253,7 +267,7 @@ const rbDivider: React.CSSProperties = {
   boxShadow: "1px 0 0 rgba(255,255,255,0.03)",
 };
 
-// The fourteen sculpt tools, rendered as a compact 5-col icon grid (3 rows). Module-scope so both
+// The sixteen sculpt tools, rendered as a compact 5-col icon grid (4 rows). Module-scope so both
 // the Draw tab's Sculpt group and the 3D tab's sculptGroup() share one source of truth.
 const SCULPT_ALL_TOOLS: { id: Tool; icon: string; short: string; name: string }[] = [
   { id: "raise",   icon: "▲", short: "Raise",     name: "Raise — drag to pull up" },
@@ -270,6 +284,8 @@ const SCULPT_ALL_TOOLS: { id: Tool; icon: string; short: string; name: string }[
   { id: "thermal", icon: "♨", short: "Thermal",   name: "Thermal — talus-angle erosion" },
   { id: "hydro",   icon: "≈", short: "Hydro",     name: "Hydro — droplet hydraulic erosion" },
   { id: "stamp",   icon: "▦", short: "Retexture", name: "Retexture — repaint surface by slope" },
+  { id: "rock",    icon: "🪨", short: "Rock",      name: "Rock — volumetric mass fused into terrain (ignores Strength/Softness)" },
+  { id: "carve",   icon: "⛏",  short: "Carve",     name: "Carve — cuts a filleted depression, sky-connected only (ignores Strength/Softness)" },
 ];
 const zInp: React.CSSProperties = {
   width: 46, background: "rgba(0,0,0,0.35)", border: "none",
@@ -477,7 +493,7 @@ export default function Ribbon(p: RibbonProps) {
   // Auto-tab: draw tool → Draw tab
   const prevToolRef2 = useRef<Tool | null>(null);
   useEffect(() => {
-    const drawTools = ["pen","brush","spray","line","rect","ellipse","polygon","smooth","noise","flatten","erode","thermal","hydro","stamp","grab","raise","lower","terrace","sharpen","slope","smear","fill"];
+    const drawTools = ["pen","brush","spray","line","rect","ellipse","polygon","smooth","noise","flatten","erode","thermal","hydro","stamp","grab","raise","lower","terrace","sharpen","slope","smear","rock","carve","fill"];
     const wasDrawTool = drawTools.includes(prevToolRef2.current ?? "");
     const isNowDraw = drawTools.includes(p.tool);
     if (isNowDraw && !wasDrawTool) setActiveTab("draw");
@@ -825,10 +841,19 @@ export default function Ribbon(p: RibbonProps) {
             <button onClick={() => p.setTool("select")} style={p.tool === "select" ? rbActive() : rb} title="Select (S)">⬚ Select</button>
             <button onClick={() => p.setTool("wand")} style={p.tool === "wand" ? rbActive("#a78bfa") : rb} title="Magic Wand (W)">⁂ Wand</button>
             <button onClick={() => p.setTool("lasso")} style={p.tool === "lasso" ? rbActive("#a855f7") : rb} title="Lasso — drag a freeform selection (K)">◌ Lasso</button>
+            <button onClick={() => p.setTool("materialize")} style={p.tool === "materialize" ? rbActive("#d97706") : rb}
+              title="Materialize — drag to select ungenerated chunk space (holes or growth beyond the map edge)">▦ Materialize</button>
           </div>
           {p.tool === "wand" && (
             <button onClick={() => p.setWandMatchPaint(!p.wandMatchPaint)} style={p.wandMatchPaint ? rbActive("#a855f7") : rb}>
               {p.wandMatchPaint ? "Type + Colour" : "Type only"}
+            </button>
+          )}
+          {p.tool === "materialize" && (
+            <button onClick={p.onOpenMaterializeModal} disabled={!p.materializeSelection}
+              style={p.materializeSelection ? rbActive("#d97706") : rbDisabled(false)}
+              title={p.materializeSelection ? "Materialize the selected chunk space into real terrain" : "Drag a selection first"}>
+              Materialize…
             </button>
           )}
           <div style={rbGroupLabel}>Navigate</div>
@@ -1142,6 +1167,82 @@ export default function Ribbon(p: RibbonProps) {
           <div style={rbGroupLabel}>Slope</div>
         </div>
         </>)}
+
+        {/* Rock/Carve — only meaningful for these two tools, which share one volumetric
+            terrain-fusion field (see RockParams in lib.rs). Ignores Strength/Softness (Radius
+            sets the mass's size instead). */}
+        {(p.tool === "rock" || p.tool === "carve") && (<>
+        <div style={rbDivider} />
+        <div style={rbGroup}>
+          <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+            <span style={{ color: "#83786c", fontSize: 10, minWidth: 60 }}>Noisiness</span>
+            <input type="range" min={0} max={1} step={0.05} value={p.rockNoisiness}
+              onChange={e => p.setRockNoisiness(Number(e.target.value))}
+              title="Displacement amplitude of the surface noise, as a fraction of the fillet radius — 0 = clean squashed ellipsoid, 1 = chaotic but still connected"
+              style={{ width: 72, accentColor: "#fb923c", cursor: "pointer" }} />
+            <span style={{ color: "#fdba74", fontSize: 10, fontVariantNumeric: "tabular-nums", minWidth: 24 }}>{p.rockNoisiness.toFixed(2)}</span>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+            <span style={{ color: "#83786c", fontSize: 10, minWidth: 60 }}>Noise size</span>
+            <input type="range" min={2} max={40} step={1} value={p.rockNoiseRadius}
+              onChange={e => p.setRockNoiseRadius(Number(e.target.value))}
+              title="Feature scale of the surface noise, in world blocks — larger = broader/blobbier, smaller = jagged"
+              style={{ width: 72, accentColor: "#fb923c", cursor: "pointer" }} />
+            <span style={{ color: "#fdba74", fontSize: 10, fontVariantNumeric: "tabular-nums", minWidth: 24 }}>{p.rockNoiseRadius}</span>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+            <span style={{ color: "#83786c", fontSize: 10, minWidth: 60 }}>Smoothing</span>
+            <input type="range" min={0} max={5} step={0.25} value={p.rockSmoothing}
+              onChange={e => p.setRockSmoothing(Number(e.target.value))}
+              title="Cohesion blur — turns granular noise into fewer, larger forms"
+              style={{ width: 72, accentColor: "#fb923c", cursor: "pointer" }} />
+            <span style={{ color: "#fdba74", fontSize: 10, fontVariantNumeric: "tabular-nums", minWidth: 24 }}>{p.rockSmoothing.toFixed(2)}</span>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+            <span style={{ color: "#83786c", fontSize: 10, minWidth: 60 }}>Blend</span>
+            <input type="range" min={0} max={3} step={0.1} value={p.rockMeld}
+              onChange={e => p.setRockMeld(Number(e.target.value))}
+              title={p.tool === "carve"
+                ? "Fillet radius where the cut rolls over into surrounding terrain — no sharp rim"
+                : "Fillet radius where the rock flares into surrounding terrain — no hard seam"}
+              style={{ width: 72, accentColor: "#fb923c", cursor: "pointer" }} />
+            <span style={{ color: "#fdba74", fontSize: 10, fontVariantNumeric: "tabular-nums", minWidth: 24 }}>{p.rockMeld.toFixed(1)}</span>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+            <span style={{ color: "#83786c", fontSize: 10, minWidth: 60 }}>Flatten</span>
+            <input type="range" min={0.2} max={1.2} step={0.05} value={p.rockFlatten}
+              onChange={e => p.setRockFlatten(Number(e.target.value))}
+              title="Vertical/horizontal ratio of the base shape — lower = squashed, never a sphere"
+              style={{ width: 72, accentColor: "#fb923c", cursor: "pointer" }} />
+            <span style={{ color: "#fdba74", fontSize: 10, fontVariantNumeric: "tabular-nums", minWidth: 24 }}>{p.rockFlatten.toFixed(2)}</span>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+            <span style={{ color: "#83786c", fontSize: 10, minWidth: 60 }}>Sink</span>
+            <input type="range" min={0} max={1} step={0.05} value={p.rockSink}
+              onChange={e => p.setRockSink(Number(e.target.value))}
+              title="Fraction of the shape's vertical half-extent buried below the anchor surface"
+              style={{ width: 72, accentColor: "#fb923c", cursor: "pointer" }} />
+            <span style={{ color: "#fdba74", fontSize: 10, fontVariantNumeric: "tabular-nums", minWidth: 24 }}>{p.rockSink.toFixed(2)}</span>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+            <span style={{ color: "#83786c", fontSize: 10, minWidth: 60 }}>Drape</span>
+            <input type="range" min={0} max={1} step={0.05} value={p.rockDrape}
+              onChange={e => p.setRockDrape(Number(e.target.value))}
+              title="How strongly the shape's base follows local terrain height near the surface — 0 = one flat anchor height, 1 = fully terrain-conformal"
+              style={{ width: 72, accentColor: "#fb923c", cursor: "pointer" }} />
+            <span style={{ color: "#fdba74", fontSize: 10, fontVariantNumeric: "tabular-nums", minWidth: 24 }}>{p.rockDrape.toFixed(2)}</span>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+            <span style={{ color: "#83786c", fontSize: 10, minWidth: 60 }}>Strata</span>
+            <input type="range" min={0} max={2} step={0.1} value={p.rockStrata}
+              onChange={e => p.setRockStrata(Number(e.target.value))}
+              title="Horizontal sedimentary-bedding ledges — 0 = none"
+              style={{ width: 72, accentColor: "#fb923c", cursor: "pointer" }} />
+            <span style={{ color: "#fdba74", fontSize: 10, fontVariantNumeric: "tabular-nums", minWidth: 24 }}>{p.rockStrata.toFixed(1)}</span>
+          </div>
+          <div style={rbGroupLabel}>{p.tool === "carve" ? "Carve" : "Rock"} (ignores Strength/Softness)</div>
+        </div>
+        </>)}
       </div>
     );
   }
@@ -1387,15 +1488,30 @@ export default function Ribbon(p: RibbonProps) {
             onKeyUp={e => p.commitSunT(parseFloat((e.target as HTMLInputElement).value))}
             style={{ width: 80, accentColor: p.gpuShadows ? "#38bdf8" : "#facc15", cursor: sunActive ? "pointer" : "default" }} />
         </div>
-        <div style={{ display: "flex", alignItems: "center", gap: 4, opacity: p.nightLighting ? 1 : 0.4 }}
-          title={p.nightLighting ? "Lamp light radius, in blocks" : "Turn on Night Lighting — lamps only cast light at night"}>
-          <span style={{ color: "#afa69d", fontSize: 10 }}>Lamp&nbsp;R {Math.round(lampRadiusDisplay)}</span>
-          <input type="range" min={2} max={32} step={1} value={lampRadiusDisplay}
-            disabled={!p.nightLighting}
-            onChange={e => setLampRadiusDisplay(parseFloat(e.target.value))}
-            onPointerUp={e => p.commitLampRadius(parseFloat((e.target as HTMLInputElement).value))}
-            onKeyUp={e => p.commitLampRadius(parseFloat((e.target as HTMLInputElement).value))}
-            style={{ width: 72, accentColor: "#facc15", cursor: p.nightLighting ? "pointer" : "default" }} />
+        <div style={{ display: "flex", alignItems: "center", gap: 4, opacity: p.nightLighting ? 1 : 0.4 }}>
+          <span style={{ display: "flex", alignItems: "center", gap: 4 }}
+            title={p.nightLighting ? "Lamp light radius, in blocks" : "Turn on Night Lighting — lamps only cast light at night"}>
+            <span style={{ color: "#afa69d", fontSize: 10 }}>Lamp&nbsp;R {Math.round(lampRadiusDisplay)}</span>
+            <input type="range" min={2} max={32} step={1} value={lampRadiusDisplay}
+              disabled={!p.nightLighting}
+              onChange={e => setLampRadiusDisplay(parseFloat(e.target.value))}
+              onPointerUp={e => p.commitLampRadius(parseFloat((e.target as HTMLInputElement).value))}
+              onKeyUp={e => p.commitLampRadius(parseFloat((e.target as HTMLInputElement).value))}
+              style={{ width: 72, accentColor: "#facc15", cursor: p.nightLighting ? "pointer" : "default" }} />
+          </span>
+          <span style={{ display: "flex", alignItems: "center", gap: 2 }}
+            title={p.nightLighting ? "Lighting profile: Legacy (~4-tile, steep falloff) vs Modern/New Dawn (~14-tile, gradual falloff). Switching snaps Lamp R to that profile's default." : "Turn on Night Lighting — the profile only affects lamp falloff shape"}>
+            <button onClick={() => p.commitLightingProfile("legacy")}
+              disabled={!p.nightLighting}
+              style={{ ...(p.lightingProfile === "legacy" ? rbActive("#facc15") : rb), padding: "2px 6px", fontSize: 10 }}>
+              Legacy
+            </button>
+            <button onClick={() => p.commitLightingProfile("modern")}
+              disabled={!p.nightLighting}
+              style={{ ...(p.lightingProfile === "modern" ? rbActive("#facc15") : rb), padding: "2px 6px", fontSize: 10 }}>
+              New Dawn
+            </button>
+          </span>
         </div>
         <div style={rbGroupLabel}>Lighting</div>
       </div>

@@ -4,7 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import type { AtlasData } from "./texturePack";
-import { isTypingTarget } from "./viewportUtils";
+import { isTypingTarget, chunkToWorld, worldToChunk } from "./viewportUtils";
 import type { WorldMeta } from "./types";
 import { chromeButton, glassMenuPanel } from "./designTokens";
 import { skyFogColor, rampFamilyBase, wedgeFamilyBase, rampDirIndex, orientBlockToFacing } from "./blockDefs";
@@ -14,7 +14,7 @@ import { maskPrismPositions, type OutlinePt, type MaskRect } from "./maskUtils";
 // fades out at the edge of what's actually streamed in, instead of a fixed distance that either
 // clips well inside the loaded radius (short) or never fades (long, at high render distance).
 const fogDistances = (radiusChunks: number) => {
-  const far = Math.max(20, radiusChunks * 16 * 0.9);
+  const far = Math.max(20, chunkToWorld(radiusChunks) * 0.9);
   const near = far * 0.3;
   return { near, far };
 };
@@ -59,6 +59,8 @@ interface ChunkGeom {
 }
 /** A lamp light for the experimental GPU night path — Eden local block coords (voxel centre) + colour 0..1. */
 interface LampLight { x: number; y: number; z: number; r: number; g: number; b: number }
+/** Which shipped lamp-lighting behaviour is active — mirrors Rust `LightingProfile` (export.rs). */
+export type LightingProfile = "legacy" | "modern";
 /** Cap on live GPU-night point lights. MeshLambertMaterial forward-lights each one in-shader, so this
  *  is the experimental perf ceiling; the nearest N lamps to the camera are assigned. */
 const MAX_NIGHT_LIGHTS = 16;
@@ -153,7 +155,7 @@ const INTERACT_SEGMENTS: { mode: Interact3D; label: string; accent: string; titl
 const SCULPT_TOOL_LABELS: Record<string, string> = {
   raise: "Raise", lower: "Lower", grab: "Grab", smooth: "Smooth", flatten: "Flatten",
   noise: "Noise", erode: "Erode", thermal: "Thermal", hydro: "Hydro", stamp: "Retexture",
-  terrace: "Terrace", sharpen: "Sharpen", slope: "Slope", smear: "Smear",
+  terrace: "Terrace", sharpen: "Sharpen", slope: "Slope", smear: "Smear", rock: "Rock", carve: "Carve",
 };
 /// Amber sculpt-brush colour (matches the Ribbon sculpt affordances / 2D sculpt ghost).
 const SCULPT_BRUSH_HEX = 0xfb923c;
@@ -436,8 +438,11 @@ const FlyView3D = forwardRef<FlyView3DRef, {
   shadows3d?: boolean;
   /** Simulated sun position driving the shadow direction: 0=sunrise, 0.5=noon, 1=sunset. Default 0.5. */
   sunT?: number;
-  /** Lamp light radius (blocks) for night lighting. Default 5 (the legacy LAMP_LIGHT_RADIUS constant). */
+  /** Lamp light radius (blocks) for night lighting. Default 4 (the "legacy" profile's default radius). */
   lampRadius?: number;
+  /** Which shipped lighting behaviour the falloff curve follows — "legacy" (tight ~4-tile pool,
+   * steep falloff) or "modern" ("New Dawn", ~14-tile pool, gradual falloff). Default "legacy". */
+  lightingProfile?: LightingProfile;
   /** Increments whenever nightLighting/shadows3d/sunT changes, forcing a chunk-mesh reload. */
   lightEpoch?: number;
   /** Persisted render-distance (chunk radius) to seed the R slider from. Default LOAD_RADIUS. */
@@ -541,7 +546,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
 }>(function FlyView3D({
   world, editEpoch = 0, lastEdit = null, spawnAt = null, worldLoadToken = 0, onFlyModeChange, onCameraMove, overlays3d = null,
   texturePack = null, texEpoch = 0, fogEnabled = true,
-  nightLighting = false, shadows3d = false, sunT = 0.5, lampRadius = 5, lightEpoch = 0,
+  nightLighting = false, shadows3d = false, sunT = 0.5, lampRadius = 4, lightingProfile = "legacy", lightEpoch = 0,
   initialRenderDistance, initialFlySpeed, onRenderDistanceChange, onFlySpeedChange, anyModalOpen = false,
   lookSensitivity = 1, dragSensitivity = 1, invertY = false,
   interact3d = "none", onPickSelect, onPickFloodFill, onPickBreak, onPickPlace, onPickEyedrop, armedSwatch = null, armedLabel = "",
@@ -606,7 +611,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
   // of sync with export.rs's LAMP_LIGHT_RADIUS/SHADOW_RAY_STEPS constants. Seeded with those same
   // values as a fallback in case the fetch hasn't landed yet (a stale/undersized radius for one
   // frame is harmless — the next edit reloads correctly once the fetch resolves).
-  const lightConstantsRef = useRef({ lampLightRadius: 5.0, shadowRayScan: 24 });
+  const lightConstantsRef = useRef({ lampLightRadius: 4.0, shadowRayScan: 24 });
   useEffect(() => {
     let cancelled = false;
     invoke<{ lamp_light_radius: number; shadow_ray_steps: number }>("get_light_constants")
@@ -618,8 +623,8 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     return () => { cancelled = true; };
   }, []);
 
-  const mapW = world.width_chunks * 16;
-  const mapH = world.height_chunks * 16;
+  const mapW = chunkToWorld(world.width_chunks);
+  const mapH = chunkToWorld(world.height_chunks);
   const maxZ = world.max_z;
 
   const onFlyModeChangeRef = useRef(onFlyModeChange);
@@ -727,6 +732,8 @@ const FlyView3D = forwardRef<FlyView3DRef, {
   sunTRef.current = sunT;
   const lampRadiusRef = useRef(lampRadius);
   lampRadiusRef.current = lampRadius;
+  const lightingProfileRef = useRef(lightingProfile);
+  lightingProfileRef.current = lightingProfile;
   const gpuShadowsRef = useRef(gpuShadows);
   gpuShadowsRef.current = gpuShadows;
 
@@ -801,6 +808,56 @@ const FlyView3D = forwardRef<FlyView3DRef, {
   useImperativeHandle(ref, () => ({
     teleport: (wx, wy) => sceneApi.current?.teleport(wx, wy),
   }), []);
+
+  // Dispose + (re)build the texture-pack materials from `pack` (or leave them disposed if null).
+  // Shared by two triggers: the texture-pack-identity effect below, and the world-dimensions reinit
+  // effect — the latter's cleanup disposes these same refs as part of a full scene teardown (see its
+  // comment), but doesn't re-run the texture-pack effect (its dependency, `texturePack`, hasn't
+  // changed identity), so without this second call site new chunks after a resize/reload would
+  // permanently bake in the untextured fallback material until the user reloaded the pack.
+  const rebuildTextureMaterials = (pack: AtlasData | null) => {
+    if (atlasTexRef.current) { atlasTexRef.current.dispose(); atlasTexRef.current = null; }
+    if (texMatRef.current) { texMatRef.current.dispose(); texMatRef.current = null; }
+    if (texMatTRef.current) { texMatTRef.current.dispose(); texMatTRef.current = null; }
+    if (texMatLRef.current) { texMatLRef.current.dispose(); texMatLRef.current = null; }
+    if (texMatLTRef.current) { texMatLTRef.current.dispose(); texMatLTRef.current = null; }
+    if (depthMatTexRef.current) { depthMatTexRef.current.dispose(); depthMatTexRef.current = null; }
+    if (pack) {
+      const { rgba, tile, rows } = pack;
+      const tex = new THREE.DataTexture(
+        new Uint8ClampedArray(rgba.buffer, rgba.byteOffset, rgba.byteLength),
+        tile, tile * rows,
+        THREE.RGBAFormat,
+      );
+      tex.minFilter = THREE.NearestFilter;
+      tex.magFilter = THREE.NearestFilter;
+      tex.flipY = false;
+      tex.needsUpdate = true;
+      atlasTexRef.current = tex;
+      texMatRef.current = new THREE.MeshBasicMaterial({
+        map: tex, vertexColors: true, side: THREE.DoubleSide,
+      });
+      // Shares the same atlas texture as the opaque material; `transparent: true` lets the tile's
+      // own PNG alpha (e.g. a glass cutout) and the block's per-vertex alpha both composite.
+      texMatTRef.current = new THREE.MeshBasicMaterial({
+        map: tex, vertexColors: true, side: THREE.DoubleSide, transparent: true, depthWrite: false,
+      });
+      // Lit (Lambert) variants for GPU-shadow mode, sharing the same atlas texture. `flatShading` so
+      // no CPU normal pass is needed (see matL above).
+      texMatLRef.current = new THREE.MeshLambertMaterial({
+        map: tex, vertexColors: true, side: THREE.DoubleSide, flatShading: true,
+      });
+      texMatLTRef.current = new THREE.MeshLambertMaterial({
+        map: tex, vertexColors: true, side: THREE.DoubleSide, transparent: true, depthWrite: false, flatShading: true,
+      });
+      // Textured depth variant for the transparent stream's shadow: `alphaTest` on the atlas tile so a
+      // fence weave's transparent texels punch a lattice into the shadow; the vertex-alpha discard
+      // (patchDepthAlpha) still keeps water/glass/flower from casting at all.
+      const dm = new THREE.MeshDepthMaterial({ depthPacking: THREE.RGBADepthPacking, map: tex, alphaTest: 0.5 });
+      patchDepthAlpha(dm);
+      depthMatTexRef.current = dm;
+    }
+  };
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -997,6 +1054,14 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     const depthMatT = new THREE.MeshDepthMaterial({ depthPacking: THREE.RGBADepthPacking });
     patchDepthAlpha(depthMatT);
 
+    // Rebuild the texture-pack materials for this fresh scene. This effect's own cleanup disposes
+    // texMatRef/atlasTexRef/etc. as part of a full scene teardown (see below), but the separate
+    // `[texturePack]` effect that normally (re)builds them won't re-fire here — `texturePack`'s
+    // object identity hasn't changed, only the world's dimensions have — so without this call every
+    // chunk mesh built by the fresh scene would permanently bake in the untextured fallback material
+    // (`hasUV && texMatRef.current ? texMatRef.current : mat`, decided once at mesh-build time).
+    rebuildTextureMaterials(texturePack);
+
     const ambient = new THREE.AmbientLight(0xffffff, 0); // intensities set by applyGpuLighting()
     const sun = new THREE.DirectionalLight(0xffffff, 0);
     sun.castShadow = true;
@@ -1084,18 +1149,24 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       // Eden coords: THREE(x,y,z) → Eden(x, z, y). Query a generous radius so lamps just off-screen
       // still light the near terrain; the pool caps how many actually render.
       const ex = camera.position.x, ey = camera.position.z, ez = camera.position.y;
-      const queryR = Math.max(48, loadRadiusRef.current * 16);
+      const queryR = Math.max(48, chunkToWorld(loadRadiusRef.current));
       invoke<LampLight[]>("get_lamps_near", { x: ex, y: ey, z: ez, radius: queryR })
         .then((lamps) => {
           if (disposed) return;
-          // Read the slider value here (not before the await) so a mid-flight drag isn't stale.
+          // Read the slider/profile values here (not before the await) so a mid-flight drag or
+          // profile switch isn't stale.
           const lampR = lampRadiusRef.current;
-          // Physical falloff (decay=2, inverse-square). `distance` is the hard cutoff — set it well
-          // beyond the nominal lamp radius so the falloff curve isn't clipped right at the edge
-          // (a distance==lampR cutoff with 2/d brightness was the "only lit at point-blank range"
-          // bug). intensity = lampR²·K makes the brightness AT distance lampR read ~K regardless of
-          // the radius (intensity/d² = K at d=lampR), so the slider grows reach, not just brightness.
+          // `decay` picks which of the two shipped falloff shapes this matches (mirrors the CPU/baked
+          // `LightingProfile::falloff` in export.rs): legacy's small, steep-edged pool reads closest to
+          // Three's decay=2 (inverse-square); modern's much broader, gradual New Dawn pool reads closer
+          // to decay=1. `distance` is the hard cutoff — set it well beyond the nominal lamp radius so
+          // the falloff curve isn't clipped right at the edge (a distance==lampR cutoff with 2/d
+          // brightness was the "only lit at point-blank range" bug). `intensity` is solved so the
+          // brightness AT distance lampR reads ~K regardless of radius or decay (intensity/d^decay = K
+          // at d=lampR), so the slider grows reach, not just brightness.
           const K = 0.4;
+          const decay = lightingProfileRef.current === "modern" ? 1 : 2;
+          const intensity = decay === 2 ? lampR * lampR * K : lampR * K;
           for (let i = 0; i < MAX_NIGHT_LIGHTS; i++) {
             const pl = nightLights[i];
             const l = lamps[i];
@@ -1103,8 +1174,8 @@ const FlyView3D = forwardRef<FlyView3DRef, {
               pl.position.set(l.x, l.z, l.y); // Eden → THREE
               pl.color.setRGB(l.r, l.g, l.b);
               pl.distance = lampR * 4;
-              pl.decay = 2;
-              pl.intensity = lampR * lampR * K;
+              pl.decay = decay;
+              pl.intensity = intensity;
               pl.visible = true;
             } else {
               pl.visible = false;
@@ -1203,7 +1274,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       active++;
       setLoadingCountRef.current(inflight.size);
       const gen = fetchGen;
-      invoke<ChunkGeom>("get_chunk_geometry", { cx: cxk, cy: cyk, night: nightLightingRef.current, shadows: shadows3dRef.current, sunT: sunTRef.current, gpu: gpuShadowsRef.current, lampRadius: lampRadiusRef.current })
+      invoke<ChunkGeom>("get_chunk_geometry", { cx: cxk, cy: cyk, night: nightLightingRef.current, shadows: shadows3dRef.current, sunT: sunTRef.current, gpu: gpuShadowsRef.current, lampRadius: lampRadiusRef.current, lightingProfile: lightingProfileRef.current })
         .then((g) => {
           if (disposed) return;
           if (gen !== fetchGen || staleKeys.has(k)) return; // stale — dropped; finally{} requeues if needed
@@ -1310,8 +1381,8 @@ const FlyView3D = forwardRef<FlyView3DRef, {
 
     // Camera-window streaming: keep chunks within LOAD_RADIUS of the camera's XY footprint.
     const streamSweep = () => {
-      const ccx = Math.floor(camera.position.x / 16);
-      const ccy = Math.floor(camera.position.z / 16); // Three.js Z = Eden Y
+      const ccx = worldToChunk(camera.position.x);
+      const ccy = worldToChunk(camera.position.z); // Three.js Z = Eden Y
       // Rebuild the work queue each sweep (nearest-first) so the camera's current position drives
       // priority and chunks that fell out of range stop being requested.
       const r = loadRadiusRef.current;
@@ -2190,7 +2261,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       if (gpuShadowsRef.current) {
         const t = sunTRef.current;
         sunDirThree(t, sunDirScratch);
-        const reach = Math.max(64, loadRadiusRef.current * 16); // world units of loaded terrain
+        const reach = Math.max(64, chunkToWorld(loadRadiusRef.current)); // world units of loaded terrain
         sun.target.position.copy(camera.position);
         sun.position.copy(camera.position).addScaledVector(sunDirScratch, reach * 1.5);
         const sc = sun.shadow.camera as THREE.OrthographicCamera;
@@ -2901,7 +2972,11 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       sceneApi.current = null;
       throw e;
     }
-  // Re-init only when world dimensions change (new world loaded).
+  // Re-init only when world dimensions change (new world loaded). `texturePack` is deliberately
+  // omitted — it's read once at setup time to seed rebuildTextureMaterials(), not reactively; a pack
+  // change alone is handled by the separate, much cheaper `[texturePack]` effect below, which doesn't
+  // tear down the whole scene.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mapW, mapH, maxZ, world.width_chunks, world.height_chunks]);
 
   // Overlay sync: push updated wireframe boxes to the scene.
@@ -2972,10 +3047,10 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       shadows3d ? lightConstantsRef.current.shadowRayScan : 0,
     );
     const chunkPad = Math.ceil(reach / 16);
-    const cx0 = Math.floor(lastEdit.x / 16) - chunkPad;
-    const cy0 = Math.floor(lastEdit.y / 16) - chunkPad;
-    const cx1 = Math.floor((lastEdit.x + Math.max(0, lastEdit.w - 1)) / 16) + chunkPad;
-    const cy1 = Math.floor((lastEdit.y + Math.max(0, lastEdit.h - 1)) / 16) + chunkPad;
+    const cx0 = worldToChunk(lastEdit.x) - chunkPad;
+    const cy0 = worldToChunk(lastEdit.y) - chunkPad;
+    const cx1 = worldToChunk(lastEdit.x + Math.max(0, lastEdit.w - 1)) + chunkPad;
+    const cy1 = worldToChunk(lastEdit.y + Math.max(0, lastEdit.h - 1)) + chunkPad;
     for (let cy = cy0; cy <= cy1; cy++)
       for (let cx = cx0; cx <= cx1; cx++)
         api.reloadChunk(cx, cy);
@@ -3008,47 +3083,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
 
   // Texture pack sync: rebuild the DataTexture + material when the pack changes.
   useEffect(() => {
-    if (atlasTexRef.current) { atlasTexRef.current.dispose(); atlasTexRef.current = null; }
-    if (texMatRef.current) { texMatRef.current.dispose(); texMatRef.current = null; }
-    if (texMatTRef.current) { texMatTRef.current.dispose(); texMatTRef.current = null; }
-    if (texMatLRef.current) { texMatLRef.current.dispose(); texMatLRef.current = null; }
-    if (texMatLTRef.current) { texMatLTRef.current.dispose(); texMatLTRef.current = null; }
-    if (depthMatTexRef.current) { depthMatTexRef.current.dispose(); depthMatTexRef.current = null; }
-    if (texturePack) {
-      const { rgba, tile, rows } = texturePack;
-      const tex = new THREE.DataTexture(
-        new Uint8ClampedArray(rgba.buffer, rgba.byteOffset, rgba.byteLength),
-        tile, tile * rows,
-        THREE.RGBAFormat,
-      );
-      tex.minFilter = THREE.NearestFilter;
-      tex.magFilter = THREE.NearestFilter;
-      tex.flipY = false;
-      tex.needsUpdate = true;
-      atlasTexRef.current = tex;
-      texMatRef.current = new THREE.MeshBasicMaterial({
-        map: tex, vertexColors: true, side: THREE.DoubleSide,
-      });
-      // Shares the same atlas texture as the opaque material; `transparent: true` lets the tile's
-      // own PNG alpha (e.g. a glass cutout) and the block's per-vertex alpha both composite.
-      texMatTRef.current = new THREE.MeshBasicMaterial({
-        map: tex, vertexColors: true, side: THREE.DoubleSide, transparent: true, depthWrite: false,
-      });
-      // Lit (Lambert) variants for GPU-shadow mode, sharing the same atlas texture. `flatShading` so
-      // no CPU normal pass is needed (see matL above).
-      texMatLRef.current = new THREE.MeshLambertMaterial({
-        map: tex, vertexColors: true, side: THREE.DoubleSide, flatShading: true,
-      });
-      texMatLTRef.current = new THREE.MeshLambertMaterial({
-        map: tex, vertexColors: true, side: THREE.DoubleSide, transparent: true, depthWrite: false, flatShading: true,
-      });
-      // Textured depth variant for the transparent stream's shadow: `alphaTest` on the atlas tile so a
-      // fence weave's transparent texels punch a lattice into the shadow; the vertex-alpha discard
-      // (patchDepthAlpha) still keeps water/glass/flower from casting at all.
-      const dm = new THREE.MeshDepthMaterial({ depthPacking: THREE.RGBADepthPacking, map: tex, alphaTest: 0.5 });
-      patchDepthAlpha(dm);
-      depthMatTexRef.current = dm;
-    }
+    rebuildTextureMaterials(texturePack);
   }, [texturePack]);
 
   // Reload all chunk meshes when the texture epoch changes (pack loaded / unloaded / toggled).

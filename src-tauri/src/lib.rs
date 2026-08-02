@@ -504,6 +504,26 @@ fn cancel_expand(flag: tauri::State<'_, ExpandCancel>) {
     flag.0.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Cooperative cancel flag for `materialize_flat_chunks`, mirrors `ExpandCancel` — its own managed
+/// state rather than a `WorldState` field so checking it never contends with the main editing mutex.
+#[derive(Default)]
+pub(crate) struct MaterializeCancel(std::sync::atomic::AtomicBool);
+
+fn materialize_cancelled(flag: &tauri::State<'_, MaterializeCancel>) -> bool {
+    flag.0.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[tauri::command]
+fn cancel_materialize(flag: tauri::State<'_, MaterializeCancel>) {
+    flag.0.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Ceiling on how many chunks one `materialize_flat_chunks` call may add, so a stray drag to the
+/// map extremes in the loosened materialize-select clamp can't queue an absurd write. Matches
+/// `create_world`'s existing 128×128 world-size cap (~2 GB worst case at 256z chunk size) — the
+/// same order of magnitude the codebase already treats as "big but sane" for a single write.
+pub(crate) const MAX_MATERIALIZE_CHUNKS: usize = 16_384;
+
 // ── World parsing ─────────────────────────────────────────────────────────────
 
 /// Decode one 16-byte chunk-pointer-table entry: `i32` X `[0..4]`, `i32` Y `[4..8]`, `u64` data
@@ -1858,6 +1878,188 @@ fn expand_world_from_template(
     Ok(ExpandResult { chunks_added: add_count, total_chunks: total })
 }
 
+#[derive(Serialize)]
+struct MaterializeResult {
+    chunks_added: u32,
+    total_chunks: u32,
+}
+
+/// Core materialize write loop, factored out of the `#[tauri::command]` wrapper so it's callable
+/// from tests without a `tauri::State`/`AppHandle`. `cancelled` is polled once per written chunk;
+/// `on_progress(done, total)` is called at the same 500-chunk cadence `expand_world_from_template`
+/// uses for its progress events.
+#[allow(clippy::too_many_arguments)]
+fn materialize_flat_chunks_inner(
+    output_path: &str,
+    chunk_size: usize,
+    header: &[u8],
+    user_chunk_bytes: &[(i32, i32, Vec<u8>)],
+    to_add: &[(i32, i32)],
+    params: &FlatChunkParams,
+    mut cancelled: impl FnMut() -> bool,
+    mut on_progress: impl FnMut(usize, usize),
+) -> Result<MaterializeResult, String> {
+    let total = (user_chunk_bytes.len() + to_add.len()) as u32;
+    let add_count = to_add.len() as u32;
+
+    let out_file = fs::File::create(output_path)
+        .map_err(|e| format!("Cannot create output file: {e}"))?;
+    let mut writer = BufWriter::with_capacity(4 * 1024 * 1024, out_file);
+
+    writer.write_all(header).map_err(|e| format!("Write error: {e}"))?;
+    let mut cur_offset: u64 = 192;
+    let mut dir_entries: Vec<(i32, i32, u64)> = Vec::with_capacity(total as usize);
+
+    // Write existing user chunks, byte-identical to the source world.
+    for (cx, cy, bytes) in user_chunk_bytes {
+        writer.write_all(bytes).map_err(|e| format!("Write error: {e}"))?;
+        dir_entries.push((*cx, *cy, cur_offset));
+        cur_offset += chunk_size as u64;
+    }
+
+    // Write freshly-generated flat chunks for every requested coord not already present. Flat
+    // terrain has no cross-chunk state, so this is safe for non-contiguous coordinates.
+    let add_total = to_add.len();
+    for (i, (cx, cy)) in to_add.iter().enumerate() {
+        if cancelled() {
+            drop(writer);
+            let _ = fs::remove_file(output_path); // don't leave a truncated/corrupt world file behind
+            return Err("Cancelled".into());
+        }
+        let data = generate_flat_chunk(*cx, *cy, params);
+        writer.write_all(&data).map_err(|e| format!("Write error: {e}"))?;
+        dir_entries.push((*cx, *cy, cur_offset));
+        cur_offset += chunk_size as u64;
+
+        if (i + 1) % 500 == 0 || i + 1 == add_total {
+            on_progress(i + 1, add_total.max(1));
+        }
+    }
+
+    let dir_offset = cur_offset;
+    for &(cx, cy, off) in &dir_entries {
+        writer.write_all(&encode_dir_entry(cx, cy, off)).map_err(|e| format!("Write error: {e}"))?;
+    }
+
+    writer.flush().map_err(|e| format!("Flush error: {e}"))?;
+    drop(writer);
+
+    // Patch directory_offset in header (bytes 32–39), same two-phase pattern (and the same known
+    // non-atomicity caveat) as `expand_world_from_template`.
+    let mut f = fs::OpenOptions::new().write(true).open(output_path)
+        .map_err(|e| format!("Cannot reopen output: {e}"))?;
+    f.seek(SeekFrom::Start(32)).map_err(|e| format!("Seek error: {e}"))?;
+    f.write_all(&dir_offset.to_le_bytes()).map_err(|e| format!("Patch error: {e}"))?;
+    drop(f);
+
+    Ok(MaterializeResult { chunks_added: add_count, total_chunks: total })
+}
+
+/// Materialize ungenerated chunk space (holes inside the current bounds, or growth beyond them)
+/// into real flat-terrain chunks, written to a **sibling output file** — this never edits the
+/// loaded world in place, so it never has to touch `with_edit`'s chunk-delta undo system (locked-in
+/// decision: non-undoable, confirm-first on the frontend, with an auto-reload of `output_path`
+/// after a successful write). Structurally cloned from `expand_world_from_template`: short lock to
+/// snapshot everything needed, then drop it before the (potentially large) buffered write.
+#[tauri::command(async)]
+fn materialize_flat_chunks(
+    output_path: String,
+    coords: Vec<(i32, i32)>,
+    stone_depth: u8,
+    dirt_depth: u8,
+    app_handle: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    cancel: tauri::State<'_, MaterializeCancel>,
+) -> Result<MaterializeResult, String> {
+    cancel.0.store(false, std::sync::atomic::Ordering::Relaxed);
+    if coords.is_empty() {
+        return Err("No chunks selected".into());
+    }
+    if coords.len() > MAX_MATERIALIZE_CHUNKS {
+        return Err(format!(
+            "Selection too large: {} chunks exceeds the {} limit for a single materialize operation",
+            coords.len(), MAX_MATERIALIZE_CHUNKS
+        ));
+    }
+
+    let (chunk_size, header, user_chunk_bytes, existing) = {
+        let ws = state.lock().unwrap_or_else(|p| p.into_inner());
+        let world = ws.world.as_ref().ok_or("No world loaded")?;
+        let chunk_size = world.chunk_size;
+        let header = world.bytes[..192.min(world.bytes.len())].to_vec();
+
+        let mut user_chunk_list: Vec<(i32, i32, usize)> = world.chunk_map.iter()
+            .map(|(&(cx, cy), &off)| (cx, cy, off))
+            .collect();
+        user_chunk_list.sort_unstable_by_key(|&(cx, cy, _)| (cx, cy));
+        // Copy each user chunk's bytes now, while the world is guaranteed stable under the lock —
+        // span-clamped and zero-padded exactly like `expand_world_from_template`.
+        let user_chunk_bytes: Vec<(i32, i32, Vec<u8>)> = user_chunk_list.into_iter()
+            .filter_map(|(cx, cy, _off)| {
+                let (off, cend) = world.chunk_range(cx, cy)?;
+                let mut data = world.bytes[off..cend].to_vec();
+                data.resize(chunk_size, 0);
+                Some((cx, cy, data))
+            })
+            .collect();
+        let existing: HashSet<(i32, i32)> = user_chunk_bytes.iter().map(|&(cx, cy, _)| (cx, cy)).collect();
+
+        (chunk_size, header, user_chunk_bytes, existing)
+    };
+
+    let num_bands = chunk_size / 8192;
+    let max_z: u32 = (num_bands * 16 - 1) as u32;
+    let surface_z: u32 = 1 + stone_depth as u32 + dirt_depth as u32;
+    if surface_z > max_z {
+        return Err(format!("Layer depths too large: surface would be at z={surface_z} but max z={max_z}"));
+    }
+    let params = FlatChunkParams { chunk_size, stone_depth, dirt_depth, surface_z };
+
+    // Existing user chunks always win — never overwritten by materialize. De-dupe the incoming
+    // coord list too (a selection rect and a bystander drag could both name the same cell).
+    let mut to_add: Vec<(i32, i32)> = coords.into_iter()
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .filter(|k| !existing.contains(k))
+        .collect();
+    to_add.sort_unstable();
+
+    // The reloaded world's bbox is the union of the old chunks and the new ones, and every 2D view
+    // is sized by it. Log it: `coords` arrives from the frontend in **absolute** chunk coordinates
+    // (a real Eden world sits near 4050,4150), and passing local 0-based indices instead writes the
+    // terrain thousands of chunks away — a silent, file-persistent corruption whose only visible
+    // symptom is a blank, sluggish 2D map. A one-line before/after makes that obvious on the spot.
+    {
+        let all = user_chunk_bytes.iter().map(|&(cx, cy, _)| (cx, cy)).chain(to_add.iter().copied());
+        let (mut nx0, mut ny0, mut nx1, mut ny1) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
+        for (cx, cy) in all {
+            nx0 = nx0.min(cx); ny0 = ny0.min(cy);
+            nx1 = nx1.max(cx); ny1 = ny1.max(cy);
+        }
+        let (mut ox0, mut oy0, mut ox1, mut oy1) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
+        for &(cx, cy) in &existing {
+            ox0 = ox0.min(cx); oy0 = oy0.min(cy);
+            ox1 = ox1.max(cx); oy1 = oy1.max(cy);
+        }
+        timing_log!(
+            "[MATERIALIZE] adding {} chunk(s); bbox ({ox0},{oy0})–({ox1},{oy1}) [{}×{}] → \
+             ({nx0},{ny0})–({nx1},{ny1}) [{}×{}]",
+            to_add.len(),
+            ox1 - ox0 + 1, oy1 - oy0 + 1,
+            nx1 - nx0 + 1, ny1 - ny0 + 1,
+        );
+    }
+
+    materialize_flat_chunks_inner(
+        &output_path, chunk_size, &header, &user_chunk_bytes, &to_add, &params,
+        || materialize_cancelled(&cancel),
+        |done, total| {
+            let pct = (done as f64 / total as f64 * 100.0) as u32;
+            let _ = app_handle.emit("materialize_progress", pct);
+        },
+    )
+}
+
 /// Return a top-down pixel patch for the rectangle (x1,y1)–(x2,y2).
 /// Used by the tiled frontend to fetch individual map tiles on demand.
 #[tauri::command]
@@ -1868,6 +2070,33 @@ fn fetch_tile(
     let ws = state.lock().unwrap_or_else(|p| p.into_inner());
     let world = ws.world.as_ref().ok_or("No world loaded")?;
     Ok(render_pixels_patch(world, x1, y1, x2, y2, ws.view_cap_z))
+}
+
+/// Report which chunks in the queried chunk-coordinate rectangle [x1,y1]–[x2,y2] actually exist
+/// in `chunk_map`. Unlike `fetch_tile`, this is deliberately **not clamped** to the current world
+/// bbox — it's the occupancy probe behind the materialize-select tool, which must be able to query
+/// space outside today's bounds (that's the whole point: growth beyond bounds looks the same to
+/// this command as a hole inside them, both come back 0). Row-major, one byte per queried chunk
+/// cell: 1 = chunk present, 0 = absent ("ungenerated").
+#[tauri::command]
+fn chunk_occupancy(
+    x1: i32, y1: i32, x2: i32, y2: i32,
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<u8>, String> {
+    let ws = state.lock().unwrap_or_else(|p| p.into_inner());
+    let world = ws.world.as_ref().ok_or("No world loaded")?;
+    let (x1, x2) = (x1.min(x2), x1.max(x2));
+    let (y1, y2) = (y1.min(y2), y1.max(y2));
+    let w = (x2 - x1 + 1) as usize;
+    let h = (y2 - y1 + 1) as usize;
+    let mut out = vec![0u8; w * h];
+    for cy in y1..=y2 {
+        for cx in x1..=x2 {
+            let idx = (cy - y1) as usize * w + (cx - x1) as usize;
+            out[idx] = world.chunk_map.contains_key(&(cx, cy)) as u8;
+        }
+    }
+    Ok(out)
 }
 
 /// Set (or clear) the cutaway ceiling. `None` restores the normal "true surface" view.
@@ -5355,6 +5584,438 @@ const SCULPT_KERNEL: [((i32, i32), f64); 8] = [
 #[derive(serde::Deserialize, Clone)]
 struct SculptPoint { x: i32, y: i32 }
 
+/// Parameters for the volumetric `rock`/`carve` sculpt modes (see `field_stamp`). One bundle
+/// instead of several more positional args on the already-25-argument `sculpt_terrain`.
+#[derive(serde::Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct RockParams {
+    /// Displacement amplitude of the domain-warped fBm noise added to the base ellipsoid field,
+    /// as a fraction of the fillet radius (`r_min`).
+    noisiness: f64,
+    /// Feature scale (world blocks) of that noise — larger = broader/blobbier, smaller = jagged.
+    noise_radius: f64,
+    /// Gaussian-ish blur strength (box-blur ×3 sigma), applied only to the noise displacement
+    /// buffer (never to the analytic ellipsoid/terrain SDF) — the step that turns granular noise
+    /// into cohesive lumps without sphericalizing the whole mass.
+    smoothing: f64,
+    /// Fillet radius between rock and terrain (in blocks, via `k = meld * 0.3 * r_min`, clamped
+    /// 1..=14) — the smooth-min/-max blend width where rock flares into ground / carve rims roll
+    /// over, replacing the old additive "flood the interior" meld.
+    meld: f64,
+    /// Vertical/horizontal radius ratio of the base ellipsoid (< 1 = squashed, never a sphere).
+    flatten: f64,
+    /// Fraction of the ellipsoid's vertical half-extent buried below the anchor surface.
+    sink: f64,
+    /// How strongly the rock's vertical frame near/below the surface drapes to follow local
+    /// terrain height (0 = one flat anchor height for the whole blob, 1 = fully terrain-conformal
+    /// near the surface) — the higher above the surface a cell is, the less this applies, so the
+    /// emergent top keeps its own free-standing form.
+    drape: f64,
+    /// Amplitude (fraction of `r_min`) of low-frequency Z-only ridged noise added to the field,
+    /// producing horizontal sedimentary-bedding ledges.
+    strata: f64,
+}
+
+impl Default for RockParams {
+    fn default() -> Self {
+        RockParams {
+            noisiness: 0.4, noise_radius: 12.0, smoothing: 1.0, meld: 1.0, flatten: 0.55,
+            sink: 0.35, drape: 0.75, strata: 0.5,
+        }
+    }
+}
+
+/// IQ polynomial smooth-min. `k` is the fillet radius in blocks; `k <= 0` degrades to a hard min.
+/// Negative = inside/solid by convention for every SDF this file combines with it.
+#[inline]
+fn smin(a: f64, b: f64, k: f64) -> f64 {
+    if k <= 0.0 { return a.min(b); }
+    let hh = (0.5 + 0.5 * (b - a) / k).clamp(0.0, 1.0);
+    b * (1.0 - hh) + a * hh - k * hh * (1.0 - hh)
+}
+#[inline]
+fn smax(a: f64, b: f64, k: f64) -> f64 { -smin(-a, -b, k) }
+
+/// Separable approximate-Gaussian blur (3 box-blur passes per axis) over a dense `w*h*d` field,
+/// box radius derived from `sigma`. This is Rock's cohesion step — it low-passes the noisy
+/// ellipsoid+fBm density into large coherent forms before thresholding (§2 of the rock design:
+/// without this step the result is granular pepper, not a mass).
+fn box_blur3_separable(field: &mut [f32], w: usize, h: usize, d: usize, sigma: f64) {
+    if sigma <= 0.0 { return; }
+    let r = (sigma.round() as i32).max(1);
+    for _ in 0..3 {
+        box_blur_axis(field, w, h, d, r, 0);
+        box_blur_axis(field, w, h, d, r, 1);
+        box_blur_axis(field, w, h, d, r, 2);
+    }
+}
+
+fn box_blur_axis(field: &mut [f32], w: usize, h: usize, d: usize, r: i32, axis: u8) {
+    let idx = |ix: usize, iy: usize, iz: usize| iz * w * h + iy * w + ix;
+    match axis {
+        0 => {
+            let mut line = vec![0f32; w];
+            for iz in 0..d { for iy in 0..h {
+                for ix in 0..w { line[ix] = field[idx(ix, iy, iz)]; }
+                box_blur_1d(&mut line, r);
+                for ix in 0..w { field[idx(ix, iy, iz)] = line[ix]; }
+            }}
+        }
+        1 => {
+            let mut line = vec![0f32; h];
+            for iz in 0..d { for ix in 0..w {
+                for iy in 0..h { line[iy] = field[idx(ix, iy, iz)]; }
+                box_blur_1d(&mut line, r);
+                for iy in 0..h { field[idx(ix, iy, iz)] = line[iy]; }
+            }}
+        }
+        _ => {
+            let mut line = vec![0f32; d];
+            for iy in 0..h { for ix in 0..w {
+                for iz in 0..d { line[iz] = field[idx(ix, iy, iz)]; }
+                box_blur_1d(&mut line, r);
+                for iz in 0..d { field[idx(ix, iy, iz)] = line[iz]; }
+            }}
+        }
+    }
+}
+
+/// 1D box blur via prefix sums, clamped at the edges (no wraparound).
+fn box_blur_1d(line: &mut [f32], r: i32) {
+    let n = line.len();
+    if n == 0 { return; }
+    let mut prefix = vec![0f64; n + 1];
+    for i in 0..n { prefix[i + 1] = prefix[i] + line[i] as f64; }
+    for i in 0..n {
+        let lo = (i as i32 - r).max(0) as usize;
+        let hi = (i as i32 + r).min(n as i32 - 1) as usize;
+        let sum = prefix[hi + 1] - prefix[lo];
+        line[i] = (sum / (hi - lo + 1) as f64) as f32;
+    }
+}
+
+/// Classify a new top block by local steepness (max height diff to an 8-neighbour): flat →
+/// grass, moderate → dirt, steep → stone. Shared by the `"stamp"` sculpt mode and Carve's
+/// post-cut floor re-cap.
+#[inline]
+fn classify_by_slope(slope: i32) -> u8 {
+    if slope >= 3 { 2 } else if slope == 2 { 3 } else { 8 }
+}
+
+/// Re-texture a column's current surface block per `classify_by_slope`, reading fresh
+/// (post-edit) heights for the column and its 8-neighbourhood. Used by Carve to re-cap an
+/// exposed floor so a cut gully doesn't show raw stone under a grass landscape.
+fn retexture_top(world: &mut LoadedWorld, wx: i32, wy: i32, cap: Option<i32>) {
+    let Some(z) = surface_z_capped(world, wx, wy, cap) else { return };
+    if read_block_abs(world, wx, wy, z) == 1 { return; } // never re-skin Bedrock
+    let mut slope = 0;
+    for ((dx, dy), _) in SCULPT_KERNEL {
+        if let Some(nz) = surface_z_capped(world, wx + dx, wy + dy, cap) {
+            slope = slope.max((nz - z).abs());
+        }
+    }
+    set_block_abs(world, wx, wy, z, classify_by_slope(slope), 0);
+}
+
+/// Volumetric Rock/Carve stamp — terrain and the rock mass are two signed-distance fields
+/// combined with a smooth-min/-max fillet (`k`), so the mass fuses into the landscape instead of
+/// sitting on top of it as a seamed object. Rock is a pure union (air → fill only, never
+/// deletes); Carve is its inverse, cutting only sky-connected material so it can never open a
+/// floating roof or a sealed cave. See the design doc for the full derivation.
+#[allow(clippy::too_many_arguments)]
+fn field_stamp(
+    world: &mut LoadedWorld,
+    cx: i32, cy: i32, radius: i32,
+    p: &RockParams,
+    seed: u64,
+    cap: Option<i32>,
+    clip: Option<[i32; 4]>,
+    fill_bt: Option<u8>,
+    fill_paint: Option<u8>,
+    carve: bool,
+) {
+    let max_z = world_max_z(world);
+    let cz = surface_z_capped(world, cx, cy, cap).unwrap_or(1);
+
+    let r_xy = (radius.max(1)) as f64;
+    let flatten = p.flatten.clamp(0.1, 1.5);
+    let r_z = ((r_xy * flatten).round() as i32).max(1);
+    let r_zf = r_z as f64;
+    let r_min = r_xy.min(r_zf);
+    let sink = p.sink.clamp(0.0, 1.0);
+    let drape = p.drape.clamp(0.0, 1.0);
+    let strata = p.strata.clamp(0.0, 2.0);
+
+    let sigma = p.smoothing.clamp(0.0, 5.0);
+    let meld_k = p.meld.clamp(0.0, 3.0);
+    // Fillet radius in blocks — the smin/smax blend width (§6 of the design doc).
+    let k = (meld_k * 0.3 * r_min).clamp(1.0, 14.0);
+    let blur_pad = sigma.ceil() as i32 + 1;
+    let pad = blur_pad.max(k.ceil() as i32) + 1;
+
+    // XY bbox depends only on cx/cy/radius/pad — never on any live-sampled height — so it (and
+    // therefore the ring sampled just outside it, below) is already call-invariant.
+    let x0 = cx - radius - pad;
+    let x1 = cx + radius + pad;
+    let y0 = cy - radius - pad;
+    let y1 = cy + radius + pad;
+
+    // Step 1 — estimate the terrain heightmap (and its slope-normalised gradient) once, sampled
+    // strictly from *outside* this stamp's own writable bbox and bilinearly interpolated inward.
+    //
+    // Every quantity the field derives from "the terrain" — the rock's own drape frame
+    // (`col_anchor`/`taper`), the Z bbox sizing below, *and* the terrain SDF it's fused against
+    // (`sd_terr`/grad) — reads this estimate, never a live in-bbox (or live-at-the-exact-centre)
+    // scan. That's the load-bearing invariant for idempotency: on a repeated identical stamp (same
+    // cx/cy/radius/params), a live scan already reflects the previous application's own output, and
+    // *every one* of the couplings below was verified as a real, measured runaway-growth bug during
+    // implementation — not just the single-point ellipsoid anchor, but the terrain-normal gradient
+    // reacting to the stamp's own newly-steep edge (each application manufactured a sharper
+    // synthetic "cliff" at its own silhouette for the next application to fuse against — the larger,
+    // non-converging coupling) and the Z-range itself (a taller `cz` after run 1 shifts the *window
+    // of voxels evaluated at all* upward, so run 2 can solidify z-slices run 1 never even
+    // considered). Sampling only the ring just outside the XY bbox — a set of points this stamp can
+    // never itself have written to, since the bbox is a deterministic function of
+    // cx/cy/radius/params — makes the whole field (and its Z extent) invariant across repeats. The
+    // cost is losing pixel-exact fidelity to real cliffs *directly under* the stamp in favour of a
+    // smooth local-slope estimate; every other design goal (draping over hills, fusing without a
+    // seam, no floating mass) is unaffected.
+    let raw_left: Vec<Option<i32>> = (y0..=y1).map(|wy| surface_z_capped(world, x0 - 1, wy, cap)).collect();
+    let raw_right: Vec<Option<i32>> = (y0..=y1).map(|wy| surface_z_capped(world, x1 + 1, wy, cap)).collect();
+    let raw_top: Vec<Option<i32>> = (x0..=x1).map(|wx| surface_z_capped(world, wx, y0 - 1, cap)).collect();
+    let raw_bot: Vec<Option<i32>> = (x0..=x1).map(|wx| surface_z_capped(world, wx, y1 + 1, cap)).collect();
+    // Fallback for an unloaded ring point (near a world/chunk boundary) must itself be
+    // call-invariant — the mean of whatever *other* ring points *were* loaded (or a fixed
+    // constant if none were), never the live (self-referential) `cz`.
+    let ring_mean = {
+        let (mut sum, mut n) = (0i64, 0i64);
+        for v in raw_left.iter().chain(&raw_right).chain(&raw_top).chain(&raw_bot).flatten() {
+            sum += *v as i64; n += 1;
+        }
+        if n > 0 { (sum / n) as i32 } else { 1 }
+    };
+    let w = (x1 - x0 + 1) as usize;
+    let h = (y1 - y0 + 1) as usize;
+    let h_left: Vec<f32> = raw_left.iter().map(|v| v.unwrap_or(ring_mean) as f32).collect();
+    let h_right: Vec<f32> = raw_right.iter().map(|v| v.unwrap_or(ring_mean) as f32).collect();
+    let h_top: Vec<f32> = raw_top.iter().map(|v| v.unwrap_or(ring_mean) as f32).collect();
+    let h_bot: Vec<f32> = raw_bot.iter().map(|v| v.unwrap_or(ring_mean) as f32).collect();
+    let stable_h = |ix: usize, iy: usize| -> f64 {
+        let tx = if w > 1 { ix as f64 / (w - 1) as f64 } else { 0.5 };
+        let ty = if h > 1 { iy as f64 / (h - 1) as f64 } else { 0.5 };
+        let h_horiz = h_left[iy] as f64 * (1.0 - tx) + h_right[iy] as f64 * tx;
+        let h_vert = h_top[ix] as f64 * (1.0 - ty) + h_bot[ix] as f64 * ty;
+        (h_horiz + h_vert) * 0.5
+    };
+    let stable_h_c = |ix: i32, iy: i32| -> f64 {
+        stable_h(ix.clamp(0, w as i32 - 1) as usize, iy.clamp(0, h as i32 - 1) as usize)
+    };
+    let h_anchor = stable_h((cx - x0) as usize, (cy - y0) as usize);
+
+    // Z bbox, sized from the stable anchor (not live `cz`) so it too is call-invariant.
+    let blob_cz_est = h_anchor + r_zf * (1.0 - sink);
+    let mut z0 = ((blob_cz_est - r_zf - pad as f64).floor() as i32).max(1);
+    let z1 = ((blob_cz_est + r_zf + pad as f64).ceil() as i32).min(max_z);
+    if carve { z0 = z0.max(2); } // never touch bedrock (z<=1)
+    if z1 < z0 || x1 < x0 || y1 < y0 { return; }
+    let d = (z1 - z0 + 1) as usize;
+    let idx = |ix: usize, iy: usize, iz: usize| iz * w * h + iy * w + ix;
+
+    // Slope-normalised gradient magnitude of `stable_h`, via central differences.
+    let mut grad = vec![0f32; w * h];
+    for iy in 0..h {
+        for ix in 0..w {
+            let hx = (stable_h_c(ix as i32 + 1, iy as i32) - stable_h_c(ix as i32 - 1, iy as i32)) * 0.5;
+            let hy = (stable_h_c(ix as i32, iy as i32 + 1) - stable_h_c(ix as i32, iy as i32 - 1)) * 0.5;
+            grad[iy * w + ix] = (1.0 + hx * hx + hy * hy).sqrt() as f32;
+        }
+    }
+    let noise_radius = p.noise_radius.clamp(1.0, 128.0);
+    let noisiness = p.noisiness.clamp(0.0, 2.0);
+    // Deterministic per-position seed offset so a stamp at a given place is reproducible but
+    // neighbouring stamps in a drag (different cx,cy) differ.
+    let seed_off = (hash3(cx, cy, 0, (seed & 0xFFFF_FFFF) as u32) % 100_000) as f64 * 0.001;
+    let warp_freq = 0.15;
+    let f_strata = 0.09; // low-frequency Z-only bedding period, ~11 blocks
+
+    // Per-stamp anisotropy: a random XY elongation ratio (0.7..1.4) and yaw, so the plan-view
+    // footprint isn't a perfect circle regardless of noise amount (fixes cause #5's residual).
+    let yaw = (hash3(cx, cy, 3, (seed & 0xFFFF_FFFF) as u32) % 62832) as f64 * 0.0001;
+    let ratio = 0.7 + (hash3(cx, cy, 4, (seed & 0xFFFF_FFFF) as u32) % 1000) as f64 * 0.0007;
+    let (cyaw, syaw) = (yaw.cos(), yaw.sin());
+
+    // Step 4/5 — fill a buffer with the noise displacement alone, then blur *only* that buffer.
+    // Cohering granular noise into lumps must not smooth away the ellipsoid's analytic shape
+    // terms or the terrain surface itself (cause #5).
+    let mut noise_buf = vec![0f32; w * h * d];
+    for iz in 0..d {
+        let wz = z0 + iz as i32;
+        for iy in 0..h {
+            let wy = y0 + iy as i32;
+            for ix in 0..w {
+                let wx = x0 + ix as i32;
+                let wf = warp_freq;
+                let warp_x = wx as f64 + fbm3(wx as f64 * wf + seed_off, wy as f64 * wf, wz as f64 * wf, 2) * r_xy * 0.3;
+                let warp_y = wy as f64 + fbm3(wy as f64 * wf + seed_off, wz as f64 * wf, wx as f64 * wf, 2) * r_xy * 0.3;
+                let warp_z = wz as f64 + fbm3(wz as f64 * wf + seed_off, wx as f64 * wf, wy as f64 * wf, 2) * r_zf * 0.3;
+                let noise = fbm3(warp_x / noise_radius + seed_off, warp_y / noise_radius, warp_z / noise_radius, 3);
+                noise_buf[idx(ix, iy, iz)] = (noisiness * r_min * 0.35 * noise) as f32;
+            }
+        }
+    }
+    box_blur3_separable(&mut noise_buf, w, h, d, sigma);
+
+    // Step 3/6 — build the combined signed-distance field: rock ellipsoid (terrain-relative
+    // `drape`d frame, blocks-scaled SDF, blurred noise + strata detail) smooth-min/-maxed against
+    // the terrain SDF. `sd < 0` means solid, for both fields and the combination, uniformly.
+    let mut field = vec![0f32; w * h * d];
+    for iz in 0..d {
+        let wz = z0 + iz as i32;
+        for iy in 0..h {
+            let wy = y0 + iy as i32;
+            for ix in 0..w {
+                let wx = x0 + ix as i32;
+                let hxy_stable = stable_h(ix, iy);
+
+                // Terrain-relative vertical frame: near/below the surface the rock's own frame is
+                // locked to local terrain height (base drapes over the slope, from the stable
+                // outside-bbox estimate — see `stable_h` above); well above it, the frame is
+                // world-vertical so the emergent top keeps a free-standing form.
+                let taper = 1.0 - smoothstep01((wz as f64 - hxy_stable) / (1.5 * r_zf));
+                let col_anchor = h_anchor + (hxy_stable - h_anchor) * drape * taper;
+                let blob_cz_col = col_anchor + r_zf * (1.0 - sink);
+
+                let dx0 = (wx - cx) as f64 / r_xy;
+                let dy0 = (wy - cy) as f64 / r_xy;
+                let dz = (wz as f64 - blob_cz_col) / r_zf;
+
+                // Anisotropy + yaw, applied to the horizontal plane only.
+                let rx = dx0 * cyaw + dy0 * syaw;
+                let ry = -dx0 * syaw + dy0 * cyaw;
+                let dx = rx * ratio;
+                let dy = ry / ratio;
+
+                let q = (dx * dx + dy * dy + dz * dz).sqrt();
+                let mut sd_rock = (q - 1.0) * r_min;
+                sd_rock -= noise_buf[idx(ix, iy, iz)] as f64;
+                if strata > 0.0 {
+                    let strata_n = ridged2(wz as f64 * f_strata + seed_off, seed_off * 0.5, 2);
+                    sd_rock -= strata * r_min * 0.15 * strata_n;
+                }
+
+                let g = (grad[iy * w + ix] as f64).max(0.05);
+                let sd_terr = (wz as f64 - hxy_stable) / g;
+
+                field[idx(ix, iy, iz)] = (if carve { smax(sd_terr, -sd_rock, k) } else { smin(sd_rock, sd_terr, k) }) as f32;
+            }
+        }
+    }
+
+    if !carve {
+        // Step 7 (Rock) — pure union: air cells inside the combined field become the fill block.
+        let bt = fill_bt.unwrap_or(2); // stone
+        let pnt = fill_paint.unwrap_or(0);
+        let mut new_cells: HashSet<(i32, i32, i32)> = HashSet::new();
+        for iz in 0..d {
+            let wz = z0 + iz as i32;
+            for iy in 0..h {
+                let wy = y0 + iy as i32;
+                if let Some([_, cy1, _, cy2]) = clip { if wy < cy1 || wy > cy2 { continue; } }
+                for ix in 0..w {
+                    let wx = x0 + ix as i32;
+                    if let Some([cx1, _, cx2, _]) = clip { if wx < cx1 || wx > cx2 { continue; } }
+                    if field[idx(ix, iy, iz)] < 0.0 && read_block_abs(world, wx, wy, wz) == 0 {
+                        set_block_abs(world, wx, wy, wz, bt, pnt);
+                        new_cells.insert((wx, wy, wz));
+                    }
+                }
+            }
+        }
+
+        // Step 8 — floater guard: BFS the newly-added cells from anything 6-adjacent to
+        // pre-existing solid; drop any component the BFS never reaches. Bbox-sized and cheap —
+        // turns "no floating blobs" from a hope into a guarantee.
+        if !new_cells.is_empty() {
+            const ADJ6: [(i32, i32, i32); 6] = [(-1,0,0),(1,0,0),(0,-1,0),(0,1,0),(0,0,-1),(0,0,1)];
+            let mut keep: HashSet<(i32, i32, i32)> = HashSet::new();
+            let mut queue: VecDeque<(i32, i32, i32)> = VecDeque::new();
+            for &(x, y, z) in &new_cells {
+                let touches_old = ADJ6.iter().any(|(dx, dy, dz)| {
+                    let n = (x + dx, y + dy, z + dz);
+                    !new_cells.contains(&n) && read_block_abs(world, n.0, n.1, n.2) != 0
+                });
+                if touches_old && keep.insert((x, y, z)) { queue.push_back((x, y, z)); }
+            }
+            while let Some((x, y, z)) = queue.pop_front() {
+                for (dx, dy, dz) in ADJ6 {
+                    let n = (x + dx, y + dy, z + dz);
+                    if new_cells.contains(&n) && keep.insert(n) { queue.push_back(n); }
+                }
+            }
+            for &c in &new_cells {
+                if !keep.contains(&c) { set_block_abs(world, c.0, c.1, c.2, 0, 0); }
+            }
+        }
+        return;
+    }
+
+    // Step 7 (Carve) — one z-descending pass per column so sky-connectivity is a single boolean:
+    // only delete solid cells reachable from open sky (or from another just-deleted cell) without
+    // crossing a surviving solid block first. Guarantees no floating roofs and no sealed caves.
+    let mut touched: Vec<(i32, i32)> = Vec::new();
+    for iy in 0..h {
+        let wy = y0 + iy as i32;
+        if let Some([_, cy1, _, cy2]) = clip { if wy < cy1 || wy > cy2 { continue; } }
+        for ix in 0..w {
+            let wx = x0 + ix as i32;
+            if let Some([cx1, _, cx2, _]) = clip { if wx < cx1 || wx > cx2 { continue; } }
+            // Real (live) surface height, not the stable/smoothed estimate — sky-connectivity
+            // gating is about the actual current world, and unlike the field above this doesn't
+            // feed back into the field's own shape, so it carries no idempotency risk.
+            let hxy_live = surface_z_capped(world, wx, wy, cap).unwrap_or(cz);
+            let mut open = false;
+            let mut col_touched = false;
+            for iz in (0..d).rev() {
+                let wz = z0 + iz as i32;
+                if wz < 2 { break; } // never touch bedrock (z<=1)
+                if wz >= hxy_live { open = true; }
+                let bt_before = read_block_abs(world, wx, wy, wz);
+                if bt_before == 1 { open = false; continue; } // never delete Bedrock
+                let solid_before = bt_before != 0;
+                if field[idx(ix, iy, iz)] >= 0.0 && solid_before && open {
+                    set_block_abs(world, wx, wy, wz, 0, 0);
+                    col_touched = true;
+                } else if solid_before {
+                    open = false;
+                }
+            }
+            if col_touched { touched.push((wx, wy)); }
+        }
+    }
+
+    // Re-cap the exposed floor so a carved gully doesn't show raw stone under a grass landscape.
+    for (wx, wy) in touched {
+        retexture_top(world, wx, wy, cap);
+    }
+}
+
+/// Test-only entry point for the Rock sculpt mode — `field_stamp(.., carve = false)`. Production
+/// code (the `"rock"`/`"carve"` match arms) calls `field_stamp` directly.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn rock_stamp(
+    world: &mut LoadedWorld,
+    cx: i32, cy: i32, radius: i32,
+    p: &RockParams,
+    seed: u64,
+    cap: Option<i32>,
+    clip: Option<[i32; 4]>,
+    fill_bt: Option<u8>,
+    fill_paint: Option<u8>,
+) {
+    field_stamp(world, cx, cy, radius, p, seed, cap, clip, fill_bt, fill_paint, false);
+}
+
 /// Sculpt terrain at brush positions.
 /// mode: "smooth" | "noise" | "flatten" | "erode" | "thermal" | "raise" | "lower"
 ///      | "grab" (drag-controlled displacement, `grab_delta`)
@@ -5366,6 +6027,11 @@ struct SculptPoint { x: i32, y: i32 }
 ///        for the same reason Flatten is: it converges in one shot from its anchor)
 ///      | "smear" (lateral height advection: pulls each column's height from `smear_dx/smear_dy`
 ///        blocks behind the drag direction, so terrain drags along with the brush)
+///      | "rock" (volumetric SDF mass fused into terrain via a smooth-min fillet — bypasses the
+///        heightmap `blend`/`round_dither` path entirely, see `field_stamp`; params in
+///        `rock: Option<RockParams>`) | "carve" (rock's inverse: cuts sky-connected material only,
+///        via smooth-max against the terrain SDF, never opening a floating roof or sealed cave;
+///        shares `RockParams`/`field_stamp`)
 ///
 /// `softness` (0..1) applies a radial falloff. By default it derives from a distance field over
 /// the swept footprint (BFS silhouette dome): 0 = hard flat edges (legacy behaviour), 1 = a full
@@ -5387,17 +6053,21 @@ struct SculptPoint { x: i32, y: i32 }
 /// stroke so they undo/redo as a single unit (see `with_edit_grouped`).
 ///
 /// Round a precise float height to the integer committed to the world. Soft brushes (`softness > 0`)
-/// dither the fractional part against the BAYER8 ordered-dither threshold (the same table
-/// `gradient_fill` uses) indexed by the column's world `(x, y)`, so a falloff isn't quantized into
-/// concentric terraces; hard brushes round exactly (audit's explicit risk note). Shared by the
-/// live-stroke float-workspace commit and the legacy per-call blend.
+/// dither the fractional part against a spatially-coherent threshold (a low-frequency `fbm2` field
+/// over world `(x, y)`) rather than the old 8×8 Bayer tile: neighbouring columns share nearly the
+/// same threshold, so a falloff's fractional band commits as contiguous wavy contour bands instead
+/// of either concentric terrace rings (per-column exact rounding) or an 8×8 checkerboard of pepper
+/// (the old fixed ordered-dither tile, which also reinforced the same pattern on every stamp of a
+/// stroke since the threshold never varied per column). Hard brushes round exactly (audit's explicit
+/// risk note) — `softness <= 0` is untouched so `frac == 0` never rounds up and determinism holds.
+/// Shared by the live-stroke float-workspace commit and the legacy per-call blend.
 fn round_dither(raw: f64, softness: f64, x: i32, y: i32) -> i32 {
     if softness <= 0.0 {
         raw.round() as i32
     } else {
         let base = raw.floor();
         let frac = raw - base;
-        let dith = (BAYER8[x.rem_euclid(8) as usize][y.rem_euclid(8) as usize] as f64 + 0.5) / 64.0;
+        let dith = (0.5 - 0.45 * fbm2(x as f64 * 0.28, y as f64 * 0.28, 2)).clamp(0.05, 0.95);
         if frac >= dith { (base + 1.0) as i32 } else { base as i32 }
     }
 }
@@ -5430,6 +6100,7 @@ fn sculpt_terrain(
     stamp_centers: Option<Vec<[i32; 2]>>,
     clip_rect: Option<[i32; 4]>,
     strength_f: Option<f64>,
+    rock: Option<RockParams>,
     state: tauri::State<'_, AppState>,
 ) -> Result<EditResult, String> {
     let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
@@ -5449,7 +6120,7 @@ fn sculpt_terrain(
                 &mut ws, None, mode.clone(), strength, seed, block_type, paint, freq,
                 noise_mode.clone(), softness, profile.clone(), grab_delta, anchor_x, anchor_y,
                 Some(c[0]), Some(c[1]), Some(r), use_cap, group_id, slope_dx, slope_dy, smear_dx,
-                smear_dy, clip_rect, strength_f,
+                smear_dy, clip_rect, strength_f, rock.clone(),
             )?;
             ux1 = ux1.min(c[0] - r); uy1 = uy1.min(c[1] - r);
             ux2 = ux2.max(c[0] + r); uy2 = uy2.max(c[1] + r);
@@ -5465,7 +6136,7 @@ fn sculpt_terrain(
     sculpt_terrain_inner(
         &mut ws, points, mode, strength, seed, block_type, paint, freq, noise_mode, softness,
         profile, grab_delta, anchor_x, anchor_y, stamp_cx, stamp_cy, stamp_radius, use_cap, group_id,
-        slope_dx, slope_dy, smear_dx, smear_dy, clip_rect, strength_f,
+        slope_dx, slope_dy, smear_dx, smear_dy, clip_rect, strength_f, rock,
     )
 }
 
@@ -5500,6 +6171,7 @@ fn sculpt_terrain_inner(
     // handled one level up in the `sculpt_terrain` command (sequential same-group stamps).
     clip_rect: Option<[i32; 4]>,
     strength_f: Option<f64>,
+    rock: Option<RockParams>,
 ) -> Result<EditResult, String> {
     let strength = strength.clamp(1, 8);
     // Fractional strength for additive modes when supplied, else the integer slider value.
@@ -5974,8 +6646,7 @@ fn sculpt_terrain_inner(
                     let slope = SCULPT_KERNEL.iter()
                         .filter_map(|((dx,dy),_)| height_map.get(&(p.x+dx, p.y+dy)).map(|v| (v.0 - cur_z).abs()))
                         .max().unwrap_or(0);
-                    let new_bt: u8 = if slope >= 3 { 2 } else if slope == 2 { 3 } else { 8 };
-                    set_block_abs(world, p.x, p.y, cur_z, new_bt, 0);
+                    set_block_abs(world, p.x, p.y, cur_z, classify_by_slope(slope), 0);
                 }
             }
             "terrace" => {
@@ -6050,6 +6721,21 @@ fn sculpt_terrain_inner(
                     sculpt_column(world, p.x, p.y, cur_z, target, max_z, surf_bt, surf_paint, block_type, paint);
                 }
             }
+            "rock" | "carve" => {
+                // Volumetric: bypasses points/height_map/weight/blend entirely — a 3D density
+                // field stamped once around the dial centre (or the footprint's bbox centre when
+                // no dial was supplied). Never touches the float workspace.
+                let (rcx, rcy, rr) = match dial {
+                    Some((dcx, dcy, dr)) => (dcx, dcy, dr.max(1)),
+                    None => (
+                        (x_min + x_max) / 2,
+                        (y_min + y_max) / 2,
+                        ((x_max - x_min).max(y_max - y_min) / 2).max(1),
+                    ),
+                };
+                let rp = rock.clone().unwrap_or_default();
+                field_stamp(world, rcx, rcy, rr, &rp, seed, cap, clip_rect, block_type, paint, mode == "carve");
+            }
             _ => {}
         }
         Ok(())
@@ -6057,8 +6743,10 @@ fn sculpt_terrain_inner(
     // Persist the float workspace only for a real (grouped) live stroke — a one-shot call (group
     // `None`: shape fills, Live-brush-OFF) has no successor stamp to accumulate into, so its session
     // is discarded and behaves exactly like the old per-call round. A foreign edit or undo/redo will
-    // reap a persisted session at one of the invalidation choke points (see `SculptSession`).
-    if group_id.is_some() {
+    // reap a persisted session at one of the invalidation choke points (see `SculptSession`). Rock
+    // and Carve never accumulate into `fheight` (their writes are a deterministic volumetric field,
+    // not a blend), so they skip persisting a session entirely rather than keeping a stale one alive.
+    if group_id.is_some() && !matches!(mode.as_str(), "rock" | "carve") {
         ws.sculpt_session = Some(session);
     }
     result
@@ -6394,12 +7082,14 @@ pub fn run() {
     tauri::Builder::default()
         .manage(Mutex::new(WorldState::new()))
         .manage(ExpandCancel::default())
+        .manage(MaterializeCancel::default())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             load_world,
             get_world_info,
             fetch_tile,
+            chunk_occupancy,
             set_view_cap,
             export_png,
             describe_selection,
@@ -6489,6 +7179,8 @@ pub fn run() {
             fetch_template_tile,
             expand_world_from_template,
             cancel_expand,
+            materialize_flat_chunks,
+            cancel_materialize,
             load_texture_pack,
             unload_texture_pack,
             get_block_tables,
@@ -8160,6 +8852,43 @@ mod tests {
         b
     }
 
+    /// Like `make_bumpy_world` but a `chunks_side × chunks_side` grid of standard (32 KB) chunks
+    /// at (0..chunks_side, 0..chunks_side), so world coords span `0..chunks_side*16` on each axis.
+    /// Rock/Carve field-fusion tests need this: their terrain estimate is sampled just *outside*
+    /// the stamp's own padded bbox (see `field_stamp`'s `stable_h`), which for anything but a tiny
+    /// radius runs past a single 16×16 chunk's bounds on the single-chunk fixture.
+    fn make_bumpy_world_grid<F: Fn(i32, i32) -> i32>(chunks_side: i32, surf_bt: u8, height: F) -> Vec<u8> {
+        const HEADER: usize = 4096;
+        const CHUNK: usize = 32768;
+        let n = (chunks_side * chunks_side) as usize;
+        let dir_off = HEADER + n * CHUNK;
+        let mut b = vec![0u8; dir_off + n * 16];
+        b[32..40].copy_from_slice(&(dir_off as u64).to_le_bytes());
+        b[40..49].copy_from_slice(b"GridTest\0");
+        let block = |base: usize, lx: usize, ly: usize, z: i32| -> usize {
+            base + (z / 16) as usize * 8192 + lx * 256 + ly * 16 + (z % 16) as usize
+        };
+        let mut i = 0usize;
+        for cy in 0..chunks_side {
+            for cx in 0..chunks_side {
+                let base = HEADER + i * CHUNK;
+                for lx in 0..16usize {
+                    for ly in 0..16usize {
+                        let (wx, wy) = (cx * 16 + lx as i32, cy * 16 + ly as i32);
+                        let h = height(wx, wy).clamp(1, 63);
+                        for z in 1..=h { b[block(base, lx, ly, z)] = surf_bt; }
+                    }
+                }
+                let e = dir_off + i * 16;
+                b[e     ..e +  4].copy_from_slice(&cx.to_le_bytes());
+                b[e +  4..e +  8].copy_from_slice(&cy.to_le_bytes());
+                b[e +  8..e + 16].copy_from_slice(&(base as u64).to_le_bytes());
+                i += 1;
+            }
+        }
+        b
+    }
+
     fn ws_with(bytes: Vec<u8>) -> WorldState {
         let mut ws = WorldState::new();
         ws.world = Some(parse_world_inner(mmap_from_bytes(bytes)).expect("parse"));
@@ -8200,7 +8929,7 @@ mod tests {
         sculpt_terrain_inner(
             ws, points, mode.into(), strength, 0, None, None, None, None,
             Some(softness), Some("smooth".into()), None, None, None, scx, scy, srad, None, group,
-            None, None, None, None, None, None,
+            None, None, None, None, None, None, None,
         ).expect("sculpt")
     }
 
@@ -8250,7 +8979,7 @@ mod tests {
         sculpt_terrain_inner(
             &mut ws, None, "raise".into(), 5, 0, None, None, None, None,
             Some(0.0), Some("smooth".into()), None, None, None, Some(8), Some(8), Some(4), None,
-            Some(9), None, None, None, None, Some([8, 0, 100, 100]), None,
+            Some(9), None, None, None, None, Some([8, 0, 100, 100]), None, None,
         ).expect("clipped raise");
         assert_eq!(surf(&ws, 9, 8) - 20, 5, "column inside the clip rect rises by strength");
         assert_eq!(surf(&ws, 8, 8) - 20, 5, "column on the clip edge (x==8) is inside and rises");
@@ -8876,7 +9605,7 @@ mod tests {
         sculpt_terrain_inner(
             &mut ws, Some(disc.clone()), "slope".into(), 1, 0, None, None, None, None,
             Some(0.0), Some("smooth".into()), None, Some(ax), Some(ay), None, None, None, None, None,
-            Some(1.0), Some(0.0), None, None, None, None,
+            Some(1.0), Some(0.0), None, None, None, None, None,
         ).expect("slope");
         assert_eq!(surf(&ws, ax, ay), 15, "anchor column sits on its own plane, unchanged");
         assert_eq!(surf(&ws, ax + 3, ay), 18, "3 blocks east at slope_dx=1 → anchor height + 3");
@@ -8898,7 +9627,7 @@ mod tests {
         sculpt_terrain_inner(
             &mut ws0, Some(disc.clone()), "smear".into(), 1, 0, None, None, None, None,
             Some(0.0), Some("smooth".into()), None, None, None, None, None, None, None, None,
-            None, None, Some(0), Some(0), None, None,
+            None, None, Some(0), Some(0), None, None, None,
         ).expect("smear no-op");
         assert_eq!(world_bytes(&ws0), before, "zero smear vector must not touch the world");
 
@@ -8908,7 +9637,7 @@ mod tests {
         sculpt_terrain_inner(
             &mut ws, Some(disc.clone()), "smear".into(), 1, 0, None, None, None, None,
             Some(0.0), Some("smooth".into()), None, None, None, None, None, None, None, None,
-            None, None, Some(-2), Some(0), None, None,
+            None, None, Some(-2), Some(0), None, None, None,
         ).expect("smear");
         // Column x=6 (low side) pulls from x=8 (high side, source = p.x - smear_dx = 6 - (-2) = 8)
         assert_eq!(surf(&ws, 6, 8), 20, "column at x=6 pulls its source height from x=8");
@@ -9403,4 +10132,460 @@ mod tests {
 
         assert!(diffs.is_empty(), "undo must restore byte-identical state; differences at {:?}", diffs);
     }
+
+    /// `materialize_flat_chunks_inner` must add exactly the requested new chunks (whether an
+    /// in-bounds hole or a coord beyond the source world's current bbox — the writer treats both
+    /// identically, per the plan), never touch the bytes of chunks the user already had, and leave
+    /// no partial output file behind when cancelled mid-write.
+    #[test]
+    fn test_materialize_flat_chunks_adds_only_missing_and_preserves_existing() {
+        let world = parse_world_inner(mmap_from_bytes(make_test_world())).expect("parse failed");
+        let chunk_size = world.chunk_size;
+        let header = world.bytes[..192.min(world.bytes.len())].to_vec();
+
+        let mut user_chunk_list: Vec<(i32, i32, usize)> = world.chunk_map.iter()
+            .map(|(&(cx, cy), &off)| (cx, cy, off))
+            .collect();
+        user_chunk_list.sort_unstable_by_key(|&(cx, cy, _)| (cx, cy));
+        let user_chunk_bytes: Vec<(i32, i32, Vec<u8>)> = user_chunk_list.into_iter()
+            .filter_map(|(cx, cy, _off)| {
+                let (off, cend) = world.chunk_range(cx, cy)?;
+                let mut data = world.bytes[off..cend].to_vec();
+                data.resize(chunk_size, 0);
+                Some((cx, cy, data))
+            })
+            .collect();
+        assert_eq!(user_chunk_bytes.len(), 1, "fixture has exactly one existing chunk, (0,0)");
+
+        let params = FlatChunkParams { chunk_size, stone_depth: 1, dirt_depth: 2, surface_z: 4 };
+        // (1, 0): an "in-bounds hole" relative to a hypothetical wider selection; (50, 50): well
+        // beyond the source world's single-chunk bbox. The writer doesn't distinguish the two.
+        let to_add = vec![(1i32, 0i32), (50i32, 50i32)];
+
+        let out_path = std::env::temp_dir()
+            .join(format!("vuencedit_materialize_test_{}.eden", std::process::id()));
+        let result = materialize_flat_chunks_inner(
+            out_path.to_str().unwrap(), chunk_size, &header, &user_chunk_bytes, &to_add, &params,
+            || false, |_, _| {},
+        ).expect("materialize must succeed");
+        assert_eq!(result.chunks_added, 2);
+        assert_eq!(result.total_chunks, 3);
+
+        let out_bytes = fs::read(&out_path).expect("read output file");
+        let reloaded = parse_world_inner(mmap_from_bytes(out_bytes)).expect("output must parse");
+        assert_eq!(reloaded.chunk_map.len(), 3, "directory must contain existing ∪ to_add");
+        for &(cx, cy) in &[(0i32, 0i32), (1, 0), (50, 50)] {
+            assert!(reloaded.chunk_map.contains_key(&(cx, cy)), "missing chunk {:?}", (cx, cy));
+        }
+
+        // Existing chunk (0,0) bytes must be byte-identical to the source — never overwritten.
+        let (orig_off, orig_end) = world.chunk_range(0, 0).unwrap();
+        let (new_off, new_end) = reloaded.chunk_range(0, 0).unwrap();
+        assert_eq!(&world.bytes[orig_off..orig_end], &reloaded.bytes[new_off..new_end],
+            "existing chunk (0,0) must be byte-identical, never overwritten by materialize");
+
+        // A freshly-materialized chunk must actually be a real, editable flat chunk, not empty air.
+        let (add_off, _) = reloaded.chunk_range(1, 0).unwrap();
+        assert_eq!(reloaded.bytes[add_off], 1, "materialized hole chunk (1,0) has real bedrock, not silently no-op'd");
+
+        let _ = fs::remove_file(&out_path);
+
+        // Cancellation mid-write must leave no partial file behind.
+        let cancel_path = std::env::temp_dir()
+            .join(format!("vuencedit_materialize_cancel_test_{}.eden", std::process::id()));
+        let mut calls = 0;
+        let cancel_result = materialize_flat_chunks_inner(
+            cancel_path.to_str().unwrap(), chunk_size, &header, &user_chunk_bytes, &to_add, &params,
+            || { calls += 1; calls >= 1 }, |_, _| {},
+        );
+        assert!(cancel_result.is_err(), "cancellation must return an error");
+        assert!(!cancel_path.exists(), "cancellation must not leave a partial output file");
+    }
+
+    // ── Rock sculpt mode ───────────────────────────────────────────────────────
+
+    /// One rock stamp on flat ground: every solid cell must have at least one face-neighbour
+    /// that is also solid (no single-block pepper — the direct anti-peppering assertion) and the
+    /// whole solid set must be one 6-connected component (a mass, not a scatter of blobs).
+    #[test]
+    fn test_rock_produces_connected_mass() {
+        let base = make_bumpy_world_grid(6, 8, |_, _| 20);
+        let mut ws = ws_with(base);
+        let mut w = ws.world.take().unwrap();
+        let params = RockParams::default();
+        rock_stamp(&mut w, 48, 48, 6, &params, 12345, None, None, None, None);
+        ws.world = Some(w);
+        let world = ws.world.as_ref().unwrap();
+
+        // Collect *added* solid cells written by the stamp within its bbox (pre-existing flat
+        // terrain up to z=20 is already one connected slab everywhere in this fixture, so it must
+        // be excluded or the assertions below would hold vacuously regardless of what Rock did).
+        let mut solid: HashSet<(i32, i32, i32)> = HashSet::new();
+        for wz in 21..=60 {
+            for wy in 38..=58 {
+                for wx in 38..=58 {
+                    if read_block_abs(world, wx, wy, wz) != 0 {
+                        solid.insert((wx, wy, wz));
+                    }
+                }
+            }
+        }
+        assert!(!solid.is_empty(), "rock must place at least some blocks");
+
+        for &(x, y, z) in &solid {
+            let has_neighbour = [(-1,0,0),(1,0,0),(0,-1,0),(0,1,0),(0,0,-1),(0,0,1)]
+                .iter()
+                .any(|(dx, dy, dz)| solid.contains(&(x + dx, y + dy, z + dz)));
+            assert!(has_neighbour, "solid cell {:?} has no face-neighbour — single-block pepper", (x, y, z));
+        }
+
+        // 6-connected flood fill from one solid cell must reach every solid cell.
+        let start = *solid.iter().next().unwrap();
+        let mut seen: HashSet<(i32, i32, i32)> = HashSet::new();
+        let mut queue = VecDeque::new();
+        queue.push_back(start);
+        seen.insert(start);
+        while let Some((x, y, z)) = queue.pop_front() {
+            for (dx, dy, dz) in [(-1,0,0),(1,0,0),(0,-1,0),(0,1,0),(0,0,-1),(0,0,1)] {
+                let n = (x + dx, y + dy, z + dz);
+                if solid.contains(&n) && seen.insert(n) {
+                    queue.push_back(n);
+                }
+            }
+        }
+        assert_eq!(seen.len(), solid.len(), "rock mass must be a single 6-connected component");
+    }
+
+    /// Stamping twice at the same centre/seed on the same ground is a no-op the second time
+    /// (union-only write of a deterministic field) — the world's bytes must be identical.
+    #[test]
+    fn test_rock_is_idempotent() {
+        let base = make_bumpy_world_grid(6, 8, |_, _| 20);
+        let mut ws = ws_with(base);
+        let mut w = ws.world.take().unwrap();
+        let params = RockParams::default();
+        rock_stamp(&mut w, 48, 48, 6, &params, 999, None, None, None, None);
+        let once = w.bytes.to_vec();
+        rock_stamp(&mut w, 48, 48, 6, &params, 999, None, None, None, None);
+        let twice = w.bytes.to_vec();
+        assert_eq!(once, twice, "re-stamping the same rock in place must be a no-op");
+    }
+
+    /// Same seed → identical output; a different seed must change the result (the noise actually
+    /// participates in the field).
+    #[test]
+    fn test_rock_deterministic_by_seed() {
+        let base = make_bumpy_world_grid(6, 8, |_, _| 20);
+        let params = RockParams::default();
+
+        let mut ws1 = ws_with(base.clone());
+        let mut w1 = ws1.world.take().unwrap();
+        rock_stamp(&mut w1, 48, 48, 6, &params, 42, None, None, None, None);
+
+        let mut ws2 = ws_with(base.clone());
+        let mut w2 = ws2.world.take().unwrap();
+        rock_stamp(&mut w2, 48, 48, 6, &params, 42, None, None, None, None);
+        assert_eq!(w1.bytes.to_vec(), w2.bytes.to_vec(), "same seed must give identical output");
+
+        let mut ws3 = ws_with(base);
+        let mut w3 = ws3.world.take().unwrap();
+        rock_stamp(&mut w3, 48, 48, 6, &params, 43, None, None, None, None);
+        assert_ne!(w1.bytes.to_vec(), w3.bytes.to_vec(), "a different seed must change the result");
+    }
+
+    /// Rock only ever turns air into solid — no existing block is ever deleted or changed.
+    #[test]
+    fn test_rock_never_deletes() {
+        let base = make_bumpy_world_grid(6, 8, |_, _| 20);
+        let mut ws = ws_with(base);
+        let mut w = ws.world.take().unwrap();
+        // Snapshot every pre-existing solid column's blocks before the stamp.
+        let mut before: Vec<(i32, i32, i32, u8)> = Vec::new();
+        for wy in 44..=52 { for wx in 44..=52 { for wz in 1..=32 {
+            let bt = read_block_abs(&w, wx, wy, wz);
+            if bt != 0 { before.push((wx, wy, wz, bt)); }
+        }}}
+        let params = RockParams::default();
+        rock_stamp(&mut w, 48, 48, 6, &params, 7, None, None, None, None);
+        for (wx, wy, wz, bt) in before {
+            assert_eq!(read_block_abs(&w, wx, wy, wz), bt,
+                "pre-existing block at ({wx},{wy},{wz}) must survive a rock stamp unchanged");
+        }
+    }
+
+    /// No write ever lands outside the stamp's own bbox (centre ± radius, generously padded for
+    /// blur/anisotropy).
+    #[test]
+    fn test_rock_stays_in_bbox() {
+        let base = make_bumpy_world_grid(6, 8, |_, _| 20);
+        let mut ws = ws_with(base);
+        let mut w = ws.world.take().unwrap();
+        let params = RockParams::default();
+        let (cx, cy, r) = (48, 48, 5);
+        rock_stamp(&mut w, cx, cy, r, &params, 55, None, None, None, None);
+        // Generous margin: flatten <= 1.5, sink <= 1.0, blur pad <= 6.
+        let margin = r + 12;
+        for wy in 8..=88 { for wx in 8..=88 {
+            if wx >= cx - margin && wx <= cx + margin && wy >= cy - margin && wy <= cy + margin { continue; }
+            for wz in 21..=63 {
+                assert_eq!(read_block_abs(&w, wx, wy, wz), 0,
+                    "rock must not write outside its padded bbox at ({wx},{wy},{wz})");
+            }
+        }}
+    }
+
+    /// Larger radius → more solid volume, monotonically.
+    #[test]
+    fn test_rock_scales_with_radius() {
+        let base = make_bumpy_world_grid(6, 8, |_, _| 20);
+        let params = RockParams::default();
+        let volume_for = |r: i32| -> usize {
+            let mut ws = ws_with(base.clone());
+            let mut w = ws.world.take().unwrap();
+            rock_stamp(&mut w, 48, 48, r, &params, 1, None, None, None, None);
+            let mut count = 0;
+            for wy in 8..=88 { for wx in 8..=88 { for wz in 21..=63 {
+                if read_block_abs(&w, wx, wy, wz) != 0 { count += 1; }
+            }}}
+            count
+        };
+        let v4 = volume_for(4);
+        let v8 = volume_for(8);
+        let v16 = volume_for(16);
+        assert!(v8 > v4, "radius 8 must place more blocks than radius 4 (v4={v4}, v8={v8})");
+        assert!(v16 > v8, "radius 16 must place more blocks than radius 8 (v8={v8}, v16={v16})");
+    }
+
+    /// Flat world, one stamp: within the stamp's own footprint, no column may have a solid
+    /// (new) cell above an air cell that itself sits above another solid cell — i.e. no detached
+    /// slab floating over a gap. Directly falsifies the "floating sphere / mushroom" defect: the
+    /// terrain-fused SDF must not leave a column's added mass disconnected from its own base.
+    #[test]
+    fn test_rock_no_air_gap_under_mass() {
+        let base = make_bumpy_world_grid(6, 8, |_, _| 20);
+        let mut ws = ws_with(base);
+        let mut w = ws.world.take().unwrap();
+        let params = RockParams::default();
+        let (cx, cy, r) = (48, 48, 6);
+        field_stamp(&mut w, cx, cy, r, &params, 12345, None, None, None, None, false);
+        ws.world = Some(w);
+        let world = ws.world.as_ref().unwrap();
+
+        // Restrict to the stamp's core footprint, circular, well inside the radius (excludes the
+        // thin rim sliver where a single isolated noise lobe touching only at one z is a
+        // legitimate, not-a-bug, silhouette feature rather than a "mushroom").
+        let margin = r / 2;
+        for wy in (cy - margin)..=(cy + margin) {
+            for wx in (cx - margin)..=(cx + margin) {
+                if (wx - cx).pow(2) + (wy - cy).pow(2) > margin * margin { continue; }
+                let mut seen_air_above_surface = false;
+                for wz in 21..=40 {
+                    let solid = read_block_abs(world, wx, wy, wz) != 0;
+                    if !solid {
+                        seen_air_above_surface = true;
+                    } else if seen_air_above_surface {
+                        panic!("column ({wx},{wy}) has solid block at z={wz} floating over an air gap");
+                    }
+                }
+            }
+        }
+    }
+
+    /// 45°-slope world: a stamp mid-slope must place blocks on both the uphill and downhill
+    /// side, and the mass's base (lowest new block per column) must track local terrain height
+    /// — uphill columns keep a higher base than downhill columns — rather than one flat anchor
+    /// height swallowing the uphill side or floating the downhill side.
+    #[test]
+    fn test_rock_hugs_slope() {
+        // 45° ramp rising with x (chunk-local coords == world coords for the single (0,0) chunk).
+        let orig_h = |wx: i32| -> i32 { (10 + wx).clamp(1, 63) };
+        let base = make_bumpy_world(2, |lx, _ly| orig_h(lx as i32));
+        let mut ws = ws_with(base);
+        let mut w = ws.world.take().unwrap();
+        let params = RockParams::default();
+        // Small radius so the padded bbox (incl. its outside-bbox edge samples) stays inside the
+        // single 16×16 test chunk.
+        let (cx, cy, r) = (8, 8, 3);
+        field_stamp(&mut w, cx, cy, r, &params, 777, None, None, None, None, false);
+        ws.world = Some(w);
+        let world = ws.world.as_ref().unwrap();
+
+        // Base of the *added* mass per column: the lowest new (post-stamp) block strictly above
+        // that column's original terrain height.
+        let new_base = |wx: i32, wy: i32| -> Option<i32> {
+            ((orig_h(wx) + 1)..=63).find(|&wz| read_block_abs(world, wx, wy, wz) != 0)
+        };
+
+        let uphill = new_base(cx + 2, cy);
+        let downhill = new_base(cx - 2, cy);
+        assert!(uphill.is_some(), "uphill side must receive new blocks");
+        assert!(downhill.is_some(), "downhill side must receive new blocks");
+        assert!(uphill.unwrap() > downhill.unwrap(),
+            "mass base must be higher on the uphill side (uphill={:?}, downhill={:?})", uphill, downhill);
+    }
+
+    /// The silhouette (per-column top height of the *added* mass) must deviate from a
+    /// best-fit spherical cap by more than a small threshold — guards the noise/anisotropy/
+    /// strata detail terms (steps 4a/4b/4c) against a regression back to a bald sphere/dome.
+    #[test]
+    fn test_rock_silhouette_not_spherical() {
+        let base = make_bumpy_world_grid(6, 8, |_, _| 20);
+        let mut ws = ws_with(base);
+        let mut w = ws.world.take().unwrap();
+        let params = RockParams::default();
+        let (cx, cy, r) = (48, 48, 8);
+        field_stamp(&mut w, cx, cy, r, &params, 4242, None, None, None, None, false);
+        ws.world = Some(w);
+        let world = ws.world.as_ref().unwrap();
+
+        let mut tops: Vec<(i32, i32, i32)> = Vec::new();
+        for dy in -r..=r {
+            for dx in -r..=r {
+                if dx * dx + dy * dy > r * r { continue; }
+                let (wx, wy) = (cx + dx, cy + dy);
+                if let Some(top) = (1..=63).filter(|&wz| read_block_abs(world, wx, wy, wz) != 0).max() {
+                    if top > 20 { tops.push((dx, dy, top)); }
+                }
+            }
+        }
+        assert!(tops.len() > 8, "need enough sampled columns to judge the silhouette");
+
+        // Best-fit spherical cap: top(dx,dy) ≈ z_apex - sqrt(r_fit² - dx² - dy²). Fit z_apex and
+        // r_fit by least-squares-ish closed form using the apex (max top) and the mean radius at
+        // which height falls to the surface.
+        let z_apex = tops.iter().map(|&(_, _, t)| t).max().unwrap() as f64;
+        let mut sq_dev_sum = 0.0;
+        let mut n = 0.0;
+        for &(dx, dy, top) in &tops {
+            let rr = (dx * dx + dy * dy) as f64;
+            let cap_h = if rr < (r * r) as f64 { z_apex - ((r * r) as f64 - rr).sqrt() } else { 20.0 };
+            let dev = top as f64 - cap_h;
+            sq_dev_sum += dev * dev;
+            n += 1.0;
+        }
+        let rmse = (sq_dev_sum / n).sqrt();
+        assert!(rmse > 0.6, "silhouette must deviate meaningfully from a bald spherical cap (rmse={rmse:.3})");
+    }
+
+    /// Every added cell must be 6-connected to pre-existing terrain (the floater guard, step 8).
+    #[test]
+    fn test_rock_no_floating_components() {
+        let base = make_bumpy_world_grid(6, 8, |_, _| 20);
+        let mut ws = ws_with(base);
+        let mut w = ws.world.take().unwrap();
+
+        let mut pre_existing: HashSet<(i32, i32, i32)> = HashSet::new();
+        for wy in 28..=68 { for wx in 28..=68 { for wz in 1..=63 {
+            if read_block_abs(&w, wx, wy, wz) != 0 { pre_existing.insert((wx, wy, wz)); }
+        }}}
+
+        let params = RockParams::default();
+        field_stamp(&mut w, 48, 48, 8, &params, 999, None, None, None, None, false);
+
+        let mut added: HashSet<(i32, i32, i32)> = HashSet::new();
+        for wy in 28..=68 { for wx in 28..=68 { for wz in 1..=63 {
+            let c = (wx, wy, wz);
+            if read_block_abs(&w, wx, wy, wz) != 0 && !pre_existing.contains(&c) { added.insert(c); }
+        }}}
+        assert!(!added.is_empty(), "rock must place at least some blocks");
+
+        const ADJ6: [(i32, i32, i32); 6] = [(-1,0,0),(1,0,0),(0,-1,0),(0,1,0),(0,0,-1),(0,0,1)];
+        let mut reached: HashSet<(i32, i32, i32)> = HashSet::new();
+        let mut queue: VecDeque<(i32, i32, i32)> = VecDeque::new();
+        for &c in &added {
+            let touches_old = ADJ6.iter().any(|(dx, dy, dz)| pre_existing.contains(&(c.0+dx, c.1+dy, c.2+dz)));
+            if touches_old && reached.insert(c) { queue.push_back(c); }
+        }
+        while let Some(c) = queue.pop_front() {
+            for (dx, dy, dz) in ADJ6 {
+                let n = (c.0+dx, c.1+dy, c.2+dz);
+                if added.contains(&n) && reached.insert(n) { queue.push_back(n); }
+            }
+        }
+        assert_eq!(reached.len(), added.len(), "every added cell must be 6-connected to pre-existing terrain");
+    }
+
+    // ── Carve sculpt mode ──────────────────────────────────────────────────────
+
+    /// Carve never turns air into solid — every changed cell goes solid → air, never the reverse.
+    #[test]
+    fn test_carve_only_deletes() {
+        let base = make_bumpy_world_grid(6, 8, |_, _| 20);
+        let mut ws = ws_with(base);
+        let mut w = ws.world.take().unwrap();
+        let mut before: HashMap<(i32, i32, i32), u8> = HashMap::new();
+        for wy in 44..=52 { for wx in 44..=52 { for wz in 1..=32 {
+            before.insert((wx, wy, wz), read_block_abs(&w, wx, wy, wz));
+        }}}
+        let params = RockParams::default();
+        field_stamp(&mut w, 48, 48, 6, &params, 55, None, None, None, None, true);
+        for (&(wx, wy, wz), &bt_before) in &before {
+            let bt_after = read_block_abs(&w, wx, wy, wz);
+            if bt_before == 0 {
+                assert_eq!(bt_after, 0, "carve must never turn air into solid at ({wx},{wy},{wz})");
+            }
+        }
+    }
+
+    /// No column ends with a solid cell that has air directly below it and continuous air up to
+    /// the sky through the carved region — the sky-connectivity write rule must never open a
+    /// floating roof or a sealed cave.
+    #[test]
+    fn test_carve_no_floating_roof() {
+        let base = make_bumpy_world_grid(6, 8, |_, _| 20);
+        let mut ws = ws_with(base);
+        let mut w = ws.world.take().unwrap();
+        let params = RockParams::default();
+        field_stamp(&mut w, 48, 48, 6, &params, 55, None, None, None, None, true);
+
+        for wy in 38..=58 { for wx in 38..=58 {
+            // Walk down from well above any plausible surface: once solid is seen, everything
+            // below (down to bedrock) must also stay solid — air reappearing beneath solid ground
+            // is a sealed cave or a floating roof, and this world has neither pre-carve.
+            let mut seen_solid = false;
+            for wz in (2..=40).rev() {
+                let solid = read_block_abs(&w, wx, wy, wz) != 0;
+                if solid {
+                    seen_solid = true;
+                } else if seen_solid {
+                    panic!("column ({wx},{wy}) has an air pocket at z={wz} beneath solid ground — sealed cave or floating roof");
+                }
+            }
+        }}
+    }
+
+    /// Carving twice at the same centre/seed is a no-op the second time.
+    #[test]
+    fn test_carve_idempotent() {
+        let base = make_bumpy_world_grid(6, 8, |_, _| 20);
+        let mut ws = ws_with(base);
+        let mut w = ws.world.take().unwrap();
+        let params = RockParams::default();
+        field_stamp(&mut w, 48, 48, 6, &params, 321, None, None, None, None, true);
+        let once = w.bytes.to_vec();
+        field_stamp(&mut w, 48, 48, 6, &params, 321, None, None, None, None, true);
+        let twice = w.bytes.to_vec();
+        assert_eq!(once, twice, "re-carving the same cut in place must be a no-op");
+    }
+
+    /// Carve never deletes Bedrock (type 1) and never touches z <= 1, even when the cavity
+    /// geometry would otherwise reach that low.
+    #[test]
+    fn test_carve_never_touches_bedrock() {
+        let base = make_bumpy_world_grid(6, 2, |_, _| 10);
+        let mut ws = ws_with(base);
+        let mut w = ws.world.take().unwrap();
+        // Lay a bedrock floor under the whole footprint.
+        for wy in 34..=62 { for wx in 34..=62 {
+            set_block_abs(&mut w, wx, wy, 1, 1, 0);
+        }}
+        let mut params = RockParams::default();
+        params.sink = 1.0; // bias the cavity as deep as possible
+        params.flatten = 1.5;
+        field_stamp(&mut w, 48, 48, 10, &params, 7, None, None, None, None, true);
+        for wy in 34..=62 { for wx in 34..=62 {
+            assert_eq!(read_block_abs(&w, wx, wy, 1), 1, "bedrock at ({wx},{wy},1) must survive any carve");
+        }}
+    }
+
 }

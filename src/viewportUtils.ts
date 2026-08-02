@@ -8,6 +8,19 @@ import type { PixelPatchRaw } from "./types";
 
 export interface ViewTransform { x: number; y: number; scale: number; }
 
+/** Blocks per chunk edge (both X and Y) — every chunk is a 16×16 column of blocks. */
+export const CHUNK_SIZE_BLOCKS = 16;
+
+/** World-block coordinate → the chunk coordinate that contains it. */
+export function worldToChunk(wCoord: number): number {
+  return Math.floor(wCoord / CHUNK_SIZE_BLOCKS);
+}
+
+/** Chunk coordinate → the world-block coordinate of its origin corner. */
+export function chunkToWorld(cCoord: number): number {
+  return cCoord * CHUNK_SIZE_BLOCKS;
+}
+
 /**
  * Zoom a pan/zoom view transform around a local (canvas-space) point — the "zoom toward
  * cursor" formula shared by MapCanvas's and SliceViewport's wheel handlers.

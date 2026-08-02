@@ -87,7 +87,7 @@ predicates `isFreehand`/`isShapeTool`/`isSculptStroke`.
 
 ## Terrain sculpt (`sculpt_terrain`/`sculpt_terrain_inner`) *(experimental)*
 
-Axiom-style heightmap sculpting. **14 modes:**
+Axiom-style heightmap sculpting. **16 modes:**
 
 | Mode | Behavior |
 |---|---|
@@ -104,15 +104,80 @@ Axiom-style heightmap sculpting. **14 modes:**
 | Terrace | Quantizes height to `strength`-block steps. |
 | Sharpen | Unsharp mask over the Smooth kernel — amplifies deviation from the local average. |
 | Smear | Advects height from `(p.x-smear_dx, p.y-smear_dy)` toward the drag direction each tick; no-op at `dx=dy=0`; forced onto the timer regardless of hold-build since a one-shot commit has no drag-direction info. |
+| Rock | Volumetric — terrain and rock are two SDFs fused with a smooth-min fillet, not a heightmap offset. Bypasses `height_map`/`weight`/`blend`/`round_dither` entirely (see below). |
+| Carve | Rock's inverse — cuts sky-connected material only, via smooth-max against the terrain SDF. Never opens a floating roof or a sealed cave; never touches Bedrock. Shares `field_stamp`/`RockParams` with Rock (see below). |
 
 - **Radial falloff — two paths, same math:** `softness` (0..1) + `profile`
   (`smooth`/`linear`/`sphere`/`sharp`). *Dial* path (every 2D/3D freehand stamp):
   a clean Euclidean dome around the stamp centre. *BFS* path (shape fills:
   rect/ellipse/polygon): 8-connected distance field over the swept footprint.
-  0 softness = hard flat edges on either path. Every mode blends `cur→target` by
-  the per-column weight, dithered with the shared **8×8 Bayer table** (`BAYER8`,
-  also used by gradient fill) when `softness > 0` to avoid ring/terrace artifacts;
-  rounds plainly at `softness <= 0`.
+  0 softness = hard flat edges on either path. Every heightmap mode blends
+  `cur→target` by the per-column weight, then rounds via `round_dither`
+  (`softness > 0`): a spatially-coherent threshold — a low-frequency `fbm2` field
+  over world `(x,y)` — so a falloff's fractional band commits as contiguous wavy
+  contour bands instead of concentric terrace rings (per-column exact rounding)
+  or an 8×8 checkerboard of pepper (the old fixed `BAYER8`-tiled threshold, which
+  also reinforced the same pattern on every stamp of a stroke since the threshold
+  never varied per column — 2026-08 rewrite). `BAYER8` itself lives on, unchanged,
+  for `gradient_fill`'s dither. Rounds plainly at `softness <= 0`. **Rock/Carve
+  don't use this path at all** — see below.
+- **Rock/Carve (volumetric).** `field_stamp(.., carve: bool)` (`rock_stamp` is a
+  test-only `carve=false` wrapper) builds a dense `w×h×d` float field around the
+  dial centre (or the footprint bbox centre if no dial), as **two signed-distance
+  fields (SDFs, negative = solid) combined with an IQ polynomial smooth-min/-max**
+  rather than one additive density:
+  - **Terrain SDF:** `sd_terr = (z - H(x,y)) / grad(x,y)`, where `grad` is the
+    slope-normalised gradient magnitude (so the fillet width doesn't visibly
+    narrow on a 45° cliff).
+  - **Rock SDF:** a squashed-ellipsoid distance in blocks (`flatten` sets the
+    vertical/horizontal ratio, never a sphere; `sink` buries a fraction of its
+    vertical half-extent below the anchor), in a **terrain-relative frame**
+    (`drape`): near/below the surface its own anchor height blends toward local
+    terrain height (so the base drapes over a slope instead of floating/being
+    swallowed); well above the surface the frame goes world-vertical so the
+    emergent top keeps a free-standing form. Plus per-stamp anisotropy (random XY
+    elongation + yaw) and three additive detail terms: domain-warped `fbm3` noise
+    (`noisiness`/`noise_radius`, **blurred alone** before combining — cohering
+    granular noise into lumps without smoothing the ellipsoid's own shape or the
+    terrain surface, `smoothing` sets the box-blur radius), and low-frequency
+    Z-only ridged noise (`strata`) for sedimentary-bedding ledges.
+  - **Fillet:** `k = meld * 0.3 * r_min` (clamped 1..14 blocks). Rock:
+    `sd = smin(sd_rock, sd_terr, k)`. Carve: `sd = smax(sd_terr, -sd_rock, k)`.
+    The smin/smax concave term is precisely the flare/rollover — no seam, because
+    there's no longer a boundary, one field, one isosurface.
+  - **Idempotency:** every terrain-derived quantity — the drape frame *and*
+    `sd_terr`/`grad` *and* the Z bbox sizing — reads a bilinear fit over a ring
+    sampled strictly **outside** the stamp's own padded bbox (`stable_h`), never a
+    live in-bbox scan. A live in-bbox sample here (verified during
+    implementation, against both this algorithm and the pre-redesign
+    single-point-anchor one) measurably ratchets the mass taller on every
+    identical repeat — the terrain SDF reacting to the previous stamp's own newly
+    steep silhouette is the dominant, non-converging feedback loop, not just the
+    ellipsoid's anchor height.
+  - **Rock write:** cells with `sd < 0` that are currently air get the fill block
+    (default stone); existing blocks are never touched (pure union, never
+    deletes) — re-stamping in place is a no-op. A BFS floater guard then drops any
+    newly-added cell not 6-connected (through other new-or-old solid) back to
+    pre-existing terrain.
+  - **Carve write:** one z-descending pass per column — delete a solid cell only
+    while "open" (reachable from the sky, or from another just-deleted cell,
+    without having crossed a surviving solid block first); hitting a surviving
+    solid or Bedrock (type 1) closes the column for the rest of the pass. Clamps
+    `z >= 2`. Then re-caps the exposed floor via the same slope classifier as
+    Stamp/Retexture (`classify_by_slope`, extracted so both modes share it) so a
+    cut gully doesn't show raw stone under a grass landscape.
+  - Params bundle: `RockParams` (`noisiness`, `noise_radius`, `smoothing`, `meld`,
+    `flatten`, `sink`, `drape`, `strata`), one `rock: Option<RockParams>` arg
+    shared by both modes. Both ignore `strength`/`softness`; radius sets size.
+    Neither touches `WorldState.sculpt_session` (nothing to accumulate — the
+    write is a deterministic volumetric field computed fresh each call). Tests:
+    `test_rock_produces_connected_mass`, `test_rock_is_idempotent`,
+    `test_rock_deterministic_by_seed`, `test_rock_never_deletes`,
+    `test_rock_stays_in_bbox`, `test_rock_scales_with_radius`,
+    `test_rock_no_air_gap_under_mass`, `test_rock_hugs_slope`,
+    `test_rock_silhouette_not_spherical`, `test_rock_no_floating_components`,
+    `test_carve_only_deletes`, `test_carve_no_floating_roof`,
+    `test_carve_idempotent`, `test_carve_never_touches_bedrock`.
 - **Grouped undo (`group_id: Option<u64>`):** a whole hold-to-build stroke commits
   as **one** undo/redo step, not one per tick — `UndoEntry.group` lets
   `undo_edit`/`redo_edit` pop-and-restore while the next stack entry shares the
