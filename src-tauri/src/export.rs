@@ -721,6 +721,45 @@ pub(crate) fn get_obj_geometry(
     Ok(obj_geometry_region(world, ws.texture_pack.as_ref(), sx1, sy1, sx2, sy2, sz1, sz2, &[], LightMode::default(), mask.as_ref()))
 }
 
+/// Which of the game's two shipped lighting behaviours a lamp's falloff follows. The original
+/// (64z-era) client used a tight, steep-falloff pool (~4 tile effective radius); "New Dawn"
+/// (256z) widened it to a much broader, gradual pool (~14 tiles). Both are real, previously-shipped
+/// behaviours — not an editor invention — so the profile is a first-class parameter threaded through
+/// `LightMode` rather than a single hardcoded curve.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum LightingProfile {
+    Legacy,
+    Modern,
+}
+
+impl Default for LightingProfile {
+    fn default() -> Self { LightingProfile::Legacy }
+}
+
+impl LightingProfile {
+    /// The lamp radius (blocks) this profile snaps to when the user hasn't overridden it.
+    pub(crate) fn default_radius(self) -> f32 {
+        match self {
+            LightingProfile::Legacy => LEGACY_LAMP_RADIUS,
+            LightingProfile::Modern => MODERN_LAMP_RADIUS,
+        }
+    }
+
+    /// Per-lamp intensity contribution at `dist` blocks for a pool of `radius` blocks, in `[0,1]`.
+    /// Legacy: quadratic falloff — stays bright near the lamp then drops off abruptly, matching the
+    /// small, sharp-edged pools of the original 64z client. Modern: linear falloff — the same shape
+    /// New Dawn's much larger radius already reads as "gradual" (its per-tile slope is `1/radius`,
+    /// shallower simply because radius is ~3.5x larger), so it keeps the existing curve.
+    fn falloff(self, dist: f32, radius: f32) -> f32 {
+        let t = (1.0 - dist / radius).max(0.0);
+        match self {
+            LightingProfile::Legacy => t * t,
+            LightingProfile::Modern => t,
+        }
+    }
+}
+
 /// Night-lighting/shadow preview toggles for `obj_geometry_region`. Both default off, reproducing
 /// today's flat fully-lit output exactly (OBJ/JSON export and `ThreeDPreview` always pass `default()`
 /// — only `FlyView3D`'s chunk streaming opts in).
@@ -737,29 +776,43 @@ pub(crate) struct LightMode {
     /// texture selection) is still derived from the SH_* constant — only the brightness multiply is
     /// skipped. Mutually exclusive with `night`/`shadows` in practice (the frontend clears them).
     pub flat: bool,
-    /// User-tunable lamp light radius (blocks). `<= 0.0` (the `Default`) falls back to the legacy
-    /// `LAMP_LIGHT_RADIUS` constant, so `LightMode::default()` output is byte-for-byte unchanged for
+    /// User-tunable lamp light radius (blocks). `<= 0.0` (the `Default`) falls back to
+    /// `profile.default_radius()`, so `LightMode::default()` output is byte-for-byte unchanged for
     /// OBJ/JSON export and `ThreeDPreview`. Only `get_chunk_geometry` (FlyView3D) passes a live value.
     pub lamp_radius: f32,
+    /// Which falloff curve/default-radius pairing to use (see `LightingProfile`). Independent of
+    /// `lamp_radius` — the profile picks the *shape* of the pool; the radius slider can still
+    /// override the profile's default distance without changing which curve is used.
+    pub profile: LightingProfile,
 }
 
 pub(crate) const LAMP_BLOCK_TYPE: u8 = 72; // TYPE_LIGHTBOX
-const LAMP_LIGHT_RADIUS: f32 = 5.0;
+const LEGACY_LAMP_RADIUS: f32 = 4.0;
+const MODERN_LAMP_RADIUS: f32 = 14.0;
 const NIGHT_AMBIENT: f32 = 0.35;
 const SHADOW_RAY_STEPS: i32 = 24; // unit steps marched toward the sun per voxel
 
 #[derive(serde::Serialize)]
 pub(crate) struct LightConstants {
     lamp_light_radius: f32,
+    legacy_lamp_radius: f32,
+    modern_lamp_radius: f32,
     shadow_ray_steps: i32,
 }
 
-/// Exposes `LAMP_LIGHT_RADIUS`/`SHADOW_RAY_STEPS` to the frontend so the edit-sync reload radius
-/// (FlyView3D: a placed lamp/block can affect neighboring chunks up to these distances away when
-/// night lighting or shadows are on) can't silently drift out of sync with the Rust constants.
+/// Exposes the legacy/modern default lamp radii + `SHADOW_RAY_STEPS` to the frontend so the edit-sync
+/// reload radius (FlyView3D: a placed lamp/block can affect neighboring chunks up to these distances
+/// away when night lighting or shadows are on) can't silently drift out of sync with the Rust
+/// constants. `lamp_light_radius` is kept as an alias of `legacy_lamp_radius` for callers that haven't
+/// been updated to the per-profile fields yet.
 #[tauri::command]
 pub(crate) fn get_light_constants() -> LightConstants {
-    LightConstants { lamp_light_radius: LAMP_LIGHT_RADIUS, shadow_ray_steps: SHADOW_RAY_STEPS }
+    LightConstants {
+        lamp_light_radius: LEGACY_LAMP_RADIUS,
+        legacy_lamp_radius: LEGACY_LAMP_RADIUS,
+        modern_lamp_radius: MODERN_LAMP_RADIUS,
+        shadow_ray_steps: SHADOW_RAY_STEPS,
+    }
 }
 const SUN_SHADOW: f32 = 0.55; // hard shadow multiplier — stays well above black even combined
                                // with the darkest per-face shade constant (SH_W=0.447)
@@ -929,7 +982,7 @@ pub(crate) fn obj_geometry_region(world: &LoadedWorld, pack: Option<&texturepack
     // Colour is the lamp block's own paint via the same `block_color` lookup normal painted blocks use
     // (Lighting.mm `addlight` is passed `colorTable[getColorc(x,z,y)]` — the lamp's paint index into
     // the shared paint table, not a dedicated lamp-colour table).
-    let lamp_radius = if mode.lamp_radius > 0.0 { mode.lamp_radius } else { LAMP_LIGHT_RADIUS };
+    let lamp_radius = if mode.lamp_radius > 0.0 { mode.lamp_radius } else { mode.profile.default_radius() };
 
     let sun_dir = sun_direction(mode.sun_t);
 
@@ -949,7 +1002,7 @@ pub(crate) fn obj_geometry_region(world: &LoadedWorld, pack: Option<&texturepack
             let dz = (wz - lz) as f32;
             let dist = (dx * dx + dy * dy + dz * dz).sqrt();
             if dist < lamp_radius {
-                let contrib = 1.0 - dist / lamp_radius;
+                let contrib = mode.profile.falloff(dist, lamp_radius);
                 l[0] += contrib * color[0];
                 l[1] += contrib * color[1];
                 l[2] += contrib * color[2];
@@ -1327,7 +1380,9 @@ pub(crate) fn get_chunk_geometry(
     night: bool, shadows: bool, sun_t: f32,
     gpu: Option<bool>,
     lamp_radius: Option<f32>,
+    lighting_profile: Option<LightingProfile>,
 ) -> Result<ObjGeometryResult, String> {
+    let profile = lighting_profile.unwrap_or_default();
     // `mut` so the lamp spatial index can be built lazily on the first night-lit request.
     let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
     let empty = || ObjGeometryResult {
@@ -1357,7 +1412,7 @@ pub(crate) fn get_chunk_geometry(
     // on and we're NOT in flat/GPU mode (GPU night uses real point lights on the frontend instead).
     let flat = gpu.unwrap_or(false);
     let baked_night = night && !flat;
-    let lamp_r = lamp_radius.unwrap_or(LAMP_LIGHT_RADIUS).clamp(1.0, 64.0);
+    let lamp_r = lamp_radius.unwrap_or_else(|| profile.default_radius()).clamp(1.0, 64.0);
     let sx1 = cx * 16; let sy1 = cy * 16;
 
     // Build the lamp index lazily on first baked-night use (opt-in feature shouldn't tax every load).
@@ -1389,6 +1444,7 @@ pub(crate) fn get_chunk_geometry(
         sun_t: sun_t.clamp(0.0, 1.0),
         flat,
         lamp_radius: lamp_r,
+        profile,
     };
     Ok(obj_geometry_region(world, ws.texture_pack.as_ref(), sx1, sy1, sx1 + 15, sy1 + 15, 0, world_max_z(world), &lamps, mode, None)) // FlyView3D streaming stays unmasked
 }
@@ -1495,7 +1551,7 @@ mod tests {
     /// A block's side-face color (any face other than top/bottom) under a given `LightMode`,
     /// found by matching the shading multiplier used for side faces (SH_S etc, all < 1.0 and != SH_BOT).
     fn side_face_color(world: &LoadedWorld, x: i32, y: i32, z: i32, z2: i32, mode: LightMode) -> [f32; 3] {
-        let radius = if mode.lamp_radius > 0.0 { mode.lamp_radius } else { LAMP_LIGHT_RADIUS };
+        let radius = if mode.lamp_radius > 0.0 { mode.lamp_radius } else { mode.profile.default_radius() };
         let lamps = if mode.night { scan_lamps(world, x, y, x, y, z, z2, radius) } else { Vec::new() };
         let g = obj_geometry_region(world, None, x, y, x, y, z, z2, &lamps, mode, None);
         let floats: Vec<f32> = g.colors.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
@@ -1519,7 +1575,7 @@ mod tests {
         world.bytes[block(3, 5, 3)] = LAMP_BLOCK_TYPE;
 
         let day = side_face_color(&world, 3, 5, 0, 0, LightMode::default());
-        let night = side_face_color(&world, 3, 5, 0, 0, LightMode { night: true, shadows: false, sun_t: 0.0, flat: false, lamp_radius: 0.0 });
+        let night = side_face_color(&world, 3, 5, 0, 0, LightMode { night: true, shadows: false, sun_t: 0.0, flat: false, lamp_radius: 0.0, profile: LightingProfile::Legacy });
 
         for c in 0..3 {
             assert!(night[c] < day[c], "night lighting should dim an unlit block relative to full daylight");
@@ -1544,7 +1600,7 @@ mod tests {
         world.bytes[block(3, 5, 3)] = LAMP_BLOCK_TYPE;
         world.bytes[paint(3, 5, 3)] = 1; // PAINT_RGB[1] = [255,170,170] — red-dominant
 
-        let night = side_face_color(&world, 3, 5, 0, 0, LightMode { night: true, shadows: false, sun_t: 0.0, flat: false, lamp_radius: 0.0 });
+        let night = side_face_color(&world, 3, 5, 0, 0, LightMode { night: true, shadows: false, sun_t: 0.0, flat: false, lamp_radius: 0.0, profile: LightingProfile::Legacy });
 
         // A red-dominant lamp should tint the probe's lit colour red-dominant too: the red channel
         // should gain more (relative to its unlit value) than green/blue. Checked via the raw ratio
@@ -1623,7 +1679,7 @@ mod tests {
 
         let unshadowed = side_face_color(&world, 3, 5, 0, 0, LightMode::default());
         // sun_t=0.5 -> near-overhead (elevation ~80deg), closest analogue to the old vertical scan.
-        let shadowed = side_face_color(&world, 3, 5, 0, 0, LightMode { night: false, shadows: true, sun_t: 0.5, flat: false, lamp_radius: 0.0 });
+        let shadowed = side_face_color(&world, 3, 5, 0, 0, LightMode { night: false, shadows: true, sun_t: 0.5, flat: false, lamp_radius: 0.0, profile: LightingProfile::Legacy });
 
         for c in 0..3 {
             assert!(shadowed[c] < unshadowed[c], "a block under a solid overhang should be darker at high noon");
@@ -1643,7 +1699,7 @@ mod tests {
 
         let unshadowed = side_face_color(&world, 3, 5, 0, 0, LightMode::default());
         // sun_t=0.0 -> sunrise, low angle, nothing along the ray to occlude it.
-        let lit_at_sunrise = side_face_color(&world, 3, 5, 0, 0, LightMode { night: false, shadows: true, sun_t: 0.0, flat: false, lamp_radius: 0.0 });
+        let lit_at_sunrise = side_face_color(&world, 3, 5, 0, 0, LightMode { night: false, shadows: true, sun_t: 0.0, flat: false, lamp_radius: 0.0, profile: LightingProfile::Legacy });
 
         assert_eq!(lit_at_sunrise, unshadowed, "an isolated block with no occluders along the ray should stay fully lit");
     }
@@ -1659,7 +1715,7 @@ mod tests {
         world.bytes[block(3, 5, 0)] = 2;
         for z in 1..=10 { world.bytes[block(3, 5, z)] = 2; }
 
-        let shadowed = side_face_color(&world, 3, 5, 0, 0, LightMode { night: false, shadows: true, sun_t: 0.5, flat: false, lamp_radius: 0.0 });
+        let shadowed = side_face_color(&world, 3, 5, 0, 0, LightMode { night: false, shadows: true, sun_t: 0.5, flat: false, lamp_radius: 0.0, profile: LightingProfile::Legacy });
         for c in 0..3 {
             assert!(shadowed[c] > 0.05, "shadowed voxel colour must stay well above pure black, got {shadowed:?}");
         }
@@ -1715,7 +1771,7 @@ mod tests {
         world.bytes[tb(3, 5, 3)] = LAMP_BLOCK_TYPE;
         world.bytes[tb(3, 5, 3) + 4096] = 1; // red-ish paint on the lamp
 
-        let mode = LightMode { night: true, shadows: false, sun_t: 0.0, flat: false, lamp_radius: 5.0 };
+        let mode = LightMode { night: true, shadows: false, sun_t: 0.0, flat: false, lamp_radius: 5.0, profile: LightingProfile::Legacy };
 
         // Old path: scan the region for lamps.
         let scan = scan_lamps(&world, 0, 0, 15, 15, 0, world_max_z(&world), 5.0);

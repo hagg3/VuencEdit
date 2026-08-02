@@ -102,26 +102,63 @@ it is **`!Sync`** — single-threaded scans only, never hand it to rayon.
 
 ## Lighting & shadows (baked path) *(experimental)*
 
-`LightMode { night, shadows, sun_t, lamp_radius, flat }` is baked into vertex
-colors inside `obj_geometry_region`. OBJ/JSON export and `ThreeDPreview` always
-pass `LightMode::default()` (unchanged output); only `get_chunk_geometry` opts in.
-Both multipliers are computed once per voxel and folded into the `push_tri!` /
-`push_quad!` macros via an `lm` (light-multiplier) argument, so every face of a
-block shares the same lighting.
+`LightMode { night, shadows, sun_t, lamp_radius, flat, profile }` is baked into
+vertex colors inside `obj_geometry_region`. OBJ/JSON export and `ThreeDPreview`
+always pass `LightMode::default()` (unchanged output, `profile` defaults to
+`LightingProfile::Legacy`); only `get_chunk_geometry` opts in. Both multipliers
+are computed once per voxel and folded into the `push_tri!` / `push_quad!`
+macros via an `lm` (light-multiplier) argument, so every face of a block shares
+the same lighting.
 
 ### Night lighting
 
 Mirrors the game's lamp-block point lighting (`Lighting.mm`, `Terrain.mm`
 `calcLight`):
 - Ambient drops to `NIGHT_AMBIENT = 0.35`.
-- Each Lamp block (type 72) contributes `(1 - dist/radius) * lampColor` per channel
-  to every block within `lamp_radius` (user-tunable; `<= 0` → legacy
-  `LAMP_LIGHT_RADIUS = 5.0`), clamped to `[0.0, 1.5]`. **Lamp color is the lamp's
+- Each Lamp block (type 72) contributes `profile.falloff(dist, radius) * lampColor`
+  per channel to every block within `lamp_radius` (user-tunable; `<= 0` →
+  `profile.default_radius()`), clamped to `[0.0, 1.5]`. **Lamp color is the lamp's
   paint color**, not a separate table.
 - Lamps render fullbright.
 - Lamps are gathered from the **lamp spatial index** (below) via
   `lamps_in_region` — O(nearby lamps), not O((16+2r)³) — so raising the radius
   isn't cubic. Empty slice → `light_at` returns fullbright.
+
+### Lighting profile (`LightingProfile`)
+
+The original game shipped two different lamp-lighting behaviours across its
+64z and 256z ("New Dawn") client eras. Both are real, previously-shipped
+behaviours, not editor inventions, so the profile is a first-class enum
+threaded through `LightMode` rather than a single hardcoded curve/constant:
+
+| Profile | `default_radius()` | `falloff(dist, radius)` | Feel |
+|---|---|---|---|
+| `Legacy` (default) | `LEGACY_LAMP_RADIUS = 4.0` | `((1 - dist/radius).max(0)).powi(2)` (quadratic) | small, sharp-edged pool |
+| `Modern` ("New Dawn") | `MODERN_LAMP_RADIUS = 14.0` | `(1 - dist/radius).max(0)` (linear) | broad, gradual pool |
+
+`get_chunk_geometry` takes an optional `lighting_profile` param (camelCase JS
+side: `lightingProfile`, `"legacy" | "modern"`, defaults to `Legacy`); a
+separately-passed `lamp_radius` still overrides that profile's default
+distance without changing which falloff curve is used — the profile picks the
+*shape*, the radius slider (Ribbon "Lamp R", 2–32 range) picks the *distance*.
+`get_light_constants` exposes `legacy_lamp_radius`/`modern_lamp_radius` (plus a
+`lamp_light_radius` alias of the legacy value for older callers) so the
+frontend's edit-sync reload radius can't drift from the Rust constants.
+
+Frontend (`FlyView3D.tsx`): `lightingProfile` prop threads into the
+`get_chunk_geometry` invoke call for the baked path. For the GPU point-light
+path (`updateNightLights`), Three.js's physical light doesn't expose an
+arbitrary falloff exponent, so the profile instead picks `decay`: `2`
+(inverse-square) for Legacy, `1` for Modern, with `intensity` solved so
+brightness at `dist == lampR` reads the same constant `K` regardless of decay
+(`intensity = lampR² · K` at decay 2, `lampR · K` at decay 1).
+
+Settings/UI: `AppSettings.lightingProfile` (`SettingsModal.tsx`, schema v5)
+persists the default; `Ribbon.tsx`'s Lighting group (3D tab) has a
+Legacy/New Dawn toggle next to (but independent of) the Lamp R slider —
+switching profile snaps Lamp R to that profile's default radius
+(`App.tsx`'s `commitLightingProfile`), same "switch resets the fine-tune"
+behavior in the Settings modal's Lighting profile row.
 
 ### Lamp spatial index (`WorldState.lamp_index`)
 
@@ -334,10 +371,13 @@ load/close** (`resetHeavyLighting()`); not persisted. When on:
   with vertex alpha < 0.75 — water/glass/flower pass light, fence casts; with a
   texture pack a textured depth variant punches the fence-weave lattice.
 - **GPU night point lights:** GPU + Night → real `THREE.PointLight`s at lamps
-  (`MAX_NIGHT_LIGHTS = 16`), physical falloff (`decay = 2`, `distance = lampR*4`,
-  `intensity = lampR²·0.4` so brightness at `lampR` ≈ K regardless of radius — the
-  Lamp R slider grows reach, not just brightness). Re-queried on camera move, on
-  enable, and on `editEpoch`.
+  (`MAX_NIGHT_LIGHTS = 16`), physical falloff with `distance = lampR*4` and a
+  per-profile `decay`/`intensity` pair approximating the baked-path curve for
+  that `LightingProfile` (see "Lighting profile" above): Legacy `decay = 2`,
+  `intensity = lampR²·0.4`; Modern `decay = 1`, `intensity = lampR·0.4` — both
+  solved so brightness at `lampR` ≈ K regardless of radius (the Lamp R slider
+  grows reach, not just brightness). Re-queried on camera move, on enable, on
+  `editEpoch`, and on profile switch.
 - **Shadow quality:** ortho half-extent clamped to `min(reach,
   SHADOW_MAX_REACH=320)·1.1`; `mapSize` bumps to 4096 when `loadRadius > 16`;
   `sun.shadow.radius = 3`.
