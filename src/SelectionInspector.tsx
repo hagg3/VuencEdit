@@ -1,7 +1,6 @@
-import { decodeU8 } from "./codec";
 import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import type { SelectionInfo, ClipboardInfo, PreviewDataRaw, PreviewData } from "./types";
+import { decodePixelPatch, decodePreviewData, type SelectionInfo, type ClipboardInfo, type PreviewData } from "./types";
 import { EDEN_TEAL_READABLE } from "./designTokens";
 import ElevationPreviewPanel from "./ElevationPreviewPanel";
 
@@ -72,8 +71,8 @@ function ClipboardInfoBlock({ clipboard }: { clipboard: ClipboardInfo }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
   useEffect(() => {
-    invoke<{ width: number; height: number; pixels: string }>("render_clipboard_preview")
-      .then((raw) => setPixels({ width: raw.width, height: raw.height, pixels: decodeU8(raw.pixels) }))
+    invoke<ArrayBuffer>("render_clipboard_preview")
+      .then((buf) => setPixels(decodePreviewData(buf)))
       .catch(() => setPixels(null));
   }, [clipboard]);
 
@@ -141,30 +140,35 @@ export default function SelectionInspector({
   // Fetch orthographic preview (front/side/top).
   useEffect(() => {
     if (!sel || view === "axo") return;
+    let cancelled = false;
     const timer = setTimeout(() => {
-      invoke<PreviewDataRaw>("render_selection_view", {
+      invoke<ArrayBuffer>("render_selection_view", {
         x1: sel.x1, y1: sel.y1, x2: sel.x2, y2: sel.y2,
         zMin: sel.z_min, zMax: sel.z_max,
         view,
       })
-        .then((raw) => setPreviewData({ ...raw, pixels: decodeU8(raw.pixels) }))
-        .catch(() => setPreviewData(null));
+        .then((buf) => { if (!cancelled) setPreviewData(decodePreviewData(buf)); })
+        .catch(() => { if (!cancelled) setPreviewData(null); });
     }, 150);
-    return () => clearTimeout(timer);
+    // Guards against out-of-order resolution: the debounce timer is cleared here, but an
+    // `invoke` already in flight when the selection changes again is not cancellable — without
+    // `cancelled`, a slow older response could land after a newer one and show stale data (audit M7).
+    return () => { cancelled = true; clearTimeout(timer); };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sel?.x1, sel?.y1, sel?.x2, sel?.y2, sel?.z_min, sel?.z_max, view]);
 
   // Fetch axo preview — clipboard contents if available, else selection footprint.
   useEffect(() => {
     if (!sel || view !== "axo") return;
+    let cancelled = false;
     const timer = setTimeout(() => {
       const p = clipboard
-        ? invoke<PreviewDataRaw>("render_axo_clipboard", { ski: axoSki, dir: axoDir })
-        : invoke<PreviewDataRaw>("render_axo_region", { x1: sel.x1, y1: sel.y1, x2: sel.x2, y2: sel.y2, ski: axoSki, dir: axoDir });
-      p.then((raw) => setPreviewData({ width: raw.width, height: raw.height, pixels: decodeU8(raw.pixels) }))
-       .catch(() => setPreviewData(null));
+        ? invoke<ArrayBuffer>("render_axo_clipboard", { ski: axoSki, dir: axoDir }).then(decodePreviewData)
+        : invoke<ArrayBuffer>("render_axo_region", { x1: sel.x1, y1: sel.y1, x2: sel.x2, y2: sel.y2, ski: axoSki, dir: axoDir }).then(decodePixelPatch);
+      p.then((data) => { if (!cancelled) setPreviewData({ width: data.width, height: data.height, pixels: data.pixels }); })
+       .catch(() => { if (!cancelled) setPreviewData(null); });
     }, 150);
-    return () => clearTimeout(timer);
+    return () => { cancelled = true; clearTimeout(timer); };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sel?.x1, sel?.y1, sel?.x2, sel?.y2, clipboard?.width, clipboard?.height, clipboard?.depth, view, axoSki, axoDir]);
 

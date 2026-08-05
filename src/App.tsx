@@ -1,9 +1,9 @@
-import { decodeU8, encodeU8 } from "./codec";
+import { encodeU8 } from "./codec";
 import { polygonPixels } from "./drawTools";
 import {
   type WorldMeta,
-  type EditResultRaw, type PreviewDataRaw,
-  type SelectionInfo, type ClipboardInfo, type ExtrudeAxis, type AutosaveInfo, type SelectionMaskInfoRaw,
+  decodeEditResult, decodePreviewData, decodeSelectionMask,
+  type SelectionInfo, type ClipboardInfo, type ExtrudeAxis, type AutosaveInfo,
 } from "./types";
 import { useRecentWorlds, timeAgo } from "./useRecentWorlds";
 import { useState, useCallback, useEffect, useRef, useMemo, useImperativeHandle, forwardRef } from "react";
@@ -13,7 +13,7 @@ import { getVersion } from "@tauri-apps/api/app";
 import { open, save, ask } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import MapCanvas, { KEY_ZOOM_STEP, TOOL_LABELS, TOOL_HINTS, type Tool, type SelectionBounds, type PixelPatch, type MapCanvasRef, type MaterializeSelectionBounds } from "./MapCanvas";
+import MapCanvas, { KEY_ZOOM_STEP, TOOL_LABELS, TOOL_HINTS, type Tool, type SelectionBounds, type MapCanvasRef, type MaterializeSelectionBounds } from "./MapCanvas";
 import MaterializeModal from "./MaterializeModal";
 import Sidebar, { type SidebarTab } from "./Sidebar";
 import SliceViewport from "./SliceViewport";
@@ -34,7 +34,7 @@ import RecoveryModal from "./RecoveryModal";
 import { resolvePrefabDir } from "./PrefabLibraryPanel";
 import Modal from "./Modal";
 import { glassPanel, chromeButton, accentRing, expBadge } from "./designTokens";
-import { decodeAtlas, tintedSwatch, type AtlasData, type TexturePackRaw, clearSwatchCache } from "./texturePack";
+import { decodeAtlas, tintedSwatch, type AtlasData, clearSwatchCache } from "./texturePack";
 import { blockDisplayName, resolveColor, applyBlockTables, orientBlockToFacing, type BlockTables } from "./blockDefs";
 import { isTypingTarget, chunkToWorld } from "./viewportUtils";
 import { decomposeMask, maskOutline } from "./maskUtils";
@@ -255,6 +255,11 @@ function App() {
   const [recoveryInfo, setRecoveryInfo] = useState<AutosaveInfo | null>(null);
   const [recovering, setRecovering] = useState(false);
   const lastAutosavedEpochRef = useRef(-1);
+  // Consecutive `autosave_world` failures across both call sites below (periodic tick + on-quit).
+  // A single failure is usually transient (disk momentarily busy); reported via `reportError` only
+  // once it's happened twice in a row, since a failed journal append means that tick's changes
+  // aren't recoverable and the user should know before it becomes a pattern. Reset to 0 on success.
+  const autosaveFailureCountRef = useRef(0);
   // Last "path|compressed" combo we've already warned about for a compressed-flag/extension
   // mismatch on plain Save — avoids re-toasting on every ⌘S while the mismatch is unresolved.
   const lastExtWarnRef = useRef<string | null>(null);
@@ -944,16 +949,16 @@ function App() {
   // fetch otherwise.
   useEffect(() => {
     if (!hasSelectionMask || !rawBounds) { setSelectionMaskOverlay(null); return; }
-    invoke<SelectionMaskInfoRaw | null>("get_selection_mask")
-      .then(raw => setSelectionMaskOverlay(raw ? { ...raw, bits: decodeU8(raw.bits) } : null))
+    invoke<ArrayBuffer>("get_selection_mask")
+      .then(buf => setSelectionMaskOverlay(decodeSelectionMask(buf)))
       .catch(() => setSelectionMaskOverlay(null));
   }, [hasSelectionMask, rawBounds]);
 
   // Fetch top-down clipboard preview whenever clipboard changes.
   useEffect(() => {
     if (!clipboard) { setClipboardPreviewPixels(null); return; }
-    invoke<PreviewDataRaw>("render_clipboard_preview")
-      .then(raw => setClipboardPreviewPixels({ ...raw, pixels: decodeU8(raw.pixels) }))
+    invoke<ArrayBuffer>("render_clipboard_preview")
+      .then(buf => setClipboardPreviewPixels(decodePreviewData(buf)))
       .catch(() => setClipboardPreviewPixels(null));
   }, [clipboard]);
 
@@ -962,7 +967,7 @@ function App() {
   async function handleGenerateTrees(treeTypes: string[], density: number, leafPaints: number[], smartPlacement: boolean) {
     if (!selection) return;
     try {
-      const result = await invoke<EditResultRaw>("generate_trees", {
+      const result = await invoke<ArrayBuffer>("generate_trees", {
         x1: selection.x1, y1: selection.y1, x2: selection.x2, y2: selection.y2,
         treeTypes, density, leafPaints, smartPlacement,
       });
@@ -973,7 +978,7 @@ function App() {
   async function handleExtrude(ignoreAir: boolean) {
     if (!selection) return;
     try {
-      const result = await invoke<EditResultRaw>("extrude_selection", {
+      const result = await invoke<ArrayBuffer>("extrude_selection", {
         x1: selection.x1, y1: selection.y1, x2: selection.x2, y2: selection.y2,
         zMin: selection.z_min, zMax: selection.z_max,
         axis: extrudeAxis, count: extrudeCount, ignoreAir,
@@ -987,7 +992,7 @@ function App() {
   async function handleSimulateFlow() {
     if (!selection) return;
     try {
-      const result = await invoke<EditResultRaw>("simulate_flow", {
+      const result = await invoke<ArrayBuffer>("simulate_flow", {
         x1: selection.x1, y1: selection.y1, x2: selection.x2, y2: selection.y2,
         zMin: selection.z_min, zMax: selection.z_max,
         includeExistingSources: fluidIncludeExisting, base: fluidBase,
@@ -1004,7 +1009,7 @@ function App() {
     setTool(prev === "poolfill" ? "select" : prev);
     if (!selection) { reportError("Make a selection around the basin first."); return; }
     try {
-      const result = await invoke<EditResultRaw>("pool_fill", {
+      const result = await invoke<ArrayBuffer>("pool_fill", {
         x1: selection.x1, y1: selection.y1, x2: selection.x2, y2: selection.y2,
         clickX: wx, clickY: wy, clickZ: zSliceZRef.current,
         targetZ: poolFillTargetZ, base: fluidBase, paint: 0,
@@ -1016,7 +1021,7 @@ function App() {
   async function handleGenerateWavySurface() {
     if (!selection) return;
     try {
-      const result = await invoke<EditResultRaw>("generate_wavy_surface", {
+      const result = await invoke<ArrayBuffer>("generate_wavy_surface", {
         x1: selection.x1, y1: selection.y1, x2: selection.x2, y2: selection.y2,
         base: fluidBase, paint: 0,
         wavelength: wavyWavelength, amplitude: wavyAmplitude, mode: wavyMode,
@@ -1025,7 +1030,8 @@ function App() {
     } catch (e) { reportError(e); }
   }
 
-  const applyEditResult = useCallback(async (raw: EditResultRaw, kind: "edit" | "undo" | "redo" = "edit") => {
+  const applyEditResult = useCallback(async (buf: ArrayBuffer, kind: "edit" | "undo" | "redo" = "edit") => {
+    const raw = decodeEditResult(buf);
     // Cutaway is a top-down render — the patch Rust returns is already capped, so it applies directly.
     if (viewModeRef.current !== "zslice") {
       if (renderModeRef.current === "axo") {
@@ -1034,8 +1040,7 @@ function App() {
         const w = worldRef.current;
         if (w) mapCanvasRef.current?.refetchRegion(0, 0, chunkToWorld(w.width_chunks), chunkToWorld(w.height_chunks));
       } else {
-        const patch: PixelPatch = { ...raw.patch, pixels: decodeU8(raw.patch.pixels) };
-        mapCanvasRef.current?.applyPatch(patch);
+        mapCanvasRef.current?.applyPatch(raw.patch);
       }
     } else {
       // z-slice: invalidate and re-fetch the affected tile region
@@ -1069,6 +1074,33 @@ function App() {
   // Core "swap the session onto this world file" logic, shared by the normal Open flow and the
   // materialize-tool auto-reload — the latter skips openFileAt's isDirty confirm because the
   // materialize modal's own confirm step already warns "save your work first" before the write.
+  // Shared by every path that swaps in a freshly-loaded world (normal open, and autosave recovery
+  // in the base+journal format, which doesn't go through `load_world` at all) — everything the
+  // returned `WorldMeta` needs applied to React state, minus the actual IPC call and its loading/
+  // error chrome, which differ enough between callers (a synchronous fetch vs. a recovery flow with
+  // its own dirty-forcing) to stay separate.
+  function applyLoadedWorld(data: WorldMeta, path: string | null, opts?: { skipRecent?: boolean }) {
+    setWorld(data);
+    setWorldEpoch((e) => e + 1);
+    setSourcePath(path);
+    setRawBounds(null);
+    setMaterializeSelection(null);
+    setZMin(0);
+    setZMax(data.max_z);
+    setTool("pan");
+    setUndoDepth(0);
+    setRedoDepth(0);
+    setViewMode("topdown");
+    setZSliceZ(32);
+    setClipboard(null);
+    resetHeavyLighting();
+    setSaveCompressed(data.was_compressed);
+    setSpawnPos(data.spawn_px != null && data.spawn_py != null ? { px: data.spawn_px, py: data.spawn_py } : null);
+    if (path && !opts?.skipRecent) addRecentWorld(path, data.name);
+    lastAutosavedEpochRef.current = editEpochRef.current;
+    savedEpochRef.current = editEpochRef.current;
+  }
+
   async function swapToWorldFile(path: string, opts?: { skipRecent?: boolean }) {
     const myEpoch = ++loadEpochRef.current;
     setLoading(true);
@@ -1076,25 +1108,7 @@ function App() {
     try {
       const data = await invoke<WorldMeta>("load_world", { path });
       if (loadEpochRef.current !== myEpoch) return;
-      setWorld(data);
-      setWorldEpoch((e) => e + 1);
-      setSourcePath(path);
-      setRawBounds(null);
-      setMaterializeSelection(null);
-      setZMin(0);
-      setZMax(data.max_z);
-      setTool("pan");
-      setUndoDepth(0);
-      setRedoDepth(0);
-      setViewMode("topdown");
-      setZSliceZ(32);
-      setClipboard(null);
-      resetHeavyLighting();
-      setSaveCompressed(data.was_compressed);
-      setSpawnPos(data.spawn_px != null && data.spawn_py != null ? { px: data.spawn_px, py: data.spawn_py } : null);
-      if (!opts?.skipRecent) addRecentWorld(path, data.name);
-      lastAutosavedEpochRef.current = editEpochRef.current;
-      savedEpochRef.current = editEpochRef.current;
+      applyLoadedWorld(data, path, opts);
     } catch (e) {
       reportError(e);
     } finally {
@@ -1273,7 +1287,7 @@ function App() {
       const bounds = rawBoundsRef.current;
       if (!bounds) break;
       try {
-        const result = await invoke<EditResultRaw>("move_selection", {
+        const result = await invoke<ArrayBuffer>("move_selection", {
           ...bounds, zMin: zMinRef.current, zMax: zMaxRef.current, dx, dy, dz: 0,
         });
         await applyEditResult(result);
@@ -1332,7 +1346,7 @@ function App() {
     const bounds = rawBoundsRef.current;
     if (!bounds) return;
     try {
-      const result = await invoke<EditResultRaw>("move_selection", {
+      const result = await invoke<ArrayBuffer>("move_selection", {
         ...bounds, zMin: zMinRef.current, zMax: zMaxRef.current, dx, dy, dz,
       });
       await applyEditResult(result);
@@ -1376,13 +1390,13 @@ function App() {
   async function pasteAt(pos: { x: number; y: number }) {
     try {
       const result = pasteTerrain
-        ? await invoke<EditResultRaw>("paste_terrain", {
+        ? await invoke<ArrayBuffer>("paste_terrain", {
             pasteX: pos.x, pasteY: pos.y,
             elevationOffset: pasteElevationOffset,
             ignoreAir: pasteIgnoreAir,
             aboveSurface: pasteTerrainAbove,
           })
-        : await invoke<EditResultRaw>("paste_at", {
+        : await invoke<ArrayBuffer>("paste_at", {
             pasteX: pos.x, pasteY: pos.y,
             elevationOffset: pasteElevationOffset,
             ignoreAir: pasteIgnoreAir,
@@ -1495,7 +1509,7 @@ function App() {
     const seed = (t === "noise" || t === "hydro") ? sculptSeedRef.current : 0;
     if (t === "noise" || t === "hydro") sculptSeedRef.current = ((sculptSeedRef.current * 1664525 + 1013904223) >>> 0);
     try {
-      const result = await invoke<EditResultRaw>("sculpt_terrain", {
+      const result = await invoke<ArrayBuffer>("sculpt_terrain", {
         points: points ?? null,
         stampCx: opts.stampCx ?? null,
         stampCy: opts.stampCy ?? null,
@@ -1566,7 +1580,7 @@ function App() {
       } else if (t === "fill") {
         if (pts.length === 0) return;
         const [x, y] = pts[0];
-        const result = await invoke<EditResultRaw>("fill_surface", {
+        const result = await invoke<ArrayBuffer>("fill_surface", {
           wx: x, wy: y, newType: fillBlockType, newPaint: fillBlockType === 0 ? 0 : fillPaint, maxFill: 50000,
         });
         await applyEditResult(result);
@@ -1574,7 +1588,7 @@ function App() {
       } else {
         const blocks = pts.map(([x, y]) => ({ x, y, z: zOverride }));
         const zOffset = drawAbove && zOverride === null ? 1 : 0;
-        const result = await invoke<EditResultRaw>("paint_blocks", {
+        const result = await invoke<ArrayBuffer>("paint_blocks", {
           blocks, blockType: fillBlockType, paint: fillBlockType === 0 ? 0 : fillPaint, zOffset,
           maskType: maskEnabled ? maskBlockType : null,
           maskPaint: maskEnabled ? maskPaint : null,
@@ -1670,7 +1684,7 @@ function App() {
       return;
     }
     try {
-      const result = await invoke<EditResultRaw>("scatter_paste", {
+      const result = await invoke<ArrayBuffer>("scatter_paste", {
         x1: rawBounds.x1, y1: rawBounds.y1, x2: rawBounds.x2, y2: rawBounds.y2,
         count: scatterCount, seed: Math.floor(Math.random() * 0xFFFFFFFF),
         elevationOffset: pasteElevationOffset, ignoreAir: pasteIgnoreAir,
@@ -1681,7 +1695,7 @@ function App() {
 
   async function handleArrayPaste(pos: { x: number; y: number }) {
     try {
-      const result = await invoke<EditResultRaw>("array_paste", {
+      const result = await invoke<ArrayBuffer>("array_paste", {
         originX: pos.x, originY: pos.y,
         cols: arrayCols, rows: arrayRows,
         spacingX: arraySpacingX, spacingY: arraySpacingY,
@@ -1694,7 +1708,7 @@ function App() {
 
   async function handleDrawElevation(x: number, y: number, z: number) {
     try {
-      const result = await invoke<EditResultRaw>("paint_blocks", {
+      const result = await invoke<ArrayBuffer>("paint_blocks", {
         blocks: [{ x, y, z }], blockType: fillBlockType, paint: fillPaint, zOffset: 0,
       });
       await applyEditResult(result);
@@ -1755,7 +1769,7 @@ function App() {
   async function handlePick3dFloodFill(x: number, y: number, z: number, nx: number, ny: number, nz: number) {
     const ax = x + nx, ay = y + ny, az = z + nz; // air cell against the clicked face = start cell
     try {
-      const result = await invoke<EditResultRaw>("flood_fill_3d", {
+      const result = await invoke<ArrayBuffer>("flood_fill_3d", {
         startX: ax, startY: ay, startZ: az,
         blockType: fillBlockType, paint: fillPaint, limit: floodFillLimit,
       });
@@ -1768,7 +1782,7 @@ function App() {
    *  chunk-mesh edit sync come for free. Same for place, below. */
   async function handlePick3dBreak(x: number, y: number, z: number) {
     try {
-      const result = await invoke<EditResultRaw>("paint_blocks", { blocks: [{ x, y, z }], blockType: 0, paint: 0, zOffset: 0 });
+      const result = await invoke<ArrayBuffer>("paint_blocks", { blocks: [{ x, y, z }], blockType: 0, paint: 0, zOffset: 0 });
       await applyEditResult(result);
     } catch (e) { reportError(e); }
   }
@@ -1780,7 +1794,7 @@ function App() {
     if (fillBlockType === 0) return; // "Air" as the armed block would be a no-op place
     const blockType = autoOrient3d ? orientBlockToFacing(fillBlockType, yaw) : fillBlockType;
     try {
-      const result = await invoke<EditResultRaw>("paint_blocks", {
+      const result = await invoke<ArrayBuffer>("paint_blocks", {
         blocks: [{ x, y, z }], blockType, paint: fillPaint, zOffset: 0,
       });
       await applyEditResult(result);
@@ -1793,7 +1807,7 @@ function App() {
   async function handlePick3dBreakBatch(cells: [number, number, number][]) {
     if (cells.length === 0) return;
     try {
-      const result = await invoke<EditResultRaw>("paint_blocks", {
+      const result = await invoke<ArrayBuffer>("paint_blocks", {
         blocks: cells.map(([x, y, z]) => ({ x, y, z })), blockType: 0, paint: 0, zOffset: 0,
       });
       await applyEditResult(result);
@@ -1803,7 +1817,7 @@ function App() {
     if (cells.length === 0 || fillBlockType === 0) return;
     const blockType = autoOrient3d ? orientBlockToFacing(fillBlockType, yaw) : fillBlockType;
     try {
-      const result = await invoke<EditResultRaw>("paint_blocks", {
+      const result = await invoke<ArrayBuffer>("paint_blocks", {
         blocks: cells.map(([x, y, z]) => ({ x, y, z })), blockType, paint: fillPaint, zOffset: 0,
       });
       await applyEditResult(result);
@@ -1823,7 +1837,7 @@ function App() {
     const blockType = mode === "break" ? 0 : (autoOrient3d && yaw != null ? orientBlockToFacing(fillBlockType, yaw) : fillBlockType);
     const paint = mode === "break" ? 0 : fillPaint;
     try {
-      const result = await invoke<EditResultRaw>("fill_connected_face", {
+      const result = await invoke<ArrayBuffer>("fill_connected_face", {
         x, y, z, nx, ny, nz, matchPaint: wandMatchPaint, blockType, paint,
       });
       await applyEditResult(result);
@@ -1846,7 +1860,7 @@ function App() {
   async function handleSlicePaint(cells: { x: number; y: number; z: number }[]) {
     if (!cells.length) return;
     try {
-      const result = await invoke<EditResultRaw>("paint_blocks", {
+      const result = await invoke<ArrayBuffer>("paint_blocks", {
         blocks: cells, blockType: fillBlockType, paint: fillBlockType === 0 ? 0 : fillPaint, zOffset: 0,
       });
       await applyEditResult(result);
@@ -1858,7 +1872,7 @@ function App() {
 
   const handleUndo = useCallback(async () => {
     try {
-      const result = await invoke<EditResultRaw>("undo_edit");
+      const result = await invoke<ArrayBuffer>("undo_edit");
       await applyEditResult(result, "undo");
     } catch (e) {
       if (e !== "Nothing to undo") reportError(e);
@@ -1867,7 +1881,7 @@ function App() {
 
   const handleRedo = useCallback(async () => {
     try {
-      const result = await invoke<EditResultRaw>("redo_edit");
+      const result = await invoke<ArrayBuffer>("redo_edit");
       await applyEditResult(result, "redo");
     } catch (e) {
       if (e !== "Nothing to redo") reportError(e);
@@ -1894,7 +1908,7 @@ function App() {
           showToast(`Saved ${saveCompressed ? "compressed" : "uncompressed"} data into a “.${ext}” file — other tools may not recognize it`);
         }
       }
-      await invoke("save_world", { path, compressed: saveCompressed });
+      await invoke("save_world", { path, compressed: saveCompressed, backupCompressed: loadSettings().backupCompressed });
       // A real save makes any pending autosave sidecar redundant — nothing left to recover.
       lastAutosavedEpochRef.current = editEpochRef.current;
       savedEpochRef.current = editEpochRef.current;
@@ -1944,13 +1958,20 @@ function App() {
       if (editEpochRef.current === lastAutosavedEpochRef.current) return;
       const epoch = editEpochRef.current;
       invoke("autosave_world", { sourcePath: sourcePathRef.current })
-        .then(() => { lastAutosavedEpochRef.current = epoch; })
-        .catch((e) => console.warn("Autosave failed:", e));
+        .then(() => {
+          lastAutosavedEpochRef.current = epoch;
+          autosaveFailureCountRef.current = 0;
+        })
+        .catch((e) => {
+          autosaveFailureCountRef.current += 1;
+          console.warn("Autosave failed:", e);
+          if (autosaveFailureCountRef.current >= 2) reportError(e);
+        });
     }, AUTOSAVE_MS);
     return () => clearInterval(id);
     // sourcePath deliberately excluded — read via sourcePathRef so a Save As mid-interval doesn't
     // reset the timer and delay the next autosave tick indefinitely.
-  }, [world, autosaveIntervalMin]);
+  }, [world, autosaveIntervalMin, reportError]);
 
   // Startup check: was there a pending autosave from a session that never cleanly saved?
   useEffect(() => {
@@ -1975,7 +1996,12 @@ function App() {
         try {
           await invoke("autosave_world", { sourcePath: sourcePathRef.current });
           lastAutosavedEpochRef.current = epoch;
-        } catch (e) { console.warn("Autosave-on-quit failed:", e); }
+          autosaveFailureCountRef.current = 0;
+        } catch (e) {
+          autosaveFailureCountRef.current += 1;
+          console.warn("Autosave-on-quit failed:", e);
+          if (autosaveFailureCountRef.current >= 2) reportError(e);
+        }
       }
       const ok = await ask("You have unsaved changes. Quit and discard them?", {
         title: "Unsaved changes", kind: "warning",
@@ -1983,23 +2009,31 @@ function App() {
       if (ok) win.destroy();
     });
     return () => { unlisten.then((f) => f()); };
-  }, [isDirty]);
+  }, [isDirty, reportError]);
 
   async function recoverAutosave() {
     if (!recoveryInfo) return;
     setRecovering(true);
     try {
-      const autosavePath = await invoke<string>("get_autosave_path");
-      await openFileAt(autosavePath, { skipRecent: true });
-      setSourcePath(recoveryInfo.source_path ?? null);
-      // openFileAt marks the freshly-loaded autosave "clean" (savedEpochRef = current edit epoch),
-      // but the in-memory world differs from the file at sourcePath — nothing has actually been
-      // saved there yet. Force dirty so the close/quit prompt guards this until a real Save
-      // succeeds. Deliberately do NOT discard the autosave sidecar here (unlike the decline path
-      // below): the periodic autosave timer won't refire until the next edit (lastAutosavedEpochRef
-      // already matches), so a crash right after recovery — before any edit or manual save — would
-      // otherwise leave nothing to recover. The sidecar is only discarded once a real Save succeeds
-      // (saveWorld/saveWorldAs) or the user later declines a fresh recovery prompt.
+      if (recoveryInfo.format === 1) {
+        // Base+journal recovery doesn't go through load_world at all — the sidecars aren't a
+        // loadable file on their own, so this resolves and replays them directly.
+        const data = await invoke<WorldMeta>("load_autosave");
+        applyLoadedWorld(data, recoveryInfo.source_path ?? null, { skipRecent: true });
+      } else {
+        const autosavePath = await invoke<string>("get_autosave_path");
+        await openFileAt(autosavePath, { skipRecent: true });
+        setSourcePath(recoveryInfo.source_path ?? null);
+      }
+      // The recovery path above marks the freshly-loaded autosave "clean" (savedEpochRef = current
+      // edit epoch), but the in-memory world differs from the file at sourcePath — nothing has
+      // actually been saved there yet. Force dirty so the close/quit prompt guards this until a
+      // real Save succeeds. Deliberately do NOT discard the autosave sidecar here (unlike the
+      // decline path below): the periodic autosave timer won't refire until the next edit
+      // (lastAutosavedEpochRef already matches), so a crash right after recovery — before any edit
+      // or manual save — would otherwise leave nothing to recover. The sidecar is only discarded
+      // once a real Save succeeds (saveWorld/saveWorldAs) or the user later declines a fresh
+      // recovery prompt.
       savedEpochRef.current = -1;
       setRecoveryInfo(null);
     } catch (e) {
@@ -2278,8 +2312,7 @@ function App() {
   // Template overlay helpers
   async function loadTexturePackFile(path: string) {
     try {
-      const raw = await invoke<TexturePackRaw>("load_texture_pack", { path });
-      const atlas = decodeAtlas(raw);
+      const atlas = decodeAtlas(await invoke<ArrayBuffer>("load_texture_pack", { path }));
       clearSwatchCache();
       setTexturePackInfo(atlas);
       setTexturePackPath(path);
@@ -2476,12 +2509,12 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
     if (!rawBounds) return;
     try {
       const result = filterBlockType !== null
-        ? await invoke<EditResultRaw>("replace_blocks", {
+        ? await invoke<ArrayBuffer>("replace_blocks", {
             ...rawBounds, zMin, zMax,
             newBlockType: 0, newPaint: 0,
             filterBlockType, filterPaint, filterInvert,
           })
-        : await invoke<EditResultRaw>("delete_blocks", { ...rawBounds, zMin, zMax });
+        : await invoke<ArrayBuffer>("delete_blocks", { ...rawBounds, zMin, zMax });
       await applyEditResult(result);
     } catch (e) {
       reportError(e);
@@ -2491,7 +2524,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
   async function fillSelection() {
     if (!rawBounds) return;
     try {
-      const result = await invoke<EditResultRaw>("replace_blocks", {
+      const result = await invoke<ArrayBuffer>("replace_blocks", {
         ...rawBounds, zMin, zMax,
         newBlockType: fillBlockType,
         newPaint: fillBlockType === 0 ? 0 : fillPaint,
@@ -2508,7 +2541,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
   async function applyGradientFill() {
     if (!rawBounds) return;
     try {
-      const result = await invoke<EditResultRaw>("gradient_fill", {
+      const result = await invoke<ArrayBuffer>("gradient_fill", {
         ...rawBounds, zMin, zMax,
         bt1: fillBlockType, paint1: fillBlockType === 0 ? 0 : fillPaint,
         bt2: gradientToBlock, paint2: gradientToBlock === 0 ? 0 : gradientToPaint,

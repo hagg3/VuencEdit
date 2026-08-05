@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { brushFootprint, rectPixels, ellipsePixels, type BrushShape, type WP } from "./drawTools";
 import { chromeButton, chromeButtonAccent, recessedWell } from "./designTokens";
-import type { PixelPatchRaw } from "./types";
+import { decodePixelPatch, decodePreviewData } from "./types";
 import { zoomAtPoint, resizeCanvasToContainer, makeSeqGuard, putPatchPixels, beginFrame, cssWidth, cssHeight, isTypingTarget, chunkToWorld } from "./viewportUtils";
 
 // Front slab = constant world-Y plane (horizontal axis = X, vertical = Z; row 0 = highest Z).
@@ -229,10 +229,10 @@ export default function SliceViewport({ world, axis, editEpoch, lastEdit, onPain
         ? { x: curDepth, y1: s, z1: 0, y2: e, z2: maxZ }
         : { z: curDepth, x1: s, y1: 0, x2: e, y2: vMax };
       const dx = s - h0;
-      invoke<PixelPatchRaw>(cmd, args)
-        .then((raw) => {
+      invoke<ArrayBuffer>(cmd, args)
+        .then((buf) => {
           if (fetchSeq.current.isStale(seq)) { done(); return; } // superseded
-          putPatchPixels(sctx, raw, dx, 0);
+          putPatchPixels(sctx, decodePixelPatch(buf), dx, 0);
           force((n) => n + 1);
           done();
         })
@@ -249,12 +249,13 @@ export default function SliceViewport({ world, axis, editEpoch, lastEdit, onPain
     const seq = orthoFetchSeq.current.next();
     fetchSeq.current.next(); // cancel any in-flight slab strip fetches
     setLoading(true);
-    invoke<PixelPatchRaw>("render_selection_view", {
+    invoke<ArrayBuffer>("render_selection_view", {
       x1: sf.xLo, y1: sf.yLo, x2: sf.xHi, y2: sf.yHi,
       zMin: sf.zLo, zMax: sf.zHi,
       view: axis === "front" ? "front" : "side",
-    }).then((raw) => {
+    }).then((buf) => {
       if (orthoFetchSeq.current.isStale(seq)) { setLoading(false); return; }
+      const raw = decodePreviewData(buf);
       let c = orthoSlabRef.current;
       if (!c) { c = document.createElement("canvas"); orthoSlabRef.current = c; }
       if (c.width !== raw.width || c.height !== raw.height) {
@@ -303,9 +304,10 @@ export default function SliceViewport({ world, axis, editEpoch, lastEdit, onPain
   useEffect(() => {
     if (!isPaste || axis === "top") { clipRef.current = null; force((n) => n + 1); return; }
     let cancelled = false;
-    invoke<PixelPatchRaw>("render_clipboard_elevation_preview", { view: axis })
-      .then((raw) => {
+    invoke<ArrayBuffer>("render_clipboard_elevation_preview", { view: axis })
+      .then((buf) => {
         if (cancelled) return;
+        const raw = decodePreviewData(buf);
         const c = document.createElement("canvas");
         c.width = raw.width; c.height = raw.height;
         putPatchPixels(c.getContext("2d")!, raw);

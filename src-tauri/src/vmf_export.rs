@@ -57,7 +57,7 @@
 //! technique the test suite's `assert_faces_outward` already uses to verify `box_face_planes`.
 
 use crate::export::{obj_occludes, ChunkCache};
-use crate::{world_max_z, AppState, LoadedWorld, SelectionMask, WorldState};
+use crate::{read_ws, world_max_z, AppState, LoadedWorld, SelectionMask, WorldState};
 use crate::colors::{block_color, transparent_alpha, PAINT_RGB};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
@@ -988,8 +988,8 @@ pub(crate) struct VmfExportResult {
 
 /// Normalize a (possibly reversed) selection rect + Z range against the loaded world, resolving
 /// the active shaped-selection mask the same way `export_vmf`/`estimate_vmf` both need.
-fn normalize_region<'a>(
-    ws: &'a std::sync::MutexGuard<'a, WorldState>,
+fn normalize_region(
+    ws: &WorldState,
     world: &LoadedWorld,
     x1: i32, y1: i32, x2: i32, y2: i32,
     z_min: i32, z_max: i32,
@@ -1027,7 +1027,7 @@ pub(crate) fn export_vmf(
     texture_mode: Option<String>,
     merge_across_materials: Option<bool>,
 ) -> Result<VmfExportResult, String> {
-    let ws = state.lock().unwrap_or_else(|p| p.into_inner());
+    let ws = read_ws(&state);
     let world = ws.world.as_ref().ok_or("No world loaded")?;
     let (sx1, sy1, sx2, sy2, sz1, sz2, mask) = normalize_region(&ws, world, x1, y1, x2, y2, z_min, z_max);
 
@@ -1076,7 +1076,7 @@ pub(crate) fn estimate_vmf(
     texture_mode: Option<String>,
     merge_across_materials: Option<bool>,
 ) -> Result<VmfExportResult, String> {
-    let ws = state.lock().unwrap_or_else(|p| p.into_inner());
+    let ws = read_ws(&state);
     let world = ws.world.as_ref().ok_or("No world loaded")?;
     let (sx1, sy1, sx2, sy2, sz1, sz2, mask) = normalize_region(&ws, world, x1, y1, x2, y2, z_min, z_max);
 
