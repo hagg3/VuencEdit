@@ -37,7 +37,7 @@ Rust backend via `invoke`.
 | File | Role |
 |---|---|
 | `types.ts` | Shared IPC-shape types mirroring Rust structs. **Import from here.** |
-| `codec.ts` | Base64 → typed-array decoders (`decodeU8`, `decodeF32`). All IPC decode. |
+| `codec.ts` | Binary-IPC framing primitives (`decodeEnvelope`, `splitBody`, `asF32`) + `encodeU8` for the JS → Rust direction. The typed `decode*` helpers live in `types.ts`. |
 | `blockDefs.ts` | `BLOCK_DEFS`, `PAINT_COLORS`, ramp helpers, `resolveColor`; `applyBlockTables()`. |
 | `drawTools.ts` | `penFootprint`, `brushFootprint`, `bresenhamLine`, `rectPixels`, `ellipsePixels`. |
 | `texturePack.ts` | Atlas decoder, `BLOCK_TOP_TEX`, `tintedSwatch`. |

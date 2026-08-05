@@ -1,6 +1,6 @@
 //! Static geometry export: OBJ, JSON block dump, and MagicaVoxel .vox.
 use crate::colors::{block_color, transparent_alpha, BI_NOTSOLID, BI_RAMPORSIDE, BLOCK_INFO};
-use crate::{fluid_base, fluid_level, serialize_bytes_b64, world_max_z, AppState, LoadedWorld};
+use crate::{fluid_base, fluid_level, read_ws, world_max_z, AppState, LoadedWorld};
 use crate::texturepack;
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
@@ -298,7 +298,7 @@ pub(crate) fn export_obj(
     x1: i32, y1: i32, x2: i32, y2: i32,
     z_min: i32, z_max: i32,
 ) -> Result<(), String> {
-    let ws = state.lock().unwrap_or_else(|p| p.into_inner());
+    let ws = read_ws(&state);
     let world = ws.world.as_ref().ok_or("No world loaded")?;
 
     let sx1 = x1.min(x2); let sx2 = x1.max(x2);
@@ -450,7 +450,7 @@ pub(crate) fn export_json(
     use flate2::Compression;
     use std::io::Write;
 
-    let ws = state.lock().unwrap_or_else(|p| p.into_inner());
+    let ws = read_ws(&state);
     let world = ws.world.as_ref().ok_or("No world loaded")?;
 
     let sx1 = x1.min(x2); let sx2 = x1.max(x2);
@@ -515,7 +515,7 @@ pub(crate) fn export_vox(
     x1: i32, y1: i32, x2: i32, y2: i32,
     z_min: i32, z_max: i32,
 ) -> Result<u32, String> {
-    let ws = state.lock().unwrap_or_else(|p| p.into_inner());
+    let ws = read_ws(&state);
     let world = ws.world.as_ref().ok_or("No world loaded")?;
 
     let sx1 = x1.min(x2); let sx2 = x1.max(x2);
@@ -661,23 +661,16 @@ pub(crate) fn export_vox(
     Ok(total_voxels)
 }
 
-#[derive(serde::Serialize)]
 pub(crate) struct ObjGeometryResult {
-    #[serde(serialize_with = "serialize_bytes_b64")]
     positions: Vec<u8>, // LE f32 triplets (x,y,z) per vertex
-    #[serde(serialize_with = "serialize_bytes_b64")]
     colors: Vec<u8>,    // LE f32 triplets (r,g,b 0..1) per vertex
-    #[serde(serialize_with = "serialize_bytes_b64")]
     uvs: Vec<u8>,       // LE f32 pairs (u,v) per vertex; empty when no texture pack loaded
     vertex_count: u32,
     // Blocks with `transparent_alpha()` (water/fence/glass/new-flower) — mirrors the game's
     // second ATLAS2 vertex buffer, kept separate so the frontend can render them with their own
     // `transparent:true` material instead of blending into the opaque draw call.
-    #[serde(serialize_with = "serialize_bytes_b64")]
     positions_t: Vec<u8>,
-    #[serde(serialize_with = "serialize_bytes_b64")]
     colors_t: Vec<u8>,  // LE f32 quadruplets (r,g,b,a 0..1) per vertex
-    #[serde(serialize_with = "serialize_bytes_b64")]
     uvs_t: Vec<u8>,
     vertex_count_t: u32,
     // Emissive stream (RGB, like the opaque one) — populated only in `flat` (GPU-shadow) mode and
@@ -686,13 +679,41 @@ pub(crate) struct ObjGeometryResult {
     // block, so the frontend draws these faces with an unlit `MeshBasicMaterial` instead. Empty (0)
     // whenever `!flat` — OBJ/JSON export and `ThreeDPreview` pass `LightMode::default()`, so their
     // output is byte-for-byte unchanged and lamp faces stay in the opaque stream as before.
-    #[serde(serialize_with = "serialize_bytes_b64")]
     positions_e: Vec<u8>,
-    #[serde(serialize_with = "serialize_bytes_b64")]
     colors_e: Vec<u8>,
-    #[serde(serialize_with = "serialize_bytes_b64")]
     uvs_e: Vec<u8>,
     vertex_count_e: u32,
+}
+
+/// Scalar half of the binary envelope (audit H2). `lens` gives the byte length of each of the nine
+/// buffers, in the order they are concatenated into the body, so the JS side can slice them apart
+/// without re-deriving sizes from the vertex counts (`uvs*` are empty when no texture pack is loaded,
+/// and `colors_t` is 4 floats per vertex where the others are 3 or 2).
+#[derive(serde::Serialize)]
+pub(crate) struct ObjGeometryHeader {
+    vertex_count: u32,
+    vertex_count_t: u32,
+    vertex_count_e: u32,
+    lens: [u32; 9],
+}
+
+impl tauri::ipc::IpcResponse for ObjGeometryResult {
+    fn body(self) -> tauri::Result<tauri::ipc::InvokeResponseBody> {
+        let bufs: [&[u8]; 9] = [
+            &self.positions, &self.colors, &self.uvs,
+            &self.positions_t, &self.colors_t, &self.uvs_t,
+            &self.positions_e, &self.colors_e, &self.uvs_e,
+        ];
+        let mut lens = [0u32; 9];
+        for (i, b) in bufs.iter().enumerate() { lens[i] = b.len() as u32; }
+        let header = ObjGeometryHeader {
+            vertex_count: self.vertex_count,
+            vertex_count_t: self.vertex_count_t,
+            vertex_count_e: self.vertex_count_e,
+            lens,
+        };
+        crate::ipc_envelope(&header, &bufs)
+    }
 }
 
 #[tauri::command(async)]
@@ -701,7 +722,7 @@ pub(crate) fn get_obj_geometry(
     x1: i32, y1: i32, x2: i32, y2: i32,
     z_min: i32, z_max: i32,
 ) -> Result<ObjGeometryResult, String> {
-    let ws = state.lock().unwrap_or_else(|p| p.into_inner());
+    let ws = read_ws(&state);
     let world = ws.world.as_ref().ok_or("No world loaded")?;
 
     let sx1 = x1.min(x2); let sx2 = x1.max(x2);
@@ -898,7 +919,7 @@ pub(crate) fn pick_block(
     dx: f32, dy: f32, dz: f32,
     max_dist: f32,
 ) -> Result<Option<PickResult>, String> {
-    let ws = state.lock().unwrap_or_else(|p| p.into_inner());
+    let ws = read_ws(&state);
     let world = ws.world.as_ref().ok_or("No world loaded")?;
     pick_block_in(world, ox, oy, oz, dx, dy, dz, max_dist)
 }
@@ -1383,8 +1404,9 @@ pub(crate) fn get_chunk_geometry(
     lighting_profile: Option<LightingProfile>,
 ) -> Result<ObjGeometryResult, String> {
     let profile = lighting_profile.unwrap_or_default();
-    // `mut` so the lamp spatial index can be built lazily on the first night-lit request.
-    let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
+    // Read guard: the lazily-built lamp index is interior-mutable (`LampIndex`), so streaming
+    // chunk geometry for the 3D pane never blocks — or is blocked by — other readers.
+    let ws = read_ws(&state);
     let empty = || ObjGeometryResult {
         positions: Vec::new(), colors: Vec::new(), uvs: Vec::new(), vertex_count: 0,
         positions_t: Vec::new(), colors_t: Vec::new(), uvs_t: Vec::new(), vertex_count_t: 0,
@@ -1415,18 +1437,16 @@ pub(crate) fn get_chunk_geometry(
     let lamp_r = lamp_radius.unwrap_or_else(|| profile.default_radius()).clamp(1.0, 64.0);
     let sx1 = cx * 16; let sy1 = cy * 16;
 
-    // Build the lamp index lazily on first baked-night use (opt-in feature shouldn't tax every load).
-    if baked_night && ws.lamp_index.is_none() {
-        let idx = crate::build_lamp_index(ws.world.as_ref().unwrap());
-        ws.lamp_index = Some(idx);
-    }
-
     let world = ws.world.as_ref().unwrap();
     // Gather lamps within reach of this chunk from the spatial index (O(lamps), not an O((16+2r)³)
-    // voxel scan), resolving each lamp's colour from its own paint.
+    // voxel scan), resolving each lamp's colour from its own paint. `LampIndex::with` builds the
+    // index lazily on the first baked-night request (opt-in feature shouldn't tax every load) —
+    // interior-mutable, so this whole command needs only a read guard.
     let lamps: Vec<([i32; 3], [f32; 3])> = if baked_night {
-        let index = ws.lamp_index.as_ref().unwrap();
-        crate::lamps_in_region(index, world, sx1, sy1, sx1 + 15, sy1 + 15, lamp_r)
+        ws.lamp_index
+            .with(world, |index| {
+                crate::lamps_in_region(index, world, sx1, sy1, sx1 + 15, sy1 + 15, lamp_r)
+            })
             .into_iter()
             .map(|p| {
                 let (_, paint) = get_block_at(world, p[0], p[1], p[2]);
@@ -1466,18 +1486,14 @@ pub(crate) fn get_lamps_near(
     state: tauri::State<'_, AppState>,
     x: f32, y: f32, z: f32, radius: f32,
 ) -> Result<Vec<LampLight>, String> {
-    let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
+    let ws = read_ws(&state);
     if ws.world.is_none() { return Err("No world loaded".into()); }
     let radius = radius.clamp(1.0, 512.0);
-    if ws.lamp_index.is_none() {
-        let idx = crate::build_lamp_index(ws.world.as_ref().unwrap());
-        ws.lamp_index = Some(idx);
-    }
     let world = ws.world.as_ref().unwrap();
-    let index = ws.lamp_index.as_ref().unwrap();
     let sx = x.floor() as i32;
     let sy = y.floor() as i32;
-    let mut lamps: Vec<(f32, LampLight)> = crate::lamps_in_region(index, world, sx, sy, sx, sy, radius)
+    let mut lamps: Vec<(f32, LampLight)> = ws.lamp_index
+        .with(world, |index| crate::lamps_in_region(index, world, sx, sy, sx, sy, radius))
         .into_iter()
         .filter_map(|p| {
             let dx = p[0] as f32 + 0.5 - x;

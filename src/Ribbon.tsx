@@ -1,4 +1,4 @@
-import { decodeU8 } from "./codec";
+import { decodePreviewData } from "./types";
 import { useState, useRef, useEffect } from "react";
 import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
@@ -542,8 +542,8 @@ export default function Ribbon(p: RibbonProps) {
   const CLIP_PREV_H = 140;
   useEffect(() => {
     if (!p.clipboard) { setClipAxoPixels(null); return; }
-    invoke<{width:number;height:number;pixels:string}>("render_clipboard_preview")
-      .then(raw => setClipAxoPixels({ width: raw.width, height: raw.height, pixels: decodeU8(raw.pixels) }))
+    invoke<ArrayBuffer>("render_clipboard_preview")
+      .then(buf => setClipAxoPixels(decodePreviewData(buf)))
       .catch(() => setClipAxoPixels(null));
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [p.clipboard]);
@@ -1208,6 +1208,10 @@ export default function Ribbon(p: RibbonProps) {
               style={{ width: 72, accentColor: "#fb923c", cursor: "pointer" }} />
             <span style={{ color: "#fdba74", fontSize: 10, fontVariantNumeric: "tabular-nums", minWidth: 24 }}>{p.rockMeld.toFixed(1)}</span>
           </div>
+          <div style={rbGroupLabel}>{p.tool === "carve" ? "Carve" : "Rock"} 1/2</div>
+        </div>
+        <div style={rbDivider} />
+        <div style={rbGroup}>
           <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
             <span style={{ color: "#83786c", fontSize: 10, minWidth: 60 }}>Flatten</span>
             <input type="range" min={0.2} max={1.2} step={0.05} value={p.rockFlatten}
@@ -1240,7 +1244,7 @@ export default function Ribbon(p: RibbonProps) {
               style={{ width: 72, accentColor: "#fb923c", cursor: "pointer" }} />
             <span style={{ color: "#fdba74", fontSize: 10, fontVariantNumeric: "tabular-nums", minWidth: 24 }}>{p.rockStrata.toFixed(1)}</span>
           </div>
-          <div style={rbGroupLabel}>{p.tool === "carve" ? "Carve" : "Rock"} (ignores Strength/Softness)</div>
+          <div style={rbGroupLabel}>{p.tool === "carve" ? "Carve" : "Rock"} 2/2 (ignores Strength/Softness)</div>
         </div>
         </>)}
       </div>

@@ -1,6 +1,6 @@
 //! Minecraft .schematic / .litematic / .schem import: NBT parsing, block-ID mapping
 //! to Eden block types, and clipboard construction.
-use crate::{AppState, Clipboard, ClipboardInfo};
+use crate::{write_ws, AppState, Clipboard, ClipboardInfo};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::fs;
@@ -920,7 +920,7 @@ pub(crate) fn import_schematic_apply(
     };
 
     let info = ClipboardInfo { width: cb.width, height: cb.height, depth: cb.depth, z_anchor: cb.z_anchor, masked: cb.mask.is_some() };
-    state.lock().unwrap_or_else(|p| p.into_inner()).clipboard = Some(cb);
+    write_ws(&state).clipboard = Some(cb);
     Ok(info)
 }
 

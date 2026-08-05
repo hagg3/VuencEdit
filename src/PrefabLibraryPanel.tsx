@@ -1,11 +1,10 @@
 import { useEffect, useState, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { openPath } from "@tauri-apps/plugin-opener";
-import { decodeU8 } from "./codec";
 import { chromeButton, accentRing } from "./designTokens";
 import { useFocusTrap } from "./Modal";
 import { isTypingTarget } from "./viewportUtils";
-import type { ClipboardInfo, PreviewDataRaw } from "./types";
+import { decodePreviewData, type ClipboardInfo } from "./types";
 
 interface PrefabEntry {
   name: string;
@@ -185,9 +184,10 @@ export default function PrefabLibraryPanel({
         if (thumbEpochRef.current !== epoch) return;
         if (thumbCacheRef.current.has(cacheKey(entry))) continue;
         try {
-          const raw = await invoke<PreviewDataRaw>("render_prefab_thumbnail", { path: entry.path });
+          const buf = await invoke<ArrayBuffer>("render_prefab_thumbnail", { path: entry.path });
           if (thumbEpochRef.current !== epoch) return;
-          const pixels = decodeU8(raw.pixels);
+          const raw = decodePreviewData(buf);
+          const pixels = raw.pixels;
           const canvas = document.createElement("canvas");
           canvas.width = raw.width; canvas.height = raw.height;
           const ctx = canvas.getContext("2d");

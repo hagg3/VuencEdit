@@ -42,6 +42,15 @@ on "No world loaded" without touching the stack. They also
 
 Test: `test_delta_undo_round_trip`.
 
+**Dirty tracking hangs off the same choke point.** `WorldState.dirty: DirtyState`
+(audit C2 Stage 1) is marked from the same four sites: `with_edit_inner` marks
+whatever `diff_chunk` actually changed, `undo_edit_inner`/`redo_edit_inner` mark
+`entry.chunks`, and the three header-only writers mark the header flag directly.
+This is what makes persistence's incremental save and journaled autosave
+(`DOCUMENTATION/02-file-format.md`, `DOCUMENTATION/10-features.md`) O(changed
+bytes) instead of O(world size) — see also the lamp index's `apply_delta`, which
+replays the same undo delta for the same reason.
+
 ## Mutex safety
 
 **All lock sites use `state.lock().unwrap_or_else(|p| p.into_inner())`** — a panic

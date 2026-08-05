@@ -58,7 +58,8 @@ them in JavaScript balloons the V8 heap, so the app is a **Tauri 2** desktop app
 a **Rust backend** does all byte-level parsing, editing, rendering, and geometry
 generation over a memory-mapped file; a **React + TypeScript** frontend renders
 the UI, the 2D map (HTML Canvas), and the 3D views (Three.js). All bulk data
-crosses the IPC boundary as base64-encoded binary, ~8× smaller than JSON.
+crosses the IPC boundary as raw binary (a length-prefixed JSON header plus the
+bytes themselves), never JSON-encoded.
 
 ## Provenance
 

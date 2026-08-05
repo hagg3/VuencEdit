@@ -3,7 +3,7 @@
 //! that create/preview worlds from each.
 use crate::colors::{block_color, grass_color};
 use crate::{
-    place_normal_tree, place_pine_tree, serialize_bytes_b64,
+    place_normal_tree, place_pine_tree,
     set_block_abs, LoadedWorld, Rng64, NORMAL_LEAF_PAINTS, SNOW_FLOWER_PAINTS,
     SNOW_LEAF_PAINTS,
 };
@@ -1153,12 +1153,19 @@ pub(crate) fn natural_config_from_params(
     }, t_height)
 }
 
-#[derive(Serialize)]
 pub(crate) struct PreviewImage {
     pub(crate) width: u32,
     pub(crate) height: u32,
-    #[serde(serialize_with = "serialize_bytes_b64")]
     pub(crate) pixels: Vec<u8>, // RGBA, row-major (alpha always 255)
+}
+
+#[derive(Serialize)]
+pub(crate) struct PreviewImageHeader { width: u32, height: u32 }
+
+impl tauri::ipc::IpcResponse for PreviewImage {
+    fn body(self) -> tauri::Result<tauri::ipc::InvokeResponseBody> {
+        crate::ipc_envelope(&PreviewImageHeader { width: self.width, height: self.height }, &[&self.pixels])
+    }
 }
 
 /// Fast top-down preview of a natural world: samples the heightmap, biome and

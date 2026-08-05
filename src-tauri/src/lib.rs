@@ -1,5 +1,6 @@
 mod colors;
 mod export;
+mod journal;
 mod network;
 mod schematic;
 mod texturepack;
@@ -16,10 +17,11 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use memmap2::{Mmap, MmapMut, MmapOptions};
 use rayon::prelude::*;
 use serde::Serialize;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
-use std::io::{BufWriter, Seek, SeekFrom, Write};
-use std::sync::Mutex;
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
+use std::sync::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Instant;
 use tauri::Emitter;
 
@@ -29,8 +31,41 @@ macro_rules! timing_log {
     ($($arg:tt)*) => { if cfg!(debug_assertions) { eprintln!($($arg)*); } };
 }
 
-pub(crate) fn serialize_bytes_b64<S: serde::Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {
-    s.serialize_str(&STANDARD.encode(bytes))
+// ── Raw binary IPC envelope (audit H2) ───────────────────────────────────────
+//
+// Every payload-carrying command used to serialize its byte buffers as base64 inside a JSON
+// object: a +33% size inflation, a full encode pass in Rust, a JSON string the size of the whole
+// payload, and a per-byte `atob` loop on the JS main thread. Tauri 2's `InvokeResponseBody::Raw`
+// delivers a command's return value straight to JS as an `ArrayBuffer` instead, so none of that
+// is needed — the frontend gets a `Uint8Array` view over bytes the webview already owns.
+//
+// The convention (one framing for every such command, decoded by `decodeEnvelope` in codec.ts):
+//
+//     [0..4]                u32 LE   header_len
+//     [4 .. 4+header_len]   JSON     the scalar fields (dimensions, counts, labels)
+//     [4+header_len ..]     raw      the byte buffers, concatenated in declaration order
+//
+// Multi-buffer payloads (geometry) put the per-buffer lengths in the JSON header so the JS side
+// can slice them apart; single-buffer payloads just take the rest of the response.
+//
+// Payload types opt in by implementing `tauri::ipc::IpcResponse` — which the command macro uses
+// for the `Ok` type of a `Result` — so **no command signature changes**: a command still returns
+// `Result<PixelPatch, String>` and the framing happens at the IPC boundary.
+pub(crate) fn ipc_envelope<H: serde::Serialize>(
+    header: &H, bodies: &[&[u8]],
+) -> tauri::Result<tauri::ipc::InvokeResponseBody> {
+    let mut hdr = serde_json::to_vec(header)?;
+    // Pad the header with spaces (JSON ignores trailing whitespace) so the body starts on a 4-byte
+    // boundary. Geometry buffers are read on the JS side as `Float32Array` *views* over the response
+    // — which requires 4-byte alignment — so without this the decoder would have to copy every
+    // vertex stream whenever the header's length happened to be odd.
+    while (4 + hdr.len()) % 4 != 0 { hdr.push(b' '); }
+    let total = 4 + hdr.len() + bodies.iter().map(|b| b.len()).sum::<usize>();
+    let mut out = Vec::with_capacity(total);
+    out.extend_from_slice(&(hdr.len() as u32).to_le_bytes());
+    out.extend_from_slice(&hdr);
+    for b in bodies { out.extend_from_slice(b); }
+    Ok(tauri::ipc::InvokeResponseBody::Raw(out))
 }
 
 fn is_zip(buf: &[u8]) -> bool {
@@ -43,6 +78,32 @@ fn temp_world_path() -> std::path::PathBuf {
         .unwrap_or_default()
         .as_nanos();
     std::env::temp_dir().join(format!("vuencedit_{ts}.eden"))
+}
+
+/// Copies `src` to `dst` for the load-time private-temp-copy staging and `.bak` creation (audit
+/// H4). On macOS, tries an APFS `clonefile(2)` first — a copy-on-write clone that's O(1) in time
+/// and consumes no extra disk space until the copy diverges — instead of `std::fs::copy`'s real
+/// byte-for-byte `fcopyfile`, which costs a full read+write of the world on every open and every
+/// save's `.bak`. Falls back to a real copy on any clone failure (different volume — `temp_dir()`
+/// isn't guaranteed to share a volume with the source — unsupported filesystem, or `dst` already
+/// existing), so behaviour is identical to a plain copy everywhere clonefile isn't available.
+#[cfg(target_os = "macos")]
+fn stage_copy(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let src_c = std::ffi::CString::new(src.as_os_str().as_bytes())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let dst_c = std::ffi::CString::new(dst.as_os_str().as_bytes())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let rc = unsafe { libc::clonefile(src_c.as_ptr(), dst_c.as_ptr(), 0) };
+    if rc == 0 {
+        return Ok(());
+    }
+    fs::copy(src, dst).map(|_| ())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn stage_copy(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    fs::copy(src, dst).map(|_| ())
 }
 
 /// Delete `vuencedit_*.eden` staging files left in the system temp dir by a previous session that
@@ -95,7 +156,10 @@ pub(crate) struct LoadedWorld {
     /// on disk is never modified — saves are explicit fs::write calls.
     pub(crate) bytes: MmapMut,
     /// Maps (chunk_cx, chunk_cy) → byte offset of that chunk's data block in `bytes`.
-    pub(crate) chunk_map: HashMap<(i32, i32), usize>,
+    // FxHashMap: SipHash-1-3 (std's default) is needlessly slow for an (i32,i32) key hashed on
+    // every voxel read/write/render — Fx is 3-5x faster and this map is the hottest lookup in
+    // the program (audit M3 (2)). Not a security-sensitive map (no untrusted external keys).
+    pub(crate) chunk_map: FxHashMap<(i32, i32), usize>,
     /// Chunks whose real span is **shorter** than `chunk_size` — i.e. the next chunk's data (or
     /// the directory, or EOF) starts before `offset + chunk_size`, so the tail of the nominal
     /// window belongs to someone else. Keyed like `chunk_map`; an absent key means the full
@@ -105,7 +169,7 @@ pub(crate) struct LoadedWorld {
     /// whose successor sits 107,072 B later instead of 131,072 — a 24,000-byte overlap that a
     /// fixed-`chunk_size` write would scribble into the neighbour (§1.9). Read/write sites must
     /// bound themselves with `chunk_range`, not `bytes.len()`.
-    pub(crate) chunk_span: HashMap<(i32, i32), usize>,
+    pub(crate) chunk_span: FxHashMap<(i32, i32), usize>,
     /// Chunk block size in bytes: 32768 for 64-layer worlds, 131072 for 256-layer worlds.
     pub(crate) chunk_size: usize,
     /// Number of z-bands per chunk: 4 (64z) or 16 (256z). Each band covers 16 z-layers.
@@ -175,7 +239,10 @@ fn write_spawn(world: &mut LoadedWorld, px: f32, py: f32) {
 /// cost more than just keeping the whole buffer; chosen in `diff_chunk` by comparing sizes.
 pub(crate) enum ChunkDelta {
     Sparse(Vec<(u32, u8)>),
-    Full(Vec<u8>),
+    /// `(start, data)` — `start` is the byte offset within the chunk (relative to its `addr`)
+    /// where `data` begins. Band-scoped snapshots (see `with_edit_zscoped`) only capture the
+    /// z-bands an edit's `z_min..z_max` actually touches, so this is rarely 0.
+    Full(u32, Vec<u8>),
 }
 
 pub(crate) struct ChunkSnapshot {
@@ -188,7 +255,7 @@ fn chunk_snapshot_bytes(s: &ChunkSnapshot) -> usize {
     match &s.delta {
         // 5 bytes/entry (u32 offset + u8 value) plus a little Vec overhead allowance.
         ChunkDelta::Sparse(v) => v.len() * 5 + 24,
-        ChunkDelta::Full(d) => d.len(),
+        ChunkDelta::Full(_, d) => d.len(),
     }
 }
 
@@ -201,6 +268,17 @@ pub(crate) struct UndoEntry {
     /// separate; only undo/redo coalescing and the group count key off this. See
     /// `count_undo_groups`, `with_edit_grouped`, `undo_edit_inner`/`redo_edit_inner`.
     pub(crate) group: Option<u64>,
+    /// Total byte cost of `chunks`, computed once here so `push_undo`'s budget accounting is
+    /// O(1) per push instead of re-summing every chunk in the stack on every push (audit M2 —
+    /// this used to make a long sculpt stroke's undo bookkeeping quadratic in stroke length).
+    pub(crate) bytes: usize,
+}
+
+impl UndoEntry {
+    fn new(operation: impl Into<String>, chunks: Vec<ChunkSnapshot>, group: Option<u64>) -> Self {
+        let bytes = chunks.iter().map(chunk_snapshot_bytes).sum();
+        UndoEntry { operation: operation.into(), chunks, group, bytes }
+    }
 }
 
 // ── Clipboard ─────────────────────────────────────────────────────────────────
@@ -337,11 +415,93 @@ pub(crate) struct SculptSession {
     pub(crate) fheight: HashMap<(i32, i32), f64>,
 }
 
+/// Chunk-level (and header) dirty tracking for incremental autosave/save (audit C2). Three
+/// independent "since X" sets exist because the journal, the on-disk file, and the autosave base
+/// image each advance on their own cadence and get cleared at different times — a chunk can be
+/// flushed to the journal (clearing `since_journal`) while still owing a write to `disk_image.path`
+/// (`since_disk` untouched) and still counting toward journal-compaction accounting (`since_base`).
+/// `header_*` mirror the three sets for header bytes 0..192, which have no `(cx,cy)` of their own —
+/// `set_spawn_pos`/`rename_world`/`set_sky_grid` write header fields directly and bypass
+/// `with_edit`, so they mark this explicitly rather than going through `mark_chunks`.
+#[derive(Default)]
+pub(crate) struct DirtyState {
+    since_journal: FxHashSet<(i32, i32)>,
+    since_disk: FxHashSet<(i32, i32)>,
+    since_base: FxHashSet<(i32, i32)>,
+    header_journal: bool,
+    header_disk: bool,
+    header_base: bool,
+    /// Monotonic counter bumped by every `mark_*` **and** by `clear_all`, i.e. by every event that
+    /// can make a previously-captured view of this struct stale. A flush that captured its work
+    /// under a *read* guard and released it before mutating this struct (the save path in
+    /// `try_incremental_save` / `record_full_write`) compares the value it saw against the current
+    /// one: unchanged proves nothing interleaved, so the entries it wrote can be cleared. Changed
+    /// means an edit — or a whole world load/close — landed in the window, and the sets are left
+    /// **over-approximate** instead. That asymmetry is the point: re-writing a chunk that was
+    /// already correct costs a few KB, while clearing one that wasn't written silently drops that
+    /// edit from the user's file forever. Never reset (not even by `clear_all`), so a stale capture
+    /// from before a world swap can never compare equal to a fresh counter.
+    seq: u64,
+}
+
+impl DirtyState {
+    pub(crate) fn mark_chunks<I: IntoIterator<Item = (i32, i32)>>(&mut self, chunks: I) {
+        self.seq = self.seq.wrapping_add(1);
+        for c in chunks {
+            self.since_journal.insert(c);
+            self.since_disk.insert(c);
+            self.since_base.insert(c);
+        }
+    }
+
+    pub(crate) fn mark_header(&mut self) {
+        self.seq = self.seq.wrapping_add(1);
+        self.header_journal = true;
+        self.header_disk = true;
+        self.header_base = true;
+    }
+
+    /// Called on world load/close — nothing prior to this instant is owed to anything, since
+    /// there's either no world or a brand-new one with no journal/disk-image history yet.
+    pub(crate) fn clear_all(&mut self) {
+        self.seq = self.seq.wrapping_add(1);
+        self.since_journal.clear();
+        self.since_disk.clear();
+        self.since_base.clear();
+        self.header_journal = false;
+        self.header_disk = false;
+        self.header_base = false;
+    }
+}
+
+/// What we believe is currently on disk at `path`, byte-identical to `world.bytes` — established at
+/// `load_world` for the non-zip case (the staged temp is an exact copy of the source file, which is
+/// exactly `world.bytes`) and re-established by every successful save. Consumed by the
+/// incremental-save eligibility check (`try_incremental_save`, audit C2 Stage 4), which is the only
+/// reader: if this is `None`, or describes a different path, or no longer matches the file actually
+/// on disk, the save falls back to a full atomic write.
+pub(crate) struct DiskImage {
+    path: std::path::PathBuf,
+    /// Length and modification time as of our own last write. Re-checked against a fresh
+    /// `metadata()` before any in-place save, so a destination that something else (the game, a
+    /// sync client, a second editor instance) has touched since is detected and declined. Both are
+    /// meaningless when `compressed` — eligibility rejects on that flag before consulting them.
+    len: u64,
+    mtime: std::time::SystemTime,
+    /// Last write to `path` was a zip — an incremental in-place update is impossible from it.
+    compressed: bool,
+}
+
 pub(crate) struct WorldState {
     pub(crate) world: Option<LoadedWorld>,
     pub(crate) clipboard: Option<Clipboard>,
     pub(crate) undo_stack: VecDeque<UndoEntry>,
     pub(crate) redo_stack: VecDeque<UndoEntry>,
+    /// Running byte totals for `undo_stack`/`redo_stack`, kept in sync by `push_undo`/`pop_undo`
+    /// (and reset to 0 wherever the stacks are `.clear()`'d) so budget accounting never re-sums
+    /// the whole stack (audit M2).
+    pub(crate) undo_bytes: usize,
+    pub(crate) redo_bytes: usize,
     /// Path to the decompressed temp file when the current world was opened from a zip.
     /// Deleted after the mmap is dropped on next world load.
     pub(crate) temp_path: Option<std::path::PathBuf>,
@@ -351,17 +511,17 @@ pub(crate) struct WorldState {
     pub(crate) template_bytes: Option<std::sync::Arc<Mmap>>,
     /// Absolute (tx, tz) chunk coords → byte offset into template_bytes.
     /// Eden.eden uses i32+i32+u64 directory, different from regular saves.
-    pub(crate) template_dir: HashMap<(i32, i32), usize>,
+    pub(crate) template_dir: FxHashMap<(i32, i32), usize>,
     /// Per-chunk surface colors: [r,g,b,a] for each of the 256 (lx*16+ly) positions.
     /// a=255 = solid block; a=0 = air column. 1 KB/chunk vs 32 KB for full raw.
     pub(crate) template_surface_cache: HashMap<(i32, i32), Box<[[u8; 4]; 256]>>,
     /// Optional texture pack loaded by the user (world-independent).
     pub(crate) texture_pack: Option<texturepack::TexturePack>,
-    /// Lazily-built lamp (block type 72) position index, keyed by chunk (cx,cy) → lamp world coords.
-    /// `None` until first needed (night lighting is opt-in); cleared on world load/close; kept current
-    /// by `with_edit`/`undo_edit`/`redo_edit` rescanning only the affected chunks. Enables an
-    /// O(lamps) gather instead of an O((16+2r)³) region scan, so the lamp radius can be a user slider.
-    pub(crate) lamp_index: Option<HashMap<(i32, i32), Vec<[i32; 3]>>>,
+    /// Lazily-built lamp (block type 72) position index — see `LampIndex`. Empty until first needed
+    /// (night lighting is opt-in); cleared on world load/close; kept current by
+    /// `with_edit`/`undo_edit`/`redo_edit` replaying their undo deltas into it. Enables an O(lamps)
+    /// gather instead of an O((16+2r)³) region scan, so the lamp radius can be a user slider.
+    pub(crate) lamp_index: LampIndex,
     /// Cutaway view: when Some(cap), every top-down render and every surface-consulting edit path
     /// behaves as if the world ended at z == cap — the map shows the cave interior, and drawing /
     /// terrain-paste / the cursor readout target the highest block *at or below* the cap. `None`
@@ -375,6 +535,18 @@ pub(crate) struct WorldState {
     /// `clear_selection_mask` and on world load/close. Edit commands only honour it when its bbox
     /// exactly matches the rect they were passed (`active_mask`).
     pub(crate) selection_mask: Option<SelectionMask>,
+    /// Chunks (+ header) changed since the last journal append / disk write / autosave base image —
+    /// see `DirtyState`. Cleared on world load/close, alongside everything else session-scoped.
+    pub(crate) dirty: DirtyState,
+    /// What we believe is currently on disk at the loaded world's source path — see `DiskImage`.
+    /// `None` until `load_world` establishes it (or after a zip load, where it stays `None`).
+    pub(crate) disk_image: Option<DiskImage>,
+    /// Random id of the currently-established journaled-autosave base image (`autosave.base.eden`),
+    /// or `None` if this session hasn't autosaved yet. Set by the first `autosave_world` tick after
+    /// load/recovery; cleared on load/close/recovery so the next session (or the next world) always
+    /// starts its own fresh base+journal lineage rather than silently extending a stale one whose
+    /// on-disk image no longer corresponds to `temp_path`.
+    pub(crate) autosave_base_id: Option<[u8; 16]>,
 }
 
 impl WorldState {
@@ -384,15 +556,20 @@ impl WorldState {
             clipboard: None,
             undo_stack: VecDeque::new(),
             redo_stack: VecDeque::new(),
+            undo_bytes: 0,
+            redo_bytes: 0,
             temp_path: None,
             template_bytes: None,
-            template_dir: HashMap::new(),
+            template_dir: FxHashMap::default(),
             template_surface_cache: HashMap::new(),
             texture_pack: None,
-            lamp_index: None,
+            lamp_index: LampIndex::default(),
             view_cap_z: None,
             sculpt_session: None,
             selection_mask: None,
+            dirty: DirtyState::default(),
+            disk_image: None,
+            autosave_base_id: None,
         }
     }
 }
@@ -405,23 +582,47 @@ impl WorldState {
 // of chunks within reach, so the radius can be a user slider (and it's the shared foundation the
 // experimental GPU night point-lights need too).
 
-/// Scan one populated chunk's voxels for Lamp blocks, returning their local block coords.
+/// Map from chunk coord to the lamp positions (editor-local block coords) inside that chunk.
+pub(crate) type LampMap = FxHashMap<(i32, i32), Vec<[i32; 3]>>;
+
+/// Decode a chunk-relative byte offset into `(lx, ly, z)`, or `None` if it addresses a *paint*
+/// byte rather than a block byte. Inverse of `addr + band*8192 + lx*256 + ly*16 + lz`; the paint
+/// half of each 8192-byte band sits at `+4096`, so only the low half carries block types.
+#[inline]
+fn decode_block_offset(off: usize) -> Option<(usize, usize, usize)> {
+    let rem = off % 8192;
+    if rem >= 4096 { return None; } // paint half-band
+    Some((rem / 256, (rem % 256) / 16, (off / 8192) * 16 + rem % 16))
+}
+
+/// Scan one populated chunk's voxels for Lamp blocks, returning their editor-local block coords.
+///
+/// Walks each band's 4096-byte *block* half **linearly** (audit H3): the old form probed
+/// `addr + band*8192 + lx*256 + ly*16 + lz` with `z` innermost, which jumps 8192 bytes every 16
+/// steps — the worst possible order for a 131 KB chunk. Scanning the contiguous half-band with
+/// `position` lets the search vectorise, halves the bytes touched (the paint halves are skipped
+/// outright rather than skipped-by-indexing), and reads the mapping sequentially so a cold chunk
+/// costs one streaming page-in instead of a strided walk over every page.
 fn scan_chunk_lamps(world: &LoadedWorld, cx: i32, cy: i32) -> Vec<[i32; 3]> {
     let Some((addr, cend)) = world.chunk_range(cx, cy) else { return Vec::new() };
-    let max_z = world.num_bands * 16;
+    let base_x = (cx - world.min_x) * 16;
+    let base_y = (cy - world.min_y) * 16;
     let mut out = Vec::new();
-    for lx in 0..16usize {
-        for ly in 0..16usize {
-            for z in 0..max_z {
-                let band = z / 16;
-                let lz = z % 16;
-                let bi = addr + band * 8192 + lx * 256 + ly * 16 + lz;
-                if bi < cend && world.bytes[bi] == LAMP_BLOCK_TYPE {
-                    let wx = (cx - world.min_x) * 16 + lx as i32;
-                    let wy = (cy - world.min_y) * 16 + ly as i32;
-                    out.push([wx, wy, z as i32]);
-                }
-            }
+    for band in 0..world.num_bands {
+        let lo = addr + band * 8192;
+        if lo >= cend { break; }
+        let hi = (lo + 4096).min(cend);
+        let half = &world.bytes[lo..hi];
+        let mut i = 0usize;
+        while let Some(rel) = half[i..].iter().position(|&b| b == LAMP_BLOCK_TYPE) {
+            let rem = i + rel;
+            out.push([
+                base_x + (rem / 256) as i32,
+                base_y + ((rem % 256) / 16) as i32,
+                (band * 16 + rem % 16) as i32,
+            ]);
+            i = rem + 1;
+            if i >= half.len() { break; }
         }
     }
     out
@@ -429,30 +630,126 @@ fn scan_chunk_lamps(world: &LoadedWorld, cx: i32, cy: i32) -> Vec<[i32; 3]> {
 
 /// Build the full lamp index by scanning only populated chunks (sparse worlds store just edited
 /// chunks, so this is bounded by the actual world size, not the 180×180 template grid).
-pub(crate) fn build_lamp_index(world: &LoadedWorld) -> HashMap<(i32, i32), Vec<[i32; 3]>> {
-    let mut index = HashMap::new();
-    for &(cx, cy) in world.chunk_map.keys() {
-        let lamps = scan_chunk_lamps(world, cx, cy);
-        if !lamps.is_empty() {
-            index.insert((cx, cy), lamps);
-        }
-    }
-    index
+///
+/// Parallel over chunks — they are independent `&LoadedWorld` reads, and nothing in the closure
+/// touches `AppState`, so the "no re-locking inside a rayon closure" rule holds.
+pub(crate) fn build_lamp_index(world: &LoadedWorld) -> LampMap {
+    let coords: Vec<(i32, i32)> = world.chunk_map.keys().copied().collect();
+    coords
+        .par_iter()
+        .filter_map(|&(cx, cy)| {
+            let lamps = scan_chunk_lamps(world, cx, cy);
+            if lamps.is_empty() { None } else { Some(((cx, cy), lamps)) }
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .collect()
 }
 
-/// Rescan the given chunks' lamp lists in place (place/remove a lamp → the index must follow, or
-/// night lighting goes stale). No-op if the index hasn't been built yet. `coords` are the same
-/// affected-chunk coords `with_edit`/undo/redo already compute for snapshots.
-fn refresh_lamp_index_chunks(ws: &mut WorldState, coords: &[(i32, i32)]) {
-    let Some(world) = ws.world.as_ref() else { return };
-    let Some(index) = ws.lamp_index.as_mut() else { return };
-    for &(cx, cy) in coords {
-        let key = (cx, cy);
-        let lamps = scan_chunk_lamps(world, key.0, key.1);
-        if lamps.is_empty() {
-            index.remove(&key);
-        } else {
-            index.insert(key, lamps);
+/// Lazily-built, interior-mutable lamp spatial index.
+///
+/// The `Mutex` is what lets the (expensive) first build happen while its caller holds only a
+/// **read** guard on `WorldState` (audit C1 step 2 + H3): tile fetches, cursor reads and other
+/// chunk-geometry requests keep running concurrently instead of queueing behind a write lock.
+/// Correctness comes from the read guard being held continuously across build *and* install —
+/// every mutating path takes the `WorldState` write lock, so no edit can slip in between and
+/// leave the freshly built index describing a world that no longer exists.
+#[derive(Default)]
+pub(crate) struct LampIndex(Mutex<Option<LampMap>>);
+
+impl LampIndex {
+    fn guard(&self) -> std::sync::MutexGuard<'_, Option<LampMap>> {
+        self.0.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Run `f` against the index, building it first if this is the first night-lit request.
+    /// Takes `&self` so it works under a `WorldState` read guard.
+    pub(crate) fn with<R>(&self, world: &LoadedWorld, f: impl FnOnce(&LampMap) -> R) -> R {
+        let mut slot = self.guard();
+        if slot.is_none() {
+            *slot = Some(build_lamp_index(world));
+        }
+        f(slot.as_ref().unwrap())
+    }
+
+    /// Drop the index (world load/close). Rebuilt on the next night-lit request.
+    pub(crate) fn clear(&self) {
+        *self.guard() = None;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn snapshot(&self) -> Option<LampMap> {
+        self.guard().clone()
+    }
+
+    /// Force a full rebuild (tests only — production always builds lazily via `with`).
+    #[cfg(test)]
+    pub(crate) fn build_now(&self, world: &LoadedWorld) {
+        *self.guard() = Some(build_lamp_index(world));
+    }
+
+    /// Bring the index in line with an edit, using the undo delta that edit just produced
+    /// (audit H3): `snaps` hold each changed byte's **previous** value, and `world` already holds
+    /// the new one, so the lamp set changes at exactly the offsets the delta lists. This replaces
+    /// a full 65,536-probe rescan of every affected chunk with O(bytes actually changed) — a large
+    /// fill used to re-scan thousands of whole chunks per edit once the index existed.
+    ///
+    /// No-op while the index is unbuilt (night lighting never enabled) — the lazy build will see
+    /// the post-edit world anyway.
+    pub(crate) fn apply_delta(&self, world: &LoadedWorld, snaps: &[ChunkSnapshot]) {
+        let mut slot = self.guard();
+        let Some(index) = slot.as_mut() else { return };
+        for snap in snaps {
+            let Some((addr, cend)) = world.chunk_range(snap.cx, snap.cy) else { continue };
+            let base_x = (snap.cx - world.min_x) * 16;
+            let base_y = (snap.cy - world.min_y) * 16;
+            // `off` is chunk-relative; `prev`/`now` are its byte value before/after the edit.
+            // Only a transition into or out of `LAMP_BLOCK_TYPE` moves the index.
+            let key = (snap.cx, snap.cy);
+            let mut visit = |off: usize, prev: u8, now: u8| {
+                let is_lamp = now == LAMP_BLOCK_TYPE;
+                if (prev == LAMP_BLOCK_TYPE) == is_lamp { return; }
+                let Some((lx, ly, z)) = decode_block_offset(off) else { return };
+                let pos = [base_x + lx as i32, base_y + ly as i32, z as i32];
+                if is_lamp {
+                    let bucket = index.entry(key).or_default();
+                    if !bucket.contains(&pos) { bucket.push(pos); }
+                } else if let Some(bucket) = index.get_mut(&key) {
+                    bucket.retain(|p| *p != pos);
+                    if bucket.is_empty() { index.remove(&key); }
+                }
+            };
+            match &snap.delta {
+                ChunkDelta::Sparse(pairs) => {
+                    for &(off, prev) in pairs {
+                        let off = off as usize;
+                        // Paint bytes can't hold a block type, so they can't create or destroy a lamp.
+                        if off % 8192 >= 4096 { continue; }
+                        let idx = addr + off;
+                        if idx >= cend { continue; }
+                        visit(off, prev, world.bytes[idx]);
+                    }
+                }
+                // Dense-edit fallback: walk the *block* half of each band the span covers as a pair
+                // of slices, so the paint halves are skipped as whole ranges (not re-tested per byte)
+                // and the pre/post comparison stays a straight zip with no per-byte bounds check.
+                ChunkDelta::Full(start_off, data) => {
+                    let start = *start_off as usize;
+                    let end = (start + data.len()).min(cend - addr);
+                    let mut band = start / 8192;
+                    while band * 8192 < end {
+                        let lo = (band * 8192).max(start);
+                        let hi = (band * 8192 + 4096).min(end);
+                        band += 1;
+                        if hi <= lo { continue; }
+                        let pre = &data[lo - start..hi - start];
+                        let post = &world.bytes[addr + lo..addr + hi];
+                        for (j, (&p, &q)) in pre.iter().zip(post).enumerate() {
+                            if p != q { visit(lo + j, p, q); }
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -462,7 +759,7 @@ fn refresh_lamp_index_chunks(ws: &mut WorldState, coords: &[(i32, i32)]) {
 /// overlapping the region expanded by `ceil(radius/16)` chunks, then filters to the exact expanded
 /// box so the result matches the old inline voxel scan exactly (parity).
 pub(crate) fn lamps_in_region(
-    index: &HashMap<(i32, i32), Vec<[i32; 3]>>,
+    index: &LampMap,
     world: &LoadedWorld,
     sx1: i32, sy1: i32, sx2: i32, sy2: i32,
     radius: f32,
@@ -487,7 +784,39 @@ pub(crate) fn lamps_in_region(
     out
 }
 
-pub(crate) type AppState = Mutex<WorldState>;
+// ── The global world lock ──────────────────────────────────────────────────────
+//
+// `RwLock`, not `Mutex` (audit C1 step 2). Everything that only *reads* the world — tile fetches,
+// every `render_*` command, cursor/surface queries, `describe_selection`, clipboard previews,
+// `get_chunk_geometry`, and **`save_world`/`autosave_world`** — takes a shared read guard and runs
+// concurrently. Only the ~30 mutating commands (the 11 editors, undo/redo, load/close, clipboard
+// writes, template/texture-pack installs, selection-mask writes) take the exclusive write guard.
+//
+// The practical effect is the one the audit called for: panning, hovering and rendering keep
+// working *during* a multi-second save or export, because those no longer serialise behind it.
+//
+// Two rules for anything added later:
+//   1. **Never hold a read guard and then ask for the write guard** (or vice versa) in the same
+//      call chain — `std::sync::RwLock` is not reentrant or upgradable, and a writer waiting in
+//      between turns it into a deadlock. Where a read path needs to populate a lazily-built cache,
+//      give that cache interior mutability instead (see `LampIndex`).
+//   2. The existing "no re-locking `AppState` inside a rayon closure" rule still applies, and is
+//      now stricter: a nested read guard is *not* safe just because reads are shared.
+pub(crate) type AppState = RwLock<WorldState>;
+
+/// Shared (read) guard on the world. Poison is deliberately ignored — a panic while some other
+/// command held the lock must not brick every subsequent command (same convention the `Mutex`
+/// version used).
+#[inline]
+pub(crate) fn read_ws(state: &AppState) -> RwLockReadGuard<'_, WorldState> {
+    state.read().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Exclusive (write) guard on the world. See `read_ws` for the poison policy.
+#[inline]
+pub(crate) fn write_ws(state: &AppState) -> RwLockWriteGuard<'_, WorldState> {
+    state.write().unwrap_or_else(|p| p.into_inner())
+}
 
 /// Cooperative cancel flag for `expand_world_from_template`, checked between chunk writes.
 /// A separate managed state (not a WorldState field) so checking it never contends with the
@@ -597,9 +926,25 @@ fn parse_world_inner(bytes: MmapMut) -> Result<LoadedWorld, String> {
     //
     // Validation is deliberately deferred to Pass B: the only correct bound is
     // `off + chunk_size <= len`, and `chunk_size` isn't known until the offsets are.
-    let mut entries: Vec<(i32, i32, u64)> = Vec::new();
+    //
+    // `ptr_offset` comes straight from the header with no validation of its own (audit M5). A
+    // corrupt or hostile file — e.g. ptr_offset == 0 — would otherwise make this loop treat the
+    // *entire file* as a directory: a 2 GB file yields ~134M entries (2.1 GB `Vec`), touching
+    // every page of the mapping before Pass B ever gets a chance to reject it. The real header is
+    // 192 bytes (see CLAUDE.md's file-format table), so a directory can never start before that;
+    // cap the entry count defensively at 4M (far more than any real world has chunks) so a bogus
+    // offset fails fast with a clear error instead of allocating.
+    const MAX_DIR_ENTRIES: usize = 4_000_000;
+    if ptr_offset < 192 || ptr_offset >= bytes.len() {
+        return Err(format!(
+            "Corrupt or unsupported world file: chunk directory offset {ptr_offset} is out of range for a {}-byte file",
+            bytes.len()
+        ));
+    }
+    let max_entries = ((bytes.len() - ptr_offset) / 16).min(MAX_DIR_ENTRIES);
+    let mut entries: Vec<(i32, i32, u64)> = Vec::with_capacity(max_entries);
     let mut i = ptr_offset;
-    while i.saturating_add(16) <= bytes.len() {
+    while i.saturating_add(16) <= bytes.len() && entries.len() < MAX_DIR_ENTRIES {
         entries.push(decode_dir_entry(&bytes[i..i + 16]));
         i += 16;
     }
@@ -643,7 +988,7 @@ fn parse_world_inner(bytes: MmapMut) -> Result<LoadedWorld, String> {
     // Replaces a hardcoded `off + 32768 <= len` guard, which on a 256z world admitted entries
     // within 128 KB of EOF whose band reads then fell out of bounds (DIAGNOSIS.md §1.10.2).
     // Stricter, never looser.
-    let mut chunk_map: HashMap<(i32, i32), usize> = HashMap::with_capacity(entries.len());
+    let mut chunk_map: FxHashMap<(i32, i32), usize> = FxHashMap::with_capacity_and_hasher(entries.len(), Default::default());
     for (cx, cy, off) in entries {
         // Compared in u64 so a >4 GiB offset can't wrap on the way to the check — which also
         // makes the `as usize` provably lossless, since anything that passes is < bytes.len().
@@ -670,7 +1015,7 @@ fn parse_world_inner(bytes: MmapMut) -> Result<LoadedWorld, String> {
     let mut sorted: Vec<usize> = chunk_map.values().copied().collect();
     sorted.sort_unstable();
     sorted.dedup();
-    let mut chunk_span: HashMap<(i32, i32), usize> = HashMap::new();
+    let mut chunk_span: FxHashMap<(i32, i32), usize> = FxHashMap::default();
     for (&(cx, cy), &addr) in &chunk_map {
         let next = sorted
             .get(sorted.partition_point(|&o| o <= addr))
@@ -729,13 +1074,36 @@ pub(crate) fn world_max_z(world: &LoadedWorld) -> i32 {
 // commands now return only the changed rectangle. The frontend applies it with
 // putImageData at (x, y) on the existing offscreen canvas.
 
-#[derive(Serialize)]
 struct PixelPatch {
     x: u32, y: u32,
     width: u32, height: u32,
-    #[serde(serialize_with = "serialize_bytes_b64")]
-    pixels: Vec<u8>,  // RGBA, row-major, (y, x) order — serialized as base64
+    /// World blocks per output pixel (audit H6). 1 = full resolution; >1 means the patch was
+    /// point-sampled every `lod`-th block on both axes, so it covers `width*lod × height*lod`
+    /// world blocks starting at (x, y) and must be drawn upscaled by `lod`.
+    lod: u32,
+    pixels: Vec<u8>,  // RGBA, row-major, (y, x) order
 }
+
+#[derive(Serialize)]
+struct PixelPatchHeader { x: u32, y: u32, width: u32, height: u32, lod: u32 }
+
+impl PixelPatch {
+    fn header(&self) -> PixelPatchHeader {
+        PixelPatchHeader { x: self.x, y: self.y, width: self.width, height: self.height, lod: self.lod }
+    }
+}
+
+impl tauri::ipc::IpcResponse for PixelPatch {
+    fn body(self) -> tauri::Result<tauri::ipc::InvokeResponseBody> {
+        ipc_envelope(&self.header(), &[&self.pixels])
+    }
+}
+
+/// Largest level-of-detail step any render command will honour. A tile is always ~`TILE` output
+/// pixels regardless of zoom, so the frontend grows the tile's *world* footprint by `lod` rather
+/// than shrinking the tile; this cap bounds that footprint (and the clamp keeps a bad IPC arg from
+/// producing a one-pixel patch covering the whole world).
+pub(crate) const MAX_LOD: u32 = 32;
 
 /// Re-render just the sub-rectangle [px1,px2] × [py1,py2] of the top-down map.
 /// Bounds are clamped to [0, world_W-1] × [0, world_H-1].
@@ -744,26 +1112,48 @@ struct PixelPatch {
 /// so the map draws whatever is directly under the cap plane (cave roofs vanish, floors show).
 /// `None` = normal render.
 fn render_pixels_patch(world: &LoadedWorld, px1: i32, py1: i32, px2: i32, py2: i32, cap: Option<i32>) -> PixelPatch {
+    render_pixels_patch_lod(world, px1, py1, px2, py2, cap, 1)
+}
+
+/// `render_pixels_patch` with a level-of-detail step (audit H6): only every `lod`-th block on each
+/// axis is scanned, so the output is `lod²` times smaller and `lod²` times cheaper. Nearest-neighbour
+/// point sampling, which matches the frontend's `imageSmoothingEnabled = false` upscale — at
+/// zoomed-out scales the discarded columns were never visible anyway.
+fn render_pixels_patch_lod(
+    world: &LoadedWorld, px1: i32, py1: i32, px2: i32, py2: i32, cap: Option<i32>, lod: u32,
+) -> PixelPatch {
+    let lod = lod.clamp(1, MAX_LOD);
     let world_w = (world.w_chunks * 16) as i32;
     let world_h = (world.h_chunks * 16) as i32;
     let x1 = px1.clamp(0, world_w - 1) as u32;
     let y1 = py1.clamp(0, world_h - 1) as u32;
     let x2 = px2.clamp(0, world_w - 1) as u32;
     let y2 = py2.clamp(0, world_h - 1) as u32;
-    let width  = x2 - x1 + 1;
-    let height = y2 - y1 + 1;
+    let width  = (x2 - x1) / lod + 1;
+    let height = (y2 - y1) / lod + 1;
     let mut pixels = vec![0u8; (width * height * 4) as usize];
 
     // One row per rayon task — rows are disjoint slices of `pixels`, and each pixel is an
     // independent O(1) lookup into `world`, so this is embarrassingly parallel.
     pixels.par_chunks_mut((width * 4) as usize).enumerate().for_each(|(row, row_pixels)| {
-        let py = y1 + row as u32;
-        for px in x1..=x2 {
+        let py = y1 + row as u32 * lod;
+        let cy = (py / 16) as i32 + world.min_y;
+        let ly = (py % 16) as usize;
+        // `chunk_range` is a hash lookup; at lod 1 `cx` only changes every 16 pixels, so memoize
+        // it across the run instead of calling it for every sample (audit M3 (1)) — ~16× fewer
+        // lookups on a wide patch. At lod ≥ 16 every sample lands in a new chunk and the memo
+        // simply never hits, which costs one integer compare.
+        let mut last_cx = i32::MIN;
+        let mut chunk: Option<(usize, usize)> = None;
+        for ox in 0..width {
+            let px = x1 + ox * lod;
             let cx = (px / 16) as i32 + world.min_x;
-            let cy = (py / 16) as i32 + world.min_y;
+            if cx != last_cx {
+                last_cx = cx;
+                chunk = world.chunk_range(cx, cy);
+            }
+            let Some((addr, cend)) = chunk else { continue };
             let lx = (px % 16) as usize;
-            let ly = (py % 16) as usize;
-            let Some((addr, cend)) = world.chunk_range(cx, cy) else { continue };
             let mut top_bt = 0u8; let mut top_paint = 0u8;
             let mut under_bt = 0u8; let mut under_paint = 0u8;
             'outer: for band in (0..world.num_bands).rev() {
@@ -800,23 +1190,32 @@ fn render_pixels_patch(world: &LoadedWorld, px1: i32, py1: i32, px2: i32, py2: i
                     ]
                 } else { c1 }
             } else { c1 };
-            let off = ((px - x1) * 4) as usize;
+            let off = (ox * 4) as usize;
             row_pixels[off] = r; row_pixels[off + 1] = g; row_pixels[off + 2] = b; row_pixels[off + 3] = 255;
         }
     });
-    PixelPatch { x: x1, y: y1, width, height, pixels }
+    PixelPatch { x: x1, y: y1, width, height, lod, pixels }
 }
 
 /// Re-render a sub-rectangle of a z-slice cross-section.
 fn render_zslice_patch_inner(world: &LoadedWorld, z: i32, px1: i32, py1: i32, px2: i32, py2: i32) -> PixelPatch {
+    render_zslice_patch_lod(world, z, px1, py1, px2, py2, 1)
+}
+
+/// `render_zslice_patch_inner` with a level-of-detail step — see `render_pixels_patch_lod`. The
+/// z-slice view is tiled by the same `MapCanvas` cache, so it takes the same `lod` its tiles do.
+fn render_zslice_patch_lod(
+    world: &LoadedWorld, z: i32, px1: i32, py1: i32, px2: i32, py2: i32, lod: u32,
+) -> PixelPatch {
+    let lod = lod.clamp(1, MAX_LOD);
     let world_w = (world.w_chunks * 16) as i32;
     let world_h = (world.h_chunks * 16) as i32;
     let x1 = px1.clamp(0, world_w - 1) as u32;
     let y1 = py1.clamp(0, world_h - 1) as u32;
     let x2 = px2.clamp(0, world_w - 1) as u32;
     let y2 = py2.clamp(0, world_h - 1) as u32;
-    let width  = x2 - x1 + 1;
-    let height = y2 - y1 + 1;
+    let width  = (x2 - x1) / lod + 1;
+    let height = (y2 - y1) / lod + 1;
     const VOID: [u8; 4] = [20, 20, 35, 255];
     let mut pixels = vec![0u8; (width * height * 4) as usize];
     for p in pixels.chunks_exact_mut(4) { p.copy_from_slice(&VOID); }
@@ -825,13 +1224,22 @@ fn render_zslice_patch_inner(world: &LoadedWorld, z: i32, px1: i32, py1: i32, px
     let lz   = (z as usize) % 16;
 
     pixels.par_chunks_mut((width * 4) as usize).enumerate().for_each(|(row, row_pixels)| {
-        let py = y1 + row as u32;
-        for px in x1..=x2 {
+        let py = y1 + row as u32 * lod;
+        let cy = (py / 16) as i32 + world.min_y;
+        let ly = (py % 16) as usize;
+        // Memoize `chunk_range` across the run the same way as `render_pixels_patch_lod`
+        // (audit M3 (1)) — at lod 1 `cx` only changes every 16 pixels.
+        let mut last_cx = i32::MIN;
+        let mut chunk: Option<(usize, usize)> = None;
+        for ox in 0..width {
+            let px = x1 + ox * lod;
             let cx = (px / 16) as i32 + world.min_x;
-            let cy = (py / 16) as i32 + world.min_y;
+            if cx != last_cx {
+                last_cx = cx;
+                chunk = world.chunk_range(cx, cy);
+            }
+            let Some((addr, cend)) = chunk else { continue };
             let lx = (px % 16) as usize;
-            let ly = (py % 16) as usize;
-            let Some((addr, cend)) = world.chunk_range(cx, cy) else { continue };
             let bi = addr + band * 8192 + lx * 256 + ly * 16 + lz;
             let pi = bi + 4096;
             if pi >= cend { continue; }
@@ -839,14 +1247,14 @@ fn render_zslice_patch_inner(world: &LoadedWorld, z: i32, px1: i32, py1: i32, px
             if bt == 0 { continue; }
             let paint = world.bytes[pi];
             let [r, g, b] = block_color(bt, paint, world.sky);
-            let off = ((px - x1) * 4) as usize;
+            let off = (ox * 4) as usize;
             row_pixels[off]     = r;
             row_pixels[off + 1] = g;
             row_pixels[off + 2] = b;
             row_pixels[off + 3] = 255;
         }
     });
-    PixelPatch { x: x1, y: y1, width, height, pixels }
+    PixelPatch { x: x1, y: y1, width, height, lod, pixels }
 }
 
 /// Front slab (constant world-Y plane). Horizontal axis = world X, vertical axis = world Z.
@@ -858,7 +1266,7 @@ fn render_yslice_patch_inner(world: &LoadedWorld, sy: i32, px1: i32, pz1: i32, p
     let world_h = (world.h_chunks * 16) as i32;
     let max_z   = world_max_z(world);
     if sy < 0 || sy >= world_h {
-        return PixelPatch { x: 0, y: 0, width: 1, height: 1, pixels: vec![20, 20, 35, 255] };
+        return PixelPatch { x: 0, y: 0, width: 1, height: 1, lod: 1, pixels: vec![20, 20, 35, 255] };
     }
     let x1 = px1.clamp(0, world_w - 1);
     let x2 = px2.clamp(0, world_w - 1);
@@ -901,7 +1309,7 @@ fn render_yslice_patch_inner(world: &LoadedWorld, sy: i32, px1: i32, pz1: i32, p
             pixels[off..off + 4].copy_from_slice(&rgba);
         }
     }
-    PixelPatch { x: x1 as u32, y: z1 as u32, width, height, pixels }
+    PixelPatch { x: x1 as u32, y: z1 as u32, width, height, lod: 1, pixels }
 }
 
 /// Side slab (constant world-X plane). Horizontal axis = world Y, vertical axis = world Z.
@@ -912,7 +1320,7 @@ fn render_xslice_patch_inner(world: &LoadedWorld, sx: i32, py1: i32, pz1: i32, p
     let world_h = (world.h_chunks * 16) as i32;
     let max_z   = world_max_z(world);
     if sx < 0 || sx >= world_w {
-        return PixelPatch { x: 0, y: 0, width: 1, height: 1, pixels: vec![20, 20, 35, 255] };
+        return PixelPatch { x: 0, y: 0, width: 1, height: 1, lod: 1, pixels: vec![20, 20, 35, 255] };
     }
     let y1 = py1.clamp(0, world_h - 1);
     let y2 = py2.clamp(0, world_h - 1);
@@ -953,7 +1361,7 @@ fn render_xslice_patch_inner(world: &LoadedWorld, sx: i32, py1: i32, pz1: i32, p
             pixels[off..off + 4].copy_from_slice(&rgba);
         }
     }
-    PixelPatch { x: y1 as u32, y: z1 as u32, width, height, pixels }
+    PixelPatch { x: y1 as u32, y: z1 as u32, width, height, lod: 1, pixels }
 }
 
 /// Compute the pixel-space bounding box of a set of chunk coordinates and
@@ -961,7 +1369,7 @@ fn render_xslice_patch_inner(world: &LoadedWorld, sx: i32, py1: i32, pz1: i32, p
 /// Used by undo/redo where the affected region is known only as chunk coords.
 fn patch_from_chunk_coords(world: &LoadedWorld, chunks: &[(i32, i32)], cap: Option<i32>) -> PixelPatch {
     if chunks.is_empty() {
-        return PixelPatch { x: 0, y: 0, width: 1, height: 1, pixels: vec![30, 30, 30, 255] };
+        return PixelPatch { x: 0, y: 0, width: 1, height: 1, lod: 1, pixels: vec![30, 30, 30, 255] };
     }
     let px1 = chunks.iter().map(|&(cx, _)| (cx as i32 - world.min_x) * 16).min().unwrap();
     let py1 = chunks.iter().map(|&(_, cy)| (cy as i32 - world.min_y) * 16).min().unwrap();
@@ -972,12 +1380,19 @@ fn patch_from_chunk_coords(world: &LoadedWorld, chunks: &[(i32, i32)], cap: Opti
 
 // ── Orthographic selection preview ────────────────────────────────────────────
 
-#[derive(Serialize)]
 struct PreviewData {
     width: u32,
     height: u32,
-    #[serde(serialize_with = "serialize_bytes_b64")]
     pixels: Vec<u8>,
+}
+
+#[derive(Serialize)]
+struct PreviewDataHeader { width: u32, height: u32 }
+
+impl tauri::ipc::IpcResponse for PreviewData {
+    fn body(self) -> tauri::Result<tauri::ipc::InvokeResponseBody> {
+        ipc_envelope(&PreviewDataHeader { width: self.width, height: self.height }, &[&self.pixels])
+    }
 }
 
 /// Front view: X=horizontal, Z=vertical; scans Y front-to-back, stops at first non-air block.
@@ -1183,6 +1598,13 @@ fn load_world(path: String, state: tauri::State<'_, AppState>) -> Result<WorldMe
         if let Ok(mut f) = fs::File::open(&path) { let _ = f.read_exact(&mut magic); }
     }
 
+    if !is_zip(&magic) {
+        // An incremental save (audit C2 Stage 4) that was interrupted mid-write left a committed redo
+        // log beside this file. Roll it forward *before* staging, so the copy we map — and therefore
+        // everything downstream, including this session's autosave base — is the repaired file.
+        recover_wal(std::path::Path::new(&path));
+    }
+
     let (mmap, maybe_temp, was_compressed): (MmapMut, Option<std::path::PathBuf>, bool) = if is_zip(&magic) {
         use zip::ZipArchive;
         timing_log!("[LOAD] detected zip archive, decompressing  t=+{}µs", us());
@@ -1216,7 +1638,7 @@ fn load_world(path: String, state: tauri::State<'_, AppState>) -> Result<WorldMe
         // undefined behaviour of writing over a still-mmapped file on Unix. map_copy stays
         // copy-on-write, so edits live in RAM and the temp is only the evictable read-backing store.
         let temp_path = temp_world_path();
-        fs::copy(&path, &temp_path).map_err(|e| format!(
+        stage_copy(std::path::Path::new(&path), &temp_path).map_err(|e| format!(
             "Failed to stage world file: {e}. Opening a world creates a private working copy; check available space for another copy on the system temporary-files drive."
         ))?;
         let file = fs::File::open(&temp_path).map_err(|e| format!("Failed to open staged file: {e}"))?;
@@ -1276,23 +1698,38 @@ fn load_world(path: String, state: tauri::State<'_, AppState>) -> Result<WorldMe
     timing_log!("[LOCK] acquire_start  cmd=load_world/step3  t=+{}µs", us());
     let t_s3 = Instant::now();
     let (_old_world, old_temp) = {
-        let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
+        let mut ws = write_ws(&state);
         let wait = t_s3.elapsed().as_micros();
-        let prev_undo: usize = ws.undo_stack.iter().flat_map(|e| e.chunks.iter()).map(chunk_snapshot_bytes).sum();
-        let prev_redo: usize = ws.redo_stack.iter().flat_map(|e| e.chunks.iter()).map(chunk_snapshot_bytes).sum();
         timing_log!("[LOCK] acquired  cmd=load_world/step3  wait={}µs  prev_undo={}B  prev_redo={}B",
-            wait, prev_undo, prev_redo);
+            wait, ws.undo_bytes, ws.redo_bytes);
         let t_held = Instant::now();
         let old_world = ws.world.replace(loaded);  // pointer swap only — dealloc happens outside the lock
         ws.clipboard = None;
         ws.undo_stack.clear();
         ws.redo_stack.clear();
-        ws.lamp_index = None; // rebuilt lazily for the new world on first night-lit request
+        ws.undo_bytes = 0;
+        ws.redo_bytes = 0;
+        ws.lamp_index.clear(); // rebuilt lazily for the new world on first night-lit request
         ws.view_cap_z = None; // cutaway is per-world; the frontend also resets viewMode on load
         ws.sculpt_session = None; // any in-flight live-sculpt workspace belongs to the old world
         ws.selection_mask = None; // a wand/lasso shape belongs to the old world's coordinates
         let old_temp = ws.temp_path.take();
         ws.temp_path = maybe_temp;
+        ws.dirty.clear_all();
+        ws.autosave_base_id = None; // the new world's autosave lineage starts fresh, not the old one's
+        // Non-zip loads: the staged temp is an exact copy of the source file, which is exactly
+        // world.bytes, so the source path is a known-good disk image the instant load succeeds.
+        // Zip loads leave this None — there is no uncompressed on-disk image to write into.
+        ws.disk_image = if was_compressed {
+            None
+        } else {
+            fs::metadata(&path).ok().map(|md| DiskImage {
+                path: std::path::PathBuf::from(&path),
+                len: md.len(),
+                mtime: md.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+                compressed: false,
+            })
+        };
         drop(ws);
         timing_log!("[LOCK] released  cmd=load_world/step3  held={}µs  t=+{}µs", t_held.elapsed().as_micros(), us());
         (old_world, old_temp)
@@ -1323,9 +1760,9 @@ struct WorldInfo {
     spawn_px: Option<f32>, spawn_py: Option<f32>,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_world_info(state: tauri::State<'_, AppState>) -> Result<WorldInfo, String> {
-    let ws = state.lock().unwrap_or_else(|p| p.into_inner());
+    let ws = read_ws(&state);
     let world = ws.world.as_ref().ok_or("No world loaded")?;
     let b = &world.bytes;
 
@@ -1400,16 +1837,26 @@ fn composite_template_full(ws: &mut WorldState, w: i32, h: i32, buf: &mut [u8]) 
             }
         }
     }
-    for py in 0..h {
-        for px in 0..w {
-            let off = ((py * w + px) * 4) as usize;
-            if buf[off + 3] != 0 { continue; } // user pixel already present
-            let tx = px / 16 + min_x;
-            let tz = py / 16 + min_y;
-            if let Some(surf) = ws.template_surface_cache.get(&(tx, tz)) {
-                let [r, g, b, a] = surf[(px % 16) as usize * 16 + (py % 16) as usize];
-                if a == 255 {
-                    buf[off] = r; buf[off + 1] = g; buf[off + 2] = b; buf[off + 3] = 255;
+    // Tile-major instead of pixel-major: resolve each tile's `template_surface_cache` entry once
+    // (a hash lookup) and reuse it for its 256 pixels, instead of hashing on every one of the
+    // buffer's 60M+ pixels for a large world (audit M4).
+    for tz in cz0..=cz1 {
+        for tx in cx0..=cx1 {
+            let Some(surf) = ws.template_surface_cache.get(&(tx, tz)) else { continue };
+            let base_px = (tx - min_x) * 16;
+            let base_py = (tz - min_y) * 16;
+            for ly in 0..16i32 {
+                let py = base_py + ly;
+                if py < 0 || py >= h { continue; }
+                for lx in 0..16i32 {
+                    let px = base_px + lx;
+                    if px < 0 || px >= w { continue; }
+                    let off = ((py * w + px) * 4) as usize;
+                    if buf[off + 3] != 0 { continue; } // user pixel already present
+                    let [r, g, b, a] = surf[lx as usize * 16 + ly as usize];
+                    if a == 255 {
+                        buf[off] = r; buf[off + 1] = g; buf[off + 2] = b; buf[off + 3] = 255;
+                    }
                 }
             }
         }
@@ -1427,29 +1874,33 @@ fn export_png(
     use_template: bool,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
-    let (w, h, buf) = {
-        let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
+    // The render itself only reads, so it takes a shared guard — a full-world PNG export no longer
+    // blocks panning or hovering (audit C1 step 2). Only the template composite needs the exclusive
+    // guard, because it memoises decoded surfaces into `template_surface_cache`.
+    let render = |ws: &WorldState| -> Result<(i32, i32, Vec<u8>), String> {
         let cap = ws.view_cap_z;
-        let (w, h) = {
-            let world = ws.world.as_ref().ok_or("No world loaded")?;
-            ((world.w_chunks * 16) as i32, (world.h_chunks * 16) as i32)
+        let world = ws.world.as_ref().ok_or("No world loaded")?;
+        let (w, h) = ((world.w_chunks * 16) as i32, (world.h_chunks * 16) as i32);
+        let buf = if view == "zslice" {
+            let max_z = world_max_z(world);
+            if z < 0 || z > max_z { return Err(format!("Z must be 0–{max_z}, got {z}")); }
+            render_zslice_patch_inner(world, z, 0, 0, w - 1, h - 1).pixels
+        } else {
+            // Cutaway is a top-down render with the cap applied, so the exported PNG matches
+            // what's on screen without the frontend passing a separate view name.
+            render_pixels_patch(world, 0, 0, w - 1, h - 1, cap).pixels
         };
-        let mut buf = {
-            let world = ws.world.as_ref().unwrap();
-            if view == "zslice" {
-                let max_z = world_max_z(world);
-                if z < 0 || z > max_z { return Err(format!("Z must be 0–{max_z}, got {z}")); }
-                render_zslice_patch_inner(world, z, 0, 0, w - 1, h - 1).pixels
-            } else {
-                // Cutaway is a top-down render with the cap applied, so the exported PNG matches
-                // what's on screen without the frontend passing a separate view name.
-                render_pixels_patch(world, 0, 0, w - 1, h - 1, cap).pixels
-            }
-        };
-        if use_template && view != "zslice" && ws.template_bytes.is_some() {
+        Ok((w, h, buf))
+    };
+    let (w, h, buf) = if use_template && view != "zslice" {
+        let mut ws = write_ws(&state);
+        let (w, h, mut buf) = render(&ws)?;
+        if ws.template_bytes.is_some() {
             composite_template_full(&mut ws, w, h, &mut buf);
         }
         (w, h, buf)
+    } else {
+        render(&read_ws(&state))?
     };
     let png = encode_rgba_png(&buf, w as u32, h as u32)?;
     fs::write(&path, &png).map_err(|e| format!("Failed to write PNG: {e}"))
@@ -1482,9 +1933,27 @@ fn validate_selection(x1: i32, y1: i32, x2: i32, y2: i32, z_min: i32, z_max: i32
     Ok(())
 }
 
+/// Voxel cap for whole-volume allocations (clipboard copy/move): 256M voxels ≈ 512 MB for a
+/// block_types+paints pair. `width`/`height`/`depth` are validated i32 selection extents, but the
+/// product must be computed in i64 — on a large enough world it overflows i32 (and, cast to usize,
+/// sign-extends into a multi-exabyte allocation request that aborts the process; see audit C3).
+const MAX_CLIPBOARD_VOLUME: i64 = 256 * 1024 * 1024;
+
+/// Computes width*height*depth in i64 and rejects selections whose voxel volume would blow the
+/// clipboard/move transient-buffer budget, before any allocation is attempted.
+fn validate_volume(width: i32, height: i32, depth: i32) -> Result<i64, String> {
+    let vol = width as i64 * height as i64 * depth as i64;
+    if vol > MAX_CLIPBOARD_VOLUME {
+        return Err(format!(
+            "Selection is {vol} blocks — the clipboard limit is {MAX_CLIPBOARD_VOLUME}. Select a smaller region."
+        ));
+    }
+    Ok(vol)
+}
+
 /// Validates and returns selection metadata. Every Phase 2b editing command
 /// takes these same six parameters.
-#[tauri::command]
+#[tauri::command(async)]
 fn describe_selection(
     x1: i32, y1: i32, x2: i32, y2: i32,
     z_min: i32, z_max: i32,
@@ -1493,7 +1962,7 @@ fn describe_selection(
     // Validate against the loaded world's real z ceiling (63 for 64z, 255 for 256z) rather than a
     // hardcoded 255 — otherwise a z range a 64z world can't hold would validate here.
     let (max_z, cell_count) = {
-        let ws = state.lock().unwrap_or_else(|p| p.into_inner());
+        let ws = read_ws(&state);
         let max_z = ws.world.as_ref().map(world_max_z).unwrap_or(255);
         let cell_count = active_mask(&ws, x1, y1, x2, y2).map(|m| m.count() as i32);
         (max_z, cell_count)
@@ -1625,7 +2094,7 @@ fn set_cursor_lock(window: tauri::Window, locked: bool) -> Result<(), String> {
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn load_eden_template(path: String, state: tauri::State<'_, AppState>) -> Result<u32, String> {
     let file = fs::File::open(&path).map_err(|e| format!("Cannot open template: {e}"))?;
     let mmap = unsafe { Mmap::map(&file).map_err(|e| format!("Cannot mmap template: {e}"))? };
@@ -1643,7 +2112,7 @@ fn load_eden_template(path: String, state: tauri::State<'_, AppState>) -> Result
     }
 
     let n_entries = (mmap.len() - dir_offset) / 16;
-    let mut template_dir: HashMap<(i32, i32), usize> = HashMap::with_capacity(n_entries);
+    let mut template_dir: FxHashMap<(i32, i32), usize> = FxHashMap::with_capacity_and_hasher(n_entries, Default::default());
     let mut i = dir_offset;
     while i + 16 <= mmap.len() {
         let tx = i32::from_le_bytes(mmap[i..i+4].try_into().unwrap());
@@ -1656,7 +2125,7 @@ fn load_eden_template(path: String, state: tauri::State<'_, AppState>) -> Result
     }
 
     let chunk_count = template_dir.len() as u32;
-    let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
+    let mut ws = write_ws(&state);
     ws.template_bytes = Some(std::sync::Arc::new(mmap));
     ws.template_dir = template_dir;
     ws.template_surface_cache.clear();
@@ -1669,10 +2138,11 @@ fn load_eden_template(path: String, state: tauri::State<'_, AppState>) -> Result
 /// spans 32×32 chunks) inline — off the main thread so it doesn't serialize other IPC behind it.
 #[tauri::command(async)]
 fn fetch_template_tile(
-    x1: i32, y1: i32, x2: i32, y2: i32,
+    x1: i32, y1: i32, x2: i32, y2: i32, lod: Option<u32>,
     state: tauri::State<'_, AppState>,
 ) -> Result<PixelPatch, String> {
-    let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
+    let lod = lod.unwrap_or(1).clamp(1, MAX_LOD);
+    let mut ws = write_ws(&state);
     if ws.world.is_none() { return Err("No world loaded".into()); }
     if ws.template_bytes.is_none() { return Err("No template loaded".into()); }
 
@@ -1686,17 +2156,26 @@ fn fetch_template_tile(
     let y1u = y1.clamp(0, world_h - 1) as u32;
     let x2u = x2.clamp(0, world_w - 1) as u32;
     let y2u = y2.clamp(0, world_h - 1) as u32;
-    let width  = x2u - x1u + 1;
-    let height = y2u - y1u + 1;
+    let width  = (x2u - x1u) / lod + 1;
+    let height = (y2u - y1u) / lod + 1;
     let mut pixels = vec![0u8; (width * height * 4) as usize];
 
-    // Collect unique chunks needed for this tile and decode missing ones
-    let cx0 = (x1u / 16) as i32 + min_x;
-    let cx1 = (x2u / 16) as i32 + min_x;
-    let cz0 = (y1u / 16) as i32 + min_y;
-    let cz1 = (y2u / 16) as i32 + min_y;
-    for tx in cx0..=cx1 {
-        for tz in cz0..=cz1 {
+    // Collect the chunks the *sampled* grid actually touches and decode the missing ones. At lod 1
+    // that is every chunk in the tile's rect; at lod ≥ 16 only every (lod/16)-th chunk is sampled,
+    // and enumerating the full rect instead would decode up to lod²× more template columns than the
+    // tile can display (at lod 32 a tile spans 1024×1024 chunks but samples just 512×512 blocks).
+    let mut txs: Vec<i32> = Vec::new();
+    for ox in 0..width {
+        let tx = ((x1u + ox * lod) / 16) as i32 + min_x;
+        if txs.last() != Some(&tx) { txs.push(tx); }
+    }
+    let mut tzs: Vec<i32> = Vec::new();
+    for oy in 0..height {
+        let tz = ((y1u + oy * lod) / 16) as i32 + min_y;
+        if tzs.last() != Some(&tz) { tzs.push(tz); }
+    }
+    for &tx in &txs {
+        for &tz in &tzs {
             if ws.template_surface_cache.contains_key(&(tx, tz)) { continue; }
             if let Some(&col_off) = ws.template_dir.get(&(tx, tz)) {
                 if let Some(surf) = decode_template_surface(ws.template_bytes.as_ref().unwrap(), col_off, sky) {
@@ -1706,24 +2185,26 @@ fn fetch_template_tile(
         }
     }
 
-    for px in x1u..=x2u {
-        for py in y1u..=y2u {
+    for oy in 0..height {
+        let py = y1u + oy * lod;
+        let tz = (py / 16) as i32 + min_y;
+        let ly = (py % 16) as usize;
+        for ox in 0..width {
+            let px = x1u + ox * lod;
             let tx = (px / 16) as i32 + min_x;
-            let tz = (py / 16) as i32 + min_y;
             let lx = (px % 16) as usize;
-            let ly = (py % 16) as usize;
 
             if let Some(surf) = ws.template_surface_cache.get(&(tx, tz)) {
                 let [r, g, b, a] = surf[lx * 16 + ly];
                 if a == 255 {
-                    let off = (((py - y1u) * width + (px - x1u)) * 4) as usize;
+                    let off = ((oy * width + ox) * 4) as usize;
                     pixels[off] = r; pixels[off+1] = g; pixels[off+2] = b; pixels[off+3] = 255;
                 }
             }
         }
     }
 
-    Ok(PixelPatch { x: x1u, y: y1u, width, height, pixels })
+    Ok(PixelPatch { x: x1u, y: y1u, width, height, lod, pixels })
 }
 
 #[derive(Serialize)]
@@ -1750,7 +2231,7 @@ fn expand_world_from_template(
     // copies are cheap relative to the write itself, so this is what actually gets other threads
     // (map render, cancel checks) their scheduling turn back.
     let (min_x, min_y, max_x, max_y, chunk_size, header, tmpl, tdir, user_chunk_bytes) = {
-        let ws = state.lock().unwrap_or_else(|p| p.into_inner());
+        let ws = read_ws(&state);
         let world = ws.world.as_ref().ok_or("No world loaded")?;
         let tmpl = ws.template_bytes.clone().ok_or("No template loaded")?;
 
@@ -1983,7 +2464,7 @@ fn materialize_flat_chunks(
     }
 
     let (chunk_size, header, user_chunk_bytes, existing) = {
-        let ws = state.lock().unwrap_or_else(|p| p.into_inner());
+        let ws = read_ws(&state);
         let world = ws.world.as_ref().ok_or("No world loaded")?;
         let chunk_size = world.chunk_size;
         let header = world.bytes[..192.min(world.bytes.len())].to_vec();
@@ -2062,14 +2543,18 @@ fn materialize_flat_chunks(
 
 /// Return a top-down pixel patch for the rectangle (x1,y1)–(x2,y2).
 /// Used by the tiled frontend to fetch individual map tiles on demand.
-#[tauri::command]
+///
+/// `lod` (audit H6) is the world-blocks-per-pixel step: the frontend passes the largest power of
+/// two that still keeps one output pixel ≤ one screen pixel, so zoomed-out tiles cost `lod²` less
+/// to render and `lod²` less to ship. Omitted/`1` = full resolution (the pre-LOD behaviour).
+#[tauri::command(async)]
 fn fetch_tile(
-    x1: i32, y1: i32, x2: i32, y2: i32,
+    x1: i32, y1: i32, x2: i32, y2: i32, lod: Option<u32>,
     state: tauri::State<'_, AppState>,
 ) -> Result<PixelPatch, String> {
-    let ws = state.lock().unwrap_or_else(|p| p.into_inner());
+    let ws = read_ws(&state);
     let world = ws.world.as_ref().ok_or("No world loaded")?;
-    Ok(render_pixels_patch(world, x1, y1, x2, y2, ws.view_cap_z))
+    Ok(render_pixels_patch_lod(world, x1, y1, x2, y2, ws.view_cap_z, lod.unwrap_or(1)))
 }
 
 /// Report which chunks in the queried chunk-coordinate rectangle [x1,y1]–[x2,y2] actually exist
@@ -2078,12 +2563,12 @@ fn fetch_tile(
 /// space outside today's bounds (that's the whole point: growth beyond bounds looks the same to
 /// this command as a hole inside them, both come back 0). Row-major, one byte per queried chunk
 /// cell: 1 = chunk present, 0 = absent ("ungenerated").
-#[tauri::command]
+#[tauri::command(async)]
 fn chunk_occupancy(
     x1: i32, y1: i32, x2: i32, y2: i32,
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<u8>, String> {
-    let ws = state.lock().unwrap_or_else(|p| p.into_inner());
+    let ws = read_ws(&state);
     let world = ws.world.as_ref().ok_or("No world loaded")?;
     let (x1, x2) = (x1.min(x2), x1.max(x2));
     let (y1, y2) = (y1.min(y2), y1.max(y2));
@@ -2102,9 +2587,9 @@ fn chunk_occupancy(
 /// Set (or clear) the cutaway ceiling. `None` restores the normal "true surface" view.
 /// Every top-down render and every surface-consulting edit path reads this off `WorldState`,
 /// so the frontend only has to set it once per mode/slider change (then refetch its tiles).
-#[tauri::command]
+#[tauri::command(async)]
 fn set_view_cap(cap: Option<i32>, state: tauri::State<'_, AppState>) -> Result<(), String> {
-    let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
+    let mut ws = write_ws(&state);
     let cap = match cap {
         None => None,
         Some(c) => {
@@ -2118,28 +2603,28 @@ fn set_view_cap(cap: Option<i32>, state: tauri::State<'_, AppState>) -> Result<(
 
 /// Return a z-slice patch for just the rectangle (x1,y1)–(x2,y2) at level z.
 /// Used after edits when the frontend is in z-slice mode, avoiding a full 243 MB re-render.
-#[tauri::command]
+#[tauri::command(async)]
 fn render_zslice_patch(
-    z: i32, x1: u32, y1: u32, x2: u32, y2: u32,
+    z: i32, x1: u32, y1: u32, x2: u32, y2: u32, lod: Option<u32>,
     state: tauri::State<'_, AppState>,
 ) -> Result<PixelPatch, String> {
-    let ws = state.lock().unwrap_or_else(|p| p.into_inner());
+    let ws = read_ws(&state);
     let world = ws.world.as_ref().ok_or("No world loaded")?;
     let max_z = world_max_z(world);
     if z < 0 || z > max_z {
         return Err(format!("Z must be 0–{max_z}, got {z}"));
     }
-    Ok(render_zslice_patch_inner(world, z, x1 as i32, y1 as i32, x2 as i32, y2 as i32))
+    Ok(render_zslice_patch_lod(world, z, x1 as i32, y1 as i32, x2 as i32, y2 as i32, lod.unwrap_or(1)))
 }
 
 /// Front-slab tile: constant world-Y plane. Horizontal = X (x1..x2), vertical = Z (z1..z2).
 /// Tiled, O(1) per pixel. Used by the front viewport in multi-viewport mode.
-#[tauri::command]
+#[tauri::command(async)]
 fn render_yslice_patch(
     y: i32, x1: i32, z1: i32, x2: i32, z2: i32,
     state: tauri::State<'_, AppState>,
 ) -> Result<PixelPatch, String> {
-    let ws = state.lock().unwrap_or_else(|p| p.into_inner());
+    let ws = read_ws(&state);
     let world = ws.world.as_ref().ok_or("No world loaded")?;
     let world_h = (world.h_chunks * 16) as i32;
     if y < 0 || y >= world_h {
@@ -2150,12 +2635,12 @@ fn render_yslice_patch(
 
 /// Side-slab tile: constant world-X plane. Horizontal = Y (y1..y2), vertical = Z (z1..z2).
 /// Tiled, O(1) per pixel. Used by the side viewport in multi-viewport mode.
-#[tauri::command]
+#[tauri::command(async)]
 fn render_xslice_patch(
     x: i32, y1: i32, z1: i32, y2: i32, z2: i32,
     state: tauri::State<'_, AppState>,
 ) -> Result<PixelPatch, String> {
-    let ws = state.lock().unwrap_or_else(|p| p.into_inner());
+    let ws = read_ws(&state);
     let world = ws.world.as_ref().ok_or("No world loaded")?;
     let world_w = (world.w_chunks * 16) as i32;
     if x < 0 || x >= world_w {
@@ -2163,6 +2648,11 @@ fn render_xslice_patch(
     }
     Ok(render_xslice_patch_inner(world, x, y1, z1, y2, z2))
 }
+
+/// Cap on the scan-buffer clone `render_selection_view`/`render_full_height_view` build before
+/// rendering a preview. Without this, ⌘A on a large world with the sidebar open clones the whole
+/// world (potentially the full mmap) under the lock on every selection/edit change (audit C5).
+const MAX_PREVIEW_BYTES: usize = 128 * 1024 * 1024; // 128 MB
 
 #[tauri::command(async)]
 fn render_selection_view(
@@ -2189,7 +2679,7 @@ fn render_selection_view(
     let t_lock = Instant::now();
     let mut sel_mask: Option<SelectionMask> = None;
     let scan_world = {
-        let ws = state.lock().unwrap_or_else(|p| p.into_inner());
+        let ws = read_ws(&state);
         let wait = t_lock.elapsed().as_micros();
         timing_log!("[LOCK] acquired  cmd=render_selection_view  wait={}µs", wait);
         let t_held = Instant::now();
@@ -2204,37 +2694,46 @@ fn render_selection_view(
         let cy_lo = y1 / 16 + world.min_y;
         let cy_hi = y2 / 16 + world.min_y;
 
-        let n_sel = ((cx_hi - cx_lo + 1) * (cy_hi - cy_lo + 1)) as usize;
-        // Build the band-scoped chunk data as a Vec first, then transfer into an anonymous
-        // MmapMut so the temporary scan world has the same LoadedWorld type as the main world.
-        let mut local_vec:   Vec<u8>                    = Vec::with_capacity(n_sel * local_band_bytes);
-        let mut local_map:   HashMap<(i32, i32), usize> = HashMap::with_capacity(n_sel);
-        for (&(cx, cy), &addr) in &world.chunk_map {
-            if cx >= cx_lo && cx <= cx_hi && cy >= cy_lo && cy <= cy_hi {
-                let local_addr = local_vec.len();
-                // Bands past the chunk's real span belong to the *next* chunk (see
-                // `LoadedWorld::chunk_span`) — zero-fill them instead of cloning a neighbour's
-                // data in, so the scan world stays a full-span buffer the renderers can read
-                // without knowing about spans at all.
-                let cend = addr + world.span_of(cx, cy);
+        let n_sel = ((cx_hi - cx_lo + 1) as i64 * (cy_hi - cy_lo + 1) as i64).max(0) as usize;
+        let total_bytes = n_sel.saturating_mul(local_band_bytes);
+        if total_bytes > MAX_PREVIEW_BYTES {
+            return Err(format!(
+                "Selection too large to preview ({} chunks, {} MB) — the preview limit is {} MB. Select a smaller region.",
+                n_sel, total_bytes / (1024 * 1024), MAX_PREVIEW_BYTES / (1024 * 1024)
+            ));
+        }
+        // Fill the anon mmap directly instead of building an intermediate Vec and copying it in —
+        // that used to be a 2× peak allocation for no benefit (audit C5). Iterate the bounded
+        // cx/cy window (not the whole `chunk_map`) so cost scales with the selection, not the
+        // world's total chunk count.
+        let mut local_bytes = MmapOptions::new().len(n_sel * local_band_bytes.max(1)).map_anon()
+            .map_err(|e| format!("Failed to allocate scan buffer: {e}"))?;
+        let mut local_map: FxHashMap<(i32, i32), usize> = FxHashMap::with_capacity_and_hasher(n_sel, Default::default());
+        let mut local_addr = 0usize;
+        for cx in cx_lo..=cx_hi {
+            for cy in cy_lo..=cy_hi {
+                let Some((addr, cend)) = world.chunk_range(cx, cy) else { continue };
+                let dst = local_addr;
                 for band in b_lo..=b_hi {
                     let src = addr + band * 8192;
+                    let out = &mut local_bytes[dst + (band - b_lo) * 8192..dst + (band - b_lo + 1) * 8192];
                     if src + 8192 <= cend {
-                        local_vec.extend_from_slice(&world.bytes[src..src + 8192]);
+                        out.copy_from_slice(&world.bytes[src..src + 8192]);
                     } else {
-                        local_vec.extend(std::iter::repeat_n(0u8, 8192));
+                        // Bands past the chunk's real span belong to the *next* chunk (see
+                        // `LoadedWorld::chunk_span`) — zero-fill instead of cloning a neighbour's
+                        // data in, so the scan world stays a full-span buffer the renderers can
+                        // read without knowing about spans at all.
+                        out.fill(0);
                     }
                 }
                 local_map.insert((cx, cy), local_addr);
+                local_addr += local_band_bytes;
             }
         }
-        let mut local_bytes = MmapOptions::new().len(local_vec.len().max(1)).map_anon()
-            .map_err(|e| format!("Failed to allocate scan buffer: {e}"))?;
-        local_bytes[..local_vec.len()].copy_from_slice(&local_vec);
-        drop(local_vec);
         let result = LoadedWorld {
             // Full-span scratch buffer by construction (short-span bands were zero-filled above).
-            bytes: local_bytes, chunk_map: local_map, chunk_span: HashMap::new(),
+            bytes: local_bytes, chunk_map: local_map, chunk_span: FxHashMap::default(),
             min_x: world.min_x, min_y: world.min_y,
             w_chunks: world.w_chunks, h_chunks: world.h_chunks,
             chunk_size: local_band_bytes, num_bands: bands_per_chunk,
@@ -2411,7 +2910,7 @@ fn render_full_height_view(
 
     let ctx = context_blocks.max(0);
     let (scan_world, z_max) = {
-        let ws = state.lock().unwrap_or_else(|p| p.into_inner());
+        let ws = read_ws(&state);
         let world = ws.world.as_ref().ok_or("No world loaded")?;
 
         let z_max        = world_max_z(world);
@@ -2424,33 +2923,39 @@ fn render_full_height_view(
         let cy_lo = y1.div_euclid(16) + world.min_y - ctx_chunks;
         let cy_hi = y2.div_euclid(16) + world.min_y + ctx_chunks;
 
-        let n_sel = ((cx_hi - cx_lo + 1) * (cy_hi - cy_lo + 1)) as usize;
-        let mut local_vec: Vec<u8>                    = Vec::with_capacity(n_sel * chunk_size);
-        let mut local_map: HashMap<(i32, i32), usize> = HashMap::with_capacity(n_sel);
-
-        for (&(cx, cy), &addr) in &world.chunk_map {
-            if cx >= cx_lo && cx <= cx_hi && cy >= cy_lo && cy <= cy_hi {
-                let local_addr = local_vec.len();
+        let n_sel = ((cx_hi - cx_lo + 1) as i64 * (cy_hi - cy_lo + 1) as i64).max(0) as usize;
+        let total_bytes = n_sel.saturating_mul(chunk_size);
+        if total_bytes > MAX_PREVIEW_BYTES {
+            return Err(format!(
+                "Selection too large to preview ({} chunks, {} MB) — the preview limit is {} MB. Select a smaller region.",
+                n_sel, total_bytes / (1024 * 1024), MAX_PREVIEW_BYTES / (1024 * 1024)
+            ));
+        }
+        // Fill the anon mmap directly (no intermediate Vec) and iterate the bounded cx/cy window
+        // (not the whole `chunk_map`) instead of scanning every chunk in the world to find the
+        // handful in range — audit C5, same fix as `render_selection_view`.
+        let mut local_bytes = MmapOptions::new().len(n_sel.max(1) * chunk_size).map_anon()
+            .map_err(|e| format!("Failed to allocate scan buffer: {e}"))?;
+        let mut local_map: FxHashMap<(i32, i32), usize> = FxHashMap::with_capacity_and_hasher(n_sel, Default::default());
+        let mut local_addr = 0usize;
+        for cx in cx_lo..=cx_hi {
+            for cy in cy_lo..=cy_hi {
+                let Some((addr, cend)) = world.chunk_range(cx, cy) else { continue };
                 // Copy only what the chunk owns (`chunk_span`), zero-padding the rest: bytes past
                 // a short span are the next chunk's, and cloning them in would render another
                 // chunk's terrain inside this one.
-                let span = world.span_of(cx, cy);
-                local_vec.extend_from_slice(&world.bytes[addr..addr + span]);
-                local_vec.extend(std::iter::repeat_n(0u8, chunk_size - span));
+                let span = cend - addr;
+                let out = &mut local_bytes[local_addr..local_addr + chunk_size];
+                out[..span].copy_from_slice(&world.bytes[addr..cend]);
+                out[span..].fill(0);
                 local_map.insert((cx, cy), local_addr);
+                local_addr += chunk_size;
             }
         }
 
-        let mut local_bytes = MmapOptions::new().len(local_vec.len().max(1)).map_anon()
-            .map_err(|e| format!("Failed to allocate scan buffer: {e}"))?;
-        if !local_vec.is_empty() {
-            local_bytes[..local_vec.len()].copy_from_slice(&local_vec);
-        }
-        drop(local_vec);
-
         let scan_world = LoadedWorld {
             // Full-span scratch buffer by construction (see the span-clamped copy above).
-            bytes: local_bytes, chunk_map: local_map, chunk_span: HashMap::new(),
+            bytes: local_bytes, chunk_map: local_map, chunk_span: FxHashMap::default(),
             min_x: world.min_x, min_y: world.min_y,
             w_chunks: world.w_chunks, h_chunks: world.h_chunks,
             chunk_size, num_bands, sky: world.sky, name: String::new(),
@@ -2549,14 +3054,319 @@ fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
 }
 
 /// Write `world.bytes` to `path`.  Before overwriting an existing file, copies
-/// it to `path.bak` — but only if that backup doesn't already exist, so the
-/// first-save snapshot is preserved across multiple saves.
-fn save_world_inner(world: &LoadedWorld, path: &str) -> Result<(), String> {
-    let bak = format!("{path}.bak");
-    if !std::path::Path::new(&bak).exists() && std::path::Path::new(path).exists() {
-        fs::copy(path, &bak).map_err(|e| format!("Failed to create backup: {e}"))?;
-    }
+/// it to `path.bak` (or, when `backup_compressed`, zips it to `path.bak.zip`) — but only if that
+/// backup doesn't already exist, so the first-save snapshot is preserved across multiple saves.
+fn save_world_inner(world: &LoadedWorld, path: &str, backup_compressed: bool) -> Result<(), String> {
+    make_backup_if_absent(std::path::Path::new(path), backup_compressed)?;
     atomic_write(std::path::Path::new(path), &world.bytes)
+}
+
+/// Create a `.bak` (or `.bak.zip`) snapshot of `src` if neither already exists, and if `src` itself
+/// exists (nothing to back up on a brand-new save target). Shared by every save path — full,
+/// compressed, and the incremental step 1 — so the "only if absent" rule and the choice of backup
+/// format can't drift between them.
+fn make_backup_if_absent(src: &std::path::Path, backup_compressed: bool) -> Result<(), String> {
+    if !src.exists() { return Ok(()); }
+    if backup_compressed {
+        let zip_bak = { let mut b = src.as_os_str().to_owned(); b.push(".bak.zip"); std::path::PathBuf::from(b) };
+        if zip_bak.exists() { return Ok(()); }
+        // A plain (uncompressed) .bak from an earlier session with backupCompressed off still
+        // counts as "already backed up" — don't produce a second backup in the other format.
+        let plain_bak = { let mut b = src.as_os_str().to_owned(); b.push(".bak"); std::path::PathBuf::from(b) };
+        if plain_bak.exists() { return Ok(()); }
+        zip_file_contents(src, &zip_bak)
+    } else {
+        let bak = { let mut b = src.as_os_str().to_owned(); b.push(".bak"); std::path::PathBuf::from(b) };
+        if bak.exists() { return Ok(()); }
+        stage_copy(src, &bak).map_err(|e| format!("Failed to create backup: {e}"))
+    }
+}
+
+/// Zip `src`'s *current on-disk contents* into `dst` at deflate level 6 (level 9 buys ~1% on voxel
+/// data for several times the time — not worth it for a backup nobody reads until disaster strikes).
+/// Used for `.bak.zip` backups, which must capture what's on disk *before* a save touches it — never
+/// `world.bytes`, which is what's about to be written, not what's there now.
+fn zip_file_contents(src: &std::path::Path, dst: &std::path::Path) -> Result<(), String> {
+    use zip::write::{SimpleFileOptions, ZipWriter};
+    use std::io::Write;
+    let inner_name = src.file_name().and_then(|f| f.to_str()).unwrap_or("world.eden").to_string();
+    let mut tmp = dst.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = std::path::PathBuf::from(tmp);
+    let write_result = (|| -> Result<(), String> {
+        let mut src_bytes = Vec::new();
+        fs::File::open(src).and_then(|mut f| f.read_to_end(&mut src_bytes)).map_err(|e| format!("Failed to read backup source: {e}"))?;
+        let file = fs::File::create(&tmp).map_err(|e| format!("Failed to create backup file: {e}"))?;
+        let mut zip = ZipWriter::new(file);
+        let options = SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated)
+            .compression_level(Some(6));
+        zip.start_file(&inner_name, options).map_err(|e| format!("Zip error: {e}"))?;
+        zip.write_all(&src_bytes).map_err(|e| format!("Write error: {e}"))?;
+        let f = zip.finish().map_err(|e| format!("Zip finish error: {e}"))?;
+        drop(f);
+        Ok(())
+    })();
+    if let Err(e) = write_result {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    fs::rename(&tmp, dst).map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        format!("Failed to finalize backup: {e}")
+    })
+}
+
+// ── Incremental in-place save (audit C2 Stage 4) ──────────────────────────────
+//
+// A repeat ⌘S over the same file rewrites only the chunks that changed since that file was last
+// written, instead of pushing the whole world (plus `atomic_write`'s staging copy) through the disk
+// again. On a 2 GB world that's the difference between ~8 s of I/O and ~0.1 s.
+//
+// The price is `atomic_write`'s temp+rename guarantee: bytes go into the user's file in place, so a
+// crash mid-write would otherwise leave it part-old/part-new with nothing to say which parts. A
+// redo write-ahead log restores the guarantee:
+//
+//   1. `.bak` first (only if absent) — the pre-save file survives even a catastrophic outcome.
+//   2. Write `<path>.wal`: every span this save will apply, then a commit record, then fsync the WAL
+//      and its parent directory. Nothing has touched the destination yet.
+//   3. Apply the spans in place, fsync the destination.
+//   4. Delete the WAL.
+//
+// Crash after 2 and before 4 → the next `load_world` finds a committed WAL and rolls it forward
+// (`recover_wal`); the spans hold exactly the bytes that belong at their offsets, so replaying an
+// already-applied WAL is a no-op. Crash *during* 2 → the WAL has no commit record, so it's discarded
+// and the destination was never touched. Either way there is no state in which the file on disk is
+// both incomplete and unrepairable.
+//
+// This works only because a loaded world's byte layout is immutable: `save_world_inner` writes
+// `world.bytes` verbatim, so `chunk_map[(cx,cy)]` is a *file* offset as much as a memory offset, and
+// nothing mutates the layout for the life of one `LoadedWorld` (world generation and template
+// expansion write brand-new files and force a reload).
+
+/// `<path>.wal` — the redo log for an in-place incremental save. A sibling of the destination, like
+/// `.savetmp` and `.bak`, so it's guaranteed to be on the same filesystem.
+fn wal_path(path: &std::path::Path) -> std::path::PathBuf {
+    let mut p = path.as_os_str().to_owned();
+    p.push(".wal");
+    std::path::PathBuf::from(p)
+}
+
+/// Fsync a *directory*, so a file just created inside it is durably named and not merely durably
+/// written. Without this a crash could lose the WAL's directory entry while the destination writes
+/// it exists to make recoverable survive — precisely the window step 2 above is guarding.
+/// Best-effort: Windows can't open a directory as a file, and there the WAL degrades to "present
+/// unless the crash lands in a very narrow window", which is still strictly better than no log.
+#[cfg(unix)]
+fn fsync_dir(dir: &std::path::Path) {
+    if let Ok(f) = fs::File::open(dir) { let _ = f.sync_all(); }
+}
+#[cfg(not(unix))]
+fn fsync_dir(_dir: &std::path::Path) {}
+
+/// Write `spans` into an already-existing file at their absolute offsets and fsync it. Shared by the
+/// incremental save's step 3 and `recover_wal`'s roll-forward so both can't drift apart. Opened
+/// `write(true)` with no truncate/append — every write is positioned, and the file's length never
+/// changes (a world's layout is fixed, see the module note above).
+fn apply_spans_in_place(dest: &std::path::Path, spans: &[(u64, &[u8])]) -> std::io::Result<()> {
+    let mut f = fs::OpenOptions::new().write(true).open(dest)?;
+    for (off, payload) in spans {
+        f.seek(SeekFrom::Start(*off))?;
+        f.write_all(payload)?;
+    }
+    f.sync_all()
+}
+
+/// Roll a committed WAL forward into `dest`, or discard it. Called on the way into `load_world` for
+/// every uncompressed path the user opens: if `<dest>.wal` exists, some previous session died
+/// between committing the log and finishing (or cleaning up after) the in-place writes it describes.
+///
+/// Only a log that ends with a commit record is applied — that marker is what distinguishes "every
+/// span here is complete and correct" from a log torn by a crash mid-write, and a torn log always
+/// predates the first destination byte being touched. Bad magic, a `base_len` that doesn't match the
+/// file we're about to open, or a corrupt tail all mean the same thing: throw it away.
+///
+/// Deliberately best-effort and silent. This runs before the user's file is even staged, and a
+/// failure to repair must not stop them opening it — worst case they get the partially-written
+/// version, exactly what they'd have got without any of this. The WAL is left in place on a *write*
+/// failure specifically so the next open can retry (replay being idempotent makes that safe).
+fn recover_wal(dest: &std::path::Path) {
+    let wal = wal_path(dest);
+    if !wal.exists() { return; }
+    let Ok(dest_len) = fs::metadata(dest).map(|m| m.len()) else {
+        // Nothing to repair — the destination was renamed or deleted since the crash, so this log
+        // can never apply to anything.
+        let _ = fs::remove_file(&wal);
+        return;
+    };
+    // An unreadable log is a transient failure (permissions, a racing reader), not a corrupt one:
+    // leave it alone rather than destroying recovery data we couldn't even look at.
+    let Ok(bytes) = fs::read(&wal) else { return };
+    let Ok(replay) = journal::replay(&bytes, dest_len) else {
+        let _ = fs::remove_file(&wal);
+        return;
+    };
+    if !replay.ended_with_commit || replay.spans.is_empty() {
+        let _ = fs::remove_file(&wal);
+        return;
+    }
+    let spans: Vec<(u64, &[u8])> = replay.spans.iter().map(|s| (s.file_off, s.payload.as_slice())).collect();
+    timing_log!("[LOAD] recovering interrupted save  spans={}  dest={:?}", spans.len(), dest);
+    if apply_spans_in_place(dest, &spans).is_ok() {
+        let _ = fs::remove_file(&wal);
+    }
+}
+
+/// Attempt an in-place incremental save of just the dirty chunks (+ the header, if a spawn/rename/sky
+/// change touched it). `Ok(true)` means the file at `path` is fully up to date and the caller is
+/// done; `Ok(false)` means this save wasn't eligible and the caller must fall back to the full
+/// `save_world_inner` — declining is a normal outcome, not a failure, and the destination is
+/// guaranteed untouched in that case. `Err` is reserved for a failure *after* the destination was
+/// partially written, where the committed WAL (left on disk on purpose) is what repairs it.
+///
+/// Runs entirely under **one read guard**. That's deliberate: read guards are shared, so rendering,
+/// panning and hovering keep working exactly as they do during a full save (audit C1's whole point),
+/// while edits — which need the write guard — are excluded for the duration. Since no edit can
+/// interleave, the dirty set can't shift underneath the write, and every span is read straight out of
+/// the mapping with no intermediate copy (a plan-shaped "snapshot the bytes, drop the guard" variant
+/// would allocate up to half the world before writing a byte).
+fn try_incremental_save(state: &AppState, path: &str, backup_compressed: bool) -> Result<bool, String> {
+    let dest = std::path::Path::new(path);
+    let wal = wal_path(dest);
+
+    let (seq_at_capture, span_count) = {
+        let ws = read_ws(state);
+        let world = ws.world.as_ref().ok_or("No world loaded")?;
+
+        // ── Eligibility. Every check below is a decline (`Ok(false)`), never an error: the caller's
+        // full atomic write is always a correct way to save.
+        let Some(di) = ws.disk_image.as_ref() else { return Ok(false) };
+        if di.compressed { return Ok(false); }
+        if di.path != dest {
+            // Tolerate different spellings of the same file (a symlink, a `..`, a case-insensitive
+            // volume) — but only when both sides actually resolve. Anything else declines.
+            match (fs::canonicalize(&di.path), fs::canonicalize(dest)) {
+                (Ok(a), Ok(b)) if a == b => {}
+                _ => return Ok(false),
+            }
+        }
+        // The recorded image must still describe both the world in memory and the file on disk. A
+        // length or mtime that has moved means something outside this editor wrote to the
+        // destination since our last save, and its contents are no longer a base we can patch.
+        if di.len != world.bytes.len() as u64 { return Ok(false); }
+        let Ok(md) = fs::metadata(dest) else { return Ok(false) };
+        if md.len() != di.len || md.modified().ok() != Some(di.mtime) { return Ok(false); }
+
+        let dirty: Vec<(i32, i32)> = ws.dirty.since_disk.iter().copied().collect();
+        let header_dirty = ws.dirty.header_disk;
+        // Nothing tracked as dirty. The file *should* already be byte-identical, but taking the full
+        // write here is the cheap insurance against the one bug class this whole feature can't
+        // self-detect: a missed `mark_chunks` hook site would otherwise turn ⌘S into a silent no-op.
+        if dirty.is_empty() && !header_dirty { return Ok(false); }
+        // Past roughly half the world, patching stops paying for itself against a single sequential
+        // rewrite — and a ⌘A-scale fill lands here by design (see the plan's manual check 6).
+        if (dirty.len() as u64).saturating_mul(world.chunk_size as u64) >= world.bytes.len() as u64 / 2 {
+            return Ok(false);
+        }
+        if header_dirty && world.bytes.len() < 192 { return Ok(false); }
+
+        let mut spans: Vec<(u64, &[u8])> = Vec::with_capacity(dirty.len() + 1);
+        let mut coords: Vec<(i32, i32)> = Vec::with_capacity(dirty.len() + 1);
+        if header_dirty {
+            spans.push((0, &world.bytes[0..192]));
+            coords.push(journal::HEADER_SPAN);
+        }
+        for (cx, cy) in dirty {
+            // A dirty coord the world doesn't have can't happen (the layout is fixed for a loaded
+            // world's lifetime), but skipping beats writing at a bogus offset if it ever did.
+            if let Some((addr, end)) = world.chunk_range(cx, cy) {
+                spans.push((addr as u64, &world.bytes[addr..end]));
+                coords.push((cx, cy));
+            }
+        }
+
+        // ── Step 1: `.bak`/`.bak.zip`, before anything is written. It matters more here than for a
+        // full save: an in-place write mutates the user's file with no rename to fall back on. On
+        // APFS the plain-copy form is a zero-byte clone, and writing into the destination afterwards
+        // splits the shared blocks rather than following them, so the backup keeps the pre-save
+        // contents either way.
+        if make_backup_if_absent(dest, backup_compressed).is_err() {
+            // Let the full-save path re-attempt it and own the error message.
+            return Ok(false);
+        }
+
+        // ── Step 2: the redo log, committed and fsynced before the destination is touched at all.
+        let wal_written = (|| -> Result<(), String> {
+            let file = fs::File::create(&wal).map_err(|e| format!("Failed to create save log: {e}"))?;
+            let mut w = journal::JournalWriter::create(file, world.bytes.len() as u64, random_base_id(), false)
+                .map_err(|e| format!("Failed to write save log header: {e}"))?;
+            for (i, (off, payload)) in spans.iter().enumerate() {
+                let (cx, cy) = coords[i];
+                w.append_span(*off, cx, cy, payload).map_err(|e| format!("Failed to write save log: {e}"))?;
+            }
+            w.append_commit().map_err(|e| format!("Failed to commit save log: {e}"))?;
+            w.flush().map_err(|e| format!("Failed to flush save log: {e}"))?;
+            w.get_mut().sync_all().map_err(|e| format!("Failed to fsync save log: {e}"))
+        })();
+        if wal_written.is_err() {
+            // The destination is still untouched, so the safest response is to leave it that way and
+            // let the caller write the whole world atomically.
+            let _ = fs::remove_file(&wal);
+            return Ok(false);
+        }
+        if let Some(parent) = dest.parent() { fsync_dir(parent); }
+
+        // ── Step 3: apply in place. From here the destination is mid-mutation, which is exactly what
+        // the committed log above covers — so a failure keeps the log (the next `load_world` rolls it
+        // forward) and reports rather than pretending the save didn't happen.
+        if let Err(e) = apply_spans_in_place(dest, &spans) {
+            return Err(format!(
+                "Save failed partway through writing {} changed regions. The file's change log was kept \
+                 and will be applied automatically the next time it's opened. Underlying error: {e}",
+                spans.len()
+            ));
+        }
+        // ── Step 4: the log has served its purpose.
+        let _ = fs::remove_file(&wal);
+
+        (ws.dirty.seq, spans.len())
+    };
+    // read guard dropped here.
+
+    record_full_write(state, dest, false, seq_at_capture)?;
+    timing_log!("[SAVE] incremental  spans={}  dest={:?}", span_count, dest);
+    Ok(true)
+}
+
+/// Record that `dest` now holds exactly the world that was in memory at the moment `seq_at_capture`
+/// was read, and clear the dirty state that write discharged. Shared by both save paths — a full
+/// atomic write establishes a known-good disk image just as much as an incremental one does, which
+/// is what makes "Save As to a new file, then ⌘S" take the fast path on the second save.
+///
+/// The `seq` comparison is the safety valve. Both callers read their state under a read guard and
+/// released it before reaching here (a `std::sync::RwLock` can be neither upgraded nor re-entered),
+/// so an edit — or a whole world load/close — can land in the gap. If the counter moved, nothing is
+/// cleared and no image is recorded: the dirty sets stay over-approximate and the next save either
+/// re-writes a handful of already-correct chunks or falls back to a full write on the now-stale
+/// mtime. Both are free; clearing a chunk that wasn't written would lose it silently.
+fn record_full_write(
+    state: &AppState,
+    dest: &std::path::Path,
+    compressed: bool,
+    seq_at_capture: u64,
+) -> Result<(), String> {
+    let md = fs::metadata(dest).map_err(|e| format!("Failed to stat saved file: {e}"))?;
+    let mut ws = write_ws(state);
+    if ws.dirty.seq != seq_at_capture { return Ok(()); }
+    ws.dirty.since_disk.clear();
+    ws.dirty.header_disk = false;
+    ws.disk_image = Some(DiskImage {
+        path: dest.to_path_buf(),
+        len: md.len(),
+        mtime: md.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+        compressed,
+    });
+    Ok(())
 }
 
 // ── Undo / Redo helpers ────────────────────────────────────────────────────────
@@ -2565,10 +3375,6 @@ fn save_world_inner(world: &LoadedWorld, path: &str) -> Result<(), String> {
 /// exceeded. Always keeps the most recent entry even if it alone exceeds the budget,
 /// so undo still functions after very large operations (e.g. fill on a 256-layer world).
 const UNDO_BYTE_BUDGET: usize = 256 * 1024 * 1024; // 256 MB
-
-fn undo_entry_bytes(entry: &UndoEntry) -> usize {
-    entry.chunks.iter().map(chunk_snapshot_bytes).sum()
-}
 
 /// Returns all chunk (cx, cy) coords whose x/y footprint overlaps the given pixel-space
 /// rectangle. z_min/z_max are irrelevant here — Eden chunks span all z layers.
@@ -2595,40 +3401,81 @@ fn affected_chunk_coords(world: &LoadedWorld, x1: i32, y1: i32, x2: i32, y2: i32
     out
 }
 
-/// Copies full chunk block data for each listed chunk coordinate — used only as the "before"
-/// buffer that `diff_chunk` compares against post-edit bytes to build a sparse delta. Never
-/// itself stored in the undo stack.
-fn snapshot_chunks_full(world: &LoadedWorld, coords: &[(i32, i32)]) -> Vec<(i32, i32, Vec<u8>)> {
+/// Copies chunk block data for each listed chunk coordinate — used only as the "before" buffer
+/// that `diff_chunk` compares against post-edit bytes to build a sparse delta. Never itself
+/// stored in the undo stack.
+///
+/// `z_range`, when given, scopes the copy to just the z-bands `z_min..=z_max` overlap (rounded
+/// out to whole 8192-byte bands) instead of the entire chunk. Most edits only ever touch a
+/// handful of a 256-layer world's 16 bands, so this is a 4–16× cut in the transient snapshot
+/// allocation and in `diff_chunk`'s comparison work (audit C4 step 1). `None` keeps the old
+/// whole-chunk behaviour — used by edits (paste, generate_trees, sculpt, …) whose write region
+/// isn't a simple static z interval.
+fn snapshot_chunks_full(
+    world: &LoadedWorld,
+    coords: &[(i32, i32)],
+    z_range: Option<(i32, i32)>,
+) -> Vec<(i32, i32, u32, Vec<u8>)> {
     coords.iter().filter_map(|&(cx, cy)| {
         // The chunk's *real* span, not `chunk_size`: capturing a short-span chunk's nominal window
         // would pull the next chunk's bytes into this chunk's undo delta, and restoring it would
         // then write them back at the same (wrong) address.
         let (addr, cend) = world.chunk_range(cx, cy)?;
-        let data = world.bytes[addr..cend].to_vec();
-        Some((cx, cy, data))
+        let (start, end) = match z_range {
+            Some((z_min, z_max)) => {
+                let last_band = world.num_bands.saturating_sub(1);
+                let band_lo = (z_min.max(0) as usize / 16).min(last_band);
+                let band_hi = (z_max.max(0) as usize / 16).min(last_band);
+                let s = (addr + band_lo * 8192).min(cend);
+                let e = (addr + (band_hi + 1) * 8192).min(cend);
+                (s, e)
+            }
+            None => (addr, cend),
+        };
+        if end <= start { return None; }
+        let start_off = (start - addr) as u32;
+        let data = world.bytes[start..end].to_vec();
+        Some((cx, cy, start_off, data))
     }).collect()
 }
 
-/// Compares `pre` (bytes captured before an edit) against the chunk's current bytes and builds
-/// a `ChunkSnapshot` describing only what changed. Returns `None` if the edit left the chunk
-/// byte-for-byte unchanged (e.g. deleting air, filling with the same block) — replaces the old
-/// full-chunk `filter_unchanged_snapshots` pass. Falls back to `Full` when the sparse encoding
-/// (5 bytes/changed byte) wouldn't actually be smaller than just keeping the whole chunk.
-fn diff_chunk(world: &LoadedWorld, cx: i32, cy: i32, pre: &[u8]) -> Option<ChunkSnapshot> {
+/// Compares `pre` (bytes captured before an edit, starting at chunk-relative offset `start_off`)
+/// against the chunk's current bytes and builds a `ChunkSnapshot` describing only what changed.
+/// Returns `None` if the edit left this span byte-for-byte unchanged (e.g. deleting air, filling
+/// with the same block) — replaces the old full-chunk `filter_unchanged_snapshots` pass. Falls
+/// back to `Full` when the sparse encoding (5 bytes/changed byte) wouldn't actually be smaller
+/// than just keeping the whole span.
+///
+/// Compares 8 bytes at a time and only descends to a byte-wise scan inside a differing word
+/// (audit C4 step 2) — chunks are usually >99% identical, so this skips most of the span at
+/// 1/8th the comparison count instead of touching every byte individually.
+fn diff_chunk(world: &LoadedWorld, cx: i32, cy: i32, start_off: u32, pre: &[u8]) -> Option<ChunkSnapshot> {
     let (addr, cend) = world.chunk_range(cx, cy)?;
-    let end = (addr + pre.len()).min(cend);
-    if end <= addr { return None; }
-    let pre = &pre[..end - addr];
-    let post = &world.bytes[addr..end];
+    let start = addr + start_off as usize;
+    if start >= cend { return None; }
+    let end = (start + pre.len()).min(cend);
+    if end <= start { return None; }
+    let pre = &pre[..end - start];
+    let post = &world.bytes[start..end];
     if post == pre { return None; }
     let mut sparse: Vec<(u32, u8)> = Vec::new();
-    for (i, (&pb, &qb)) in pre.iter().zip(post.iter()).enumerate() {
-        if pb != qb { sparse.push((i as u32, pb)); }
+    let mut i = 0usize;
+    while i + 8 <= pre.len() {
+        if pre[i..i + 8] != post[i..i + 8] {
+            for j in i..i + 8 {
+                if pre[j] != post[j] { sparse.push((start_off + j as u32, pre[j])); }
+            }
+        }
+        i += 8;
+    }
+    while i < pre.len() {
+        if pre[i] != post[i] { sparse.push((start_off + i as u32, pre[i])); }
+        i += 1;
     }
     let delta = if sparse.len() * 5 < pre.len() {
         ChunkDelta::Sparse(sparse)
     } else {
-        ChunkDelta::Full(pre.to_vec())
+        ChunkDelta::Full(start_off, pre.to_vec())
     };
     Some(ChunkSnapshot { cx, cy, delta })
 }
@@ -2653,13 +3500,15 @@ fn restore_and_invert(world: &mut LoadedWorld, entry: &UndoEntry) -> Vec<ChunkSn
                 }
                 Some(ChunkSnapshot { cx: snap.cx, cy: snap.cy, delta: ChunkDelta::Sparse(inverse) })
             }
-            ChunkDelta::Full(data) => {
-                let end = (addr + data.len()).min(cend);
-                if end <= addr { return None; }
-                let data = &data[..end - addr];
-                let cur = world.bytes[addr..end].to_vec();
-                world.bytes[addr..end].copy_from_slice(data);
-                Some(ChunkSnapshot { cx: snap.cx, cy: snap.cy, delta: ChunkDelta::Full(cur) })
+            ChunkDelta::Full(start_off, data) => {
+                let start = addr + *start_off as usize;
+                if start >= cend { return None; }
+                let end = (start + data.len()).min(cend);
+                if end <= start { return None; }
+                let data = &data[..end - start];
+                let cur = world.bytes[start..end].to_vec();
+                world.bytes[start..end].copy_from_slice(data);
+                Some(ChunkSnapshot { cx: snap.cx, cy: snap.cy, delta: ChunkDelta::Full(*start_off, cur) })
             }
         }
     }).collect()
@@ -2667,19 +3516,30 @@ fn restore_and_invert(world: &mut LoadedWorld, entry: &UndoEntry) -> Vec<ChunkSn
 
 /// Push an entry onto an undo/redo stack, evicting oldest entries to keep the stack under
 /// UNDO_BYTE_BUDGET. Used for both `undo_stack` and `redo_stack` so neither can grow unbounded.
-fn push_undo(stack: &mut VecDeque<UndoEntry>, entry: UndoEntry) {
+/// `running` is the stack's cached total (`WorldState::undo_bytes`/`redo_bytes`) — updated
+/// incrementally here instead of re-summing every chunk in the stack on every push, which used
+/// to make bookkeeping for an n-stamp sculpt stroke O(n²) (audit M2).
+fn push_undo(stack: &mut VecDeque<UndoEntry>, running: &mut usize, entry: UndoEntry) {
+    *running += entry.bytes;
     stack.push_back(entry);
-    let mut total: usize = stack.iter().map(undo_entry_bytes).sum();
-    while total > UNDO_BYTE_BUDGET && stack.len() > 1 {
+    while *running > UNDO_BYTE_BUDGET && stack.len() > 1 {
         if let Some(evicted) = stack.pop_front() {
-            total -= undo_entry_bytes(&evicted);
+            *running -= evicted.bytes;
         }
     }
 }
 
+/// Pops the most recent entry off an undo/redo stack, keeping `running` (the stack's cached
+/// byte total) in sync. Counterpart to `push_undo` — every direct `pop_back` on `undo_stack`/
+/// `redo_stack` must go through this so the cached total never drifts.
+fn pop_undo(stack: &mut VecDeque<UndoEntry>, running: &mut usize) -> Option<UndoEntry> {
+    let entry = stack.pop_back()?;
+    *running -= entry.bytes;
+    Some(entry)
+}
+
 // ── EditResult — returned by every command that mutates world state ─────────────
 
-#[derive(Serialize)]
 struct EditResult {
     /// Pixel patch for only the changed region — replaces the old full WorldData
     /// returned on every edit. Applying this via putImageData is ~60× cheaper for
@@ -2690,6 +3550,26 @@ struct EditResult {
     /// Human-readable label for the operation just performed (e.g. "Delete 40×40×12"),
     /// shown as a toast by the frontend. Empty string for undo/redo of no-op edits.
     operation: String,
+}
+
+#[derive(Serialize)]
+struct EditResultHeader {
+    patch: PixelPatchHeader,
+    undo_depth: usize,
+    redo_depth: usize,
+    operation: String,
+}
+
+impl tauri::ipc::IpcResponse for EditResult {
+    fn body(self) -> tauri::Result<tauri::ipc::InvokeResponseBody> {
+        let header = EditResultHeader {
+            patch: self.patch.header(),
+            undo_depth: self.undo_depth,
+            redo_depth: self.redo_depth,
+            operation: self.operation,
+        };
+        ipc_envelope(&header, &[&self.patch.pixels])
+    }
 }
 
 // ── Editing commands ───────────────────────────────────────────────────────────
@@ -2722,7 +3602,26 @@ fn with_edit<F>(
 where
     F: FnOnce(&mut LoadedWorld) -> Result<(), String>,
 {
-    with_edit_inner(ws, operation, snap_rect, patch_rect, None, edit)
+    with_edit_inner(ws, operation, snap_rect, patch_rect, None, None, edit)
+}
+
+/// `with_edit`, but scoped to the z-bands `z_min..=z_max` overlap for the undo snapshot/diff
+/// (audit C4 step 1) — use when the edit's entire vertical extent is known statically (delete,
+/// replace/fill, gradient, move). Skips the transient whole-chunk copy+diff for every band the
+/// edit can't possibly touch. Edits whose write region isn't a simple static z interval (paste,
+/// tree canopies, sculpt, flood/pool fill, …) should keep using plain `with_edit`.
+fn with_edit_zscoped<F>(
+    ws: &mut WorldState,
+    operation: &str,
+    snap_rect: (i32, i32, i32, i32),
+    patch_rect: (i32, i32, i32, i32),
+    z_range: (i32, i32),
+    edit: F,
+) -> Result<EditResult, String>
+where
+    F: FnOnce(&mut LoadedWorld) -> Result<(), String>,
+{
+    with_edit_inner(ws, operation, snap_rect, patch_rect, None, Some(z_range), edit)
 }
 
 /// Group-tagged sibling of `with_edit`: identical, but stamps the resulting `UndoEntry` with
@@ -2740,7 +3639,7 @@ fn with_edit_grouped<F>(
 where
     F: FnOnce(&mut LoadedWorld) -> Result<(), String>,
 {
-    with_edit_inner(ws, operation, snap_rect, patch_rect, group, edit)
+    with_edit_inner(ws, operation, snap_rect, patch_rect, group, None, edit)
 }
 
 fn with_edit_inner<F>(
@@ -2749,6 +3648,7 @@ fn with_edit_inner<F>(
     snap_rect: (i32, i32, i32, i32),
     patch_rect: (i32, i32, i32, i32),
     group: Option<u64>,
+    z_range: Option<(i32, i32)>,
     edit: F,
 ) -> Result<EditResult, String>
 where
@@ -2770,7 +3670,7 @@ where
     } else {
         affected_chunk_coords(&world, sx1, sy1, sx2, sy2)
     };
-    let pre_full = snapshot_chunks_full(&world, &affected);
+    let pre_full = snapshot_chunks_full(&world, &affected, z_range);
 
     if let Err(e) = edit(&mut world) {
         ws.world = Some(world);
@@ -2780,16 +3680,25 @@ where
     let (px1, py1, px2, py2) = patch_rect;
     let patch = render_pixels_patch(&world, px1, py1, px2, py2, cap);
     let pre_snap: Vec<ChunkSnapshot> = pre_full.into_iter()
-        .filter_map(|(cx, cy, pre)| diff_chunk(&world, cx, cy, &pre))
+        .filter_map(|(cx, cy, start_off, pre)| diff_chunk(&world, cx, cy, start_off, &pre))
         .collect();
     ws.world = Some(world);
 
-    // Keep the lamp index (if built) current: a placed/removed lamp in any touched chunk must update
-    // its bucket or night lighting goes stale. Reuses the affected set already computed for snapshots.
-    refresh_lamp_index_chunks(ws, &affected);
+    // Keep the lamp index (if built) current: a placed/removed lamp must update its bucket or night
+    // lighting goes stale. Driven by the undo delta just computed (which lists exactly the changed
+    // offsets and their pre-edit values), so this costs O(changed bytes) rather than a full rescan
+    // of every affected chunk — audit H3.
+    if let Some(w) = ws.world.as_ref() {
+        ws.lamp_index.apply_delta(w, &pre_snap);
+    }
+
+    // Dirty tracking for incremental autosave/save (audit C2): pre_snap is exactly the chunks
+    // diff_chunk found to have actually changed, which is more precise than `affected` (a no-op
+    // edit over a region touches nothing here).
+    ws.dirty.mark_chunks(pre_snap.iter().map(|s| (s.cx, s.cy)));
 
     if !pre_snap.is_empty() {
-        push_undo(&mut ws.undo_stack, UndoEntry { operation: operation.into(), chunks: pre_snap, group });
+        push_undo(&mut ws.undo_stack, &mut ws.undo_bytes, UndoEntry::new(operation, pre_snap, group));
         ws.redo_stack.clear();
     }
 
@@ -2823,7 +3732,7 @@ fn delete_blocks(
     z_min: i32, z_max: i32,
     state: tauri::State<'_, AppState>,
 ) -> Result<EditResult, String> {
-    let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
+    let mut ws = write_ws(&state);
     let max_z = ws.world.as_ref().map(world_max_z).unwrap_or(63);
     validate_selection(x1, y1, x2, y2, z_min, z_max, max_z)?;
     let rect = (x1, y1, x2, y2);
@@ -2831,7 +3740,7 @@ fn delete_blocks(
     // only clears the shaped cells. No match → rect-only, exactly as before (see `active_mask`).
     let mask = active_mask(&ws, x1, y1, x2, y2);
     let label = format!("Delete {}×{}×{}", x2 - x1 + 1, y2 - y1 + 1, z_max - z_min + 1);
-    with_edit(&mut ws, &label, rect, rect, |world| {
+    with_edit_zscoped(&mut ws, &label, rect, rect, (z_min, z_max), |world| {
         delete_blocks_inner(world, x1, y1, x2, y2, z_min, z_max, mask.as_ref());
         Ok(())
     })
@@ -2856,14 +3765,14 @@ fn replace_blocks(
             return Err(format!("Invalid filter paint {fp}: must be 0–54"));
         }
     }
-    let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
+    let mut ws = write_ws(&state);
     let max_z = ws.world.as_ref().map(world_max_z).unwrap_or(63);
     validate_selection(x1, y1, x2, y2, z_min, z_max, max_z)?;
     let rect = (x1, y1, x2, y2);
     // Fill / filtered-delete also honour the shaped selection (see `active_mask`).
     let mask = active_mask(&ws, x1, y1, x2, y2);
     let label = format!("Replace {}×{}×{}", x2 - x1 + 1, y2 - y1 + 1, z_max - z_min + 1);
-    with_edit(&mut ws, &label, rect, rect, |world| {
+    with_edit_zscoped(&mut ws, &label, rect, rect, (z_min, z_max), |world| {
         replace_blocks_inner(world, x1, y1, x2, y2, z_min, z_max, new_block_type, new_paint, filter_block_type, filter_paint, filter_invert, mask.as_ref());
         Ok(())
     })
@@ -2900,7 +3809,7 @@ fn gradient_fill(
     if paint1 > 54 || paint2 > 54 {
         return Err(format!("Invalid paint byte: must be 0–54 (got {paint1}, {paint2})"));
     }
-    let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
+    let mut ws = write_ws(&state);
     let max_z = ws.world.as_ref().map(world_max_z).unwrap_or(63);
     validate_selection(x1, y1, x2, y2, z_min, z_max, max_z)?;
     let rect = (x1, y1, x2, y2);
@@ -2909,7 +3818,7 @@ fn gradient_fill(
     // colour ramp stays consistent with the visible selection box. No match → rect-only.
     let mask = active_mask(&ws, x1, y1, x2, y2);
     let label = format!("Gradient {}×{}×{}", x2 - x1 + 1, y2 - y1 + 1, z_max - z_min + 1);
-    with_edit(&mut ws, &label, rect, rect, |world| {
+    with_edit_zscoped(&mut ws, &label, rect, rect, (z_min, z_max), |world| {
         gradient_fill_inner(world, x1, y1, x2, y2, z_min, z_max, bt1, paint1, bt2, paint2, &axis, include_air, mask.as_ref());
         Ok(())
     })
@@ -2971,7 +3880,7 @@ fn paint_blocks(
     if blocks.is_empty() {
         return Err("No blocks to paint".into());
     }
-    let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
+    let mut ws = write_ws(&state);
 
     // Compute bounding rect for chunk snapshot + patch render.
     let (mut x_min, mut y_min, mut x_max, mut y_max) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
@@ -3103,7 +4012,7 @@ fn fill_connected_face(
     const MAX_CELLS: u32 = 4_000;
 
     let matched: Vec<(i32, i32, i32)> = {
-        let ws = state.lock().unwrap_or_else(|p| p.into_inner());
+        let ws = read_ws(&state);
         let world = ws.world.as_ref().ok_or("No world loaded")?;
         if read_block_abs(world, x, y, z) == 0 { return Err("No block at that face".into()); }
         find_connected_face_cells(world, x, y, z, nx, ny, nz, match_paint, MAX_CELLS)
@@ -3119,15 +4028,16 @@ fn fill_connected_face(
 /// Move the player spawn/home position to the given editor-coordinate pixel (px, py).
 /// Height is resolved to one block above the surface. The change is written to the in-memory
 /// mmap and persists the next time the world is saved.
-#[tauri::command]
+#[tauri::command(async)]
 fn set_spawn_pos(px: i32, py: i32, state: tauri::State<'_, AppState>) -> Result<(f32, f32), String> {
-    let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
+    let mut ws = write_ws(&state);
     let world = ws.world.as_mut().ok_or("No world loaded")?;
     write_spawn(world, px as f32, py as f32);
+    ws.dirty.mark_header();
     Ok((px as f32, py as f32))
 }
 
-fn save_world_compressed(world: &LoadedWorld, path: &str) -> Result<(), String> {
+fn save_world_compressed(world: &LoadedWorld, path: &str, backup_compressed: bool) -> Result<(), String> {
     use zip::write::{SimpleFileOptions, ZipWriter};
     use std::io::Write;
     let inner_name = {
@@ -3137,10 +4047,7 @@ fn save_world_compressed(world: &LoadedWorld, path: &str) -> Result<(), String> 
         if fname.ends_with(".eden.zip") { fname[..fname.len() - 4].to_string() }
         else { fname.to_string() }
     };
-    let bak = format!("{path}.bak");
-    if !std::path::Path::new(&bak).exists() && std::path::Path::new(path).exists() {
-        fs::copy(path, &bak).map_err(|e| format!("Failed to create backup: {e}"))?;
-    }
+    make_backup_if_absent(std::path::Path::new(path), backup_compressed)?;
     // Stage the zip into a sibling temp file, then rename over the destination — same atomic-save
     // rationale as save_world_inner (never truncate the destination in place; never touch a file
     // that might be mapped).
@@ -3173,54 +4080,302 @@ fn save_world_compressed(world: &LoadedWorld, path: &str) -> Result<(), String> 
 }
 
 #[tauri::command(async)]
-fn save_world(path: String, compressed: bool, state: tauri::State<'_, AppState>) -> Result<(), String> {
-    let ws = state.lock().unwrap_or_else(|p| p.into_inner());
-    let world = ws.world.as_ref().ok_or("No world loaded")?;
-    if compressed { save_world_compressed(world, &path) } else { save_world_inner(world, &path) }
+fn save_world(path: String, compressed: bool, backup_compressed: bool, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let dest = std::path::PathBuf::from(&path);
+
+    // Fast path: rewrite only what changed since this file was last written (audit C2 Stage 4). It
+    // declines — falling through to the full write below — for a compressed target, an unknown or
+    // stale on-disk image, an externally modified destination, or a dirty set too large to be worth
+    // patching. Declining never touches the destination.
+    if !compressed && try_incremental_save(&state, &path, backup_compressed)? {
+        return Ok(());
+    }
+
+    let seq_at_capture = {
+        let ws = read_ws(&state);
+        let world = ws.world.as_ref().ok_or("No world loaded")?;
+        let seq = ws.dirty.seq;
+        if compressed { save_world_compressed(world, &path, backup_compressed)? } else { save_world_inner(world, &path, backup_compressed)? }
+        seq
+    };
+    // A completed full write supersedes any redo log for this destination: `atomic_write`'s rename
+    // published a whole, self-consistent file, so an older log's spans could now only *revert* the
+    // chunks they cover (they hold bytes captured before whatever went into this write).
+    let _ = fs::remove_file(wal_path(&dest));
+    record_full_write(&state, &dest, compressed, seq_at_capture)
 }
 
 /// Release the currently loaded world and everything tied to it — the mmap, clipboard, and the
 /// undo/redo stacks (up to 256 MB) — and delete its staged temp file. Without this, closing a
 /// world in the UI left all of that resident in the backend until the next `load_world`.
 /// World-independent state (texture pack, Eden.eden template) is intentionally left loaded.
-#[tauri::command]
+#[tauri::command(async)]
 fn close_world(state: tauri::State<'_, AppState>) {
     let (old_world, old_temp) = {
-        let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
+        let mut ws = write_ws(&state);
         ws.clipboard = None;
         ws.undo_stack.clear();
         ws.redo_stack.clear();
-        ws.lamp_index = None;
+        ws.undo_bytes = 0;
+        ws.redo_bytes = 0;
+        ws.lamp_index.clear();
         ws.view_cap_z = None;
         ws.sculpt_session = None;
         ws.selection_mask = None;
+        ws.dirty.clear_all();
+        ws.disk_image = None;
+        ws.autosave_base_id = None;
         (ws.world.take(), ws.temp_path.take())
     };
     drop(old_world); // release the mmap before deleting its backing temp file
     if let Some(p) = old_temp { let _ = fs::remove_file(&p); }
 }
 
-// ── Autosave / crash recovery ───────────────────────────────────────────────
+// ── Autosave / crash recovery (audit C2 Stage 3) ────────────────────────────
 //
-// A single rotating sidecar (not the user's save file): `<app_data_dir>/autosave.eden`
-// plus a JSON metadata sidecar recording where it came from. Written on a frontend
-// timer while a world is loaded and dirty; cleared whenever the user performs a real
-// Save/Save As. If `autosave.meta.json` still exists at next launch, the previous
-// session ended without a clean save (crash, force-quit, or forgot to save) and the
-// frontend offers to recover it.
+// Sidecars in `<app_data_dir>`, not the user's save file:
+//   - `autosave.base.eden` — established once per session, on the first autosave tick, as an
+//     O(1)/zero-extra-bytes APFS clone (`stage_copy`) of the load-time staged temp. The temp is
+//     always the pristine as-loaded image (edits live only in the mmap's private COW pages, never
+//     written back to it), so this is always a clean base to journal on top of.
+//   - `autosave.journal` — an append-only `journal::JournalWriter` stream of the chunk (+header)
+//     spans that have changed since the base, compressed per-record. Ticks normally just append;
+//     periodically (or once, on the first tick) the whole journal is rewritten from `since_base` —
+//     see `autosave_world_inner`.
+//   - `autosave.meta.json` — `AutosaveInfo`, written *last* so its mere existence at next launch
+//     means a previous tick's base+journal are already fully durable.
+//   - `autosave.eden` — the pre-Stage-3 legacy format (one full-world copy per tick). No longer
+//     written, but still recognised by `get_autosave_info`/`discard_autosave` so an autosave left
+//     over from before this change is still offered for recovery (via the ordinary `load_world`
+//     path) and still gets cleaned up.
+//
+// Written on a frontend timer while a world is loaded and dirty; cleared whenever the user performs
+// a real Save/Save As. If `autosave.meta.json` still exists at next launch, the previous session
+// ended without a clean save (crash, force-quit, or forgot to save) and the frontend offers to
+// recover it via `load_autosave` (format 1) or the legacy `load_world` path (format 0).
 
 #[derive(Serialize, serde::Deserialize, Clone)]
 struct AutosaveInfo {
     world_name: String,
     source_path: Option<String>,
     timestamp: u64, // unix seconds
+    /// 0 = legacy single-file autosave (`autosave.eden`); 1 = base+journal (`autosave.base.eden` +
+    /// `autosave.journal`). Absent in metadata written before this field existed — `serde(default)`
+    /// reads that back as 0, which is exactly the legacy format it describes.
+    #[serde(default)]
+    format: u32,
+    /// The journal's own `base_id`, duplicated here so `load_autosave` can refuse to replay a
+    /// journal that doesn't actually belong to `autosave.base.eden` (format 1 only).
+    #[serde(default)]
+    base_id: [u8; 16],
 }
 
-fn autosave_paths(app: &tauri::AppHandle) -> Result<(std::path::PathBuf, std::path::PathBuf), String> {
+struct AutosavePaths {
+    /// Legacy pre-Stage-3 single-file autosave. Never written anymore; still checked for and
+    /// cleaned up so an old-format sidecar from before this change doesn't linger forever.
+    legacy_data: std::path::PathBuf,
+    meta: std::path::PathBuf,
+    base: std::path::PathBuf,
+    journal: std::path::PathBuf,
+}
+
+/// Pure path arithmetic, factored out of `autosave_paths` so it's callable from tests without a
+/// `tauri::AppHandle` — mirrors the `_inner` convention used for `materialize_flat_chunks`/etc.
+fn autosave_paths_at(dir: &std::path::Path) -> AutosavePaths {
+    AutosavePaths {
+        legacy_data: dir.join("autosave.eden"),
+        meta: dir.join("autosave.meta.json"),
+        base: dir.join("autosave.base.eden"),
+        journal: dir.join("autosave.journal"),
+    }
+}
+
+fn autosave_paths(app: &tauri::AppHandle) -> Result<AutosavePaths, String> {
     use tauri::Manager;
     let dir = app.path().app_data_dir().map_err(|e| format!("Failed to resolve app data dir: {e}"))?;
     fs::create_dir_all(&dir).map_err(|e| format!("Failed to create app data dir: {e}"))?;
-    Ok((dir.join("autosave.eden"), dir.join("autosave.meta.json")))
+    Ok(autosave_paths_at(&dir))
+}
+
+/// Below this many bytes' worth of journal already on disk, an autosave tick just appends. Above
+/// it (or when the tick's own pending chunks alone would already cross a quarter of the world's
+/// size), the journal is rewritten from scratch from `since_base` instead — bounds both the
+/// journal's own on-disk growth and the cost of any single append.
+const AUTOSAVE_COMPACT_MIN_JOURNAL_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Not cryptographic — this id only has to distinguish "this session's base image" from a stale
+/// one left by a previous session, which nanosecond-resolution wall time plus the OS pid already
+/// does far more than well enough. Avoids pulling in a `rand` dependency for a sanity-check field.
+fn random_base_id() -> [u8; 16] {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let pid = std::process::id() as u128;
+    (nanos ^ pid.rotate_left(64) ^ pid.wrapping_mul(0x9E37_79B9_7F4A_7C15)).to_le_bytes()
+}
+
+/// Write a brand-new journal (first tick of a session, or a compaction) atomically: build it as
+/// `<journal>.tmp`, fsync, then rename over the destination. Without this, a crash partway through
+/// a *compacting* rewrite (which truncates the file before it has written anything back) could
+/// leave `autosave.journal` shorter than what it replaced — losing history a plain append's
+/// truncation-tolerant replay was never at risk of losing in the first place.
+fn write_fresh_journal(
+    path: &std::path::Path,
+    base_len: u64,
+    base_id: [u8; 16],
+    header: &Option<Vec<u8>>,
+    spans: &[(u64, i32, i32, Vec<u8>)],
+) -> Result<(), String> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = std::path::PathBuf::from(tmp);
+    {
+        let file = fs::File::create(&tmp).map_err(|e| format!("Failed to create autosave journal: {e}"))?;
+        let mut writer = journal::JournalWriter::create(file, base_len, base_id, true)
+            .map_err(|e| format!("Failed to write autosave journal header: {e}"))?;
+        if let Some(h) = header {
+            writer.append_span(0, journal::HEADER_SPAN.0, journal::HEADER_SPAN.1, h)
+                .map_err(|e| format!("Failed to append autosave journal header span: {e}"))?;
+        }
+        for (off, cx, cy, bytes) in spans {
+            writer.append_span(*off, *cx, *cy, bytes)
+                .map_err(|e| format!("Failed to append autosave journal span: {e}"))?;
+        }
+        writer.flush().map_err(|e| format!("Failed to flush autosave journal: {e}"))?;
+        writer.get_mut().sync_all().map_err(|e| format!("Failed to fsync autosave journal: {e}"))?;
+    }
+    fs::rename(&tmp, path).map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        format!("Failed to finalize autosave journal: {e}")
+    })
+}
+
+/// Append to an existing journal in place. Safe to leave torn on a crash mid-write — that's the
+/// whole point of the journal's truncation-tolerant replay (see `journal::replay`) — so this
+/// doesn't need the create-temp-then-rename treatment `write_fresh_journal` needs.
+fn append_journal(
+    path: &std::path::Path,
+    header: &Option<Vec<u8>>,
+    spans: &[(u64, i32, i32, Vec<u8>)],
+) -> Result<(), String> {
+    let file = fs::OpenOptions::new().append(true).open(path)
+        .map_err(|e| format!("Failed to open autosave journal: {e}"))?;
+    let mut writer = journal::JournalWriter::resume(file, true);
+    if let Some(h) = header {
+        writer.append_span(0, journal::HEADER_SPAN.0, journal::HEADER_SPAN.1, h)
+            .map_err(|e| format!("Failed to append autosave journal header span: {e}"))?;
+    }
+    for (off, cx, cy, bytes) in spans {
+        writer.append_span(*off, *cx, *cy, bytes)
+            .map_err(|e| format!("Failed to append autosave journal span: {e}"))?;
+    }
+    writer.flush().map_err(|e| format!("Failed to flush autosave journal: {e}"))?;
+    writer.get_mut().sync_all().map_err(|e| format!("Failed to fsync autosave journal: {e}"))
+}
+
+/// Core of `autosave_world`, factored out so it's callable from tests with a bare `AppState` and a
+/// plain directory instead of a `tauri::AppHandle` (mirrors the `_inner` convention used elsewhere
+/// in this file). See the module doc above and the "Journaled Autosave" section of CLAUDE.md for
+/// the guard-drop/retain discipline this implements.
+fn autosave_world_inner(
+    state: &AppState,
+    paths: &AutosavePaths,
+    source_path: Option<String>,
+) -> Result<(), String> {
+    // ── Step 1: read guard — snapshot everything this tick needs, then drop the guard before any
+    // I/O. `std::sync::RwLock` is neither reentrant nor upgradable, so the write guard in step 4 is
+    // a fully separate, later acquisition — never nested with this one.
+    let journal_len_on_disk = fs::metadata(&paths.journal).map(|m| m.len()).unwrap_or(0);
+
+    let (base_id, need_new_base, base_len, world_name, temp_path, compact, spans, header, written_chunks) = {
+        let ws = read_ws(state);
+        let world = ws.world.as_ref().ok_or("No world loaded")?;
+        let base_len = world.bytes.len() as u64;
+        let need_new_base = ws.autosave_base_id.is_none();
+        let base_id = ws.autosave_base_id.unwrap_or_else(random_base_id);
+
+        let dirty_now = ws.dirty.since_journal.len() as u64;
+        let compact_threshold = (base_len / 10).max(AUTOSAVE_COMPACT_MIN_JOURNAL_BYTES);
+        let compact = need_new_base
+            || dirty_now.saturating_mul(world.chunk_size as u64) > base_len / 4
+            || journal_len_on_disk > compact_threshold;
+
+        let coords: Vec<(i32, i32)> = if compact {
+            ws.dirty.since_base.iter().copied().collect()
+        } else {
+            ws.dirty.since_journal.iter().copied().collect()
+        };
+        let header_dirty = if compact { ws.dirty.header_base } else { ws.dirty.header_journal };
+
+        let mut spans = Vec::with_capacity(coords.len());
+        let mut written_chunks = std::collections::HashSet::with_capacity(coords.len());
+        for (cx, cy) in coords {
+            if let Some((addr, end)) = world.chunk_range(cx, cy) {
+                spans.push((addr as u64, cx, cy, world.bytes[addr..end].to_vec()));
+                written_chunks.insert((cx, cy));
+            }
+        }
+        let header = if header_dirty && world.bytes.len() >= 192 {
+            Some(world.bytes[0..192].to_vec())
+        } else {
+            None
+        };
+
+        (base_id, need_new_base, base_len, world.name.clone(), ws.temp_path.clone(), compact, spans, header, written_chunks)
+    };
+    // read guard dropped here.
+
+    if spans.is_empty() && header.is_none() && !need_new_base {
+        // Nothing pending — matches the frontend's own dirty-gating, but a defensive no-op here
+        // means a stray call can never create an empty journal or an unnecessary meta rewrite.
+        return Ok(());
+    }
+
+    if need_new_base {
+        let temp_path = temp_path.ok_or("No staged world file to autosave from")?;
+        let _ = fs::remove_file(&paths.base); // stage_copy's clonefile fails if the destination exists
+        stage_copy(&temp_path, &paths.base).map_err(|e| format!("Failed to stage autosave base: {e}"))?;
+    }
+
+    if compact {
+        write_fresh_journal(&paths.journal, base_len, base_id, &header, &spans)?;
+    } else {
+        append_journal(&paths.journal, &header, &spans)?;
+    }
+
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+    let info = AutosaveInfo { world_name, source_path, timestamp, format: 1, base_id };
+    let json = serde_json::to_string(&info).map_err(|e| format!("Failed to serialize autosave meta: {e}"))?;
+    fs::write(&paths.meta, json).map_err(|e| format!("Failed to write autosave meta: {e}"))?;
+    // Format-1 sidecars are now fully durable — a stale legacy sidecar would otherwise shadow them
+    // (get_autosave_info reads whichever format the meta claims, but a leftover autosave.eden is
+    // just wasted disk once this exists).
+    let _ = fs::remove_file(&paths.legacy_data);
+
+    // ── Step 4: write guard, strictly after step 1's guard was dropped. `retain`, never a blanket
+    // clear: an edit can land in the gap between the drop above and the acquire below, and a
+    // blanket clear would silently drop it from the next tick (this is the one correctness rule
+    // this function exists to get right — see CLAUDE.md "World lock").
+    {
+        let mut ws = write_ws(state);
+        ws.autosave_base_id = Some(base_id);
+        ws.dirty.since_journal.retain(|c| !written_chunks.contains(c));
+        // Header has no coordinate to key a retain on, so a byte-compare substitutes for one: only
+        // clear header_journal if the header we captured (and just wrote) still matches what's
+        // live right now. If it doesn't, something wrote the header again during the I/O window
+        // above and that edit is still owed to the journal next tick.
+        if let Some(captured) = &header {
+            let still_matches = ws.world.as_ref()
+                .is_some_and(|w| w.bytes.len() >= 192 && &w.bytes[0..192] == captured.as_slice());
+            if still_matches {
+                ws.dirty.header_journal = false;
+            }
+        }
+    }
+
+    Ok(())
 }
 
 #[tauri::command(async)]
@@ -3229,53 +4384,184 @@ fn autosave_world(
     source_path: Option<String>,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
-    // Write directly from the mmap'd bytes rather than `.to_vec()`-ing a heap copy first: on a
-    // >4 GiB world that copy was itself a 5 GB allocation on top of the 5 GB mapping (DIAGNOSIS.md
-    // §1.10.4). The lock is held for the whole write instead, so a concurrent edit command waits
-    // for the autosave to finish — but this command is already `async` (runs off the main thread
-    // via Tauri's async-command pool), so the UI event loop never blocks on it either way.
-    let (data_path, meta_path) = autosave_paths(&app)?;
-    let world_name = {
-        let ws = state.lock().unwrap_or_else(|p| p.into_inner());
-        let world = ws.world.as_ref().ok_or("No world loaded")?;
-        atomic_write(&data_path, &world.bytes).map_err(|e| format!("Failed to write autosave: {e}"))?;
-        world.name.clone()
+    let paths = autosave_paths(&app)?;
+    autosave_world_inner(&state, &paths, source_path)
+}
+
+/// Core of `load_autosave`; see that command for the recovery procedure. Factored out for testing
+/// the same way `autosave_world_inner` is.
+fn load_autosave_inner(state: &AppState, paths: &AutosavePaths) -> Result<WorldMeta, String> {
+    let meta_json = fs::read_to_string(&paths.meta).map_err(|e| format!("Failed to read autosave meta: {e}"))?;
+    let info: AutosaveInfo = serde_json::from_str(&meta_json).map_err(|e| format!("Failed to parse autosave meta: {e}"))?;
+    if info.format != 1 {
+        return Err("This autosave is in the legacy single-file format; open it directly instead of recovering".into());
+    }
+
+    let base_len = fs::metadata(&paths.base).map_err(|e| format!("Failed to stat autosave base: {e}"))?.len();
+
+    // Stage into a fresh temp file exactly like load_world does, then replay the journal into
+    // THAT file — never into a live mmap — so the temp on disk stays the pristine "as-loaded"
+    // image the *next* session's own base-establishment depends on.
+    let temp_path = temp_world_path();
+    stage_copy(&paths.base, &temp_path).map_err(|e| format!("Failed to stage autosave base: {e}"))?;
+
+    let journal_bytes = fs::read(&paths.journal).map_err(|e| {
+        let _ = fs::remove_file(&temp_path);
+        format!("Failed to read autosave journal: {e}")
+    })?;
+    if let Some(hdr) = journal::JournalHeader::decode(&journal_bytes) {
+        // A journal whose base_id doesn't match the meta sidecar belongs to a different lineage
+        // than autosave.base.eden (e.g. the base survived a crash mid-compaction while the meta
+        // pointed at an older journal generation) — refuse rather than replay mismatched history
+        // onto the wrong base.
+        if hdr.base_id != info.base_id {
+            let _ = fs::remove_file(&temp_path);
+            return Err("Autosave journal does not match its base image — recovery aborted for safety".into());
+        }
+    }
+    let replay = journal::replay(&journal_bytes, base_len).map_err(|e| {
+        let _ = fs::remove_file(&temp_path);
+        match e {
+            journal::JournalError::BadMagic => "Autosave journal is corrupt (bad header)".to_string(),
+            journal::JournalError::BaseLenMismatch { expected, found } => format!(
+                "Autosave journal doesn't match its base image (base is {expected}B, journal expects {found}B)"
+            ),
+        }
+    })?;
+    timing_log!("[LOAD] autosave replay  spans={}  truncated={}", replay.spans.len(), replay.truncated);
+
+    if !replay.spans.is_empty() {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut f = fs::OpenOptions::new().write(true).open(&temp_path).map_err(|e| {
+            let _ = fs::remove_file(&temp_path);
+            format!("Failed to open staged temp for replay: {e}")
+        })?;
+        for span in &replay.spans {
+            let result = f.seek(SeekFrom::Start(span.file_off)).and_then(|_| f.write_all(&span.payload));
+            if let Err(e) = result {
+                drop(f);
+                let _ = fs::remove_file(&temp_path);
+                return Err(format!("Failed to replay autosave journal: {e}"));
+            }
+        }
+        f.sync_all().map_err(|e| format!("Failed to fsync staged temp: {e}"))?;
+    }
+
+    let file = fs::File::open(&temp_path).map_err(|e| format!("Failed to open staged temp: {e}"))?;
+    // SAFETY: temp file is private, written by us, and stays alive for the duration of the mmap.
+    let mmap = unsafe { MmapOptions::new().map_copy(&file) }
+        .map_err(|e| format!("Failed to map staged temp: {e}"))?;
+
+    let loaded = match parse_world_inner(mmap) {
+        Ok(l) => l,
+        Err(e) => {
+            let _ = fs::remove_file(&temp_path);
+            return Err(e);
+        }
     };
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-    let info = AutosaveInfo { world_name, source_path, timestamp };
-    let json = serde_json::to_string(&info).map_err(|e| format!("Failed to serialize autosave meta: {e}"))?;
-    fs::write(&meta_path, json).map_err(|e| format!("Failed to write autosave meta: {e}"))?;
-    Ok(())
+
+    let spawn = read_spawn(&loaded);
+    let center = {
+        let n = loaded.chunk_map.len();
+        if n == 0 { None } else {
+            let (sx, sy) = loaded.chunk_map.keys().fold((0i64, 0i64), |(ax, ay), &(cx, cy)| {
+                (ax + ((cx - loaded.min_x) as i64 * 16 + 8),
+                 ay + ((cy - loaded.min_y) as i64 * 16 + 8))
+            });
+            Some((sx as f32 / n as f32, sy as f32 / n as f32))
+        }
+    };
+    let meta = WorldMeta {
+        name:          loaded.name.clone(),
+        width_chunks:  loaded.w_chunks,
+        height_chunks: loaded.h_chunks,
+        max_z:         world_max_z(&loaded) as u32,
+        was_compressed: false, // the base image (and this recovered form) is always raw
+        spawn_px: spawn.map(|(x, _)| x),
+        spawn_py: spawn.map(|(_, y)| y),
+        center_px: center.map(|(x, _)| x),
+        center_py: center.map(|(_, y)| y),
+        abs_min_x: loaded.min_x,
+        abs_min_y: loaded.min_y,
+        sky: loaded.sky,
+    };
+
+    // ── Locked swap — mirrors load_world's step 3.
+    let (_old_world, old_temp) = {
+        let mut ws = write_ws(state);
+        let old_world = ws.world.replace(loaded);
+        ws.clipboard = None;
+        ws.undo_stack.clear();
+        ws.redo_stack.clear();
+        ws.undo_bytes = 0;
+        ws.redo_bytes = 0;
+        ws.lamp_index.clear();
+        ws.view_cap_z = None;
+        ws.sculpt_session = None;
+        ws.selection_mask = None;
+        let old_temp = ws.temp_path.take();
+        ws.temp_path = Some(temp_path);
+        ws.dirty.clear_all();
+        // The recovered world isn't known to correspond byte-for-byte to any file on disk yet — no
+        // DiskImage until a real Save succeeds. Likewise `autosave_base_id`: this recovered session
+        // starts its own fresh base+journal lineage on its first autosave tick rather than
+        // resuming appends into a journal whose `since_base` bookkeeping no longer matches (see
+        // `autosave_base_id`'s doc comment).
+        ws.disk_image = None;
+        ws.autosave_base_id = None;
+        drop(ws);
+        (old_world, old_temp)
+    };
+    if let Some(p) = old_temp { let _ = fs::remove_file(&p); }
+
+    Ok(meta)
+}
+
+#[tauri::command(async)]
+fn load_autosave(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<WorldMeta, String> {
+    let paths = autosave_paths(&app)?;
+    load_autosave_inner(&state, &paths)
 }
 
 /// Checked once at startup. Returns `None` if no autosave is pending recovery.
 #[tauri::command]
 fn get_autosave_info(app: tauri::AppHandle) -> Result<Option<AutosaveInfo>, String> {
-    let (data_path, meta_path) = autosave_paths(&app)?;
-    if !data_path.exists() || !meta_path.exists() {
+    let paths = autosave_paths(&app)?;
+    if !paths.meta.exists() {
         return Ok(None);
     }
-    let json = fs::read_to_string(&meta_path).map_err(|e| format!("Failed to read autosave meta: {e}"))?;
+    let json = fs::read_to_string(&paths.meta).map_err(|e| format!("Failed to read autosave meta: {e}"))?;
     let info: AutosaveInfo = serde_json::from_str(&json).map_err(|e| format!("Failed to parse autosave meta: {e}"))?;
+    let sidecars_present = if info.format == 1 {
+        paths.base.exists() && paths.journal.exists()
+    } else {
+        paths.legacy_data.exists()
+    };
+    if !sidecars_present {
+        return Ok(None);
+    }
     Ok(Some(info))
 }
 
-/// The path to load the pending autosave from — the caller feeds this into the
-/// existing `load_world` command to recover it, exactly like opening any other file.
+/// The path to load a *legacy* (format 0) pending autosave from — the caller feeds this into the
+/// existing `load_world` command to recover it, exactly like opening any other file. Format 1
+/// recovers via `load_autosave` instead, which needs no path (it resolves its own sidecars).
 #[tauri::command]
 fn get_autosave_path(app: tauri::AppHandle) -> Result<String, String> {
-    let (data_path, _) = autosave_paths(&app)?;
-    Ok(data_path.to_string_lossy().into_owned())
+    let paths = autosave_paths(&app)?;
+    Ok(paths.legacy_data.to_string_lossy().into_owned())
 }
 
-/// Clears the pending autosave. Called after a successful manual Save/Save As
-/// (nothing left to recover) or when the user declines the recovery prompt.
+/// Clears the pending autosave — every sidecar format might have left behind. Called after a
+/// successful manual Save/Save As (nothing left to recover) or when the user declines the recovery
+/// prompt.
 #[tauri::command]
 fn discard_autosave(app: tauri::AppHandle) -> Result<(), String> {
-    let (data_path, meta_path) = autosave_paths(&app)?;
-    let _ = fs::remove_file(&data_path);
-    let _ = fs::remove_file(&meta_path);
+    let paths = autosave_paths(&app)?;
+    let _ = fs::remove_file(&paths.legacy_data);
+    let _ = fs::remove_file(&paths.meta);
+    let _ = fs::remove_file(&paths.base);
+    let _ = fs::remove_file(&paths.journal);
     Ok(())
 }
 
@@ -3303,9 +4589,9 @@ fn undo_stack_labels(stack: &VecDeque<UndoEntry>) -> Vec<String> {
 
 /// Read-only projection of the undo/redo stacks for the sidebar's History tab — labels only, no
 /// chunk data, so it's cheap to poll after every edit.
-#[tauri::command]
+#[tauri::command(async)]
 fn list_undo_stack(state: tauri::State<'_, AppState>) -> Result<UndoStackInfo, String> {
-    let ws = state.lock().unwrap_or_else(|p| p.into_inner());
+    let ws = read_ws(&state);
     Ok(UndoStackInfo {
         undo: undo_stack_labels(&ws.undo_stack),
         redo: undo_stack_labels(&ws.redo_stack),
@@ -3314,13 +4600,13 @@ fn list_undo_stack(state: tauri::State<'_, AppState>) -> Result<UndoStackInfo, S
 
 #[tauri::command(async)]
 fn undo_edit(state: tauri::State<'_, AppState>) -> Result<EditResult, String> {
-    let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
+    let mut ws = write_ws(&state);
     undo_edit_inner(&mut ws)
 }
 
 #[tauri::command(async)]
 fn redo_edit(state: tauri::State<'_, AppState>) -> Result<EditResult, String> {
-    let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
+    let mut ws = write_ws(&state);
     redo_edit_inner(&mut ws)
 }
 
@@ -3339,7 +4625,7 @@ fn undo_edit_inner(ws: &mut WorldState) -> Result<EditResult, String> {
     // stray call with no world can't silently discard an entry (harmless today since the stacks
     // are cleared with the world, but fragile ordering otherwise).
     let mut world = ws.world.take().ok_or("No world loaded")?;
-    let entry = match ws.undo_stack.pop_back() {
+    let entry = match pop_undo(&mut ws.undo_stack, &mut ws.undo_bytes) {
         Some(e) => e,
         None => { ws.world = Some(world); return Err("Nothing to undo".into()); }
     };
@@ -3351,18 +4637,21 @@ fn undo_edit_inner(ws: &mut WorldState) -> Result<EditResult, String> {
     while let Some(entry) = current.take() {
         for s in &entry.chunks { affected.push((s.cx, s.cy)); }
         let redo_snaps = restore_and_invert(&mut world, &entry);
-        push_undo(&mut ws.redo_stack, UndoEntry { operation: entry.operation, chunks: redo_snaps, group: entry.group });
+        // Same delta-driven lamp maintenance as `with_edit_inner`: the inverse snapshots hold the
+        // pre-restore bytes and `world` now holds the restored ones (audit H3).
+        ws.lamp_index.apply_delta(&world, &redo_snaps);
+        push_undo(&mut ws.redo_stack, &mut ws.redo_bytes, UndoEntry::new(entry.operation, redo_snaps, entry.group));
         // Continue only for a group whose next entry down matches the same id.
         if let Some(g) = group {
             if ws.undo_stack.back().map(|e| e.group) == Some(Some(g)) {
-                current = ws.undo_stack.pop_back();
+                current = pop_undo(&mut ws.undo_stack, &mut ws.undo_bytes);
             }
         }
     }
 
+    ws.dirty.mark_chunks(affected.iter().copied());
     let patch = patch_from_chunk_coords(&world, &affected, ws.view_cap_z);
     ws.world = Some(world);
-    refresh_lamp_index_chunks(ws, &affected);
 
     Ok(EditResult {
         patch,
@@ -3377,7 +4666,7 @@ fn undo_edit_inner(ws: &mut WorldState) -> Result<EditResult, String> {
 fn redo_edit_inner(ws: &mut WorldState) -> Result<EditResult, String> {
     ws.sculpt_session = None; // bypasses with_edit_inner — clear the live-sculpt workspace (see SculptSession)
     let mut world = ws.world.take().ok_or("No world loaded")?;
-    let entry = match ws.redo_stack.pop_back() {
+    let entry = match pop_undo(&mut ws.redo_stack, &mut ws.redo_bytes) {
         Some(e) => e,
         None => { ws.world = Some(world); return Err("Nothing to redo".into()); }
     };
@@ -3389,17 +4678,18 @@ fn redo_edit_inner(ws: &mut WorldState) -> Result<EditResult, String> {
     while let Some(entry) = current.take() {
         for s in &entry.chunks { affected.push((s.cx, s.cy)); }
         let undo_snaps = restore_and_invert(&mut world, &entry);
-        push_undo(&mut ws.undo_stack, UndoEntry { operation: entry.operation, chunks: undo_snaps, group: entry.group });
+        ws.lamp_index.apply_delta(&world, &undo_snaps); // delta-driven lamp maintenance (audit H3)
+        push_undo(&mut ws.undo_stack, &mut ws.undo_bytes, UndoEntry::new(entry.operation, undo_snaps, entry.group));
         if let Some(g) = group {
             if ws.redo_stack.back().map(|e| e.group) == Some(Some(g)) {
-                current = ws.redo_stack.pop_back();
+                current = pop_undo(&mut ws.redo_stack, &mut ws.redo_bytes);
             }
         }
     }
 
+    ws.dirty.mark_chunks(affected.iter().copied());
     let patch = patch_from_chunk_coords(&world, &affected, ws.view_cap_z);
     ws.world = Some(world);
-    refresh_lamp_index_chunks(ws, &affected);
 
     Ok(EditResult {
         patch,
@@ -3419,7 +4709,7 @@ fn copy_selection(
     z_min: i32, z_max: i32,
     state: tauri::State<'_, AppState>,
 ) -> Result<ClipboardInfo, String> {
-    let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
+    let mut ws = write_ws(&state);
     let max_z = ws.world.as_ref().map(world_max_z).unwrap_or(63);
     validate_selection(x1, y1, x2, y2, z_min, z_max, max_z)?;
     let world = ws.world.as_ref().ok_or("No world loaded")?;
@@ -3427,33 +4717,27 @@ fn copy_selection(
     let width  = x2 - x1 + 1;
     let height = y2 - y1 + 1;
     let depth  = z_max - z_min + 1;
-    let vol    = (width * height * depth) as usize;
+    let vol    = validate_volume(width, height, depth)? as usize;
 
     let mut block_types = vec![0u8; vol];
     let mut paints      = vec![0u8; vol];
 
-    for dz in 0..depth {
-        let z    = z_min + dz;
-        let band = (z as usize) / 16;
-        let lz   = (z as usize) % 16;
-        for dy in 0..height {
-            let py       = y1 + dy;
-            let chunk_cy = py / 16 + world.min_y;
-            let ly       = (py % 16) as usize;
-            for dx in 0..width {
-                let px       = x1 + dx;
-                let chunk_cx = px / 16 + world.min_x;
-                let lx       = (px % 16) as usize;
-                let Some((addr, cend)) = world.chunk_range(chunk_cx, chunk_cy) else {
-                    continue; // outside world → leave 0 (air)
-                };
-                let bi  = addr + band * 8192 + lx * 256 + ly * 16 + lz;
-                let pi  = bi + 4096;
+    // Column-major bulk read (audit M8): one chunk lookup per (dx,dy) column instead of one per
+    // voxel, and the z run copied via `read_column_bulk`'s per-band `copy_from_slice`s instead of
+    // `width*height*depth` individual indexed reads. The clipboard's own flat layout is dz-outer
+    // (`dz*height*width + dy*width + dx`, documented on `Clipboard`), so the column-contiguous read
+    // lands in a small `tmp` buffer first and is scattered into that layout — still one lookup per
+    // column rather than one per voxel, which was the dominant cost.
+    let dstride = depth as usize;
+    let mut tmp_bt = vec![0u8; dstride];
+    let mut tmp_paint = vec![0u8; dstride];
+    for dy in 0..height {
+        for dx in 0..width {
+            read_column_bulk(world, x1 + dx, y1 + dy, z_min, depth, &mut tmp_bt, &mut tmp_paint);
+            for dz in 0..depth {
                 let idx = (dz * height * width + dy * width + dx) as usize;
-                if pi < cend {
-                    block_types[idx] = world.bytes[bi];
-                    paints[idx]      = world.bytes[pi];
-                }
+                block_types[idx] = tmp_bt[dz as usize];
+                paints[idx]      = tmp_paint[dz as usize];
             }
         }
     }
@@ -3575,7 +4859,7 @@ pub(crate) fn surface_z_capped(world: &LoadedWorld, px: i32, py: i32, cap: Optio
     None
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn rename_world(state: tauri::State<'_, AppState>, name: String) -> Result<(), String> {
     if name.len() > 32 {
         return Err("Name must be 32 characters or fewer".into());
@@ -3585,7 +4869,7 @@ fn rename_world(state: tauri::State<'_, AppState>, name: String) -> Result<(), S
             return Err(format!("Invalid character '{}' — only A–Z, a–z, 0–9 and ' are allowed", ch));
         }
     }
-    let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
+    let mut ws = write_ws(&state);
     let world = ws.world.as_mut().ok_or("No world loaded")?;
     if world.bytes.len() < 76 {
         return Err("World file too small to contain name field".into());
@@ -3595,12 +4879,13 @@ fn rename_world(state: tauri::State<'_, AppState>, name: String) -> Result<(), S
         world.bytes[40 + i] = if i < name_bytes.len() { name_bytes[i] } else { 0 };
     }
     world.name = name;
+    ws.dirty.mark_header();
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_surface_z(state: tauri::State<'_, AppState>, x: i32, y: i32) -> Result<Option<i32>, String> {
-    let ws = state.lock().unwrap_or_else(|p| p.into_inner());
+    let ws = read_ws(&state);
     let world = ws.world.as_ref().ok_or("no world")?;
     Ok(surface_z(world, x, y))
 }
@@ -3610,9 +4895,9 @@ struct PickedBlock { block_type: u8, paint: u8 }
 
 /// Return the surface Z, block type, and paint at (wx, wy). Used by status bar cursor info.
 /// Returns None if no world loaded or column is empty.
-#[tauri::command]
+#[tauri::command(async)]
 fn get_cursor_block(state: tauri::State<'_, AppState>, wx: i32, wy: i32) -> Option<[i32; 3]> {
-    let ws = state.lock().unwrap_or_else(|p| p.into_inner());
+    let ws = read_ws(&state);
     let world = ws.world.as_ref()?;
     // Report the block the cutaway view is actually showing (and that a z-less draw would hit).
     let z = surface_z_capped(world, wx, wy, ws.view_cap_z)?;
@@ -3622,9 +4907,9 @@ fn get_cursor_block(state: tauri::State<'_, AppState>, wx: i32, wy: i32) -> Opti
 
 /// Return the block type and paint at the surface of (wx, wy).
 /// Returns air (0,0) if the column is empty or out of bounds.
-#[tauri::command]
+#[tauri::command(async)]
 fn pick_block_surface(state: tauri::State<'_, AppState>, wx: i32, wy: i32) -> Result<PickedBlock, String> {
-    let ws = state.lock().unwrap_or_else(|p| p.into_inner());
+    let ws = read_ws(&state);
     let world = ws.world.as_ref().ok_or("no world")?;
     let z = surface_z_capped(world, wx, wy, ws.view_cap_z).unwrap_or(0);
     let (bt, paint) = get_block_at(world, wx, wy, z);
@@ -3679,9 +4964,9 @@ fn rotate_clipboard_inner(cb: &mut Clipboard) {
     cb.mask = new_mask;
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn rotate_clipboard(state: tauri::State<'_, AppState>) -> Result<ClipboardInfo, String> {
-    let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
+    let mut ws = write_ws(&state);
     let cb = ws.clipboard.as_mut().ok_or("Clipboard is empty")?;
     rotate_clipboard_inner(cb);
     Ok(cb.info())
@@ -3723,9 +5008,9 @@ fn mirror_clipboard_x_inner(cb: &mut Clipboard) {
 
 /// Mirror clipboard on the X axis (left↔right on the map): (dx,dy,dz) → (width-1-dx, dy, dz).
 /// Ramp IDs are remapped so E-facing ramps become W-facing and vice versa.
-#[tauri::command]
+#[tauri::command(async)]
 fn mirror_clipboard_x(state: tauri::State<'_, AppState>) -> Result<ClipboardInfo, String> {
-    let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
+    let mut ws = write_ws(&state);
     let cb = ws.clipboard.as_mut().ok_or("Clipboard is empty")?;
     mirror_clipboard_x_inner(cb);
     Ok(cb.info())
@@ -3767,9 +5052,9 @@ fn mirror_clipboard_y_inner(cb: &mut Clipboard) {
 
 /// Mirror clipboard on the Y axis (top↔bottom on the map): (dx,dy,dz) → (dx, height-1-dy, dz).
 /// Ramp IDs are remapped so S-facing ramps become N-facing and vice versa.
-#[tauri::command]
+#[tauri::command(async)]
 fn mirror_clipboard_y(state: tauri::State<'_, AppState>) -> Result<ClipboardInfo, String> {
-    let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
+    let mut ws = write_ws(&state);
     let cb = ws.clipboard.as_mut().ok_or("Clipboard is empty")?;
     mirror_clipboard_y_inner(cb);
     Ok(cb.info())
@@ -3788,7 +5073,7 @@ fn paste_at(
     ignore_air: bool,
     state: tauri::State<'_, AppState>,
 ) -> Result<EditResult, String> {
-    let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
+    let mut ws = write_ws(&state);
 
     // Clone clipboard data before taking world to avoid borrow conflict.
     let (width, height, depth, z_anchor, block_types, paints, mask) = {
@@ -3803,9 +5088,10 @@ fn paste_at(
     // Clamp to non-negative for affected_chunk_coords (negative coords have no chunks).
     let snap_rect = (paste_x.max(0), paste_y.max(0), x2_paste, y2_paste);
     let patch_rect = (paste_x, paste_y, x2_paste, y2_paste);
+    let z_range = (z_anchor + elevation_offset, z_anchor + elevation_offset + depth - 1);
 
     let label = format!("Paste {width}×{height}×{depth}");
-    with_edit(&mut ws, &label, snap_rect, patch_rect, |world| {
+    with_edit_zscoped(&mut ws, &label, snap_rect, patch_rect, z_range, |world| {
         for dz in 0..depth {
             let z = z_anchor + elevation_offset + dz;
             if z < 0 || z > world_max_z(world) { continue; }
@@ -3854,7 +5140,7 @@ fn paste_terrain(
     above_surface: bool,
     state: tauri::State<'_, AppState>,
 ) -> Result<EditResult, String> {
-    let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
+    let mut ws = write_ws(&state);
 
     let (width, height, depth, block_types, paints, mask) = {
         let cb = ws.clipboard.as_ref().ok_or("Clipboard is empty")?;
@@ -3928,7 +5214,7 @@ fn extrude_selection(
     ignore_air: bool,
     state: tauri::State<'_, AppState>,
 ) -> Result<EditResult, String> {
-    let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
+    let mut ws = write_ws(&state);
     if count <= 0 { return Err("count must be at least 1".into()); }
 
     // Non-rectangular selection: gate on the *source* footprint (mask only exists over the source
@@ -4058,7 +5344,7 @@ fn move_selection(
     dx: i32, dy: i32, dz: i32,
     state: tauri::State<'_, AppState>,
 ) -> Result<EditResult, String> {
-    let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
+    let mut ws = write_ws(&state);
     let max_z = ws.world.as_ref().map(world_max_z).unwrap_or(63);
     validate_selection(x1, y1, x2, y2, z_min, z_max, max_z)?;
     if dx == 0 && dy == 0 && dz == 0 {
@@ -4068,8 +5354,12 @@ fn move_selection(
     let width  = x2 - x1 + 1;
     let height = y2 - y1 + 1;
     let depth  = z_max - z_min + 1;
+    validate_volume(width, height, depth)?;
     let (x1d, y1d, x2d, y2d) = (x1 + dx, y1 + dy, x2 + dx, y2 + dy);
     let snap_rect = (x1.min(x1d), y1.min(y1d), x2.max(x2d), y2.max(y2d));
+    // Source and destination bands both need to survive in the undo snapshot — a nonzero dz shifts
+    // the write's z interval away from the read's, so the union of both is the true vertical extent.
+    let z_range = (z_min.min(z_min + dz), z_max.max(z_max + dz));
     let label = format!("Move {width}×{height}×{depth}");
 
     // A shaped selection moves only its footprint (dragging the box was the wand bug's twin). The
@@ -4078,37 +5368,47 @@ fn move_selection(
     let mask = active_mask(&ws, x1, y1, x2, y2);
     let masked = mask.is_some();
 
-    let result = with_edit(&mut ws, &label, snap_rect, snap_rect, |world| {
+    let result = with_edit_zscoped(&mut ws, &label, snap_rect, snap_rect, z_range, |world| {
+        // Column-major buffer (lx,ly,lz) with lz innermost — audit M8: this is what lets each
+        // column's read/write go through one chunk lookup and per-band `copy_from_slice`s
+        // (`read_column_bulk`/`write_column_bulk`) instead of `width*height*depth` individual
+        // `read_block_abs`/`set_block_abs` calls, each of which redid the chunk lookup and
+        // band/offset arithmetic from scratch. 16 consecutive z levels are contiguous bytes in the
+        // world's own addressing, so this layout lets the bulk helpers copy them as slices.
         let n = (width * height * depth) as usize;
+        let dstride = depth as usize;
         let mut buf_bt = vec![0u8; n];
         let mut buf_paint = vec![0u8; n];
-        for lz in 0..depth {
+        for lx in 0..width {
             for ly in 0..height {
-                for lx in 0..width {
-                    let idx = (lz * height * width + ly * width + lx) as usize;
-                    buf_bt[idx]    = read_block_abs(world, x1 + lx, y1 + ly, z_min + lz);
-                    buf_paint[idx] = read_paint_abs(world, x1 + lx, y1 + ly, z_min + lz);
-                }
+                let base = ((lx * height + ly) * depth) as usize;
+                read_column_bulk(world, x1 + lx, y1 + ly, z_min, depth,
+                    &mut buf_bt[base..base + dstride], &mut buf_paint[base..base + dstride]);
             }
         }
         // Clear the (masked) source first, then write the (masked) dest — so an overlapping move
         // never clears a cell it just wrote. Both passes gate on the same source-column predicate.
-        for lz in 0..depth {
+        let zeros = vec![0u8; dstride];
+        for lx in 0..width {
             for ly in 0..height {
-                for lx in 0..width {
-                    if let Some(m) = &mask { if !m.contains(x1 + lx, y1 + ly) { continue; } }
-                    set_block_abs(world, x1 + lx, y1 + ly, z_min + lz, 0, 0);
-                }
+                if let Some(m) = &mask { if !m.contains(x1 + lx, y1 + ly) { continue; } }
+                write_column_bulk(world, x1 + lx, y1 + ly, z_min, depth, &zeros, &zeros);
             }
         }
-        for lz in 0..depth {
-            let tz = z_min + dz + lz;
-            if tz < 0 || tz > max_z { continue; }
-            for ly in 0..height {
-                for lx in 0..width {
+        // Destination z run clipped to [0, max_z] up front (same effect as the old per-layer
+        // `if tz < 0 || tz > max_z { continue }` skip, but as one contiguous sub-range per column
+        // instead of a per-lz branch).
+        let (tz0, tz1) = (z_min + dz, z_max + dz);
+        let (clip_lo, clip_hi) = (tz0.max(0), tz1.min(max_z));
+        if clip_lo <= clip_hi {
+            let skip_head = (clip_lo - tz0) as usize;
+            let run_len = (clip_hi - clip_lo + 1) as usize;
+            for lx in 0..width {
+                for ly in 0..height {
                     if let Some(m) = &mask { if !m.contains(x1 + lx, y1 + ly) { continue; } }
-                    let idx = (lz * height * width + ly * width + lx) as usize;
-                    set_block_abs(world, x1d + lx, y1d + ly, tz, buf_bt[idx], buf_paint[idx]);
+                    let base = ((lx * height + ly) * depth) as usize + skip_head;
+                    write_column_bulk(world, x1d + lx, y1d + ly, clip_lo, run_len as i32,
+                        &buf_bt[base..base + run_len], &buf_paint[base..base + run_len]);
                 }
             }
         }
@@ -4364,7 +5664,7 @@ fn generate_trees(
             .subsec_nanos() as u64
     });
 
-    let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
+    let mut ws = write_ws(&state);
     // Only validate XY; z is ignored (trees find the surface themselves).
     if x2 < x1 || y2 < y1 {
         return Err("Invalid selection bounds".into());
@@ -4465,7 +5765,7 @@ fn render_axo_region(
     dir: u8, // 0=SE 1=SW 2=NE 3=NW
     state: tauri::State<'_, AppState>,
 ) -> Result<PixelPatch, String> {
-    let ws = state.lock().unwrap_or_else(|p| p.into_inner());
+    let ws = read_ws(&state);
     let world = ws.world.as_ref().ok_or("No world loaded")?;
     let world_w = (world.w_chunks * 16) as i32;
     let world_h = (world.h_chunks * 16) as i32;
@@ -4536,14 +5836,14 @@ fn render_axo_region(
             row_pixels[off] = r; row_pixels[off + 1] = g; row_pixels[off + 2] = b; row_pixels[off + 3] = 255;
         }
     });
-    Ok(PixelPatch { x: ox1, y: oy1, width, height, pixels })
+    Ok(PixelPatch { x: ox1, y: oy1, width, height, lod: 1, pixels })
 }
 
 /// Axonometric preview of the clipboard contents for the 3D tab in SelectionInspector.
 /// Same projection math as render_axo_region but iterates in-memory clipboard voxels.
-#[tauri::command]
+#[tauri::command(async)]
 fn render_axo_clipboard(ski: f32, dir: u8, state: tauri::State<'_, AppState>) -> Result<PreviewData, String> {
-    let ws  = state.lock().unwrap_or_else(|p| p.into_inner());
+    let ws = read_ws(&state);
     let sky = ws.world.as_ref().map(|w| w.sky).unwrap_or(0);
     let cb  = ws.clipboard.as_ref().ok_or("Clipboard is empty")?;
     Ok(render_axo_clipboard_inner(cb, sky, ski, dir))
@@ -4609,9 +5909,9 @@ fn render_axo_clipboard_inner(cb: &Clipboard, sky: u8, ski: f32, dir: u8) -> Pre
 
 /// Used to show a block preview inside the paste ghost box.
 /// Reads only from clipboard + sky — no world mutation.
-#[tauri::command]
+#[tauri::command(async)]
 fn render_clipboard_preview(state: tauri::State<'_, AppState>) -> Result<PreviewData, String> {
-    let ws  = state.lock().unwrap_or_else(|p| p.into_inner());
+    let ws = read_ws(&state);
     let sky = ws.world.as_ref().map(|w| w.sky).unwrap_or(0);
     let cb  = ws.clipboard.as_ref().ok_or("Clipboard is empty")?;
     Ok(render_clipboard_preview_inner(cb, sky))
@@ -4656,12 +5956,12 @@ fn render_clipboard_preview_inner(cb: &Clipboard, sky: u8) -> PreviewData {
 
 // Renders the front (X-Z) or side (Y-Z) face of the clipboard for use as a
 // ghost overlay in the elevation preview panel. Transparent pixels = air.
-#[tauri::command]
+#[tauri::command(async)]
 fn render_clipboard_elevation_preview(
     view: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<PreviewData, String> {
-    let ws  = state.lock().unwrap_or_else(|p| p.into_inner());
+    let ws = read_ws(&state);
     let sky = ws.world.as_ref().map(|w| w.sky).unwrap_or(0);
     let cb  = ws.clipboard.as_ref().ok_or("Clipboard is empty")?;
     Ok(render_clipboard_elevation_preview_inner(cb, sky, &view))
@@ -4844,7 +6144,7 @@ fn simulate_flow(
     if base != 20 && base != 23 {
         return Err("base must be 20 (water) or 23 (lava)".into());
     }
-    let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
+    let mut ws = write_ws(&state);
     let max_z = ws.world.as_ref().map(world_max_z).unwrap_or(63);
     validate_selection(x1, y1, x2, y2, z_min, z_max, max_z)?;
     let mask = active_mask(&ws, x1, y1, x2, y2);
@@ -4922,7 +6222,7 @@ fn pool_fill(
     if paint > 54 {
         return Err(format!("Invalid paint byte {paint}: must be 0–54"));
     }
-    let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
+    let mut ws = write_ws(&state);
     let max_z = ws.world.as_ref().map(world_max_z).unwrap_or(63);
     if x1 < 0 || y1 < 0 || x2 < x1 || y2 < y1 {
         return Err("Invalid XY bounds: x1/y1 must be >= 0 and x2/y2 >= x1/y1".into());
@@ -5071,7 +6371,7 @@ fn flood_fill_3d(
     }
     let limit = (limit as usize).clamp(1, FLOOD_FILL_MAX_CELLS);
 
-    let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
+    let mut ws = write_ws(&state);
 
     // Phase A: read-only BFS under an immutable borrow. Phase B (below) takes the world for editing.
     let cells: Vec<(i32, i32, i32)> = {
@@ -5139,7 +6439,7 @@ fn generate_wavy_surface(
     if !(wavelength > 0.0) {
         return Err("Wavelength must be > 0".into());
     }
-    let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
+    let mut ws = write_ws(&state);
     let max_z = ws.world.as_ref().map(world_max_z).unwrap_or(63);
     if x1 < 0 || y1 < 0 || x2 < x1 || y2 < y1 {
         return Err("Invalid XY bounds: x1/y1 must be >= 0 and x2/y2 >= x1/y1".into());
@@ -5297,20 +6597,20 @@ fn deserialize_prefab(data: &[u8]) -> Result<Clipboard, String> {
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn save_prefab(path: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
-    let ws = state.lock().unwrap_or_else(|p| p.into_inner());
+    let ws = read_ws(&state);
     let cb = ws.clipboard.as_ref().ok_or("Clipboard is empty")?;
     let bytes = serialize_prefab(cb);
     atomic_write(std::path::Path::new(&path), &bytes)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn load_prefab(path: String, state: tauri::State<'_, AppState>) -> Result<ClipboardInfo, String> {
     let data = fs::read(&path).map_err(|e| format!("Failed to read prefab: {e}"))?;
     let cb   = deserialize_prefab(&data)?;
     let info = cb.info();
-    let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
+    let mut ws = write_ws(&state);
     ws.clipboard = Some(cb);
     Ok(info)
 }
@@ -5437,32 +6737,49 @@ fn prefab_exists(path: String) -> bool {
 }
 
 /// Top-down thumbnail for a prefab file on disk — doesn't touch the clipboard or undo state.
-#[tauri::command]
+#[tauri::command(async)]
 fn render_prefab_thumbnail(path: String, state: tauri::State<'_, AppState>) -> Result<PreviewData, String> {
     let data = fs::read(&path).map_err(|e| format!("Failed to read prefab: {e}"))?;
     let cb = deserialize_prefab(&data)?;
-    let ws = state.lock().unwrap_or_else(|p| p.into_inner());
+    let ws = read_ws(&state);
     let sky = ws.world.as_ref().map(|w| w.sky).unwrap_or(0);
     Ok(render_clipboard_preview_inner(&cb, sky))
 }
 
 // ── Texture pack commands ────────────────────────────────────────────────────
 
-#[derive(serde::Serialize)]
 struct TexturePackInfo {
     rows: u32,
     tile: u32,
     /// Number of full-color tiles N; a block's grayscale (painted) row = color_row + this offset.
     gray_row_offset: u32,
-    #[serde(serialize_with = "serialize_bytes_b64")]
     atlas: Vec<u8>,
     name_to_row: HashMap<String, u32>,
+}
+
+#[derive(serde::Serialize)]
+struct TexturePackHeader {
+    rows: u32,
+    tile: u32,
+    gray_row_offset: u32,
+    name_to_row: HashMap<String, u32>,
+}
+
+impl tauri::ipc::IpcResponse for TexturePackInfo {
+    fn body(self) -> tauri::Result<tauri::ipc::InvokeResponseBody> {
+        let header = TexturePackHeader {
+            rows: self.rows, tile: self.tile,
+            gray_row_offset: self.gray_row_offset,
+            name_to_row: self.name_to_row,
+        };
+        ipc_envelope(&header, &[&self.atlas])
+    }
 }
 
 /// Load a texture pack zip and return the atlas RGBA + name→row map.
 /// The pack is stored in AppState (world-independent) and automatically used by subsequent
 /// get_chunk_geometry / get_obj_geometry calls.
-#[tauri::command]
+#[tauri::command(async)]
 fn load_texture_pack(path: String, state: tauri::State<'_, AppState>) -> Result<TexturePackInfo, String> {
     let pack = texturepack::load_pack(&path)?;
     let info = TexturePackInfo {
@@ -5472,14 +6789,14 @@ fn load_texture_pack(path: String, state: tauri::State<'_, AppState>) -> Result<
         atlas: pack.atlas_rgba.clone(),
         name_to_row: pack.name_to_row.clone(),
     };
-    state.lock().unwrap_or_else(|p| p.into_inner()).texture_pack = Some(pack);
+    write_ws(&state).texture_pack = Some(pack);
     Ok(info)
 }
 
 /// Unload the current texture pack, reverting to flat vertex-color rendering.
-#[tauri::command]
+#[tauri::command(async)]
 fn unload_texture_pack(state: tauri::State<'_, AppState>) {
-    state.lock().unwrap_or_else(|p| p.into_inner()).texture_pack = None;
+    write_ws(&state).texture_pack = None;
 }
 
 // ── App entry point ────────────────────────────────────────────────────────────
@@ -5514,6 +6831,87 @@ fn read_paint_abs(world: &LoadedWorld, wx: i32, wy: i32, wz: i32) -> u8 {
         if pi < cend { return world.bytes[pi]; }
     }
     0
+}
+
+/// Bulk column read: fills `out_bt[0..depth]`/`out_paint[0..depth]` with the block/paint bytes at
+/// world column `(wx,wy)`, z levels `z0..z0+depth` (audit M8). One chunk lookup for the whole column
+/// instead of one per voxel, and each run that stays within a single 16-z band (the common case) is
+/// a slice `copy_from_slice` instead of `depth` indexed reads — `addr + band*8192 + lx*256 + ly*16 +
+/// lz` means 16 consecutive `lz` are contiguous bytes in both the block and paint half. Falls back to
+/// a per-byte, bounds-checked copy only for the tail of a short chunk span (rare — see `chunk_span`;
+/// well-formed worlds have none), so behaviour matches `read_block_abs`/`read_paint_abs` exactly,
+/// including the "missing chunk / past a short span → 0" convention. Caller guarantees
+/// `0 <= z0` and `z0 + depth <= world.num_bands * 16` (both callers derive this from an
+/// already-validated selection).
+fn read_column_bulk(world: &LoadedWorld, wx: i32, wy: i32, z0: i32, depth: i32, out_bt: &mut [u8], out_paint: &mut [u8]) {
+    let cx = wx.div_euclid(16) + world.min_x;
+    let cy = wy.div_euclid(16) + world.min_y;
+    let Some((addr, cend)) = world.chunk_range(cx, cy) else {
+        out_bt.fill(0);
+        out_paint.fill(0);
+        return;
+    };
+    let lx = wx.rem_euclid(16) as usize;
+    let ly = wy.rem_euclid(16) as usize;
+    let depth = depth as usize;
+    let mut z = z0 as usize;
+    let mut i = 0usize;
+    while i < depth {
+        let band = z / 16;
+        let lz0 = z % 16;
+        let run = (16 - lz0).min(depth - i);
+        let bt_start = addr + band * 8192 + lx * 256 + ly * 16 + lz0;
+        let pt_start = bt_start + 4096;
+        if pt_start + run <= cend {
+            out_bt[i..i + run].copy_from_slice(&world.bytes[bt_start..bt_start + run]);
+            out_paint[i..i + run].copy_from_slice(&world.bytes[pt_start..pt_start + run]);
+        } else {
+            for k in 0..run {
+                let (bi, pi) = (bt_start + k, pt_start + k);
+                out_bt[i + k] = if pi < cend { world.bytes[bi] } else { 0 };
+                out_paint[i + k] = if pi < cend { world.bytes[pi] } else { 0 };
+            }
+        }
+        z += run;
+        i += run;
+    }
+}
+
+/// Bulk column write: the write-side twin of `read_column_bulk` (audit M8). Writes
+/// `bt[0..depth]`/`paint[0..depth]` to world column `(wx,wy)`, z levels `z0..z0+depth`, one chunk
+/// lookup and per-band `copy_from_slice` instead of `depth` calls to `set_block_abs`. Silently drops
+/// writes to a missing chunk or past a short chunk span's tail, exactly like `set_block_abs`. Same
+/// caller-guaranteed `z0`/`depth` bounds as `read_column_bulk`.
+fn write_column_bulk(world: &mut LoadedWorld, wx: i32, wy: i32, z0: i32, depth: i32, bt: &[u8], paint: &[u8]) {
+    let cx = wx.div_euclid(16) + world.min_x;
+    let cy = wy.div_euclid(16) + world.min_y;
+    let Some((addr, cend)) = world.chunk_range(cx, cy) else { return };
+    let lx = wx.rem_euclid(16) as usize;
+    let ly = wy.rem_euclid(16) as usize;
+    let depth = depth as usize;
+    let mut z = z0 as usize;
+    let mut i = 0usize;
+    while i < depth {
+        let band = z / 16;
+        let lz0 = z % 16;
+        let run = (16 - lz0).min(depth - i);
+        let bt_start = addr + band * 8192 + lx * 256 + ly * 16 + lz0;
+        let pt_start = bt_start + 4096;
+        if pt_start + run <= cend {
+            world.bytes[bt_start..bt_start + run].copy_from_slice(&bt[i..i + run]);
+            world.bytes[pt_start..pt_start + run].copy_from_slice(&paint[i..i + run]);
+        } else {
+            for k in 0..run {
+                let (bi, pi) = (bt_start + k, pt_start + k);
+                if pi < cend {
+                    world.bytes[bi] = bt[i + k];
+                    world.bytes[pi] = paint[i + k];
+                }
+            }
+        }
+        z += run;
+        i += run;
+    }
 }
 
 /// Raise or lower a terrain column to target_z.
@@ -6103,34 +7501,17 @@ fn sculpt_terrain(
     rock: Option<RockParams>,
     state: tauri::State<'_, AppState>,
 ) -> Result<EditResult, String> {
-    let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
+    let mut ws = write_ws(&state);
 
     // Live-stroke batching (row 6): a live 2D stroke ships every stamp centre queued since the last
-    // flush in one call. Apply them sequentially — each sees the previous stamp's committed result,
-    // the shared `group_id` keeps them one undo group, and the float session accumulates residuals
-    // across them — then return a single patch over the union of all stamp discs so every change
-    // reaches the frontend in one apply. Equivalent (byte-for-byte) to N separate same-group calls.
+    // flush in one call — handled by `sculpt_terrain_batch_inner` (audit M1's `_inner`-only batch
+    // helper, split out so it's directly unit-testable like `sculpt_terrain_inner`).
     if let Some(centers) = stamp_centers.filter(|c| !c.is_empty()) {
-        let r = stamp_radius.unwrap_or(0).max(0);
-        let cap = if use_cap.unwrap_or(true) { ws.view_cap_z } else { None };
-        let (mut ux1, mut uy1, mut ux2, mut uy2) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
-        let mut last: Option<EditResult> = None;
-        for c in &centers {
-            let res = sculpt_terrain_inner(
-                &mut ws, None, mode.clone(), strength, seed, block_type, paint, freq,
-                noise_mode.clone(), softness, profile.clone(), grab_delta, anchor_x, anchor_y,
-                Some(c[0]), Some(c[1]), Some(r), use_cap, group_id, slope_dx, slope_dy, smear_dx,
-                smear_dy, clip_rect, strength_f, rock.clone(),
-            )?;
-            ux1 = ux1.min(c[0] - r); uy1 = uy1.min(c[1] - r);
-            ux2 = ux2.max(c[0] + r); uy2 = uy2.max(c[1] + r);
-            last = Some(res);
-        }
-        let mut res = last.ok_or("No stamps")?;
-        if let Some(world) = ws.world.as_ref() {
-            res.patch = render_pixels_patch(world, ux1, uy1, ux2, uy2, cap);
-        }
-        return Ok(res);
+        return sculpt_terrain_batch_inner(
+            &mut ws, centers, mode, strength, seed, block_type, paint, freq, noise_mode, softness,
+            profile, grab_delta, anchor_x, anchor_y, stamp_radius.unwrap_or(0).max(0), use_cap,
+            group_id, slope_dx, slope_dy, smear_dx, smear_dy, clip_rect, strength_f, rock,
+        );
     }
 
     sculpt_terrain_inner(
@@ -6138,6 +7519,642 @@ fn sculpt_terrain(
         profile, grab_delta, anchor_x, anchor_y, stamp_cx, stamp_cy, stamp_radius, use_cap, group_id,
         slope_dx, slope_dy, smear_dx, smear_dy, clip_rect, strength_f, rock,
     )
+}
+
+/// Batched sibling of `sculpt_terrain_inner` (audit M1): applies every centre in `centers` inside a
+/// *single* `with_edit_grouped` closure — each stamp sees the previous one's committed result and the
+/// float session accumulates residuals across them, exactly as N separate same-group
+/// `sculpt_terrain_inner` calls would, but with one chunk snapshot/diff/render for the whole flush
+/// instead of N (each of those was the dominant cost: `with_edit_inner` copies every affected chunk
+/// in full before diffing it back down to a sparse delta). The undo stack also gains one `UndoEntry`
+/// per flush instead of N — same observable undo/redo granularity, since
+/// `count_undo_groups`/`undo_edit_inner`/`redo_edit_inner` already collapse a run of same-`group_id`
+/// entries into one logical unit. Byte-for-byte equivalent to N sequential `sculpt_terrain_inner`
+/// calls sharing `group_id` (verified by `test_stamp_batch_matches_sequential_calls`).
+#[allow(clippy::too_many_arguments)]
+fn sculpt_terrain_batch_inner(
+    ws: &mut WorldState,
+    centers: Vec<[i32; 2]>,
+    mode: String,
+    strength: i32,
+    seed: u64,
+    block_type: Option<u8>,
+    paint: Option<u8>,
+    freq: Option<f64>,
+    noise_mode: Option<String>,
+    softness: Option<f64>,
+    profile: Option<String>,
+    grab_delta: Option<i32>,
+    anchor_x: Option<i32>,
+    anchor_y: Option<i32>,
+    r: i32,
+    use_cap: Option<bool>,
+    group_id: Option<u64>,
+    slope_dx: Option<f64>,
+    slope_dy: Option<f64>,
+    smear_dx: Option<i32>,
+    smear_dy: Option<i32>,
+    clip_rect: Option<[i32; 4]>,
+    strength_f: Option<f64>,
+    rock: Option<RockParams>,
+) -> Result<EditResult, String> {
+    let cap = if use_cap.unwrap_or(true) { ws.view_cap_z } else { None };
+    let strength_c = strength.clamp(1, 8);
+    let strength_eff = strength_f.map(|f| f.clamp(0.0, 64.0)).unwrap_or(strength_c as f64);
+    let softness_v = softness.unwrap_or(0.0).clamp(0.0, 1.0);
+    let profile_v = profile.unwrap_or_else(|| "smooth".into());
+
+    let (mut ux1, mut uy1, mut ux2, mut uy2) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
+    for c in &centers {
+        ux1 = ux1.min(c[0] - r); uy1 = uy1.min(c[1] - r);
+        ux2 = ux2.max(c[0] + r); uy2 = uy2.max(c[1] + r);
+    }
+    let union_rect = (ux1, uy1, ux2, uy2);
+
+    let mode_label = mode.chars().next().map(|c| c.to_uppercase().to_string() + &mode[1..]).unwrap_or_else(|| mode.clone());
+    let label = format!("{mode_label} ({} stamps)", centers.len());
+    let mut session = match ws.sculpt_session.take() {
+        Some(s) if Some(s.group_id) == group_id => s,
+        _ => SculptSession { group_id: group_id.unwrap_or(0), fheight: HashMap::new() },
+    };
+    let result = with_edit_grouped(ws, &label, union_rect, union_rect, group_id, |world| {
+        for c in &centers {
+            let pts = dial_disc_points(c[0], c[1], r);
+            sculpt_stamp_body(
+                world, &mut session, &pts, Some((c[0], c[1], r)), cap, softness_v, &profile_v,
+                clip_rect, mode.as_str(), strength_c, strength_eff, seed, block_type, paint,
+                freq, noise_mode.as_deref(), grab_delta, anchor_x, anchor_y, slope_dx, slope_dy,
+                smear_dx, smear_dy, &rock, c[0] - r, c[1] - r, c[0] + r, c[1] + r,
+            )?;
+        }
+        Ok(())
+    });
+    if group_id.is_some() && !matches!(mode.as_str(), "rock" | "carve") {
+        ws.sculpt_session = Some(session);
+    }
+    result
+}
+
+/// Filled disc footprint around a dial stamp centre — same `(dx² + dy²) <= (r + 0.5)²` convention
+/// as the frontend's `brushFootprint(size = r*2+1, "circ")` so 2D and 3D disc sizes match. Shared by
+/// `sculpt_terrain_inner`'s single-stamp path and the batched multi-centre path (audit M1).
+fn dial_disc_points(cx: i32, cy: i32, r: i32) -> Vec<SculptPoint> {
+    let r = r.max(0);
+    let rr = (r as f64 + 0.5).powi(2);
+    let mut pts = Vec::new();
+    for dy in -r..=r {
+        for dx in -r..=r {
+            if ((dx * dx + dy * dy) as f64) <= rr {
+                pts.push(SculptPoint { x: cx + dx, y: cy + dy });
+            }
+        }
+    }
+    pts
+}
+
+/// One stamp's worth of sculpt mode logic, factored out of `sculpt_terrain_inner` so a batch of
+/// live-stroke stamps can run inside a single `with_edit_grouped` closure — one snapshot/diff/render
+/// for N stamps instead of N of each (audit M1). Mutates `world`/`session` in place; height_map and
+/// weight are recomputed per call (cheap: footprint-sized, no chunk snapshot involved) so each stamp
+/// in a batch reads the *previous* stamp's committed heights, exactly like N sequential single-stamp
+/// calls would.
+#[allow(clippy::too_many_arguments)]
+fn sculpt_stamp_body(
+    world: &mut LoadedWorld,
+    session: &mut SculptSession,
+    points: &[SculptPoint],
+    dial: Option<(i32, i32, i32)>,
+    cap: Option<i32>,
+    softness: f64,
+    profile: &str,
+    clip_rect: Option<[i32; 4]>,
+    mode: &str,
+    strength: i32,
+    strength_eff: f64,
+    seed: u64,
+    block_type: Option<u8>,
+    paint: Option<u8>,
+    freq: Option<f64>,
+    noise_mode: Option<&str>,
+    grab_delta: Option<i32>,
+    anchor_x: Option<i32>,
+    anchor_y: Option<i32>,
+    slope_dx: Option<f64>,
+    slope_dy: Option<f64>,
+    smear_dx: Option<i32>,
+    smear_dy: Option<i32>,
+    rock: &Option<RockParams>,
+    x_min: i32,
+    y_min: i32,
+    x_max: i32,
+    y_max: i32,
+) -> Result<(), String> {
+    // Pre-read all heights and surface blocks while we have a shared ref. Smooth/erode/
+    // thermal read the full 8-neighbourhood, so widen the pre-read beyond the footprint.
+    let height_map: HashMap<(i32, i32), (i32, u8, u8)> = {
+        let w: &LoadedWorld = world;
+        let mut all_pts = std::collections::HashSet::new();
+        for p in points {
+            all_pts.insert((p.x, p.y));
+            for (dx, dy) in SCULPT_KERNEL.map(|(o, _)| o) {
+                all_pts.insert((p.x + dx, p.y + dy));
+            }
+        }
+        all_pts.into_iter()
+            .filter_map(|(x, y)| {
+                surface_z_capped(w, x, y, cap).map(|z| {
+                    let bt    = read_block_abs(w, x, y, z);
+                    let paint = read_paint_abs(w, x, y, z);
+                    ((x, y), (z, bt, paint))
+                })
+            })
+            .collect()
+    };
+
+    // Radial falloff weights. Dial stamps use a clean Euclidean dome around the stamp centre;
+    // otherwise a distance field (8-connected BFS inward from the footprint boundary) → normalised
+    // dome, blended toward a flat edge by `softness`.
+    let weight: Box<dyn Fn(i32, i32) -> f64> = if let Some((scx, scy, srad)) = dial {
+        // Per-stamp radial dome: literal Euclidean distance from the stamp centre, not graph
+        // distance to the silhouette edge. weight = (1-softness) + dome*softness, clamped [0,1].
+        let r = srad.max(1) as f64;
+        let s = softness;
+        let prof = profile.to_string();
+        Box::new(move |x, y| {
+            if s <= 0.0 { return 1.0; }
+            let d = (((x - scx) as f64).powi(2) + ((y - scy) as f64).powi(2)).sqrt();
+            let dome = falloff_dome(1.0 - (d / r).min(1.0), &prof);
+            ((1.0 - s) + dome * s).clamp(0.0, 1.0)
+        })
+    } else if softness <= 0.0 {
+        Box::new(|_x, _y| 1.0) // hard edges
+    } else {
+        let members: HashSet<(i32, i32)> = points.iter().map(|p| (p.x, p.y)).collect();
+        let mut dist: HashMap<(i32, i32), i32> = HashMap::new();
+        let mut queue: VecDeque<(i32, i32)> = VecDeque::new();
+        for &(x, y) in &members {
+            let is_edge = SCULPT_KERNEL.iter().any(|((dx, dy), _)| !members.contains(&(x + dx, y + dy)));
+            if is_edge { dist.insert((x, y), 1); queue.push_back((x, y)); }
+        }
+        while let Some((x, y)) = queue.pop_front() {
+            let d = dist[&(x, y)];
+            for ((dx, dy), _) in SCULPT_KERNEL {
+                let n = (x + dx, y + dy);
+                if members.contains(&n) && !dist.contains_key(&n) {
+                    dist.insert(n, d + 1);
+                    queue.push_back(n);
+                }
+            }
+        }
+        let max_dist = (*dist.values().max().unwrap_or(&1)).max(1) as f64;
+        let profile_owned = profile.to_string();
+        let weight_of: HashMap<(i32, i32), f64> = members.iter().map(|&(x, y)| {
+            let d = *dist.get(&(x, y)).unwrap_or(&(max_dist as i32)) as f64;
+            let dome = falloff_dome(d / max_dist, &profile_owned);
+            ((x, y), (1.0 - softness) + dome * softness)
+        }).collect();
+        Box::new(move |x, y| *weight_of.get(&(x, y)).unwrap_or(&1.0))
+    };
+
+    // Server-side selection clip: a cell outside `clip_rect` gets weight 0, so blend leaves it at
+    // its current height (no-op) — a true per-cell mask that supersedes the frontend point-filter
+    // for the batched live path and upgrades the 3D pane's crude centre-in-bounds drop.
+    let weight: Box<dyn Fn(i32, i32) -> f64> = if let Some([cx1, cy1, cx2, cy2]) = clip_rect {
+        let inner = weight;
+        Box::new(move |x, y| {
+            if x >= cx1 && x <= cx2 && y >= cy1 && y <= cy2 { inner(x, y) } else { 0.0 }
+        })
+    } else {
+        weight
+    };
+
+    let max_z = world_max_z(world);
+    // Blend `cur` toward the float `target` by the column's radial weight, accumulating the
+    // precise result in the per-stroke float workspace and committing its dithered round. The
+    // workspace seeds from `cur` (the world's current integer height) only on a column's FIRST
+    // touch this stroke; later stamps read the retained float, so a 0.3-weight rim column gains
+    // 0.3/stamp and crosses the next integer every ~3 stamps regardless of its fixed BAYER
+    // threshold. Additive modes pass `target = cur + delta`; convergent modes pass the plane/
+    // average target — both are the same `fh + (target - fh) * w` step.
+    let mut blend = |cur: i32, target: f64, w: f64, x: i32, y: i32| -> i32 {
+        let fh = session.fheight.entry((x, y)).or_insert(cur as f64);
+        let raw = *fh + (target - *fh) * w;
+        *fh = raw;
+        round_dither(raw, softness, x, y)
+    };
+    match mode {
+        "smooth" => {
+            // Iterated 8-connected averaging (cardinals 1, diagonals √½, centre 1). Runs
+            // `strength` Jacobi passes over a local working copy seeded from `height_map`: each
+            // pass reads the *previous* pass's heights (never values updated within the same
+            // pass), so the result is independent of iteration order over `points`. Only the
+            // final heights are committed to the world (sculpt_column bakes in surface-layering
+            // side effects we don't want repeated per pass). Missing neighbours (world edge /
+            // no surface) drop out of the average at every pass ("fix edges"); neighbours in
+            // height_map but outside `points` act as fixed boundaries.
+            // Passes run in float now (no per-pass rounding); the radial weight and the
+            // float-workspace accumulation apply once at commit.
+            let mut work: HashMap<(i32, i32), f64> =
+                height_map.iter().map(|(&k, &(z, _, _))| (k, z as f64)).collect();
+            for _ in 0..strength {
+                let prev = work.clone();
+                for p in points {
+                    let Some(&cur_f) = prev.get(&(p.x, p.y)) else { continue };
+                    let mut hsum = cur_f;
+                    let mut wsum = 1.0;
+                    for ((dx, dy), k) in SCULPT_KERNEL {
+                        if let Some(&v) = prev.get(&(p.x + dx, p.y + dy)) {
+                            hsum += v * k;
+                            wsum += k;
+                        }
+                    }
+                    if wsum <= 1.0 { continue; }
+                    work.insert((p.x, p.y), hsum / wsum);
+                }
+            }
+            for p in points {
+                let Some(&(cur_z, surf_bt, surf_paint)) = height_map.get(&(p.x, p.y)) else { continue };
+                let smoothed = *work.get(&(p.x, p.y)).unwrap_or(&(cur_z as f64));
+                let final_z = blend(cur_z, smoothed, weight(p.x, p.y), p.x, p.y);
+                sculpt_column(world, p.x, p.y, cur_z, final_z, max_z, surf_bt, surf_paint, block_type, paint);
+            }
+        }
+        "raise" | "lower" => {
+            let sign = if mode == "raise" { 1 } else { -1 };
+            for p in points {
+                let Some(&(cur_z, surf_bt, surf_paint)) = height_map.get(&(p.x, p.y)) else { continue };
+                let target = blend(cur_z, cur_z as f64 + sign as f64 * strength_eff, weight(p.x, p.y), p.x, p.y);
+                sculpt_column(world, p.x, p.y, cur_z, target, max_z, surf_bt, surf_paint, block_type, paint);
+            }
+        }
+        "noise" => {
+            // Coherent displacement (spatially correlated) instead of white noise.
+            // "mountains" uses ridged multifractal (sharp ridgelines, pushes up);
+            // "hills" (default) uses fbm (smooth rolling billows, ± around current).
+            let freq = freq.unwrap_or(0.06).clamp(0.004, 0.5);
+            let mountains = noise_mode == Some("mountains");
+            let amp = strength as f64;
+            // Per-stroke offset so successive strokes vary but a single stroke is coherent.
+            let so = ((seed % 1_000_000) as f64) * 0.017 + 13.37;
+            for p in points {
+                let Some(&(cur_z, surf_bt, surf_paint)) = height_map.get(&(p.x, p.y)) else { continue };
+                let fx = p.x as f64 * freq + so;
+                let fy = p.y as f64 * freq + so;
+                let raw = if mountains {
+                    // ridged2 ∈ [0,1] → always builds upward, sharper peaks
+                    ridged2(fx, fy, 4) * amp * 2.5
+                } else {
+                    // fbm2 ∈ [-1,1] → gentle rolling ups and downs
+                    fbm2(fx, fy, 4) * amp
+                };
+                // Weight + float-workspace accumulation via blend; `raw` is the full displacement.
+                let target = blend(cur_z, cur_z as f64 + raw, weight(p.x, p.y), p.x, p.y);
+                if target != cur_z {
+                    sculpt_column(world, p.x, p.y, cur_z, target, max_z, surf_bt, surf_paint, block_type, paint);
+                }
+            }
+        }
+        "flatten" => {
+            // Level to the pointer-down column's height (stroke-start), falling back to
+            // the footprint average when no anchor was supplied.
+            let target_z = anchor_x.zip(anchor_y)
+                .and_then(|(ax, ay)| height_map.get(&(ax, ay)).map(|v| v.0))
+                .or_else(|| {
+                    let heights: Vec<i32> = points.iter()
+                        .filter_map(|p| height_map.get(&(p.x, p.y)).map(|v| v.0))
+                        .collect();
+                    if heights.is_empty() { None }
+                    else { Some((heights.iter().sum::<i32>() as f32 / heights.len() as f32).round() as i32) }
+                });
+            let Some(target_z) = target_z else { return Err("No surface".into()) };
+            for p in points {
+                let Some(&(cur_z, surf_bt, surf_paint)) = height_map.get(&(p.x, p.y)) else { continue };
+                let target = blend(cur_z, target_z as f64, weight(p.x, p.y), p.x, p.y);
+                sculpt_column(world, p.x, p.y, cur_z, target, max_z, surf_bt, surf_paint, block_type, paint);
+            }
+        }
+        "erode" => {
+            for p in points {
+                let Some(&(cur_z, surf_bt, surf_paint)) = height_map.get(&(p.x, p.y)) else { continue };
+                let min_n = SCULPT_KERNEL.iter()
+                    .filter_map(|((dx,dy),_)| height_map.get(&(p.x+dx, p.y+dy)).map(|v| v.0))
+                    .min();
+                if let Some(mn) = min_n {
+                    if cur_z > mn {
+                        let eroded = (cur_z - strength).max(mn);
+                        let target = blend(cur_z, eroded as f64, weight(p.x, p.y), p.x, p.y);
+                        sculpt_column(world, p.x, p.y, cur_z, target, max_z, surf_bt, surf_paint, block_type, paint);
+                    }
+                }
+            }
+        }
+        "thermal" => {
+            // Talus-angle erosion: any column whose drop to its lowest neighbour exceeds
+            // the max stable slope (talus) sheds the excess, proportional to how far over
+            // it is. `strength` sets the talus threshold (steeper allowed at low strength).
+            let talus = (9 - strength).max(1); // strength 1..8 → talus 8..1
+            for p in points {
+                let Some(&(cur_z, surf_bt, surf_paint)) = height_map.get(&(p.x, p.y)) else { continue };
+                let min_n = SCULPT_KERNEL.iter()
+                    .filter_map(|((dx,dy),_)| height_map.get(&(p.x+dx, p.y+dy)).map(|v| v.0))
+                    .min();
+                if let Some(mn) = min_n {
+                    let excess = cur_z - mn - talus;
+                    if excess > 0 {
+                        // Shed half the excess (rounded up), never below the neighbour.
+                        let drop = ((excess as f64 * 0.5).ceil() as i32).clamp(1, cur_z - mn);
+                        let eroded = cur_z - drop;
+                        let target = blend(cur_z, eroded as f64, weight(p.x, p.y), p.x, p.y);
+                        sculpt_column(world, p.x, p.y, cur_z, target, max_z, surf_bt, surf_paint, block_type, paint);
+                    }
+                }
+            }
+        }
+        "grab" => {
+            // Drag-controlled displacement: raise (+) or lower (−) every column by the
+            // vertical drag distance, shaped by the radial falloff so the pulled region
+            // domes up / dishes down smoothly rather than as a flat plateau.
+            let d = grab_delta.unwrap_or(0);
+            if d == 0 { return Ok(()); }
+            for p in points {
+                let Some(&(cur_z, surf_bt, surf_paint)) = height_map.get(&(p.x, p.y)) else { continue };
+                let target = blend(cur_z, (cur_z + d) as f64, weight(p.x, p.y), p.x, p.y);
+                sculpt_column(world, p.x, p.y, cur_z, target, max_z, surf_bt, surf_paint, block_type, paint);
+            }
+        }
+        "hydro" => {
+            // Beyer-style droplet hydraulic erosion (the standard SebLague formulation).
+            // Droplets flow in *continuous* float position, steered by the bilinear-interpolated
+            // height gradient with inertia; they erode downhill — spread over an erosion-radius
+            // brush so channels are dendritic gullies, not 1-wide staircase trenches — and drop
+            // sediment onto the four bilinear corner nodes where the flow slows or climbs.
+            //
+            // The simulation runs over a workspace expanded HYDRO_MARGIN cells past the footprint
+            // (read fresh from the world, since the shared `height_map` is only footprint + its
+            // 8-ring): droplets that wander off the brush erode into that margin instead of dying
+            // unnaturally at the footprint boundary. Only footprint columns are committed — any
+            // change that lands in the margin is discarded.
+            const HYDRO_INERTIA: f64 = 0.05;
+            const HYDRO_SEDIMENT_CAPACITY_FACTOR: f64 = 4.0;
+            const HYDRO_MIN_SEDIMENT_CAPACITY: f64 = 0.01;
+            const HYDRO_ERODE_SPEED: f64 = 0.3;
+            const HYDRO_DEPOSIT_SPEED: f64 = 0.3;
+            const HYDRO_EVAPORATE_SPEED: f64 = 0.02;
+            const HYDRO_GRAVITY: f64 = 4.0;
+            const HYDRO_MAX_LIFETIME: i32 = 32;
+            const HYDRO_INITIAL_WATER: f64 = 1.0;
+            const HYDRO_INITIAL_SPEED: f64 = 1.0;
+            const HYDRO_EROSION_RADIUS: i32 = 3;
+            const HYDRO_MARGIN: i32 = 16;
+
+            let ws_x0 = x_min - HYDRO_MARGIN;
+            let ws_y0 = y_min - HYDRO_MARGIN;
+            let ws_w = (x_max - x_min + 1 + 2 * HYDRO_MARGIN) as usize;
+            let ws_h = (y_max - y_min + 1 + 2 * HYDRO_MARGIN) as usize;
+
+            // Dense workspace heightmap in float; `None` = no surface / outside the world, which
+            // stops any droplet that reaches it. Read directly from the world (see comment above).
+            let world_ref: &LoadedWorld = world;
+            let mut hmap: Vec<Option<f64>> = Vec::with_capacity(ws_w * ws_h);
+            for gy in 0..ws_h {
+                for gx in 0..ws_w {
+                    let wx = ws_x0 + gx as i32;
+                    let wy = ws_y0 + gy as i32;
+                    hmap.push(surface_z_capped(world_ref, wx, wy, cap).map(|z| z as f64));
+                }
+            }
+
+            // Grid accessors take `&hmap`/`&mut hmap` explicitly so they never hold a borrow
+            // across the droplet loop's own mutations.
+            let node_at = |hmap: &[Option<f64>], gx: i32, gy: i32| -> Option<f64> {
+                if gx < 0 || gy < 0 || gx >= ws_w as i32 || gy >= ws_h as i32 { return None; }
+                hmap[gy as usize * ws_w + gx as usize]
+            };
+            let modify = |hmap: &mut [Option<f64>], gx: i32, gy: i32, d: f64| {
+                if gx < 0 || gy < 0 || gx >= ws_w as i32 || gy >= ws_h as i32 { return; }
+                if let Some(h) = hmap[gy as usize * ws_w + gx as usize].as_mut() { *h += d; }
+            };
+
+            // Radial erosion brush: weight = max(0, radius - dist), normalised to sum 1. Precomputed
+            // once (offsets are droplet-independent).
+            let erosion_brush: Vec<(i32, i32, f64)> = {
+                let r = HYDRO_EROSION_RADIUS;
+                let mut v = Vec::new();
+                let mut total = 0.0f64;
+                for dy in -r..=r {
+                    for dx in -r..=r {
+                        let w = (r as f64 - ((dx * dx + dy * dy) as f64).sqrt()).max(0.0);
+                        if w > 0.0 { v.push((dx, dy, w)); total += w; }
+                    }
+                }
+                for e in v.iter_mut() { e.2 /= total; }
+                v
+            };
+
+            // Rng64 has no float method; derive a uniform [0,1) from its top 53 bits.
+            let rand01 = |rng: &mut Rng64| -> f64 { (rng.next() >> 11) as f64 / (1u64 << 53) as f64 };
+
+            let n_droplets = points.len() * (strength as usize) / 2 + points.len();
+            let mut rng = Rng64::new(seed ^ 0x9E37_79B9_7F4A_7C15);
+            let member: Vec<(i32, i32)> = points.iter().map(|p| (p.x, p.y)).collect();
+            for _ in 0..n_droplets {
+                // Random continuous start within the footprint disc (a member node + sub-cell jitter).
+                let (sx, sy) = member[(rng.next() as usize) % member.len()];
+                let mut px = (sx - ws_x0) as f64 + rand01(&mut rng);
+                let mut py = (sy - ws_y0) as f64 + rand01(&mut rng);
+                let (mut dir_x, mut dir_y) = (0.0f64, 0.0f64);
+                let mut speed = HYDRO_INITIAL_SPEED;
+                let mut water = HYDRO_INITIAL_WATER;
+                let mut sediment = 0.0f64;
+
+                for _ in 0..HYDRO_MAX_LIFETIME {
+                    let (nx, ny) = (px.floor() as i32, py.floor() as i32);
+                    let (u, v) = (px - nx as f64, py - ny as f64);
+                    let (Some(h00), Some(h10), Some(h01), Some(h11)) = (
+                        node_at(&hmap, nx, ny),     node_at(&hmap, nx + 1, ny),
+                        node_at(&hmap, nx, ny + 1), node_at(&hmap, nx + 1, ny + 1),
+                    ) else { break };
+                    let grad_x = (h10 - h00) * (1.0 - v) + (h11 - h01) * v;
+                    let grad_y = (h01 - h00) * (1.0 - u) + (h11 - h10) * u;
+                    let height_here = h00 * (1.0 - u) * (1.0 - v) + h10 * u * (1.0 - v)
+                        + h01 * (1.0 - u) * v + h11 * u * v;
+
+                    // Blend the running direction (inertia) with the downhill gradient, then
+                    // normalise to a unit step. Flat + stalled → random unit dir so it explores.
+                    dir_x = dir_x * HYDRO_INERTIA - grad_x * (1.0 - HYDRO_INERTIA);
+                    dir_y = dir_y * HYDRO_INERTIA - grad_y * (1.0 - HYDRO_INERTIA);
+                    let len = (dir_x * dir_x + dir_y * dir_y).sqrt();
+                    if len <= 1e-8 {
+                        let ang = rand01(&mut rng) * std::f64::consts::TAU;
+                        dir_x = ang.cos();
+                        dir_y = ang.sin();
+                    } else {
+                        dir_x /= len;
+                        dir_y /= len;
+                    }
+
+                    let (old_px, old_py) = (px, py);
+                    px += dir_x;
+                    py += dir_y;
+
+                    // Sample the new height (bilinear); leaving the workspace stops the droplet.
+                    let (mx, my) = (px.floor() as i32, py.floor() as i32);
+                    let (mu, mv) = (px - mx as f64, py - my as f64);
+                    let (Some(n00), Some(n10), Some(n01), Some(n11)) = (
+                        node_at(&hmap, mx, my),     node_at(&hmap, mx + 1, my),
+                        node_at(&hmap, mx, my + 1), node_at(&hmap, mx + 1, my + 1),
+                    ) else { break };
+                    let new_height = n00 * (1.0 - mu) * (1.0 - mv) + n10 * mu * (1.0 - mv)
+                        + n01 * (1.0 - mu) * mv + n11 * mu * mv;
+                    let delta_height = new_height - height_here;
+
+                    let capacity = (-delta_height * speed * water * HYDRO_SEDIMENT_CAPACITY_FACTOR)
+                        .max(HYDRO_MIN_SEDIMENT_CAPACITY);
+
+                    let (onx, ony) = (old_px.floor() as i32, old_py.floor() as i32);
+                    let (ou, ov) = (old_px - onx as f64, old_py - ony as f64);
+                    if delta_height > 0.0 || sediment > capacity {
+                        // Deposit onto the four bilinear corners at the OLD position. Uphill: fill
+                        // the pit, capped by carried sediment; else shed the over-capacity excess.
+                        let amount = if delta_height > 0.0 {
+                            delta_height.min(sediment)
+                        } else {
+                            (sediment - capacity) * HYDRO_DEPOSIT_SPEED
+                        };
+                        sediment -= amount;
+                        modify(&mut hmap, onx,     ony,     amount * (1.0 - ou) * (1.0 - ov));
+                        modify(&mut hmap, onx + 1, ony,     amount * ou * (1.0 - ov));
+                        modify(&mut hmap, onx,     ony + 1, amount * (1.0 - ou) * ov);
+                        modify(&mut hmap, onx + 1, ony + 1, amount * ou * ov);
+                    } else {
+                        // Erode, spread across the radial brush at the OLD position (never take
+                        // more than the height drop). Cells outside the workspace drop out.
+                        let amount = ((capacity - sediment) * HYDRO_ERODE_SPEED).min(-delta_height);
+                        for &(dx, dy, bw) in &erosion_brush {
+                            modify(&mut hmap, onx + dx, ony + dy, -amount * bw);
+                        }
+                        sediment += amount;
+                    }
+
+                    // deltaHeight is negative when descending → this speeds the droplet up; max(0)
+                    // guards a NaN sqrt when climbing sharply. Evaporate, then stop if dry.
+                    speed = (speed * speed + delta_height * HYDRO_GRAVITY).max(0.0).sqrt();
+                    water *= 1.0 - HYDRO_EVAPORATE_SPEED;
+                    if water < 0.01 { break; }
+                }
+            }
+
+            // Commit final workspace heights back — footprint columns only (see arm comment).
+            for p in points {
+                let Some(&(cur_z, surf_bt, surf_paint)) = height_map.get(&(p.x, p.y)) else { continue };
+                let new_h = node_at(&hmap, p.x - ws_x0, p.y - ws_y0)
+                    .unwrap_or(cur_z as f64).round() as i32;
+                let target = blend(cur_z, new_h as f64, weight(p.x, p.y), p.x, p.y);
+                sculpt_column(world, p.x, p.y, cur_z, target, max_z, surf_bt, surf_paint, block_type, paint);
+            }
+        }
+        "stamp" => {
+            // Retexture the surface block by local steepness (max height diff to an
+            // 8-neighbour): flat → grass, moderate → dirt, steep → stone. Purely repaints
+            // the top block; never changes heights. Ignores an explicit fill block.
+            for p in points {
+                let Some(&(cur_z, _surf_bt, _surf_paint)) = height_map.get(&(p.x, p.y)) else { continue };
+                let slope = SCULPT_KERNEL.iter()
+                    .filter_map(|((dx,dy),_)| height_map.get(&(p.x+dx, p.y+dy)).map(|v| (v.0 - cur_z).abs()))
+                    .max().unwrap_or(0);
+                set_block_abs(world, p.x, p.y, cur_z, classify_by_slope(slope), 0);
+            }
+        }
+        "terrace" => {
+            // Quantize each column's height to N-block steps (Strength doubles as step size).
+            let step = strength.max(1);
+            for p in points {
+                let Some(&(cur_z, surf_bt, surf_paint)) = height_map.get(&(p.x, p.y)) else { continue };
+                let terraced = ((cur_z as f64 / step as f64).round() as i32) * step;
+                let target = blend(cur_z, terraced as f64, weight(p.x, p.y), p.x, p.y);
+                sculpt_column(world, p.x, p.y, cur_z, target, max_z, surf_bt, surf_paint, block_type, paint);
+            }
+        }
+        "sharpen" => {
+            // Unsharp mask: push each column away from its 8-neighbour average — the inverse
+            // of Smooth. Strength (1..8) scales how much of the deviation from the local
+            // average gets amplified back in.
+            let amount = strength as f64 / 8.0;
+            for p in points {
+                let Some(&(cur_z, surf_bt, surf_paint)) = height_map.get(&(p.x, p.y)) else { continue };
+                let mut hsum = cur_z as f64;
+                let mut wsum = 1.0;
+                for ((dx, dy), k) in SCULPT_KERNEL {
+                    if let Some(v) = height_map.get(&(p.x + dx, p.y + dy)) {
+                        hsum += v.0 as f64 * k;
+                        wsum += k;
+                    }
+                }
+                if wsum <= 1.0 { continue; }
+                let avg = hsum / wsum;
+                let sharpened = (cur_z as f64 + (cur_z as f64 - avg) * amount).round() as i32;
+                let target = blend(cur_z, sharpened as f64, weight(p.x, p.y), p.x, p.y);
+                sculpt_column(world, p.x, p.y, cur_z, target, max_z, surf_bt, surf_paint, block_type, paint);
+            }
+        }
+        "slope" => {
+            // Planar flatten: level toward an angled plane through the anchor column, tilted
+            // by slope_dx/slope_dy (rise per block along X/Y). Requires an anchor, same as
+            // Flatten — a flat (0-tilt) plane through the anchor is exactly Flatten's result.
+            let (sdx, sdy) = (slope_dx.unwrap_or(0.0), slope_dy.unwrap_or(0.0));
+            let anchor = anchor_x.zip(anchor_y);
+            let anchor_z = anchor.and_then(|(ax, ay)| height_map.get(&(ax, ay)).map(|v| v.0));
+            let Some(anchor_z) = anchor_z else { return Err("No surface".into()) };
+            let (ax, ay) = anchor.unwrap();
+            for p in points {
+                let Some(&(cur_z, surf_bt, surf_paint)) = height_map.get(&(p.x, p.y)) else { continue };
+                let plane_z = anchor_z as f64 + sdx * (p.x - ax) as f64 + sdy * (p.y - ay) as f64;
+                let target = blend(cur_z, plane_z, weight(p.x, p.y), p.x, p.y);
+                sculpt_column(world, p.x, p.y, cur_z, target, max_z, surf_bt, surf_paint, block_type, paint);
+            }
+        }
+        "smear" => {
+            // Lateral height advection: pull each column's height from a position offset
+            // opposite the drag direction, so terrain drags along with the brush like wet
+            // paint. Sources are read fresh from the world (pre-mutation) for the whole
+            // footprint first — points may overlap each other's sources within one stamp.
+            let (sdx, sdy) = (smear_dx.unwrap_or(0), smear_dy.unwrap_or(0));
+            if sdx == 0 && sdy == 0 { return Ok(()); }
+            // Explicit shared reborrow: the `.map` closure only needs read access, and capturing
+            // `world` (a `&mut LoadedWorld`) directly would move the unique borrow into the
+            // closure, leaving it unusable for `sculpt_column` below.
+            let world_ref: &LoadedWorld = world;
+            let sources: Vec<Option<(i32, u8, u8)>> = points.iter().map(|p| {
+                let (sx, sy) = (p.x - sdx, p.y - sdy);
+                surface_z_capped(world_ref, sx, sy, cap).map(|z| {
+                    (z, read_block_abs(world_ref, sx, sy, z), read_paint_abs(world_ref, sx, sy, z))
+                })
+            }).collect();
+            for (p, src) in points.iter().zip(sources.iter()) {
+                let Some(&(cur_z, surf_bt, surf_paint)) = height_map.get(&(p.x, p.y)) else { continue };
+                let Some((src_z, _, _)) = *src else { continue };
+                let target = blend(cur_z, src_z as f64, weight(p.x, p.y), p.x, p.y);
+                sculpt_column(world, p.x, p.y, cur_z, target, max_z, surf_bt, surf_paint, block_type, paint);
+            }
+        }
+        "rock" | "carve" => {
+            // Volumetric: bypasses points/height_map/weight/blend entirely — a 3D density
+            // field stamped once around the dial centre (or the footprint's bbox centre when
+            // no dial was supplied). Never touches the float workspace.
+            let (rcx, rcy, rr) = match dial {
+                Some((dcx, dcy, dr)) => (dcx, dcy, dr.max(1)),
+                None => (
+                    (x_min + x_max) / 2,
+                    (y_min + y_max) / 2,
+                    ((x_max - x_min).max(y_max - y_min) / 2).max(1),
+                ),
+            };
+            let rp = rock.clone().unwrap_or_default();
+            field_stamp(world, rcx, rcy, rr, &rp, seed, cap, clip_rect, block_type, paint, mode == "carve");
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6185,112 +8202,21 @@ fn sculpt_terrain_inner(
     };
 
     // Resolve the footprint. Explicit non-empty points win; otherwise generate a filled disc from
-    // the stamp centre/radius (same `(dx² + dy²) <= (r + 0.5)²` convention as the frontend's
-    // `brushFootprint(size = r*2+1, "circ")` so 2D and 3D disc sizes match). No points and no dial
-    // → the historical "No points" error.
+    // the stamp centre/radius (dial). No points and no dial → the historical "No points" error.
     let points: Vec<SculptPoint> = match points {
         Some(p) if !p.is_empty() => p,
         _ => match dial {
-            Some((cx, cy, r)) => {
-                let r = r.max(0);
-                let rr = (r as f64 + 0.5).powi(2);
-                let mut pts = Vec::new();
-                for dy in -r..=r {
-                    for dx in -r..=r {
-                        if ((dx * dx + dy * dy) as f64) <= rr {
-                            pts.push(SculptPoint { x: cx + dx, y: cy + dy });
-                        }
-                    }
-                }
-                pts
-            }
+            Some((cx, cy, r)) => dial_disc_points(cx, cy, r),
             None => return Err("No points".into()),
         },
     };
     if points.is_empty() { return Err("No points".into()); }
 
-    // Pre-read all heights and surface blocks while we have a shared ref. Smooth/erode/
-    // thermal read the full 8-neighbourhood, so widen the pre-read beyond the footprint.
     // Cutaway: normally sculpt the exposed sub-cap surface; `use_cap: false` (3D pane, which is not
     // clipped by cutaway) ignores the cap and targets the true surface.
     let cap = if use_cap.unwrap_or(true) { ws.view_cap_z } else { None };
-    let height_map: HashMap<(i32, i32), (i32, u8, u8)> = {
-        let world = ws.world.as_ref().ok_or("No world loaded")?;
-        let mut all_pts = std::collections::HashSet::new();
-        for p in &points {
-            all_pts.insert((p.x, p.y));
-            for (dx, dy) in SCULPT_KERNEL.map(|(o, _)| o) {
-                all_pts.insert((p.x + dx, p.y + dy));
-            }
-        }
-        all_pts.into_iter()
-            .filter_map(|(x, y)| {
-                surface_z_capped(world, x, y, cap).map(|z| {
-                    let bt    = read_block_abs(world, x, y, z);
-                    let paint = read_paint_abs(world, x, y, z);
-                    ((x, y), (z, bt, paint))
-                })
-            })
-            .collect()
-    };
-
-    // Radial falloff weights. Dial stamps use a clean Euclidean dome around the stamp centre;
-    // otherwise a distance field (8-connected BFS inward from the footprint boundary) → normalised
-    // dome, blended toward a flat edge by `softness`.
     let softness = softness.unwrap_or(0.0).clamp(0.0, 1.0);
     let profile = profile.unwrap_or_else(|| "smooth".into());
-    let weight: Box<dyn Fn(i32, i32) -> f64> = if let Some((scx, scy, srad)) = dial {
-        // Per-stamp radial dome: literal Euclidean distance from the stamp centre, not graph
-        // distance to the silhouette edge. weight = (1-softness) + dome*softness, clamped [0,1].
-        let r = srad.max(1) as f64;
-        let s = softness;
-        let prof = profile.clone();
-        Box::new(move |x, y| {
-            if s <= 0.0 { return 1.0; }
-            let d = (((x - scx) as f64).powi(2) + ((y - scy) as f64).powi(2)).sqrt();
-            let dome = falloff_dome(1.0 - (d / r).min(1.0), &prof);
-            ((1.0 - s) + dome * s).clamp(0.0, 1.0)
-        })
-    } else if softness <= 0.0 {
-        Box::new(|_x, _y| 1.0) // hard edges
-    } else {
-        let members: HashSet<(i32, i32)> = points.iter().map(|p| (p.x, p.y)).collect();
-        let mut dist: HashMap<(i32, i32), i32> = HashMap::new();
-        let mut queue: VecDeque<(i32, i32)> = VecDeque::new();
-        for &(x, y) in &members {
-            let is_edge = SCULPT_KERNEL.iter().any(|((dx, dy), _)| !members.contains(&(x + dx, y + dy)));
-            if is_edge { dist.insert((x, y), 1); queue.push_back((x, y)); }
-        }
-        while let Some((x, y)) = queue.pop_front() {
-            let d = dist[&(x, y)];
-            for ((dx, dy), _) in SCULPT_KERNEL {
-                let n = (x + dx, y + dy);
-                if members.contains(&n) && !dist.contains_key(&n) {
-                    dist.insert(n, d + 1);
-                    queue.push_back(n);
-                }
-            }
-        }
-        let max_dist = (*dist.values().max().unwrap_or(&1)).max(1) as f64;
-        let weight_of: HashMap<(i32, i32), f64> = members.iter().map(|&(x, y)| {
-            let d = *dist.get(&(x, y)).unwrap_or(&(max_dist as i32)) as f64;
-            let dome = falloff_dome(d / max_dist, &profile);
-            ((x, y), (1.0 - softness) + dome * softness)
-        }).collect();
-        Box::new(move |x, y| *weight_of.get(&(x, y)).unwrap_or(&1.0))
-    };
-
-    // Server-side selection clip: a cell outside `clip_rect` gets weight 0, so blend leaves it at
-    // its current height (no-op) — a true per-cell mask that supersedes the frontend point-filter
-    // for the batched live path and upgrades the 3D pane's crude centre-in-bounds drop.
-    let weight: Box<dyn Fn(i32, i32) -> f64> = if let Some([cx1, cy1, cx2, cy2]) = clip_rect {
-        let inner = weight;
-        Box::new(move |x, y| {
-            if x >= cx1 && x <= cx2 && y >= cy1 && y <= cy2 { inner(x, y) } else { 0.0 }
-        })
-    } else {
-        weight
-    };
 
     let (mut x_min, mut y_min, mut x_max, mut y_max) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
     for p in &points {
@@ -6311,434 +8237,16 @@ fn sculpt_terrain_inner(
         Some(s) if Some(s.group_id) == group_id => s,
         _ => SculptSession { group_id: group_id.unwrap_or(0), fheight: HashMap::new() },
     };
+    // Single-stamp path funnels through `sculpt_stamp_body` too (audit M1) — the batched multi-centre
+    // path in `sculpt_terrain` calls it N times inside one `with_edit_grouped` closure instead of
+    // wrapping each stamp in its own `with_edit_grouped` (one snapshot/diff/render for N stamps).
     let result = with_edit_grouped(ws, &label, rect, rect, group_id, |world| {
-        let max_z = world_max_z(world);
-        // Blend `cur` toward the float `target` by the column's radial weight, accumulating the
-        // precise result in the per-stroke float workspace and committing its dithered round. The
-        // workspace seeds from `cur` (the world's current integer height) only on a column's FIRST
-        // touch this stroke; later stamps read the retained float, so a 0.3-weight rim column gains
-        // 0.3/stamp and crosses the next integer every ~3 stamps regardless of its fixed BAYER
-        // threshold. Additive modes pass `target = cur + delta`; convergent modes pass the plane/
-        // average target — both are the same `fh + (target - fh) * w` step.
-        let mut blend = |cur: i32, target: f64, w: f64, x: i32, y: i32| -> i32 {
-            let fh = session.fheight.entry((x, y)).or_insert(cur as f64);
-            let raw = *fh + (target - *fh) * w;
-            *fh = raw;
-            round_dither(raw, softness, x, y)
-        };
-        match mode.as_str() {
-            "smooth" => {
-                // Iterated 8-connected averaging (cardinals 1, diagonals √½, centre 1). Runs
-                // `strength` Jacobi passes over a local working copy seeded from `height_map`: each
-                // pass reads the *previous* pass's heights (never values updated within the same
-                // pass), so the result is independent of iteration order over `points`. Only the
-                // final heights are committed to the world (sculpt_column bakes in surface-layering
-                // side effects we don't want repeated per pass). Missing neighbours (world edge /
-                // no surface) drop out of the average at every pass ("fix edges"); neighbours in
-                // height_map but outside `points` act as fixed boundaries.
-                // Passes run in float now (no per-pass rounding); the radial weight and the
-                // float-workspace accumulation apply once at commit.
-                let mut work: HashMap<(i32, i32), f64> =
-                    height_map.iter().map(|(&k, &(z, _, _))| (k, z as f64)).collect();
-                for _ in 0..strength {
-                    let prev = work.clone();
-                    for p in &points {
-                        let Some(&cur_f) = prev.get(&(p.x, p.y)) else { continue };
-                        let mut hsum = cur_f;
-                        let mut wsum = 1.0;
-                        for ((dx, dy), k) in SCULPT_KERNEL {
-                            if let Some(&v) = prev.get(&(p.x + dx, p.y + dy)) {
-                                hsum += v * k;
-                                wsum += k;
-                            }
-                        }
-                        if wsum <= 1.0 { continue; }
-                        work.insert((p.x, p.y), hsum / wsum);
-                    }
-                }
-                for p in &points {
-                    let Some(&(cur_z, surf_bt, surf_paint)) = height_map.get(&(p.x, p.y)) else { continue };
-                    let smoothed = *work.get(&(p.x, p.y)).unwrap_or(&(cur_z as f64));
-                    let final_z = blend(cur_z, smoothed, weight(p.x, p.y), p.x, p.y);
-                    sculpt_column(world, p.x, p.y, cur_z, final_z, max_z, surf_bt, surf_paint, block_type, paint);
-                }
-            }
-            "raise" | "lower" => {
-                let sign = if mode == "raise" { 1 } else { -1 };
-                for p in &points {
-                    let Some(&(cur_z, surf_bt, surf_paint)) = height_map.get(&(p.x, p.y)) else { continue };
-                    let target = blend(cur_z, cur_z as f64 + sign as f64 * strength_eff, weight(p.x, p.y), p.x, p.y);
-                    sculpt_column(world, p.x, p.y, cur_z, target, max_z, surf_bt, surf_paint, block_type, paint);
-                }
-            }
-            "noise" => {
-                // Coherent displacement (spatially correlated) instead of white noise.
-                // "mountains" uses ridged multifractal (sharp ridgelines, pushes up);
-                // "hills" (default) uses fbm (smooth rolling billows, ± around current).
-                let freq = freq.unwrap_or(0.06).clamp(0.004, 0.5);
-                let mountains = noise_mode.as_deref() == Some("mountains");
-                let amp = strength as f64;
-                // Per-stroke offset so successive strokes vary but a single stroke is coherent.
-                let so = ((seed % 1_000_000) as f64) * 0.017 + 13.37;
-                for p in &points {
-                    let Some(&(cur_z, surf_bt, surf_paint)) = height_map.get(&(p.x, p.y)) else { continue };
-                    let fx = p.x as f64 * freq + so;
-                    let fy = p.y as f64 * freq + so;
-                    let raw = if mountains {
-                        // ridged2 ∈ [0,1] → always builds upward, sharper peaks
-                        ridged2(fx, fy, 4) * amp * 2.5
-                    } else {
-                        // fbm2 ∈ [-1,1] → gentle rolling ups and downs
-                        fbm2(fx, fy, 4) * amp
-                    };
-                    // Weight + float-workspace accumulation via blend; `raw` is the full displacement.
-                    let target = blend(cur_z, cur_z as f64 + raw, weight(p.x, p.y), p.x, p.y);
-                    if target != cur_z {
-                        sculpt_column(world, p.x, p.y, cur_z, target, max_z, surf_bt, surf_paint, block_type, paint);
-                    }
-                }
-            }
-            "flatten" => {
-                // Level to the pointer-down column's height (stroke-start), falling back to
-                // the footprint average when no anchor was supplied.
-                let target_z = anchor_x.zip(anchor_y)
-                    .and_then(|(ax, ay)| height_map.get(&(ax, ay)).map(|v| v.0))
-                    .or_else(|| {
-                        let heights: Vec<i32> = points.iter()
-                            .filter_map(|p| height_map.get(&(p.x, p.y)).map(|v| v.0))
-                            .collect();
-                        if heights.is_empty() { None }
-                        else { Some((heights.iter().sum::<i32>() as f32 / heights.len() as f32).round() as i32) }
-                    });
-                let Some(target_z) = target_z else { return Err("No surface".into()) };
-                for p in &points {
-                    let Some(&(cur_z, surf_bt, surf_paint)) = height_map.get(&(p.x, p.y)) else { continue };
-                    let target = blend(cur_z, target_z as f64, weight(p.x, p.y), p.x, p.y);
-                    sculpt_column(world, p.x, p.y, cur_z, target, max_z, surf_bt, surf_paint, block_type, paint);
-                }
-            }
-            "erode" => {
-                for p in &points {
-                    let Some(&(cur_z, surf_bt, surf_paint)) = height_map.get(&(p.x, p.y)) else { continue };
-                    let min_n = SCULPT_KERNEL.iter()
-                        .filter_map(|((dx,dy),_)| height_map.get(&(p.x+dx, p.y+dy)).map(|v| v.0))
-                        .min();
-                    if let Some(mn) = min_n {
-                        if cur_z > mn {
-                            let eroded = (cur_z - strength).max(mn);
-                            let target = blend(cur_z, eroded as f64, weight(p.x, p.y), p.x, p.y);
-                            sculpt_column(world, p.x, p.y, cur_z, target, max_z, surf_bt, surf_paint, block_type, paint);
-                        }
-                    }
-                }
-            }
-            "thermal" => {
-                // Talus-angle erosion: any column whose drop to its lowest neighbour exceeds
-                // the max stable slope (talus) sheds the excess, proportional to how far over
-                // it is. `strength` sets the talus threshold (steeper allowed at low strength).
-                let talus = (9 - strength).max(1); // strength 1..8 → talus 8..1
-                for p in &points {
-                    let Some(&(cur_z, surf_bt, surf_paint)) = height_map.get(&(p.x, p.y)) else { continue };
-                    let min_n = SCULPT_KERNEL.iter()
-                        .filter_map(|((dx,dy),_)| height_map.get(&(p.x+dx, p.y+dy)).map(|v| v.0))
-                        .min();
-                    if let Some(mn) = min_n {
-                        let excess = cur_z - mn - talus;
-                        if excess > 0 {
-                            // Shed half the excess (rounded up), never below the neighbour.
-                            let drop = ((excess as f64 * 0.5).ceil() as i32).clamp(1, cur_z - mn);
-                            let eroded = cur_z - drop;
-                            let target = blend(cur_z, eroded as f64, weight(p.x, p.y), p.x, p.y);
-                            sculpt_column(world, p.x, p.y, cur_z, target, max_z, surf_bt, surf_paint, block_type, paint);
-                        }
-                    }
-                }
-            }
-            "grab" => {
-                // Drag-controlled displacement: raise (+) or lower (−) every column by the
-                // vertical drag distance, shaped by the radial falloff so the pulled region
-                // domes up / dishes down smoothly rather than as a flat plateau.
-                let d = grab_delta.unwrap_or(0);
-                if d == 0 { return Ok(()); }
-                for p in &points {
-                    let Some(&(cur_z, surf_bt, surf_paint)) = height_map.get(&(p.x, p.y)) else { continue };
-                    let target = blend(cur_z, (cur_z + d) as f64, weight(p.x, p.y), p.x, p.y);
-                    sculpt_column(world, p.x, p.y, cur_z, target, max_z, surf_bt, surf_paint, block_type, paint);
-                }
-            }
-            "hydro" => {
-                // Beyer-style droplet hydraulic erosion (the standard SebLague formulation).
-                // Droplets flow in *continuous* float position, steered by the bilinear-interpolated
-                // height gradient with inertia; they erode downhill — spread over an erosion-radius
-                // brush so channels are dendritic gullies, not 1-wide staircase trenches — and drop
-                // sediment onto the four bilinear corner nodes where the flow slows or climbs.
-                //
-                // The simulation runs over a workspace expanded HYDRO_MARGIN cells past the footprint
-                // (read fresh from the world, since the shared `height_map` is only footprint + its
-                // 8-ring): droplets that wander off the brush erode into that margin instead of dying
-                // unnaturally at the footprint boundary. Only footprint columns are committed — any
-                // change that lands in the margin is discarded.
-                const HYDRO_INERTIA: f64 = 0.05;
-                const HYDRO_SEDIMENT_CAPACITY_FACTOR: f64 = 4.0;
-                const HYDRO_MIN_SEDIMENT_CAPACITY: f64 = 0.01;
-                const HYDRO_ERODE_SPEED: f64 = 0.3;
-                const HYDRO_DEPOSIT_SPEED: f64 = 0.3;
-                const HYDRO_EVAPORATE_SPEED: f64 = 0.02;
-                const HYDRO_GRAVITY: f64 = 4.0;
-                const HYDRO_MAX_LIFETIME: i32 = 32;
-                const HYDRO_INITIAL_WATER: f64 = 1.0;
-                const HYDRO_INITIAL_SPEED: f64 = 1.0;
-                const HYDRO_EROSION_RADIUS: i32 = 3;
-                const HYDRO_MARGIN: i32 = 16;
-
-                let ws_x0 = x_min - HYDRO_MARGIN;
-                let ws_y0 = y_min - HYDRO_MARGIN;
-                let ws_w = (x_max - x_min + 1 + 2 * HYDRO_MARGIN) as usize;
-                let ws_h = (y_max - y_min + 1 + 2 * HYDRO_MARGIN) as usize;
-
-                // Dense workspace heightmap in float; `None` = no surface / outside the world, which
-                // stops any droplet that reaches it. Read directly from the world (see comment above).
-                let world_ref: &LoadedWorld = world;
-                let mut hmap: Vec<Option<f64>> = Vec::with_capacity(ws_w * ws_h);
-                for gy in 0..ws_h {
-                    for gx in 0..ws_w {
-                        let wx = ws_x0 + gx as i32;
-                        let wy = ws_y0 + gy as i32;
-                        hmap.push(surface_z_capped(world_ref, wx, wy, cap).map(|z| z as f64));
-                    }
-                }
-
-                // Grid accessors take `&hmap`/`&mut hmap` explicitly so they never hold a borrow
-                // across the droplet loop's own mutations.
-                let node_at = |hmap: &[Option<f64>], gx: i32, gy: i32| -> Option<f64> {
-                    if gx < 0 || gy < 0 || gx >= ws_w as i32 || gy >= ws_h as i32 { return None; }
-                    hmap[gy as usize * ws_w + gx as usize]
-                };
-                let modify = |hmap: &mut [Option<f64>], gx: i32, gy: i32, d: f64| {
-                    if gx < 0 || gy < 0 || gx >= ws_w as i32 || gy >= ws_h as i32 { return; }
-                    if let Some(h) = hmap[gy as usize * ws_w + gx as usize].as_mut() { *h += d; }
-                };
-
-                // Radial erosion brush: weight = max(0, radius - dist), normalised to sum 1. Precomputed
-                // once (offsets are droplet-independent).
-                let erosion_brush: Vec<(i32, i32, f64)> = {
-                    let r = HYDRO_EROSION_RADIUS;
-                    let mut v = Vec::new();
-                    let mut total = 0.0f64;
-                    for dy in -r..=r {
-                        for dx in -r..=r {
-                            let w = (r as f64 - ((dx * dx + dy * dy) as f64).sqrt()).max(0.0);
-                            if w > 0.0 { v.push((dx, dy, w)); total += w; }
-                        }
-                    }
-                    for e in v.iter_mut() { e.2 /= total; }
-                    v
-                };
-
-                // Rng64 has no float method; derive a uniform [0,1) from its top 53 bits.
-                let rand01 = |rng: &mut Rng64| -> f64 { (rng.next() >> 11) as f64 / (1u64 << 53) as f64 };
-
-                let n_droplets = points.len() * (strength as usize) / 2 + points.len();
-                let mut rng = Rng64::new(seed ^ 0x9E37_79B9_7F4A_7C15);
-                let member: Vec<(i32, i32)> = points.iter().map(|p| (p.x, p.y)).collect();
-                for _ in 0..n_droplets {
-                    // Random continuous start within the footprint disc (a member node + sub-cell jitter).
-                    let (sx, sy) = member[(rng.next() as usize) % member.len()];
-                    let mut px = (sx - ws_x0) as f64 + rand01(&mut rng);
-                    let mut py = (sy - ws_y0) as f64 + rand01(&mut rng);
-                    let (mut dir_x, mut dir_y) = (0.0f64, 0.0f64);
-                    let mut speed = HYDRO_INITIAL_SPEED;
-                    let mut water = HYDRO_INITIAL_WATER;
-                    let mut sediment = 0.0f64;
-
-                    for _ in 0..HYDRO_MAX_LIFETIME {
-                        let (nx, ny) = (px.floor() as i32, py.floor() as i32);
-                        let (u, v) = (px - nx as f64, py - ny as f64);
-                        let (Some(h00), Some(h10), Some(h01), Some(h11)) = (
-                            node_at(&hmap, nx, ny),     node_at(&hmap, nx + 1, ny),
-                            node_at(&hmap, nx, ny + 1), node_at(&hmap, nx + 1, ny + 1),
-                        ) else { break };
-                        let grad_x = (h10 - h00) * (1.0 - v) + (h11 - h01) * v;
-                        let grad_y = (h01 - h00) * (1.0 - u) + (h11 - h10) * u;
-                        let height_here = h00 * (1.0 - u) * (1.0 - v) + h10 * u * (1.0 - v)
-                            + h01 * (1.0 - u) * v + h11 * u * v;
-
-                        // Blend the running direction (inertia) with the downhill gradient, then
-                        // normalise to a unit step. Flat + stalled → random unit dir so it explores.
-                        dir_x = dir_x * HYDRO_INERTIA - grad_x * (1.0 - HYDRO_INERTIA);
-                        dir_y = dir_y * HYDRO_INERTIA - grad_y * (1.0 - HYDRO_INERTIA);
-                        let len = (dir_x * dir_x + dir_y * dir_y).sqrt();
-                        if len <= 1e-8 {
-                            let ang = rand01(&mut rng) * std::f64::consts::TAU;
-                            dir_x = ang.cos();
-                            dir_y = ang.sin();
-                        } else {
-                            dir_x /= len;
-                            dir_y /= len;
-                        }
-
-                        let (old_px, old_py) = (px, py);
-                        px += dir_x;
-                        py += dir_y;
-
-                        // Sample the new height (bilinear); leaving the workspace stops the droplet.
-                        let (mx, my) = (px.floor() as i32, py.floor() as i32);
-                        let (mu, mv) = (px - mx as f64, py - my as f64);
-                        let (Some(n00), Some(n10), Some(n01), Some(n11)) = (
-                            node_at(&hmap, mx, my),     node_at(&hmap, mx + 1, my),
-                            node_at(&hmap, mx, my + 1), node_at(&hmap, mx + 1, my + 1),
-                        ) else { break };
-                        let new_height = n00 * (1.0 - mu) * (1.0 - mv) + n10 * mu * (1.0 - mv)
-                            + n01 * (1.0 - mu) * mv + n11 * mu * mv;
-                        let delta_height = new_height - height_here;
-
-                        let capacity = (-delta_height * speed * water * HYDRO_SEDIMENT_CAPACITY_FACTOR)
-                            .max(HYDRO_MIN_SEDIMENT_CAPACITY);
-
-                        let (onx, ony) = (old_px.floor() as i32, old_py.floor() as i32);
-                        let (ou, ov) = (old_px - onx as f64, old_py - ony as f64);
-                        if delta_height > 0.0 || sediment > capacity {
-                            // Deposit onto the four bilinear corners at the OLD position. Uphill: fill
-                            // the pit, capped by carried sediment; else shed the over-capacity excess.
-                            let amount = if delta_height > 0.0 {
-                                delta_height.min(sediment)
-                            } else {
-                                (sediment - capacity) * HYDRO_DEPOSIT_SPEED
-                            };
-                            sediment -= amount;
-                            modify(&mut hmap, onx,     ony,     amount * (1.0 - ou) * (1.0 - ov));
-                            modify(&mut hmap, onx + 1, ony,     amount * ou * (1.0 - ov));
-                            modify(&mut hmap, onx,     ony + 1, amount * (1.0 - ou) * ov);
-                            modify(&mut hmap, onx + 1, ony + 1, amount * ou * ov);
-                        } else {
-                            // Erode, spread across the radial brush at the OLD position (never take
-                            // more than the height drop). Cells outside the workspace drop out.
-                            let amount = ((capacity - sediment) * HYDRO_ERODE_SPEED).min(-delta_height);
-                            for &(dx, dy, bw) in &erosion_brush {
-                                modify(&mut hmap, onx + dx, ony + dy, -amount * bw);
-                            }
-                            sediment += amount;
-                        }
-
-                        // deltaHeight is negative when descending → this speeds the droplet up; max(0)
-                        // guards a NaN sqrt when climbing sharply. Evaporate, then stop if dry.
-                        speed = (speed * speed + delta_height * HYDRO_GRAVITY).max(0.0).sqrt();
-                        water *= 1.0 - HYDRO_EVAPORATE_SPEED;
-                        if water < 0.01 { break; }
-                    }
-                }
-
-                // Commit final workspace heights back — footprint columns only (see arm comment).
-                for p in &points {
-                    let Some(&(cur_z, surf_bt, surf_paint)) = height_map.get(&(p.x, p.y)) else { continue };
-                    let new_h = node_at(&hmap, p.x - ws_x0, p.y - ws_y0)
-                        .unwrap_or(cur_z as f64).round() as i32;
-                    let target = blend(cur_z, new_h as f64, weight(p.x, p.y), p.x, p.y);
-                    sculpt_column(world, p.x, p.y, cur_z, target, max_z, surf_bt, surf_paint, block_type, paint);
-                }
-            }
-            "stamp" => {
-                // Retexture the surface block by local steepness (max height diff to an
-                // 8-neighbour): flat → grass, moderate → dirt, steep → stone. Purely repaints
-                // the top block; never changes heights. Ignores an explicit fill block.
-                for p in &points {
-                    let Some(&(cur_z, _surf_bt, _surf_paint)) = height_map.get(&(p.x, p.y)) else { continue };
-                    let slope = SCULPT_KERNEL.iter()
-                        .filter_map(|((dx,dy),_)| height_map.get(&(p.x+dx, p.y+dy)).map(|v| (v.0 - cur_z).abs()))
-                        .max().unwrap_or(0);
-                    set_block_abs(world, p.x, p.y, cur_z, classify_by_slope(slope), 0);
-                }
-            }
-            "terrace" => {
-                // Quantize each column's height to N-block steps (Strength doubles as step size).
-                let step = strength.max(1);
-                for p in &points {
-                    let Some(&(cur_z, surf_bt, surf_paint)) = height_map.get(&(p.x, p.y)) else { continue };
-                    let terraced = ((cur_z as f64 / step as f64).round() as i32) * step;
-                    let target = blend(cur_z, terraced as f64, weight(p.x, p.y), p.x, p.y);
-                    sculpt_column(world, p.x, p.y, cur_z, target, max_z, surf_bt, surf_paint, block_type, paint);
-                }
-            }
-            "sharpen" => {
-                // Unsharp mask: push each column away from its 8-neighbour average — the inverse
-                // of Smooth. Strength (1..8) scales how much of the deviation from the local
-                // average gets amplified back in.
-                let amount = strength as f64 / 8.0;
-                for p in &points {
-                    let Some(&(cur_z, surf_bt, surf_paint)) = height_map.get(&(p.x, p.y)) else { continue };
-                    let mut hsum = cur_z as f64;
-                    let mut wsum = 1.0;
-                    for ((dx, dy), k) in SCULPT_KERNEL {
-                        if let Some(v) = height_map.get(&(p.x + dx, p.y + dy)) {
-                            hsum += v.0 as f64 * k;
-                            wsum += k;
-                        }
-                    }
-                    if wsum <= 1.0 { continue; }
-                    let avg = hsum / wsum;
-                    let sharpened = (cur_z as f64 + (cur_z as f64 - avg) * amount).round() as i32;
-                    let target = blend(cur_z, sharpened as f64, weight(p.x, p.y), p.x, p.y);
-                    sculpt_column(world, p.x, p.y, cur_z, target, max_z, surf_bt, surf_paint, block_type, paint);
-                }
-            }
-            "slope" => {
-                // Planar flatten: level toward an angled plane through the anchor column, tilted
-                // by slope_dx/slope_dy (rise per block along X/Y). Requires an anchor, same as
-                // Flatten — a flat (0-tilt) plane through the anchor is exactly Flatten's result.
-                let (sdx, sdy) = (slope_dx.unwrap_or(0.0), slope_dy.unwrap_or(0.0));
-                let anchor = anchor_x.zip(anchor_y);
-                let anchor_z = anchor.and_then(|(ax, ay)| height_map.get(&(ax, ay)).map(|v| v.0));
-                let Some(anchor_z) = anchor_z else { return Err("No surface".into()) };
-                let (ax, ay) = anchor.unwrap();
-                for p in &points {
-                    let Some(&(cur_z, surf_bt, surf_paint)) = height_map.get(&(p.x, p.y)) else { continue };
-                    let plane_z = anchor_z as f64 + sdx * (p.x - ax) as f64 + sdy * (p.y - ay) as f64;
-                    let target = blend(cur_z, plane_z, weight(p.x, p.y), p.x, p.y);
-                    sculpt_column(world, p.x, p.y, cur_z, target, max_z, surf_bt, surf_paint, block_type, paint);
-                }
-            }
-            "smear" => {
-                // Lateral height advection: pull each column's height from a position offset
-                // opposite the drag direction, so terrain drags along with the brush like wet
-                // paint. Sources are read fresh from the world (pre-mutation) for the whole
-                // footprint first — points may overlap each other's sources within one stamp.
-                let (sdx, sdy) = (smear_dx.unwrap_or(0), smear_dy.unwrap_or(0));
-                if sdx == 0 && sdy == 0 { return Ok(()); }
-                // Explicit shared reborrow: the `.map` closure only needs read access, and capturing
-                // `world` (a `&mut LoadedWorld`) directly would move the unique borrow into the
-                // closure, leaving it unusable for `sculpt_column` below.
-                let world_ref: &LoadedWorld = world;
-                let sources: Vec<Option<(i32, u8, u8)>> = points.iter().map(|p| {
-                    let (sx, sy) = (p.x - sdx, p.y - sdy);
-                    surface_z_capped(world_ref, sx, sy, cap).map(|z| {
-                        (z, read_block_abs(world_ref, sx, sy, z), read_paint_abs(world_ref, sx, sy, z))
-                    })
-                }).collect();
-                for (p, src) in points.iter().zip(sources.iter()) {
-                    let Some(&(cur_z, surf_bt, surf_paint)) = height_map.get(&(p.x, p.y)) else { continue };
-                    let Some((src_z, _, _)) = *src else { continue };
-                    let target = blend(cur_z, src_z as f64, weight(p.x, p.y), p.x, p.y);
-                    sculpt_column(world, p.x, p.y, cur_z, target, max_z, surf_bt, surf_paint, block_type, paint);
-                }
-            }
-            "rock" | "carve" => {
-                // Volumetric: bypasses points/height_map/weight/blend entirely — a 3D density
-                // field stamped once around the dial centre (or the footprint's bbox centre when
-                // no dial was supplied). Never touches the float workspace.
-                let (rcx, rcy, rr) = match dial {
-                    Some((dcx, dcy, dr)) => (dcx, dcy, dr.max(1)),
-                    None => (
-                        (x_min + x_max) / 2,
-                        (y_min + y_max) / 2,
-                        ((x_max - x_min).max(y_max - y_min) / 2).max(1),
-                    ),
-                };
-                let rp = rock.clone().unwrap_or_default();
-                field_stamp(world, rcx, rcy, rr, &rp, seed, cap, clip_rect, block_type, paint, mode == "carve");
-            }
-            _ => {}
-        }
-        Ok(())
+        sculpt_stamp_body(
+            world, &mut session, &points, dial, cap, softness, &profile, clip_rect,
+            mode.as_str(), strength, strength_eff, seed, block_type, paint, freq,
+            noise_mode.as_deref(), grab_delta, anchor_x, anchor_y, slope_dx, slope_dy,
+            smear_dx, smear_dy, &rock, x_min, y_min, x_max, y_max,
+        )
     });
     // Persist the float workspace only for a real (grouped) live stroke — a one-shot call (group
     // `None`: shape fills, Live-brush-OFF) has no successor stamp to accumulate into, so its session
@@ -6765,7 +8273,7 @@ fn fill_surface(
     if new_paint > 54 { return Err("Invalid paint".into()); }
     let max_fill = max_fill.clamp(1, 50_000);
 
-    let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
+    let mut ws = write_ws(&state);
 
     // Phase 1: BFS to collect all cells to fill (read-only pass).
     let (fill_cells, x_min, y_min, x_max, y_max) = {
@@ -6833,7 +8341,7 @@ fn magic_wand_select(
     match_paint: bool,
     state: tauri::State<'_, AppState>,
 ) -> Result<Option<SelectRect>, String> {
-    let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
+    let mut ws = write_ws(&state);
 
     // Phase A: run the BFS under an immutable world borrow, collecting every *matched* cell (not the
     // whole `visited` frontier, which includes rejected neighbours). Then drop the borrow so Phase B
@@ -6901,7 +8409,7 @@ fn magic_wand_select(
 /// base64 row-major bitset over the bbox — `ceil(width*height/8)` bytes, bit `(y-y1)*width+(x-x1)`.
 /// Rejects a size that doesn't match the bbox so a malformed payload can't produce an under-read
 /// mask (`contains` would then silently treat missing bytes as unselected — a rejection is clearer).
-#[tauri::command]
+#[tauri::command(async)]
 fn set_selection_mask(
     x1: i32, y1: i32, x2: i32, y2: i32,
     bits_b64: String,
@@ -6917,7 +8425,7 @@ fn set_selection_mask(
     if bits.len() != need {
         return Err(format!("Mask size mismatch: got {} bytes, need {} for {w}×{h}", bits.len(), need));
     }
-    let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
+    let mut ws = write_ws(&state);
     ws.selection_mask = Some(SelectionMask { x1, y1, x2, y2, bits });
     Ok(())
 }
@@ -6926,29 +8434,43 @@ fn set_selection_mask(
 /// reshape (new marquee, edge resize, select-all, 3D two-click, clear) so a stale wand/lasso shape
 /// never lingers; edits then behave rect-only. (The backend also re-checks the rect every edit, so
 /// this is defense-in-depth, not the sole guard — see `SelectionMask`.)
-#[tauri::command]
+#[tauri::command(async)]
 fn clear_selection_mask(state: tauri::State<'_, AppState>) -> Result<(), String> {
-    let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
+    let mut ws = write_ws(&state);
     ws.selection_mask = None;
     Ok(())
 }
 
-#[derive(Serialize)]
+/// The active mask, or "no mask" — a single `IpcResponse` type rather than `Option<…>`, since the
+/// binary envelope (audit H2) is framed by the payload type itself and `Option` has no framing of
+/// its own. Absence is a `null` JSON header with an empty body; JS reads `header === null`.
 struct SelectionMaskInfo {
-    x1: i32, y1: i32, x2: i32, y2: i32,
-    /// Row-major bitset over the bbox, base64 — decode with `decodeU8` (codec.ts).
-    #[serde(serialize_with = "serialize_bytes_b64")]
+    mask: Option<SelectionMaskHeader>,
+    /// Row-major bitset over the bbox; empty when `mask` is `None`.
     bits: Vec<u8>,
 }
 
-/// Return the active non-rectangular selection footprint (bbox + base64 bitset), or `None` when the
+#[derive(Serialize)]
+struct SelectionMaskHeader { x1: i32, y1: i32, x2: i32, y2: i32 }
+
+impl tauri::ipc::IpcResponse for SelectionMaskInfo {
+    fn body(self) -> tauri::Result<tauri::ipc::InvokeResponseBody> {
+        ipc_envelope(&self.mask, &[&self.bits])
+    }
+}
+
+/// Return the active non-rectangular selection footprint (bbox + bitset), or a null header when the
 /// selection is a plain rectangle. The map-canvas overlay decodes this to fill only the shaped cells.
-#[tauri::command]
-fn get_selection_mask(state: tauri::State<'_, AppState>) -> Result<Option<SelectionMaskInfo>, String> {
-    let ws = state.lock().unwrap_or_else(|p| p.into_inner());
-    Ok(ws.selection_mask.as_ref().map(|m| SelectionMaskInfo {
-        x1: m.x1, y1: m.y1, x2: m.x2, y2: m.y2, bits: m.bits.clone(),
-    }))
+#[tauri::command(async)]
+fn get_selection_mask(state: tauri::State<'_, AppState>) -> Result<SelectionMaskInfo, String> {
+    let ws = read_ws(&state);
+    Ok(match ws.selection_mask.as_ref() {
+        Some(m) => SelectionMaskInfo {
+            mask: Some(SelectionMaskHeader { x1: m.x1, y1: m.y1, x2: m.x2, y2: m.y2 }),
+            bits: m.bits.clone(),
+        },
+        None => SelectionMaskInfo { mask: None, bits: Vec::new() },
+    })
 }
 
 // ── Scatter / Array paste ─────────────────────────────────────────────────────
@@ -7004,7 +8526,7 @@ fn scatter_paste(
     state: tauri::State<'_, AppState>,
 ) -> Result<EditResult, String> {
     let count = count.clamp(1, 100);
-    let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
+    let mut ws = write_ws(&state);
 
     let (width, height, depth, z_anchor, block_types, paints, mask) = {
         let cb = ws.clipboard.as_ref().ok_or("Clipboard is empty")?;
@@ -7049,7 +8571,7 @@ fn array_paste(
 ) -> Result<EditResult, String> {
     let cols = cols.clamp(1, 20);
     let rows = rows.clamp(1, 20);
-    let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
+    let mut ws = write_ws(&state);
 
     let (width, height, depth, z_anchor, block_types, paints, mask) = {
         let cb = ws.clipboard.as_ref().ok_or("Clipboard is empty")?;
@@ -7080,7 +8602,10 @@ fn array_paste(
 pub fn run() {
     sweep_stale_temps(); // clear staging temps leaked by a previous clean quit
     tauri::Builder::default()
-        .manage(Mutex::new(WorldState::new()))
+        // Must stay `AppState` (= `RwLock<WorldState>`), not a bare `RwLock::new` of some other
+        // type: `manage` is generic, so a mismatch here compiles fine and fails at *runtime* on
+        // the first `State<'_, AppState>` resolution.
+        .manage(AppState::new(WorldState::new()))
         .manage(ExpandCancel::default())
         .manage(MaterializeCancel::default())
         .plugin(tauri_plugin_opener::init())
@@ -7101,6 +8626,7 @@ pub fn run() {
             save_world,
             close_world,
             autosave_world,
+            load_autosave,
             get_autosave_info,
             get_autosave_path,
             discard_autosave,
@@ -7193,9 +8719,9 @@ pub fn run() {
 
 /// Read the 4×4 sky-colour grid from header bytes 132–147.
 /// Returns 16 paint indices (0 = default blue, 1–54 = paint palette).
-#[tauri::command]
+#[tauri::command(async)]
 fn get_sky_grid(state: tauri::State<'_, AppState>) -> Result<Vec<u8>, String> {
-    let ws = state.lock().unwrap_or_else(|p| p.into_inner());
+    let ws = read_ws(&state);
     let world = ws.world.as_ref().ok_or("No world loaded")?;
     if world.bytes.len() < 148 {
         return Ok(vec![0u8; 16]);
@@ -7204,10 +8730,10 @@ fn get_sky_grid(state: tauri::State<'_, AppState>) -> Result<Vec<u8>, String> {
 }
 
 /// Write a 4×4 sky-colour grid to header bytes 132–147 and recompute sky majority.
-#[tauri::command]
+#[tauri::command(async)]
 fn set_sky_grid(grid: Vec<u8>, state: tauri::State<'_, AppState>) -> Result<(), String> {
     if grid.len() != 16 { return Err("Expected exactly 16 sky values".into()); }
-    let mut ws = state.lock().unwrap_or_else(|p| p.into_inner());
+    let mut ws = write_ws(&state);
     let world = ws.world.as_mut().ok_or("No world loaded")?;
     if world.bytes.len() < 148 { return Err("World header too short".into()); }
     world.bytes[132..148].copy_from_slice(&grid);
@@ -7221,6 +8747,7 @@ fn set_sky_grid(grid: Vec<u8>, state: tauri::State<'_, AppState>) -> Result<(), 
         counts.iter().enumerate().max_by_key(|(_, &c)| c)
             .map(|(i, _)| i as u8).unwrap_or(14)
     };
+    ws.dirty.mark_header();
     Ok(())
 }
 
@@ -7239,13 +8766,13 @@ struct CreatureInfo {
 /// Read up to 200 entity slots from the 12 000-byte block that precedes the
 /// chunk directory.  Skips empty slots (type == −1) and out-of-range types.
 /// Returns an empty list for editor-created worlds that have no entity block.
-#[tauri::command]
+#[tauri::command(async)]
 fn get_creatures(state: tauri::State<'_, AppState>) -> Result<Vec<CreatureInfo>, String> {
     const MAX_SAVED: usize = 200;
     const ENTITY_BYTES: usize = 60; // sizeof(EntityData)
     const BLOCK_SIZE: usize = MAX_SAVED * ENTITY_BYTES; // 12 000
 
-    let ws = state.lock().unwrap_or_else(|p| p.into_inner());
+    let ws = read_ws(&state);
     let world = ws.world.as_ref().ok_or("No world loaded")?;
     let bytes = &world.bytes[..];
 
@@ -7597,6 +9124,76 @@ mod tests {
         assert_eq!(read_paint_abs(&world, 3, 5, 200), 7);
     }
 
+    /// Audit M8 — `read_column_bulk`/`write_column_bulk` must agree with the scalar
+    /// `read_block_abs`/`read_paint_abs`/`set_block_abs` they replace in `copy_selection`/
+    /// `move_selection`'s hot loops, including across a 16-z band boundary (the whole reason for the
+    /// per-band `copy_from_slice` split) and outside any chunk (missing-chunk → 0 / write dropped).
+    #[test]
+    fn test_column_bulk_matches_scalar_band_crossing() {
+        let base = make_multi_chunk_world(1, 131072, 5);
+        let mut world = parse_world_inner(mmap_from_bytes(base.clone())).expect("parse failed");
+        assert_eq!(world.num_bands, 16, "256z world for a real band boundary at z=16");
+
+        // Scribble a distinct (type, paint) at every z in a column spanning two bands (10..=25
+        // crosses the z=16 boundary), plus a neighbouring column, via the scalar path.
+        for z in 0..40 {
+            set_block_abs(&mut world, 5, 5, z, (z % 251 + 1) as u8, (z % 53 + 1) as u8);
+            set_block_abs(&mut world, 6, 5, z, ((z * 3) % 251 + 1) as u8, ((z * 7) % 53 + 1) as u8);
+        }
+
+        for &(wx, wy, z0, depth) in &[(5, 5, 10, 16), (5, 5, 0, 40), (6, 5, 15, 3), (9, 9, 0, 40)] {
+            let mut bulk_bt = vec![0u8; depth as usize];
+            let mut bulk_paint = vec![0u8; depth as usize];
+            read_column_bulk(&world, wx, wy, z0, depth, &mut bulk_bt, &mut bulk_paint);
+            for i in 0..depth {
+                assert_eq!(bulk_bt[i as usize], read_block_abs(&world, wx, wy, z0 + i),
+                    "block mismatch at ({wx},{wy},{}) window z0={z0} depth={depth}", z0 + i);
+                assert_eq!(bulk_paint[i as usize], read_paint_abs(&world, wx, wy, z0 + i),
+                    "paint mismatch at ({wx},{wy},{}) window z0={z0} depth={depth}", z0 + i);
+            }
+        }
+
+        // Write side: bulk-write a band-crossing run to a fresh column and diff the resulting bytes
+        // against an independently-parsed world written the old (scalar) way.
+        let mut bulk_world = parse_world_inner(mmap_from_bytes(base.clone())).expect("parse failed");
+        let mut scalar_world = parse_world_inner(mmap_from_bytes(base)).expect("parse failed");
+        let pattern_bt: Vec<u8> = (0..20).map(|i| (i * 11 % 250 + 1) as u8).collect();
+        let pattern_paint: Vec<u8> = (0..20).map(|i| (i * 5 % 52 + 1) as u8).collect();
+        for (i, (&bt, &pt)) in pattern_bt.iter().zip(pattern_paint.iter()).enumerate() {
+            set_block_abs(&mut scalar_world, 7, 7, 8 + i as i32, bt, pt);
+        }
+        write_column_bulk(&mut bulk_world, 7, 7, 8, 20, &pattern_bt, &pattern_paint);
+        assert_eq!(&bulk_world.bytes[..], &scalar_world.bytes[..],
+            "bulk write must match the scalar set_block_abs loop byte-for-byte");
+    }
+
+    /// Audit M8 — the bulk helpers must fall back to the same clamp-at-span behaviour as
+    /// `read_block_abs`/`set_block_abs` when a run crosses a short chunk span (`DIAGNOSE/
+    /// DIAGNOSIS.md` §1.9): the neighbour's bytes are never touched or read as this chunk's.
+    #[test]
+    fn test_column_bulk_respects_short_chunk_span() {
+        const SHORT: usize = 107_072;
+        let mut world = parse_world_inner(mmap_from_bytes(make_short_span_world()))
+            .expect("parse failed");
+        let neighbour_before = world.bytes[HEADER + SHORT..HEADER + SHORT + 24_000].to_vec();
+
+        // z=250 (band 15) starts past the short span for chunk (0,0); a bulk write covering it
+        // must be silently dropped, exactly like `set_block_abs`.
+        let bt = vec![9u8; 8];
+        let pt = vec![3u8; 8];
+        write_column_bulk(&mut world, 3, 5, 248, 8, &bt, &pt);
+        assert_eq!(
+            world.bytes[HEADER + SHORT..HEADER + SHORT + 24_000],
+            neighbour_before[..],
+            "a bulk write past the short span must not reach the next chunk's bytes",
+        );
+        let mut out_bt = vec![0u8; 8];
+        let mut out_pt = vec![0u8; 8];
+        read_column_bulk(&world, 3, 5, 248, 8, &mut out_bt, &mut out_pt);
+        assert_eq!(out_bt, vec![0u8; 8], "reading past the short span returns 0, not neighbour data");
+        assert_eq!(out_pt, vec![0u8; 8]);
+    }
+
     /// The undo path must be span-aware too: snapshotting a short chunk at its nominal size would
     /// pull the neighbour's bytes into this chunk's delta, and restoring would write them back at
     /// the same wrong address — turning undo itself into the corruption vector.
@@ -7605,11 +9202,11 @@ mod tests {
         const SHORT: usize = 107_072;
         let world = parse_world_inner(mmap_from_bytes(make_short_span_world()))
             .expect("parse failed");
-        let snaps = snapshot_chunks_full(&world, &[(0, 0), (1, 0)]);
-        let short = snaps.iter().find(|&&(cx, cy, _)| (cx, cy) == (0, 0)).unwrap();
-        let full  = snaps.iter().find(|&&(cx, cy, _)| (cx, cy) == (1, 0)).unwrap();
-        assert_eq!(short.2.len(), SHORT, "short chunk snapshots only what it owns");
-        assert_eq!(full.2.len(), 131072);
+        let snaps = snapshot_chunks_full(&world, &[(0, 0), (1, 0)], None);
+        let short = snaps.iter().find(|&(cx, cy, _, _)| (*cx, *cy) == (0, 0)).unwrap();
+        let full  = snaps.iter().find(|&(cx, cy, _, _)| (*cx, *cy) == (1, 0)).unwrap();
+        assert_eq!(short.3.len(), SHORT, "short chunk snapshots only what it owns");
+        assert_eq!(full.3.len(), 131072);
     }
 
     /// Round-trip: parse → delete column (3,5) z 0–63 → save to new path →
@@ -7643,7 +9240,7 @@ mod tests {
         let tmp = std::env::temp_dir().join("eden_test_round_trip.eden");
         let tmp_str = tmp.to_str().unwrap();
         let _ = fs::remove_file(&tmp);
-        save_world_inner(&world, tmp_str).expect("save failed");
+        save_world_inner(&world, tmp_str, false).expect("save failed");
         assert!(!std::path::Path::new(&format!("{tmp_str}.bak")).exists(),
             ".bak should not be created when destination didn't exist");
 
@@ -7684,38 +9281,678 @@ mod tests {
         let target = blk(3, 5, 0);
 
         // ── Sparse case: mutate exactly one byte of a 32 KB chunk ──────────────────────────
-        let pre_full = snapshot_chunks_full(&world, &[(0, 0)]);
+        let pre_full = snapshot_chunks_full(&world, &[(0, 0)], None);
         let original_val = world.bytes[target];
         world.bytes[target] = 99;
 
-        let snap = diff_chunk(&world, 0, 0, &pre_full[0].2).expect("changed chunk must diff to Some");
+        let snap = diff_chunk(&world, 0, 0, pre_full[0].2, &pre_full[0].3).expect("changed chunk must diff to Some");
         match &snap.delta {
             ChunkDelta::Sparse(pairs) => assert_eq!(pairs.len(), 1, "single-byte edit must diff to one sparse entry"),
-            ChunkDelta::Full(_) => panic!("single-byte edit should not fall back to Full"),
+            ChunkDelta::Full(_, _) => panic!("single-byte edit should not fall back to Full"),
         }
 
-        let entry = UndoEntry { operation: "test".into(), chunks: vec![snap], group: None };
+        let entry = UndoEntry::new("test", vec![snap], None);
         let redo_chunks = restore_and_invert(&mut world, &entry);
         assert_eq!(world.bytes[target], original_val, "undo must restore the original byte");
 
-        let redo_entry = UndoEntry { operation: "test".into(), chunks: redo_chunks, group: None };
+        let redo_entry = UndoEntry::new("test", redo_chunks, None);
         let undo_again_chunks = restore_and_invert(&mut world, &redo_entry);
         assert_eq!(world.bytes[target], 99, "redo must restore the edited byte");
 
-        restore_and_invert(&mut world, &UndoEntry { operation: "test".into(), chunks: undo_again_chunks, group: None });
+        restore_and_invert(&mut world, &UndoEntry::new("test", undo_again_chunks, None));
         assert_eq!(world.bytes[target], original_val, "second undo must restore the original byte again");
 
         // ── Dense case: overwrite the whole file so diff_chunk falls back to Full ──────────
-        let pre_full2 = snapshot_chunks_full(&world, &[(0, 0)]);
+        let pre_full2 = snapshot_chunks_full(&world, &[(0, 0)], None);
         for b in world.bytes.iter_mut() { *b = 0xAB; }
-        let snap2 = diff_chunk(&world, 0, 0, &pre_full2[0].2).expect("dense change must diff to Some");
+        let snap2 = diff_chunk(&world, 0, 0, pre_full2[0].2, &pre_full2[0].3).expect("dense change must diff to Some");
         match &snap2.delta {
-            ChunkDelta::Full(_) => {}
+            ChunkDelta::Full(_, _) => {}
             ChunkDelta::Sparse(pairs) => panic!("dense edit should fall back to Full, got Sparse({} entries)", pairs.len()),
         }
-        restore_and_invert(&mut world, &UndoEntry { operation: "test".into(), chunks: vec![snap2], group: None });
-        assert_eq!(&world.bytes[HEADER..HEADER + 32768], &pre_full2[0].2[..],
+        restore_and_invert(&mut world, &UndoEntry::new("test", vec![snap2], None));
+        assert_eq!(&world.bytes[HEADER..HEADER + 32768], &pre_full2[0].3[..],
             "Full-delta undo must restore the whole chunk");
+    }
+
+    /// Audit C2 Stage 1 — `DirtyState.since_disk` must equal the *actual* set of changed chunks
+    /// (+ header) after a scripted mix of edits, undo and redo. This is the test that catches a
+    /// missed hook site: if any of `with_edit_inner` / `undo_edit_inner` / `redo_edit_inner` /
+    /// the header writers forgot to call `mark_chunks`/`mark_header`, the ground-truth diff below
+    /// (computed independently, by comparing bytes) would disagree with `ws.dirty.since_disk`.
+    #[test]
+    fn test_dirty_set_matches_ground_truth() {
+        let original = make_bumpy_world_grid(2, 8, |_, _| 20); // 2×2 chunks: (0,0) (1,0) (0,1) (1,1)
+        let mut ws = ws_with(original.clone());
+
+        // Edit 1: delete a rect that only touches chunk (0,0) — grouped None (immediate undo entry).
+        with_edit(&mut ws, "delete", (0, 0, 5, 5), (0, 0, 5, 5), |world| {
+            delete_blocks_inner(world, 0, 0, 5, 5, 0, 63, None);
+            Ok(())
+        }).expect("delete chunk (0,0)");
+
+        // Edit 2: delete a rect spanning all four chunks.
+        with_edit(&mut ws, "delete", (0, 0, 31, 31), (0, 0, 31, 31), |world| {
+            delete_blocks_inner(world, 0, 0, 31, 31, 0, 63, None);
+            Ok(())
+        }).expect("delete all chunks");
+
+        // Undo the second delete — restores chunks (0,0),(1,0),(0,1),(1,1) again (all still "dirty"
+        // relative to the original on-disk image, since undo doesn't return them to the as-loaded
+        // bytes: chunk (0,0) is still missing edit 1's deletion).
+        undo_edit_inner(&mut ws).expect("undo");
+
+        // Redo it — re-deletes all four chunks.
+        redo_edit_inner(&mut ws).expect("redo");
+
+        // Header-only change: mirrors what set_spawn_pos does (write header bytes, mark dirty).
+        {
+            let world = ws.world.as_mut().unwrap();
+            write_spawn(world, 5.0, 5.0);
+        }
+        ws.dirty.mark_header();
+
+        // ── Ground truth: diff final bytes against the pristine as-loaded copy, chunk by chunk ──
+        let world = ws.world.as_ref().unwrap();
+        let mut expected_chunks: std::collections::HashSet<(i32, i32)> = std::collections::HashSet::new();
+        for (&(cx, cy), _) in world.chunk_map.iter() {
+            let (addr, end) = world.chunk_range(cx, cy).unwrap();
+            if world.bytes[addr..end] != original[addr..end] {
+                expected_chunks.insert((cx, cy));
+            }
+        }
+        let expected_header = world.bytes[0..192] != original[0..192];
+
+        let actual_chunks: std::collections::HashSet<(i32, i32)> =
+            ws.dirty.since_disk.iter().copied().collect();
+        assert_eq!(actual_chunks, expected_chunks,
+            "since_disk must equal the ground-truth changed-chunk set");
+        assert_eq!(ws.dirty.header_disk, expected_header,
+            "header_disk must equal the ground-truth header diff");
+
+        // since_journal and since_base track the same events in Stage 1 (nothing yet clears them
+        // independently), so they must agree with since_disk too.
+        let journal_chunks: std::collections::HashSet<(i32, i32)> =
+            ws.dirty.since_journal.iter().copied().collect();
+        let base_chunks: std::collections::HashSet<(i32, i32)> =
+            ws.dirty.since_base.iter().copied().collect();
+        assert_eq!(journal_chunks, expected_chunks);
+        assert_eq!(base_chunks, expected_chunks);
+        assert_eq!(ws.dirty.header_journal, expected_header);
+        assert_eq!(ws.dirty.header_base, expected_header);
+    }
+
+    /// A `WorldState` wired up like a freshly-`load_world`'d one, with a real on-disk staged temp
+    /// (not just an anonymous mapping) — `autosave_world_inner` needs `temp_path` to point at an
+    /// actual file so it can `stage_copy` the autosave base from it.
+    fn ws_with_temp_path(bytes: Vec<u8>, temp_path: &std::path::Path) -> WorldState {
+        fs::write(temp_path, &bytes).expect("stage temp file for test");
+        let mut ws = ws_with(bytes);
+        ws.temp_path = Some(temp_path.to_path_buf());
+        ws
+    }
+
+    /// Audit C2 Stage 3 — a scripted mix of a chunk edit, a header edit, and an edit-then-undo,
+    /// autosaved across two ticks (exercising both the first-tick "establish base" path and a
+    /// plain incremental append), must recover byte-identical via `load_autosave_inner` — including
+    /// the header change and the fact that the undone edit's chunk ends up back at its original
+    /// bytes. This is the ground-truth check for the whole base+journal round trip, mirroring
+    /// `test_dirty_set_matches_ground_truth`'s style for Stage 1.
+    #[test]
+    fn test_journaled_autosave_round_trip_with_recovery() {
+        let original = make_bumpy_world_grid(2, 8, |_, _| 20); // 2×2 chunks: (0,0) (1,0) (0,1) (1,1)
+        let dir = std::env::temp_dir().join(format!("vuencedit_autosave_test_{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("create test sidecar dir");
+        let staged = dir.join("staged.eden");
+        let paths = autosave_paths_at(&dir);
+
+        let ws = ws_with_temp_path(original, &staged);
+        let state: AppState = RwLock::new(ws);
+
+        // Tick 1: a single chunk edit, then autosave — establishes the base image + journal.
+        {
+            let mut ws = write_ws(&state);
+            with_edit(&mut ws, "delete", (0, 0, 5, 5), (0, 0, 5, 5), |world| {
+                delete_blocks_inner(world, 0, 0, 5, 5, 0, 63, None);
+                Ok(())
+            }).expect("edit 1");
+        }
+        autosave_world_inner(&state, &paths, None).expect("autosave tick 1");
+        assert!(paths.base.exists(), "first tick must establish the base image");
+        assert!(paths.journal.exists(), "first tick must create the journal");
+
+        // Header change (mirrors set_spawn_pos: write header bytes directly, then mark dirty).
+        {
+            let mut ws = write_ws(&state);
+            write_spawn(ws.world.as_mut().unwrap(), 5.0, 5.0);
+            ws.dirty.mark_header();
+        }
+        // Edit-then-undo in a different chunk — still dirty (Stage 1's tracking is conservative),
+        // but its final bytes are back to the pristine original for that chunk.
+        {
+            let mut ws = write_ws(&state);
+            with_edit(&mut ws, "delete", (16, 0, 20, 5), (16, 0, 20, 5), |world| {
+                delete_blocks_inner(world, 16, 0, 20, 5, 0, 63, None);
+                Ok(())
+            }).expect("edit 2");
+        }
+        undo_edit_inner(&mut write_ws(&state)).expect("undo edit 2");
+
+        // Tick 2: incremental append (base already established this session).
+        autosave_world_inner(&state, &paths, Some("source.eden".into())).expect("autosave tick 2");
+        assert!(read_ws(&state).dirty.since_journal.is_empty(), "tick 2 must flush everything pending");
+        assert!(!read_ws(&state).dirty.header_journal, "tick 2 must flush the header too");
+
+        let expected = world_bytes(&read_ws(&state));
+
+        // Recover into a brand-new, otherwise-empty WorldState/AppState.
+        let fresh: AppState = RwLock::new(WorldState::new());
+        let meta = load_autosave_inner(&fresh, &paths).expect("load_autosave_inner");
+        assert_eq!(meta.name, "GridTest");
+        let recovered = world_bytes(&read_ws(&fresh));
+        assert_eq!(recovered, expected, "recovered world must be byte-identical to the last-autosaved state");
+
+        let recovered_temp = read_ws(&fresh).temp_path.clone().expect("recovery must stage a temp file");
+        let _ = fs::remove_file(&recovered_temp);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Audit C2 Stage 3 — when a single tick's pending chunks are large relative to the world (here
+    /// forced by editing 2 of the world's 4 chunks in one tick against a tiny fixture), autosave
+    /// must take the compaction path (`write_fresh_journal` from `since_base`) instead of appending,
+    /// and the resulting journal must still recover byte-identical. A compacted journal also must
+    /// not carry forward stale records: replaying it directly should yield exactly one span per
+    /// distinct dirty chunk, not one per edit.
+    #[test]
+    fn test_autosave_compaction_recovers_and_dedupes_spans() {
+        let original = make_bumpy_world_grid(2, 8, |_, _| 20);
+        let dir = std::env::temp_dir().join(format!("vuencedit_autosave_compact_test_{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("create test sidecar dir");
+        let staged = dir.join("staged.eden");
+        let paths = autosave_paths_at(&dir);
+
+        let ws = ws_with_temp_path(original, &staged);
+        let state: AppState = RwLock::new(ws);
+
+        // Tick 1: touch chunk (0,0) only, establish base + journal.
+        {
+            let mut ws = write_ws(&state);
+            with_edit(&mut ws, "delete", (0, 0, 5, 5), (0, 0, 5, 5), |world| {
+                delete_blocks_inner(world, 0, 0, 5, 5, 0, 63, None);
+                Ok(())
+            }).expect("edit 1");
+        }
+        autosave_world_inner(&state, &paths, None).expect("autosave tick 1");
+        let base_len = fs::metadata(&paths.base).unwrap().len();
+
+        // Before tick 2: re-touch chunk (0,0) and touch chunk (1,0) — 2 chunks * 32768B chunk_size
+        // comfortably exceeds base_len/4 for this small fixture, forcing the compact branch.
+        {
+            let mut ws = write_ws(&state);
+            with_edit(&mut ws, "delete", (0, 0, 8, 8), (0, 0, 8, 8), |world| {
+                delete_blocks_inner(world, 0, 0, 8, 8, 0, 63, None);
+                Ok(())
+            }).expect("edit 2");
+            with_edit(&mut ws, "delete", (16, 0, 20, 5), (16, 0, 20, 5), |world| {
+                delete_blocks_inner(world, 16, 0, 20, 5, 0, 63, None);
+                Ok(())
+            }).expect("edit 3");
+        }
+        autosave_world_inner(&state, &paths, None).expect("autosave tick 2 (compaction)");
+
+        let journal_bytes = fs::read(&paths.journal).expect("read compacted journal");
+        let replay = journal::replay(&journal_bytes, base_len).expect("replay compacted journal");
+        assert!(!replay.truncated);
+        let distinct: std::collections::HashSet<(i32, i32)> =
+            replay.spans.iter().map(|s| (s.cx, s.cy)).collect();
+        assert_eq!(replay.spans.len(), distinct.len(),
+            "a compacted journal must carry exactly one span per dirty chunk, not one per edit");
+        assert_eq!(distinct, std::collections::HashSet::from([(0, 0), (1, 0)]));
+
+        let expected = world_bytes(&read_ws(&state));
+        let fresh: AppState = RwLock::new(WorldState::new());
+        load_autosave_inner(&fresh, &paths).expect("load_autosave_inner after compaction");
+        let recovered = world_bytes(&read_ws(&fresh));
+        assert_eq!(recovered, expected, "post-compaction recovery must match the live world");
+
+        let recovered_temp = read_ws(&fresh).temp_path.clone().expect("recovery must stage a temp file");
+        let _ = fs::remove_file(&recovered_temp);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── Audit C2 Stage 4: incremental in-place save ──────────────────────────────────────────────
+
+    /// Per-test scratch directory under the system temp dir, keyed by name *and* pid so a parallel
+    /// `cargo test` run can't have two tests writing the same destination file.
+    fn stage4_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("vuencedit_c2s4_{name}_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create Stage 4 test dir");
+        dir
+    }
+
+    /// A `WorldState` wired up like a freshly-`load_world`'d **uncompressed** world: the same bytes
+    /// exist at `dest` on disk and are recorded as the known-good `DiskImage`. That recorded image is
+    /// what makes an incremental save eligible at all, so this mirrors `load_world`'s non-zip branch.
+    fn ws_with_disk_image(bytes: Vec<u8>, dest: &std::path::Path) -> WorldState {
+        fs::write(dest, &bytes).expect("write test destination");
+        let md = fs::metadata(dest).expect("stat test destination");
+        let mut ws = ws_with(bytes);
+        ws.disk_image = Some(DiskImage {
+            path: dest.to_path_buf(),
+            len: md.len(),
+            mtime: md.modified().expect("mtime"),
+            compressed: false,
+        });
+        ws
+    }
+
+    /// Hand-build a `<dest>.wal` the way `try_incremental_save` would, so `recover_wal` can be tested
+    /// against logs this file never actually produces (uncommitted, torn, mismatched).
+    fn write_test_wal(dest: &std::path::Path, base_len: u64, spans: &[(u64, i32, i32, Vec<u8>)], commit: bool) {
+        let f = fs::File::create(wal_path(dest)).expect("create test wal");
+        let mut w = journal::JournalWriter::create(f, base_len, [9u8; 16], false).expect("wal header");
+        for (off, cx, cy, payload) in spans {
+            w.append_span(*off, *cx, *cy, payload).expect("wal span");
+        }
+        if commit { w.append_commit().expect("wal commit"); }
+        w.flush().expect("wal flush");
+    }
+
+    /// A one-chunk edit followed by an incremental save must leave the destination byte-identical to
+    /// what a full `save_world_inner` of the same state would have produced — that equivalence is the
+    /// whole contract, since the fast path is only ever chosen *instead of* the slow one. Also pins
+    /// the surrounding bookkeeping: the `.bak` holds the pre-save file (an APFS clone must not follow
+    /// the in-place writes that come after it), the redo log is cleaned up, and the dirty set and
+    /// disk image are advanced so a follow-up save can be incremental too.
+    #[test]
+    fn test_incremental_save_matches_full_save() {
+        let dir = stage4_dir("match_full");
+        let original = make_bumpy_world_grid(2, 8, |_, _| 20);
+        let dest = dir.join("world.eden");
+        let state: AppState = RwLock::new(ws_with_disk_image(original.clone(), &dest));
+
+        {
+            let mut ws = write_ws(&state);
+            with_edit(&mut ws, "delete", (0, 0, 5, 5), (0, 0, 5, 5), |world| {
+                delete_blocks_inner(world, 0, 0, 5, 5, 0, 63, None);
+                Ok(())
+            }).expect("edit");
+        }
+        assert_eq!(read_ws(&state).dirty.since_disk.len(), 1, "the edit must dirty exactly chunk (0,0)");
+
+        let took_fast_path = try_incremental_save(&state, dest.to_str().unwrap(), false).expect("incremental save");
+        assert!(took_fast_path, "a one-chunk edit on a known-good disk image must be eligible");
+
+        let expected = world_bytes(&read_ws(&state));
+        assert_eq!(fs::read(&dest).unwrap(), expected, "incrementally saved file must match the live world");
+
+        // Byte-identical to the full-write path over the same state.
+        let full = dir.join("full.eden");
+        save_world_inner(read_ws(&state).world.as_ref().unwrap(), full.to_str().unwrap(), false).expect("full save");
+        assert_eq!(fs::read(&full).unwrap(), expected, "full save must match too (sanity)");
+        assert_eq!(fs::read(&dest).unwrap(), fs::read(&full).unwrap(),
+            "incremental and full saves of the same state must be byte-identical");
+
+        // The backup captured the file as it was *before* this save.
+        let bak = dir.join("world.eden.bak");
+        assert!(bak.exists(), "an in-place save must leave a .bak behind");
+        assert_eq!(fs::read(&bak).unwrap(), original,
+            ".bak must hold the pre-save bytes — an in-place write must not bleed through the clone");
+
+        assert!(!wal_path(&dest).exists(), "the redo log must be removed once the save completed");
+        {
+            let ws = read_ws(&state);
+            assert!(ws.dirty.since_disk.is_empty(), "a completed save discharges since_disk");
+            assert!(!ws.dirty.header_disk);
+            let di = ws.disk_image.as_ref().expect("disk image must be re-recorded");
+            let md = fs::metadata(&dest).unwrap();
+            assert_eq!(di.len, md.len());
+            assert_eq!(di.mtime, md.modified().unwrap(), "recorded mtime must match the file we just wrote");
+        }
+
+        // And a second edit + save still works against the freshly recorded image.
+        {
+            let mut ws = write_ws(&state);
+            with_edit(&mut ws, "delete", (16, 0, 20, 5), (16, 0, 20, 5), |world| {
+                delete_blocks_inner(world, 16, 0, 20, 5, 0, 63, None);
+                Ok(())
+            }).expect("edit 2");
+        }
+        assert!(try_incremental_save(&state, dest.to_str().unwrap(), false).expect("incremental save 2"),
+            "the image recorded by the previous incremental save must make the next one eligible");
+        assert_eq!(fs::read(&dest).unwrap(), world_bytes(&read_ws(&state)));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The eligibility gate exists to catch a destination that something outside this editor (the
+    /// game, a sync client, a second instance) has written since our last save — patching such a file
+    /// would splice our chunks into someone else's world. Both detectors must decline *and* leave the
+    /// destination completely untouched, so the caller's full atomic write is still the only writer.
+    #[test]
+    fn test_incremental_save_declines_on_external_modification() {
+        let dir = stage4_dir("external_mod");
+        let original = make_bumpy_world_grid(2, 8, |_, _| 20);
+        let dest = dir.join("world.eden");
+        let state: AppState = RwLock::new(ws_with_disk_image(original.clone(), &dest));
+
+        {
+            let mut ws = write_ws(&state);
+            with_edit(&mut ws, "delete", (0, 0, 5, 5), (0, 0, 5, 5), |world| {
+                delete_blocks_inner(world, 0, 0, 5, 5, 0, 63, None);
+                Ok(())
+            }).expect("edit");
+        }
+
+        // (a) mtime moved. Asserted by corrupting the *recorded* value rather than touching the file:
+        // exactly equivalent to the file's mtime having moved, but independent of the host
+        // filesystem's timestamp granularity.
+        write_ws(&state).disk_image.as_mut().unwrap().mtime = std::time::SystemTime::UNIX_EPOCH;
+        assert!(!try_incremental_save(&state, dest.to_str().unwrap(), false).expect("decline, not error"),
+            "a destination whose mtime no longer matches our record must decline");
+        assert_eq!(fs::read(&dest).unwrap(), original, "a declined save must not touch the destination");
+        assert!(!wal_path(&dest).exists(), "a declined save must not leave a redo log");
+        assert_eq!(read_ws(&state).dirty.since_disk.len(), 1, "a declined save must not discharge dirty state");
+
+        // (b) length moved (an external truncation or extension).
+        {
+            let md = fs::metadata(&dest).unwrap();
+            let mut di = write_ws(&state);
+            let di = di.disk_image.as_mut().unwrap();
+            di.mtime = md.modified().unwrap();     // restore (a)'s sabotage
+            di.len = md.len();
+        }
+        let mut longer = original.clone();
+        longer.push(0);
+        fs::write(&dest, &longer).unwrap();
+        assert!(!try_incremental_save(&state, dest.to_str().unwrap(), false).expect("decline, not error"),
+            "a destination whose length no longer matches our record must decline");
+        assert_eq!(fs::read(&dest).unwrap(), longer, "a declined save must not touch the destination");
+
+        // (c) a compressed image can never be patched in place.
+        {
+            let md = fs::metadata(&dest).unwrap();
+            let mut ws = write_ws(&state);
+            ws.disk_image = Some(DiskImage {
+                path: dest.clone(), len: md.len(), mtime: md.modified().unwrap(), compressed: true,
+            });
+        }
+        assert!(!try_incremental_save(&state, dest.to_str().unwrap(), false).expect("decline, not error"),
+            "a zip on disk is not a patchable image of world.bytes");
+
+        // (d) no recorded image at all (e.g. a freshly recovered autosave, or a Save As to a new path).
+        write_ws(&state).disk_image = None;
+        assert!(!try_incremental_save(&state, dest.to_str().unwrap(), false).expect("decline, not error"),
+            "with no known-good image there is nothing to patch against");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `set_spawn_pos` / `rename_world` / `set_sky_grid` write header bytes only and never dirty a
+    /// chunk, so the header span is the one case where an incremental save has no chunk work at all.
+    /// It must still be written — and must not disturb a single byte outside the 192-byte header.
+    #[test]
+    fn test_incremental_save_writes_header_only_change() {
+        let dir = stage4_dir("header_only");
+        let original = make_bumpy_world_grid(2, 8, |_, _| 20);
+        let dest = dir.join("world.eden");
+        let state: AppState = RwLock::new(ws_with_disk_image(original.clone(), &dest));
+
+        {
+            let mut ws = write_ws(&state);
+            write_spawn(ws.world.as_mut().unwrap(), 5.0, 7.0);
+            ws.dirty.mark_header();
+        }
+        assert!(read_ws(&state).dirty.since_disk.is_empty(), "a header write dirties no chunk");
+
+        assert!(try_incremental_save(&state, dest.to_str().unwrap(), false).expect("incremental save"),
+            "a header-only change must still take the fast path");
+
+        let saved = fs::read(&dest).unwrap();
+        let expected = world_bytes(&read_ws(&state));
+        assert_eq!(saved, expected, "the header change must have landed");
+        assert_ne!(saved[0..192], original[0..192], "sanity: the header really did change");
+        assert_eq!(saved[192..], original[192..], "nothing outside the header may be rewritten");
+        assert!(!read_ws(&state).dirty.header_disk, "a completed save discharges header_disk");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Past roughly half the world, patching stops beating one sequential rewrite, so a ⌘A-scale edit
+    /// must fall back to the full atomic write (the plan's manual check 6) — and, like every other
+    /// decline, must leave the destination untouched on the way out.
+    #[test]
+    fn test_incremental_save_declines_when_dirty_set_too_large() {
+        let dir = stage4_dir("too_large");
+        let original = make_bumpy_world_grid(2, 8, |_, _| 20);
+        let dest = dir.join("world.eden");
+        let state: AppState = RwLock::new(ws_with_disk_image(original.clone(), &dest));
+
+        {
+            let mut ws = write_ws(&state);
+            with_edit(&mut ws, "delete", (0, 0, 31, 31), (0, 0, 31, 31), |world| {
+                delete_blocks_inner(world, 0, 0, 31, 31, 0, 63, None);
+                Ok(())
+            }).expect("delete everything");
+        }
+        assert_eq!(read_ws(&state).dirty.since_disk.len(), 4, "all four chunks must be dirty");
+
+        assert!(!try_incremental_save(&state, dest.to_str().unwrap(), false).expect("decline, not error"),
+            "4 × 32 KB of a ~132 KB world is past the half-world threshold");
+        assert_eq!(fs::read(&dest).unwrap(), original, "a declined save must not touch the destination");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Save, undo, save again: the second save must put the *reverted* bytes on disk. Undo bypasses
+    /// `with_edit_inner` entirely, so this is the regression guard for `undo_edit_inner`'s own
+    /// `mark_chunks` hook still feeding the save path (Stage 1's second hook row).
+    #[test]
+    fn test_incremental_save_after_undo_writes_reverted_bytes() {
+        let dir = stage4_dir("after_undo");
+        let original = make_bumpy_world_grid(2, 8, |_, _| 20);
+        let dest = dir.join("world.eden");
+        let state: AppState = RwLock::new(ws_with_disk_image(original.clone(), &dest));
+
+        {
+            let mut ws = write_ws(&state);
+            with_edit(&mut ws, "delete", (0, 0, 5, 5), (0, 0, 5, 5), |world| {
+                delete_blocks_inner(world, 0, 0, 5, 5, 0, 63, None);
+                Ok(())
+            }).expect("edit");
+        }
+        assert!(try_incremental_save(&state, dest.to_str().unwrap(), false).expect("save 1"));
+        assert_ne!(fs::read(&dest).unwrap(), original, "sanity: the edit is on disk");
+
+        undo_edit_inner(&mut write_ws(&state)).expect("undo");
+        assert_eq!(read_ws(&state).dirty.since_disk.len(), 1, "undo must re-dirty the chunk it reverted");
+
+        assert!(try_incremental_save(&state, dest.to_str().unwrap(), false).expect("save 2"));
+        assert_eq!(fs::read(&dest).unwrap(), original,
+            "saving after an undo must write the reverted bytes, restoring the original file exactly");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A committed redo log is rolled forward on the next open, and — because every span holds the
+    /// exact bytes that belong at its offset, not a delta — replaying one that was already applied
+    /// writes the same bytes again. That idempotency is what makes "crashed somewhere between step 3
+    /// and step 4" a single case rather than a spectrum.
+    #[test]
+    fn test_wal_replay_is_idempotent() {
+        let dir = stage4_dir("wal_idempotent");
+        let original = make_bumpy_world_grid(2, 8, |_, _| 20);
+        let dest = dir.join("world.eden");
+        fs::write(&dest, &original).unwrap();
+        let base_len = original.len() as u64;
+
+        // A span carrying a whole rewritten chunk (0,0), plus a header span — the two span shapes a
+        // real save produces.
+        let chunk = vec![0x5Au8; 32768];
+        let mut header = original[0..192].to_vec();
+        header[40] = b'Z';
+        let spans = vec![
+            (0u64, journal::HEADER_SPAN.0, journal::HEADER_SPAN.1, header.clone()),
+            (4096u64, 0, 0, chunk.clone()),
+        ];
+
+        let mut expected = original.clone();
+        expected[0..192].copy_from_slice(&header);
+        expected[4096..4096 + 32768].copy_from_slice(&chunk);
+
+        write_test_wal(&dest, base_len, &spans, true);
+        recover_wal(&dest);
+        assert_eq!(fs::read(&dest).unwrap(), expected, "a committed log must be rolled forward");
+        assert!(!wal_path(&dest).exists(), "a successfully applied log must be removed");
+
+        // Replay the identical log over the already-repaired file: same result, no drift.
+        write_test_wal(&dest, base_len, &spans, true);
+        recover_wal(&dest);
+        assert_eq!(fs::read(&dest).unwrap(), expected, "replaying an applied log must be a no-op");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The commit record is the entire basis for "the destination was never touched": a log without
+    /// one was still being written when the crash happened, which is strictly before step 3 begins.
+    /// All three malformed shapes must be discarded with the destination left pristine.
+    #[test]
+    fn test_uncommitted_wal_is_discarded() {
+        let dir = stage4_dir("wal_uncommitted");
+        let original = make_bumpy_world_grid(2, 8, |_, _| 20);
+        let dest = dir.join("world.eden");
+        let base_len = original.len() as u64;
+        let spans = vec![(4096u64, 0, 0, vec![0x5Au8; 32768])];
+
+        // (a) No commit record.
+        fs::write(&dest, &original).unwrap();
+        write_test_wal(&dest, base_len, &spans, false);
+        recover_wal(&dest);
+        assert_eq!(fs::read(&dest).unwrap(), original, "an uncommitted log must not be applied");
+        assert!(!wal_path(&dest).exists(), "an uncommitted log must be discarded");
+
+        // (b) Committed, then torn — a crash while the log itself was being flushed.
+        write_test_wal(&dest, base_len, &spans, true);
+        {
+            let wal = wal_path(&dest);
+            let len = fs::metadata(&wal).unwrap().len();
+            let f = fs::OpenOptions::new().write(true).open(&wal).unwrap();
+            f.set_len(len - 3).unwrap();
+        }
+        recover_wal(&dest);
+        assert_eq!(fs::read(&dest).unwrap(), original, "a torn log must not be partially applied");
+        assert!(!wal_path(&dest).exists());
+
+        // (c) A log belonging to a different file entirely (mismatched base_len).
+        write_test_wal(&dest, base_len + 1, &spans, true);
+        recover_wal(&dest);
+        assert_eq!(fs::read(&dest).unwrap(), original, "a log that doesn't fit this file must not apply");
+        assert!(!wal_path(&dest).exists());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// "Save As to a new path, then ⌘S" (the plan's manual check 5): the first save has no image to
+    /// patch against and must decline to the full write, and recording that write must make the
+    /// *second* save incremental against the new path.
+    #[test]
+    fn test_full_write_establishes_disk_image_for_next_incremental() {
+        let dir = stage4_dir("save_as");
+        let original = make_bumpy_world_grid(2, 8, |_, _| 20);
+        let dest = dir.join("saved-as.eden");
+        let state: AppState = RwLock::new(ws_with(original.clone())); // no disk image: nothing loaded from a file
+
+        {
+            let mut ws = write_ws(&state);
+            with_edit(&mut ws, "delete", (0, 0, 5, 5), (0, 0, 5, 5), |world| {
+                delete_blocks_inner(world, 0, 0, 5, 5, 0, 63, None);
+                Ok(())
+            }).expect("edit 1");
+        }
+
+        assert!(!try_incremental_save(&state, dest.to_str().unwrap(), false).expect("decline, not error"),
+            "a Save As to an unknown path must decline to the full write");
+
+        // What `save_world`'s full-write branch does.
+        let seq = {
+            let ws = read_ws(&state);
+            let seq = ws.dirty.seq;
+            save_world_inner(ws.world.as_ref().unwrap(), dest.to_str().unwrap(), false).expect("full save");
+            seq
+        };
+        record_full_write(&state, &dest, false, seq).expect("record full write");
+        {
+            let ws = read_ws(&state);
+            assert!(ws.dirty.since_disk.is_empty(), "a full write discharges the whole dirty set");
+            assert_eq!(ws.disk_image.as_ref().unwrap().path, dest);
+        }
+
+        {
+            let mut ws = write_ws(&state);
+            with_edit(&mut ws, "delete", (16, 0, 20, 5), (16, 0, 20, 5), |world| {
+                delete_blocks_inner(world, 16, 0, 20, 5, 0, 63, None);
+                Ok(())
+            }).expect("edit 2");
+        }
+        assert!(try_incremental_save(&state, dest.to_str().unwrap(), false).expect("incremental save"),
+            "the image recorded by the full write must make the next save incremental");
+        assert_eq!(fs::read(&dest).unwrap(), world_bytes(&read_ws(&state)));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `record_full_write`'s `seq` comparison is what stops a save from clearing dirty state it
+    /// didn't actually write — an edit (or a whole world swap) landing between the save's read guard
+    /// and its write guard must invalidate the capture. Every mutator of `DirtyState` therefore has
+    /// to move the counter, `clear_all` included: a world load/close that reset it could otherwise
+    /// let a stale capture compare equal and discharge the *new* world's dirty set.
+    #[test]
+    fn test_dirty_seq_invalidates_a_stale_capture() {
+        let mut d = DirtyState::default();
+
+        let captured = d.seq;
+        d.mark_chunks([(0, 0)]);
+        assert_ne!(d.seq, captured, "mark_chunks must invalidate a capture taken before it");
+
+        let captured = d.seq;
+        d.mark_header();
+        assert_ne!(d.seq, captured, "mark_header must invalidate a capture taken before it");
+
+        let captured = d.seq;
+        d.clear_all();
+        assert_ne!(d.seq, captured, "clear_all (world load/close) must invalidate a capture too");
+    }
+
+    /// A declined incremental save must not have written to the destination — and the one path that
+    /// could violate that is `record_full_write` being reached with a stale `seq`. Exercise that
+    /// branch directly: a capture taken before an edit must record nothing at all.
+    #[test]
+    fn test_record_full_write_ignores_a_stale_capture() {
+        let dir = stage4_dir("stale_capture");
+        let original = make_bumpy_world_grid(2, 8, |_, _| 20);
+        let dest = dir.join("world.eden");
+        let state: AppState = RwLock::new(ws_with_disk_image(original.clone(), &dest));
+
+        let stale = read_ws(&state).dirty.seq;
+        {
+            let mut ws = write_ws(&state);
+            with_edit(&mut ws, "delete", (0, 0, 5, 5), (0, 0, 5, 5), |world| {
+                delete_blocks_inner(world, 0, 0, 5, 5, 0, 63, None);
+                Ok(())
+            }).expect("edit landing 'during' the save");
+        }
+
+        record_full_write(&state, &dest, false, stale).expect("must not error");
+        let ws = read_ws(&state);
+        assert_eq!(ws.dirty.since_disk.len(), 1,
+            "an edit that landed after the capture must stay dirty — clearing it would drop it from the file");
+        // The pre-existing image is left as it was rather than being advanced to describe a file that
+        // doesn't hold that edit, so the next save re-checks it and falls back if it no longer fits.
+        assert_eq!(ws.disk_image.as_ref().unwrap().len, original.len() as u64);
+
+        drop(ws);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// B2 face-fill bucket: `find_connected_face_cells` must follow a contiguous same-type run
@@ -7814,6 +10051,99 @@ mod tests {
         assert_eq!(px(&capped),   stone, "cutaway render shows the block under the cap (stone)");
     }
 
+    /// The binary IPC envelope (audit H2) is the contract `decodeEnvelope` in codec.ts reads back:
+    /// a u32 LE header length, the header JSON, then the bodies concatenated — with the header
+    /// padded so the body starts 4-byte aligned (the JS side takes `Float32Array` *views* over it).
+    #[test]
+    fn test_ipc_envelope_framing() {
+        use tauri::ipc::InvokeResponseBody;
+        let unwrap_raw = |b: InvokeResponseBody| match b {
+            InvokeResponseBody::Raw(v) => v,
+            InvokeResponseBody::Json(_) => panic!("envelope must be a raw body, not JSON"),
+        };
+
+        // Single body: a pixel patch. Header carries the dims, body is exactly the pixels.
+        let patch = PixelPatch { x: 7, y: 9, width: 2, height: 1, lod: 4, pixels: vec![1, 2, 3, 4, 5, 6, 7, 8] };
+        let bytes = unwrap_raw(tauri::ipc::IpcResponse::body(patch).expect("frame failed"));
+        let hlen = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
+        assert_eq!((4 + hlen) % 4, 0, "body must start 4-byte aligned");
+        let hdr: serde_json::Value = serde_json::from_slice(&bytes[4..4 + hlen]).expect("header must be valid JSON");
+        assert_eq!(hdr["x"], 7);
+        assert_eq!(hdr["y"], 9);
+        assert_eq!(hdr["width"], 2);
+        assert_eq!(hdr["height"], 1);
+        assert_eq!(hdr["lod"], 4);
+        assert_eq!(&bytes[4 + hlen..], &[1, 2, 3, 4, 5, 6, 7, 8], "body is the pixels, verbatim");
+
+        // Multiple bodies concatenate in order, and the header's `lens` is what splits them.
+        #[derive(Serialize)]
+        struct H { lens: [u32; 3] }
+        let body = unwrap_raw(
+            ipc_envelope(&H { lens: [4, 0, 8] }, &[&[9u8; 4][..], &[][..], &[3u8; 8][..]]).expect("frame failed"),
+        );
+        let hlen = u32::from_le_bytes(body[..4].try_into().unwrap()) as usize;
+        assert_eq!(body.len(), 4 + hlen + 12);
+        assert_eq!(&body[4 + hlen..4 + hlen + 4], &[9u8; 4]);
+        assert_eq!(&body[4 + hlen + 4..], &[3u8; 8]);
+
+        // A `None` header (the "no selection mask" case) frames as literal JSON null with no body.
+        let none = unwrap_raw(tauri::ipc::IpcResponse::body(
+            SelectionMaskInfo { mask: None, bits: Vec::new() },
+        ).expect("frame failed"));
+        let hlen = u32::from_le_bytes(none[..4].try_into().unwrap()) as usize;
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&none[4..4 + hlen]).unwrap(), serde_json::Value::Null);
+        assert_eq!(none.len(), 4 + hlen, "no body when there's no mask");
+    }
+
+    /// LOD rendering (audit H6) is *point sampling*, not averaging: pixel (ox,oy) of a lod-N patch
+    /// must be byte-identical to pixel (ox*N, oy*N) of the full-resolution patch over the same
+    /// rect. That pins both the output dimensions and the sampling phase — an off-by-one in either
+    /// would shift the zoomed-out map against the tile grid it's drawn into.
+    #[test]
+    fn test_render_lod_matches_sampled_full_render() {
+        let world = parse_world_inner(mmap_from_bytes(make_test_world())).expect("parse failed");
+        let w = (world.w_chunks * 16) as i32;
+        let h = (world.h_chunks * 16) as i32;
+        let full = render_pixels_patch(&world, 0, 0, w - 1, h - 1, None);
+        assert_eq!(full.lod, 1, "the unscoped renderer is lod 1");
+
+        for lod in [2u32, 4, 8] {
+            let p = render_pixels_patch_lod(&world, 0, 0, w - 1, h - 1, None, lod);
+            assert_eq!(p.lod, lod);
+            assert_eq!(p.width,  (w as u32 - 1) / lod + 1, "lod {lod} width");
+            assert_eq!(p.height, (h as u32 - 1) / lod + 1, "lod {lod} height");
+            for oy in 0..p.height {
+                for ox in 0..p.width {
+                    let lo = ((oy * p.width + ox) * 4) as usize;
+                    let fo = (((oy * lod) * full.width + ox * lod) * 4) as usize;
+                    assert_eq!(&p.pixels[lo..lo + 4], &full.pixels[fo..fo + 4],
+                        "lod {lod} pixel ({ox},{oy}) must be the block at ({},{})", ox * lod, oy * lod);
+                }
+            }
+        }
+
+        // A range whose length isn't a multiple of the step still covers its first sample and
+        // never reads past `x2`: 0..=14 at step 4 samples 0,4,8,12 → 4 pixels.
+        let ragged = render_pixels_patch_lod(&world, 0, 0, 14, 14, None, 4);
+        assert_eq!((ragged.width, ragged.height), (4, 4));
+
+        // Same contract for the z-slice renderer, which shares the tile grid.
+        let zfull = render_zslice_patch_inner(&world, 0, 0, 0, w - 1, h - 1);
+        let zlod  = render_zslice_patch_lod(&world, 0, 0, 0, w - 1, h - 1, 4);
+        assert_eq!((zlod.width, zlod.height), ((w as u32 - 1) / 4 + 1, (h as u32 - 1) / 4 + 1));
+        for oy in 0..zlod.height {
+            for ox in 0..zlod.width {
+                let lo = ((oy * zlod.width + ox) * 4) as usize;
+                let fo = (((oy * 4) * zfull.width + ox * 4) * 4) as usize;
+                assert_eq!(&zlod.pixels[lo..lo + 4], &zfull.pixels[fo..fo + 4], "zslice lod 4 ({ox},{oy})");
+            }
+        }
+
+        // Out-of-range steps clamp rather than producing a degenerate patch.
+        assert_eq!(render_pixels_patch_lod(&world, 0, 0, w - 1, h - 1, None, 0).lod, 1);
+        assert_eq!(render_pixels_patch_lod(&world, 0, 0, w - 1, h - 1, None, 9999).lod, MAX_LOD);
+    }
+
     /// Backup semantics: first save to an existing path creates path.bak;
     /// second save does NOT overwrite an already-present .bak.
     #[test]
@@ -7830,7 +10160,7 @@ mod tests {
         fs::write(&tmp, sentinel).unwrap();
 
         // First save → .bak should capture the pre-save content
-        save_world_inner(&world, tmp.to_str().unwrap()).expect("first save failed");
+        save_world_inner(&world, tmp.to_str().unwrap(), false).expect("first save failed");
         assert!(tmp_bak.exists(), ".bak must be created on first save over existing file");
         assert_eq!(fs::read(&tmp_bak).unwrap(), sentinel,
             ".bak must contain the pre-save file content");
@@ -7839,12 +10169,53 @@ mod tests {
         fs::write(&tmp, b"intermediate content").unwrap();
 
         // Second save → .bak already exists, must NOT be overwritten
-        save_world_inner(&world, tmp.to_str().unwrap()).expect("second save failed");
+        save_world_inner(&world, tmp.to_str().unwrap(), false).expect("second save failed");
         assert_eq!(fs::read(&tmp_bak).unwrap(), sentinel,
             ".bak must not be overwritten on subsequent saves");
 
         let _ = fs::remove_file(&tmp);
         let _ = fs::remove_file(&tmp_bak);
+    }
+
+    /// Audit C2 Stage 5 — `backupCompressed` writes `<path>.bak.zip` capturing the pre-save file,
+    /// not `world.bytes`; a pre-existing plain `.bak` still counts as "already backed up" so
+    /// toggling the setting mid-session doesn't produce two backups.
+    #[test]
+    fn test_compressed_backup_semantics() {
+        let world = parse_world_inner(mmap_from_bytes(make_test_world())).expect("parse failed");
+
+        let tmp = std::env::temp_dir().join(format!("eden_test_zbackup_{}.eden", std::process::id()));
+        let tmp_bak_zip = std::env::temp_dir().join(format!("eden_test_zbackup_{}.eden.bak.zip", std::process::id()));
+        let tmp_bak = std::env::temp_dir().join(format!("eden_test_zbackup_{}.eden.bak", std::process::id()));
+        let _ = fs::remove_file(&tmp);
+        let _ = fs::remove_file(&tmp_bak_zip);
+        let _ = fs::remove_file(&tmp_bak);
+
+        let sentinel = b"original content before first save";
+        fs::write(&tmp, sentinel).unwrap();
+
+        save_world_inner(&world, tmp.to_str().unwrap(), true).expect("first save failed");
+        assert!(tmp_bak_zip.exists(), ".bak.zip must be created when backupCompressed is on");
+        assert!(!tmp_bak.exists(), "a plain .bak must not also be written");
+        let mut zip = zip::ZipArchive::new(fs::File::open(&tmp_bak_zip).unwrap()).expect("open backup zip");
+        assert_eq!(zip.len(), 1);
+        let mut entry = zip.by_index(0).unwrap();
+        let mut contents = Vec::new();
+        std::io::Read::read_to_end(&mut entry, &mut contents).unwrap();
+        assert_eq!(contents, sentinel, ".bak.zip must contain the pre-save file content");
+        drop(entry);
+        drop(zip);
+
+        fs::write(&tmp, b"intermediate content").unwrap();
+        save_world_inner(&world, tmp.to_str().unwrap(), true).expect("second save failed");
+        let mut zip = zip::ZipArchive::new(fs::File::open(&tmp_bak_zip).unwrap()).expect("open backup zip");
+        let mut entry = zip.by_index(0).unwrap();
+        let mut contents = Vec::new();
+        std::io::Read::read_to_end(&mut entry, &mut contents).unwrap();
+        assert_eq!(contents, sentinel, ".bak.zip must not be overwritten on subsequent saves");
+
+        let _ = fs::remove_file(&tmp);
+        let _ = fs::remove_file(&tmp_bak_zip);
     }
 
     /// Exercise the whole-world procedural generator: it must run without
@@ -8555,7 +10926,7 @@ mod tests {
 
         let tmp = std::env::temp_dir().join("eden_test_full_identity.eden");
         let _ = fs::remove_file(&tmp);
-        save_world_inner(&world, tmp.to_str().unwrap()).expect("save failed");
+        save_world_inner(&world, tmp.to_str().unwrap(), false).expect("save failed");
 
         let saved_bytes = fs::read(&tmp).expect("read back failed");
         assert_eq!(original, saved_bytes, "unedited save must be byte-identical to the source file");
@@ -8799,27 +11170,106 @@ mod tests {
         world.bytes[blk(4, 6, 5)] = 72;
         let index = build_lamp_index(&world);
         assert_eq!(index.get(&(0, 0)), Some(&vec![[4, 6, 5]]), "lamp bucketed at its chunk with local coords");
+
+        // The band-major linear scan (audit H3) must decode `(lx, ly, lz)` back out of a flat
+        // half-band offset correctly in *every* band, and must never read the paint half — a paint
+        // byte that happens to hold 72 is colour index 72, not a lamp.
+        world.bytes[blk(15, 15, 63)] = 72; // last voxel of the last band
+        world.bytes[blk(0, 0, 16)] = 72;   // first voxel of band 1
+        world.bytes[pnt(1, 1, 20)] = 72;   // paint byte — must be ignored
+        let mut lamps = build_lamp_index(&world).remove(&(0, 0)).expect("lamps present");
+        lamps.sort_unstable();
+        assert_eq!(lamps, vec![[0, 0, 16], [4, 6, 5], [15, 15, 63]],
+                   "every band decoded, paint half-band skipped");
     }
 
-    /// refresh_lamp_index_chunks must follow a placed/removed lamp — the core correctness invariant
-    /// the with_edit/undo/redo hooks rely on.
+    /// Reads must be genuinely *shared* — that is the whole point of the `RwLock` (audit C1 step 2):
+    /// `fetch_tile`/`get_cursor_block`/render must keep running while `save_world` holds its guard.
+    /// If `AppState` is ever reverted to a `Mutex`, the second acquisition blocks forever and this
+    /// fails on the timeout instead of silently regressing to the old freeze-during-save behaviour.
     #[test]
-    fn refresh_lamp_index_tracks_place_and_remove() {
-        let mut world = parse_world_inner(mmap_from_bytes(make_test_world())).expect("parse failed");
+    fn app_state_readers_do_not_block_each_other() {
+        use std::sync::{mpsc, Arc};
+        let state = Arc::new(AppState::new(WorldState::new()));
+        let held = read_ws(&state); // stands in for a long save holding its read guard
+        let (tx, rx) = mpsc::channel();
+        let other = Arc::clone(&state);
+        let t = std::thread::spawn(move || {
+            let ws = read_ws(&other);
+            tx.send(ws.world.is_none()).unwrap();
+        });
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(5)),
+            Ok(true),
+            "a second reader must acquire while the first still holds its guard",
+        );
+        drop(held);
+        t.join().unwrap();
+    }
+
+    /// Mutate `world.bytes` at `writes` and replay the resulting undo delta into `ws.lamp_index`,
+    /// exactly as `with_edit_inner`/`undo_edit_inner` do. `z_range` picks the snapshot scope, which
+    /// is what decides `Sparse` vs `Full` in `diff_chunk`.
+    fn edit_and_replay_delta(ws: &mut WorldState, z_range: Option<(i32, i32)>, writes: &[(usize, u8)]) {
+        let pre = snapshot_chunks_full(ws.world.as_ref().unwrap(), &[(0, 0)], z_range);
+        for &(off, byte) in writes {
+            ws.world.as_mut().unwrap().bytes[off] = byte;
+        }
+        let world = ws.world.as_ref().unwrap();
+        let snaps: Vec<ChunkSnapshot> = pre.into_iter()
+            .filter_map(|(cx, cy, start, data)| diff_chunk(world, cx, cy, start, &data))
+            .collect();
+        ws.lamp_index.apply_delta(world, &snaps);
+    }
+
+    /// The lamp index must follow a placed/removed lamp — the core correctness invariant the
+    /// with_edit/undo/redo hooks rely on. Now driven by the edit's undo delta (audit H3) rather
+    /// than a full chunk rescan, so this also asserts the two agree.
+    #[test]
+    fn lamp_index_delta_tracks_place_and_remove() {
         let mut ws = WorldState::new();
-        ws.world = Some(std::mem::replace(&mut world, parse_world_inner(mmap_from_bytes(make_test_world())).unwrap()));
-        ws.lamp_index = Some(build_lamp_index(ws.world.as_ref().unwrap()));
-        assert!(ws.lamp_index.as_ref().unwrap().is_empty(), "starts with no lamps");
+        ws.world = Some(parse_world_inner(mmap_from_bytes(make_test_world())).expect("parse failed"));
+        ws.lamp_index.build_now(ws.world.as_ref().unwrap());
+        assert!(ws.lamp_index.snapshot().unwrap().is_empty(), "starts with no lamps");
 
-        // Place a lamp, then refresh chunk (0,0): it must appear.
-        ws.world.as_mut().unwrap().bytes[blk(4, 6, 5)] = 72;
-        refresh_lamp_index_chunks(&mut ws, &[(0, 0)]);
-        assert_eq!(ws.lamp_index.as_ref().unwrap().get(&(0, 0)), Some(&vec![[4, 6, 5]]), "placed lamp indexed after refresh");
+        edit_and_replay_delta(&mut ws, None, &[(blk(4, 6, 5), 72)]);
+        assert_eq!(ws.lamp_index.snapshot().unwrap().get(&(0, 0)), Some(&vec![[4, 6, 5]]),
+                   "placed lamp indexed from the delta");
+        assert_eq!(ws.lamp_index.snapshot().unwrap(), build_lamp_index(ws.world.as_ref().unwrap()),
+                   "delta path agrees with a from-scratch rescan");
 
-        // Break it (set to air), refresh again: the bucket must be removed.
-        ws.world.as_mut().unwrap().bytes[blk(4, 6, 5)] = 0;
-        refresh_lamp_index_chunks(&mut ws, &[(0, 0)]);
-        assert!(ws.lamp_index.as_ref().unwrap().get(&(0, 0)).is_none(), "removed lamp drops its chunk bucket");
+        edit_and_replay_delta(&mut ws, None, &[(blk(4, 6, 5), 0)]);
+        assert!(ws.lamp_index.snapshot().unwrap().get(&(0, 0)).is_none(),
+                "removed lamp drops its chunk bucket");
+    }
+
+    /// A dense edit falls back to `ChunkDelta::Full`; the lamp index must replay that branch too.
+    /// Also pins the paint half-band skip: byte 72 written into a *paint* byte is a colour index,
+    /// not a lamp, and must never enter the index.
+    #[test]
+    fn lamp_index_delta_handles_full_delta_and_skips_paint() {
+        let mut ws = WorldState::new();
+        ws.world = Some(parse_world_inner(mmap_from_bytes(make_test_world())).expect("parse failed"));
+        ws.lamp_index.build_now(ws.world.as_ref().unwrap());
+
+        // Fill band 0's entire block half with lamps → 4096 changed bytes over an 8192-byte
+        // band-scoped snapshot, so `diff_chunk` picks `Full` rather than `Sparse`.
+        let writes: Vec<(usize, u8)> = (0..16)
+            .flat_map(|lx| (0..16).flat_map(move |ly| (0..16).map(move |z| (blk(lx, ly, z), 72u8))))
+            .collect();
+        edit_and_replay_delta(&mut ws, Some((0, 15)), &writes);
+        let rescan = build_lamp_index(ws.world.as_ref().unwrap());
+        assert_eq!(rescan.get(&(0, 0)).map(|v| v.len()), Some(4096), "the whole band is lamps");
+        let mut from_delta = ws.lamp_index.snapshot().unwrap().remove(&(0, 0)).unwrap();
+        let mut from_scan = rescan.get(&(0, 0)).unwrap().clone();
+        from_delta.sort_unstable();
+        from_scan.sort_unstable();
+        assert_eq!(from_delta, from_scan, "Full-delta replay matches a from-scratch rescan");
+
+        // Paint byte holding 72 must not register as a lamp.
+        edit_and_replay_delta(&mut ws, None, &[(pnt(2, 2, 40), 72)]);
+        assert_eq!(ws.lamp_index.snapshot().unwrap().get(&(0, 0)).map(|v| v.len()), Some(4096),
+                   "a paint byte of 72 is a colour, not a lamp");
     }
 
     // ── Sculpt engine (Pass 1) test fixtures ──────────────────────────────────────
@@ -9031,6 +11481,53 @@ mod tests {
         assert!(ws.sculpt_session.is_none(), "undo reaps the session it belonged to");
         sculpt(&mut ws, None, "raise", 4, 0.0, Some((8, 8, 3)), gid);
         assert_eq!(world_bytes(&ws), reference, "post-undo stamp re-seeds, no residual carryover");
+    }
+
+    /// Audit M1 — `sculpt_terrain_batch_inner` (one `with_edit_grouped` call for N stamps) must be
+    /// byte-for-byte equivalent to N sequential same-group `sculpt_terrain_inner` calls (the old
+    /// per-stamp loop). Covers a mode that reads the float session (`raise`) and one that reads a
+    /// wide neighbourhood off the live world each stamp (`smooth`), over overlapping discs so a
+    /// stamp's own prior neighbours are re-read after mutation — the case a naive batch could get
+    /// wrong by reusing a stale `height_map`.
+    #[test]
+    fn test_stamp_batch_matches_sequential_calls() {
+        let base = make_bumpy_world(8, |x, y| 20 + ((x * 7 + y * 3) % 5) as i32);
+        let centers = vec![[6, 6], [8, 6], [7, 8], [9, 9]];
+        let r = 3;
+        let gid = Some(777u64);
+
+        for mode in ["raise", "smooth"] {
+            // Reference: N sequential single-stamp calls sharing one group.
+            let mut seq = ws_with(base.clone());
+            for c in &centers {
+                sculpt_terrain_inner(
+                    &mut seq, None, mode.into(), 3, 0, None, None, None, None,
+                    Some(0.3), Some("smooth".into()), None, None, None,
+                    Some(c[0]), Some(c[1]), Some(r), None, gid,
+                    None, None, None, None, None, None, None,
+                ).expect("sequential stamp");
+            }
+
+            // Batched: one `sculpt_terrain_batch_inner` call over all centres.
+            let mut batch = ws_with(base.clone());
+            sculpt_terrain_batch_inner(
+                &mut batch, centers.clone(), mode.into(), 3, 0, None, None, None, None,
+                Some(0.3), Some("smooth".into()), None, None, None, r, None, gid,
+                None, None, None, None, None, None, None,
+            ).expect("batched stamps");
+
+            assert_eq!(
+                world_bytes(&seq), world_bytes(&batch),
+                "mode {mode}: batched stamps must match N sequential same-group calls exactly"
+            );
+            // One flush = one undo stack entry now, vs. N before — still one logical undo unit
+            // either way (count_undo_groups collapses a same-group run), but the batch path is the
+            // whole point of M1: assert it landed.
+            assert_eq!(batch.undo_stack.len(), 1, "batch commits one UndoEntry for the whole flush");
+            assert_eq!(seq.undo_stack.len(), centers.len(), "sequential calls still push one entry each");
+            assert_eq!(count_undo_groups(&batch.undo_stack), count_undo_groups(&seq.undo_stack),
+                       "same logical undo-group count either way");
+        }
     }
 
     // ── Non-rectangular selection (SelectionMask) ─────────────────────────────────
@@ -10023,7 +12520,7 @@ mod tests {
             "{}.noop_save_test.eden",
             extracted.file_stem().unwrap().to_string_lossy()
         ));
-        save_world_inner(&world, out_path.to_str().unwrap()).expect("save failed");
+        save_world_inner(&world, out_path.to_str().unwrap(), false).expect("save failed");
         let original = fs::read(extracted).expect("read original fixture");
         let saved = fs::read(&out_path).expect("read saved output");
         let diffs = diff_positions(&original, &saved, 20);
@@ -10082,7 +12579,7 @@ mod tests {
             "{}.edit_locality_test.eden",
             extracted.file_stem().unwrap().to_string_lossy()
         ));
-        save_world_inner(&world, out_path.to_str().unwrap()).expect("save failed");
+        save_world_inner(&world, out_path.to_str().unwrap(), false).expect("save failed");
         let saved = fs::read(&out_path).expect("read saved output");
         let diffs = diff_positions(&original, &saved, 20);
         let _ = fs::remove_file(&out_path);
@@ -10124,7 +12621,7 @@ mod tests {
             "{}.undo_roundtrip_test.eden",
             extracted.file_stem().unwrap().to_string_lossy()
         ));
-        save_world_inner(&world, out_path.to_str().unwrap()).expect("save failed");
+        save_world_inner(&world, out_path.to_str().unwrap(), false).expect("save failed");
         let saved = fs::read(&out_path).expect("read saved output");
         let diffs = diff_positions(&original, &saved, 20);
         let _ = fs::remove_file(&out_path);

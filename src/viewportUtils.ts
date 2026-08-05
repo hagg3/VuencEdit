@@ -3,8 +3,6 @@
 // decoding. Pure functions only — both callers manage their own refs/draw loops, so a shared
 // hook would just relocate state without removing duplication. See CLAUDE.md M4.
 
-import { decodeU8 } from "./codec";
-import type { PixelPatchRaw } from "./types";
 
 export interface ViewTransform { x: number; y: number; scale: number; }
 
@@ -132,11 +130,16 @@ export function makeSeqGuard() {
   };
 }
 
-/** Decodes a base64 pixel patch and blits it onto a 2D context at (dx, dy). */
-export function putPatchPixels(ctx: CanvasRenderingContext2D, raw: PixelPatchRaw, dx = 0, dy = 0): void {
-  const pixels = decodeU8(raw.pixels);
-  const img = new ImageData(new Uint8ClampedArray(pixels), raw.width, raw.height);
-  ctx.putImageData(img, dx, dy);
+/** Blits a decoded pixel buffer onto a 2D context at (dx, dy). `pixels` is a view over the raw IPC
+ *  response bytes (audit H2); re-viewing it as `Uint8ClampedArray` keeps it a view, so the whole
+ *  path from the webview's response buffer to `putImageData` is copy-free. */
+export function putPatchPixels(
+  ctx: CanvasRenderingContext2D,
+  patch: { width: number; height: number; pixels: Uint8Array },
+  dx = 0, dy = 0,
+): void {
+  const clamped = new Uint8ClampedArray(patch.pixels.buffer, patch.pixels.byteOffset, patch.pixels.byteLength);
+  ctx.putImageData(new ImageData(clamped, patch.width, patch.height), dx, dy);
 }
 
 // ── keyboard-target guard ─────────────────────────────────────────────────────

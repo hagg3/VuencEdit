@@ -7,10 +7,68 @@ surface, grouped by subsystem. Call from the frontend with
 
 **Conventions**
 - Rust `snake_case` params are **camelCased** on the JS side (`z_min` → `zMin`).
-- Bulk pixel data returns as base64 (`PixelPatch`/`PreviewData`) — decode via
-  `src/codec.ts` / the `decode*` helpers in `src/types.ts`.
+- Bulk binary data (`PixelPatch`/`PreviewData`/geometry/atlas) returns as a **raw
+  binary envelope**, not JSON — see the section below; decode via the `decode*`
+  helpers in `src/types.ts`.
 - Editing commands return `EditResult { patch, undo_depth, redo_depth }`.
 - Commands marked **(async)** are `#[tauri::command(async)]` (off main thread).
+
+## Binary payload envelope *(2026-08-05, audit H2)*
+
+Payload-carrying commands used to base64-encode their byte buffers inside a JSON
+object. That cost a +33% size inflation, a full encode pass in Rust, a JSON string
+the size of the whole payload, and a **per-byte `atob` loop on the JS main thread**
+— five copies of every buffer. A ⌘A + Fill on a 451×528-chunk world produced a
+243 MB patch → 324 MB base64 → a 243 M-iteration JS loop.
+
+Tauri 2's `InvokeResponseBody::Raw` delivers a command's return value to JS as an
+`ArrayBuffer` instead, so none of that is needed. One framing for every such
+command — `ipc_envelope` in `lib.rs`, `decodeEnvelope` in `src/codec.ts`:
+
+```
+[0..4]                u32 LE   header_len
+[4 .. 4+header_len]   JSON     the scalar fields (dimensions, counts, labels)
+[4+header_len ..]     raw      the byte buffers, concatenated in declaration order
+```
+
+**Opting in is a trait impl, not a signature change.** The `#[tauri::command]`
+macro requires `T: tauri::ipc::IpcResponse` for a `Result<T, E>`'s Ok type. Tauri
+provides a blanket `impl<T: Serialize> IpcResponse for T`, but that does *not*
+block a local impl on a **non-`Serialize`** local type. So each payload type drops
+`#[derive(Serialize)]`, gains a small `…Header` struct that keeps it, and
+implements `IpcResponse` to frame itself:
+
+| Type | Header fields | Body |
+|---|---|---|
+| `PixelPatch` | `x, y, width, height, lod` | RGBA pixels |
+| `EditResult` | `patch{…}, undo_depth, redo_depth, operation` | the patch's pixels |
+| `PreviewData` / `PreviewImage` | `width, height` | RGBA pixels |
+| `SelectionMaskInfo` | `Option<{x1,y1,x2,y2}>` | row-major bitset (empty when `null`) |
+| `TexturePackInfo` | `rows, tile, gray_row_offset, name_to_row` | RGBA atlas |
+| `ObjGeometryResult` | `vertex_count{,_t,_e}, lens[9]` | 9 f32 streams |
+
+> ⚠️ **A payload type must not derive `Serialize`.** If it does, the blanket impl
+> silently wins and the command quietly reverts to base64-in-JSON.
+
+**Zero-copy on the JS side.** `decodeEnvelope` returns `body` as a *view* over the
+response bytes; `decodePixelPatch`/`decodePreviewData` pass it straight to
+`putImageData` (re-viewed as `Uint8ClampedArray`), and `decodeGeometry` splits it
+with `splitBody(body, header.lens)` and views each stream with `asF32` for
+`THREE.BufferAttribute`. `Float32Array` views require 4-byte alignment, which is
+why `ipc_envelope` **space-pads the JSON header** until the body starts on a
+4-byte boundary (JSON ignores trailing whitespace).
+
+**The `Option` case.** `Option<T>` has no `IpcResponse` impl of its own, so a
+command that can return "nothing" frames the absence itself: `get_selection_mask`
+returns a `SelectionMaskInfo` whose header is an `Option<SelectionMaskHeader>`
+— a literal JSON `null` header with an empty body. JS reads `header === null`.
+
+**What's left of base64.** Only the **JS → Rust** direction: `encodeU8` in
+`codec.ts` for `set_selection_mask`'s bitset. `serialize_bytes_b64` and `decodeU8`
+are gone.
+
+Tests: `test_ipc_envelope_framing` (lib.rs) pins the wire format, including the
+alignment padding and the null-header case.
 
 ## World lifecycle
 
@@ -21,23 +79,24 @@ surface, grouped by subsystem. Call from the frontend with
 | `rename_world` | `(name)` | Header-only write; bumps `editEpoch` so it isn't lost by the dirty guard. |
 | `set_spawn_pos` | `(px, py) → (f32, f32)` | Sets spawn to surface at (px,py); bumps `editEpoch`. |
 | `get_surface_z` | `(x, y) → Option<i32>` | Highest non-air Z at a column. |
-| `save_world` **(async)** | `(path, compressed)` | Atomic write; `compressed` → deflate-9 ZIP. |
+| `save_world` **(async)** | `(path, compressed, backupCompressed)` | Tries an incremental in-place patch first (audit C2 Stage 4); falls back to atomic write (`compressed` → deflate-9 ZIP). `backupCompressed` picks `.bak` vs. deflated `.bak.zip` for the one-time pre-save backup. See `DOCUMENTATION/02-file-format.md`. |
 | `close_world` | `()` | Releases world/clipboard/undo/temp; reconciles saved-epoch refs. |
-| `autosave_world` **(async)** | `(...)` | Snapshots bytes under lock, writes released, to a sidecar. |
+| `autosave_world` **(async)** | `(...)` | Journaled: a one-time-per-session base clone + append-only compressed journal, not a full rewrite. |
+| `load_autosave` **(async)** | `() → WorldMeta` | Recovery counterpart to `load_world`: stages the autosave base, replays the journal into the staged temp, parses, swaps in. Legacy single-file autosaves (`format: 0`) still route through `load_world`. |
 | `get_autosave_info` / `get_autosave_path` / `discard_autosave` | | Crash-recovery sidecar management. |
 
 ## Rendering (2D)
 
 | Command | Returns | Notes |
 |---|---|---|
-| `fetch_tile` | `PixelPatch` | Top-down tile. Sync (small/frequent). |
+| `fetch_tile` **(async)** | `PixelPatch` | Top-down tile. Optional `lod` (world blocks per pixel) — see [05](05-rendering-2d.md). |
 | `export_png` **(async)** | — | Renders + PNG-encodes in Rust; no pixels over IPC. |
-| `render_zslice_patch` | `PixelPatch` | Constant-Z horizontal layer. |
-| `render_yslice_patch` | `PixelPatch` | Constant world-Y plane (X×Z), row 0 = highest Z. |
-| `render_xslice_patch` | `PixelPatch` | Constant world-X plane (Y×Z). |
+| `render_zslice_patch` **(async)** | `PixelPatch` | Constant-Z horizontal layer. Takes the same optional `lod` as `fetch_tile`. |
+| `render_yslice_patch` **(async)** | `PixelPatch` | Constant world-Y plane (X×Z), row 0 = highest Z. |
+| `render_xslice_patch` **(async)** | `PixelPatch` | Constant world-X plane (Y×Z). |
 | `render_selection_view` **(async)** | `PreviewData` | Orthographic front/side projection of a selection. |
 | `render_full_height_view` **(async)** | `PreviewData` | Full front/side elevation of the footprint. |
-| `render_axo_region` **(async)** | `PreviewData` | Axonometric (isometric) strip render. `ski` = skew. |
+| `render_axo_region` **(async)** | `PixelPatch` | Axonometric (isometric) strip render. `ski` = skew. |
 | `render_axo_clipboard` | `PreviewData` | Axo render of the clipboard. |
 
 See [05 — 2D Rendering](./05-rendering-2d.md).
@@ -114,7 +173,7 @@ See [08 — World Generation](./08-world-generation.md).
 | Command | Notes |
 |---|---|
 | `load_eden_template` | `(path) → chunk_count`. Mmaps `Eden.eden`, parses its directory. |
-| `fetch_template_tile` **(async)** | `PixelPatch`; alpha=0 where no template chunk. |
+| `fetch_template_tile` **(async)** | `PixelPatch`; alpha=0 where no template chunk. Takes `lod`; decodes only the template columns the sampled grid touches. |
 | `expand_world_from_template` **(async)** | Bake template chunks into a new world file. `"expand_progress"` events. |
 | `cancel_expand` | Sets a separate `ExpandCancel` AtomicBool; deletes partial output. |
 

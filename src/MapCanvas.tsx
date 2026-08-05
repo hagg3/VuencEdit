@@ -1,7 +1,7 @@
 import { useEffect, useRef, useCallback, forwardRef, useImperativeHandle } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { brushFootprint, bresenhamLine, linePixels, polygonPixels, rectPixels, ellipsePixels, type WP, type BrushShape, type FillMode } from "./drawTools";
-import { type WorldMeta, type PixelPatch, type PixelPatchRaw } from "./types";
+import { type WorldMeta, type PixelPatch, decodePixelPatch } from "./types";
 import { zoomAtPoint, resizeCanvasToContainer, makeSeqGuard, putPatchPixels, beginFrame, cssWidth, cssHeight, isTypingTarget, chunkToWorld, worldToChunk, CHUNK_SIZE_BLOCKS } from "./viewportUtils";
 import { maskOutline, type OutlinePt } from "./maskUtils";
 
@@ -104,7 +104,9 @@ function sculptWeightAt(d: number, radius: number, softness: number, profile: Dr
   return Math.max(0, Math.min(1, (1 - softness) + dome * softness));
 }
 
-/** World pixels per tile side. Each tile is fetched independently via IPC. */
+/** Output pixels per tile side. A tile always renders TILE×TILE pixels; at LOD `n` it *covers*
+ *  `TILE * n` world blocks per side, so the visible tile count stays roughly constant at any zoom
+ *  instead of exploding when the whole world is on screen (audit H6). */
 const TILE = 512;
 
 /** Number of extra tile rows/cols to prefetch beyond the visible viewport edge. */
@@ -112,6 +114,53 @@ const TILE_BUFFER = 1;
 
 /** Maximum simultaneous in-flight tile fetches. Prevents IPC channel saturation. */
 const MAX_CONCURRENT = 4;
+
+/** Coarsest level of detail the backend will honour — must match `MAX_LOD` in lib.rs. */
+const MAX_LOD = 32;
+
+/** Floor for the tile caches' bounded LRU, in tiles (a full tile is TILE² RGBA ≈ 1 MB). Retaining
+ *  more than the visible window is the point: pan-back and zoom-back hit the cache instead of
+ *  re-fetching tiles that were discarded a frame earlier. `ensureTiles` raises the live limit to
+ *  `2 × the visible window` when that's larger (a 4K viewport can need ~100 tiles on its own, and
+ *  a limit below the visible count would evict tiles the very frame they're fetched). */
+const TILE_CACHE_LIMIT = 96;
+const TEMPLATE_CACHE_LIMIT = 48;
+
+/** World blocks per rendered pixel for a given zoom: the largest power of two that still maps a
+ *  rendered pixel to at most one screen pixel, so LOD never *upscales* (which would look blurrier
+ *  than today). scale ≥ 1 → 1 (untouched full-resolution behaviour); scale 0.5 → 2; 0.1 → 8. */
+function lodForScale(scale: number): number {
+  if (!(scale > 0) || scale >= 1) return 1;
+  const lod = 2 ** Math.floor(Math.log2(1 / scale));
+  return Math.max(1, Math.min(MAX_LOD, lod));
+}
+
+/** Tile cache key. LOD is part of the key so levels coexist in the cache and a zoom change reuses
+ *  whatever it already has (and can draw a coarser level underneath while the new one streams in). */
+function tileKey(lod: number, tx: number, ty: number): string { return `${lod},${tx},${ty}`; }
+
+/** Inverse of `tileKey` — also yields the tile's world-space origin (`wx`,`wy`) and side span. */
+function parseTileKey(key: string): { lod: number; tx: number; ty: number; wx: number; wy: number; span: number } {
+  const [lod, tx, ty] = key.split(",").map(Number);
+  const span = TILE * lod;
+  return { lod, tx, ty, wx: tx * span, wy: ty * span, span };
+}
+
+/** Move `key` to the most-recently-used end of an insertion-ordered Map (JS Maps iterate in
+ *  insertion order, so delete+set is the whole LRU bookkeeping). No-op if absent. */
+function touchTile(cache: Map<string, HTMLCanvasElement>, key: string): void {
+  const v = cache.get(key);
+  if (v !== undefined) { cache.delete(key); cache.set(key, v); }
+}
+
+/** Drop least-recently-used entries until the cache is within `limit`. */
+function evictTiles(cache: Map<string, HTMLCanvasElement>, limit: number): void {
+  while (cache.size > limit) {
+    const oldest = cache.keys().next();
+    if (oldest.done) break;
+    cache.delete(oldest.value);
+  }
+}
 
 /** Zoom bounds, shared by the wheel handler and the keyboard zoom (zoomBy/zoomToBox). */
 const MIN_SCALE = 0.25;
@@ -322,7 +371,7 @@ interface Props {
   onMaterializeSelectionChange?: (bounds: MaterializeSelectionBounds | null) => void;
 }
 
-type TileJob = { key: string; x1: number; y1: number; x2: number; y2: number };
+type TileJob = { key: string; lod: number; x1: number; y1: number; x2: number; y2: number };
 
 const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   { world, worldEpoch, tool, viewMode, zSliceZ, viewCapZ = null,
@@ -345,6 +394,9 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   const tileCacheRef  = useRef<Map<string, HTMLCanvasElement>>(new Map());
   const templateTileCacheRef = useRef<Map<string, HTMLCanvasElement>>(new Map());
   const pendingRef    = useRef<Set<string>>(new Set());
+  // Live LRU caps, recomputed by ensureTiles from the current visible tile count (see TILE_CACHE_LIMIT).
+  const tileLimitRef  = useRef(TILE_CACHE_LIMIT);
+  const templateLimitRef = useRef(TEMPLATE_CACHE_LIMIT);
   // Bumped whenever mode/z/world/renderMode changes — lets in-flight fetches detect staleness
   const tileEpoch = useRef(makeSeqGuard());
 
@@ -607,24 +659,34 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
       const fc = fullCanvasRef.current;
       if (fc) ctx.drawImage(fc, 0, 0);
     } else {
+      // The cache holds several LOD levels at once (audit H6), so a zoom change has something to
+      // show immediately: draw the coarser levels first and let finer ones paint over them, with
+      // the level this view actually wants (`curLod`) last. Off-screen tiles are skipped — the
+      // cache is an LRU bounded well past the visible window, not the visible set.
+      const curLod = lodForScale(scale);
+      const visX1 = -vx / scale, visY1 = -vy / scale;
+      const visX2 = (cw - vx) / scale, visY2 = (ch - vy) / scale;
+      const drawLayer = (cache: Map<string, HTMLCanvasElement>) => {
+        const entries: { tile: HTMLCanvasElement; wx: number; wy: number; lod: number; order: number }[] = [];
+        for (const [key, tile] of cache) {
+          const { lod, wx, wy } = parseTileKey(key);
+          const w = tile.width * lod, h = tile.height * lod;
+          if (wx >= visX2 || wy >= visY2 || wx + w <= visX1 || wy + h <= visY1) continue;
+          entries.push({ tile, wx, wy, lod, order: lod === curLod ? Infinity : -lod });
+        }
+        entries.sort((a, b) => a.order - b.order);
+        for (const e of entries) {
+          ctx.drawImage(e.tile, e.wx, e.wy, e.tile.width * e.lod, e.tile.height * e.lod);
+        }
+      };
       // Draw template layer first at 35% opacity. User tile's transparent pixels (no chunk)
       // let the template show through; opaque user pixels naturally cover it.
       if (showTemplateOverlayRef.current && templateTileCacheRef.current.size > 0) {
         ctx.globalAlpha = 0.35;
-        for (const [key, tile] of templateTileCacheRef.current) {
-          const comma = key.indexOf(",");
-          const tx = parseInt(key.slice(0, comma));
-          const ty = parseInt(key.slice(comma + 1));
-          ctx.drawImage(tile, tx * TILE, ty * TILE);
-        }
+        drawLayer(templateTileCacheRef.current);
         ctx.globalAlpha = 1.0;
       }
-      for (const [key, tile] of tileCacheRef.current) {
-        const comma = key.indexOf(",");
-        const tx = parseInt(key.slice(0, comma));
-        const ty = parseInt(key.slice(comma + 1));
-        ctx.drawImage(tile, tx * TILE, ty * TILE);
-      }
+      drawLayer(tileCacheRef.current);
     }
 
     ctx.restore();
@@ -1275,34 +1337,38 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   // ── loadTile ──────────────────────────────────────────────────────────────
 
   const loadTile = useCallback(async (
-    key: string, x1: number, y1: number, x2: number, y2: number,
+    key: string, lod: number, x1: number, y1: number, x2: number, y2: number,
   ) => {
     const myEpoch = tileEpoch.current.peek();
     pendingRef.current.add(key);
     try {
       const tilePromise = viewModeRef.current === "zslice"
-        ? invoke<PixelPatchRaw>("render_zslice_patch", { z: zSliceZRef.current, x1, y1, x2, y2 })
-        : invoke<PixelPatchRaw>("fetch_tile", { x1, y1, x2, y2 });
+        ? invoke<ArrayBuffer>("render_zslice_patch", { z: zSliceZRef.current, x1, y1, x2, y2, lod })
+        : invoke<ArrayBuffer>("fetch_tile", { x1, y1, x2, y2, lod });
 
       // Fire the template overlay fetch concurrently with the base tile rather than after it.
       const wantTemplate = showTemplateOverlayRef.current && viewModeRef.current !== "zslice" && !templateTileCacheRef.current.has(key);
       const templatePromise = wantTemplate
-        ? invoke<PixelPatchRaw>("fetch_template_tile", { x1, y1, x2, y2 }).catch(() => null)
+        ? invoke<ArrayBuffer>("fetch_template_tile", { x1, y1, x2, y2, lod }).catch(() => null)
         : Promise.resolve(null);
 
-      const [raw, traw] = await Promise.all([tilePromise, templatePromise]);
+      const [rawBuf, trawBuf] = await Promise.all([tilePromise, templatePromise]);
       if (tileEpoch.current.isStale(myEpoch)) return;
+      const raw = decodePixelPatch(rawBuf);
+      const traw = trawBuf ? decodePixelPatch(trawBuf) : null;
       const tc  = document.createElement("canvas");
       tc.width  = raw.width;
       tc.height = raw.height;
       putPatchPixels(tc.getContext("2d")!, raw);
       tileCacheRef.current.set(key, tc);
+      evictTiles(tileCacheRef.current, tileLimitRef.current);
 
       if (traw) {
         const ttc = document.createElement("canvas");
         ttc.width = traw.width; ttc.height = traw.height;
         putPatchPixels(ttc.getContext("2d")!, traw);
         templateTileCacheRef.current.set(key, ttc);
+        evictTiles(templateTileCacheRef.current, templateLimitRef.current);
       }
 
       draw();
@@ -1337,7 +1403,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
       const job = q.shift()!;
       if (tileCacheRef.current.has(job.key) || pendingRef.current.has(job.key)) continue;
       activeRef.current++;
-      loadTile(job.key, job.x1, job.y1, job.x2, job.y2);
+      loadTile(job.key, job.lod, job.x1, job.y1, job.x2, job.y2);
     }
   }, [loadTile]);
 
@@ -1366,18 +1432,19 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
       for (let y = 0; y < mH; y += STRIP_H) {
         if (tileEpoch.current.isStale(myEpoch)) return;
         const y2 = Math.min(mH - 1, y + STRIP_H - 1);
-        let raw: PixelPatchRaw;
+        let buf: ArrayBuffer;
         if (viewModeRef.current === "zslice") {
-          raw = await invoke<PixelPatchRaw>("render_zslice_patch", {
+          buf = await invoke<ArrayBuffer>("render_zslice_patch", {
             z: zSliceZRef.current, x1: 0, y1: y, x2: mW - 1, y2,
           });
         } else if (renderModeRef.current === "axo") {
-          raw = await invoke<PixelPatchRaw>("render_axo_region", {
+          buf = await invoke<ArrayBuffer>("render_axo_region", {
             x1: 0, y1: y, x2: mW - 1, y2, ski: axoSkewRef.current,
           });
         } else {
-          raw = await invoke<PixelPatchRaw>("fetch_tile", { x1: 0, y1: y, x2: mW - 1, y2 });
+          buf = await invoke<ArrayBuffer>("fetch_tile", { x1: 0, y1: y, x2: mW - 1, y2 });
         }
+        const raw = decodePixelPatch(buf);
         if (tileEpoch.current.isStale(myEpoch)) return;
         putPatchPixels(fctx, raw, 0, y);
         fullProgressRef.current = Math.min(1, (y + STRIP_H) / mH);
@@ -1408,52 +1475,61 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     const mW = mapWRef.current;
     const mH = mapHRef.current;
 
-    const tx0 = Math.max(0, Math.floor(Math.max(0, -vx) / scale / TILE) - TILE_BUFFER);
-    const ty0 = Math.max(0, Math.floor(Math.max(0, -vy) / scale / TILE) - TILE_BUFFER);
+    // One tile spans `span` world blocks and always renders TILE×TILE pixels (audit H6), so the
+    // window below stays ~the same tile count no matter how far out the view is zoomed.
+    const lod = lodForScale(scale);
+    const span = TILE * lod;
+
+    const tx0 = Math.max(0, Math.floor(Math.max(0, -vx) / scale / span) - TILE_BUFFER);
+    const ty0 = Math.max(0, Math.floor(Math.max(0, -vy) / scale / span) - TILE_BUFFER);
     const tx1 = Math.min(
-      Math.ceil(mW / TILE),
-      Math.ceil((cssWidth(canvas) - vx) / scale / TILE) + TILE_BUFFER,
+      Math.ceil(mW / span),
+      Math.ceil((cssWidth(canvas) - vx) / scale / span) + TILE_BUFFER,
     );
     const ty1 = Math.min(
-      Math.ceil(mH / TILE),
-      Math.ceil((cssHeight(canvas) - vy) / scale / TILE) + TILE_BUFFER,
+      Math.ceil(mH / span),
+      Math.ceil((cssHeight(canvas) - vy) / scale / span) + TILE_BUFFER,
     );
 
     const needed = new Set<string>();
     for (let ty = ty0; ty < ty1; ty++) {
       for (let tx = tx0; tx < tx1; tx++) {
-        needed.add(`${tx},${ty}`);
+        needed.add(tileKey(lod, tx, ty));
       }
     }
 
-    for (const key of tileCacheRef.current.keys()) {
-      if (!needed.has(key)) tileCacheRef.current.delete(key);
+    // Bounded LRU rather than "prune to exactly the visible window": mark what's needed now as
+    // most-recently-used, then trim from the other end. Panning back and forth (or zooming back to
+    // a level just left) now hits the cache instead of re-fetching what was discarded a frame ago.
+    for (const key of needed) {
+      touchTile(tileCacheRef.current, key);
+      touchTile(templateTileCacheRef.current, key);
     }
-    for (const key of templateTileCacheRef.current.keys()) {
-      if (!needed.has(key)) templateTileCacheRef.current.delete(key);
-    }
+    tileLimitRef.current = Math.max(TILE_CACHE_LIMIT, needed.size * 2);
+    templateLimitRef.current = Math.max(TEMPLATE_CACHE_LIMIT, needed.size * 2);
+    evictTiles(tileCacheRef.current, tileLimitRef.current);
+    evictTiles(templateTileCacheRef.current, templateLimitRef.current);
 
     draw();
 
     const jobs: TileJob[] = [];
     for (const key of needed) {
       if (tileCacheRef.current.has(key) || pendingRef.current.has(key)) continue;
-      const comma = key.indexOf(",");
-      const tx = parseInt(key.slice(0, comma));
-      const ty = parseInt(key.slice(comma + 1));
+      const { tx, ty } = parseTileKey(key);
       jobs.push({
         key,
-        x1: tx * TILE,
-        y1: ty * TILE,
-        x2: Math.min(mW - 1, (tx + 1) * TILE - 1),
-        y2: Math.min(mH - 1, (ty + 1) * TILE - 1),
+        lod,
+        x1: tx * span,
+        y1: ty * span,
+        x2: Math.min(mW - 1, (tx + 1) * span - 1),
+        y2: Math.min(mH - 1, (ty + 1) * span - 1),
       });
     }
     const cxW = (cssWidth(canvas)  / 2 - vx) / scale;
     const cyW = (cssHeight(canvas) / 2 - vy) / scale;
     jobs.sort((a, b) => {
-      const da = (a.x1 + TILE / 2 - cxW) ** 2 + (a.y1 + TILE / 2 - cyW) ** 2;
-      const db = (b.x1 + TILE / 2 - cxW) ** 2 + (b.y1 + TILE / 2 - cyW) ** 2;
+      const da = (a.x1 + span / 2 - cxW) ** 2 + (a.y1 + span / 2 - cyW) ** 2;
+      const db = (b.x1 + span / 2 - cxW) ** 2 + (b.y1 + span / 2 - cyW) ** 2;
       return da - db;
     });
     queueRef.current = jobs;
@@ -1494,24 +1570,46 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
         draw();
         return;
       }
+      // Edit patches are always full-resolution (lod 1). LOD tiles can't take a 1:1 putImageData,
+      // so they get the patch drawn through a nearest-neighbour downscale instead — visually the
+      // same sampling the backend would do at that level, and it keeps the coarse levels live
+      // during an edit rather than blanking them until a refetch lands.
+      let patchCanvas: HTMLCanvasElement | null = null;
       for (const [key, tc] of tileCacheRef.current) {
-        const comma = key.indexOf(",");
-        const txPx  = parseInt(key.slice(0, comma)) * TILE;
-        const tyPx  = parseInt(key.slice(comma + 1)) * TILE;
-        const ix0 = Math.max(patch.x, txPx);
-        const iy0 = Math.max(patch.y, tyPx);
-        const ix1 = Math.min(patch.x + patch.width,  txPx + tc.width);
-        const iy1 = Math.min(patch.y + patch.height, tyPx + tc.height);
-        if (ix0 >= ix1 || iy0 >= iy1) continue;
-        const iw  = ix1 - ix0;
-        const ih  = iy1 - iy0;
+        const { lod, wx, wy, span } = parseTileKey(key);
+        if (wx >= patch.x + patch.width || wy >= patch.y + patch.height ||
+            wx + span <= patch.x || wy + span <= patch.y) continue;
         const ctx = tc.getContext("2d")!;
-        const sub = ctx.createImageData(iw, ih);
-        for (let row = 0; row < ih; row++) {
-          const si = ((iy0 - patch.y + row) * patch.width + (ix0 - patch.x)) * 4;
-          sub.data.set(patch.pixels.subarray(si, si + iw * 4), row * iw * 4);
+        if (lod === 1) {
+          const ix0 = Math.max(patch.x, wx);
+          const iy0 = Math.max(patch.y, wy);
+          const ix1 = Math.min(patch.x + patch.width,  wx + tc.width);
+          const iy1 = Math.min(patch.y + patch.height, wy + tc.height);
+          if (ix0 >= ix1 || iy0 >= iy1) continue;
+          const iw  = ix1 - ix0;
+          const ih  = iy1 - iy0;
+          const sub = ctx.createImageData(iw, ih);
+          for (let row = 0; row < ih; row++) {
+            const si = ((iy0 - patch.y + row) * patch.width + (ix0 - patch.x)) * 4;
+            sub.data.set(patch.pixels.subarray(si, si + iw * 4), row * iw * 4);
+          }
+          ctx.putImageData(sub, ix0 - wx, iy0 - wy);
+        } else {
+          if (!patchCanvas) {
+            patchCanvas = document.createElement("canvas");
+            patchCanvas.width = patch.width;
+            patchCanvas.height = patch.height;
+            const pimg = patchCanvas.getContext("2d")!.createImageData(patch.width, patch.height);
+            pimg.data.set(patch.pixels);
+            patchCanvas.getContext("2d")!.putImageData(pimg, 0, 0);
+          }
+          ctx.imageSmoothingEnabled = false;
+          ctx.drawImage(
+            patchCanvas,
+            (patch.x - wx) / lod, (patch.y - wy) / lod,
+            patch.width / lod, patch.height / lod,
+          );
         }
-        ctx.putImageData(sub, ix0 - txPx, iy0 - tyPx);
       }
       draw();
     },
@@ -1522,10 +1620,8 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
         return;
       }
       for (const [key] of tileCacheRef.current) {
-        const comma = key.indexOf(",");
-        const txPx  = parseInt(key.slice(0, comma)) * TILE;
-        const tyPx  = parseInt(key.slice(comma + 1)) * TILE;
-        if (txPx < x2 && txPx + TILE > x1 && tyPx < y2 && tyPx + TILE > y1) {
+        const { wx, wy, span } = parseTileKey(key);
+        if (wx < x2 && wx + span > x1 && wy < y2 && wy + span > y1) {
           tileCacheRef.current.delete(key);
         }
       }
@@ -1715,11 +1811,11 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
       if (!fc) return null;
       octx.drawImage(fc, sel.x1, sel.y1, w, h, 0, 0, w, h);
     } else {
-      for (const [key, tile] of tileCacheRef.current) {
-        const comma = key.indexOf(",");
-        const tx = parseInt(key.slice(0, comma)) * TILE;
-        const ty = parseInt(key.slice(comma + 1)) * TILE;
-        octx.drawImage(tile, tx - sel.x1, ty - sel.y1);
+      // Coarser levels first so a finer tile covering the same ground wins (audit H6).
+      const tiles = [...tileCacheRef.current].map(([key, tile]) => ({ tile, ...parseTileKey(key) }));
+      tiles.sort((a, b) => b.lod - a.lod);
+      for (const t of tiles) {
+        octx.drawImage(t.tile, t.wx - sel.x1, t.wy - sel.y1, t.tile.width * t.lod, t.tile.height * t.lod);
       }
     }
     // Shaped selection: punch the ghost down to the mask so holes reveal the map beneath during a

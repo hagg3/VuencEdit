@@ -13,8 +13,10 @@ There are two 3D consumers:
 - **`FlyView3D.tsx`** — streaming fly-through of the whole world (quad-view 4th
   cell). Uses `get_chunk_geometry` per chunk.
 
-Both build Three.js `BufferGeometry` from base64 f32 arrays produced by the shared
-`obj_geometry_region` in `export.rs`.
+Both build Three.js `BufferGeometry` from the f32 streams produced by the shared
+`obj_geometry_region` in `export.rs`, decoded by `decodeGeometry` (`src/types.ts`)
+as zero-copy `Float32Array` views over the raw IPC response — see
+[04](./04-ipc-reference.md#binary-payload-envelope-2026-08-05-audit-h2).
 
 ## Coordinate mapping (the one rule to get right)
 

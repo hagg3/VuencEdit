@@ -156,9 +156,24 @@ since Source caps a compile at 8,192 brushes.
 
 ## Autosave & crash recovery
 
-`autosave_world` snapshots bytes under the lock, then writes released, to a sidecar
-next to the world. On launch, `get_autosave_info` offers recovery via
-`RecoveryModal`.
+Audit C2 Stage 3 replaced the old single-file autosave (a full copy of `world.bytes`
+every tick) with a **journaled** one: `autosave.base.eden` is established once per
+session (`stage_copy` of the load-time temp — an O(1) zero-byte clone on APFS),
+and each tick appends only the chunks in `dirty.since_journal` (+ header) to
+`autosave.journal` in the shared wire format (`DOCUMENTATION/02-file-format.md`
+"Journal wire format"). A tick whose pending set is large relative to the world,
+or whose journal has grown past a threshold, **compacts** instead — rewrites the
+journal from scratch from `since_base` rather than appending, still far cheaper
+than a full-world write. `autosave.meta.json` (`AutosaveInfo`) carries
+`format: 1` for the journaled sidecar; `format: 0` marks a legacy single-file
+autosave, still recognized and still deleted by `discard_autosave`.
+
+Recovery: `get_autosave_info` offers it via `RecoveryModal`; the frontend calls
+`load_autosave` (`format: 1`) or falls back to the old `get_autosave_path` +
+`openFileAt` (`format: 0`). `load_autosave` mirrors `load_world` — stage the base,
+**replay the journal by `pwrite`-ing into the staged temp file**, not into any
+in-memory mapping, so the "temp file == as-loaded image" invariant the *next*
+session's base depends on still holds — then parse and swap in under lock.
 
 ⚠️ **`recoverAutosave` does not delete the sidecar on recovery.** The autosave
 timer only refires on the *next edit* (`lastAutosavedEpochRef` already matches the
@@ -166,6 +181,23 @@ just-loaded epoch), so a crash between recovery and the first edit/save would
 otherwise lose the only copy. The sidecar stays on disk until a real Save succeeds
 (`saveWorld`/`saveWorldAs` call `discard_autosave`) or the user declines a fresh
 prompt.
+
+**Interrupted-save recovery is a separate mechanism** from autosave: a repeat ⌘S
+over the same file can now write in place (audit C2 Stage 4, see
+`DOCUMENTATION/02-file-format.md` "Incremental in-place save"). If that's
+interrupted mid-write, `load_world` repairs the destination itself on the next
+open of that exact path via a committed, fsynced `<path>.wal` redo log — no
+sidecar, no recovery prompt, the file is simply correct the next time it's opened.
+This repair is eager only on that specific path; if something else rewrites the
+destination between the crash and the next open, the stale WAL is still rolled
+forward (the `base_len` check only catches a length change).
+
+**Known gap:** the journaled autosave's own guard-drop-then-`retain` window (step
+1 drops the read guard for the journal I/O, then a write guard does
+`since_journal.retain(|c| !written_chunks.contains(c))`) has the same race the
+incremental save's `dirty.seq` was added to close, but hasn't been backported —
+worst case a crash recovery is missing one tick's worth of one chunk, never the
+user's own saved file.
 
 ## Dirty guard
 

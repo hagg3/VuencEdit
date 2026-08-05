@@ -193,14 +193,132 @@ shares files with the game):
   taken; only then does one locked section swap in the parsed world and clear the
   old clipboard/undo/redo/lamp-index/temp. A corrupt or wrong-type file leaves the
   previously-loaded world untouched; a parse failure cleans up its own staged temp.
-- **All saves go through `atomic_write(path, bytes)`** — stage `<path>.savetmp`,
+- **Full saves go through `atomic_write(path, bytes)`** — stage `<path>.savetmp`,
   then `fs::rename` over the destination. Used by `save_world_inner`,
   `save_world_compressed` (drops the zip file handle before rename — Windows can't
-  rename an open file), `autosave_world`, and `save_prefab`.
-- `save_world(compressed: bool)` → deflate-9 ZIP when `compressed`.
+  rename an open file), and `save_prefab`.
+- `save_world(compressed: bool, backup_compressed: bool)` → deflate-9 ZIP when
+  `compressed`. ⚠️ `save_world` tries an **incremental in-place save** first (audit
+  C2 Stage 4, below) — "every save is a temp+rename" is no longer the invariant.
 - `close_world` releases world/clipboard/undo/temp. `sweep_stale_temps()` runs at
   startup to delete `vuencedit_*.eden` temps leaked by a previous clean quit
   (normal loads delete the prior temp; only a clean quit leaks one).
+
+### Backups (`.bak` / `.bak.zip`)
+
+Every save path (full, compressed, incremental) creates a one-time pre-save
+snapshot of the destination through `make_backup_if_absent`, **only if no backup
+of either form already exists** — the first-save snapshot is preserved across
+every later save, compressed or not. `backup_compressed` (`AppSettings.backupCompressed`,
+default off) selects the form:
+
+- **Off (default):** `stage_copy` (the H4 `clonefile` helper — an O(1) APFS clone
+  where available, a plain copy elsewhere) to `<path>.bak`.
+- **On:** `zip_file_contents` deflates the **destination file's current on-disk
+  bytes** — never `world.bytes`, which is what's about to be written, not what's
+  there now — to `<path>.bak.zip` at deflate level 6 (level 9 buys ~1% on voxel
+  data for several times the time, not worth it off the interactive path). Staged
+  via a sibling `.tmp` + rename, same rationale as `atomic_write`.
+
+Toggling the setting mid-session doesn't produce two backups: a pre-existing
+plain `.bak` counts as "already backed up" even when `backup_compressed` is now
+on, and vice versa.
+
+## Incremental in-place save (audit C2 Stage 4)
+
+A repeat ⌘S over the same file rewrites only the chunks that changed since that
+file was last written, instead of pushing the whole world (plus `atomic_write`'s
+staging copy) through the disk again — on a 2 GB world, the difference between
+~8 s of I/O and ~0.1 s. This works only because a loaded world's byte layout is
+fixed for its lifetime (see "Per-chunk spans" above): `chunk_map[(cx,cy)]` is a
+*file* offset as much as a memory offset, so dirty chunks are addressable by
+absolute offset without re-deriving anything.
+
+**Dirty tracking (`WorldState.dirty: DirtyState`).** Four hook sites cover every
+byte-mutating path: `with_edit_inner` marks the chunks `diff_chunk` actually
+changed; `undo_edit_inner`/`redo_edit_inner` mark `entry.chunks`; `set_spawn_pos`/
+`rename_world`/`set_sky_grid` mark the header (they write bytes 0..192 directly,
+bypassing `with_edit`); `load_world`/`close_world` clear everything. `since_disk`
+(chunks changed since `disk_image.path` was last fully known-good) is what
+`try_incremental_save` reads. A `u64 seq`, bumped by every mark and by
+`clear_all`, guards the read-guard/write-guard gap described below — see the
+"Deviation from the plan" note in `TEST WORLDS/c2-stage5-handoff-2026-08-05.md`
+for why retain-by-written-coords wasn't enough.
+
+**Eligibility** (`try_incremental_save`) — any failure declines to the full write
+below, never an error, and the destination is guaranteed untouched on a decline:
+caller's `compressed` flag is false and the recorded `DiskImage` isn't
+compressed either; `DiskImage.path` resolves to the same file as the save target;
+the destination's live `len`/`mtime` still match the recorded image (an external
+modification — the game, a sync client, another editor instance — declines);
+`since_disk`/`header_disk` is non-empty (an empty dirty set takes the full write
+rather than silently no-op-ing — the cheap insurance against a missed hook site);
+the dirty chunk count stays under half the world (a ⌘A-scale edit lands here by
+design).
+
+**Procedure**, all under one **read** guard (shared — rendering/panning/hovering
+keep working during a save, C1's read-guard promise):
+
+1. `.bak`/`.bak.zip` if absent (see above) — matters more here than for a full
+   save, since an in-place write has no rename to fall back on.
+2. Write `<path>.wal` in the journal wire format below (uncompressed —
+   latency-sensitive and short-lived), append a **commit** record, `fsync` the
+   WAL and its parent directory. Nothing has touched the destination yet.
+3. `pwrite` each dirty span into the destination at its absolute offset
+   (`apply_spans_in_place`), `fsync` the destination.
+4. Delete the WAL.
+
+Then a brief separate **write** guard (`record_full_write`) clears the discharged
+dirty state and re-records `DiskImage` from a fresh `metadata()` call — comparing
+against `dirty.seq` first, so an edit that landed in the gap since the read guard
+was dropped isn't silently lost (see the `seq` note above).
+
+**Crash recovery.** `load_world` calls `recover_wal(path)` for every uncompressed
+path it opens, before staging the temp copy, so what gets mapped is the repaired
+file. Only a WAL ending in a **commit** record is rolled forward (idempotent —
+records hold absolute bytes, not deltas, so replaying an already-applied log is a
+no-op); anything else — no commit, a torn tail, bad magic, a `base_len` that
+doesn't fit the destination — is discarded, because a torn log always predates
+the first destination byte being written.
+
+**Known limitation:** the repair happens on the *next* `load_world` of that exact
+path, not eagerly. If something else rewrites the destination between a crash and
+the next open, `recover_wal` still rolls the stale spans forward — the `base_len`
+check only catches a length change, and the window is milliseconds.
+
+## Journal wire format (`journal.rs`)
+
+Shared by the autosave journal ([10 — Features](./10-features.md#autosave--crash-recovery))
+and the incremental save's `.wal`. Self-contained — no `AppState`, no Tauri.
+
+```
+"VEJ1"      4 B    magic
+flags       u32    bit0 = record payloads are raw-deflated
+base_len    u64    expected byte length of the base image (sanity check on replay)
+base_id     16 B   random per-session id, cross-checked against the meta sidecar
+reserved    8 B
+```
+
+then an append-only stream of records:
+
+```
+kind        u8     0 = span, 1 = commit
+file_off    u64    absolute offset into the base image   (kind 0 only)
+cx, cy      i32,i32 chunk coords, or (i32::MIN, i32::MIN) for the header span (kind 0 only)
+raw_len     u32    uncompressed payload length            (kind 0 only)
+comp_len    u32    stored payload length                  (kind 0 only)
+crc32       u32    of the *uncompressed* payload          (kind 0 only)
+payload     comp_len bytes                                (kind 0 only)
+```
+
+Replay applies records in order by absolute offset — last write wins, so
+re-dirtying a chunk across ticks is handled by appending again — and stops
+cleanly at the first record that's short, has a bad CRC, or whose
+`file_off + raw_len` exceeds `base_len`; everything before that point is still
+applied. That's what makes an append-only journal crash-safe without an fsync
+per record. A `kind = 1` commit record marks "everything above is a complete
+set": the autosave journal ignores it (partial replay beats nothing); the save
+WAL requires it.
 
 ### Compressed flag vs. file extension (frontend)
 
