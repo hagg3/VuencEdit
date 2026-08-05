@@ -1,4 +1,4 @@
-import { decodeU8 } from "./codec";
+import { decodePreviewData } from "./types";
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -8,7 +8,6 @@ import Modal from "./Modal";
 import NumberField from "./NumberField";
 
 interface GenProgress { phase: string; pct: number; }
-interface PreviewRaw { width: number; height: number; pixels: string; }
 interface Preview { width: number; height: number; pixels: Uint8Array; }
 
 function PreviewCanvas({ preview }: { preview: Preview }) {
@@ -244,7 +243,7 @@ export default function NewWorldModal({ onClose, onCreated }: Props) {
     setPreviewing(true);
     setError(null);
     try {
-      const raw = await invoke<PreviewRaw>("preview_natural_world", {
+      const buf = await invoke<ArrayBuffer>("preview_natural_world", {
         widthChunks, heightChunks, extendedZ,
         seed, baseHeight, roughnessLevel, erosionLevel,
         terrainScaleLevel: terrainScale,
@@ -256,7 +255,7 @@ export default function NewWorldModal({ onClose, onCreated }: Props) {
         clouds: cloudsEnabled,
         maxPx: 220,
       });
-      setPreview({ width: raw.width, height: raw.height, pixels: decodeU8(raw.pixels) });
+      setPreview(decodePreviewData(buf));
     } catch (e) {
       setError(String(e));
     } finally {
@@ -269,12 +268,12 @@ export default function NewWorldModal({ onClose, onCreated }: Props) {
     setTg2Previewing(true);
     setError(null);
     try {
-      const raw = await invoke<PreviewRaw>("preview_tg2_world", {
+      const buf = await invoke<ArrayBuffer>("preview_tg2_world", {
         sizeChunks: tg2SizeChunks, seed: tg2Seed, terrainType: tg2TerrainType, maxPx: 220,
         customBiomes: tg2TerrainType === 9 ? [...tg2CustomBiomes] : null,
         extendedZ, amplitude: tg2Amplitude, seaLevelOff: tg2SeaLevel,
       });
-      setTg2Preview({ width: raw.width, height: raw.height, pixels: decodeU8(raw.pixels) });
+      setTg2Preview(decodePreviewData(buf));
     } catch (e) {
       setError(String(e));
     } finally {

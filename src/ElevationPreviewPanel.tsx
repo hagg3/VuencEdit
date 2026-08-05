@@ -1,7 +1,6 @@
-import { decodeU8 } from "./codec";
 import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import type { SelectionInfo, PreviewDataRaw, PreviewData } from "./types";
+import { decodePreviewData, type SelectionInfo, type PreviewData } from "./types";
 import { MAX_CANVAS_DPR } from "./viewportUtils";
 
 /** HiDPI backing store for this panel's canvas — see viewportUtils. The element keeps its CSS
@@ -254,45 +253,54 @@ export default function ElevationPreviewPanel({
 
   // Fetch front view
   useEffect(() => {
+    let cancelled = false;
     const timer = setTimeout(() => {
-      invoke<PreviewDataRaw>("render_full_height_view", {
+      invoke<ArrayBuffer>("render_full_height_view", {
         x1: sel.x1, y1: sel.y1, x2: sel.x2, y2: sel.y2,
         view: "front", contextBlocks: showContext ? CONTEXT_BLOCKS : 0,
       })
-        .then(raw => setFrontData({ ...raw, pixels: decodeU8(raw.pixels) }))
-        .catch(() => setFrontData(null));
+        .then(buf => { if (!cancelled) setFrontData(decodePreviewData(buf)); })
+        .catch(() => { if (!cancelled) setFrontData(null); });
     }, 150);
-    return () => clearTimeout(timer);
+    // The debounce timer is cleared on cleanup, but an `invoke` already dispatched is not — without
+    // `cancelled`, two rapid selection changes can resolve out of order and leave the panel showing
+    // a stale preview (audit M7; mirrors the `cancelled`-flag convention already used in Sidebar.tsx).
+    return () => { cancelled = true; clearTimeout(timer); };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sel.x1, sel.y1, sel.x2, sel.y2, showContext, editEpoch]);
 
   // Fetch side view
   useEffect(() => {
+    let cancelled = false;
     const timer = setTimeout(() => {
-      invoke<PreviewDataRaw>("render_full_height_view", {
+      invoke<ArrayBuffer>("render_full_height_view", {
         x1: sel.x1, y1: sel.y1, x2: sel.x2, y2: sel.y2,
         view: "side", contextBlocks: showContext ? CONTEXT_BLOCKS : 0,
       })
-        .then(raw => setSideData({ ...raw, pixels: decodeU8(raw.pixels) }))
-        .catch(() => setSideData(null));
+        .then(buf => { if (!cancelled) setSideData(decodePreviewData(buf)); })
+        .catch(() => { if (!cancelled) setSideData(null); });
     }, 150);
-    return () => clearTimeout(timer);
+    return () => { cancelled = true; clearTimeout(timer); };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sel.x1, sel.y1, sel.x2, sel.y2, showContext, editEpoch]);
 
   // Fetch clipboard elevation ghosts
   useEffect(() => {
     if (!isPastePreview) { setClipFrontData(null); return; }
-    invoke<PreviewDataRaw>("render_clipboard_elevation_preview", { view: "front" })
-      .then(raw => setClipFrontData({ ...raw, pixels: decodeU8(raw.pixels) }))
-      .catch(() => setClipFrontData(null));
+    let cancelled = false;
+    invoke<ArrayBuffer>("render_clipboard_elevation_preview", { view: "front" })
+      .then(buf => { if (!cancelled) setClipFrontData(decodePreviewData(buf)); })
+      .catch(() => { if (!cancelled) setClipFrontData(null); });
+    return () => { cancelled = true; };
   }, [isPastePreview]);
 
   useEffect(() => {
     if (!isPastePreview) { setClipSideData(null); return; }
-    invoke<PreviewDataRaw>("render_clipboard_elevation_preview", { view: "side" })
-      .then(raw => setClipSideData({ ...raw, pixels: decodeU8(raw.pixels) }))
-      .catch(() => setClipSideData(null));
+    let cancelled = false;
+    invoke<ArrayBuffer>("render_clipboard_elevation_preview", { view: "side" })
+      .then(buf => { if (!cancelled) setClipSideData(decodePreviewData(buf)); })
+      .catch(() => { if (!cancelled) setClipSideData(null); });
+    return () => { cancelled = true; };
   }, [isPastePreview]);
 
   // Draw both sections on single canvas

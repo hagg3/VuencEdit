@@ -1,4 +1,4 @@
-import { decodeU8 } from "./codec";
+import { decodeEnvelope, type IpcBinary } from "./codec";
 import { resolveColor } from "./blockDefs";
 
 export interface AtlasData {
@@ -10,21 +10,23 @@ export interface AtlasData {
   nameToRow: Record<string, number>;
 }
 
-export interface TexturePackRaw {
+interface TexturePackHeader {
   rows: number;
   tile: number;
   gray_row_offset: number;
-  atlas: string;          // base64 RGBA
   name_to_row: Record<string, number>;
 }
 
-export function decodeAtlas(raw: TexturePackRaw): AtlasData {
+/** Decode `load_texture_pack`'s binary response (audit H2): scalars in the JSON header, the RGBA
+ *  atlas — which can be several MB — as the raw body. */
+export function decodeAtlas(buf: IpcBinary): AtlasData {
+  const { header, body } = decodeEnvelope<TexturePackHeader>(buf);
   return {
-    rgba: decodeU8(raw.atlas),
-    tile: raw.tile,
-    rows: raw.rows,
-    grayRowOffset: raw.gray_row_offset,
-    nameToRow: raw.name_to_row,
+    rgba: body,
+    tile: header.tile,
+    rows: header.rows,
+    grayRowOffset: header.gray_row_offset,
+    nameToRow: header.name_to_row,
   };
 }
 

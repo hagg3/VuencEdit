@@ -1,4 +1,4 @@
-import { decodeF32 } from "./codec";
+import { decodeGeometry, type VoxelGeometry } from "./types";
 import { useEffect, useRef, useState, forwardRef, useImperativeHandle } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import * as THREE from "three";
@@ -49,14 +49,6 @@ const hexToRgb = (hex: string): [number, number, number] => {
 // used until the user picks a custom color or reverts to the world's own (often muddy) sky paint.
 const DEFAULT_SKY_COLOR = "#8cbeff";
 
-interface ChunkGeom {
-  positions: string; colors: string; uvs: string; vertex_count: number;
-  // Transparent stream (water/glass/fence/new-flower) — colors are RGBA (itemSize 4), not RGB.
-  positions_t: string; colors_t: string; uvs_t: string; vertex_count_t: number;
-  // Emissive stream — lamp-block faces, RGB. Populated only in GPU (flat) mode; drawn unlit so lamps
-  // stay fullbright under the lit Lambert material. Empty otherwise.
-  positions_e: string; colors_e: string; uvs_e: string; vertex_count_e: number;
-}
 /** A lamp light for the experimental GPU night path — Eden local block coords (voxel centre) + colour 0..1. */
 interface LampLight { x: number; y: number; z: number; r: number; g: number; b: number }
 /** Which shipped lamp-lighting behaviour is active — mirrors Rust `LightingProfile` (export.rs). */
@@ -1258,6 +1250,11 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     const maxConcurrent = () => (flyModeRef.current ? MAX_CONCURRENT_FLY : MAX_CONCURRENT_IDLE);
     let active = 0;
     let queue: { cx: number; cy: number }[] = [];
+    // Last camera chunk streamSweep actually swept from — lets a stationary camera's interval
+    // tick early-out instead of redoing the O((2r+1)²) disc scan + Set-union + string-split dispose
+    // pass 6.7×/second for nothing (audit M6). Reset to an impossible value so the very first sweep
+    // (and any forced sweep via reloadChunk/reloadAllChunks/camera-move) always runs in full.
+    let lastSweepCcx = Number.NaN, lastSweepCcy = Number.NaN;
 
     // Monotonic generation counter + per-key stale set: a fetch that resolves after its chunk was
     // force-reloaded (edit) or the whole cache was invalidated (texture/lighting toggle) must not
@@ -1274,19 +1271,20 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       active++;
       setLoadingCountRef.current(inflight.size);
       const gen = fetchGen;
-      invoke<ChunkGeom>("get_chunk_geometry", { cx: cxk, cy: cyk, night: nightLightingRef.current, shadows: shadows3dRef.current, sunT: sunTRef.current, gpu: gpuShadowsRef.current, lampRadius: lampRadiusRef.current, lightingProfile: lightingProfileRef.current })
-        .then((g) => {
+      invoke<ArrayBuffer>("get_chunk_geometry", { cx: cxk, cy: cyk, night: nightLightingRef.current, shadows: shadows3dRef.current, sunT: sunTRef.current, gpu: gpuShadowsRef.current, lampRadius: lampRadiusRef.current, lightingProfile: lightingProfileRef.current })
+        .then((buf) => {
           if (disposed) return;
           if (gen !== fetchGen || staleKeys.has(k)) return; // stale — dropped; finally{} requeues if needed
+          const g: VoxelGeometry = decodeGeometry(buf);
           disposeMesh(k); // replace any existing mesh (reload path)
           if (g.vertex_count > 0) {
             const geom = new THREE.BufferGeometry();
-            geom.setAttribute("position", new THREE.BufferAttribute(decodeF32(g.positions), 3));
-            geom.setAttribute("color", new THREE.BufferAttribute(decodeF32(g.colors), 3));
-            // Add UV attribute when the pack is loaded (uvs is non-empty base64 string).
+            geom.setAttribute("position", new THREE.BufferAttribute(g.positions, 3));
+            geom.setAttribute("color", new THREE.BufferAttribute(g.colors, 3));
+            // Add UV attribute when the pack is loaded (uvs is a non-empty float stream).
             const hasUVs = g.uvs && g.uvs.length > 0;
             if (hasUVs) {
-              geom.setAttribute("uv", new THREE.BufferAttribute(decodeF32(g.uvs), 2));
+              geom.setAttribute("uv", new THREE.BufferAttribute(g.uvs, 2));
             }
             // No CPU normals: baked mode is unlit (shading is in the vertex colours), and GPU mode's
             // Lambert materials use `flatShading` (normals derived in-shader). Voxel faces are exactly
@@ -1304,12 +1302,12 @@ const FlyView3D = forwardRef<FlyView3DRef, {
           }
           if (g.vertex_count_t > 0) {
             const geomT = new THREE.BufferGeometry();
-            geomT.setAttribute("position", new THREE.BufferAttribute(decodeF32(g.positions_t), 3));
+            geomT.setAttribute("position", new THREE.BufferAttribute(g.positions_t, 3));
             // RGBA (itemSize 4) — Three.js reads a 4-component color attribute as vertex alpha too.
-            geomT.setAttribute("color", new THREE.BufferAttribute(decodeF32(g.colors_t), 4));
+            geomT.setAttribute("color", new THREE.BufferAttribute(g.colors_t, 4));
             const hasUVsT = g.uvs_t && g.uvs_t.length > 0;
             if (hasUVsT) {
-              geomT.setAttribute("uv", new THREE.BufferAttribute(decodeF32(g.uvs_t), 2));
+              geomT.setAttribute("uv", new THREE.BufferAttribute(g.uvs_t, 2));
             }
             geomT.computeBoundingSphere();
             const meshT = new THREE.Mesh(geomT, pickMat(true, !!hasUVsT));
@@ -1331,11 +1329,11 @@ const FlyView3D = forwardRef<FlyView3DRef, {
           // (Basic is unlit; the shadow depth pass doesn't consume them meaningfully here).
           if (g.vertex_count_e > 0) {
             const geomE = new THREE.BufferGeometry();
-            geomE.setAttribute("position", new THREE.BufferAttribute(decodeF32(g.positions_e), 3));
-            geomE.setAttribute("color", new THREE.BufferAttribute(decodeF32(g.colors_e), 3));
+            geomE.setAttribute("position", new THREE.BufferAttribute(g.positions_e, 3));
+            geomE.setAttribute("color", new THREE.BufferAttribute(g.colors_e, 3));
             const hasUVsE = g.uvs_e && g.uvs_e.length > 0;
             if (hasUVsE) {
-              geomE.setAttribute("uv", new THREE.BufferAttribute(decodeF32(g.uvs_e), 2));
+              geomE.setAttribute("uv", new THREE.BufferAttribute(g.uvs_e, 2));
             }
             geomE.computeBoundingSphere();
             const emissiveMat = (hasUVsE && texMatRef.current) ? texMatRef.current : mat;
@@ -1380,9 +1378,19 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     };
 
     // Camera-window streaming: keep chunks within LOAD_RADIUS of the camera's XY footprint.
-    const streamSweep = () => {
+    // `force` skips the early-out below — needed by callers that just disposed meshes without
+    // moving the camera (reloadAllChunks) or that intentionally want a sweep even though the
+    // camera hasn't visibly moved yet (resetCamera/teleport fire this before their tween ticks).
+    const streamSweep = (force = false) => {
       const ccx = worldToChunk(camera.position.x);
       const ccy = worldToChunk(camera.position.z); // Three.js Z = Eden Y
+      // A stationary camera with nothing queued has nothing new to do — skip the O((2r+1)²) disc
+      // scan and the Set-union + string-split dispose pass below, which otherwise runs unconditionally
+      // 6.7×/second (STREAM_MS) for the entire time the 3D pane is open, moving or not (audit M6).
+      if (!force && ccx === lastSweepCcx && ccy === lastSweepCcy && queue.length === 0) {
+        return;
+      }
+      lastSweepCcx = ccx; lastSweepCcy = ccy;
       // Rebuild the work queue each sweep (nearest-first) so the camera's current position drives
       // priority and chunks that fell out of range stop being requested.
       const r = loadRadiusRef.current;
@@ -1437,7 +1445,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       fetchGen++;
       queue = [];
       for (const k of new Set([...meshes.keys(), ...emptyChunks])) disposeMesh(k);
-      streamSweep();
+      streamSweep(true); // meshes were just disposed with the camera unmoved — must not early-out
     };
 
     // ---- Fly controller ----
@@ -2373,7 +2381,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
         new THREE.Vector3(s.x, maxZ + 60, s.y + 110),
         new THREE.Vector3(s.x, Math.min(maxZ, 28), s.y),
       );
-      streamSweep(); // re-prioritise chunk streaming around the new viewpoint
+      streamSweep(true); // re-prioritise chunk streaming around the new viewpoint (tween hasn't ticked yet)
       invalidate();
     };
 
@@ -2383,7 +2391,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       const toPos = camera.position.clone(); toPos.x = wx; toPos.z = wy; // Three.js Z = Eden Y
       const toTarget = controls.target.clone(); toTarget.x = wx; toTarget.z = wy;
       startCamTween(toPos, toTarget);
-      streamSweep(); // immediate sweep without waiting for the next interval tick
+      streamSweep(true); // immediate sweep without waiting for the next interval tick (tween hasn't ticked yet)
       invalidate();
     };
 

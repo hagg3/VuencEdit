@@ -9,6 +9,9 @@ export interface AppSettings {
   defaultQuadView: boolean;
   default3dPane: boolean;
   defaultSaveCompressed: boolean;
+  /** Compress the one-time `.bak` snapshot as `<path>.bak.zip` (deflate level 6) instead of a plain
+   *  copy. Off by default — a plain copy is faster to create and, on APFS, an O(1) clone. */
+  backupCompressed: boolean;
   templatePath: string | null;
   texturePackPath: string | null;
   /** Directory the Prefab Library panel scans for .epfab files. null = app-managed default (see get_default_prefab_dir). */
@@ -58,12 +61,13 @@ export interface AppSettings {
 }
 
 /** Current settings schema version. Bump + add a case to `migrate()` when a stored default must change. */
-const SETTINGS_VERSION = 5;
+const SETTINGS_VERSION = 6;
 
 const DEFAULTS: AppSettings = {
   defaultQuadView: true,
   default3dPane: false,
   defaultSaveCompressed: false,
+  backupCompressed: false,
   templatePath: null,
   texturePackPath: null,
   prefabDirectory: null,
@@ -108,6 +112,8 @@ function migrate(s: Record<string, unknown>): boolean {
   // to 4 to match the real original-client pool size. Only snap installs still parked on the old
   // untouched default — anyone who dragged the Lamp R slider keeps their chosen value.
   if (from < 5 && s.lampRadius === 5) s.lampRadius = 4;
+  // v5 → v6: added backupCompressed. No forced value needed — the `{...DEFAULTS, ...parsed}` merge
+  // supplies it (default false, matching the pre-existing plain-.bak behaviour).
   s.settingsVersion = SETTINGS_VERSION;
   return true;
 }
@@ -447,6 +453,14 @@ export default function SettingsModal({ onClose, onSave }: Props) {
                 <div style={labelCol}>
                   <span style={labelText}>Save compressed by default</span>
                   <span style={labelSub}>New worlds save as .zip; overridden by the loaded world's format</span>
+                </div>
+              </div>
+
+              <div style={row}>
+                <Checkbox value={local.backupCompressed} onChange={v => set("backupCompressed", v)} label="Compress backups" />
+                <div style={labelCol}>
+                  <span style={labelText}>Compress backups</span>
+                  <span style={labelSub}>The one-time pre-save snapshot is written as .bak.zip instead of a plain .bak copy</span>
                 </div>
               </div>
 

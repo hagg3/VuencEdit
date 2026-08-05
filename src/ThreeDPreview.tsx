@@ -1,22 +1,9 @@
-import { decodeF32 } from "./codec";
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
-import type { SelectionInfo } from "./types";
+import { decodeGeometry, type SelectionInfo } from "./types";
 import type { AtlasData } from "./texturePack";
-
-interface ObjGeometryResult {
-  positions: string; // base64 LE f32
-  colors: string;    // base64 LE f32
-  uvs: string;       // base64 LE f32; empty when no pack
-  vertex_count: number;
-  // Transparent stream (water/glass/fence/new-flower) — colors are RGBA, not RGB.
-  positions_t: string;
-  colors_t: string;
-  uvs_t: string;
-  vertex_count_t: number;
-}
 
 const W = 190, H = 160;
 
@@ -130,10 +117,10 @@ export default function ThreeDPreview({ selection: sel, texturePack = null, texE
     setLoading(true);
     setError(null);
     try {
-      const result = await invoke<ObjGeometryResult>("get_obj_geometry", {
+      const result = decodeGeometry(await invoke<ArrayBuffer>("get_obj_geometry", {
         x1: sel.x1, y1: sel.y1, x2: sel.x2, y2: sel.y2,
         zMin: sel.z_min, zMax: sel.z_max,
-      });
+      }));
       const t = threeRef.current;
       if (!t) return;
 
@@ -145,13 +132,13 @@ export default function ThreeDPreview({ selection: sel, texturePack = null, texE
       const box = new THREE.Box3();
 
       if (result.vertex_count > 0) {
-        const positions = decodeF32(result.positions);
-        const colors = decodeF32(result.colors);
+        const positions = result.positions;
+        const colors = result.colors;
         const geo = new THREE.BufferGeometry();
         geo.setAttribute("position", new THREE.BufferAttribute(positions, 3));
         geo.setAttribute("color", new THREE.BufferAttribute(colors, 3));
         const hasUVs = result.uvs && result.uvs.length > 0;
-        if (hasUVs) geo.setAttribute("uv", new THREE.BufferAttribute(decodeF32(result.uvs), 2));
+        if (hasUVs) geo.setAttribute("uv", new THREE.BufferAttribute(result.uvs, 2));
         const meshMat = (hasUVs && texMatRef.current)
           ? texMatRef.current
           : new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide });
@@ -163,14 +150,14 @@ export default function ThreeDPreview({ selection: sel, texturePack = null, texE
       }
 
       if (result.vertex_count_t > 0) {
-        const positionsT = decodeF32(result.positions_t);
-        const colorsT = decodeF32(result.colors_t);
+        const positionsT = result.positions_t;
+        const colorsT = result.colors_t;
         const geoT = new THREE.BufferGeometry();
         geoT.setAttribute("position", new THREE.BufferAttribute(positionsT, 3));
         // RGBA (itemSize 4) — Three.js reads a 4-component color attribute as vertex alpha too.
         geoT.setAttribute("color", new THREE.BufferAttribute(colorsT, 4));
         const hasUVsT = result.uvs_t && result.uvs_t.length > 0;
-        if (hasUVsT) geoT.setAttribute("uv", new THREE.BufferAttribute(decodeF32(result.uvs_t), 2));
+        if (hasUVsT) geoT.setAttribute("uv", new THREE.BufferAttribute(result.uvs_t, 2));
         const meshMatT = (hasUVsT && texMatTRef.current)
           ? texMatTRef.current
           : new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide, transparent: true, depthWrite: false });

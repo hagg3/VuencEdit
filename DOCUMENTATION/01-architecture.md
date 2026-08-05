@@ -108,12 +108,17 @@ parallel call sites.
 
 ## IPC architecture
 
-- **Bulk binary payloads** (pixel buffers) cross as **base64** via a custom serde
-  serializer (`serialize_bytes_b64`), decoded on the JS side by
-  `decodeU8(b64) → Uint8Array` in [`src/codec.ts`](../src/codec.ts). ~8× smaller
-  than JSON number arrays. Geometry float arrays use `decodeF32` (truncates to a
-  4-byte multiple). **All IPC decode goes through `codec.ts` — never hand-roll
-  `atob` loops.**
+- **Bulk binary payloads** (pixel buffers, geometry streams, texture atlases)
+  cross as a **raw `tauri::ipc::Response`** — an `ArrayBuffer` in JS, with no
+  base64 and no JSON string — framed as
+  `u32 LE header_len | JSON header | concatenated buffers` by `ipc_envelope`
+  (lib.rs) and read back by `decodeEnvelope` in
+  [`src/codec.ts`](../src/codec.ts). The decoded buffers are **views** over the
+  response bytes, so the path to `putImageData` / `THREE.BufferAttribute` is
+  copy-free. **All IPC decode goes through the `decode*` helpers in
+  [`src/types.ts`](../src/types.ts) — never hand-roll the framing.** Full
+  contract, including why payload types must not derive `Serialize`:
+  [04 — IPC Command Reference](./04-ipc-reference.md#binary-payload-envelope-2026-08-05-audit-h2).
 - **Edit flow.** Editing commands return
   `EditResult { patch: PixelPatch, undo_depth, redo_depth }`. Only the changed
   rectangle crosses IPC. `applyEditResult()` on the frontend decodes the patch,

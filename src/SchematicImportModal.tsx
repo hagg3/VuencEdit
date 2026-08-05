@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from "react";
-import { decodeU8 } from "./codec";
+import { decodePreviewData } from "./types";
 import { invoke } from "@tauri-apps/api/core";
 import { BLOCK_DEFS, PAINT_COLORS } from "./blockDefs";
 import { EDEN_TEAL, EDEN_TEAL_READABLE, glassPanel, glassBackdrop, glassMenuPanel, chromeButton, chromeButtonAccent, recessedWell } from "./designTokens";
@@ -280,8 +280,8 @@ export default function SchematicImportModal({ info, path, onApply, onCancel, ap
     setPreviewError(null);
     try {
       await invoke("import_schematic_apply", { path, mapping });
-      const raw = await invoke<{ width: number; height: number; pixels: string }>("render_clipboard_preview");
-      setPreviewPixels({ pixels: decodeU8(raw.pixels), width: raw.width, height: raw.height });
+      const raw = decodePreviewData(await invoke<ArrayBuffer>("render_clipboard_preview"));
+      setPreviewPixels({ pixels: raw.pixels, width: raw.width, height: raw.height });
       setShowPreview(true);
     } catch (e) {
       // Was console-only: the button just stopped saying "Loading…" and nothing else happened.

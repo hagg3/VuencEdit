@@ -1,8 +1,9 @@
 # 05 — 2D Rendering
 
 The top-down map and the slice viewports are drawn with the HTML **Canvas 2D**
-API. All pixel data is rendered in Rust and shipped as base64 `PixelPatch` /
-`PreviewData`; the frontend only composites and transforms.
+API. All pixel data is rendered in Rust and shipped as `PixelPatch` /
+`PreviewData` binary envelopes (see [04](./04-ipc-reference.md#binary-payload-envelope-2026-08-05-audit-h2));
+the frontend only composites and transforms.
 
 ## Render modes (top-down map)
 
@@ -10,13 +11,74 @@ API. All pixel data is rendered in Rust and shipped as base64 `PixelPatch` /
 
 - **Tiled (default).** `Map<string, HTMLCanvasElement>` of 512-px tiles fetched
   on demand via `fetch_tile`, up to `MAX_CONCURRENT = 4` in-flight IPC requests,
-  prioritized by distance from the viewport center. Tiles are evicted as the view
-  moves.
+  prioritized by distance from the viewport center. Multi-level (see
+  [Tile LOD + LRU](#tile-lod--lru-2026-08-05-audit-h6)) and evicted by a bounded
+  LRU, not by leaving the viewport.
 - **Full Map.** A single offscreen canvas filled in 128-px strips, with an amber
   progress bar. Best for lag-free pan/zoom on large worlds once loaded.
 - **Axo (axonometric).** `render_axo_region(x1,y1,x2,y2, ski)` — `ski = 0.2` gives
   an SE isometric perspective; the Skew slider adjusts it. **Edits force a full
   reload** (the projection can't be patched incrementally).
+
+## Tile LOD + LRU *(2026-08-05, audit H6)*
+
+Before this, tiles were always 512×512 **world blocks** rendered at full
+resolution regardless of zoom. Fit-zoom on a 7216×8448 world therefore asked for
+15×17 = **255 tiles**, each scanning 262,144 columns down to 256 z — ~67 M column
+scans and ~250 MB of pixels, to fill maybe 1 M screen pixels. ~99% of the work was
+thrown away by the downscale. The tile cache also pruned to exactly the visible
+window + 1, so panning back re-fetched tiles discarded a frame earlier.
+
+**The inversion:** a tile always renders `TILE`×`TILE` *output pixels*; at LOD `n`
+it *covers* `TILE * n` world blocks per side. The visible tile count is then
+roughly constant at any zoom — that same fit-zoom now asks for ~20 tiles (~5 M
+column scans), a ~13× reduction, and it does not grow as worlds get bigger.
+
+### Backend
+
+`render_pixels_patch_lod` / `render_zslice_patch_lod` take a `lod` step and
+**point-sample** every `lod`-th block on both axes — output pixel `(ox, oy)` is
+exactly the block at `(x1 + ox*lod, y1 + oy*lod)`. Not an average: nearest-neighbour
+matches the canvas's `imageSmoothingEnabled = false` upscale, and at these zooms
+the skipped columns were never visible. Cost drops by `lod²`.
+
+- `lod` is an `Option<u32>` param on `fetch_tile`, `render_zslice_patch` and
+  `fetch_template_tile`, clamped to `1..=MAX_LOD` (32). Omitted/`1` is the
+  pre-LOD behaviour byte-for-byte, which is what every non-tile caller (edit
+  patches, full-map strips, slice slabs) still gets.
+- `PixelPatch` carries its own `lod`, so a patch is self-describing rather than
+  relying on the requester to remember what it asked for.
+- ⚠️ **`fetch_template_tile` derives the chunks to decode from the sampled grid,
+  not the tile rect.** At lod 32 a tile spans 1024×1024 template chunks but
+  samples only 512×512 blocks; enumerating the rect would decode up to `lod²`×
+  more template columns than the tile can possibly display.
+- Test: `test_render_lod_matches_sampled_full_render` asserts every LOD pixel
+  equals the corresponding full-resolution pixel (pinning the sampling *phase*,
+  where an off-by-one would shift the zoomed-out map against the tile grid),
+  plus the ragged-range dimensions and the clamping of out-of-range steps.
+
+### Frontend (`MapCanvas.tsx`)
+
+- **`lodForScale(scale)`** = the largest power of two ≤ `1/scale`. That keeps a
+  rendered pixel at ≤ one screen pixel, so LOD never *upscales* (which would look
+  blurrier than the old behaviour); `scale ≥ 1` → 1.
+- **Cache key is `"lod,tx,ty"`** (`tileKey` / `parseTileKey`), so levels coexist.
+  `draw()` paints coarser levels first and the current level last, which is what
+  makes a zoom-out show content immediately instead of blanking and filling in.
+  Off-screen tiles are skipped per frame.
+- **Bounded LRU replaces prune-to-visible.** `touchTile` marks the needed set as
+  most-recently-used (delete + re-set on an insertion-ordered `Map`), then
+  `evictTiles` trims from the other end. The cap is
+  `max(TILE_CACHE_LIMIT, 2 × visible tiles)` — a fixed cap alone would evict
+  tiles the frame they arrive on a 4K viewport, where the visible window can
+  exceed 96 tiles by itself.
+- **`applyPatch` handles both levels.** Edit patches are always lod 1: lod-1
+  tiles take the usual 1:1 `putImageData`; lod > 1 tiles get the patch drawn
+  through a nearest-neighbour downscale instead, so coarse levels stay live
+  during an edit rather than blanking until a refetch lands.
+- `refetchRegion` and `snapshotSelectionPixels` are LOD-aware too — the former
+  invalidates intersecting tiles at *every* level, the latter draws coarser
+  levels first so a finer tile covering the same ground wins.
 
 ## Slice / Z modes
 
