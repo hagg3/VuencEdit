@@ -2,6 +2,7 @@
 use crate::colors::{block_color, transparent_alpha, BI_NOTSOLID, BI_RAMPORSIDE, BLOCK_INFO};
 use crate::{fluid_base, fluid_level, read_ws, world_max_z, AppState, LoadedWorld};
 use crate::texturepack;
+use rustc_hash::FxHashMap;
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -685,6 +686,18 @@ pub(crate) struct ObjGeometryResult {
     vertex_count_e: u32,
 }
 
+impl ObjGeometryResult {
+    /// Total wire bytes this result will occupy on the JS side (the nine buffers, exclusive of the
+    /// envelope header). The frontend's geometry budget and its dev memory HUD count the same
+    /// number — a GPU VBO is the size of the buffer it was uploaded from — so this is the honest
+    /// per-chunk memory cost, unlike the vertex counts (which ignore UV/RGBA stream width).
+    pub(crate) fn wire_bytes(&self) -> usize {
+        self.positions.len() + self.colors.len() + self.uvs.len()
+            + self.positions_t.len() + self.colors_t.len() + self.uvs_t.len()
+            + self.positions_e.len() + self.colors_e.len() + self.uvs_e.len()
+    }
+}
+
 /// Scalar half of the binary envelope (audit H2). `lens` gives the byte length of each of the nine
 /// buffers, in the order they are concatenated into the body, so the JS side can slice them apart
 /// without re-deriving sizes from the vertex counts (`uvs*` are empty when no texture pack is loaded,
@@ -965,9 +978,48 @@ pub(crate) fn pick_block_in(
     }))
 }
 
+/// One plain-cube face, deferred out of the voxel pass so coplanar neighbours can be greedily merged
+/// into a single large quad before any vertex exists (Stage 5 of the 3D-pane crash fix).
+///
+/// `dir` also fixes the face's plane and its two in-plane axes, so `slice`/`u`/`v` are enough to
+/// rebuild the world-space rectangle — see `MERGE_DIRS` and the emission loop at the end of
+/// `obj_geometry_region`:
+///
+/// | `dir` | face | plane | `slice` | `u` | `v` |
+/// |---|---|---|---|---|---|
+/// | 0 | top    | `z = slice+1` | `wz` | `wx` | `wy` |
+/// | 1 | bottom | `z = slice`   | `wz` | `wx` | `wy` |
+/// | 2 | south (+Y) | `y = slice+1` | `wy` | `wx` | `wz` |
+/// | 3 | north (−Y) | `y = slice`   | `wy` | `wx` | `wz` |
+/// | 4 | east (+X)  | `x = slice+1` | `wx` | `wy` | `wz` |
+/// | 5 | west (−X)  | `x = slice`   | `wx` | `wy` | `wz` |
+///
+/// **Field order is the merge key and it is load-bearing**: `derive(Ord)` sorts lexicographically by
+/// declaration order, so sorting the whole face list groups everything that may merge — same
+/// direction, same plane, same block, same light — into one contiguous run ordered (v, u), which is
+/// exactly the scan order the greedy rectangle pass wants. `lm` is stored as raw bits because two
+/// faces may only merge when they render *bit-identically*; that is what keeps per-block lamp light
+/// and sun shadows intact through the merge instead of averaging them across a big quad.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct FaceRec {
+    dir: u8,
+    slice: i32,
+    bt: u8,
+    paint: u8,
+    lm: [u32; 3],
+    v: i32,
+    u: i32,
+}
+
 /// Face-culled cube/ramp/wedge geometry for an arbitrary world box, encoded as LE f32 position +
 /// colour triplets (Three.js Y-up coords). Shared by `get_obj_geometry` (64³ selection preview) and
 /// `get_chunk_geometry` (world-scale fly-through chunk streaming).
+///
+/// Plain cube faces are **greedily meshed**: instead of six quads per voxel, coplanar adjacent faces
+/// that render identically fuse into one large quad, which is what keeps a 256z world's chunk
+/// payload (and the GPU buffers it becomes) proportional to the terrain's *surface complexity*
+/// rather than its voxel count. Ramps, wedges and partial-height fluid faces stay per-block — they
+/// are not unit squares, so there is nothing to tile. See `FaceRec`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn obj_geometry_region(world: &LoadedWorld, pack: Option<&texturepack::TexturePack>, sx1: i32, sy1: i32, sx2: i32, sy2: i32, sz1: i32, sz2: i32, lamps: &[([i32; 3], [f32; 3])], mode: LightMode, mask: Option<&crate::SelectionMask>) -> ObjGeometryResult {
     // Every block read below goes through the chunk-address memo. Single-threaded by construction
@@ -983,6 +1035,22 @@ pub(crate) fn obj_geometry_region(world: &LoadedWorld, pack: Option<&texturepack
         cache.get(wx, wy, wz)
     };
 
+    // Face-culling neighbour getter — `gb` clipped to the emitted z range. A block just *outside*
+    // `[sz1, sz2]` is not part of this render, so it must not occlude the face it touches: without
+    // this, clipping the range (FlyView3D's camera band / cutaway cap, or any sub-column selection
+    // preview) culls the top face of the topmost emitted block and the bottom face of the lowest,
+    // producing a see-through roof/floor at the cut plane. Only the vertical lookups can leave the
+    // range — laterals share `wz`, so `gbz == gb` for them — but every neighbour read in the
+    // emission loop goes through it so a future lookup can't reintroduce the hole.
+    //
+    // Deliberately NOT used by `shadow_at`: the sun raymarch reads the *real* world, so a clipped
+    // render keeps the shadows it would have had unclipped (a ray escaping the band must still be
+    // blocked by the terrain above it).
+    let gbz = |wx: i32, wy: i32, wz: i32| -> (u8, u8) {
+        if wz < sz1 || wz > sz2 { return (0u8, 0u8); }
+        gb(wx, wy, wz)
+    };
+
     let mut pos_f: Vec<f32> = Vec::new();
     let mut col_f: Vec<f32> = Vec::new();
     let mut uv_f:  Vec<f32> = Vec::new();
@@ -995,6 +1063,11 @@ pub(crate) fn obj_geometry_region(world: &LoadedWorld, pack: Option<&texturepack
     let mut pos_ef: Vec<f32> = Vec::new();
     let mut col_ef: Vec<f32> = Vec::new();
     let mut uv_ef:  Vec<f32> = Vec::new();
+
+    // Deferred plain-cube faces, merged and emitted after the voxel pass (see `FaceRec`). A record is
+    // ~28 B where the six vertices it stands for cost ≥ 144 B, so collecting first is cheaper in peak
+    // memory than emitting first — before merging removes any of them.
+    let mut faces: Vec<FaceRec> = Vec::new();
 
     // Lamp positions + light colour within reach of this region are supplied by the caller (only
     // populated when night preview is on — day-lit/no-lamp regions pass an empty slice). The caller
@@ -1069,13 +1142,22 @@ pub(crate) fn obj_geometry_region(world: &LoadedWorld, pack: Option<&texturepack
 
     // Push UV coords for a quad (6 verts: ABD, BCD) covering atlas row with v in [v0,v1], into a
     // caller-chosen buffer (opaque `uv_f` or transparent `uv_ft`).
+    //
+    // `$nu` is how many block-sized tiles the quad spans along its U axis — 1 for every per-block
+    // quad, and the merged width for a greedy-meshed face (see `FaceRec` below). U therefore runs
+    // 0..$nu instead of 0..1, which needs `wrapS = RepeatWrapping` on the atlas texture; the atlas is
+    // exactly one tile wide (`texturepack.rs`: `atlas_w = TILE`), so repeating in U re-tiles the same
+    // column and never bleeds into a neighbouring row. **V has no such freedom** — the atlas is a
+    // vertical strip and V selects the row, so tiling it would walk into the next block's texture.
+    // That is why greedy merging only grows along V when no pack is loaded.
     macro_rules! push_quad_uv {
-        ($buf:expr, $v0:expr, $v1:expr) => {
+        ($buf:expr, $v0:expr, $v1:expr, $nu:expr) => {{
+            let nu: f32 = $nu;
             $buf.extend_from_slice(&[
-                0.0, $v0,  1.0, $v0,  0.0, $v1,
-                1.0, $v0,  1.0, $v1,  0.0, $v1,
+                0.0, $v0,  nu, $v0,  0.0, $v1,
+                nu, $v0,   nu, $v1,  0.0, $v1,
             ]);
-        };
+        }};
     }
     // Push UV coords for a triangle covering the same atlas row.
     macro_rules! push_tri_uv {
@@ -1136,8 +1218,11 @@ pub(crate) fn obj_geometry_region(world: &LoadedWorld, pack: Option<&texturepack
             }
         }};
     }
-    macro_rules! push_quad {
-        ($a:expr,$b:expr,$c:expr,$d:expr,$rgb:expr,$sh:expr,$lm:expr,$btype:expr,$bpaint:expr) => {{
+    // Tiled quad: `$nu` block-tiles along U (1 for a per-block face, the merged width for a
+    // greedy-meshed one). `push_quad!` below is the 1-tile wrapper every ramp/wedge/partial-fluid
+    // call site uses.
+    macro_rules! push_quad_t {
+        ($a:expr,$b:expr,$c:expr,$d:expr,$rgb:expr,$sh:expr,$lm:expr,$btype:expr,$bpaint:expr,$nu:expr) => {{
             let fk = face_kind!($sh);
             let (rgb2, row_opt) = if let Some(p) = pack {
                 texturepack::face_color_and_row(p, $btype, $bpaint, fk, $rgb)
@@ -1148,24 +1233,29 @@ pub(crate) fn obj_geometry_region(world: &LoadedWorld, pack: Option<&texturepack
                 if let Some(p) = pack {
                     let ar = p.atlas_rows as f32;
                     let (v0, v1) = match row_opt { Some(row) => (row as f32/ar, (row+1) as f32/ar), None => (0.0, 1.0/ar) };
-                    push_quad_uv!(uv_ef, v1, v0);
+                    push_quad_uv!(uv_ef, v1, v0, $nu);
                 }
             } else if let Some(alpha) = transparent_alpha($btype) {
                 for (x,y,z) in [$a,$b,$d, $b,$c,$d] { pos_ft.extend_from_slice(&[x,y,z]); col_ft.extend_from_slice(&[r,g,b_,alpha]); }
                 if let Some(p) = pack {
                     let ar = p.atlas_rows as f32;
                     let (v0, v1) = match row_opt { Some(row) => (row as f32/ar, (row+1) as f32/ar), None => (0.0, 1.0/ar) };
-                    push_quad_uv!(uv_ft, v1, v0);
+                    push_quad_uv!(uv_ft, v1, v0, $nu);
                 }
             } else {
                 for (x,y,z) in [$a,$b,$d, $b,$c,$d] { pos_f.extend_from_slice(&[x,y,z]); col_f.extend_from_slice(&[r,g,b_]); }
                 if let Some(p) = pack {
                     let ar = p.atlas_rows as f32;
                     let (v0, v1) = match row_opt { Some(row) => (row as f32/ar, (row+1) as f32/ar), None => (0.0, 1.0/ar) };
-                    push_quad_uv!(uv_f, v1, v0); // swap: $v0 arg → A/B vertices, $v1 arg → C/D vertices; tile reads top→bottom
+                    push_quad_uv!(uv_f, v1, v0, $nu); // swap: $v0 arg → A/B vertices, $v1 arg → C/D vertices; tile reads top→bottom
                 }
             }
         }};
+    }
+    macro_rules! push_quad {
+        ($a:expr,$b:expr,$c:expr,$d:expr,$rgb:expr,$sh:expr,$lm:expr,$btype:expr,$bpaint:expr) => {
+            push_quad_t!($a,$b,$c,$d,$rgb,$sh,$lm,$btype,$bpaint, 1.0)
+        };
     }
 
     for wz in sz1..=sz2 {
@@ -1188,12 +1278,12 @@ pub(crate) fn obj_geometry_region(world: &LoadedWorld, pack: Option<&texturepack
                     (0, 0, 0, 0, 0, 0)
                 } else {
                     (
-                        gb(wx, wy, wz + 1).0,
-                        gb(wx, wy, wz - 1).0,
-                        gb(wx, wy + 1, wz).0,
-                        gb(wx, wy - 1, wz).0,
-                        gb(wx + 1, wy, wz).0,
-                        gb(wx - 1, wy, wz).0,
+                        gbz(wx, wy, wz + 1).0,
+                        gbz(wx, wy, wz - 1).0,
+                        gbz(wx, wy + 1, wz).0,
+                        gbz(wx, wy - 1, wz).0,
+                        gbz(wx + 1, wy, wz).0,
+                        gbz(wx - 1, wy, wz).0,
                     )
                 };
                 // Cheap early-out: a plain cube with every face hidden emits nothing, so skip the
@@ -1220,11 +1310,11 @@ pub(crate) fn obj_geometry_region(world: &LoadedWorld, pack: Option<&texturepack
 
                 if matches!(bt, 24..=39) {
                     let dir = (bt-24)%4;
-                    let ss = obj_occludes(gb(wx,wy+1,wz).0);
-                    let sn = obj_occludes(gb(wx,wy-1,wz).0);
-                    let se = obj_occludes(gb(wx+1,wy,wz).0);
-                    let sw = obj_occludes(gb(wx-1,wy,wz).0);
-                    if !obj_occludes(gb(wx,wy,wz-1).0) {
+                    let ss = obj_occludes(gbz(wx,wy+1,wz).0);
+                    let sn = obj_occludes(gbz(wx,wy-1,wz).0);
+                    let se = obj_occludes(gbz(wx+1,wy,wz).0);
+                    let sw = obj_occludes(gbz(wx-1,wy,wz).0);
+                    if !obj_occludes(gbz(wx,wy,wz-1).0) {
                         push_quad!(o(x0,y1f,z0),o(x1f,y1f,z0),o(x1f,y0,z0),o(x0,y0,z0),rgb,SH_BOT,lm,bt,paint);
                     }
                     match dir {
@@ -1259,12 +1349,12 @@ pub(crate) fn obj_geometry_region(world: &LoadedWorld, pack: Option<&texturepack
                     // SE fills the NE-SE-SW triangle (cuts off the NW corner), etc.
                     // Two rectangular faces at the named sides + one diagonal 45° rectangular face.
                     let dir = (bt-40)%4;
-                    let ss = obj_occludes(gb(wx,wy+1,wz).0);
-                    let sn = obj_occludes(gb(wx,wy-1,wz).0);
-                    let se = obj_occludes(gb(wx+1,wy,wz).0);
-                    let sw = obj_occludes(gb(wx-1,wy,wz).0);
-                    let s_top = obj_occludes(gb(wx,wy,wz+1).0);
-                    let s_bot = obj_occludes(gb(wx,wy,wz-1).0);
+                    let ss = obj_occludes(gbz(wx,wy+1,wz).0);
+                    let sn = obj_occludes(gbz(wx,wy-1,wz).0);
+                    let se = obj_occludes(gbz(wx+1,wy,wz).0);
+                    let sw = obj_occludes(gbz(wx-1,wy,wz).0);
+                    let s_top = obj_occludes(gbz(wx,wy,wz+1).0);
+                    let s_bot = obj_occludes(gbz(wx,wy,wz-1).0);
                     match dir {
                         0 => { // SE: triangle NE(x1f,y0)-SE(x1f,y1f)-SW(x0,y1f). Diagonal NE↔SW faces NW.
                             if !s_bot { push_tri!([o(x1f,y0,z0),o(x1f,y1f,z0),o(x0,y1f,z0)],rgb,SH_BOT,lm,bt,paint); }
@@ -1313,8 +1403,8 @@ pub(crate) fn obj_geometry_region(world: &LoadedWorld, pack: Option<&texturepack
                     // Block directly above each lateral neighbour — only fluids need it (to tell a
                     // submerged neighbour, which reaches full height, from a partial surface one).
                     let (nab_s, nab_n, nab_e, nab_w) = if base_fluid.is_some() {
-                        (gb(wx, wy + 1, wz + 1).0, gb(wx, wy - 1, wz + 1).0,
-                         gb(wx + 1, wy, wz + 1).0, gb(wx - 1, wy, wz + 1).0)
+                        (gbz(wx, wy + 1, wz + 1).0, gbz(wx, wy - 1, wz + 1).0,
+                         gbz(wx + 1, wy, wz + 1).0, gbz(wx - 1, wy, wz + 1).0)
                     } else { (0, 0, 0, 0) };
 
                     // Surface height of a same-base fluid neighbour, in this cell's z units — how far up
@@ -1338,33 +1428,134 @@ pub(crate) fn obj_geometry_region(world: &LoadedWorld, pack: Option<&texturepack
                         (false, z0)
                     };
 
+                    // Greedy-merge bookkeeping. A face only defers to the merge pass when it covers its
+                    // whole unit cell — i.e. it is a real 1×1 square that can tile with its neighbours.
+                    // Partial-height fluid faces (a ¾/½/¼ surface, or a lateral sliver stepping down to
+                    // a shallower neighbour) are not squares, so they emit immediately and unmerged,
+                    // exactly as before. `key_lm` is the light the merge key compares: in flat mode
+                    // `lit_rgb!` discards `lm` entirely, so folding it to a constant there lets a
+                    // GPU-shadow render merge across lamp light it isn't going to bake anyway.
+                    let full_top = ztop == z1f;
+                    let key_lm = if flat { [1.0f32, 1.0, 1.0] } else { lm };
+                    let key_lm = [key_lm[0].to_bits(), key_lm[1].to_bits(), key_lm[2].to_bits()];
+                    let mut defer = |dir: u8, slice: i32, u: i32, v: i32| {
+                        faces.push(FaceRec { dir, slice, bt, paint, lm: key_lm, v, u });
+                    };
+
                     let top_hidden = obj_occludes(n_top) || n_top == bt
                         || base_fluid.is_some_and(|bf| fluid_base(n_top) == Some(bf));
                     if !top_hidden {
-                        push_quad!(o(x0,y0,ztop),o(x1f,y0,ztop),o(x1f,y1f,ztop),o(x0,y1f,ztop),rgb,SH_TOP,lm,bt,paint);
+                        if full_top { defer(0, wz, wx, wy); }
+                        else { push_quad!(o(x0,y0,ztop),o(x1f,y0,ztop),o(x1f,y1f,ztop),o(x0,y1f,ztop),rgb,SH_TOP,lm,bt,paint); }
                     }
                     let bot_hidden = obj_occludes(n_bot) || n_bot == bt
                         || base_fluid.is_some_and(|bf| fluid_base(n_bot) == Some(bf));
                     if !bot_hidden {
-                        push_quad!(o(x0,y1f,z0),o(x1f,y1f,z0),o(x1f,y0,z0),o(x0,y0,z0),rgb,SH_BOT,lm,bt,paint);
+                        // The bottom face always sits at z0 and always spans the full cell.
+                        defer(1, wz, wx, wy);
                     }
+                    // A lateral face spans [zb, ztop]; it fills its cell only when that is the whole
+                    // block. `zb != z0` means a fluid neighbour occluded the lower part of it.
                     let (h_s, zb_s) = lat(n_s, nab_s);
                     if !h_s {
-                        push_quad!(o(x0,y1f,zb_s),o(x1f,y1f,zb_s),o(x1f,y1f,ztop),o(x0,y1f,ztop),rgb,SH_S,lm,bt,paint);
+                        if full_top && zb_s == z0 { defer(2, wy, wx, wz); }
+                        else { push_quad!(o(x0,y1f,zb_s),o(x1f,y1f,zb_s),o(x1f,y1f,ztop),o(x0,y1f,ztop),rgb,SH_S,lm,bt,paint); }
                     }
                     let (h_n, zb_n) = lat(n_n, nab_n);
                     if !h_n {
-                        push_quad!(o(x1f,y0,zb_n),o(x0,y0,zb_n),o(x0,y0,ztop),o(x1f,y0,ztop),rgb,SH_N,lm,bt,paint);
+                        if full_top && zb_n == z0 { defer(3, wy, wx, wz); }
+                        else { push_quad!(o(x1f,y0,zb_n),o(x0,y0,zb_n),o(x0,y0,ztop),o(x1f,y0,ztop),rgb,SH_N,lm,bt,paint); }
                     }
                     let (h_e, zb_e) = lat(n_e, nab_e);
                     if !h_e {
-                        push_quad!(o(x1f,y1f,zb_e),o(x1f,y0,zb_e),o(x1f,y0,ztop),o(x1f,y1f,ztop),rgb,SH_E,lm,bt,paint);
+                        if full_top && zb_e == z0 { defer(4, wx, wy, wz); }
+                        else { push_quad!(o(x1f,y1f,zb_e),o(x1f,y0,zb_e),o(x1f,y0,ztop),o(x1f,y1f,ztop),rgb,SH_E,lm,bt,paint); }
                     }
                     let (h_w, zb_w) = lat(n_w, nab_w);
                     if !h_w {
-                        push_quad!(o(x0,y0,zb_w),o(x0,y1f,zb_w),o(x0,y1f,ztop),o(x0,y0,ztop),rgb,SH_W,lm,bt,paint);
+                        if full_top && zb_w == z0 { defer(5, wx, wy, wz); }
+                        else { push_quad!(o(x0,y0,zb_w),o(x0,y1f,zb_w),o(x0,y1f,ztop),o(x0,y0,ztop),rgb,SH_W,lm,bt,paint); }
                     }
                 }
+            }
+        }
+    }
+
+    // ---- Greedy mesh pass ---------------------------------------------------------------------
+    // Sorting collects the deferred faces into contiguous runs of "same direction, same plane, same
+    // block, same light" — everything that may legally fuse — with each run already ordered (v, u),
+    // which is the row-major scan order the rectangle sweep wants. It is also what makes the output
+    // deterministic, which several tests lean on (a z-clipped render must be byte-identical to a
+    // render of the equivalently truncated world).
+    faces.sort_unstable();
+    // The second in-plane axis may only grow when no texture pack is loaded: U tiles by repeating a
+    // one-tile-wide atlas, but V *selects the row*, so growing it would run into the next block's
+    // texture. See `push_quad_uv!`. Untextured (the default) gets the full 2D merge.
+    let grow_v = pack.is_none();
+    // Eden (X east, Y south, Z up) → Three.js Y-up, same mapping the voxel pass uses.
+    let o = |ex: f32, ey: f32, ez: f32| -> (f32, f32, f32) { (ex, ez, ey) };
+    // Reused across groups so a world of single-face groups (every block differently lit, e.g. sun
+    // shadows on) doesn't pay an allocation per group.
+    let mut idx: FxHashMap<(i32, i32), usize> = FxHashMap::default();
+    let mut used: Vec<bool> = Vec::new();
+    let mut gi = 0usize;
+    while gi < faces.len() {
+        let head = faces[gi];
+        let mut gj = gi + 1;
+        while gj < faces.len()
+            && faces[gj].dir == head.dir && faces[gj].slice == head.slice
+            && faces[gj].bt == head.bt && faces[gj].paint == head.paint && faces[gj].lm == head.lm
+        { gj += 1; }
+        let group = &faces[gi..gj];
+        gi = gj;
+
+        let rgb = block_color(head.bt, head.paint, world.sky);
+        let lm = [f32::from_bits(head.lm[0]), f32::from_bits(head.lm[1]), f32::from_bits(head.lm[2])];
+
+        idx.clear();
+        used.clear();
+        used.resize(group.len(), false);
+        if group.len() > 1 {
+            idx.extend(group.iter().enumerate().map(|(k, f)| ((f.v, f.u), k)));
+        }
+
+        for k in 0..group.len() {
+            if used[k] { continue; }
+            let (u0, v0) = (group[k].u, group[k].v);
+            let mut w = 1i32;
+            let mut h = 1i32;
+            if group.len() > 1 {
+                // Widen along u through unconsumed cells, then grow the whole run along v while every
+                // cell of the next row is present and unconsumed. Scanning in (v, u) order guarantees
+                // `k` is the rectangle's origin corner, so this covers the group exactly once.
+                let free = |uu: i32, vv: i32| idx.get(&(vv, uu)).is_some_and(|&m| !used[m]);
+                while free(u0 + w, v0) { w += 1; }
+                if grow_v {
+                    while (0..w).all(|du| free(u0 + du, v0 + h)) { h += 1; }
+                }
+                for dv in 0..h {
+                    for du in 0..w {
+                        if let Some(&m) = idx.get(&(v0 + dv, u0 + du)) { used[m] = true; }
+                    }
+                }
+            } else {
+                used[k] = true;
+            }
+
+            // Rebuild the world-space rectangle from (slice, u, v, w, h) — see the table on `FaceRec`.
+            let (f0, f1) = (u0 as f32, (u0 + w) as f32);
+            let (g0, g1) = (v0 as f32, (v0 + h) as f32);
+            let s0 = head.slice as f32;
+            let s1 = s0 + 1.0;
+            let (bt, paint) = (head.bt, head.paint);
+            let nu = w as f32;
+            match head.dir {
+                0 => push_quad_t!(o(f0,g0,s1),o(f1,g0,s1),o(f1,g1,s1),o(f0,g1,s1),rgb,SH_TOP,lm,bt,paint,nu),
+                1 => push_quad_t!(o(f0,g1,s0),o(f1,g1,s0),o(f1,g0,s0),o(f0,g0,s0),rgb,SH_BOT,lm,bt,paint,nu),
+                2 => push_quad_t!(o(f0,s1,g0),o(f1,s1,g0),o(f1,s1,g1),o(f0,s1,g1),rgb,SH_S,lm,bt,paint,nu),
+                3 => push_quad_t!(o(f1,s0,g0),o(f0,s0,g0),o(f0,s0,g1),o(f1,s0,g1),rgb,SH_N,lm,bt,paint,nu),
+                4 => push_quad_t!(o(s1,f1,g0),o(s1,f0,g0),o(s1,f0,g1),o(s1,f1,g1),rgb,SH_E,lm,bt,paint,nu),
+                _ => push_quad_t!(o(s0,f0,g0),o(s0,f1,g0),o(s0,f1,g1),o(s0,f0,g1),rgb,SH_W,lm,bt,paint,nu),
             }
         }
     }
@@ -1391,8 +1582,17 @@ pub(crate) fn obj_geometry_region(world: &LoadedWorld, pack: Option<&texturepack
     }
 }
 
-/// Face-culled geometry for a single chunk (16×16 XY × full Z). For the 3D fly-through pane, which
+/// Face-culled geometry for a single chunk (16×16 XY × a z band). For the 3D fly-through pane, which
 /// streams meshes per chunk near the camera.
+///
+/// `z_min`/`z_max` (Stage 3 of the 3D-pane crash fix) clip the emitted band; omitted = the full
+/// `0..=world_max_z` column, i.e. the pre-Stage-3 behaviour. The frontend sends a camera-relative
+/// band so a 256z world doesn't cost 4× a 64z one per chunk; the **cutaway cap is applied here**,
+/// not by the caller — `view_cap_z` is backend state (see `set_view_cap`), so composing it server-
+/// side keeps the one source of truth. Both only ever *narrow* the range, so they compose by `min`.
+/// The frontend still has to invalidate its chunk cache when the cap changes (it does — `viewCapZ`
+/// is a `reloadAllChunks()` trigger in FlyView3D), which is why the band itself stays an explicit
+/// parameter rather than being derived here too.
 #[tauri::command(async)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn get_chunk_geometry(
@@ -1402,6 +1602,7 @@ pub(crate) fn get_chunk_geometry(
     gpu: Option<bool>,
     lamp_radius: Option<f32>,
     lighting_profile: Option<LightingProfile>,
+    z_min: Option<i32>, z_max: Option<i32>,
 ) -> Result<ObjGeometryResult, String> {
     let profile = lighting_profile.unwrap_or_default();
     // Read guard: the lazily-built lamp index is interior-mutable (`LampIndex`), so streaming
@@ -1439,14 +1640,12 @@ pub(crate) fn get_chunk_geometry(
 
     let world = ws.world.as_ref().unwrap();
     // Gather lamps within reach of this chunk from the spatial index (O(lamps), not an O((16+2r)³)
-    // voxel scan), resolving each lamp's colour from its own paint. `LampIndex::with` builds the
-    // index lazily on the first baked-night request (opt-in feature shouldn't tax every load) —
-    // interior-mutable, so this whole command needs only a read guard.
+    // voxel scan), resolving each lamp's colour from its own paint. `LampIndex::lamps_in_region`
+    // scans just the handful of chunks this request needs, on demand — interior-mutable, so this
+    // whole command needs only a read guard.
     let lamps: Vec<([i32; 3], [f32; 3])> = if baked_night {
         ws.lamp_index
-            .with(world, |index| {
-                crate::lamps_in_region(index, world, sx1, sy1, sx1 + 15, sy1 + 15, lamp_r)
-            })
+            .lamps_in_region(world, sx1, sy1, sx1 + 15, sy1 + 15, lamp_r)
             .into_iter()
             .map(|p| {
                 let (_, paint) = get_block_at(world, p[0], p[1], p[2]);
@@ -1466,7 +1665,27 @@ pub(crate) fn get_chunk_geometry(
         lamp_radius: lamp_r,
         profile,
     };
-    Ok(obj_geometry_region(world, ws.texture_pack.as_ref(), sx1, sy1, sx1 + 15, sy1 + 15, 0, world_max_z(world), &lamps, mode, None)) // FlyView3D streaming stays unmasked
+    let t0 = std::time::Instant::now();
+    // Emitted z band: the caller's camera band ∩ the cutaway cap ∩ the world's real z range. Clamped
+    // (not rejected) so a nonsensical band degrades to a smaller render, never an error mid-stream;
+    // an inverted or fully out-of-range band collapses to sz1 > sz2, and the emission loop then emits
+    // nothing — the same empty result an all-air chunk gives.
+    let max_z = world_max_z(world);
+    let cap = ws.view_cap_z.unwrap_or(max_z);
+    let sz1 = z_min.unwrap_or(0).clamp(0, max_z);
+    let sz2 = z_max.unwrap_or(max_z).min(cap).clamp(0, max_z);
+    let res = obj_geometry_region(world, ws.texture_pack.as_ref(), sx1, sy1, sx1 + 15, sy1 + 15, sz1, sz2, &lamps, mode, None); // FlyView3D streaming stays unmasked
+    // Stage 0 instrumentation: per-chunk payload size, so a pathological chunk (a tall 256z cliff
+    // face can emit >1 M verts / tens of MB) is identifiable next to the frontend's resident-bytes
+    // HUD. Debug builds only — `timing_log!` compiles to nothing in release.
+    crate::timing_log!(
+        "[GEOM] chunk ({},{}) z{}..{} verts {}/{}/{} payload {:.2} MB in {:?}",
+        cx, cy, sz1, sz2,
+        res.vertex_count, res.vertex_count_t, res.vertex_count_e,
+        res.wire_bytes() as f64 / (1 << 20) as f64,
+        t0.elapsed(),
+    );
+    Ok(res)
 }
 
 /// One lamp light for the experimental GPU night path (real `THREE.PointLight`s). Position is in
@@ -1493,7 +1712,7 @@ pub(crate) fn get_lamps_near(
     let sx = x.floor() as i32;
     let sy = y.floor() as i32;
     let mut lamps: Vec<(f32, LampLight)> = ws.lamp_index
-        .with(world, |index| crate::lamps_in_region(index, world, sx, sy, sx, sy, radius))
+        .lamps_in_region(world, sx, sy, sx, sy, radius)
         .into_iter()
         .filter_map(|p| {
             let dx = p[0] as f32 + 0.5 - x;
@@ -1671,7 +1890,14 @@ mod tests {
         let masked = obj_geometry_region(&world, None, 3, 5, 4, 5, 0, 0, &[], LightMode::default(), Some(&mask));
 
         assert!(masked.vertex_count > 0, "masked cell still emits geometry");
-        assert!(masked.vertex_count < full.vertex_count, "the unmasked cube is gone");
+        // NB: vertex *counts* can't tell these apart any more — greedy meshing fuses the two cubes'
+        // coplanar faces, so the 2×1 slab and the lone cube both come out as six quads. Compare the
+        // geometry itself: the masked render must not reach past the surviving column at x=4.
+        assert_ne!(masked.positions, full.positions, "the unmasked cube is gone");
+        let max_x = masked.positions.chunks_exact(4).step_by(3)
+            .map(|v| f32::from_le_bytes([v[0], v[1], v[2], v[3]]))
+            .fold(f32::NEG_INFINITY, f32::max);
+        assert_eq!(max_x, 4.0, "no vertex from the masked-out cube (which would reach x=5)");
 
         // Masking the neighbour exposes the +x face that was culled while it was solid: the surviving
         // cube renders exactly like a genuinely isolated one. Build that reference from a world whose
@@ -1680,6 +1906,282 @@ mod tests {
         lone_world.bytes[block(3, 5, 0)] = 2;
         let isolated = obj_geometry_region(&lone_world, None, 3, 5, 3, 5, 0, 0, &[], LightMode::default(), None);
         assert_eq!(masked.vertex_count, isolated.vertex_count, "hole-facing side face emits (full cube)");
+        assert_eq!(masked.positions, isolated.positions, "and is byte-identical to a genuinely lone cube");
+    }
+
+    /// Stage 3 (fly-view camera z band / cutaway phase 2): a z-clipped render must behave as if the
+    /// world *ended* at the cut planes. The trap this pins is the see-through roof — face culling
+    /// reads the real world through `gb`, so the block just above `sz2` would otherwise occlude the
+    /// top face of the topmost emitted block, leaving a hole you can look straight through into the
+    /// interior. Same in reverse at `sz1` for the floor.
+    ///
+    /// Reference: the identical column rendered *unclipped* in a world where the out-of-band blocks
+    /// genuinely don't exist. Byte-identical output is the invariant — a clipped render is exactly a
+    /// render of the truncated world.
+    #[test]
+    fn test_obj_geometry_z_clip_emits_cap_faces() {
+        let block = |lx: usize, ly: usize, z: i32| -> usize {
+            let band = (z / 16) as usize;
+            let lz = (z % 16) as usize;
+            4096 + band * 8192 + lx * 256 + ly * 16 + lz
+        };
+        // Tall column z=0..=5 at (3,5), rendered clipped to the middle slab z=2..=4.
+        let mut tall = make_test_world();
+        for z in 0..=5 { tall.bytes[block(3, 5, z)] = 2; }
+        let clipped = obj_geometry_region(&tall, None, 3, 5, 3, 5, 2, 4, &[], LightMode::default(), None);
+
+        // Same three blocks, but z=1 and z=5 really are air — rendered over the whole world column so
+        // no clipping is in play at all.
+        let mut short = make_test_world();
+        for z in 2..=4 { short.bytes[block(3, 5, z)] = 2; }
+        let reference = obj_geometry_region(&short, None, 3, 5, 3, 5, 0, world_max_z(&short), &[], LightMode::default(), None);
+
+        // 4 side faces (each greedy-merged into one 3-tall quad down the column) + the two cap faces
+        // = 6 quads = 36 verts. Spelled out so a regression that silently drops the caps (24) or
+        // double-emits fails loudly, not just "differs".
+        assert_eq!(clipped.vertex_count, 6 * 6, "clipped slab emits 4 merged sides plus both cap faces");
+        assert_eq!(clipped.vertex_count, reference.vertex_count);
+        assert_eq!(clipped.positions, reference.positions, "a clipped render == a render of the truncated world");
+        assert_eq!(clipped.colors, reference.colors);
+
+        // Nothing escapes the band. THREE coords are (ex, ez, ey), so index 1 is Eden z; a block at
+        // z spans [z, z+1].
+        for v in clipped.positions.chunks_exact(4).skip(1).step_by(3) {
+            let y = f32::from_le_bytes([v[0], v[1], v[2], v[3]]);
+            assert!((2.0..=5.0).contains(&y), "vertex at z={y} outside the clipped band 2..=4");
+        }
+    }
+
+    /// Degenerate bands emit nothing rather than erroring or wrapping: a band entirely above the
+    /// terrain, and an inverted one (which `get_chunk_geometry`'s clamp can produce when the cutaway
+    /// cap sits below the camera band). `for wz in sz1..=sz2` is empty when sz1 > sz2.
+    #[test]
+    fn test_obj_geometry_z_clip_degenerate_bands() {
+        let mut world = make_test_world();
+        let block = |lx: usize, ly: usize, z: i32| -> usize {
+            let band = (z / 16) as usize;
+            let lz = (z % 16) as usize;
+            4096 + band * 8192 + lx * 256 + ly * 16 + lz
+        };
+        for z in 0..=5 { world.bytes[block(3, 5, z)] = 2; }
+
+        let above = obj_geometry_region(&world, None, 3, 5, 3, 5, 40, 48, &[], LightMode::default(), None);
+        assert_eq!(above.vertex_count, 0, "band above the terrain emits nothing");
+        let inverted = obj_geometry_region(&world, None, 3, 5, 3, 5, 4, 2, &[], LightMode::default(), None);
+        assert_eq!(inverted.vertex_count, 0, "inverted band emits nothing");
+    }
+
+    // ---- Greedy meshing (Stage 5 of the 3D-pane crash fix) --------------------------------------
+
+    /// Byte index of block `(lx, ly, z)`'s *type* in `make_test_world`'s single chunk.
+    fn tblock(lx: usize, ly: usize, z: i32) -> usize {
+        let band = (z / 16) as usize;
+        let lz = (z % 16) as usize;
+        4096 + band * 8192 + lx * 256 + ly * 16 + lz
+    }
+
+    /// The emitted opaque quads as `[(three_x, three_y, three_z); 6]` vertex tuples. Positions are
+    /// non-indexed, 6 verts per quad, so the stream chunks exactly.
+    fn quads(res: &ObjGeometryResult) -> Vec<[(f32, f32, f32); 6]> {
+        let f: Vec<f32> = res.positions.chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
+        f.chunks_exact(18).map(|q| {
+            let v = |i: usize| (q[i * 3], q[i * 3 + 1], q[i * 3 + 2]);
+            [v(0), v(1), v(2), v(3), v(4), v(5)]
+        }).collect()
+    }
+
+    /// As `quads`, but over the transparent stream (water/glass/fence/flower).
+    fn quads_t(res: &ObjGeometryResult) -> Vec<[(f32, f32, f32); 6]> {
+        let f: Vec<f32> = res.positions_t.chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
+        f.chunks_exact(18).map(|q| {
+            let v = |i: usize| (q[i * 3], q[i * 3 + 1], q[i * 3 + 2]);
+            [v(0), v(1), v(2), v(3), v(4), v(5)]
+        }).collect()
+    }
+
+    /// Quads lying entirely in the horizontal plane `three_y == y` — i.e. the top faces of blocks at
+    /// `z = y - 1` (bottom faces of the same blocks sit at `three_y == z`).
+    fn quads_in_plane_y(res: &ObjGeometryResult, y: f32) -> Vec<[(f32, f32, f32); 6]> {
+        quads(res).into_iter().filter(|q| q.iter().all(|v| v.1 == y)).collect()
+    }
+
+    /// The unit cells a set of horizontal quads covers, as `(x, eden_y)` integer pairs — panics on any
+    /// cell covered twice, which is what makes "the merge tiles the footprint exactly" checkable.
+    fn covered_cells(qs: &[[(f32, f32, f32); 6]]) -> HashSet<(i32, i32)> {
+        let mut cells = HashSet::new();
+        for q in qs {
+            // THREE (ex, ez, ey): index 0 is Eden x, index 2 is Eden y.
+            let x0 = q.iter().map(|v| v.0).fold(f32::INFINITY, f32::min) as i32;
+            let x1 = q.iter().map(|v| v.0).fold(f32::NEG_INFINITY, f32::max) as i32;
+            let y0 = q.iter().map(|v| v.2).fold(f32::INFINITY, f32::min) as i32;
+            let y1 = q.iter().map(|v| v.2).fold(f32::NEG_INFINITY, f32::max) as i32;
+            for x in x0..x1 {
+                for y in y0..y1 {
+                    assert!(cells.insert((x, y)), "cell ({x},{y}) covered by two merged quads");
+                }
+            }
+        }
+        cells
+    }
+
+    /// The headline win: a flat slab's whole exposed surface collapses to one quad per face
+    /// direction, independent of how many blocks it is made of. 4×4×1 stone = 16 top + 16 bottom +
+    /// 16 side faces unmerged (48 quads); merged it is 6.
+    #[test]
+    fn test_greedy_merge_flat_slab_collapses_to_one_quad_per_face() {
+        let mut world = make_test_world();
+        for x in 3..=6 { for y in 5..=8 { world.bytes[tblock(x, y, 0)] = 2; } }
+        let g = obj_geometry_region(&world, None, 3, 5, 6, 8, 0, 0, &[], LightMode::default(), None);
+        assert_eq!(g.vertex_count, 6 * 6, "top + bottom + four merged sides");
+
+        // The single top quad really spans the whole 4×4 footprint, rather than six quads happening
+        // to add up to the right count.
+        let top = quads_in_plane_y(&g, 1.0);
+        assert_eq!(top.len(), 1);
+        assert_eq!(covered_cells(&top).len(), 16);
+        assert_eq!(top[0].iter().map(|v| v.0).fold(f32::NEG_INFINITY, f32::max), 7.0, "x spans 3..7");
+        assert_eq!(top[0].iter().map(|v| v.2).fold(f32::NEG_INFINITY, f32::max), 9.0, "eden y spans 5..9");
+    }
+
+    /// A non-rectangular footprint must be tiled *exactly* — every cell covered once, none twice, and
+    /// nothing outside the shape. This is the property that makes the merge safe in general; the
+    /// quad count is incidental (an L is two maximal rectangles).
+    #[test]
+    fn test_greedy_merge_tiles_an_l_shape_exactly() {
+        let mut world = make_test_world();
+        let shape = [(3, 5), (4, 5), (5, 5), (3, 6), (3, 7)];
+        for &(x, y) in &shape { world.bytes[tblock(x, y, 0)] = 2; }
+        let g = obj_geometry_region(&world, None, 3, 5, 5, 7, 0, 0, &[], LightMode::default(), None);
+
+        let top = quads_in_plane_y(&g, 1.0);
+        let cells = covered_cells(&top);
+        let want: HashSet<(i32, i32)> = shape.iter().map(|&(x, y)| (x as i32, y as i32)).collect();
+        assert_eq!(cells, want, "merged top faces cover the L and nothing else");
+        assert_eq!(top.len(), 2, "an L is two maximal rectangles");
+    }
+
+    /// Faces only fuse when they render identically. A checkerboard of two block types shares no
+    /// edge between same-typed cells, so nothing merges — the guard against a merge keyed on
+    /// position alone, which would smear one material over its neighbour.
+    #[test]
+    fn test_greedy_merge_splits_on_block_type() {
+        let mut world = make_test_world();
+        for x in 3..=6 { for y in 5..=8 {
+            world.bytes[tblock(x, y, 0)] = if (x + y) % 2 == 0 { 2 } else { 3 }; // stone / dirt
+        } }
+        let g = obj_geometry_region(&world, None, 3, 5, 6, 8, 0, 0, &[], LightMode::default(), None);
+        let top = quads_in_plane_y(&g, 1.0);
+        assert_eq!(top.len(), 16, "no two same-type cells are edge-adjacent, so no top face merges");
+        assert_eq!(covered_cells(&top).len(), 16);
+    }
+
+    /// …and only when they are lit identically. Two adjacent stone blocks under night lighting sit at
+    /// different distances from a lamp, so their top faces carry different colours and must stay
+    /// separate quads — merging them would flatten the lamp falloff into one average.
+    #[test]
+    fn test_greedy_merge_splits_on_per_block_light() {
+        let mut world = make_test_world();
+        world.bytes[tblock(3, 5, 0)] = 2;
+        world.bytes[tblock(4, 5, 0)] = 2;
+        world.bytes[tblock(3, 5, 3)] = LAMP_BLOCK_TYPE;
+
+        let day = obj_geometry_region(&world, None, 3, 5, 4, 5, 0, 0, &[], LightMode::default(), None);
+        assert_eq!(quads_in_plane_y(&day, 1.0).len(), 1, "unlit: identical colour, one merged quad");
+
+        let night_mode = LightMode { night: true, shadows: false, sun_t: 0.0, flat: false, lamp_radius: 0.0, profile: LightingProfile::Legacy };
+        let lamps = scan_lamps(&world, 3, 5, 4, 5, 0, 0, night_mode.profile.default_radius());
+        let night = obj_geometry_region(&world, None, 3, 5, 4, 5, 0, 0, &lamps, night_mode, None);
+        let top = quads_in_plane_y(&night, 1.0);
+        assert_eq!(top.len(), 2, "lit differently → not merged");
+        assert_eq!(covered_cells(&top).len(), 2);
+    }
+
+    /// Texture packs constrain the merge to one axis. The atlas is a vertical strip of per-block rows,
+    /// so U can tile (it repeats the same one-tile-wide column) but V *selects the row* — growing V
+    /// would run a merged quad into the next block's texture. A 3×3 wall therefore merges into three
+    /// 3-wide rows with a pack loaded, and into a single quad without one, and every emitted V stays
+    /// inside one atlas row either way.
+    #[test]
+    fn test_greedy_merge_with_texture_pack_tiles_u_only() {
+        let mut world = make_test_world();
+        for x in 3..=5 { for z in 0..=2 { world.bytes[tblock(x, 5, z)] = 2; } }
+
+        let pack = texturepack::TexturePack {
+            tile: 1,
+            atlas_rgba: vec![255u8; 3 * 4], // tile 1×1 RGBA × 3 rows; only `atlas_rows` is read here
+            atlas_rows: 3, // row 0 sentinel + 1 colour row + 1 grayscale row
+            gray_row_offset: 1,
+            name_to_row: [("stone".to_string(), 1u32)].into_iter().collect(),
+        };
+
+        // South (+Y) faces lie in the Eden-y = 6 plane → THREE z == 6.
+        let south = |res: &ObjGeometryResult| -> Vec<[(f32, f32, f32); 6]> {
+            quads(res).into_iter().filter(|q| q.iter().all(|v| v.2 == 6.0)).collect()
+        };
+
+        let bare = obj_geometry_region(&world, None, 3, 5, 5, 5, 0, 2, &[], LightMode::default(), None);
+        assert_eq!(south(&bare).len(), 1, "untextured: the 3×3 wall face is one quad");
+
+        let textured = obj_geometry_region(&world, Some(&pack), 3, 5, 5, 5, 0, 2, &[], LightMode::default(), None);
+        assert_eq!(south(&textured).len(), 3, "textured: 3-wide rows, never merged vertically");
+
+        // U tiles up to the merged width; V never leaves the single row it started in.
+        let uv: Vec<f32> = textured.uvs.chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
+        assert!(!uv.is_empty(), "a loaded pack must emit UVs");
+        let us: Vec<f32> = uv.iter().step_by(2).copied().collect();
+        let vs: Vec<f32> = uv.iter().skip(1).step_by(2).copied().collect();
+        assert_eq!(us.iter().cloned().fold(f32::NEG_INFINITY, f32::max), 3.0, "U tiles across the merged width");
+        let vmin = vs.iter().cloned().fold(f32::INFINITY, f32::min);
+        let vmax = vs.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let row_h = 1.0 / pack.atlas_rows as f32;
+        assert!((vmax - vmin - row_h).abs() < 1e-6, "V spans exactly one atlas row ({vmin}..{vmax})");
+    }
+
+    /// Ramps and wedges are not unit squares, so they never enter the merge pass — and a plain-cube
+    /// run must not merge *through* one as if the cell were empty or flat. A row of stone cubes with a
+    /// stone ramp in the middle therefore yields two separate merged top quads (left of the ramp and
+    /// right of it), covering exactly the cube cells and skipping the ramp's.
+    #[test]
+    fn test_greedy_merge_leaves_ramps_unmerged_and_splits_the_run_around_them() {
+        let mut world = make_test_world();
+        for x in 3..=7 { world.bytes[tblock(x, 5, 0)] = 2; } // stone row
+        world.bytes[tblock(5, 5, 0)] = 24; // Stone Ramp (south) in the middle
+
+        let g = obj_geometry_region(&world, None, 3, 5, 7, 5, 0, 0, &[], LightMode::default(), None);
+        let top = quads_in_plane_y(&g, 1.0);
+        // The ramp's own top is a sloped quad, not in the z=1 plane, so only the cubes' tops appear.
+        assert_eq!(top.len(), 2, "the ramp splits the cube run into two merged quads");
+        assert_eq!(
+            covered_cells(&top),
+            [(3, 5), (4, 5), (6, 5), (7, 5)].into_iter().collect::<HashSet<_>>(),
+            "merged tops cover the cube cells and never the ramp's",
+        );
+    }
+
+    /// Fluids: a face defers to the merge pass only when it fills its unit cell. Full-height water
+    /// merges normally (and lands in the *transparent* stream, not the opaque one); a ½-height surface
+    /// sits at z+0.5, so its top faces are not unit squares and must emit one per block, unmerged —
+    /// merging them would be harmless here but the same gate protects the stepped-sliver lateral faces
+    /// a mixed-level pool produces.
+    #[test]
+    fn test_greedy_merge_full_fluid_merges_partial_fluid_does_not() {
+        let mut full = make_test_world();
+        for x in 3..=6 { full.bytes[tblock(x, 5, 0)] = 20; } // Water, level 4
+        let g = obj_geometry_region(&full, None, 3, 5, 6, 5, 0, 0, &[], LightMode::default(), None);
+        assert_eq!(g.vertex_count, 0, "water is transparent — nothing in the opaque stream");
+        let top: Vec<_> = quads_t(&g).into_iter().filter(|q| q.iter().all(|v| v.1 == 1.0)).collect();
+        assert_eq!(top.len(), 1, "full-height water tops merge into one quad");
+        assert_eq!(covered_cells(&top).len(), 4);
+
+        let mut half = make_test_world();
+        for x in 3..=6 { half.bytes[tblock(x, 5, 0)] = 60; } // Water ½, level 2
+        let g = obj_geometry_region(&half, None, 3, 5, 6, 5, 0, 0, &[], LightMode::default(), None);
+        let top: Vec<_> = quads_t(&g).into_iter().filter(|q| q.iter().all(|v| v.1 == 0.5)).collect();
+        assert_eq!(top.len(), 4, "a ½-height surface is not a unit square — one quad per block");
+        assert_eq!(covered_cells(&top).len(), 4);
     }
 
     #[test]
@@ -1891,4 +2393,3 @@ mod tests {
         assert_eq!(hit.block_type, 20);
     }
 }
-

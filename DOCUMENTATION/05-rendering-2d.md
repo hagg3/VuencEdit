@@ -69,9 +69,16 @@ the skipped columns were never visible. Cost drops by `lod²`.
 - **Bounded LRU replaces prune-to-visible.** `touchTile` marks the needed set as
   most-recently-used (delete + re-set on an insertion-ordered `Map`), then
   `evictTiles` trims from the other end. The cap is
-  `max(TILE_CACHE_LIMIT, 2 × visible tiles)` — a fixed cap alone would evict
-  tiles the frame they arrive on a 4K viewport, where the visible window can
-  exceed 96 tiles by itself.
+  `min(max(TILE_CACHE_LIMIT, 2 × visible tiles), max(visible tiles, byteCap))` —
+  never below the visible window (a fixed cap alone would evict tiles the frame
+  they arrive on a 4K viewport, where the visible window can exceed 96 tiles by
+  itself) but also never above what `tileBudgetBytes` allows (2026-08
+  memory-efficiency pass §2 — the byte ceiling that was missing before; split ⅔
+  base-tile / ⅓ template-tile, matching the historical 96/48-tile ratio;
+  `tileBudgetBytes` is a `MapCanvas` prop wired from `MEMORY_PRESETS` — see
+  CLAUDE.md's "Memory Budget" section). `evictTiles`/`clearTiles` zero a canvas's
+  `width`/`height` before dropping it so the ~1 MiB backing store is released
+  immediately instead of waiting on GC.
 - **`applyPatch` handles both levels.** Edit patches are always lod 1: lod-1
   tiles take the usual 1:1 `putImageData`; lod > 1 tiles get the patch drawn
   through a nearest-neighbour downscale instead, so coarse levels stay live

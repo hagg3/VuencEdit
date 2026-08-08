@@ -7,7 +7,7 @@ import { maskOutline, type OutlinePt } from "./maskUtils";
 
 export type { PixelPatch } from "./types";
 
-export type Tool = "pan" | "select" | "wand" | "lasso" | "paste" | "pen" | "brush" | "spray" | "line" | "rect" | "ellipse" | "polygon" | "smooth" | "noise" | "flatten" | "erode" | "thermal" | "hydro" | "stamp" | "grab" | "raise" | "lower" | "terrace" | "sharpen" | "slope" | "smear" | "rock" | "carve" | "fill" | "eyedropper" | "poolfill" | "materialize";
+export type Tool = "pan" | "select" | "wand" | "lasso" | "polyselect" | "paste" | "pen" | "brush" | "spray" | "line" | "rect" | "ellipse" | "polygon" | "smooth" | "noise" | "flatten" | "erode" | "thermal" | "hydro" | "stamp" | "grab" | "raise" | "lower" | "terrace" | "sharpen" | "slope" | "smear" | "rock" | "carve" | "fill" | "eyedropper" | "poolfill" | "materialize";
 
 /** Ceiling on chunks per materialize operation — mirrors `MAX_MATERIALIZE_CHUNKS` in lib.rs. Used
  *  both to bound the materialize-select tool's loosened drag clamp and by the confirm-dialog copy. */
@@ -18,7 +18,7 @@ export const MAX_MATERIALIZE_CHUNKS = 16_384;
  * A `Record<Tool, …>` (not a ternary chain) so adding a Tool is a compile error until it's named.
  */
 export const TOOL_LABELS: Record<Tool, string> = {
-  pan: "Pan", select: "Select", wand: "Wand", lasso: "Lasso", paste: "Paste",
+  pan: "Pan", select: "Select", wand: "Wand", lasso: "Lasso", polyselect: "Polygon Select", paste: "Paste",
   pen: "Pen", brush: "Brush", spray: "Spray", line: "Line",
   rect: "Rect", ellipse: "Ellipse", polygon: "Polygon",
   smooth: "Smooth", noise: "Noise", flatten: "Flatten", erode: "Erode",
@@ -36,6 +36,7 @@ export const TOOL_LABELS: Record<Tool, string> = {
 export const TOOL_HINTS: Partial<Record<Tool, string>> = {
   polygon: "Click to add points · click the first point (or double-click) to close · Esc cancels",
   lasso: "Drag to trace a freeform selection · release to close · Esc cancels",
+  polyselect: "Click to add points · click the first point (or double-click) to close · Esc cancels",
   grab: "Press on the terrain and drag up / down to raise or lower it",
   wand: "Click a block to flood-select everything matching it on the surface",
   eyedropper: "Click a block to make it the active block",
@@ -59,7 +60,7 @@ export const TOOL_HINTS: Partial<Record<Tool, string>> = {
  * where over the selection the pointer is, not just the armed tool).
  */
 export const TOOL_CURSOR: Record<Tool, string> = {
-  pan: "grab", paste: "copy", wand: "cell", lasso: "crosshair", eyedropper: "cell", grab: "ns-resize",
+  pan: "grab", paste: "copy", wand: "cell", lasso: "crosshair", polyselect: "crosshair", eyedropper: "cell", grab: "ns-resize",
   select: "crosshair", pen: "crosshair", brush: "crosshair", spray: "crosshair",
   line: "crosshair", rect: "crosshair", ellipse: "crosshair", polygon: "crosshair",
   smooth: "crosshair", noise: "crosshair", flatten: "crosshair", erode: "crosshair",
@@ -126,6 +127,13 @@ const MAX_LOD = 32;
 const TILE_CACHE_LIMIT = 96;
 const TEMPLATE_CACHE_LIMIT = 48;
 
+/** Bytes per cached tile canvas (RGBA, TILE×TILE). */
+const TILE_BYTES = TILE * TILE * 4;
+
+/** Default combined tile+template cache budget — the "Balanced" memory-budget preset (§6). Split
+ *  ⅔ base / ⅓ template below, matching the historical 96/48-tile ratio. */
+const DEFAULT_TILE_BUDGET_BYTES = 256 * 1024 * 1024;
+
 /** World blocks per rendered pixel for a given zoom: the largest power of two that still maps a
  *  rendered pixel to at most one screen pixel, so LOD never *upscales* (which would look blurrier
  *  than today). scale ≥ 1 → 1 (untouched full-resolution behaviour); scale 0.5 → 2; 0.1 → 8. */
@@ -153,8 +161,40 @@ function touchTile(cache: Map<string, HTMLCanvasElement>, key: string): void {
   if (v !== undefined) { cache.delete(key); cache.set(key, v); }
 }
 
-/** Drop least-recently-used entries until the cache is within `limit`. */
+/** Zero a canvas's backing store before dropping it — setting `width`/`height` releases the pixel
+ *  buffer immediately instead of waiting on GC, which otherwise leaves the 1 MiB/tile backing
+ *  store resident until whenever the collector gets to it (§2 of the 2026-08 memory-efficiency
+ *  pass — a bounded cache count is not a bounded *retained-heap* guarantee without this). */
+function freeTileCanvas(c: HTMLCanvasElement): void {
+  c.width = 0;
+  c.height = 0;
+}
+
+/** Drop least-recently-used entries until the cache is within `limit`, freeing each evicted
+ *  canvas's backing store immediately (see `freeTileCanvas`). */
 function evictTiles(cache: Map<string, HTMLCanvasElement>, limit: number): void {
+  while (cache.size > limit) {
+    const oldest = cache.keys().next();
+    if (oldest.done) break;
+    const c = cache.get(oldest.value);
+    if (c) freeTileCanvas(c);
+    cache.delete(oldest.value);
+  }
+}
+
+/** Wholesale-clear a tile cache, freeing every canvas's backing store first (see `freeTileCanvas`). */
+function clearTiles(cache: Map<string, HTMLCanvasElement>): void {
+  for (const c of cache.values()) freeTileCanvas(c);
+  cache.clear();
+}
+
+/** Bound on `materializeOccupancyRef` (§2): one entry per queried chunk, cleared only on world
+ *  change — panning the materialize-select overlay across a huge world could otherwise grow it
+ *  without limit. Insertion-order eviction, same idiom as the tile caches. */
+const MATERIALIZE_OCCUPANCY_LIMIT = 65536;
+
+/** Drop oldest entries from a JS `Map` (insertion order) until it's within `limit`. */
+function evictOldestEntries<K, V>(cache: Map<K, V>, limit: number): void {
   while (cache.size > limit) {
     const oldest = cache.keys().next();
     if (oldest.done) break;
@@ -335,6 +375,8 @@ interface Props {
   onMagicWand?: (wx: number, wy: number) => void;
   /** Called when a lasso drag is released, with the ordered world-space path. */
   onLassoSelect?: (pts: [number, number][]) => void;
+  /** Called when a click-vertex polygon selection is closed, with the ordered world-space path. */
+  onPolySelect?: (pts: [number, number][]) => void;
   /** Active shaped-selection footprint (wand/lasso), decoded from get_selection_mask. When its bbox
    *  matches the committed selection exactly, the selection overlay fills only the set cells instead
    *  of the whole box. */
@@ -369,6 +411,10 @@ interface Props {
   committedMaterializeSelection?: MaterializeSelectionBounds | null;
   /** Called when a materialize-select drag commits (or is cleared) with the chunk-coordinate rect. */
   onMaterializeSelectionChange?: (bounds: MaterializeSelectionBounds | null) => void;
+  /** Total byte budget for the tile + template tile caches combined (memory-budget preset, §2/§6
+   *  of the 2026-08 memory-efficiency pass). Split ⅔ base / ⅓ template, matching the historical
+   *  96/48-tile ratio. Defaults to the "Balanced" preset. */
+  tileBudgetBytes?: number;
 }
 
 type TileJob = { key: string; lod: number; x1: number; y1: number; x2: number; y2: number };
@@ -378,12 +424,13 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     committedSelection, onSelectionChange, pastePreview, clipboardPreviewPixels, onPasteAt,
     renderMode, axoSkew = 0.2, lockedPastePos = null,
     drawConfig, onDrawStroke, onSculptStroke, onCancelStroke, drawZOverride = null,
-    extrudePreview = null, lastPasteDelta = null, onCursorMove, onMagicWand, onLassoSelect, selectionMask = null,
+    extrudePreview = null, lastPasteDelta = null, onCursorMove, onMagicWand, onLassoSelect, onPolySelect, selectionMask = null,
     spawnPos = null, creatures = [],
     pasteElevationOffset = 0, onEyedropper, onPoolFillPick, sliceLines = null,
     cameraPos3d = null, onSetCamera3d,
     showTemplateOverlay = false, onMapContextMenu, onSelectDragUpdate, onMoveSelection, moveWithContents = false,
-    committedMaterializeSelection = null, onMaterializeSelectionChange }: Props,
+    committedMaterializeSelection = null, onMaterializeSelectionChange,
+    tileBudgetBytes = DEFAULT_TILE_BUDGET_BYTES }: Props,
   ref,
 ) {
   const canvasRef  = useRef<HTMLCanvasElement>(null);
@@ -474,6 +521,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   const onMapContextMenuRef = useRef(onMapContextMenu);
   const onMagicWandRef      = useRef(onMagicWand);
   const onLassoSelectRef    = useRef(onLassoSelect);
+  const onPolySelectRef     = useRef(onPolySelect);
   const spawnPosRef         = useRef(spawnPos);
   const creaturesRef        = useRef(creatures);
   const sliceLinesRef       = useRef(sliceLines);
@@ -542,8 +590,8 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
       strokeCancelledRef.current = true;
       pendingStampsRef.current = [];
     }
-    // Leaving the polygon tool abandons an unclosed polygon.
-    if (tool !== "polygon") polyVertsRef.current = [];
+    // Leaving the polygon/polyselect tool abandons an unclosed polygon.
+    if (tool !== "polygon" && tool !== "polyselect") polyVertsRef.current = [];
   }, [tool]);
   useEffect(() => { onSelChangeRef.current = onSelectionChange; }, [onSelectionChange]);
   useEffect(() => { onPasteAtRef.current   = onPasteAt; }, [onPasteAt]);
@@ -559,6 +607,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   useEffect(() => { onMapContextMenuRef.current = onMapContextMenu; }, [onMapContextMenu]);
   useEffect(() => { onMagicWandRef.current     = onMagicWand;         }, [onMagicWand]);
   useEffect(() => { onLassoSelectRef.current   = onLassoSelect;       }, [onLassoSelect]);
+  useEffect(() => { onPolySelectRef.current    = onPolySelect;        }, [onPolySelect]);
   useEffect(() => { selectionMaskRef.current   = selectionMask;       }, [selectionMask]);
   useEffect(() => { spawnPosRef.current        = spawnPos;            }, [spawnPos]);
   useEffect(() => { creaturesRef.current       = creatures;           }, [creatures]);
@@ -1214,11 +1263,12 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
         for (let i = 1; i < drag.pts.length; i++) { const s = toS(drag.pts[i]); ctx.lineTo(s.x, s.y); }
         ctx.lineTo(s0.x, s0.y);
         ctx.stroke();
-      } else if (drawTool === "polygon" && polyVertsRef.current.length > 0) {
-        // Polygon-in-progress: vertices + edges + rubber-band to cursor.
+      } else if ((drawTool === "polygon" || drawTool === "polyselect") && polyVertsRef.current.length > 0) {
+        // Polygon-in-progress: vertices + edges + rubber-band to cursor. Polyselect uses the same
+        // violet as lasso/wand to read as a selection gesture, not a draw one.
         const verts = polyVertsRef.current;
         const toS = (p: WP) => ({ x: Math.round(p.x * scale + vx) + gs / 2, y: Math.round(p.y * scale + vy) + gs / 2 });
-        ctx.strokeStyle = "rgba(56,189,248,0.9)";
+        ctx.strokeStyle = drawTool === "polyselect" ? "rgba(168,85,247,0.9)" : "rgba(56,189,248,0.9)";
         ctx.lineWidth = 1.5;
         ctx.beginPath();
         const s0 = toS(verts[0]);
@@ -1322,6 +1372,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
             materializeOccupancyRef.current.set(`${cx},${cy}`, flags[(cy - cy1) * w + (cx - cx1)] === 1);
           }
         }
+        evictOldestEntries(materializeOccupancyRef.current, MATERIALIZE_OCCUPANCY_LIMIT);
         scheduleDraw();
       })
       .catch(() => {});
@@ -1383,10 +1434,10 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
 
   // When overlay is toggled, invalidate tile cache so loadTile re-runs and fetches template tiles too
   useEffect(() => {
-    templateTileCacheRef.current.clear();
+    clearTiles(templateTileCacheRef.current);
     if (showTemplateOverlay) {
       tileEpoch.current.next();
-      tileCacheRef.current.clear();
+      clearTiles(tileCacheRef.current);
       pendingRef.current.clear();
       queueRef.current = [];
       ensureTilesRef.current();
@@ -1505,8 +1556,14 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
       touchTile(tileCacheRef.current, key);
       touchTile(templateTileCacheRef.current, key);
     }
-    tileLimitRef.current = Math.max(TILE_CACHE_LIMIT, needed.size * 2);
-    templateLimitRef.current = Math.max(TEMPLATE_CACHE_LIMIT, needed.size * 2);
+    // Never below the visible window (a limit under `needed.size` would evict tiles the very frame
+    // they're fetched), but also never above what the byte budget allows — §2 of the 2026-08
+    // memory-efficiency pass: the old floor-only expression had no ceiling, so a 4K viewport at low
+    // zoom (all LOD levels sharing one bucket) could grow unbounded.
+    const baseByteCap = Math.floor((tileBudgetBytes * 2 / 3) / TILE_BYTES);
+    const templateByteCap = Math.floor((tileBudgetBytes * 1 / 3) / TILE_BYTES);
+    tileLimitRef.current = Math.min(Math.max(TILE_CACHE_LIMIT, needed.size * 2), Math.max(needed.size, baseByteCap));
+    templateLimitRef.current = Math.min(Math.max(TEMPLATE_CACHE_LIMIT, needed.size * 2), Math.max(needed.size, templateByteCap));
     evictTiles(tileCacheRef.current, tileLimitRef.current);
     evictTiles(templateTileCacheRef.current, templateLimitRef.current);
 
@@ -1744,8 +1801,8 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     viewModeRef.current = viewMode;
     zSliceZRef.current  = zSliceZ;
     tileEpoch.current.next();
-    tileCacheRef.current.clear();
-    templateTileCacheRef.current.clear();
+    clearTiles(tileCacheRef.current);
+    clearTiles(templateTileCacheRef.current);
     pendingRef.current.clear();
     queueRef.current = [];
     fullCanvasRef.current = null;
@@ -1756,8 +1813,8 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   useEffect(() => {
     renderModeRef.current = renderMode;
     tileEpoch.current.next();
-    tileCacheRef.current.clear();
-    templateTileCacheRef.current.clear();
+    clearTiles(tileCacheRef.current);
+    clearTiles(templateTileCacheRef.current);
     pendingRef.current.clear();
     queueRef.current = [];
     fullCanvasRef.current = null;
@@ -1842,11 +1899,15 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
 
   // ── Pointer / wheel handlers ──────────────────────────────────────────────
 
-  // Close the polygon-in-progress: fill/outline its interior and commit as one stroke.
+  // Close the polygon-in-progress: for the draw tool, fill/outline its interior and commit as one
+  // stroke; for polyselect, hand the raw vertex path to the caller (mirrors lasso's onLassoSelect,
+  // which does its own polygonPixels(..., "fill") + set_selection_mask).
   const commitPolygon = useCallback(() => {
     const verts = polyVertsRef.current;
     polyVertsRef.current = [];
-    if (verts.length >= 2 && onDrawStrokeRef.current) {
+    if (toolRef.current === "polyselect") {
+      if (verts.length >= 3) onPolySelectRef.current?.(verts.map(p => [p.x, p.y]));
+    } else if (verts.length >= 2 && onDrawStrokeRef.current) {
       const mode: FillMode = drawConfigRef.current?.fillMode ?? "fill";
       const pts = polygonPixels(verts, mode);
       strokeIdRef.current++; // one polygon fill = one undo group
@@ -2018,9 +2079,10 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
       strokeIdRef.current++; // grab is a single-commit stroke, but still its own undo group
       dragRef.current = { kind: "sculpt-grab", pts, cx: wp.x, cy: wp.y, downClientY: e.clientY, delta: 0 };
       draw();
-    } else if (toolRef.current === "polygon") {
-      // Polygon/lasso: each click adds a vertex; click near the first vertex (or double-click)
-      // closes and fills. No drag state — vertices persist in polyVertsRef across clicks.
+    } else if (toolRef.current === "polygon" || toolRef.current === "polyselect") {
+      // Polygon (draw/select): each click adds a vertex; click near the first vertex (or
+      // double-click) closes and commits. No drag state — vertices persist in polyVertsRef across
+      // clicks. commitPolygon() branches on the active tool for what "commit" means.
       const wp = screenToWorld(e.clientX, e.clientY);
       const verts = polyVertsRef.current;
       if (verts.length >= 3) {
@@ -2471,7 +2533,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
       onPointerMove={onPointerMove}
       onPointerUp={onPointerUp}
       onPointerLeave={onPointerLeave}
-      onDoubleClick={() => { if (toolRef.current === "polygon") commitPolygon(); }}
+      onDoubleClick={() => { if (toolRef.current === "polygon" || toolRef.current === "polyselect") commitPolygon(); }}
       onContextMenu={e => {
         e.preventDefault();
         const wp = screenToWorld(e.clientX, e.clientY);

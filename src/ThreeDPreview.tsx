@@ -102,6 +102,9 @@ export default function ThreeDPreview({ selection: sel, texturePack = null, texE
       );
       tex.minFilter = THREE.NearestFilter;
       tex.magFilter = THREE.NearestFilter;
+      // Merged (greedy-meshed) quads tile U across their width — see the same note in FlyView3D's
+      // rebuildTextureMaterials. `get_obj_geometry` feeds this pane through the same emitter.
+      tex.wrapS = THREE.RepeatWrapping;
       tex.flipY = false;
       tex.needsUpdate = true;
       atlasTexRef.current = tex;

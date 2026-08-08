@@ -56,12 +56,35 @@ export interface AppSettings {
   sidebarWidth: number;
   /** Docked sidebar's active tab on load. Default "inspector". */
   sidebarTab: "inspector" | "prefabs" | "history";
+  /** Memory-budget preset (§6 of the 2026-08 memory-efficiency pass) — trades resident RAM against
+   *  undo depth / cache hit rate / 3D streaming range. See `MEMORY_PRESETS`. Default "balanced". */
+  memoryBudget: "low" | "balanced" | "high";
   /** Bumped when a default changes in a way that must be pushed onto existing installs (see loadSettings). */
   settingsVersion: number;
 }
 
+/** Memory-budget preset table — the single source of truth for what each preset actually bounds.
+ *  `undoBudgetBytes` reaches Rust via `set_undo_budget`; `tileBudgetBytes`/`geometryBudgetBytes` stay
+ *  frontend-side as props into `MapCanvas`/`FlyView3D`. See CLAUDE.md's memory-efficiency pass notes.
+ *
+ *  `geometryBudgetBytes` replaced the old `vertexBudget` (3D-pane crash fix, Stage 1): a vertex costs
+ *  24–36 B depending on stream and texture pack, and a 256z world reaches any vertex count 4× faster
+ *  than the 64z worlds the old numbers were tuned on — so the cap now counts the thing that actually
+ *  costs memory. ≈ 6 M / 16 M / 32 M textured verts, and (post upload-release) ≈ the resident GPU
+ *  bytes rather than half of a doubled JS+GPU footprint. */
+export const MEMORY_PRESETS: Record<AppSettings["memoryBudget"], {
+  label: string;
+  undoBudgetBytes: number;
+  tileBudgetBytes: number;
+  geometryBudgetBytes: number;
+}> = {
+  low:      { label: "Low",      undoBudgetBytes:  48 << 20, tileBudgetBytes: 128 << 20, geometryBudgetBytes:  192 << 20 },
+  balanced: { label: "Balanced", undoBudgetBytes:  96 << 20, tileBudgetBytes: 256 << 20, geometryBudgetBytes:  512 << 20 },
+  high:     { label: "High",     undoBudgetBytes: 256 << 20, tileBudgetBytes: 512 << 20, geometryBudgetBytes: 1024 << 20 },
+};
+
 /** Current settings schema version. Bump + add a case to `migrate()` when a stored default must change. */
-const SETTINGS_VERSION = 6;
+const SETTINGS_VERSION = 8;
 
 const DEFAULTS: AppSettings = {
   defaultQuadView: true,
@@ -88,6 +111,7 @@ const DEFAULTS: AppSettings = {
   sidebarOpen: true,
   sidebarWidth: 260,
   sidebarTab: "inspector",
+  memoryBudget: "balanced",
   settingsVersion: SETTINGS_VERSION,
 };
 
@@ -114,6 +138,14 @@ function migrate(s: Record<string, unknown>): boolean {
   if (from < 5 && s.lampRadius === 5) s.lampRadius = 4;
   // v5 → v6: added backupCompressed. No forced value needed — the `{...DEFAULTS, ...parsed}` merge
   // supplies it (default false, matching the pre-existing plain-.bak behaviour).
+  // v6 → v7: added the memoryBudget preset (Low/Balanced/High). No forced value needed — the
+  // `{...DEFAULTS, ...parsed}` merge supplies "balanced", matching every pre-existing install's
+  // actual undo/tile/vertex ceilings (96 MB / 256 MB / 30 M verts) exactly, so this is purely additive.
+  // v7 → v8: the 3D pane's `vertexBudget` became `geometryBudgetBytes` and every preset's 3D ceiling
+  // was retuned down (a 30 M-vertex "Balanced" was ~1.9 GB of resident geometry — the 256z fly-view
+  // crash). No forced value needed: the ceilings live in `MEMORY_PRESETS` above, not in the stored
+  // blob, so an existing install picks them up from the `memoryBudget` preset it already has. The
+  // bump is here to record that the meaning of that preset changed.
   s.settingsVersion = SETTINGS_VERSION;
   return true;
 }
@@ -337,7 +369,7 @@ export default function SettingsModal({ onClose, onSave }: Props) {
                 </div>
               </div>
 
-              <div style={{ ...row, borderBottom: "none" }}>
+              <div style={row}>
                 <Checkbox value={local.enableExperimentalExport} onChange={v => set("enableExperimentalExport", v)} label="Experimental exports (OBJ/VMF)" />
                 <div style={labelCol}>
                   <span style={labelText}>
@@ -345,6 +377,28 @@ export default function SettingsModal({ onClose, onSave }: Props) {
                     <span style={expBadge({ marginLeft: 7, verticalAlign: "middle" })}>exp</span>
                   </span>
                   <span style={labelSub}>Shows File → Export OBJ… and Export VMF (Hammer)… — both are still buggy</span>
+                </div>
+              </div>
+
+              <div style={{ ...row, borderBottom: "none" }}>
+                <div style={labelCol}>
+                  <span style={labelText}>Memory budget</span>
+                  <span style={labelSub}>
+                    Trades resident RAM against undo depth, tile-cache hit rate, and 3D streaming range.
+                    {" "}{MEMORY_PRESETS[local.memoryBudget].label} ≈ {MEMORY_PRESETS[local.memoryBudget].undoBudgetBytes / (1 << 20)} MB undo
+                    + {MEMORY_PRESETS[local.memoryBudget].tileBudgetBytes / (1 << 20)} MB tiles
+                    + {MEMORY_PRESETS[local.memoryBudget].geometryBudgetBytes / (1 << 20)} MB 3D geometry.
+                  </span>
+                </div>
+                <div style={{ display: "flex", gap: 4, marginLeft: "auto" }}>
+                  {(Object.keys(MEMORY_PRESETS) as (keyof typeof MEMORY_PRESETS)[]).map(key => (
+                    <button
+                      key={key}
+                      onClick={() => set("memoryBudget", key)}
+                      style={local.memoryBudget === key ? chromeButtonAccent(EDEN_TEAL, `rgb(${EDEN_TEAL})`, { padding: "4px 10px", fontSize: 12 }) : chromeButton({ padding: "4px 10px", fontSize: 12 })}>
+                      {MEMORY_PRESETS[key].label}
+                    </button>
+                  ))}
                 </div>
               </div>
             </>

@@ -186,6 +186,36 @@ shares files with the game):
   against replace/delete, so mapping the source would make an atomic temp+rename
   save fail with a sharing violation; on Unix, writing over a still-mmapped file
   is UB. Mapping a throwaway copy sidesteps both.
+- **The temp is mapped `MAP_SHARED`, not copy-on-write** (2026-08 memory pass §3).
+  All three load paths — zip, raw, `load_autosave` — go through one helper,
+  `map_staged_temp`, so they can't drift. Because the temp is a throwaway we own
+  outright, letting edits land in it costs nothing and keeps every edited page
+  file-backed and reclaimable under memory pressure; `MAP_PRIVATE` would turn each
+  one into anonymous dirty RAM that can only go to swap, growing without bound
+  across a long sculpt session.
+  - The file must be reopened `read(true).write(true)` — `fs::File::open` is
+    `O_RDONLY` and `map_mut` on it fails at *runtime* with `EACCES`
+    (`ERROR_ACCESS_DENIED` on Windows) while compiling perfectly clean.
+  - **Fallback to `map_copy`** on `VUENCEDIT_MAP=private`, on a macOS `statvfs`
+    check finding less than ~1.25× the world's size free on the temp volume, or on
+    any failure to take the writable mapping. The space check exists because
+    `stage_copy` clones on APFS: the temp shares blocks with the source until it
+    diverges, so every page a `MAP_SHARED` edit touches must allocate. Out of space
+    at writeback, macOS raises **SIGBUS** — an instant abort with no chance to save
+    — where `MAP_PRIVATE` would merely add swap pressure. Deliberately an env var
+    rather than a Settings toggle: it would need a new `load_world` parameter for a
+    knob no user can reason about.
+  - ⚠️ **Consequence: the temp is no longer the pristine as-loaded image.** Nothing
+    may assume it is — see the autosave base ordering below.
+  - The test-only `map_fixture` stays `map_copy` on purpose: it maps the shared
+    extracted fixture itself rather than a per-test copy, so a shared mapping would
+    leak one editing test's mutations into every other test and into the fixture on
+    disk.
+  - No `madvise` in this pass: `MADV_DONTNEED` discards dirty `MAP_PRIVATE` pages
+    and is unsafe on `MAP_SHARED` while `&LoadedWorld` borrows are live (they are,
+    everywhere), and `advise` is `#[cfg(unix)]` so any call site needs a shim or the
+    Windows build breaks. The problem it would have addressed — "we just paged in
+    half the world" — is what the on-demand lamp index (§4) removed at the source.
 - **`WorldMeta.was_compressed`** is tracked separately from the temp path (every
   load has a temp now).
 - **Load never destroys the current session before success is certain.** The new
