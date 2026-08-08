@@ -168,12 +168,31 @@ than a full-world write. `autosave.meta.json` (`AutosaveInfo`) carries
 `format: 1` for the journaled sidecar; `format: 0` marks a legacy single-file
 autosave, still recognized and still deleted by `discard_autosave`.
 
+⚠️ **Base ordering (2026-08 memory pass §3).** The world is mapped `MAP_SHARED`
+over the staged temp (`map_staged_temp`), so edits land *in the file the base is
+cloned from* — a clone taken while an edit is in flight can capture a chunk torn at
+page granularity, which would load fine and be silently half-wrong. What makes this
+safe is that `autosave_world_inner` establishes the base in a **step 0, before** the
+read guard that captures the tick's spans. `dirty.since_base`/`header_base` are
+monotone for a session (`mark_chunks`/`mark_header` only insert; the tick's cleanup
+touches only the `_journal` sets, `record_full_write` only the `_disk` sets, and the
+sole reset is `clear_all` on load/close), so every byte where the base differs from
+the as-loaded image was written by an edit that called `mark_*` before releasing its
+write guard — hence it is already in `since_base` when the spans are captured, ends
+up in the journal, and is fully overwritten on replay. **Reversing that order
+reintroduces silent voxel corruption**: an edit landing between capture and clone
+would be baked into the base while absent from that tick's journal. No guard is held
+across the clone's I/O. Pinned by
+`test_shared_temp_divergence_is_covered_by_since_base`, which is the only autosave
+test that maps its temp shared — `ws_with_temp_path` builds the world from `map_anon`
+and structurally cannot observe the hazard.
+
 Recovery: `get_autosave_info` offers it via `RecoveryModal`; the frontend calls
 `load_autosave` (`format: 1`) or falls back to the old `get_autosave_path` +
 `openFileAt` (`format: 0`). `load_autosave` mirrors `load_world` — stage the base,
 **replay the journal by `pwrite`-ing into the staged temp file**, not into any
-in-memory mapping, so the "temp file == as-loaded image" invariant the *next*
-session's base depends on still holds — then parse and swap in under lock.
+in-memory mapping, so the recovered temp is the recovered world before it is ever
+mapped — then parse and swap in under lock.
 
 ⚠️ **`recoverAutosave` does not delete the sidecar on recovery.** The autosave
 timer only refires on the *next edit* (`lastAutosavedEpochRef` already matches the

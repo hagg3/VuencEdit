@@ -90,9 +90,13 @@ tool is active (`pinnedBlocks`, `recentBlocks`, `hotbarHover`).
 - **Settings** — `AppSettings { defaultQuadView, default3dPane,
   defaultSaveCompressed, templatePath, texturePackPath, prefabDirectory,
   enableFog, renderDistance, flySpeed, sunT, lampRadius, showQuickActions,
-  autoOrient3d, settingsVersion }`. `loadSettings()`/`saveSettings()` use
+  autoOrient3d, memoryBudget, settingsVersion, … }` (list not exhaustive — see
+  `SettingsModal.tsx` for the full field set, which has grown past this excerpt).
+  `loadSettings()`/`saveSettings()` use
   `localStorage` key `eden_settings`. `saveSettingsDebounced` (250 ms) for slider
-  drags.
+  drags. `memoryBudget` ("low"|"balanced"|"high", 2026-08 memory-efficiency pass)
+  indexes `MEMORY_PRESETS` for the undo/tile/vertex ceilings — see CLAUDE.md's
+  "Memory Budget" section.
 - **Settings migrations** (`settingsVersion` + `migrate()`) — a plain
   `{...DEFAULTS, ...parsed}` merge can never push a *changed* default onto an
   existing install, since the stored explicit value always wins. `migrate()`

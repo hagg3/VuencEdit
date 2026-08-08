@@ -841,6 +841,7 @@ export default function Ribbon(p: RibbonProps) {
             <button onClick={() => p.setTool("select")} style={p.tool === "select" ? rbActive() : rb} title="Select (S)">⬚ Select</button>
             <button onClick={() => p.setTool("wand")} style={p.tool === "wand" ? rbActive("#a78bfa") : rb} title="Magic Wand (W)">⁂ Wand</button>
             <button onClick={() => p.setTool("lasso")} style={p.tool === "lasso" ? rbActive("#a855f7") : rb} title="Lasso — drag a freeform selection (K)">◌ Lasso</button>
+            <button onClick={() => p.setTool("polyselect")} style={p.tool === "polyselect" ? rbActive("#a855f7") : rb} title="Polygon Select — click points, close to select the shape (J)">⬠ Poly</button>
             <button onClick={() => p.setTool("materialize")} style={p.tool === "materialize" ? rbActive("#d97706") : rb}
               title="Materialize — drag to select ungenerated chunk space (holes or growth beyond the map edge)">▦ Materialize</button>
           </div>

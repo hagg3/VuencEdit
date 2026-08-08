@@ -102,11 +102,36 @@ function posToRadius(pos: number): number {
 }
 const STREAM_MS = 150;   // throttle for the load/dispose sweep
 const MAX_DPR = 1.5;     // cap device-pixel-ratio — Retina (2×) quadruples fragment load for ~no gain
-// Hard cap on resident vertex count (opaque + transparent streams combined) regardless of render
-// distance. At MAX_RENDER_DISTANCE=32 a fully-loaded disc is ~3200 chunks — with no cap that's
-// unbounded GPU memory (a dense world can be 10K+ verts/chunk). Once resident geometry crosses this,
-// the streaming queue stops pulling new chunks until eviction (moving the camera) frees headroom.
-const VERTEX_BUDGET = 30_000_000;
+
+// ---- Camera z band (3D-pane crash fix, Stage 3) -------------------------------------------------
+// A 256z chunk is a 16×16×256 scan — 4× a 64z one — and that 4× is paid per chunk, per fetch, on
+// the Rust side before a single vertex exists. The band caps the *ceiling* of what each chunk
+// fetch scans at `camera z + Z_BAND_ABOVE`, so the mostly-empty air a New Dawn world stacks above
+// the terrain is never walked. `get_chunk_geometry` intersects it with the cutaway cap
+// (`view_cap_z`) server-side; both only narrow, so they compose.
+//
+// ⚠️ Deliberately one-sided (up only) rather than the symmetric ±96 band the plan sketched. A band
+// with a *floor* hides terrain below the camera, and "fly up to survey the map" is a routine editor
+// gesture — the whole landscape would vanish. Clipping above the camera has a bounded failure mode
+// instead (a ceiling more than Z_BAND_ABOVE overhead pops in as you climb toward it), and it is
+// where all the empty air actually is. The see-through-roof trap the cut plane would otherwise
+// create is handled in Rust (`gbz` in obj_geometry_region — the cap face emits).
+const Z_BAND_ABOVE = 96;
+// Quantize the ceiling so vertical travel doesn't invalidate the whole resident set continuously —
+// the band only moves once per this many blocks climbed, and each move costs a full restream.
+const Z_BAND_STEP = 64;
+// Hard cap on resident chunk-geometry *bytes* (opaque + transparent + emissive streams) regardless
+// of render distance. At MAX_RENDER_DISTANCE=32 a fully-loaded disc is ~3200 chunks — with no cap
+// that's unbounded GPU memory (a dense 256z chunk can emit tens of MB on its own). Once resident
+// geometry crosses this, the streaming queue stops pulling new chunks until eviction (moving the
+// camera) frees headroom.
+//
+// Counted in bytes, not vertices (3D-pane crash fix, Stage 1): a vertex is 24–36 B depending on
+// which stream it lands in and whether a texture pack is loaded, so a vertex cap is a 1.5× fuzzy
+// byte cap — and it says nothing about world height, where the 256z crashes actually came from.
+// Bytes are what the GPU and the JS heap both charge for, and the number comes straight off the
+// envelope header (`VoxelGeometry.bytes*`) rather than being re-derived.
+const GEOMETRY_BUDGET_BYTES = 512 << 20;
 
 export interface FlyView3DRef {
   /** Move the camera to a world XY position (keeps current height). */
@@ -406,6 +431,36 @@ const CoordHud = forwardRef<CoordHudRef>(function CoordHud(_props, ref) {
   );
 });
 
+/** Dev-only geometry-memory readout (3D-pane crash fix, Stage 0). Everything here is measured, not
+ *  modelled: `gpu`/`js` come from the envelope's own `lens` header, so "did the Stage 1 upload-release
+ *  actually land" is directly visible as `js` staying near zero while `gpu` climbs to the budget. */
+type GeomMemData = {
+  chunks: number; gpu: number; js: number; inflight: number; peak: number; maxChunk: number; budget: number;
+};
+interface GeomMemHudRef { set: (d: GeomMemData) => void }
+
+const MB = (b: number) => `${(b / (1 << 20)).toFixed(b >= (100 << 20) ? 0 : 1)}M`;
+
+const GeomMemHud = forwardRef<GeomMemHudRef>(function GeomMemHud(_props, ref) {
+  const [d, setD] = useState<GeomMemData | null>(null);
+  useImperativeHandle(ref, () => ({ set: setD }), []);
+  if (!d) return null;
+  const frac = d.budget > 0 ? (d.gpu + d.inflight) / d.budget : 0;
+  return (
+    <div
+      title="Dev build only — resident 3D chunk geometry. gpu = uploaded VBO bytes, js = wire buffers still on the JS heap (should stay near 0 once uploads land), fly = in-flight fetch reservations."
+      style={{
+        position: "absolute", bottom: 6, right: 6, zIndex: 1, pointerEvents: "none",
+        padding: "2px 7px", borderRadius: 4, fontSize: 9, fontVariantNumeric: "tabular-nums",
+        background: "rgba(31,28,26,0.7)", border: "1px solid rgba(131,120,108,0.3)",
+        color: frac > 0.9 ? "#ef4444" : "#83786c", lineHeight: 1.5,
+      }}>
+      <div>{d.chunks} chunks · gpu {MB(d.gpu)} / {MB(d.budget)} · js {MB(d.js)} · fly {MB(d.inflight)}</div>
+      <div>peak {MB(d.peak)} · max chunk {MB(d.maxChunk)}</div>
+    </div>
+  );
+});
+
 const FlyView3D = forwardRef<FlyView3DRef, {
   world: WorldMeta; editEpoch?: number; lastEdit?: EditBounds | null;
   /** Initial camera target in Eden local block coords (x = east, y = south). Spawns the camera
@@ -535,6 +590,25 @@ const FlyView3D = forwardRef<FlyView3DRef, {
    *  shadow map, and fetches flat (unshaded) geometry. Overrides the baked night/shadow preview.
    *  Makes sunT free (moving the sun just repositions the light — no chunk reload). Default false. */
   gpuShadows?: boolean;
+  /** Hard cap on resident chunk-geometry bytes (all three streams, plus the payloads of in-flight
+   *  fetches) — memory-budget preset (§6 of the 2026-08 memory-efficiency pass, retuned to bytes by
+   *  the 3D-pane crash fix). Default `GEOMETRY_BUDGET_BYTES` (512 MB, "Balanced").
+   *  Note this only *pauses streaming* once crossed (see the `budgetLimited` gate below) — it never
+   *  evicts, so a stationary camera at a lower preset simply plateaus at a smaller resident set. */
+  geometryBudgetBytes?: number;
+  /** Non-fatal warning channel (WebGL context loss/restore). Same idiom as `SliceViewport.onNotice`:
+   *  the pane's only other escape hatch is *throwing*, which the ErrorBoundary turns into a full-pane
+   *  replacement — wrong for a condition the pane recovers from on its own. */
+  onNotice?: (msg: string) => void;
+  /** Cutaway ceiling (App's `viewCapZ`), or null for none. Purely a cache-invalidation key here —
+   *  the cap itself is backend state (`WorldState.view_cap_z`) and `get_chunk_geometry` applies it
+   *  to the emitted z band on its own. Changing it reloads every resident chunk. */
+  viewCapZ?: number | null;
+  /** Suspended = mounted but not visible (3D pane switched off, or quad view left). Parks the rAF
+   *  loop and the streaming sweep and drops every resident chunk mesh, so a hidden pane costs
+   *  essentially nothing — but keeps its WebGL context, which is the point: repeatedly creating and
+   *  destroying contexts is what walks WKWebView into its live-context ceiling (Stage 4). */
+  suspended?: boolean;
 }>(function FlyView3D({
   world, editEpoch = 0, lastEdit = null, spawnAt = null, worldLoadToken = 0, onFlyModeChange, onCameraMove, overlays3d = null,
   texturePack = null, texEpoch = 0, fogEnabled = true,
@@ -550,6 +624,10 @@ const FlyView3D = forwardRef<FlyView3DRef, {
   onSetInteract3d,
   sculptTool = "raise", sculptRadius = 6, sculptStrength = 2, onSculptStamp3d,
   gpuShadows = false,
+  geometryBudgetBytes = GEOMETRY_BUDGET_BYTES,
+  onNotice,
+  viewCapZ = null,
+  suspended = false,
 }, ref) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [camMode, setCamMode] = useState<CamMode>("orbit");
@@ -579,6 +657,23 @@ const FlyView3D = forwardRef<FlyView3DRef, {
   onRenderDistanceChangeRef.current = onRenderDistanceChange;
   const onFlySpeedChangeRef = useRef(onFlySpeedChange);
   onFlySpeedChangeRef.current = onFlySpeedChange;
+  // Read fresh inside the long-lived scene-setup effect's pump() closure below, mirroring the two
+  // refs above — a mid-session Settings preset change takes effect on the next pump without
+  // needing this deep effect's own dependency array to grow.
+  const geometryBudgetRef = useRef(geometryBudgetBytes);
+  geometryBudgetRef.current = geometryBudgetBytes;
+  // Non-fatal notice channel, mirrored into a ref so the big scene effect's dep array stays stable
+  // (SliceViewport's idiom). The context-loss handlers below are its only callers today.
+  const onNoticeRef = useRef(onNotice);
+  onNoticeRef.current = onNotice;
+  // Read once at the end of scene init: the scene effect re-runs on a world change, which builds a
+  // fresh (unsuspended) closure while the `suspended` prop may already be true — and the prop-driven
+  // effect below won't fire, because the prop itself didn't change.
+  const suspendedRef = useRef(suspended);
+  suspendedRef.current = suspended;
+  // Dev-only geometry-memory readout (3D-pane crash fix, Stage 0). Fed imperatively like CoordHud so
+  // the ~7 Hz updates re-render one leaf <div>, not the whole pane.
+  const memHudRef = useRef<GeomMemHudRef | null>(null);
 
   // initialRenderDistance/initialFlySpeed only seed useState's initial value — they don't otherwise
   // propagate, so a Settings reload/reset that changes the persisted value out from under this pane
@@ -780,6 +875,9 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     setMaxDpr: (max: number) => void;
     setGridVisible: (v: boolean) => void;
     setGpuShadows: (on: boolean) => void;
+    /** Park/resume the pane while it's mounted but hidden (Stage 4). Suspending disposes every
+     *  resident chunk mesh; resuming re-measures the canvas and restreams from the camera. */
+    setSuspended: (on: boolean) => void;
     /** Re-apply scene light state for the current (gpuShadows, nightLighting) combo — no chunk reload. */
     updateGpuLighting: () => void;
     /** Re-query lamp point lights around the camera (GPU night only). */
@@ -823,6 +921,12 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       );
       tex.minFilter = THREE.NearestFilter;
       tex.magFilter = THREE.NearestFilter;
+      // Greedy meshing (Stage 5) emits merged quads whose U runs 0..N, one unit per block tiled, so
+      // U must repeat. The atlas is exactly one tile wide and N tiles tall (`texturepack.rs`), so
+      // repeating in U re-tiles the same column and can never bleed into a neighbouring block's row.
+      // V is left clamped on purpose — it *selects* the row, which is why the Rust side refuses to
+      // merge along V whenever a pack is loaded.
+      tex.wrapS = THREE.RepeatWrapping;
       tex.flipY = false;
       tex.needsUpdate = true;
       atlasTexRef.current = tex;
@@ -850,6 +954,18 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       depthMatTexRef.current = dm;
     }
   };
+
+  // True once this component is going away for good, as opposed to the scene effect merely re-running
+  // (world resize, StrictMode's double-mount, HMR). React runs a component's effect cleanups in
+  // effect-definition order, so declaring this *above* the scene effect guarantees the flag is set
+  // before the scene cleanup below reads it — which is what lets that cleanup release the WebGL
+  // context on a real unmount without breaking the reuse case. Reset in the effect body so a
+  // StrictMode remount starts clean.
+  const unmountingRef = useRef(false);
+  useEffect(() => {
+    unmountingRef.current = false;
+    return () => { unmountingRef.current = true; };
+  }, []);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -884,8 +1000,12 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     // called synchronously by the first `resize()` during init — referencing it later would hit the
     // temporal dead zone and throw "cannot access uninitialized variable", blanking the pane.
     let raf = 0;
+    // Stage 4: mounted-but-hidden. Declared here (not next to `contextLost` below) because
+    // `invalidate` closes over it and runs during init. See `setSuspended` for what it parks.
+    let suspendedNow = false;
     const invalidate = () => {
       dirty = true;
+      if (suspendedNow) return; // nothing to paint into — the pane isn't on screen
       if (rafPending) return;
       rafPending = true;
       raf = requestAnimationFrame(frame);
@@ -1206,37 +1326,93 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     // `.dispose()`d every time an empty chunk is evicted despite never being added to the scene.
     const emptyChunks = new Set<string>();
     const isResident = (k: string) => meshes.has(k) || meshesE.has(k) || emptyChunks.has(k);
+    /** Every key this cache is holding anything for — the eviction/teardown iteration set. */
+    const residentKeys = () => new Set([...meshes.keys(), ...meshesT.keys(), ...meshesE.keys(), ...emptyChunks]);
 
-    // Running total of resident vertices (opaque + transparent streams) — cheaper than summing over
-    // all meshes on every pump() call, and drives the H6 vertex budget below.
-    let residentVerts = 0;
+    // ---- Resident-geometry accounting (3D-pane crash fix, Stages 0–1) ----
+    // Running totals, in bytes, rather than a re-sum over every mesh on each pump():
+    //   residentBytes  — GPU VBO bytes for installed meshes (each mesh's own wire payload).
+    //   jsBytes        — wire buffers still pinned on the JS heap. Every attribute array is a *view*
+    //                    over the one IPC envelope for its chunk (zero-copy, from the H2 pass), so a
+    //                    single surviving view pins all nine buffers. The `onUpload` release below
+    //                    drops them once the GPU has the data, which is what halves resident memory.
+    //   inflightBytes  — reserved estimate per in-flight fetch, so up to `maxConcurrent()` dense
+    //                    chunks landing at once can't overshoot the budget (the old gate tested
+    //                    resident-only, *before* starting a fetch).
+    let residentBytes = 0;
+    let jsBytes = 0;
+    let inflightBytes = 0;
+    let peakBytes = 0;
+    let maxChunkBytes = 0;
     let budgetLimited = false;
+    // Per-fetch reservation, recorded at start so a mid-flight estimate change can't desync the
+    // running total. Seeded at 2 MB and tracked as an EWMA of observed payloads — a fresh session on
+    // a dense 256z world converges within the first few chunks.
+    let chunkEstimateBytes = 2 << 20;
+    const reserved = new Map<string, number>();
+
+    // Drop the CPU-side copy of each attribute once the GPU has it. Chunk meshes are never raycast
+    // (picking is the Rust-side DDA `pick_block`; the only THREE.Raycaster here tests gizmoHandles)
+    // and nothing ever sets `needsUpdate` on them, so `array` has no reader after upload —
+    // `computeBoundingSphere()` has already run at install time, so frustum culling keeps working off
+    // the cached sphere. ⚠️ This makes the geometry unrecoverable after a GPU context loss: three
+    // re-uploads from `attribute.array`. The `webglcontextrestored` handler below therefore *must*
+    // call reloadAllChunks() — the two changes are load-bearing on each other.
+    const releaseOnUpload = (mesh: THREE.Mesh) => {
+      for (const attr of Object.values(mesh.geometry.attributes)) {
+        if (!(attr instanceof THREE.BufferAttribute)) continue;
+        const bytes = attr.array.byteLength;
+        attr.onUpload(function (this: THREE.BufferAttribute) {
+          if (this.array === null) return;
+          jsBytes -= bytes;
+          mesh.userData.jsBytes = (mesh.userData.jsBytes as number) - bytes;
+          (this as unknown as { array: ArrayLike<number> | null }).array = null;
+        });
+      }
+    };
+
+    /** Install a chunk mesh: scene + cache + byte accounting + the upload-release hook. */
+    const addChunkMesh = (map: Map<string, THREE.Mesh>, k: string, mesh: THREE.Mesh, bytes: number) => {
+      mesh.userData.geomBytes = bytes;
+      mesh.userData.jsBytes = bytes;
+      residentBytes += bytes;
+      jsBytes += bytes;
+      releaseOnUpload(mesh);
+      scene.add(mesh);
+      map.set(k, mesh);
+    };
+
+    const dropChunkMesh = (map: Map<string, THREE.Mesh>, k: string) => {
+      const m = map.get(k);
+      if (!m) return;
+      residentBytes -= (m.userData.geomBytes as number) ?? 0;
+      jsBytes -= (m.userData.jsBytes as number) ?? 0;
+      scene.remove(m);
+      m.geometry.dispose();
+      map.delete(k);
+    };
 
     const disposeMesh = (k: string) => {
-      const m = meshes.get(k);
-      if (m) {
-        residentVerts -= m.geometry.attributes.position?.count ?? 0;
-        scene.remove(m);
-        m.geometry.dispose();
-        meshes.delete(k);
-      }
-      const mt = meshesT.get(k);
-      if (mt) {
-        residentVerts -= mt.geometry.attributes.position?.count ?? 0;
-        scene.remove(mt);
-        mt.geometry.dispose();
-        meshesT.delete(k);
-      }
-      const me = meshesE.get(k);
-      if (me) {
-        residentVerts -= me.geometry.attributes.position?.count ?? 0;
-        scene.remove(me);
-        me.geometry.dispose();
-        meshesE.delete(k);
-      }
+      dropChunkMesh(meshes, k);
+      dropChunkMesh(meshesT, k);
+      dropChunkMesh(meshesE, k);
       emptyChunks.delete(k);
       invalidate();
     };
+
+    // Push the dev memory readout. Called wherever the totals move; the HUD is its own leaf, so this
+    // costs one small re-render and nothing else. No-ops entirely in a production build.
+    const pushMemHud = import.meta.env.DEV
+      ? () => {
+          const total = residentBytes + jsBytes + inflightBytes;
+          if (total > peakBytes) peakBytes = total;
+          memHudRef.current?.set({
+            chunks: meshes.size + emptyChunks.size,
+            gpu: residentBytes, js: jsBytes, inflight: inflightBytes,
+            peak: peakBytes, maxChunk: maxChunkBytes, budget: geometryBudgetRef.current,
+          });
+        }
+      : () => {};
 
     // Bounded-concurrency fetch queue. The streaming sweep can need ~100 chunks; firing them all at
     // once floods the IPC bridge and the world mutex (each get_chunk_geometry locks it), tanking fps.
@@ -1256,6 +1432,20 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     // (and any forced sweep via reloadChunk/reloadAllChunks/camera-move) always runs in full.
     let lastSweepCcx = Number.NaN, lastSweepCcy = Number.NaN;
 
+    // ---- Camera z band (Stage 3) ----
+    // Ceiling of the z range each chunk fetch scans, quantized so it only moves in Z_BAND_STEP jumps.
+    // `null` = no clip: on a world short enough that the band already covers it (every 64z world, and
+    // a 256z one whenever the camera is high), we omit the parameter entirely so the request is
+    // byte-for-byte the pre-Stage-3 one. The cutaway cap is NOT folded in here — the backend applies
+    // `view_cap_z` itself; this pane only has to invalidate when it changes (see the viewCapZ effect).
+    const zBandTop = (): number | null => {
+      const top = Math.ceil((camera.position.y + Z_BAND_ABOVE) / Z_BAND_STEP) * Z_BAND_STEP;
+      return top >= maxZ ? null : top;
+    };
+    // Band the resident meshes were actually built with. `undefined` = never computed, so the first
+    // sweep always installs one (a legitimate value of `null` must not read as "unchanged").
+    let zBand: number | null | undefined = undefined;
+
     // Monotonic generation counter + per-key stale set: a fetch that resolves after its chunk was
     // force-reloaded (edit) or the whole cache was invalidated (texture/lighting toggle) must not
     // install its result — it may predate the change it's racing against. `fetchGen` invalidates
@@ -1269,13 +1459,25 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       if (inflight.has(k) || isResident(k)) return;
       inflight.add(k);
       active++;
+      // Reserve this fetch's estimated payload against the budget for as long as it's in flight.
+      // Without it, pump()'s gate tests only what's already resident and up to `maxConcurrent()`
+      // dense chunks can land past the cap together.
+      reserved.set(k, chunkEstimateBytes);
+      inflightBytes += chunkEstimateBytes;
       setLoadingCountRef.current(inflight.size);
       const gen = fetchGen;
-      invoke<ArrayBuffer>("get_chunk_geometry", { cx: cxk, cy: cyk, night: nightLightingRef.current, shadows: shadows3dRef.current, sunT: sunTRef.current, gpu: gpuShadowsRef.current, lampRadius: lampRadiusRef.current, lightingProfile: lightingProfileRef.current })
+      // zMax = the camera band's ceiling (Stage 3); zMin stays 0 — see Z_BAND_ABOVE on why the band
+      // is one-sided. `undefined` means "no clip" and is what a 64z world always sends.
+      invoke<ArrayBuffer>("get_chunk_geometry", { cx: cxk, cy: cyk, night: nightLightingRef.current, shadows: shadows3dRef.current, sunT: sunTRef.current, gpu: gpuShadowsRef.current, lampRadius: lampRadiusRef.current, lightingProfile: lightingProfileRef.current, zMax: zBand ?? undefined })
         .then((buf) => {
           if (disposed) return;
-          if (gen !== fetchGen || staleKeys.has(k)) return; // stale — dropped; finally{} requeues if needed
           const g: VoxelGeometry = decodeGeometry(buf);
+          // Feed the in-flight estimator from every landed payload, including the stale ones below —
+          // a dropped result still measured a real chunk of this world.
+          const payload = g.bytes + g.bytes_t + g.bytes_e;
+          if (payload > maxChunkBytes) maxChunkBytes = payload;
+          chunkEstimateBytes = Math.round(chunkEstimateBytes * 0.8 + payload * 0.2);
+          if (gen !== fetchGen || staleKeys.has(k)) return; // stale — dropped; finally{} requeues if needed
           disposeMesh(k); // replace any existing mesh (reload path)
           if (g.vertex_count > 0) {
             const geom = new THREE.BufferGeometry();
@@ -1292,9 +1494,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
             geom.computeBoundingSphere(); // cheap frustum-cull test per frame
             const mesh = new THREE.Mesh(geom, pickMat(false, !!hasUVs));
             mesh.castShadow = mesh.receiveShadow = gpuShadowsRef.current;
-            scene.add(mesh);
-            meshes.set(k, mesh);
-            residentVerts += g.vertex_count;
+            addChunkMesh(meshes, k, mesh, g.bytes);
           } else {
             // Marks the chunk "fetched" even when it's air (or all-transparent, e.g. an all-water
             // chunk went entirely into meshesT) — `isResident(k)` is what stops it from being refetched.
@@ -1319,9 +1519,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
             meshT.receiveShadow = gpuShadowsRef.current;
             meshT.castShadow = gpuShadowsRef.current;
             meshT.customDepthMaterial = (hasUVsT && depthMatTexRef.current) ? depthMatTexRef.current : depthMatT;
-            scene.add(meshT);
-            meshesT.set(k, meshT);
-            residentVerts += g.vertex_count_t;
+            addChunkMesh(meshesT, k, meshT, g.bytes_t);
           }
           // Emissive stream (lamp faces, GPU mode only). Drawn with the UNLIT Basic material so lamps
           // stay fullbright under the scene's dim night ambient — matching the baked path and the game.
@@ -1340,9 +1538,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
             const meshE = new THREE.Mesh(geomE, emissiveMat);
             meshE.castShadow = true;
             meshE.receiveShadow = false;
-            scene.add(meshE);
-            meshesE.set(k, meshE);
-            residentVerts += g.vertex_count_e;
+            addChunkMesh(meshesE, k, meshE, g.bytes_e);
           }
           invalidate();
         })
@@ -1350,31 +1546,39 @@ const FlyView3D = forwardRef<FlyView3DRef, {
         .finally(() => {
           inflight.delete(k);
           active--;
+          inflightBytes -= reserved.get(k) ?? 0;
+          reserved.delete(k);
           const wasStale = staleKeys.delete(k);
           if (disposed) return;
           if (wasStale) queue.unshift({ cx: cxk, cy: cyk }); // requeue immediately — its result was dropped
           pump();
           setLoadingCountRef.current(inflight.size);
+          pushMemHud();
         });
     };
 
     const pump = () => {
-      // H6: once resident geometry crosses the vertex budget, stop pulling new chunks — the queue
+      // H6: once resident geometry crosses the byte budget, stop pulling new chunks — the queue
       // stays populated and resumes once eviction (moving the camera) frees headroom. Only calls
       // setState on an actual transition so this doesn't re-render every pump() (called on every
-      // fetch completion).
-      const overBudget = residentVerts >= VERTEX_BUDGET;
+      // fetch completion). In-flight reservations count too, so a burst of concurrent fetches on a
+      // dense 256z world can't land collectively past the cap.
+      const overBudget = residentBytes + inflightBytes >= geometryBudgetRef.current;
       if (overBudget !== budgetLimited) {
         budgetLimited = overBudget;
         setBudgetLimitedRef.current(overBudget);
       }
       if (overBudget) return;
       while (active < maxConcurrent() && queue.length) {
+        // Re-test per iteration: each startFetch below adds its own reservation, so filling the
+        // concurrency slots in one go could otherwise reserve past the cap in a single pump().
+        if (residentBytes + inflightBytes >= geometryBudgetRef.current) break;
         const it = queue.shift()!;
         const k = key(it.cx, it.cy);
         if (inflight.has(k) || isResident(k)) continue;
         startFetch(it.cx, it.cy);
       }
+      pushMemHud();
     };
 
     // Camera-window streaming: keep chunks within LOAD_RADIUS of the camera's XY footprint.
@@ -1384,10 +1588,23 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     const streamSweep = (force = false) => {
       const ccx = worldToChunk(camera.position.x);
       const ccy = worldToChunk(camera.position.z); // Three.js Z = Eden Y
+      // Vertical travel moves the z band (Stage 3). Every resident mesh was built against the old
+      // ceiling, so they're all wrong at once — same invalidation reloadAllChunks() does, inlined
+      // here rather than calling it because it re-enters streamSweep. Checked *before* the
+      // stationary-camera early-out, which only compares chunk XY and would otherwise miss a purely
+      // vertical climb. Quantization (Z_BAND_STEP) is what keeps this rare.
+      const nextBand = zBandTop();
+      const bandMoved = nextBand !== zBand;
+      if (bandMoved) {
+        zBand = nextBand;
+        fetchGen++;
+        queue = [];
+        for (const k of residentKeys()) disposeMesh(k);
+      }
       // A stationary camera with nothing queued has nothing new to do — skip the O((2r+1)²) disc
       // scan and the Set-union + string-split dispose pass below, which otherwise runs unconditionally
       // 6.7×/second (STREAM_MS) for the entire time the 3D pane is open, moving or not (audit M6).
-      if (!force && ccx === lastSweepCcx && ccy === lastSweepCcy && queue.length === 0) {
+      if (!force && !bandMoved && ccx === lastSweepCcx && ccy === lastSweepCcy && queue.length === 0) {
         return;
       }
       lastSweepCcx = ccx; lastSweepCcy = ccy;
@@ -1413,13 +1630,19 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       // above (d2 <= r*r) — a Chebyshev/square test here would let chunks up to ~1.41r+2.8 away
       // survive (the corners of the square), roughly doubling the resident set at large r.
       const dropSq = (r + 2) * (r + 2);
-      for (const k of new Set([...meshes.keys(), ...emptyChunks])) {
+      // Union of all four residency maps. `meshes ∪ emptyChunks` alone happens to cover every key
+      // today — a chunk with zero opaque verts is always added to `emptyChunks` — but that is a
+      // property of one branch in startFetch, not an invariant anything enforces. A future change
+      // that installs a transparent-only or emissive-only mesh without touching `emptyChunks` would
+      // silently make those chunks unevictable, which is exactly the leak this budget exists to stop.
+      for (const k of residentKeys()) {
         const [kx, ky] = k.split(",").map(Number);
         const dx = kx - ccx, dy = ky - ccy;
         if (dx * dx + dy * dy > dropSq) {
           disposeMesh(k);
         }
       }
+      pushMemHud();
     };
 
     // Forced reload (edit-sync): drop the cached mesh and re-queue it at the front for immediate
@@ -1444,7 +1667,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     const reloadAllChunks = () => {
       fetchGen++;
       queue = [];
-      for (const k of new Set([...meshes.keys(), ...emptyChunks])) disposeMesh(k);
+      for (const k of residentKeys()) disposeMesh(k);
       streamSweep(true); // meshes were just disposed with the camera unmoved — must not early-out
     };
 
@@ -2147,6 +2370,9 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       // drag — so once you touched a slider, Z was dead for the rest of the session and only a world
       // reload (remounting the pane) brought it back.
       if (anyModalOpenRef.current || isTypingTarget(e.target)) return;
+      // Hidden pane (Stage 4): this is a `window` subscription and survives suspension, so without
+      // this it would keep eating W/A/S/D and Z for an invisible viewport.
+      if (suspendedNow) return;
       // Escape cancels a live sculpt hold/grab stroke, or a live gizmo drag, in ANY camera mode (the
       // fly-mode Escape below only fires while walking). Doesn't return — App's own Escape handling
       // still runs, mirroring the sculpt-cancel precedence already established here.
@@ -2185,7 +2411,13 @@ const FlyView3D = forwardRef<FlyView3DRef, {
 
     let prev = performance.now();
     let disposed = false;
+    // Set between `webglcontextlost` and `webglcontextrestored`. While true there is no usable GL
+    // context: frame() must not call renderer.render() (it would spew INVALID_OPERATION every rAF and
+    // leave the pane black with nothing thrown for the ErrorBoundary to catch), and streaming is
+    // parked so we don't accumulate geometry nobody can upload.
+    let contextLost = false;
     let lastEmitT = 0;
+    let lastMemHudT = 0;
     let lastEmitExternalT = 0;
     let lastEmitEX = NaN, lastEmitEY = NaN;
 
@@ -2209,8 +2441,81 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     // Orbit-controls "change" wakes the loop whenever the user drags/zooms; damping keeps it alive
     // until inertia settles (controls.update() returns false), then it goes fully idle.
     controls.addEventListener("change", invalidate);
-    // streamSweep runs on its own interval — independent of render cadence.
-    const sweepInterval = setInterval(streamSweep, STREAM_MS);
+    // streamSweep runs on its own interval — independent of render cadence. Held in a mutable slot
+    // rather than a const because the context-loss handler below parks it and the restore handler
+    // starts it again.
+    let sweepInterval = setInterval(streamSweep, STREAM_MS);
+
+    // ---- WebGL context loss / restore -------------------------------------------------------------
+    // A driver can drop the context under memory pressure — the very condition the geometry budget
+    // above exists to avoid, so this is the safety net for when it isn't enough. Without a
+    // `preventDefault()` on the loss event the context is *never* restorable and the pane is dead for
+    // the rest of the session, with nothing thrown for the ErrorBoundary to catch.
+    const onContextLost = (e: Event) => {
+      e.preventDefault();
+      contextLost = true;
+      cancelAnimationFrame(raf);
+      rafPending = false;
+      clearInterval(sweepInterval);
+      onNoticeRef.current?.("3D view: the graphics context was lost (usually memory pressure). Recovering — lower the Memory budget preset or the render distance if it keeps happening.");
+    };
+    const onContextRestored = () => {
+      contextLost = false;
+      // three re-initialises its own GL state and re-uploads textures from their source images, but
+      // it re-uploads *geometry* from `attribute.array` — which the upload-release above set to null.
+      // Every resident chunk is therefore unrecoverable and must be refetched; reloadAllChunks()
+      // disposes them and bumps fetchGen so any fetch issued pre-loss is dropped rather than
+      // installed. This is the dependency Stage 1's release deliberately takes on.
+      if (atlasTexRef.current) atlasTexRef.current.needsUpdate = true;
+      // A pane suspended while its context was lost stays parked — `setSuspended(false)` restarts
+      // the sweep and refetches. Restarting it here would stream geometry into a hidden pane.
+      if (suspendedNow) return;
+      sweepInterval = setInterval(streamSweep, STREAM_MS);
+      reloadAllChunks();
+      invalidate();
+      onNoticeRef.current?.("3D view: graphics context restored — reloading terrain.");
+    };
+    canvas.addEventListener("webglcontextlost", onContextLost);
+    canvas.addEventListener("webglcontextrestored", onContextRestored);
+
+    // ---- Suspend / resume (Stage 4) ---------------------------------------------------------------
+    // App keeps this pane mounted when it's switched off or the user leaves quad view, so the WebGL
+    // context isn't destroyed and recreated on every toggle (WKWebView has a low ceiling on live
+    // contexts, and churning them is a plausible contributor to the crash). Suspension is what makes
+    // that free: no rAF, no streaming interval, and — the part that matters for memory — the whole
+    // resident chunk set is disposed, so a hidden pane holds a bare context and nothing else.
+    const setSuspended = (on: boolean) => {
+      if (on === suspendedNow) return;
+      suspendedNow = on;
+      if (on) {
+        // Drop every live gesture first. Fly/look mode in particular holds the *OS cursor grab* — a
+        // pane that goes invisible while walking would leave the cursor captured with nothing on
+        // screen to release it. applyMode("orbit") is the one exit that also releases the grab.
+        cancelSculptStroke();
+        cancelGizmoDrag();
+        clearBuildShapeAnchor();
+        applyMode("orbit");
+        keys.clear();
+        cancelAnimationFrame(raf);
+        rafPending = false;
+        clearInterval(sweepInterval);
+        // Drop resident geometry and invalidate whatever is in flight (fetchGen), so nothing lands
+        // into a pane nobody is looking at. `zBand = undefined` forces the next sweep to recompute
+        // and refetch from scratch rather than trusting a band nothing is resident under any more.
+        fetchGen++;
+        queue = [];
+        for (const k of residentKeys()) disposeMesh(k);
+        zBand = undefined;
+        pushMemHud();
+      } else if (!contextLost) {
+        // The canvas was `display:none`, so its ResizeObserver reported 0 and `resize()` clamped the
+        // renderer to 1×1. Re-measure before the first frame or the pane comes back stretched.
+        resize();
+        sweepInterval = setInterval(streamSweep, STREAM_MS);
+        streamSweep(true); // meshes were disposed with the camera unmoved — must not early-out
+        invalidate();
+      }
+    };
 
     // Kick off: first chunk load + first render.
     streamSweep();
@@ -2219,7 +2524,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     // Hoisted function declaration so `invalidate` (defined above) can reference `frame` safely.
     function frame() {
       rafPending = false;
-      if (disposed) return;
+      if (disposed || contextLost || suspendedNow) return;
       const now = performance.now();
       const dt = Math.min(0.05, (now - prev) / 1000);
       prev = now;
@@ -2362,6 +2667,10 @@ const FlyView3D = forwardRef<FlyView3DRef, {
           m.visible = frustum.intersectsObject(m);
         }
         renderer.render(scene, camera);
+        // Post-render, because the upload-release callbacks fire *inside* render() — this is the only
+        // point where the JS-heap total reflects what actually got freed. Dev-only and self-throttled
+        // (`pushMemHud` is an empty function in a production build).
+        if (now - lastMemHudT >= 250) { lastMemHudT = now; pushMemHud(); }
       }
 
       // Reschedule if fly/damping need more frames, or if invalidate() fired during this frame.
@@ -2867,6 +3176,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       // Flip the scene lighting, then rebuild every chunk mesh (material + normals + flat-vs-baked
       // geometry all differ between modes).
       setGpuShadows: () => { applyGpuLighting(); reloadAllChunks(); },
+      setSuspended,
       updateGpuLighting: () => applyGpuLighting(),
       refreshNightLights: () => updateNightLights(),
       refresh: () => invalidate(),
@@ -2885,6 +3195,8 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     // Apply initial gizmo state — a selection may already exist when the pane mounts (quad view /
     // 3D pane toggled on with a selection already committed from the 2D map).
     sceneApi.current.setGizmoSelection(interact3dRef.current, selectionBounds3dRef.current ?? null);
+    // Same for suspension: a world change rebuilds this closure while the pane may already be hidden.
+    if (suspendedRef.current) setSuspended(true);
 
     return () => {
       disposed = true;
@@ -2926,7 +3238,10 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       window.removeEventListener("keydown", onKeyDown);
       window.removeEventListener("keyup", onKeyUp);
       window.removeEventListener("blur", onBlur);
-      for (const k of new Set([...meshes.keys(), ...meshesT.keys(), ...meshesE.keys()])) disposeMesh(k);
+      // Before the forceContextLoss() below — that fires a webglcontextlost event we must not handle.
+      canvas.removeEventListener("webglcontextlost", onContextLost);
+      canvas.removeEventListener("webglcontextrestored", onContextRestored);
+      for (const k of residentKeys()) disposeMesh(k);
       clearOverlays();
       scene.remove(highlight);
       scene.remove(breakHighlight);
@@ -2963,12 +3278,28 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       if (depthMatTexRef.current) { depthMatTexRef.current.dispose(); depthMatTexRef.current = null; }
       if (atlasTexRef.current) { atlasTexRef.current.dispose(); atlasTexRef.current = null; }
       controls.dispose();
-      // dispose() only — do NOT forceContextLoss() here. The renderer binds to the fixed <canvas>
-      // ref, and a canvas can own just one WebGL context for its lifetime. Losing it would leave a
-      // dead context that the next init on the same canvas (React StrictMode's double-mount, HMR)
-      // would reuse — `new WebGLRenderer` then crashes in getShaderPrecisionFormat. dispose() frees
-      // GPU resources while leaving the context healthy for reuse. (Mirrors ThreeDPreview.)
+      // dispose() always; forceContextLoss() ONLY on a true unmount.
+      //
+      // The distinction matters because the renderer binds to the fixed <canvas> ref, and a canvas
+      // can own just one WebGL context for its lifetime. When this effect merely *re-runs* (world
+      // resize, StrictMode's double-mount, HMR) the same canvas is reused, and a dead context left
+      // behind would be handed straight back to the next `new WebGLRenderer`, which then crashes in
+      // getShaderPrecisionFormat — hence the long-standing "never forceContextLoss here" rule.
+      //
+      // On a real unmount React discards the canvas, so nothing can reuse the context and releasing
+      // it explicitly is both safe and necessary: WKWebView holds a low ceiling on simultaneously
+      // live contexts, and toggling the 3D pane / quad view repeatedly used to strand one per
+      // teardown until the GC eventually collected the canvas. `unmountingRef` (set by the
+      // definition-order-earlier effect above) is the signal; the deferred `isConnected` re-check is
+      // the belt-and-braces guard, since React's StrictMode remount looks identical from in here at
+      // cleanup time but leaves the canvas attached to the document.
       renderer.dispose();
+      if (unmountingRef.current) {
+        setTimeout(() => {
+          if (canvas.isConnected) return; // it was a remount after all — the new renderer owns this context
+          try { renderer.forceContextLoss(); } catch { /* context already gone */ }
+        }, 0);
+      }
       scene.clear();
       sceneApi.current = null;
     };
@@ -3100,6 +3431,23 @@ const FlyView3D = forwardRef<FlyView3DRef, {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [texEpoch]);
 
+  // Cutaway cap changed: `get_chunk_geometry` folds `view_cap_z` into the emitted z band on the Rust
+  // side, so every resident mesh was built against the old cap and has to be rebuilt. Same idiom as
+  // the texture-epoch reload above. Skipped on mount (the first render's cap is whatever the world
+  // loaded with, and the initial sweep already fetches under it).
+  const capMountedRef = useRef(false);
+  useEffect(() => {
+    if (!capMountedRef.current) { capMountedRef.current = true; return; }
+    sceneApi.current?.reloadAllChunks();
+  }, [viewCapZ]);
+
+  // Suspend/resume (Stage 4). App keeps this component mounted across the 3D-pane and quad-view
+  // toggles instead of unmounting it, so the WebGL context survives; `suspended` is what makes a
+  // hidden pane free.
+  useEffect(() => {
+    sceneApi.current?.setSuspended(suspended);
+  }, [suspended]);
+
   // Reload all chunk meshes when the night-lighting/shadow preview toggles change — but NOT in
   // GPU-shadow mode, where geometry is flat and independent of night/shadows/sunT. That's what makes
   // sunT free there: the per-frame sun-follow moves the light; no reload is needed.
@@ -3178,7 +3526,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
         )}
         {budgetLimited && (
           <span
-            title={`Resident chunk geometry hit the ${(VERTEX_BUDGET / 1e6).toFixed(0)}M vertex budget — streaming is paused until you fly away from some of it to free headroom.`}
+            title={`Resident chunk geometry hit the ${(geometryBudgetBytes / (1 << 20)).toFixed(0)} MB budget — streaming is paused until you fly away from some of it to free headroom. Raise it in Settings → Memory budget.`}
             style={{
               padding: "1px 5px", borderRadius: 4, fontSize: 9,
               background: "rgba(239,68,68,0.12)", border: "1px solid rgba(239,68,68,0.3)",
@@ -3375,6 +3723,9 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       )}
       {/* Camera position / heading HUD (Eden coords) */}
       <CoordHud ref={hudRef} />
+      {/* Resident-geometry readout — dev builds only (tree-shaken out of a production bundle by the
+          constant `import.meta.env.DEV`, and the scene effect's pushMemHud() is a no-op there too). */}
+      {import.meta.env.DEV && <GeomMemHud ref={memHudRef} />}
       {/* In-pane hotbar (bottom-centre, build mode only) — 5 pinned + 5 recent, mirrors the Ribbon
           hotbar and the 1-5/6-0 digit keys so the active slot never needs a glance back at the Ribbon. */}
       {interact3d === "build" && hotbarSlots && hotbarSlots.length > 0 && (

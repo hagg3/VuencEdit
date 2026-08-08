@@ -130,7 +130,7 @@ Tracked in full in `CLAUDE.md`; highlights:
 - Z-slice viewport-only patch (lag on large worlds).
 - Viewport tile fetch (`fetch_viewport` to eliminate per-tile IPC).
 - World expansion via paste (`serialize_world` needed).
-- FlyView3D greedy meshing / smooth per-vertex AO (only if perf demands).
+- FlyView3D smooth per-vertex AO (only if perf demands). *(Greedy meshing landed — see `06-rendering-3d.md`.)*
 
 ## For agents: where to look first
 

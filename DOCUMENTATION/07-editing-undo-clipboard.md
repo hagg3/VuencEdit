@@ -33,7 +33,12 @@ Routing all edits through `with_edit` means there are no hand-audited call sites
 
 `restore_and_invert` applies a delta and derives its exact inverse in one pass, so
 `undo_edit`/`redo_edit` **never take a full pre-copy**. Both stacks are capped at
-**256 MB** (`UNDO_BYTE_BUDGET`; `push_undo` evicts oldest, used for redo too).
+`WorldState.undo_budget` (default `DEFAULT_UNDO_BYTE_BUDGET` = **96 MB**, the
+"Balanced" memory-budget preset; `push_undo`/`trim_stack` evict oldest, used for
+redo too). User-adjustable per session, 16–512 MB, via `set_undo_budget` (Settings
+→ General → Memory budget, see CLAUDE.md's "Memory Budget" section) — lowering it
+re-trims both stacks immediately. `chunk_snapshot_bytes` counts real heap
+(`Vec::capacity()`, after `diff_chunk`'s `shrink_to_fit()`), not `len()`.
 
 `undo_edit`/`redo_edit` restore from their own stack (not via `with_edit`), but
 are invariant-safe: they `take()` the world *before* popping their stack, erroring

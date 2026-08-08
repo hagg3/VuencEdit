@@ -110,11 +110,28 @@ export const BLOCK_TOP_TEX: Record<number, string> = {
   111: "steel",
 };
 
-// Cache: "(blockType,paint)" → data URL (or null when no tile available)
+// Cache: "(blockType,paint)" → data URL (or null when no tile available). Bounded (§2 of the
+// 2026-08 memory-efficiency pass) — retained forever otherwise, cleared only on pack change.
+// Insertion-order eviction: a swatch is cheap to regenerate, so LRU-on-read precision isn't
+// worth the bookkeeping (same idiom as MapCanvas's tile caches).
+const SWATCH_CACHE_LIMIT = 512;
 const swatchCache = new Map<string, string | null>();
 
 export function clearSwatchCache() {
   swatchCache.clear();
+}
+
+/** Set `swatchCache[key] = value`, then evict oldest entries past `SWATCH_CACHE_LIMIT`. The
+ *  single write path every `tintedSwatch` return goes through, so a cached `null` (no tile
+ *  available) counts against the bound exactly like a real swatch. */
+function cacheSwatch(key: string, value: string | null): string | null {
+  swatchCache.set(key, value);
+  while (swatchCache.size > SWATCH_CACHE_LIMIT) {
+    const oldest = swatchCache.keys().next();
+    if (oldest.done) break;
+    swatchCache.delete(oldest.value);
+  }
+  return value;
 }
 
 export function tintedSwatch(
@@ -126,10 +143,10 @@ export function tintedSwatch(
   if (swatchCache.has(key)) return swatchCache.get(key)!;
 
   const texName = BLOCK_TOP_TEX[blockType] ?? null;
-  if (!texName) { swatchCache.set(key, null); return null; }
+  if (!texName) return cacheSwatch(key, null);
 
   const colorRow = atlas.nameToRow[texName];
-  if (colorRow === undefined) { swatchCache.set(key, null); return null; }
+  if (colorRow === undefined) return cacheSwatch(key, null);
 
   // Painted blocks sample the grayscale modulation row so paint × gray reads clean, matching the
   // 3D views (face_color_and_row in texturepack.rs). Unpainted → the full-color row.
@@ -164,6 +181,5 @@ export function tintedSwatch(
   canvas.getContext("2d")!.putImageData(imgData, 0, 0);
 
   const url = canvas.toDataURL();
-  swatchCache.set(key, url);
-  return url;
+  return cacheSwatch(key, url);
 }

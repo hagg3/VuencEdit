@@ -8,8 +8,11 @@
 > Three.js side owns only camera, materials, and the coordinate permutation.
 
 There are two 3D consumers:
-- **`ThreeDPreview.tsx`** — on-demand render of a selection (≤ 64×64×64) in the
-  Selection Inspector. Uses `get_obj_geometry`.
+- **`ThreeDPreview.tsx`** — on-demand render of a selection (≤ 64×64×64). Uses
+  `get_obj_geometry`. ⚠️ **Currently dead code**: nothing in `src/` imports or
+  mounts it, so `FlyView3D` is the only live WebGL context in the app. Kept as the
+  worked example of the `get_obj_geometry` path (and the reason that command still
+  exists); references to it below describe the code, not a mounted component.
 - **`FlyView3D.tsx`** — streaming fly-through of the whole world (quad-view 4th
   cell). Uses `get_chunk_geometry` per chunk.
 
@@ -94,6 +97,69 @@ neighbor occlusion tests are **hoisted before** the lamp/shadow lighting
 computation, so a fully-hidden voxel skips the expensive per-lamp loop and shadow
 raymarch entirely.
 
+### Greedy meshing (Stage 5 of the 256z crash fix)
+
+After face culling, a naive emitter still writes **six vertices per visible face**,
+so a chunk's payload scales with its voxel count. The greedy pass makes it scale
+with the terrain's **surface complexity** instead: coplanar adjacent faces that
+render identically fuse into one large quad.
+
+Measured on 16×16 heightmaps (merged quads vs. the raw visible-face count the
+pre-Stage-5 emitter produced):
+
+| Terrain | Raw faces | Merged quads | Reduction |
+|---|---|---|---|
+| Flat plain | 640 | 10 | **64×** |
+| Deep flat (256z-shaped, h=40) | 640 | 10 | **64×** |
+| Cliff / step | 672 | 17 | **39.5×** |
+| Gentle rolling | 707 | 102 | **6.9×** |
+| Hilly | 1162 | 712 | 1.6× |
+| Violently bumpy | 1116 | 669 | 1.7× |
+
+The win is largest exactly where 256z worlds hurt most — deep flat ground and tall
+cliff faces, whose side faces merge down the whole column. Rough terrain gains
+little, which is expected: there is genuinely nothing coplanar to fuse.
+
+**How it works.** The voxel loop no longer emits plain-cube faces; it pushes a
+`FaceRec { dir, slice, bt, paint, lm, v, u }` per face and emits after the scan.
+
+- `dir` fixes the plane and both in-plane axes, so `(slice, u, v)` rebuilds the
+  world-space rectangle. The mapping table lives on `FaceRec`'s doc comment.
+- **Field order is the merge key and is load-bearing.** `derive(Ord)` sorts
+  lexicographically by declaration order, so a single `sort_unstable()` collects
+  every legally-fusible face — same direction, plane, block and light — into one
+  contiguous run that is *already ordered (v, u)*, which is precisely the
+  row-major scan order the rectangle sweep wants. It is also what makes the
+  output deterministic, which the z-clip tests depend on (a clipped render must
+  be byte-identical to a render of the truncated world). Reorder those fields and
+  you silently break both.
+- `lm` is stored as raw `f32::to_bits()`: faces may merge only when they render
+  **bit-identically**. That is what keeps per-block lamp falloff and sun shadows
+  intact instead of averaging them across a big quad. In `flat` (GPU-shadow) mode
+  the key folds to a constant, since `lit_rgb!` discards `lm` there anyway.
+- Within a group the sweep widens along `u` through unconsumed cells, then grows
+  the whole run along `v` while every cell of the next row is present and free —
+  standard maximal-rectangle greedy meshing. Scanning in (v, u) order guarantees
+  the current cell is the rectangle's origin corner, so each group is covered
+  exactly once.
+
+**Only full-cell faces defer.** A face joins the merge pass only when it fills its
+unit square. Ramps and wedges are not unit squares; neither is a partial-height
+fluid face (a ¾/½/¼ surface, or a lateral sliver stepping down to a shallower
+neighbour). Those emit immediately and unmerged, exactly as before.
+
+⚠️ **With a texture pack loaded, the merge is U-only** (`grow_v = pack.is_none()`).
+The atlas is one tile wide × N rows tall, so U can tile by repeating that single
+column — but **V selects the row**, so growing V would run a merged quad straight
+into the next block's texture. Tiling U means UVs run `0..w` instead of `0..1`,
+which requires `tex.wrapS = THREE.RepeatWrapping` on the atlas texture, set in
+**both** `FlyView3D.tsx` and `ThreeDPreview.tsx`. `wrapT` must stay clamped.
+
+⚠️ **Vertex counts stopped being a proxy for "how much is visible."** A 2×1 slab
+and a lone cube are both six quads now. Tests that compared `vertex_count` to
+detect missing geometry compare the `positions` bytes instead — see
+`test_obj_geometry_respects_mask`.
+
 ### `ChunkCache` (perf)
 
 `obj_geometry_region` reads every block through `ChunkCache` (export.rs): a
@@ -164,13 +230,21 @@ behavior in the Settings modal's Lighting profile row.
 
 ### Lamp spatial index (`WorldState.lamp_index`)
 
-`Option<HashMap<(i32,i32), Vec<[i32;3]>>>` (chunk-keyed). Lazily built
-(`build_lamp_index`, scans only populated `chunk_map`) on the first night-lit
-`get_chunk_geometry`/`get_lamps_near`; reset to `None` on world load/close. Kept
-current by `refresh_lamp_index_chunks(ws, affected)` in
-`with_edit`/`undo_edit`/`redo_edit` — a placed/removed lamp rescans just its
-chunk's bucket. `lamps_in_region(...)` gathers positions from chunks overlapping
-the region expanded by `ceil(radius/16)` chunks, then filters to the exact xy box.
+`LampIndex` wraps `LampIndexState { lamps: HashMap<(i32,i32), Vec<[i32;3]>>, scanned:
+HashSet<(i32,i32)> }` (chunk-keyed). **On-demand, per-chunk** (2026-08
+memory-efficiency pass — replaced a whole-world `build_lamp_index` scan on the
+first night-lit request): `LampIndex::lamps_in_region`, called from
+`get_chunk_geometry`/`get_lamps_near`, scans only the not-yet-`scanned` chunks a
+given region query's neighbourhood touches, memoises, marks them scanned, then
+gathers. Reset to empty on world load/close. Kept current by
+`LampIndex::apply_delta(world, snaps)` in `with_edit_inner`/`undo_edit_inner`/
+`redo_edit_inner` — a placed/removed lamp updates just its chunk's bucket from the
+edit's own undo delta; a delta into an unscanned chunk is dropped (not fabricated
+into a bucket), since the next real query re-derives it from truth.
+`lamps_in_region(...)` gathers positions from chunks overlapping the region
+expanded by `ceil(radius/16)` chunks (`region_chunk_box`), then filters to the
+exact xy box. `build_lamp_index` (whole-world scan) is now `#[cfg(test)]`-only —
+the parity oracle, no longer a production fallback.
 
 ### Shadows (directional sun raymarch)
 
@@ -210,14 +284,100 @@ Not vertical sky-occlusion — a real directional sun:
 
 - `Map<chunkKey, Mesh>` (+ a second map for the transparent mesh, third for
   emissive) within `LOAD_RADIUS = 5` chunks (user `RD_MIN=2`..`MAX_RENDER_DISTANCE = 32`
-  via an in-pane slider). The `<input type="range">` maps **1:1 to chunk radius**
-  (`min=RD_MIN max=MAX_RENDER_DISTANCE step=1`, value = `loadRadius`) — one notch =
-  one chunk. (The earlier quadratic `radiusToSliderPos`/`sliderPosToRadius` remap was
-  dropped: it gave the low range more pixels but made the top half jump several chunks
-  per pixel, e.g. 16→20 in one nudge, which read as "dodgy".)
-- **`VERTEX_BUDGET = 30_000_000`** hard resident-vertex cap (opaque+transparent):
-  once crossed, streaming stops pulling new chunks until eviction frees headroom;
-  a "render distance limited by memory" pill appears.
+  via an in-pane slider). The `<input type="range">` runs over *slider positions*, not
+  chunk radii, via `radiusToPos`/`posToRadius` (FlyView3D.tsx ~95): one notch per chunk
+  up to 16, then one notch per **two** chunks to 32. So the cheap low range gets full
+  per-chunk resolution while the expensive top half doesn't eat half the track.
+- **Hard resident-geometry byte cap (all three streams + in-flight fetches)**,
+  `geometryBudgetBytes` prop (default `GEOMETRY_BUDGET_BYTES = 512 MB`, the "Balanced"
+  memory-budget preset — App.tsx wires it from
+  `MEMORY_PRESETS[memoryBudget].geometryBudgetBytes`; see CLAUDE.md's "Memory
+  Budget" section): once crossed, streaming stops pulling new chunks until eviction
+  frees headroom; a "render distance limited by memory" pill appears. Read via a
+  ref (`geometryBudgetRef`) inside the scene-setup effect's `pump()` closure so a
+  mid-session preset change takes effect without growing that effect's own
+  dependency array.
+  - Counted in **bytes, not vertices** (3D-pane crash fix): a vertex costs 24–36 B
+    depending on stream and texture pack, and the old 30 M-vertex "Balanced" cap was
+    ~1.9 GB of resident geometry — reachable within seconds on a 256z world, which is
+    where the fly-view crashes came from. The number is the envelope's own `lens` sum
+    (`VoxelGeometry.bytes`/`bytes_t`/`bytes_e`), stored on `mesh.userData.geomBytes`
+    so `disposeMesh` subtracts exactly what was added.
+  - **In-flight fetches reserve** an EWMA-estimated payload (`chunkEstimateBytes`,
+    seeded 2 MB) so up to `maxConcurrent()` dense chunks landing together can't
+    overshoot; the gate is re-tested per iteration inside `pump()`'s fill loop.
+- **Camera z band** (`Z_BAND_ABOVE = 96`, `Z_BAND_STEP = 64`). `get_chunk_geometry`
+  takes optional `zMin`/`zMax`; FlyView3D sends a `zMax` of
+  `ceil((cameraEdenZ + 96) / 64) * 64`, or **omits it** when that already covers
+  `world.max_z` (so every 64z world sends the pre-Stage-3 request unchanged). This
+  attacks the 256z cost *at source*: a 16×16×256 chunk scan is 4× a 64z one and is
+  paid in Rust before a single vertex exists, almost all of it walking empty air
+  stacked above the terrain.
+  - **One-sided (ceiling only), deliberately.** The original plan called for a
+    symmetric ±96 band widening on look-down. A band with a *floor* hides terrain
+    below the camera, and "fly up to survey the map" is a routine editor gesture —
+    the landscape would vanish. Clipping only above has a bounded failure mode (a
+    ceiling more than ~96–159 blocks overhead pops in as you climb toward it) and it
+    is where the empty air actually is.
+  - The **cutaway cap composes server-side**: `get_chunk_geometry` intersects the
+    caller's band with `ws.view_cap_z` itself (both only ever narrow, so `min` is the
+    whole composition). The frontend's job is invalidation only — the `viewCapZ` prop
+    is a `reloadAllChunks()` trigger, nothing more. This closes the "Cutaway phase 2"
+    item.
+  - **Cache invalidation:** the band is not part of the chunk key. `streamSweep`
+    recomputes it each tick and, when it moved, bumps `fetchGen` + disposes every
+    resident mesh before sweeping — checked *before* the stationary-camera early-out,
+    which compares chunk XY only and would miss a purely vertical climb. `Z_BAND_STEP`
+    quantization is what keeps that full restream rare.
+  - ⚠️ **The see-through-roof trap.** Face culling reads the *real* world, so the
+    block just above `sz2` still occludes the top face of the topmost emitted one — a
+    naive clip leaves a hole you look straight through into the terrain interior.
+    `obj_geometry_region` therefore culls against **`gbz`**, `gb` clipped to
+    `[sz1, sz2]`, so an out-of-band neighbour reads as air and the cap face emits.
+    `shadow_at` deliberately keeps using the unclipped `gb`: the sun raymarch must
+    still be blocked by terrain outside the band. Pinned by
+    `test_obj_geometry_z_clip_emits_cap_faces` (a clipped render is byte-identical to
+    a render of the truncated world) and `..._degenerate_bands`.
+- **Suspend instead of unmount** (`suspended` prop). App mounts FlyView3D the first
+  time the pane goes live and never unmounts it again (`mounted3dRef` latch in
+  App.tsx); the ✕3D / quad-view toggles hide it (`display: none` on its cell wrapper,
+  plus `display: none` on the whole quad grid when quad view is off) and suspend it.
+  `setSuspended(true)` cancels the rAF loop, clears the sweep interval, bumps
+  `fetchGen`, and disposes every resident chunk mesh, so a hidden pane holds a bare
+  context and nothing else; `setSuspended(false)` re-measures the canvas (it read 0
+  while hidden, so `resize()` had clamped the renderer to 1×1), restarts the sweep and
+  restreams. `invalidate()` and `frame()` both bail while suspended, and the
+  context-restore handler doesn't restart streaming into a hidden pane. Motivation:
+  WKWebView caps simultaneously live WebGL contexts, and creating/destroying one per
+  toggle is a plausible secondary contributor to the crash.
+- **CPU copy released after GPU upload.** Each chunk attribute gets an
+  `onUpload(function () { this.array = null })` hook (`releaseOnUpload`). The decoded
+  streams are zero-copy *views* over the one IPC envelope (H2), which Three.js would
+  otherwise keep alive alongside the GPU VBO — double-counting every resident chunk.
+  Safe because chunk meshes are never raycast (picking is the Rust-side `pick_block`
+  DDA), nothing sets `needsUpdate` on them, and `computeBoundingSphere()` has already
+  run at install time so frustum culling keeps working off the cached sphere.
+  ⚠️ It also makes the geometry **unrecoverable after a context loss** — the
+  `webglcontextrestored` handler below *must* call `reloadAllChunks()`.
+- **WebGL context loss/restore.** `webglcontextlost` → `preventDefault()` (without it
+  the context is never restorable), cancel the rAF loop, park the sweep interval, set
+  a `contextLost` flag that makes `frame()` bail, and toast via the `onNotice` prop
+  (the `SliceViewport.onNotice` idiom — the pane's only other escape hatch is throwing,
+  which the ErrorBoundary turns into a full-pane replacement). `webglcontextrestored`
+  → restart the sweep, `reloadAllChunks()`, resume rendering.
+- **Teardown releases the context only on a true unmount.** `forceContextLoss()` is
+  wrong when the scene effect merely *re-runs* (world resize, StrictMode double-mount,
+  HMR): the same `<canvas>` is reused and a dead context breaks the next
+  `new WebGLRenderer`. On a real unmount React discards the canvas, so releasing is
+  both safe and needed — WKWebView caps simultaneously live contexts, and repeated
+  pane toggles used to strand one each. Detected by `unmountingRef`, set by a
+  mount-only effect declared **above** the scene effect (React runs cleanups in
+  effect-definition order), with a deferred `canvas.isConnected` re-check as the
+  StrictMode guard.
+- **Dev-only memory HUD** (`GeomMemHud`, bottom-right): resident chunk count, GPU
+  bytes vs budget, JS-heap bytes still pinned, in-flight reservations, peak, and the
+  largest single-chunk payload. Fed imperatively like `CoordHud`. Its Rust counterpart
+  is a `[GEOM]` `timing_log!` line per `get_chunk_geometry` (debug builds only).
 - Throttled sweep (`STREAM_MS = 150`) disposes chunks outside `(r+2)` **Euclidean**
   distance (matches the loading disc's `d2 <= r*r` test). Air-only chunks tracked
   in a `Set<string>`.

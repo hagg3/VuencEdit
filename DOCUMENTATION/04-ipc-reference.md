@@ -141,7 +141,7 @@ See [05 — 2D Rendering](./05-rendering-2d.md).
 | Command | Returns | Notes |
 |---|---|---|
 | `get_obj_geometry` | geometry b64 | Selection preview (≤64³), `ThreeDPreview`. Always `LightMode::default()`. |
-| `get_chunk_geometry` | multi-stream geometry | One 16×16×full-Z chunk for `FlyView3D`; opaque + transparent + emissive streams. |
+| `get_chunk_geometry` | multi-stream geometry | One 16×16 chunk column for `FlyView3D`; opaque + transparent + emissive streams. Optional `zMin`/`zMax` clip the emitted band (omitted = full `0..=world_max_z`); the cutaway cap `view_cap_z` is intersected in server-side. See [06](./06-rendering-3d.md). |
 | `get_light_constants` | `LightConstants` | `LAMP_LIGHT_RADIUS`, `SHADOW_RAY_STEPS` — for the edit-sync reload rect. |
 | `get_lamps_near` | `Vec<LampLight>` | Nearest lamps for GPU point lighting (cap 64). |
 | `pick_block` | `PickResult` | DDA voxel raycast (Eden coords in). Returns hit + entry face normal. |
