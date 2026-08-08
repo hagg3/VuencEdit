@@ -28,7 +28,7 @@ import NewWorldModal from "./NewWorldModal";
 import SchematicImportModal, { type SchematicInfo, type MappingEntry } from "./SchematicImportModal";
 import Ribbon, { RIBBON_HEIGHT_COLLAPSED, TAB_BAR_HEIGHT, DEFAULT_BODY_HEIGHT, EDEN_TEAL, EDEN_TEAL_READABLE, type RibbonTab, type MapViewMode } from "./Ribbon";
 import QuickActionsBar from "./QuickActionsBar";
-import SettingsModal, { loadSettings, saveSettings, type AppSettings } from "./SettingsModal";
+import SettingsModal, { loadSettings, saveSettings, MEMORY_PRESETS, type AppSettings } from "./SettingsModal";
 import WorldInfoModal from "./WorldInfoModal";
 import RecoveryModal from "./RecoveryModal";
 import { resolvePrefabDir } from "./PrefabLibraryPanel";
@@ -44,6 +44,11 @@ import "./App.css";
 // Quad-view divider positions (column/row split fractions), persisted so a layout the user tuned
 // survives reloads. Clamped to 0.15–0.85 so no cell can be dragged to nothing.
 const STATUS_BAR_HEIGHT = 20; // px reserved at the bottom of the window for statusBarEl
+/** Ceiling on `fullCanvasRef`'s single RGBA canvas (§2 of the 2026-08 memory-efficiency pass —
+ *  232 MB on a 7216×8448 world, held until a mode/world/z change, with no way today to refuse
+ *  it). Matches the "Balanced" tile-cache preset's total; will become preset-derived once §6's
+ *  memory-budget setting exists. */
+const FULL_MAP_BUDGET_BYTES = 256 * 1024 * 1024;
 
 // Toasts (see pushToast). Errors linger ~3× longer than status blips — they carry a message the
 // user may need to read, not just an acknowledgement of something they just did.
@@ -326,6 +331,23 @@ function App() {
   }, [pushToast]);
 
   const [renderMode, setRenderMode] = useState<"tiled" | "full" | "axo">("tiled");
+  /** Ceiling on `fullCanvasRef`'s single RGBA canvas (§2 of the 2026-08 memory-efficiency pass —
+   *  232 MB on a 7216×8448 world, held until a mode/world/z change, with no way today to refuse
+   *  it). Matches the "Balanced" tile-cache preset's total; will become preset-derived once §6's
+   *  memory-budget setting exists. */
+  /** Wraps `setRenderMode` so switching to Full Map/Axo on a world too large for the current
+   *  memory budget toasts instead of allocating a canvas the browser may itself refuse. */
+  const requestRenderMode = useCallback((mode: "tiled" | "full" | "axo") => {
+    if ((mode === "full" || mode === "axo") && world) {
+      const mapW = chunkToWorld(world.width_chunks);
+      const mapH = chunkToWorld(world.height_chunks);
+      if (mapW * mapH * 4 > FULL_MAP_BUDGET_BYTES) {
+        reportError("World too large for Full Map at this memory budget — use Tiled.");
+        return;
+      }
+    }
+    setRenderMode(mode);
+  }, [world, reportError]);
   const [axoSkew, setAxoSkew] = useState(0.2);
   const [showHelp, setShowHelp] = useState(false);
   const [showAbout, setShowAbout] = useState(false);
@@ -349,6 +371,18 @@ function App() {
   // 3D fly-through pane (4th quad cell) — off by default; it's the most expensive pane, so the user
   // opts in. `exp` (experimental, perf-heavy on large worlds).
   const [enable3dPane, setEnable3dPane] = useState(() => loadSettings().default3dPane);
+  // Latch: has the 3D pane been live at least once this session? Once true, FlyView3D (and the quad
+  // grid that hosts it) stay *mounted but hidden* rather than being torn down on every ✕3D / quad-view
+  // toggle — Stage 4 of the 3D-pane crash fix. Destroying and recreating a WebGL context per toggle
+  // walks WKWebView toward its live-context ceiling; a suspended pane disposes all its geometry and
+  // parks its loops, so keeping it costs a bare context. Never reset — a world close unmounts the
+  // whole editor branch anyway.
+  // A ref rather than state: it's a monotone latch that only ever flips during a render that's
+  // already happening (the one where the pane turns on), so it never needs to schedule one.
+  const pane3dLive = showSlicePanels && enable3dPane;
+  const mounted3dRef = useRef(false);
+  if (pane3dLive) mounted3dRef.current = true;
+  const mounted3d = mounted3dRef.current;
   const [fogEnabled, setFogEnabled] = useState(() => loadSettings().enableFog);
   // Night lighting / shadow previews + the GPU shadow map for FlyView3D (see CLAUDE.md). `lightEpoch`
   // bumps whenever the baked ones change, driving a chunk-mesh reload (same mechanism as texEpoch).
@@ -421,6 +455,15 @@ function App() {
   const [autoOrient3d, setAutoOrient3d] = useState(() => loadSettings().autoOrient3d);
   const [floodFillLimit, setFloodFillLimit] = useState(() => loadSettings().floodFillLimit);
   const [enableExperimentalExport, setEnableExperimentalExport] = useState(() => loadSettings().enableExperimentalExport);
+  // Memory-budget preset (§6 of the 2026-08 memory-efficiency pass) — only the undo budget reaches
+  // Rust (via set_undo_budget below); tile/vertex budgets stay frontend-side as MapCanvas/FlyView3D props.
+  const [memoryBudget, setMemoryBudget] = useState<AppSettings["memoryBudget"]>(() => loadSettings().memoryBudget);
+  // Push the undo budget once at startup (Rust's WorldState default is already "balanced", but a
+  // saved Low/High preset must apply before the user's first edit, not just after their next Save).
+  useEffect(() => {
+    invoke("set_undo_budget", { bytes: MEMORY_PRESETS[memoryBudget].undoBudgetBytes }).catch(() => {});
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   // Debounces the localStorage write only (state stays live so the slider/HUD track immediately) —
   // dragging the render-distance slider fires an onChange per pixel, and saveSettings() does a full
   // loadSettings() (JSON.parse) + JSON.stringify round-trip; without this a drag gesture does dozens
@@ -450,6 +493,8 @@ function App() {
     setAutoOrient3d(s.autoOrient3d);
     setFloodFillLimit(s.floodFillLimit);
     setEnableExperimentalExport(s.enableExperimentalExport);
+    setMemoryBudget(s.memoryBudget);
+    invoke("set_undo_budget", { bytes: MEMORY_PRESETS[s.memoryBudget].undoBudgetBytes }).catch(() => {});
     if (s.templatePath !== templatePath) setTemplatePath(s.templatePath);
     if (s.texturePackPath !== texturePackPath) {
       if (s.texturePackPath) loadTexturePackFile(s.texturePackPath);
@@ -1648,7 +1693,9 @@ function App() {
     } catch (e) { reportError(e); }
   }
 
-  async function handleLassoSelect(pathPts: [number, number][]) {
+  // Shared by lasso (freehand drag) and polyselect (click-vertex polygon) — both reduce to an
+  // ordered world-space path that this fills and installs as the backend selection mask.
+  async function applyPolygonSelection(pathPts: [number, number][]) {
     try {
       const verts = pathPts.map(([x, y]) => ({ x, y }));
       const filled = polygonPixels(verts, "fill");
@@ -1674,6 +1721,14 @@ function App() {
       setHasSelectionMask(true);
       setRawBounds(rect);
     } catch (e) { reportError(e); }
+  }
+
+  async function handleLassoSelect(pathPts: [number, number][]) {
+    await applyPolygonSelection(pathPts);
+  }
+
+  async function handlePolySelect(pathPts: [number, number][]) {
+    await applyPolygonSelection(pathPts);
   }
 
   async function handleScatterPaste(_pos: { x: number; y: number }) {
@@ -2146,7 +2201,7 @@ function App() {
           return;
         }
         const t = appToolRef.current;
-        if (t === "paste" || t === "wand" || t === "lasso" || t === "pen" || t === "brush" || t === "spray" || t === "line" || t === "rect" || t === "ellipse" || t === "polygon" ||
+        if (t === "paste" || t === "wand" || t === "lasso" || t === "polyselect" || t === "pen" || t === "brush" || t === "spray" || t === "line" || t === "rect" || t === "ellipse" || t === "polygon" ||
             t === "smooth" || t === "noise" || t === "flatten" || t === "erode" || t === "thermal" ||
             t === "hydro" || t === "stamp" || t === "grab" || t === "raise" || t === "lower" ||
             t === "terrace" || t === "sharpen" || t === "slope" || t === "smear" || t === "rock" || t === "carve" || t === "fill" || t === "eyedropper" || t === "poolfill") {
@@ -2195,6 +2250,7 @@ function App() {
         if (e.key === "f" || e.key === "F") { e.preventDefault(); setTool("fill"); return; }
         if (e.key === "w" || e.key === "W") { e.preventDefault(); setTool("wand"); return; }
         if (e.key === "k" || e.key === "K") { e.preventDefault(); setTool("lasso"); return; }
+        if (e.key === "j" || e.key === "J") { e.preventDefault(); setTool("polyselect"); return; }
         if (e.key === "i" || e.key === "I") {
           e.preventDefault();
           prevToolRef.current = appToolRef.current === "eyedropper" ? "pen" : appToolRef.current;
@@ -2685,6 +2741,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
       onPasteAt={handlePasteClick}
       lockedPastePos={lockedPastePos}
       renderMode={renderMode}
+      tileBudgetBytes={MEMORY_PRESETS[memoryBudget].tileBudgetBytes}
       axoSkew={axoSkew}
       sliceLines={showSlicePanels ? { x: sliceSideX, y: sliceFrontY } : null}
       drawConfig={{ brushSize, brushShape, fillMode: drawFilled ? "fill" : "outline", sculptRadius, sculptSoftness, sculptProfile, sculptAccumulate, sprayDensity, strokeStabilizer }}
@@ -2701,6 +2758,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
       onCursorMove={handleCursorMove}
       onMagicWand={handleMagicWand}
       onLassoSelect={handleLassoSelect}
+      onPolySelect={handlePolySelect}
       selectionMask={selectionMaskOverlay}
       spawnPos={spawnPos}
       creatures={[]}
@@ -2889,19 +2947,25 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
     );
     return (
       <div style={{ position: "relative", width: "100vw", height: "100vh" }}>
-        {showSlicePanels ? (
+        {(showSlicePanels || mounted3d) && (
           // Quad view: the real top-down map (top-left) + Front / Side slices + 3D placeholder.
           // Top strip is left clear for the floating menu/toolbar chrome.
+          //
+          // Kept mounted (hidden, not unmounted) once the 3D pane has been used this session — see
+          // `mounted3d`. Its only live occupant then is FlyView3D, suspended; the map/slice cells
+          // render nothing, and the map moves to the non-quad wrapper below.
           <div ref={quadGridRef} style={{
             position: "absolute", top: effectiveRibbonHeight, left: 0, right: sidebarInsetPx, bottom: STATUS_BAR_HEIGHT,
-            display: "grid", gridTemplateColumns: quadCols, gridTemplateRows: quadRows,
+            display: showSlicePanels ? "grid" : "none",
+            gridTemplateColumns: quadCols, gridTemplateRows: quadRows,
             gap: 2, background: "#0a0f1e",
           }}>
             <div style={{ position: "relative", minWidth: 0, minHeight: 0, overflow: "hidden", outline: "1px solid #312c28" }}>
-              {mapPaneEl}
+              {showSlicePanels && mapPaneEl}
               {maxBtn("map")}
             </div>
             <div style={{ position: "relative", minWidth: 0, minHeight: 0, overflow: "hidden", outline: "1px solid #312c28" }}>
+              {showSlicePanels && (
               <ErrorBoundary label="Front view">
                 <SliceViewport {...sliceCommon} axis="front"
                   depth={sliceFrontY} onDepthChange={setSliceFrontY}
@@ -2910,9 +2974,11 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
                   selFull={!sliceIsPaste && sliceSel ? { xLo: sliceSel.x1, yLo: sliceSel.y1, xHi: sliceSel.x2, yHi: sliceSel.y2, zLo: sliceSel.z_min, zHi: sliceSel.z_max } : null}
                   onHRangeChange={sliceHResizeFront} onSelect={sliceSelectFront} />
               </ErrorBoundary>
+              )}
               {maxBtn("front")}
             </div>
             <div style={{ position: "relative", minWidth: 0, minHeight: 0, overflow: "hidden", outline: "1px solid #312c28" }}>
+              {showSlicePanels && (
               <ErrorBoundary label="Side view">
                 <SliceViewport {...sliceCommon} axis="side"
                   depth={sliceSideX} onDepthChange={setSliceSideX}
@@ -2921,11 +2987,17 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
                   selFull={!sliceIsPaste && sliceSel ? { xLo: sliceSel.x1, yLo: sliceSel.y1, xHi: sliceSel.x2, yHi: sliceSel.y2, zLo: sliceSel.z_min, zHi: sliceSel.z_max } : null}
                   onHRangeChange={sliceHResizeSide} onSelect={sliceSelectSide} />
               </ErrorBoundary>
+              )}
               {maxBtn("side")}
             </div>
             <div style={{ position: "relative", minWidth: 0, minHeight: 0, overflow: "hidden", outline: "1px solid #312c28" }}>
-              {enable3dPane ? (
-                <>
+              {/* Mounted from the first time the pane is enabled and never unmounted again (Stage 4
+                  of the 3D-pane crash fix): hidden + `suspended` instead. Creating and destroying a
+                  WebGL context on every ✕3D / quad-view toggle walks WKWebView toward its live-context
+                  ceiling, and a suspended pane costs a bare context — it disposes all its geometry,
+                  parks its rAF loop, and stops streaming. */}
+              {mounted3d && (
+                <div style={{ position: "absolute", inset: 0, display: pane3dLive ? "block" : "none" }}>
                   <ErrorBoundary label="3D view">
                     <FlyView3D
                       ref={flyView3dRef}
@@ -2939,6 +3011,14 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
                             ? { x: world.center_px, y: world.center_py } : undefined)
                       }
                       worldLoadToken={worldEpoch}
+                      geometryBudgetBytes={MEMORY_PRESETS[memoryBudget].geometryBudgetBytes}
+                      // Non-fatal warnings (WebGL context lost/restored) — a toast, not the
+                      // ErrorBoundary: the pane recovers on its own from both.
+                      onNotice={showToast}
+                      // Cache-invalidation key only — the cap itself is backend state and
+                      // `get_chunk_geometry` folds it into the streamed z band (Cutaway phase 2).
+                      viewCapZ={viewCapZ}
+                      suspended={!pane3dLive}
                       anyModalOpen={anyModalOpen}
                       editEpoch={editEpoch}
                       lastEdit={lastEditBounds}
@@ -2999,8 +3079,9 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
                       borderRadius: 4, padding: "1px 7px", fontSize: 11, cursor: "pointer",
                     }}
                   >✕ 3D</button>
-                </>
-              ) : (
+                </div>
+              )}
+              {!enable3dPane && (
                 // Off by default — the 3D pane is the heaviest viewport. Opt in here.
                 <div style={{
                   display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center",
@@ -3027,7 +3108,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
 
             {/* Draggable splitters — hidden while a pane is maximized. A vertical bar moves the
                 column split, a horizontal bar the row split, and the centre knob moves both. */}
-            {!maximizedPane && (
+            {showSlicePanels && !maximizedPane && (
               <>
                 <div
                   onPointerDown={beginQuadDrag("col")}
@@ -3070,7 +3151,8 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
               </>
             )}
           </div>
-        ) : (
+        )}
+        {!showSlicePanels && (
           // Non-quad mode: reserve the sidebar's width so the canvas paints in the remaining
           // region instead of under it. MapCanvas's ResizeObserver watches the canvas element
           // itself, so shrinking this wrapper's width is a resize, not a rewrite (see Sidebar.tsx
@@ -3177,7 +3259,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           followSurface={followSurface}
           setFollowSurface={setFollowSurface}
           renderMode={renderMode}
-          setRenderMode={setRenderMode}
+          setRenderMode={requestRenderMode}
           axoSkew={axoSkew}
           setAxoSkew={setAxoSkew}
           showSlicePanels={showSlicePanels}

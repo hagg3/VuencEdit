@@ -25,8 +25,11 @@ use std::sync::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Instant;
 use tauri::Emitter;
 
-// Lock/render timing instrumentation ([LOAD]/[LOCK]/[SCAN]/[PREVIEW] lines).
+// Lock/render timing instrumentation ([LOAD]/[LOCK]/[SCAN]/[PREVIEW]/[GEOM] lines).
 // Debug builds only — release builds stay quiet on stderr.
+// `#[macro_export]` (not just textual scope): the `mod` declarations above sit *before* this
+// definition, so sibling modules can't see it textually — they call it as `crate::timing_log!`.
+#[macro_export]
 macro_rules! timing_log {
     ($($arg:tt)*) => { if cfg!(debug_assertions) { eprintln!($($arg)*); } };
 }
@@ -106,6 +109,98 @@ fn stage_copy(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<(
     fs::copy(src, dst).map(|_| ())
 }
 
+/// How the load-time staged temp copy gets mapped into `LoadedWorld::bytes`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MapMode {
+    /// `MAP_SHARED` — edited pages stay file-backed by the temp and are reclaimable under memory
+    /// pressure. The default.
+    Shared,
+    /// `MAP_PRIVATE` (copy-on-write) — every edited page becomes anonymous dirty RAM that can only
+    /// go to swap. The pre-2026-08 behaviour, kept as the fallback.
+    Private,
+}
+
+/// Whether the volume holding `path` has room for the staged temp to fully diverge from its clone.
+///
+/// Only meaningful on macOS, where `stage_copy` uses APFS `clonefile(2)`: the temp initially shares
+/// its blocks with the source and consumes no extra space, so writing to a `MAP_SHARED` mapping of
+/// it must allocate a fresh block per touched page. If the volume is full when that happens, the
+/// kernel raises **SIGBUS** during writeback — an instant abort with no chance to save — whereas
+/// `MAP_PRIVATE` would merely add swap pressure. Require ~1.25× the world's size free before
+/// accepting that risk. An unreadable `statvfs` returns `true`: not being able to tell is not a
+/// reason to give up the reclaimability win.
+#[cfg(target_os = "macos")]
+fn temp_volume_has_room_for(path: &std::path::Path, len: u64) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else { return true };
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c_path.as_ptr(), &mut st) } != 0 {
+        return true;
+    }
+    let free = (st.f_bavail as u64).saturating_mul(st.f_frsize as u64);
+    free >= len.saturating_add(len / 4)
+}
+
+/// `VUENCEDIT_MAP=private|shared` overrides the choice; anything else falls through to the
+/// free-space check. Deliberately an env var and not a Settings toggle — it would need a new
+/// `load_world` parameter for a knob no user can reason about.
+fn staged_map_mode(path: &std::path::Path) -> MapMode {
+    match std::env::var("VUENCEDIT_MAP").ok().as_deref() {
+        Some("private") => return MapMode::Private,
+        Some("shared") => return MapMode::Shared,
+        _ => {}
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let len = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        if !temp_volume_has_room_for(path, len) {
+            return MapMode::Private;
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = path;
+    MapMode::Shared
+}
+
+/// Map the staged temp copy for `LoadedWorld::bytes` — the single entry point for all three load
+/// paths (zip, raw, autosave recovery) so they can't drift apart.
+///
+/// `MAP_SHARED` by default: the temp is a private throwaway we already own, so letting edits land in
+/// it costs nothing and keeps every touched page file-backed and evictable instead of accumulating
+/// as anonymous dirty RAM for the life of the session. ⚠️ This means **the temp is no longer the
+/// pristine as-loaded image** — `autosave_world_inner` establishes its base clone before capturing a
+/// tick's spans precisely because of that (see the module doc there).
+///
+/// The file must be reopened read+write: `fs::File::open` is `O_RDONLY` and `map_mut` on it fails at
+/// runtime with `EACCES` (`ERROR_ACCESS_DENIED` on Windows). Any failure to map shared — including a
+/// filesystem that won't take a writable mapping — falls back to the old `map_copy` behaviour rather
+/// than failing the load.
+fn map_staged_temp(path: &std::path::Path) -> std::io::Result<MmapMut> {
+    if staged_map_mode(path) == MapMode::Shared {
+        // SAFETY: the temp file is private to this process, written by us, and stays alive for the
+        // duration of the mapping (deleted only after the LoadedWorld holding it has been dropped).
+        let shared = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .and_then(|file| unsafe { MmapOptions::new().map_mut(&file) });
+        match shared {
+            Ok(m) => {
+                timing_log!("[LOAD] mapped staged temp MAP_SHARED  bytes={}B", m.len());
+                return Ok(m);
+            }
+            Err(e) => {
+                timing_log!("[LOAD] MAP_SHARED failed ({e}) — falling back to MAP_PRIVATE");
+            }
+        }
+    }
+    // SAFETY: as above.
+    let file = fs::File::open(path)?;
+    let m = unsafe { MmapOptions::new().map_copy(&file) }?;
+    timing_log!("[LOAD] mapped staged temp MAP_PRIVATE  bytes={}B", m.len());
+    Ok(m)
+}
+
 /// Delete `vuencedit_*.eden` staging files left in the system temp dir by a previous session that
 /// quit without loading another world (normal operation deletes the prior temp on the next load, so
 /// only a clean quit leaks one). Best-effort, run once at startup. Deleting a file another running
@@ -151,9 +246,13 @@ pub struct WorldMeta {
 // ── In-memory world state ────────────────────────────────────────────────────
 
 pub(crate) struct LoadedWorld {
-    /// Private copy-on-write mapping of the world file. Reads are file-backed and evictable
-    /// under OS memory pressure; writes COW only the touched 4 KB page. The original file
-    /// on disk is never modified — saves are explicit fs::write calls.
+    /// Mapping of the *staged temp copy* of the world file — never the user's file. Normally
+    /// `MAP_SHARED` (see `map_staged_temp`), so both reads and edited pages are file-backed by the
+    /// temp and evictable under OS memory pressure; `MAP_PRIVATE` copy-on-write is the fallback,
+    /// where an edited page becomes anonymous dirty RAM instead. Either way the user's original
+    /// file on disk is never modified — saves are explicit writes through `save_world_inner`.
+    /// ⚠️ Under `MAP_SHARED` the temp diverges from the as-loaded image as soon as anything is
+    /// edited; nothing may assume it is pristine (see `autosave_world_inner`).
     pub(crate) bytes: MmapMut,
     /// Maps (chunk_cx, chunk_cy) → byte offset of that chunk's data block in `bytes`.
     // FxHashMap: SipHash-1-3 (std's default) is needlessly slow for an (i32,i32) key hashed on
@@ -251,11 +350,14 @@ pub(crate) struct ChunkSnapshot {
     pub(crate) delta: ChunkDelta,
 }
 
+/// Real heap cost of one snapshot's delta. `(u32, u8)` is 8 bytes (align 4, padded), and the Vec
+/// is `push`-grown so its capacity can run to 2× its length — so this counts `capacity()`, not
+/// `len()`, and must be called *after* `diff_chunk`'s `shrink_to_fit()` or it overstates. `+40`
+/// approximates the `Vec`/`ChunkSnapshot` spine overhead per entry.
 fn chunk_snapshot_bytes(s: &ChunkSnapshot) -> usize {
     match &s.delta {
-        // 5 bytes/entry (u32 offset + u8 value) plus a little Vec overhead allowance.
-        ChunkDelta::Sparse(v) => v.len() * 5 + 24,
-        ChunkDelta::Full(_, d) => d.len(),
+        ChunkDelta::Sparse(v) => v.capacity() * 8 + 40,
+        ChunkDelta::Full(_, d) => d.capacity() + 40,
     }
 }
 
@@ -492,6 +594,57 @@ pub(crate) struct DiskImage {
     compressed: bool,
 }
 
+/// Bound on `template_surface_cache` entries (§5, 2026-08 memory-efficiency pass): each entry is a
+/// 1 KB decoded surface, and both callers (`composite_template_full`'s whole-footprint PNG export
+/// overlay, `fetch_template_tile`'s panning fetches) could otherwise grow it to the size of the
+/// whole template with no eviction — `export_png` with the overlay on used to cache a surface for
+/// every chunk of Eden.eden's 180×180 grid in one shot (~32 MB).
+const TEMPLATE_SURFACE_CACHE_LIMIT: usize = 16384; // ~16 MB
+
+/// Bounded cache of decoded template surfaces, insertion-order eviction (like the frontend's
+/// `swatchCache`) — a template surface is cheap to recompute (`decode_template_surface` just
+/// re-decodes one RLE chunk column), so LRU-on-read precision isn't worth the bookkeeping.
+/// `order` mirrors `map`'s keys exactly: every insert site checks `contains_key` first (never
+/// re-inserting a live key), and eviction always pops both in lockstep.
+#[derive(Default)]
+pub(crate) struct TemplateSurfaceCache {
+    map: HashMap<(i32, i32), Box<[[u8; 4]; 256]>>,
+    order: VecDeque<(i32, i32)>,
+}
+
+impl TemplateSurfaceCache {
+    pub(crate) fn contains_key(&self, key: &(i32, i32)) -> bool {
+        self.map.contains_key(key)
+    }
+
+    pub(crate) fn get(&self, key: &(i32, i32)) -> Option<&Box<[[u8; 4]; 256]>> {
+        self.map.get(key)
+    }
+
+    /// Insert a freshly decoded surface. Caller must have already checked `contains_key` (every
+    /// call site does, to skip re-decoding) — inserting an already-present key would desync
+    /// `order` from `map`.
+    pub(crate) fn insert(&mut self, key: (i32, i32), value: Box<[[u8; 4]; 256]>) {
+        self.map.insert(key, value);
+        self.order.push_back(key);
+        while self.order.len() > TEMPLATE_SURFACE_CACHE_LIMIT {
+            if let Some(evicted) = self.order.pop_front() {
+                self.map.remove(&evicted);
+            }
+        }
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.map.clear();
+        self.order.clear();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.map.len()
+    }
+}
+
 pub(crate) struct WorldState {
     pub(crate) world: Option<LoadedWorld>,
     pub(crate) clipboard: Option<Clipboard>,
@@ -502,6 +655,10 @@ pub(crate) struct WorldState {
     /// the whole stack (audit M2).
     pub(crate) undo_bytes: usize,
     pub(crate) redo_bytes: usize,
+    /// Ceiling (bytes) each of `undo_stack`/`redo_stack` is trimmed to independently — see
+    /// `trim_stack`. User-configurable via `set_undo_budget` (memory-budget presets, §1c of the
+    /// 2026-08 memory-efficiency pass); clamped server-side to `16..=512 MB`.
+    pub(crate) undo_budget: usize,
     /// Path to the decompressed temp file when the current world was opened from a zip.
     /// Deleted after the mmap is dropped on next world load.
     pub(crate) temp_path: Option<std::path::PathBuf>,
@@ -513,8 +670,9 @@ pub(crate) struct WorldState {
     /// Eden.eden uses i32+i32+u64 directory, different from regular saves.
     pub(crate) template_dir: FxHashMap<(i32, i32), usize>,
     /// Per-chunk surface colors: [r,g,b,a] for each of the 256 (lx*16+ly) positions.
-    /// a=255 = solid block; a=0 = air column. 1 KB/chunk vs 32 KB for full raw.
-    pub(crate) template_surface_cache: HashMap<(i32, i32), Box<[[u8; 4]; 256]>>,
+    /// a=255 = solid block; a=0 = air column. 1 KB/chunk vs 32 KB for full raw. Bounded (§5) —
+    /// see `TemplateSurfaceCache`.
+    pub(crate) template_surface_cache: TemplateSurfaceCache,
     /// Optional texture pack loaded by the user (world-independent).
     pub(crate) texture_pack: Option<texturepack::TexturePack>,
     /// Lazily-built lamp (block type 72) position index — see `LampIndex`. Empty until first needed
@@ -558,10 +716,11 @@ impl WorldState {
             redo_stack: VecDeque::new(),
             undo_bytes: 0,
             redo_bytes: 0,
+            undo_budget: DEFAULT_UNDO_BYTE_BUDGET,
             temp_path: None,
             template_bytes: None,
             template_dir: FxHashMap::default(),
-            template_surface_cache: HashMap::new(),
+            template_surface_cache: TemplateSurfaceCache::default(),
             texture_pack: None,
             lamp_index: LampIndex::default(),
             view_cap_z: None,
@@ -571,6 +730,21 @@ impl WorldState {
             disk_image: None,
             autosave_base_id: None,
         }
+    }
+
+    /// Clear the redo stack and its byte counter together. Every clear site must pair them —
+    /// leaving `redo_bytes` stale after `redo_stack.clear()` makes it ratchet up for the rest of
+    /// the session until it exceeds the budget, at which point `push_undo` on the redo stack
+    /// starts evicting to `len()==1` on every push and redo depth silently collapses to one.
+    pub(crate) fn clear_redo(&mut self) {
+        self.redo_stack.clear();
+        self.redo_bytes = 0;
+    }
+
+    /// Clear the undo stack and its byte counter together (mirrors `clear_redo`).
+    pub(crate) fn clear_undo(&mut self) {
+        self.undo_stack.clear();
+        self.undo_bytes = 0;
     }
 }
 
@@ -633,6 +807,10 @@ fn scan_chunk_lamps(world: &LoadedWorld, cx: i32, cy: i32) -> Vec<[i32; 3]> {
 ///
 /// Parallel over chunks — they are independent `&LoadedWorld` reads, and nothing in the closure
 /// touches `AppState`, so the "no re-locking inside a rayon closure" rule holds.
+///
+/// Production always builds lazily and per-chunk via `LampIndex::lamps_in_region` (§4 of the
+/// 2026-08 memory-efficiency pass) — this whole-world scan is now only the test/parity oracle.
+#[cfg(test)]
 pub(crate) fn build_lamp_index(world: &LoadedWorld) -> LampMap {
     let coords: Vec<(i32, i32)> = world.chunk_map.keys().copied().collect();
     coords
@@ -646,46 +824,81 @@ pub(crate) fn build_lamp_index(world: &LoadedWorld) -> LampMap {
         .collect()
 }
 
-/// Lazily-built, interior-mutable lamp spatial index.
-///
-/// The `Mutex` is what lets the (expensive) first build happen while its caller holds only a
-/// **read** guard on `WorldState` (audit C1 step 2 + H3): tile fetches, cursor reads and other
-/// chunk-geometry requests keep running concurrently instead of queueing behind a write lock.
-/// Correctness comes from the read guard being held continuously across build *and* install —
-/// every mutating path takes the `WorldState` write lock, so no edit can slip in between and
-/// leave the freshly built index describing a world that no longer exists.
+/// Interior state behind `LampIndex`: the lamp buckets built so far, plus which chunks have been
+/// scanned. A `scanned` set rather than an `Unscanned/Scanned(Vec)` enum per chunk, because
+/// `apply_delta` already deletes empty buckets to keep `lamps` small (§4) — an enum would force a
+/// permanent `Scanned(vec![])` entry per lamp-free chunk, which on a sparse world is most of them.
 #[derive(Default)]
-pub(crate) struct LampIndex(Mutex<Option<LampMap>>);
+struct LampIndexState {
+    lamps: LampMap,
+    scanned: FxHashSet<(i32, i32)>,
+}
+
+/// Lazily, *per-chunk* built, interior-mutable lamp spatial index (§4 of the 2026-08
+/// memory-efficiency pass — replaced a whole-world `build_lamp_index` scan on the first night-lit
+/// request, which forced ~half the mmap resident in one burst).
+///
+/// The `Mutex` is what lets scanning happen while its caller holds only a **read** guard on
+/// `WorldState` (audit C1 step 2 + H3): tile fetches, cursor reads and other chunk-geometry
+/// requests keep running concurrently instead of queueing behind a write lock. Correctness comes
+/// from the read guard being held continuously across scan *and* install — every mutating path
+/// takes the `WorldState` write lock, so no edit can slip in between and leave a freshly scanned
+/// chunk describing a world that no longer exists.
+#[derive(Default)]
+pub(crate) struct LampIndex(Mutex<LampIndexState>);
 
 impl LampIndex {
-    fn guard(&self) -> std::sync::MutexGuard<'_, Option<LampMap>> {
+    fn guard(&self) -> std::sync::MutexGuard<'_, LampIndexState> {
         self.0.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    /// Run `f` against the index, building it first if this is the first night-lit request.
-    /// Takes `&self` so it works under a `WorldState` read guard.
-    pub(crate) fn with<R>(&self, world: &LoadedWorld, f: impl FnOnce(&LampMap) -> R) -> R {
-        let mut slot = self.guard();
-        if slot.is_none() {
-            *slot = Some(build_lamp_index(world));
+    /// Gather lamps within reach of a pixel-space region, scanning any chunk in that neighbourhood
+    /// not already seen and memoising the result before delegating to the pure `lamps_in_region`
+    /// gather. `&self` keeps this usable under a `WorldState` read guard, same contract as the
+    /// `build_lamp_index`-based `with` it replaces.
+    pub(crate) fn lamps_in_region(
+        &self, world: &LoadedWorld, sx1: i32, sy1: i32, sx2: i32, sy2: i32, radius: f32,
+    ) -> Vec<[i32; 3]> {
+        let (cx_lo, cx_hi, cy_lo, cy_hi) = region_chunk_box(world, sx1, sy1, sx2, sy2, radius);
+        let mut st = self.guard();
+        let LampIndexState { lamps, scanned } = &mut *st;
+        let todo: Vec<(i32, i32)> = (cx_lo..=cx_hi)
+            .flat_map(|cx| (cy_lo..=cy_hi).map(move |cy| (cx, cy)))
+            .filter(|coord| !scanned.contains(coord))
+            .collect();
+        if !todo.is_empty() {
+            // Same shape as the old `build_lamp_index`: independent `&LoadedWorld` reads, nothing
+            // in the closure touches `AppState`, so the "no re-locking inside a rayon closure"
+            // rule holds even though we're under a read guard here.
+            let scans: Vec<((i32, i32), Vec<[i32; 3]>)> = todo
+                .par_iter()
+                .map(|&(cx, cy)| ((cx, cy), scan_chunk_lamps(world, cx, cy)))
+                .collect();
+            for (key, v) in scans {
+                if !v.is_empty() { lamps.insert(key, v); }
+                scanned.insert(key);
+            }
         }
-        f(slot.as_ref().unwrap())
+        lamps_in_region(lamps, world, sx1, sy1, sx2, sy2, radius)
     }
 
-    /// Drop the index (world load/close). Rebuilt on the next night-lit request.
+    /// Drop the index (world load/close). Rebuilt on-demand for the new world.
     pub(crate) fn clear(&self) {
-        *self.guard() = None;
+        *self.guard() = LampIndexState::default();
     }
 
     #[cfg(test)]
-    pub(crate) fn snapshot(&self) -> Option<LampMap> {
-        self.guard().clone()
+    pub(crate) fn snapshot(&self) -> LampMap {
+        self.guard().lamps.clone()
     }
 
-    /// Force a full rebuild (tests only — production always builds lazily via `with`).
+    /// Force a full rebuild, marking every populated chunk scanned (tests only — production
+    /// always builds lazily, per-chunk, via `lamps_in_region`).
     #[cfg(test)]
     pub(crate) fn build_now(&self, world: &LoadedWorld) {
-        *self.guard() = Some(build_lamp_index(world));
+        let mut st = self.guard();
+        st.lamps = build_lamp_index(world);
+        st.scanned = world.chunk_map.keys().copied().collect();
     }
 
     /// Bring the index in line with an edit, using the undo delta that edit just produced
@@ -694,18 +907,22 @@ impl LampIndex {
     /// a full 65,536-probe rescan of every affected chunk with O(bytes actually changed) — a large
     /// fill used to re-scan thousands of whole chunks per edit once the index existed.
     ///
-    /// No-op while the index is unbuilt (night lighting never enabled) — the lazy build will see
-    /// the post-edit world anyway.
+    /// A chunk that hasn't been scanned yet is skipped outright, *before* touching its snapshot —
+    /// applying a delta to an unscanned chunk would `entry().or_default()` a bucket holding only
+    /// this edit's lamps and wrongly mark the chunk fully known. Skipping it is correct because
+    /// `world.bytes` already holds post-edit bytes at every one of `apply_delta`'s three call
+    /// sites, so the eventual on-demand scan re-derives the chunk from truth.
     pub(crate) fn apply_delta(&self, world: &LoadedWorld, snaps: &[ChunkSnapshot]) {
-        let mut slot = self.guard();
-        let Some(index) = slot.as_mut() else { return };
+        let mut st = self.guard();
+        let LampIndexState { lamps: index, scanned } = &mut *st;
         for snap in snaps {
+            let key = (snap.cx, snap.cy);
+            if !scanned.contains(&key) { continue; }
             let Some((addr, cend)) = world.chunk_range(snap.cx, snap.cy) else { continue };
             let base_x = (snap.cx - world.min_x) * 16;
             let base_y = (snap.cy - world.min_y) * 16;
             // `off` is chunk-relative; `prev`/`now` are its byte value before/after the edit.
             // Only a transition into or out of `LAMP_BLOCK_TYPE` moves the index.
-            let key = (snap.cx, snap.cy);
             let mut visit = |off: usize, prev: u8, now: u8| {
                 let is_lamp = now == LAMP_BLOCK_TYPE;
                 if (prev == LAMP_BLOCK_TYPE) == is_lamp { return; }
@@ -754,10 +971,28 @@ impl LampIndex {
     }
 }
 
+/// The chunk box a region's lamp gather needs: chunks overlapping `[sx1..=sx2] × [sy1..=sy2]`
+/// expanded by `ceil(radius/16)` chunks (plus a safety chunk). Shared by the scanning path
+/// (`LampIndex::lamps_in_region`) and the pure gather below so they can't compute different
+/// neighbourhoods.
+fn region_chunk_box(
+    world: &LoadedWorld, sx1: i32, sy1: i32, sx2: i32, sy2: i32, radius: f32,
+) -> (i32, i32, i32, i32) {
+    let r = radius.ceil() as i32;
+    let cr = r.div_euclid(16) + 1;
+    let cx_lo = sx1.div_euclid(16) + world.min_x - cr;
+    let cx_hi = sx2.div_euclid(16) + world.min_x + cr;
+    let cy_lo = sy1.div_euclid(16) + world.min_y - cr;
+    let cy_hi = sy2.div_euclid(16) + world.min_y + cr;
+    (cx_lo, cx_hi, cy_lo, cy_hi)
+}
+
 /// Gather lamp positions (local block coords) within reach of a pixel-space region — every lamp
 /// that could light a voxel in `[sx1..=sx2] × [sy1..=sy2]` given `radius`. Collects from the chunks
 /// overlapping the region expanded by `ceil(radius/16)` chunks, then filters to the exact expanded
-/// box so the result matches the old inline voxel scan exactly (parity).
+/// box so the result matches the old inline voxel scan exactly (parity). Pure gather — the free
+/// function tests key on, and what `LampIndex::lamps_in_region` delegates to once its on-demand
+/// chunks are scanned.
 pub(crate) fn lamps_in_region(
     index: &LampMap,
     world: &LoadedWorld,
@@ -765,11 +1000,7 @@ pub(crate) fn lamps_in_region(
     radius: f32,
 ) -> Vec<[i32; 3]> {
     let r = radius.ceil() as i32;
-    let cr = r.div_euclid(16) + 1; // chunk-expansion margin, ceil(radius/16) plus a safety chunk
-    let cx_lo = sx1.div_euclid(16) + world.min_x - cr;
-    let cx_hi = sx2.div_euclid(16) + world.min_x + cr;
-    let cy_lo = sy1.div_euclid(16) + world.min_y - cr;
-    let cy_hi = sy2.div_euclid(16) + world.min_y + cr;
+    let (cx_lo, cx_hi, cy_lo, cy_hi) = region_chunk_box(world, sx1, sy1, sx2, sy2, radius);
     let mut out = Vec::new();
     for cx in cx_lo..=cx_hi {
         for cy in cy_lo..=cy_hi {
@@ -1623,10 +1854,7 @@ fn load_world(path: String, state: tauri::State<'_, AppState>) -> Result<WorldMe
                 .map_err(|e| format!("Failed to decompress: {e}"))?;
         } // tmp closed here before mmap
         timing_log!("[LOAD] decompressed to {:?}  t=+{}µs", temp_path, us());
-        let file = fs::File::open(&temp_path)
-            .map_err(|e| format!("Failed to open temp file: {e}"))?;
-        // SAFETY: temp file is private, written by us, and stays alive for the duration of the mmap.
-        let mmap = unsafe { MmapOptions::new().map_copy(&file) }
+        let mmap = map_staged_temp(&temp_path)
             .map_err(|e| format!("Failed to map temp file: {e}"))?;
         (mmap, Some(temp_path), true)
     } else {
@@ -1635,15 +1863,14 @@ fn load_world(path: String, state: tauri::State<'_, AppState>) -> Result<WorldMe
         // would make the atomic temp-file+rename save (see save_world_inner) fail with a sharing
         // violation whenever the destination is the file being edited. Mapping a throwaway copy
         // leaves the original unlocked so the rename can replace it. It also sidesteps the
-        // undefined behaviour of writing over a still-mmapped file on Unix. map_copy stays
-        // copy-on-write, so edits live in RAM and the temp is only the evictable read-backing store.
+        // undefined behaviour of writing over a still-mmapped file on Unix. Because the temp is
+        // ours alone, `map_staged_temp` maps it MAP_SHARED — edits land in the temp and stay
+        // file-backed and reclaimable rather than piling up as anonymous COW pages.
         let temp_path = temp_world_path();
         stage_copy(std::path::Path::new(&path), &temp_path).map_err(|e| format!(
             "Failed to stage world file: {e}. Opening a world creates a private working copy; check available space for another copy on the system temporary-files drive."
         ))?;
-        let file = fs::File::open(&temp_path).map_err(|e| format!("Failed to open staged file: {e}"))?;
-        // SAFETY: temp file is private, written by us, and stays alive for the duration of the mmap.
-        let mmap = unsafe { MmapOptions::new().map_copy(&file) }
+        let mmap = map_staged_temp(&temp_path)
             .map_err(|e| format!("Failed to map staged file: {e}"))?;
         (mmap, Some(temp_path), false)
     };
@@ -1697,7 +1924,7 @@ fn load_world(path: String, state: tauri::State<'_, AppState>) -> Result<WorldMe
     // point at which we commit to discarding the previous world.
     timing_log!("[LOCK] acquire_start  cmd=load_world/step3  t=+{}µs", us());
     let t_s3 = Instant::now();
-    let (_old_world, old_temp) = {
+    let (old_world, old_temp) = {
         let mut ws = write_ws(&state);
         let wait = t_s3.elapsed().as_micros();
         timing_log!("[LOCK] acquired  cmd=load_world/step3  wait={}µs  prev_undo={}B  prev_redo={}B",
@@ -1705,11 +1932,10 @@ fn load_world(path: String, state: tauri::State<'_, AppState>) -> Result<WorldMe
         let t_held = Instant::now();
         let old_world = ws.world.replace(loaded);  // pointer swap only — dealloc happens outside the lock
         ws.clipboard = None;
-        ws.undo_stack.clear();
-        ws.redo_stack.clear();
-        ws.undo_bytes = 0;
-        ws.redo_bytes = 0;
+        ws.clear_undo();
+        ws.clear_redo();
         ws.lamp_index.clear(); // rebuilt lazily for the new world on first night-lit request
+        ws.template_surface_cache.clear(); // world-footprint-shaped, unlike template_bytes itself
         ws.view_cap_z = None; // cutaway is per-world; the frontend also resets viewMode on load
         ws.sculpt_session = None; // any in-flight live-sculpt workspace belongs to the old world
         ws.selection_mask = None; // a wand/lasso shape belongs to the old world's coordinates
@@ -1734,7 +1960,11 @@ fn load_world(path: String, state: tauri::State<'_, AppState>) -> Result<WorldMe
         timing_log!("[LOCK] released  cmd=load_world/step3  held={}µs  t=+{}µs", t_held.elapsed().as_micros(), us());
         (old_world, old_temp)
     };
-    // _old_world (Option<LoadedWorld>) drops here, releasing the mmap before we delete the temp file.
+    // Release the old mmap before unlinking its backing temp. This drop must be explicit: a named
+    // binding lives to the end of the function, so `let (_old_world, ..)` left the mapping alive
+    // across the remove_file below — contrary to what the comment here used to claim. `close_world`
+    // already does it this way.
+    drop(old_world);
     if let Some(p) = old_temp { let _ = fs::remove_file(&p); }
     timing_log!("[LOAD] end  total={}µs", us());
 
@@ -2601,6 +2831,22 @@ fn set_view_cap(cap: Option<i32>, state: tauri::State<'_, AppState>) -> Result<(
     Ok(())
 }
 
+/// Set the per-session undo/redo byte budget (memory-budget presets, §1c of the 2026-08
+/// memory-efficiency pass) and immediately re-trim both stacks to it. Clamped server-side so a
+/// malformed frontend value can't disable the ceiling entirely or starve undo to nothing.
+#[tauri::command(async)]
+fn set_undo_budget(bytes: usize, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let mut ws = write_ws(&state);
+    let budget = bytes.clamp(MIN_UNDO_BYTE_BUDGET, MAX_UNDO_BYTE_BUDGET);
+    ws.undo_budget = budget;
+    // Split the guard's single `DerefMut` into disjoint field borrows up front — the borrow
+    // checker can't see through a custom Deref impl to know `undo_stack`/`redo_stack` don't alias.
+    let WorldState { undo_stack, undo_bytes, redo_stack, redo_bytes, .. } = &mut *ws;
+    trim_stack(undo_stack, undo_bytes, budget);
+    trim_stack(redo_stack, redo_bytes, budget);
+    Ok(())
+}
+
 /// Return a z-slice patch for just the rectangle (x1,y1)–(x2,y2) at level z.
 /// Used after edits when the frontend is in z-slice mode, avoiding a full 243 MB re-render.
 #[tauri::command(async)]
@@ -3371,10 +3617,14 @@ fn record_full_write(
 
 // ── Undo / Redo helpers ────────────────────────────────────────────────────────
 
-/// Maximum total bytes held across all undo entries. Oldest entries are evicted when
-/// exceeded. Always keeps the most recent entry even if it alone exceeds the budget,
-/// so undo still functions after very large operations (e.g. fill on a 256-layer world).
-const UNDO_BYTE_BUDGET: usize = 256 * 1024 * 1024; // 256 MB
+/// Default ceiling (bytes) held across all undo entries — the "Balanced" memory-budget preset.
+/// Oldest entries are evicted when exceeded. Always keeps the most recent entry even if it alone
+/// exceeds the budget, so undo still functions after very large operations (e.g. fill on a
+/// 256-layer world). User-configurable per session via `set_undo_budget`; see `WorldState::undo_budget`.
+const DEFAULT_UNDO_BYTE_BUDGET: usize = 96 * 1024 * 1024; // 96 MB
+/// Server-side clamp for `set_undo_budget`.
+const MIN_UNDO_BYTE_BUDGET: usize = 16 * 1024 * 1024; // 16 MB
+const MAX_UNDO_BYTE_BUDGET: usize = 512 * 1024 * 1024; // 512 MB
 
 /// Returns all chunk (cx, cy) coords whose x/y footprint overlaps the given pixel-space
 /// rectangle. z_min/z_max are irrelevant here — Eden chunks span all z layers.
@@ -3473,6 +3723,10 @@ fn diff_chunk(world: &LoadedWorld, cx: i32, cy: i32, start_off: u32, pre: &[u8])
         i += 1;
     }
     let delta = if sparse.len() * 5 < pre.len() {
+        // shrink_to_fit before this snapshot's bytes are ever counted (chunk_snapshot_bytes reads
+        // `capacity()`, not `len()`) — a `push`-grown Vec's capacity can otherwise run to 2× len,
+        // and `UndoEntry::new` computes `bytes` once and never recomputes it.
+        sparse.shrink_to_fit();
         ChunkDelta::Sparse(sparse)
     } else {
         ChunkDelta::Full(start_off, pre.to_vec())
@@ -3514,18 +3768,31 @@ fn restore_and_invert(world: &mut LoadedWorld, entry: &UndoEntry) -> Vec<ChunkSn
     }).collect()
 }
 
-/// Push an entry onto an undo/redo stack, evicting oldest entries to keep the stack under
-/// UNDO_BYTE_BUDGET. Used for both `undo_stack` and `redo_stack` so neither can grow unbounded.
-/// `running` is the stack's cached total (`WorldState::undo_bytes`/`redo_bytes`) — updated
-/// incrementally here instead of re-summing every chunk in the stack on every push, which used
-/// to make bookkeeping for an n-stamp sculpt stroke O(n²) (audit M2).
-fn push_undo(stack: &mut VecDeque<UndoEntry>, running: &mut usize, entry: UndoEntry) {
-    *running += entry.bytes;
-    stack.push_back(entry);
-    while *running > UNDO_BYTE_BUDGET && stack.len() > 1 {
+/// Evict oldest entries until `running` is back under `budget`, always keeping at least one entry
+/// (dropping the floor would make a single large edit non-undoable). Extracted from `push_undo` so
+/// `set_undo_budget` can re-trim an already-populated stack when the user lowers the budget.
+fn trim_stack(stack: &mut VecDeque<UndoEntry>, running: &mut usize, budget: usize) {
+    while *running > budget && stack.len() > 1 {
         if let Some(evicted) = stack.pop_front() {
             *running -= evicted.bytes;
         }
+    }
+}
+
+/// Push an entry onto an undo/redo stack, evicting oldest entries to keep it under `budget`. Used
+/// for both `undo_stack` and `redo_stack` so neither can grow unbounded. `running` is the stack's
+/// cached total (`WorldState::undo_bytes`/`redo_bytes`) — updated incrementally here instead of
+/// re-summing every chunk in the stack on every push, which used to make bookkeeping for an
+/// n-stamp sculpt stroke O(n²) (audit M2).
+///
+/// ⚠️ One large edit's snapshot can still park arbitrarily far above `budget`: `trim_stack` keeps
+/// a `len() > 1` floor, so a single ⌘A-fill entry that alone exceeds the budget is never evicted.
+fn push_undo(stack: &mut VecDeque<UndoEntry>, running: &mut usize, entry: UndoEntry, budget: usize) {
+    *running += entry.bytes;
+    stack.push_back(entry);
+    trim_stack(stack, running, budget);
+    if stack.len() == 1 && *running > budget {
+        timing_log!("[UNDO] single entry ({} bytes) alone exceeds the {} byte budget; kept anyway", running, budget);
     }
 }
 
@@ -3698,8 +3965,9 @@ where
     ws.dirty.mark_chunks(pre_snap.iter().map(|s| (s.cx, s.cy)));
 
     if !pre_snap.is_empty() {
-        push_undo(&mut ws.undo_stack, &mut ws.undo_bytes, UndoEntry::new(operation, pre_snap, group));
-        ws.redo_stack.clear();
+        let budget = ws.undo_budget;
+        push_undo(&mut ws.undo_stack, &mut ws.undo_bytes, UndoEntry::new(operation, pre_snap, group), budget);
+        ws.clear_redo();
     }
 
     Ok(EditResult {
@@ -4114,11 +4382,10 @@ fn close_world(state: tauri::State<'_, AppState>) {
     let (old_world, old_temp) = {
         let mut ws = write_ws(&state);
         ws.clipboard = None;
-        ws.undo_stack.clear();
-        ws.redo_stack.clear();
-        ws.undo_bytes = 0;
-        ws.redo_bytes = 0;
+        ws.clear_undo();
+        ws.clear_redo();
         ws.lamp_index.clear();
+        ws.template_surface_cache.clear(); // world-footprint-shaped, unlike template_bytes itself
         ws.view_cap_z = None;
         ws.sculpt_session = None;
         ws.selection_mask = None;
@@ -4135,9 +4402,10 @@ fn close_world(state: tauri::State<'_, AppState>) {
 //
 // Sidecars in `<app_data_dir>`, not the user's save file:
 //   - `autosave.base.eden` — established once per session, on the first autosave tick, as an
-//     O(1)/zero-extra-bytes APFS clone (`stage_copy`) of the load-time staged temp. The temp is
-//     always the pristine as-loaded image (edits live only in the mmap's private COW pages, never
-//     written back to it), so this is always a clean base to journal on top of.
+//     O(1)/zero-extra-bytes APFS clone (`stage_copy`) of the load-time staged temp. ⚠️ The temp is
+//     **not** a pristine as-loaded image: the world is mapped MAP_SHARED over it (`map_staged_temp`),
+//     so edits land in it, and this clone can catch a chunk mid-edit or torn at page granularity.
+//     What makes the base sound anyway is ordering — see step 0 of `autosave_world_inner`.
 //   - `autosave.journal` — an append-only `journal::JournalWriter` stream of the chunk (+header)
 //     spans that have changed since the base, compressed per-record. Ticks normally just append;
 //     periodically (or once, on the first tick) the whole journal is rewritten from `since_base` —
@@ -4283,17 +4551,44 @@ fn autosave_world_inner(
     paths: &AutosavePaths,
     source_path: Option<String>,
 ) -> Result<(), String> {
+    // ── Step 0: establish this session's base image BEFORE step 1 captures the tick's spans.
+    //
+    // The world is mapped MAP_SHARED over the staged temp, so an edit landing while `stage_copy`
+    // runs can be cloned into the base half-old and half-new (page granularity). Cloning *first* is
+    // what makes that harmless: `dirty.since_base`/`header_base` are monotone for the session
+    // (`mark_chunks`/`mark_header` only insert; the tick cleanup below touches only the `_journal`
+    // sets, `record_full_write` only the `_disk` sets, and the sole reset is `clear_all` on
+    // load/close). So every byte where the base differs from the as-loaded image was written by an
+    // edit that called `mark_*` before releasing its write guard — hence it is already in
+    // `since_base` when step 1's read guard captures spans, ends up in `spans`, and is fully
+    // overwritten on replay. Reversing this order would let an edit slip between capture and clone,
+    // landing in the base while being absent from that tick's journal: a silently torn chunk that
+    // still loads. No guard is held across the I/O.
+    let (need_new_base, base_id, base_temp_path) = {
+        let ws = read_ws(state);
+        if ws.world.is_none() { return Err("No world loaded".into()); }
+        (
+            ws.autosave_base_id.is_none(),
+            ws.autosave_base_id.unwrap_or_else(random_base_id),
+            ws.temp_path.clone(),
+        )
+    };
+
+    if need_new_base {
+        let temp_path = base_temp_path.ok_or("No staged world file to autosave from")?;
+        let _ = fs::remove_file(&paths.base); // stage_copy's clonefile fails if the destination exists
+        stage_copy(&temp_path, &paths.base).map_err(|e| format!("Failed to stage autosave base: {e}"))?;
+    }
+
     // ── Step 1: read guard — snapshot everything this tick needs, then drop the guard before any
     // I/O. `std::sync::RwLock` is neither reentrant nor upgradable, so the write guard in step 4 is
     // a fully separate, later acquisition — never nested with this one.
     let journal_len_on_disk = fs::metadata(&paths.journal).map(|m| m.len()).unwrap_or(0);
 
-    let (base_id, need_new_base, base_len, world_name, temp_path, compact, spans, header, written_chunks) = {
+    let (base_len, world_name, compact, spans, header, written_chunks) = {
         let ws = read_ws(state);
         let world = ws.world.as_ref().ok_or("No world loaded")?;
         let base_len = world.bytes.len() as u64;
-        let need_new_base = ws.autosave_base_id.is_none();
-        let base_id = ws.autosave_base_id.unwrap_or_else(random_base_id);
 
         let dirty_now = ws.dirty.since_journal.len() as u64;
         let compact_threshold = (base_len / 10).max(AUTOSAVE_COMPACT_MIN_JOURNAL_BYTES);
@@ -4322,20 +4617,16 @@ fn autosave_world_inner(
             None
         };
 
-        (base_id, need_new_base, base_len, world.name.clone(), ws.temp_path.clone(), compact, spans, header, written_chunks)
+        (base_len, world.name.clone(), compact, spans, header, written_chunks)
     };
     // read guard dropped here.
 
     if spans.is_empty() && header.is_none() && !need_new_base {
         // Nothing pending — matches the frontend's own dirty-gating, but a defensive no-op here
         // means a stray call can never create an empty journal or an unnecessary meta rewrite.
+        // The `!need_new_base` term is load-bearing: a tick that just cloned a base in step 0 must
+        // always go on to write the journal and meta that make it recoverable.
         return Ok(());
-    }
-
-    if need_new_base {
-        let temp_path = temp_path.ok_or("No staged world file to autosave from")?;
-        let _ = fs::remove_file(&paths.base); // stage_copy's clonefile fails if the destination exists
-        stage_copy(&temp_path, &paths.base).map_err(|e| format!("Failed to stage autosave base: {e}"))?;
     }
 
     if compact {
@@ -4447,9 +4738,7 @@ fn load_autosave_inner(state: &AppState, paths: &AutosavePaths) -> Result<WorldM
         f.sync_all().map_err(|e| format!("Failed to fsync staged temp: {e}"))?;
     }
 
-    let file = fs::File::open(&temp_path).map_err(|e| format!("Failed to open staged temp: {e}"))?;
-    // SAFETY: temp file is private, written by us, and stays alive for the duration of the mmap.
-    let mmap = unsafe { MmapOptions::new().map_copy(&file) }
+    let mmap = map_staged_temp(&temp_path)
         .map_err(|e| format!("Failed to map staged temp: {e}"))?;
 
     let loaded = match parse_world_inner(mmap) {
@@ -4487,15 +4776,14 @@ fn load_autosave_inner(state: &AppState, paths: &AutosavePaths) -> Result<WorldM
     };
 
     // ── Locked swap — mirrors load_world's step 3.
-    let (_old_world, old_temp) = {
+    let (old_world, old_temp) = {
         let mut ws = write_ws(state);
         let old_world = ws.world.replace(loaded);
         ws.clipboard = None;
-        ws.undo_stack.clear();
-        ws.redo_stack.clear();
-        ws.undo_bytes = 0;
-        ws.redo_bytes = 0;
+        ws.clear_undo();
+        ws.clear_redo();
         ws.lamp_index.clear();
+        ws.template_surface_cache.clear(); // world-footprint-shaped, unlike template_bytes itself
         ws.view_cap_z = None;
         ws.sculpt_session = None;
         ws.selection_mask = None;
@@ -4512,6 +4800,7 @@ fn load_autosave_inner(state: &AppState, paths: &AutosavePaths) -> Result<WorldM
         drop(ws);
         (old_world, old_temp)
     };
+    drop(old_world); // explicit — a named binding would keep the mmap live past the unlink below
     if let Some(p) = old_temp { let _ = fs::remove_file(&p); }
 
     Ok(meta)
@@ -4640,7 +4929,7 @@ fn undo_edit_inner(ws: &mut WorldState) -> Result<EditResult, String> {
         // Same delta-driven lamp maintenance as `with_edit_inner`: the inverse snapshots hold the
         // pre-restore bytes and `world` now holds the restored ones (audit H3).
         ws.lamp_index.apply_delta(&world, &redo_snaps);
-        push_undo(&mut ws.redo_stack, &mut ws.redo_bytes, UndoEntry::new(entry.operation, redo_snaps, entry.group));
+        push_undo(&mut ws.redo_stack, &mut ws.redo_bytes, UndoEntry::new(entry.operation, redo_snaps, entry.group), ws.undo_budget);
         // Continue only for a group whose next entry down matches the same id.
         if let Some(g) = group {
             if ws.undo_stack.back().map(|e| e.group) == Some(Some(g)) {
@@ -4679,7 +4968,7 @@ fn redo_edit_inner(ws: &mut WorldState) -> Result<EditResult, String> {
         for s in &entry.chunks { affected.push((s.cx, s.cy)); }
         let undo_snaps = restore_and_invert(&mut world, &entry);
         ws.lamp_index.apply_delta(&world, &undo_snaps); // delta-driven lamp maintenance (audit H3)
-        push_undo(&mut ws.undo_stack, &mut ws.undo_bytes, UndoEntry::new(entry.operation, undo_snaps, entry.group));
+        push_undo(&mut ws.undo_stack, &mut ws.undo_bytes, UndoEntry::new(entry.operation, undo_snaps, entry.group), ws.undo_budget);
         if let Some(g) = group {
             if ws.redo_stack.back().map(|e| e.group) == Some(Some(g)) {
                 current = pop_undo(&mut ws.redo_stack, &mut ws.redo_bytes);
@@ -8616,6 +8905,7 @@ pub fn run() {
             fetch_tile,
             chunk_occupancy,
             set_view_cap,
+            set_undo_budget,
             export_png,
             describe_selection,
             delete_blocks,
@@ -9315,6 +9605,85 @@ mod tests {
             "Full-delta undo must restore the whole chunk");
     }
 
+    /// §1a — a fresh edit after an undo must reset `redo_bytes` to 0, not just clear `redo_stack`.
+    /// Before the fix, `ws.clear_redo()` didn't exist and `with_edit_inner` only cleared the
+    /// stack, leaving the byte counter stale for the rest of the session.
+    #[test]
+    fn test_redo_bytes_reset_on_new_edit() {
+        let mut ws = ws_with(make_bumpy_world_grid(1, 8, |_, _| 20));
+        with_edit(&mut ws, "delete", (0, 0, 5, 5), (0, 0, 5, 5), |world| {
+            delete_blocks_inner(world, 0, 0, 5, 5, 0, 63, None);
+            Ok(())
+        }).expect("edit 1");
+        undo_edit_inner(&mut ws).expect("undo");
+        assert!(ws.redo_bytes > 0, "undo must have populated the redo stack's byte total");
+
+        with_edit(&mut ws, "delete", (0, 0, 3, 3), (0, 0, 3, 3), |world| {
+            delete_blocks_inner(world, 0, 0, 3, 3, 0, 63, None);
+            Ok(())
+        }).expect("edit 2");
+        assert_eq!(ws.redo_bytes, 0, "a new edit must reset redo_bytes, not just clear redo_stack");
+        assert!(ws.redo_stack.is_empty());
+    }
+
+    /// §1c — lowering the undo budget via `set_undo_budget` must immediately re-trim both stacks
+    /// to fit, and the cached byte totals must match a fresh re-sum (no drift from the eviction).
+    #[test]
+    fn test_undo_budget_trims_on_lower() {
+        let mut ws = ws_with(make_bumpy_world_grid(1, 8, |_, _| 20));
+        // Many small, distinct edits so the stack has several evictable entries.
+        for i in 0..40 {
+            let z = (i % 20) as i32;
+            with_edit(&mut ws, "raise", (0, 0, 15, 15), (0, 0, 15, 15), |world| {
+                set_block_abs(world, i % 16, (i / 16) % 16, z, 2, 0);
+                Ok(())
+            }).expect("edit");
+        }
+        assert!(ws.undo_stack.len() > 1, "need multiple entries for trimming to be observable");
+
+        let low_budget = 64usize; // far below any real entry — trim_stack's len()>1 floor kicks in
+        trim_stack(&mut ws.undo_stack, &mut ws.undo_bytes, low_budget);
+        ws.undo_budget = low_budget;
+
+        let resummed: usize = ws.undo_stack.iter().map(|e| e.bytes).sum();
+        assert_eq!(ws.undo_bytes, resummed, "cached total must match a fresh re-sum after trimming");
+        assert_eq!(ws.undo_stack.len(), 1, "trims down to the len()>1 floor when every entry alone exceeds budget");
+    }
+
+    /// §1b — `chunk_snapshot_bytes` must report real heap capacity (post `shrink_to_fit`), not an
+    /// undercount based on `len()` alone: `(u32,u8)` is 8 bytes (align 4, padded), not 5.
+    #[test]
+    fn test_snapshot_bytes_matches_real_capacity() {
+        let mut world = parse_world_inner(mmap_from_bytes(make_test_world())).expect("parse failed");
+        let pre_full = snapshot_chunks_full(&world, &[(0, 0)], None);
+        world.bytes[blk(3, 5, 0)] = 99;
+        world.bytes[blk(7, 2, 10)] = 5;
+        let snap = diff_chunk(&world, 0, 0, pre_full[0].2, &pre_full[0].3).expect("must diff to Some");
+        match &snap.delta {
+            ChunkDelta::Sparse(pairs) => {
+                assert_eq!(pairs.capacity(), pairs.len(), "diff_chunk must shrink_to_fit before it's ever counted");
+                assert_eq!(chunk_snapshot_bytes(&snap), pairs.capacity() * 8 + 40);
+            }
+            ChunkDelta::Full(_, _) => panic!("two-byte edit should not fall back to Full"),
+        }
+    }
+
+    /// §5 — `TemplateSurfaceCache` must evict oldest entries once past `TEMPLATE_SURFACE_CACHE_LIMIT`,
+    /// keeping `map`/`order` in lockstep (no leftover key reachable via `get` after eviction).
+    #[test]
+    fn template_surface_cache_evicts_oldest_past_limit() {
+        let mut cache = TemplateSurfaceCache::default();
+        let n = TEMPLATE_SURFACE_CACHE_LIMIT + 100;
+        for i in 0..n {
+            cache.insert((i as i32, 0), Box::new([[0u8; 4]; 256]));
+        }
+        assert_eq!(cache.len(), TEMPLATE_SURFACE_CACHE_LIMIT, "must never exceed the bound");
+        assert!(!cache.contains_key(&(0, 0)), "oldest entries must be evicted first");
+        assert!(cache.contains_key(&((n - 1) as i32, 0)), "most recent entry must survive");
+        cache.clear();
+        assert_eq!(cache.len(), 0, "clear must empty both map and order");
+    }
+
     /// Audit C2 Stage 1 — `DirtyState.since_disk` must equal the *actual* set of changed chunks
     /// (+ header) after a scripted mix of edits, undo and redo. This is the test that catches a
     /// missed hook site: if any of `with_edit_inner` / `undo_edit_inner` / `redo_edit_inner` /
@@ -9390,6 +9759,99 @@ mod tests {
         let mut ws = ws_with(bytes);
         ws.temp_path = Some(temp_path.to_path_buf());
         ws
+    }
+
+    /// Like `ws_with_temp_path`, but wired up the way `load_world` actually does it: the temp is
+    /// mapped **MAP_SHARED** via `map_staged_temp`, so edits land in the temp file on disk.
+    ///
+    /// `ws_with_temp_path` writes the temp with `fs::write` and builds the world from `map_anon`,
+    /// which decouples the two by construction — it structurally cannot observe the "the autosave
+    /// base is cloned from a temp that edits are actively mutating" hazard. Only this helper can.
+    fn ws_with_shared_temp(bytes: Vec<u8>, temp_path: &std::path::Path) -> WorldState {
+        fs::write(temp_path, &bytes).expect("stage temp file for test");
+        let mmap = map_staged_temp(temp_path).expect("map staged temp");
+        let mut ws = WorldState::new();
+        ws.world = Some(parse_world_inner(mmap).expect("parse"));
+        ws.temp_path = Some(temp_path.to_path_buf());
+        ws
+    }
+
+    /// §3 ground truth — with the world mapped MAP_SHARED over the staged temp, the autosave base is
+    /// a clone of a file that edits are actively mutating, so it can be captured torn. What keeps
+    /// recovery correct is `autosave_world_inner`'s step-0 ordering: the clone happens *before* the
+    /// tick's spans are captured, and `since_base` is monotone, so every chunk where the temp has
+    /// diverged from the as-loaded image is guaranteed to be in `since_base` (hence in the journal,
+    /// hence fully overwritten on replay).
+    ///
+    /// Asserts both halves: the containment property directly, and that recovery is still
+    /// byte-identical. Reversing step 0 back below the read guard leaves this test's containment
+    /// assertion passing but is exactly the ordering the assertion exists to pin.
+    #[test]
+    fn test_shared_temp_divergence_is_covered_by_since_base() {
+        let original = make_bumpy_world_grid(2, 8, |_, _| 20); // 2×2 chunks
+        let dir = std::env::temp_dir().join(format!("vuencedit_shared_temp_test_{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("create test sidecar dir");
+        let staged = dir.join("staged.eden");
+        let paths = autosave_paths_at(&dir);
+
+        let ws = ws_with_shared_temp(original.clone(), &staged);
+        let state: AppState = RwLock::new(ws);
+
+        // Two edits in different chunks, one of them undone (so its final bytes match the original
+        // again while the temp in between did not) — plus a header write.
+        {
+            let mut ws = write_ws(&state);
+            with_edit(&mut ws, "delete", (0, 0, 5, 5), (0, 0, 5, 5), |world| {
+                delete_blocks_inner(world, 0, 0, 5, 5, 0, 63, None);
+                Ok(())
+            }).expect("edit 1");
+            with_edit(&mut ws, "delete", (16, 0, 20, 5), (16, 0, 20, 5), |world| {
+                delete_blocks_inner(world, 16, 0, 20, 5, 0, 63, None);
+                Ok(())
+            }).expect("edit 2");
+            write_spawn(ws.world.as_mut().unwrap(), 5.0, 5.0);
+            ws.dirty.mark_header();
+        }
+        undo_edit_inner(&mut write_ws(&state)).expect("undo edit 2");
+
+        autosave_world_inner(&state, &paths, None).expect("autosave tick");
+        assert!(paths.base.exists(), "tick must establish the base image");
+
+        // The mapping really is shared: the edits must be visible in the temp file on disk. A
+        // MAP_PRIVATE fallback (env override, or a full temp volume) leaves the temp equal to
+        // `original` and there is nothing to check — but don't let that silently hollow the test
+        // out, so decide from the mode this machine actually chose.
+        let temp_on_disk = fs::read(&staged).expect("read staged temp");
+        if staged_map_mode(&staged) == MapMode::Shared {
+            assert_ne!(temp_on_disk, original,
+                "MAP_SHARED must write edits through to the staged temp — if this fails, \
+                 map_staged_temp silently fell back to map_copy and §3 buys nothing");
+        }
+        if temp_on_disk != original {
+            let ws = read_ws(&state);
+            let world = ws.world.as_ref().unwrap();
+            for &(cx, cy) in world.chunk_map.keys() {
+                let (addr, end) = world.chunk_range(cx, cy).unwrap();
+                if temp_on_disk[addr..end] != original[addr..end] {
+                    assert!(ws.dirty.since_base.contains(&(cx, cy)),
+                        "chunk ({cx},{cy}) diverged in the shared temp but is missing from since_base — \
+                         the autosave base can be torn there with nothing in the journal to repair it");
+                }
+            }
+            if temp_on_disk[0..192] != original[0..192] {
+                assert!(ws.dirty.header_base, "header diverged in the shared temp but header_base is false");
+            }
+        }
+
+        let expected = world_bytes(&read_ws(&state));
+        let fresh: AppState = RwLock::new(WorldState::new());
+        load_autosave_inner(&fresh, &paths).expect("load_autosave_inner");
+        assert_eq!(world_bytes(&read_ws(&fresh)), expected,
+            "recovery from a base cloned out from under live edits must still be byte-identical");
+
+        let recovered_temp = read_ws(&fresh).temp_path.clone().expect("recovery must stage a temp file");
+        let _ = fs::remove_file(&recovered_temp);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// Audit C2 Stage 3 — a scripted mix of a chunk edit, a header edit, and an edit-then-undo,
@@ -11230,16 +11692,16 @@ mod tests {
         let mut ws = WorldState::new();
         ws.world = Some(parse_world_inner(mmap_from_bytes(make_test_world())).expect("parse failed"));
         ws.lamp_index.build_now(ws.world.as_ref().unwrap());
-        assert!(ws.lamp_index.snapshot().unwrap().is_empty(), "starts with no lamps");
+        assert!(ws.lamp_index.snapshot().is_empty(), "starts with no lamps");
 
         edit_and_replay_delta(&mut ws, None, &[(blk(4, 6, 5), 72)]);
-        assert_eq!(ws.lamp_index.snapshot().unwrap().get(&(0, 0)), Some(&vec![[4, 6, 5]]),
+        assert_eq!(ws.lamp_index.snapshot().get(&(0, 0)), Some(&vec![[4, 6, 5]]),
                    "placed lamp indexed from the delta");
-        assert_eq!(ws.lamp_index.snapshot().unwrap(), build_lamp_index(ws.world.as_ref().unwrap()),
+        assert_eq!(ws.lamp_index.snapshot(), build_lamp_index(ws.world.as_ref().unwrap()),
                    "delta path agrees with a from-scratch rescan");
 
         edit_and_replay_delta(&mut ws, None, &[(blk(4, 6, 5), 0)]);
-        assert!(ws.lamp_index.snapshot().unwrap().get(&(0, 0)).is_none(),
+        assert!(ws.lamp_index.snapshot().get(&(0, 0)).is_none(),
                 "removed lamp drops its chunk bucket");
     }
 
@@ -11260,7 +11722,7 @@ mod tests {
         edit_and_replay_delta(&mut ws, Some((0, 15)), &writes);
         let rescan = build_lamp_index(ws.world.as_ref().unwrap());
         assert_eq!(rescan.get(&(0, 0)).map(|v| v.len()), Some(4096), "the whole band is lamps");
-        let mut from_delta = ws.lamp_index.snapshot().unwrap().remove(&(0, 0)).unwrap();
+        let mut from_delta = ws.lamp_index.snapshot().remove(&(0, 0)).unwrap();
         let mut from_scan = rescan.get(&(0, 0)).unwrap().clone();
         from_delta.sort_unstable();
         from_scan.sort_unstable();
@@ -11268,8 +11730,112 @@ mod tests {
 
         // Paint byte holding 72 must not register as a lamp.
         edit_and_replay_delta(&mut ws, None, &[(pnt(2, 2, 40), 72)]);
-        assert_eq!(ws.lamp_index.snapshot().unwrap().get(&(0, 0)).map(|v| v.len()), Some(4096),
+        assert_eq!(ws.lamp_index.snapshot().get(&(0, 0)).map(|v| v.len()), Some(4096),
                    "a paint byte of 72 is a colour, not a lamp");
+    }
+
+    /// The core §4 invariant: an edit's delta into a chunk `LampIndex` has never scanned must be
+    /// dropped, not fabricated into a bucket claiming the chunk is fully known — the later
+    /// on-demand scan (triggered by a real region query) is what must see the edit.
+    #[test]
+    fn lamp_delta_dropped_for_unscanned_chunk_then_scan_sees_the_edit() {
+        let mut ws = WorldState::new();
+        ws.world = Some(parse_world_inner(mmap_from_bytes(make_test_world())).expect("parse failed"));
+        // ws.lamp_index starts empty — chunk (0,0) has never been scanned.
+        edit_and_replay_delta(&mut ws, None, &[(blk(4, 6, 5), 72)]);
+        assert!(ws.lamp_index.snapshot().is_empty(),
+                "delta into an unscanned chunk must be dropped, not fabricate a bucket");
+
+        let world = ws.world.as_ref().unwrap();
+        let found = ws.lamp_index.lamps_in_region(world, 0, 0, 15, 15, 5.0);
+        assert_eq!(found, vec![[4, 6, 5]], "on-demand scan re-derives the lamp from truth");
+    }
+
+    /// Once a chunk *has* been scanned (via a real region query), the delta path must track a
+    /// place → undo → redo cycle exactly, agreeing with a from-scratch rescan at every step. Pins
+    /// both delta directions (`with_edit_inner` and `undo_edit_inner`/`redo_edit_inner`) against
+    /// the write-then-apply ordering `apply_delta` relies on.
+    #[test]
+    fn lamp_delta_applied_for_scanned_chunk_matches_rescan() {
+        let mut ws = WorldState::new();
+        ws.world = Some(parse_world_inner(mmap_from_bytes(make_test_world())).expect("parse failed"));
+        {
+            let world = ws.world.as_ref().unwrap();
+            ws.lamp_index.lamps_in_region(world, 0, 0, 15, 15, 1.0); // scans chunk (0,0)
+        }
+        let check = |ws: &WorldState, label: &str| {
+            let mut rescan = scan_chunk_lamps(ws.world.as_ref().unwrap(), 0, 0);
+            let mut from_index = ws.lamp_index.snapshot().remove(&(0, 0)).unwrap_or_default();
+            rescan.sort_unstable();
+            from_index.sort_unstable();
+            assert_eq!(from_index, rescan, "{label}: index must match a from-scratch rescan");
+        };
+
+        with_edit(&mut ws, "place lamp", (0, 0, 15, 15), (0, 0, 15, 15), |world| {
+            set_block_abs(world, 4, 6, 5, LAMP_BLOCK_TYPE, 0);
+            Ok(())
+        }).expect("place lamp");
+        check(&ws, "after place");
+
+        undo_edit_inner(&mut ws).expect("undo");
+        check(&ws, "after undo");
+        assert!(ws.lamp_index.snapshot().get(&(0, 0)).is_none(), "lamp gone after undo");
+
+        redo_edit_inner(&mut ws).expect("redo");
+        check(&ws, "after redo");
+        assert_eq!(ws.lamp_index.snapshot().get(&(0, 0)), Some(&vec![[4, 6, 5]]), "lamp back after redo");
+    }
+
+    /// The set-vs-enum design choice §4 hinges on: a chunk with zero lamps must still be marked
+    /// `scanned` (so a later query doesn't rescan it every time), even though it gets no `lamps`
+    /// bucket at all (buckets are only created for non-empty results).
+    #[test]
+    fn lamp_free_chunk_is_marked_scanned_not_rescanned() {
+        let world = parse_world_inner(mmap_from_bytes(make_test_world())).expect("parse failed");
+        let index = LampIndex::default();
+        assert!(index.lamps_in_region(&world, 0, 0, 15, 15, 1.0).is_empty(), "no lamps yet");
+        assert!(index.snapshot().is_empty(), "lamp-free chunk gets no bucket");
+        // A second query over the same region must not need to touch the world again — there's no
+        // way to assert "didn't rescan" directly without instrumentation, so this instead pins the
+        // observable contract: the result is stable and still empty.
+        assert!(index.lamps_in_region(&world, 0, 0, 15, 15, 1.0).is_empty(), "still no lamps");
+    }
+
+    /// `LampIndex::clear` must drop the `scanned` set along with `lamps` — otherwise a chunk that
+    /// was scanned for the old world would be wrongly treated as already-known for a newly loaded
+    /// one sharing the same chunk coords.
+    #[test]
+    fn lamp_index_clear_resets_scanned() {
+        let mut ws = WorldState::new();
+        ws.world = Some(parse_world_inner(mmap_from_bytes(make_test_world())).expect("parse failed"));
+        ws.lamp_index.build_now(ws.world.as_ref().unwrap());
+        ws.lamp_index.clear();
+        // A delta into (0,0) after clear must be dropped again — proof `scanned` was reset, not
+        // just `lamps`.
+        edit_and_replay_delta(&mut ws, None, &[(blk(4, 6, 5), 72)]);
+        assert!(ws.lamp_index.snapshot().is_empty(), "clear must reset scanned, not just lamps");
+    }
+
+    /// `LampIndex::lamps_in_region` (on-demand, per-chunk) must return exactly what a full
+    /// `build_lamp_index` scan finds for every populated chunk, once every chunk has been queried.
+    #[test]
+    fn on_demand_scan_matches_full_build() {
+        let mut world = parse_world_inner(mmap_from_bytes(make_test_world())).expect("parse failed");
+        world.bytes[blk(4, 6, 5)] = LAMP_BLOCK_TYPE;
+        world.bytes[blk(0, 0, 16)] = LAMP_BLOCK_TYPE;
+        let full = build_lamp_index(&world);
+
+        let index = LampIndex::default();
+        for &(cx, cy) in world.chunk_map.keys() {
+            let base_x = (cx - world.min_x) * 16;
+            let base_y = (cy - world.min_y) * 16;
+            index.lamps_in_region(&world, base_x, base_y, base_x + 15, base_y + 15, 1.0);
+        }
+        let mut on_demand = index.snapshot();
+        for v in on_demand.values_mut() { v.sort_unstable(); }
+        let mut expected = full;
+        for v in expected.values_mut() { v.sort_unstable(); }
+        assert_eq!(on_demand, expected, "on-demand scan must agree with a from-scratch build");
     }
 
     // ── Sculpt engine (Pass 1) test fixtures ──────────────────────────────────────
@@ -12413,8 +12979,12 @@ mod tests {
     fn pherbos_zip() -> std::path::PathBuf { fixture_dir().join("Pherbos V5'1'0 1784973077.eden.zip") }
     fn antibes_zip() -> std::path::PathBuf { fixture_dir().join("Antibes City 64 1784034039.eden.zip") }
 
-    /// Maps a fixture's extracted `.eden` file copy-on-write, same as `load_world`'s non-zip path
-    /// (`map_copy`) — mutations from an editing test never touch the file on disk.
+    /// Maps a fixture's extracted `.eden` file copy-on-write (`map_copy`).
+    ///
+    /// ⚠️ Deliberately diverges from `load_world`, which maps its staged temp MAP_SHARED via
+    /// `map_staged_temp`. This maps the *shared extracted fixture itself*, not a per-test copy of
+    /// it, so a shared mapping would leak one editing test's mutations into every other test and
+    /// into the on-disk fixture. Keep it `map_copy`.
     fn map_fixture(path: &std::path::Path) -> MmapMut {
         let file = fs::File::open(path).unwrap_or_else(|e| panic!("failed to open {path:?}: {e}"));
         unsafe { MmapOptions::new().map_copy(&file) }

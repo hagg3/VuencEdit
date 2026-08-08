@@ -74,6 +74,11 @@ export interface VoxelGeometry {
   positions_t: Float32Array; colors_t: Float32Array; uvs_t: Float32Array; vertex_count_t: number;
   /** Emissive stream — lamp-block faces, RGB. Populated only in GPU (flat) mode. */
   positions_e: Float32Array; colors_e: Float32Array; uvs_e: Float32Array; vertex_count_e: number;
+  /** Wire bytes behind each stream (position + color + uv), straight from the envelope's own `lens`
+   *  header. FlyView3D's geometry budget counts these rather than vertices: a GPU VBO is exactly the
+   *  size of the buffer it was uploaded from, whereas a vertex costs 24–36 B depending on which
+   *  stream it lands in and whether a texture pack is loaded. */
+  bytes: number; bytes_t: number; bytes_e: number;
 }
 
 type VoxelGeometryHeader = {
@@ -85,10 +90,12 @@ type VoxelGeometryHeader = {
 export function decodeGeometry(buf: IpcBinary): VoxelGeometry {
   const { header, body } = decodeEnvelope<VoxelGeometryHeader>(buf);
   const [p, c, u, pt, ct, ut, pe, ce, ue] = splitBody(body, header.lens).map(asF32);
+  const L = header.lens;
   return {
     positions: p, colors: c, uvs: u, vertex_count: header.vertex_count,
     positions_t: pt, colors_t: ct, uvs_t: ut, vertex_count_t: header.vertex_count_t,
     positions_e: pe, colors_e: ce, uvs_e: ue, vertex_count_e: header.vertex_count_e,
+    bytes: L[0] + L[1] + L[2], bytes_t: L[3] + L[4] + L[5], bytes_e: L[6] + L[7] + L[8],
   };
 }
 

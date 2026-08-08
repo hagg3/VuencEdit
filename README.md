@@ -213,7 +213,7 @@ src/
   MapCanvas.tsx              — Canvas: tiled rendering, pan/zoom/select/paste/draw input, right-click menu
   SelectionInspector.tsx     — floating stats + orthographic preview + extrude + trees + 3D view
   ElevationPreviewPanel.tsx  — resizable front/side elevation cross-section, draw support
-  ThreeDPreview.tsx          — on-demand Three.js 3D render of the current selection
+  ThreeDPreview.tsx          — on-demand Three.js 3D render of a selection (currently unmounted/dead code)
   FlyView3D.tsx              — streaming fly-through 3D pane (quad view)
   SliceViewport.tsx          — front/side slab + ortho viewports for quad view
   texturePack.ts             — texture-pack atlas decoder + tinted picker swatches
