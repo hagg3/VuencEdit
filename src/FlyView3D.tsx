@@ -4,7 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import type { AtlasData } from "./texturePack";
-import { isTypingTarget, chunkToWorld, worldToChunk } from "./viewportUtils";
+import { isTypingTarget, chunkToWorld, worldToChunk, gridDivisions } from "./viewportUtils";
 import type { WorldMeta } from "./types";
 import { chromeButton, glassMenuPanel } from "./designTokens";
 import { skyFogColor, rampFamilyBase, wedgeFamilyBase, rampDirIndex, orientBlockToFacing } from "./blockDefs";
@@ -76,8 +76,12 @@ const SHADOW_MAX_REACH = 320;
 interface EditBounds { x: number; y: number; w: number; h: number }
 
 const LOAD_RADIUS = 5;   // chunks loaded around the camera (in chunk units)
-const MAX_RENDER_DISTANCE = 32; // slider ceiling (chunk radius)
-const RD_MIN = 2;               // slider floor (chunk radius)
+// M1: exported so every render-distance slider (this pane's own, the ribbon 3D tab, Settings) shares
+// one floor/ceiling — they used to disagree (1–16 / 2–32 / 2–32), so the ribbon slider could push
+// `loadRadius` to 1 (below this pane's own floor, breaking `radiusToPos`) and couldn't reach 17–32,
+// silently clamping a value Settings had just set the next time it was touched.
+export const MAX_RENDER_DISTANCE = 32; // slider ceiling (chunk radius)
+export const RD_MIN = 2;               // slider floor (chunk radius)
 // The slider maps 1:1 to chunk radius (step = 1 chunk). The old quadratic remap gave the low range
 // more pixels but made the top half jump several chunks per pixel (e.g. 16→20 in one nudge), which
 // read as "dodgy". A plain linear integer domain is fully predictable — one notch = one chunk.
@@ -86,6 +90,7 @@ const RD_MIN = 2;               // slider floor (chunk radius)
 const LOOK_SENS_BASE = 0.006;
 const DRAG_SENS_BASE = 0.0025;
 const RENDER_DISTANCE_WARN_THRESHOLD = 16; // above this, chunk count grows enough to warn
+const FLY3D_LEGEND_SEEN_KEY = "eden_3dpane_legend_seen"; // M4: auto-open the legend once, ever
 // Piecewise slider-position ↔ chunk-radius mapping: positions 0…14 map 1:1 to chunks RD_MIN(2)…16
 // (the range where frame rate is cheap to buy), then two slider positions per chunk from 17…32 (the
 // range where frame rate falls off a cliff) — so the same physical drag distance buys half as much
@@ -336,16 +341,35 @@ function prismWireframePoints(kind: "ramp" | "wedge", dir: 0 | 1 | 2 | 3): Float
   return out;
 }
 
+/** Reach for *informational* picks — hover in select mode, the eyedropper, flood-fill seeds. Build
+ *  mode uses the separate, user-configurable `buildReach` prop instead (H5): a 250-block pick is a
+ *  useful readout, but a 250-block *edit* lands where the 1-block outline is already sub-pixel. */
 const PICK_DIST = 256;
 /** Hover-highlight repick cadence. ~30Hz — one ~1ms IPC round-trip per tick is well inside budget. */
 const PICK_HOVER_MS = 33;
+/** M2: a click reuses the hover pick that drove the outline instead of re-picking, as long as it's
+ *  fresher than this and the cursor hasn't moved. A few ticks' worth of slack past PICK_HOVER_MS. */
+const HOVER_PICK_REUSE_MS = 100;
 /** A pointerdown/up pair inside this many px and ms is a click, not a look-drag or an orbit drag. */
 const CLICK_SLOP_PX = 4;
 const CLICK_SLOP_MS = 250;
 /** Held break/place: delay before the first repeat (must exceed CLICK_SLOP_MS so a quick click never
- *  races the repeat timer), then the steady repeat interval. Mirrors the sculpt hold-timer's cadence. */
+ *  races the repeat timer), then the steady repeat interval. Mirrors the sculpt hold-timer's cadence.
+ *  Since H4 this interval is only the *stationary airbrush* fallback — a real sweep is driven by
+ *  pointermove, so it stamps at pointer rate rather than every BUILD_REPEAT_MS. */
 const BUILD_REPEAT_DELAY_MS = 300;
 const BUILD_REPEAT_MS = 220;
+/** Hard watchdog on one build gesture. Replaces C1's BUILD_REPEAT_IDLE_TICKS, which parked the hold
+ *  after 3 no-op ticks — correct for the old "stationary hold marches a tower" model, but it would
+ *  now kill a sweep that merely paused. The IPC-spin half of that fix is covered better by the
+ *  aim-change gate in `buildRepeatTick` (an unchanged aim doesn't even issue a pick); this bounds the
+ *  remaining case, a hold whose pointerup the webview never delivers at all. */
+const BUILD_GESTURE_MAX_MS = 20_000;
+/** Trailing debounce on the *lighting halo* half of an edit's chunk reload (C3 steps 2–3). Long
+ *  enough that a build sweep — whose stamps arrive far faster than this — pays the halo exactly once,
+ *  on release, instead of once per placed block. Short enough that a single click's lit/shadowed seam
+ *  settles before you notice it. */
+const HALO_FLUSH_MS = 350;
 
 /** A wireframe box overlay in Eden world coordinates (Three.js coords are derived internally). */
 export interface Overlay3D {
@@ -516,12 +540,17 @@ const FlyView3D = forwardRef<FlyView3DRef, {
   /** Left click in "floodfill" mode: the picked block face + its normal. App flood-fills the
    *  connected air cell against that face (`hit + normal`) as the start cell. */
   onPickFloodFill?: (x: number, y: number, z: number, nx: number, ny: number, nz: number) => void;
-  /** Left click in "build" mode: the voxel to clear. */
-  onPickBreak?: (x: number, y: number, z: number) => void;
+  /** Left click in "build" mode: the voxel to clear. `group` (H1) ties every break/place stamp
+   *  of one gesture (a sweep, or a single click) to the same backend undo group, so a 2-second
+   *  drag collapses to one undo entry instead of one per stamp. */
+  onPickBreak?: (x: number, y: number, z: number, group?: number) => void;
   /** Right click in "build" mode: the empty voxel against the picked face, where a block goes.
    *  `yaw` is the player's horizontal look direction in Eden coords (atan2(dx, dy), 0 = South),
-   *  so App can auto-orient directional blocks to face the player. */
-  onPickPlace?: (x: number, y: number, z: number, yaw: number) => void;
+   *  so App can auto-orient directional blocks to face the player. `group`: see onPickBreak. */
+  onPickPlace?: (x: number, y: number, z: number, yaw: number, group?: number) => void;
+  /** Fires once when a build gesture (single click or sweep) ends with at least one stamp — the
+   *  cue for App to show one summary toast instead of one per stamp (H1). */
+  onBuildGestureEnd?: (mode: "break" | "place", count: number) => void;
   /** Middle click in "build" mode: pick the block/paint under the cursor as the new armed block
    *  (mirrors the 2D eyedropper). Not offered in "select"/"sculpt" — keeps scope to build mode. */
   onPickEyedrop?: (blockType: number, paint: number) => void;
@@ -561,6 +590,11 @@ const FlyView3D = forwardRef<FlyView3DRef, {
   /** Whether auto-orient is on (mirrors App's `autoOrient3d` setting) — the placement preview shows
    *  the oriented shape auto-orient would place, or the raw armed variant verbatim when off. */
   autoOrient3d?: boolean;
+  /** Max distance (blocks) a build-mode break/place may reach (H5, `AppSettings.buildReach`).
+   *  Build-mode *hover* picks at the same distance, so the placement outline simply doesn't appear
+   *  past the cap and a click there does nothing — the refusal is visible, not silent. Select mode,
+   *  the eyedropper and flood-fill deliberately keep the full `PICK_DIST`. Default 64. */
+  buildReach?: number;
   /** In-pane hotbar overlay data (build mode only), 10 slots: index 0-4 pinned (null = empty pin
    *  slot, digit key 1-5), index 5-9 recent (digit key 6-0). Precomputed by App so this component
    *  doesn't need its own resolveColor/tintedSwatch import. */
@@ -615,9 +649,9 @@ const FlyView3D = forwardRef<FlyView3DRef, {
   nightLighting = false, shadows3d = false, sunT = 0.5, lampRadius = 4, lightingProfile = "legacy", lightEpoch = 0,
   initialRenderDistance, initialFlySpeed, onRenderDistanceChange, onFlySpeedChange, anyModalOpen = false,
   lookSensitivity = 1, dragSensitivity = 1, invertY = false,
-  interact3d = "none", onPickSelect, onPickFloodFill, onPickBreak, onPickPlace, onPickEyedrop, armedSwatch = null, armedLabel = "",
+  interact3d = "none", onPickSelect, onPickFloodFill, onPickBreak, onPickPlace, onBuildGestureEnd, onPickEyedrop, armedSwatch = null, armedLabel = "",
   onPickBreakBatch, onPickPlaceBatch, onPickFillFace,
-  armedBlockType = 0, autoOrient3d = true,
+  armedBlockType = 0, autoOrient3d = true, buildReach = 64,
   selectionBounds3d = null, onGizmoRegionChange, onGizmoMoveBlocks,
   moveWithContents = false, setMoveWithContents,
   hotbarSlots, activeBlock, onHotbarSelect,
@@ -647,7 +681,16 @@ const FlyView3D = forwardRef<FlyView3DRef, {
   const [distanceWarnOpen, setDistanceWarnOpen] = useState(false);
   // Controls legend popover (D1) — a discoverable, always-available reminder for every pane binding,
   // including the ones with no on-canvas affordance (Alt-crawl, Esc drag-cancel precedence, etc.).
-  const [legendOpen, setLegendOpen] = useState(false);
+  // M4: the pane itself is easy to miss (two nested toggles, now one — see ViewTab) and once open its
+  // control reference lived only behind a 14px "?". Auto-open it the first time this component ever
+  // mounts (it mounts once and is suspended/resumed thereafter, never remounted — see the module doc
+  // on "suspend-don't-unmount" — so "first mount" is exactly "first time the pane is used").
+  const [legendOpen, setLegendOpen] = useState(() => {
+    try { return localStorage.getItem(FLY3D_LEGEND_SEEN_KEY) !== "true"; } catch { return false; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem(FLY3D_LEGEND_SEEN_KEY, "true"); } catch { /* quota / private mode */ }
+  }, []);
   const [loadingCount, setLoadingCount] = useState(0);
   const setLoadingCountRef = useRef(setLoadingCount);
   const [budgetLimited, setBudgetLimited] = useState(false);
@@ -693,6 +736,13 @@ const FlyView3D = forwardRef<FlyView3DRef, {
 
   // Camera position/heading HUD (Eden coords), refreshed at the ~10fps broadcast cadence.
   const hudRef = useRef<CoordHudRef | null>(null);
+
+  // C3 steps 2–3: the deferred lighting-halo half of the edit-sync reload rect. Keys are `"cx,cy"`,
+  // accumulated across every edit inside one HALO_FLUSH_MS window (i.e. one build sweep) and flushed
+  // together. See the edit-sync effect below for why the core chunks are *not* deferred.
+  const haloKeysRef = useRef<Set<string>>(new Set());
+  const haloTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => { if (haloTimerRef.current) clearTimeout(haloTimerRef.current); }, []);
 
   // Lamp/shadow reach, fetched once from Rust so the edit-sync reload radius below can't drift out
   // of sync with export.rs's LAMP_LIGHT_RADIUS/SHADOW_RAY_STEPS constants. Seeded with those same
@@ -742,6 +792,8 @@ const FlyView3D = forwardRef<FlyView3DRef, {
   onPickBreakRef.current = onPickBreak;
   const onPickPlaceRef = useRef(onPickPlace);
   onPickPlaceRef.current = onPickPlace;
+  const onBuildGestureEndRef = useRef(onBuildGestureEnd);
+  onBuildGestureEndRef.current = onBuildGestureEnd;
   const onPickEyedropRef = useRef(onPickEyedrop);
   onPickEyedropRef.current = onPickEyedrop;
   const onPickBreakBatchRef = useRef(onPickBreakBatch);
@@ -754,6 +806,10 @@ const FlyView3D = forwardRef<FlyView3DRef, {
   armedBlockTypeRef.current = armedBlockType;
   const autoOrient3dRef = useRef(autoOrient3d);
   autoOrient3dRef.current = autoOrient3d;
+  // Clamped to the picker's own hard ceiling: a reach past PICK_DIST could never resolve anyway, and
+  // a non-positive one would make build mode silently inert with no way to tell from the UI.
+  const buildReachRef = useRef(buildReach);
+  buildReachRef.current = Math.max(1, Math.min(PICK_DIST, buildReach));
 
   // Build shape toggle (B1) — pane-local (no App state needed; a shape gesture reduces to the same
   // batched place/break callbacks either way). Toggle-only, no keyboard modifier (stays clash-free
@@ -883,11 +939,17 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     /** Re-query lamp point lights around the camera (GPU night only). */
     refreshNightLights: () => void;
     refresh: () => void;
+    /** H3: re-pick and redraw the placement/select outline immediately, bypassing the hover throttle —
+     *  called after every edit so the box never shows a stale pre-edit target. */
+    refreshHighlight: () => void;
     clearHighlight: () => void;
     /** Cancel any live sculpt hold-timer/grab stroke and hide the brush-disc cursor. */
     clearSculpt: () => void;
-    /** Enable/disable OrbitControls' LEFT mouse action (disabled while sculpt mode owns left-drag). */
+    /** Enable/disable OrbitControls' LEFT mouse action (disabled while sculpt or build owns left-drag). */
     setOrbitLeftEnabled: (enabled: boolean) => void;
+    /** Hand RIGHT-drag to build mode's place-sweep and move camera orbit onto MIDDLE-drag (H4).
+     *  Call *after* `setOrbitLeftEnabled` — it also resets the Alt-held override. */
+    setOrbitBuildMode: (on: boolean) => void;
     /** Cancel a live line/box build-shape gesture (armed start cell, no commit). */
     clearBuildShape: () => void;
     /** Show/hide + (re)lay out the Select-mode transform gizmo. No-op while a drag is in progress
@@ -1088,7 +1150,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       return s ? { x: s.x, y: s.y } : { x: cx, y: cy };
     };
 
-    const grid = new THREE.GridHelper(Math.max(mapW, mapH), Math.max(world.width_chunks, world.height_chunks));
+    const grid = new THREE.GridHelper(Math.max(mapW, mapH), gridDivisions(world.width_chunks, world.height_chunks));
     grid.position.set(cx, 0, cy);
     grid.visible = gridVisibleRef.current;
     scene.add(grid);
@@ -1109,14 +1171,54 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     const controls = new OrbitControls(camera, renderer.domElement);
     controls.enableDamping = true;
     controls.dampingFactor = 0.1;
-    // Snapshot the controls' original LEFT-button action so sculpt mode can disable left-drag orbit
-    // (setting it to null makes OrbitControls' onMouseDown fall through to STATE.NONE — verified in
-    // three's source) and restore *exactly* this value on leaving sculpt, rather than hardcoding
-    // THREE.MOUSE.ROTATE. Middle/right buttons keep orbiting/panning throughout.
+    // Snapshot the controls' original button actions so a mode that owns a drag can disable the
+    // camera's claim on it (setting an entry to null makes OrbitControls' onMouseDown fall through to
+    // STATE.NONE — verified in three's source) and restore *exactly* these values on leaving, rather
+    // than hardcoding THREE.MOUSE.ROTATE/PAN/DOLLY.
     const origLeftButton = controls.mouseButtons.LEFT;
+    const origRightButton = controls.mouseButtons.RIGHT;
+    const origMiddleButton = controls.mouseButtons.MIDDLE;
     const setOrbitLeftEnabled = (enabled: boolean) => {
       controls.mouseButtons.LEFT = enabled ? origLeftButton : null;
     };
+    // Build mode (H4) owns BOTH drags: left sweeps break, right sweeps place. Taking RIGHT away from
+    // OrbitControls is also what makes C2 (a right-drag pan ending in a stray placed block)
+    // structurally impossible rather than merely slop-guarded. The camera keeps a full set of
+    // gestures anyway: MIDDLE-drag becomes ROTATE (its DOLLY duty is fully covered by the wheel), and
+    // holding Alt hands LEFT/RIGHT back for one drag (see `syncBuildAltOrbit`). Middle *click* stays
+    // the eyedropper — `onPickUp`'s isClick slop test already separates a click from a drag.
+    let buildOwnsDrag = false;
+    let altHeld = false;
+    const syncBuildAltOrbit = () => {
+      if (!buildOwnsDrag) return;
+      controls.mouseButtons.LEFT = altHeld ? origLeftButton : null;
+      controls.mouseButtons.RIGHT = altHeld ? origRightButton : null;
+    };
+    const setOrbitBuildMode = (on: boolean) => {
+      buildOwnsDrag = on;
+      altHeld = false;
+      controls.mouseButtons.RIGHT = on ? null : origRightButton;
+      controls.mouseButtons.MIDDLE = on ? THREE.MOUSE.ROTATE : origMiddleButton;
+    };
+    // Alt is tracked from raw key events rather than read off the pointer event, because
+    // OrbitControls reads `mouseButtons` inside its *own* pointerdown handler — whose ordering
+    // against ours isn't guaranteed. Keeping the mapping in sync while the key is merely held means
+    // it is already correct whenever that handler runs.
+    const onAltKey = (e: KeyboardEvent) => {
+      if (e.altKey === altHeld) return;
+      altHeld = e.altKey;
+      syncBuildAltOrbit();
+    };
+    // Alt+Tab / focus loss never delivers the keyup, which would strand the camera owning left-drag.
+    const onAltBlur = () => { if (altHeld) { altHeld = false; syncBuildAltOrbit(); } };
+    window.addEventListener("keydown", onAltKey);
+    window.addEventListener("keyup", onAltKey);
+    window.addEventListener("blur", onAltBlur);
+    // Seed the ownership from the live mode. This effect re-runs on a world-size change, building a
+    // fresh OrbitControls with its stock mapping, while `interact3d` may already be "sculpt"/"build" —
+    // and the mode effect below won't re-fire, because its dependency didn't change.
+    setOrbitLeftEnabled(interact3dRef.current !== "sculpt" && interact3dRef.current !== "build");
+    setOrbitBuildMode(interact3dRef.current === "build");
     {
       const s = spawnXY();
       controls.target.set(s.x, Math.min(maxZ, 28), s.y);
@@ -1325,7 +1427,11 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     // doesn't keep refetching it. A plain key set — not a shared sentinel mesh, which would need
     // `.dispose()`d every time an empty chunk is evicted despite never being added to the scene.
     const emptyChunks = new Set<string>();
-    const isResident = (k: string) => meshes.has(k) || meshesE.has(k) || emptyChunks.has(k);
+    // L1: `meshesT` belongs here for symmetry with residentKeys() below. Not live today (a chunk
+    // with zero opaque verts always also lands in `emptyChunks`), but that's a property of one
+    // branch in startFetch, not an invariant — a transparent-only mesh installed without it would
+    // otherwise be refetched forever by the sweep.
+    const isResident = (k: string) => meshes.has(k) || meshesT.has(k) || meshesE.has(k) || emptyChunks.has(k);
     /** Every key this cache is holding anything for — the eviction/teardown iteration set. */
     const residentKeys = () => new Set([...meshes.keys(), ...meshesT.keys(), ...meshesE.keys(), ...emptyChunks]);
 
@@ -1453,10 +1559,18 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     // fetch (reloadChunk) without bumping the generation for everything else.
     let fetchGen = 0;
     const staleKeys = new Set<string>();
+    // Keys allowed to refetch *while still resident* — the edit-sync reload path (C3 step 1). It used
+    // to dispose the mesh up front, which is what made every placed block punch a visible hole in the
+    // terrain for a full round-trip; the replacement is installed atomically by the disposeMesh(k)
+    // already in startFetch's .then(), so the old geometry can simply stay up until it arrives.
+    const forceKeys = new Set<string>();
+    /** Residency gate shared by pump() and startFetch, so neither can skip a forced reload. */
+    const wantsFetch = (k: string) => !inflight.has(k) && (!isResident(k) || forceKeys.has(k));
 
     const startFetch = (cxk: number, cyk: number) => {
       const k = key(cxk, cyk);
-      if (inflight.has(k) || isResident(k)) return;
+      if (!wantsFetch(k)) return;
+      forceKeys.delete(k); // consumed — this fetch IS the forced one
       inflight.add(k);
       active++;
       // Reserve this fetch's estimated payload against the budget for as long as it's in flight.
@@ -1574,8 +1688,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
         // concurrency slots in one go could otherwise reserve past the cap in a single pump().
         if (residentBytes + inflightBytes >= geometryBudgetRef.current) break;
         const it = queue.shift()!;
-        const k = key(it.cx, it.cy);
-        if (inflight.has(k) || isResident(k)) continue;
+        if (!wantsFetch(key(it.cx, it.cy))) continue;
         startFetch(it.cx, it.cy);
       }
       pushMemHud();
@@ -1599,6 +1712,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
         zBand = nextBand;
         fetchGen++;
         queue = [];
+        forceKeys.clear();
         for (const k of residentKeys()) disposeMesh(k);
       }
       // A stationary camera with nothing queued has nothing new to do — skip the O((2r+1)²) disc
@@ -1650,11 +1764,19 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     // land — mark it stale so the .finally{} in startFetch drops it and requeues instead.
     const reloadChunk = (cxk: number, cyk: number) => {
       const k = key(cxk, cyk);
+      // Set on both paths: the requeue in startFetch's finally{} runs while the *old* mesh is still
+      // resident now that the dispose is no longer eager, so without the force flag the requeued
+      // fetch would be skipped as "already resident" and the chunk would keep pre-edit geometry.
+      forceKeys.add(k);
       if (inflight.has(k)) {
         staleKeys.add(k);
         return; // requeued by startFetch's finally{} once the stale fetch resolves
       }
-      disposeMesh(k);
+      // …unless the pane is already at its geometry budget: pump() refuses to start anything while
+      // the old mesh still counts against it, so keeping it resident would strand *pre-edit*
+      // geometry indefinitely. There the eager dispose is still right — it frees the headroom the
+      // refetch needs, at the cost of the visible hole this change otherwise removes.
+      if (residentBytes + inflightBytes >= geometryBudgetRef.current) disposeMesh(k);
       queue.unshift({ cx: cxk, cy: cyk });
       pump();
     };
@@ -1667,6 +1789,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     const reloadAllChunks = () => {
       fetchGen++;
       queue = [];
+      forceKeys.clear();
       for (const k of residentKeys()) disposeMesh(k);
       streamSweep(true); // meshes were just disposed with the camera unmoved — must not early-out
     };
@@ -1703,6 +1826,12 @@ const FlyView3D = forwardRef<FlyView3DRef, {
         yaw = Math.atan2(-dir.x, -dir.z);
         pitch = Math.asin(THREE.MathUtils.clamp(dir.y, -1, 1));
         controls.enabled = false;
+        // Belt-and-suspenders alongside `enabled = false`: right-drag must never pan the camera
+        // while walking (fly/look) — a right-drag-pan felt during mouselook was reported as a bug,
+        // even though `enabled = false` alone should already block OrbitControls' own pointer
+        // handling. Restored on the way back to orbit below, reflecting whatever build/alt state
+        // is live then rather than blindly resetting it.
+        controls.mouseButtons.RIGHT = null;
       }
 
       // Look mode grabs the OS cursor (frozen + hidden app-wide) until it exits; the other modes
@@ -1718,6 +1847,9 @@ const FlyView3D = forwardRef<FlyView3DRef, {
         camera.getWorldDirection(dir);
         controls.target.copy(camera.position).addScaledVector(dir, 10);
         controls.enabled = true;
+        // Restore RIGHT to whatever the live build/alt state says it should be, rather than
+        // blindly reinstating `origRightButton` — build mode may still own the drag.
+        controls.mouseButtons.RIGHT = buildOwnsDrag ? (altHeld ? origRightButton : null) : origRightButton;
         lookDrag = false;
         keys.clear(); // drop held movement keys so the camera doesn't drift after exit
       }
@@ -1816,14 +1948,19 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       return Math.atan2(dx, dy);
     };
 
-    const pick = async (clientX: number, clientY: number): Promise<PickResult | null> => {
+    /** `maxDist` defaults to the informational reach; build-mode call sites pass `buildReach()`
+     *  instead (H5) so a click can never edit further than the outline could show. */
+    const pick = async (clientX: number, clientY: number, maxDist: number = PICK_DIST): Promise<PickResult | null> => {
       const r = cursorRay(clientX, clientY);
       try {
-        return await invoke<PickResult | null>("pick_block", { ...r, maxDist: PICK_DIST });
+        return await invoke<PickResult | null>("pick_block", { ...r, maxDist });
       } catch {
         return null; // no world loaded, or a degenerate ray — treat as a miss
       }
     };
+    /** The reach every build-mode pick uses — hover *and* click, so what the outline shows is exactly
+     *  what a click can act on. Past it the pick misses, the outline hides, and the click no-ops. */
+    const buildReachDist = () => buildReachRef.current;
 
     // Hover highlight: reused wireframe cubes moved to the picked voxel. Allocated once —
     // rebuilding an EdgesGeometry per pointermove would churn GPU buffers at 30Hz.
@@ -2009,6 +2146,19 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     let cursorX = 0, cursorY = 0;
     let lastPickT = 0;
     let pickInflight = false;
+    // M2: the hover pick refreshHighlight just ran drove the outline the user was looking at when
+    // they clicked — reusing it for the click itself removes a redundant `pick_block` round trip from
+    // every click's latency and guarantees "what the outline showed is what the click did". Only valid
+    // when the cursor hasn't moved since that pick and it's still fresh; a stale/mismatched cache falls
+    // back to a real pick, so this is purely a latency win, never a correctness risk.
+    let lastHoverPick: PickResult | null = null;
+    let lastHoverCx = NaN, lastHoverCy = NaN, lastHoverT = 0;
+    const pickOrHover = async (cx: number, cy: number, maxDist: number): Promise<PickResult | null> => {
+      if (cx === lastHoverCx && cy === lastHoverCy && performance.now() - lastHoverT < HOVER_PICK_REUSE_MS) {
+        return lastHoverPick;
+      }
+      return pick(cx, cy, maxDist);
+    };
     const refreshHighlight = async () => {
       const mode = interact3dRef.current;
       // In fly mode the crosshair is the cursor and the pointer may be locked (no pointerenter/leave,
@@ -2022,7 +2172,13 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       lastPickT = now;
       pickInflight = true;
       try {
-        const p = await pick(cursorX, cursorY);
+        // Build hovers at the *build* reach (H5), so the green box vanishing past the cap IS the
+        // out-of-range feedback — and the outline can never promise an edit the click would refuse.
+        const p = await pick(cursorX, cursorY, mode === "build" ? buildReachDist() : PICK_DIST);
+        // M2: cache this pick so an imminent click at the same cursor position can reuse it instead of
+        // re-picking. Cached even for sculpt mode's hover (harmless — build/select/floodfill are the
+        // only readers) and even on a miss (`p === null`), since a fresh pick would miss too.
+        lastHoverPick = p; lastHoverCx = cursorX; lastHoverCy = cursorY; lastHoverT = now;
         // Sculpt shows the amber brush disc; select/build show the wireframe box. Never both.
         if (mode === "sculpt") { placeBrush(p); setHighlight(null); }
         else { setHighlight(p, placeYaw(cursorX, cursorY)); placeBrush(null); }
@@ -2036,47 +2192,149 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     // the drag-to-look fallback, which matters because pointer lock is exactly what webviews refuse.
     let downX = 0, downY = 0, downT = 0, downBtn = -1;
 
-    // Hold-to-repeat break/place (build mode only). A short press still resolves through the
-    // click-gated onPickUp/onPickContext below; BUILD_REPEAT_DELAY_MS is chosen > CLICK_SLOP_MS so
-    // the two paths never both fire for the same gesture (by the time the repeat delay elapses, a
-    // quick click's own pointerup has already missed the click-slop time window).
+    // ---- Build gesture: Minecraft-style drag-sweep (H4) -------------------------------------------
+    //
+    // A build gesture is "a button held in build mode". Two things drive stamps out of it:
+    //   • **pointermove** — the sweep. Every move re-picks and stamps the newly-aimed cell, so
+    //     dragging across a wall lays a line of blocks along it. This is the gesture the pane used to
+    //     lack entirely: pre-H4, drifting past CLICK_SLOP_PX *cancelled* the hold, because
+    //     OrbitControls owned left-drag and had to be allowed to take over. Build mode now owns both
+    //     drags (`setOrbitBuildMode`), so there is nothing left to yield to and the slop-kill is gone.
+    //   • **the interval** — the stationary airbrush fallback, unchanged in cadence. It matters in
+    //     fly/look mode, where the pointer never moves but WASD/mouselook still re-aims the crosshair.
+    //
+    // A short press with neither still resolves through the click-gated onPickUp/onPickContext below;
+    // BUILD_REPEAT_DELAY_MS > CLICK_SLOP_MS keeps the interval out of that window, and
+    // `buildRepeatFired` keeps a move-driven stamp from being doubled by the click path.
     let buildRepeatDelayTimer: number | null = null;
     let buildRepeatTimer: number | null = null;
     let buildRepeatButton = -1; // 0 = break (left), 2 = place (right)
-    let buildRepeatLastCell: string | null = null; // skip no-op repeats of the same voxel this hold
-    let buildRepeatFired = false; // guards onPickContext from double-placing after a held repeat
+    let buildRepeatStartT = 0;  // gesture start, for the BUILD_GESTURE_MAX_MS watchdog
+    // H1: one undo group per gesture (single click or sweep) — mirrors `sculptGroupSeq`, sharing its
+    // seed/counter so ids from the two families never collide. Set fresh in onPickDown's arm branch,
+    // which runs for every build press regardless of whether it turns into a sweep or resolves as a
+    // plain click, so both paths below can tag their `paint_blocks` calls with the same id.
+    let buildGestureGroup = 0;
+    // Every cell this gesture has already edited — NOT just the previous one. Each place/break
+    // changes the world, so the next pick along the same ray returns a *new* cell one step nearer
+    // (place) or further (break) than the last: a "previous cell only" dedupe therefore let a
+    // stationary hold march a tower into the camera's face / tunnel through terrain at ~4.5
+    // blocks/sec. A swept path never revisits a cell, so a whole-gesture set costs a sweep nothing
+    // while degenerating a stationary hold to exactly one block.
+    const buildRepeatCells = new Set<string>();
+    // H4's placement-plane lock: the plane this gesture's FIRST stamp acted on, as
+    // `"nx,ny,nz@offset"` — the face *orientation* plus the acted cell's coordinate along that
+    // normal's axis. Every later stamp must land on the same plane.
+    //
+    // The offset half is what makes this work, and orientation alone would not: sweeping a flat field
+    // from above, the ray dips into the hole you just made and hits the next block down through its
+    // (newly exposed) *top* face — same normal, one layer deeper. Locking the coordinate too is what
+    // keeps a break-sweep peeling exactly one surface layer and a place-sweep laying exactly one, so
+    // neither can tunnel down or build back toward the camera; locking the normal is what keeps
+    // either from wrapping around a corner onto the adjoining face.
+    let buildRepeatPlane: string | null = null;
+    /** `"nx,ny,nz@offset"` for a stamp: the face normal plus the acted cell's coordinate along it. */
+    const planeKey = (nx: number, ny: number, nz: number, cx: number, cy: number, cz: number) =>
+      `${nx},${ny},${nz}@${nx !== 0 ? cx : ny !== 0 ? cy : cz}`;
+    let buildRepeatFired = false; // guards onPickUp/onPickContext from double-editing after a stamp
+    // Re-entrancy: the tick is async and awaits a pick round-trip that can exceed BUILD_REPEAT_MS on
+    // a large world, so bare setInterval ticks would stack and fire together. Same discipline as the
+    // sculpt hold-timer below: busy is set *before* the await so two ticks can't both slip past.
+    // Under H4 it does double duty as the sweep's rate limiter: pointermove fires at 60–120 Hz, and
+    // this is what collapses that to exactly one pick+edit in flight at a time.
+    let buildRepeatBusy = false;
+    // Bumped by every stopBuildRepeat(): a tick already parked on `await pick(...)` when the button
+    // is released must not land its edit afterwards (one extra block after you let go).
+    let buildRepeatGen = 0;
+    // Aim the last tick actually picked from — cursor position plus the camera's own pose, since in
+    // fly/look mode the pointer is frozen and the camera is the only thing that re-aims. An unchanged
+    // aim can't resolve to a new cell, so the tick returns *before* issuing a pick: that, not C1's
+    // tick counter, is what stops a stationary hold from spinning IPC (and the mutex behind it).
+    let aimCx = NaN, aimCy = NaN;
+    const aimPos = new THREE.Vector3(NaN, NaN, NaN);
+    const aimQuat = new THREE.Quaternion(NaN, NaN, NaN, NaN);
+    const aimChanged = () =>
+      cursorX !== aimCx || cursorY !== aimCy ||
+      !aimPos.equals(camera.position) || !aimQuat.equals(camera.quaternion);
+    const recordAim = () => {
+      aimCx = cursorX; aimCy = cursorY;
+      aimPos.copy(camera.position); aimQuat.copy(camera.quaternion);
+    };
 
+    const buildActive = () => interact3dRef.current === "build";
     const stopBuildRepeat = () => {
       if (buildRepeatDelayTimer !== null) { clearTimeout(buildRepeatDelayTimer); buildRepeatDelayTimer = null; }
       if (buildRepeatTimer !== null) { clearInterval(buildRepeatTimer); buildRepeatTimer = null; }
+      buildRepeatGen++;
       buildRepeatButton = -1;
-      buildRepeatLastCell = null;
+      buildRepeatBusy = false;
+      buildRepeatPlane = null;
+      buildRepeatCells.clear();
+      aimCx = NaN; aimCy = NaN; // next gesture must re-pick even from an identical pose
     };
 
-    // Each repeat tick re-picks the live crosshair (frozen while flying, live cursor while orbiting)
-    // and cancels itself the moment the pointer has drifted past click-slop since mouse-down — that's
-    // the signal a drag became an orbit-rotate instead of a held break/place, so we back off and let
-    // OrbitControls own the gesture.
+    // H1: the true "a gesture just ended" signal, wrapping `stopBuildRepeat`. Only a *sweep* (one or
+    // more ticks fired via pointermove/the airbrush interval) has anything to summarize here — a plain
+    // click never arms the repeat far enough to accumulate a cell, and reports its own one-block
+    // gesture directly at its call site (see onPickUp/onPickContext below) since by the time a handler
+    // reaches that point `stopBuildRepeat`/this has already run and cleared `buildRepeatCells`.
+    const endBuildGesture = () => {
+      if (buildRepeatButton >= 0 && buildRepeatCells.size > 0) {
+        onBuildGestureEndRef.current?.(buildRepeatButton === 0 ? "break" : "place", buildRepeatCells.size);
+      }
+      stopBuildRepeat();
+    };
+
+    // One stamp attempt for the live gesture: re-pick the current aim (pointer while orbiting,
+    // crosshair while flying) and break/place the resolved cell if it's new and on this gesture's
+    // locked plane. Called from pointermove (the sweep) and from the interval (the airbrush).
     const buildRepeatTick = async () => {
-      if (interact3dRef.current !== "build") { stopBuildRepeat(); return; }
-      if (Math.abs(cursorX - downX) > CLICK_SLOP_PX || Math.abs(cursorY - downY) > CLICK_SLOP_PX) { stopBuildRepeat(); return; }
-      const hit = await pick(cursorX, cursorY);
-      if (disposed || !hit) return;
-      if (buildRepeatButton === 0) {
-        const key = `${hit.x},${hit.y},${hit.z}`;
-        if (key === buildRepeatLastCell) return;
-        buildRepeatLastCell = key;
+      if (buildRepeatBusy || buildRepeatButton < 0) return;
+      if (!buildActive()) { endBuildGesture(); return; }
+      // Absolute bound on one gesture: if the webview never delivers the pointerup (the failure this
+      // whole handler family is defensive about), the hold ends here rather than living forever.
+      if (performance.now() - buildRepeatStartT > BUILD_GESTURE_MAX_MS) { endBuildGesture(); return; }
+      if (!aimChanged()) return; // nothing has moved — a pick would return the same cell
+      recordAim();
+      const gen = buildRepeatGen;
+      const button = buildRepeatButton;
+      buildRepeatBusy = true;
+      try {
+        const hit = await pick(cursorX, cursorY, buildReachDist());
+        // Released (or mode-switched / suspended) while the pick was in flight — the gesture this
+        // tick belonged to is over, so dispatching now would edit a block the user never asked for.
+        if (disposed || gen !== buildRepeatGen || !hit) return;
+        // The cell this stamp would act on: the hit voxel for break, the empty neighbour for place.
+        let tx: number, ty: number, tz: number;
+        if (button === 0) {
+          tx = hit.x; ty = hit.y; tz = hit.z;
+        } else if (button === 2) {
+          const t = clickTarget(hit);
+          const c = threeToEden(camera.position);
+          if (Math.floor(c.x) === t.x && Math.floor(c.y) === t.y && Math.floor(c.z) === t.z) return;
+          tx = t.x; ty = t.y; tz = t.z;
+        } else {
+          return;
+        }
+        const plane = planeKey(hit.nx, hit.ny, hit.nz, tx, ty, tz);
+        if (buildRepeatPlane !== null && plane !== buildRepeatPlane) return; // off this gesture's plane
+        const cell = `${tx},${ty},${tz}`;
+        if (buildRepeatCells.has(cell)) return;
+        buildRepeatCells.add(cell);
+        buildRepeatPlane ??= plane; // first stamp of the gesture fixes the plane
         buildRepeatFired = true;
-        onPickBreakRef.current?.(hit.x, hit.y, hit.z);
-      } else if (buildRepeatButton === 2) {
-        const t = clickTarget(hit);
-        const c = threeToEden(camera.position);
-        if (Math.floor(c.x) === t.x && Math.floor(c.y) === t.y && Math.floor(c.z) === t.z) return;
-        const key = `${t.x},${t.y},${t.z}`;
-        if (key === buildRepeatLastCell) return;
-        buildRepeatLastCell = key;
-        buildRepeatFired = true;
-        onPickPlaceRef.current?.(t.x, t.y, t.z, placeYaw(cursorX, cursorY));
+        if (button === 0) onPickBreakRef.current?.(tx, ty, tz, buildGestureGroup);
+        else onPickPlaceRef.current?.(tx, ty, tz, placeYaw(cursorX, cursorY), buildGestureGroup);
+      } finally {
+        buildRepeatBusy = false;
+        // Trailing edge. Every pointermove that arrived while this pick was in flight was dropped by
+        // the busy guard, so the end of a fast flick would otherwise never be stamped — and the click
+        // path can't cover it either (buildRepeatFired suppresses it). Deliberately gated on the
+        // *cursor* having moved, not the camera: a camera-only re-aim (fly/look mode) stays on the
+        // interval's cadence rather than picking as fast as IPC allows.
+        if (!disposed && buildRepeatButton >= 0 && (cursorX !== aimCx || cursorY !== aimCy)) {
+          void buildRepeatTick();
+        }
       }
     };
 
@@ -2122,20 +2380,33 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     const onPickDown = (e: PointerEvent) => {
       // Idempotent re-arm: a missed release (pointerup off-canvas, pointercancel, focus loss) would
       // otherwise leave the previous hold-repeat interval running forever while this one starts a
-      // second, compounding into runaway break/place. Always clear any stale timer before arming.
-      stopBuildRepeat();
+      // second, compounding into runaway break/place. Always clear any stale timer before arming —
+      // and if that stale gesture had already stamped something, summarize it now rather than losing
+      // its toast entirely (H1).
+      endBuildGesture();
+      // Unconditional (M3). Resetting it inside the build/single branch below left a left-hold's
+      // `true` standing, so the next right-click after e.g. switching build shape was silently
+      // swallowed. (Since H4 both onPickUp and onPickContext consume it, one per gesture — but only
+      // whichever handler this gesture's button reaches, so a per-gesture reset is still what clears
+      // the other one's leftover.)
+      buildRepeatFired = false;
       downX = e.clientX; downY = e.clientY; downT = performance.now(); downBtn = e.button;
       // Suppress the browser's middle-click autoscroll icon; only relevant in build mode (eyedropper).
-      if (e.button === 1 && interact3dRef.current === "build") e.preventDefault();
+      if (e.button === 1 && buildActive()) e.preventDefault();
       // Break (left) is reliable in WKWebView; place (right) is attempted the same way but the
       // guaranteed fallback is the `contextmenu` handler below (button-2 pointer events are
       // unreliable there — see its comment). Hold-to-repeat only applies to plain single-voxel
       // building — a line/box gesture is a deliberate two-click arm+commit, not a hold.
-      if ((e.button === 0 || e.button === 2) && interact3dRef.current === "build" && buildShapeRef.current === "single") {
+      // Alt hands both drags back to the camera for this gesture (see setOrbitBuildMode) — arming a
+      // build sweep under it would edit the world while the user is orbiting.
+      if ((e.button === 0 || e.button === 2) && !e.altKey && buildActive() && buildShapeRef.current === "single") {
         canvas.setPointerCapture(e.pointerId); // guarantees pointerup lands here, even released off-canvas
         buildRepeatButton = e.button;
-        buildRepeatLastCell = null;
-        buildRepeatFired = false;
+        buildRepeatStartT = performance.now();
+        buildGestureGroup = ++sculptGroupSeq; // H1: one undo group for every stamp this gesture makes
+        // The sweep is live from here: pointermove drives it (H4). The timer below only adds the
+        // stationary-airbrush tick, and stays delayed past CLICK_SLOP_MS so a quick click resolves
+        // through the click path instead of racing it.
         buildRepeatDelayTimer = window.setTimeout(() => {
           buildRepeatDelayTimer = null;
           void buildRepeatTick();
@@ -2143,21 +2414,51 @@ const FlyView3D = forwardRef<FlyView3DRef, {
         }, BUILD_REPEAT_DELAY_MS);
       }
     };
+    // Fallback arm for the right-button *hold*, mirroring `contextmenu`'s existing role as the
+    // guaranteed fallback for a right-*click*: button-2 `pointerdown` is the specific event macOS
+    // WKWebView is unreliable about delivering (see the comment above), and unlike a click there is
+    // no later event that can stand in for a dropped one — a held sweep needs to have armed at
+    // press-time to have anything to drive it. Legacy `mousedown` is dispatched through a different
+    // WebKit code path than PointerEvents and does not share that gap, so it is the second, redundant
+    // trigger for exactly the same arm sequence `onPickDown` already runs. Ordinarily `pointerdown`
+    // fires first and arms `buildRepeatButton`, so this is a no-op almost every time; it only matters
+    // the (previously silent) times WKWebView drops the pointer event and left/place kept "just
+    // panning" the camera via mouselook — the actually-reported bug — with nothing left to arm it.
+    const onPickMouseDownFallback = (e: MouseEvent) => {
+      if (e.button !== 2 || buildRepeatButton === 2) return; // already armed by pointerdown — no-op
+      endBuildGesture();
+      buildRepeatFired = false;
+      downX = e.clientX; downY = e.clientY; downT = performance.now(); downBtn = e.button;
+      if (e.altKey || !buildActive() || buildShapeRef.current !== "single") return;
+      // No `setPointerCapture` here — MouseEvent carries no `pointerId`. A release off-canvas is
+      // still covered by the existing safety nets (BUILD_GESTURE_MAX_MS, `onBlur`, the re-arm at the
+      // top of the next `onPickDown`/this fallback).
+      buildRepeatButton = e.button;
+      buildRepeatStartT = performance.now();
+      buildGestureGroup = ++sculptGroupSeq;
+      buildRepeatDelayTimer = window.setTimeout(() => {
+        buildRepeatDelayTimer = null;
+        void buildRepeatTick();
+        buildRepeatTimer = window.setInterval(() => { void buildRepeatTick(); }, BUILD_REPEAT_MS);
+      }, BUILD_REPEAT_DELAY_MS);
+    };
     // Safety net for a missed pointerup (webview-issued pointercancel, e.g. from an OS gesture or
     // focus loss mid-press) — without this the repeat interval above would run forever.
-    const onPickCancel = () => stopBuildRepeat();
-    const isClick = (e: PointerEvent) =>
-      e.button === downBtn &&
+    const onPickCancel = () => endBuildGesture();
+    // Split out of isClick so `contextmenu` — a MouseEvent, with no reliable `button` of its own in
+    // WKWebView — can apply the same slop test against the press it belongs to (C2).
+    const withinClickSlop = (cx: number, cy: number) =>
       performance.now() - downT < CLICK_SLOP_MS &&
-      Math.abs(e.clientX - downX) <= CLICK_SLOP_PX &&
-      Math.abs(e.clientY - downY) <= CLICK_SLOP_PX;
+      Math.abs(cx - downX) <= CLICK_SLOP_PX &&
+      Math.abs(cy - downY) <= CLICK_SLOP_PX;
+    const isClick = (e: PointerEvent) => e.button === downBtn && withinClickSlop(e.clientX, e.clientY);
 
     // Left-click. Select mode → pick a selection corner. Build mode → BREAK the picked block.
     // Sculpt mode's left button is a press-and-hold gesture owned by the sculpt controller, so this
     // click handler must NOT fall through to break — an explicit build-only guard replaces the old
     // "not select ⇒ build" assumption now that "sculpt" is a fourth mode.
     const onPickUp = async (e: PointerEvent) => {
-      if ((e.button === 0 || e.button === 2) && buildRepeatButton === e.button) stopBuildRepeat();
+      if ((e.button === 0 || e.button === 2) && buildRepeatButton === e.button) endBuildGesture();
       // A click that started on a gizmo handle (see "3D selection gizmo" below) must never also
       // fall through to select mode's two-click corner-pick, even when the press barely moved.
       if (gizmoConsumedClick) { gizmoConsumedClick = false; return; }
@@ -2165,24 +2466,30 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       // Middle click in build mode: eyedropper (pick block+paint under the cursor). Build-only —
       // select/sculpt don't offer it, matching the plan's scope cut.
       if (e.button === 1) {
-        if (interact3dRef.current !== "build") return;
+        if (!buildActive()) return;
         const hit = await pick(e.clientX, e.clientY);
         if (hit) onPickEyedropRef.current?.(hit.block_type, hit.paint);
         return;
       }
       if (e.button !== 0) return;
       if (interact3dRef.current === "select") {
-        const hit = await pick(e.clientX, e.clientY);
+        const hit = await pickOrHover(e.clientX, e.clientY, PICK_DIST);
         if (hit) onPickSelectRef.current?.(hit.x, hit.y, hit.z);
         return;
       }
       if (interact3dRef.current === "floodfill") {
-        const hit = await pick(e.clientX, e.clientY);
+        const hit = await pickOrHover(e.clientX, e.clientY, PICK_DIST);
         if (hit) onPickFloodFillRef.current?.(hit.x, hit.y, hit.z, hit.nx, hit.ny, hit.nz);
         return;
       }
-      if (interact3dRef.current !== "build") return; // sculpt (or anything else): never breaks
-      const hit = await pick(e.clientX, e.clientY);
+      if (!buildActive()) return; // sculpt (or anything else): never breaks
+      // A sweep stamp already ran for this press (H4: pointermove drives stamping from the moment the
+      // button goes down, so even a press that stays inside the click slop can have edited once).
+      // Without this the click path would break a *second* cell on release.
+      if (buildRepeatFired) { buildRepeatFired = false; return; }
+      // M2: refreshHighlight's hover pick drove the green/blue box the user was looking at when they
+      // clicked — reuse it instead of a redundant round trip, so the click can never disagree with it.
+      const hit = await pickOrHover(e.clientX, e.clientY, buildReachDist());
       if (!hit) return;
       if (buildShapeRef.current === "fill") {
         onPickFillFaceRef.current?.(hit.x, hit.y, hit.z, hit.nx, hit.ny, hit.nz, "break");
@@ -2192,7 +2499,10 @@ const FlyView3D = forwardRef<FlyView3DRef, {
         handleBuildShapeClick(hit.x, hit.y, hit.z, "break", 0);
         return;
       }
-      onPickBreakRef.current?.(hit.x, hit.y, hit.z);
+      // A plain click that never reached buildRepeatTick — exactly one block, so summarize it here
+      // directly rather than through endBuildGesture (which already ran above with an empty cell set).
+      onPickBreakRef.current?.(hit.x, hit.y, hit.z, buildGestureGroup);
+      onBuildGestureEndRef.current?.("break", 1);
     };
 
     // Right-click → PLACE at the highlighted cell (the previewed hit+normal), so what a click does
@@ -2204,9 +2514,39 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     // swallowed instead of placing a second block.
     const onPickContext = async (e: MouseEvent) => {
       e.preventDefault();
-      if (interact3dRef.current !== "build") return;
+      // Disarm here too (C1 §3). This handler exists precisely because button-2 *pointer* events are
+      // unreliable in WKWebView — but the only disarm used to live in onPickUp, gated on
+      // `buildRepeatButton === e.button`. A dropped button-2 pointerup therefore left the place
+      // interval running until some later pointerdown happened to hit the re-arm above: the single
+      // most likely mechanism behind "one click gets stuck placing blocks".
+      //
+      // Gated on the press being *out* of the click-slop window, because platforms disagree on when
+      // `contextmenu` fires: on the ones that fire it at press time an unconditional stop here would
+      // cancel every right-hold before its first repeat tick. Out-of-slop means the press is either
+      // released (a real pan/drag) or long past the point a pointerup should have arrived — both
+      // cases where the repeat has no business still running. A stationary hold whose pointerup is
+      // dropped outright is covered structurally instead: the whole-gesture cell set makes it a
+      // no-op after one cell, the aim-change gate stops it issuing picks, and BUILD_GESTURE_MAX_MS
+      // ends it outright. H4 does *not* make this conditional gating moot — the platform disagreement
+      // it works around is about when `contextmenu` fires, which a new input model doesn't change.
+      const wasRepeating = buildRepeatButton === 2;
+      const stale = !withinClickSlop(e.clientX, e.clientY);
+      if (wasRepeating && stale) endBuildGesture();
+      if (!buildActive()) return;
+      // Alt+right-drag is the camera's pan gesture in build mode (see setOrbitBuildMode) — never a place.
+      if (e.altKey) return;
       if (buildRepeatFired) { buildRepeatFired = false; return; }
-      const hit = await pick(e.clientX, e.clientY);
+      // C2: OrbitControls used to bind RIGHT to PAN, so a right-drag to slide the camera ended in a
+      // `contextmenu` — with no slop test this placed a block wherever the drag happened to end. H4
+      // takes RIGHT away from OrbitControls in build mode, which makes that specific path impossible;
+      // the test stays because right-drag is now a place-*sweep*, and a sweep's stamps come from the
+      // tick — a release far from the press must not add one more at the release point.
+      // Only enforced when we actually saw the matching button-2 pointerdown (or the repeat armed
+      // from it): if the webview dropped that event we have no evidence of a drag, and refusing
+      // would break placing outright on exactly the platform this fallback path exists for.
+      if ((downBtn === 2 || wasRepeating) && stale) return;
+      // M2: see the matching comment in onPickUp.
+      const hit = await pickOrHover(e.clientX, e.clientY, buildReachDist());
       if (!hit) return;
       // Fill re-skins the clicked wall in place (the seed IS the solid hit cell) — no offset-into-
       // empty-neighbour math and no camera-occupancy guard (the seed being solid already rules out
@@ -2223,11 +2563,17 @@ const FlyView3D = forwardRef<FlyView3DRef, {
         handleBuildShapeClick(t.x, t.y, t.z, "place", yaw);
         return;
       }
-      onPickPlaceRef.current?.(t.x, t.y, t.z, yaw);
+      // Plain click, never reached buildRepeatTick — one block, summarized directly (see onPickUp).
+      onPickPlaceRef.current?.(t.x, t.y, t.z, yaw, buildGestureGroup);
+      onBuildGestureEndRef.current?.("place", 1);
     };
 
     const onPickMove = (e: PointerEvent) => {
       cursorX = e.clientX; cursorY = e.clientY;
+      // H4's sweep: while a build button is held, every move is a stamp attempt. `buildRepeatBusy`
+      // collapses the 60–120 Hz move stream to one pick+edit in flight, and `buildRepeatCells` /
+      // the plane lock decide whether the newly-aimed cell actually gets edited.
+      if (buildRepeatButton >= 0) void buildRepeatTick();
       void refreshHighlight();
     };
     // Pointer lock can synthesize a pointerleave; while flying the crosshair still has a target.
@@ -2332,6 +2678,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     canvas.addEventListener("pointerup", onSculptUp);
 
     canvas.addEventListener("pointerdown", onPickDown);
+    canvas.addEventListener("mousedown", onPickMouseDownFallback);
     canvas.addEventListener("pointerup", onPickUp);
     canvas.addEventListener("pointercancel", onPickCancel);
     canvas.addEventListener("pointermove", onPickMove);
@@ -2398,7 +2745,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     // Losing window focus (alt-tab, devtools) can swallow the keyup for a held direction key, leaving
     // it stuck in the set so the camera drifts indefinitely. Clear on blur. Also drop out of look
     // mode — a persistent OS cursor grab would otherwise freeze the cursor in whatever app we tab to.
-    const onBlur = () => { keys.clear(); lookDrag = false; cancelSculptStroke(); stopBuildRepeat(); cancelGizmoDrag(); clearBuildShapeAnchor(); if (camModeRef.current === "look") applyMode("orbit"); };
+    const onBlur = () => { keys.clear(); lookDrag = false; cancelSculptStroke(); endBuildGesture(); cancelGizmoDrag(); clearBuildShapeAnchor(); if (camModeRef.current === "look") applyMode("orbit"); };
     window.addEventListener("blur", onBlur);
 
     const fwd = new THREE.Vector3();
@@ -2494,6 +2841,11 @@ const FlyView3D = forwardRef<FlyView3DRef, {
         cancelSculptStroke();
         cancelGizmoDrag();
         clearBuildShapeAnchor();
+        // …including a held break/place. Without this, hiding the pane mid-hold left the repeat
+        // interval editing the world against an invisible viewport; it only self-healed because
+        // App forces mode3d="off" one effect later. Summarize first (H1) — the pane going invisible
+        // is a legitimate gesture end, not a discard.
+        endBuildGesture();
         applyMode("orbit");
         keys.clear();
         cancelAnimationFrame(raf);
@@ -2504,6 +2856,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
         // and refetch from scratch rather than trusting a band nothing is resident under any more.
         fetchGen++;
         queue = [];
+        forceKeys.clear();
         for (const k of residentKeys()) disposeMesh(k);
         zBand = undefined;
         pushMemHud();
@@ -3180,10 +3533,14 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       updateGpuLighting: () => applyGpuLighting(),
       refreshNightLights: () => updateNightLights(),
       refresh: () => invalidate(),
-      clearHighlight: () => { setHighlight(null); stopBuildRepeat(); },
+      // H3: force a fresh pick past the hover throttle, so the outline can be told to catch up right
+      // after an edit lands instead of waiting for the pointer to move.
+      refreshHighlight: () => { lastPickT = 0; void refreshHighlight(); },
+      clearHighlight: () => { setHighlight(null); endBuildGesture(); },
       clearSculpt: () => { cancelSculptStroke(); placeBrush(null); },
       clearBuildShape: () => clearBuildShapeAnchor(),
       setOrbitLeftEnabled,
+      setOrbitBuildMode,
       setGizmoSelection: (mode, b) => {
         if (gizmoDragging) return; // don't fight a live drag — it owns the visual until release
         if (mode === "select" && b) { gizmoGroup.visible = true; layoutGizmoHandles(b); }
@@ -3226,6 +3583,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       canvas.removeEventListener("pointermove", onSculptMove);
       canvas.removeEventListener("pointerup", onSculptUp);
       canvas.removeEventListener("pointerdown", onPickDown);
+      canvas.removeEventListener("mousedown", onPickMouseDownFallback);
       canvas.removeEventListener("pointerup", onPickUp);
       canvas.removeEventListener("pointercancel", onPickCancel);
       canvas.removeEventListener("pointermove", onPickMove);
@@ -3238,6 +3596,9 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       window.removeEventListener("keydown", onKeyDown);
       window.removeEventListener("keyup", onKeyUp);
       window.removeEventListener("blur", onBlur);
+      window.removeEventListener("keydown", onAltKey);
+      window.removeEventListener("keyup", onAltKey);
+      window.removeEventListener("blur", onAltBlur);
       // Before the forceContextLoss() below — that fires a webglcontextlost event we must not handle.
       canvas.removeEventListener("webglcontextlost", onContextLost);
       canvas.removeEventListener("webglcontextrestored", onContextRestored);
@@ -3334,7 +3695,11 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     if (interact3d !== "select" && interact3d !== "build" && interact3d !== "floodfill") api.clearHighlight();
     if (interact3d !== "sculpt") api.clearSculpt();
     if (interact3d !== "build") api.clearBuildShape();
-    api.setOrbitLeftEnabled(interact3d !== "sculpt");
+    // Sculpt and build both own left-drag (sculpt strokes / H4 break-sweeps); build additionally
+    // takes RIGHT (place-sweep) and moves camera orbit onto MIDDLE. Order matters: setOrbitBuildMode
+    // resets the Alt override, so it must run after setOrbitLeftEnabled.
+    api.setOrbitLeftEnabled(interact3d !== "sculpt" && interact3d !== "build");
+    api.setOrbitBuildMode(interact3d === "build");
   }, [interact3d]);
 
   // Gizmo sync: show/hide + relay out the Select-mode transform handles whenever the mode or the
@@ -3375,7 +3740,21 @@ const FlyView3D = forwardRef<FlyView3DRef, {
   // or shadows are on, a placed lamp (LAMP_LIGHT_RADIUS) or a new occluder (SHADOW_RAY_STEPS, the
   // shadow raymarch distance) can visibly affect blocks in the *next* chunk over — reloading only the
   // chunk(s) the edit's own bounds touch would leave a lit/shadowed seam at that boundary until the
-  // camera flies away and back. Expand the reload rect by that reach, converted to whole chunks.
+  // camera flies away and back. The rect is therefore expanded by that reach, converted to whole
+  // chunks — but the two halves are **not** reloaded on the same schedule (C3 steps 2–3):
+  //
+  //   • **core** (the edit's own chunks, usually 1) — immediately. This is the block you just placed
+  //     appearing, so it can never be deferred.
+  //   • **halo** (everything the reach adds on top) — accumulated and flushed on a trailing
+  //     HALO_FLUSH_MS debounce. With baked shadows on, `shadowRayScan = 24` makes the padded rect
+  //     5×5 = 25 chunks; paying that per *placed block* is the storm that made building on a large
+  //     world feel broken. A build sweep stamps far faster than the debounce, so it now pays the halo
+  //     once, after release — which is the "coalesce per gesture" outcome without any gesture
+  //     plumbing between the scene closure and this effect: the edit rate *is* the gesture signal.
+  //     A lone click pays it 350 ms later; the seam it fixes was never visible sooner than that.
+  //
+  // Both halves go through the same `reloadChunk` (and so the same forceKeys/staleKeys discipline),
+  // which since C3 step 1 keeps the old mesh up until the replacement lands — no blanking hole.
   useEffect(() => {
     const api = sceneApi.current;
     if (!api || !lastEdit) return;
@@ -3386,15 +3765,41 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       shadows3d ? lightConstantsRef.current.shadowRayScan : 0,
     );
     const chunkPad = Math.ceil(reach / 16);
-    const cx0 = worldToChunk(lastEdit.x) - chunkPad;
-    const cy0 = worldToChunk(lastEdit.y) - chunkPad;
-    const cx1 = worldToChunk(lastEdit.x + Math.max(0, lastEdit.w - 1)) + chunkPad;
-    const cy1 = worldToChunk(lastEdit.y + Math.max(0, lastEdit.h - 1)) + chunkPad;
+    const cx0 = worldToChunk(lastEdit.x);
+    const cy0 = worldToChunk(lastEdit.y);
+    const cx1 = worldToChunk(lastEdit.x + Math.max(0, lastEdit.w - 1));
+    const cy1 = worldToChunk(lastEdit.y + Math.max(0, lastEdit.h - 1));
     for (let cy = cy0; cy <= cy1; cy++)
       for (let cx = cx0; cx <= cx1; cx++)
         api.reloadChunk(cx, cy);
+    if (chunkPad > 0) {
+      const halo = haloKeysRef.current;
+      for (let cy = cy0 - chunkPad; cy <= cy1 + chunkPad; cy++)
+        for (let cx = cx0 - chunkPad; cx <= cx1 + chunkPad; cx++) {
+          if (cx >= cx0 && cx <= cx1 && cy >= cy0 && cy <= cy1) continue; // core — already reloaded
+          halo.add(`${cx},${cy}`);
+        }
+      if (haloTimerRef.current) clearTimeout(haloTimerRef.current);
+      haloTimerRef.current = setTimeout(() => {
+        haloTimerRef.current = null;
+        const keys = haloKeysRef.current;
+        haloKeysRef.current = new Set();
+        const a = sceneApi.current;
+        // A suspended pane disposed every mesh and emptied its queue; re-queueing into it would
+        // start fetches nobody is looking at. Its resume path restreams from scratch anyway.
+        if (!a || suspendedRef.current) return;
+        for (const k of keys) {
+          const [cx, cy] = k.split(",").map(Number);
+          a.reloadChunk(cx, cy);
+        }
+      }, HALO_FLUSH_MS);
+    }
     // GPU night: a placed/broken lamp changes the point-light set — re-query around the camera.
     if (gpuShadowsRef.current && nightLighting) api.refreshNightLights();
+    // H3: the outline is a promise ("this is where the next click goes") — after any edit (this pane's
+    // own build clicks included) it must catch up immediately rather than waiting for the pointer to
+    // twitch, which in orbit mode with a stationary cursor otherwise never happens on its own.
+    api.refreshHighlight();
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [editEpoch]);
 
@@ -3548,9 +3953,12 @@ const FlyView3D = forwardRef<FlyView3DRef, {
             aria-controls="fly3d-controls-legend"
             style={{
               display: "flex", alignItems: "center", justifyContent: "center",
-              width: 14, height: 14, borderRadius: "50%", border: "1px solid rgba(131,120,108,0.4)",
+              // M4: the circle stays visually small (11px glyph well) but the hit target is a standard
+              // ~24px tap size, via a transparent padding ring — a 14px circle was sub-touch-target and
+              // fussy to hit with a mouse too.
+              width: 24, height: 24, borderRadius: "50%", border: "1px solid rgba(131,120,108,0.4)",
               background: legendOpen ? "rgba(131,120,108,0.3)" : "rgba(131,120,108,0.12)",
-              color: "#afa69d", fontSize: 9, fontWeight: 700, cursor: "pointer", padding: 0, lineHeight: 1,
+              color: "#afa69d", fontSize: 11, fontWeight: 700, cursor: "pointer", padding: 0, lineHeight: 1,
             }}
           >?</button>
           {legendOpen && (
@@ -3560,11 +3968,27 @@ const FlyView3D = forwardRef<FlyView3DRef, {
               aria-label="3D pane controls legend"
               style={{
                 ...glassMenuPanel,
-                position: "absolute", top: 18, left: 0, zIndex: 10,
+                position: "absolute", top: 28, left: 0, zIndex: 10,
                 width: 300, maxHeight: 420, overflowY: "auto",
                 padding: 10, fontSize: 10, lineHeight: 1.5, color: "#dad6d2", fontWeight: 400,
               }}>
-              <div style={{ fontWeight: 700, color: "#fff", marginBottom: 4 }}>Camera</div>
+              {/* Explicit close affordance — Esc dismisses this too, but a popup with no visible way
+                  to close it reads as stuck, especially since it can auto-open on first pane use with
+                  no click required to open it in the first place. */}
+              <button
+                type="button"
+                onClick={() => setLegendOpen(false)}
+                title="Close"
+                aria-label="Close controls legend"
+                style={{
+                  position: "absolute", top: 6, right: 6, width: 18, height: 18,
+                  display: "flex", alignItems: "center", justifyContent: "center",
+                  borderRadius: "50%", border: "1px solid rgba(131,120,108,0.4)",
+                  background: "rgba(131,120,108,0.12)", color: "#afa69d",
+                  fontSize: 11, lineHeight: 1, cursor: "pointer", padding: 0,
+                }}
+              >×</button>
+              <div style={{ fontWeight: 700, color: "#fff", marginBottom: 4, paddingRight: 20 }}>Camera</div>
               <div>Z / click pill — cycle Orbit → Look → Fly → Orbit</div>
               <div>Orbit — drag to rotate, scroll to zoom</div>
               <div>Look / Fly — WASD move · Space/E up · Ctrl/Q down</div>
@@ -3581,8 +4005,12 @@ const FlyView3D = forwardRef<FlyView3DRef, {
                 blocks (undoable) — resize is always region-only</div>
               <div>Esc mid-drag — cancel the gizmo drag, no change committed</div>
               <div style={{ fontWeight: 700, color: "#fff", margin: "6px 0 4px" }}>Build mode</div>
-              <div>Left click/hold — break · Right click/hold — place</div>
-              <div>Middle click — eyedropper (pick block+paint)</div>
+              <div>Left drag — sweep break · Right drag — sweep place</div>
+              <div>A sweep sticks to the face you started on and never revisits a cell</div>
+              <div>Click without dragging — exactly one block</div>
+              <div>Camera: middle drag orbits · Alt+left orbits · Alt+right pans · scroll zooms</div>
+              <div>Middle click (no drag) — eyedropper (pick block+paint)</div>
+              <div>Reach {Math.round(buildReach)} blocks — no outline means out of range (Settings ▸ 3D)</div>
               <div>1–5 / 6–0 — hotbar pinned/recent slots (works while flying)</div>
               <div style={{ fontWeight: 700, color: "#fff", margin: "6px 0 4px" }}>Sculpt mode</div>
               <div>Left press+hold — sculpt under the cursor (Grab: vertical drag)</div>
@@ -3860,7 +4288,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
                     ? `click a wall — L clear · R fill${armedLabel ? ` ${armedLabel}` : ""}`
                     : buildShape !== "single"
                       ? `${buildShapeArmed ? "click end cell to commit" : `click start cell (${buildShape})`}${armedLabel ? ` · ${armedLabel}` : ""}`
-                      : `L break · R place${armedLabel ? ` ${armedLabel}` : ""}`}
+                      : `L drag break · R drag place${armedLabel ? ` ${armedLabel}` : ""}`}
             </span>
           </div>
         )}

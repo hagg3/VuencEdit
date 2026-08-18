@@ -1,9 +1,10 @@
+import { useState } from "react";
 import {
   BLOCK_DEFS, PAINT_COLORS, resolveColor,
   RAMP_FAMILIES, RAMP_DIRS, WEDGE_FAMILIES, WEDGE_DIRS,
   rampFamilyBase, wedgeFamilyBase, rampDirIndex, blockDisplayName,
   doorFamilyBase, portalFamilyBase, DOOR_PORTAL_DIRS,
-  EXPANSION_BLOCKS, isExpansionBlock, PARTIAL_WATER, PARTIAL_LAVA, SPECIAL_BLOCKS,
+  EXPANSION_BLOCKS, isExpansionBlock, NEW_FORMAT_BLOCKS, isNewFormatBlock, PARTIAL_WATER, PARTIAL_LAVA, SPECIAL_BLOCKS,
 } from "./blockDefs";
 import { tintedSwatch, type AtlasData } from "./texturePack";
 import { EDEN_TEAL, EDEN_TEAL_READABLE, recessedWell, chromeButtonAccent } from "./designTokens";
@@ -31,6 +32,12 @@ export default function BlockPaintPicker({
 }: Props) {
   const isFill = mode === "fill";
   const bt = blockType;
+  // New-format blocks (112–127) are tucked behind a disclosure rather than always shown — they're
+  // a rare 2026-update-only block set most worlds never see, and always rendering a 16-swatch grid
+  // made the picker noticeably wider/taller than it needs to be for everyone else. Auto-opens when
+  // one is already the active selection so its highlight is never hidden behind a closed toggle.
+  const newFormatActive = bt !== null && isNewFormatBlock(bt);
+  const [newFormatOpen, setNewFormatOpen] = useState(newFormatActive);
 
   return (
     <div style={{ display: "flex", alignItems: "flex-start", gap: 10, ...(isFill ? {} : { overflowX: "auto" }) }}>
@@ -280,6 +287,39 @@ export default function BlockPaintPicker({
             );
           })}
         </div>
+
+        {/* New-format blocks (112–127) — real names unknown, tucked behind a disclosure (see the
+            `newFormatOpen` comment above) rather than always shown as a full grid. */}
+        <div
+          onClick={() => setNewFormatOpen(v => !v)}
+          title="16 new block types added by a 2026 game update (real names unknown)"
+          style={{
+            display: "flex", alignItems: "center", gap: 4, marginTop: 2,
+            cursor: "pointer", userSelect: "none",
+          }}
+        >
+          <span style={{ color: "#61584f", fontSize: 8 }}>{newFormatOpen ? "▼" : "▶"}</span>
+          <span style={{ color: newFormatActive ? EDEN_TEAL_READABLE : "#61584f", fontSize: 9 }}>
+            New (16){newFormatActive ? " •" : ""}
+          </span>
+        </div>
+        {newFormatOpen && (
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(8, 18px)", gap: 2, marginTop: 1 }}>
+            {NEW_FORMAT_BLOCKS.map(b => {
+              const selected = bt === b.type;
+              return (
+                <div key={b.type} title={`New block ${b.type}`} onClick={() => onBlockTypeChange(b.type)}
+                  style={{
+                    width: 18, height: 18, borderRadius: 2, cursor: "pointer", boxSizing: "border-box",
+                    background: `rgb(${b.color[0]},${b.color[1]},${b.color[2]})`,
+                    border: selected ? "2px solid #fff" : "2px solid rgba(255,255,255,0.08)",
+                    outline: selected ? "1px solid #00dde9" : "none", outlineOffset: 1,
+                  }}
+                />
+              );
+            })}
+          </div>
+        )}
       </div>
 
       <div style={{ width: 1, background: "#312c28", alignSelf: "stretch", ...(isFill ? {} : { flexShrink: 0 }) }} />

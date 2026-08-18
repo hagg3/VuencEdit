@@ -3,7 +3,22 @@ import { invoke } from "@tauri-apps/api/core";
 import { brushFootprint, rectPixels, ellipsePixels, type BrushShape, type WP } from "./drawTools";
 import { chromeButton, chromeButtonAccent, recessedWell } from "./designTokens";
 import { decodePixelPatch, decodePreviewData } from "./types";
-import { zoomAtPoint, resizeCanvasToContainer, makeSeqGuard, putPatchPixels, beginFrame, cssWidth, cssHeight, isTypingTarget, chunkToWorld } from "./viewportUtils";
+import { zoomAtPoint, resizeCanvasToContainer, makeSeqGuard, putPatchPixels, beginFrame, cssWidth, cssHeight, isTypingTarget, chunkToWorld, slabFetchWindow } from "./viewportUtils";
+
+/** Cap on the scan-buffer clone `render_selection_view` builds before rendering the ortho facade —
+ *  must match `MAX_PREVIEW_BYTES` in lib.rs. Estimated here so an oversize selection (e.g. ⌘A) never
+ *  pays for the doomed IPC call at all; it just shows the depth slab with an explanation instead. */
+const MAX_ORTHO_PREVIEW_BYTES = 128 * 1024 * 1024;
+
+/** Mirrors lib.rs's `render_selection_view` cost estimate (`n_sel * bands * 8192`, lib.rs:2972-2979):
+ *  number of 16×16 chunks the selection's X/Y footprint touches, times the number of 16-block Z bands
+ *  its Z range touches, times 8192 bytes/band/chunk. */
+function orthoPreviewBytes(sf: { xLo: number; yLo: number; xHi: number; yHi: number; zLo: number; zHi: number }): number {
+  const chunksX = Math.floor(sf.xHi / 16) - Math.floor(sf.xLo / 16) + 1;
+  const chunksY = Math.floor(sf.yHi / 16) - Math.floor(sf.yLo / 16) + 1;
+  const bands = Math.floor(sf.zHi / 16) - Math.floor(sf.zLo / 16) + 1;
+  return Math.max(0, chunksX) * Math.max(0, chunksY) * Math.max(0, bands) * 8192;
+}
 
 // Front slab = constant world-Y plane (horizontal axis = X, vertical = Z; row 0 = highest Z).
 // Side slab  = constant world-X plane (horizontal axis = Y, vertical = Z; row 0 = highest Z).
@@ -64,9 +79,13 @@ interface Props {
   /** Surface a one-off explanation to the user (App shows it as a toast). Used when ortho mode
    *  auto-enables and quietly takes painting away. */
   onNotice?: (msg: string) => void;
+  /** Surface a fetch/render failure (App toasts it via `reportError`, deduped there — both panes
+   *  failing identically shouldn't produce two toasts). Distinct from `onNotice`, which has a
+   *  one-shot latch that would swallow every failure after the first. */
+  onError?: (msg: string) => void;
 }
 
-export default function SliceViewport({ world, axis, editEpoch, lastEdit, onPaint, brush, tool, fill, depth, onDepthChange, crossH, crossV, selRange, selZ, selFull, extrudeCount = 0, extrudeAxis = "z+", isPaste = false, onZRangeChange, onHRangeChange, viewCapZ = null, selectMode = false, onSelect, onNotice }: Props) {
+export default function SliceViewport({ world, axis, editEpoch, lastEdit, onPaint, brush, tool, fill, depth, onDepthChange, crossH, crossV, selRange, selZ, selFull, extrudeCount = 0, extrudeAxis = "z+", isPaste = false, onZRangeChange, onHRangeChange, viewCapZ = null, selectMode = false, onSelect, onNotice, onError }: Props) {
   const worldW = chunkToWorld(world.width_chunks);
   const worldH = chunkToWorld(world.height_chunks);
   const maxZ = world.max_z;
@@ -89,17 +108,15 @@ export default function SliceViewport({ world, axis, editEpoch, lastEdit, onPain
   const winOriginRef = useRef(0);
 
   const selScoped = selRange != null;
-  const ctxCols = selRange ? Math.max(1, Math.round((selRange.hi - selRange.lo + 1) * 0.5)) : 0;
-  const fetchLo = selRange
-    ? Math.max(0, selRange.lo - ctxCols)
-    : Math.max(0, Math.min(planeW - freeWinW, winOrigin));
-  const fetchHi = selRange
-    ? Math.min(planeW - 1, selRange.hi + ctxCols)
-    : fetchLo + freeWinW - 1;
+  const { lo: fetchLo, hi: fetchHi } = slabFetchWindow({ planeW, selRange: selRange ?? null, winOrigin, maxWin: MAX_WIN });
   winOriginRef.current = fetchLo; // cellToWorld / crosshair are relative to the fetched origin
 
   const [localDepth, setLocalDepth] = useState(Math.floor(depthMax / 2));
-  const curDepth = depth ?? localDepth;
+  // Clamped, not raw: `depth` comes from App, which holds one crosshair position across world
+  // loads. Loading a smaller world would otherwise request a plane outside it — the backend
+  // rejects that ("Y must be 0–447, got 7518") and, before the failed-key guard below, the
+  // reconciler retried the doomed fetch on every render, spinning the CPU and the toast channel.
+  const curDepth = Math.max(0, Math.min(depthMax, depth ?? localDepth));
   const setDepth = useCallback((d: number) => {
     const c = Math.max(0, Math.min(depthMax, d));
     if (onDepthChange) onDepthChange(c); else setLocalDepth(c);
@@ -130,6 +147,10 @@ export default function SliceViewport({ world, axis, editEpoch, lastEdit, onPain
   const clipRef = useRef<HTMLCanvasElement | null>(null);  // offscreen clipboard ghost (paste preview)
   const edgeHoverRef = useRef<string | null>(null);  // "z-max"|"z-min"|"h-lo"|"h-hi" or null
   const [loading, setLoading] = useState(false);
+  // draw() reads loading through a ref (like onPaint/onNotice) so toggling it doesn't recreate the
+  // stable draw callback — draw isn't in loading's dep list, it's called imperatively everywhere.
+  const loadingRef = useRef(loading);
+  loadingRef.current = loading;
   const viewRef = useRef({ x: 0, y: 0, scale: 2 });
   const dragRef = useRef<{ sx: number; sy: number; vx: number; vy: number } | null>(null);
   const zDragRef = useRef<{ edge: "min" | "max"; startY: number; startZ: number; scale: number } | null>(null);
@@ -137,6 +158,10 @@ export default function SliceViewport({ world, axis, editEpoch, lastEdit, onPain
   const hDragRef = useRef<{ edge: "lo" | "hi" } | null>(null);
   const hPreviewRef = useRef<{ lo: number; hi: number } | null>(null);
   const fittedRef = useRef(false);
+  // D3 surface: the first error string from the most recent failed fetch (slab batch or ortho),
+  // and which of the two produced it (Retry needs to know whether to re-arm ortho).
+  const [paneError, setPaneError] = useState<string | null>(null);
+  const paneErrorSourceRef = useRef<"slab" | "ortho" | null>(null);
   // In-progress rect/ellipse drag in slab-cell space (col,row) — drives the live ghost.
   const shapeRef = useRef<{ start: WP; end: WP } | null>(null);
   // In-progress marquee-select drag in slab-cell space (col,row) — drives the blue selection ghost.
@@ -154,10 +179,16 @@ export default function SliceViewport({ world, axis, editEpoch, lastEdit, onPain
   const [orthoMode, setOrthoMode] = useState(false);
   const orthoModeRef = useRef(false);
   orthoModeRef.current = orthoMode;
+  // Desired identity of the slab's fetched content — the reconciler effect (below, near doFetch)
+  // fetches whenever this drifts from what's actually resident (slabKeyRef) or in flight
+  // (inFlightKeyRef). null in ortho mode, where the slab fetch is inert.
+  const desiredSlabKey = orthoMode ? null : `${axis}|${curDepth}|${fetchLo}|${fetchHi}`;
   // Kept in a ref so the auto-enable effect doesn't re-run (and re-toast) when App re-renders with
   // a fresh callback identity.
   const onNoticeRef = useRef(onNotice);
   onNoticeRef.current = onNotice;
+  const onErrorRef = useRef(onError);
+  onErrorRef.current = onError;
   // draw() reads the paint handler through a ref so a new callback identity from App doesn't
   // rebuild the whole draw closure.
   const onPaintRef = useRef(onPaint);
@@ -182,11 +213,21 @@ export default function SliceViewport({ world, axis, editEpoch, lastEdit, onPain
       setOrthoMode(false);
       orthoSlabRef.current = null; // free memory immediately
       hadSelFullRef.current = false;
+      fittedRef.current = false; // D6: the slab replaces the ortho facade, re-fit to it
       force(n => n + 1);
     } else if (!hadSelFullRef.current) {
       hadSelFullRef.current = true;
-      setOrthoMode(true);
-      if (onPaint) onNoticeRef.current?.("Ortho view turned on — the front/side panes now show the selection's facade, and painting in them is off. Toggle ORTHO off in the pane header to paint again.");
+      // 1.3: pre-empt the doomed IPC call instead of paying for it and failing (D2) — a selection
+      // this large always exceeds MAX_PREVIEW_BYTES on the backend.
+      const sf = selFullRef.current;
+      const bytes = sf ? orthoPreviewBytes(sf) : 0;
+      if (bytes > MAX_ORTHO_PREVIEW_BYTES) {
+        setPaneError(`Selection too large for the ortho facade (${Math.round(bytes / (1024 * 1024))} MB > ${MAX_ORTHO_PREVIEW_BYTES / (1024 * 1024)} MB) — showing the depth slab`);
+        paneErrorSourceRef.current = null; // nothing to retry — it's a static estimate, not a failed fetch
+      } else {
+        setOrthoMode(true);
+        if (onPaint) onNoticeRef.current?.("Ortho view turned on — the front/side panes now show the selection's facade, and painting in them is off. Toggle ORTHO off in the pane header to paint again.");
+      }
     }
   }, [hasSelFull, onPaint]);
 
@@ -198,13 +239,46 @@ export default function SliceViewport({ world, axis, editEpoch, lastEdit, onPain
   // Fetched in horizontal strips so wide windows render progressively and don't block the UI on a
   // single multi-megabyte IPC blob. A sequence token discards stale responses (view/edit races).
   const STRIP = 256;
+  const MAX_SLAB_CONCURRENT = 4; // ports MapCanvas's MAX_CONCURRENT idiom — bounds in-flight IPC
   const fetchSeq = useRef(makeSeqGuard());
+  // Key reconciler (1.1): `slabKeyRef` is the key of the content actually resident in `slabRef`
+  // (null = blank/unknown); `inFlightKeyRef` is the key currently being fetched. The reconciler
+  // effect below compares these against `desiredSlabKey` and fetches on drift — so ortho→slab,
+  // a cancelled batch, or any other state where the slab doesn't match what's wanted self-heals
+  // instead of relying on a single identity-driven effect that can never fire again after D1.
+  const slabKeyRef = useRef<string | null>(null);
+  const inFlightKeyRef = useRef<string | null>(null);
+  // Key of the last fetch that failed outright. The reconciler runs after *every* render and a
+  // total failure leaves nothing resident and nothing in flight, so without this a persistently
+  // failing request (bad depth plane, backend error) re-fires forever — one IPC round trip and one
+  // error toast per iteration, at full CPU. Any change to axis/depth/window mints a new key and
+  // retries naturally; Retry clears it explicitly.
+  const failedKeyRef = useRef<string | null>(null);
+  // Bounded strip-fetch concurrency (2.3): a shared queue/active-count pair, mirroring
+  // MapCanvas's `queueRef`/`activeRef`/`drainRef` idiom. `slabDrainRef` always points at the
+  // latest call's drain closure, so a strip completing from an older (superseded) doFetch call
+  // still drains whatever the newest call queued.
+  const slabActiveRef = useRef(0);
+  const slabQueueRef = useRef<Array<() => void>>([]);
+  const slabDrainRef = useRef<() => void>(() => {});
   const doFetch = useCallback(() => {
     if (orthoModeRef.current) return; // ortho mode handles its own fetch
     const seq = fetchSeq.current.next();
     const h0 = fetchLo, h1 = fetchHi;
+    const key = `${axis}|${curDepth}|${h0}|${h1}`;
+    inFlightKeyRef.current = key;
+    slabKeyRef.current = null; // the resize below (if any) destroys whatever was resident
     const totalW = h1 - h0 + 1;
     const height = (axis === "top" ? vMax : maxZ) + 1;
+    // 2.2: WKWebView is stricter than Chromium about zero-size drawImage source rects — bail
+    // before touching the canvas instead of tripping the ErrorBoundary mid-render.
+    if (totalW <= 0 || height <= 0) {
+      setPaneError("Nothing to fetch — empty range.");
+      paneErrorSourceRef.current = "slab";
+      failedKeyRef.current = key;
+      if (inFlightKeyRef.current === key) inFlightKeyRef.current = null;
+      return;
+    }
     let slab = slabRef.current;
     if (!slab) { slab = document.createElement("canvas"); slabRef.current = slab; }
     // Resizing clears the canvas; do it once up front. Re-fit only when the footprint changes
@@ -217,29 +291,82 @@ export default function SliceViewport({ world, axis, editEpoch, lastEdit, onPain
     // front: render_yslice_patch(y,x1,z1,x2,z2); side: render_xslice_patch(x,y1,z1,y2,z2);
     // top: render_zslice_patch(z,x1,y1,x2,y2)
     const cmd = axis === "front" ? "render_yslice_patch" : axis === "side" ? "render_xslice_patch" : "render_zslice_patch";
+
     let pending = 0;
-    const done = () => { if (--pending === 0 && !fetchSeq.current.isStale(seq)) setLoading(false); };
-    setLoading(true);
+    let stripCount = 0;
+    let failCount = 0;
+    let firstErr: string | null = null;
+    // 1.5: capture strip failures. Only a fully-failed batch surfaces a banner/toast — a partial
+    // failure leaves whatever data landed on screen and stays silent (matches the pre-existing
+    // progressive-fill behaviour for a batch that's still succeeding).
+    const done = () => {
+      if (--pending !== 0) return;
+      if (fetchSeq.current.isStale(seq)) {
+        if (inFlightKeyRef.current === key) inFlightKeyRef.current = null;
+        return; // superseded — neither resident nor in-flight anymore
+      }
+      setLoading(false);
+      if (inFlightKeyRef.current === key) inFlightKeyRef.current = null;
+      if (failCount > 0 && failCount === stripCount) {
+        const msg = firstErr ?? "Failed to load slab data.";
+        setPaneError(msg);
+        paneErrorSourceRef.current = "slab";
+        failedKeyRef.current = key;
+        onErrorRef.current?.(msg);
+      } else {
+        slabKeyRef.current = key;
+        failedKeyRef.current = null;
+        setPaneError(null);
+      }
+    };
+    const finishJob = () => {
+      slabActiveRef.current--;
+      slabDrainRef.current();
+      done();
+    };
+    const drain = () => {
+      while (slabActiveRef.current < MAX_SLAB_CONCURRENT && slabQueueRef.current.length > 0) {
+        const launch = slabQueueRef.current.shift()!;
+        slabActiveRef.current++;
+        launch();
+      }
+    };
+    slabDrainRef.current = drain;
+    slabQueueRef.current = []; // supersede any jobs still queued from a prior (now-stale) call
+
     for (let s = h0; s <= h1; s += STRIP) {
-      pending++;
       const e = Math.min(h1, s + STRIP - 1);
-      const args = axis === "front"
-        ? { y: curDepth, x1: s, z1: 0, x2: e, z2: maxZ }
-        : axis === "side"
-        ? { x: curDepth, y1: s, z1: 0, y2: e, z2: maxZ }
-        : { z: curDepth, x1: s, y1: 0, x2: e, y2: vMax };
       const dx = s - h0;
-      invoke<ArrayBuffer>(cmd, args)
-        .then((buf) => {
-          if (fetchSeq.current.isStale(seq)) { done(); return; } // superseded
-          putPatchPixels(sctx, decodePixelPatch(buf), dx, 0);
-          force((n) => n + 1);
-          done();
-        })
-        .catch(() => done());
+      stripCount++;
+      slabQueueRef.current.push(() => {
+        const args = axis === "front"
+          ? { y: curDepth, x1: s, z1: 0, x2: e, z2: maxZ }
+          : axis === "side"
+          ? { x: curDepth, y1: s, z1: 0, y2: e, z2: maxZ }
+          : { z: curDepth, x1: s, y1: 0, x2: e, y2: vMax };
+        invoke<ArrayBuffer>(cmd, args)
+          .then((buf) => {
+            if (fetchSeq.current.isStale(seq)) { finishJob(); return; } // superseded
+            putPatchPixels(sctx, decodePixelPatch(buf), dx, 0);
+            force((n) => n + 1);
+            finishJob();
+          })
+          .catch((e) => {
+            failCount++;
+            if (firstErr === null) firstErr = String(e);
+            finishJob();
+          });
+      });
     }
-    if (pending === 0) setLoading(false);
-  }, [axis, curDepth, fetchLo, fetchHi, vMax, maxZ]);
+    pending = stripCount;
+    if (pending === 0) {
+      setLoading(false);
+      if (inFlightKeyRef.current === key) inFlightKeyRef.current = null;
+      return;
+    }
+    setLoading(true);
+    drain();
+  }, [axis, curDepth, fetchLo, fetchHi, vMax, maxZ, orthoMode]);
 
   // Fetch the ortho projection of the current selection via render_selection_view.
   const orthoFetchSeq = useRef(makeSeqGuard());
@@ -248,6 +375,9 @@ export default function SliceViewport({ world, axis, editEpoch, lastEdit, onPain
     if (!sf || axis === "top") return;
     const seq = orthoFetchSeq.current.next();
     fetchSeq.current.next(); // cancel any in-flight slab strip fetches
+    // The cancelled strips above must not count as resident/in-flight for the 1.1 reconciler.
+    slabKeyRef.current = null;
+    inFlightKeyRef.current = null;
     setLoading(true);
     invoke<ArrayBuffer>("render_selection_view", {
       x1: sf.xLo, y1: sf.yLo, x2: sf.xHi, y2: sf.yHi,
@@ -264,12 +394,23 @@ export default function SliceViewport({ world, axis, editEpoch, lastEdit, onPain
       }
       putPatchPixels(c.getContext("2d")!, raw);
       setLoading(false);
+      setPaneError(null);
       force(n => n + 1);
-    }).catch(() => setLoading(false));
+    }).catch((e) => {
+      // 1.2: fall back to the slab instead of stranding a blank ortho facade forever (D2). No
+      // retry loop — `hadSelFullRef` (the auto-enable effect) stays true until the selection
+      // clears, so ortho won't re-arm itself for the same selection; the 1.1 reconciler then
+      // immediately fetches the slab since `orthoMode` just went false.
+      if (orthoFetchSeq.current.isStale(seq)) { setLoading(false); return; }
+      setLoading(false);
+      const msg = String(e);
+      setPaneError(msg);
+      paneErrorSourceRef.current = "ortho";
+      onErrorRef.current?.(msg);
+      fittedRef.current = false; // D6: re-fit to the slab that's about to replace this facade
+      setOrthoMode(false);
+    });
   }, [axis]); // selFull read via ref to avoid dep-cascade
-
-  // View-driven refetch (axis / depth / selection range / window scroll).
-  useEffect(() => { doFetch(); }, [doFetch]);
 
   // Ortho fetch: runs when ortho mode is on and the selection changes.
   useEffect(() => {
@@ -297,8 +438,25 @@ export default function SliceViewport({ world, axis, editEpoch, lastEdit, onPain
                     : true; // top: patch has no z extent → always refetch
       if (!touched) return;
     }
+    // One fetch call site (the 1.1 reconciler, below) — just mark nothing resident and let it fetch.
+    slabKeyRef.current = null;
+  }, [editEpoch, lastEdit, axis, curDepth, doOrthoFetch]);
+
+  // View-driven refetch (axis / depth / selection range / window scroll) — a key reconciler (1.1),
+  // not an identity-driven effect. Deliberately no dep array: it runs after every commit and costs
+  // one string compare, so ortho→slab transitions, a cancelled batch, or any other drift between
+  // "what's wanted" and "what's resident/in-flight" converges on its own instead of depending on a
+  // single callback identity that (per D1) can permanently stop firing.
+  // ⚠️ Declared *after* the effects above that null `slabKeyRef`/`inFlightKeyRef` as a side effect
+  // without their own state update (the edit-epoch effect's `touched` branch) — React runs effects
+  // in declaration order within a commit, and a ref mutation doesn't itself schedule a re-render, so
+  // if this ran first it would read the stale key and never get another chance to react.
+  useEffect(() => {
+    if (orthoMode || !desiredSlabKey) return;
+    if (slabKeyRef.current === desiredSlabKey || inFlightKeyRef.current === desiredSlabKey) return;
+    if (failedKeyRef.current === desiredSlabKey) return; // already failed — don't spin on it
     doFetch();
-  }, [editEpoch, lastEdit, axis, curDepth, doFetch, doOrthoFetch]);
+  });
 
   // Clipboard elevation ghost for paste preview (front/side image matching this slab's axis).
   useEffect(() => {
@@ -347,7 +505,17 @@ export default function SliceViewport({ world, axis, editEpoch, lastEdit, onPain
     // Choose which offscreen canvas to display.
     const isOrtho = orthoModeRef.current && orthoSlabRef.current != null && axis !== "top";
     const slab = isOrtho ? orthoSlabRef.current! : slabRef.current;
-    if (!slab) return;
+    // 1.6: no reachable state renders featureless background anymore — either the offscreen image
+    // is there and gets blitted below, or the pane says why not (with 1.4's banner giving the detail).
+    if (!slab || slab.width < 1 || slab.height < 1) {
+      ctx.font = "10px monospace";
+      ctx.fillStyle = "rgba(175,166,157,0.75)";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillText(loadingRef.current ? "Loading slab…" : "No slab data — press ⊡ or Retry", cw / 2, ch / 2);
+      ctx.textAlign = "left";
+      return;
+    }
 
     // In ortho mode, the image covers exactly selFull's horizontal extent; in slab mode it covers
     // the fetch window. Both crosshair and overlay coords are computed relative to the active origin.
@@ -370,10 +538,14 @@ export default function SliceViewport({ world, axis, editEpoch, lastEdit, onPain
     if (effSel) {
       const a = effSel.lo - winOriginRef.current;       // slab col of selection start
       const b = effSel.hi - winOriginRef.current + 1;   // slab col just past selection end
+      // 2.1: the fetch window can now be capped (and re-centred) independently of `effSel`'s own
+      // extent, so a/b may fall outside [0, slab.width] — clamp before using them as rect geometry.
+      const aClamped = Math.max(0, Math.min(slab.width, a));
+      const bClamped = Math.max(0, Math.min(slab.width, b));
       const slabBottom = y + slab.height * scale;
       ctx.fillStyle = "rgba(24,15,8,0.6)";
-      if (a > 0) ctx.fillRect(x, y, a * scale, slab.height * scale);                       // left context
-      if (b < slab.width) ctx.fillRect(x + b * scale, y, (slab.width - b) * scale, slab.height * scale); // right context
+      if (aClamped > 0) ctx.fillRect(x, y, aClamped * scale, slab.height * scale);                       // left context
+      if (bClamped < slab.width) ctx.fillRect(x + bClamped * scale, y, (slab.width - bClamped) * scale, slab.height * scale); // right context
       ctx.strokeStyle = "rgba(175,166,157,0.65)";
       ctx.lineWidth = 1;
       for (const c of [a, b]) {
@@ -872,6 +1044,9 @@ export default function SliceViewport({ world, axis, editEpoch, lastEdit, onPain
   }, [draw]);
 
   const label = axis === "front" ? `Front  (Y=${shownDepth})` : axis === "side" ? `Side  (X=${shownDepth})` : `Top  (Z=${shownDepth})`;
+  const orthoBytes = selFull ? orthoPreviewBytes(selFull) : 0;
+  const orthoOverCap = orthoBytes > MAX_ORTHO_PREVIEW_BYTES;
+  const orthoMbLabel = `${Math.round(orthoBytes / (1024 * 1024))} MB > ${MAX_ORTHO_PREVIEW_BYTES / (1024 * 1024)} MB`;
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%", background: "#0a0f1e", color: "#dad6d2", userSelect: "none", WebkitUserSelect: "none" }}>
@@ -895,8 +1070,21 @@ export default function SliceViewport({ world, axis, editEpoch, lastEdit, onPain
         />
         {selFull && axis !== "top" && (
           <button
-            onClick={() => setOrthoMode(m => !m)}
-            title={orthoMode ? "Ortho view is ON — showing the selection's facade. Toggle off for the slab view, where you can paint." : "Slab view — click to turn ortho view on (shows the selection's facade; painting is off)"}
+            onClick={() => {
+              // 1.3: pre-empt the doomed IPC call — this selection would always fail server-side.
+              if (!orthoMode && orthoOverCap) {
+                setPaneError(`Selection too large for the ortho facade (${orthoMbLabel}) — showing the depth slab`);
+                paneErrorSourceRef.current = null;
+                return;
+              }
+              fittedRef.current = false; // D6: re-fit to whichever image becomes active
+              setOrthoMode(m => !m);
+            }}
+            title={orthoMode
+              ? "Ortho view is ON — showing the selection's facade. Toggle off for the slab view, where you can paint."
+              : orthoOverCap
+              ? `Selection too large for ortho (${orthoMbLabel}) — click shows why and stays on the depth slab`
+              : "Slab view — click to turn ortho view on (shows the selection's facade; painting is off)"}
             style={orthoMode
               ? chromeButtonAccent("99,102,241", "#818cf8", {
                   color: "#a5b4fc", padding: "1px 7px",
@@ -918,6 +1106,22 @@ export default function SliceViewport({ world, axis, editEpoch, lastEdit, onPain
       </div>
       {loading && (
         <div style={{ height: 2, background: "#f59e0b", flexShrink: 0 }} />
+      )}
+      {paneError && (
+        <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "2px 8px", fontSize: 10, background: "rgba(239,68,68,0.16)", color: "#fca5a5", borderBottom: "1px solid rgba(239,68,68,0.35)", flexShrink: 0 }}>
+          <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={paneError}>{paneError}</span>
+          <button
+            onClick={() => {
+              const src = paneErrorSourceRef.current;
+              setPaneError(null);
+              paneErrorSourceRef.current = null;
+              slabKeyRef.current = null; // let the 1.1 reconciler re-fetch the slab
+              failedKeyRef.current = null; // an explicit Retry re-arms the failed key
+              if (src === "ortho") doOrthoFetch();
+            }}
+            style={chromeButton({ color: "#fca5a5", padding: "0px 6px", fontSize: 10, flexShrink: 0 })}
+          >Retry</button>
+        </div>
       )}
       <canvas
         ref={canvasRef}

@@ -31,31 +31,99 @@ before parsing.
 
 ### `version` and the two chunk formats
 
-`version` selects the chunk layout. The values observed in the wild:
+`version` is a hint, not authority — **`version` alone no longer determines the
+chunk format** (see the "updated game" discovery below). The values observed in
+the wild:
 
 - **`version >= 5`** → **256z "New Dawn"** format (versions 5 and 6 seen in the
-  wild). 131,072 bytes/chunk.
-- **`version <= 4`** → **64z legacy** format (Eden 2.1 and older; version 2 is
-  also legacy). 32,768 bytes/chunk.
+  wild), **authoritative**. 131,072 bytes/chunk.
+- **`version <= 4`** → *usually* **64z legacy** format (Eden 2.1 and older).
+  32,768 bytes/chunk. **But not always** — see below.
 
 `version` out of the range `1..=1000` triggers legacy block-ID conversion.
 
 When **writing**, `write_world_file` picks the version from `chunk_size`
 (`>= 131072` → 5, else 4). Getting the version wrong causes misaligned reads.
 
+⚠️ **A 2026-08 game update writes `version = 2` on 256z-sized (16-band) worlds.**
+`TEST WORLDS/newblocks/` is one such world: header `version` = 2, but its chunks
+are unambiguously 131,072 B (`header.home.z` = 246, impossible in a 64-tall
+world; see "The creature-gap chunk-size detector" below for the arithmetic that
+proves it). A `version <= 4` file can therefore be either a genuinely old 64z
+world *or* one written by the updated game — the byte itself can't tell them
+apart, only the chunk-size detector can. This is also the marker for the new
+block types (112–127, see [03-blocks-and-colors.md](03-blocks-and-colors.md))
+and the sidecar sign format (below): a 256z-sized world with a non-`5`/`6`
+version is classified `NewFormat256z` (vs. `NewDawn256z` for version 5/6, and
+`Legacy64z` for a genuinely 32,768-byte-chunk world).
+
 ### Format detection when parsing
 
 ```
-version >= 5                    → 256z (131072 B/chunk, 16 bands)
-version <= 4                    → 64z  (32768 B/chunk, 4 bands)
-version out of range / ambiguous→ fall back to the min-offset-gap heuristic
+version >= 5                          → 256z (131072 B/chunk, 16 bands), authoritative
+version <= 4 (0, 2, 4, …)             → creature-gap detector (below), then min-offset-gap fallback
 ```
 
-The heuristic: a valid 256z file never has two chunk data blocks closer than
-131,072 bytes apart, so `min_gap >= 131072 → 256z, else 64z`. (See `lib.rs`
-around the `chunk_size = if version >= 5 { 131072 } …` block.)
+The **creature-gap detector** runs first for any non-`>=5` version and is what
+correctly resolves the updated-game case above (min-gap cannot: a world with
+only one saved chunk has no gap to measure). It exploits a structure the game
+always reserves directly before the real directory — see the next section.
+Only when the creature-gap test is ambiguous (neither or both chunk sizes
+produce a valid gap) does detection fall back to the old **min-offset-gap
+heuristic**: a valid 256z file never has two chunk data blocks closer than
+131,072 bytes apart, so `min_gap >= 131072 → 256z, else 64z`. (See
+`detect_chunk_size_by_creature_gap` and the `chunk_size = if version >= 5 …`
+block in `lib.rs`.)
 
 `num_bands = chunk_size / 8192` → **4** bands (64z) or **16** bands (256z).
+
+### The creature-gap chunk-size detector
+
+Both 64z and 256z worlds reserve a **400-slot × 60-byte `EntityData` creature
+block** (24,000 bytes total) directly before the chunk directory — this is
+`FileManager::deriveColumnSpans`'s reserved region in the game's own source
+(`~/emod/Classes/FileManager.mm:634-666`), not slack. For a candidate
+`chunk_size`, define:
+
+```
+gap = directory_offset − (max_chunk_data_offset + chunk_size)
+```
+
+`gap` is **valid** iff it is `0` (no creature block at all — true of every
+VuencEdit-written world, which doesn't emit one) or a whole number of 60-byte
+slots, `0 < gap ≤ 24000`. Trying `chunk_size ∈ {131072, 32768}` (256z checked
+first) and taking the size for which the gap is valid — when exactly one of the
+two is — identifies the real chunk size independent of `version` and even for a
+**single-chunk** world, which the min-gap heuristic structurally cannot handle
+(it needs ≥2 chunks to measure a gap at all). Verified unique against every
+world sampled during this format's investigation, including both `quarry.eden`
+(version 5, 30,299 chunks) and the updated-game `newblocks` world (version 2, 3
+chunks).
+
+`load_eden_template`'s directory decode uses the same coordinate gate (below)
+but never runs this detector — the bundled `Eden.eden` template is always
+131,072-byte 256z chunks by construction.
+
+**Reading the creature block itself, and preserving it on rewrite (fixed
+2026-08-18).** `creature_block_range(world) -> (start, end)` (lib.rs) recovers
+the *actual* reserved gap for the currently-loaded world — `start` is the end
+of the highest-offset real chunk, `end` is `directory_offset` read fresh from
+the header — rather than assuming a fixed slot count. `get_creatures` used to
+hardcode `BLOCK_SIZE = 200 slots × 60 B = 12,000 B` regardless of what the world
+actually had, which silently read the **wrong half** of a 256z world's real
+400-slot/24,000-byte block (it would read the block's second half as if it were
+the whole thing, since `dir_off - 12000` lands 12,000 bytes short of the block's
+true start). It now reads exactly `[start, end)`, capped at 400 slots. The two
+*rebuilding* writers (`expand_world_from_template`, `materialize_flat_chunks_inner`)
+previously dropped this region entirely — they wrote real/generated chunks
+directly followed by the directory, with no gap — silently discarding whatever
+the game had reserved there on any world that had one. Both now capture
+`creature_block_range`'s bytes under the same read lock as `dir_trailer` and
+re-emit them verbatim, in the same position (directly before the directory),
+mirroring the `dir_trailer` re-emission on the other side of it. Tests:
+`test_creature_block_range_detects_reserved_gap`,
+`test_creature_block_range_empty_when_no_gap`,
+`test_materialize_preserves_creature_block`.
 
 ## Chunk pointer table (directory)
 
@@ -104,6 +172,74 @@ writers (`write_world_file`, `expand_world_from_template`) go through.
 > build; the shipped 256z binary is closed-source and shares the identical 16-byte
 > entry layout, so the evidence transfers as strong but indirect. A >4 GiB
 > expand-then-load-in-game test would be the direct proof.
+
+### The chunk-coordinate gate, and the post-directory sign trailer
+
+The game keys its in-memory chunk directory by `twoToOne(x,z) = (x<<15)|z`
+(`~/emod/Classes/Util.mm:1053`), which returns its "invalid/corrupt, skip"
+sentinel `0` for any `(x,z)` outside `0..1<<15` — so a directory row naming a
+coordinate outside that range is unreachable in-game no matter what the file
+claims. `is_chunk_coord` (`lib.rs`) enforces the same range on the read path;
+chunk `(0,0)` is deliberately kept even though `twoToOne` also maps it to 0,
+since every generated world and every test fixture actually sits there.
+
+**Why this matters beyond correctness:** the game itself relies on this gate to
+skip a **signs section it appends inside the chunk-directory region** rather
+than as a true sidecar. Every row of that section is tagged `x = 0xffffffff`
+(−1 as i32), which fails the coordinate gate and is silently skipped by the
+game's own `FileManager::readDirectory` (`~/emod/Classes/FileManager.mm:556`,
+which reads to EOF and drops any row whose `twoToOne` key is 0). Before this
+gate existed, VuencEdit had **no** coordinate validation (`lib.rs`'s only check
+was `off + chunk_size <= bytes.len()`), so these tag rows were parsed as real
+chunks at wild coordinates like `(-1, 1953719668)` — the exact cause of the
+`quarry.eden` load bug (garbage `w_chunks`/`h_chunks`, blank 2D views, a 3D-pane
+crash from an unbuildable `GridHelper`). The tag-row structure, stripped of its
+`ff ff ff ff` prefix:
+
+```
+"SGN1" | u32 payload_len   — wrapper row (payload_len = 12 × following row count)
+i32 x, i32 y, i32 z        — sign world position   ┐
+i32 a, i32 b, i32 c        — unknown (see below)    │ one 120-byte sign record
+char text[96]              — NUL-padded ASCII       ┘ per every 10 tag rows
+… more sign records, then zero-padding rows to fill out the directory slot
+```
+
+This is **byte-for-byte the same record layout as the sidecar sign file** (see
+`signs_<world>.eden.dat` below) — a reader needs one record parser for both.
+
+**Parsing.** `parse_world_inner`'s "Pass A½" runs after decoding every raw
+directory row and before chunk-size detection (the tag rows manufacture a
+60-byte offset gap that would otherwise poison a `version <= 4` file's min-gap
+fallback — irrelevant to quarry, since its own `version` is 5, but exactly the
+trap a `NewFormat256z` world could fall into). It finds the last row that
+passes the coordinate gate via `rposition`, treats everything from there to the
+end of the raw entries as a **trailer**, captures it verbatim (capped at 64
+KiB — a multiple of 16 so it never splits a slot) into `LoadedWorld.dir_trailer`,
+and drops any row that fails the gate *interior* to the real entries (never
+captured — re-emitting interior garbage into a rebuilt file could feed a real
+`SGN1` parser something it shouldn't see). A directory row must also start at
+`off >= 192` (never inside the 192-byte header) in both the main decode and the
+min-gap fallback's offset filter.
+
+**Round-tripping.** `save_world_inner` writes `world.bytes` verbatim, so an
+ordinary save/incremental-save preserves the trailer automatically — nothing to
+do there. The two *rebuilding* writers (`expand_world_from_template`,
+`materialize_flat_chunks_inner`) do have to re-emit it explicitly, immediately
+after the real directory entries, since they reconstruct the directory region
+from scratch; both now take the world's captured `dir_trailer` and write it
+back byte-for-byte. Sign records hold world block coordinates, never file
+offsets, so relocating chunks during a rebuild never invalidates them.
+`materialize_flat_chunks`'s coordinate parameter is validated with the same
+`is_chunk_coord` gate before it can write an unaddressable chunk into a new
+file.
+
+**Known limitation:** an all-zero padding row *inside* a trailer would itself
+pass the coordinate gate as `(0,0)` and get dropped by the interior-rejection
+path instead of captured as part of the trailer. Not observed in the wild —
+every real trailer row seen so far is `ff ff ff ff`-prefixed — and widening the
+predicate to "not admitted to the chunk map" would turn two legitimate
+EOF-rejection cases into false-positive trailers, so this is left as a known
+edge rather than "fixed" further.
 
 ### Per-chunk spans — a chunk is not always `chunk_size` long
 
@@ -171,8 +307,77 @@ which is *different* — see below.
 24–27 Stone Ramp (S/W/N/E)   28–31 Wood Ramp   32–35 Shingle Ramp   36–39 Ice Ramp
 40–55 Wedges (4 families × 4 apex dirs)      56 Shingles   57 NeonSquare  58 Glass
 59–61 Water ¾/½/¼            72 Lamp (lightbox)            73 NewFlower
-82–110 Expansion pack
+82–110 Expansion pack   112–127 New-format blocks (see below)
 ```
+
+## Sign records and per-world sidecar files (updated-game format)
+
+A 2026-08 game update writes new-format worlds with signs stored in a **true
+sidecar file** rather than the inline post-directory trailer described above —
+`signs_<worldfile>.eden.dat` next to the `.eden` (⚠️ the game's naming is a
+**prefix on the full file name including the extension**, e.g. `foo.eden` →
+`signs_foo.eden.dat` — not a suffix/stem-swap, so the established
+`wal_path`-style `OsString`-append idiom used elsewhere in this codebase does
+not transfer to it). Layout:
+
+```
+"SGN1" | u32 version | u32 count | count × 120-byte record
+```
+
+Each record (same layout as the inline trailer's stripped rows, see above):
+
+```
+i32 x, i32 y, i32 z      world block coordinates
+i32 a, i32 b, i32 c      unknown — see below
+char text[96]            NUL-padded ASCII
+```
+
+`c ∈ {0,1,3}` is plausibly a facing, `a ∈ {3,4}` a face/kind, `b ∈ {2,17}` a
+style — **unconfirmed**. Of four specimen signs collected alongside the
+`newblocks` world, only one sits on a new-format block (type 121); the other
+three sit on ordinary grass (type 8), so the position↔block relationship isn't
+determined and neither is the meaning of `a`/`b`/`c`. A controlled specimen —
+place signs one at a time on known blocks in known facings, save, diff — would
+settle it.
+
+Two more per-world companion files exist, both currently undocumented/unparsed
+by design: `spacemap3_<worldfile>.eden.raw` (1,048,576 B, a 512×512×4 map-cache
+image, cheap to regenerate — not user data) and `achievements.dat` (folder-global,
+not per-world, unrelated to any single `.eden`).
+
+**Status (Phase 4, landed 2026-08-18): signs are read and displayed, read-only.**
+`src-tauri/src/signs.rs` — `parse_signs` (sidecar format) and `parse_inline_signs`
+(strips the trailer's `ff ff ff ff` tags and its own outer `"SGN1"+length` wrapper
+row, then delegates to `parse_signs`) are the one shared record parser for both
+sources. `load_world` populates `WorldState.signs` once per load: sidecar
+preferred if it exists beside the *source* path (never the staged temp — the
+sidecar travels with the user's file, not the private working copy), else the
+inline trailer. A missing/foreign/corrupt sidecar never fails the load, it just
+means no signs. `get_signs` (Rust) converts each sign's raw `x`/`y` into
+editor-local coordinates the same way `read_spawn`/`read_player_pos` do (`z` is
+already an absolute height, no origin offset) and returns `facing` (`c`, still
+just a hypothesis). Frontend: `MapCanvas.tsx` draws each sign as a small diamond
+marker at its editor-local position; the Sidebar's Inspector tab lists sign text
++ position + facing via a `SignsList` component, shown only when the world
+actually has signs. Both are read-only — nothing writes a sign, and `a`/`b`
+still aren't surfaced anywhere, only kept on the parsed `Sign` struct for future
+use.
+
+Two more per-world companion files exist, both still currently undocumented/unparsed
+by design (not signs, so out of scope for Phase 4): `spacemap3_<worldfile>.eden.raw`
+(1,048,576 B, a 512×512×4 map-cache image, cheap to regenerate — not user data)
+and `achievements.dat` (folder-global, not per-world, unrelated to any single
+`.eden`).
+
+⚠️ **Sidecar travel-with-world (download/upload/Save As/backups) is still not
+implemented — Phase 5, not started, re-scoped and deliberately paused.** A live
+network capture (`DOCUMENTATION/10-features.md`'s Part C) found the real desktop
+client's own upload never sends a sidecar at all — signs travelled anyway because
+they were already inline in the `.eden` bytes being uploaded. Whether Phase 5 is
+needed at all (vs. local-copy hygiene only) is an open scope question the plan
+flags for a human + Opus co-decision, not started here. All sidecar I/O happens
+in Rust regardless: `src-tauri/capabilities/default.json` grants the frontend no
+`fs` plugin access, so the frontend cannot stat or read these files itself.
 
 ## World staging & atomic saves
 
@@ -267,8 +472,8 @@ absolute offset without re-deriving anything.
 **Dirty tracking (`WorldState.dirty: DirtyState`).** Four hook sites cover every
 byte-mutating path: `with_edit_inner` marks the chunks `diff_chunk` actually
 changed; `undo_edit_inner`/`redo_edit_inner` mark `entry.chunks`; `set_spawn_pos`/
-`rename_world`/`set_sky_grid` mark the header (they write bytes 0..192 directly,
-bypassing `with_edit`); `load_world`/`close_world` clear everything. `since_disk`
+`set_player_pos`/`rename_world`/`set_sky_grid` mark the header (they write bytes
+0..192 directly, bypassing `with_edit`); `load_world`/`close_world` clear everything. `since_disk`
 (chunks changed since `disk_image.path` was last fully known-good) is what
 `try_incremental_save` reads. A `u64 seq`, bumped by every mark and by
 `clear_all`, guards the read-guard/write-guard gap described below — see the

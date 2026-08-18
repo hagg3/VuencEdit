@@ -288,6 +288,11 @@ Not vertical sky-occlusion — a real directional sun:
   chunk radii, via `radiusToPos`/`posToRadius` (FlyView3D.tsx ~95): one notch per chunk
   up to 16, then one notch per **two** chunks to 32. So the cheap low range gets full
   per-chunk resolution while the expensive top half doesn't eat half the track.
+  **M1:** `RD_MIN`/`MAX_RENDER_DISTANCE` are `export`ed from FlyView3D.tsx and imported
+  by the ribbon 3D tab's slider and SettingsModal's — the three used to disagree
+  (1–16 / 2–32 / 2–32), so the ribbon slider could push `loadRadius` to 1 (below this
+  pane's own floor, breaking `radiusToPos`) and couldn't reach 17–32, silently
+  clamping a value Settings had just set the next time it was touched.
 - **Hard resident-geometry byte cap (all three streams + in-flight fetches)**,
   `geometryBudgetBytes` prop (default `GEOMETRY_BUDGET_BYTES = 512 MB`, the "Balanced"
   memory-budget preset — App.tsx wires it from
@@ -446,6 +451,21 @@ hard snap back toward it.
 **App-level interaction:** App's global keydown gates on `flyActiveRef` so WASD
 doesn't fire editor shortcuts while flying, but lets ⌘-combos through.
 
+### Discoverability (M4)
+
+The pane used to require finding two nested toggles (Quad View, then 3D Pane) before
+it appeared at all. ViewTab's **3D Pane** button now implies Quad View: clicking it
+on calls `setShowSlicePanels(true)` (if not already on) alongside
+`setEnable3dPane(true)`; turning it back off leaves Quad View as-is, since
+Top/Front/Side may still be in use independently. Once open, the control reference
+lives behind the "?" legend button (bottom-right) — enlarged from a 14px circle to a
+24px hit target (the glyph itself stays visually small) — and now **auto-opens the
+first time the pane component ever mounts**, gated on a `localStorage` flag
+(`eden_3dpane_legend_seen`). This works because FlyView3D mounts once per session and
+is suspended/resumed thereafter rather than remounted (see "suspend-don't-unmount"
+above), so "first mount" is exactly "first time the pane is used" — no separate
+gesture-tracking needed.
+
 ## Voxel picking (`pick_block`)
 
 `pick_block(ox,oy,oz, dx,dy,dz, maxDist)` marches `dda_march` from a ray **in Eden
@@ -459,26 +479,156 @@ and doesn't need the chunk streamed in.
 - **Hover highlight:** one reused `LineSegments(EdgesGeometry(BoxGeometry))`,
   repicked at ~30 Hz. Previews the cell a left-click acts on: build → placement
   cell `hit + normal` (green); select → the hit voxel (blue).
-- **Build controls:** **left-click breaks**, **right-click (contextmenu) places**
-  at `hit + normal` (matches vanilla Minecraft L-break/R-place; place uses
-  `contextmenu` to avoid button-2 unreliability). Edits go through `paint_blocks`
-  → `with_edit`, so undo/redo + chunk-mesh reload are free.
-- **Hold-to-repeat break/place:** holding the button past `BUILD_REPEAT_DELAY_MS`
-  arms a `setInterval` (`BUILD_REPEAT_MS`) that re-picks and re-fires each tick,
-  cancelling itself once the pointer drifts past click-slop (→ an orbit-drag took
-  over) or the tool leaves build mode. `onPickDown` calls `stopBuildRepeat()`
-  **before** arming — idempotent re-arm, so a missed release (pointer released
-  off-canvas, focus loss) can never leave a stale interval running underneath a new
-  one. Belt-and-suspenders: `canvas.setPointerCapture(e.pointerId)` on build-down
-  guarantees the matching `pointerup` lands on this canvas even if released
-  elsewhere, and a `pointercancel` listener (webview-issued, e.g. an OS gesture)
-  also calls `stopBuildRepeat()`.
+- **Two reaches, not one** (H5). `PICK_DIST = 256` serves the *informational* picks
+  — select-mode hover/clicks, the eyedropper, flood-fill seeds. Build mode instead
+  picks at **`buildReach`** (`AppSettings.buildReach`, default 64, Settings ▸ 3D,
+  slider 8–256, clamped to `PICK_DIST` in the pane). Build **hover uses the same
+  reach as the build click**, so past the cap the pick simply misses, the green box
+  disappears, and the click no-ops — the refusal is visible rather than silent, and
+  the outline can never promise an edit the click would refuse. This exists because
+  a 250-block edit lands where the 1-block outline is already sub-pixel.
 - **3D two-click selection:** two picked voxels reduce to `rawBounds` + zMin/zMax
   (a full 3D box), lighting up copy/paste/fill/extrude/gradient/prefab and the slab
   viewports. App owns the state machine (`pick3dFirst`, amber ghost, Escape).
-- **Mode ownership:** `interact3d` derives from `mode3d` (`off|select|build`),
-  owned by the contextual **3D ribbon tab** — *not* the map's Draw/Select tools.
-  3D build has its own armed block (`build3dBlock`/`build3dPaint`).
+- **Mode ownership:** `interact3d` derives from `mode3d`
+  (`off|select|build|sculpt|floodfill`), owned by the contextual **3D ribbon tab** —
+  *not* the map's Draw/Select tools. 3D build has **no armed block of its own**: it
+  places App's shared `fillBlockType`/`fillPaint`, the same pair the 2D Draw tools
+  and every palette surface use, which is why the in-pane hotbar and the ribbon
+  palette stay in lock-step for free.
+
+### Build input model (Minecraft-style drag-sweep, H4)
+
+**Left = break, right = place** at `hit + normal`, both as *sweeps*: press, drag
+across a surface, get a line of blocks along it. Right-click places through
+`contextmenu`, not a button-2 pointer event (button 2 is unreliable in macOS
+WKWebView — MapCanvas hit the same). Edits go through `paint_blocks` →
+`with_edit`, so undo/redo + chunk-mesh reload are free.
+
+**Build mode owns both drags.** The mode effect calls
+`setOrbitLeftEnabled(interact3d !== "sculpt" && interact3d !== "build")` **and**
+`setOrbitBuildMode(interact3d === "build")` (order matters — the latter resets the
+Alt override). `setOrbitBuildMode` nulls OrbitControls' RIGHT and remaps MIDDLE to
+ROTATE. So in build mode the camera is: **middle-drag** orbits, **Alt+left** orbits,
+**Alt+right** pans, wheel zooms. Middle *click* is still the eyedropper —
+`onPickUp`'s `isClick` slop test separates click from drag. Both mappings are also
+seeded at scene-init from `interact3dRef`, because the scene effect re-runs on a
+world-size change while `interact3d` may already be build/sculpt and the mode effect
+(dependency unchanged) will not re-fire.
+
+Taking RIGHT away is also what makes **C2** — a right-drag *pan* ending in a stray
+placed block — structurally impossible rather than merely slop-guarded. The
+`withinClickSlop` test in `onPickContext` stays anyway: a right-drag is now a
+place-*sweep*, whose stamps come from the tick, so a release far from the press must
+not add one more block at the release point.
+
+**Two things drive stamps** out of a live gesture (`buildRepeatButton >= 0`):
+
+- **`pointermove`** — the sweep. Pre-H4 a drift past `CLICK_SLOP_PX` *cancelled* the
+  hold, because OrbitControls owned left-drag and had to be allowed to take over;
+  with nothing left to yield to, that slop-kill is gone and every move is a stamp
+  attempt instead. `buildRepeatBusy` (set *before* the `await pick`) collapses the
+  60–120 Hz move stream to exactly one pick+edit in flight.
+- **the interval** (`BUILD_REPEAT_DELAY_MS` → `BUILD_REPEAT_MS`) — the stationary
+  airbrush fallback. It earns its keep in fly/look mode, where the pointer never
+  moves but WASD/mouselook still re-aims the crosshair. Its delay stays longer than
+  `CLICK_SLOP_MS` so a quick click resolves through the click path instead of racing
+  it; `buildRepeatFired` then suppresses the click path in `onPickUp`/`onPickContext`
+  whenever a stamp already ran for that press.
+
+**Three things bound a gesture**, and they are why a hold can no longer run away:
+
+- **`buildRepeatCells`** — every cell edited *this gesture*, not just the previous
+  one. Each edit changes the world, so the next pick along the same ray returns a
+  new cell one step nearer (place) / further (break); a previous-cell-only dedupe is
+  what used to march a tower into the camera's face at ~4.5 blocks/sec. A swept path
+  never revisits a cell, so the set costs a sweep nothing.
+- **the placement-plane lock** (`buildRepeatPlane`, `"nx,ny,nz@offset"`) — the first
+  stamp fixes both the face *orientation* and the acted cell's coordinate along that
+  normal's axis; every later stamp must match. Orientation alone would not do:
+  sweeping a flat field from above, the ray dips into the hole you just made and hits
+  the next block down through its newly-exposed *top* face — same normal, one layer
+  deeper. The offset is what keeps a break-sweep peeling exactly one surface layer
+  and a place-sweep laying exactly one; the normal is what keeps either from wrapping
+  around a corner onto the adjoining face.
+- **the aim-change gate** — the tick returns *before issuing a pick* when neither the
+  cursor nor the camera pose has moved since the last one. An unchanged aim cannot
+  resolve to a new cell, so this is what stops a stationary hold from spinning IPC
+  (and the world mutex behind it). It replaced `BUILD_REPEAT_IDLE_TICKS`, which
+  parked the hold after 3 no-op ticks — right for the old model, but it would now
+  kill a sweep that merely paused. `BUILD_GESTURE_MAX_MS` (20 s) is the remaining
+  hard bound, for a hold whose `pointerup` the webview never delivers at all.
+
+**Disarm paths**, all calling `endBuildGesture()` (H1's wrapper around
+`stopBuildRepeat()` — see "Undo grouping" below; it bumps `buildRepeatGen`, so a
+tick already parked on `await pick(...)` drops its edit instead of landing it one
+block after you let go): `onPickDown` **before** arming (idempotent re-arm, so a
+missed release can't leave a stale interval under a new one), `onPickUp`,
+`pointercancel`, `setSuspended(true)`, `onBlur`, a mode change out of build
+(`clearHighlight`), and `onPickContext` — the last one **only when the press is
+outside the click-slop window**, because platforms disagree on whether `contextmenu`
+fires at press or release time and an unconditional stop would cancel every
+right-hold on a fire-at-press platform. H4 does not make that conditional gating
+moot: the disagreement is about event timing, which an input-model change doesn't
+touch. Belt-and-suspenders: `canvas.setPointerCapture(e.pointerId)` on build-down
+guarantees the matching `pointerup` lands on this canvas even if released elsewhere.
+
+### Undo grouping, hover-pick reuse, and highlight freshness (H1–H3)
+
+**H1 — one undo entry per gesture, not per stamp.** `paint_blocks` (lib.rs) takes an
+optional `group: Option<u64>` and routes through `with_edit_grouped` instead of
+`with_edit` — identical machinery to sculpt strokes (`count_undo_groups` already
+collapses contiguous same-group entries, so the History tab and undo/redo depth
+badges pick this up for free). FlyView3D mints one id per build gesture
+(`buildGestureGroup = ++sculptGroupSeq`, shared counter with sculpt so the two
+families' ids never collide) in `onPickDown`'s arm branch — which runs for every
+build press regardless of whether it resolves as a plain click or a sweep, so both
+paths tag their stamps with the same id. `onPickBreak`/`onPickPlace` gained a
+trailing optional `group` param carrying it through to App's
+`handlePick3dBreak`/`handlePick3dPlace` → `paint_blocks`. A grouped stamp's
+`applyEditResult` call passes `{ silent: true }`, suppressing its own toast; a new
+`onBuildGestureEnd(mode, count)` callback fires once when the gesture truly ends
+(wrapped as `endBuildGesture()`, replacing the disarm paths' old bare
+`stopBuildRepeat()` calls) and App shows one summary toast ("Placed 14 blocks").
+A plain click that never reaches `buildRepeatTick` (short press, no sweep tick
+fired) reports its own one-block gesture directly at its call site in
+`onPickUp`/`onPickContext`, since by the time execution reaches that point
+`endBuildGesture()` already ran higher up the same handler and found an empty
+`buildRepeatCells` (nothing to summarize there).
+
+**H2 — the Axo-mode full-world refetch is debounced.** `applyEditResult` (App.tsx)
+used to call `refetchRegion` over the *entire* world on every single edit while in
+Axo render mode (flat patch coordinates don't map to axo pixel positions, so a
+partial patch can't be applied directly) — fine for a deliberate 2D edit, pathological
+once a build gesture is dispatching an edit every ~220ms. It's now a trailing
+~250ms debounce (`AXO_REFETCH_DEBOUNCE_MS`, `axoRefetchTimerRef`): a burst collapses
+to one full re-render after it quiets down, whether the burst came from a 3D build
+sweep or rapid 2D edits.
+
+**H3 — the placement outline can no longer show a stale pre-edit target.** The
+green/blue box used to refresh only on real pointer movement (`onPickMove`) or, in
+fly mode, the render loop — so in **orbit** mode a stationary click left the box
+showing the target *before* the edit until the mouse jiggled. `sceneApi` gained
+`refreshHighlight()` (resets `lastPickT` to 0, bypassing the hover throttle, then
+re-picks), called from the `editEpoch` effect — which already fires after every
+edit regardless of origin (2D or 3D), so this one call site covers all of them.
+
+**M2 — a click reuses the hover pick that drove the outline** instead of re-picking
+from scratch. `refreshHighlight`'s pick is cached (`lastHoverPick` +
+cursor position + timestamp); `pickOrHover(cx, cy, maxDist)` returns the cache when
+the cursor hasn't moved and it's fresher than `HOVER_PICK_REUSE_MS` (100ms), else
+falls back to a real pick — so this is a pure latency win (one fewer `pick_block`
+round trip per click) with no correctness risk, and it guarantees the click can
+never resolve to a cell other than the one the outline just showed. Applied in
+`onPickUp` (select/floodfill/build-break) and `onPickContext` (place); the
+middle-click eyedropper still picks fresh.
+
+Alt is tracked from raw `keydown`/`keyup`/`blur` on `window` rather than read off the
+pointer event, because OrbitControls reads `mouseButtons` inside its *own*
+`pointerdown` handler, whose ordering against ours isn't guaranteed; keeping the
+mapping correct while the key is merely held sidesteps that. `onPickDown` and
+`onPickContext` both refuse to act while `altKey` is set, so an Alt camera drag never
+edits.
 
 ### Select-mode transform gizmo (Axiom-style)
 
@@ -552,14 +702,42 @@ on the flag.
 
 ### Edit sync (3D)
 
-`editEpoch` + `lastEdit` reload chunk meshes overlapping the edit's top-down
-bounds — expanded by `ceil(max(lampRadius, shadowRayScan)/16)` chunks when night
-lighting or shadows are on (a placed lamp or new occluder affects the *next* chunk
-over). GPU mode early-outs the `lightEpoch` reload to a single repaint.
+`editEpoch` + `lastEdit` reload chunk meshes overlapping the edit's top-down bounds,
+expanded by `ceil(max(lampRadius, shadowRayScan)/16)` chunks when night lighting or
+shadows are on (a placed lamp or new occluder affects the *next* chunk over). The
+two halves of that rect are **not** on the same schedule (C3 steps 2–3):
+
+- **core** — the chunks the edit's own bounds touch, usually 1. Reloaded
+  immediately: this is the block you just placed appearing, so it can't be deferred.
+- **halo** — everything the reach adds on top. Accumulated into a `"cx,cy"` key set
+  and flushed on a trailing `HALO_FLUSH_MS` (350 ms) debounce. With baked shadows on,
+  `shadowRayScan = 24` makes the padded rect **5×5 = 25 chunks**; paying that per
+  *placed block* is the refetch storm that made building on a large world feel
+  broken. A build sweep stamps far faster than the debounce, so it now pays the halo
+  once, after release — the "coalesce per gesture" outcome with no gesture plumbing
+  between the scene closure and the effect, because the edit rate *is* the gesture
+  signal. A lone click pays it 350 ms later, and the seam it fixes was never visible
+  sooner than that. The flush no-ops on a suspended pane (which disposed every mesh
+  and emptied its queue; its resume path restreams from scratch).
+
+Both halves go through the same `reloadChunk`, and therefore the same
+`forceKeys`/`staleKeys` discipline: since **C3 step 1** the old mesh stays in the
+scene until its replacement lands (`startFetch`'s `.then()` disposes and installs
+atomically), so an edit no longer punches a visible hole in the terrain for a full
+round-trip. `forceKeys` is what lets a *resident* chunk refetch at all — it's set on
+the in-flight path too, or the `staleKeys` requeue in `startFetch`'s `finally{}` would
+be skipped as "already resident" and strand pre-edit geometry. The one exception: when
+`residentBytes + inflightBytes` is already at the geometry budget, `reloadChunk` keeps
+the old eager `disposeMesh(k)` — `pump()` refuses to start a fetch while the stale mesh
+still counts against the cap, so on a budget-limited pane the hole is the correct trade
+against stranding pre-edit geometry indefinitely.
+
+GPU mode early-outs the `lightEpoch` reload to a single repaint.
 
 ## Quad view
 
-Full-screen CSS-grid 2×2 (`paddingTop: 50`): top-left `MapCanvas`, top-right Front
+Full-screen CSS-grid 2×2, positioned from `effectiveRibbonHeight` /
+`STATUS_BAR_HEIGHT` (App.tsx) rather than a fixed top pad: top-left `MapCanvas`, top-right Front
 slab, bottom-left Side slab, bottom-right the 3D pane (`FlyView3D`). Toggle:
 View → Quad view (`showSlicePanels`). The 3D pane is separately opt-in
 (`enable3dPane`) for performance. Panes are wrapped in `ErrorBoundary` so a

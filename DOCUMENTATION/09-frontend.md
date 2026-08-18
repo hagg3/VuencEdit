@@ -8,12 +8,15 @@ Rust backend via `invoke`.
 
 | File | Role |
 |---|---|
-| `App.tsx` (3082 L) | Global state, keyboard shortcuts, orchestration. |
-| `Ribbon.tsx` (1993 L) | Tabbed ribbon toolbar (Home / Selection / View / 3D / File). |
+| `App.tsx` | Global state, keyboard shortcuts, orchestration. |
+| `Ribbon.tsx` + `src/ribbon/` | Ribbon shell + its tokens, icons, primitives, tier solver, top bar and 8 tab modules. |
+| `AppMenu.tsx` | Two-pane Office-2007 application menu (replaces the old VuencEdit ▾ / File ▾ dropdowns). |
+| `WorldNamePill.tsx` | Top-bar world identity, details popover and rename. |
+| `src/panels/` | `AboutPanel` / `WorldInfoPanel` — shared by the application menu and their modals. |
 | `MapCanvas.tsx` (1626 L) | 2D map: pan/zoom/select/paste/draw, `DragOp` input, right-click menu. |
 | `FlyView3D.tsx` (1986 L) | Streaming fly-through 3D pane (Three.js + OrbitControls). |
 | `SliceViewport.tsx` (838 L) | Front/side slab + ortho viewports for quad view. |
-| `SelectionInspector.tsx` | Floating panel: stats + ortho preview + extrude + prefab save + trees + 3D view. |
+| `SelectionInspector.tsx` | Sidebar Inspector tab: stats + ortho preview + extrude + prefab save + trees + 3D view. |
 | `ElevationPreviewPanel.tsx` | Full-height front/side elevation view (opt-in, resizable, draw). |
 | `ThreeDPreview.tsx` | On-demand 3D render of a selection (≤ 64³). |
 | `BlockPaintPicker.tsx` | Reusable block+paint picker (fill / filter modes), texture swatches. |
@@ -23,10 +26,10 @@ Rust backend via `invoke`.
 | `SchematicImportModal.tsx` | MC `.schematic`/`.litematic` import. |
 | `WorldBrowserModal.tsx` | Search/download worlds from Eden servers. |
 | `UploadModal.tsx` | Upload world + thumbnail. |
-| `WorldInfoModal.tsx` | World summary dialog. |
+| `WorldInfoModal.tsx` | Thin `Modal` wrapper around `WorldInfoPanel`. |
 | `SettingsModal.tsx` | Persistent app settings. |
 | `HelpModal.tsx` | Shortcuts + texture-pack help. |
-| `AboutModal.tsx` | About dialog. |
+| `AboutModal.tsx` | Thin `Modal` wrapper around `AboutPanel` (also mounted by the splash screen). |
 | `RecoveryModal.tsx` | Autosave crash-recovery prompt. |
 | `Modal.tsx` | Shared modal shell (backdrop + Escape + focus-trap + ARIA). |
 | `ErrorBoundary.tsx` | Inline error fallback wrapping quad-view panes. |
@@ -45,31 +48,326 @@ Rust backend via `invoke`.
 | `viewportUtils.ts` | Pure canvas helpers (`zoomAtPoint`, `resizeCanvasToContainer`, `beginFrame`…). |
 | `useRecentWorlds.ts` | `localStorage` MRU world list + `timeAgo()`. |
 
-## UI shell: Ribbon (`Ribbon.tsx`)
+## UI shell: the Ribbon (`Ribbon.tsx` + `src/ribbon/`)
 
-A collapsible tabbed toolbar pinned below the title row. Height is user-resizable
-(60–240 px body, persisted in `localStorage`). Exports `RIBBON_HEIGHT_COLLAPSED`,
-`TAB_BAR_HEIGHT`, `DEFAULT_BODY_HEIGHT`.
+Rewritten 2026-08-12. `Ribbon.tsx` is a thin shell (~250 L); everything visual
+lives under `src/ribbon/`. Density target is the **Office 2007–2010 ribbon** —
+compact rows, mixed large/small buttons, not a touch toolbar.
 
-**Tabs:** Home | Selection | View | 3D | File (+ app-menu ▾ for settings/help/
-about). **3D is a *contextual* tab** shown only while the fly-view is up
-(`showSlicePanels && enable3dPane`); if it vanishes while active the Ribbon falls
-back to View.
+```
+src/ribbon/
+  tokens.ts        geometry + the visual system (scales, surfaces, accents, state recipes);
+                   throws at import if the height constants stop summing
+  icons.tsx        <Icon name=… size=… tone=…/> over lucide-react (named imports only)
+  primitives.tsx   Group GroupDivider MenuSeparator LargeButton SmallButton IconButton
+                   CommandButton SplitButton DropdownButton MoreChevron Popover SliderRow
+                   RangeSlider Segmented Caption MenuItem Row Col
+                   Badge FieldLabel Swatch NumField Check + RIBBON_CSS
+  layout.ts        pure tier solver          layout.test.ts  its unit tests
+  context.tsx      RibbonContext + useRibbon()      props.ts  RibbonProps / RibbonTab
+  sculptTools.ts   the 16 sculpt tools, shared by SculptTab and 3D Sculpt mode
+  TopBar.tsx       Menu · Undo/Redo · tabs · world pill · Help · collapse
+  PaletteGroup.tsx the one palette presentation (+ TextureGroup)
+  tabs/            HomeTab DrawTab SculptTab InsertTab ViewTab ThreeDTab
+                   SelectionTab ClipboardTab
+```
 
-- **Home** — tool picker, undo/redo, draw options (brush size/shape, fill/hollow),
-  sculpt strength, z-range, `BlockPaintPicker` (fill), replace filter, draw mask.
-- **Selection** — stats, copy/delete/fill, filter, paste controls, advanced paste,
-  paste transform, extrude, prefab save, tree gen.
-- **View** — view mode (Top-down / Z-slice), render mode (Tiled / Full / Axo),
-  Fit, Quad View, 3D Pane, Template Overlay, Texture Pack.
-- **3D (contextual)** — 3D Mode (Camera/Select/Build), Build Block picker,
-  Lighting group (Night / Shadows / GPU Shadows — each ⚡-badged perf-heavy — + Sun
-  and Lamp Radius sliders), Textures.
-- **File** — Save / Save As / Open / New World / World Browser / Upload / Export /
-  Import Schematic / Expand from Template / Close.
+### Geometry — and why labels can't be clipped
 
-**Hotbar:** 5 pinned + 5 recent block+paint swatches above the picker when a draw
-tool is active (`pinnedBlocks`, `recentBlocks`, `hotbarHover`).
+Fixed heights, no drag-resize (collapse remains):
+
+| Token | Value |
+|---|---|
+| `TOP_BAR_HEIGHT` | 34 |
+| `RIBBON_BODY_HEIGHT` | 104 |
+| `RIBBON_HEIGHT_COLLAPSED` | 34 (= top bar alone) |
+| `GROUP_PAD_TOP` / `GROUP_PAD_BOTTOM` | 4 / 2 |
+| `GROUP_CONTENT_H` | 82 |
+| `GROUP_LABEL_H` | 16 |
+| `LARGE_H` / `SMALL_H` / `ROW_GAP` | 82 / 26 / 2 |
+
+`RIBBON_BODY_HEIGHT = GROUP_PAD_TOP + GROUP_CONTENT_H + GROUP_LABEL_H + GROUP_PAD_BOTTOM`,
+asserted at module load. And `3 × SMALL_H + 2 × ROW_GAP = LARGE_H = GROUP_CONTENT_H`,
+so a column of three small buttons exactly fills a group.
+
+⚠️ **`Group` renders its control area as a fixed-height box with `overflow: hidden`,
+then the label strip after it.** The old ribbon used `marginTop: auto` on the label,
+which meant a group whose rows added up to more than the body pushed its own label
+down and off the bottom. Structurally that can no longer happen. The consequence for
+authors: **anything needing more than three 26px rows must add a column, not a row** —
+see the Rock/Carve group's eight parameters laid out as three columns of three.
+
+### Visual system (`tokens.ts`) — restyled 2026-08-12
+
+The architecture above landed with an unsystematised visual layer: four unrelated
+aesthetics (translucent white-wash buttons, a cyan default icon tone, a bright blue
+floating tab pill, Office group organisation) and **68 hardcoded `accent="#hex"` props
+across the 8 tabs in 18 distinct colours**. The restyle keeps every geometry constant
+and every primitive signature; only values and recipes changed.
+
+**Scales** — `RADIUS {sm 2, md 3, lg 5}` · `FONT {micro 9, label 10, body 11, tab 12}` ·
+`ICON {xs 12, sm 14, lg 24}` · `SPACE {xs 2, sm 4, md 6, lg 8}`. Retired: `fontSize`
+6/8/12.5/13 and icon sizes 11/13/15/16/26, none of which had a constant behind them.
+
+**Material.** Every control sits on `SURFACE.raised` (an opaque vertical gradient) with
+`inset 0 0 0 1px BORDER.outline, inset 0 1px 0 BORDER.bevel` — deliberately the same
+family as `designTokens.chromeButton`, which the QuickActionsBar already used, so the
+ribbon and the floating pill match at rest. The radius differs on purpose (3 vs 6): a
+docked dense ribbon and a floating pill are different objects. `SURFACE.body` is a
+neutral blue-grey vertical gradient; the old `90deg` slate→teal wash is gone, and
+`ICON_TONE` moved from cyan `#7fd4e0` to neutral `#c3ccd2` — **cyan now appears only on
+active and focus**, which is what stopped it reading as the ribbon's material.
+
+**Five states, defined once:** `btnBase` · `btnHover` (revived; it was dead code) ·
+`btnPressed` (**new** — inverted gradient + inner shadow, no `transform`, which would
+break grid alignment) · `btnActive(accent)` (tinted + outlined, not glowing) ·
+`btnDisabled` (one recipe; `QatButton`'s `.5`-opacity variant is gone). Hover and
+pressed live in CSS; active and disabled are inline.
+
+**Four sanctioned accent hues**, replacing the 18:
+
+| Token | Hue | Meaning |
+|---|---|---|
+| `ACCENT.primary` | `#00a4ad` Eden teal | draw tools, generic toggles, default |
+| `ACCENT.warm` | `#d98a2b` | sculpt |
+| `ACCENT.green` | `#3fa85c` | selection / clipboard |
+| `ACCENT.violet` | `#7c6bd6` | 3D / spatial |
+
+`DANGER` `#c2504f` replaces `#ef4444`/`#fca5a5`/`#f87171`. `CTX_ACCENT` maps the
+contextual tabs onto the same four (3D moved off sky-blue `#38bdf8`, which was
+near-indistinguishable from the primary accent). `FOCUS_RING` `#5b9fd6` and `ARMED_RING`
+(= `ACCENT.primary`) are separate tokens **on purpose** — both used to be `#00dde9`, so
+a focused control and an armed one looked identical.
+
+⚠️ Accents name the **tool family**, not the individual command. Within a tab most
+buttons therefore share one accent; that is the system working, not missing variety.
+`ThreeDTab`'s `MODES` is the one place a row mixes hues, because each mode hands you a
+*different* family (Build/Flood Fill → primary, Sculpt → warm, Camera/Select → violet).
+
+### Tabs
+
+Permanent **Home · Draw · Sculpt · Insert · View**; contextual **3D**
+(`showSlicePanels && enable3dPane`), **Selection** (`rawBounds`), **Clipboard**
+(`clipboard`), each with an appearance flash and its own `CTX_ACCENT` hue (3D violet,
+Selection warm, Clipboard green). The flash colour comes from a `--rbn-pulse` CSS custom
+property set inline per tab — `@keyframes rbnCtxPulse` used to be hardcoded amber and so
+flashed amber for the green Clipboard tab too.
+
+A contextual tab carries its hue as an **Aero-style glow** — a tinted fill, an inset
+halo and a matching `text-shadow` — that intensifies sharply on selection. It replaced a
+2px top strip, which read as a hairline rather than as "this tab is special".
+⚠️ **The glow is `inset`, not an outer `box-shadow`.** The tab strip is `overflow: hidden`
+and that is load-bearing: at the 900px `minWidth` the strip has to clip rather than run
+over the world pill, so an outer glow would be sliced off at the strip's edges and along
+its bottom. A selected contextual tab's gradient still ends on `TAB_ACTIVE_BOT`, so it
+merges into the body exactly like a permanent tab; only its top half is tinted.
+
+If the 3D pane closes while its tab is active
+the ribbon falls back to View. Arming a 2D draw tool jumps to Draw; arming any of
+the 16 sculpt tools jumps to Sculpt.
+
+Mental model, stated so placement is predictable:
+
+> **Home** = what you touch constantly. **Draw** = place blocks by hand. **Sculpt** =
+> reshape terrain. **Insert** = generate/import content. **View** = change what you
+> see, never the world. **3D / Selection / Clipboard** = contextual, own the object
+> that exists.
+
+| Tab | Groups |
+|---|---|
+| Home | Clipboard · Navigation · Selection · Palette · Set Point |
+| Draw | Tools · Brush · Options · Palette · Mask |
+| Sculpt | Sculpt tools · Brush · Falloff · Palette (compact) · Tool Options (contextual tail) |
+| Insert | Prefab · Import · Nature · Fluids · World Extent |
+| View | Map View · Render · Zoom · Layout · Template · Textures (+ Z-level tail) |
+| 3D | Mode · mode slot (fixed `MODE_SLOT_MIN` 416px) · Camera · Lighting · Textures |
+| Selection | Modify · Z Range · Move · Fill (Fill+Gradient merged) · Replace · Extrude |
+| Clipboard | Preview · Place · Transform · Options · Mode · Prefab |
+
+Moves worth knowing: Materialize Home → Insert; Fluids Selection → Insert (it is
+selection-scoped *generation*, exactly like Trees, and Selection was at 8 groups);
+Load Prefab / Import Schematic / Expand from Template File menu → Insert; the World
+readout Home → the top-bar pill; New World / Browse Online Home → the application menu.
+
+Deliberate duplications — each a *shared component*, never a forked path:
+Copy/Cut/Delete/Fill/Grow/Shrink/Clear on Home + Selection; Paste/Rotate/Flip on Home
++ Clipboard; `PaletteGroup` on Home + Draw + Sculpt + 3D; `TextureGroup` on View + 3D.
+
+### Responsive tiers (`layout.ts`)
+
+```ts
+solveLayout(groups: GroupMetrics[], available: number): Record<string, Tier>
+```
+
+Each group declares `widths: {full, medium, compact}`, a `minTier` floor and a
+`priority`. Start everything at `full`; while the row overflows, demote one group one
+tier — choosing **the widest current tier first, then the highest priority**. That
+ordering matters: demoting purely by priority would hide the least-important group
+behind a chevron while its neighbours were still full-size, which reads as a bug.
+`minTier: "full"` exempts a small group from shrinking at all (MS guidance: don't
+collapse a two-command group to a popup icon).
+
+Tier meanings: `full` = the mockup layout · `medium` = large buttons become small
+icon+label rows (`CommandButton` is the only place that mapping lives) · `compact` =
+the whole group becomes one chevron opening a `Popover` with its full content.
+
+Widths are **declared, not measured**, which is what keeps the solver pure and
+unit-testable. A dev-only `ResizeObserver` in `Group` `console.warn`s on drift, so it is
+caught without making the solve non-deterministic.
+
+⚠️ The guard is **two-sided** (`WIDTH_TOLERANCE` 8px). It used to fire only when a group
+rendered *wider* than declared, which left the opposite mistake silent: over-declaring
+reserves width the group never uses, so the row demotes earlier than it needs to and the
+tab carries dead space nothing ever reports. Both directions print the measured pixel
+value, so one dev run yields the exact number — and it must be pasted into **both** copies,
+the tab's `SPECS.widths.full` *and* its matching `declaredWidth` prop. Only the `full`
+tier is checked; `medium`/`compact` widths live solely in SPECS and are never handed to a
+`Group`, so there is nothing to compare them against.
+
+Deleted with this: the `◄ ►` scroll arrows, `updateScrollArrows`/`canScrollLeft/Right`,
+the wheel→horizontal remap, the resize grip, and the `ribbon_body_height` key (removed
+from `localStorage` on first run). `overflowX: auto` remains as a silent last resort
+below the minimum window width (`tauri.conf.json` `minWidth` is 900).
+
+### Primitives notes
+
+- Hover, **pressed** and focus rings live in `RIBBON_CSS`, injected once by the shell —
+  inline styles can't express `:hover`/`:active`, and per-button state would be ~60
+  extra `useState`s per tab. The rules use `!important` scoped by
+  `:not([data-active="true"]):not([aria-disabled="true"])`, so an armed button's inline
+  accent still wins and a disabled one doesn't light up. A higher-specificity
+  `[role="menuitem"]` pair keeps popover rows highlighting instead of growing a bevel.
+- A `@media (prefers-reduced-motion: reduce)` block kills the button transitions and the
+  contextual-tab pulse.
+- Unselected tabs carry `.rbn-tab` purely so CSS can give them a hover state; they are
+  not `.rbn-btn`, and before this they had no hover at all.
+- Disabled controls use `opacity` + `pointerEvents: none` (layout stability) **and**
+  `aria-disabled` + `tabIndex={-1}` — otherwise they stay focusable but unclickable.
+- `Popover` portals to `document.body` for **two** reasons: the ribbon body clips
+  overflow, *and* the ribbon root's `z-index: 100` is its own stacking context, so an
+  in-tree panel can never rise above the docked sidebar (`z-index: 120`) whatever
+  z-index it asks for. Its chrome is `SURFACE.popover` — the ribbon's own material, not
+  the app-wide warm-brown `glassMenuPanel`, which read as a foreign object over a cool
+  slate ribbon. `Ribbon.tsx`'s `BlockPaintPicker` portal uses the same chrome. Popover
+  flips above the anchor when it would overflow the viewport bottom, and handles Escape
+  capture-phase with `stopPropagation` so App's global step-back doesn't also fire.
+  ⚠️ That Escape listener is **capture-phase on `window`**, so a child input cannot
+  `stopPropagation()` its way out of closing the panel — pass `onEscape` when the panel
+  owns an inner gesture Escape should step back from first (`WorldNamePill`'s rename).
+- Small shared parts, each replacing a family of one-offs: `Badge` (was `Exp()` copied
+  into four tabs plus `Perf()`) · `FieldLabel` (~16 hand-rolled label spans across eight
+  different widths) · `Swatch` (**three** treatments for one concept: the palette hotbar,
+  InsertTab's leaf colours, SelectionTab's block chip) · `NumField` (was
+  `{...fieldStyle, width: N}` spread at every call site) · `Check` · `MenuSeparator` ·
+  `RangeSlider` (the dual-thumb Z-range, promoted out of `SelectionTab` where it was
+  hand-built from five untokenised blues).
+- One `RAIL_W` (15) for split/chevron rails — `SplitButton` used 16 and `PaletteGroup`
+  15. `TOPBAR_BTN_H` (24) and `PALETTE_COMPACT_H` (34) replace an undeclared `23` and
+  the expression `SMALL_H + 8`.
+- The top-left **brand button** is Office 2010's File tab: permanently filled with
+  `ACCENT.primary` (not a neutral control that lights up when open) and carrying the app
+  identity — the 20px icon plus the **VuencEdit** wordmark, bold `Vuenc` + regular `Edit`,
+  restored from the pre-rewrite ribbon. Its glow widens from 9px to 16px while the menu is
+  open. ⚠️ It is `.rbn-brand`, **not** `.rbn-btn`: the neutral hover gradient would stomp
+  its accent fill, so it has its own hover/active rules in `RIBBON_CSS`.
+- ⚠️ **Undo/Redo in the top bar are fixed-width** (`QAT_W_LABELLED`/`QAT_W_ICON`). Both
+  show a stack depth that changes on *every edit*, so an auto-width button shoved the
+  whole tab strip sideways each time you drew a block. The count is clamped to `99+` and
+  sits in a fixed box with tabular figures.
+- `hexToRgbTriplet()` in `tokens.ts` replaces the old `accentRgb()` — a six-entry
+  lookup table that silently returned green for any colour not in it.
+
+### Shell services (`context.tsx`)
+
+`useRibbon()` gives a tab `{ p, activeTab, setActiveTab, bodyWidth, pickerKind,
+togglePicker, openAppMenu, armTransientTool }`. `RibbonProps` is passed whole rather
+than threaded per-tab: only one tab is mounted at a time, so the context's changing
+identity costs nothing over the old whole-component re-render.
+
+⚠️ `armTransientTool(next, escapeTo)` exists because `react-hooks/immutability`
+forbids writing a ref reached through a hook's return value. Eyedropper and Pool Fill
+need to record `prevToolRef`; only `Ribbon.tsx`, which receives that ref as a prop,
+may write it.
+
+Slider *display* values (z-slice, sun, lamp radius, fly speed, render distance) live
+in their own tab modules, synced from the committed prop by the render-phase derived
+-state pattern. This improves on the previous convention: a drag now re-renders one
+tab instead of the whole ribbon.
+
+### Palette
+
+One `PaletteGroup` component, two variants (`full` = large split Block button + Pinned
+×5 + Recent ×5; `compact` = swatch + name), four call sites (Home, Draw, Sculpt, 3D
+Build). It reads `fillBlockType`/`fillPaint` off context, so three divergent palette
+states are structurally impossible. Exactly one `BlockPaintPicker` portal exists,
+hoisted into the shell; tabs only ask it to open via `togglePicker(e, kind)`.
+
+Hotbar cells are `Swatch`es, and the selected one carries the `ARMED_RING` **outside**
+the cell (`0 0 0 2px`) rather than the old `inset 0 0 0 2px #fff, 0 0 0 1px #00dde9`
+double ring. ⚠️ That is why the two hotbar rows use `gap: SPACE.sm` (4) instead of
+`COL_GAP` (2) — at 2px a selected cell's ring would touch its neighbour. It costs the
+Palette group ~10px, which is why its declared width is 264, not 252.
+
+## Application menu (`src/AppMenu.tsx`)
+
+One two-pane Office-2007 menu replacing the old VuencEdit ▾ and File ▾ dropdowns and
+their inline `showRecentSub` / `showExportSub` accordions. Opens under the top bar's
+Menu button. Left column → right contextual pane:
+
+⚠️ **The panel is a fixed `MENU_W` × `MENU_H` (720 × 540), not `minWidth`-to-`maxWidth`
+elastic.** It used to be `minWidth: 880` / `maxWidth: min(1180px, 96vw)` with panes free
+to be as wide as their content, so the menu visibly resized as you moved down the command
+column. Consequently the explanatory panes (New · Download · Upload · Help) are plain
+`term — definition` text lists (`TextList`), not the two-column icon-card grid they were:
+under the fixed width those cards were both too narrow to read and wider than the pane,
+and their icons were decorative. Export rows keep their cards — those are *actions*, each
+with its own button — but stack title-above-description so a 476px pane can't squeeze
+them. The one-off violet border and violet row highlight are now `ACCENT.primary`, so the
+menu and the Menu button that opens it belong to the same system.
+
+| Row | Right pane |
+|---|---|
+| New | The four generators (Flat / Natural / Classic / Tg2), what each produces, + **New World…** |
+| Open | Recent worlds list (click to open) + **Browse for a file…** |
+| Download | What the world browser offers (quality sort, date filters, hide junk) + **Browse Online Worlds…** |
+| Save | Compressed + backup-compressed toggles, how incremental/WAL saving works, + **Save Now** |
+| Save As | Same options, extension-correction and overwrite notes, + **Choose Location & Save…** |
+| Export | One row per format (PNG · JSON · OBJ *exp* · VMF *exp*), each with its own **Export** button |
+| Upload | What is sent, naming, save-first, permanence, + **Upload This World…** |
+| Properties | `WorldInfoPanel` + an inline rename field |
+| Settings | Quick view toggles + **Open Settings…** |
+| Help | Shortcut cheat-sheet cards + **Open Help** |
+| About | `AboutPanel` |
+| Close World | What closing releases + **Close World** (red) |
+
+Two rules drive that table:
+
+1. **No pane is ever blank.** Rows with nothing to preview explain the command *and*
+   the feature behind it, so the menu teaches rather than showing dead space.
+2. **Slow or destructive rows repeat their action as a button in the pane.** Once a
+   row also drives a preview, "click the row to run it" stops being obvious.
+
+`AboutModal` and `WorldInfoModal` are now thin `Modal` wrappers around
+`src/panels/AboutPanel.tsx` and `src/panels/WorldInfoPanel.tsx`, which the About and
+Properties panes render. **Both modals must survive** — the splash screen mounts
+`AboutModal` and has no ribbon to open the menu from.
+
+## World name pill (`src/WorldNamePill.tsx`)
+
+Top-bar right cluster, before Help and the collapse chevron. Face = the world name +
+a 64z/256z badge; click opens a popover with format, chunk and block dimensions, Z
+range, Home/Start positions, the file name, an inline rename, and links to the
+Properties pane and the World Info dialog.
+
+The rename flow is ported verbatim from Home's old World group, including the
+`renameCancelledRef` guard: Escape triggers a blur, and without the flag that blur
+would commit the very edit Escape cancelled. ⚠️ `rename_world` bypasses `with_edit`,
+so App bumps `editEpoch` by hand or the change is silently lost on close.
+
+⚠️ The component destructures every field it needs off `p` up front. The lint rule
+guarding ref access treats any object reached through a hook's return value as
+ref-like once one of its fields *is* a ref (`renameInputRef`), so reading `p.<field>`
+inline in the JSX trips it on every unrelated field too.
 
 ## App.tsx state & patterns
 

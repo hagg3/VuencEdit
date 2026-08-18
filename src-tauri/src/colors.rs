@@ -4,8 +4,9 @@ use serde::Serialize;
 // ── Color system (tables ported from Globals.mm / Hud.mm game source) ─────────
 
 // Unpainted block base colours — blockColor[NUM_BLOCKS+1][3] from Globals.mm.
-// Index = block type ID (0–111). Zero entries are unused/unset in the game.
-pub(crate) const BLOCK_RGB: [[u8; 3]; 112] = [
+// Index = block type ID (0–111 known; 112–127 new-format, see below). Zero entries
+// are unused/unset in the game.
+pub(crate) const BLOCK_RGB: [[u8; 3]; 128] = [
     [  0,   0,   0], //   0 air (handled before table lookup)
     [ 90,  90,  90], //   1 bedrock
     [158, 156, 158], //   2 stone        #9e9c9e
@@ -118,6 +119,26 @@ pub(crate) const BLOCK_RGB: [[u8; 3]; 112] = [
     [148,  15,   2], // 109 bt-firework
     [148,  15,   2], // 110 bt-lightbox
     [148,  15,   2], // 111 bt-steel
+    // 112–127: new-format blocks (updated game, `TEST WORLDS/newblocks/`). Real names/colours are
+    // unknown (`~/emod` reference source stops at 111) — per project decision these are NOT invented
+    // placeholder hues. Each reuses the exact RGB of an existing, visually distinct known block (and
+    // the matching BLOCK_PAINT_SCALE entry below), so paint behaves identically to that donor block.
+    [158, 156, 158], // 112 unknown (new format) — reuses  2 stone
+    [ 91,  61,   2], // 113 unknown (new format) — reuses  3 dirt
+    [245, 221, 141], // 114 unknown (new format) — reuses  4 sand
+    [ 20, 129,  28], // 115 unknown (new format) — reuses  5 leaves
+    [112,  81,  19], // 116 unknown (new format) — reuses  6 trunk
+    [167, 146,  79], // 117 unknown (new format) — reuses  7 wood
+    [195,  98,  94], // 118 unknown (new format) — reuses 13 brick
+    [ 49,  52,  54], // 119 unknown (new format) — reuses 14 slate
+    [120, 145, 167], // 120 unknown (new format) — reuses 15 ice
+    [255, 255, 255], // 121 unknown (new format) — reuses 19 cloud
+    [ 22,  31, 184], // 122 unknown (new format) — reuses 20 water
+    [216, 180, 101], // 123 unknown (new format) — reuses 21 fence
+    [244,  68,   0], // 124 unknown (new format) — reuses 23 lava
+    [129, 128, 128], // 125 unknown (new format) — reuses 74 steel
+    [235, 201,  52], // 126 unknown (new format) — reuses 71 golden cube
+    [254, 251, 149], // 127 unknown (new format) — reuses 72 lightbox
 ];
 
 // Paint colour table — colorTable[54] from Hud::genColorTable() (Hud.mm:150-196).
@@ -185,9 +206,9 @@ pub(crate) const PAINT_RGB: [[u8; 3]; 55] = [
 pub(crate) const BI_NOTSOLID:   u32 = 0b0000_0000_0000_0010;
 pub(crate) const BI_RAMPORSIDE: u32 = 0b0000_0000_0001_0000;
 
-// blockinfo[NUM_BLOCKS+1] — one entry per block type (0–111).
+// blockinfo[NUM_BLOCKS+1] — one entry per block type (0–111 known; 112–127 new-format).
 // Only the flags relevant to the editor are preserved verbatim; the rest stay zero.
-pub(crate) const BLOCK_INFO: [u32; 112] = [
+pub(crate) const BLOCK_INFO: [u32; 128] = [
     BI_NOTSOLID,                 //   0 air
     0,                           //   1 bedrock      IS_HARD
     0,                           //   2 stone         IS_HARD
@@ -300,6 +321,24 @@ pub(crate) const BLOCK_INFO: [u32; 112] = [
     0,                           // 109 bt-firework
     0,                           // 110 bt-lightbox
     0,                           // 111 bt-steel
+    // 112–127: solid/occluding (0) — right for a plain decorative cube, wrong for whichever ID turns
+    // out to be a sign or another non-solid; flips with one entry once identified (see signs.rs).
+    0,                           // 112 unknown (new format)
+    0,                           // 113 unknown (new format)
+    0,                           // 114 unknown (new format)
+    0,                           // 115 unknown (new format)
+    0,                           // 116 unknown (new format)
+    0,                           // 117 unknown (new format)
+    0,                           // 118 unknown (new format)
+    0,                           // 119 unknown (new format)
+    0,                           // 120 unknown (new format)
+    0,                           // 121 unknown (new format)
+    0,                           // 122 unknown (new format)
+    0,                           // 123 unknown (new format)
+    0,                           // 124 unknown (new format)
+    0,                           // 125 unknown (new format)
+    0,                           // 126 unknown (new format)
+    0,                           // 127 unknown (new format)
 ];
 
 /// Alpha (0–1) for a transparent block; None = opaque.
@@ -320,7 +359,7 @@ pub(crate) fn transparent_alpha(bt: u8) -> Option<f32> {
 // Scales painted colours so the same paint reads differently on different
 // materials (e.g. dark stone 0.50 vs ice 0.90), preserving visual distinction
 // in the flat top-down renderer where no texture contributes that difference.
-pub(crate) const BLOCK_PAINT_SCALE: [f32; 112] = [
+pub(crate) const BLOCK_PAINT_SCALE: [f32; 128] = [
     1.00, // 0  air
     0.60, // 1  bedrock
     0.80, // 2  stone
@@ -433,6 +472,23 @@ pub(crate) const BLOCK_PAINT_SCALE: [f32; 112] = [
     0.70, // 109 bt-firework
     0.90, // 110 bt-lightbox
     0.70, // 111 bt-steel
+    // 112–127: matches the donor block's scale (see BLOCK_RGB above) so paint reads identically to it.
+    0.80, // 112 unknown (new format) — matches  2 stone
+    0.60, // 113 unknown (new format) — matches  3 dirt
+    0.80, // 114 unknown (new format) — matches  4 sand
+    0.65, // 115 unknown (new format) — matches  5 leaves
+    0.70, // 116 unknown (new format) — matches  6 trunk
+    0.70, // 117 unknown (new format) — matches  7 wood
+    0.70, // 118 unknown (new format) — matches 13 brick
+    0.40, // 119 unknown (new format) — matches 14 slate
+    0.90, // 120 unknown (new format) — matches 15 ice
+    1.00, // 121 unknown (new format) — matches 19 cloud
+    0.90, // 122 unknown (new format) — matches 20 water
+    0.80, // 123 unknown (new format) — matches 21 fence
+    0.60, // 124 unknown (new format) — matches 23 lava
+    0.70, // 125 unknown (new format) — matches 74 steel
+    0.70, // 126 unknown (new format) — matches 71 golden cube
+    0.90, // 127 unknown (new format) — matches 72 lightbox
 ];
 
 pub(crate) fn grass_color(sky: u8) -> [u8; 3] {

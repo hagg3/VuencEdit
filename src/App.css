@@ -64,6 +64,18 @@ body {
   border-radius: 3px;
 }
 
+/* Pressed/clicked feedback for plain dialog & menu buttons (Settings, App menu, World Browser,
+   New World, Schematic Import, Prefab Library, VMF Export, etc.) — these are inline-styled via
+   designTokens' chromeButton()/chromeButtonAccent()/glassTab() and had no :active state of their
+   own, since inline styles can't express pseudo-classes. `filter` (not a background swap) is used
+   so the press dims whatever gradient/accent hue a given button already has instead of overwriting
+   it with one fixed color. The ribbon has its own richer pressed treatment (RIBBON_CSS's
+   `.rbn-btn:active`), so those buttons are excluded here to avoid double-dimming. */
+button:active:not(:disabled):not([aria-disabled="true"]):not(.rbn-btn):not(.rbn-brand) {
+  filter: brightness(0.85);
+  transform: translateY(1px);
+}
+
 /* Respect the OS "reduce motion" setting: motion becomes instant, but *indicators* keep moving —
    a blanket `animation: none` would freeze the loading spinner, which communicates progress rather
    than decorating it. So: kill transitions (toggle knobs, hovers, progress-bar widths) and flatten
