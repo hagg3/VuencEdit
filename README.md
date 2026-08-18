@@ -25,7 +25,7 @@ Pre-built installers for macOS (Apple Silicon + Intel universal), Windows, and L
 ## Screenshot
 
 <p align="center">
-  <img src="assets/screen.png" alt="VuencEdit editing a world in quad view" width="900">
+  <img src="assets/screen.png?=v3" alt="VuencEdit editing a world in quad view" width="900">
 </p>
 
 ---
