@@ -39,6 +39,8 @@ export interface QuickActionsBarProps {
   rawBounds: SelectionBounds | null;
   clipboard: ClipboardInfo | null;
   onCopy: () => void;
+  /** Copy-then-clear. Composed in App from the two existing commands, so it costs one undo step. */
+  onCut: () => void;
   onFill: () => void;
   onDelete: () => void;
   onDeselect: () => void;
@@ -79,6 +81,7 @@ export default function QuickActionsBar(p: QuickActionsBarProps) {
         <>
           <span style={groupLabel}>Sel</span>
           <button style={btn()} onClick={p.onCopy} title="Copy selection (⌘C)">⧉ Copy</button>
+          <button style={btn()} onClick={p.onCut} title="Cut selection — copy, then clear">✂ Cut</button>
           <button style={btn("#fcd34d")} onClick={p.onFill} title="Fill selection with the active block">▦ Fill</button>
           <button style={btn("#f87171")} onClick={p.onDelete} title="Delete selection (⌫)">🗑 Delete</button>
           <button style={btn()} onClick={p.onDeselect} title="Clear selection (⌘D)">✕</button>

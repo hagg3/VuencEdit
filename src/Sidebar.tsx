@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { EDEN_TEAL_READABLE, glassPanel, glassTab } from "./designTokens";
 import SelectionInspector from "./SelectionInspector";
 import PrefabLibraryPanel from "./PrefabLibraryPanel";
-import type { SelectionInfo, ClipboardInfo } from "./types";
+import type { SelectionInfo, ClipboardInfo, SignInfo } from "./types";
 
 export type SidebarTab = "inspector" | "prefabs" | "history";
 
@@ -73,6 +73,46 @@ function HistoryTab({ editEpoch, worldEpoch }: { editEpoch: number; worldEpoch: 
   );
 }
 
+/** Read-only sign list (256z-format plan, Phase 4) — shown only when the world actually has
+ *  signs, which is the overwhelming minority. `facing` is a strong-but-unproven hypothesis (see
+ *  CLAUDE.md's "File Format" section), shown as a raw number rather than decoded further.
+ *  Collapsible like the Inspector tab's other sections (elevation view — `SelectionInspector`),
+ *  same ▼/▶ header idiom, open by default. */
+function SignsList({ signs, onSignClick }: { signs: SignInfo[]; onSignClick?: (s: SignInfo) => void }) {
+  const [open, setOpen] = useState(true);
+  if (signs.length === 0) return null;
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 11, marginBottom: 10 }}>
+      <div
+        onClick={() => setOpen(v => !v)}
+        style={{ display: "flex", alignItems: "center", gap: 5, cursor: "pointer", userSelect: "none" }}
+      >
+        <span style={{ color: "#61584f", fontSize: 9 }}>{open ? "▼" : "▶"}</span>
+        <span style={{ color: "#83786c", fontWeight: 700, fontSize: 10, letterSpacing: "0.08em" }}>
+          SIGNS ({signs.length})
+        </span>
+      </div>
+      {open && signs.map((s, i) => (
+        <div key={i}
+          onClick={onSignClick ? () => onSignClick(s) : undefined}
+          title={onSignClick ? "Click to centre the map on this sign" : undefined}
+          style={{
+            padding: "4px 6px", borderRadius: 4, background: "rgba(232,192,74,0.10)",
+            border: "1px solid rgba(232,192,74,0.25)",
+            cursor: onSignClick ? "pointer" : "default",
+          }}>
+          <div style={{ color: "#ebe9e7", whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
+            {s.text || <span style={{ color: "#61584f", fontStyle: "italic" }}>(empty)</span>}
+          </div>
+          <div style={{ color: "#83786c", fontSize: 10, marginTop: 2 }}>
+            ({Math.round(s.x)}, {Math.round(s.y)}, {s.z}) · facing {s.facing}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 export interface SidebarProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -109,6 +149,11 @@ export interface SidebarProps {
 
   // History tab
   worldEpoch: number;
+
+  // Inspector tab — signs (256z-format plan, Phase 4)
+  signs: SignInfo[];
+  /** Clicking a sign row focuses the 2D map on it. Omitted = rows are inert. */
+  onSignClick?: (s: SignInfo) => void;
 }
 
 export default function Sidebar(p: SidebarProps) {
@@ -197,6 +242,8 @@ export default function Sidebar(p: SidebarProps) {
 
       <div style={{ flex: 1, minHeight: 0, overflowY: "auto", padding: PAD, color: "#ebe9e7" }}>
         {p.tab === "inspector" && (
+          <>
+          <SignsList signs={p.signs} onSignClick={p.onSignClick} />
           <SelectionInspector
             selection={p.selection}
             clipboard={p.clipboard}
@@ -212,6 +259,7 @@ export default function Sidebar(p: SidebarProps) {
             onDrawElevation={p.onDrawElevation}
             onZRangeChange={p.onZRangeChange}
           />
+          </>
         )}
         {p.tab === "prefabs" && (
           <PrefabLibraryPanel

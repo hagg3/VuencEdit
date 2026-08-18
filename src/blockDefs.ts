@@ -104,7 +104,9 @@ let paintRgbTable: readonly (readonly [number, number, number])[] = [
 ];
 
 let blockPaintScaleTable: readonly number[] = (() => {
-  const t = new Array<number>(112).fill(0.7);
+  // 128 = full type range incl. 112–127 (new-format); overwritten by applyBlockTables() on startup,
+  // this is only the brief pre-fetch fallback, so 0.7 default is fine for the new-format entries too.
+  const t = new Array<number>(128).fill(0.7);
   t[0] = 1.0; t[19] = 1.0; t[101] = 1.0;
   return t;
 })();
@@ -184,6 +186,35 @@ export const EXPANSION_BLOCKS: readonly { type: number; name: string }[] = [
 /** Returns true if blockType is any expansion block (82–111). */
 export function isExpansionBlock(blockType: number): boolean {
   return blockType >= 82 && blockType <= 111;
+}
+
+// New-format blocks (112–127): 16 types added by the updated game (see TEST WORLDS/newblocks).
+// Names are not yet known (`~/emod` reference source stops at 111) — per project decision these do
+// NOT get invented placeholder hues. Each reuses the exact colour of an existing known block
+// (mirrors BLOCK_RGB in colors.rs — keep the two in sync), so unpainted new blocks read as a
+// recognizable material and painting them behaves identically to the donor block.
+export const NEW_FORMAT_BLOCKS: readonly { type: number; name: string; color: [number, number, number] }[] = [
+  { type: 112, name: "New Block 112", color: [158, 156, 158] }, // reuses Stone
+  { type: 113, name: "New Block 113", color: [ 91,  61,   2] }, // reuses Dirt
+  { type: 114, name: "New Block 114", color: [245, 221, 141] }, // reuses Sand
+  { type: 115, name: "New Block 115", color: [ 20, 129,  28] }, // reuses Leaves
+  { type: 116, name: "New Block 116", color: [112,  81,  19] }, // reuses Trunk
+  { type: 117, name: "New Block 117", color: [167, 146,  79] }, // reuses Wood
+  { type: 118, name: "New Block 118", color: [195,  98,  94] }, // reuses Brick
+  { type: 119, name: "New Block 119", color: [ 49,  52,  54] }, // reuses Slate
+  { type: 120, name: "New Block 120", color: [120, 145, 167] }, // reuses Ice
+  { type: 121, name: "New Block 121", color: [255, 255, 255] }, // reuses Cloud
+  { type: 122, name: "New Block 122", color: [ 22,  31, 184] }, // reuses Water
+  { type: 123, name: "New Block 123", color: [216, 180, 101] }, // reuses Fence
+  { type: 124, name: "New Block 124", color: [244,  68,   0] }, // reuses Lava
+  { type: 125, name: "New Block 125", color: [129, 128, 128] }, // reuses Steel
+  { type: 126, name: "New Block 126", color: [235, 201,  52] }, // reuses Golden Cube
+  { type: 127, name: "New Block 127", color: [254, 251, 149] }, // reuses Lightbox
+] as const;
+
+/** Returns true if blockType is any new-format block (112–127). */
+export function isNewFormatBlock(blockType: number): boolean {
+  return blockType >= 112 && blockType <= 127;
 }
 
 // Partial water/lava fill states.
@@ -296,6 +327,9 @@ export function blockDisplayName(blockType: number): string {
   if (isExpansionBlock(blockType)) {
     return `Expansion (${EXPANSION_BLOCKS.find(e => e.type === blockType)?.name ?? blockType})`;
   }
+  if (isNewFormatBlock(blockType)) {
+    return NEW_FORMAT_BLOCKS.find(b => b.type === blockType)?.name ?? `New Block ${blockType}`;
+  }
   return BLOCK_DEFS.find((b) => b.type === blockType)?.name ?? `Type ${blockType}`;
 }
 
@@ -344,5 +378,8 @@ export function resolveColor(blockType: number, paintByte: number): readonly [nu
   if (blockType >= 62 && blockType <= 64) return [255, 69, 0];
   // Expansion blocks
   if (isExpansionBlock(blockType)) return [229, 207, 170];
+  // New-format blocks (112–127) — see NEW_FORMAT_BLOCKS.
+  const newFormat = NEW_FORMAT_BLOCKS.find(b => b.type === blockType);
+  if (newFormat) return newFormat.color;
   return [128, 128, 128];
 }

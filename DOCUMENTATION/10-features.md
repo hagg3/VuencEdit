@@ -87,6 +87,21 @@ binary layout and the RLE format. Feature UI/behavior:
   never contends with the edit mutex). Drops the lock before the (up to ~1 GB)
   write; `bail_too_large!` guards the u32 offset ceiling.
 
+## Signs (`signs.rs`) — 256z-format plan Phase 4, landed 2026-08-18
+
+Read-only display of the game's on-map signs. Full binary-format detail lives in
+[02-file-format.md](02-file-format.md)'s "Sign records and per-world sidecar
+files" section; the IPC shape is in
+[04-ipc-reference.md](04-ipc-reference.md#signs-signsrs-256z-format-plan-phase-4-landed-2026-08-18).
+Short version: `load_world` decodes signs from whichever source the world
+actually has (sidecar file preferred, else the inline post-directory trailer —
+see Part A of the file-format doc), `get_signs` exposes them with editor-local
+coordinates, `MapCanvas.tsx` draws a small marker per sign, and the Sidebar's
+Inspector tab lists their text/position/facing. Nothing writes a sign — `a`/`b`
+stay unconfirmed and unsurfaced, `c` (facing) is shown as a raw number rather
+than decoded into a compass direction, since the hypothesis is strong but not
+proven (Part C3 below).
+
 ## Network / Eden servers (`network.rs`)
 
 **HTTP only** (TLS fails against these servers). `app2.edengame.net` (current) /
@@ -95,10 +110,77 @@ binary layout and the RLE format. Feature UI/behavior:
 - **`search_worlds`** — response parser scans for `.eden`/`.name` line adjacency
   (a fixed stride-2 layout desynced on stray blank lines). `WorldBrowserModal` has
   Quality sort + date filters + Hide-junk.
+- **`list_worlds`** (added 2026-08-18, Part C2 below) — browse with no search term,
+  `?start=&sort=`. Shares `parse_world_list_response` with `search_worlds` (same
+  response shape). `WorldBrowserModal.tsx` auto-calls `list_worlds(0, 2, server)`
+  on open and on server switch whenever the query field is empty, with a "Load
+  more" button appending the next page (`start = results.length so far` — the
+  server never advertises a page size or total count, so this is a heuristic,
+  not a real cursor). `sort`'s value semantics beyond "distinguishes an
+  ordering" are unconfirmed; `2` is what the real client's own browse mode sent
+  when captured.
 - **`download_world`** — streams to disk (not buffering the whole body in RAM),
   decompresses file→file through a `take()`-capped reader
   (`MAX_DOWNLOADED_WORLD_BYTES = 2 GB`).
 - **`upload_world`** — multipart, requires a PNG thumbnail (`UploadModal.tsx`).
+
+### Verified against the live updated desktop client's own traffic (2026-08-18)
+
+The "New Dawn v2" format plan's open question — whether the server publishes/accepts sign
+sidecars, and whether the game's own upload/download needed reverse-engineering before touching
+`WorldBrowserModal`/`network.rs` — was answered by capturing the real desktop client's own HTTP
+traffic (passive `tcpdump` + `dpkt` TCP-stream reassembly; the client does **not** honor the OS
+web-proxy setting, so a MITM proxy alone doesn't work against it — passive capture does, since the
+server is plain HTTP, no TLS to strip). Findings:
+
+- **Browse** (no search term) is `GET /list2.php?start=0&sort=2` — `start` paginates, `sort`
+  selects an order. VuencEdit's `search_worlds` only ever sent `?search=<query>` and the frontend
+  (`WorldBrowserModal.tsx` `doSearch`) refused to run with an empty query — there was no "browse
+  all/recent worlds" mode, only search-by-name, unlike the real client. **Fixed 2026-08-18**: see
+  the `list_worlds` entry above.
+- **Search** (`?search=<term>`) and the plain-text `<id>.eden\n<name>.name\n` response format
+  VuencEdit already parses are **byte-for-byte what the real client sends/receives** — no drift.
+- **Upload** is `POST /upload2.php?uuid=<uuid>`, `uuid` generated **client-side** (confirmed: the
+  real client does not GET anything first to obtain one, contrary to this file's previous comment)
+  in the same `XXXXXXXX-XXXX-4XXX-8XXX-XXXXXXXXXXXX` shape VuencEdit already generates. The
+  multipart body has **exactly two parts**, gzip-compressed world first then PNG preview, filenames
+  literally `file.bin`/`image.bin` — but the field **names** are `uploaded` and `uploaded2`, *not*
+  `file.bin`/`image.bin`. VuencEdit's `upload_world` used the wrong field names (`"file.bin"`,
+  `"image.bin"`) until this was caught and fixed 2026-08-18 — a PHP endpoint keys `$_FILES` off the
+  field name, not the filename, so every prior upload from this app was almost certainly landing in
+  an unused `$_FILES` slot server-side while still getting back the same `200 OK` / `YES` success
+  reply, i.e. **uploads looked successful in the UI but the file likely never reached the server.**
+  There is also no third `submit` field in the real request (VuencEdit's old code sent one) — left
+  unremoved since an extra ignored field is very unlikely to be the difference between success and
+  failure, unlike the field-name mismatch.
+- **No sidecar is ever sent or received over the wire.** A real upload — of a world whose local
+  in-game copy *did* have signs — carried only the two parts above; nothing named after
+  `signs_*.dat` or `spacemap3_*.raw`, and no third part at all. The uploaded world's own bytes
+  (decompressed and inspected byte-for-byte) had its signs in the **inline post-directory `SGN1`
+  trailer** described in [02-file-format.md](02-file-format.md) — the same structure diagnosed in
+  `quarry.eden`'s load bug, now confirmed to be exactly what the current, live game produces for a
+  normal save, not a one-off corrupt specimen. This strongly suggests the inline trailer is the
+  *canonical* on-the-wire sign representation, and the standalone `signs_<file>.eden.dat` sidecar
+  (as seen in `TEST WORLDS/newblocks/`) is a separate, likely local-only artifact whose relationship
+  to uploads is still unconfirmed (not tested this session — no sidecar-carrying world's own upload
+  was captured). **Practical consequence for Phase 4/5 of the format plan:** sign support built on
+  top of the already-landed `dir_trailer` capture (Phase 1) required no new network code at all —
+  inline signs already travel through every existing download/upload/save/Save-As path unmodified,
+  since they're just bytes inside `world.bytes`. **Phase 4 (read/display) landed 2026-08-18** — see
+  `02-file-format.md`'s sign-sidecar section and `04-ipc-reference.md`'s `get_signs` entry. Phase
+  5's sidecar-travel work (download/upload/Save-As/backup handling of `signs_<file>.eden.dat`)
+  still only matters for the separate, rarer sidecar case, and even there, whether it's worth
+  sending over the wire at all is genuinely unclear — the live client didn't. **Not started**;
+  the plan flags the scope decision itself as needing a sharper model + human judgment call before
+  committing engineering time, not just more implementation.
+- The response body on upload success is the literal 3 bytes `YES` (not JSON, not the world's id).
+  Search/browse responses come from a `Server: Jetty(10.0.3)` backend.
+
+Capture method for reproducing or extending this: `tcpdump -i <interface> -w x.pcap 'tcp port 80'`
+while using the real game's World Browser, then reassemble per-stream payloads with `dpkt` (a
+mitmproxy-based approach failed — the client doesn't route through the OS proxy setting even when
+it's the only network path available). No sudo-requiring capture tooling needed to be left running
+or installed system-wide; nothing about the client or server was modified.
 
 ## Export
 
@@ -231,3 +313,5 @@ guard. `window.destroy()` needs `core:window:allow-destroy`.
   add state + View toggle + 4×4 swatch panel.
 - **Creature viewer** — `get_creatures` registered; MapCanvas has draw code; UI
   passes `creatures={[]}`. Re-enable: add state + View toggle + world-load fetch.
+  Its slot-count bug is fixed regardless of UI status — see `creature_block_range`
+  in `02-file-format.md`/`04-ipc-reference.md`.

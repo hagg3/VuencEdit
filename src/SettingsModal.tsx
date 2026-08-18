@@ -2,6 +2,9 @@ import { useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { EDEN_TEAL, EDEN_TEAL_READABLE, glassPanel, glassTab, chromeButton, chromeButtonAccent, recessedWell, expBadge } from "./designTokens";
 import Modal from "./Modal";
+// M1: shared floor/ceiling with FlyView3D's own in-pane slider and the ribbon 3D tab, so a value set
+// here can never be silently clamped by a stricter range on either of the other two.
+import { MAX_RENDER_DISTANCE, RD_MIN } from "./FlyView3D";
 
 export const SETTINGS_KEY = "eden_settings";
 
@@ -48,6 +51,12 @@ export interface AppSettings {
   autoOrient3d: boolean;
   /** 3D pane Flood Fill mode's max air cells filled per click. Default 1000. */
   floodFillLimit: number;
+  /** How far (blocks) a 3D build-mode break/place can reach. Deliberately *not* the pick reach:
+   *  select / eyedropper / flood-fill keep the full `PICK_DIST` (256) because a long-range pick is
+   *  informational, while a long-range edit lands where the 1-block outline is already sub-pixel —
+   *  no visual confirmation of what changed. Past this cap the placement outline simply doesn't
+   *  appear (build-mode hover picks at the same distance), so the refusal is legible. Default 64. */
+  buildReach: number;
   /** Shows OBJ/VMF export menu items. Both are buggy/unfinished; off by default so most users never see them. */
   enableExperimentalExport: boolean;
   /** Docked right sidebar (Inspector/Prefabs/History tabs — Elevation folded into Inspector) open on load. Default true. */
@@ -59,6 +68,9 @@ export interface AppSettings {
   /** Memory-budget preset (§6 of the 2026-08 memory-efficiency pass) — trades resident RAM against
    *  undo depth / cache hit rate / 3D streaming range. See `MEMORY_PRESETS`. Default "balanced". */
   memoryBudget: "low" | "balanced" | "high";
+  /** Check github.com/hagg3/VuencEdit/releases on launch and show a splash-screen banner when a newer
+   *  version is available. Default true; off means no network request is made at all. */
+  checkForUpdatesOnLaunch: boolean;
   /** Bumped when a default changes in a way that must be pushed onto existing installs (see loadSettings). */
   settingsVersion: number;
 }
@@ -84,7 +96,7 @@ export const MEMORY_PRESETS: Record<AppSettings["memoryBudget"], {
 };
 
 /** Current settings schema version. Bump + add a case to `migrate()` when a stored default must change. */
-const SETTINGS_VERSION = 8;
+const SETTINGS_VERSION = 10;
 
 const DEFAULTS: AppSettings = {
   defaultQuadView: true,
@@ -107,11 +119,13 @@ const DEFAULTS: AppSettings = {
   autosaveIntervalMin: 3,
   autoOrient3d: true,
   floodFillLimit: 1000,
+  buildReach: 64,
   enableExperimentalExport: false,
   sidebarOpen: true,
   sidebarWidth: 260,
   sidebarTab: "inspector",
   memoryBudget: "balanced",
+  checkForUpdatesOnLaunch: true,
   settingsVersion: SETTINGS_VERSION,
 };
 
@@ -146,6 +160,12 @@ function migrate(s: Record<string, unknown>): boolean {
   // crash). No forced value needed: the ceilings live in `MEMORY_PRESETS` above, not in the stored
   // blob, so an existing install picks them up from the `memoryBudget` preset it already has. The
   // bump is here to record that the meaning of that preset changed.
+  // v8 → v9: added buildReach (3D build-mode break/place cap, default 64). No forced value needed —
+  // the `{...DEFAULTS, ...parsed}` merge supplies it. This *is* a behaviour change for existing
+  // installs (build used to reach the full 256-block pick distance), which is the point: an edit
+  // 250 blocks out has no legible outline. The bump records it.
+  // v9 → v10: added checkForUpdatesOnLaunch (splash-screen GitHub release check). No forced value
+  // needed — the `{...DEFAULTS, ...parsed}` merge supplies it (default true).
   s.settingsVersion = SETTINGS_VERSION;
   return true;
 }
@@ -370,6 +390,14 @@ export default function SettingsModal({ onClose, onSave }: Props) {
               </div>
 
               <div style={row}>
+                <Checkbox value={local.checkForUpdatesOnLaunch} onChange={v => set("checkForUpdatesOnLaunch", v)} label="Check for updates on launch" />
+                <div style={labelCol}>
+                  <span style={labelText}>Check for updates on launch</span>
+                  <span style={labelSub}>Checks github.com/hagg3/VuencEdit/releases and shows a banner on the splash screen if a newer version is out</span>
+                </div>
+              </div>
+
+              <div style={row}>
                 <Checkbox value={local.enableExperimentalExport} onChange={v => set("enableExperimentalExport", v)} label="Experimental exports (OBJ/VMF)" />
                 <div style={labelCol}>
                   <span style={labelText}>
@@ -448,7 +476,7 @@ export default function SettingsModal({ onClose, onSave }: Props) {
               <div style={sectionLabel}>3D pane sliders</div>
 
               <Slider
-                label="Render distance" value={local.renderDistance} min={2} max={32} step={1}
+                label="Render distance" value={local.renderDistance} min={RD_MIN} max={MAX_RENDER_DISTANCE} step={1}
                 format={v => `${Math.round(v)} chunks`}
                 onChange={v => set("renderDistance", Math.round(v))}
               />
@@ -474,6 +502,16 @@ export default function SettingsModal({ onClose, onSave }: Props) {
                 onChange={v => set("lampRadius", Math.round(v))}
               />
               <div style={{ height: 8 }} />
+
+              <Slider
+                label="Build reach" value={local.buildReach} min={8} max={256} step={8}
+                format={v => `${Math.round(v)} blocks`}
+                onChange={v => set("buildReach", Math.round(v))}
+              />
+              <div style={{ ...labelSub, marginTop: -2, marginBottom: 10 }}>
+                How far a 3D build-mode break/place can reach. Past it the placement outline doesn&apos;t
+                appear and a click does nothing. Select, eyedropper and flood fill still reach 256.
+              </div>
 
               <div style={row}>
                 <div style={labelCol}>

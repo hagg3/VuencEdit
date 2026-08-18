@@ -3,6 +3,7 @@ mod export;
 mod journal;
 mod network;
 mod schematic;
+mod signs;
 mod texturepack;
 mod vmf_export;
 mod worldgen;
@@ -241,6 +242,15 @@ pub struct WorldMeta {
     pub abs_min_y: i32,
     /// Sky color index (into the 54-entry paint palette) — used for grass tint and 3D-view fog color.
     pub sky: u8,
+    /// Header `version` field (bytes 92–95) — lets the frontend distinguish `NewFormat256z`
+    /// (256z, `version` not 5/6 — the 2026 game update) from `NewDawn256z` (256z, `version` 5 or
+    /// 6) without a second `get_world_info` round trip. See CLAUDE.md's "File Format" table.
+    pub version: i32,
+    /// True when this world's signs came from a `signs_<file>.eden.dat` **sidecar** rather than
+    /// the inline post-directory trailer. The sidecar is a separate file that nothing in VuencEdit
+    /// writes, so it does not travel with Save As, Upload, or a compressed save — the frontend
+    /// warns once on load. False when there are no signs at all, or when they were inline.
+    pub signs_from_sidecar: bool,
 }
 
 // ── In-memory world state ────────────────────────────────────────────────────
@@ -279,6 +289,12 @@ pub(crate) struct LoadedWorld {
     pub(crate) h_chunks: u32,
     pub(crate) name: String,
     pub(crate) sky: u8,
+    /// Raw bytes of a post-directory metadata section (currently only ever a `SGN1` signs
+    /// container — see `parse_signs`/Part A of the 256z-format plan), captured verbatim so the
+    /// rebuilding writers (`expand_world_from_template`, `materialize_flat_chunks_inner`) can
+    /// re-emit it instead of silently dropping the world's inline sign data. Empty for the
+    /// overwhelming majority of worlds, which have no trailer at all.
+    pub(crate) dir_trailer: Vec<u8>,
 }
 
 impl LoadedWorld {
@@ -312,6 +328,42 @@ fn read_spawn(world: &LoadedWorld) -> Option<(f32, f32)> {
     let px = abs_x - world.min_x as f32 * 16.0;
     let py = abs_z - world.min_y as f32 * 16.0;
     Some((px, py))
+}
+
+/// Read the last-walked player position from the `pos` field (bytes 4–15: X f32, height f32,
+/// Z f32 LE — game Z is editor Y). Returns (px, py) in editor 0-indexed coordinates, or None
+/// when both are zero (never walked). Mirrors `read_spawn`'s convention exactly.
+fn read_player_pos(world: &LoadedWorld) -> Option<(f32, f32)> {
+    let b = &world.bytes;
+    if b.len() < 16 { return None; }
+    let abs_x = f32::from_le_bytes([b[4], b[5], b[6], b[7]]);
+    let abs_z = f32::from_le_bytes([b[12], b[13], b[14], b[15]]);
+    if abs_x == 0.0 && abs_z == 0.0 { return None; }
+    let px = abs_x - world.min_x as f32 * 16.0;
+    let py = abs_z - world.min_y as f32 * 16.0;
+    Some((px, py))
+}
+
+/// Read the header's `version` field (bytes 92–95, i32 LE) — the raw byte, not a format
+/// classification. `0` for anything too short to hold it (never a real world file).
+fn read_world_version(bytes: &[u8]) -> i32 {
+    if bytes.len() < 96 { return 0; }
+    i32::from_le_bytes([bytes[92], bytes[93], bytes[94], bytes[95]])
+}
+
+/// Write the last-walked player position to the `pos` field (bytes 4–15). Same abs/height
+/// convention as `write_spawn`; deliberately does NOT touch `home` (bytes 16–27) — the two are
+/// distinct header fields ("Start" vs "Home" in the ribbon's Set Point group).
+fn write_player_pos(world: &mut LoadedWorld, px: f32, py: f32) {
+    let abs_x = px + world.min_x as f32 * 16.0;
+    let abs_z = py + world.min_y as f32 * 16.0;
+    let height = surface_z(world, px as i32, py as i32)
+        .map(|z| z as f32 + 2.0)
+        .unwrap_or(34.0);
+    if world.bytes.len() < 16 { return; }
+    world.bytes[4..8].copy_from_slice(&abs_x.to_le_bytes());
+    world.bytes[8..12].copy_from_slice(&height.to_le_bytes());
+    world.bytes[12..16].copy_from_slice(&abs_z.to_le_bytes());
 }
 
 /// Write the respawn/home position to the `home` field (bytes 16–27). Height is set to
@@ -705,6 +757,11 @@ pub(crate) struct WorldState {
     /// starts its own fresh base+journal lineage rather than silently extending a stale one whose
     /// on-disk image no longer corresponds to `temp_path`.
     pub(crate) autosave_base_id: Option<[u8; 16]>,
+    /// Signs for the currently-loaded world (256z-format plan, Phase 4) — sidecar preferred if
+    /// present beside the world's source path, else decoded from `LoadedWorld::dir_trailer`.
+    /// Populated once by `load_world`, read by `get_signs`. Empty for the overwhelming majority
+    /// of worlds, which have no signs at all. Cleared on world load/close.
+    pub(crate) signs: Vec<signs::Sign>,
 }
 
 impl WorldState {
@@ -729,6 +786,7 @@ impl WorldState {
             dirty: DirtyState::default(),
             disk_image: None,
             autosave_base_id: None,
+            signs: Vec::new(),
         }
     }
 
@@ -1112,6 +1170,65 @@ pub(crate) fn encode_dir_entry(cx: i32, cy: i32, off: u64) -> [u8; 16] {
     e
 }
 
+/// Chunk coordinates Eden can actually index. The game keys its in-memory directory by
+/// `twoToOne(x,z) = (x<<15)|z` (`~/emod/Classes/Util.mm:1053`), which returns its own
+/// "invalid/corrupt, skip" sentinel 0 for anything outside this range — so a directory row naming
+/// a chunk outside it is unreachable in-game no matter what the file claims. The game's own reader
+/// (`FileManager::readDirectory`) relies on exactly this to skip a trailing signs section written
+/// into the same 16-byte-slot region, tagged `x = -1`; see `CHUNK_COORD_LIMIT` callers in
+/// `parse_world_inner`/`decode_template_dir` for the read-side half of that contract.
+///
+/// Deliberately **looser than the game in one place**: chunk (0,0) is kept. `twoToOne` returns 0
+/// for it too, but every generated world sits at `CENTER_CHUNK = 4096` and the test fixtures live
+/// at (0,0) — dropping it costs tests and gains nothing real-world.
+pub(crate) const CHUNK_COORD_LIMIT: i32 = 1 << 15;
+#[inline]
+pub(crate) fn is_chunk_coord(c: i32) -> bool { (0..CHUNK_COORD_LIMIT).contains(&c) }
+
+/// Version-independent chunk-size detector (256z-format plan, Phase 2a). The game reserves a
+/// **400-slot, 60-byte-per-slot `EntityData` creature block** (24,000 B) immediately before the
+/// chunk directory whenever it has ever written one — so for the true `chunk_size`,
+/// `directory_offset − (max_chunk_offset + chunk_size)` is either exactly `0` (no creature block —
+/// every VuencEdit-generated world) or a whole number of those 60-byte slots, capped at 400. This
+/// is the same arithmetic the patched game engine uses (`FileManager::deriveColumnSpans`) and,
+/// unlike the min-gap heuristic below it, correctly identifies a **single-chunk** world, which has
+/// no second offset to diff against.
+///
+/// Returns `None` if zero or both candidates pass (ambiguous — let the caller fall back).
+fn detect_chunk_size_by_creature_gap(entries: &[(i32, i32, u64)], directory_offset: u64) -> Option<usize> {
+    let max_off = entries.iter().map(|&(_, _, off)| off).max()?;
+    let is_valid_gap = |cs: u64| {
+        directory_offset.checked_sub(max_off + cs)
+            .is_some_and(|gap| gap == 0 || (gap % 60 == 0 && gap / 60 <= 400))
+    };
+    match (is_valid_gap(131072), is_valid_gap(32768)) {
+        (true, false) => Some(131072),
+        (false, true) => Some(32768),
+        _ => None, // neither, or ambiguously both
+    }
+}
+
+/// Byte range `[start, end)` in `world.bytes` of the reserved creature block (see
+/// `detect_chunk_size_by_creature_gap`) — up to 400 slots of 60-byte `EntityData` that the game
+/// writes immediately before the chunk directory whenever it has ever done so. `start` is the end
+/// of the highest-offset real chunk (`chunk_size`-wide, mirroring the gap detector's own
+/// arithmetic); `end` is the directory offset read fresh from the header, since a handful of
+/// callers (e.g. `get_creatures` after an in-place incremental save) may see it move. Empty
+/// (`start == end`) for the overwhelming majority of worlds, which have no creature block at all —
+/// `get_creatures` used to assume a hardcoded 200-slot/12,000-byte block regardless of what was
+/// actually there, which read the wrong half of a 256z world's real 400-slot/24,000-byte block.
+fn creature_block_range(world: &LoadedWorld) -> (usize, usize) {
+    let max_chunk_end = world.chunk_map.values().copied().max()
+        .map(|off| off + world.chunk_size)
+        .unwrap_or(192);
+    let dir_off = if world.bytes.len() >= 40 {
+        u64::from_le_bytes(world.bytes[32..40].try_into().unwrap()) as usize
+    } else {
+        max_chunk_end
+    };
+    if dir_off > max_chunk_end { (max_chunk_end, dir_off) } else { (max_chunk_end, max_chunk_end) }
+}
+
 fn parse_world_inner(bytes: MmapMut) -> Result<LoadedWorld, String> {
     if bytes.len() < 36 {
         return Err("File too small to be a valid .eden world".into());
@@ -1180,6 +1297,40 @@ fn parse_world_inner(bytes: MmapMut) -> Result<LoadedWorld, String> {
         i += 16;
     }
 
+    // ── Pass A½: split off a trailing signs/metadata section from real chunk-pointer rows ────
+    //
+    // The game appends a `SGN1` signs section directly after the real chunk directory, using the
+    // same 16-byte slot layout with every row's chunk-X tagged `-1` — see
+    // DOCUMENTATION/02-file-format.md and `CHUNK_COORD_LIMIT`'s doc comment. Before this gate
+    // existed those rows decoded as chunks at coordinates like `(-1, 1953719668)`, which corrupted
+    // the world's reported bounding box (`w_chunks`/`h_chunks`) and everything downstream of it.
+    //
+    // Only a contiguous *trailing* run is captured as `dir_trailer` and preserved verbatim; an
+    // interior row that fails the gate is corruption, dropped outright and never appended to the
+    // trailer (re-emitting garbage there could feed a real `SGN1` parser on the next load). This is
+    // why the trailer is computed from `rposition` (last real entry) before any filtering — filtering
+    // first would make the same row indices no longer line up with byte offsets.
+    const MAX_TRAILER_BYTES: usize = 64 * 1024; // multiple of 16 — never splits a slot
+    let last_valid_entry = entries.iter()
+        .rposition(|&(cx, cy, _)| is_chunk_coord(cx) && is_chunk_coord(cy));
+    let kept_entries = last_valid_entry.map(|i| i + 1).unwrap_or(0);
+    let dir_trailer: Vec<u8> = {
+        let start = (ptr_offset + kept_entries * 16).min(bytes.len());
+        let end = (ptr_offset + entries.len() * 16).min(bytes.len());
+        let raw = if start < end { &bytes[start..end] } else { &[][..] };
+        raw[..raw.len().min(MAX_TRAILER_BYTES)].to_vec()
+    };
+    entries.truncate(kept_entries);
+    let pre_interior_filter = entries.len();
+    entries.retain(|&(cx, cy, _)| is_chunk_coord(cx) && is_chunk_coord(cy));
+    let interior_dropped = pre_interior_filter - entries.len();
+    if !dir_trailer.is_empty() || interior_dropped > 0 {
+        eprintln!(
+            "[WORLD] chunk directory: {} B of post-directory metadata ({} interior entries dropped as corrupt)",
+            dir_trailer.len(), interior_dropped
+        );
+    }
+
     // Detect whether this is a 64-layer world (32768 bytes/chunk, 4 bands) or a
     // 256-layer world (131072 bytes/chunk, 16 bands).
     //
@@ -1196,6 +1347,13 @@ fn parse_world_inner(bytes: MmapMut) -> Result<LoadedWorld, String> {
     } else { 4 };
     let chunk_size = if version >= 5 {
         131072
+    } else if let Some(cs) = detect_chunk_size_by_creature_gap(&entries, ptr_offset as u64) {
+        // The updated game writes `version` values (2, seen so far) that predate the New Dawn
+        // version field entirely but still uses 256z chunks — see DOCUMENTATION/02-file-format.md
+        // "NewFormat256z". The creature-gap test settles this even for a *single*-chunk world,
+        // where the min-gap fallback below has no second offset to diff against and would
+        // silently default to 32768 (unreadable past z=63).
+        cs
     } else {
         // Legacy (version <= 4) worlds are the only ones that reach this fallback — which is
         // exactly why the truncation stayed invisible until >4 GiB (always version 5+) files
@@ -1205,7 +1363,7 @@ fn parse_world_inner(bytes: MmapMut) -> Result<LoadedWorld, String> {
         // collapsed (a repeated offset would otherwise yield a gap of 0).
         let mut offsets: Vec<u64> = entries.iter()
             .map(|&(_, _, off)| off)
-            .filter(|&off| off < bytes.len() as u64)
+            .filter(|&off| off >= 192 && off < bytes.len() as u64)
             .collect();
         offsets.sort_unstable();
         offsets.dedup();
@@ -1223,13 +1381,16 @@ fn parse_world_inner(bytes: MmapMut) -> Result<LoadedWorld, String> {
     for (cx, cy, off) in entries {
         // Compared in u64 so a >4 GiB offset can't wrap on the way to the check — which also
         // makes the `as usize` provably lossless, since anything that passes is < bytes.len().
-        if off.checked_add(chunk_size as u64).is_some_and(|end| end <= bytes.len() as u64) {
+        // `off >= 192`: chunk data can never start inside the 192-byte header (mirrors the
+        // `ptr_offset >= 192` check above).
+        if off >= 192 && off.checked_add(chunk_size as u64).is_some_and(|end| end <= bytes.len() as u64) {
             chunk_map.insert((cx, cy), off as usize);
         }
     }
 
     if chunk_map.is_empty() {
-        return Err("No valid chunks found".into());
+        return Err("Corrupt or unsupported world file: every chunk directory entry named an \
+            unaddressable coordinate or offset".into());
     }
 
     // ── Per-chunk spans: what each chunk really owns, not what its nominal size claims ─────────
@@ -1278,6 +1439,13 @@ fn parse_world_inner(bytes: MmapMut) -> Result<LoadedWorld, String> {
     let min_y = chunk_map.keys().map(|&(_, y)| y).min().unwrap();
     let max_x = chunk_map.keys().map(|&(x, _)| x).max().unwrap();
     let max_y = chunk_map.keys().map(|&(_, y)| y).max().unwrap();
+    let w_chunks = (max_x - min_x + 1) as u32;
+    let h_chunks = (max_y - min_y + 1) as u32;
+    // Every key survived the `is_chunk_coord` gate above (0..CHUNK_COORD_LIMIT), so both bounds
+    // are structurally <= CHUNK_COORD_LIMIT — this is what makes the ~27 unguarded
+    // `(world.h_chunks * 16) as i32`-style expressions across the render paths provably safe from
+    // the u32-overflow class that a stray `(-1, 1953719668)` "chunk" used to trigger.
+    debug_assert!(w_chunks as i32 <= CHUNK_COORD_LIMIT && h_chunks as i32 <= CHUNK_COORD_LIMIT);
 
     Ok(LoadedWorld {
         bytes,
@@ -1287,10 +1455,11 @@ fn parse_world_inner(bytes: MmapMut) -> Result<LoadedWorld, String> {
         num_bands,
         min_x,
         min_y,
-        w_chunks: (max_x - min_x + 1) as u32,
-        h_chunks: (max_y - min_y + 1) as u32,
+        w_chunks,
+        h_chunks,
         name,
         sky,
+        dir_trailer,
     })
 }
 
@@ -1889,6 +2058,24 @@ fn load_world(path: String, state: tauri::State<'_, AppState>) -> Result<WorldMe
     timing_log!("[LOAD] parsed  {}×{} chunks  count={}  world_bytes={}B  t=+{}µs",
         loaded.w_chunks, loaded.h_chunks, loaded.chunk_map.len(), loaded.bytes.len(), us());
 
+    // Signs (256z-format plan, Phase 4): sidecar preferred if it exists beside the *source* path
+    // (never the staged temp — the sidecar travels with the user's file, not our private copy),
+    // else decoded from the inline post-directory trailer (Part A/C — what an upload actually
+    // sends). A missing/foreign/corrupt sidecar must never fail the load, just show no signs.
+    let (signs, signs_from_sidecar) = match fs::read(signs::sign_sidecar_path(std::path::Path::new(&path))) {
+        Ok(bytes) => {
+            let parsed = signs::parse_signs(&bytes);
+            // A sidecar that exists but decodes to nothing is not a sidecar world — fall back, so
+            // a stray/foreign file can't suppress signs sitting inline in the world itself.
+            if parsed.is_empty() {
+                (signs::parse_inline_signs(&loaded.dir_trailer), false)
+            } else {
+                (parsed, true)
+            }
+        }
+        Err(_) => (signs::parse_inline_signs(&loaded.dir_trailer), false),
+    };
+
     // Capture metadata before moving loaded into state.
     // No render_pixels call — tiles are fetched on demand by the frontend.
     let spawn = read_spawn(&loaded);
@@ -1917,6 +2104,8 @@ fn load_world(path: String, state: tauri::State<'_, AppState>) -> Result<WorldMe
         abs_min_x: loaded.min_x,
         abs_min_y: loaded.min_y,
         sky: loaded.sky,
+        version: read_world_version(&loaded.bytes),
+        signs_from_sidecar,
     };
 
     // Step 3: Swap in the new world and clear old session state (clipboard/undo/redo/lamp index/
@@ -1943,6 +2132,7 @@ fn load_world(path: String, state: tauri::State<'_, AppState>) -> Result<WorldMe
         ws.temp_path = maybe_temp;
         ws.dirty.clear_all();
         ws.autosave_base_id = None; // the new world's autosave lineage starts fresh, not the old one's
+        ws.signs = signs;
         // Non-zip loads: the staged temp is an exact copy of the source file, which is exactly
         // world.bytes, so the source path is a known-good disk image the instant load succeeds.
         // Zip loads leave this None — there is no uncompressed on-disk image to write into.
@@ -2324,6 +2514,25 @@ fn set_cursor_lock(window: tauri::Window, locked: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// Decode a template's chunk-pointer directory, gated by `is_chunk_coord` like the world reader
+/// (Phase 1f of the 256z-format plan) — provably a no-op on the shipped `Eden.eden` (every row is
+/// in-range), but without it a corrupt/foreign row would make `expand_world_from_template` write a
+/// garbage-RLE chunk at an unaddressable coordinate.
+fn decode_template_dir(mmap: &[u8], dir_offset: usize) -> FxHashMap<(i32, i32), usize> {
+    let n_entries = (mmap.len() - dir_offset) / 16;
+    let mut template_dir: FxHashMap<(i32, i32), usize> = FxHashMap::with_capacity_and_hasher(n_entries, Default::default());
+    let mut i = dir_offset;
+    while i + 16 <= mmap.len() {
+        let (tx, tz, offset) = decode_dir_entry(&mmap[i..i + 16]);
+        let offset = offset as usize;
+        if is_chunk_coord(tx) && is_chunk_coord(tz) && offset < mmap.len() {
+            template_dir.insert((tx, tz), offset);
+        }
+        i += 16;
+    }
+    template_dir
+}
+
 #[tauri::command(async)]
 fn load_eden_template(path: String, state: tauri::State<'_, AppState>) -> Result<u32, String> {
     let file = fs::File::open(&path).map_err(|e| format!("Cannot open template: {e}"))?;
@@ -2341,18 +2550,7 @@ fn load_eden_template(path: String, state: tauri::State<'_, AppState>) -> Result
         return Err("Invalid template directory offset".into());
     }
 
-    let n_entries = (mmap.len() - dir_offset) / 16;
-    let mut template_dir: FxHashMap<(i32, i32), usize> = FxHashMap::with_capacity_and_hasher(n_entries, Default::default());
-    let mut i = dir_offset;
-    while i + 16 <= mmap.len() {
-        let tx = i32::from_le_bytes(mmap[i..i+4].try_into().unwrap());
-        let tz = i32::from_le_bytes(mmap[i+4..i+8].try_into().unwrap());
-        let offset = u64::from_le_bytes(mmap[i+8..i+16].try_into().unwrap()) as usize;
-        if offset < mmap.len() {
-            template_dir.insert((tx, tz), offset);
-        }
-        i += 16;
-    }
+    let template_dir = decode_template_dir(&mmap, dir_offset);
 
     let chunk_count = template_dir.len() as u32;
     let mut ws = write_ws(&state);
@@ -2460,7 +2658,7 @@ fn expand_world_from_template(
     // it finished. Cloning the template Arc is a refcount bump; the header/dir/user-chunk-list
     // copies are cheap relative to the write itself, so this is what actually gets other threads
     // (map render, cancel checks) their scheduling turn back.
-    let (min_x, min_y, max_x, max_y, chunk_size, header, tmpl, tdir, user_chunk_bytes) = {
+    let (min_x, min_y, max_x, max_y, chunk_size, header, tmpl, tdir, user_chunk_bytes, dir_trailer, creature_block) = {
         let ws = read_ws(&state);
         let world = ws.world.as_ref().ok_or("No world loaded")?;
         let tmpl = ws.template_bytes.clone().ok_or("No template loaded")?;
@@ -2471,6 +2669,11 @@ fn expand_world_from_template(
         let max_y = min_y + world.h_chunks as i32 - 1;
         let chunk_size = world.chunk_size;
         let header = world.bytes[..192.min(world.bytes.len())].to_vec();
+        let dir_trailer = world.dir_trailer.clone();
+        // Preserve the source world's reserved creature block (see `creature_block_range`) rather
+        // than silently dropping it — same rationale as `dir_trailer`, one slot below it.
+        let (cb_start, cb_end) = creature_block_range(world);
+        let creature_block = world.bytes[cb_start..cb_end].to_vec();
 
         let mut user_chunk_list: Vec<(i32, i32, usize)> = world.chunk_map.iter()
             .map(|(&(cx, cy), &off)| (cx, cy, off))
@@ -2489,7 +2692,7 @@ fn expand_world_from_template(
             })
             .collect();
 
-        (min_x, min_y, max_x, max_y, chunk_size, header, tmpl, ws.template_dir.clone(), user_chunk_bytes)
+        (min_x, min_y, max_x, max_y, chunk_size, header, tmpl, ws.template_dir.clone(), user_chunk_bytes, dir_trailer, creature_block)
     };
     let tmpl: &[u8] = tmpl.as_ref();
 
@@ -2567,6 +2770,12 @@ fn expand_world_from_template(
         }
     }
 
+    // Re-emit the source world's reserved creature block (see `creature_block_range`) directly
+    // before the directory, exactly where the game itself reserves it — mirrors the dir_trailer
+    // re-emission below, just on the other side of the directory.
+    writer.write_all(&creature_block).map_err(|e| format!("Write error: {e}"))?;
+    cur_offset += creature_block.len() as u64;
+
     // Write directory (16 B/entry: i32 cx, i32 cy, u64 off — all little-endian). For the
     // non-negative, sub-4 GiB values the old i16+pad / u32+pad form produced, this is
     // byte-for-byte identical output; it additionally round-trips negative chunk coordinates
@@ -2575,6 +2784,10 @@ fn expand_world_from_template(
     for &(cx, cy, off) in &dir_entries {
         writer.write_all(&encode_dir_entry(cx, cy, off)).map_err(|e| format!("Write error: {e}"))?;
     }
+    // Re-emit the source world's post-directory trailer (inline signs, see `LoadedWorld::dir_trailer`)
+    // verbatim, immediately after the real entries — the same layout the game itself writes, and what
+    // `parse_world_inner`'s Pass A½ expects to find.
+    writer.write_all(&dir_trailer).map_err(|e| format!("Write error: {e}"))?;
 
     writer.flush().map_err(|e| format!("Flush error: {e}"))?;
     drop(writer);
@@ -2607,6 +2820,8 @@ fn materialize_flat_chunks_inner(
     user_chunk_bytes: &[(i32, i32, Vec<u8>)],
     to_add: &[(i32, i32)],
     params: &FlatChunkParams,
+    dir_trailer: &[u8],
+    creature_block: &[u8],
     mut cancelled: impl FnMut() -> bool,
     mut on_progress: impl FnMut(usize, usize),
 ) -> Result<MaterializeResult, String> {
@@ -2647,10 +2862,18 @@ fn materialize_flat_chunks_inner(
         }
     }
 
+    // Re-emit the source world's reserved creature block verbatim — see the identical comment in
+    // `expand_world_from_template`.
+    writer.write_all(creature_block).map_err(|e| format!("Write error: {e}"))?;
+    cur_offset += creature_block.len() as u64;
+
     let dir_offset = cur_offset;
     for &(cx, cy, off) in &dir_entries {
         writer.write_all(&encode_dir_entry(cx, cy, off)).map_err(|e| format!("Write error: {e}"))?;
     }
+    // Re-emit the source world's post-directory trailer verbatim — see the identical comment in
+    // `expand_world_from_template`.
+    writer.write_all(dir_trailer).map_err(|e| format!("Write error: {e}"))?;
 
     writer.flush().map_err(|e| format!("Flush error: {e}"))?;
     drop(writer);
@@ -2693,11 +2916,21 @@ fn materialize_flat_chunks(
         ));
     }
 
-    let (chunk_size, header, user_chunk_bytes, existing) = {
+    if let Some(&(bad_x, bad_y)) = coords.iter().find(|&&(cx, cy)| !is_chunk_coord(cx) || !is_chunk_coord(cy)) {
+        return Err(format!(
+            "Chunk coordinate ({bad_x}, {bad_y}) is outside the addressable range \
+             0..{CHUNK_COORD_LIMIT} — the game cannot index it"
+        ));
+    }
+
+    let (chunk_size, header, user_chunk_bytes, existing, dir_trailer, creature_block) = {
         let ws = read_ws(&state);
         let world = ws.world.as_ref().ok_or("No world loaded")?;
         let chunk_size = world.chunk_size;
         let header = world.bytes[..192.min(world.bytes.len())].to_vec();
+        let dir_trailer = world.dir_trailer.clone();
+        let (cb_start, cb_end) = creature_block_range(world);
+        let creature_block = world.bytes[cb_start..cb_end].to_vec();
 
         let mut user_chunk_list: Vec<(i32, i32, usize)> = world.chunk_map.iter()
             .map(|(&(cx, cy), &off)| (cx, cy, off))
@@ -2715,7 +2948,7 @@ fn materialize_flat_chunks(
             .collect();
         let existing: HashSet<(i32, i32)> = user_chunk_bytes.iter().map(|&(cx, cy, _)| (cx, cy)).collect();
 
-        (chunk_size, header, user_chunk_bytes, existing)
+        (chunk_size, header, user_chunk_bytes, existing, dir_trailer, creature_block)
     };
 
     let num_bands = chunk_size / 8192;
@@ -2762,7 +2995,7 @@ fn materialize_flat_chunks(
     }
 
     materialize_flat_chunks_inner(
-        &output_path, chunk_size, &header, &user_chunk_bytes, &to_add, &params,
+        &output_path, chunk_size, &header, &user_chunk_bytes, &to_add, &params, &dir_trailer, &creature_block,
         || materialize_cancelled(&cancel),
         |done, total| {
             let pct = (done as f64 / total as f64 * 100.0) as u32;
@@ -2870,13 +3103,17 @@ fn render_yslice_patch(
     y: i32, x1: i32, z1: i32, x2: i32, z2: i32,
     state: tauri::State<'_, AppState>,
 ) -> Result<PixelPatch, String> {
+    let t0 = Instant::now();
     let ws = read_ws(&state);
     let world = ws.world.as_ref().ok_or("No world loaded")?;
     let world_h = (world.h_chunks * 16) as i32;
     if y < 0 || y >= world_h {
         return Err(format!("Y must be 0–{}, got {y}", world_h - 1));
     }
-    Ok(render_yslice_patch_inner(world, y, x1, z1, x2, z2))
+    let patch = render_yslice_patch_inner(world, y, x1, z1, x2, z2);
+    timing_log!("[SLAB] render_yslice_patch  {}×{}  elapsed={}µs",
+        patch.width, patch.height, t0.elapsed().as_micros());
+    Ok(patch)
 }
 
 /// Side-slab tile: constant world-X plane. Horizontal = Y (y1..y2), vertical = Z (z1..z2).
@@ -2886,13 +3123,17 @@ fn render_xslice_patch(
     x: i32, y1: i32, z1: i32, y2: i32, z2: i32,
     state: tauri::State<'_, AppState>,
 ) -> Result<PixelPatch, String> {
+    let t0 = Instant::now();
     let ws = read_ws(&state);
     let world = ws.world.as_ref().ok_or("No world loaded")?;
     let world_w = (world.w_chunks * 16) as i32;
     if x < 0 || x >= world_w {
         return Err(format!("X must be 0–{}, got {x}", world_w - 1));
     }
-    Ok(render_xslice_patch_inner(world, x, y1, z1, y2, z2))
+    let patch = render_xslice_patch_inner(world, x, y1, z1, y2, z2);
+    timing_log!("[SLAB] render_xslice_patch  {}×{}  elapsed={}µs",
+        patch.width, patch.height, t0.elapsed().as_micros());
+    Ok(patch)
 }
 
 /// Cap on the scan-buffer clone `render_selection_view`/`render_full_height_view` build before
@@ -2983,7 +3224,7 @@ fn render_selection_view(
             min_x: world.min_x, min_y: world.min_y,
             w_chunks: world.w_chunks, h_chunks: world.h_chunks,
             chunk_size: local_band_bytes, num_bands: bands_per_chunk,
-            sky: world.sky, name: String::new(),
+            sky: world.sky, name: String::new(), dir_trailer: Vec::new(),
         };
         drop(ws);  // explicit drop — lock released here, before any scanning
         timing_log!("[LOCK] released  cmd=render_selection_view  held={}µs  cloned={}B  bands={}/{}  t=+{}µs",
@@ -3204,7 +3445,7 @@ fn render_full_height_view(
             bytes: local_bytes, chunk_map: local_map, chunk_span: FxHashMap::default(),
             min_x: world.min_x, min_y: world.min_y,
             w_chunks: world.w_chunks, h_chunks: world.h_chunks,
-            chunk_size, num_bands, sky: world.sky, name: String::new(),
+            chunk_size, num_bands, sky: world.sky, name: String::new(), dir_trailer: Vec::new(),
         };
         drop(ws);
         (scan_world, z_max)
@@ -4139,6 +4380,7 @@ fn paint_blocks(
     z_offset: Option<i32>,
     mask_type: Option<u8>,
     mask_paint: Option<u8>,
+    group: Option<u64>,
     state: tauri::State<'_, AppState>,
 ) -> Result<EditResult, String> {
     let z_offset = z_offset.unwrap_or(0);
@@ -4166,7 +4408,7 @@ fn paint_blocks(
     // so drawing underground behaves exactly like drawing on the true surface.
     let cap = ws.view_cap_z;
     let label = format!("Paint {} block{}", blocks.len(), if blocks.len() == 1 { "" } else { "s" });
-    with_edit(&mut ws, &label, rect, rect, |world| {
+    with_edit_grouped(&mut ws, &label, rect, rect, group, |world| {
         let max_z = world_max_z(world);
         for b in &blocks {
             let z = match b.z {
@@ -4290,7 +4532,7 @@ fn fill_connected_face(
         return Err("Nothing to fill".into());
     }
     let blocks: Vec<PaintBlock> = matched.into_iter().map(|(x, y, z)| PaintBlock { x, y, z: Some(z) }).collect();
-    paint_blocks(blocks, block_type, paint, None, None, None, state)
+    paint_blocks(blocks, block_type, paint, None, None, None, None, state)
 }
 
 /// Move the player spawn/home position to the given editor-coordinate pixel (px, py).
@@ -4303,6 +4545,27 @@ fn set_spawn_pos(px: i32, py: i32, state: tauri::State<'_, AppState>) -> Result<
     write_spawn(world, px as f32, py as f32);
     ws.dirty.mark_header();
     Ok((px as f32, py as f32))
+}
+
+/// Move the *last-walked player position* (`pos`, header bytes 4–15) — the ribbon's
+/// Home ▸ Set Point ▸ Start. Distinct from `set_spawn_pos`, which writes `home` (16–27).
+/// Like it, this bypasses `with_edit` (no undo entry), so the caller must bump `editEpoch`
+/// or the write is silently lost when the world closes.
+#[tauri::command(async)]
+fn set_player_pos(px: i32, py: i32, state: tauri::State<'_, AppState>) -> Result<(f32, f32), String> {
+    let mut ws = write_ws(&state);
+    let world = ws.world.as_mut().ok_or("No world loaded")?;
+    write_player_pos(world, px as f32, py as f32);
+    ws.dirty.mark_header();
+    Ok((px as f32, py as f32))
+}
+
+/// Editor-coordinate `pos` readout for the Set Point group / world pill. `None` = never walked.
+#[tauri::command(async)]
+fn get_player_pos(state: tauri::State<'_, AppState>) -> Result<Option<(f32, f32)>, String> {
+    let ws = read_ws(&state);
+    let world = ws.world.as_ref().ok_or("No world loaded")?;
+    Ok(read_player_pos(world))
 }
 
 fn save_world_compressed(world: &LoadedWorld, path: &str, backup_compressed: bool) -> Result<(), String> {
@@ -4392,6 +4655,7 @@ fn close_world(state: tauri::State<'_, AppState>) {
         ws.dirty.clear_all();
         ws.disk_image = None;
         ws.autosave_base_id = None;
+        ws.signs.clear();
         (ws.world.take(), ws.temp_path.take())
     };
     drop(old_world); // release the mmap before deleting its backing temp file
@@ -4773,6 +5037,8 @@ fn load_autosave_inner(state: &AppState, paths: &AutosavePaths) -> Result<WorldM
         abs_min_x: loaded.min_x,
         abs_min_y: loaded.min_y,
         sky: loaded.sky,
+        version: read_world_version(&loaded.bytes),
+        signs_from_sidecar: false, // autosave recovery has no source path to hold a sidecar
     };
 
     // ── Locked swap — mirrors load_world's step 3.
@@ -8954,8 +9220,10 @@ pub fn run() {
             render_axo_region,
             render_axo_clipboard,
             search_worlds,
+            list_worlds,
             download_world,
             upload_world,
+            check_for_update,
             get_surface_z,
             rename_world,
             sculpt_terrain,
@@ -8984,10 +9252,13 @@ pub fn run() {
             create_tg2_world,
             preview_tg2_world,
             set_spawn_pos,
+            set_player_pos,
+            get_player_pos,
             import_schematic_info,
             import_schematic_apply,
             get_sky_grid,
             set_sky_grid,
+            get_signs,
             get_creatures,
             pick_block_surface,
             get_cursor_block,
@@ -9041,6 +9312,39 @@ fn set_sky_grid(grid: Vec<u8>, state: tauri::State<'_, AppState>) -> Result<(), 
     Ok(())
 }
 
+// ── Signs (256z-format plan, Phase 4) ───────────────────────────────────────────
+
+#[derive(Serialize)]
+struct SignInfo {
+    /// Editor-local coordinates — `world block coord - min_{x,y}*16`, the same convention
+    /// `read_spawn`/`read_player_pos` use for the header's `pos`/`home` fields.
+    x: f32,
+    y: f32,
+    /// Absolute height — signs carry no z origin offset, unlike x/y.
+    z: i32,
+    /// Strong-but-unproven hypothesis: a 0–3 facing quadrant (Part C3 of the 256z-format plan).
+    facing: i32,
+    text: String,
+}
+
+/// Read-only sign list for the currently-loaded world (`ws.signs`, populated by `load_world` —
+/// see the comment there for sidecar-vs-inline-trailer precedence). Converts each sign's raw
+/// world x/y into editor-local coordinates on the way out.
+#[tauri::command(async)]
+fn get_signs(state: tauri::State<'_, AppState>) -> Result<Vec<SignInfo>, String> {
+    let ws = read_ws(&state);
+    let world = ws.world.as_ref().ok_or("No world loaded")?;
+    let origin_x = world.min_x as f32 * 16.0;
+    let origin_y = world.min_y as f32 * 16.0;
+    Ok(ws.signs.iter().map(|s| SignInfo {
+        x: s.x as f32 - origin_x,
+        y: s.y as f32 - origin_y,
+        z: s.z,
+        facing: s.c,
+        text: s.text.clone(),
+    }).collect())
+}
+
 // ── Creature viewer (Phase 6) ─────────────────────────────────────────────────
 
 #[derive(Serialize)]
@@ -9053,14 +9357,15 @@ struct CreatureInfo {
     angle:   f32,
 }
 
-/// Read up to 200 entity slots from the 12 000-byte block that precedes the
-/// chunk directory.  Skips empty slots (type == −1) and out-of-range types.
+/// Read up to 400 entity slots from the reserved creature block that precedes the chunk
+/// directory (`creature_block_range` — sized to whatever gap the world actually has, not a
+/// hardcoded 200-slot/12,000-byte assumption, which used to read the wrong half of a 256z world's
+/// real 400-slot/24,000-byte block). Skips empty slots (type == −1) and out-of-range types.
 /// Returns an empty list for editor-created worlds that have no entity block.
 #[tauri::command(async)]
 fn get_creatures(state: tauri::State<'_, AppState>) -> Result<Vec<CreatureInfo>, String> {
-    const MAX_SAVED: usize = 200;
     const ENTITY_BYTES: usize = 60; // sizeof(EntityData)
-    const BLOCK_SIZE: usize = MAX_SAVED * ENTITY_BYTES; // 12 000
+    const MAX_SLOTS: usize = 400;
 
     let ws = read_ws(&state);
     let world = ws.world.as_ref().ok_or("No world loaded")?;
@@ -9068,20 +9373,17 @@ fn get_creatures(state: tauri::State<'_, AppState>) -> Result<Vec<CreatureInfo>,
 
     if bytes.len() < 192 { return Ok(vec![]); }
 
-    // directory_offset is stored as u64 at bytes 32..40; clamp to usize.
-    let dir_off = u64::from_le_bytes(bytes[32..40].try_into().unwrap()) as usize;
+    let (block_start, block_end) = creature_block_range(world);
+    if block_end <= block_start || block_end > bytes.len() { return Ok(vec![]); }
+    let slot_count = ((block_end - block_start) / ENTITY_BYTES).min(MAX_SLOTS);
 
-    // Sanity check: the entity block must fit before directory_offset.
-    if dir_off < BLOCK_SIZE || dir_off > bytes.len() { return Ok(vec![]); }
-
-    let block_start = dir_off - BLOCK_SIZE;
     let mut out = Vec::new();
 
     // EntityData layout (Vector.h):
     //   pos(3×f32 @0): x=Eden-X, y=Eden-Z(up), z=Eden-Y(south)
     //   vel(3×f32 @12)
     //   angle(f32 @24)  type(i32 @28)  color(i32 @32)  touched/extra2/extra3/extra4 @36
-    for i in 0..MAX_SAVED {
+    for i in 0..slot_count {
         let base = block_start + i * ENTITY_BYTES;
         if base + ENTITY_BYTES > bytes.len() { break; }
         let s = &bytes[base..base + ENTITY_BYTES];
@@ -9292,28 +9594,50 @@ mod tests {
         assert_eq!(encode_dir_entry(cx, cy, off), legacy);
     }
 
-    /// End-to-end for the generator writer: `write_world_file` → `parse_world_inner`. Uses a
-    /// negative `start_cx`, which the old `as i16` + zero-pad encoding decoded as a large
-    /// *positive* X under the corrected reader — so this fails pre-Stage-4.
+    /// End-to-end for the generator writer: `write_world_file` → `parse_world_inner`, pinning the
+    /// `is_chunk_coord` gate's upper edge (`start_cx = 32766` puts the second chunk at the last
+    /// legal X, 32767) and guarding 1c (`off >= 192`): the first chunk must land at exactly 192.
     #[test]
-    fn test_write_world_file_round_trips_negative_chunk_coords() {
+    fn test_write_world_file_round_trips_boundary_chunk_coords() {
         let chunk_size = 32768usize;
         let (w, h) = (2u32, 1u32);
         let chunks: Vec<Vec<u8>> = (0..(w * h)).map(|_| vec![0u8; chunk_size]).collect();
         let path = std::env::temp_dir().join(format!("vuencedit_stage4_{}.eden", std::process::id()));
         let p = path.to_string_lossy().to_string();
-        worldgen::write_world_file(&p, "neg", w, h, chunk_size, -3, 4096, 10, &chunks)
+        worldgen::write_world_file(&p, "bnd", w, h, chunk_size, 32766, 4096, 10, &chunks)
             .expect("write failed");
         let bytes = fs::read(&path).expect("read back failed");
         let _ = fs::remove_file(&path);
 
         let world = parse_world_inner(mmap_from_bytes(bytes)).expect("parse failed");
         assert_eq!(world.chunk_map.len(), 2);
-        // 192 = the real header size `write_world_file` emits (the test module's `HEADER`
-        // constant is a 4096-byte fixture convention, not the format's header length).
-        assert_eq!(world.chunk_map.get(&(-3, 4096)), Some(&192));
-        assert_eq!(world.chunk_map.get(&(-2, 4096)), Some(&(192 + chunk_size)));
-        assert_eq!(world.min_x, -3, "min_x must reflect the real negative coord");
+        assert_eq!(world.chunk_map.get(&(32766, 4096)), Some(&192),
+            "the first chunk must land at exactly byte 192 (the real header size)");
+        assert_eq!(world.chunk_map.get(&(32767, 4096)), Some(&(192 + chunk_size)));
+        assert_eq!(world.min_x, 32766, "min_x must reflect the real coord");
+    }
+
+    /// The game's own directory reader keys chunks by `twoToOne(x,z) = (x<<15)|z`, which cannot
+    /// address a negative X — `parse_world_inner` must reject such an entry rather than load a
+    /// chunk the game itself could never find (see `is_chunk_coord`'s doc comment). Superseded
+    /// `test_write_world_file_round_trips_negative_chunk_coords`, which asserted the opposite
+    /// before the coordinate gate existed: no in-range positive coord can distinguish the widened
+    /// i32 encoding from the old i16 one, so re-pointing that test at a positive value would have
+    /// tested nothing new.
+    #[test]
+    fn test_parse_rejects_negative_chunk_coords_the_game_cannot_index() {
+        let chunk_size = 32768usize;
+        let (w, h) = (2u32, 1u32);
+        let chunks: Vec<Vec<u8>> = (0..(w * h)).map(|_| vec![0u8; chunk_size]).collect();
+        let path = std::env::temp_dir().join(format!("vuencedit_stage4_neg_{}.eden", std::process::id()));
+        let p = path.to_string_lossy().to_string();
+        worldgen::write_world_file(&p, "neg", w, h, chunk_size, -3, 4096, 10, &chunks)
+            .expect("write failed");
+        let bytes = fs::read(&path).expect("read back failed");
+        let _ = fs::remove_file(&path);
+
+        assert!(parse_world_inner(mmap_from_bytes(bytes)).is_err(),
+            "a negative chunk X is unaddressable in-game (twoToOne returns 0) and must be rejected");
     }
 
     /// §5.1.2 — an entry whose chunk would run past EOF is excluded from `chunk_map` rather than
@@ -9369,6 +9693,343 @@ mod tests {
         assert_eq!(world.chunk_size, 131072, "min-gap 131072 must detect a 256z world");
         assert_eq!(world.num_bands, 16);
         assert_eq!(world.chunk_map.len(), 2);
+    }
+
+    // ── Phase 1 (256z-format plan): post-directory sign trailer + coordinate gate ─────────────
+
+    /// The real 192-byte post-directory trailer found at the end of `TEST WORLDS/quarry.eden`:
+    /// 12 rows, each tagged `x = -1` (`ff ff ff ff`) so the game's own reader skips them. Row 0 is
+    /// a wrapper (`"SGN1"` + length 132); row 1 is the real `SGN1` header (version 1, count 1);
+    /// rows 2–4 are the one sign record's first 36 bytes (position + 3 unknown i32s + start of
+    /// text); rows 5–11 are zero padding to fill the 120-byte record. See the plan doc's Part A.
+    const QUARRY_SIGN_TRAILER: [u8; 192] = {
+        let mut b = [0u8; 192];
+        const ROWS: [[u8; 12]; 5] = [
+            [0x53, 0x47, 0x4e, 0x31, 0x84, 0, 0, 0, 0, 0, 0, 0],            // "SGN1", len 132
+            [0x53, 0x47, 0x4e, 0x31, 1, 0, 0, 0, 1, 0, 0, 0],               // "SGN1", version 1, count 1
+            [0x84, 0xff, 0, 0, 0x2d, 0xfe, 0, 0, 0x20, 0, 0, 0],            // x=65412, y=65069, z=32
+            [4, 0, 0, 0, 9, 0, 0, 0, 1, 0, 0, 0],                           // a=4, b=9, c=1
+            [0x74, 0x65, 0x73, 0x74, 0, 0, 0, 0, 0, 0, 0, 0],               // "test"
+        ];
+        let mut row = 0;
+        while row < 12 {
+            let e = row * 16;
+            b[e] = 0xff; b[e + 1] = 0xff; b[e + 2] = 0xff; b[e + 3] = 0xff;
+            if row < ROWS.len() {
+                let src = &ROWS[row];
+                let mut i = 0;
+                while i < 12 { b[e + 4 + i] = src[i]; i += 1; }
+            }
+            row += 1;
+        }
+        b
+    };
+
+    /// `make_multi_chunk_world` plus `trailer` bytes appended immediately after the real chunk
+    /// directory entries — mirrors how the game itself lays out a trailing `SGN1` section.
+    fn make_world_with_sign_trailer(n: usize, chunk_size: usize, version: i32, trailer: &[u8]) -> Vec<u8> {
+        let mut b = make_multi_chunk_world(n, chunk_size, version);
+        b.extend_from_slice(trailer);
+        b
+    }
+
+    /// Overwrite directory entry `i`'s X/Y coordinate fields in a `make_multi_chunk_world` fixture.
+    fn set_entry_coords(b: &mut [u8], dir_off: usize, i: usize, cx: i32, cy: i32) {
+        let e = dir_off + i * 16;
+        b[e..e + 4].copy_from_slice(&cx.to_le_bytes());
+        b[e + 4..e + 8].copy_from_slice(&cy.to_le_bytes());
+    }
+
+    /// The core regression: a trailing `SGN1` section must never be decoded as chunk rows — this
+    /// is exactly the old failure mode that reported quarry.eden as 4198 × 1,953,719,669 chunks.
+    #[test]
+    fn test_parse_ignores_post_directory_sign_trailer() {
+        let b = make_world_with_sign_trailer(2, 32768, 0, &QUARRY_SIGN_TRAILER);
+        let world = parse_world_inner(mmap_from_bytes(b)).expect("parse failed");
+        assert_eq!(world.chunk_map.len(), 2, "only the two real chunks may be admitted");
+        assert_eq!(world.w_chunks, 2, "the trailer's bogus X=-1 rows must not widen the bbox");
+        assert_eq!(world.h_chunks, 1);
+        assert!(world.chunk_span.is_empty(),
+            "the trailer rows must never be treated as chunks with short spans");
+    }
+
+    /// The trailer bytes themselves must survive parsing verbatim, so a rebuilding writer can
+    /// re-emit the world's real inline sign data instead of silently dropping it.
+    #[test]
+    fn test_parse_preserves_sign_trailer_bytes() {
+        let b = make_world_with_sign_trailer(2, 32768, 0, &QUARRY_SIGN_TRAILER);
+        let world = parse_world_inner(mmap_from_bytes(b)).expect("parse failed");
+        assert_eq!(world.dir_trailer, QUARRY_SIGN_TRAILER);
+    }
+
+    /// Ordering regression: the trailer's offset-0/offset-132 rows must be stripped *before*
+    /// `chunk_size` detection runs, or a legacy-version world's min-gap fallback would measure a
+    /// spurious tiny gap against them and misdetect 64z vs 256z.
+    #[test]
+    fn test_parse_min_gap_fallback_ignores_sign_trailer_offsets() {
+        // version 0 forces the min-gap fallback; two real chunks 131072 B apart should read 256z
+        // regardless of the trailer rows' tiny (0- and 132-byte) fake offsets.
+        let b = make_world_with_sign_trailer(2, 131072, 0, &QUARRY_SIGN_TRAILER);
+        let world = parse_world_inner(mmap_from_bytes(b)).expect("parse failed");
+        assert_eq!(world.chunk_size, 131072, "the trailer's fake offsets must not poison min-gap");
+        assert_eq!(world.chunk_map.len(), 2);
+    }
+
+    /// An *interior* out-of-range entry (not part of a trailing run) is corruption, not a sign
+    /// trailer — it must be dropped and never folded into `dir_trailer`.
+    #[test]
+    fn test_parse_drops_interior_out_of_range_entry() {
+        let mut b = make_multi_chunk_world(3, 32768, 0);
+        let dir_off = HEADER + 3 * 32768;
+        set_entry_coords(&mut b, dir_off, 1, -1, 999); // middle entry, not the trailing one
+        let world = parse_world_inner(mmap_from_bytes(b)).expect("parse failed");
+        assert_eq!(world.chunk_map.len(), 2, "chunks 0 and 2 must still load");
+        assert!(world.chunk_map.contains_key(&(0, 0)));
+        assert!(world.chunk_map.contains_key(&(2, 0)));
+        assert!(world.dir_trailer.is_empty(),
+            "an interior corrupt row must be dropped outright, not captured as a trailer");
+    }
+
+    /// 1c: chunk data can never start inside the 192-byte header, mirroring the `ptr_offset >= 192`
+    /// check. An entry pointing at offset 0 (as the real quarry trailer's wrapper row does) must be
+    /// rejected by Pass B even if it somehow carried an in-range coordinate.
+    #[test]
+    fn test_parse_drops_entry_pointing_into_header() {
+        let mut b = make_multi_chunk_world(2, 32768, 0);
+        let dir_off = HEADER + 2 * 32768;
+        set_entry_offset(&mut b, dir_off, 1, 0); // in-range coord, but offset 0 < 192
+        let world = parse_world_inner(mmap_from_bytes(b)).expect("parse failed");
+        assert!(world.chunk_map.contains_key(&(0, 0)));
+        assert!(!world.chunk_map.contains_key(&(1, 0)),
+            "an entry whose offset lands inside the header must be rejected");
+    }
+
+    /// The template-directory reader (1f) must apply the same coordinate gate as the world reader,
+    /// so a corrupt/foreign row in `Eden.eden` can't make `expand_world_from_template` write a
+    /// garbage-RLE chunk at an unaddressable coordinate.
+    #[test]
+    fn test_template_dir_skips_out_of_range_entries() {
+        let dir_off = 32usize;
+        let mut b = vec![0u8; dir_off + 3 * 16];
+        let entry = |b: &mut [u8], i: usize, cx: i32, cy: i32, off: u64| {
+            let e = dir_off + i * 16;
+            b[e..e + 4].copy_from_slice(&cx.to_le_bytes());
+            b[e + 4..e + 8].copy_from_slice(&cy.to_le_bytes());
+            b[e + 8..e + 16].copy_from_slice(&off.to_le_bytes());
+        };
+        entry(&mut b, 0, 4096, 4096, 0);
+        entry(&mut b, 1, -1, 999, 0);   // out of range — must be skipped
+        entry(&mut b, 2, 4097, 4096, 0);
+
+        let dir = decode_template_dir(&b, dir_off);
+        assert_eq!(dir.len(), 2);
+        assert!(dir.contains_key(&(4096, 4096)));
+        assert!(dir.contains_key(&(4097, 4096)));
+        assert!(!dir.contains_key(&(-1, 999)));
+    }
+
+    /// Full round trip: a world carrying the real quarry sign trailer, materialized to a sibling
+    /// file, must reload with that trailer intact — proving `materialize_flat_chunks_inner` re-emits
+    /// it instead of silently dropping the world's inline sign data (1g).
+    #[test]
+    fn test_materialize_preserves_post_directory_trailer() {
+        let b = make_world_with_sign_trailer(1, 32768, 0, &QUARRY_SIGN_TRAILER);
+        let world = parse_world_inner(mmap_from_bytes(b)).expect("parse failed");
+        let chunk_size = world.chunk_size;
+        let header = world.bytes[..192.min(world.bytes.len())].to_vec();
+        let user_chunk_bytes: Vec<(i32, i32, Vec<u8>)> = world.chunk_map.iter()
+            .map(|(&(cx, cy), _)| {
+                let (off, cend) = world.chunk_range(cx, cy).unwrap();
+                (cx, cy, world.bytes[off..cend].to_vec())
+            })
+            .collect();
+        let params = FlatChunkParams { chunk_size, stone_depth: 1, dirt_depth: 2, surface_z: 4 };
+        let out_path = std::env::temp_dir()
+            .join(format!("vuencedit_materialize_trailer_test_{}.eden", std::process::id()));
+        materialize_flat_chunks_inner(
+            out_path.to_str().unwrap(), chunk_size, &header, &user_chunk_bytes, &[], &params,
+            &world.dir_trailer, &[], || false, |_, _| {},
+        ).expect("materialize must succeed");
+        let out_bytes = fs::read(&out_path).expect("read output");
+        let _ = fs::remove_file(&out_path);
+        let reloaded = parse_world_inner(mmap_from_bytes(out_bytes)).expect("output must parse");
+        assert_eq!(reloaded.dir_trailer, QUARRY_SIGN_TRAILER);
+    }
+
+    // ── Phase 2a (256z-format plan): version-independent creature-gap chunk-size detector ─────
+
+    /// A single-chunk world whose directory sits `gap` bytes after the chunk's nominal end —
+    /// modelling the 400-slot creature block the game reserves immediately before the real
+    /// directory. `version` is deliberately `< 5` so neither the authoritative New Dawn rule nor
+    /// (with only one chunk) the min-gap fallback can resolve `chunk_size` on their own.
+    fn make_single_chunk_world_with_gap(chunk_size: usize, gap: usize, version: i32) -> Vec<u8> {
+        let dir_off = HEADER + chunk_size + gap;
+        let mut b = vec![0u8; dir_off + 16];
+        b[32..40].copy_from_slice(&(dir_off as u64).to_le_bytes());
+        b[92..96].copy_from_slice(&version.to_le_bytes());
+        let e = dir_off;
+        b[e..e + 4].copy_from_slice(&0i32.to_le_bytes());
+        b[e + 4..e + 8].copy_from_slice(&0i32.to_le_bytes());
+        b[e + 8..e + 16].copy_from_slice(&(HEADER as u64).to_le_bytes());
+        b
+    }
+
+    /// The exact scenario the updated game produces: `version` predates the New Dawn version
+    /// field (2, observed in `TEST WORLDS/newblocks`) but the world is 256z, and there is only one
+    /// chunk — the case the min-gap fallback structurally cannot solve.
+    #[test]
+    fn test_creature_gap_detects_256z_on_legacy_version() {
+        let b = make_single_chunk_world_with_gap(131072, 24_000, 2); // 400 slots, the max
+        let world = parse_world_inner(mmap_from_bytes(b)).expect("parse failed");
+        assert_eq!(world.chunk_size, 131072);
+        assert_eq!(world.num_bands, 16);
+    }
+
+    /// A legacy 64z world with a 200-slot (12,000 B) creature block must still resolve to 32768.
+    #[test]
+    fn test_creature_gap_detects_64z_with_200_slots() {
+        let b = make_single_chunk_world_with_gap(32768, 12_000, 0);
+        let world = parse_world_inner(mmap_from_bytes(b)).expect("parse failed");
+        assert_eq!(world.chunk_size, 32768);
+        assert_eq!(world.num_bands, 4);
+    }
+
+    /// A gap that is not a whole number of 60-byte slots for either candidate satisfies neither
+    /// half of the creature-gap test, so detection must fall through to the existing min-gap
+    /// heuristic rather than erroring — exercised here with two real chunks so min-gap has
+    /// something to measure.
+    #[test]
+    fn test_creature_gap_falls_back_to_min_gap_when_neither_matches() {
+        let mut b = make_multi_chunk_world(2, 131072, 0);
+        // Push the directory 37 bytes further out — not a multiple of 60 for either chunk size.
+        let old_dir_off = HEADER + 2 * 131072;
+        let new_dir_off = old_dir_off + 37;
+        b.resize(new_dir_off + 2 * 16, 0);
+        for i in 0..2 {
+            let src = old_dir_off + i * 16;
+            let (cx, cy, off) = decode_dir_entry(&b[src..src + 16].to_vec());
+            let dst = new_dir_off + i * 16;
+            b[dst..dst + 16].copy_from_slice(&encode_dir_entry(cx, cy, off));
+        }
+        b[32..40].copy_from_slice(&(new_dir_off as u64).to_le_bytes());
+        let world = parse_world_inner(mmap_from_bytes(b)).expect("parse failed");
+        assert_eq!(world.chunk_size, 131072, "min-gap fallback must still resolve this correctly");
+    }
+
+    // ── Open work (256z-format plan, item 6): creature-block range + preservation ─────────────
+
+    /// Build a world with `n` real chunks of `chunk_size`, then `creature_bytes` verbatim
+    /// (modelling the reserved creature block), then a directory naming just the `n` chunks.
+    fn make_world_with_creature_block(n: usize, chunk_size: usize, creature_bytes: &[u8]) -> Vec<u8> {
+        let chunks_end = HEADER + n * chunk_size;
+        let dir_off = chunks_end + creature_bytes.len();
+        let mut b = vec![0u8; dir_off + n * 16];
+        b[32..40].copy_from_slice(&(dir_off as u64).to_le_bytes());
+        b[chunks_end..chunks_end + creature_bytes.len()].copy_from_slice(creature_bytes);
+        for i in 0..n {
+            let e = dir_off + i * 16;
+            b[e     ..e +  4].copy_from_slice(&(i as i32).to_le_bytes());
+            b[e +  4..e +  8].copy_from_slice(&0i32.to_le_bytes());
+            b[e +  8..e + 16].copy_from_slice(&((HEADER + i * chunk_size) as u64).to_le_bytes());
+        }
+        b
+    }
+
+    /// `creature_block_range` must recover the exact reserved-gap bytes, not a hardcoded slot
+    /// count — the bug `get_creatures` used to have (always assumed 200 slots / 12,000 B).
+    #[test]
+    fn test_creature_block_range_detects_reserved_gap() {
+        let creature_bytes: Vec<u8> = (0..120u8).cycle().take(180).collect(); // 3 slots × 60 B
+        let b = make_world_with_creature_block(1, 32768, &creature_bytes);
+        let world = parse_world_inner(mmap_from_bytes(b)).expect("parse failed");
+        let (start, end) = creature_block_range(&world);
+        assert_eq!(end - start, creature_bytes.len());
+        assert_eq!(&world.bytes[start..end], &creature_bytes[..]);
+    }
+
+    /// The overwhelming majority of worlds have no creature block at all — the directory follows
+    /// the last chunk immediately, so the range must be empty (`start == end`), not underflow.
+    #[test]
+    fn test_creature_block_range_empty_when_no_gap() {
+        let b = make_multi_chunk_world(2, 131072, 5);
+        let world = parse_world_inner(mmap_from_bytes(b)).expect("parse failed");
+        let (start, end) = creature_block_range(&world);
+        assert_eq!(start, end, "no gap between last chunk and directory");
+    }
+
+    /// `materialize_flat_chunks_inner` must re-emit the source world's creature block verbatim,
+    /// directly before the new directory — mirroring `test_materialize_preserves_post_directory_trailer`
+    /// on the other side of the directory. Before this fix the two rebuilding writers silently
+    /// dropped this reserved space, closing the gap between the last chunk and the directory.
+    #[test]
+    fn test_materialize_preserves_creature_block() {
+        let creature_bytes: Vec<u8> = (0..255u8).cycle().take(600).collect(); // 10 slots × 60 B
+        let b = make_world_with_creature_block(1, 32768, &creature_bytes);
+        let world = parse_world_inner(mmap_from_bytes(b)).expect("parse failed");
+        let chunk_size = world.chunk_size;
+        let header = world.bytes[..192.min(world.bytes.len())].to_vec();
+        let user_chunk_bytes: Vec<(i32, i32, Vec<u8>)> = world.chunk_map.iter()
+            .map(|(&(cx, cy), _)| {
+                let (off, cend) = world.chunk_range(cx, cy).unwrap();
+                (cx, cy, world.bytes[off..cend].to_vec())
+            })
+            .collect();
+        let params = FlatChunkParams { chunk_size, stone_depth: 1, dirt_depth: 2, surface_z: 4 };
+        let (cb_start, cb_end) = creature_block_range(&world);
+        let creature_block = world.bytes[cb_start..cb_end].to_vec();
+        let out_path = std::env::temp_dir()
+            .join(format!("vuencedit_materialize_creature_test_{}.eden", std::process::id()));
+        materialize_flat_chunks_inner(
+            out_path.to_str().unwrap(), chunk_size, &header, &user_chunk_bytes, &[], &params,
+            &[], &creature_block, || false, |_, _| {},
+        ).expect("materialize must succeed");
+        let out_bytes = fs::read(&out_path).expect("read output");
+        let _ = fs::remove_file(&out_path);
+        let reloaded = parse_world_inner(mmap_from_bytes(out_bytes)).expect("output must parse");
+        let (rs, re) = creature_block_range(&reloaded);
+        assert_eq!(&reloaded.bytes[rs..re], &creature_bytes[..], "creature block must survive materialize");
+    }
+
+    // ── Phase 3 (256z-format plan): new-format block types 112–127 (placeholder appearance) ────
+
+    /// All four block-indexed tables must agree on covering exactly 128 types (0–111 known,
+    /// 112–127 new-format) — a length mismatch would silently reintroduce the "flood fill errors,
+    /// VMF export drops the cell, occlusion is wrong" hazard class for whichever table lagged.
+    #[test]
+    fn test_block_tables_cover_all_128_types() {
+        assert_eq!(BLOCK_RGB.len(), 128);
+        assert_eq!(BLOCK_INFO.len(), 128);
+        assert_eq!(BLOCK_PAINT_SCALE.len(), 128);
+        assert_eq!(crate::texturepack::BLOCK_FACE_TEX.len(), 128);
+        // Per the project decision to reuse existing colours/scales rather than invent placeholder
+        // hues: every new-format entry must equal some existing 0–111 entry, not a novel colour.
+        for bt in 112u8..=127 {
+            let rgb = BLOCK_RGB[bt as usize];
+            assert!(BLOCK_RGB[0..112].contains(&rgb), "block {bt}'s colour must reuse an existing 0–111 colour, got {rgb:?}");
+            let scale = BLOCK_PAINT_SCALE[bt as usize];
+            assert!(BLOCK_PAINT_SCALE[0..112].contains(&scale), "block {bt}'s paint scale must reuse an existing 0–111 scale, got {scale}");
+        }
+    }
+
+    /// `flood_fill_3d`'s only block-type validation is `(block_type as usize) >= BLOCK_RGB.len()`
+    /// (the one hard rejection in the whole IPC surface, per the audit) — replicated directly here
+    /// since the command itself takes a `tauri::State` the test build has no harness to construct.
+    /// Growing `BLOCK_RGB` to 128 is what fixes it; this pins that the fix covers the full new range.
+    #[test]
+    fn test_flood_fill_accepts_new_block_types() {
+        for bt in 112usize..=127 {
+            assert!(bt < BLOCK_RGB.len(), "flood_fill_3d must accept new-format block type {bt}");
+        }
+    }
+
+    /// New-format blocks must occlude like a normal solid cube — `BLOCK_INFO[112..=127] == 0` (no
+    /// `BI_NOTSOLID`/`BI_RAMPORSIDE`) — so neighbours cull hidden faces, they cast sun shadows, and
+    /// VMF/OBJ export include them instead of treating them as air-like out-of-range types.
+    #[test]
+    fn test_obj_occludes_treats_new_blocks_as_solid() {
+        for bt in 112u8..=127 {
+            assert!(obj_occludes(bt), "block {bt} must occlude (solid new-format block)");
+        }
     }
 
     // ── Stage 3: per-chunk span clamping (DIAGNOSE/DIAGNOSIS.md §1.9, §5.1.4) ─────────────────
@@ -9603,6 +10264,56 @@ mod tests {
         restore_and_invert(&mut world, &UndoEntry::new("test", vec![snap2], None));
         assert_eq!(&world.bytes[HEADER..HEADER + 32768], &pre_full2[0].3[..],
             "Full-delta undo must restore the whole chunk");
+    }
+
+    /// H1 (3D fly-view build-gesture audit) — `paint_blocks` accepts a `group: Option<u64>` routed
+    /// through `with_edit_grouped`, so a run of stamps sharing one gesture id collapses to a single
+    /// logical undo unit: `count_undo_groups` reports 1, and one `undo_edit` reverts every stamp.
+    /// `paint_blocks` itself takes a `tauri::State` the test build has no harness to construct (see
+    /// `test_flood_fill_accepts_new_block_types`'s comment on the same limitation), so this exercises
+    /// `with_edit_grouped` directly with the same one-block-per-call shape paint_blocks uses.
+    #[test]
+    fn test_paint_blocks_group_collapses_undo() {
+        let mut ws = ws_with(make_bumpy_world_grid(1, 8, |_, _| 20));
+        let group = Some(42u64);
+        for i in 0..5 {
+            let (x, y) = (i, 0);
+            with_edit_grouped(&mut ws, "Paint 1 block", (x, y, x, y), (x, y, x, y), group, |world| {
+                set_block_abs(world, x, y, 21, 2, 0);
+                Ok(())
+            }).expect("grouped stamp");
+        }
+        assert_eq!(count_undo_groups(&ws.undo_stack), 1, "5 same-group stamps must collapse to one undo unit");
+        assert_eq!(ws.undo_stack.len(), 5, "the stack itself still holds one entry per stamp");
+
+        undo_edit_inner(&mut ws).expect("undo the whole gesture");
+        assert!(ws.undo_stack.is_empty(), "one undo must pop every entry in the group");
+        let world = ws.world.as_ref().unwrap();
+        for i in 0..5 {
+            assert_eq!(read_block_abs(world, i, 0, 21), 0, "stamp {i} must be reverted");
+        }
+    }
+
+    /// Sibling of the above: `group: None` (every non-build `paint_blocks` caller) must be unaffected
+    /// — each call is still its own undo entry, no regression for the 2D draw/fill/slice paths.
+    #[test]
+    fn test_paint_blocks_ungrouped_unchanged() {
+        let mut ws = ws_with(make_bumpy_world_grid(1, 8, |_, _| 20));
+        for i in 0..5 {
+            let (x, y) = (i, 0);
+            with_edit_grouped(&mut ws, "Paint 1 block", (x, y, x, y), (x, y, x, y), None, |world| {
+                set_block_abs(world, x, y, 21, 2, 0);
+                Ok(())
+            }).expect("ungrouped stamp");
+        }
+        assert_eq!(count_undo_groups(&ws.undo_stack), 5, "ungrouped stamps must not coalesce");
+        assert_eq!(ws.undo_stack.len(), 5);
+
+        undo_edit_inner(&mut ws).expect("undo one entry");
+        assert_eq!(ws.undo_stack.len(), 4, "an ungrouped undo must pop exactly one entry");
+        let world = ws.world.as_ref().unwrap();
+        assert_eq!(read_block_abs(world, 4, 0, 21), 0, "only the last stamp is reverted");
+        assert_eq!(read_block_abs(world, 0, 0, 21), 2, "earlier stamps are untouched");
     }
 
     /// §1a — a fresh edit after an undo must reset `redo_bytes` to 0, not just clear `redo_stack`.
@@ -10511,6 +11222,35 @@ mod tests {
         let stone = block_color(2, 5, world.sky); // the fixture's stone is painted (paint 5)
         assert_eq!(px(&uncapped), dirt,  "normal render shows the top block (dirt)");
         assert_eq!(px(&capped),   stone, "cutaway render shows the block under the cap (stone)");
+    }
+
+    /// Set Point writes two *distinct* header fields: Home → `home` (bytes 16–27) and
+    /// Start → `pos` (bytes 4–15). Each must leave the other byte-identical, or "set my start
+    /// position" would silently move the respawn point too (and vice versa).
+    #[test]
+    fn test_set_point_home_and_start_are_independent_fields() {
+        let mut world = parse_world_inner(mmap_from_bytes(make_test_world())).expect("parse failed");
+
+        // Neither field is set in the fixture (all-zero header), so both readers say None.
+        assert_eq!(read_spawn(&world), None, "fresh fixture has no home");
+        assert_eq!(read_player_pos(&world), None, "fresh fixture has no pos");
+
+        // Write only `pos`.
+        let home_before = world.bytes[16..28].to_vec();
+        write_player_pos(&mut world, 3.0, 5.0);
+        assert_eq!(&world.bytes[16..28], &home_before[..], "writing pos must not touch home");
+        let (ppx, ppy) = read_player_pos(&world).expect("pos round-trips");
+        assert_eq!((ppx, ppy), (3.0, 5.0));
+        // Height resolves to one above the column's surface (dirt @ z48 → 50.0), same rule as home.
+        assert_eq!(f32::from_le_bytes(world.bytes[8..12].try_into().unwrap()), 50.0);
+        assert_eq!(read_spawn(&world), None, "home still unset");
+
+        // Write only `home`.
+        let pos_before = world.bytes[4..16].to_vec();
+        write_spawn(&mut world, 7.0, 2.0);
+        assert_eq!(&world.bytes[4..16], &pos_before[..], "writing home must not touch pos");
+        assert_eq!(read_spawn(&world), Some((7.0, 2.0)));
+        assert_eq!(read_player_pos(&world), Some((3.0, 5.0)), "pos survives a home write");
     }
 
     /// The binary IPC envelope (audit H2) is the contract `decodeEnvelope` in codec.ts reads back:
@@ -12991,6 +13731,50 @@ mod tests {
             .unwrap_or_else(|e| panic!("failed to mmap {path:?}: {e}"))
     }
 
+    /// Manual regression check against the real specimen that motivated Phase 1 of the 256z-format
+    /// plan: before the post-directory trailer gate, this file reported 4198 × 1,953,719,669
+    /// chunks (the trailing `SGN1` rows decoded as chunks). `TEST WORLDS/` is private and not
+    /// guaranteed present, so this is `#[ignore]`d — run explicitly with
+    /// `cargo test manual_quarry -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn manual_quarry_eden_dimensions_are_sane() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../TEST WORLDS/quarry.eden");
+        let world = parse_world_inner(map_fixture(&path)).expect("quarry.eden must parse");
+        eprintln!(
+            "quarry.eden: {}x{} chunks, chunk_size={}, dir_trailer={}B, chunk_span short-spans={}",
+            world.w_chunks, world.h_chunks, world.chunk_size, world.dir_trailer.len(),
+            world.chunk_span.len()
+        );
+        assert!(world.w_chunks < 1000 && world.h_chunks < 1000,
+            "bbox must be sane, not the old 4198 x 1,953,719,669 garbage");
+        assert_eq!(world.chunk_size, 131072, "quarry.eden is a 256z world");
+        assert!(!world.dir_trailer.is_empty(), "quarry.eden's inline signs section must be captured");
+
+        // Phase 4: the captured trailer must decode to exactly the one real sign record (Part A).
+        let quarry_signs = signs::parse_inline_signs(&world.dir_trailer);
+        assert_eq!(quarry_signs.len(), 1);
+        assert_eq!(quarry_signs[0].x, 65412);
+        assert_eq!(quarry_signs[0].y, 65069);
+        assert_eq!(quarry_signs[0].z, 32);
+        assert_eq!(quarry_signs[0].text, "test");
+    }
+
+    /// Manual regression for the *other* Phase-1/2 specimen: the updated game's world, whose
+    /// header `version` (2) predates the New Dawn `>=5` rule despite being 256z. Confirms the
+    /// creature-gap detector (Phase 2a), not luck, is what resolves it.
+    #[test]
+    #[ignore]
+    fn manual_newblocks_world_is_256z_despite_legacy_version() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../TEST WORLDS/newblocks/afwxungtbnunqwgbqcmanznucpwfbmiwrnaqpbgv.eden");
+        let world = parse_world_inner(map_fixture(&path)).expect("newblocks world must parse");
+        eprintln!("newblocks: {}x{} chunks, chunk_size={}", world.w_chunks, world.h_chunks, world.chunk_size);
+        assert_eq!(world.chunk_size, 131072, "must detect 256z despite version=2");
+        assert_eq!(world.num_bands, 16);
+        assert_eq!(world.chunk_map.len(), 3);
+    }
+
     /// Locates the first differing bytes between two equal-length buffers without doing a
     /// byte-by-byte scalar scan over gigabytes: compares in 1 MB windows using slice equality
     /// (an optimized memcmp), and only falls back to a per-byte scan inside a window that
@@ -13232,7 +14016,7 @@ mod tests {
         let out_path = std::env::temp_dir()
             .join(format!("vuencedit_materialize_test_{}.eden", std::process::id()));
         let result = materialize_flat_chunks_inner(
-            out_path.to_str().unwrap(), chunk_size, &header, &user_chunk_bytes, &to_add, &params,
+            out_path.to_str().unwrap(), chunk_size, &header, &user_chunk_bytes, &to_add, &params, &[], &[],
             || false, |_, _| {},
         ).expect("materialize must succeed");
         assert_eq!(result.chunks_added, 2);
@@ -13262,7 +14046,7 @@ mod tests {
             .join(format!("vuencedit_materialize_cancel_test_{}.eden", std::process::id()));
         let mut calls = 0;
         let cancel_result = materialize_flat_chunks_inner(
-            cancel_path.to_str().unwrap(), chunk_size, &header, &user_chunk_bytes, &to_add, &params,
+            cancel_path.to_str().unwrap(), chunk_size, &header, &user_chunk_bytes, &to_add, &params, &[], &[],
             || { calls += 1; calls >= 1 }, |_, _| {},
         );
         assert!(cancel_result.is_err(), "cancellation must return an error");

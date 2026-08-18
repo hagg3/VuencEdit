@@ -20,9 +20,31 @@ export interface WorldMeta {
   abs_min_x: number;
   abs_min_y: number;
   sky: number;
+  /** Header `version` field — distinguishes `NewFormat256z` (256z, not version 5/6 — the 2026
+   *  game update) from `NewDawn256z` (256z, version 5 or 6) without a second IPC round trip. */
+  version: number;
+  /** True when this world's signs came from a `signs_<file>.eden.dat` sidecar rather than from the
+   *  inline post-directory trailer. Nothing in VuencEdit writes a sidecar, so those signs do not
+   *  survive Save As / Upload / a compressed save — App warns once on load. */
+  signs_from_sidecar: boolean;
 }
 
 export interface RecentWorld { path: string; name: string; timestamp: number; }
+
+/** Mirrors CLAUDE.md's "File Format" table's three classes. The one thing every format-labeled
+ *  UI spot (status bar, world pill, Properties) must agree on, so it lives in one place rather
+ *  than three copies of "max_z === 255 && version is/isn't 5 or 6" that could silently drift. */
+export type WorldFormatClass = "legacy64z" | "newDawn256z" | "newFormat256z";
+
+/** `newFormat256z` = 256z but `version` isn't the New Dawn 5/6 you'd expect — the 2026 game
+ *  update's variant (16 new block types, signs stored differently), predating the version bump it
+ *  should have gotten. Labeled distinctly from "New Dawn 256z" since players associate "New Dawn"
+ *  with the pre-2026 format specifically. */
+export function classifyWorldFormat(meta: { max_z: number; version: number }): WorldFormatClass {
+  if (meta.max_z !== 255) return "legacy64z";
+  if (meta.version === 5 || meta.version === 6) return "newDawn256z";
+  return "newFormat256z";
+}
 
 // ---- Pixel patches (partial re-renders returned by edit/render commands) ----
 
@@ -132,6 +154,19 @@ export interface ClipboardInfo {
 
 export type ExtrudeAxis = "z+" | "z-" | "x+" | "x-" | "y+" | "y-";
 export type TreeType = "normal" | "terrain" | "pine" | "tall_pine";
+
+// ---- Signs (256z-format plan, Phase 4) ----
+
+/** Decoded `get_signs` result. `x`/`y` are already editor-local (min_x/min_y offset applied on
+ *  the Rust side); `z` is an absolute height. `facing` is a strong-but-unproven hypothesis (a 0–3
+ *  quadrant, see CLAUDE.md's "File Format" section) — shown as a raw number, not decoded further. */
+export interface SignInfo {
+  x: number;
+  y: number;
+  z: number;
+  facing: number;
+  text: string;
+}
 
 export interface AutosaveInfo {
   world_name: string;

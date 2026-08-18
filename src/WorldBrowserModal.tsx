@@ -82,6 +82,11 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
   const [results, setResults] = useState<WorldSearchResult[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [searching, setSearching] = useState(false);
+  // Browse mode (C2 of the 256z-format plan): `list_worlds(start, sort)` with no search term,
+  // the real client's own default listing. `hasMore` is a heuristic (an empty page means done) —
+  // the server never advertises a total count or page size.
+  const [browsing, setBrowsing] = useState(false);
+  const [hasMoreToBrowse, setHasMoreToBrowse] = useState(true);
   const [downloading, setDownloading] = useState(false);
   const [downloadProgress, setDownloadProgress] = useState<DownloadProgress | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -126,6 +131,38 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
       setSearching(false);
     }
   }
+
+  // Browse mode (C2 of the 256z-format plan): the real client's own default listing when no
+  // search term is entered — `GET /list2.php?start=<start>&sort=2`, paginated via `start`.
+  // VuencEdit had no way to do this before; `search_worlds` only ever sent `?search=`.
+  const BROWSE_SORT = 2; // the value the real client sent when captured (Part C2/C6); unconfirmed beyond that
+  const isBrowseMode = !query.trim();
+
+  async function doBrowse(reset: boolean) {
+    if (browsing) return;
+    setBrowsing(true);
+    setError(null);
+    if (reset) setSelectedId(null);
+    const startAt = reset ? 0 : results.length;
+    try {
+      const res = await invoke<WorldSearchResult[]>("list_worlds", { start: startAt, sort: BROWSE_SORT, server });
+      setResults(prev => reset ? res : [...prev, ...res]);
+      setHasMoreToBrowse(res.length > 0);
+      setSearched(true);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBrowsing(false);
+    }
+  }
+
+  // Auto-browse on open and whenever the server changes, as long as the user hasn't typed a
+  // search term — mirrors the real client opening straight into a listing rather than an empty
+  // "type something" state.
+  useEffect(() => {
+    if (isBrowseMode) doBrowse(true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [server]);
 
   async function startDownload(openAfter: boolean) {
     const result = results.find(r => r.id === selectedId);
@@ -364,10 +401,18 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
               </table>
             ) : (
               <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: 120, color: "#61584f", fontSize: 13 }}>
-                {searching ? "Searching…" :
+                {searching || browsing ? (isBrowseMode ? "Loading worlds…" : "Searching…") :
                  results.length > 0 ? "No results match your filters" :
-                 searched ? "No worlds found — try a different search term" :
-                 "Search to browse worlds"}
+                 searched ? (isBrowseMode ? "No worlds found" : "No worlds found — try a different search term") :
+                 "Loading worlds…"}
+              </div>
+            )}
+            {isBrowseMode && hasMoreToBrowse && filteredResults.length > 0 && !searching && (
+              <div style={{ display: "flex", justifyContent: "center", padding: "8px 0" }}>
+                <button onClick={() => doBrowse(false)} disabled={browsing}
+                  style={{ ...btn, fontSize: 12, opacity: browsing ? 0.5 : 1, cursor: browsing ? "not-allowed" : "pointer" }}>
+                  {browsing ? "Loading…" : "Load more"}
+                </button>
               </div>
             )}
           </div>

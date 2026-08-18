@@ -77,7 +77,9 @@ alignment padding and the null-header case.
 | `load_world` **(async)** | `(path) → WorldMeta` | Stages a private temp copy, parses, then swaps in under lock. Never destroys current session before success. |
 | `get_world_info` | `() → WorldInfo` | Name, seed, format/version, dims, chunk count, spawn, golden cubes, sky palette. |
 | `rename_world` | `(name)` | Header-only write; bumps `editEpoch` so it isn't lost by the dirty guard. |
-| `set_spawn_pos` | `(px, py) → (f32, f32)` | Sets spawn to surface at (px,py); bumps `editEpoch`. |
+| `set_spawn_pos` | `(px, py) → (f32, f32)` | Writes the **`home`** field (header 16–27) — the respawn point. Height resolves to one above the surface. Ribbon: Home ▸ Set Point ▸ Home. Caller bumps `editEpoch`. |
+| `set_player_pos` | `(px, py) → (f32, f32)` | Writes the **`pos`** field (header 4–15) — the last-walked position. Same abs/height convention; deliberately leaves `home` untouched. Ribbon: Home ▸ Set Point ▸ Start. Caller bumps `editEpoch`. |
+| `get_player_pos` | `() → (f32, f32) \| null` | Reads `pos` back in editor coordinates; `null` = never walked. Mirrors `WorldInfo.spawn_px/py` for `home`. |
 | `get_surface_z` | `(x, y) → Option<i32>` | Highest non-air Z at a column. |
 | `save_world` **(async)** | `(path, compressed, backupCompressed)` | Tries an incremental in-place patch first (audit C2 Stage 4); falls back to atomic write (`compressed` → deflate-9 ZIP). `backupCompressed` picks `.bak` vs. deflated `.bak.zip` for the one-time pre-save backup. See `DOCUMENTATION/02-file-format.md`. |
 | `close_world` | `()` | Releases world/clipboard/undo/temp; reconciles saved-epoch refs. |
@@ -189,6 +191,7 @@ See [08 — World Generation](./08-world-generation.md).
 | Command | Notes |
 |---|---|
 | `search_worlds` | `(query, server) → Vec<WorldSearchResult>`. HTTP only (TLS fails). |
+| `list_worlds` **(async)** | `(start, sort, server) → Vec<WorldSearchResult>`. Browse with no search term — `?start=&sort=`, same response shape/parser as `search_worlds` (shared `parse_world_list_response`). Added 2026-08-18 (256z-format plan, Part C2) — `search_worlds` alone gave VuencEdit no way to list *any* worlds, unlike the real client. |
 | `download_world` **(async)** | Streams to disk, 2 GB cap. |
 | `upload_world` **(async)** | Multipart upload + PNG thumbnail. |
 
@@ -202,9 +205,15 @@ Servers: `app2.edengame.net` (current), `app.edengame.net` (legacy).
 | `unload_texture_pack` | — |
 | `get_block_tables` | `BlockTables` — canonical color tables installed on the frontend at startup. |
 
+## Signs (`signs.rs`, 256z-format plan Phase 4, landed 2026-08-18)
+
+| Command | Notes |
+|---|---|
+| `get_signs` | `Vec<SignInfo>` — `WorldState.signs`, populated once by `load_world` (sidecar preferred, else the inline `dir_trailer`), converted to editor-local x/y on the way out. Read-only. MapCanvas draws a marker per sign; Sidebar's Inspector tab lists them via `SignsList`. |
+
 ## Sky & creatures (registered, UI hidden)
 
 | Command | Notes |
 |---|---|
 | `get_sky_grid` / `set_sky_grid` | 4×4 sky color grid. UI not wired. |
-| `get_creatures` | `Vec<CreatureInfo>`. MapCanvas has draw code; UI passes `creatures={[]}`. |
+| `get_creatures` | `Vec<CreatureInfo>`. MapCanvas has draw code; UI passes `creatures={[]}`. Reads `creature_block_range(world)` (fixed 2026-08-18 — used to hardcode a 200-slot/12,000-byte block, reading the wrong half of a 256z world's real 400-slot/24,000-byte one). |
