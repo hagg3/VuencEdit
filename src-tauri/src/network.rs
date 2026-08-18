@@ -38,24 +38,12 @@ pub(crate) struct WorldSearchResult {
 }
 // ── Network commands ─────────────────────────────────────────────────────────
 
-/// Search the Eden world server. Returns worlds ordered as received from server.
-/// Response body is plain text, one filename per line — no file sizes are fetched.
-#[tauri::command]
-pub(crate) async fn search_worlds(query: String, server: String) -> Result<Vec<WorldSearchResult>, String> {
-    let srv = get_server(&server)?;
-    let url = format!("{}?search={}", srv.search_url, urlencoding_encode(&query));
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .map_err(|e| e.to_string())?;
-    let text = client.get(&url).send().await
-        .map_err(|e| format!("Failed to query {server} server: {e}"))?
-        .text().await
-        .map_err(|e| e.to_string())?;
-
-    // Scan for a `.eden` line immediately followed by its `.name` line rather than trusting a
-    // fixed stride-2 layout — one stray blank line in the response would otherwise desync every
-    // subsequent pair.
+/// Parse a `list2.php` response body: plain text, alternating `<id>.eden` / `<name>.name` lines,
+/// no JSON (Part C6 of the 256z-format plan) — shared by both `search_worlds` (a `?search=`
+/// query) and `list_worlds` (a `?start=&sort=` browse page). Scans for a `.eden` line immediately
+/// followed by its `.name` line rather than trusting a fixed stride-2 layout — one stray blank
+/// line in the response would otherwise desync every subsequent pair.
+fn parse_world_list_response(text: &str) -> Vec<WorldSearchResult> {
     let lines: Vec<&str> = text.lines().map(str::trim).collect();
     let mut pairs: Vec<(String, String)> = Vec::new();
     let mut i = 0;
@@ -72,15 +60,101 @@ pub(crate) async fn search_worlds(query: String, server: String) -> Result<Vec<W
         }
     }
 
-    let results: Vec<WorldSearchResult> = pairs
+    pairs
         .into_iter()
         .map(|(id, name)| {
             let timestamp = id.parse::<i64>().unwrap_or(0);
             WorldSearchResult { id, name, timestamp }
         })
-        .collect();
+        .collect()
+}
 
-    Ok(results)
+/// Search the Eden world server. Returns worlds ordered as received from server.
+/// Response body is plain text, one filename per line — no file sizes are fetched.
+#[tauri::command]
+pub(crate) async fn search_worlds(query: String, server: String) -> Result<Vec<WorldSearchResult>, String> {
+    let srv = get_server(&server)?;
+    let url = format!("{}?search={}", srv.search_url, urlencoding_encode(&query));
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let text = client.get(&url).send().await
+        .map_err(|e| format!("Failed to query {server} server: {e}"))?
+        .text().await
+        .map_err(|e| e.to_string())?;
+
+    Ok(parse_world_list_response(&text))
+}
+
+/// Browse the Eden world server with no search term — `GET /list2.php?start=<start>&sort=<sort>`,
+/// paginated via `start` (the real client sent 0 for its first page when captured; there is no
+/// server-advertised page size, so the frontend re-requests with `start = results so far`).
+/// `sort`'s exact value semantics beyond "distinguishes an ordering" are unconfirmed — `2` is the
+/// value the real desktop client's own World Browser sent (Part C2/C6 of the 256z-format plan).
+/// `search_worlds` was VuencEdit's only way to list *any* worlds before this — an empty query was
+/// refused frontend-side, unlike the real client's browse mode this mirrors.
+#[tauri::command]
+pub(crate) async fn list_worlds(start: u32, sort: u32, server: String) -> Result<Vec<WorldSearchResult>, String> {
+    let srv = get_server(&server)?;
+    let url = format!("{}?start={}&sort={}", srv.search_url, start, sort);
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let text = client.get(&url).send().await
+        .map_err(|e| format!("Failed to query {server} server: {e}"))?
+        .text().await
+        .map_err(|e| e.to_string())?;
+
+    Ok(parse_world_list_response(&text))
+}
+
+#[derive(serde::Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct UpdateInfo {
+    latest_version: String,
+    release_url: String,
+}
+
+#[derive(serde::Deserialize)]
+struct GithubRelease {
+    tag_name: String,
+    html_url: String,
+}
+
+/// Check GitHub's "latest release" endpoint for the public mirror. GitHub requires a `User-Agent`
+/// on API requests (rejects with 403 otherwise) — set to the app name, not a browser UA. Silent-fail
+/// is the caller's job (frontend swallows any `Err` here without surfacing it); this command just
+/// reports what it found or a plain error string.
+#[tauri::command]
+pub(crate) async fn check_for_update() -> Result<UpdateInfo, String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let response = client
+        .get("https://api.github.com/repos/hagg3/VuencEdit/releases/latest")
+        .header("User-Agent", "VuencEdit-UpdateCheck")
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+        .map_err(|e| format!("Update check failed: {e}"))?;
+
+    if !response.status().is_success() {
+        return Err(format!("Update check returned {}", response.status()));
+    }
+
+    let body = response
+        .text()
+        .await
+        .map_err(|e| format!("Update check response was malformed: {e}"))?;
+    let release: GithubRelease = serde_json::from_str(&body)
+        .map_err(|e| format!("Update check response was malformed: {e}"))?;
+
+    let latest_version = release.tag_name.trim_start_matches('v').to_string();
+    Ok(UpdateInfo { latest_version, release_url: release.html_url })
 }
 
 pub(crate) fn urlencoding_encode(s: &str) -> String {
@@ -233,8 +307,35 @@ pub(crate) async fn download_world(
 
 #[cfg(test)]
 mod tests {
-    use super::copy_capped;
+    use super::{copy_capped, parse_world_list_response};
     use std::io::Cursor;
+
+    #[test]
+    fn parse_world_list_response_pairs_eden_and_name_lines() {
+        let text = "1690000001.eden\nFirst World.name\n1690000002.eden\nSecond World.name\n";
+        let results = parse_world_list_response(text);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].id, "1690000001");
+        assert_eq!(results[0].name, "First World");
+        assert_eq!(results[0].timestamp, 1690000001);
+        assert_eq!(results[1].id, "1690000002");
+        assert_eq!(results[1].name, "Second World");
+    }
+
+    #[test]
+    fn parse_world_list_response_resyncs_past_a_stray_blank_line() {
+        let text = "1690000001.eden\n\nFirst World.name\n1690000002.eden\nSecond World.name\n";
+        let results = parse_world_list_response(text);
+        // The blank line desyncs the first pair (id line no longer immediately precedes its name
+        // line), but the scan must still find the second, well-formed pair.
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "1690000002");
+    }
+
+    #[test]
+    fn parse_world_list_response_empty_body_yields_no_results() {
+        assert!(parse_world_list_response("").is_empty());
+    }
 
     #[test]
     fn copy_capped_accepts_input_at_the_limit() {
@@ -253,9 +354,12 @@ mod tests {
     }
 }
 
-/// Upload a world file + PNG preview to the Eden server.
-/// GETs the upload page first to obtain the server-assigned uuid (client IP),
-/// then POSTs the multipart form with ?uuid=<ip>.
+/// Upload a world file + PNG preview to the Eden server. Generates a client-side UUID (matching
+/// the format the iOS client's `UIDevice.identifierForVendor` produces) and POSTs the multipart
+/// form to `?uuid=<uuid>` directly — no GET round-trip first. Confirmed against the real desktop
+/// client's own traffic 2026-08-18 (see DOCUMENTATION/10-features.md): it also generates its own
+/// UUID client-side rather than fetching one, and sends exactly two parts, `uploaded`/`uploaded2`
+/// (field *names*, not filenames), no third `submit` field.
 #[tauri::command]
 pub(crate) async fn upload_world(
     app: tauri::AppHandle,
@@ -320,21 +424,21 @@ pub(crate) async fn upload_world(
         ts & 0x0000_FFFF_FFFF_FFFF_u64);
     let post_url = format!("{}?uuid={}", srv.upload_url, uuid);
 
-    let world_filename = std::path::Path::new(&world_path)
-        .file_name().and_then(|f| f.to_str()).unwrap_or("world.eden")
-        .to_string();
-    let image_filename = std::path::Path::new(&image_path)
-        .file_name().and_then(|f| f.to_str()).unwrap_or("preview.png")
-        .to_string();
-
+    // Field *names* must be "uploaded"/"uploaded2" — confirmed 2026-08-18 by capturing the real
+    // desktop client's own upload traffic (see DOCUMENTATION/10-features.md). The PHP endpoint keys
+    // off the form field name (`$_FILES['uploaded']`), not the filename — the previous
+    // "file.bin"/"image.bin" field names meant every VuencEdit-originated upload was silently going
+    // to an empty $_FILES slot server-side despite the 200 OK response, since the server's success
+    // reply doesn't depend on the file actually being found under the field it expected. Filenames
+    // are literally "file.bin"/"image.bin" (not the source path's own name) to match the observed
+    // request byte-for-byte; the server does not appear to use them for anything.
     let form = reqwest::multipart::Form::new()
-        .part("file.bin", reqwest::multipart::Part::bytes(world_bytes)
-            .file_name(world_filename)
+        .part("uploaded", reqwest::multipart::Part::bytes(world_bytes)
+            .file_name("file.bin")
             .mime_str("application/octet-stream").unwrap())
-        .part("image.bin", reqwest::multipart::Part::bytes(image_bytes)
-            .file_name(image_filename)
-            .mime_str("image/png").unwrap())
-        .text("submit", "Upload");
+        .part("uploaded2", reqwest::multipart::Part::bytes(image_bytes)
+            .file_name("image.bin")
+            .mime_str("image/png").unwrap());
 
     let response = client.post(&post_url).multipart(form).send().await
         .map_err(|e| format!("Upload failed: {e}"))?;

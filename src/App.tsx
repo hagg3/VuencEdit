@@ -3,7 +3,8 @@ import { polygonPixels } from "./drawTools";
 import {
   type WorldMeta,
   decodeEditResult, decodePreviewData, decodeSelectionMask,
-  type SelectionInfo, type ClipboardInfo, type ExtrudeAxis, type AutosaveInfo,
+  type SelectionInfo, type ClipboardInfo, type ExtrudeAxis, type AutosaveInfo, type SignInfo,
+  classifyWorldFormat,
 } from "./types";
 import { useRecentWorlds, timeAgo } from "./useRecentWorlds";
 import { useState, useCallback, useEffect, useRef, useMemo, useImperativeHandle, forwardRef } from "react";
@@ -26,7 +27,7 @@ import UploadModal from "./UploadModal";
 import VmfExportModal, { type VmfExportBounds } from "./VmfExportModal";
 import NewWorldModal from "./NewWorldModal";
 import SchematicImportModal, { type SchematicInfo, type MappingEntry } from "./SchematicImportModal";
-import Ribbon, { RIBBON_HEIGHT_COLLAPSED, TAB_BAR_HEIGHT, DEFAULT_BODY_HEIGHT, EDEN_TEAL, EDEN_TEAL_READABLE, type RibbonTab, type MapViewMode } from "./Ribbon";
+import Ribbon, { ribbonHeight, EDEN_TEAL, EDEN_TEAL_READABLE, type RibbonTab, type MapViewMode } from "./Ribbon";
 import QuickActionsBar from "./QuickActionsBar";
 import SettingsModal, { loadSettings, saveSettings, MEMORY_PRESETS, type AppSettings } from "./SettingsModal";
 import WorldInfoModal from "./WorldInfoModal";
@@ -34,6 +35,11 @@ import RecoveryModal from "./RecoveryModal";
 import { resolvePrefabDir } from "./PrefabLibraryPanel";
 import Modal from "./Modal";
 import { glassPanel, chromeButton, accentRing, expBadge } from "./designTokens";
+import { Icon, type IconName } from "./ribbon/icons";
+import {
+  SURFACE, BORDER, TEXT, TEXT_DIM, TEXT_LABEL, TEXT_DISABLED, TEXT_DANGER,
+  ACCENT, FONT, ICON, IS_MAC, RADIUS, SPACE, FOCUS_RING, GRAD_HOVER, GRAD_PRESSED, hexToRgbTriplet,
+} from "./ribbon/tokens";
 import { decodeAtlas, tintedSwatch, type AtlasData, clearSwatchCache } from "./texturePack";
 import { blockDisplayName, resolveColor, applyBlockTables, orientBlockToFacing, type BlockTables } from "./blockDefs";
 import { isTypingTarget, chunkToWorld } from "./viewportUtils";
@@ -57,6 +63,15 @@ type Toast = { id: number; text: string; kind: ToastKind };
 const INFO_TOAST_MS = 2500;
 const ERROR_TOAST_MS = 8000;
 const MAX_TOASTS = 4;
+/** H2: trailing debounce for the axo full-world re-render an edit triggers in Axo render mode —
+ *  collapses a burst of edits (a held 3D build gesture) into one re-render instead of one per edit. */
+const AXO_REFETCH_DEBOUNCE_MS = 250;
+/** Stable empty array for the sign-marker prop — a fresh `[]` each render would churn MapCanvas's
+ *  prop-mirroring effects on every App re-render (cursor ticks, FPS, …). */
+const NO_SIGNS: SignInfo[] = [];
+/** Zoom (px per world block) the map is taken to when focusing a sign from the Inspector — enough
+ *  to read the sign's immediate surroundings, not so close that you lose the neighbourhood. */
+const SIGN_FOCUS_SCALE = 8;
 const QUAD_SPLITS_KEY = "eden_quad_splits";
 const clampSplit = (v: number) => Math.min(0.85, Math.max(0.15, v));
 
@@ -90,12 +105,109 @@ function saveQuadSplits(col: number, row: number) {
   localStorage.setItem(QUAD_SPLITS_KEY, JSON.stringify({ col, row }));
 }
 
+// ── splash / launcher chrome ─────────────────────────────────────────────────
+// The launcher is styled from `ribbon/tokens` rather than the old warm-brown palette, so the
+// pre-world screen and the editor read as one app. Hover/pressed/focus live in a CSS block
+// (injected once by the splash branch) because inline styles can't express pseudo-classes —
+// the same reason `RIBBON_CSS` exists; this is the splash's own copy since the ribbon shell,
+// which injects that one, isn't mounted before a world is loaded.
+
+/** Size cap on the centred launcher card. Below this the card shrinks to the window (the Tauri
+ *  window's own minimum is 900×400, tauri.conf.json). */
+const SPLASH_MAX_W = 900;
+const SPLASH_MAX_H = 550;
+/** Fixed width of the launcher's command column. */
+const SPLASH_NAV_W = 280;
+/** Recent worlds shown before the "More…" disclosure (`MAX_RECENT` is 8, useRecentWorlds.ts). */
+const SPLASH_RECENT_COLLAPSED = 5;
+
+const SPLASH_CSS = `
+.spl-row {
+  display: flex; align-items: center; gap: ${SPACE.lg}px;
+  width: 100%; height: 34px; padding: 0 ${SPACE.lg}px;
+  background: transparent; border: none; border-radius: ${RADIUS.md}px;
+  color: ${TEXT}; font-size: ${FONT.tab}px; text-align: left;
+  cursor: pointer; outline: none; user-select: none;
+}
+.spl-row:hover:not([aria-disabled="true"]) {
+  background: ${GRAD_HOVER};
+  box-shadow: inset 0 0 0 1px ${BORDER.outline}, inset 0 1px 0 rgba(255,255,255,.14);
+}
+.spl-row:active:not([aria-disabled="true"]) {
+  background: ${GRAD_PRESSED};
+  box-shadow: inset 0 0 0 1px ${BORDER.outline}, inset 0 1px 2px rgba(0,0,0,.45);
+}
+.spl-row:focus-visible { box-shadow: inset 0 0 0 2px ${FOCUS_RING}; }
+.spl-row[aria-disabled="true"] { opacity: .4; cursor: default; }
+
+.spl-recent {
+  display: flex; align-items: center; gap: ${SPACE.lg}px;
+  width: 100%; padding: ${SPACE.md}px ${SPACE.lg}px;
+  background: ${SURFACE.raised}; border: none; border-radius: ${RADIUS.md}px;
+  box-shadow: inset 0 0 0 1px ${BORDER.outline}, inset 0 1px 0 ${BORDER.bevel};
+  color: ${TEXT}; text-align: left; cursor: pointer; outline: none;
+}
+.spl-recent:hover:not([aria-disabled="true"]) { background: ${GRAD_HOVER}; }
+.spl-recent:active:not([aria-disabled="true"]) { background: ${GRAD_PRESSED}; }
+.spl-recent:focus-visible { box-shadow: inset 0 0 0 2px ${FOCUS_RING}; }
+.spl-recent[aria-disabled="true"] { opacity: .45; cursor: default; }
+`;
+
+/** Uppercase section caption over a hairline — "CREATE / OPEN", "RECENT WORLDS". */
+function SplashCaption({ children }: { children: React.ReactNode }) {
+  return (
+    <div style={{
+      fontSize: FONT.label, fontWeight: 600, letterSpacing: "0.08em",
+      color: TEXT_LABEL, textTransform: "uppercase",
+      padding: `0 ${SPACE.lg}px ${SPACE.md}px`,
+      borderBottom: `1px solid ${BORDER.hairline}`,
+      marginBottom: SPACE.lg, flexShrink: 0,
+    }}>
+      {children}
+    </div>
+  );
+}
+
+/**
+ * One command row in the left column. Disabled rows stay mounted and inert via `aria-disabled` +
+ * `tabIndex={-1}` (the `btnDisabled` convention) rather than the `disabled` attribute, which would
+ * also swallow the focus ring.
+ */
+function SplashCommand({ icon, label, onClick, disabled }: {
+  icon: IconName; label: string; onClick: () => void; disabled?: boolean;
+}) {
+  return (
+    <button
+      className="spl-row"
+      aria-disabled={disabled || undefined}
+      tabIndex={disabled ? -1 : 0}
+      onClick={() => { if (!disabled) onClick(); }}
+    >
+      <Icon name={icon} size={ICON.lg} strokeWidth={1.5} />
+      <span>{label}</span>
+    </button>
+  );
+}
+
+/** Plain MAJOR.MINOR.PATCH comparison — matches the `bump-version.sh` format (no pre-release tags),
+ *  so nothing fancier than dotted-integer comparison is needed. Missing/non-numeric segments count
+ *  as 0, so "1.1" > "1.0.9" behaves sanely even though this project never actually publishes that. */
+function isNewerVersion(latest: string, current: string): boolean {
+  const a = latest.split(".").map(n => parseInt(n, 10) || 0);
+  const b = current.split(".").map(n => parseInt(n, 10) || 0);
+  for (let i = 0; i < Math.max(a.length, b.length); i++) {
+    const av = a[i] ?? 0, bv = b[i] ?? 0;
+    if (av !== bv) return av > bv;
+  }
+  return false;
+}
+
 function SplashLink({ href, children }: { href: string; children: React.ReactNode }) {
   return (
     <a
       href="#"
       onClick={(e) => { e.preventDefault(); openUrl(href); }}
-      style={{ color: "#83786c", textDecoration: "underline" }}
+      style={{ color: TEXT_LABEL, textDecoration: "underline" }}
     >
       {children}
     </a>
@@ -204,6 +316,11 @@ function App() {
   // Monotonically increments only on full world load; triggers view+selection reset in MapCanvas.
   const [worldEpoch, setWorldEpoch] = useState(0);
   const mapCanvasRef = useRef<MapCanvasRef>(null);
+  // Inspector ▸ SIGNS row click: centre the 2D map on the sign and zoom in far enough to read its
+  // surroundings, without ever zooming back out from a closer view (see MapCanvasRef.focusOn).
+  const focusOnSign = useCallback((s: SignInfo) => {
+    mapCanvasRef.current?.focusOn(s.x, s.y, SIGN_FOCUS_SCALE);
+  }, []);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [exporting, setExporting] = useState(false);
@@ -215,15 +332,21 @@ function App() {
   const [vmfExportBounds, setVmfExportBounds] = useState<VmfExportBounds | null>(null);
   const [saving, setSaving] = useState(false);
   const [saveCompressed, setSaveCompressed] = useState(() => loadSettings().defaultSaveCompressed);
+  const [backupCompressed, setBackupCompressed] = useState(() => loadSettings().backupCompressed);
   const { recentWorlds, addRecentWorld } = useRecentWorlds();
+  /** Splash "More…" disclosure — collapsed shows SPLASH_RECENT_COLLAPSED of the MAX_RECENT entries. */
+  const [showAllRecent, setShowAllRecent] = useState(false);
   const [ribbonCollapsed, setRibbonCollapsed] = useState(() => {
     try { return localStorage.getItem("ribbon_collapsed") === "true"; } catch { return false; }
   });
-  const [ribbonBodyHeight, setRibbonBodyHeight] = useState(() => {
-    try { return parseInt(localStorage.getItem("ribbon_body_height") ?? String(DEFAULT_BODY_HEIGHT), 10) || DEFAULT_BODY_HEIGHT; } catch { return DEFAULT_BODY_HEIGHT; }
-  });
-  const effectiveRibbonHeight = ribbonCollapsed ? RIBBON_HEIGHT_COLLAPSED : TAB_BAR_HEIGHT + ribbonBodyHeight + 4;
+  // The ribbon body is a fixed height now (the drag-resize handle is gone, collapse remains), so
+  // this is derived rather than stored. Everything downstream — the quad grid's `top`, the
+  // sidebar's `topPx`, the Quick Actions bar's `top` — reads it.
+  const effectiveRibbonHeight = ribbonHeight(ribbonCollapsed);
+  // Drop the retired `ribbon_body_height` key on first run so it doesn't linger forever.
+  useEffect(() => { try { localStorage.removeItem("ribbon_body_height"); } catch { /* ignore */ } }, []);
   const [showQuickActions, setShowQuickActions] = useState(() => loadSettings().showQuickActions);
+  const [checkForUpdatesOnLaunch, setCheckForUpdatesOnLaunch] = useState(() => loadSettings().checkForUpdatesOnLaunch);
   // Docked right sidebar (Inspector/Prefabs/Elevation/History) — see Sidebar.tsx. Width persists via
   // the same debounced-localStorage pattern as other drag-driven values (see saveSettingsDebounced).
   const [sidebarOpen, setSidebarOpen] = useState(() => loadSettings().sidebarOpen);
@@ -268,6 +391,8 @@ function App() {
   // Last "path|compressed" combo we've already warned about for a compressed-flag/extension
   // mismatch on plain Save — avoids re-toasting on every ⌘S while the mismatch is unresolved.
   const lastExtWarnRef = useRef<string | null>(null);
+  // H2: pending debounced axo full-refetch timer (see applyEditResult).
+  const axoRefetchTimerRef = useRef<number | null>(null);
 
   // Toasts: transient popups, stacked bottom-centre above the status bar. Two kinds —
   // "info" (status summaries after named edit/undo/redo operations, E5) and "error" (every async
@@ -283,6 +408,9 @@ function App() {
     const t = toastTimersRef.current.get(id);
     if (t) { clearTimeout(t); toastTimersRef.current.delete(id); }
     setToasts((list) => list.filter((x) => x.id !== id));
+    // A manually-dismissed toast should be able to reappear if the same text fires again soon —
+    // otherwise dedupe would silently swallow a legitimate repeat the user already closed.
+    if (lastToastRef.current?.id === id) lastToastRef.current = null;
   }, []);
 
   const armToastTimer = useCallback((id: number, ms: number) => {
@@ -291,16 +419,30 @@ function App() {
     toastTimersRef.current.set(id, setTimeout(() => dismissToast(id), ms));
   }, [dismissToast]);
 
+  // L2: the same text within a short window refreshes the existing toast's timer instead of pushing a
+  // duplicate underneath it. Subsumes the old `sliceErrorDedupeRef` special case (both slabs commonly
+  // fail identically) and blunts H1's per-stamp toast spam even where the group id doesn't reach here.
+  const lastToastRef = useRef<{ text: string; kind: ToastKind; id: number; at: number } | null>(null);
+  const TOAST_DEDUPE_MS = 1500;
+
   const pushToast = useCallback((text: string, kind: ToastKind) => {
-    const id = ++toastIdRef.current;
-    // Cap the stack — a failing background tick could otherwise queue toasts indefinitely.
-    setToasts((list) => [...list.slice(-(MAX_TOASTS - 1)), { id, text, kind }]);
+    const now = Date.now();
     // Info toasts are one-line status summaries — a fixed 2.5s is fine for "Filled 40 blocks" but
     // cuts off mid-read for a longer one. Scale mildly with length past a baseline, capped so a
     // very long message doesn't linger forever (error toasts already stay parked on hover).
     const ms = kind === "error" ? ERROR_TOAST_MS
       : Math.min(INFO_TOAST_MS * 2.4, INFO_TOAST_MS + Math.max(0, text.length - 30) * 35);
+    const last = lastToastRef.current;
+    if (last && last.text === text && last.kind === kind && now - last.at < TOAST_DEDUPE_MS) {
+      lastToastRef.current = { ...last, at: now };
+      armToastTimer(last.id, ms);
+      return last.id;
+    }
+    const id = ++toastIdRef.current;
+    // Cap the stack — a failing background tick could otherwise queue toasts indefinitely.
+    setToasts((list) => [...list.slice(-(MAX_TOASTS - 1)), { id, text, kind }]);
     armToastTimer(id, ms);
+    lastToastRef.current = { text, kind, id, at: now };
     return id;
   }, [armToastTimer]);
 
@@ -329,6 +471,11 @@ function App() {
     setError(msg);
     pushToast(msg, "error");
   }, [pushToast]);
+
+  // Front/side SliceViewports each surface their own fetch failures (D3) via `onError`. Both panes
+  // commonly fail identically (the same oversize selection, the same "No world loaded") — `pushToast`'s
+  // general dedupe (L2) now collapses that pair into one toast, so this no longer needs its own.
+  const sliceError = reportError;
 
   const [renderMode, setRenderMode] = useState<"tiled" | "full" | "axo">("tiled");
   /** Ceiling on `fullCanvasRef`'s single RGBA canvas (§2 of the 2026-08 memory-efficiency pass —
@@ -360,6 +507,26 @@ function App() {
   const [prefabRefreshToken, setPrefabRefreshToken] = useState(0);
   const [appVersion, setAppVersion] = useState("…");
   useEffect(() => { getVersion().then(setAppVersion); }, []);
+  // Splash-screen update check (github.com/hagg3/VuencEdit/releases). Runs once per launch when the
+  // toggle is on; silent-fail on any error (offline, rate-limited, malformed response) — no toast, no
+  // banner. Dismissing the banner is session-only by design (no persisted "seen this version" flag),
+  // so it reappears on every subsequent launch until the user updates or turns the toggle off.
+  const [updateInfo, setUpdateInfo] = useState<{ latestVersion: string; releaseUrl: string } | null>(null);
+  const [updateDismissed, setUpdateDismissed] = useState(false);
+  useEffect(() => {
+    if (!checkForUpdatesOnLaunch) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const current = await getVersion();
+        const info = await invoke<{ latestVersion: string; releaseUrl: string }>("check_for_update");
+        if (!cancelled && isNewerVersion(info.latestVersion, current)) setUpdateInfo(info);
+      } catch {
+        // Silent-fail — see comment above.
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [checkForUpdatesOnLaunch]);
   // Fetch canonical block/paint colour tables from Rust once at startup so TS
   // swatch tints match the map/3D render exactly (C6 — ends dual-maintenance drift).
   useEffect(() => {
@@ -454,6 +621,7 @@ function App() {
   const [autosaveIntervalMin, setAutosaveIntervalMin] = useState(() => loadSettings().autosaveIntervalMin);
   const [autoOrient3d, setAutoOrient3d] = useState(() => loadSettings().autoOrient3d);
   const [floodFillLimit, setFloodFillLimit] = useState(() => loadSettings().floodFillLimit);
+  const [buildReach, setBuildReach] = useState(() => loadSettings().buildReach);
   const [enableExperimentalExport, setEnableExperimentalExport] = useState(() => loadSettings().enableExperimentalExport);
   // Memory-budget preset (§6 of the 2026-08 memory-efficiency pass) — only the undo budget reaches
   // Rust (via set_undo_budget below); tile/vertex budgets stay frontend-side as MapCanvas/FlyView3D props.
@@ -479,8 +647,10 @@ function App() {
     setShowSlicePanels(s.defaultQuadView);
     setEnable3dPane(s.default3dPane);
     setSaveCompressed(s.defaultSaveCompressed);
+    setBackupCompressed(s.backupCompressed);
     setFogEnabled(s.enableFog);
     setShowQuickActions(s.showQuickActions);
+    setCheckForUpdatesOnLaunch(s.checkForUpdatesOnLaunch);
     setSunT(s.sunT);
     setLampRadius(s.lampRadius);
     setLightingProfile(s.lightingProfile);
@@ -492,6 +662,7 @@ function App() {
     setAutosaveIntervalMin(s.autosaveIntervalMin);
     setAutoOrient3d(s.autoOrient3d);
     setFloodFillLimit(s.floodFillLimit);
+    setBuildReach(s.buildReach);
     setEnableExperimentalExport(s.enableExperimentalExport);
     setMemoryBudget(s.memoryBudget);
     invoke("set_undo_budget", { bytes: MEMORY_PRESETS[s.memoryBudget].undoBudgetBytes }).catch(() => {});
@@ -544,6 +715,16 @@ function App() {
   const [schematicPath, setSchematicPath] = useState<string | null>(null);
   const [schematicApplying, setSchematicApplying] = useState(false);
   const [spawnPos, setSpawnPos] = useState<{ px: number; py: number } | null>(null);
+  // `pos` (header bytes 4–15) — the last-walked player position, a *different* field from `home`
+  // (16–27). Home ▸ Set Point writes one each; see `set_player_pos` / `set_spawn_pos` in lib.rs.
+  const [playerPos, setPlayerPos] = useState<{ px: number; py: number } | null>(null);
+  // Signs (256z-format plan, Phase 4) — fetched once per world load, read-only. Empty for the
+  // overwhelming majority of worlds, which have none.
+  const [signs, setSigns] = useState<SignInfo[]>([]);
+  // Sign markers on the 2D map. Deliberately session state, not an AppSettings key: it re-arms to
+  // ON for every world opened (see applyLoadedWorld) so signs are never silently missing on a
+  // world you've just opened, while still being switchable off for a session (View ▸ Layout).
+  const [showSigns, setShowSigns] = useState(true);
   const cursorWorldRef = useRef<{ wx: number; wy: number }>({ wx: 0, wy: 0 });
 
   // Template overlay state
@@ -1075,15 +1256,26 @@ function App() {
     } catch (e) { reportError(e); }
   }
 
-  const applyEditResult = useCallback(async (buf: ArrayBuffer, kind: "edit" | "undo" | "redo" = "edit") => {
+  const applyEditResult = useCallback(async (
+    buf: ArrayBuffer, kind: "edit" | "undo" | "redo" = "edit", opts?: { silent?: boolean },
+  ) => {
     const raw = decodeEditResult(buf);
     // Cutaway is a top-down render — the patch Rust returns is already capped, so it applies directly.
     if (viewModeRef.current !== "zslice") {
       if (renderModeRef.current === "axo") {
         // Axo projection: flat patch positions don't match axo pixel positions, force full re-render.
         // Read via ref: this runs from []-memoized undo/redo callbacks where `world` is stale.
-        const w = worldRef.current;
-        if (w) mapCanvasRef.current?.refetchRegion(0, 0, chunkToWorld(w.width_chunks), chunkToWorld(w.height_chunks));
+        //
+        // H2: debounced (trailing ~250ms) rather than firing per call — a 3D build gesture dispatches
+        // an edit every ~220ms while held, and without this each one queued its own full-world axo
+        // re-render (seconds of work on a large world) even though the user is looking at the 3D pane,
+        // not the axo one. A burst now collapses to one re-render, ~250ms after it quiets down.
+        if (axoRefetchTimerRef.current !== null) clearTimeout(axoRefetchTimerRef.current);
+        axoRefetchTimerRef.current = window.setTimeout(() => {
+          axoRefetchTimerRef.current = null;
+          const w = worldRef.current;
+          if (w) mapCanvasRef.current?.refetchRegion(0, 0, chunkToWorld(w.width_chunks), chunkToWorld(w.height_chunks));
+        }, AXO_REFETCH_DEBOUNCE_MS);
       } else {
         mapCanvasRef.current?.applyPatch(raw.patch);
       }
@@ -1101,7 +1293,9 @@ function App() {
     setUndoDepth(raw.undo_depth);
     setRedoDepth(raw.redo_depth);
     setEditEpoch(e => e + 1);
-    if (raw.operation) {
+    // H1: a grouped build stamp (part of a gesture) suppresses its own toast — the gesture emits one
+    // summary toast on release instead (see handleBuildGestureEnd).
+    if (raw.operation && !opts?.silent) {
       const prefix = kind === "undo" ? "Undid: " : kind === "redo" ? "Redid: " : "";
       showToast(prefix + raw.operation);
     }
@@ -1137,10 +1331,33 @@ function App() {
     setRedoDepth(0);
     setViewMode("topdown");
     setZSliceZ(32);
+    // Quad-view slab planes are world coordinates, so they must not survive a world swap — a
+    // plane left over from a bigger world sits outside the new one and every slab fetch fails.
+    // Centre of the new world, matching SliceViewport's own uncontrolled default.
+    setSliceFrontY(Math.floor((data.height_chunks * 16) / 2));
+    setSliceSideX(Math.floor((data.width_chunks * 16) / 2));
     setClipboard(null);
     resetHeavyLighting();
     setSaveCompressed(data.was_compressed);
     setSpawnPos(data.spawn_px != null && data.spawn_py != null ? { px: data.spawn_px, py: data.spawn_py } : null);
+    invoke<[number, number] | null>("get_player_pos")
+      .then(pos => setPlayerPos(pos ? { px: pos[0], py: pos[1] } : null))
+      .catch(() => setPlayerPos(null));
+    setShowSigns(true); // markers default back on for every newly opened world
+    invoke<SignInfo[]>("get_signs")
+      .then(setSigns)
+      .catch(() => setSigns([]));
+    // Sidecar signs are read-only *and* untravelled: nothing in VuencEdit writes a sidecar, so a
+    // Save As / Upload / compressed save of this world silently drops them. Warn once, on load,
+    // rather than at save time — by then the user has already chosen a destination.
+    if (data.signs_from_sidecar) {
+      pushToast(
+        "This world's signs live in a separate signs_….eden.dat file beside it. They're shown here, "
+        + "but VuencEdit can't write that file — Save As, Upload and compressed saves will drop them. "
+        + "Keep the sidecar next to the world, or re-upload from the game to fold the signs in.",
+        "error",
+      );
+    }
     if (path && !opts?.skipRecent) addRecentWorld(path, data.name);
     lastAutosavedEpochRef.current = editEpochRef.current;
     savedEpochRef.current = editEpochRef.current;
@@ -1834,28 +2051,38 @@ function App() {
   }
 
   /** Break: clear the picked voxel. Goes through paint_blocks → with_edit, so undo/redo and the
-   *  chunk-mesh edit sync come for free. Same for place, below. */
-  async function handlePick3dBreak(x: number, y: number, z: number) {
+   *  chunk-mesh edit sync come for free. Same for place, below.
+   *  `group` (H1): FlyView3D's build gesture id. Every stamp of one gesture shares it, so the backend
+   *  coalesces them into a single undo entry (`with_edit_grouped`) — and the per-stamp toast here is
+   *  suppressed in favour of one summary toast on release (see handleBuildGestureEnd). */
+  async function handlePick3dBreak(x: number, y: number, z: number, group?: number) {
     try {
-      const result = await invoke<ArrayBuffer>("paint_blocks", { blocks: [{ x, y, z }], blockType: 0, paint: 0, zOffset: 0 });
-      await applyEditResult(result);
+      const result = await invoke<ArrayBuffer>("paint_blocks", { blocks: [{ x, y, z }], blockType: 0, paint: 0, zOffset: 0, group });
+      await applyEditResult(result, "edit", { silent: group !== undefined });
     } catch (e) { reportError(e); }
   }
 
   /** Place the armed block (shared with the 2D fill block/hotbar) in the empty voxel against the
    *  picked face. `yaw` is the player's Eden look direction at click time; with Auto-orient on it
-   *  rotates directional blocks (ramps/wedges/doors) to face the player. */
-  async function handlePick3dPlace(x: number, y: number, z: number, yaw: number) {
+   *  rotates directional blocks (ramps/wedges/doors) to face the player. `group`: see handlePick3dBreak. */
+  async function handlePick3dPlace(x: number, y: number, z: number, yaw: number, group?: number) {
     if (fillBlockType === 0) return; // "Air" as the armed block would be a no-op place
     const blockType = autoOrient3d ? orientBlockToFacing(fillBlockType, yaw) : fillBlockType;
     try {
       const result = await invoke<ArrayBuffer>("paint_blocks", {
-        blocks: [{ x, y, z }], blockType, paint: fillPaint, zOffset: 0,
+        blocks: [{ x, y, z }], blockType, paint: fillPaint, zOffset: 0, group,
       });
-      await applyEditResult(result);
+      await applyEditResult(result, "edit", { silent: group !== undefined });
       trackRecentBlock(fillBlockType, fillPaint);
     } catch (e) { reportError(e); }
   }
+
+  /** H1: one build gesture (a plain click or a multi-stamp sweep) just ended with ≥1 stamp — replaces
+   *  every suppressed per-stamp toast with one summary. Fired by FlyView3D's `onBuildGestureEnd`. */
+  const handleBuildGestureEnd = useCallback((mode: "break" | "place", count: number) => {
+    const verb = mode === "break" ? "Broke" : "Placed";
+    showToast(`${verb} ${count} block${count === 1 ? "" : "s"}`);
+  }, [showToast]);
 
   /** B1 build-shape (line/box) commit: the whole run in one `with_edit` call, one undo step. Mirrors
    *  handlePick3dBreak/Place above, generalized to a cell list. */
@@ -1943,7 +2170,14 @@ function App() {
     }
   }, [applyEditResult, reportError]);
 
-  const saveWorld = useCallback(async (path: string) => {
+  // Returns whether the save actually landed — callers that update other state on the assumption
+  // the file now exists at `path` (Save As's `setSourcePath`) must check this instead of assuming
+  // success just because the promise resolved; this function swallows its own errors (toast +
+  // `reportError`) rather than rethrowing, so `await`ing it alone can't distinguish success from
+  // failure. Without the check, a failed Save As still pointed `sourcePath` at a file that was
+  // never written, which made a later Upload fail with "Cannot read world: No such file or
+  // directory" — the state believed a save had happened when it hadn't.
+  const saveWorld = useCallback(async (path: string): Promise<boolean> => {
     setSaving(true);
     setError(null);
     try {
@@ -1963,13 +2197,15 @@ function App() {
           showToast(`Saved ${saveCompressed ? "compressed" : "uncompressed"} data into a “.${ext}” file — other tools may not recognize it`);
         }
       }
-      await invoke("save_world", { path, compressed: saveCompressed, backupCompressed: loadSettings().backupCompressed });
+      await invoke("save_world", { path, compressed: saveCompressed, backupCompressed });
       // A real save makes any pending autosave sidecar redundant — nothing left to recover.
       lastAutosavedEpochRef.current = editEpochRef.current;
       savedEpochRef.current = editEpochRef.current;
       invoke("discard_autosave").catch(() => {});
+      return true;
     } catch (e) {
       reportError(e);
+      return false;
     } finally {
       setSaving(false);
     }
@@ -1998,8 +2234,8 @@ function App() {
       );
       if (!ok) return;
     }
-    await saveWorld(finalPath);
-    setSourcePath(finalPath);
+    const ok = await saveWorld(finalPath);
+    if (ok) setSourcePath(finalPath);
   }, [sourcePath, saveWorld, saveCompressed]);
 
   // Timer-based autosave: every `autosaveIntervalMin` minutes (Settings → Editor; default 3), if a
@@ -2577,6 +2813,17 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
     }
   }
 
+  /**
+   * Cut = copy, then clear. Composed here rather than added as a Rust command because
+   * `copy_selection` is read-only and pushes no undo entry, so the pair already yields **one**
+   * undo step — a dedicated command would buy nothing but a nicer toast label.
+   */
+  async function cutSelection() {
+    if (!rawBounds) return;
+    await copySelection();
+    await deleteBlocks();
+  }
+
   async function fillSelection() {
     if (!rawBounds) return;
     try {
@@ -2671,6 +2918,8 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
     setRedoDepth(0);
     setTool("pan");
     setSpawnPos(null);
+    setPlayerPos(null);
+    setSigns([]);
     setTemplateLoaded(false);
     setShowTemplateOverlay(false);
     resetHeavyLighting();
@@ -2686,6 +2935,20 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
       // set_spawn_pos writes into the mmapped header outside with_edit (no undo entry), so it
       // doesn't otherwise bump editEpoch — without this, the change is silently lost if the user
       // closes without saving (the unsaved-changes prompt only fires when dirty).
+      setEditEpoch(e => e + 1);
+    } catch (e) { reportError(e); }
+  }
+
+  /** Home ▸ Set Point ▸ Start. Mirrors `setSpawnAtSelection`, including its `editEpoch` bump —
+   *  `set_player_pos` writes the header outside `with_edit`, so nothing else marks the session
+   *  dirty and the change would vanish on close. */
+  async function setPlayerPosAtSelection() {
+    if (!selection) return;
+    const cx = Math.round((selection.x1 + selection.x2) / 2);
+    const cy = Math.round((selection.y1 + selection.y2) / 2);
+    try {
+      await invoke("set_player_pos", { px: cx, py: cy });
+      setPlayerPos({ px: cx, py: cy });
       setEditEpoch(e => e + 1);
     } catch (e) { reportError(e); }
   }
@@ -2762,6 +3025,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
       selectionMask={selectionMaskOverlay}
       spawnPos={spawnPos}
       creatures={[]}
+      signs={showSigns ? signs : NO_SIGNS}
       pasteElevationOffset={pasteElevationOffset}
       onEyedropper={handleEyedropper}
       onPoolFillPick={handlePoolFillPick}
@@ -2801,9 +3065,11 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
       <div style={{ padding: "0 10px", borderRight: "1px solid #322d28", whiteSpace: "nowrap" }}>
         {chunkToWorld(world.width_chunks)}×{chunkToWorld(world.height_chunks)}
         <span
-          title={world.max_z === 255
-            ? "New Dawn (256z) format — worlds up to 256 blocks tall"
-            : "Legacy (64z) format — worlds up to 64 blocks tall"}
+          title={
+            classifyWorldFormat(world) === "legacy64z" ? "Legacy (64z) format — worlds up to 64 blocks tall"
+            : classifyWorldFormat(world) === "newDawn256z" ? "New Dawn (256z) format — worlds up to 256 blocks tall"
+            : "NewFormat256z — a 2026 game update's 256z variant, not the original New Dawn format"
+          }
           style={{ color: world.max_z === 255 ? "#6d28d9" : "#453f38", marginLeft: 6 }}
         >
           {world.max_z === 255 ? "256z" : "64z"}
@@ -2920,6 +3186,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
       extrudeAxis,
       isPaste: sliceIsPaste,
       onNotice: sliceNotice,
+      onError: sliceError,
       onZRangeChange: sliceZResize,
       viewCapZ,
       selectMode: sliceSelectMode,
@@ -3048,6 +3315,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
                       onPickFloodFill={handlePick3dFloodFill}
                       onPickBreak={handlePick3dBreak}
                       onPickPlace={handlePick3dPlace}
+                      onBuildGestureEnd={handleBuildGestureEnd}
                       onPickEyedrop={handlePick3dEyedrop}
                       onPickBreakBatch={handlePick3dBreakBatch}
                       onPickPlaceBatch={handlePick3dPlaceBatch}
@@ -3065,6 +3333,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
                       armedLabel={blockDisplayName(fillBlockType)}
                       armedBlockType={fillBlockType}
                       autoOrient3d={autoOrient3d}
+                      buildReach={buildReach}
                       hotbarSlots={hotbar3dSlots}
                       activeBlock={{ type: fillBlockType, paint: fillPaint }}
                       onHotbarSelect={(type, paint) => { setFillBlockType(type); setFillPaint(paint); }}
@@ -3163,6 +3432,29 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
         )}
 
 
+        {/* A crash anywhere in the ribbon (incl. the portal-mounted block picker, which still
+            unwinds through this boundary since a portal stays in the React ownership tree) used
+            to vanish into `fallback={() => null}` — no message, no Retry, nothing for the user to
+            report. This compact one-line fallback fits the ribbon's own fixed height instead of
+            the ErrorBoundary's default full-pane box, and actually surfaces what broke. */}
+        <ErrorBoundary label="Ribbon" fallback={(error, retry) => (
+          <div style={{
+            height: "100%", display: "flex", alignItems: "center", gap: 10, padding: "0 14px",
+            background: "#1e1b18", color: "#afa69d", fontSize: 12, overflow: "hidden",
+          }}>
+            <span style={{ color: "#f87171", fontWeight: 600, flexShrink: 0 }}>Ribbon failed to render</span>
+            <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "#83786c" }}>
+              {error.message || String(error)}
+            </span>
+            <button
+              onClick={retry}
+              style={{
+                marginLeft: "auto", flexShrink: 0, background: "#312c28", color: "#dad6d2",
+                border: "1px solid #61584f", borderRadius: 6, padding: "3px 10px", fontSize: 11, cursor: "pointer",
+              }}
+            >Retry</button>
+          </div>
+        )}>
         <Ribbon
           world={world}
           appVersion={appVersion}
@@ -3285,10 +3577,27 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           lightingProfile={lightingProfile}
           commitLightingProfile={commitLightingProfile}
           onFitMap={() => mapCanvasRef.current?.resetView()}
+          // View ▸ Zoom. All three already existed on MapCanvas's ref but were keyboard-only.
+          onZoomToSelection={() => { const rb = rawBoundsRef.current; if (rb) mapCanvasRef.current?.zoomToBox(rb.x1, rb.y1, rb.x2, rb.y2); }}
+          onZoomIn={() => mapCanvasRef.current?.zoomBy(KEY_ZOOM_STEP)}
+          onZoomOut={() => mapCanvasRef.current?.zoomBy(1 / KEY_ZOOM_STEP)}
+          // View ▸ Layout. Persisted state that used to be reachable only through Settings.
+          sidebarOpen={sidebarOpen}
+          onToggleSidebar={() => { setSidebarOpen(v => { saveSettings({ sidebarOpen: !v }); return !v; }); }}
+          showQuickActions={showQuickActions}
+          onToggleQuickActions={() => { setShowQuickActions(v => { saveSettings({ showQuickActions: !v }); return !v; }); }}
+          // 3D ▸ Camera. Display/commit split: the tab holds the drag value, App gets the commit.
+          flySpeed={flySpeed}
+          commitFlySpeed={(n) => { setFlySpeed(n); saveSettingsDebounced({ flySpeed: n }); }}
+          renderDistance={renderDistance}
+          commitRenderDistance={(n) => { setRenderDistance(n); saveSettingsDebounced({ renderDistance: n }); }}
           templateLoaded={templateLoaded}
           templatePath={templatePath}
           showTemplateOverlay={showTemplateOverlay}
           setShowTemplateOverlay={setShowTemplateOverlay}
+          showSigns={showSigns}
+          setShowSigns={setShowSigns}
+          hasSigns={signs.length > 0}
           openTemplateFile={openTemplateFile}
           texturePackLoaded={texturePackInfo !== null}
           texturePackPath={texturePackPath}
@@ -3296,14 +3605,18 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           openTexturePackFile={openTexturePackFile}
           unloadTexturePack={unloadTexturePack}
           spawnPos={spawnPos}
+          playerPos={playerPos}
           onSetSpawnAtSelection={setSpawnAtSelection}
+          onSetPlayerPosAtSelection={setPlayerPosAtSelection}
           onShowWorldInfo={() => setShowWorldInfo(true)}
           selection={selection}
           rawBounds={rawBounds}
           setRawBounds={setRawBounds}
           copySelection={copySelection}
+          cutSelection={cutSelection}
           deleteBlocks={deleteBlocks}
           fillSelection={fillSelection}
+          onSelectAll={() => world && setRawBounds({ x1: 0, y1: 0, x2: chunkToWorld(world.width_chunks) - 1, y2: chunkToWorld(world.height_chunks) - 1 })}
           gradientToBlock={gradientToBlock}
           setGradientToBlock={setGradientToBlock}
           gradientToPaint={gradientToPaint}
@@ -3355,6 +3668,8 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           exportingJson={exportingJson}
           saveCompressed={saveCompressed}
           setSaveCompressed={setSaveCompressed}
+          backupCompressed={backupCompressed}
+          setBackupCompressed={(v) => { setBackupCompressed(v); saveSettings({ backupCompressed: v }); }}
           recentWorlds={recentWorlds}
           openFile={openFile}
           openFileAt={openFileAt}
@@ -3380,6 +3695,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           }}
           moveWithContents={moveWithContents}
           setMoveWithContents={setMoveWithContents}
+          onNudgeSelection={nudgeSelection}
           setShowNewWorld={setShowNewWorld}
           setShowWorldBrowser={setShowWorldBrowser}
           setShowUploadModal={setShowUploadModal}
@@ -3424,13 +3740,8 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           collapsed={ribbonCollapsed}
           registerTabSetter={registerRibbonTabSetter}
           onCollapse={(v) => { setRibbonCollapsed(v); try { localStorage.setItem("ribbon_collapsed", String(v)); } catch {} }}
-          ribbonBodyHeight={ribbonBodyHeight}
-          onBodyHeightChange={(h) => {
-            const clamped = Math.max(60, Math.min(240, h));
-            setRibbonBodyHeight(clamped);
-            try { localStorage.setItem("ribbon_body_height", String(clamped)); } catch {}
-          }}
         />
+        </ErrorBoundary>
 
 
         {/* Docked right sidebar: Inspector / Prefabs / Elevation / History tabs — see Sidebar.tsx. */}
@@ -3459,6 +3770,8 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           onDrawElevation={handleDrawElevation}
           onZRangeChange={pastePreviewSelection ? undefined : (zMin, zMax) => { setZMin(zMin); setZMax(zMax); }}
           worldEpoch={worldEpoch}
+          signs={signs}
+          onSignClick={focusOnSign}
         />
 
         {prefabNameModal && (
@@ -3836,6 +4149,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
             rawBounds={rawBounds}
             clipboard={clipboard}
             onCopy={copySelection}
+            onCut={cutSelection}
             onFill={fillSelection}
             onDelete={() => deleteBlocks()}
             onDeselect={() => setRawBounds(null)}
@@ -3917,153 +4231,179 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
     );
   }
 
+  const visibleRecent = showAllRecent ? recentWorlds : recentWorlds.slice(0, SPLASH_RECENT_COLLAPSED);
+
   return (
-    <div style={{
-      display: "flex", height: "100vh",
-      background: `radial-gradient(600px 240px at 50% 0%, rgba(${EDEN_TEAL},.16) 0%, rgba(0,0,0,0) 100%), #130f0c`,
-    }}>
-      {/* Left panel */}
+    <div
+      {...(IS_MAC ? { "data-tauri-drag-region": true } : null)}
+      style={{
+        display: "flex", alignItems: "center", justifyContent: "center",
+        height: "100vh", minWidth: 0, padding: SPACE.lg * 2, boxSizing: "border-box",
+        background: `radial-gradient(700px 260px at 50% 0%, rgba(${hexToRgbTriplet(ACCENT.primary)},.10) 0%, rgba(0,0,0,0) 100%), #16191d`,
+      }}
+    >
+      <style>{SPLASH_CSS}</style>
+
+      {/* The launcher is a centred, size-capped card rather than a full-bleed screen: at the
+          window's 1440×900 default the dense layout would otherwise strand most of its width
+          empty. It still shrinks to fit windows smaller than the cap. */}
       <div style={{
-        width: 560, minWidth: 400, display: "flex", flexDirection: "column",
-        alignItems: "center", justifyContent: "center", padding: "48px 56px",
-        gap: 0, background: "linear-gradient(180deg, rgb(36,33,30) 0%, rgb(24,20,17) 100%)",
-        boxShadow: "inset -1px 0 0 rgba(255,255,255,.05), inset 0 0 40px rgba(0,0,0,.35)",
+        display: "flex", flexDirection: "column", minWidth: 0,
+        width: "100%", height: "100%", maxWidth: SPLASH_MAX_W, maxHeight: SPLASH_MAX_H,
+        borderRadius: RADIUS.lg, overflow: "hidden", background: SURFACE.body,
+        boxShadow: `inset 0 0 0 1px ${BORDER.outline}, inset 0 1px 0 ${BORDER.bevel}, 0 12px 40px rgba(0,0,0,.45)`,
       }}>
-        {/* App icon */}
+
+      {/* Title strip — icon + wordmark + version, replacing the old 120px icon / 36px title stack.
+          Also the splash's stand-in title bar on macOS (see the outer div's drag region above) —
+          marked separately since the outer region only covers its own direct background, not the
+          card's children. */}
+      <div
+        {...(IS_MAC ? { "data-tauri-drag-region": true } : null)}
+        style={{
+          height: 48, flexShrink: 0, display: "flex", alignItems: "center", gap: SPACE.lg,
+          padding: `0 ${SPACE.lg * 2}px`, background: SURFACE.topbar,
+          boxShadow: `inset 0 -1px 0 ${BORDER.hairline}`,
+        }}
+      >
         <img
           src={appIcon}
-          alt="VuencEdit"
+          alt=""
           style={{
-            width: 120, height: 120, borderRadius: 24, marginBottom: 20, imageRendering: "pixelated",
-            boxShadow: "inset 0 0 0 1px rgba(255,255,255,.12), 0 8px 24px rgba(0,0,0,.5)",
+            width: 28, height: 28, borderRadius: RADIUS.lg, imageRendering: "pixelated",
+            boxShadow: `inset 0 0 0 1px ${BORDER.bevel}, 0 1px 3px rgba(0,0,0,.5)`,
           }}
         />
-        {/* Title */}
-        <div style={{ fontSize: 36, letterSpacing: -0.5, lineHeight: 1 }}>
-          <span style={{ fontWeight: 800, color: "#ffffff", textShadow: "0 -1px 0 rgba(0,0,0,.5)" }}>Vuenc</span>
-          <span style={{ fontWeight: 400, color: EDEN_TEAL_READABLE, textShadow: "0 -1px 0 rgba(0,0,0,.5)" }}>Edit</span>
+        <div style={{ fontSize: 20, letterSpacing: -0.3, lineHeight: 1 }}>
+          <span style={{ fontWeight: 800, color: "#ffffff" }}>Vuenc</span>
+          <span style={{ fontWeight: 400, color: EDEN_TEAL_READABLE }}>Edit</span>
         </div>
-        <div style={{ fontSize: 13, color: "#625a51", marginBottom: 28, marginTop: 6 }}>v{appVersion}</div>
+        <div style={{ marginLeft: "auto", fontSize: FONT.body, color: TEXT_DISABLED }}>v{appVersion}</div>
+      </div>
 
-        {/* Action buttons */}
-        <div style={{ display: "flex", flexDirection: "column", gap: 10, width: "100%", maxWidth: 480 }}>
-          {/* New World */}
-          <button
-            onClick={() => setShowNewWorld(true)}
-            disabled={loading}
-            style={{
-              display: "flex", alignItems: "center", gap: 16,
-              background: "linear-gradient(180deg, rgba(74,222,128,0.22) 0%, rgba(74,222,128,0.06) 100%)",
-              border: "none", boxShadow: "inset 0 0 0 1px rgba(74,222,128,.4), 0 .5px .5px rgba(255,255,255,.12)",
-              borderRadius: 10, padding: "14px 20px",
-              cursor: loading ? "not-allowed" : "pointer",
-              opacity: loading ? 0.6 : 1, textAlign: "left", width: "100%",
-            }}
-          >
-            <span style={{ fontSize: 28, lineHeight: 1 }}>✏️</span>
-            <div>
-              <div style={{ fontSize: 15, fontWeight: 700, color: "#ebe9e7" }}>New World</div>
-              <div style={{ fontSize: 13, color: "#afa69d", marginTop: 2 }}>Create a new world file</div>
-            </div>
-          </button>
-
-          {/* Open World */}
-          <button
-            onClick={openFile}
-            disabled={loading}
-            style={{
-              display: "flex", alignItems: "center", gap: 16,
-              background: "linear-gradient(180deg, rgb(46,58,82) 0%, rgb(26,34,52) 100%)",
-              border: "none", boxShadow: "inset 0 0 0 1px rgba(0,0,0,.5), 0 .5px .5px rgba(255,255,255,.15)",
-              borderRadius: 10, padding: "14px 20px",
-              cursor: loading ? "not-allowed" : "pointer",
-              opacity: loading ? 0.6 : 1, textAlign: "left", width: "100%",
-            }}
-          >
-            <span style={{ fontSize: 28, lineHeight: 1 }}>🗂️</span>
-            <div>
-              <div style={{ fontSize: 15, fontWeight: 700, color: "#ebe9e7" }}>
-                {loading ? "Loading…" : "Open World"}
-              </div>
-              <div style={{ fontSize: 13, color: "#afa69d", marginTop: 2 }}>Open a local world file</div>
-            </div>
-          </button>
-
-          {/* Browse Worlds */}
-          <button
-            onClick={() => setShowWorldBrowser(true)}
-            disabled={loading}
-            style={{
-              display: "flex", alignItems: "center", gap: 16,
-              background: "linear-gradient(180deg, rgb(46,58,82) 0%, rgb(26,34,52) 100%)",
-              border: "none", boxShadow: "inset 0 0 0 1px rgba(0,0,0,.5), 0 .5px .5px rgba(255,255,255,.15)",
-              borderRadius: 10, padding: "14px 20px",
-              cursor: loading ? "not-allowed" : "pointer",
-              opacity: loading ? 0.6 : 1, textAlign: "left", width: "100%",
-            }}
-          >
-            <span style={{ fontSize: 28, lineHeight: 1 }}>🔍</span>
-            <div>
-              <div style={{ fontSize: 15, fontWeight: 700, color: "#ebe9e7" }}>Browse Worlds</div>
-              <div style={{ fontSize: 13, color: "#afa69d", marginTop: 2 }}>Browse shared worlds</div>
-            </div>
-          </button>
-
-          {/* Settings */}
-          <button
-            onClick={() => setShowSettings(true)}
-            style={{
-              display: "flex", alignItems: "center", gap: 14,
-              background: "none", border: "none",
-              boxShadow: "inset 0 0 0 1px #2d2824",
-              borderRadius: 8, padding: "9px 16px",
-              cursor: "pointer", textAlign: "left", width: "100%",
-              color: "#83786c", transition: "box-shadow .1s, color .1s",
-            }}
-            onMouseEnter={e => { (e.currentTarget as HTMLElement).style.boxShadow = `inset 0 0 0 1px rgba(${EDEN_TEAL},.5)`; (e.currentTarget as HTMLElement).style.color = EDEN_TEAL_READABLE; }}
-            onMouseLeave={e => { (e.currentTarget as HTMLElement).style.boxShadow = "inset 0 0 0 1px #2d2824"; (e.currentTarget as HTMLElement).style.color = "#83786c"; }}
-          >
-            <span style={{ fontSize: 16, lineHeight: 1 }}>⚙</span>
-            <span style={{ fontSize: 13 }}>Settings</span>
-          </button>
-        </div>
-
-        {error && (
-          <p style={{ color: "#f87171", fontSize: 13, maxWidth: 420, textAlign: "center", marginTop: 16 }}>
-            {error}
-          </p>
-        )}
-
-        {/* Attribution footer */}
+      {updateInfo && !updateDismissed && (
         <div style={{
-          marginTop: "auto", paddingTop: 20, borderTop: "1px solid #2d2824",
-          fontSize: 11, color: "#625a51", lineHeight: 1.6, textAlign: "center",
-          width: "100%", maxWidth: 480,
+          flexShrink: 0, display: "flex", alignItems: "center", gap: SPACE.md,
+          padding: `${SPACE.sm}px ${SPACE.lg * 2}px`,
+          background: `rgba(${hexToRgbTriplet(ACCENT.primary)},.14)`,
+          boxShadow: `inset 0 -1px 0 ${BORDER.hairline}`,
+          fontSize: FONT.body,
         }}>
-          <p style={{ margin: "0 0 4px" }}>
-            Based on{" "}
-            <SplashLink href="https://github.com/jldeiro/EdenWorldManipulator2.0">Eden World Manipulator</SplashLink>
-            {" "}and{" "}
-            <SplashLink href="https://github.com/bLUUBfACE/EdenWorldManipulator">Vuenctools</SplashLink>.
-            Docs by{" "}
-            <SplashLink href="https://mrob.com/pub/vidgames/eden-file-format.html">Robert Munafo</SplashLink>.
-          </p>
-          <p style={{ margin: "0 0 8px" }}>
-            Eden World Builder by Ari Ronen (open source 2018). Support:{" "}
-            <SplashLink href="https://discord.com/invite/rjYXwBC">Discord</SplashLink>.
-          </p>
+          <span style={{ color: TEXT }}>
+            VuencEdit {updateInfo.latestVersion} is available (you have {appVersion}).
+          </span>
+          <SplashLink href={updateInfo.releaseUrl}>View release</SplashLink>
           <button
-            onClick={() => setShowAbout(true)}
+            className="rb"
+            onClick={() => setUpdateDismissed(true)}
             style={{
-              background: "none", border: "none", color: "#625a51",
-              fontSize: 11, cursor: "pointer", padding: 0, textDecoration: "underline",
+              marginLeft: "auto", background: "transparent", border: "none", cursor: "pointer",
+              color: TEXT_DIM, fontSize: FONT.body, padding: `${SPACE.xs}px ${SPACE.sm}px`,
             }}
-            onMouseEnter={e => (e.currentTarget.style.color = EDEN_TEAL_READABLE)}
-            onMouseLeave={e => (e.currentTarget.style.color = "#625a51")}
           >
-            About VuencEdit…
+            Dismiss
           </button>
         </div>
+      )}
+
+      <div style={{ flex: 1, display: "flex", minHeight: 0 }}>
+        {/* Left column — commands */}
+        <div style={{
+          width: SPLASH_NAV_W, flexShrink: 0, display: "flex", flexDirection: "column",
+          padding: `${SPACE.lg * 2}px ${SPACE.md}px ${SPACE.lg}px`,
+          boxShadow: `inset -1px 0 0 ${BORDER.hairline}`,
+        }}>
+          <SplashCaption>Create / Open</SplashCaption>
+
+          <SplashCommand icon="new" label="New World" onClick={() => setShowNewWorld(true)} disabled={loading} />
+          <SplashCommand icon="open" label={loading ? "Loading…" : "Open World…"} onClick={openFile} disabled={loading} />
+          <SplashCommand icon="download" label="Browse Worlds…" onClick={() => setShowWorldBrowser(true)} disabled={loading} />
+
+          <div style={{ height: 1, background: BORDER.hairline, margin: `${SPACE.md}px ${SPACE.lg}px` }} />
+
+          <SplashCommand icon="settings" label="Settings…" onClick={() => setShowSettings(true)} />
+          <SplashCommand icon="about" label="About VuencEdit…" onClick={() => setShowAbout(true)} />
+
+          {error && (
+            <p style={{
+              color: TEXT_DANGER, fontSize: FONT.body, lineHeight: 1.5,
+              margin: `${SPACE.lg}px ${SPACE.lg}px 0`,
+            }}>
+              {error}
+            </p>
+          )}
+
+          {/* Attribution — credit obligation, kept but condensed to two micro lines. */}
+          <div style={{
+            margin: `auto ${SPACE.lg}px 0`, paddingTop: SPACE.lg,
+            borderTop: `1px solid ${BORDER.hairline}`, fontSize: FONT.label, color: TEXT_DISABLED, lineHeight: 1.6,
+          }}>
+            <p style={{ margin: "0 0 2px" }}>
+              Based on{" "}
+              <SplashLink href="https://github.com/jldeiro/EdenWorldManipulator2.0">Eden World Manipulator</SplashLink>
+              {" "}and{" "}
+              <SplashLink href="https://github.com/bLUUBfACE/EdenWorldManipulator">Vuenctools</SplashLink>.
+              Docs by{" "}
+              <SplashLink href="https://mrob.com/pub/vidgames/eden-file-format.html">Robert Munafo</SplashLink>.
+            </p>
+            <p style={{ margin: 0 }}>
+              Eden World Builder by Ari Ronen (open source 2018). Support:{" "}
+              <SplashLink href="https://discord.com/invite/rjYXwBC">Discord</SplashLink>.
+            </p>
+          </div>
+        </div>
+
+        {/* Right column — recent worlds */}
+        <div style={{
+          flex: 1, minWidth: 0, display: "flex", flexDirection: "column",
+          padding: `${SPACE.lg * 2}px ${SPACE.lg * 2}px ${SPACE.lg}px`,
+          background: "rgba(0,0,0,.16)",
+        }}>
+          <SplashCaption>Recent Worlds</SplashCaption>
+
+          {recentWorlds.length === 0 ? (
+            <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center" }}>
+              <span style={{ color: TEXT_DISABLED, fontSize: FONT.tab }}>No recent worlds</span>
+            </div>
+          ) : (
+            <div style={{ flex: 1, overflowY: "auto", display: "flex", flexDirection: "column", gap: SPACE.xs }}>
+              {visibleRecent.map((r) => (
+                <button
+                  key={r.path}
+                  className="spl-recent"
+                  aria-disabled={loading || undefined}
+                  tabIndex={loading ? -1 : 0}
+                  onClick={() => { if (!loading) openFileAt(r.path); }}
+                  title={r.path}
+                >
+                  <Icon name="world" size={ICON.lg} strokeWidth={1.5} />
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontSize: FONT.tab, fontWeight: 600, color: TEXT, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                      {r.name}
+                    </div>
+                    {/* `direction: rtl` ellipsizes the *front* of the path, keeping the filename visible. */}
+                    <div style={{ fontSize: FONT.label, color: TEXT_DIM, marginTop: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", direction: "rtl", textAlign: "left" }}>
+                      {r.path}
+                    </div>
+                  </div>
+                  <span style={{ fontSize: FONT.label, color: TEXT_DISABLED, flexShrink: 0 }}>{timeAgo(r.timestamp)}</span>
+                </button>
+              ))}
+
+              {recentWorlds.length > SPLASH_RECENT_COLLAPSED && (
+                <button
+                  className="spl-row"
+                  style={{ color: TEXT_DIM, flexShrink: 0 }}
+                  onClick={() => setShowAllRecent(v => !v)}
+                >
+                  <Icon name={showAllRecent ? "collapse" : "expandBar"} size={ICON.sm} />
+                  <span>{showAllRecent ? "Less…" : "More…"}</span>
+                </button>
+              )}
+            </div>
+          )}
+        </div>
+      </div>
       </div>
 
       {showAbout && <AboutModal version={appVersion} onClose={() => setShowAbout(false)} />}
@@ -4076,54 +4416,6 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           onSave={applySettings}
         />
       )}
-
-      {/* Right panel — recent worlds */}
-      <div style={{
-        flex: 1, display: "flex", flexDirection: "column", overflow: "hidden",
-        background: "linear-gradient(180deg, rgb(34,29,25) 0%, rgb(24,20,17) 100%)",
-      }}>
-        <div style={{ padding: "20px 24px 10px", borderBottom: "1px solid #2d2824", boxShadow: "inset 0 1px 0 rgba(255,255,255,.04)" }}>
-          <span style={{ fontSize: 11, fontWeight: 600, letterSpacing: "0.08em", color: "#625a51", textTransform: "uppercase" }}>
-            Recent Worlds
-          </span>
-        </div>
-        {recentWorlds.length === 0 ? (
-          <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center" }}>
-            <span style={{ color: "#625a51", fontSize: 15 }}>No Recent Worlds</span>
-          </div>
-        ) : (
-          <div style={{ flex: 1, overflowY: "auto" }}>
-            {recentWorlds.map((r, i) => (
-              <button
-                key={r.path}
-                onClick={() => { if (!loading) openFileAt(r.path); }}
-                disabled={loading}
-                style={{
-                  display: "flex", alignItems: "center", gap: 14,
-                  width: "100%", textAlign: "left", background: "none",
-                  border: "none", borderBottom: i < recentWorlds.length - 1 ? "1px solid #2d2824" : "none",
-                  padding: "14px 24px", cursor: loading ? "not-allowed" : "pointer",
-                  opacity: loading ? 0.5 : 1,
-                }}
-                onMouseEnter={e => { if (!loading) (e.currentTarget as HTMLElement).style.background = `rgba(${EDEN_TEAL},0.10)`; }}
-                onMouseLeave={e => { (e.currentTarget as HTMLElement).style.background = "none"; }}
-                title={r.path}
-              >
-                <span style={{ fontSize: 22, lineHeight: 1, flexShrink: 0 }}>🌍</span>
-                <div style={{ flex: 1, minWidth: 0 }}>
-                  <div style={{ fontSize: 14, fontWeight: 600, color: "#ebe9e7", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                    {r.name}
-                  </div>
-                  <div style={{ fontSize: 11, color: "#625a51", marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", direction: "rtl", textAlign: "left" }}>
-                    {r.path}
-                  </div>
-                </div>
-                <span style={{ fontSize: 11, color: "#61584f", flexShrink: 0 }}>{timeAgo(r.timestamp)}</span>
-              </button>
-            ))}
-          </div>
-        )}
-      </div>
 
       {showWorldBrowser && (
         <WorldBrowserModal

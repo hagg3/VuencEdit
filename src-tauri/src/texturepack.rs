@@ -6,7 +6,7 @@ pub const TILE: u32 = 32;
 // [side_tex, bottom_tex, top_tex] per block type (index = block type, "" = no texture → flat-color fallback)
 // Ported from blockTypeFaces in Globals.mm + TEX_* / TYPE_* from Constants.h.
 // Face mapping: Globals face 0-3 = sides, face 4 = bottom, face 5 = top.
-pub const BLOCK_FACE_TEX: [[&str; 3]; 112] = [
+pub const BLOCK_FACE_TEX: [[&str; 3]; 128] = [
     ["", "", ""],                                   // 0  AIR
     ["bedrock", "bedrock", "bedrock"],               // 1  BEDROCK
     ["stone", "stone", "stone"],                    // 2  STONE
@@ -128,6 +128,26 @@ pub const BLOCK_FACE_TEX: [[&str; 3]; 112] = [
     ["blocktnt", "blocktnt", "firework"],           // 109 BTFIREWORK
     ["blocktnt", "blocktnt", "lightbox"],           // 110 BTLIGHTBOX
     ["blocktnt", "blocktnt", "steel"],              // 111 BTSTEEL
+    // 112–127: new-format blocks — no atlas row (shipped game atlas has no free slots; a texture
+    // pack would need a `KNOWN_TEX_NAMES` extension once real names are known). Empty string ⇒
+    // `face_tile` returns None ⇒ falls back to atlas row 0 (white sentinel), so the placeholder
+    // BLOCK_RGB colour above shows through unmodulated.
+    ["", "", ""],                                   // 112 unknown (new format)
+    ["", "", ""],                                   // 113 unknown (new format)
+    ["", "", ""],                                   // 114 unknown (new format)
+    ["", "", ""],                                   // 115 unknown (new format)
+    ["", "", ""],                                   // 116 unknown (new format)
+    ["", "", ""],                                   // 117 unknown (new format)
+    ["", "", ""],                                   // 118 unknown (new format)
+    ["", "", ""],                                   // 119 unknown (new format)
+    ["", "", ""],                                   // 120 unknown (new format)
+    ["", "", ""],                                   // 121 unknown (new format)
+    ["", "", ""],                                   // 122 unknown (new format)
+    ["", "", ""],                                   // 123 unknown (new format)
+    ["", "", ""],                                   // 124 unknown (new format)
+    ["", "", ""],                                   // 125 unknown (new format)
+    ["", "", ""],                                   // 126 unknown (new format)
+    ["", "", ""],                                   // 127 unknown (new format)
 ];
 
 pub struct TexturePack {

@@ -2,7 +2,7 @@ import { useEffect, useRef, useCallback, forwardRef, useImperativeHandle } from 
 import { invoke } from "@tauri-apps/api/core";
 import { brushFootprint, bresenhamLine, linePixels, polygonPixels, rectPixels, ellipsePixels, type WP, type BrushShape, type FillMode } from "./drawTools";
 import { type WorldMeta, type PixelPatch, decodePixelPatch } from "./types";
-import { zoomAtPoint, resizeCanvasToContainer, makeSeqGuard, putPatchPixels, beginFrame, cssWidth, cssHeight, isTypingTarget, chunkToWorld, worldToChunk, CHUNK_SIZE_BLOCKS } from "./viewportUtils";
+import { zoomAtPoint, resizeCanvasToContainer, makeSeqGuard, putPatchPixels, beginFrame, cssWidth, cssHeight, isTypingTarget, chunkToWorld, worldToChunk, CHUNK_SIZE_BLOCKS, tileWindowFits } from "./viewportUtils";
 import { maskOutline, type OutlinePt } from "./maskUtils";
 
 export type { PixelPatch } from "./types";
@@ -225,6 +225,11 @@ const DEFAULT_LOAD_MIN_SCALE = 0.5;
 /** Per-step zoom factor for ⌘+ / ⌘− (coarser than the wheel's 1.1, which fires many times a drag). */
 export const KEY_ZOOM_STEP = 1.25;
 
+/** Zoom (px per world block) at and above which sign markers get their text drawn beside them. */
+const SIGN_LABEL_MIN_SCALE = 4;
+/** Longest sign label drawn on the map — the full text is always in the sidebar's Inspector tab. */
+const SIGN_LABEL_MAX_CHARS = 24;
+
 export interface MapCanvasRef {
   /** Write top-down pixel patch directly into the affected tiles/canvas (top-down mode edit). */
   applyPatch: (patch: PixelPatch) => void;
@@ -238,6 +243,9 @@ export interface MapCanvasRef {
   zoomToBox: (x1: number, y1: number, x2: number, y2: number) => void;
   /** Recentre the view on a world-space point, keeping the current zoom level ("Center Map on 3D Camera"). */
   centerOn: (wx: number, wy: number) => void;
+  /** Recentre on a world-space point and zoom *in* to at least `minScale` px/block, never out —
+   *  so clicking the same target twice is idempotent (clicking a sign in the Inspector). */
+  focusOn: (wx: number, wy: number, minScale: number) => void;
 }
 
 interface WorldPoint { x: number; y: number }
@@ -385,6 +393,9 @@ interface Props {
   spawnPos?: { px: number; py: number } | null;
   /** Creature list from get_creatures() — drawn as coloured dots when non-empty. */
   creatures?: { type_id: number; color: number; x: number; y: number }[];
+  /** Sign list from get_signs() (256z-format plan, Phase 4) — drawn as small markers when
+   *  non-empty. `x`/`y` are already editor-local. */
+  signs?: { x: number; y: number; z: number; text: string }[];
   /** Elevation offset applied to paste (shown as label above ghost rect). */
   pasteElevationOffset?: number;
   /** Called when eyedropper tool clicks a world coordinate. */
@@ -425,7 +436,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     renderMode, axoSkew = 0.2, lockedPastePos = null,
     drawConfig, onDrawStroke, onSculptStroke, onCancelStroke, drawZOverride = null,
     extrudePreview = null, lastPasteDelta = null, onCursorMove, onMagicWand, onLassoSelect, onPolySelect, selectionMask = null,
-    spawnPos = null, creatures = [],
+    spawnPos = null, creatures = [], signs = [],
     pasteElevationOffset = 0, onEyedropper, onPoolFillPick, sliceLines = null,
     cameraPos3d = null, onSetCamera3d,
     showTemplateOverlay = false, onMapContextMenu, onSelectDragUpdate, onMoveSelection, moveWithContents = false,
@@ -441,6 +452,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   const tileCacheRef  = useRef<Map<string, HTMLCanvasElement>>(new Map());
   const templateTileCacheRef = useRef<Map<string, HTMLCanvasElement>>(new Map());
   const pendingRef    = useRef<Set<string>>(new Set());
+  const tileWindowWarnedRef = useRef(false); // one-shot warn for tileWindowFits (Phase 6 guard)
   // Live LRU caps, recomputed by ensureTiles from the current visible tile count (see TILE_CACHE_LIMIT).
   const tileLimitRef  = useRef(TILE_CACHE_LIMIT);
   const templateLimitRef = useRef(TEMPLATE_CACHE_LIMIT);
@@ -524,6 +536,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   const onPolySelectRef     = useRef(onPolySelect);
   const spawnPosRef         = useRef(spawnPos);
   const creaturesRef        = useRef(creatures);
+  const signsRef            = useRef(signs);
   const sliceLinesRef       = useRef(sliceLines);
   const pasteElevOffsetRef  = useRef(pasteElevationOffset);
   const onEyedropperRef     = useRef(onEyedropper);
@@ -611,6 +624,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   useEffect(() => { selectionMaskRef.current   = selectionMask;       }, [selectionMask]);
   useEffect(() => { spawnPosRef.current        = spawnPos;            }, [spawnPos]);
   useEffect(() => { creaturesRef.current       = creatures;           }, [creatures]);
+  useEffect(() => { signsRef.current           = signs;               }, [signs]);
   useEffect(() => { sliceLinesRef.current      = sliceLines;           }, [sliceLines]);
   useEffect(() => { pasteElevOffsetRef.current = pasteElevationOffset; }, [pasteElevationOffset]);
   useEffect(() => { onEyedropperRef.current    = onEyedropper;        }, [onEyedropper]);
@@ -1114,6 +1128,50 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
       }
     }
 
+    // Sign markers (256z-format plan, Phase 4) — small pin at each sign's editor-local position.
+    // Not depth-sorted or z-filtered against the current view: signs are rare enough (max observed
+    // so far: 6 on one world) that always showing all of them beats a fiddly z-slice-matching rule.
+    {
+      const slist = signsRef.current;
+      if (slist.length > 0) {
+        const r3 = Math.max(3, Math.min(7, scale * 1.0));
+        for (const s of slist) {
+          const sx2 = Math.round(s.x * scale + vx);
+          const sy2 = Math.round(s.y * scale + vy);
+          ctx.save();
+          ctx.beginPath();
+          ctx.moveTo(sx2, sy2 - r3 * 1.6);
+          ctx.lineTo(sx2 + r3, sy2);
+          ctx.lineTo(sx2, sy2 + r3 * 1.6);
+          ctx.lineTo(sx2 - r3, sy2);
+          ctx.closePath();
+          ctx.fillStyle = "#e8c04a";
+          ctx.globalAlpha = 0.9;
+          ctx.fill();
+          ctx.globalAlpha = 1;
+          ctx.strokeStyle = "#453210";
+          ctx.lineWidth = 1;
+          ctx.stroke();
+          // Text label once zoomed in far enough to be reading one area rather than surveying the
+          // map — a bare diamond doesn't say what the sign says, and jumping to one from the
+          // Inspector (MapCanvasRef.focusOn) lands well above this threshold.
+          if (scale >= SIGN_LABEL_MIN_SCALE && s.text) {
+            const label = s.text.split("\n")[0].slice(0, SIGN_LABEL_MAX_CHARS);
+            ctx.font = "11px ui-sans-serif, system-ui, sans-serif";
+            ctx.textAlign = "center";
+            ctx.textBaseline = "bottom";
+            const ty = sy2 - r3 * 1.6 - 3;
+            ctx.lineWidth = 3;
+            ctx.strokeStyle = "rgba(20,16,10,0.85)"; // halo, so the text reads over any terrain
+            ctx.strokeText(label, sx2, ty);
+            ctx.fillStyle = "#f2dc9a";
+            ctx.fillText(label, sx2, ty);
+          }
+          ctx.restore();
+        }
+      }
+    }
+
     // Paste ghost box — amber when XY is locked, green when hovering
     if (toolRef.current === "paste" && pastePreviewRef.current) {
       const locked = lockedPastePosRef.current;
@@ -1542,6 +1600,18 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
       Math.ceil((cssHeight(canvas) - vy) / scale / span) + TILE_BUFFER,
     );
 
+    // Defense in depth (Phase 6, 256z-format plan): a corrupt world (the quarry.eden bug's failure
+    // mode) could still make fit-scale enumerate millions of tiles even after Phase 1's coordinate
+    // gate closes the known cause. Bail to the cached tiles instead of building a huge `needed` set.
+    if (tx1 > tx0 && ty1 > ty0 && !tileWindowFits(tx0, ty0, tx1 - 1, ty1 - 1)) {
+      if (!tileWindowWarnedRef.current) {
+        tileWindowWarnedRef.current = true;
+        console.warn(`[MapCanvas] tile window ${tx1 - tx0}×${ty1 - ty0} exceeds the fetch cap — rendering cached tiles only`);
+      }
+      draw();
+      return;
+    }
+
     const needed = new Set<string>();
     for (let ty = ty0; ty < ty1; ty++) {
       for (let tx = tx0; tx < tx1; tx++) {
@@ -1737,6 +1807,17 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
       const cw = cssWidth(canvas), ch = cssHeight(canvas);
       const v = viewRef.current;
       viewRef.current = { scale: v.scale, x: cw / 2 - wx * v.scale, y: ch / 2 - wy * v.scale };
+      ensureTiles();
+    },
+    focusOn(wx: number, wy: number, minScale: number) {
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+      const cw = cssWidth(canvas), ch = cssHeight(canvas);
+      const v = viewRef.current;
+      // Raise the zoom to `minScale` if we're below it, but never pull back from a closer view the
+      // user has already set — repeat clicks on the same target then settle instead of ratcheting.
+      const scale = Math.min(MAX_SCALE, Math.max(v.scale, minScale));
+      viewRef.current = { scale, x: cw / 2 - wx * scale, y: ch / 2 - wy * scale };
       ensureTiles();
     },
   }), [draw, ensureTiles, loadFullCanvas]);

@@ -9,6 +9,45 @@ export interface ViewTransform { x: number; y: number; scale: number; }
 /** Blocks per chunk edge (both X and Y) — every chunk is a 16×16 column of blocks. */
 export const CHUNK_SIZE_BLOCKS = 16;
 
+/**
+ * Fetch window along a slab's horizontal world axis (`SliceViewport`'s front/side panes).
+ * Two modes, chosen by whether `selRange` is set:
+ *  - Selection-scoped: the window covers the selection + 50% context each side, capped at `maxWin`
+ *    and re-centred on the selection's midpoint when the natural span would exceed it (so a huge
+ *    selection still gets a bounded, centred fetch instead of either an unbounded one or a window
+ *    pinned to one edge).
+ *  - Free-scroll: a `maxWin`-wide window clamped to `[0, planeW - freeWinW]`, anchored at `winOrigin`.
+ * Always returns `hi >= lo` inside `[0, planeW - 1]` (or `{lo:0,hi:0}` when `planeW <= 0`).
+ */
+export function slabFetchWindow(args: {
+  planeW: number;
+  selRange: { lo: number; hi: number } | null;
+  winOrigin: number;
+  maxWin: number;
+}): { lo: number; hi: number } {
+  const { planeW, selRange, winOrigin, maxWin } = args;
+  if (planeW <= 0) return { lo: 0, hi: 0 };
+  const pMax = planeW - 1;
+  if (selRange) {
+    const lo0 = Math.max(0, Math.min(pMax, Math.min(selRange.lo, selRange.hi)));
+    const hi0 = Math.max(0, Math.min(pMax, Math.max(selRange.lo, selRange.hi)));
+    const ctxCols = Math.max(1, Math.round((hi0 - lo0 + 1) * 0.5));
+    let lo = Math.max(0, lo0 - ctxCols);
+    let hi = Math.min(pMax, hi0 + ctxCols);
+    if (hi - lo + 1 > maxWin) {
+      const mid = Math.round((lo0 + hi0) / 2);
+      hi = Math.min(pMax, mid + Math.floor(maxWin / 2));
+      lo = Math.max(0, hi - maxWin + 1);
+      hi = Math.min(pMax, lo + maxWin - 1);
+    }
+    return { lo, hi: Math.max(lo, hi) };
+  }
+  const freeWinW = Math.min(planeW, maxWin);
+  const lo = Math.max(0, Math.min(planeW - freeWinW, winOrigin));
+  const hi = lo + freeWinW - 1;
+  return { lo, hi };
+}
+
 /** World-block coordinate → the chunk coordinate that contains it. */
 export function worldToChunk(wCoord: number): number {
   return Math.floor(wCoord / CHUNK_SIZE_BLOCKS);
@@ -140,6 +179,34 @@ export function putPatchPixels(
 ): void {
   const clamped = new Uint8ClampedArray(patch.pixels.buffer, patch.pixels.byteOffset, patch.pixels.byteLength);
   ctx.putImageData(new ImageData(clamped, patch.width, patch.height), dx, dy);
+}
+
+// ── Frontend robustness guards (256z-format plan, Phase 6 — defense in depth) ─────────────────
+// Both caps below exist so a corrupt/garbage world (the `quarry.eden` bug's exact failure mode —
+// bogus directory rows producing billions-scale chunk dimensions) degrades to "warn and stop"
+// instead of an OOM/RangeError crash, even after Phase 1's coordinate gate closes the known cause.
+// Sized so no real world changes behaviour — the biggest real world is ~451×528 chunks.
+
+/** Divisions for `FlyView3D`'s ground-plane `THREE.GridHelper`, capped so a bogus/huge chunk
+ *  dimension (e.g. quarry.eden's pre-fix 1.95e9) can't make Three.js build a two-array grid with
+ *  billions of elements. `wChunks`/`hChunks` are chunk-grid dimensions, not block counts. */
+export function gridDivisions(wChunks: number, hChunks: number): number {
+  const n = Math.max(wChunks, hChunks);
+  if (!Number.isFinite(n)) return 1;
+  return Math.min(2048, Math.max(1, Math.round(n)));
+}
+
+/** True if the tile window `[tx0,tx1] × [ty0,ty1]` (inclusive tile-grid coordinates) is small
+ *  enough to enumerate and fetch. Guards `MapCanvas`'s tile-fetch loop against the same failure
+ *  mode as `gridDivisions`: a corrupt world's fit-scale can otherwise enumerate millions of tile
+ *  keys and build a matching `jobs` array before anything renders. Real worlds need ~42–56 tiles
+ *  on a 4K viewport, so 4096 is roughly 40× headroom. */
+export function tileWindowFits(tx0: number, ty0: number, tx1: number, ty1: number): boolean {
+  if (![tx0, ty0, tx1, ty1].every(Number.isFinite)) return false;
+  const nx = tx1 - tx0 + 1;
+  const ny = ty1 - ty0 + 1;
+  if (nx <= 0 || ny <= 0) return false;
+  return nx * ny <= 4096;
 }
 
 // ── keyboard-target guard ─────────────────────────────────────────────────────

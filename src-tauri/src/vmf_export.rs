@@ -1671,4 +1671,18 @@ mod tests {
         // Equal counts (1 each) — smallest (bt,paint) tuple wins: (2,0) < (5,0).
         assert_eq!(dominant_material(&cells, 0, 0, 0, 1, 0, 0), (2, 0));
     }
+
+    /// New-format blocks (112–127, `TEST WORLDS/newblocks/`) must not be silently dropped by
+    /// VMF export the way an out-of-`BLOCK_INFO`-range type used to be (`obj_occludes` fell through
+    /// to `false`, so `collect_solid_cells` skipped the cell entirely — data loss, no warning).
+    #[test]
+    fn test_vmf_export_includes_new_block_types() {
+        let mut world = make_test_world();
+        set_block(&mut world, 0, 0, 0, 112);
+        let opts = BuildOpts::legacy(32, 8192, false);
+        let (_text, brushes, ..) = build_vmf(&world, 0, 0, 0, 0, 0, 0, None, &opts).unwrap();
+        assert_eq!(brushes, 1, "a lone new-format block must still emit exactly one brush");
+        let by_mat = collect_solid_cells(&world, 0, 0, 0, 0, 0, 0, None);
+        assert_eq!(by_mat.get(&(112, 0)).map(Vec::len), Some(1));
+    }
 }
