@@ -1,0 +1,15 @@
+- title: "Getting Started"
+  url: /docs/getting-started/
+  text: "Open a world, move around the map, and make your first edit."
+- title: "Editing"
+  url: /docs/editing/
+  text: "Draw tools, selections, fill and replace, and terrain sculpting."
+- title: "3D & Quad View"
+  url: /docs/3d-and-quad-view/
+  text: "The four-pane editor, the fly-through pane, and building in 3D."
+- title: "Prefabs & Clipboard"
+  url: /docs/prefabs-and-clipboard/
+  text: "Copy/paste, the prefab library, and schematic import/export."
+- title: "World Compatibility"
+  url: /docs/world-compatibility/
+  text: "Legacy64z, New Dawn 256z, and NewFormat256z — what each means for you."

@@ -1,0 +1,166 @@
+.navbar {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  height: $navbar-height;
+  background: $surface-topbar;
+  border-bottom: 1px solid $border-outline;
+  box-shadow: inset 0 -1px 0 $border-hairline;
+}
+
+.navbar-inner {
+  max-width: $content-max-width;
+  height: 100%;
+  margin: 0 auto;
+  padding: 0 20px;
+  display: flex;
+  align-items: center;
+  gap: 22px;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.brand img {
+  width: 24px;
+  height: 24px;
+  border-radius: 6px;
+  display: block;
+}
+
+.brand-wordmark {
+  font-size: 16px;
+  letter-spacing: -0.2px;
+}
+
+.brand-wordmark .w-vuenc {
+  font-weight: 800;
+  color: #ffffff;
+}
+
+.brand-wordmark .w-edit {
+  font-weight: 400;
+  color: $eden-teal-readable;
+}
+
+.beta-chip {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+  color: #2a1c08;
+  background: $accent-warm;
+  border-radius: 999px;
+  padding: 2px 8px;
+  margin-left: 2px;
+}
+
+.nav-links {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: 1;
+}
+
+.nav-links a {
+  display: inline-flex;
+  align-items: center;
+  height: $navbar-height;
+  padding: 0 12px;
+  font-size: 13px;
+  font-weight: 600;
+  color: $text-dim;
+  text-decoration: none;
+  border-bottom: 2px solid transparent;
+}
+
+.nav-links a:hover {
+  color: $text;
+  text-decoration: none;
+}
+
+.nav-links a.active {
+  color: #fff;
+  border-bottom-color: $accent-primary;
+}
+
+.nav-gh {
+  margin-left: auto;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: $text-dim;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.nav-gh:hover {
+  color: #fff;
+  text-decoration: none;
+}
+
+.nav-gh svg {
+  width: 16px;
+  height: 16px;
+  fill: currentColor;
+}
+
+.beta-strip {
+  height: $beta-strip-height;
+  background: rgba($accent-warm, 0.16);
+  border-bottom: 1px solid rgba($accent-warm, 0.35);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.beta-strip-inner {
+  font-size: 12px;
+  color: #f0c98a;
+  text-align: center;
+  padding: 0 16px;
+}
+
+.beta-strip-inner strong {
+  color: #ffd699;
+  font-weight: 700;
+}
+
+// Mobile: collapse nav links to a smaller, scrollable row rather than a hamburger — five
+// items fit even on a narrow phone at this font size.
+@media (max-width: 640px) {
+  .navbar-inner {
+    gap: 12px;
+    padding: 0 12px;
+  }
+
+  .brand-wordmark {
+    font-size: 14px;
+  }
+
+  .nav-links {
+    gap: 0;
+    overflow-x: auto;
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+
+  .nav-links::-webkit-scrollbar {
+    display: none;
+  }
+
+  .nav-links a {
+    padding: 0 8px;
+    font-size: 12px;
+    white-space: nowrap;
+  }
+
+  .nav-gh span {
+    display: none;
+  }
+}

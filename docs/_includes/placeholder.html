@@ -1,0 +1,8 @@
+<!--
+  Zero-image-byte stand-in for a screenshot not yet supplied.
+  Usage: {% raw %}{% include placeholder.html caption="The Draw tab with the block picker open" ratio="16/9" %}{% endraw %}
+-->
+<div class="placeholder-img" style="aspect-ratio: {{ include.ratio | default: '16/9' }};">
+  <span class="ph-icon">🖼</span>
+  <span class="ph-caption">{{ include.caption | default: "Screenshot coming soon" }}</span>
+</div>

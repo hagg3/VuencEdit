@@ -33,3 +33,9 @@ src-tauri/target/
 EdenWorldManipulator2.0/**/obj/
 EdenWorldManipulator2.0/**/bin/
 uploadcode/
+
+# Jekyll site build output / gem vendoring (docs/ source is tracked)
+docs/_site/
+docs/.jekyll-cache/
+docs/.bundle/
+docs/vendor/

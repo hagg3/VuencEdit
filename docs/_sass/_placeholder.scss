@@ -1,0 +1,28 @@
+// Zero-byte stand-in for a real screenshot. Matches the app's own "well" recess so it reads as
+// intentional chrome, not a broken image. Swap the {% include placeholder.html %} call for a real
+// <img> when art is supplied — the caption text says exactly what should go there.
+.placeholder-img {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  width: 100%;
+  background: $surface-well;
+  border: 1px dashed rgba($accent-primary, 0.45);
+  border-radius: 6px;
+  color: $text-label;
+  text-align: center;
+  padding: 16px;
+  margin: 14px 0;
+}
+
+.placeholder-img .ph-icon {
+  font-size: 22px;
+  opacity: 0.7;
+}
+
+.placeholder-img .ph-caption {
+  font-size: 12px;
+  max-width: 420px;
+}

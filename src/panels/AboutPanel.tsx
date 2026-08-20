@@ -112,6 +112,9 @@ export default function AboutPanel({ version, compact }: { version: string; comp
         borderTop: "1px solid #2d2824", paddingTop: 16, width: "100%",
       }}>
         <p style={{ margin: "0 0 10px" }}>
+          <Link href="https://hagg3.github.io/VuencEdit/">Website</Link>
+        </p>
+        <p style={{ margin: "0 0 10px" }}>
           Based on{" "}
           <Link href="https://github.com/jldeiro/EdenWorldManipulator2.0">Eden World Manipulator</Link>
           {" "}which is itself based on{" "}
