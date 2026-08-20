@@ -10,7 +10,8 @@ surface, grouped by subsystem. Call from the frontend with
 - Bulk binary data (`PixelPatch`/`PreviewData`/geometry/atlas) returns as a **raw
   binary envelope**, not JSON — see the section below; decode via the `decode*`
   helpers in `src/types.ts`.
-- Editing commands return `EditResult { patch, undo_depth, redo_depth }`.
+- Editing commands return `EditResult { patch, invalidate, undo_depth, redo_depth,
+  operation, undo_dropped }` — see `07-editing-undo-clipboard.md` for the last two.
 - Commands marked **(async)** are `#[tauri::command(async)]` (off main thread).
 
 ## Binary payload envelope *(2026-08-05, audit H2)*
@@ -41,7 +42,7 @@ implements `IpcResponse` to frame itself:
 | Type | Header fields | Body |
 |---|---|---|
 | `PixelPatch` | `x, y, width, height, lod` | RGBA pixels |
-| `EditResult` | `patch{…}, undo_depth, redo_depth, operation` | the patch's pixels |
+| `EditResult` | `patch{…}, invalidate, undo_depth, redo_depth, operation, undo_dropped` | the patch's pixels (**empty** when `invalidate`) |
 | `PreviewData` / `PreviewImage` | `width, height` | RGBA pixels |
 | `SelectionMaskInfo` | `Option<{x1,y1,x2,y2}>` | row-major bitset (empty when `null`) |
 | `TexturePackInfo` | `rows, tile, gray_row_offset, name_to_row` | RGBA atlas |
@@ -57,6 +58,16 @@ with `splitBody(body, header.lens)` and views each stream with `asF32` for
 `THREE.BufferAttribute`. `Float32Array` views require 4-byte alignment, which is
 why `ipc_envelope` **space-pads the JSON header** until the body starts on a
 4-byte boundary (JSON ignores trailing whitespace).
+
+**Single-body payloads move, they don't copy** *(audit C2, 2026-08-19)*.
+`ipc_envelope` builds a fresh `Vec::with_capacity(total)` and copies every body
+into it — fine for the multi-buffer geometry payload, but it means a large pixel
+payload is live **twice** in Rust before the webview allocates its own copy.
+`ipc_envelope_one(header, body: Vec<u8>)` instead reserves exactly the framing's
+length on the front of the body the renderer already produced and `splice`s it in:
+no reallocation, peak stays at one copy. `PixelPatch`, `EditResult`, `PreviewData`,
+`TexturePackInfo` and `SelectionMaskInfo` all use it; the framing it produces is
+byte-identical (pinned by `test_ipc_envelope_framing`).
 
 **The `Option` case.** `Option<T>` has no `IpcResponse` impl of its own, so a
 command that can return "nothing" frames the absence itself: `get_selection_mask`
@@ -155,9 +166,51 @@ See [06 — 3D Rendering](./06-rendering-3d.md).
 
 | Command | Notes |
 |---|---|
-| `export_obj` **(async)** | Wavefront OBJ + MTL; face-culled cubes, ramp prisms, wedge pyramids. |
-| `export_json` **(async)** | JSON geometry dump. |
-| `export_vox` **(async)** | MagicaVoxel `.vox` (menu item currently disabled). |
+| `export_obj` **(async)** | Wavefront OBJ + MTL; face-culled cubes, ramp prisms, wedge pyramids. Long-op `kind: "obj"`, cancellable. |
+| `export_json` **(async)** | JSON geometry dump. Long-op `kind: "json"`, cancellable. |
+| `export_vox` **(async)** | MagicaVoxel `.vox` (menu item currently disabled). Long-op `kind: "vox"`, cancellable. |
+| `export_png` **(async)** | Renders + encodes in Rust. Long-op `kind: "png"`, *not* cancellable. |
+
+All four refuse a region over `MAX_EXPORT_VOXELS` (256 M, matching
+`MAX_CLIPBOARD_VOLUME`) up front via `check_export_volume`, with the estimate spelled
+out in the message — see [10](./10-features.md#export) (audit C6).
+
+## Long operations (`LongOps`, audit C6 + M14, 2026-08-20)
+
+One contract shared by every long-running command, replacing ten different stories
+(two had a cancel atomic + progress + modal; one had progress but no cancel; one had
+an indeterminate shimmer; four had nothing at all and were indistinguishable from a
+hang).
+
+`LongOps` is managed state holding a monotonic id counter and the id the user asked to
+cancel — a single slot, not a registry, because every long operation is modal in the
+UI and only one runs at a time. Storing the *id* rather than a bare bool means a cancel
+that arrives just after an operation finished can never leak onto the next one.
+
+```rust
+let op = ops.begin(&app, "obj", "Exporting OBJ".into(), total_rows, /* cancellable */ true);
+op.step(done, "Writing geometry")?;   // emits (throttled) AND returns Err(LONG_OP_CANCELLED)
+```
+
+- Event name: **`long-op`**. The opening event carries
+  `{ id, kind, label, phase, done, total, pct, cancellable, finished: false }`;
+  progress events carry only what changed; `LongOpHandle::drop` emits
+  `{ id, kind, finished: true }`. The frontend merges later events onto the opener, so
+  `label`/`cancellable` survive the run.
+- Throttled to whole-percent changes **and** a `LONG_OP_MIN_INTERVAL_MS` (80 ms) floor.
+- `cancel_long_op(id)` sets the flag; `step` turns it into `Err("Cancelled")`, which
+  propagates through the usual `?`. `ExportCleanup` (export.rs) deletes the
+  half-written file unless `keep()` was called, so a cancel never leaves a truncated
+  export that looks real.
+- `kind` values: `"png" | "obj" | "json" | "vox" | "save"`.
+- **Saves report progress but are not cancellable** — `try_incremental_save` writes in
+  place through a committed WAL that the next load rolls forward, so "cancel" has no
+  coherent meaning there. `atomic_write_progress` / `save_world_compressed` chunk their
+  writes at `SAVE_PROGRESS_CHUNK` (16 MB) to report.
+- **Not migrated:** `expand_world_from_template` and `materialize_flat_chunks` keep
+  `ExpandCancel`/`MaterializeCancel` and their `expand_progress`/`materialize_progress`
+  events. They already had working cancel + progress + a dedicated modal; converting
+  them would be churn against no user-visible gain.
 
 ## World generation (`worldgen.rs`)
 

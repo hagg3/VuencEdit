@@ -22,7 +22,7 @@ import WorldInfoPanel from "./panels/WorldInfoPanel";
 import { Icon, type IconName } from "./ribbon/icons";
 import { useRibbon } from "./ribbon/context";
 import {
-  ACCENT, BORDER, RADIUS, SURFACE, TEXT, TEXT_DIM, TEXT_LABEL, btnBase, hexToRgbTriplet,
+  ACCENT, BORDER, MOD, RADIUS, SHIFT, SURFACE, TEXT, TEXT_DIM, TEXT_LABEL, btnBase, hexToRgbTriplet,
 } from "./ribbon/tokens";
 import { timeAgo } from "./useRecentWorlds";
 
@@ -72,25 +72,25 @@ export default function AppMenu({
     };
   }, [onClose]);
 
-  const rows: ({ kind: "sep" } | { kind: "row"; id: AppMenuRow; label: string; icon: IconName; danger?: boolean; disabled?: boolean; onActivate?: () => void })[] =
+  const rows: ({ kind: "sep" } | { kind: "row"; id: AppMenuRow; label: string; icon: IconName; accel?: string; danger?: boolean; disabled?: boolean; onActivate?: () => void })[] =
     useMemo(() => [
-      { kind: "row", id: "new", label: "New", icon: "new", onActivate: () => { onClose(); p.setShowNewWorld(true); } },
-      { kind: "row", id: "open", label: "Open", icon: "open", onActivate: () => { onClose(); p.openFile(); } },
+      { kind: "row", id: "new", label: "New", icon: "new", accel: `${MOD}N`, onActivate: () => { onClose(); p.setShowNewWorld(true); } },
+      { kind: "row", id: "open", label: "Open", icon: "open", accel: `${MOD}O`, onActivate: () => { onClose(); p.openFile(); } },
       { kind: "row", id: "download", label: "Download", icon: "download", onActivate: () => { onClose(); p.setShowWorldBrowser(true); } },
       { kind: "sep" },
-      { kind: "row", id: "save", label: "Save", icon: "save", disabled: !p.sourcePath || p.saving, onActivate: () => { if (p.sourcePath && !p.saving) { onClose(); p.saveWorld(p.sourcePath); } } },
-      { kind: "row", id: "saveas", label: "Save As", icon: "saveAs", disabled: p.saving, onActivate: () => { if (!p.saving) { onClose(); p.saveWorldAs(); } } },
+      { kind: "row", id: "save", label: "Save", icon: "save", accel: `${MOD}S`, disabled: !p.sourcePath || p.saving, onActivate: () => { if (p.sourcePath && !p.saving) { onClose(); p.saveWorld(p.sourcePath); } } },
+      { kind: "row", id: "saveas", label: "Save As", icon: "saveAs", accel: `${MOD}${SHIFT}S`, disabled: p.saving, onActivate: () => { if (!p.saving) { onClose(); p.saveWorldAs(); } } },
       { kind: "sep" },
       { kind: "row", id: "export", label: "Export", icon: "export" },
       { kind: "row", id: "upload", label: "Upload", icon: "upload", disabled: !p.world, onActivate: () => { onClose(); p.setShowUploadModal(true); } },
       { kind: "sep" },
       { kind: "row", id: "properties", label: "Properties", icon: "properties" },
       { kind: "sep" },
-      { kind: "row", id: "settings", label: "Settings", icon: "settings", onActivate: () => { onClose(); p.setShowSettings(true); } },
-      { kind: "row", id: "help", label: "Help", icon: "help" },
+      { kind: "row", id: "settings", label: "Settings", icon: "settings", accel: `${MOD},`, onActivate: () => { onClose(); p.setShowSettings(true); } },
+      { kind: "row", id: "help", label: "Help", icon: "help", accel: "?" },
       { kind: "row", id: "about", label: "About", icon: "about" },
       { kind: "sep" },
-      { kind: "row", id: "close", label: "Close World", icon: "close", danger: true, disabled: !p.world, onActivate: () => { onClose(); p.closeWorld(); } },
+      { kind: "row", id: "close", label: "Close World", icon: "close", accel: `${MOD}W`, danger: true, disabled: !p.world, onActivate: () => { onClose(); p.closeWorld(); } },
     ], [p, onClose]);
 
   const rowIds = rows.filter(r => r.kind === "row").map(r => (r as { id: AppMenuRow }).id);
@@ -153,7 +153,12 @@ export default function AppMenu({
             }}
           >
             <Icon name={r.icon} size={16} tone={r.danger ? "danger" : "default"} />
-            {r.label}
+            <span style={{ flex: 1 }}>{r.label}</span>
+            {r.accel && (
+              <span style={{ fontSize: 11.5, color: row === r.id ? "rgba(255,255,255,.7)" : TEXT_DIM, fontFamily: "ui-monospace, 'SF Mono', monospace" }}>
+                {r.accel}
+              </span>
+            )}
           </button>
         ))}
       </div>
@@ -366,14 +371,14 @@ function Pane({ row, onClose, infoKey, bumpInfo }: { row: AppMenuRow; onClose: (
         <PaneHead title="Export"
           sub="Write the world out in another format. Exports never modify your world." />
         <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 8 }}>
-          <ExportRow icon="fullmap" title="PNG image" busy={p.exporting}
+          <ExportRow icon="fullmap" title="PNG image" busy={p.longOpKind === "png"}
             desc="A top-down render of the whole map at one pixel per block, using the same colours the 2D view draws."
             onExport={() => { onClose(); p.exportPng(); }} />
-          <ExportRow icon="properties" title="JSON" busy={p.exportingJson} disabled={!p.world}
+          <ExportRow icon="properties" title="JSON" busy={p.longOpKind === "json"} disabled={!p.world}
             desc="The world header plus a chunk index, for scripting and diffing. Human-readable and small."
             onExport={() => { onClose(); p.exportJson(); }} />
           {p.enableExperimentalExport && (
-            <ExportRow icon="axo" title="OBJ mesh" badge={<span style={expBadge()}>exp</span>} busy={p.exportingObj} disabled={!p.world}
+            <ExportRow icon="axo" title="OBJ mesh" badge={<span style={expBadge()}>exp</span>} busy={p.longOpKind === "obj"} disabled={!p.world}
               desc="Face-culled cubes plus ramp prisms and wedge pyramids, one material per block/paint combination. Opens in Blender."
               onExport={() => { onClose(); p.exportObj(); }} />
           )}
@@ -398,7 +403,7 @@ function Pane({ row, onClose, infoKey, bumpInfo }: { row: AppMenuRow; onClose: (
         <TextList items={[
           ["What gets sent", "The world is uploaded exactly as it is in memory, compressed. Your local file is not modified and nothing else about your machine is transmitted."],
           ["Name and description", "The upload dialog takes the listing name and blurb. The world's internal name (the button in the top bar) is separate. You can rename it there first if you want them to match."],
-          ["Save first", "Uploading does not save. If you want the same bytes on disk, press ⌘S before uploading."],
+          ["Save first", `Uploading does not save. If you want the same bytes on disk, press ${MOD}S before uploading.`],
           ["Finding it again", "Fresh uploads appear at the top of the browser's date sort. As in the game itself, there is no way to delete, so treat a publish as permanent."],
         ]} />
         <Primary icon="upload" label="Upload This World…" disabled={!p.world}
@@ -443,14 +448,15 @@ function Pane({ row, onClose, infoKey, bumpInfo }: { row: AppMenuRow; onClose: (
         <PaneHead title="Help"
           sub="The help window collects the keyboard map and a tour of each tool family. A few things worth knowing right now:" />
         <TextList items={[
-          ["Getting around", <>Middle-drag pans from any tool; <Kbd>Space</Kbd> holds pan temporarily. <Kbd>Home</Kbd> fits the whole map, <Kbd>⌘±</Kbd> zooms, <Kbd>⌘⇧0</Kbd> zooms to the selection.</>],
+          ["Getting around", <>Middle-drag pans from any tool; <Kbd>Space</Kbd> holds pan temporarily. <Kbd>Home</Kbd> fits the whole map, <Kbd>{MOD}±</Kbd> zooms, <Kbd>{MOD}{SHIFT}0</Kbd> zooms to the selection.</>],
           ["Selecting", <><Kbd>S</Kbd> rectangle, <Kbd>W</Kbd> magic wand, <Kbd>K</Kbd> lasso, <Kbd>J</Kbd> polygon. Wand and lasso make real shaped selections, not just bounding boxes.</>],
           ["Drawing", <><Kbd>P</Kbd> pen, <Kbd>B</Kbd> brush, <Kbd>L</Kbd> line, <Kbd>R</Kbd> rectangle, <Kbd>E</Kbd> ellipse, <Kbd>G</Kbd> polygon, <Kbd>I</Kbd> eyedropper. Digits <Kbd>1</Kbd>–<Kbd>5</Kbd> arm pinned blocks, <Kbd>6</Kbd>–<Kbd>0</Kbd> recent ones.</>],
-          ["Sculpting", <><Kbd>[</Kbd> / <Kbd>]</Kbd> change radius, with <Kbd>⇧</Kbd> for strength. Escape mid-stroke reverts the whole stroke as one undo step.</>],
-          ["Undo", <><Kbd>⌘Z</Kbd> / <Kbd>⌘⇧Z</Kbd>. Undo is chunk-scoped and byte-budgeted; the sidebar's History tab lists what is on each stack.</>],
+          ["Sculpting", <><Kbd>[</Kbd> / <Kbd>]</Kbd> change radius, with <Kbd>{SHIFT}</Kbd> for strength. Escape mid-stroke reverts the whole stroke as one undo step.</>],
+          ["Undo", <><Kbd>{MOD}Z</Kbd> / <Kbd>{MOD}{SHIFT}Z</Kbd>. Undo is chunk-scoped and byte-budgeted; the sidebar's History tab lists what is on each stack.</>],
           ["Escape", "Steps back through whatever is in progress — paste, a shape, the selection, a sculpt grab, a lasso — one level per press."],
         ]} />
         <Primary icon="help" label="Open Help" onClick={() => { onClose(); p.setShowHelp(true); }} />
+        <Primary icon="help" label="Replay the guided tour" onClick={() => { onClose(); p.startTour(); }} />
       </>);
 
     // ── About ────────────────────────────────────────────────────────────

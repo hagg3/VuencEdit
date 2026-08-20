@@ -1,7 +1,9 @@
 import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { decodePixelPatch, decodePreviewData, type SelectionInfo, type ClipboardInfo, type PreviewData } from "./types";
-import { EDEN_TEAL_READABLE } from "./designTokens";
+import {
+  ACCENT, TEXT, TEXT_ARMED, TEXT_DIM, TEXT_DISABLED, TEXT_LABEL,
+} from "./ribbon/tokens";
 import ElevationPreviewPanel from "./ElevationPreviewPanel";
 
 type PreviewView = "front" | "side" | "top" | "axo";
@@ -37,7 +39,7 @@ const panelStyle: React.CSSProperties = {
   flexDirection: "column",
   gap: 6,
   fontSize: 12,
-  color: "#ebe9e7",
+  color: TEXT,
   userSelect: "none",
 };
 
@@ -49,14 +51,14 @@ function SelectionInfoBlock({ sel }: { sel: SelectionInfo }) {
       <div style={{ display: "flex", gap: 4, fontVariantNumeric: "tabular-nums" }}>
         {[["W", sel.width], ["H", sel.height], ["D", sel.depth]].map(([l, v]) => (
           <div key={l as string} style={{ textAlign: "center", background: "rgba(255,255,255,0.04)", borderRadius: 3, padding: "2px 6px", minWidth: 30 }}>
-            <div style={{ color: "#83786c", fontSize: 8 }}>{l}</div>
-            <div style={{ color: l === "D" ? "#7dd3fc" : "#ebe9e7", fontSize: 12, fontWeight: 700 }}>{v}</div>
+            <div style={{ color: TEXT_LABEL, fontSize: 8 }}>{l}</div>
+            <div style={{ color: l === "D" ? TEXT_ARMED : TEXT, fontSize: 12, fontWeight: 700 }}>{v}</div>
           </div>
         ))}
       </div>
-      <div style={{ fontVariantNumeric: "tabular-nums", fontSize: 10, color: "#83786c", lineHeight: 1.3 }}>
+      <div style={{ fontVariantNumeric: "tabular-nums", fontSize: 10, color: TEXT_LABEL, lineHeight: 1.3 }}>
         <div>X {sel.x1}–{sel.x2}  Y {sel.y1}–{sel.y2}</div>
-        <div style={{ color: "#61584f" }}>
+        <div style={{ color: TEXT_DISABLED }}>
           {sel.width * sel.height * sel.depth} blocks
           {sel.masked && sel.cell_count != null ? ` — ◆ shaped (${sel.cell_count} cells)` : ""}
         </div>
@@ -81,7 +83,7 @@ function ClipboardInfoBlock({ clipboard }: { clipboard: ClipboardInfo }) {
     if (!canvas) return;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
-    ctx.fillStyle = "#151311";
+    ctx.fillStyle = "#14181c";
     ctx.fillRect(0, 0, CLIP_PREV_W, CLIP_PREV_H);
     if (pixels && pixels.width > 0 && pixels.height > 0) {
       const off = document.createElement("canvas");
@@ -101,15 +103,15 @@ function ClipboardInfoBlock({ clipboard }: { clipboard: ClipboardInfo }) {
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
-      <div style={{ color: "#afa69d", fontWeight: 700, fontSize: 10, letterSpacing: "0.08em" }}>CLIPBOARD</div>
+      <div style={{ color: TEXT_DIM, fontWeight: 700, fontSize: 10, letterSpacing: "0.08em" }}>CLIPBOARD</div>
       <div style={{ fontSize: 11 }}>
-        <span style={{ color: "#86efac", fontVariantNumeric: "tabular-nums", fontWeight: 700 }}>
+        <span style={{ color: ACCENT.green, fontVariantNumeric: "tabular-nums", fontWeight: 700 }}>
           {clipboard.width}×{clipboard.height}×{clipboard.depth}
         </span>
-        <span style={{ color: "#4ade80", fontSize: 10, marginLeft: 6 }}>
+        <span style={{ color: ACCENT.green, fontSize: 10, marginLeft: 6 }}>
           z{clipboard.z_anchor}–{clipboard.z_anchor + clipboard.depth - 1}
         </span>
-        {clipboard.masked && <span style={{ color: "#4ade80", fontSize: 10, marginLeft: 6 }}>◆ shaped</span>}
+        {clipboard.masked && <span style={{ color: ACCENT.green, fontSize: 10, marginLeft: 6 }}>◆ shaped</span>}
       </div>
       <canvas
         ref={canvasRef}
@@ -128,11 +130,11 @@ export default function SelectionInspector({
   editEpoch, drawActive, onDrawElevation, onZRangeChange,
 }: Props) {
   void quadMode;
-  const [view, setView] = useState<PreviewView>("front");
+  const [view, setView] = useState<PreviewView>("top");
   const [previewData, setPreviewData] = useState<PreviewData | null>(null);
   // Ortho view is always auto-expanded now (previously collapsed by default in quad mode).
   const [orthoOpen, setOrthoOpen] = useState(true);
-  const [elevationOpen, setElevationOpen] = useState(true);
+  const [elevationOpen, setElevationOpen] = useState(false);
   const [axoSki, setAxoSki] = useState(0.2);
   const [axoDir, setAxoDir] = useState(0);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -155,7 +157,7 @@ export default function SelectionInspector({
     // `cancelled`, a slow older response could land after a newer one and show stale data (audit M7).
     return () => { cancelled = true; clearTimeout(timer); };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sel?.x1, sel?.y1, sel?.x2, sel?.y2, sel?.z_min, sel?.z_max, view]);
+  }, [sel?.x1, sel?.y1, sel?.x2, sel?.y2, sel?.z_min, sel?.z_max, view, editEpoch]);
 
   // Fetch axo preview — clipboard contents if available, else selection footprint.
   useEffect(() => {
@@ -170,7 +172,7 @@ export default function SelectionInspector({
     }, 150);
     return () => { cancelled = true; clearTimeout(timer); };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sel?.x1, sel?.y1, sel?.x2, sel?.y2, clipboard?.width, clipboard?.height, clipboard?.depth, view, axoSki, axoDir]);
+  }, [sel?.x1, sel?.y1, sel?.x2, sel?.y2, clipboard?.width, clipboard?.height, clipboard?.depth, view, axoSki, axoDir, editEpoch]);
 
   // Render preview onto canvas.
   useEffect(() => {
@@ -180,7 +182,7 @@ export default function SelectionInspector({
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
 
-    ctx.fillStyle = "#151311";
+    ctx.fillStyle = "#14181c";
     ctx.fillRect(0, 0, CW, CH);
 
     if (previewData && previewData.width > 0 && previewData.height > 0) {
@@ -205,7 +207,7 @@ export default function SelectionInspector({
     const viewLabel = view === "front" ? "Front X-Z" : view === "side" ? "Side Y-Z" : view === "axo" ? `Axo ${axoDirLabel} d=${axoSki.toFixed(2)}` : "Top X-Y";
     ctx.fillStyle = "rgba(0,0,0,0.65)";
     ctx.fillRect(0, CH - LABEL_H, CW, LABEL_H);
-    ctx.fillStyle = "#7dd3fc";
+    ctx.fillStyle = TEXT_ARMED;
     ctx.font = "7px monospace";
     ctx.textAlign = "left";
     ctx.textBaseline = "middle";
@@ -222,16 +224,16 @@ export default function SelectionInspector({
       ? "linear-gradient(180deg, rgba(0,164,173,0.35) 0%, rgba(0,164,173,0.10) 100%)"
       : "linear-gradient(180deg, rgba(255,255,255,0.05) 0%, rgba(255,255,255,0.02) 100%)",
     boxShadow: view === v
-      ? `inset 0 0 0 1px ${EDEN_TEAL_READABLE}, 0 .5px .5px rgba(255,255,255,.15)`
+      ? `inset 0 0 0 1px ${TEXT_ARMED}, 0 .5px .5px rgba(255,255,255,.15)`
       : "inset 0 0 0 1px rgba(0,0,0,.5)",
-    color: view === v ? EDEN_TEAL_READABLE : "#83786c",
+    color: view === v ? TEXT_ARMED : TEXT_LABEL,
     borderRadius: 3,
   });
 
   if (!sel) {
     return (
       <div style={panelStyle}>
-        <div style={{ color: "#61584f", fontSize: 11, textAlign: "center", padding: "16px 4px" }}>
+        <div style={{ color: TEXT_DISABLED, fontSize: 11, textAlign: "center", padding: "16px 4px" }}>
           No selection. Drag on the map (Select tool) or use the Wand/Lasso to inspect a region here.
         </div>
       </div>
@@ -247,8 +249,8 @@ export default function SelectionInspector({
           onClick={() => setOrthoOpen(v => !v)}
           style={{ display: "flex", alignItems: "center", gap: 5, cursor: "pointer", userSelect: "none" }}
         >
-          <span style={{ color: "#61584f", fontSize: 9 }}>{orthoOpen ? "▼" : "▶"}</span>
-          <span style={{ color: "#afa69d", fontWeight: 700, fontSize: 10, letterSpacing: "0.08em" }}>ORTHO VIEW</span>
+          <span style={{ color: TEXT_DISABLED, fontSize: 9 }}>{orthoOpen ? "▼" : "▶"}</span>
+          <span style={{ color: TEXT_DIM, fontWeight: 700, fontSize: 10, letterSpacing: "0.08em" }}>ORTHO VIEW</span>
         </div>
         {orthoOpen && (<>
           <div style={{ display: "flex", gap: 3 }}>
@@ -268,18 +270,18 @@ export default function SelectionInspector({
                       background: axoDir === d
                         ? "linear-gradient(180deg, rgba(168,85,247,0.35) 0%, rgba(168,85,247,0.10) 100%)"
                         : "linear-gradient(180deg, rgba(255,255,255,0.05) 0%, rgba(255,255,255,0.02) 100%)",
-                      boxShadow: axoDir === d ? "inset 0 0 0 1px #a855f7, 0 .5px .5px rgba(255,255,255,.15)" : "inset 0 0 0 1px rgba(0,0,0,.5)",
-                      color: axoDir === d ? "#d8b4fe" : "#83786c", borderRadius: 3,
+                      boxShadow: axoDir === d ? `inset 0 0 0 1px ${ACCENT.violet}, 0 .5px .5px rgba(255,255,255,.15)` : "inset 0 0 0 1px rgba(0,0,0,.5)",
+                      color: axoDir === d ? ACCENT.violet : TEXT_LABEL, borderRadius: 3,
                     }}
                   >{label}</button>
                 ))}
               </div>
               <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
-                <span style={{ color: "#83786c", fontSize: 10, whiteSpace: "nowrap" }}>Depth</span>
+                <span style={{ color: TEXT_LABEL, fontSize: 10, whiteSpace: "nowrap" }}>Depth</span>
                 <input type="range" min={0.05} max={0.5} step={0.01} value={axoSki}
                   onChange={e => setAxoSki(parseFloat(e.target.value))}
-                  style={{ flex: 1, accentColor: "#a855f7" }} />
-                <span style={{ color: "#d8b4fe", fontSize: 10, minWidth: 28, textAlign: "right", fontVariantNumeric: "tabular-nums" }}>
+                  style={{ flex: 1, accentColor: ACCENT.violet }} />
+                <span style={{ color: ACCENT.violet, fontSize: 10, minWidth: 28, textAlign: "right", fontVariantNumeric: "tabular-nums" }}>
                   {axoSki.toFixed(2)}
                 </span>
               </div>
@@ -301,8 +303,8 @@ export default function SelectionInspector({
           onClick={() => setElevationOpen(v => !v)}
           style={{ display: "flex", alignItems: "center", gap: 5, cursor: "pointer", userSelect: "none" }}
         >
-          <span style={{ color: "#61584f", fontSize: 9 }}>{elevationOpen ? "▼" : "▶"}</span>
-          <span style={{ color: "#afa69d", fontWeight: 700, fontSize: 10, letterSpacing: "0.08em" }}>ELEVATION VIEW</span>
+          <span style={{ color: TEXT_DISABLED, fontSize: 9 }}>{elevationOpen ? "▼" : "▶"}</span>
+          <span style={{ color: TEXT_DIM, fontWeight: 700, fontSize: 10, letterSpacing: "0.08em" }}>ELEVATION VIEW</span>
         </div>
         {elevationOpen && (
           elevationSelection ? (
@@ -319,7 +321,7 @@ export default function SelectionInspector({
               onZRangeChange={onZRangeChange}
             />
           ) : (
-            <div style={{ color: "#61584f", fontSize: 11, textAlign: "center", padding: "8px 4px" }}>
+            <div style={{ color: TEXT_DISABLED, fontSize: 11, textAlign: "center", padding: "8px 4px" }}>
               No selection. Make a selection to see its front/side elevation.
             </div>
           )

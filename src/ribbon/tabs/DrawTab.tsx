@@ -93,7 +93,8 @@ export default function DrawTab() {
       {/* ── Brush ─────────────────────────────────────────────────────────── */}
       <Group id="brush" label="Brush" tier={tier.brush} declaredWidth={214} icon="brush">
         <Col style={{ justifyContent: "center", height: GROUP_CONTENT_H }}>
-          <div style={{ ...(sizeApplies ? null : { opacity: 0.35, pointerEvents: "none" as const }) }}>
+          {/* audit H7: `inert` (not just opacity/pointerEvents) keeps a dimmed row out of the tab order. */}
+          <div style={{ ...(sizeApplies ? null : { opacity: 0.35, pointerEvents: "none" as const }) }} inert={!sizeApplies || undefined}>
             {isSpray ? (
               <SliderRow label="Density" min={5} max={100} step={5} accent={ACCENT.primary}
                 value={Math.round(p.sprayDensity * 100)} onChange={v => p.setSprayDensity(v / 100)}
@@ -105,7 +106,7 @@ export default function DrawTab() {
                 options={[1, 3, 5, 7, 9].map(n => ({ id: String(n), label: String(n), title: `${n}-block brush` }))} />
             )}
           </div>
-          <div style={{ ...(shapeApplies ? null : { opacity: 0.35, pointerEvents: "none" as const }) }}>
+          <div style={{ ...(shapeApplies ? null : { opacity: 0.35, pointerEvents: "none" as const }) }} inert={!shapeApplies || undefined}>
             <Segmented ariaLabel="Brush shape" label="Shape" accent={ACCENT.primary}
               value={p.brushShape} onChange={p.setBrushShape}
               options={[
@@ -152,7 +153,7 @@ export default function DrawTab() {
           <SmallButton icon="filter" label={p.maskEnabled ? "Mask ✓" : "Mask"} full accent={ACCENT.primary}
             active={p.maskEnabled} onClick={() => p.setMaskEnabled(!p.maskEnabled)}
             title="Restrict every stroke to blocks matching the type/paint below — draw only over stone, only over grass, etc." />
-          <Row style={{ opacity: p.maskEnabled ? 1 : 0.35, pointerEvents: p.maskEnabled ? "auto" : "none", height: SMALL_H }}>
+          <Row style={{ opacity: p.maskEnabled ? 1 : 0.35, pointerEvents: p.maskEnabled ? "auto" : "none", height: SMALL_H }} inert={!p.maskEnabled || undefined}>
             <FieldLabel width={30}>Type</FieldLabel>
             <select aria-label="Mask block type" value={p.maskBlockType ?? ""}
               onChange={e => p.setMaskBlockType(e.target.value === "" ? null : Number(e.target.value))}
@@ -162,7 +163,7 @@ export default function DrawTab() {
               {NEW_FORMAT_BLOCKS.map(b => <option key={b.type} value={b.type}>{b.name}</option>)}
             </select>
           </Row>
-          <Row style={{ opacity: p.maskEnabled ? 1 : 0.35, pointerEvents: p.maskEnabled ? "auto" : "none", height: SMALL_H }}>
+          <Row style={{ opacity: p.maskEnabled ? 1 : 0.35, pointerEvents: p.maskEnabled ? "auto" : "none", height: SMALL_H }} inert={!p.maskEnabled || undefined}>
             <FieldLabel width={30}>Paint</FieldLabel>
             <select aria-label="Mask paint" value={p.maskPaint ?? ""}
               onChange={e => p.setMaskPaint(e.target.value === "" ? null : Number(e.target.value))}

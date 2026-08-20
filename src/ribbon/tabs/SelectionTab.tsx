@@ -13,7 +13,7 @@ import {
   Caption, Check, Col, CommandButton, FieldLabel, Group, GroupDivider, IconButton, NumField,
   RangeSlider, Row, Segmented, SmallButton, Swatch,
 } from "../primitives";
-import { ACCENT, GROUP_CONTENT_H, SMALL_H, btnActive, btnBase } from "../tokens";
+import { ACCENT, GROUP_CONTENT_H, MOD, SMALL_H, btnActive, btnBase } from "../tokens";
 import { Icon } from "../icons";
 
 const SPECS: GroupMetrics[] = [
@@ -59,8 +59,8 @@ export default function SelectionTab() {
         <CommandButton tier={tier.modify === "full" ? "full" : "medium"} icon="clear" label="Clear" tone="danger"
           title="Deselect (Esc)" onClick={() => p.setRawBounds(null)} />
         <Col style={{ justifyContent: "center", height: GROUP_CONTENT_H }}>
-          <SmallButton icon="selectAll" label="Select All" full title="Select the whole world (⌘A)" onClick={p.onSelectAll} />
-          <SmallButton icon="copy" label="Copy" full title="Copy the selection (⌘C)" onClick={p.copySelection} />
+          <SmallButton icon="selectAll" label="Select All" full title={`Select the whole world (${MOD}A)`} onClick={p.onSelectAll} />
+          <SmallButton icon="copy" label="Copy" full title={`Copy the selection (${MOD}C)`} onClick={p.copySelection} />
           <SmallButton icon="cut" label="Cut" full title="Copy the selection, then clear it" onClick={p.cutSelection} />
         </Col>
       </Group>
@@ -111,7 +111,7 @@ export default function SelectionTab() {
           <BlockChip label="Write" blockType={p.fillBlockType} paint={p.fillPaint}
             open={pickerKind === "block-fill"} onClick={e => togglePicker(e, "block-fill")}
             title="The block Fill writes — and Gradient's starting colour. To replace only certain blocks, set the filter in Replace →" />
-          <BlockChip label="Fade to" blockType={p.gradientToBlock} paint={p.gradientToPaint}
+          <BlockChip label="Fade" blockType={p.gradientToBlock} paint={p.gradientToPaint}
             open={pickerKind === "gradient-to"} onClick={e => togglePicker(e, "gradient-to")}
             title="Gradient's ending colour — ignored by Fill" />
           <Row style={{ height: SMALL_H }}>
@@ -130,7 +130,7 @@ export default function SelectionTab() {
           disabled={!p.rawBounds} title="Fill the selection with the Write block, respecting the Replace filter"
           onClick={p.fillSelection} />
         <CommandButton tier={tier.fill === "full" ? "full" : "medium"} icon="gradient" label="Gradient" accent={ACCENT.primary}
-          disabled={!p.rawBounds} title="Dither-blend Write → Fade to across the selection along the chosen axis"
+          disabled={!p.rawBounds} title="Dither-blend Write → Fade across the selection along the chosen axis"
           onClick={p.applyGradientFill} />
       </Group>
       <GroupDivider />

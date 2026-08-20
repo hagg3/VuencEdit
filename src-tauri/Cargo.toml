@@ -26,7 +26,13 @@ base64 = "0.22"
 memmap2 = "0.9"
 flate2 = "1"
 zip = "2"
-reqwest = { version = "0.12", features = ["multipart"] }
+reqwest = { version = "0.12", features = ["multipart", "stream"] }
+# Streamed upload bodies (audit C4): a `Stream` adapter over the compressed world file so a 2 GB
+# upload costs a 256 KB buffer instead of 4-6 GB, and reports real byte progress on the way out.
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+tokio = { version = "1", features = ["fs", "rt"] }
+tokio-util = { version = "0.7", features = ["io"] }
+bytes = "1"
 image = { version = "0.25", default-features = false, features = ["png"] }
 rayon = "1"
 rustc-hash = "2"

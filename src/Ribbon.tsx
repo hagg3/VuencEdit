@@ -268,22 +268,22 @@ export default function Ribbon(p: RibbonProps) {
                 onBlockTypeChange={bt => { if (bt !== null) p.setFillBlockType(bt); }}
                 onPaintChange={paint => p.setFillPaint(paint ?? 0)}
                 onFill={p.fillSelection} selectionExists={!!p.rawBounds}
-                texturePack={p.texturePack} />
+                texturePack={p.texturePack} allowNewFormat={p.world?.max_z === 255} />
             ) : picker.kind === "build-3d" ? (
               <BlockPaintPicker mode="fill" blockType={p.fillBlockType} paint={p.fillPaint}
                 onBlockTypeChange={bt => { if (bt !== null) p.setFillBlockType(bt); }}
                 onPaintChange={paint => p.setFillPaint(paint ?? 0)}
-                texturePack={p.texturePack} />
+                texturePack={p.texturePack} allowNewFormat={p.world?.max_z === 255} />
             ) : picker.kind === "gradient-to" ? (
               <BlockPaintPicker mode="fill" blockType={p.gradientToBlock} paint={p.gradientToPaint}
                 onBlockTypeChange={bt => { if (bt !== null) p.setGradientToBlock(bt); }}
                 onPaintChange={paint => p.setGradientToPaint(paint ?? 0)}
                 onFill={p.applyGradientFill} selectionExists={!!p.rawBounds}
-                texturePack={p.texturePack} />
+                texturePack={p.texturePack} allowNewFormat={p.world?.max_z === 255} />
             ) : (
               <BlockPaintPicker mode="filter" blockType={p.filterBlockType} paint={p.filterPaint}
                 onBlockTypeChange={p.setFilterBlockType} onPaintChange={p.setFilterPaint}
-                texturePack={p.texturePack} />
+                texturePack={p.texturePack} allowNewFormat={p.world?.max_z === 255} />
             )}
           </div>,
           document.body,

@@ -32,6 +32,16 @@ export const IS_MAC = typeof navigator !== "undefined" && /Mac/.test(navigator.p
 /** Clears the traffic-light cluster (starts at x=12, ~52px wide) plus a little breathing room. */
 export const MAC_TRAFFIC_LIGHT_CLEARANCE = 72;
 
+/**
+ * Platform-aware modifier glyphs for shortcut labels (audit H9) — every tooltip/menu/help
+ * accelerator should read from these instead of hardcoding ⌘/⇧, which is wrong on Windows/Linux
+ * (the keydown handler in App.tsx already accepts `ctrlKey` there; only the *display* was Mac-only).
+ */
+export const MOD = IS_MAC ? "⌘" : "Ctrl+";
+export const SHIFT = IS_MAC ? "⇧" : "Shift+";
+/** Delete/Backspace — both are bound, but the glyph a user recognises differs by platform. */
+export const DEL = IS_MAC ? "⌫" : "Del";
+
 export const GROUP_PAD_TOP = 4;
 export const GROUP_PAD_BOTTOM = 2;
 /** The exact height of a group's control area. 3 × SMALL_H + 2 × ROW_GAP === LARGE_H === this. */

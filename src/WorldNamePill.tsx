@@ -46,7 +46,7 @@ export default function WorldNamePill() {
   const dawnRgb = hexToRgbTriplet(ACCENT.violet);
 
   return (
-    <div ref={wrapRef} style={{ position: "relative", display: "flex", alignItems: "center", marginRight: 4 }}>
+    <div ref={wrapRef} data-tour="world-pill" style={{ position: "relative", display: "flex", alignItems: "center", marginRight: 4 }}>
       <button
         className="rbn-btn" type="button" onClick={() => setOpen(v => !v)}
         title={`${w.name} — ${formatLabel}, ${w.width_chunks}×${w.height_chunks} chunks. Click for world details and rename.`}

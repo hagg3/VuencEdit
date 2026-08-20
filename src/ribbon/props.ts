@@ -92,6 +92,7 @@ export interface RibbonProps {
   // View ▸ Layout — persisted state previously reachable only through Settings.
   sidebarOpen: boolean; onToggleSidebar: () => void;
   showQuickActions: boolean; onToggleQuickActions: () => void;
+  leftToolbarOpen: boolean; onToggleLeftToolbar: () => void;
   // 3D fly-view interaction (the contextual "3D" tab). Decoupled from the map's Draw/Select tools.
   mode3d: "off" | "select" | "build" | "sculpt" | "floodfill"; setMode3d: (v: "off" | "select" | "build" | "sculpt" | "floodfill") => void;
   /** Auto-orient directional blocks (ramps/wedges/doors) to the player's facing when placing in 3D build. */
@@ -186,7 +187,9 @@ export interface RibbonProps {
   onGenerateWavySurface: () => void;
   // File ops
   sourcePath: string | null; saving: boolean;
-  exporting: boolean; exportingObj: boolean; exportingJson: boolean;
+  /** `kind` of the long operation currently running (audit C6/M14), or null. One field for what
+   *  used to be three booleans; `"png" | "obj" | "json" | "vox" | "save"`. */
+  longOpKind: string | null;
   saveCompressed: boolean; setSaveCompressed: (v: boolean) => void;
   backupCompressed: boolean; setBackupCompressed: (v: boolean) => void;
   recentWorlds: RecentWorld[];
@@ -205,6 +208,9 @@ export interface RibbonProps {
   setShowHelp: (v: boolean) => void;
   setShowAbout: (v: boolean) => void;
   setShowSettings: (v: boolean) => void;
+  /** Opens the onboarding coach-mark tour (`src/tour/`) — the application menu's Help pane and
+   *  `HelpModal` both offer a "replay" entry point through this. */
+  startTour: () => void;
   // Collapse
   collapsed: boolean; onCollapse: (v: boolean) => void;
   /** Called once on mount with a setter for the active tab, so outside chrome (the Quick Actions

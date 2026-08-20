@@ -1,6 +1,7 @@
 import React, { useState } from "react";
 import { EDEN_TEAL, EDEN_TEAL_READABLE, glassPanel, glassTab, wipBadge } from "./designTokens";
 import Modal from "./Modal";
+import { MOD, SHIFT } from "./ribbon/tokens";
 
 function Key({ children }: { children: React.ReactNode }) {
   return (
@@ -284,7 +285,7 @@ const sectionHead: React.CSSProperties = {
   marginTop: 14, marginBottom: 2,
 };
 
-export default function HelpModal({ onClose }: { onClose: () => void }) {
+export default function HelpModal({ onClose, onStartTour }: { onClose: () => void; onStartTour?: () => void }) {
   const [tab, setTab] = useState<"shortcuts" | "tools" | "textures">("shortcuts");
 
   return (
@@ -315,16 +316,29 @@ export default function HelpModal({ onClose }: { onClose: () => void }) {
               </button>
             ))}
           </div>
-          <button
-            onClick={onClose}
-            onMouseEnter={e => (e.currentTarget.style.color = EDEN_TEAL_READABLE)}
-            onMouseLeave={e => (e.currentTarget.style.color = "#61584f")}
-            style={{
-              background: "none", border: "none", color: "#61584f",
-              fontSize: 20, lineHeight: 1, cursor: "pointer", padding: "0 2px", transition: "color .1s",
-            }}
-            title="Close"
-          >×</button>
+          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            {onStartTour && (
+              <button
+                onClick={() => { onStartTour(); onClose(); }}
+                style={{
+                  background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.14)",
+                  color: EDEN_TEAL_READABLE, fontSize: 12, fontWeight: 600, cursor: "pointer",
+                  padding: "4px 10px", borderRadius: 4, whiteSpace: "nowrap",
+                }}
+                title="Replay the guided tour of the app's main surfaces"
+              >Take the guided tour</button>
+            )}
+            <button
+              onClick={onClose}
+              onMouseEnter={e => (e.currentTarget.style.color = EDEN_TEAL_READABLE)}
+              onMouseLeave={e => (e.currentTarget.style.color = "#61584f")}
+              style={{
+                background: "none", border: "none", color: "#61584f",
+                fontSize: 20, lineHeight: 1, cursor: "pointer", padding: "0 2px", transition: "color .1s",
+              }}
+              title="Close"
+            >×</button>
+          </div>
         </div>
 
         {tab === "shortcuts" ? (
@@ -333,9 +347,9 @@ export default function HelpModal({ onClose }: { onClose: () => void }) {
               <tbody>
                 <Section title="Navigation" />
                 <Row keys={<>Scroll</>}                                      action="Zoom in / out (toward cursor)" />
-                <Row keys={<><Key>⌘</Key><Key>+</Key> / <Key>⌘</Key><Key>−</Key></>} action="Zoom in / out (viewport centre)" />
-                <Row keys={<><Key>⌘</Key><Key>0</Key> / <Key>Home</Key></>}  action="Fit map to window" />
-                <Row keys={<><Key>⌘</Key><Key>⇧</Key><Key>0</Key></>}       action="Zoom to selection" />
+                <Row keys={<><Key>{MOD}+</Key> / <Key>{MOD}−</Key></>} action="Zoom in / out (viewport centre)" />
+                <Row keys={<><Key>{MOD}</Key><Key>0</Key> / <Key>Home</Key></>}  action="Fit map to window" />
+                <Row keys={<><Key>{MOD}</Key><Key>{SHIFT}</Key><Key>0</Key></>}       action="Zoom to selection" />
                 <Row keys={<>Middle drag</>}                                  action="Pan" />
 
                 <Section title="Tools" />
@@ -351,32 +365,34 @@ export default function HelpModal({ onClose }: { onClose: () => void }) {
                 <Row keys={<><Key>I</Key></>}                                action="Eyedropper — pick the block under the cursor" />
                 <Row keys={<><Key>W</Key></>}                                action="Magic Wand — flood-select matching surface blocks (type+colour toggle in toolbar)" />
                 <Row keys={<><Key>K</Key></>}                                action="Lasso — drag a freeform selection shape; edits, paste, gradient, extrude, trees, previews all follow the traced footprint (sculpt clip and prefab save still use the bounding box)" />
+                <Row keys={<><Key>J</Key></>}                                action="Polygon Select — click vertices to build a selection shape" />
 
                 <Section title="Sculpt" />
                 <Row keys={<><Key>[</Key> / <Key>]</Key></>}                 action="Brush radius down / up (while a sculpt tool is armed)" />
-                <Row keys={<><Key>⇧</Key><Key>[</Key> / <Key>⇧</Key><Key>]</Key></>} action="Strength down / up" />
-                <Row keys={<>Hold <Key>⌘</Key> / <Key>Ctrl</Key></>}         action="Invert — swaps Raise ↔ Lower for the stroke" />
-                <Row keys={<>Hold <Key>⇧</Key></>}                            action="Temporary Smooth — overrides the armed tool while held (any sculpt tool except Grab)" />
+                <Row keys={<><Key>{SHIFT}</Key><Key>[</Key> / <Key>{SHIFT}</Key><Key>]</Key></>} action="Strength down / up" />
+                <Row keys={<>Hold <Key>Ctrl</Key></>}         action="Invert — swaps Raise ↔ Lower for the stroke" />
+                <Row keys={<>Hold <Key>{SHIFT}</Key></>}                            action="Temporary Smooth — overrides the armed tool while held (any sculpt tool except Grab)" />
 
                 <Section title="Blocks" />
                 <Row keys={<><Key>1</Key>–<Key>5</Key></>}                   action="Pinned hotbar slots — also works in the 3D pane's Build mode" />
                 <Row keys={<><Key>6</Key>–<Key>0</Key></>}                   action="Recently-used hotbar slots — also works in the 3D pane's Build mode" />
 
                 <Section title="Editing" />
-                <Row keys={<><Key>⌘</Key><Key>Z</Key></>}                   action="Undo" />
-                <Row keys={<><Key>⌘</Key><Key>⇧</Key><Key>Z</Key> / <Key>⌘</Key><Key>Y</Key></>} action="Redo" />
-                <Row keys={<><Key>⌘</Key><Key>C</Key></>}                   action="Copy selection" />
-                <Row keys={<><Key>⌘</Key><Key>V</Key></>}                   action="Arm paste" />
-                <Row keys={<><Key>⌘</Key><Key>A</Key></>}                   action="Select whole world" />
-                <Row keys={<><Key>⌘</Key><Key>D</Key></>}                   action="Deselect" />
-                <Row keys={<>Arrows</>}                                       action="Nudge selection (Select tool only; ⇧ = 10 blocks)" />
-                <Row keys={<>Drag inside selection</>}                         action="Move it (hold ⇧ to lock to one axis)" />
+                <Row keys={<><Key>{MOD}</Key><Key>Z</Key></>}                   action="Undo" />
+                <Row keys={<><Key>{MOD}</Key><Key>{SHIFT}</Key><Key>Z</Key> / <Key>{MOD}</Key><Key>Y</Key></>} action="Redo" />
+                <Row keys={<><Key>{MOD}</Key><Key>C</Key></>}                   action="Copy selection" />
+                <Row keys={<><Key>{MOD}</Key><Key>V</Key></>}                   action="Arm paste" />
+                <Row keys={<><Key>{MOD}</Key><Key>A</Key></>}                   action="Select whole world" />
+                <Row keys={<><Key>{MOD}</Key><Key>D</Key></>}                   action="Deselect" />
+                <Row keys={<><Key>Delete</Key> / <Key>Backspace</Key></>}     action="Fill the selection with air (Select tool only)" />
+                <Row keys={<>Arrows</>}                                       action={`Nudge selection (Select tool only; ${SHIFT} = 10 blocks)`} />
+                <Row keys={<>Drag inside selection</>}                         action={`Move it (hold ${SHIFT} to lock to one axis)`} />
 
                 <Section title="Paste mode" />
                 <Row keys={<>Click</>}                                        action="Lock paste position (ghost turns amber)" />
                 <Row keys={<>Click again / Confirm</>}                        action="Stamp paste" />
                 <Row keys={<><Key>.</Key></>}                                 action="Repeat paste one step in same direction" />
-                <Row keys={<><Key>PgUp</Key> / <Key>PgDn</Key></>}            action="Raise / lower paste Z offset (⇧ = ±5)" />
+                <Row keys={<><Key>PgUp</Key> / <Key>PgDn</Key></>}            action={`Raise / lower paste Z offset (${SHIFT} = ±5)`} />
                 <Row keys={<><Key>Esc</Key></>}                               action="Unlock position → exit paste mode" />
 
                 <Section title="3D pane" />
@@ -387,12 +403,12 @@ export default function HelpModal({ onClose }: { onClose: () => void }) {
                 <Row keys={<>Hold left</>}                                    action="Sculpt mode: sculpt terrain under the cursor/crosshair (orbit's left-drag rotate is disabled while armed; drag-to-look is unavailable in Fly mode — use Look mode or WASD instead)" />
 
                 <Section title="File" />
-                <Row keys={<><Key>⌘</Key><Key>N</Key></>}                   action="New world" />
-                <Row keys={<><Key>⌘</Key><Key>O</Key></>}                   action="Open world" />
-                <Row keys={<><Key>⌘</Key><Key>S</Key></>}                   action="Save" />
-                <Row keys={<><Key>⌘</Key><Key>⇧</Key><Key>S</Key></>}      action="Save As…" />
-                <Row keys={<><Key>⌘</Key><Key>W</Key></>}                   action="Close world" />
-                <Row keys={<><Key>⌘</Key><Key>,</Key></>}                   action="Settings" />
+                <Row keys={<><Key>{MOD}</Key><Key>N</Key></>}                   action="New world" />
+                <Row keys={<><Key>{MOD}</Key><Key>O</Key></>}                   action="Open world" />
+                <Row keys={<><Key>{MOD}</Key><Key>S</Key></>}                   action="Save" />
+                <Row keys={<><Key>{MOD}</Key><Key>{SHIFT}</Key><Key>S</Key></>}      action="Save As…" />
+                <Row keys={<><Key>{MOD}</Key><Key>W</Key></>}                   action="Close world" />
+                <Row keys={<><Key>{MOD}</Key><Key>,</Key></>}                   action="Settings" />
 
                 <Section title="General" />
                 <Row keys={<><Key>Esc</Key></>}                               action="Step back: context menu → paste lock → tool → selection" />

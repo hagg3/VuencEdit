@@ -1,13 +1,51 @@
 //! Static geometry export: OBJ, JSON block dump, and MagicaVoxel .vox.
 use crate::colors::{block_color, transparent_alpha, BI_NOTSOLID, BI_RAMPORSIDE, BLOCK_INFO};
-use crate::{fluid_base, fluid_level, read_ws, world_max_z, AppState, LoadedWorld};
+use crate::{fluid_base, fluid_level, read_ws, world_max_z, AppState, LoadedWorld, LongOps};
 use crate::texturepack;
 use rustc_hash::FxHashMap;
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufWriter, Write};
-use tauri::Emitter;
+
+/// Ceiling on the voxel volume one OBJ / JSON / VOX export may span (audit C6).
+///
+/// All three are linear in the volume and emit a per-voxel record, so a whole-world export on a
+/// populated 256z world (7216 × 8448 × 256 ≈ 1.6 × 10¹⁰ blocks) is billions of records and hundreds
+/// of gigabytes — it does not finish, and it holds the read guard while not finishing, so no edit,
+/// undo, save or autosave can run either. The frontend defaults these exports to the whole world
+/// when there is no selection, which is how that gets reached by accident. 256 M matches the
+/// clipboard's own `MAX_CLIPBOARD_VOLUME`, i.e. the volume this codebase already treats as the
+/// largest single region worth materialising.
+pub(crate) const MAX_EXPORT_VOXELS: u64 = 256_000_000;
+
+/// Refuse an over-budget export up front, with the estimate spelled out — the user's next move is
+/// to select a region, so say so rather than starting something that can't finish.
+fn check_export_volume(sx1: i32, sy1: i32, sz1: i32, sx2: i32, sy2: i32, sz2: i32, what: &str) -> Result<u64, String> {
+    let w = (sx2 - sx1 + 1).max(0) as u64;
+    let h = (sy2 - sy1 + 1).max(0) as u64;
+    let d = (sz2 - sz1 + 1).max(0) as u64;
+    let volume = w.saturating_mul(h).saturating_mul(d);
+    if volume > MAX_EXPORT_VOXELS {
+        return Err(format!(
+            "This region is {w}×{h}×{d} = {} blocks — more than the {} block {what} export limit. \
+             Select a smaller region first.",
+            fmt_big(volume), fmt_big(MAX_EXPORT_VOXELS),
+        ));
+    }
+    Ok(volume)
+}
+
+/// "1.6 trillion" / "256 million" / "12,800" — readable magnitudes for the message above.
+fn fmt_big(n: u64) -> String {
+    const T: u64 = 1_000_000_000_000;
+    const B: u64 = 1_000_000_000;
+    const M: u64 = 1_000_000;
+    if n >= T { format!("{:.1} trillion", n as f64 / T as f64) }
+    else if n >= B { format!("{:.1} billion", n as f64 / B as f64) }
+    else if n >= M { format!("{:.0} million", n as f64 / M as f64) }
+    else { n.to_string() }
+}
 
 // ── OBJ Export ────────────────────────────────────────────────────────────────
 
@@ -294,6 +332,8 @@ pub(crate) fn emit_merged_quad(w: &mut impl Write, dir: u8, plane: i32, u0: i32,
 
 #[tauri::command(async)]
 pub(crate) fn export_obj(
+    app: tauri::AppHandle,
+    ops: tauri::State<'_, LongOps>,
     state: tauri::State<'_, AppState>,
     path: String,
     x1: i32, y1: i32, x2: i32, y2: i32,
@@ -306,10 +346,17 @@ pub(crate) fn export_obj(
     let sy1 = y1.min(y2); let sy2 = y1.max(y2);
     let sz1 = z_min.min(z_max).max(0);
     let sz2 = z_min.max(z_max).min(world_max_z(world));
+    check_export_volume(sx1, sy1, sz1, sx2, sy2, sz2, "OBJ")?;
+
+    // Two full passes over the volume (materials, then geometry), reported as one 0–100% bar.
+    let rows = (sz2 - sz1 + 1).max(0) as u64 * 2;
+    let op = ops.begin(&app, "obj", "Exporting OBJ".into(), rows, true);
+    let cleanup = ExportCleanup::new(&path);
 
     // Collect unique (block_type, paint) combos for the MTL file.
     let mut mat_set: HashSet<(u8, u8)> = HashSet::new();
     for wz in sz1..=sz2 {
+        op.step((wz - sz1) as u64, "Scanning materials")?;
         for wy in sy1..=sy2 {
             for wx in sx1..=sx2 {
                 let (bt, paint) = get_block_at(world, wx, wy, wz);
@@ -365,6 +412,7 @@ pub(crate) fn export_obj(
     let mut cur_mat = String::new();
 
     for wz in sz1..=sz2 {
+        op.step((sz2 - sz1 + 1) as u64 + (wz - sz1) as u64, "Writing geometry")?;
         for wy in sy1..=sy2 {
             for wx in sx1..=sx2 {
                 let (bt, paint) = get_block_at(world, wx, wy, wz);
@@ -435,13 +483,32 @@ pub(crate) fn export_obj(
         }
     }
 
+    ow.flush().map_err(|e| e.to_string())?;
+    cleanup.keep();
     Ok(())
+}
+
+/// Deletes a half-written export file unless `keep()` was called (audit C6). A cancelled or failed
+/// export used to leave a truncated `.obj`/`.json.gz`/`.vox` behind that looks like a real one.
+pub(crate) struct ExportCleanup { path: std::path::PathBuf, keep: Cell<bool> }
+impl ExportCleanup {
+    pub(crate) fn new(path: &str) -> Self {
+        ExportCleanup { path: std::path::PathBuf::from(path), keep: Cell::new(false) }
+    }
+    pub(crate) fn keep(&self) { self.keep.set(true); }
+}
+impl Drop for ExportCleanup {
+    fn drop(&mut self) {
+        if !self.keep.get() { let _ = fs::remove_file(&self.path); }
+    }
 }
 
 // ── JSON Export ────────────────────────────────────────────────────────────────
 
 #[tauri::command(async)]
 pub(crate) fn export_json(
+    app: tauri::AppHandle,
+    ops: tauri::State<'_, LongOps>,
     state: tauri::State<'_, AppState>,
     path: String,
     x1: i32, y1: i32, x2: i32, y2: i32,
@@ -458,6 +525,10 @@ pub(crate) fn export_json(
     let sy1 = y1.min(y2); let sy2 = y1.max(y2);
     let sz1 = z_min.min(z_max).max(0);
     let sz2 = z_min.max(z_max).min(world_max_z(world));
+    check_export_volume(sx1, sy1, sz1, sx2, sy2, sz2, "JSON")?;
+
+    let op = ops.begin(&app, "json", "Exporting JSON".into(), (sz2 - sz1 + 1).max(0) as u64, true);
+    let cleanup = ExportCleanup::new(&path);
 
     let format_str = if world.chunk_size >= 131072 { "256z" } else { "64z" };
 
@@ -487,6 +558,7 @@ pub(crate) fn export_json(
     let mut count: u32 = 0;
     let mut first = true;
     for wz in sz1..=sz2 {
+        op.step((wz - sz1) as u64, "Writing blocks")?;
         for wy in sy1..=sy2 {
             for wx in sx1..=sx2 {
                 let (bt, paint) = get_block_at(world, wx, wy, wz);
@@ -501,8 +573,9 @@ pub(crate) fn export_json(
     }
 
     gz.write_all(b"\n]}\n").map_err(|e| e.to_string())?;
-    gz.finish().map_err(|e| e.to_string())?;
-
+    let mut f = gz.finish().map_err(|e| e.to_string())?;
+    f.flush().map_err(|e| e.to_string())?;
+    cleanup.keep();
     Ok(count)
 }
 
@@ -510,7 +583,8 @@ pub(crate) fn export_json(
 
 #[tauri::command(async)]
 pub(crate) fn export_vox(
-    app_handle: tauri::AppHandle,
+    app: tauri::AppHandle,
+    ops: tauri::State<'_, LongOps>,
     state: tauri::State<'_, AppState>,
     path: String,
     x1: i32, y1: i32, x2: i32, y2: i32,
@@ -523,24 +597,23 @@ pub(crate) fn export_vox(
     let sy1 = y1.min(y2); let sy2 = y1.max(y2);
     let sz1 = z_min.min(z_max).max(0);
     let sz2 = z_min.max(z_max).min(world_max_z(world));
+    check_export_volume(sx1, sy1, sz1, sx2, sy2, sz2, "VOX")?;
     let total_z = (sz2 - sz1 + 1) as f32;
 
-    // Throttled progress emitter — fires only when rounded integer pct advances.
-    let mut last_pct = -1i32;
-    let mut emit_progress = |phase: &str, frac: f32| {
-        let pct = (frac * 100.0).round().clamp(0.0, 100.0) as i32;
-        if pct != last_pct {
-            last_pct = pct;
-            let _ = app_handle.emit("vox-progress",
-                serde_json::json!({ "phase": phase, "pct": pct }));
-        }
+    // Progress and cancellation now go through the shared long-operation contract (audit C6/M14)
+    // rather than this command's own private `vox-progress` event — VOX was the one export that
+    // already had a progress bar, and it is what the contract was modelled on.
+    let op = ops.begin(&app, "vox", "Exporting VOX".into(), 1000, true);
+    let cleanup = ExportCleanup::new(&path);
+    let emit_progress = |phase: &str, frac: f32| -> Result<(), String> {
+        op.step((frac.clamp(0.0, 1.0) * 1000.0) as u64, phase)
     };
 
     // Pass 1: collect unique RGB values in encounter order (0–45% of progress).
     let mut unique_colors: Vec<[u8; 3]> = Vec::new();
     let mut seen: HashSet<[u8; 3]> = HashSet::new();
     for wz in sz1..=sz2 {
-        emit_progress("Scanning colors", (wz - sz1) as f32 / total_z * 0.45);
+        emit_progress("Scanning colors", (wz - sz1) as f32 / total_z * 0.45)?;
         for wy in sy1..=sy2 {
             for wx in sx1..=sx2 {
                 let (bt, paint) = get_block_at(world, wx, wy, wz);
@@ -564,7 +637,7 @@ pub(crate) fn export_vox(
     // Nearest-neighbor quantization for any overflow colors (>255 unique).
     let overflow_count = n_colors.saturating_sub(255);
     if overflow_count > 0 {
-        emit_progress(&format!("Quantizing palette ({overflow_count} overflow colors)"), 0.46);
+        emit_progress(&format!("Quantizing palette ({overflow_count} overflow colors)"), 0.46)?;
         for &rgb in unique_colors.iter().skip(255) {
             let best = palette.iter().enumerate()
                 .min_by_key(|(_, &p)| {
@@ -604,7 +677,7 @@ pub(crate) fn export_vox(
             } else {
                 "Building model".to_string()
             };
-            emit_progress(&label, 0.47 + model_idx as f32 / total_models * 0.50);
+            emit_progress(&label, 0.47 + model_idx as f32 / total_models * 0.50)?;
             model_idx += 1;
 
             let mut voxels: Vec<[u8; 4]> = Vec::new();
@@ -648,7 +721,7 @@ pub(crate) fn export_vox(
     write_vox_chunk(&mut children_buf, b"RGBA", &rgba);
 
     // Write file: magic + version + MAIN chunk.
-    emit_progress("Writing file", 0.97);
+    emit_progress("Writing file", 0.97)?;
     let f = fs::File::create(&path).map_err(|e| format!("Cannot create .vox: {e}"))?;
     let mut w = BufWriter::with_capacity(1 << 20, f);
     w.write_all(b"VOX ").map_err(|e| e.to_string())?;
@@ -657,8 +730,9 @@ pub(crate) fn export_vox(
     w.write_all(&0i32.to_le_bytes()).map_err(|e| e.to_string())?; // MAIN content_size
     w.write_all(&(children_buf.len() as i32).to_le_bytes()).map_err(|e| e.to_string())?;
     w.write_all(&children_buf).map_err(|e| e.to_string())?;
-    emit_progress("Done", 1.0);
-
+    w.flush().map_err(|e| e.to_string())?;
+    emit_progress("Done", 1.0)?;
+    cleanup.keep();
     Ok(total_voxels)
 }
 
@@ -2391,5 +2465,45 @@ mod tests {
         world.bytes[tb(3, 5, 2)] = 20; // Water — BI_NOTSOLID, so `obj_occludes` is false for it
         let hit = pick_block_in(&world, 3.5, 5.5, 9.0, 0.0, 0.0, -1.0, 32.0).unwrap().expect("water is pickable");
         assert_eq!(hit.block_type, 20);
+    }
+
+    // ── Audit C6: export volume guard ─────────────────────────────────────────
+
+    /// A whole-world 256z export is ~15 trillion voxels — `export_json` would emit one JSON record
+    /// each while holding the read guard, so it must be refused up front rather than started.
+    #[test]
+    fn test_export_volume_guard_refuses_whole_256z_world() {
+        let err = check_export_volume(0, 0, 0, 7215, 8447, 255, "JSON")
+            .expect_err("a whole 256z world is far past the budget");
+        assert!(err.contains("15.6 billion"), "the message states the magnitude: {err}");
+        assert!(err.contains("Select a smaller region"), "and what to do about it: {err}");
+    }
+
+    /// A selection at the budget is allowed; one voxel past it is not. The boundary matters —
+    /// this is the same 256 M figure the clipboard uses, so the two guards agree.
+    #[test]
+    fn test_export_volume_guard_boundary() {
+        let side = 16_000; // 16000 × 16000 × 1 = 256 M exactly
+        assert_eq!(
+            check_export_volume(0, 0, 0, side - 1, side - 1, 0, "OBJ").expect("at the budget"),
+            MAX_EXPORT_VOXELS,
+        );
+        assert!(check_export_volume(0, 0, 0, side, side - 1, 0, "OBJ").is_err(), "one row over");
+        // A realistic selection is nowhere near it.
+        assert!(check_export_volume(100, 100, 0, 355, 355, 63, "OBJ").is_ok());
+    }
+
+    /// Degenerate/inverted bounds must not wrap into a small volume that slips past the guard.
+    #[test]
+    fn test_export_volume_guard_handles_degenerate_bounds() {
+        assert_eq!(check_export_volume(10, 10, 5, 9, 9, 4, "OBJ").expect("empty"), 0);
+    }
+
+    #[test]
+    fn test_fmt_big_reads_naturally() {
+        assert_eq!(fmt_big(12_800), "12800");
+        assert_eq!(fmt_big(256_000_000), "256 million");
+        assert_eq!(fmt_big(1_600_000_000), "1.6 billion");
+        assert_eq!(fmt_big(15_600_000_000_000), "15.6 trillion");
     }
 }
