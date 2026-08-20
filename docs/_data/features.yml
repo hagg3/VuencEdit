@@ -1,0 +1,36 @@
+- icon: "🗺️"
+  title: "Map & navigation"
+  text: >-
+    Zoomable, pannable top-down map with Z-slice, cutaway, axonometric, and full-map render
+    modes, plus a Hammer-style quad view with front/side slabs and a live 3D pane.
+  exp: false
+- icon: "✏️"
+  title: "Drawing & selection"
+  text: >-
+    Pen, brush, spray, line, rectangle, ellipse, and polygon tools; click-drag and magic-wand
+    selection with a non-rectangular cell mask so Wand and Lasso select real shapes.
+  exp: false
+- icon: "⛰️"
+  title: "Terrain sculpting"
+  text: >-
+    Sixteen brush-based sculpt tools — raise, lower, smooth, erode, hydraulic erosion, stamp,
+    volumetric rock and carve — with soft falloff and a live stroke preview.
+  exp: true
+- icon: "🧊"
+  title: "3D & quad view"
+  text: >-
+    A streaming Three.js fly-through with orbit, fly, and mouselook cameras; build and select
+    directly in 3D, all going through the same undo/redo as the 2D map.
+  exp: false
+- icon: "🌍"
+  title: "World generation"
+  text: >-
+    Four generators — Flat, Natural (biome pipeline with erosion and structures), Classic, and
+    Tg2 — for both the legacy 64z and New Dawn 256z height formats.
+  exp: false
+- icon: "📦"
+  title: "Import & export"
+  text: >-
+    Copy/paste with rotate/mirror/scatter/array, a searchable prefab library, Minecraft
+    schematic import, and OBJ / Source-engine VMF export.
+  exp: false

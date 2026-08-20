@@ -123,7 +123,7 @@ See [05 — 2D Rendering](./05-rendering-2d.md).
 | `paint_blocks` | Fill/draw blocks. ⚠️ `z_offset: Option<i32>` (defaults 0) — keep it optional. |
 | `gradient_fill` | Dither-blend one block → another across an axis. |
 | `fill_surface` | Fill at each column's surface Z. |
-| `sculpt_terrain` | Heightmap sculpting (10 modes — see [07](./07-editing-undo-clipboard.md)). |
+| `sculpt_terrain` | Heightmap sculpting (16 modes — see [07](./07-editing-undo-clipboard.md)). |
 | `extrude_selection` | N non-overlapping copies along an axis. |
 | `move_selection` | Translate a selection. |
 | `generate_trees` | Multi-type tree placement over a selection. |

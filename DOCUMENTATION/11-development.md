@@ -33,7 +33,9 @@ npm run test             # vitest (frontend unit tests, e.g. drawTools.test.ts)
 
 **Rust** (`src-tauri/Cargo.toml`): `tauri` 2, `tauri-plugin-opener`,
 `tauri-plugin-dialog`, `serde`/`serde_json`, `base64`, `memmap2`, `flate2`, `zip`,
-`reqwest` (multipart), `image` (png only), `rayon`.
+`reqwest` (multipart), `image` (png only), `rayon`, `tokio`/`tokio-util`/
+`futures-util`/`bytes` (streamed upload/download, audit C4), `rustc-hash`,
+`crc32fast`.
 
 **Frontend** (`package.json`): `react`/`react-dom` 19, `three` ^0.184,
 `@tauri-apps/api` 2 + dialog/opener plugins; dev: `vite` 7, `typescript` ~5.8,
@@ -43,18 +45,20 @@ npm run test             # vitest (frontend unit tests, e.g. drawTools.test.ts)
 ## CI (`.github/workflows/ci.yml`)
 
 Every push/PR to `main` runs, on **macOS**:
-`tsc --noEmit` → `npm run lint` → `vite build`, plus `cargo test` (+ clippy,
-**advisory**). A **windows-latest** gate also runs (`tsc` → `vite build` →
-`cargo test`) so platform-specific breakage (path separators, save-rename +
-mmap-lock behavior) is caught. **Keep CI green.** The release workflow (`v*` tags)
-is separate.
+`tsc --noEmit` → `npm run lint` → `npm test` (vitest) → `vite build`, plus
+`cargo test` (+ clippy, **advisory**). A **windows-latest** gate also runs
+(`tsc` → `vite build` → `cargo test`) so platform-specific breakage (path
+separators, save-rename + mmap-lock behavior) is caught. **Keep CI green.**
+The release workflow (`v*` tags) is separate.
 
 ## ESLint (`eslint.config.js`, flat config)
 
 - `rules-of-hooks` + correctness rules are **blocking errors**.
 - react-hooks v6 opinionated rules (`set-state-in-effect`, `static-components`,
-  `refs`, `exhaustive-deps`) are **warnings** (~45 pre-existing, mostly legitimate
-  "reset on external change" effects).
+  `refs`, `exhaustive-deps`, `preserve-manual-memoization`) are **warnings**
+  (~45 pre-existing, mostly legitimate "reset on external change" effects),
+  alongside a few unrelated warn-level rules (`no-useless-assignment`,
+  `preserve-caught-error`, `@typescript-eslint/no-explicit-any`, `prefer-const`).
 
 **Don't add new errors; reducing warnings is welcome.**
 
@@ -63,10 +67,12 @@ is separate.
 - **`timing_log!`** (lib.rs) — all `[LOAD]/[LOCK]/[SCAN]/[PREVIEW]` timing
   instrumentation goes through this macro (debug builds only). Use it, not
   `eprintln!`, for new instrumentation.
-- **Mutex** — every lock site uses `state.lock().unwrap_or_else(|p|
-  p.into_inner())` (poison-tolerant). See [01](./01-architecture.md).
+- **`RwLock`** — `AppState = RwLock<WorldState>`; every lock site goes through
+  `read_ws`/`write_ws` (lib.rs), never `state.read()/.write()` directly, both
+  poison-tolerant (`unwrap_or_else(|p| p.into_inner())`). See [01](./01-architecture.md).
 - **rayon** — pure render/gen functions only; never let a parallel closure re-lock
-  the app mutex the caller holds. See [01](./01-architecture.md#rayon).
+  the `AppState` guard the caller holds — post-`RwLock` this applies to nested
+  *read* guards too, not just writes. See [01](./01-architecture.md#rayon).
 - **`with_edit`** — all edits route through it. See [07](./07-editing-undo-clipboard.md).
 - **IPC types** — mirror Rust structs in `types.ts`; decode via `codec.ts`. See
   [01](./01-architecture.md#ipc-architecture).
@@ -78,7 +84,7 @@ is separate.
 
 **`bump-version.sh` is the single writer** of all three version fields
 (`tauri.conf.json`, `Cargo.toml`, `package.json`). Don't edit versions by hand.
-(Currently `package.json`/`tauri.conf.json` = 1.0.2; `Cargo.toml` crate = 1.0.0.)
+(Currently `package.json`/`tauri.conf.json` = 1.0.15; `Cargo.toml` crate = 1.0.0.)
 
 ## Releases
 

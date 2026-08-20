@@ -11,7 +11,7 @@
 | 3D rendering | **Three.js** (`three` ^0.184) + OrbitControls |
 | Styling | **Tailwind CSS v4** (via `@tailwindcss/vite`) |
 
-Versions: `package.json`/`tauri.conf.json` are at **1.0.2**; `src-tauri/Cargo.toml`
+Versions: `package.json`/`tauri.conf.json` are at **1.0.15**; `src-tauri/Cargo.toml`
 crate at 1.0.0. All version fields are written by `bump-version.sh` — never edit
 them by hand (see [11 — Development](./11-development.md)).
 
@@ -33,42 +33,61 @@ tiles, geometry, and metadata, and sends back edit commands.
 ## Process & module layout
 
 ```
-src-tauri/src/            Rust backend (single library crate + thin main.rs)
-  main.rs                 Entry point → eden_world_editor_lib::run()
-  lib.rs        (6038 L)  World parse/model, all editing commands, with_edit,
-                          copy/paste, prefab, sculpt/fill, sky/creatures, tests
-  colors.rs      (479 L)  BLOCK_RGB / PAINT_RGB / BLOCK_INFO tables + helpers
-  worldgen.rs   (2843 L)  Perlin noise + Natural/Classic/TG2 generators + commands
-  schematic.rs   (926 L)  MC .schematic/.litematic/.schem import, NBT parsing
-  export.rs     (1729 L)  OBJ/JSON/VOX export, geometry generation, 3D lighting,
-                          voxel picking, get_chunk_geometry
-  network.rs     (284 L)  Eden server search/download/upload
-  texturepack.rs (616 L)  Texture pack loader: atlas builder, per-face tile map
+src-tauri/src/             Rust backend (single library crate + thin main.rs)
+  main.rs                  Entry point → eden_world_editor_lib::run()
+  lib.rs        (~15600 L) World parse/model, all editing commands, with_edit,
+                           copy/paste, prefab, sculpt/fill, sky/creatures, tests
+  colors.rs       (535 L)  BLOCK_RGB / PAINT_RGB / BLOCK_INFO tables + helpers
+  worldgen.rs    (2862 L)  Perlin noise + Natural/Classic/TG2 generators + commands
+  schematic.rs    (926 L)  MC .schematic/.litematic/.schem import, NBT parsing
+  export.rs      (2509 L)  OBJ/JSON/VOX/PNG export, geometry generation, 3D
+                           lighting, voxel picking, get_chunk_geometry
+  network.rs      (648 L)  Eden server search/list/download/upload
+  texturepack.rs  (636 L)  Texture pack loader: atlas builder, per-face tile map
+  journal.rs      (542 L)  WAL / autosave journal wire format (shared by both)
+  signs.rs        (255 L)  Sign sidecar decode
+  vmf_export.rs  (1688 L)  Source Engine VMF (Hammer brushwork) export
 
-src/                      React + TypeScript frontend
-  App.tsx       (3082 L)  Global state, keyboard shortcuts, orchestration
-  Ribbon.tsx    (1993 L)  Tabbed ribbon toolbar
-  MapCanvas.tsx (1626 L)  2D map: pan/zoom/select/paste/draw
-  FlyView3D.tsx (1986 L)  Streaming 3D fly-through pane (Three.js)
-  ... (see 09-frontend.md for the full component map)
+src/                        React + TypeScript frontend
+  App.tsx        (~4570 L)  Global state, keyboard shortcuts, orchestration
+  Ribbon.tsx       (~300 L) Thin ribbon shell — see src/ribbon/ for the tab
+                             modules that carry the actual bulk (09-frontend.md)
+  MapCanvas.tsx  (~2700 L)  2D map: pan/zoom/select/paste/draw
+  FlyView3D.tsx  (~4300 L)  Streaming 3D fly-through pane (Three.js)
+  ... (see 09-frontend.md for the full component map, incl. src/ribbon/,
+       src/panels/, src/tour/, Sidebar.tsx, AppMenu.tsx, WorldNamePill.tsx)
 ```
 
-Rust `lib.rs` was intentionally split into submodules (`colors`, `worldgen`,
-`schematic`, `export`, `network`, `texturepack`); `lib.rs` still owns the world
+Line counts are approximate and drift with every change — treat them as
+order-of-magnitude, not exact. Rust `lib.rs` was intentionally split into
+submodules (`colors`, `worldgen`, `schematic`, `export`, `network`,
+`texturepack`, `journal`, `signs`, `vmf_export`); `lib.rs` still owns the world
 model, the editing commands, and `with_edit`.
 
-## The `WorldState` and the app mutex
+## The `WorldState` and the app lock
 
-The backend holds one `WorldState` behind a `std::sync::Mutex`, `.manage()`d by
-Tauri. Every command that touches the world locks it:
+The backend holds one `WorldState` behind an `RwLock` (`AppState = RwLock<WorldState>`),
+`.manage()`d by Tauri — not a plain `Mutex` (that was true pre-2026-08-05 audit
+C1 step 2; the switch to `RwLock` let read-only commands, e.g. renders/tile
+fetches, run concurrently with each other and only serialize against writers).
+Every command that touches the world goes through one of two helpers in
+`lib.rs`, never `state.read()/.write()` directly:
 
 ```rust
-state.lock().unwrap_or_else(|p| p.into_inner())
+read_ws(&state)   // shared guard — ~36 commands (renders, fetch_tile, save/autosave, …)
+write_ws(&state)  // exclusive guard — ~37 commands (the editors, undo/redo, load/close, …)
 ```
 
-**Always use `unwrap_or_else(|p| p.into_inner())`, never `.unwrap()`** — a panic
-while holding the lock must not poison every subsequent command. Keep this pattern
-for any new command.
+Both ignore lock poisoning (`unwrap_or_else(|p| p.into_inner())`) — a panic
+while holding the lock must not poison every subsequent command. Keep this
+pattern for any new command.
+
+⚠️ **`std::sync::RwLock` is neither reentrant nor upgradable.** Never hold one
+guard and then ask for the other in the same call chain — a writer queued in
+between turns it into a deadlock. See CLAUDE.md's "World lock (RwLock)" section
+and [07 — Editing/Undo/Clipboard](./07-editing-undo-clipboard.md) for the full
+read-guard/write-guard command split and the `sculpt_terrain` three-phase
+exception.
 
 `WorldState` carries (among other things): the parsed world + its private temp
 path, the clipboard, undo/redo stacks, a lazily-built lamp spatial index, and
@@ -90,9 +109,17 @@ run off-thread and don't stall the UI:
 - `fetch_template_tile` (a first pan over virgin template can decode ~1,000 chunk
   columns)
 
-Their bodies stay **synchronous**: `lock mutex → work → unlock`, with **no
-`.await` under the guard**, so the `std::Mutex` is safe. Small, frequent tile
-fetches (`fetch_tile`) stay sync to avoid per-call spawn overhead.
+Their bodies stay **synchronous**: `lock → work → unlock`, with **no
+`.await` under the guard**, so the `RwLock` is safe. As of the 2026-08-05 audit
+C1 step 1, nearly every remaining command that touches `AppState` is also
+`#[tauri::command(async)]` — a sync command sharing the lock with an in-flight
+async one still blocks on `state.lock()`/`read_ws`/`write_ws` **on the Tauri
+main thread**, stalling the whole window. Only a handful of commands that never
+touch `AppState` stay plain-sync (`cancel_expand`/`cancel_materialize` on their
+own atomics, `get_autosave_info/path`, `discard_autosave`, prefab directory
+list/delete/rename/exists, `get_light_constants`, `set_cursor_lock`). Small,
+frequent tile fetches (`fetch_tile`) are async too now, not sync — the
+per-call spawn overhead lost to the freeze this fix removes.
 
 Async is also what lets `cancel_expand` land mid-run, and lets `autosave_world`
 snapshot bytes under the lock then write with the lock released.
@@ -103,8 +130,11 @@ snapshot bytes under the lock then write with the lock released.
 (`render_pixels_patch`, the z/y/x-slice renderers, `render_axo_region`, the
 Natural/Classic heightmap + per-chunk fill passes). **Invariant:** never invoke a
 `par_iter`/`par_chunks_mut` in a way that lets a parallel closure try to re-lock
-the app mutex the calling command already holds. Check this before adding new
-parallel call sites.
+the `AppState` guard the calling command already holds. Post-`RwLock` this is
+**stricter, not looser** — a nested *read* guard is not safe just because reads
+are shared. `build_lamp_index` (`par_iter` under a read guard, touching only
+`&LoadedWorld`) is the pattern to copy. Check this before adding new parallel
+call sites.
 
 ## IPC architecture
 
@@ -120,9 +150,10 @@ parallel call sites.
   contract, including why payload types must not derive `Serialize`:
   [04 — IPC Command Reference](./04-ipc-reference.md#binary-payload-envelope-2026-08-05-audit-h2).
 - **Edit flow.** Editing commands return
-  `EditResult { patch: PixelPatch, invalidate, undo_depth, redo_depth }`. Only the changed
-  rectangle crosses IPC. `applyEditResult()` on the frontend decodes the patch,
-  applies it to the canvas, and increments `editEpoch` (see [07](./07-editing-undo-clipboard.md)).
+  `EditResult { patch: PixelPatch, invalidate, undo_depth, redo_depth, operation, undo_dropped }`.
+  Only the changed rectangle crosses IPC. `applyEditResult()` on the frontend
+  decodes the patch, applies it to the canvas, and increments `editEpoch` (see
+  [07](./07-editing-undo-clipboard.md)).
 - **Shared IPC types.** Rust struct shapes are mirrored in
   [`src/types.ts`](../src/types.ts): `WorldMeta`, `RecentWorld`, `PixelPatch(Raw)`,
   `EditResultRaw`, `PreviewData(Raw)` (+ `decodePixelPatch`/`decodePreviewData`),
@@ -152,8 +183,9 @@ console names the violated directive.
 
 Untrusted-input hardening lives in the parsers: NBT recursion is capped
 (`NBT_MAX_DEPTH=64`), gzip reads go through a size-capped `gunzip_capped()`,
-`download_world` streams to disk with a 2 GB cap, and `validate_selection` rejects
-negative coordinates at the IPC boundary. See [10](./10-features.md).
+`download_world` streams to disk with a 12 GiB cap (`MAX_DOWNLOADED_WORLD_BYTES`,
+network.rs), and `validate_selection` rejects negative coordinates at the IPC
+boundary. See [10](./10-features.md).
 
 ## Capabilities
 

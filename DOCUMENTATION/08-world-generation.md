@@ -58,8 +58,10 @@ A port of the Eden 2.0 `TerrainGen2.mm` (~2,917 lines ObjC).
 
 - **`Tg2Grid`** = an intermediate flat workspace (`x*(gsize*t_height) +
   z*t_height + y`) so biome passes can read back already-placed blocks.
-- **9 terrain types:** Plains, Mars, RiverForest, Mtn+River, Desert, Ponies,
-  Beach, Mix, Flat.
+- **9 terrain types exposed in the New World modal:** Plains, Mars, RiverForest,
+  Mtn+River, Desert, Ponies, Beach, Mix, Flat. A 10th backend value,
+  `CustomMix` (`terrain_type` field, `worldgen.rs`), exists in the enum but
+  isn't wired into any frontend UI — reserved/dead as far as the app goes.
 - **`tg2_flush`** pushes the grid → `WorldGen`.
 - **Vertical scaling:** `vs = t_height / 64`; `g.sv` / `relief` / `sea_level`
   helpers scale to the chosen height format.

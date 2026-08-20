@@ -1,0 +1,233 @@
+.card {
+  background: linear-gradient(180deg, $surface-raised-top 0%, $surface-raised-bot 100%);
+  border-radius: 6px;
+  box-shadow:
+    inset 0 0 0 1px $border-outline,
+    inset 0 1px 0 $border-bevel;
+  padding: 16px;
+}
+
+.card h3 {
+  margin-top: 0;
+}
+
+.card p:last-child {
+  margin-bottom: 0;
+}
+
+// Feature grid (home + features page)
+.feature-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 12px;
+  margin: 18px 0 8px;
+}
+
+@media (max-width: 760px) {
+  .feature-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+
+@media (max-width: 480px) {
+  .feature-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.feature-card h3 {
+  font-size: 14px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.feature-card p {
+  font-size: 13px;
+  color: $text-dim;
+  margin: 0;
+}
+
+// Buttons
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 700;
+  padding: 9px 16px;
+  border-radius: 5px;
+  cursor: pointer;
+  border: none;
+  text-decoration: none;
+}
+
+.btn:hover {
+  text-decoration: none;
+}
+
+.btn-primary {
+  background: linear-gradient(180deg, lighten($accent-primary, 6%) 0%, $accent-primary 100%);
+  color: #06232a;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.25), inset 0 0 0 1px rgba(0, 0, 0, 0.25);
+}
+
+.btn-primary:hover {
+  background: linear-gradient(180deg, lighten($accent-primary, 10%) 0%, lighten($accent-primary, 4%) 100%);
+}
+
+.btn-secondary {
+  background: $surface-well;
+  color: $text;
+  box-shadow: inset 0 0 0 1px $border-outline, inset 0 1px 0 $border-bevel;
+}
+
+.btn-secondary:hover {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.btn-row {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin: 18px 0;
+}
+
+// Compatibility strip (home page)
+.compat-strip {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin: 14px 0 6px;
+}
+
+.compat-pill {
+  flex: 1;
+  min-width: 180px;
+  background: $surface-well;
+  border-radius: 5px;
+  box-shadow: inset 0 0 0 1px $border-hairline;
+  padding: 10px 12px;
+}
+
+.compat-pill .compat-name {
+  font-weight: 700;
+  font-size: 13px;
+  color: #fff;
+  margin-bottom: 2px;
+}
+
+.compat-pill .compat-desc {
+  font-size: 12px;
+  color: $text-dim;
+}
+
+// Download cards
+.download-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 12px;
+  margin: 18px 0;
+}
+
+@media (max-width: 760px) {
+  .download-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.download-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.download-card.current-platform {
+  box-shadow:
+    inset 0 0 0 1px rgba($accent-primary, 0.7),
+    inset 0 1px 0 $border-bevel;
+}
+
+.download-card .platform-name {
+  font-size: 15px;
+  font-weight: 700;
+  color: #fff;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.download-card .you-badge {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+  color: #06232a;
+  background: $accent-primary;
+  border-radius: 999px;
+  padding: 2px 7px;
+}
+
+.download-card .file-meta {
+  font-size: 12px;
+  color: $text-dim;
+}
+
+.download-card .secondary-links {
+  font-size: 12px;
+  margin-top: -4px;
+}
+
+// Beta / warning callouts
+.callout {
+  border-radius: 5px;
+  padding: 12px 14px;
+  margin: 16px 0;
+  font-size: 13px;
+  box-shadow: inset 0 0 0 1px $border-hairline;
+}
+
+.callout-warm {
+  background: rgba($accent-warm, 0.10);
+  box-shadow: inset 0 0 0 1px rgba($accent-warm, 0.35);
+}
+
+.callout-warm strong {
+  color: #f0c98a;
+}
+
+// Doc index cards
+.doc-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 12px;
+  margin: 18px 0;
+}
+
+@media (max-width: 640px) {
+  .doc-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.doc-card {
+  display: block;
+  color: $text;
+}
+
+.doc-card:hover {
+  text-decoration: none;
+  box-shadow:
+    inset 0 0 0 1px rgba($accent-primary, 0.6),
+    inset 0 1px 0 $border-bevel;
+}
+
+.doc-card h3 {
+  margin-bottom: 4px;
+}
+
+.doc-card p {
+  font-size: 13px;
+  color: $text-dim;
+  margin: 0;
+}

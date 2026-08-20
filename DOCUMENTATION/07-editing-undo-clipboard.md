@@ -2,7 +2,10 @@
 
 ## The `with_edit` contract
 
-All **11 editing commands** go through one function in `lib.rs`:
+The original **11 editing commands** go through one function in `lib.rs`
+(more editing commands have landed since this count was written — e.g.
+`fill_surface`/`pool_fill`/`flood_fill_3d`/`generate_trees` — so treat "11" as
+historical, not a live total):
 
 ```rust
 with_edit(ws, operation, snap_rect, patch_rect, edit_fn) -> EditResult
@@ -63,6 +66,30 @@ Tests: `test_edit_patch_caps_oversized_rect`,
 the world before propagating. A fallible op between `take` and `reinstall` that
 dropped the world would leave *every* later command failing "No world loaded".
 Routing all edits through `with_edit` means there are no hand-audited call sites.
+
+### `with_edit_zscoped` — band-scoped snapshot/diff (audit C4 step 1)
+
+`with_edit`, `with_edit_zscoped`, and `with_edit_grouped` (sculpt only, see
+"Terrain Sculpt" below) all funnel into one shared `with_edit_inner`, so the
+take/reinstall sequence has exactly one implementation regardless of entry
+point:
+
+```rust
+with_edit_zscoped(ws, operation, snap_rect, patch_rect, (z_min, z_max), edit_fn) -> EditResult
+```
+
+Use when an edit's entire vertical write extent is known **statically** —
+`delete_blocks`, `replace_blocks`, `gradient_fill`, `paste_at`, and
+`move_selection` all call it instead of plain `with_edit`. It skips the
+transient whole-chunk snapshot/diff for every z-band the edit provably can't
+touch, so a shallow delete/replace on a 256z world doesn't pay for a full
+16-band chunk copy. `ChunkDelta::Full`'s snapshot correspondingly only covers
+the touched bands, not the whole chunk, when reached through this path.
+
+Edits whose write region isn't a simple static z interval — paste's terrain
+mode, tree canopies, sculpt, flood/pool fill — must keep using plain
+`with_edit`, since those can touch z outside any band known ahead of the
+closure running.
 
 ## Delta undo
 
