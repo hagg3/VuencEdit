@@ -62,17 +62,32 @@ export function decodePixelPatch(buf: IpcBinary): PixelPatch {
 }
 
 /** Returned by every editing command (see CLAUDE.md Edit flow). */
-export interface EditResult { patch: PixelPatch; undo_depth: number; redo_depth: number; operation: string; }
+export interface EditResult {
+  patch: PixelPatch;
+  /** Audit C2: the patch would have been larger than the backend's ceiling, so it carries the
+   *  changed rect (`patch.x/y` + `patch.width/height × patch.lod` blocks) and **no pixels** —
+   *  re-fetch that region instead of blitting it. */
+  invalidate: boolean;
+  undo_depth: number; redo_depth: number; operation: string;
+  /** Audit C1 step 3: this edit's undo delta exceeded the whole undo budget, so it was dropped and
+   *  the rest of the history with it. The edit itself applied; nothing is undoable. */
+  undo_dropped: boolean;
+}
 
-type EditResultHeader = { patch: PixelPatchHeader; undo_depth: number; redo_depth: number; operation: string };
+type EditResultHeader = {
+  patch: PixelPatchHeader; invalidate: boolean;
+  undo_depth: number; redo_depth: number; operation: string; undo_dropped: boolean;
+};
 
 export function decodeEditResult(buf: IpcBinary): EditResult {
   const { header, body } = decodeEnvelope<EditResultHeader>(buf);
   return {
     patch: { ...header.patch, pixels: body },
+    invalidate: header.invalidate,
     undo_depth: header.undo_depth,
     redo_depth: header.redo_depth,
     operation: header.operation,
+    undo_dropped: header.undo_dropped,
   };
 }
 

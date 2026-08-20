@@ -15,7 +15,7 @@ import {
   FileOutput, FilePlus, Filter, Flag, Flame, FlipHorizontal2, FlipVertical2, FolderOpen, Frame,
   Globe2, Grid2x2, Grid3x3, Hammer, Hand, History, House, Image, Info, Lasso, LayoutGrid, Layers,
   Layers2, LibraryBig, Map, Maximize, Minimize2, Minus, Moon, Mountain, Move,
-  MoveHorizontal, Package, PaintBucket, PanelRight, Pencil, Pentagon, Pickaxe, Pipette, Repeat,
+  MoveHorizontal, Package, PaintBucket, PanelLeft, PanelRight, Pencil, Pentagon, Pickaxe, Pipette, Repeat,
   Replace, RotateCw, Rows3, Save, SaveAll, Scissors, Settings, Shuffle, Slash, Snowflake,
   Signpost, Sparkles, SprayCan, Square, SquareDashed, SquareSplitVertical, Stamp, Sun, Target,
   TrendingUp, Trash2, TreePine, Triangle, Undo2, Redo2, Upload, Wand2, Waves, Wind, X, ZoomIn,
@@ -52,7 +52,7 @@ const MAP = {
   // View
   topdown: Map, zslice: Layers, cutaway: SquareSplitVertical, tiled: Grid3x3, fullmap: Image,
   axo: Box, fit: Maximize, zoomIn: ZoomIn, zoomOut: ZoomOut, zoomSel: Crosshair,
-  quad: LayoutGrid, pane3d: Cuboid, sidebar: PanelRight, quickActions: Rows3, signs: Signpost,
+  quad: LayoutGrid, pane3d: Cuboid, sidebar: PanelRight, toolbar: PanelLeft, quickActions: Rows3, signs: Signpost,
   template: Map, textures: Image,
   // 3D
   camera: Camera, build: Hammer, floodfill: Droplets, night: Moon, shadows: Sun,

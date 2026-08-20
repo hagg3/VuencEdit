@@ -13,7 +13,8 @@ import { useRibbon } from "./context";
 import { Icon } from "./icons";
 import type { RibbonTab } from "./props";
 import {
-  ACCENT, BORDER, CTX_ACCENT, FONT, HAIRLINE, ICON, IS_MAC, MAC_TRAFFIC_LIGHT_CLEARANCE, RADIUS,
+  ACCENT, BORDER, CTX_ACCENT, FONT, HAIRLINE, ICON, IS_MAC, MAC_TRAFFIC_LIGHT_CLEARANCE, MOD,
+  RADIUS, SHIFT,
   TAB_ACTIVE_BOT, TAB_ACTIVE_TOP, TEXT, TEXT_DIM, TEXT_LABEL, TOPBAR_BTN_H, TOP_BAR_HEIGHT, btnBase,
   btnDisabled, hexToRgbTriplet, lighten,
 } from "./tokens";
@@ -114,9 +115,9 @@ export default function TopBar({
 
       {/* Undo / Redo — always visible, per the mockup, and fixed-width (see QAT_W_*). */}
       <QatButton icon="undo" label="Undo" showLabel count={p.undoDepth}
-        title={`Undo (⌘Z) · ${p.undoDepth} available`} onClick={p.handleUndo} disabled={p.undoDepth === 0} />
+        title={`Undo (${MOD}Z) · ${p.undoDepth} available`} onClick={p.handleUndo} disabled={p.undoDepth === 0} />
       <QatButton icon="redo" label="Redo" count={p.redoDepth}
-        title={`Redo (⌘⇧Z) · ${p.redoDepth} available`} onClick={p.handleRedo} disabled={p.redoDepth === 0} />
+        title={`Redo (${MOD}${SHIFT}Z) · ${p.redoDepth} available`} onClick={p.handleRedo} disabled={p.redoDepth === 0} />
 
       <Sep />
 

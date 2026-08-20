@@ -8,7 +8,7 @@ import type { Tool } from "../../MapCanvas";
 import { solveLayout, type GroupMetrics } from "../layout";
 import { useRibbon } from "../context";
 import PaletteGroup from "../PaletteGroup";
-import { SCULPT_MORE, SCULPT_PRIMARY, SCULPT_IS_VOLUMETRIC, SCULPT_USES_PALETTE } from "../sculptTools";
+import { SCULPT_MORE, SCULPT_PRIMARY, SCULPT_IS_VOLUMETRIC, SCULPT_USES_PALETTE, SCULPT_IS_EXPERIMENTAL } from "../sculptTools";
 import {
   Badge, Caption, Col, CommandButton, DropdownButton, Group, GroupDivider, MenuItem, Row, Segmented, SliderRow, SplitButton,
 } from "../primitives";
@@ -41,7 +41,7 @@ export default function SculptTab() {
   return (
     <>
       {/* ── Tools ─────────────────────────────────────────────────────────── */}
-      <Group id="tools" label={<>Sculpt tools <Badge /></>} tier={tier.tools} declaredWidth={306} icon="sculpt">
+      <Group id="tools" label="Sculpt tools" tier={tier.tools} declaredWidth={306} icon="sculpt">
         {SCULPT_PRIMARY.map(t => (
           <CommandButton key={t.id} tier={big} icon={t.icon} label={t.label} title={t.title} accent={AMBER}
             onClick={() => p.setTool(t.id)} active={p.tool === t.id} />
@@ -56,8 +56,9 @@ export default function SculptTab() {
             menu={() => (
               <div style={{ display: "flex", flexDirection: "column", gap: 1, padding: 6, minWidth: 170 }}>
                 {SCULPT_MORE.map(t => (
-                  <MenuItem key={t.id} icon={t.icon} label={t.label} title={t.title}
-                    active={p.tool === t.id} onClick={() => armMore(t.id)} />
+                  <MenuItem key={t.id} icon={t.icon}
+                    label={SCULPT_IS_EXPERIMENTAL(t.id) ? <>{t.label} <Badge /></> : t.label}
+                    title={t.title} active={p.tool === t.id} onClick={() => armMore(t.id)} />
                 ))}
               </div>
             )}

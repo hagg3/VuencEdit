@@ -11,6 +11,11 @@ interface WorldSearchResult {
   timestamp: number;
 }
 
+interface LegacyFeaturedList {
+  filename: string;
+  date: string;
+}
+
 interface DownloadProgress {
   downloaded: number;
   total: number | null;
@@ -68,11 +73,23 @@ const btnActive: React.CSSProperties = chromeButtonAccent(EDEN_TEAL, EDEN_TEAL_R
 
 export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
   const [server, setServer] = useState<"current" | "legacy">("current");
-  // True once a search has come back — distinguishes "no matches" from "you haven't searched yet".
+  // True once a search/browse/featured fetch has come back — distinguishes "no matches" from
+  // "you haven't looked yet".
   const [searched, setSearched] = useState(false);
+  // Featured (server-published popularlist.txt, or one of the bundled historic snapshots) is the
+  // default view; Browse and Search are reachable via their own tabs.
+  const [viewMode, setViewMode] = useState<"featured" | "browse" | "search">("featured");
   const switchServer = (s: "current" | "legacy") => {
     if (s === server) return;
     setServer(s);
+    setResults([]);
+    setSelectedId(null);
+    setSearched(false);
+    setError(null);
+  };
+  const switchMode = (m: "featured" | "browse" | "search") => {
+    if (m === viewMode) return;
+    setViewMode(m);
     setResults([]);
     setSelectedId(null);
     setSearched(false);
@@ -87,6 +104,11 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
   // the server never advertises a total count or page size.
   const [browsing, setBrowsing] = useState(false);
   const [hasMoreToBrowse, setHasMoreToBrowse] = useState(true);
+  // Featured tab: "live" pulls the server's current popularlist.txt; anything else is the
+  // filename of a bundled historic snapshot under eden-leaderboards/ (list from the backend).
+  const [featuredSource, setFeaturedSource] = useState<string>("live");
+  const [legacyLists, setLegacyLists] = useState<LegacyFeaturedList[]>([]);
+  const [featuredLoading, setFeaturedLoading] = useState(false);
   const [downloading, setDownloading] = useState(false);
   const [downloadProgress, setDownloadProgress] = useState<DownloadProgress | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -115,6 +137,7 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
 
   async function doSearch() {
     if (!query.trim()) return;
+    setViewMode("search");
     setSearching(true);
     setError(null);
     setResults([]);
@@ -132,11 +155,10 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
     }
   }
 
-  // Browse mode (C2 of the 256z-format plan): the real client's own default listing when no
-  // search term is entered — `GET /list2.php?start=<start>&sort=2`, paginated via `start`.
-  // VuencEdit had no way to do this before; `search_worlds` only ever sent `?search=`.
+  // Browse mode (C2 of the 256z-format plan): the real client's own default listing —
+  // `GET /list2.php?start=<start>&sort=2`, paginated via `start`. Reachable via its own tab
+  // (Featured is the default view now — see `doFeatured` below).
   const BROWSE_SORT = 2; // the value the real client sent when captured (Part C2/C6); unconfirmed beyond that
-  const isBrowseMode = !query.trim();
 
   async function doBrowse(reset: boolean) {
     if (browsing) return;
@@ -156,13 +178,36 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
     }
   }
 
-  // Auto-browse on open and whenever the server changes, as long as the user hasn't typed a
-  // search term — mirrors the real client opening straight into a listing rather than an empty
-  // "type something" state.
+  // Featured tab: the server's live popularlist.txt (files{,2}.edengame.net/popularlist.txt), or
+  // one of the bundled historic snapshots under eden-leaderboards/ when `featuredSource` names one.
+  async function doFeatured() {
+    setFeaturedLoading(true);
+    setError(null);
+    setSelectedId(null);
+    try {
+      const res = featuredSource === "live"
+        ? await invoke<WorldSearchResult[]>("fetch_featured_worlds", { server })
+        : await invoke<WorldSearchResult[]>("load_legacy_featured_list", { filename: featuredSource });
+      setResults(res);
+      setSearched(true);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setFeaturedLoading(false);
+    }
+  }
+
+  // Load the archive of bundled historic snapshots once, for the Featured tab's dropdown.
   useEffect(() => {
-    if (isBrowseMode) doBrowse(true);
+    invoke<LegacyFeaturedList[]>("list_legacy_featured_lists").then(setLegacyLists).catch(() => {});
+  }, []);
+
+  // Fetch whenever the active tab, server, or (for Featured) the chosen snapshot changes.
+  useEffect(() => {
+    if (viewMode === "featured") doFeatured();
+    else if (viewMode === "browse") doBrowse(true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [server]);
+  }, [viewMode, server, featuredSource]);
 
   async function startDownload(openAfter: boolean) {
     const result = results.find(r => r.id === selectedId);
@@ -252,6 +297,38 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
           <button onClick={() => switchServer("legacy")} style={server === "legacy" ? btnActive : btn}>
             Legacy Server
           </button>
+        </div>
+
+        {/* View mode tabs: Featured (default) / Browse / Search. */}
+        <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+          <button onClick={() => switchMode("featured")} style={viewMode === "featured" ? btnActive : btn}>
+            ★ Featured
+          </button>
+          <button onClick={() => switchMode("browse")} style={viewMode === "browse" ? btnActive : btn}>
+            Latest
+          </button>
+          {viewMode === "featured" && (
+            <>
+              <div style={{ flex: 1 }} />
+              <span style={{ fontSize: 9, color: "#61584f", textTransform: "uppercase", letterSpacing: "0.06em", fontWeight: 600 }}>
+                Snapshot
+              </span>
+              <select
+                value={featuredSource}
+                onChange={e => setFeaturedSource(e.target.value)}
+                style={{
+                  ...recessedWell,
+                  color: "#ebe9e7", borderRadius: 5, padding: "3px 7px", fontSize: 12,
+                  colorScheme: "dark",
+                } as React.CSSProperties}
+              >
+                <option value="live">Live (current)</option>
+                {legacyLists.map(l => (
+                  <option key={l.filename} value={l.filename}>{l.date}</option>
+                ))}
+              </select>
+            </>
+          )}
         </div>
 
         {/* Search bar */}
@@ -401,13 +478,14 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
               </table>
             ) : (
               <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: 120, color: "#61584f", fontSize: 13 }}>
-                {searching || browsing ? (isBrowseMode ? "Loading worlds…" : "Searching…") :
+                {searching ? "Searching…" :
+                 browsing || featuredLoading ? "Loading worlds…" :
                  results.length > 0 ? "No results match your filters" :
-                 searched ? (isBrowseMode ? "No worlds found" : "No worlds found — try a different search term") :
+                 searched ? (viewMode === "search" ? "No worlds found — try a different search term" : "No worlds found") :
                  "Loading worlds…"}
               </div>
             )}
-            {isBrowseMode && hasMoreToBrowse && filteredResults.length > 0 && !searching && (
+            {viewMode === "browse" && hasMoreToBrowse && filteredResults.length > 0 && !searching && (
               <div style={{ display: "flex", justifyContent: "center", padding: "8px 0" }}>
                 <button onClick={() => doBrowse(false)} disabled={browsing}
                   style={{ ...btn, fontSize: 12, opacity: browsing ? 0.5 : 1, cursor: browsing ? "not-allowed" : "pointer" }}>

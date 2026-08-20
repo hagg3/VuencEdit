@@ -45,3 +45,11 @@ export const SCULPT_TOOL_IDS: Tool[] = SCULPT_ALL.map(t => t.id);
 /** Rock and Carve are volumetric and share one parameter block; Retexture consumes the palette. */
 export const SCULPT_USES_PALETTE = (t: Tool) => t === "rock" || t === "stamp";
 export const SCULPT_IS_VOLUMETRIC = (t: Tool) => t === "rock" || t === "carve";
+
+/** The newer/less-battle-tested tools, each flagged individually in the "More tools" menu rather
+ *  than the whole module carrying one blanket EXP badge — Raise/Lower/Rock/Carve/Smooth/Flatten
+ *  are considered stable. */
+const EXPERIMENTAL: ReadonlySet<Tool> = new Set([
+  "slope", "noise", "erode", "thermal", "hydro", "terrace", "sharpen", "smear", "grab", "stamp",
+]);
+export const SCULPT_IS_EXPERIMENTAL = (t: Tool) => EXPERIMENTAL.has(t);

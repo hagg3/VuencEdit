@@ -25,10 +25,16 @@ interface Props {
   onFill?: () => void;
   selectionExists?: boolean;
   texturePack?: AtlasData | null;
+  /** New-format blocks (112–127) only exist in 256z worlds — a 64z (legacy) world has no way to
+   *  store them, so the New-format disclosure is greyed out and inert rather than offering a
+   *  selection that can't actually be placed. Default true (assume 256z) so callers that don't
+   *  know the loaded world's format yet don't spuriously lock the section. */
+  allowNewFormat?: boolean;
 }
 
 export default function BlockPaintPicker({
   mode, blockType, paint, onBlockTypeChange, onPaintChange, onFill, selectionExists, texturePack = null,
+  allowNewFormat = true,
 }: Props) {
   const isFill = mode === "fill";
   const bt = blockType;
@@ -289,21 +295,26 @@ export default function BlockPaintPicker({
         </div>
 
         {/* New-format blocks (112–127) — real names unknown, tucked behind a disclosure (see the
-            `newFormatOpen` comment above) rather than always shown as a full grid. */}
+            `newFormatOpen` comment above) rather than always shown as a full grid. Disabled (not
+            hidden) on a 64z world — the section still communicates that these blocks exist, it
+            just can't be opened or clicked into. */}
         <div
-          onClick={() => setNewFormatOpen(v => !v)}
-          title="16 new block types added by a 2026 game update (real names unknown)"
+          onClick={allowNewFormat ? () => setNewFormatOpen(v => !v) : undefined}
+          title={allowNewFormat
+            ? "16 new block types added by a 2026 game update (real names unknown)"
+            : "New-format blocks only exist in 256z worlds — unavailable for this (64z) world"}
           style={{
             display: "flex", alignItems: "center", gap: 4, marginTop: 2,
-            cursor: "pointer", userSelect: "none",
+            cursor: allowNewFormat ? "pointer" : "not-allowed", userSelect: "none",
+            opacity: allowNewFormat ? 1 : 0.4,
           }}
         >
-          <span style={{ color: "#61584f", fontSize: 8 }}>{newFormatOpen ? "▼" : "▶"}</span>
+          <span style={{ color: "#61584f", fontSize: 8 }}>{allowNewFormat && newFormatOpen ? "▼" : "▶"}</span>
           <span style={{ color: newFormatActive ? EDEN_TEAL_READABLE : "#61584f", fontSize: 9 }}>
             New (16){newFormatActive ? " •" : ""}
           </span>
         </div>
-        {newFormatOpen && (
+        {allowNewFormat && newFormatOpen && (
           <div style={{ display: "grid", gridTemplateColumns: "repeat(8, 18px)", gap: 2, marginTop: 1 }}>
             {NEW_FORMAT_BLOCKS.map(b => {
               const selected = bt === b.type;

@@ -880,8 +880,8 @@ const FlyView3D = forwardRef<FlyView3DRef, {
   const gpuShadowsRef = useRef(gpuShadows);
   gpuShadowsRef.current = gpuShadows;
 
-  // Fog model: soft = exponential (FogExp2, hazier / more fog-like, the default); hard = linear.
-  const [fogSoft, setFogSoft] = useState(true);
+  // Fog model: soft = exponential (FogExp2, hazier / more fog-like); hard = linear (the default).
+  const [fogSoft, setFogSoft] = useState(false);
   const fogSoftRef = useRef(fogSoft);
   fogSoftRef.current = fogSoft;
 
@@ -2442,6 +2442,26 @@ const FlyView3D = forwardRef<FlyView3DRef, {
         buildRepeatTimer = window.setInterval(() => { void buildRepeatTick(); }, BUILD_REPEAT_MS);
       }, BUILD_REPEAT_DELAY_MS);
     };
+    // Fallback disarm for the right-button *release*, mirroring `onPickMouseDownFallback`'s role for
+    // the press: button-2 `pointerup` is exactly as unreliable in WKWebView as its pointerdown
+    // counterpart (same root cause), but unlike pointerdown there's no later click-shaped event to
+    // stand in for a dropped one here — `contextmenu`'s own firing time is itself platform-ambiguous
+    // (see its comment: press-time on some platforms, release-time on others), so its handler
+    // deliberately only disarms the stale/drag case and can't be trusted to disarm a plain quick
+    // click too. When pointerup is dropped on a platform where contextmenu fires at release, that left
+    // buildRepeatButton armed with its delay timer/interval still ticking after the physical button
+    // was already up — 300ms (BUILD_REPEAT_DELAY_MS) later the first tick's `aimChanged` NaN-seeded
+    // "always true on gesture start" behavior (see its comment) fired a phantom stamp at wherever the
+    // cursor was aimed by then, i.e. the "have to click really fast or it silently places two blocks"
+    // bug: a deliberate second click within that 300ms window re-armed and re-cancelled before the
+    // phantom could fire, but any slower cadence let it land. Legacy `mouseup` is dispatched through a
+    // separate WebKit code path and does not share the gap, so it's the second, redundant trigger for
+    // exactly the disarm `onPickUp` already runs — a no-op almost every time, mattering only when
+    // WKWebView drops the pointer event.
+    const onPickMouseUpFallback = (e: MouseEvent) => {
+      if (e.button !== 2 || buildRepeatButton !== 2) return;
+      endBuildGesture();
+    };
     // Safety net for a missed pointerup (webview-issued pointercancel, e.g. from an OS gesture or
     // focus loss mid-press) — without this the repeat interval above would run forever.
     const onPickCancel = () => endBuildGesture();
@@ -2679,6 +2699,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
 
     canvas.addEventListener("pointerdown", onPickDown);
     canvas.addEventListener("mousedown", onPickMouseDownFallback);
+    canvas.addEventListener("mouseup", onPickMouseUpFallback);
     canvas.addEventListener("pointerup", onPickUp);
     canvas.addEventListener("pointercancel", onPickCancel);
     canvas.addEventListener("pointermove", onPickMove);
@@ -3584,6 +3605,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       canvas.removeEventListener("pointerup", onSculptUp);
       canvas.removeEventListener("pointerdown", onPickDown);
       canvas.removeEventListener("mousedown", onPickMouseDownFallback);
+      canvas.removeEventListener("mouseup", onPickMouseUpFallback);
       canvas.removeEventListener("pointerup", onPickUp);
       canvas.removeEventListener("pointercancel", onPickCancel);
       canvas.removeEventListener("pointermove", onPickMove);

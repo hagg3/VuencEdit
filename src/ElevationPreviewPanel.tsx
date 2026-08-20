@@ -2,6 +2,9 @@ import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { decodePreviewData, type SelectionInfo, type PreviewData } from "./types";
 import { MAX_CANVAS_DPR } from "./viewportUtils";
+import {
+  ACCENT, BORDER, TEXT, TEXT_ARMED, TEXT_LABEL, hexToRgbTriplet,
+} from "./ribbon/tokens";
 
 /** HiDPI backing store for this panel's canvas — see viewportUtils. The element keeps its CSS
  *  size (canvasW × canvasH); only the backing store and the base transform are scaled. */
@@ -89,7 +92,7 @@ function drawSection(
   ctx.rect(0, yStart, sectionW, availH);
   ctx.clip();
 
-  ctx.fillStyle = "#151311";
+  ctx.fillStyle = "#14181c";
   ctx.fillRect(0, yStart, sectionW, availH);
 
   let scale = 1, dw = 0, dh = 0, ox = 0, oy = yStart;
@@ -202,7 +205,7 @@ function drawSection(
   const labelY = yStart + sectionH - LABEL_H;
   ctx.fillStyle = "rgba(0,0,0,0.65)";
   ctx.fillRect(0, labelY, sectionW, LABEL_H);
-  ctx.fillStyle = "#7dd3fc";
+  ctx.fillStyle = TEXT_ARMED;
   ctx.font = "9px monospace";
   ctx.textAlign = "left";
   ctx.textBaseline = "middle";
@@ -312,7 +315,7 @@ export default function ElevationPreviewPanel({
     // Draw in CSS pixels (canvasW/canvasH) against the dpr-scaled backing store.
     ctx.setTransform(elevDpr(), 0, 0, elevDpr(), 0, 0);
 
-    ctx.fillStyle = "#151311";
+    ctx.fillStyle = "#14181c";
     ctx.fillRect(0, 0, canvasW, canvasH);
 
     const topH = Math.floor(canvasH / 2);
@@ -328,11 +331,11 @@ export default function ElevationPreviewPanel({
     ctx.textAlign = "left";
     ctx.fillStyle = "rgba(0,0,0,0.55)";
     ctx.fillRect(0, 0, 44, 14);
-    ctx.fillStyle = "#93c5fd";
+    ctx.fillStyle = TEXT_ARMED;
     ctx.fillText("FRONT", 3, 3);
     ctx.fillStyle = "rgba(0,0,0,0.55)";
     ctx.fillRect(0, topH, 38, 14);
-    ctx.fillStyle = "#86efac";
+    ctx.fillStyle = ACCENT.green;
     ctx.fillText("SIDE", 3, topH + 3);
     // Divider line between sections
     ctx.strokeStyle = "rgba(175,166,157,0.3)";
@@ -413,7 +416,7 @@ export default function ElevationPreviewPanel({
     <div style={{
       position: "relative",
       fontSize: 12,
-      color: "#ebe9e7",
+      color: TEXT,
       width: canvasW,
       display: "flex",
       flexDirection: "column",
@@ -421,14 +424,14 @@ export default function ElevationPreviewPanel({
       userSelect: "none",
     }}>
       <div style={{ display: "flex", alignItems: "center" }}>
-        <span style={{ color: "#93c5fd", fontWeight: 700, fontSize: 10, letterSpacing: "0.08em" }}>ELEVATION VIEW</span>
+        <span style={{ color: TEXT_ARMED, fontWeight: 700, fontSize: 10, letterSpacing: "0.08em" }}>ELEVATION VIEW</span>
         {zoom !== 1.0 && (
           <button
             onClick={resetZoomPan}
             style={{
               marginLeft: 6, padding: "1px 5px", fontSize: 9, cursor: "pointer",
-              background: "rgba(99,102,241,0.2)", border: "1px solid #6366f1",
-              color: "#a5b4fc", borderRadius: 3,
+              background: `rgba(${hexToRgbTriplet(ACCENT.violet)},.20)`, border: `1px solid ${ACCENT.violet}`,
+              color: ACCENT.violet, borderRadius: 3,
             }}
             title="Reset zoom and pan"
           >{zoom.toFixed(1)}× ✕</button>
@@ -441,9 +444,9 @@ export default function ElevationPreviewPanel({
             type="checkbox"
             checked={showContext}
             onChange={e => setShowContext(e.target.checked)}
-            style={{ accentColor: "#3b82f6" }}
+            style={{ accentColor: ACCENT.primary }}
           />
-          <span style={{ color: "#83786c", fontSize: 10, whiteSpace: "nowrap" }}>± context cols</span>
+          <span style={{ color: TEXT_LABEL, fontSize: 10, whiteSpace: "nowrap" }}>± context cols</span>
         </label>
       </div>
 
@@ -453,7 +456,7 @@ export default function ElevationPreviewPanel({
         height={Math.round(canvasH * elevDpr())}
         style={{
           display: "block", width: canvasW, height: canvasH,
-          borderRadius: 4, border: "1px solid #342f2a",
+          borderRadius: 4, border: `1px solid ${BORDER.outline}`,
           cursor: canvasCursor !== "default" ? canvasCursor : drawActive ? "crosshair" : zoom > 1 ? "grab" : "default",
         }}
         title={`Elevation view — front (top) + side (bottom), ±${CONTEXT_BLOCKS} context blocks, z${sel.z_min}–${sel.z_max} highlighted. Scroll to zoom, drag to pan.`}

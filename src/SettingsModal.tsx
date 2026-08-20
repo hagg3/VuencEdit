@@ -65,6 +65,8 @@ export interface AppSettings {
   sidebarWidth: number;
   /** Docked sidebar's active tab on load. Default "inspector". */
   sidebarTab: "inspector" | "prefabs" | "history";
+  /** Thin docked-left tool rail (Pan/Select/Draw families — see `LeftToolbar.tsx`) open on load. Default true. */
+  leftToolbarOpen: boolean;
   /** Memory-budget preset (§6 of the 2026-08 memory-efficiency pass) — trades resident RAM against
    *  undo depth / cache hit rate / 3D streaming range. See `MEMORY_PRESETS`. Default "balanced". */
   memoryBudget: "low" | "balanced" | "high";
@@ -73,6 +75,11 @@ export interface AppSettings {
   checkForUpdatesOnLaunch: boolean;
   /** Bumped when a default changes in a way that must be pushed onto existing installs (see loadSettings). */
   settingsVersion: number;
+  /** Which `TOUR_VERSION` (`src/tour/steps.tsx`) the onboarding coach-mark tour has been offered
+   *  at. `0` (the default) means never — so a fresh install *and* every existing install whose
+   *  stored blob predates this field both trigger the tour once. `bump-version.sh` is the only
+   *  thing that raises `TOUR_VERSION`, to re-onboard existing users after a UI change. */
+  tourVersion: number;
 }
 
 /** Memory-budget preset table — the single source of truth for what each preset actually bounds.
@@ -96,7 +103,7 @@ export const MEMORY_PRESETS: Record<AppSettings["memoryBudget"], {
 };
 
 /** Current settings schema version. Bump + add a case to `migrate()` when a stored default must change. */
-const SETTINGS_VERSION = 10;
+const SETTINGS_VERSION = 12;
 
 const DEFAULTS: AppSettings = {
   defaultQuadView: true,
@@ -124,9 +131,11 @@ const DEFAULTS: AppSettings = {
   sidebarOpen: true,
   sidebarWidth: 260,
   sidebarTab: "inspector",
+  leftToolbarOpen: true,
   memoryBudget: "balanced",
   checkForUpdatesOnLaunch: true,
   settingsVersion: SETTINGS_VERSION,
+  tourVersion: 0,
 };
 
 /** Push new defaults onto an install that already has a stored settings blob. A plain
@@ -166,6 +175,11 @@ function migrate(s: Record<string, unknown>): boolean {
   // 250 blocks out has no legible outline. The bump records it.
   // v9 → v10: added checkForUpdatesOnLaunch (splash-screen GitHub release check). No forced value
   // needed — the `{...DEFAULTS, ...parsed}` merge supplies it (default true).
+  // v10 → v11: added leftToolbarOpen (docked-left tool rail). No forced value needed — the
+  // `{...DEFAULTS, ...parsed}` merge supplies it (default true).
+  // v11 → v12: added tourVersion (onboarding coach-mark tour gate). No forced value needed — the
+  // `{...DEFAULTS, ...parsed}` merge supplies it (default 0), which is what makes every existing
+  // install see the tour once, same as a fresh one.
   s.settingsVersion = SETTINGS_VERSION;
   return true;
 }
