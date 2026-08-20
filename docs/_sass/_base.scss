@@ -1,0 +1,139 @@
+* {
+  box-sizing: border-box;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  font-family: $font-stack;
+  font-size: 15px;
+  line-height: 1.6;
+  color: $text;
+  background: linear-gradient(180deg, $surface-body-top 0%, $surface-body-bot 100%) fixed;
+}
+
+.content {
+  max-width: $content-max-width;
+  margin: 0 auto;
+  padding: 28px 20px 56px;
+}
+
+a {
+  color: $eden-teal-readable;
+  text-decoration: none;
+}
+
+a:hover {
+  text-decoration: underline;
+}
+
+h1, h2, h3, h4 {
+  color: #fff;
+  font-weight: 700;
+  line-height: 1.25;
+  margin: 0 0 12px;
+}
+
+h1 {
+  font-size: 30px;
+  letter-spacing: -0.3px;
+}
+
+h2 {
+  font-size: 21px;
+  margin-top: 34px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid $border-hairline;
+}
+
+h3 {
+  font-size: 16px;
+  color: $eden-teal-readable;
+  margin-top: 22px;
+}
+
+p {
+  margin: 0 0 14px;
+  color: $text;
+}
+
+p.lede {
+  font-size: 17px;
+  color: $text-dim;
+}
+
+ul, ol {
+  padding-left: 22px;
+  margin: 0 0 14px;
+}
+
+li {
+  margin-bottom: 6px;
+}
+
+code {
+  background: $surface-well;
+  border: 1px solid $border-hairline;
+  border-radius: 3px;
+  padding: 1px 5px;
+  font-size: 0.9em;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  color: #dfe4e8;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 0 0 18px;
+  font-size: 14px;
+}
+
+th, td {
+  text-align: left;
+  padding: 8px 10px;
+  border-bottom: 1px solid $border-hairline;
+  vertical-align: top;
+}
+
+th {
+  color: $text-label;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  font-weight: 600;
+}
+
+hr {
+  border: none;
+  border-top: 1px solid $border-hairline;
+  margin: 28px 0;
+}
+
+.tag-exp {
+  display: inline-block;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.3px;
+  text-transform: uppercase;
+  color: #2a1c08;
+  background: $accent-warm;
+  border-radius: 3px;
+  padding: 1px 5px;
+  margin-left: 6px;
+  vertical-align: 1px;
+}
+
+.section-divider {
+  height: 1px;
+  background: $border-hairline;
+  margin: 32px 0;
+  border: none;
+}
+
+::selection {
+  background: rgba($accent-primary, 0.35);
+}

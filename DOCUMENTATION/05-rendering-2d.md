@@ -111,7 +111,10 @@ cap. The frontend's `viewCapZ` state mirrors the cap the backend already has
 callback and used purely as a cache-invalidation key, since keying refetch on
 `viewMode`/the raw slider value directly would refetch under the stale cap.
 Committing the cap clamps the selection's `zMax`; the template overlay is
-gated to top-down only. The 3D pane is **not** clipped by the cutaway cap.
+gated to top-down only. **The 3D pane is also clipped by the cutaway cap** —
+`get_chunk_geometry` (export.rs) intersects the caller's Z band with
+`ws.view_cap_z` server-side, so cutaway composes into the fly-view geometry too
+(see [06 — Rendering 3D](./06-rendering-3d.md)'s "Camera z band" section).
 
 ## Coordinate & input model (`MapCanvas.tsx`)
 
@@ -119,16 +122,22 @@ The canvas sizes to its container via `ResizeObserver`; `toLocal()` subtracts th
 bounding-rect before every coordinate transform, so the map works decoupled from
 window layout (essential for quad view).
 
-Input is driven by a **`DragOp`** discriminated union:
+Input is driven by a **`DragOp`** discriminated union (`MapCanvas.tsx`, the
+`Tool`/`DragOp` type definitions are the source of truth — this is a
+convenience summary, not a substitute for reading them):
 
 ```ts
 DragOp = null
-  | { kind: "pan" }
-  | { kind: "select" }
-  | { kind: "draw-stroke"; pts: Set<string> }
-  | { kind: "draw-shape"; tool: "rect" | "ellipse"; start, end }
-  | { kind: "cam3d-drag" }
+  | { kind: "pan"; ... }
+  | { kind: "select"; ... }
+  | { kind: "resizeEdge"; edge: ResizeEdge; ... }
+  | { kind: "moveSel"; ... }
+  | { kind: "draw-stroke"; pts: Set<string>; ... }
   | { kind: "sculpt-grab"; ... }
+  | { kind: "draw-shape"; tool: "rect" | "ellipse" | "line"; start, end }
+  | { kind: "lasso"; pts: WP[] }
+  | { kind: "cam3d-drag" }
+  | { kind: "materialize-select"; start, end }
 ```
 
 Middle-mouse is **always** pan. `setPointerCapture` is only called for button 0/1,
@@ -137,9 +146,13 @@ button 2 in macOS WKWebView, so the menu fires from `<canvas onContextMenu>`
 (which `preventDefault()`s the OS menu). See the context-menu gotcha in
 [09 — Frontend](./09-frontend.md).
 
-**Tools:** `pan | select | wand | paste | pen | brush | rect | ellipse` (plus
-sculpt tools). `TOOL_LABELS: Record<Tool, string>` is the single source of tool
-display names — adding a `Tool` is a compile error until it's named.
+**Tools:** draw/paint — `pan | select | wand | lasso | polyselect | paste |
+pen | brush | spray | line | rect | ellipse | polygon | fill | eyedropper |
+poolfill | materialize`; sculpt (16) — `raise | lower | smooth | flatten |
+slope | noise | erode | thermal | hydro | stamp | grab | terrace | sharpen |
+smear | rock | carve`. `TOOL_LABELS`/`TOOL_CURSOR: Record<Tool, string>` are
+the exhaustive sources of tool display names/cursors — adding a `Tool` is a
+compile error until it's named in both.
 
 ## HiDPI canvas plumbing (`viewportUtils.ts`)
 

@@ -14,8 +14,9 @@ content, not extension):
 
 ### Backend (`src-tauri/src/texturepack.rs`)
 
-- **`BLOCK_FACE_TEX: [[&str; 3]; 112]`** — `[side, bottom, top]` tile name per
-  block type.
+- **`BLOCK_FACE_TEX: [[&str; 3]; 128]`** — `[side, bottom, top]` tile name per
+  block type (extended from 112 to 128 alongside the new-format block work —
+  see "File Format"/"Color System" in CLAUDE.md).
 - **`KNOWN_TEX_NAMES`** — 32 canonical tile names (lowercased, no extension). The
   ZIP scanner is case-insensitive and path-stripping.
 - **`ATLAS1_MAP` / `ATLAS2_MAP`** — canonical name → tile index in the game's
@@ -121,7 +122,7 @@ proven (Part C3 below).
   when captured.
 - **`download_world`** — streams to disk (not buffering the whole body in RAM),
   decompresses file→file through a `take()`-capped reader
-  (`MAX_DOWNLOADED_WORLD_BYTES = 2 GB`).
+  (`MAX_DOWNLOADED_WORLD_BYTES = 12 GiB`, `network.rs`).
 - **`upload_world`** — multipart, requires a PNG thumbnail (`UploadModal.tsx`).
   **Streamed as of 2026-08-20 (audit C4).** It used to `fs::read` the world, decompress
   a zip into a second `Vec`, gzip into a third at `Compression::best()`, and hand the

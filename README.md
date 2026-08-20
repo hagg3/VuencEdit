@@ -4,6 +4,8 @@
 
 # VuencEdit
 
+**[hagg3.github.io/VuencEdit](https://hagg3.github.io/VuencEdit/)**
+
 A map viewer and block editor for **Eden World Builder** world files (`.eden`).
 
 Open a world file and get a colour-coded top-down map of everything in it. Pan and zoom around, select regions, fill or replace blocks, copy and paste structures, generate whole new worlds from scratch, and save your changes back — all without touching the game itself.

@@ -1,0 +1,62 @@
+---
+layout: default
+title: Home
+---
+<div class="content">
+
+  <section style="text-align: center; padding: 20px 0 8px;">
+    <div style="font-size: 40px; letter-spacing: -1px; margin-bottom: 10px;">
+      <span style="font-weight: 800; color: #fff;">Vuenc</span><span style="font-weight: 400; color: #00dde9;">Edit</span>
+    </div>
+    <p class="lede" style="max-width: 620px; margin: 0 auto 6px;">
+      A comprehensive world editor for <strong style="color:#dfe4e8;">Eden: World Builder</strong>.
+      Open a <code>.eden</code> file, edit it in a full 2D/3D toolset, and save it straight back —
+      without touching the game.
+    </p>
+    <span class="beta-chip" style="margin-top: 6px; display: inline-block;">Beta</span>
+
+    <div class="btn-row" style="justify-content: center;">
+      <a class="btn btn-primary" href="{{ '/downloads/' | relative_url }}">Download</a>
+      <a class="btn btn-secondary" href="https://github.com/{{ site.repository }}" target="_blank" rel="noopener">View on GitHub</a>
+    </div>
+  </section>
+
+  {% include screenshot.html src="/assets/img/hero.webp" alt="VuencEdit editing a world in quad view — top-down map, front/side slices, 3D pane, and prefab sidebar" width="1600" height="1134" %}
+
+  <h2>What it does</h2>
+  <div class="feature-grid">
+    {% for f in site.data.features %}
+      {% include card.html icon=f.icon title=f.title text=f.text exp=f.exp %}
+    {% endfor %}
+  </div>
+  <p style="text-align: right; margin-top: 4px;"><a href="{{ '/features/' | relative_url }}">See every feature &rarr;</a></p>
+
+  <h2>World compatibility</h2>
+  <p>VuencEdit reads and writes every Eden world format the game itself has ever shipped, and detects which one it's looking at automatically.</p>
+  <div class="compat-strip">
+    <div class="compat-pill">
+      <div class="compat-name">Legacy64z</div>
+      <div class="compat-desc">The original format — 64 height levels.</div>
+    </div>
+    <div class="compat-pill">
+      <div class="compat-name">NewDawn256z</div>
+      <div class="compat-desc">The New Dawn update — 256 height levels.</div>
+    </div>
+    <div class="compat-pill">
+      <div class="compat-name">NewFormat256z</div>
+      <div class="compat-desc">A 2026 update — 256 levels, new blocks, signs.</div>
+    </div>
+  </div>
+  <p><a href="{{ '/docs/world-compatibility/' | relative_url }}">Read the full compatibility guide &rarr;</a></p>
+
+  <hr>
+
+  <section style="text-align: center; padding: 8px 0 4px;">
+    <h2 style="border: none;">Ready to try it?</h2>
+    <p class="lede">Pick your platform and you'll be editing a world in a couple of minutes.</p>
+    <div class="btn-row" style="justify-content: center;">
+      <a class="btn btn-primary" href="{{ '/downloads/' | relative_url }}">Get VuencEdit</a>
+    </div>
+  </section>
+
+</div>

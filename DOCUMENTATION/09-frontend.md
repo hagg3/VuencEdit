@@ -13,20 +13,23 @@ Rust backend via `invoke`.
 | `AppMenu.tsx` | Two-pane Office-2007 application menu (replaces the old VuencEdit ▾ / File ▾ dropdowns). |
 | `WorldNamePill.tsx` | Top-bar world identity, details popover and rename. |
 | `src/panels/` | `AboutPanel` / `WorldInfoPanel` — shared by the application menu and their modals. |
-| `MapCanvas.tsx` (1626 L) | 2D map: pan/zoom/select/paste/draw, `DragOp` input, right-click menu. |
-| `FlyView3D.tsx` (1986 L) | Streaming fly-through 3D pane (Three.js + OrbitControls). |
+| `MapCanvas.tsx` (~2700 L) | 2D map: pan/zoom/select/paste/draw, `DragOp` input, right-click menu. |
+| `FlyView3D.tsx` (~4300 L) | Streaming fly-through 3D pane (Three.js + OrbitControls). |
 | `SliceViewport.tsx` (838 L) | Front/side slab + ortho viewports for quad view. |
 | `Sidebar.tsx` | Docked right-edge tabbed panel (Inspector / Prefabs / History) + collapse rail + drag-resize. |
-| `SelectionInspector.tsx` | Sidebar Inspector tab: stats + ortho preview + extrude + prefab save + trees + 3D view. |
-| `ElevationPreviewPanel.tsx` | Full-height front/side elevation view (opt-in, resizable, draw). |
-| `ThreeDPreview.tsx` | On-demand 3D render of a selection (≤ 64³). |
+| `SelectionInspector.tsx` | Sidebar Inspector tab: stats + ortho preview + extrude + prefab save + trees + 3D view + the collapsible elevation section (see `ElevationPreviewPanel.tsx` below — it's not its own sidebar tab). |
+| `ElevationPreviewPanel.tsx` | Full-height front/side elevation view. Content-only — mounted inside `SelectionInspector`'s collapsible elevation section, not a standalone dock tab. |
+| `ThreeDPreview.tsx` | On-demand 3D render of a selection (≤ 64³). **Dead code** — nothing in `src/` imports/mounts it; kept as the `get_obj_geometry` worked example. |
 | `BlockPaintPicker.tsx` | Reusable block+paint picker (fill / filter modes), texture swatches. |
 | `PrefabLibraryPanel.tsx` | Dockable prefab gallery. |
 | `QuickActionsBar.tsx` | Floating pill under the ribbon: selection copy/fill/delete + clipboard paste/Z-offset/rotate/mirror. |
+| `LeftToolbar.tsx` | Left-edge tool strip. |
 | `NewWorldModal.tsx` | New world dialog (Flat / Natural / Classic / Tg2). |
 | `SchematicImportModal.tsx` | MC `.schematic`/`.litematic` import. |
 | `WorldBrowserModal.tsx` | Search/download worlds from Eden servers. |
 | `UploadModal.tsx` | Upload world + thumbnail. |
+| `MaterializeModal.tsx` | Materialize-from-template / expand-from-template progress + confirm dialog. |
+| `VmfExportModal.tsx` | Source Engine VMF export options (Dev/Flat-color texture mode, skybox shell, merge-across-materials). |
 | `WorldInfoModal.tsx` | Thin `Modal` wrapper around `WorldInfoPanel`. |
 | `SettingsModal.tsx` | Persistent app settings. |
 | `HelpModal.tsx` | Shortcuts + texture-pack help. |
@@ -35,6 +38,7 @@ Rust backend via `invoke`.
 | `Modal.tsx` | Shared modal shell (backdrop + Escape + focus-trap + ARIA). |
 | `ErrorBoundary.tsx` | Inline error fallback wrapping quad-view panes. |
 | `NumberField.tsx` | Numeric input that doesn't clamp mid-keystroke. |
+| `maskUtils.ts` | Shaped-selection mask helpers (e.g. `decomposeMask` for the 3D fly-view overlay). |
 
 ### Support modules
 

@@ -1,0 +1,40 @@
+// Transcribed from src/ribbon/tokens.ts (the app's own ribbon palette) so the site reads as
+// the same application. Reconcile by eye against that file if the app's palette ever moves.
+
+// Surfaces
+$surface-topbar: #1b2128;
+$surface-body-top: #2b333c;
+$surface-body-bot: #242b33;
+$surface-raised-top: #39434e;
+$surface-raised-bot: #2c343d;
+$surface-well: rgba(0, 0, 0, 0.30);
+
+// Borders
+$border-outline: rgba(0, 0, 0, 0.55);
+$border-bevel: rgba(255, 255, 255, 0.10);
+$border-hairline: rgba(255, 255, 255, 0.08);
+
+// Text
+$text: #dfe4e8;
+$text-dim: #a3adb6;
+$text-label: #8b959e;
+$text-disabled: #606a73;
+
+// The 4 sanctioned tool-family accents, same convention as the app: hue names a family,
+// not a specific command.
+$accent-primary: #00a4ad;   // teal — primary / navigation
+$accent-warm: #d98a2b;      // amber — beta / experimental
+$accent-green: #3fa85c;     // selection / clipboard topics
+$accent-violet: #7c6bd6;    // 3D / spatial topics
+
+$eden-teal-readable: #00dde9; // brighter teal used for the "Edit" half of the wordmark + links
+
+$danger: #c2504f;
+
+// Layout
+$content-max-width: 1040px;
+$navbar-height: 48px;
+$beta-strip-height: 28px;
+
+// Type
+$font-stack: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
