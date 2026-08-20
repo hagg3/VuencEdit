@@ -12,20 +12,32 @@ import { TextureGroup } from "../PaletteGroup";
 import {
   Badge, Caption, Check, Col, CommandButton, Group, GroupDivider, Row, SliderRow, SmallButton,
 } from "../primitives";
-import { ACCENT, GROUP_CONTENT_H } from "../tokens";
+import { ACCENT, GROUP_CONTENT_H, MOD, SHIFT } from "../tokens";
 
 const SPECS: GroupMetrics[] = [
   { id: "mapview", widths: { full: 228, medium: 150, compact: 44 }, minTier: "medium", priority: 0 },
   { id: "render", widths: { full: 170, medium: 128, compact: 44 }, minTier: "compact", priority: 2 },
   { id: "zoom", widths: { full: 216, medium: 148, compact: 44 }, minTier: "compact", priority: 3 },
-  { id: "layout", widths: { full: 258, medium: 166, compact: 44 }, minTier: "compact", priority: 1 },
+  { id: "layout", widths: { full: 350, medium: 230, compact: 44 }, minTier: "compact", priority: 1 },
   { id: "template", widths: { full: 158, medium: 120, compact: 44 }, minTier: "compact", priority: 4 },
   { id: "textures", widths: { full: 158, medium: 120, compact: 44 }, minTier: "compact", priority: 5 },
 ];
 
+// Contextual seventh group (audit H5) — only present in the solve while it's actually rendered
+// (zslice/cutaway view modes), otherwise it silently ate ~200px the solver never accounted for
+// and the row fell back to horizontal scroll instead of demoting a tier like every other group.
+const SPECS_WITH_ZLEVEL: GroupMetrics[] = [
+  ...SPECS,
+  { id: "zlevel", widths: { full: 190, medium: 150, compact: 44 }, minTier: "compact", priority: 6 },
+];
+
 export default function ViewTab() {
   const { p, bodyWidth } = useRibbon();
-  const tier = useMemo(() => solveLayout(SPECS, bodyWidth), [bodyWidth]);
+  const sliced = p.viewMode === "zslice" || p.viewMode === "cutaway";
+  const tier = useMemo(
+    () => solveLayout(sliced ? SPECS_WITH_ZLEVEL : SPECS, bodyWidth),
+    [bodyWidth, sliced],
+  );
 
   // Drag-time slider value, re-synced whenever App changes the committed one out of band
   // (world load reset, follow-surface, Settings apply) — React's derived-state pattern, no effect.
@@ -34,7 +46,6 @@ export default function ViewTab() {
   if (prevZ !== p.zSliceZ) { setPrevZ(p.zSliceZ); setZDisplay(p.zSliceZ); }
 
   const big = tier.mapview === "full" ? "full" : "medium";
-  const sliced = p.viewMode === "zslice" || p.viewMode === "cutaway";
 
   return (
     <>
@@ -78,16 +89,16 @@ export default function ViewTab() {
           icon="fit" label="Fit Map" title="Fit the whole world in the viewport (Home)" onClick={p.onFitMap} />
         <Col style={{ justifyContent: "center", height: GROUP_CONTENT_H }}>
           <SmallButton icon="zoomSel" label="To Selection" full disabled={!p.rawBounds}
-            title={p.rawBounds ? "Zoom to the selection (⌘⇧0)" : "Make a selection first"}
+            title={p.rawBounds ? `Zoom to the selection (${MOD}${SHIFT}0)` : "Make a selection first"}
             onClick={p.onZoomToSelection} />
-          <SmallButton icon="zoomIn" label="Zoom In" full title="Zoom in (⌘+)" onClick={p.onZoomIn} />
-          <SmallButton icon="zoomOut" label="Zoom Out" full title="Zoom out (⌘−)" onClick={p.onZoomOut} />
+          <SmallButton icon="zoomIn" label="Zoom In" full title={`Zoom in (${MOD}+)`} onClick={p.onZoomIn} />
+          <SmallButton icon="zoomOut" label="Zoom Out" full title={`Zoom out (${MOD}−)`} onClick={p.onZoomOut} />
         </Col>
       </Group>
       <GroupDivider />
 
       {/* ── Layout ────────────────────────────────────────────────────────── */}
-      <Group id="layout" label="Layout" tier={tier.layout} declaredWidth={258} icon="quad">
+      <Group id="layout" label="Layout" tier={tier.layout} declaredWidth={350} icon="quad">
         <CommandButton tier={tier.layout === "full" ? "full" : "medium"}
           icon="quad" label="Quad View" accent={ACCENT.violet} active={p.showSlicePanels}
           title="Hammer-style four-pane editor: Top + Front + Side + 3D (experimental)"
@@ -118,6 +129,11 @@ export default function ViewTab() {
               : "This world has no signs. Signs are written by the game; VuencEdit reads and shows them but can't place them."}
             onClick={() => p.setShowSigns(!p.showSigns)} />
         </Col>
+        <Col style={{ justifyContent: "center", height: GROUP_CONTENT_H }}>
+          <SmallButton icon="toolbar" label={p.leftToolbarOpen ? "Toolbar ✓" : "Toolbar"} full active={p.leftToolbarOpen}
+            title="Docked left tool rail: Pan / Select / Draw quick-access, Illustrator-style"
+            onClick={p.onToggleLeftToolbar} />
+        </Col>
       </Group>
       <GroupDivider />
 
@@ -145,7 +161,7 @@ export default function ViewTab() {
       {/* ── Contextual tail: one slider, two meanings ─────────────────────── */}
       {sliced && (<>
         <GroupDivider />
-        <Group id="zlevel" label={p.viewMode === "cutaway" ? "Cap Z" : "Z-Slice Level"} tier="full" icon="zslice">
+        <Group id="zlevel" label={p.viewMode === "cutaway" ? "Cap Z" : "Z-Slice Level"} tier={tier.zlevel} declaredWidth={190} icon="zslice">
           <Col style={{ justifyContent: "center", height: GROUP_CONTENT_H }}>
             <SliderRow
               label={p.viewMode === "cutaway" ? "Cap" : "Level"} min={0} max={p.world?.max_z ?? 63}

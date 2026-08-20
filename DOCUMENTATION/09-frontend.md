@@ -16,6 +16,7 @@ Rust backend via `invoke`.
 | `MapCanvas.tsx` (1626 L) | 2D map: pan/zoom/select/paste/draw, `DragOp` input, right-click menu. |
 | `FlyView3D.tsx` (1986 L) | Streaming fly-through 3D pane (Three.js + OrbitControls). |
 | `SliceViewport.tsx` (838 L) | Front/side slab + ortho viewports for quad view. |
+| `Sidebar.tsx` | Docked right-edge tabbed panel (Inspector / Prefabs / History) + collapse rail + drag-resize. |
 | `SelectionInspector.tsx` | Sidebar Inspector tab: stats + ortho preview + extrude + prefab save + trees + 3D view. |
 | `ElevationPreviewPanel.tsx` | Full-height front/side elevation view (opt-in, resizable, draw). |
 | `ThreeDPreview.tsx` | On-demand 3D render of a selection (≤ 64³). |
@@ -243,6 +244,28 @@ below the minimum window width (`tauri.conf.json` `minWidth` is 900).
   not `.rbn-btn`, and before this they had no hover at all.
 - Disabled controls use `opacity` + `pointerEvents: none` (layout stability) **and**
   `aria-disabled` + `tabIndex={-1}` — otherwise they stay focusable but unclickable.
+- **Keyboard model for menus and radiogroups** *(audit M2, 2026-08-20)*. Every popover
+  opener already declared `aria-haspopup="menu"` + `aria-expanded`, so assistive tech
+  announced a menu the keyboard could not drive. A `Popover` with `role="menu"` now
+  focuses its first enabled `[role="menuitem"]` one frame after mount (deferred, because
+  the panel is portaled and positioned in a layout effect — focusing before that lands
+  would scroll to the off-screen `-9999` staging position), roves focus on
+  Up/Down/Home/End, **closes on Tab** (the ARIA menu convention: a menu is not a dialog,
+  so it traps nothing), and restores focus to whatever had it — but only if focus is
+  still inside the panel, so a click elsewhere isn't fought. `role="dialog"` panels (the
+  block picker, the world pill's details) are deliberately left alone: they own their own
+  inner focus order, and stealing it would break the pill's rename field.
+  ⚠️ **`onClose` is read through a ref, and the effect is keyed on `role` alone.** Nearly
+  every call site passes an inline arrow, so depending on `onClose` directly would re-run
+  the effect on every parent render — harmless for the outside-click/Escape listener
+  (it just re-registers) but here it would re-fire the focus-first-item step and yank
+  focus back to the top of the menu while the user was arrowing through it.
+  `Segmented` is now **one** tab stop, not one per option — only the checked option is
+  tabbable — and Left/Right/Up/Down move the selection *and* focus (wrapping), with
+  Home/End at the ends. `checkedIndex` floors at 0 so a group whose `value` doesn't match
+  any option still has exactly one tab stop instead of dropping out of the tab order.
+  Still deferred: the block picker's swatches are mouse-only `<div>`s (roving tabindex
+  over a swatch grid).
 - `Popover` portals to `document.body` for **two** reasons: the ribbon body clips
   overflow, *and* the ribbon root's `z-index: 100` is its own stacking context, so an
   in-tree panel can never rise above the docked sidebar (`z-index: 120`) whatever
@@ -308,6 +331,35 @@ double ring. ⚠️ That is why the two hotbar rows use `gap: SPACE.sm` (4) inst
 `COL_GAP` (2) — at 2px a selected cell's ring would touch its neighbour. It costs the
 Palette group ~10px, which is why its declared width is 264, not 252.
 
+## Docked sidebar (`Sidebar.tsx`) — restyled 2026-08-20 *(audit H10 step 3)*
+
+The sidebar was the app's third competing visual system: warm-brown
+`glassPanel`/`glassTab`, text-only tabs and its own eight hard-coded greys, sitting
+flush against a cool-slate ribbon. It is now built from `ribbon/tokens` +
+`ribbon/icons`. **Nothing about the layout changed** — same `MIN_WIDTH`/`MAX_WIDTH`
+(200/420), same `COLLAPSED_RAIL` (28), same left-edge drag-resize, same
+`z-index: 120` — only the material, the type tones and the tab glyphs.
+
+- Shell: `SURFACE.body` with a `BORDER.outline`/`BORDER.bevel` inset left edge in place
+  of the old glass panel + outer shadow pair.
+- Tab strip: `role="tablist"` on `SURFACE.topbar`, each tab a `.rbn-tab` (not
+  `.rbn-btn` — the latter's hover grows a *raised* face, wrong for a flat strip) with a
+  lucide icon and an `ACCENT.primary` underline when selected, so a selected sidebar tab
+  reads the same way a selected ribbon tab does. Inspector carries the **selection**
+  glyph rather than a generic "info" one, because that is what it reads out.
+- The collapse rail and the collapse button use `Icon name="left"/"right"` instead of
+  `◀`/`▶` text glyphs.
+- The three content components inside it were migrated in the same pass
+  (`SelectionInspector`, `PrefabLibraryPanel`, `ElevationPreviewPanel`) — a slate shell
+  wrapped around warm-brown content would have read worse than either end state. Their
+  ~40 raw hex values map onto `TEXT`/`TEXT_DIM`/`TEXT_LABEL`/`TEXT_DISABLED` and the
+  four sanctioned `ACCENT` hues (clipboard green, axo violet, armed teal);
+  `PrefabLibraryPanel`'s `chromeButton` calls became a local `panelBtn` over `btnBase`,
+  and its `✓ ✗ ✎ 🗑 ▦ ☰` emoji became lucide icons.
+- Still warm-brown, deliberately: `designTokens.ts` is now used by modals, the app menu
+  and a few App-level surfaces only — the audit's stated end state is that it becomes an
+  explicit, consistent *second* surface for modals rather than being eliminated.
+
 ## Application menu (`src/AppMenu.tsx`)
 
 One two-pane Office-2007 menu replacing the old VuencEdit ▾ and File ▾ dropdowns and
@@ -369,6 +421,113 @@ guarding ref access treats any object reached through a hook's return value as
 ref-like once one of its fields *is* a ref (`renameInputRef`), so reading `p.<field>`
 inline in the JSX trips it on every unrelated field too.
 
+## Onboarding tour (`src/tour/`)
+
+Three files. `steps.tsx` is content-only — a flat `TOUR_STEPS: TourStep[]` array and
+`TOUR_VERSION` (bumped only by `bump-version.sh`). `TourOverlay.tsx` is the engine.
+`placement.test.ts` is the tour's only automated coverage.
+
+**`TourStep`:** `{ id, title, body: ReactNode, target: string | null, placement?, padding?,
+before?: (ctx: TourCtx) => void }`. `body` is JSX (hence `.tsx`, not `.ts`) so a step can carry
+`<Kbd>` keycaps the same way `HelpModal`/`AppMenu` do — there's a local `Kbd` in `steps.tsx`
+rather than importing `AppMenu`'s (not exported, and importing across that boundary for one
+component isn't worth it). `target: null` renders a centred card with no spotlight (used once, for
+the welcome step). `before` is the **guided-passive reveal** — it may switch ribbon tabs, open the
+sidebar, uncollapse the ribbon or reveal the left toolbar via `TourCtx`'s five setters, but never
+touches world data and never waits on a user action; it runs in a `useLayoutEffect` keyed on
+`stepIndex` so any state update it triggers upstream (App) commits before the browser paints —
+that's what lets the following measurement effect's `requestAnimationFrame` see the post-reveal
+DOM instead of a stale one.
+
+**Engine (`TourOverlay.tsx`, ~250 lines):**
+- Portaled to `document.body`, z-index `9990` — above every chrome layer, below the block-picker
+  portal and `AboutModal` (9999). Neither can be open while the tour runs.
+- **Spotlight = two divs, no SVG mask.** A full-screen `pointer-events: auto` layer swallows every
+  click so the app is inert during the tour; a div positioned at the padded **cutout** rect with
+  `box-shadow: 0 0 0 9999px rgba(8,12,16,.66)` paints the dim scrim *and* the cutout with no
+  geometry maths, `pointer-events: none` so clicks pass through to the catcher beneath it. A
+  `.eden-tour-ring` div tracks the primary `target` alone (not the cutout) and carries the pulse
+  (`@keyframes eden-tour-pulse`, defined in a `TOUR_CSS` `<style>` block rendered inline — the
+  `RIBBON_CSS`/`SPLASH_CSS` idiom).
+  ⚠️ **The reduced-motion opt-out is a JS `matchMedia` check** (`prefersReducedMotion()`, read once
+  via `useState`'s lazy initializer), which conditionally omits the `.eden-tour-ring` class rather
+  than a CSS `@media (prefers-reduced-motion: reduce)` block overriding the same class's animation.
+  An earlier version did it in CSS — `@media (prefers-reduced-motion: reduce) { .eden-tour-ring {
+  animation: none !important; ... } }` on the class the keyframes lived on — and that combination
+  froze the whole app on a real device with Reduce Motion enabled (dimmed overlay, card never
+  appeared); root cause not chased down, but a WKWebView-specific interaction between a media query,
+  an inline-rendered `<style>` tag and `!important` is the leading suspect. The JS branch sidesteps
+  it entirely and isn't more code.
+- **`secondaryTargets`** (per-step, optional): extra selectors unioned into the spotlight's cutout
+  rect without taking the ring. Exists because a step spotlighting a ribbon group sits *below* the
+  tab strip — without folding the strip into the cutout, the dim scrim covers it too and the active
+  tab (which just changed via `before`) reads as illegible. The five ribbon-group steps include
+  `RIBBON_TABLIST` (`[role="tablist"][aria-label="Ribbon tabs"]`); Draw tools additionally folds in
+  the Mask group, Selecting folds in Navigation, and View layouts folds in the map (`[data-tour=
+  "map"]`, since it also describes cutaway view). `unionRects` is memoized (`useMemo` keyed on
+  `[rect, secondaryRects]`) — the placement effect below is keyed on the union, and an unmemoized
+  call would mint a new object every render, re-triggering that effect (and `setPos`) forever.
+- **Measurement:** `document.querySelector(step.target)` → `getBoundingClientRect()`, re-run on a
+  `requestAnimationFrame` after `before()` settles, on `window` resize, and via a `ResizeObserver`
+  on `document.body` (catches a reflow that doesn't fire `resize`, e.g. the sidebar opening).
+  ⚠️ **A missing target is never fatal** — an unresolved selector degrades the step to a centred
+  card with no spotlight and a dev-only `console.warn`, so a hidden `LeftToolbar` (user-collapsed)
+  or a contextual ribbon tab that never appears during the tour can't crash it, only ask the step
+  to advance without pointing at anything.
+- **Card placement** is `placeCard(rect | null, card: {w,h}, vw, vh, placement)` — a pure,
+  exported function: picks the side of the target with the most room (or the step's explicit
+  `placement`), then clamps into the viewport with an 8px margin. `rect === null` centres it. Pure
+  and node-testable — `placement.test.ts` pins the viewport-margin clamp at each corner/edge and
+  the auto-side choice, the tour's counterpart to `ribbon/layout.test.ts`.
+- **Card** is `role="dialog" aria-modal="true"`, styled from `ribbon/tokens`
+  (`SURFACE.popover`/`BORDER`/`RADIUS.lg`/`FONT`/`ACCENT.primary`), holding an `N / total` counter
+  + dot progress strip, title, body, and Skip tour / Back / Next (Done on the last step). Focus is
+  trapped via `useFocusTrap` (reused from `Modal.tsx`, not reimplemented) on the card ref.
+- **Keyboard**, capture-phase on `window` with `stopPropagation()` (the `AppMenu.tsx`/`Popover`
+  idiom): →/Enter/Space advance, ← steps back, Esc skips (`onClose(false)`). Capture + stop is what
+  keeps editor shortcuts (`P`, `[`, `⌘Z`) from firing underneath the overlay — belt-and-braces with
+  App's `anyModalOpen` gate below.
+- Props: `{ steps, ctx, onClose(completed: boolean) }`. Owns only `stepIndex` and the measured
+  rect; everything else is derived per render from `steps[stepIndex]`.
+
+**Wiring in `App.tsx`:** `tourOpen` state + a `tourCheckedRef` (once-per-session latch) + a
+`useEffect` on `[world, anyModalOpen]` — *not* a call inside `applyLoadedWorld`, since that runs
+before the editor branch has mounted and would measure into an empty DOM; running after covers
+new/open/download/recent/recovery uniformly with no change to `applyLoadedWorld`'s two call sites.
+It compares `loadSettings().tourVersion` against `TOUR_VERSION` and writes the flag at *open* time,
+not completion (mirrors `FlyView3D.tsx`'s `FLY3D_LEGEND_SEEN_KEY` idiom — a user who skips
+immediately has still been offered it once). `anyModalOpen` includes `tourOpen`, so editor
+shortcuts can't fire under the overlay even before its own capture-phase listener would catch them.
+`startTour = useCallback(() => setTourOpen(true), [])` is threaded onto `RibbonProps` (so `AppMenu`
+and the ribbon's Help button can reach it via `useRibbon()`) and passed directly to `HelpModal` as
+`onStartTour` (outside the ribbon prop bag, since `HelpModal` isn't ribbon-context-mounted).
+`TourCtx` is a `useMemo` wrapping the existing `ribbonTabSetterRef.current?.(t)` escape hatch (the
+same one the Quick Actions bar's "More…" jump already uses — no ribbon refactor needed) plus the
+raw `setRibbonCollapsed`/`setSidebarOpen`/`setSidebarTab`/`setLeftToolbarOpen` setters. ⚠️ **The
+overlay mounts only inside App's `if (world) { return … }` editor branch** — the standing
+two-`return`-branches warning (see "App.tsx state & patterns" below) applies here too.
+
+**Anchors** are inert `data-tour`/`data-group` attributes with zero behaviour change on their own:
+`Group`'s shell div in `ribbon/primitives.tsx` (`data-group={id}`, both the compact-tier and
+full/medium variant) is what makes `#ribbon-tabpanel [data-group="tools"]`-style selectors work;
+`Sidebar.tsx` carries `data-tour="sidebar"` on its open-panel root and `data-tab={t.id}` per tab;
+`LeftToolbar.tsx`/`QuickActionsBar.tsx` carry `data-tour="left-toolbar"`/`"quick-actions"` on their
+roots; `App.tsx` carries `data-tour="map"` on the non-quad map wrapper and the quad view's
+top-left cell (mutually exclusive via `showSlicePanels`, since the quad grid stays mounted-but-
+hidden once the 3D pane has been used this session — its cell's attribute is conditional on
+`showSlicePanels` too, so `document.querySelector` never resolves to the hidden copy) and
+`data-tour="status-bar"` on `statusBarEl`; `WorldNamePill.tsx` carries `data-tour="world-pill"`.
+⚠️ **`Group` ids are not globally unique** (`tools` exists on both Draw and Sculpt, `toolopts`
+repeats within Sculpt) — only one tab is mounted at a time, but every group selector in
+`steps.tsx` is still scoped under `#ribbon-tabpanel` to be unambiguous.
+
+**Settings:** `AppSettings.tourVersion` (default `0`) gates the auto-trigger — both a fresh install
+and every pre-existing one (whose stored blob predates the field and gets `0` from the
+`{...DEFAULTS, ...parsed}` merge) trigger the tour once. `SETTINGS_VERSION` 11 → 12, comment-only
+migration case (purely additive). `bump-version.sh` is the single writer of `TOUR_VERSION` — its
+prompt is hoisted above the script's "version unchanged → exit 0" early return, so re-onboarding
+existing users doesn't require an app version bump in the same run.
+
 ## App.tsx state & patterns
 
 - **`worldRef`** mirrors `world` for `[]`-memoized callbacks (undo/redo →
@@ -414,6 +573,30 @@ inline in the JSX trips it on every unrelated field too.
   `fillBlockType`/`fillPaint` state the 2D draw tools and hotbar use, not a
   separate 3D-only value, so picking a block in either place arms the other.
   Number keys 1–5/6–0 arm hotbar slots and work in the 3D fly-view pane too.
+
+### Long-operation overlay (`LongOpOverlay`, audit C6 + M14, 2026-08-20)
+
+One modal overlay for every long-running backend operation — PNG/OBJ/JSON/VOX export,
+full save, compressed save — plus the world-load spinner when its `op` prop is null.
+It replaced four hand-rolled overlays that between them offered six different levels of
+feedback (a percentage bar, an indeterminate shimmer, two static "Exporting X…" labels)
+and no Cancel at all.
+
+- State is a single `longOp: LongOpState | null`, fed by the backend's `long-op` event
+  (see [04](./04-ipc-reference.md#long-operations-longops-audit-c6--m14-2026-08-20)).
+  The listener **merges** progress events onto the opening event rather than replacing
+  it, so `label`/`cancellable` survive; a `finished` for an id no longer showing is
+  ignored, so a late event can't blank the current operation.
+- Adding progress to a new command is a `LongOps::begin` call in Rust and *nothing*
+  on this side.
+- `pointerEvents` is `"auto"` only while the operation is cancellable; otherwise the
+  overlay stays click-through inert, as the old one always was.
+- `reportExportError` swallows `"Cancelled"` — a cancel the user asked for should not
+  raise a red toast. Every other failure still goes through `reportError`.
+- `RibbonProps.longOpKind` (one string) replaced the three `exporting` /
+  `exportingObj` / `exportingJson` booleans; `AppMenu`'s export rows key their busy
+  spinner off it.
+- Styled from `ribbon/tokens`, per H10's "finish the migration" direction.
 
 ### App.tsx gotchas
 

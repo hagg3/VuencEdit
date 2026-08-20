@@ -17,10 +17,13 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import MapCanvas, { KEY_ZOOM_STEP, TOOL_LABELS, TOOL_HINTS, type Tool, type SelectionBounds, type MapCanvasRef, type MaterializeSelectionBounds } from "./MapCanvas";
 import MaterializeModal from "./MaterializeModal";
 import Sidebar, { type SidebarTab } from "./Sidebar";
+import LeftToolbar from "./LeftToolbar";
 import SliceViewport from "./SliceViewport";
 import FlyView3D, { type FlyView3DRef, type Overlay3D, type Interact3D } from "./FlyView3D";
 import ErrorBoundary from "./ErrorBoundary";
 import HelpModal from "./HelpModal";
+import TourOverlay from "./tour/TourOverlay";
+import { TOUR_STEPS, TOUR_VERSION, type TourCtx } from "./tour/steps";
 import AboutModal from "./AboutModal";
 import WorldBrowserModal from "./WorldBrowserModal";
 import UploadModal from "./UploadModal";
@@ -28,7 +31,7 @@ import VmfExportModal, { type VmfExportBounds } from "./VmfExportModal";
 import NewWorldModal from "./NewWorldModal";
 import SchematicImportModal, { type SchematicInfo, type MappingEntry } from "./SchematicImportModal";
 import Ribbon, { ribbonHeight, EDEN_TEAL, EDEN_TEAL_READABLE, type RibbonTab, type MapViewMode } from "./Ribbon";
-import QuickActionsBar from "./QuickActionsBar";
+import QuickActionsBar, { QUICK_ACTIONS_BAR_H } from "./QuickActionsBar";
 import SettingsModal, { loadSettings, saveSettings, MEMORY_PRESETS, type AppSettings } from "./SettingsModal";
 import WorldInfoModal from "./WorldInfoModal";
 import RecoveryModal from "./RecoveryModal";
@@ -37,7 +40,7 @@ import Modal from "./Modal";
 import { glassPanel, chromeButton, accentRing, expBadge } from "./designTokens";
 import { Icon, type IconName } from "./ribbon/icons";
 import {
-  SURFACE, BORDER, TEXT, TEXT_DIM, TEXT_LABEL, TEXT_DISABLED, TEXT_DANGER,
+  SURFACE, BORDER, TEXT, TEXT_DIM, TEXT_LABEL, TEXT_DISABLED, TEXT_DANGER, HAIRLINE, TOPBAR_BG,
   ACCENT, FONT, ICON, IS_MAC, RADIUS, SPACE, FOCUS_RING, GRAD_HOVER, GRAD_PRESSED, hexToRgbTriplet,
 } from "./ribbon/tokens";
 import { decodeAtlas, tintedSwatch, type AtlasData, clearSwatchCache } from "./texturePack";
@@ -46,6 +49,29 @@ import { isTypingTarget, chunkToWorld } from "./viewportUtils";
 import { decomposeMask, maskOutline } from "./maskUtils";
 import appIcon from "./assets/app-icon.png";
 import "./App.css";
+
+/**
+ * One long-running backend operation (audit C6/M14). The backend's `long-op` event carries the
+ * full shape on the opening event and only the changed fields afterwards; the listener merges
+ * them, so `label` and `cancellable` are set for the whole run.
+ *
+ * `kind` identifies the operation (`"png" | "obj" | "json" | "vox" | "save"`) and is what the
+ * overlay keys its copy off; `total` is in whatever unit that operation counts (rows, bytes,
+ * permille), so only `pct` is meaningful across all of them.
+ */
+type LongOpState = {
+  id: number;
+  kind: string;
+  label?: string;
+  phase?: string;
+  done?: number;
+  total?: number;
+  pct?: number;
+  cancellable?: boolean;
+};
+
+/** The error string a cancelled long operation returns — mirrors `LONG_OP_CANCELLED` in lib.rs. */
+const LONG_OP_CANCELLED = "Cancelled";
 
 // Quad-view divider positions (column/row split fractions), persisted so a layout the user tuned
 // survives reloads. Clamped to 0.15–0.85 so no cell can be dragged to nothing.
@@ -218,6 +244,74 @@ function SplashLink({ href, children }: { href: string; children: React.ReactNod
 
 // Self-contained FPS meter: owns its rAF loop and 1 Hz state update so the
 // per-second re-render stays inside this leaf instead of cascading from App.
+/**
+ * The single modal overlay every long-running operation shares (audit C6/M14) — PNG/OBJ/JSON/VOX
+ * export, full save and compressed save, plus the world-load spinner when `op` is null.
+ *
+ * It replaced four hand-rolled overlays that between them offered six different levels of feedback
+ * (a percentage bar, an indeterminate shimmer, two static "Exporting X…" labels) and no Cancel at
+ * all. Everything here comes from the backend's `long-op` stream, so adding progress to a new
+ * operation is a `LongOps::begin` call and nothing on this side.
+ *
+ * Styled from `ribbon/tokens` rather than the warm-brown glass it used to use, per H10's
+ * "finish the migration" direction.
+ */
+function LongOpOverlay({ op, onCancel }: { op: LongOpState | null; onCancel: () => void }) {
+  const pct = op?.pct ?? null;
+  const label = op?.label ?? "Loading world…";
+  return (
+    <div style={{
+      position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center",
+      background: "rgba(0,0,0,0.45)", zIndex: 200,
+      // Only a cancellable operation needs to receive clicks; everything else stays click-through
+      // inert exactly as the old overlay was.
+      pointerEvents: op?.cancellable ? "auto" : "none",
+    }}>
+      <div style={{
+        background: SURFACE.popover, border: `1px solid ${BORDER.outline}`,
+        borderRadius: RADIUS.lg, padding: "18px 24px", minWidth: 260, textAlign: "center",
+        boxShadow: "0 8px 28px rgba(0,0,0,.45)",
+      }}>
+        <div style={{ color: TEXT, fontSize: FONT.tab, marginBottom: SPACE.md }}>
+          {label}{pct !== null ? ` — ${pct}%` : "…"}
+        </div>
+        {op?.phase && (
+          <div style={{ color: TEXT_DIM, fontSize: FONT.body, marginBottom: SPACE.md }}>{op.phase}</div>
+        )}
+        <div style={{
+          background: SURFACE.well, borderRadius: RADIUS.sm, height: 6,
+          overflow: "hidden", position: "relative",
+        }}>
+          {pct !== null ? (
+            <div style={{
+              background: ACCENT.primary, height: "100%", borderRadius: RADIUS.sm,
+              width: `${pct}%`, transition: "width 0.12s ease",
+            }} />
+          ) : (
+            <div style={{
+              position: "absolute", inset: 0, width: "30%",
+              background: `linear-gradient(90deg, transparent, ${ACCENT.primary}, transparent)`,
+              animation: "eden-shimmer 1.1s ease-in-out infinite",
+            }} />
+          )}
+        </div>
+        {op?.cancellable && (
+          <button
+            onClick={onCancel}
+            style={{
+              marginTop: SPACE.lg + 2, background: "transparent",
+              border: `1px solid ${BORDER.bevel}`, borderRadius: RADIUS.md,
+              color: TEXT_DIM, fontSize: FONT.body, padding: "4px 14px", cursor: "pointer",
+            }}
+          >
+            Cancel
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function FpsCounter() {
   const [fps, setFps] = useState(0);
   useEffect(() => {
@@ -254,16 +348,16 @@ const CursorHud = forwardRef<CursorHudHandle>((_props, ref) => {
   }), []);
   return (
     <>
-      <div style={{ padding: "0 10px", borderRight: "1px solid #322d28", minWidth: 100, whiteSpace: "nowrap" }}>
+      <div style={{ padding: "0 10px", borderRight: `1px solid ${HAIRLINE}`, minWidth: 100, whiteSpace: "nowrap" }}>
         {pos
-          ? <>X <span style={{ color: "#83786c" }}>{Math.round(pos.wx)}</span>{"  "}Y <span style={{ color: "#83786c" }}>{Math.round(pos.wy)}</span></>
-          : <span style={{ color: "#312c28" }}>X — Y —</span>
+          ? <>X <span style={{ color: TEXT_DIM }}>{Math.round(pos.wx)}</span>{"  "}Y <span style={{ color: TEXT_DIM }}>{Math.round(pos.wy)}</span></>
+          : <span style={{ color: TEXT_DISABLED }}>X — Y —</span>
         }
       </div>
       {block && (
-        <div style={{ padding: "0 10px", borderRight: "1px solid #322d28", whiteSpace: "nowrap" }}>
-          Z <span style={{ color: "#83786c" }}>{block.z}</span>
-          {"  "}<span style={{ color: "#61584f" }}>{blockDisplayName(block.bt)}{block.paint > 0 ? <span style={{ color: "#4b443d" }}> #{block.paint}</span> : null}</span>
+        <div style={{ padding: "0 10px", borderRight: `1px solid ${HAIRLINE}`, whiteSpace: "nowrap" }}>
+          Z <span style={{ color: TEXT_DIM }}>{block.z}</span>
+          {"  "}<span style={{ color: TEXT_LABEL }}>{blockDisplayName(block.bt)}{block.paint > 0 ? <span style={{ color: TEXT_DISABLED }}> #{block.paint}</span> : null}</span>
         </div>
       )}
     </>
@@ -283,24 +377,24 @@ const SelStatusHud = forwardRef<SelStatusHudHandle, { selection: SelectionInfo |
     useImperativeHandle(ref, () => ({ setDrag: (r) => setDrag(r) }), []);
     if (drag) {
       return (
-        <div style={{ padding: "0 10px", borderRight: "1px solid #322d28", color: EDEN_TEAL_READABLE, whiteSpace: "nowrap" }}>
+        <div style={{ padding: "0 10px", borderRight: `1px solid ${HAIRLINE}`, color: EDEN_TEAL_READABLE, whiteSpace: "nowrap" }}>
           Sel <span style={{ color: EDEN_TEAL_READABLE }}>
             {Math.round(drag.x2 - drag.x1) + 1}×{Math.round(drag.y2 - drag.y1) + 1}
           </span>
-          {" · Z "}<span style={{ color: "#70665b" }}>{zMin}–{zMax}</span>
+          {" · Z "}<span style={{ color: TEXT_LABEL }}>{zMin}–{zMax}</span>
         </div>
       );
     }
     if (selection) {
       return (
-        <div style={{ padding: "0 10px", borderRight: "1px solid #322d28", color: "#70665b", whiteSpace: "nowrap" }}>
-          Sel <span style={{ color: "#83786c" }}>{selection.width}×{selection.height}</span>
+        <div style={{ padding: "0 10px", borderRight: `1px solid ${HAIRLINE}`, color: TEXT_LABEL, whiteSpace: "nowrap" }}>
+          Sel <span style={{ color: TEXT_DIM }}>{selection.width}×{selection.height}</span>
           {selection.masked && selection.cell_count != null && (
-            <span style={{ color: "#a855f7", marginLeft: 5 }} title="Shaped selection — edits affect only the wand/lasso footprint, not the whole box">
+            <span style={{ color: ACCENT.violet, marginLeft: 5 }} title="Shaped selection — edits affect only the wand/lasso footprint, not the whole box">
               ◆ shaped ({selection.cell_count.toLocaleString()} cells)
             </span>
           )}
-          {" · Z "}<span style={{ color: "#70665b" }}>{selection.z_min}–{selection.z_max}</span>
+          {" · Z "}<span style={{ color: TEXT_LABEL }}>{selection.z_min}–{selection.z_max}</span>
         </div>
       );
     }
@@ -323,12 +417,11 @@ function App() {
   }, []);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
-  const [exporting, setExporting] = useState(false);
-  const [exportProgress, setExportProgress] = useState<number | null>(null);
-  const [exportingObj, setExportingObj] = useState(false);
-  const [exportingJson, setExportingJson] = useState(false);
-  const [exportingVox, setExportingVox] = useState(false);
-  const [voxProgress, setVoxProgress] = useState<{ phase: string; pct: number } | null>(null);
+  /// Audit C6/M14 — one piece of state for every long-running backend operation (PNG/OBJ/JSON/VOX
+  /// export, full save, compressed save), fed by the shared `long-op` event. Replaces the six
+  /// booleans and two bespoke progress shapes these used to need, and the four hand-rolled
+  /// overlays that read them.
+  const [longOp, setLongOp] = useState<LongOpState | null>(null);
   const [vmfExportBounds, setVmfExportBounds] = useState<VmfExportBounds | null>(null);
   const [saving, setSaving] = useState(false);
   const [saveCompressed, setSaveCompressed] = useState(() => loadSettings().defaultSaveCompressed);
@@ -353,12 +446,26 @@ function App() {
   const [sidebarWidth, setSidebarWidth] = useState(() => loadSettings().sidebarWidth);
   const [sidebarTab, setSidebarTab] = useState<SidebarTab>(() => loadSettings().sidebarTab);
   const sidebarInsetPx = sidebarOpen ? sidebarWidth : 0;
+  const [leftToolbarOpen, setLeftToolbarOpen] = useState(() => loadSettings().leftToolbarOpen);
   // Set once by the Ribbon on mount (see its `registerTabSetter` prop) so the Quick Actions bar's
   // "More…" can jump to the Selection tab without lifting the Ribbon's tab state into App.
   const ribbonTabSetterRef = useRef<((t: RibbonTab) => void) | null>(null);
   const registerRibbonTabSetter = useCallback((fn: (t: RibbonTab) => void) => { ribbonTabSetterRef.current = fn; }, []);
   const [undoDepth, setUndoDepth] = useState(0);
   const [redoDepth, setRedoDepth] = useState(0);
+
+  // Onboarding coach-mark tour (src/tour/) — auto-fires once per TOUR_VERSION on the first world
+  // that loads, replayable any time via Help/AppMenu. See CLAUDE.md's "Onboarding Tour" note.
+  const [tourOpen, setTourOpen] = useState(false);
+  const tourCheckedRef = useRef(false);
+  const startTour = useCallback(() => setTourOpen(true), []);
+  const tourCtx = useMemo<TourCtx>(() => ({
+    setRibbonTab: (t) => ribbonTabSetterRef.current?.(t),
+    setRibbonCollapsed,
+    setSidebarOpen,
+    setSidebarTab,
+    setLeftToolbarOpen,
+  }), []);
 
   // Status bar: cursor world position and FPS. cursorHudRef feeds the leaf CursorHud component
   // directly (see its definition) so the throttled mouse-move tick doesn't re-render all of App.
@@ -471,6 +578,16 @@ function App() {
     setError(msg);
     pushToast(msg, "error");
   }, [pushToast]);
+
+  /**
+   * `reportError`, except that a user-requested cancel is not an error (audit C6/M14). Every
+   * cancellable long operation returns the literal string `"Cancelled"` when the user hits Cancel;
+   * raising a red toast for something they just asked for would be noise.
+   */
+  const reportExportError = useCallback((e: unknown) => {
+    if (String(e).includes(LONG_OP_CANCELLED)) return;
+    reportError(e);
+  }, [reportError]);
 
   // Front/side SliceViewports each surface their own fetch failures (D3) via `onError`. Both panes
   // commonly fail identically (the same oversize selection, the same "No world loaded") — `pushToast`'s
@@ -1260,36 +1377,38 @@ function App() {
     buf: ArrayBuffer, kind: "edit" | "undo" | "redo" = "edit", opts?: { silent?: boolean },
   ) => {
     const raw = decodeEditResult(buf);
-    // Cutaway is a top-down render — the patch Rust returns is already capped, so it applies directly.
-    if (viewModeRef.current !== "zslice") {
-      if (renderModeRef.current === "axo") {
-        // Axo projection: flat patch positions don't match axo pixel positions, force full re-render.
-        // Read via ref: this runs from []-memoized undo/redo callbacks where `world` is stale.
-        //
-        // H2: debounced (trailing ~250ms) rather than firing per call — a 3D build gesture dispatches
-        // an edit every ~220ms while held, and without this each one queued its own full-world axo
-        // re-render (seconds of work on a large world) even though the user is looking at the 3D pane,
-        // not the axo one. A burst now collapses to one re-render, ~250ms after it quiets down.
-        if (axoRefetchTimerRef.current !== null) clearTimeout(axoRefetchTimerRef.current);
-        axoRefetchTimerRef.current = window.setTimeout(() => {
-          axoRefetchTimerRef.current = null;
-          const w = worldRef.current;
-          if (w) mapCanvasRef.current?.refetchRegion(0, 0, chunkToWorld(w.width_chunks), chunkToWorld(w.height_chunks));
-        }, AXO_REFETCH_DEBOUNCE_MS);
-      } else {
-        mapCanvasRef.current?.applyPatch(raw.patch);
-      }
+    // The patch is sampled at `patch.lod` (audit M3), so its *world* footprint is its pixel
+    // dimensions times that step — every consumer below that speaks world coordinates uses these.
+    const editW = raw.patch.width * raw.patch.lod;
+    const editH = raw.patch.height * raw.patch.lod;
+    // Audit C2: an oversized patch arrives as a rect with no pixels — re-fetch that region through
+    // the tile pipeline (bounded by the viewport) instead of blitting a world-sized image, which is
+    // exactly what the z-slice branch below has always done. Axo is deliberately *not* handled
+    // here: it needs the whole projection re-rendered either way, and its debounce (below) is what
+    // keeps a build gesture from queueing one full-world render per stamp.
+    if (viewModeRef.current === "zslice" || (raw.invalidate && renderModeRef.current !== "axo")) {
+      // z-slice has always re-fetched rather than blitted; an invalidated patch joins it.
+      mapCanvasRef.current?.refetchRegion(raw.patch.x, raw.patch.y, raw.patch.x + editW, raw.patch.y + editH);
+    } else if (renderModeRef.current === "axo") {
+      // Axo projection: flat patch positions don't match axo pixel positions, force full re-render.
+      // Read via ref: this runs from []-memoized undo/redo callbacks where `world` is stale.
+      //
+      // H2: debounced (trailing ~250ms) rather than firing per call — a 3D build gesture dispatches
+      // an edit every ~220ms while held, and without this each one queued its own full-world axo
+      // re-render (seconds of work on a large world) even though the user is looking at the 3D pane,
+      // not the axo one. A burst now collapses to one re-render, ~250ms after it quiets down.
+      if (axoRefetchTimerRef.current !== null) clearTimeout(axoRefetchTimerRef.current);
+      axoRefetchTimerRef.current = window.setTimeout(() => {
+        axoRefetchTimerRef.current = null;
+        const w = worldRef.current;
+        if (w) mapCanvasRef.current?.refetchRegion(0, 0, chunkToWorld(w.width_chunks), chunkToWorld(w.height_chunks));
+      }, AXO_REFETCH_DEBOUNCE_MS);
     } else {
-      // z-slice: invalidate and re-fetch the affected tile region
-      mapCanvasRef.current?.refetchRegion(
-        raw.patch.x, raw.patch.y,
-        raw.patch.x + raw.patch.width,
-        raw.patch.y + raw.patch.height,
-      );
+      mapCanvasRef.current?.applyPatch(raw.patch);
     }
     // Broadcast the edit's world bounds so slice slabs can skip refetching when their depth plane
     // wasn't touched. (Patch carries top-down X/Y extent; z always overlaps the full-height slabs.)
-    setLastEditBounds({ x: raw.patch.x, y: raw.patch.y, w: raw.patch.width, h: raw.patch.height });
+    setLastEditBounds({ x: raw.patch.x, y: raw.patch.y, w: editW, h: editH });
     setUndoDepth(raw.undo_depth);
     setRedoDepth(raw.redo_depth);
     setEditEpoch(e => e + 1);
@@ -1299,7 +1418,14 @@ function App() {
       const prefix = kind === "undo" ? "Undid: " : kind === "redo" ? "Redid: " : "";
       showToast(prefix + raw.operation);
     }
-  }, [showToast]);
+    // Audit C1 step 3: the edit applied, but its undo delta didn't fit the memory budget, so the
+    // history was dropped rather than parked in RAM for the session. Never silent — this is the
+    // one case where ⌘Z won't get the user's work back.
+    if (raw.undo_dropped) {
+      pushToast("This edit was too large to undo — undo history has been cleared. " +
+                "Raise the memory budget in Settings ▸ General to keep undo for edits this size.", "error");
+    }
+  }, [showToast, pushToast]);
 
   async function openFile() {
     const selected = await open({
@@ -1329,6 +1455,9 @@ function App() {
     setTool("pan");
     setUndoDepth(0);
     setRedoDepth(0);
+    // Full Map/Axo are gated behind requestRenderMode's byte-budget check (audit M9) — opening a
+    // huge world while one is still armed from a previous, smaller world must not bypass it.
+    setRenderMode("tiled");
     setViewMode("topdown");
     setZSliceZ(32);
     // Quad-view slab planes are world coordinates, so they must not survive a world swap — a
@@ -1396,8 +1525,6 @@ function App() {
       defaultPath: `${world.name}${suffix}.png`,
     });
     if (!savePath) return;
-    setExporting(true);
-    setExportProgress(null); // indeterminate — Rust renders + encodes the whole map in one call
     try {
       // Render + PNG-encode entirely in Rust. The old path built the full RGBA buffer, a binary
       // string, and a base64 string in the JS heap (≈4× the map size) before this IPC hop.
@@ -1410,10 +1537,7 @@ function App() {
         useTemplate: showTemplateOverlay && templateLoaded && viewMode === "topdown",
       });
     } catch (e) {
-      reportError(e);
-    } finally {
-      setExporting(false);
-      setExportProgress(null);
+      reportExportError(e);
     }
   }
 
@@ -1431,13 +1555,10 @@ function App() {
     const y2 = selection ? selection.y2 : chunkToWorld(world.height_chunks) - 1;
     const zMin = selection ? selection.z_min : 0;
     const zMax = selection ? selection.z_max : world.max_z;
-    setExportingObj(true);
     try {
       await invoke("export_obj", { path: savePath, x1, y1, x2, y2, zMin, zMax });
     } catch (e) {
-      reportError(e);
-    } finally {
-      setExportingObj(false);
+      reportExportError(e);
     }
   }
 
@@ -1455,13 +1576,10 @@ function App() {
     const y2 = selection ? selection.y2 : chunkToWorld(world.height_chunks) - 1;
     const zMin = selection ? selection.z_min : 0;
     const zMax = selection ? selection.z_max : world.max_z;
-    setExportingJson(true);
     try {
       await invoke("export_json", { path: savePath, x1, y1, x2, y2, zMin, zMax });
     } catch (e) {
-      reportError(e);
-    } finally {
-      setExportingJson(false);
+      reportExportError(e);
     }
   }
 
@@ -1495,15 +1613,10 @@ function App() {
     const y2 = selection ? selection.y2 : chunkToWorld(world.height_chunks) - 1;
     const zMin = selection ? selection.z_min : 0;
     const zMax = selection ? selection.z_max : world.max_z;
-    setExportingVox(true);
-    setVoxProgress({ phase: "Starting…", pct: 0 });
     try {
       await invoke("export_vox", { path: savePath, x1, y1, x2, y2, zMin, zMax });
     } catch (e) {
-      reportError(e);
-    } finally {
-      setExportingVox(false);
-      setVoxProgress(null);
+      reportExportError(e);
     }
   }; void _exportVox;
 
@@ -2238,6 +2351,28 @@ function App() {
     if (ok) setSourcePath(finalPath);
   }, [sourcePath, saveWorld, saveCompressed]);
 
+  // Upload sends `sourcePath` — the file on disk, not the in-memory world — so unsaved edits
+  // would silently upload a stale version. Gate opening the modal on the same `isDirty()` check
+  // the close/quit/open-new-world guards use, offering a Save first.
+  const requestShowUploadModal = useCallback(async (v: boolean) => {
+    if (!v) { setShowUploadModal(false); return; }
+    if (isDirty()) {
+      const ok = await ask(
+        "You have unsaved changes. Uploading now would send the last saved version, not your current edits. Save first?",
+        { title: "Unsaved changes", kind: "warning", okLabel: "Save", cancelLabel: "Cancel" },
+      );
+      if (!ok) return;
+      if (sourcePath) {
+        const saved = await saveWorld(sourcePath);
+        if (!saved) return;
+      } else {
+        await saveWorldAs();
+        if (isDirty()) return; // Save As was cancelled or failed
+      }
+    }
+    setShowUploadModal(true);
+  }, [isDirty, sourcePath, saveWorld, saveWorldAs]);
+
   // Timer-based autosave: every `autosaveIntervalMin` minutes (Settings → Editor; default 3), if a
   // world is loaded and has unsaved edits (editEpoch moved since the last autosave/save), snapshot
   // it to a sidecar file so a crash doesn't lose everything since the last manual save. Does not
@@ -2351,9 +2486,24 @@ function App() {
   const anyModalOpen =
     showAbout || showSettings || showWorldInfo || showWorldBrowser || showUploadModal ||
     showNewWorld || !!schematicInfo || showExpandModal || !!recoveryInfo || prefabNameModal ||
-    !!vmfExportBounds;
+    !!vmfExportBounds || tourOpen;
   const anyModalOpenRef = useRef(false);
   useEffect(() => { anyModalOpenRef.current = anyModalOpen; }, [anyModalOpen]);
+
+  // Auto-trigger the onboarding tour the first time a world becomes loaded (new/open/download/
+  // recent/recovery — this effect runs after the editor branch has mounted regardless of which
+  // path got us here, so it doesn't need a change to `applyLoadedWorld`'s call sites). Gated on a
+  // versioned settings flag: `tourVersion < TOUR_VERSION` covers both a fresh install (0 < N) and
+  // a re-onboard after `bump-version.sh` raises TOUR_VERSION. Written at *open* time, not
+  // completion — a user who immediately skips has still been offered it once.
+  useEffect(() => {
+    if (!world || tourCheckedRef.current || anyModalOpen) return;
+    tourCheckedRef.current = true;
+    if (loadSettings().tourVersion < TOUR_VERSION) {
+      saveSettings({ tourVersion: TOUR_VERSION });
+      setTourOpen(true);
+    }
+  }, [world, anyModalOpen]);
 
   // Live Ctrl/⌘-invert and Shift-temporary-smooth modifier tracking for sculpt strokes (read by
   // applySculpt on every stamp — see sculptModRef's declaration). Tracks the modifier keys' own
@@ -2487,6 +2637,13 @@ function App() {
         if (e.key === "w" || e.key === "W") { e.preventDefault(); setTool("wand"); return; }
         if (e.key === "k" || e.key === "K") { e.preventDefault(); setTool("lasso"); return; }
         if (e.key === "j" || e.key === "J") { e.preventDefault(); setTool("polyselect"); return; }
+        // Delete/Backspace clears the current selection (audit H9) — advertised in tooltips
+        // (Home's Delete button, the Quick Actions bar) since before there was ever a binding.
+        if ((e.key === "Delete" || e.key === "Backspace") && appToolRef.current === "select" && rawBoundsRef.current) {
+          e.preventDefault();
+          void deleteBlocksRef.current();
+          return;
+        }
         if (e.key === "i" || e.key === "I") {
           e.preventDefault();
           prevToolRef.current = appToolRef.current === "eyedropper" ? "pen" : appToolRef.current;
@@ -2664,13 +2821,26 @@ function App() {
     return () => { unlisten.then(f => f()); };
   }, []);
 
-  // VOX export progress event listener
+  // Shared long-operation progress (audit C6/M14). The backend emits one `long-op` stream for
+  // every long command: a `begin` event carrying `label`/`cancellable`, throttled progress events
+  // carrying only what changed, and a final `finished` event. Later events are merged onto the
+  // begin event rather than replacing it, so `label` and `cancellable` survive; a `finished` for
+  // an id we're no longer showing is ignored, so a late event can't blank the current operation.
   useEffect(() => {
-    const unlisten = listen<{ phase: string; pct: number }>("vox-progress", (e) => {
-      setVoxProgress(e.payload);
+    const unlisten = listen<LongOpState & { finished?: boolean }>("long-op", (e) => {
+      const p = e.payload;
+      setLongOp((prev) => {
+        if (p.finished) return prev && prev.id === p.id ? null : prev;
+        if (prev && prev.id === p.id) return { ...prev, ...p };
+        return p;
+      });
     });
     return () => { unlisten.then(f => f()); };
   }, []);
+
+  const cancelLongOp = useCallback(() => {
+    if (longOp) void invoke("cancel_long_op", { id: longOp.id });
+  }, [longOp]);
 
   async function runExpand() {
     const outPath = await save({ filters: [{ name: "Eden World", extensions: ["eden"] }], defaultPath: "world_expanded.eden" });
@@ -2812,6 +2982,11 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
       reportError(e);
     }
   }
+
+  // Stable ref so the keyboard handler (which reads rawBounds via rawBoundsRef, not state) can
+  // always call the latest deleteBlocks closure without re-registering on every selection change.
+  const deleteBlocksRef = useRef(deleteBlocks);
+  useEffect(() => { deleteBlocksRef.current = deleteBlocks; });
 
   /**
    * Cut = copy, then clear. Composed here rather than added as a Rust command because
@@ -3024,6 +3199,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
       onPolySelect={handlePolySelect}
       selectionMask={selectionMaskOverlay}
       spawnPos={spawnPos}
+      playerPos={playerPos}
       creatures={[]}
       signs={showSigns ? signs : NO_SIGNS}
       pasteElevationOffset={pasteElevationOffset}
@@ -3045,24 +3221,24 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
 
   // Status bar element — computed outside JSX so TypeScript narrows `world` properly
   const statusBarEl = world ? (
-    <div style={{
+    <div data-tour="status-bar" style={{
       position: "fixed", bottom: 0, left: 0, right: 0, height: STATUS_BAR_HEIGHT, zIndex: 150,
-      background: "linear-gradient(to bottom, #201208, #100f0d)",
-      borderTop: "1px solid #322d28",
+      background: TOPBAR_BG,
+      borderTop: `1px solid ${HAIRLINE}`,
       boxShadow: "inset 0 1px 0 rgba(255,255,255,.05)",
       display: "flex", alignItems: "center",
-      fontSize: 10, color: "#61584f", userSelect: "none",
+      fontSize: 10, color: TEXT_LABEL, userSelect: "none",
       fontVariantNumeric: "tabular-nums",
     }}>
-      <div style={{ padding: "0 10px", borderRight: "1px solid #322d28", whiteSpace: "nowrap", color: "#70665b" }}>
+      <div style={{ padding: "0 10px", borderRight: `1px solid ${HAIRLINE}`, whiteSpace: "nowrap", color: TEXT_LABEL }}>
         {tool === "brush" ? `Brush ${brushSize}px`
           : tool === "paste" && pasteMode !== "normal" ? `Paste (${pasteMode})`
           : TOOL_LABELS[tool]}
       </div>
-      <div style={{ padding: "0 10px", borderRight: "1px solid #322d28", color: "#4b443d", whiteSpace: "nowrap" }}>
+      <div style={{ padding: "0 10px", borderRight: `1px solid ${HAIRLINE}`, color: TEXT_DISABLED, whiteSpace: "nowrap" }}>
         {world.name}
       </div>
-      <div style={{ padding: "0 10px", borderRight: "1px solid #322d28", whiteSpace: "nowrap" }}>
+      <div style={{ padding: "0 10px", borderRight: `1px solid ${HAIRLINE}`, whiteSpace: "nowrap" }}>
         {chunkToWorld(world.width_chunks)}×{chunkToWorld(world.height_chunks)}
         <span
           title={
@@ -3070,7 +3246,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
             : classifyWorldFormat(world) === "newDawn256z" ? "New Dawn (256z) format — worlds up to 256 blocks tall"
             : "NewFormat256z — a 2026 game update's 256z variant, not the original New Dawn format"
           }
-          style={{ color: world.max_z === 255 ? "#6d28d9" : "#453f38", marginLeft: 6 }}
+          style={{ color: world.max_z === 255 ? ACCENT.violet : TEXT_DISABLED, marginLeft: 6 }}
         >
           {world.max_z === 255 ? "256z" : "64z"}
         </span>
@@ -3081,27 +3257,27 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
         const { cx1, cy1, cx2, cy2 } = materializeSelection;
         const nChunks = (cx2 - cx1 + 1) * (cy2 - cy1 + 1);
         return (
-          <div style={{ padding: "0 10px", borderRight: "1px solid #322d28", color: "#d97706", whiteSpace: "nowrap" }}>
+          <div style={{ padding: "0 10px", borderRight: `1px solid ${HAIRLINE}`, color: ACCENT.warm, whiteSpace: "nowrap" }}>
             ▦ {nChunks.toLocaleString()} chunk{nChunks === 1 ? "" : "s"} selected
           </div>
         );
       })()}
-      <div style={{ padding: "0 10px", borderRight: "1px solid #322d28", whiteSpace: "nowrap" }}>
-        ↩ <span style={{ color: "#4b443d" }}>{undoDepth}</span>
-        {"  "}↪ <span style={{ color: "#4b443d" }}>{redoDepth}</span>
+      <div style={{ padding: "0 10px", borderRight: `1px solid ${HAIRLINE}`, whiteSpace: "nowrap" }}>
+        ↩ <span style={{ color: TEXT_DISABLED }}>{undoDepth}</span>
+        {"  "}↪ <span style={{ color: TEXT_DISABLED }}>{redoDepth}</span>
       </div>
       {/* The filter's only other Clear button lives in the Selection tab, which disappears with the
           selection — deselect and the filter (which still gates deletes) became unclearable. */}
       {filterBlockType !== null && (
-        <div style={{ padding: "0 4px 0 8px", borderRight: "1px solid #322d28", whiteSpace: "nowrap",
+        <div style={{ padding: "0 4px 0 8px", borderRight: `1px solid ${HAIRLINE}`, whiteSpace: "nowrap",
           display: "flex", alignItems: "center", gap: 4,
-          color: "#f59e0b", background: "rgba(245,158,11,0.07)" }}>
+          color: ACCENT.warm, background: `rgba(${hexToRgbTriplet(ACCENT.warm)},0.10)` }}>
           <span>Filter: {blockDisplayName(filterBlockType)}{filterPaint !== null ? ` #${filterPaint}` : ""}{filterInvert ? " (inv)" : ""}</span>
           <button
             onClick={() => { setFilterBlockType(null); setFilterPaint(null); setFilterInvert(false); }}
             title="Clear the replace filter"
             aria-label="Clear replace filter"
-            style={{ background: "none", border: "none", cursor: "pointer", color: "#f59e0b",
+            style={{ background: "none", border: "none", cursor: "pointer", color: ACCENT.warm,
               minWidth: 18, minHeight: 18, display: "flex", alignItems: "center", justifyContent: "center",
               fontSize: 11, lineHeight: 1, opacity: 0.75 }}
             onMouseEnter={e => { e.currentTarget.style.opacity = "1"; }}
@@ -3110,17 +3286,17 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
         </div>
       )}
       {maskEnabled && maskBlockType !== null && (
-        <div style={{ padding: "0 8px", borderRight: "1px solid #322d28", whiteSpace: "nowrap",
-          color: "#a78bfa", background: "rgba(167,139,250,0.07)" }}>
+        <div style={{ padding: "0 8px", borderRight: `1px solid ${HAIRLINE}`, whiteSpace: "nowrap",
+          color: ACCENT.violet, background: `rgba(${hexToRgbTriplet(ACCENT.violet)},0.10)` }}>
           Mask: {blockDisplayName(maskBlockType)}{maskPaint !== null ? ` #${maskPaint}` : ""}
         </div>
       )}
       {/* Two-click paste is otherwise signalled only by the ghost turning green → amber, which is
           easy to miss — this is the "why did nothing paste?" moment. */}
       {tool === "paste" && (
-        <div style={{ padding: "0 8px", borderRight: "1px solid #322d28", whiteSpace: "nowrap",
-          color: lockedPastePos ? "#fcd34d" : "#86efac",
-          background: lockedPastePos ? "rgba(245,158,11,0.07)" : "rgba(34,197,94,0.06)" }}>
+        <div style={{ padding: "0 8px", borderRight: `1px solid ${HAIRLINE}`, whiteSpace: "nowrap",
+          color: lockedPastePos ? ACCENT.warm : ACCENT.green,
+          background: `rgba(${hexToRgbTriplet(lockedPastePos ? ACCENT.warm : ACCENT.green)},0.10)` }}>
           {lockedPastePos
             ? "Position locked — click again to stamp, Esc to unlock"
             : "Click the map to lock the paste position"}
@@ -3130,17 +3306,17 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           close-the-loop click, Grab's vertical drag, and the fact that a selection can be dragged
           and resized at all. */}
       {tool !== "paste" && TOOL_HINTS[tool] && (
-        <div style={{ padding: "0 8px", borderRight: "1px solid #322d28", whiteSpace: "nowrap", color: "#83786c" }}>
+        <div style={{ padding: "0 8px", borderRight: `1px solid ${HAIRLINE}`, whiteSpace: "nowrap", color: TEXT_DIM }}>
           {TOOL_HINTS[tool]}
         </div>
       )}
       {tool === "select" && rawBounds && (
-        <div style={{ padding: "0 8px", borderRight: "1px solid #322d28", whiteSpace: "nowrap", color: "#83786c" }}>
+        <div style={{ padding: "0 8px", borderRight: `1px solid ${HAIRLINE}`, whiteSpace: "nowrap", color: TEXT_DIM }}>
           Drag an edge grip to resize · drag inside to move {moveWithContents ? "the blocks" : "the box only"} · arrows nudge
         </div>
       )}
       <div style={{ flex: 1 }} />
-      <div style={{ padding: "0 10px", borderLeft: "1px solid #322d28", color: EDEN_TEAL_READABLE, opacity: 0.6, whiteSpace: "nowrap" }}>
+      <div style={{ padding: "0 10px", borderLeft: `1px solid ${HAIRLINE}`, color: EDEN_TEAL_READABLE, opacity: 0.6, whiteSpace: "nowrap" }}>
         <FpsCounter />
       </div>
     </div>
@@ -3227,7 +3403,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
             gridTemplateColumns: quadCols, gridTemplateRows: quadRows,
             gap: 2, background: "#0a0f1e",
           }}>
-            <div style={{ position: "relative", minWidth: 0, minHeight: 0, overflow: "hidden", outline: "1px solid #312c28" }}>
+            <div data-tour={showSlicePanels ? "map" : undefined} style={{ position: "relative", minWidth: 0, minHeight: 0, overflow: "hidden", outline: "1px solid #312c28" }}>
               {showSlicePanels && mapPaneEl}
               {maxBtn("map")}
             </div>
@@ -3426,7 +3602,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           // region instead of under it. MapCanvas's ResizeObserver watches the canvas element
           // itself, so shrinking this wrapper's width is a resize, not a rewrite (see Sidebar.tsx
           // / CLAUDE.md's docked-sidebar layout note).
-          <div style={{ position: "absolute", top: 0, left: 0, bottom: 0, right: sidebarInsetPx }}>
+          <div data-tour="map" style={{ position: "absolute", top: 0, left: 0, bottom: 0, right: sidebarInsetPx }}>
             {mapPaneEl}
           </div>
         )}
@@ -3586,6 +3762,8 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           onToggleSidebar={() => { setSidebarOpen(v => { saveSettings({ sidebarOpen: !v }); return !v; }); }}
           showQuickActions={showQuickActions}
           onToggleQuickActions={() => { setShowQuickActions(v => { saveSettings({ showQuickActions: !v }); return !v; }); }}
+          leftToolbarOpen={leftToolbarOpen}
+          onToggleLeftToolbar={() => { setLeftToolbarOpen(v => { saveSettings({ leftToolbarOpen: !v }); return !v; }); }}
           // 3D ▸ Camera. Display/commit split: the tab holds the drag value, App gets the commit.
           flySpeed={flySpeed}
           commitFlySpeed={(n) => { setFlySpeed(n); saveSettingsDebounced({ flySpeed: n }); }}
@@ -3663,9 +3841,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           pasteAt={pasteAt}
           sourcePath={sourcePath}
           saving={saving}
-          exporting={exporting}
-          exportingObj={exportingObj}
-          exportingJson={exportingJson}
+          longOpKind={longOp?.kind ?? null}
           saveCompressed={saveCompressed}
           setSaveCompressed={setSaveCompressed}
           backupCompressed={backupCompressed}
@@ -3698,13 +3874,14 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           onNudgeSelection={nudgeSelection}
           setShowNewWorld={setShowNewWorld}
           setShowWorldBrowser={setShowWorldBrowser}
-          setShowUploadModal={setShowUploadModal}
+          setShowUploadModal={requestShowUploadModal}
           setShowExpandModal={setShowExpandModal}
           setExpandResult={setExpandResult}
           closeWorld={closeWorld}
           setShowHelp={setShowHelp}
           setShowAbout={setShowAbout}
           setShowSettings={setShowSettings}
+          startTour={startTour}
           onSavePrefab={openPrefabNameModal}
           onSavePrefabAs={savePrefabAs}
           extrudeCount={extrudeCount}
@@ -3743,6 +3920,16 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
         />
         </ErrorBoundary>
 
+
+        {/* Floating tool palette — Pan/Select/Draw quick access, see LeftToolbar.tsx. Sits below the
+            ribbon and, when it's showing, the Quick Actions bar. */}
+        {leftToolbarOpen && (
+          <LeftToolbar
+            tool={tool}
+            setTool={setTool}
+            top={effectiveRibbonHeight + (showQuickActions ? QUICK_ACTIONS_BAR_H : 0) + SPACE.sm}
+          />
+        )}
 
         {/* Docked right sidebar: Inspector / Prefabs / Elevation / History tabs — see Sidebar.tsx. */}
         <Sidebar
@@ -3837,66 +4024,14 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           </Modal>
         )}
 
-        {(exporting || exportingObj || exportingJson || exportingVox || loading) && (
-          <div style={{
-            position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center",
-            background: "rgba(0,0,0,0.45)", zIndex: 200, pointerEvents: "none",
-          }}>
-            <div style={{
-              background: "rgba(31,28,26,0.95)", border: "1px solid #4b443d",
-              borderRadius: 10, padding: "20px 32px", minWidth: 220, textAlign: "center",
-            }}>
-              {exporting ? (
-                <>
-                  <div style={{ color: "#ebe9e7", fontSize: 14, marginBottom: 12 }}>
-                    Exporting PNG… {exportProgress !== null ? `${Math.round(exportProgress * 100)}%` : ""}
-                  </div>
-                  <div style={{ background: "#312c28", borderRadius: 4, height: 6, overflow: "hidden", position: "relative" }}>
-                    {exportProgress !== null ? (
-                      <div style={{
-                        background: "#f59e0b", height: "100%", borderRadius: 4,
-                        width: `${Math.round(exportProgress * 100)}%`,
-                        transition: "width 0.1s ease",
-                      }} />
-                    ) : (
-                      <div style={{
-                        position: "absolute", inset: 0, width: "30%",
-                        background: "linear-gradient(90deg, transparent, #f59e0b, transparent)",
-                        animation: "eden-shimmer 1.1s ease-in-out infinite",
-                      }} />
-                    )}
-                  </div>
-                </>
-              ) : exportingObj ? (
-                <div style={{ color: "#ebe9e7", fontSize: 14 }}>Exporting OBJ…</div>
-              ) : exportingJson ? (
-                <div style={{ color: "#ebe9e7", fontSize: 14 }}>Exporting JSON…</div>
-              ) : exportingVox ? (
-                <>
-                  <div style={{ color: "#ebe9e7", fontSize: 14, marginBottom: 8 }}>
-                    Exporting VOX… {voxProgress ? `${voxProgress.pct}%` : ""}
-                  </div>
-                  {voxProgress && (
-                    <div style={{ color: "#afa69d", fontSize: 12, marginBottom: 8 }}>
-                      {voxProgress.phase}
-                    </div>
-                  )}
-                  <div style={{ background: "#312c28", borderRadius: 4, height: 6, overflow: "hidden" }}>
-                    <div style={{
-                      background: "#f59e0b", height: "100%", borderRadius: 4,
-                      width: `${voxProgress?.pct ?? 0}%`,
-                      transition: "width 0.15s ease",
-                    }} />
-                  </div>
-                </>
-              ) : (
-                <div style={{ color: "#ebe9e7", fontSize: 14 }}>Loading world…</div>
-              )}
-            </div>
-          </div>
+        {(longOp || loading) && (
+          <LongOpOverlay op={longOp} onCancel={cancelLongOp} />
         )}
 
-        {showHelp && <HelpModal onClose={() => setShowHelp(false)} />}
+        {showHelp && <HelpModal onClose={() => setShowHelp(false)} onStartTour={startTour} />}
+        {tourOpen && (
+          <TourOverlay steps={TOUR_STEPS} ctx={tourCtx} onClose={() => setTourOpen(false)} />
+        )}
         {showAbout && <AboutModal version={appVersion} onClose={() => setShowAbout(false)} />}
         {showWorldInfo && <WorldInfoModal onClose={() => setShowWorldInfo(false)} />}
         {recoveryInfo && (
@@ -4140,11 +4275,13 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           );
         })()}
 
-        {/* Quick Actions — floating bar under the ribbon. ⚠️ Must stay inside the `world` branch:
-            App has a second return for the splash screen, where this would never render. */}
+        {/* Quick Actions — docked flush under the ribbon, always mounted with every control visible
+            (dimmed when inactive) rather than appearing/disappearing with the selection/clipboard.
+            ⚠️ Must stay inside the `world` branch: App has a second return for the splash screen,
+            where this would never render. */}
         {showQuickActions && (
           <QuickActionsBar
-            top={effectiveRibbonHeight + 8}
+            top={effectiveRibbonHeight}
             rightInset={sidebarInsetPx}
             rawBounds={rawBounds}
             clipboard={clipboard}
@@ -4169,7 +4306,6 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
               setPasteElevationOffset(0);
               setTool(t => (t === "paste" ? "pan" : t));
             }}
-            onMore={() => ribbonTabSetterRef.current?.("selection")}
           />
         )}
 

@@ -391,6 +391,9 @@ interface Props {
   selectionMask?: { x1: number; y1: number; x2: number; y2: number; bits: Uint8Array } | null;
   /** Spawn/home position in editor pixel coords — drawn as a marker on the map. */
   spawnPos?: { px: number; py: number } | null;
+  /** Player start position in editor pixel coords — drawn as an orange marker, distinct from the
+   *  teal home marker above (they're two independent header fields; see "Set Point" in CLAUDE.md). */
+  playerPos?: { px: number; py: number } | null;
   /** Creature list from get_creatures() — drawn as coloured dots when non-empty. */
   creatures?: { type_id: number; color: number; x: number; y: number }[];
   /** Sign list from get_signs() (256z-format plan, Phase 4) — drawn as small markers when
@@ -436,7 +439,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     renderMode, axoSkew = 0.2, lockedPastePos = null,
     drawConfig, onDrawStroke, onSculptStroke, onCancelStroke, drawZOverride = null,
     extrudePreview = null, lastPasteDelta = null, onCursorMove, onMagicWand, onLassoSelect, onPolySelect, selectionMask = null,
-    spawnPos = null, creatures = [], signs = [],
+    spawnPos = null, playerPos = null, creatures = [], signs = [],
     pasteElevationOffset = 0, onEyedropper, onPoolFillPick, sliceLines = null,
     cameraPos3d = null, onSetCamera3d,
     showTemplateOverlay = false, onMapContextMenu, onSelectDragUpdate, onMoveSelection, moveWithContents = false,
@@ -464,6 +467,17 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   const queueRef   = useRef<TileJob[]>([]);
   const drainRef      = useRef<() => void>(() => {});
   const ensureTilesRef = useRef<() => void>(() => {});
+
+  // Audit M3: the backend renders each edit patch at the map's current LOD, which it learns from
+  // here. Mirrored (not sent per edit) for the same reason the cutaway cap is — otherwise all 11
+  // editing commands would grow a `lod` argument. Fired only on an actual change: LODs are powers
+  // of two, so a continuous zoom crosses one every octave, not every frame.
+  const reportedLodRef = useRef<number | null>(null);
+  const reportViewLod = useCallback((lod: number) => {
+    if (reportedLodRef.current === lod) return;
+    reportedLodRef.current = lod;
+    invoke("set_view_lod", { lod }).catch(() => { reportedLodRef.current = null; });
+  }, []);
 
   // Full-canvas state (used in "full" and "axo" modes)
   const renderModeRef     = useRef(renderMode);
@@ -535,6 +549,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   const onLassoSelectRef    = useRef(onLassoSelect);
   const onPolySelectRef     = useRef(onPolySelect);
   const spawnPosRef         = useRef(spawnPos);
+  const playerPosRef        = useRef(playerPos);
   const creaturesRef        = useRef(creatures);
   const signsRef            = useRef(signs);
   const sliceLinesRef       = useRef(sliceLines);
@@ -623,6 +638,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   useEffect(() => { onPolySelectRef.current    = onPolySelect;        }, [onPolySelect]);
   useEffect(() => { selectionMaskRef.current   = selectionMask;       }, [selectionMask]);
   useEffect(() => { spawnPosRef.current        = spawnPos;            }, [spawnPos]);
+  useEffect(() => { playerPosRef.current       = playerPos;           }, [playerPos]);
   useEffect(() => { creaturesRef.current       = creatures;           }, [creatures]);
   useEffect(() => { signsRef.current           = signs;               }, [signs]);
   useEffect(() => { sliceLinesRef.current      = sliceLines;           }, [sliceLines]);
@@ -1024,6 +1040,34 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
           ctx.textAlign  = "center";
           ctx.textBaseline = "middle";
           ctx.fillText("⌂", sx, sy + 0.5);
+          ctx.textAlign    = "left";
+          ctx.textBaseline = "alphabetic";
+        }
+        ctx.restore();
+      }
+    }
+
+    // Player start marker — orange pin, distinct from the teal home marker above
+    {
+      const pp = playerPosRef.current;
+      if (pp) {
+        const sx = Math.round(pp.px * scale + vx);
+        const sy = Math.round(pp.py * scale + vy);
+        const r  = Math.max(4, Math.min(10, scale * 1.5));
+        ctx.save();
+        ctx.beginPath();
+        ctx.arc(sx, sy, r, 0, Math.PI * 2);
+        ctx.fillStyle   = "rgba(249,115,22,0.85)";
+        ctx.fill();
+        ctx.strokeStyle = "#fff";
+        ctx.lineWidth   = 1.5;
+        ctx.stroke();
+        if (scale >= 3) {
+          ctx.fillStyle  = "#fff";
+          ctx.font       = `bold ${Math.round(r * 1.1)}px sans-serif`;
+          ctx.textAlign  = "center";
+          ctx.textBaseline = "middle";
+          ctx.fillText("▶", sx, sy + 0.5);
           ctx.textAlign    = "left";
           ctx.textBaseline = "alphabetic";
         }
@@ -1573,6 +1617,9 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
 
   const ensureTiles = useCallback(() => {
     if (renderModeRef.current === "full" || renderModeRef.current === "axo") {
+      // Both of these canvases are 1:1 with world blocks — an edit patch sampled coarser than that
+      // would have to be upscaled into them, so report full resolution while they're up.
+      reportViewLod(1);
       if (!fullCanvasRef.current) loadFullCanvas();
       draw();
       return;
@@ -1587,6 +1634,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     // One tile spans `span` world blocks and always renders TILE×TILE pixels (audit H6), so the
     // window below stays ~the same tile count no matter how far out the view is zoomed.
     const lod = lodForScale(scale);
+    reportViewLod(lod);
     const span = TILE * lod;
 
     const tx0 = Math.max(0, Math.floor(Math.max(0, -vx) / scale / span) - TILE_BUFFER);
@@ -1687,55 +1735,73 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
         loadFullCanvas();
         return;
       }
+      // A patch is `patch.width × patch.height` *sampled* pixels covering `×patch.lod` that many
+      // world blocks (audit M3 — edit patches are rendered at the view's own LOD now, not always
+      // at full resolution).
+      const pw = patch.width * patch.lod;
+      const ph = patch.height * patch.lod;
+      // One nearest-neighbour source canvas, built once and reused across every tile the patch
+      // touches. `patchCanvas` is in *patch pixels*; the draws below scale it into tile pixels.
+      let patchCanvas: HTMLCanvasElement | null = null;
+      const sourceCanvas = () => {
+        if (!patchCanvas) {
+          patchCanvas = document.createElement("canvas");
+          patchCanvas.width = patch.width;
+          patchCanvas.height = patch.height;
+          const pctx = patchCanvas.getContext("2d")!;
+          const pimg = pctx.createImageData(patch.width, patch.height);
+          pimg.data.set(patch.pixels);
+          pctx.putImageData(pimg, 0, 0);
+        }
+        return patchCanvas;
+      };
       if (renderModeRef.current === "full") {
         const fc = fullCanvasRef.current;
         if (!fc) return;
         const fctx = fc.getContext("2d")!;
-        const img = fctx.createImageData(patch.width, patch.height);
-        img.data.set(patch.pixels);
-        fctx.putImageData(img, patch.x, patch.y);
+        if (patch.lod === 1) {
+          const img = fctx.createImageData(patch.width, patch.height);
+          img.data.set(patch.pixels);
+          fctx.putImageData(img, patch.x, patch.y);
+        } else {
+          // The full canvas is 1:1 with world blocks, so a sampled patch has to be upscaled into
+          // it. MapCanvas reports lod 1 to the backend in this mode, so this is only reachable if
+          // the mode changed between the edit dispatching and its result landing.
+          fctx.imageSmoothingEnabled = false;
+          fctx.drawImage(sourceCanvas(), patch.x, patch.y, pw, ph);
+        }
         draw();
         return;
       }
-      // Edit patches are always full-resolution (lod 1). LOD tiles can't take a 1:1 putImageData,
-      // so they get the patch drawn through a nearest-neighbour downscale instead — visually the
-      // same sampling the backend would do at that level, and it keeps the coarse levels live
-      // during an edit rather than blanking them until a refetch lands.
-      let patchCanvas: HTMLCanvasElement | null = null;
       for (const [key, tc] of tileCacheRef.current) {
         const { lod, wx, wy, span } = parseTileKey(key);
-        if (wx >= patch.x + patch.width || wy >= patch.y + patch.height ||
-            wx + span <= patch.x || wy + span <= patch.y) continue;
+        if (wx >= patch.x + pw || wy >= patch.y + ph || wx + span <= patch.x || wy + span <= patch.y) continue;
+        // A tile *finer* than the patch can't be repaired from it — upscaling coarse samples into
+        // it would bake wrong pixels into a level the user will see again the moment they zoom in.
+        // Drop it instead; `ensureTiles` re-fetches it at full detail when it's next visible.
+        if (lod < patch.lod) { tileCacheRef.current.delete(key); continue; }
         const ctx = tc.getContext("2d")!;
-        if (lod === 1) {
+        if (lod === patch.lod) {
+          // Same sampling grid (the backend floors the patch origin to a multiple of its lod), so
+          // this is an exact 1:1 blit in tile pixels.
           const ix0 = Math.max(patch.x, wx);
           const iy0 = Math.max(patch.y, wy);
-          const ix1 = Math.min(patch.x + patch.width,  wx + tc.width);
-          const iy1 = Math.min(patch.y + patch.height, wy + tc.height);
+          const ix1 = Math.min(patch.x + pw, wx + tc.width * lod);
+          const iy1 = Math.min(patch.y + ph, wy + tc.height * lod);
           if (ix0 >= ix1 || iy0 >= iy1) continue;
-          const iw  = ix1 - ix0;
-          const ih  = iy1 - iy0;
+          const iw = (ix1 - ix0) / lod;
+          const ih = (iy1 - iy0) / lod;
           const sub = ctx.createImageData(iw, ih);
           for (let row = 0; row < ih; row++) {
-            const si = ((iy0 - patch.y + row) * patch.width + (ix0 - patch.x)) * 4;
+            const si = (((iy0 - patch.y) / lod + row) * patch.width + (ix0 - patch.x) / lod) * 4;
             sub.data.set(patch.pixels.subarray(si, si + iw * 4), row * iw * 4);
           }
-          ctx.putImageData(sub, ix0 - wx, iy0 - wy);
+          ctx.putImageData(sub, (ix0 - wx) / lod, (iy0 - wy) / lod);
         } else {
-          if (!patchCanvas) {
-            patchCanvas = document.createElement("canvas");
-            patchCanvas.width = patch.width;
-            patchCanvas.height = patch.height;
-            const pimg = patchCanvas.getContext("2d")!.createImageData(patch.width, patch.height);
-            pimg.data.set(patch.pixels);
-            patchCanvas.getContext("2d")!.putImageData(pimg, 0, 0);
-          }
+          // Coarser tile than the patch: nearest-neighbour downscale, so the coarse levels stay
+          // live during an edit instead of blanking until a refetch lands.
           ctx.imageSmoothingEnabled = false;
-          ctx.drawImage(
-            patchCanvas,
-            (patch.x - wx) / lod, (patch.y - wy) / lod,
-            patch.width / lod, patch.height / lod,
-          );
+          ctx.drawImage(sourceCanvas(), (patch.x - wx) / lod, (patch.y - wy) / lod, pw / lod, ph / lod);
         }
       }
       draw();
@@ -1887,6 +1953,10 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     pendingRef.current.clear();
     queueRef.current = [];
     fullCanvasRef.current = null;
+    // `load_world`/`close_world` reset the backend's mirrored LOD to 1, so forget what we last
+    // reported — otherwise the next `ensureTiles` would see no change and leave the backend
+    // believing the map is at full resolution for the rest of the session.
+    reportedLodRef.current = null;
     ensureTiles();
   }, [viewMode, zSliceZ, viewCapZ, worldEpoch, ensureTiles]);
 

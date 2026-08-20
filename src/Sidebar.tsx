@@ -1,17 +1,42 @@
+/**
+ * The docked right-edge sidebar — Inspector / Prefabs / History.
+ *
+ * Restyled onto `ribbon/tokens` + `ribbon/icons` (audit H10 step 3). It used to be the app's third
+ * competing visual system: warm-brown `glassPanel`/`glassTab`, text-only tabs, and its own eight
+ * hard-coded greys, sitting flush against a cool-slate ribbon. Nothing about the layout changed —
+ * same widths, same drag-resize, same collapse rail — only the material, the type tones and the
+ * tab glyphs.
+ */
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { EDEN_TEAL_READABLE, glassPanel, glassTab } from "./designTokens";
+import { Icon, type IconName } from "./ribbon/icons";
+import {
+  ACCENT, BORDER, FONT, HAIRLINE, RADIUS, SPACE, SURFACE, TEXT, TEXT_DIM, TEXT_DISABLED,
+  TEXT_LABEL, btnBase, hexToRgbTriplet,
+} from "./ribbon/tokens";
 import SelectionInspector from "./SelectionInspector";
 import PrefabLibraryPanel from "./PrefabLibraryPanel";
 import type { SelectionInfo, ClipboardInfo, SignInfo } from "./types";
 
 export type SidebarTab = "inspector" | "prefabs" | "history";
 
-const TABS: { id: SidebarTab; label: string }[] = [
-  { id: "inspector", label: "Inspector" },
-  { id: "prefabs", label: "Prefabs" },
-  { id: "history", label: "History" },
+const TABS: { id: SidebarTab; label: string; icon: IconName }[] = [
+  // Inspector reads out the *selection*, so it carries the selection glyph rather than a generic
+  // "info" one — same command, same icon, wherever it appears.
+  { id: "inspector", label: "Inspector", icon: "select" },
+  { id: "prefabs", label: "Prefabs", icon: "prefabLibrary" },
+  { id: "history", label: "History", icon: "history" },
 ];
+
+/** Section heading shared by the History and Signs lists — the ribbon's `FieldLabel` treatment. */
+function SectionLabel({ children }: { children: React.ReactNode }) {
+  return (
+    <span style={{
+      color: TEXT_LABEL, fontWeight: 700, fontSize: FONT.label, letterSpacing: "0.08em",
+      userSelect: "none",
+    }}>{children}</span>
+  );
+}
 
 const MIN_WIDTH = 200;
 const MAX_WIDTH = 420;
@@ -36,19 +61,20 @@ function HistoryTab({ editEpoch, worldEpoch }: { editEpoch: number; worldEpoch: 
   }, [editEpoch, worldEpoch]);
 
   const rowStyle = (highlight: boolean): React.CSSProperties => ({
-    padding: "3px 6px", borderRadius: 4, fontSize: 11,
-    color: highlight ? EDEN_TEAL_READABLE : "#afa69d",
-    background: highlight ? "rgba(0,164,173,0.14)" : "transparent",
+    padding: "3px 6px", borderRadius: RADIUS.md, fontSize: FONT.body,
+    color: highlight ? TEXT : TEXT_DIM,
+    background: highlight ? `rgba(${hexToRgbTriplet(ACCENT.primary)},.16)` : "transparent",
+    boxShadow: highlight ? `inset 0 0 0 1px rgba(${hexToRgbTriplet(ACCENT.primary)},.35)` : undefined,
   });
 
-  if (!info) return <div style={{ color: "#61584f", fontSize: 11 }}>Loading…</div>;
+  if (!info) return <div style={{ color: TEXT_DISABLED, fontSize: FONT.body }}>Loading…</div>;
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 10, fontSize: 11 }}>
+    <div style={{ display: "flex", flexDirection: "column", gap: SPACE.lg + 2, fontSize: FONT.body }}>
       <div>
-        <div style={{ color: "#83786c", fontWeight: 700, fontSize: 10, letterSpacing: "0.08em", marginBottom: 4 }}>UNDO STACK</div>
+        <div style={{ marginBottom: SPACE.sm }}><SectionLabel>UNDO STACK</SectionLabel></div>
         {info.undo.length === 0 ? (
-          <div style={{ color: "#61584f" }}>Nothing to undo.</div>
+          <div style={{ color: TEXT_DISABLED }}>Nothing to undo.</div>
         ) : (
           <div style={{ display: "flex", flexDirection: "column-reverse", gap: 1 }}>
             {info.undo.map((label, i) => (
@@ -58,9 +84,9 @@ function HistoryTab({ editEpoch, worldEpoch }: { editEpoch: number; worldEpoch: 
         )}
       </div>
       <div>
-        <div style={{ color: "#83786c", fontWeight: 700, fontSize: 10, letterSpacing: "0.08em", marginBottom: 4 }}>REDO STACK</div>
+        <div style={{ marginBottom: SPACE.sm }}><SectionLabel>REDO STACK</SectionLabel></div>
         {info.redo.length === 0 ? (
-          <div style={{ color: "#61584f" }}>Nothing to redo.</div>
+          <div style={{ color: TEXT_DISABLED }}>Nothing to redo.</div>
         ) : (
           <div style={{ display: "flex", flexDirection: "column", gap: 1 }}>
             {info.redo.map((label, i) => (
@@ -78,37 +104,54 @@ function HistoryTab({ editEpoch, worldEpoch }: { editEpoch: number; worldEpoch: 
  *  CLAUDE.md's "File Format" section), shown as a raw number rather than decoded further.
  *  Collapsible like the Inspector tab's other sections (elevation view — `SelectionInspector`),
  *  same ▼/▶ header idiom, open by default. */
+const SIGNS_COLLAPSED_COUNT = 3;
+
 function SignsList({ signs, onSignClick }: { signs: SignInfo[]; onSignClick?: (s: SignInfo) => void }) {
   const [open, setOpen] = useState(true);
+  const [showAll, setShowAll] = useState(false);
   if (signs.length === 0) return null;
+  const visible = showAll ? signs : signs.slice(0, SIGNS_COLLAPSED_COUNT);
+  const hiddenCount = signs.length - visible.length;
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 11, marginBottom: 10 }}>
+    <div style={{ display: "flex", flexDirection: "column", gap: SPACE.sm, fontSize: FONT.body, marginBottom: SPACE.lg + 2 }}>
       <div
         onClick={() => setOpen(v => !v)}
-        style={{ display: "flex", alignItems: "center", gap: 5, cursor: "pointer", userSelect: "none" }}
+        style={{ display: "flex", alignItems: "center", gap: SPACE.sm, cursor: "pointer", userSelect: "none" }}
       >
-        <span style={{ color: "#61584f", fontSize: 9 }}>{open ? "▼" : "▶"}</span>
-        <span style={{ color: "#83786c", fontWeight: 700, fontSize: 10, letterSpacing: "0.08em" }}>
-          SIGNS ({signs.length})
-        </span>
+        <Icon name={open ? "expandBar" : "right"} size={FONT.body} tone="default" />
+        <SectionLabel>SIGNS ({signs.length})</SectionLabel>
       </div>
-      {open && signs.map((s, i) => (
-        <div key={i}
-          onClick={onSignClick ? () => onSignClick(s) : undefined}
-          title={onSignClick ? "Click to centre the map on this sign" : undefined}
-          style={{
-            padding: "4px 6px", borderRadius: 4, background: "rgba(232,192,74,0.10)",
-            border: "1px solid rgba(232,192,74,0.25)",
-            cursor: onSignClick ? "pointer" : "default",
-          }}>
-          <div style={{ color: "#ebe9e7", whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
-            {s.text || <span style={{ color: "#61584f", fontStyle: "italic" }}>(empty)</span>}
+      {open && <>
+        {visible.map((s, i) => (
+          <div key={i}
+            onClick={onSignClick ? () => onSignClick(s) : undefined}
+            title={onSignClick ? "Click to centre the map on this sign" : undefined}
+            style={{
+              padding: "4px 6px", borderRadius: RADIUS.md,
+              background: `rgba(${hexToRgbTriplet(ACCENT.warm)},.10)`,
+              boxShadow: `inset 0 0 0 1px rgba(${hexToRgbTriplet(ACCENT.warm)},.30)`,
+              cursor: onSignClick ? "pointer" : "default",
+            }}>
+            <div style={{ color: TEXT, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
+              {s.text || <span style={{ color: TEXT_DISABLED, fontStyle: "italic" }}>(empty)</span>}
+            </div>
+            <div style={{ color: TEXT_LABEL, fontSize: FONT.label, marginTop: 2 }}>
+              ({Math.round(s.x)}, {Math.round(s.y)}, {s.z}) · facing {s.facing}
+            </div>
           </div>
-          <div style={{ color: "#83786c", fontSize: 10, marginTop: 2 }}>
-            ({Math.round(s.x)}, {Math.round(s.y)}, {s.z}) · facing {s.facing}
+        ))}
+        {signs.length > SIGNS_COLLAPSED_COUNT && (
+          <div
+            onClick={() => setShowAll(v => !v)}
+            style={{
+              textAlign: "center", padding: "3px 0", cursor: "pointer", userSelect: "none",
+              color: TEXT_LABEL, fontSize: FONT.label,
+            }}
+          >
+            {showAll ? "Show less" : `Show ${hiddenCount} more…`}
           </div>
-        </div>
-      ))}
+        )}
+      </>}
     </div>
   );
 }
@@ -182,15 +225,18 @@ export default function Sidebar(p: SidebarProps) {
   if (!p.open) {
     return (
       <div
-        style={glassPanel({
+        style={{
           position: "fixed", top: p.topPx, right: 0, bottom: p.bottomPx, width: COLLAPSED_RAIL,
           zIndex: 120, display: "flex", flexDirection: "column", alignItems: "center",
-          paddingTop: 8, cursor: "pointer",
-        })}
+          paddingTop: SPACE.lg, cursor: "pointer",
+          background: SURFACE.body,
+          boxShadow: `inset 1px 0 0 ${BORDER.outline}, inset 2px 0 0 ${BORDER.bevel}`,
+          color: TEXT_DIM,
+        }}
         onClick={() => p.onOpenChange(true)}
         title="Open sidebar"
       >
-        <span style={{ color: "#83786c", fontSize: 13 }}>◀</span>
+        <Icon name="left" size={14} tone="default" />
       </div>
     );
   }
@@ -198,11 +244,12 @@ export default function Sidebar(p: SidebarProps) {
   const contentWidth = p.width - PAD * 2;
 
   return (
-    <div style={glassPanel({
+    <div data-tour="sidebar" style={{
       position: "fixed", top: p.topPx, right: 0, bottom: p.bottomPx, width: p.width,
       zIndex: 120, display: "flex", flexDirection: "column",
-      boxShadow: "inset 0 1px 0 rgba(255,255,255,.06), inset 0 0 30px rgba(0,0,0,.35), -6px 0 20px rgba(0,0,0,.4)",
-    })}>
+      background: SURFACE.body, color: TEXT, fontSize: FONT.body,
+      boxShadow: `inset 1px 0 0 ${BORDER.outline}, inset 2px 0 0 ${BORDER.bevel}, -6px 0 20px rgba(0,0,0,.4)`,
+    }}>
       {/* Left-edge drag-resize handle */}
       <div
         title="Drag to resize sidebar"
@@ -216,31 +263,48 @@ export default function Sidebar(p: SidebarProps) {
         }}
       />
 
-      <div style={{ display: "flex", alignItems: "stretch", borderBottom: "1px solid rgba(255,255,255,0.08)" }}>
-        {TABS.map((t) => (
-          <button
-            key={t.id}
-            onClick={() => p.onTabChange(t.id)}
-            style={{
-              ...glassTab(p.tab === t.id),
-              flex: 1, padding: "7px 0", fontSize: 11, color: p.tab === t.id ? EDEN_TEAL_READABLE : "#83786c",
-              fontWeight: p.tab === t.id ? 700 : 400,
-            }}
-          >
-            {t.label}
-          </button>
-        ))}
+      {/* Tab strip. `role="tablist"` + the ribbon's own armed treatment (accent underline, lit
+          icon) rather than the old bespoke `glassTab`, so a selected sidebar tab reads the same
+          way a selected ribbon tab does. */}
+      <div className="eden-ribbon" role="tablist" aria-label="Sidebar panels" style={{
+        display: "flex", alignItems: "stretch", background: SURFACE.topbar,
+        boxShadow: `inset 0 -1px 0 ${HAIRLINE}`,
+      }}>
+        {TABS.map((t) => {
+          const on = p.tab === t.id;
+          return (
+            <button
+              key={t.id} className="rbn-tab" type="button" role="tab" aria-selected={on}
+              data-active={on ? "true" : undefined} data-tab={t.id}
+              onClick={() => p.onTabChange(t.id)}
+              title={t.label}
+              style={btnBase({
+                flex: 1, height: 28, padding: 0, borderRadius: 0, background: "none",
+                boxShadow: on ? `inset 0 -2px 0 ${ACCENT.primary}` : "none",
+                display: "flex", alignItems: "center", justifyContent: "center", gap: SPACE.sm,
+                color: on ? TEXT : TEXT_LABEL, fontWeight: on ? 700 : 400, fontSize: FONT.body,
+              })}
+            >
+              <Icon name={t.icon} size={13} tone={on ? "accent" : "default"} />
+              {t.label}
+            </button>
+          );
+        })}
         <button
+          className="rbn-btn" type="button"
           onClick={() => p.onOpenChange(false)}
-          title="Collapse sidebar"
-          style={{
-            background: "none", border: "none", color: "#61584f", fontSize: 12, cursor: "pointer",
-            padding: "0 8px",
-          }}
-        >▶</button>
+          title="Collapse sidebar" aria-label="Collapse sidebar"
+          style={btnBase({
+            width: 26, height: 28, padding: 0, borderRadius: 0, background: "none",
+            boxShadow: "none", display: "flex", alignItems: "center", justifyContent: "center",
+            color: TEXT_LABEL,
+          })}
+        >
+          <Icon name="right" size={13} tone="default" />
+        </button>
       </div>
 
-      <div style={{ flex: 1, minHeight: 0, overflowY: "auto", padding: PAD, color: "#ebe9e7" }}>
+      <div style={{ flex: 1, minHeight: 0, overflowY: "auto", padding: PAD, color: TEXT }}>
         {p.tab === "inspector" && (
           <>
           <SignsList signs={p.signs} onSignClick={p.onSignClick} />

@@ -110,6 +110,83 @@ pub(crate) async fn list_worlds(start: u32, sort: u32, server: String) -> Result
     Ok(parse_world_list_response(&text))
 }
 
+/// Fetch the server's live featured/popular world list — `GET {download_base_url}/popularlist.txt`,
+/// same alternating `<id>.eden` / `<name>.name` plain-text format as `list2.php`, served from the
+/// download host rather than the search host (confirmed by the user against the live URLs).
+#[tauri::command]
+pub(crate) async fn fetch_featured_worlds(server: String) -> Result<Vec<WorldSearchResult>, String> {
+    let srv = get_server(&server)?;
+    let url = format!("{}/popularlist.txt", srv.download_base_url);
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let text = client.get(&url).send().await
+        .map_err(|e| format!("Failed to query {server} server: {e}"))?
+        .text().await
+        .map_err(|e| e.to_string())?;
+
+    Ok(parse_world_list_response(&text))
+}
+
+#[derive(serde::Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct LegacyFeaturedList {
+    /// Bare filename, e.g. `search--leaderboard-20180205.txt` — the only value round-tripped
+    /// back into `load_legacy_featured_list`; never build a path from user input elsewhere.
+    filename: String,
+    /// `YYYY-MM-DD` parsed from the filename, for display; falls back to the filename itself if
+    /// the archive ever gains a differently-named entry.
+    date: String,
+}
+
+/// `search--leaderboard-<8 digits>.txt` — the only filename shape accepted, both when listing the
+/// bundled archive and when validating a filename handed back from the frontend for loading.
+fn parse_leaderboard_filename(filename: &str) -> Option<String> {
+    let stem = filename.strip_prefix("search--leaderboard-")?.strip_suffix(".txt")?;
+    if stem.len() != 8 || !stem.bytes().all(|b| b.is_ascii_digit()) { return None; }
+    Some(format!("{}-{}-{}", &stem[0..4], &stem[4..6], &stem[6..8]))
+}
+
+fn leaderboards_dir(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+    use tauri::Manager;
+    app.path().resolve("eden-leaderboards", tauri::path::BaseDirectory::Resource)
+        .map_err(|e| format!("Failed to resolve leaderboard archive directory: {e}"))
+}
+
+/// List the bundled historic featured-world snapshots (`eden-leaderboards/*.txt`), newest first.
+#[tauri::command]
+pub(crate) fn list_legacy_featured_lists(app: tauri::AppHandle) -> Result<Vec<LegacyFeaturedList>, String> {
+    let dir = leaderboards_dir(&app)?;
+    let entries = fs::read_dir(&dir)
+        .map_err(|e| format!("Failed to read leaderboard archive at {}: {e}", dir.display()))?;
+
+    let mut out: Vec<LegacyFeaturedList> = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if let Some(date) = parse_leaderboard_filename(&name) {
+            out.push(LegacyFeaturedList { filename: name, date });
+        }
+    }
+    out.sort_by(|a, b| b.date.cmp(&a.date));
+    Ok(out)
+}
+
+/// Load one bundled historic featured-world snapshot by filename. `filename` is validated against
+/// the same fixed shape `list_legacy_featured_lists` produces, so it can never escape the archive
+/// directory regardless of what the frontend sends.
+#[tauri::command]
+pub(crate) fn load_legacy_featured_list(app: tauri::AppHandle, filename: String) -> Result<Vec<WorldSearchResult>, String> {
+    if parse_leaderboard_filename(&filename).is_none() {
+        return Err(format!("Invalid leaderboard archive filename: {filename}"));
+    }
+    let path = leaderboards_dir(&app)?.join(&filename);
+    let text = fs::read_to_string(&path)
+        .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
+    Ok(parse_world_list_response(&text))
+}
+
 #[derive(serde::Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct UpdateInfo {
@@ -224,7 +301,8 @@ pub(crate) async fn download_world(
     let srv = get_server(&server)?;
     let url = format!("{}/{}.eden", srv.download_base_url, id);
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .read_timeout(std::time::Duration::from_secs(60))
         .build()
         .map_err(|e| e.to_string())?;
 
@@ -307,8 +385,25 @@ pub(crate) async fn download_world(
 
 #[cfg(test)]
 mod tests {
-    use super::{copy_capped, parse_world_list_response};
+    use super::{copy_capped, parse_leaderboard_filename, parse_world_list_response};
     use std::io::Cursor;
+
+    #[test]
+    fn parse_leaderboard_filename_accepts_the_bundled_shape() {
+        assert_eq!(
+            parse_leaderboard_filename("search--leaderboard-20180205.txt"),
+            Some("2018-02-05".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_leaderboard_filename_rejects_anything_else() {
+        assert_eq!(parse_leaderboard_filename("search--leaderboard-2018020.txt"), None);
+        assert_eq!(parse_leaderboard_filename("search--leaderboard-2018020x.txt"), None);
+        assert_eq!(parse_leaderboard_filename("../../etc/passwd"), None);
+        assert_eq!(parse_leaderboard_filename("search--leaderboard-20180205.txt.eden"), None);
+        assert_eq!(parse_leaderboard_filename(""), None);
+    }
 
     #[test]
     fn parse_world_list_response_pairs_eden_and_name_lines() {
@@ -360,6 +455,104 @@ mod tests {
 /// client's own traffic 2026-08-18 (see DOCUMENTATION/10-features.md): it also generates its own
 /// UUID client-side rather than fetching one, and sends exactly two parts, `uploaded`/`uploaded2`
 /// (field *names*, not filenames), no third `submit` field.
+/// Progress events are emitted at most once per this many bytes, so a multi-GB upload doesn't
+/// flood the IPC channel with tens of thousands of events (the bar can't show more than this).
+const UPLOAD_PROGRESS_STEP: u64 = 1024 * 1024;
+
+/// A temp file that deletes itself when dropped — used for the gzip staging file below, so an
+/// aborted or failed upload doesn't leak a world-sized file into `$TMPDIR`.
+struct TempFile(std::path::PathBuf);
+impl Drop for TempFile {
+    fn drop(&mut self) { let _ = fs::remove_file(&self.0); }
+}
+
+/// Gzip `src` into a fresh temp file, streaming through a fixed buffer (audit C4).
+///
+/// The server stores and delivers worlds as gzip. This used to be `fs::read` → (unzip into a
+/// second `Vec`) → `GzEncoder::new(Vec::new(), Compression::best())` → `Part::bytes`, i.e. two to
+/// three whole copies of the world resident before the first byte went out — 4–6 GB for a 2 GB
+/// world. Compressing to a file instead costs a 64 KB buffer, and it is also what makes a *real*
+/// `Content-Length` possible: a gzip stream's length isn't known until it's finished, and without
+/// one the upload would have to fall back to chunked transfer encoding against a PHP endpoint that
+/// has never been observed accepting it.
+///
+/// Returns `None` when the source is already gzip — that file is streamed directly, no temp.
+/// `Compression::new(6)` rather than `best()`: about 1 % larger on voxel data and several times
+/// faster (audit C4).
+fn gzip_world_to_temp(src: &std::path::Path) -> Result<Option<(TempFile, u64)>, String> {
+    use flate2::{write::GzEncoder, Compression};
+
+    let mut probe = [0u8; 4];
+    {
+        let mut f = fs::File::open(src).map_err(|e| format!("Cannot read world: {e}"))?;
+        let mut read = 0usize;
+        while read < 4 {
+            match f.read(&mut probe[read..]) {
+                Ok(0) => break,
+                Ok(n) => read += n,
+                Err(e) => return Err(format!("Cannot read world: {e}")),
+            }
+        }
+        if probe[..2] == [0x1f, 0x8b] { return Ok(None); }
+    }
+
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let temp = TempFile(std::env::temp_dir().join(format!("vuencedit_upload_{ts}.gz")));
+    let out = fs::File::create(&temp.0).map_err(|e| format!("Cannot stage upload: {e}"))?;
+    let mut enc = GzEncoder::new(std::io::BufWriter::new(out), Compression::new(6));
+
+    if probe == [0x50, 0x4B, 0x03, 0x04] {
+        // Zip container: stream the first entry straight into the encoder.
+        let f = fs::File::open(src).map_err(|e| format!("Cannot read world: {e}"))?;
+        let mut archive = zip::ZipArchive::new(std::io::BufReader::new(f))
+            .map_err(|e| format!("Invalid zip: {e}"))?;
+        let mut entry = archive.by_index(0).map_err(|e| format!("Zip entry: {e}"))?;
+        std::io::copy(&mut entry, &mut enc).map_err(|e| format!("Decompress zip: {e}"))?;
+    } else {
+        let f = fs::File::open(src).map_err(|e| format!("Cannot read world: {e}"))?;
+        let mut r = std::io::BufReader::with_capacity(256 * 1024, f);
+        std::io::copy(&mut r, &mut enc).map_err(|e| format!("Gzip write: {e}"))?;
+    }
+    let mut w = enc.finish().map_err(|e| format!("Gzip finish: {e}"))?;
+    w.flush().map_err(|e| format!("Gzip flush: {e}"))?;
+    drop(w);
+
+    let len = fs::metadata(&temp.0).map_err(|e| format!("Cannot stat upload: {e}"))?.len();
+    Ok(Some((temp, len)))
+}
+
+/// Wrap `path` in a reqwest body that streams it from disk and emits truthful `upload-progress`
+/// events as bytes leave (audit C4). Progress used to be a lie: exactly two events fired, 0 % at
+/// the start and 100 % at the end, so a ten-minute upload showed a bar pinned at zero.
+async fn upload_body_with_progress(
+    app: tauri::AppHandle,
+    path: std::path::PathBuf,
+    total: u64,
+) -> Result<reqwest::Body, String> {
+    use futures_util::StreamExt;
+
+    let file = tokio::fs::File::open(&path).await
+        .map_err(|e| format!("Cannot read staged upload: {e}"))?;
+    let reader = tokio_util::io::ReaderStream::with_capacity(file, 256 * 1024);
+    let mut sent: u64 = 0;
+    let mut last_emit: u64 = 0;
+    let stream = reader.map(move |chunk| {
+        if let Ok(b) = &chunk {
+            sent += b.len() as u64;
+            if sent - last_emit >= UPLOAD_PROGRESS_STEP {
+                last_emit = sent;
+                let _ = app.emit("upload-progress",
+                    serde_json::json!({ "bytes_sent": sent.min(total), "total": total }));
+            }
+        }
+        chunk
+    });
+    Ok(reqwest::Body::wrap_stream(stream))
+}
+
 #[tauri::command]
 pub(crate) async fn upload_world(
     app: tauri::AppHandle,
@@ -368,7 +561,6 @@ pub(crate) async fn upload_world(
     server: String,
 ) -> Result<String, String> {
     let srv = get_server(&server)?;
-    let raw_world = fs::read(&world_path).map_err(|e| format!("Cannot read world: {e}"))?;
     let image_bytes = fs::read(&image_path).map_err(|e| format!("Cannot read image: {e}"))?;
     const MAX_IMAGE_BYTES: usize = 2 * 1024 * 1024;
     if image_bytes.len() > MAX_IMAGE_BYTES {
@@ -378,35 +570,29 @@ pub(crate) async fn upload_world(
         ));
     }
 
-    // Server stores and delivers worlds as gzip; upload in gzip format to match.
-    // If already gzip: upload as-is. If zip (PK): decompress to raw first, then gzip.
-    let world_bytes: Vec<u8> = if raw_world.starts_with(&[0x1f, 0x8b]) {
-        raw_world
-    } else {
-        use flate2::{write::GzEncoder, Compression};
-        use std::io::Write;
-        let raw = if raw_world.starts_with(&[0x50, 0x4B, 0x03, 0x04]) {
-            use zip::ZipArchive;
-            let cursor = std::io::Cursor::new(&raw_world);
-            let mut archive = ZipArchive::new(cursor).map_err(|e| format!("Invalid zip: {e}"))?;
-            let mut entry = archive.by_index(0).map_err(|e| format!("Zip entry: {e}"))?;
-            let mut out = Vec::new();
-            std::io::copy(&mut entry, &mut out).map_err(|e| format!("Decompress zip: {e}"))?;
-            out
-        } else {
-            raw_world
-        };
-        let mut enc = GzEncoder::new(Vec::new(), Compression::best());
-        enc.write_all(&raw).map_err(|e| format!("Gzip write: {e}"))?;
-        enc.finish().map_err(|e| format!("Gzip finish: {e}"))?
+    // Compress off the async runtime — this is minutes of CPU on a large world.
+    let src = std::path::PathBuf::from(&world_path);
+    let staged = tokio::task::spawn_blocking(move || gzip_world_to_temp(&src))
+        .await
+        .map_err(|e| format!("Compression task failed: {e}"))??;
+
+    // `_keep` holds the temp alive (and deletes it) for the rest of this function.
+    let (body_path, world_len, _keep) = match staged {
+        Some((temp, len)) => (temp.0.clone(), len, Some(temp)),
+        None => {
+            // Already gzip — stream the user's file itself, no staging copy.
+            let len = fs::metadata(&world_path)
+                .map_err(|e| format!("Cannot read world: {e}"))?.len();
+            (std::path::PathBuf::from(&world_path), len, None)
+        }
     };
 
-    let total = (world_bytes.len() + image_bytes.len()) as u64;
-
+    let total = world_len + image_bytes.len() as u64;
     let _ = app.emit("upload-progress", serde_json::json!({ "bytes_sent": 0u64, "total": total }));
 
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .read_timeout(std::time::Duration::from_secs(60))
         .build()
         .map_err(|e| e.to_string())?;
 
@@ -432,8 +618,14 @@ pub(crate) async fn upload_world(
     // reply doesn't depend on the file actually being found under the field it expected. Filenames
     // are literally "file.bin"/"image.bin" (not the source path's own name) to match the observed
     // request byte-for-byte; the server does not appear to use them for anything.
+    //
+    // ⚠️ `stream_with_length` (not `stream`) — with a length the part is sent with a real
+    // `Content-Length` exactly as the byte-buffer version was; without one reqwest switches the
+    // whole request to chunked transfer encoding, which this endpoint has never been observed
+    // accepting.
+    let world_body = upload_body_with_progress(app.clone(), body_path, total).await?;
     let form = reqwest::multipart::Form::new()
-        .part("uploaded", reqwest::multipart::Part::bytes(world_bytes)
+        .part("uploaded", reqwest::multipart::Part::stream_with_length(world_body, world_len)
             .file_name("file.bin")
             .mime_str("application/octet-stream").unwrap())
         .part("uploaded2", reqwest::multipart::Part::bytes(image_bytes)

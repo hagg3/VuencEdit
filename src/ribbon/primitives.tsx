@@ -95,8 +95,8 @@ export const RIBBON_CSS = `
 
 // ── Layout helpers ────────────────────────────────────────────────────────────
 
-export function Row({ children, gap = COL_GAP, style }: { children: ReactNode; gap?: number; style?: CSSProperties }) {
-  return <div style={{ display: "flex", alignItems: "center", gap, ...style }}>{children}</div>;
+export function Row({ children, gap = COL_GAP, style, inert }: { children: ReactNode; gap?: number; style?: CSSProperties; inert?: boolean }) {
+  return <div style={{ display: "flex", alignItems: "center", gap, ...style }} inert={inert}>{children}</div>;
 }
 
 /** A vertical stack of small controls, top-aligned inside the fixed content box. */
@@ -179,7 +179,7 @@ export function Group({
 
   if (tier === "compact") {
     return (
-      <div ref={ref} style={{ ...groupShell, ...style }}>
+      <div ref={ref} data-group={id} style={{ ...groupShell, ...style }}>
         <div style={groupBody}>
           <IconButton
             icon={icon}
@@ -203,10 +203,15 @@ export function Group({
   return (
     <div
       ref={ref}
+      data-group={id}
       style={{ ...groupShell, ...(dim ? { opacity: 0.4 } : null), ...style }}
       aria-disabled={dim || undefined}
     >
-      <div style={{ ...groupBody, ...(dim ? { pointerEvents: "none" as const } : null) }}>{children}</div>
+      {/* `inert` (not just pointerEvents:none) is what keeps a dimmed group's descendants out of
+          the tab order — audit H7: pointerEvents only blocks the mouse, so a keyboard user could
+          Tab into a dimmed group (e.g. Home's Selection/Set Point with nothing selected) and
+          activate a command that has no target. */}
+      <div style={{ ...groupBody, ...(dim ? { pointerEvents: "none" as const } : null) }} inert={dim || undefined}>{children}</div>
       <GroupLabel>
         {label}
         {dim && dimNote ? <span style={{ color: TEXT_DIM, opacity: 0.9, marginLeft: SPACE.sm }}>{dimNote}</span> : null}
@@ -483,6 +488,8 @@ export function Popover({
 }) {
   const panelRef = useRef<HTMLDivElement>(null);
   const [pos, setPos] = useState<{ top: number; left: number } | null>(null);
+  /** Element focus should return to when the panel closes — captured before focus moves in. */
+  const returnFocusRef = useRef<HTMLElement | null>(null);
 
   useLayoutEffect(() => {
     const a = anchorRef.current;
@@ -514,6 +521,65 @@ export function Popover({
       window.removeEventListener("keydown", key, true);
     };
   }, [anchorRef, onClose, onEscape]);
+
+  /**
+   * Keyboard model for `role="menu"` panels (audit M2). Every opener already declares
+   * `aria-haspopup="menu"` + `aria-expanded`, so assistive tech announced a menu that the keyboard
+   * could not actually drive: focus never entered the panel, arrows did nothing, and closing it
+   * dropped focus to the document body.
+   *
+   * Now: focus moves to the first enabled item on open, Up/Down/Home/End rove between items, Tab
+   * closes the menu and lets focus continue past the opener (the ARIA menu convention — a menu is
+   * not a dialog, so it traps nothing), and focus returns to whatever had it when the panel opened.
+   * `role="dialog"` panels (the block picker, the world pill's details) are left alone: they own
+   * their own inner focus order, and stealing it would break the pill's rename field.
+   */
+  // ⚠️ `onClose` is an inline arrow at almost every call site, so it changes identity on every
+  // render of the parent. Depending on it directly would re-run the effect below constantly —
+  // harmless for the listener above (it just re-registers), but here it would re-fire the
+  // focus-first-item step and yank focus back to the top of the menu while the user was arrowing
+  // through it. Read it through a ref instead and keep the effect keyed on `role` alone.
+  const closeRef = useRef(onClose);
+  useEffect(() => { closeRef.current = onClose; }, [onClose]);
+
+  useEffect(() => {
+    if (role !== "menu") return;
+    returnFocusRef.current = document.activeElement as HTMLElement | null;
+    // Captured once: the panel node is stable for this effect's lifetime, and reading the ref in
+    // the cleanup would read whatever it points at *after* unmount.
+    const panel = panelRef.current;
+    const items = () => Array.from(
+      panel?.querySelectorAll<HTMLElement>('[role="menuitem"]:not([aria-disabled="true"])') ?? [],
+    );
+    // Defer one frame: the panel is portaled and positioned in a layout effect, so focusing before
+    // that lands would scroll the page to the off-screen (-9999) staging position.
+    const raf = requestAnimationFrame(() => items()[0]?.focus());
+
+    const onKey = (e: KeyboardEvent) => {
+      if (!panel?.contains(document.activeElement)) return;
+      if (e.key === "Tab") { closeRef.current(); return; }
+      const list = items();
+      if (list.length === 0) return;
+      const i = list.indexOf(document.activeElement as HTMLElement);
+      let next = -1;
+      if (e.key === "ArrowDown") next = i < 0 ? 0 : (i + 1) % list.length;
+      else if (e.key === "ArrowUp") next = i < 0 ? list.length - 1 : (i - 1 + list.length) % list.length;
+      else if (e.key === "Home") next = 0;
+      else if (e.key === "End") next = list.length - 1;
+      if (next < 0) return;
+      e.preventDefault();
+      e.stopPropagation();
+      list[next].focus();
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => {
+      cancelAnimationFrame(raf);
+      window.removeEventListener("keydown", onKey, true);
+      // Only reclaim focus if it's still inside the panel — a click elsewhere already moved it,
+      // and yanking it back would fight the user.
+      if (panel?.contains(document.activeElement)) returnFocusRef.current?.focus();
+    };
+  }, [role]);
 
   return createPortal(
     <div
@@ -586,8 +652,11 @@ export function RangeSlider({
   const hiPct = ((Math.max(lo, hi) - min) / span) * 100;
   const rgb = hexToRgbTriplet(accent);
 
+  // Thumb centre tracks `pct` of the *travel* range (width minus the thumb's own diameter), not
+  // the full container width — otherwise the leftmost thumb's centre sits at x=0 and half its
+  // 10px circle renders past the container's left edge, clipped by any ancestor's overflow.
   const thumb = (pct: number, bright: boolean): CSSProperties => ({
-    position: "absolute", top: 8, left: `calc(${pct}% - 5px)`, width: 10, height: 10,
+    position: "absolute", top: 8, left: (pct / 100) * (width - 10), width: 10, height: 10,
     borderRadius: "50%", pointerEvents: "none",
     background: bright ? `rgb(${rgb})` : `rgba(${rgb},.65)`,
     boxShadow: `0 0 0 1px ${BORDER.outline}, inset 0 1px 0 rgba(255,255,255,.35)`,
@@ -613,6 +682,15 @@ export function RangeSlider({
 }
 
 /** Radio-style row of small buttons. */
+/**
+ * Radio-style row of small buttons.
+ *
+ * Keyboard model per the ARIA radiogroup pattern (audit M2): the group is **one** tab stop, not
+ * one per option — only the checked option is tabbable — and Left/Right/Up/Down move the selection
+ * (and focus) to the adjacent option, wrapping, with Home/End jumping to the ends. Before this,
+ * every option sat in the tab order and none of the arrow keys did anything, so a five-option
+ * group cost five Tab presses to walk past and could not be changed from the keyboard at all.
+ */
 export function Segmented<T extends string>({
   label, value, options, onChange, accent, ariaLabel,
 }: {
@@ -620,12 +698,31 @@ export function Segmented<T extends string>({
   options: { id: T; label: string; title?: string; icon?: IconName }[];
   onChange: (v: T) => void; accent?: string;
 }) {
+  const groupRef = useRef<HTMLDivElement>(null);
+  const move = (from: number, key: string) => {
+    const n = options.length;
+    let to = -1;
+    if (key === "ArrowRight" || key === "ArrowDown") to = (from + 1) % n;
+    else if (key === "ArrowLeft" || key === "ArrowUp") to = (from - 1 + n) % n;
+    else if (key === "Home") to = 0;
+    else if (key === "End") to = n - 1;
+    if (to < 0) return false;
+    onChange(options[to].id);
+    // Focus follows selection, which is what makes repeated arrow presses keep working.
+    groupRef.current?.querySelectorAll<HTMLElement>('[role="radio"]')[to]?.focus();
+    return true;
+  };
+  // A group whose value isn't one of its options (shouldn't happen, but a stale prop would do it)
+  // must still have exactly one tab stop, or it drops out of the tab order entirely.
+  const checkedIndex = Math.max(0, options.findIndex(o => o.id === value));
   return (
-    <div role="radiogroup" aria-label={ariaLabel} style={{ display: "flex", alignItems: "center", gap: COL_GAP, height: SMALL_H }}>
+    <div ref={groupRef} role="radiogroup" aria-label={ariaLabel} style={{ display: "flex", alignItems: "center", gap: COL_GAP, height: SMALL_H }}>
       {label && <FieldLabel>{label}</FieldLabel>}
-      {options.map(o => (
+      {options.map((o, idx) => (
         <button
           key={o.id} role="radio" aria-checked={value === o.id} className="rbn-btn" type="button"
+          tabIndex={idx === checkedIndex ? 0 : -1}
+          onKeyDown={e => { if (move(idx, e.key)) { e.preventDefault(); e.stopPropagation(); } }}
           title={o.title ?? o.label} onClick={() => onChange(o.id)} data-active={value === o.id ? "true" : undefined}
           style={btnBase({
             height: SMALL_H, padding: o.icon && !o.label ? 0 : "0 7px",

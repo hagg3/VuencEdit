@@ -123,6 +123,24 @@ proven (Part C3 below).
   decompresses file→file through a `take()`-capped reader
   (`MAX_DOWNLOADED_WORLD_BYTES = 2 GB`).
 - **`upload_world`** — multipart, requires a PNG thumbnail (`UploadModal.tsx`).
+  **Streamed as of 2026-08-20 (audit C4).** It used to `fs::read` the world, decompress
+  a zip into a second `Vec`, gzip into a third at `Compression::best()`, and hand the
+  result to `Part::bytes` — two to three whole copies resident (4–6 GB for a 2 GB world)
+  before the first byte went out — while `upload-progress` fired exactly twice, 0 % and
+  100 %, so a ten-minute upload showed a bar pinned at zero.
+  Now `gzip_world_to_temp` streams the source (raw, or a zip entry decompressed on the
+  fly) into `$TMPDIR/vuencedit_upload_<ns>.gz` at `Compression::new(6)` — ~1 % larger on
+  voxel data and several times faster — on a `spawn_blocking` thread, and
+  `upload_body_with_progress` wraps that file in a `tokio_util::io::ReaderStream` that
+  emits a real `upload-progress` event every `UPLOAD_PROGRESS_STEP` (1 MB). Peak RAM is
+  a 256 KB buffer.
+  ⚠️ **The staging file exists to make `Content-Length` knowable.** A gzip stream's
+  length isn't known until it's finished, and `Part::stream` *without* a length flips
+  the whole request to chunked transfer encoding, which this PHP endpoint has never been
+  observed accepting — hence `stream_with_length`. An already-gzip source skips the temp
+  and is streamed directly. A `TempFile` guard deletes the staging file on every exit
+  path; `sweep_stale_temps()` also now sweeps `vuencedit_*.gz` at startup for the case
+  where the process died mid-transfer.
 
 ### Verified against the live updated desktop client's own traffic (2026-08-18)
 
@@ -194,7 +212,17 @@ or installed system-wide; nothing about the client or server was modified.
   commented out (the 256³ model limit + chunk-splitting are hard to validate
   without round-trip tooling).
 
-OBJ/JSON export the current selection if one is active, else the whole world.
+OBJ/JSON/VOX export the current selection if one is active, else the whole world —
+which is how a whole-256z-world export used to get started by accident. All four
+exporters now refuse a region over **`MAX_EXPORT_VOXELS`** (256 M voxels, the same
+figure as `MAX_CLIPBOARD_VOLUME`) before doing any work, with the size spelled out:
+*"This region is 7216×8448×256 = 15.6 billion blocks — more than the 256 million block
+JSON export limit. Select a smaller region first."* (audit C6). Under the cap they run
+with real progress and — except PNG — a working Cancel, through the shared
+[`LongOps` contract](./04-ipc-reference.md#long-operations-longops-audit-c6--m14-2026-08-20).
+
+They still hold the **read** guard for their whole run, so edits/undo/save queue behind
+them; the volume cap and the cancel are what make that bounded rather than unbounded.
 
 ## Source Engine VMF export (`vmf_export.rs`) *(experimental)*
 

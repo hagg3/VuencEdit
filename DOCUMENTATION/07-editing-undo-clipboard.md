@@ -14,11 +14,50 @@ It owns the whole sequence:
 2. `snapshot_chunks_full(affected_chunk_coords)` — a transient full pre-copy of
    the touched chunks.
 3. Run the `edit_fn` closure (the actual mutation).
-4. `render_pixels_patch` over `patch_rect` — the changed pixels.
+4. `edit_patch` over `patch_rect` — the changed pixels, at `WorldState::view_lod`
+   (audit M3) and **capped** at `MAX_EDIT_PATCH_PIXELS` (audit C2, see below).
 5. `diff_chunk` each touched chunk into a stored **delta**.
 6. Reinstall the world.
-7. Push the delta onto the undo stack; clear redo.
-8. Return `EditResult { patch, undo_depth, redo_depth }`.
+7. Push the delta onto the undo stack; clear redo — *unless* it doesn't fit the
+   budget, see "Budget enforcement" below.
+8. Return `EditResult { patch, invalidate, undo_depth, redo_depth, operation,
+   undo_dropped }`.
+
+Steps 6–8 are factored into **`finish_edit(ws, operation, group, patch, invalidate,
+pre_snap)`** (audit H1), which is also what the sculpt read/write split calls — so
+the lamp-index replay, the dirty-set marking and the undo-budget rule have exactly
+one implementation rather than two that can drift.
+
+### The patch is bounded, and sampled at the view's LOD *(audit C2 + M3, 2026-08-19)*
+
+`with_edit_inner` used to call `render_pixels_patch` unconditionally at full
+resolution. With ⌘A that is the whole map: 61 M pixels = **243 MB** of RGBA on a
+7216×8448 world, built in Rust, copied again by `ipc_envelope`, then copied a third
+time by the webview — for a screen that can show ~1 M pixels. Two changes:
+
+- **`edit_patch(world, rect, cap, lod)`** returns `(PixelPatch, invalidate)`. Above
+  `MAX_EDIT_PATCH_PIXELS` (2 M output pixels = 8 MB) it returns the rect with **no
+  pixels** and `invalidate = true`; `applyEditResult` then calls
+  `MapCanvas.refetchRegion`, which re-fetches through the tile pipeline — bounded by
+  the viewport rather than by the edit. That is the path z-slice mode has always used.
+- **The patch renders at `WorldState::view_lod`**, mirrored from the frontend by
+  `set_view_lod` (MapCanvas reports `lodForScale(scale)`, or 1 in Full Map / Axo mode
+  where the canvas is 1:1). Backend state, not a per-command argument, for the same
+  reason `view_cap_z` is — otherwise all 11 editing commands grow a `lod` parameter.
+  Reset to 1 on world load/close, and `MapCanvas` clears its "last reported" memo on
+  the same event so it re-reports.
+
+> ⚠️ **The patch origin is floored to a multiple of `lod`.** A patch point-samples
+> every `lod`-th block starting at its origin; the LOD tiles sample from a grid
+> anchored at 0. An unaligned origin puts the patch half a step out of phase with
+> every tile it lands in, which no amount of nearest-neighbour blitting can correct.
+> `MapCanvas.applyPatch` relies on this: at `tile lod === patch.lod` it does an exact
+> 1:1 sub-image blit, coarser tiles get a nearest downscale, and a tile *finer* than
+> the patch is **evicted** rather than filled with coarse samples it would keep
+> showing after the user zooms back in.
+
+Tests: `test_edit_patch_caps_oversized_rect`,
+`test_edit_patch_lod_aligns_origin_and_samples`.
 
 **Invariant enforced structurally:** an `edit_fn` returning `Err` still reinstalls
 the world before propagating. A fallible op between `take` and `reinstall` that
@@ -29,7 +68,38 @@ Routing all edits through `with_edit` means there are no hand-audited call sites
 
 `ChunkSnapshot.delta: ChunkDelta` is one of:
 - `Sparse(Vec<(u32, u8)>)` — (offset, original-byte) pairs, for small edits.
-- `Full(Vec<u8>)` — dense-edit fallback, chosen when `entries*5 >= chunk_size`.
+- `Full(u32, Vec<u8>)` — dense-edit fallback, chosen when `entries*5 >= chunk_size`.
+- `FullZ(u32, Vec<u8>, u32)` — a **deflated** `Full` *(audit C1 step 2, 2026-08-19)*:
+  `(start, deflated, raw_len)`.
+
+**`UndoEntry::new` is the only place a snapshot becomes long-lived, and therefore
+the only place compression happens.** Every consumer that needs raw bytes —
+`LampIndex::apply_delta`, `DirtyState::mark_chunks` — runs *before* it at all three
+call sites, so nothing downstream has to know `FullZ` exists. Deflate level is **1**,
+not `journal.rs`'s 6: this runs synchronously inside the edit that produced it, and
+the payload that matters (a uniformly filled or deleted chunk — the ⌘A case) is
+already near-maximally compressible at level 1. An incompressible payload keeps its
+raw `Full` form rather than growing. `ChunkDelta::full_bytes(&mut scratch)` inflates
+one chunk at a time for `restore_and_invert`, so a stack full of compressed deltas
+never has more than a single chunk expanded at once. Tests:
+`test_full_delta_is_deflated_and_round_trips`,
+`test_incompressible_delta_stays_uncompressed`.
+
+### Budget enforcement at accumulation time *(audit C1 step 3, 2026-08-19)*
+
+`trim_stack` keeps a `stack.len() > 1` floor, so the entry that most needs evicting —
+a single ⌘A fill's world-sized delta — used to be exempt from the budget and parked
+in RAM for the rest of the session. `with_edit_inner` now prices the entry (after
+compression, which is the first point its true size is known — a delta's size is not
+predictable *before* the edit runs, which is why the audit's "up-front confirm" was
+not implementable as written) and, if it alone exceeds `undo_budget`, **drops it and
+clears both stacks**, reporting `undo_dropped: true`. Clearing the rest is not
+optional: every older entry is a delta that would restore pre-edit bytes over chunks
+this edit has since changed. The edit itself still applies; the frontend raises an
+error toast pointing at Settings ▸ General ▸ Memory budget. Undo/redo's own inverse
+entries keep the old lenient `push_undo` behaviour — dropping one mid-group would
+break the group chain, and it was already within budget when it was pushed.
+Test: `test_oversized_undo_entry_drops_history`.
 
 `restore_and_invert` applies a delta and derives its exact inverse in one pass, so
 `undo_edit`/`redo_edit` **never take a full pre-copy**. Both stacks are capped at
@@ -55,6 +125,104 @@ This is what makes persistence's incremental save and journaled autosave
 (`DOCUMENTATION/02-file-format.md`, `DOCUMENTATION/10-features.md`) O(changed
 bytes) instead of O(world size) — see also the lamp index's `apply_delta`, which
 replays the same undo delta for the same reason.
+
+## Voxel views and the sculpt scratch *(audit H1, 2026-08-20)*
+
+Every per-block accessor — `read_block_abs`, `read_paint_abs`, `surface_z_capped`,
+`set_block_abs`, `world_max_z`, `sculpt_column`, `retexture_top`, `field_stamp`,
+`sculpt_stamp_body` — is generic over two small traits instead of taking
+`&LoadedWorld`/`&mut LoadedWorld` directly:
+
+```rust
+trait VoxelView {
+    fn num_bands(&self) -> usize;
+    fn chunk_origin(&self) -> (i32, i32);
+    fn chunk_bytes(&self, cx: i32, cy: i32) -> Option<&[u8]>;   // the chunk's real span
+}
+trait VoxelViewMut: VoxelView {
+    fn chunk_bytes_mut(&mut self, cx: i32, cy: i32) -> Option<&mut [u8]>;
+}
+```
+
+Those three methods are everything the addressing formula
+(`band*8192 + lx*256 + ly*16 + lz`, `+4096` for paint) actually needs. Because
+`chunk_bytes` hands back the chunk's *real* span, an intra-chunk index is in bounds
+iff it is `< slice.len()` — the same guarantee `chunk_range` gave, expressed once.
+
+`LoadedWorld` implements both. So does **`ChunkScratch<'a>`**: a private, writable
+copy of a bounded set of chunks layered over a live world.
+
+- **Reads** of an owned chunk see the scratch; reads of any other chunk fall
+  through to the world. A brush reading its 8-neighbourhood across a chunk boundary
+  therefore gets real terrain, never silent air — the failure mode a naive
+  "copy just these chunks into a mini-world" would have.
+- **Writes** to a chunk the scratch does not own are **dropped**. Every caller must
+  build the scratch from a rect that provably covers the whole write extent; for
+  sculpt that is `sculpt_write_rect`.
+- `into_chunks()` drops the borrow of the world and keeps the copies
+  (`ScratchChunks`), which is what lets the compute phase run under a read guard and
+  the commit under a write guard.
+- `ScratchChunks::commit(world)` writes each owned chunk back and returns one
+  `ChunkSnapshot` per chunk that actually changed — the undo delta, built by the
+  same `diff_span` `diff_chunk` uses, so the two paths produce identical deltas.
+  Output is sorted by `(cx, cy)`, matching `affected_chunk_coords`' order.
+
+### `sculpt_write_rect` and the rock pad
+
+Heightmap modes write only inside their own footprint. Rock/Carve's `field_stamp`
+writes across a `rock_stamp_pad(params, radius)` ring *outside* it — the wider of the
+noise blur kernel and the terrain fillet radius, plus one. That ring used to fall
+outside the `with_edit` snapshot rect entirely, so the outer edge of every rock stamp
+was applied but **never captured for undo**. `sculpt_write_rect` now derives both the
+snapshot rect and the scratch's chunk set from the same arithmetic `field_stamp`
+itself uses, which fixes that hole and is what makes dropping out-of-scratch writes
+safe. Test: `test_rock_stamp_writes_stay_inside_the_write_rect`.
+
+## The sculpt read/write guard split *(audit H1, 2026-08-20)*
+
+A held brush is a near-continuous writer at ~10 flushes/second, and every flush used
+to hold the **exclusive** guard across the whole stamp: the heightmap pre-read, the
+falloff field, Rock/Carve's `w*h*d` f32 buffers and three separable blur passes, the
+chunk snapshot, the diff and the patch render. `fetch_tile`, `get_chunk_geometry`,
+`get_cursor_block` and every `render_*` queued behind it for the duration of the
+stroke — which defeated the whole point of the `Mutex → RwLock` conversion for the
+one interaction where responsiveness matters most.
+
+`sculpt_terrain` now runs in three phases (`sculpt_split`):
+
+| Phase | Guard | Work |
+|---|---|---|
+| 0 | write, brief | Note `dirty.seq`; take `ws.sculpt_session` (matching group, else fresh). |
+| 1 | **read (shared)** | Build the `ChunkScratch` over `sculpt_flush_rect`, run every stamp against it. |
+| 2 | write | Re-check `seq`, `commit` the scratch, render the patch, `finish_edit`. |
+
+Phase 1 is essentially the whole cost, and readers run throughout it. The snapshot
+copy disappears too: the scratch *is* the pre-image, so `commit` diffs it against the
+live chunk on the way back instead of `with_edit_inner`'s separate up-front copy.
+
+⚠️ **Staleness.** The guard is released twice, so there are two windows a foreign writer
+could land in, and they fail differently: between phase 1 and 2 the *scratch* goes stale
+and its wholesale write would clobber the other edit; between phase 0 and 1 the scratch
+is fine (it is built from whatever the world holds at that moment) but the **float
+workspace** taken in phase 0 is stale — which is exactly the event `with_edit_inner`
+clears `sculpt_session` on.
+
+`dirty.seq` — bumped by every `mark_chunks`/`mark_header`/`clear_all`, i.e. by every path
+that mutates world bytes — is captured in **phase 0** and re-checked in phase 2. Because
+it is monotonic, that single comparison covers both windows. If it moved, the scratch is
+discarded and the stamp is re-run under the write guard with a **fresh** float workspace.
+In practice this never fires: the frontend keeps one sculpt flush in flight at a time.
+
+⚠️ This path bypasses `with_edit_inner`, so it owns that function's two invariants
+itself — the `sculpt_session` take/reinstate above, and routing the post-edit
+bookkeeping through the shared `finish_edit`.
+
+`sculpt_terrain_inner` / `sculpt_terrain_batch_inner` / `run_sculpt_in_guard` survive as
+`#[cfg(test)]`-only: they run the same flush wholly inside one `with_edit_grouped`, and
+are the reference the split path is required to match byte for byte
+(`test_scratch_stamp_matches_direct_stamp`). Both entry points and the command share the
+same resolution types — `SculptArgs` (mode parameters), `SculptStamp` (footprint + dial)
+and `run_sculpt_flush` — so parameter clamping can't diverge between them.
 
 ## Mutex safety
 

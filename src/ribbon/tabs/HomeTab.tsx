@@ -13,7 +13,7 @@ import {
   Col, CommandButton, DropdownButton, Group, GroupDivider, MenuItem, MenuSeparator, MoreChevron,
   SmallButton,
 } from "../primitives";
-import { ACCENT, GROUP_CONTENT_H, ROW_GAP } from "../tokens";
+import { ACCENT, DEL, GROUP_CONTENT_H, MOD, ROW_GAP } from "../tokens";
 
 /** Declared widths feed the pure solver; the dev-mode `ResizeObserver` in `Group` warns on drift. */
 const SPECS: GroupMetrics[] = [
@@ -44,7 +44,7 @@ export default function HomeTab() {
         />
         <div style={{ display: "grid", gridTemplateColumns: "auto auto", gap: ROW_GAP, alignContent: "center", height: GROUP_CONTENT_H }}>
           <SmallButton icon="copy" label="Copy" full disabled={!hasSel}
-            title={hasSel ? "Copy the selection (⌘C)" : "Make a selection first"} onClick={p.copySelection} />
+            title={hasSel ? `Copy the selection (${MOD}C)` : "Make a selection first"} onClick={p.copySelection} />
           <SmallButton icon="rotate" label="Rotate" full disabled={!hasClip}
             title={hasClip ? "Rotate the clipboard 90° clockwise" : "Copy or cut something first"} onClick={p.rotateClipboard} />
           <SmallButton icon="cut" label="Cut" full disabled={!hasSel}
@@ -92,7 +92,7 @@ export default function HomeTab() {
       <Group id="selection" label="Selection" tier={tier.selection} declaredWidth={214} icon="select"
         dim={!hasSel} dimNote="(none)">
         <CommandButton tier={tier.selection === "full" ? "full" : "medium"}
-          icon="delete" label="Delete" tone="danger" title="Fill the selection with air (⌫)"
+          icon="delete" label="Delete" tone="danger" title={`Fill the selection with air (${DEL})`}
           onClick={p.deleteBlocks} />
         <CommandButton tier={tier.selection === "full" ? "full" : "medium"}
           icon="fill" label="Fill" accent={ACCENT.primary} title="Fill the selection with the active block"

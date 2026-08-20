@@ -120,7 +120,7 @@ parallel call sites.
   contract, including why payload types must not derive `Serialize`:
   [04 — IPC Command Reference](./04-ipc-reference.md#binary-payload-envelope-2026-08-05-audit-h2).
 - **Edit flow.** Editing commands return
-  `EditResult { patch: PixelPatch, undo_depth, redo_depth }`. Only the changed
+  `EditResult { patch: PixelPatch, invalidate, undo_depth, redo_depth }`. Only the changed
   rectangle crosses IPC. `applyEditResult()` on the frontend decodes the patch,
   applies it to the canvas, and increments `editEpoch` (see [07](./07-editing-undo-clipboard.md)).
 - **Shared IPC types.** Rust struct shapes are mirrored in
