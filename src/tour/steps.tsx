@@ -9,7 +9,7 @@ import type { SidebarTab } from "../Sidebar";
 import { MOD, SHIFT, TEXT } from "../ribbon/tokens";
 
 // ⚠ written by bump-version.sh — keep this on one line
-export const TOUR_VERSION = 2;
+export const TOUR_VERSION = 3;
 
 export interface TourCtx {
   setRibbonTab: (t: RibbonTab) => void;
