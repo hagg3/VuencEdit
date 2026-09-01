@@ -69,13 +69,14 @@ Routing all edits through `with_edit` means there are no hand-audited call sites
 
 ### `with_edit_zscoped` — band-scoped snapshot/diff (audit C4 step 1)
 
-`with_edit`, `with_edit_zscoped`, and `with_edit_grouped` (sculpt only, see
-"Terrain Sculpt" below) all funnel into one shared `with_edit_inner`, so the
+`with_edit`, `with_edit_zscoped`, and `with_edit_grouped` (sculpt and
+`paint_blocks`, see below) all funnel into one shared `with_edit_inner`, so the
 take/reinstall sequence has exactly one implementation regardless of entry
 point:
 
 ```rust
 with_edit_zscoped(ws, operation, snap_rect, patch_rect, (z_min, z_max), edit_fn) -> EditResult
+with_edit_grouped(ws, operation, snap_rect, patch_rect, group, z_range, edit_fn) -> EditResult
 ```
 
 Use when an edit's entire vertical write extent is known **statically** —
@@ -90,6 +91,39 @@ Edits whose write region isn't a simple static z interval — paste's terrain
 mode, tree canopies, sculpt, flood/pool fill — must keep using plain
 `with_edit`, since those can touch z outside any band known ahead of the
 closure running.
+
+#### `paint_blocks` derives its range *conditionally* (3D fixplan Phase 4.1, 2026-08-29)
+
+`paint_blocks` needs both knobs at once — a 3D build sweep is grouped **and**
+supplies concrete z coordinates — so `with_edit_grouped` takes an
+`Option<(i32, i32)>` `z_range` rather than the repo growing a fourth wrapper. The
+range comes from the pure `paint_z_range(&blocks, top_type)`, and the reason it is
+an `Option` is that a `PaintBlock` with `z: None` resolves its z from
+`surface_z_capped` *inside* the closure: one `None` anywhere makes the batch's
+extent unknowable and falls the whole thing back to a whole-chunk snapshot.
+
+This is the per-stamp cost of a 3D build sweep — one `paint_blocks` per stamp, each
+previously copying 131 KB per affected chunk on a 256z world to snapshot 16 bands
+for a one-voxel edit. Every 3D break/place path in `App.tsx` passes an explicit
+`{x, y, z}`, so they all take the scoped path; the 2D surface-paint tools pass
+`z: null` and keep the old behaviour.
+
+⚠️ **Two traps, both silent.** `snapshot_chunks_full` rounds the range *out* to
+whole 16-block bands, so a range that is merely too **narrow** doesn't error — the
+writes outside it never enter the undo delta, so undo restores part of the edit and
+leaves the rest, and (if a chunk's *only* writes were outside the range) that chunk
+never reaches `dirty.mark_chunks` either:
+- **`z_offset` is not part of the range.** `paint_blocks` applies `z_offset` only on
+  the `z: None` surface-relative branch; an explicit `Some(z)` is absolute and is
+  written unshifted. (The Phase 4 plan's formula said otherwise.)
+- **Doors and portals auto-place a paired top block one above the base**, so
+  `top_type != 0` widens the high end by 1 — and that block is exactly what crosses
+  a band boundary in practice (a base at z=31 tops out in band 2).
+
+Tests: `test_paint_z_range_covers_every_written_block` (the derivation) and
+`test_paint_z_scoped_undo_restores_writes_outside_the_base_band` (a byte-for-byte
+undo round trip across that band boundary — the existing `test_delta_undo_round_trip`
+cannot catch a too-narrow range, since it snapshots with `None`).
 
 ## Delta undo
 
@@ -136,6 +170,38 @@ redo too). User-adjustable per session, 16–512 MB, via `set_undo_budget` (Sett
 → General → Memory budget, see CLAUDE.md's "Memory Budget" section) — lowering it
 re-trims both stacks immediately. `chunk_snapshot_bytes` counts real heap
 (`Vec::capacity()`, after `diff_chunk`'s `shrink_to_fit()`), not `len()`.
+
+### Cached logical-unit counts *(3D fixplan Phase 4.2, 2026-08-29)*
+
+Every `EditResult` reports `undo_depth`/`redo_depth`, which are **logical units**,
+not `stack.len()`: contiguous entries sharing the same `Some(g)` group collapse to
+one (a whole sculpt stroke, a whole 3D build sweep). Computing them used to mean
+walking the whole `VecDeque` twice per edit — and since `trim_stack` won't evict a
+~50-byte sparse entry until the stack holds roughly 2 M of them, that walk was
+unbounded in practice. Same bug class audit M2 already fixed for `push_undo`'s byte
+accounting, and fixed the same way: `WorldState::undo_groups`/`redo_groups` are
+maintained incrementally by `push_undo` / `pop_undo` / `trim_stack` (each now takes
+a `&mut usize` for the count alongside the byte total) plus `clear_undo`/`clear_redo`.
+
+The whole rule lives in one predicate:
+
+```rust
+fn starts_new_group(entry: Option<u64>, neighbour: Option<Option<u64>>) -> bool
+```
+
+It is deliberately **symmetric**, so one function serves both ends of the deque:
+pushing or popping at the *back* adds/removes a unit exactly when it holds against
+the new back, and `trim_stack` — which evicts from the **front** — removes one
+exactly when it holds against the new front. Getting that end wrong is the easy
+mistake: evicting the older half of a same-group pair must *not* decrement.
+
+`count_undo_groups` survives as a `#[cfg(test)]`-only oracle;
+`test_cached_group_counts_match_the_oracle` pins the cache against a fresh walk
+after each of the shapes that can diverge — two different groups back to back, an
+ungrouped edit splitting one group id into two non-adjacent runs (which must count
+as two units), one-entry-at-a-time budget eviction from inside a group, and
+undo/redo moving whole groups between the stacks. `undo_stack_labels` (the Sidebar
+History tab) still walks the stack, but it's a per-open read, not a per-edit one.
 
 `undo_edit`/`redo_edit` restore from their own stack (not via `with_edit`), but
 are invariant-safe: they `take()` the world *before* popping their stack, erroring

@@ -19,17 +19,14 @@ Rust backend via `invoke`.
 | `Sidebar.tsx` | Docked right-edge tabbed panel (Inspector / Prefabs / History) + collapse rail + drag-resize. |
 | `SelectionInspector.tsx` | Sidebar Inspector tab: stats + ortho preview + extrude + prefab save + trees + 3D view + the collapsible elevation section (see `ElevationPreviewPanel.tsx` below — it's not its own sidebar tab). |
 | `ElevationPreviewPanel.tsx` | Full-height front/side elevation view. Content-only — mounted inside `SelectionInspector`'s collapsible elevation section, not a standalone dock tab. |
-| `ThreeDPreview.tsx` | On-demand 3D render of a selection (≤ 64³). **Dead code** — nothing in `src/` imports/mounts it; kept as the `get_obj_geometry` worked example. |
 | `BlockPaintPicker.tsx` | Reusable block+paint picker (fill / filter modes), texture swatches. |
 | `PrefabLibraryPanel.tsx` | Dockable prefab gallery. |
 | `QuickActionsBar.tsx` | Floating pill under the ribbon: selection copy/fill/delete + clipboard paste/Z-offset/rotate/mirror. |
 | `LeftToolbar.tsx` | Left-edge tool strip. |
 | `NewWorldModal.tsx` | New world dialog (Flat / Natural / Classic / Tg2). |
-| `SchematicImportModal.tsx` | MC `.schematic`/`.litematic` import. |
 | `WorldBrowserModal.tsx` | Search/download worlds from Eden servers. |
 | `UploadModal.tsx` | Upload world + thumbnail. |
 | `MaterializeModal.tsx` | Materialize-from-template / expand-from-template progress + confirm dialog. |
-| `VmfExportModal.tsx` | Source Engine VMF export options (Dev/Flat-color texture mode, skybox shell, merge-across-materials). |
 | `WorldInfoModal.tsx` | Thin `Modal` wrapper around `WorldInfoPanel`. |
 | `SettingsModal.tsx` | Persistent app settings. |
 | `HelpModal.tsx` | Shortcuts + texture-pack help. |
@@ -183,7 +180,7 @@ Mental model, stated so placement is predictable:
 | Home | Clipboard · Navigation · Selection · Palette · Set Point |
 | Draw | Tools · Brush · Options · Palette · Mask |
 | Sculpt | Sculpt tools · Brush · Falloff · Palette (compact) · Tool Options (contextual tail) |
-| Insert | Prefab · Import · Nature · Fluids · World Extent |
+| Insert | Prefab · Nature · Fluids · World Extent |
 | View | Map View · Render · Zoom · Layout · Template · Textures (+ Z-level tail) |
 | 3D | Mode · mode slot (fixed `MODE_SLOT_MIN` 416px) · Camera · Lighting · Textures |
 | Selection | Modify · Z Range · Move · Fill (Fill+Gradient merged) · Replace · Extrude |
@@ -191,8 +188,10 @@ Mental model, stated so placement is predictable:
 
 Moves worth knowing: Materialize Home → Insert; Fluids Selection → Insert (it is
 selection-scoped *generation*, exactly like Trees, and Selection was at 8 groups);
-Load Prefab / Import Schematic / Expand from Template File menu → Insert; the World
+Load Prefab / Expand from Template File menu → Insert; the World
 readout Home → the top-bar pill; New World / Browse Online Home → the application menu.
+(The Insert tab's former Import group — Schematic import — was removed along with
+the rest of VuencEdit's format-conversion features; see `~/EdenToMC`.)
 
 Deliberate duplications — each a *shared component*, never a forked path:
 Copy/Cut/Delete/Fill/Grow/Shrink/Clear on Home + Selection; Paste/Rotate/Flip on Home
@@ -388,7 +387,7 @@ menu and the Menu button that opens it belong to the same system.
 | Download | What the world browser offers (quality sort, date filters, hide junk) + **Browse Online Worlds…** |
 | Save | Compressed + backup-compressed toggles, how incremental/WAL saving works, + **Save Now** |
 | Save As | Same options, extension-correction and overwrite notes, + **Choose Location & Save…** |
-| Export | One row per format (PNG · JSON · OBJ *exp* · VMF *exp*), each with its own **Export** button |
+| Export | PNG image, with its own **Export** button (the only export format left in this repo — the others moved to `~/EdenToMC`) |
 | Upload | What is sent, naming, save-first, permanence, + **Upload This World…** |
 | Properties | `WorldInfoPanel` + an inline rename field |
 | Settings | Quick view toggles + **Open Settings…** |
@@ -580,8 +579,10 @@ existing users doesn't require an app version bump in the same run.
 
 ### Long-operation overlay (`LongOpOverlay`, audit C6 + M14, 2026-08-20)
 
-One modal overlay for every long-running backend operation — PNG/OBJ/JSON/VOX export,
-full save, compressed save — plus the world-load spinner when its `op` prop is null.
+One modal overlay for every long-running backend operation — PNG export, full save,
+compressed save — plus the world-load spinner when its `op` prop is null. (OBJ/JSON/VOX
+export also used this overlay before they were removed; the `"obj"`/`"json"`/`"vox"`
+`LongOps` kinds are unused now, kept rather than narrowed — see [04](./04-ipc-reference.md).)
 It replaced four hand-rolled overlays that between them offered six different levels of
 feedback (a percentage bar, an indeterminate shimmer, two static "Exporting X…" labels)
 and no Cancel at all.

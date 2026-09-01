@@ -133,7 +133,7 @@ export default function ThreeDTab() {
       {/* ── Camera — per-session view controls, previously Settings-only ──── */}
       <Group id="camera" label="Camera" tier={tier.camera} declaredWidth={208} icon="camera">
         <Col style={{ justifyContent: "center", height: GROUP_CONTENT_H }}>
-          <SliderRow label="Fly speed" min={2} max={60} accent={SPATIAL} labelWidth={54}
+          <SliderRow label="Fly speed" min={0.1} max={3} step={0.1} accent={SPATIAL} labelWidth={54}
             value={flyDisplay} onChange={setFlyDisplay} onCommit={p.commitFlySpeed}
             title="Movement speed in fly/look mode, in blocks per second" />
           <SliderRow label="Distance" min={RD_MIN} max={MAX_RENDER_DISTANCE} accent={SPATIAL} labelWidth={54}

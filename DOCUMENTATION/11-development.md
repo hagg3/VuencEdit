@@ -145,8 +145,8 @@ Tracked in full in `CLAUDE.md`; highlights:
 | Change a block color / add a block | [03](./03-blocks-and-colors.md), `colors.rs` + `blockDefs.ts` |
 | Add / change a backend command | [04](./04-ipc-reference.md), `lib.rs` generate_handler + `types.ts` |
 | 2D map behavior | [05](./05-rendering-2d.md), `MapCanvas.tsx` / `viewportUtils.ts` |
-| 3D view / lighting / a port | [06](./06-rendering-3d.md), `FlyView3D.tsx` + `export.rs` |
+| 3D view / lighting / a port | [06](./06-rendering-3d.md), `FlyView3D.tsx` + `geometry.rs` |
 | Editing / new edit op | [07](./07-editing-undo-clipboard.md), `with_edit` in `lib.rs` |
 | Terrain generation | [08](./08-world-generation.md), `worldgen.rs` |
 | UI / Ribbon / state | [09](./09-frontend.md), `App.tsx` / `Ribbon.tsx` |
-| Import/export/network/template | [10](./10-features.md), `schematic.rs`/`export.rs`/`network.rs` |
+| Texture packs/network/template/PNG export | [10](./10-features.md), `texturepack.rs`/`network.rs` |

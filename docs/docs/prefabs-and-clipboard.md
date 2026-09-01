@@ -1,7 +1,7 @@
 ---
 layout: doc
 title: Prefabs & Clipboard
-subtitle: Copy/paste, the prefab library, and schematic import/export.
+subtitle: Copy/paste and the prefab library.
 ---
 
 ## Copy & paste
@@ -39,22 +39,8 @@ non-rectangular Wand or Lasso selection, not just its bounding box.
 
 {% include placeholder.html caption="The Prefabs tab, showing a gallery of saved structures" ratio="4/3" %}
 
-## Schematic import
-
-Bring in Minecraft `.schematic` and `.litematic` builds: pick the file, map its block palette onto
-Eden blocks (with a colour-substrate fallback for anything without an obvious match), preview it
-top-down, and it lands on your clipboard ready to paste like anything else. Axis mapping is
-Minecraft X → Eden X, Minecraft Z → Eden Y, Minecraft Y → Eden Z.
-
 ## Export
 
-- **OBJ** <span class="tag-exp">exp</span> — export a selection or the whole world as a Wavefront
-  OBJ + MTL, with face-culled cube geometry and correct ramp/wedge prisms; one material per
-  block+paint combination.
-- **Source Engine VMF** <span class="tag-exp">exp</span> — turns a selection into editable Hammer
-  brushwork: a 3D greedy box merge into cuboid brushes, ramp/wedge prisms, an optional skybox
-  shell, and either a no-sidecar "dev texture" mode or a flat-colour texture sidecar per
-  block+paint.
-
-Both large exports go through the same progress/cancel system as saves — cancelling cleans up any
-partially-written file rather than leaving one behind.
+PNG image export — a top-down render of the map — lives on the **File → Export** menu.
+Minecraft schematic import and OBJ/Source Engine VMF export moved to the sibling
+[EdenToMC](https://github.com/hagg3/EdenToMC) project.

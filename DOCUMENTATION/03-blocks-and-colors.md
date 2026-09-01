@@ -2,8 +2,10 @@
 
 > **Game-format reference.** The tables here are ported directly from the game
 > source (`Globals.mm`, `Hud.mm`, `la-map`) and live in
-> `src-tauri/src/colors.rs`. External ports can treat this as the canonical block
-> registry and color palette.
+> `packages/voxel-core/src/colors.rs` (re-exported as `crate::colors`, so every call site reads
+> unchanged). External ports can treat this as the canonical block registry and color palette.
+> The fluid-family helpers (`fluid_base`/`fluid_level`/`fluid_type_for`) sit beside them in
+> `packages/voxel-core/src/blocks.rs`.
 
 ## Block type IDs
 

@@ -53,11 +53,16 @@ function HistoryTab({ editEpoch, worldEpoch }: { editEpoch: number; worldEpoch: 
   const [info, setInfo] = useState<UndoStackInfo | null>(null);
 
   useEffect(() => {
+    // Debounced (HALO_FLUSH_MS idiom): editEpoch bumps once per stamp during a 3D build
+    // sweep, and list_undo_stack clones every group's operation String, so fetching per
+    // bump is an O(history) round trip per stamp. Trailing-edge only.
     let cancelled = false;
-    invoke<UndoStackInfo>("list_undo_stack")
-      .then((r) => { if (!cancelled) setInfo(r); })
-      .catch(() => { if (!cancelled) setInfo(null); });
-    return () => { cancelled = true; };
+    const t = setTimeout(() => {
+      invoke<UndoStackInfo>("list_undo_stack")
+        .then((r) => { if (!cancelled) setInfo(r); })
+        .catch(() => { if (!cancelled) setInfo(null); });
+    }, 200);
+    return () => { cancelled = true; clearTimeout(t); };
   }, [editEpoch, worldEpoch]);
 
   const rowStyle = (highlight: boolean): React.CSSProperties => ({

@@ -57,8 +57,6 @@ export interface AppSettings {
    *  no visual confirmation of what changed. Past this cap the placement outline simply doesn't
    *  appear (build-mode hover picks at the same distance), so the refusal is legible. Default 64. */
   buildReach: number;
-  /** Shows OBJ/VMF export menu items. Both are buggy/unfinished; off by default so most users never see them. */
-  enableExperimentalExport: boolean;
   /** Docked right sidebar (Inspector/Prefabs/History tabs — Elevation folded into Inspector) open on load. Default true. */
   sidebarOpen: boolean;
   /** Docked sidebar width in px, drag-resizable ~200–420. Default 260. */
@@ -103,7 +101,7 @@ export const MEMORY_PRESETS: Record<AppSettings["memoryBudget"], {
 };
 
 /** Current settings schema version. Bump + add a case to `migrate()` when a stored default must change. */
-const SETTINGS_VERSION = 12;
+const SETTINGS_VERSION = 14;
 
 const DEFAULTS: AppSettings = {
   defaultQuadView: true,
@@ -127,7 +125,6 @@ const DEFAULTS: AppSettings = {
   autoOrient3d: true,
   floodFillLimit: 1000,
   buildReach: 64,
-  enableExperimentalExport: false,
   sidebarOpen: true,
   sidebarWidth: 260,
   sidebarTab: "inspector",
@@ -180,6 +177,24 @@ function migrate(s: Record<string, unknown>): boolean {
   // v11 → v12: added tourVersion (onboarding coach-mark tour gate). No forced value needed — the
   // `{...DEFAULTS, ...parsed}` merge supplies it (default 0), which is what makes every existing
   // install see the tour once, same as a fresh one.
+  // v12 → v13: removed enableExperimentalExport (OBJ/JSON/VOX export and schematic import moved to
+  // the sibling EdenToMC project). Strip the stale key so it doesn't linger forever in localStorage —
+  // the `{...DEFAULTS, ...parsed}` merge would otherwise keep re-adding a field nothing reads. Also
+  // drop the now-orphaned `eden_schematic_presets` key (written by the deleted SchematicImportModal),
+  // a separate localStorage entry outside this settings blob.
+  if (from < 13) {
+    delete s.enableExperimentalExport;
+    try { localStorage.removeItem("eden_schematic_presets"); } catch { /* ignore */ }
+  }
+  // v13 → v14: fly speed was badly calibrated — the slider ran 0.1-12/60 depending on which of two
+  // mismatched sliders you touched, and the old default of 1.0 actually felt like warp speed; 0.2 was
+  // the value that felt right. The actual movement math was rescaled to match (FLY_SPEED_SCALE in
+  // FlyView3D.tsx), so a stored value from before this version means something 5x faster than it used
+  // to — clamp any pre-existing value into the new 0.1-3 range so an install that had cranked the old
+  // slider up doesn't suddenly fly 5x faster than before.
+  if (from < 14 && typeof s.flySpeed === "number") {
+    s.flySpeed = Math.min(3, Math.max(0.1, s.flySpeed));
+  }
   s.settingsVersion = SETTINGS_VERSION;
   return true;
 }
@@ -411,17 +426,6 @@ export default function SettingsModal({ onClose, onSave }: Props) {
                 </div>
               </div>
 
-              <div style={row}>
-                <Checkbox value={local.enableExperimentalExport} onChange={v => set("enableExperimentalExport", v)} label="Experimental exports (OBJ/VMF)" />
-                <div style={labelCol}>
-                  <span style={labelText}>
-                    Experimental exports (OBJ/VMF)
-                    <span style={expBadge({ marginLeft: 7, verticalAlign: "middle" })}>exp</span>
-                  </span>
-                  <span style={labelSub}>Shows File → Export OBJ… and Export VMF (Hammer)… — both are still buggy</span>
-                </div>
-              </div>
-
               <div style={{ ...row, borderBottom: "none" }}>
                 <div style={labelCol}>
                   <span style={labelText}>Memory budget</span>
@@ -497,7 +501,7 @@ export default function SettingsModal({ onClose, onSave }: Props) {
               <div style={{ height: 8 }} />
 
               <Slider
-                label="Fly speed" value={local.flySpeed} min={0.1} max={12} step={0.1}
+                label="Fly speed" value={local.flySpeed} min={0.1} max={3} step={0.1}
                 format={v => `${v.toFixed(1)}×`}
                 onChange={v => set("flySpeed", v)}
               />

@@ -72,11 +72,16 @@ export interface EditResult {
   /** Audit C1 step 3: this edit's undo delta exceeded the whole undo budget, so it was dropped and
    *  the rest of the history with it. The edit itself applied; nothing is undoable. */
   undo_dropped: boolean;
+  /** Non-fatal advisory toasts — e.g. dense doors/flowers packed into this edit's footprint, a block
+   *  family suspected of a fixed client-side capacity (see the ComBlock crash writeup). The edit
+   *  already applied; this is informational only. Empty for undo/redo. */
+  warnings: string[];
 }
 
 type EditResultHeader = {
   patch: PixelPatchHeader; invalidate: boolean;
   undo_depth: number; redo_depth: number; operation: string; undo_dropped: boolean;
+  warnings: string[];
 };
 
 export function decodeEditResult(buf: IpcBinary): EditResult {
@@ -88,6 +93,7 @@ export function decodeEditResult(buf: IpcBinary): EditResult {
     redo_depth: header.redo_depth,
     operation: header.operation,
     undo_dropped: header.undo_dropped,
+    warnings: header.warnings,
   };
 }
 
@@ -101,7 +107,7 @@ export function decodePreviewData(buf: IpcBinary): PreviewData {
   return { width: header.width, height: header.height, pixels: body };
 }
 
-// ---- Voxel geometry (get_chunk_geometry / get_obj_geometry) ----
+// ---- Voxel geometry (get_chunk_geometry) ----
 
 /** Decoded geometry: three vertex streams (opaque / transparent / emissive), each already a
  *  `Float32Array` view over the IPC response — ready to hand straight to `THREE.BufferAttribute`. */

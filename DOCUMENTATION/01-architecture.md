@@ -32,21 +32,39 @@ tiles, geometry, and metadata, and sends back edit commands.
 
 ## Process & module layout
 
+This repo is a workspace: the app is `apps/vuencedit/`, and everything that is **pure voxel
+logic** — no world type, no lock, no Tauri command — lives in the shared Rust crate
+`packages/voxel-core`, generic over the `VoxelView` trait. Paths below are relative to
+`apps/vuencedit/` unless they start with `packages/`.
+
 ```
+packages/voxel-core/src/   Shared voxel primitives — NO tauri dependency, ever
+  colors.rs       (596 L)  BLOCK_RGB / PAINT_RGB / BLOCK_INFO tables + helpers
+  blocks.rs        (62 L)  Fluid family: fluid_base / fluid_level / fluid_type_for
+  view.rs         (170 L)  VoxelView / VoxelViewMut / ViewMeta + block addressing
+  mask.rs          (51 L)  SelectionMask (the shaped-selection footprint)
+  texture.rs      (213 L)  Atlas layout contract the mesher reads
+  geometry.rs   (~1770 L)  Live 3D geometry pipeline: per-chunk face-culled/
+                           greedy-meshed mesh generation, night-lighting/shadow
+                           previews, voxel picking (DDA)
+  lamps.rs        (472 L)  Lamp spatial index (lazy, per-chunk, interior-mutable)
+  render.rs       (833 L)  Raster + every 2D renderer: top-down map, z/y/x slices,
+                           axonometric, ortho front/side/top (+ _ctx variants)
+
 src-tauri/src/             Rust backend (single library crate + thin main.rs)
   main.rs                  Entry point → eden_world_editor_lib::run()
-  lib.rs        (~15600 L) World parse/model, all editing commands, with_edit,
-                           copy/paste, prefab, sculpt/fill, sky/creatures, tests
-  colors.rs       (535 L)  BLOCK_RGB / PAINT_RGB / BLOCK_INFO tables + helpers
+  lib.rs        (~15150 L) World parse/model, all editing commands, with_edit,
+                           copy/paste, prefab, sculpt/fill, sky/creatures, the
+                           thin render_* wrappers over voxel-core, tests
   worldgen.rs    (2862 L)  Perlin noise + Natural/Classic/TG2 generators + commands
-  schematic.rs    (926 L)  MC .schematic/.litematic/.schem import, NBT parsing
-  export.rs      (2509 L)  OBJ/JSON/VOX/PNG export, geometry generation, 3D
-                           lighting, voxel picking, get_chunk_geometry
+  geometry.rs     (143 L)  Tauri/IPC shell only: get_chunk_geometry, pick_block,
+                           get_lamps_near, get_light_constants + the binary
+                           envelope newtype. The pipeline itself is voxel-core's.
   network.rs      (648 L)  Eden server search/list/download/upload
-  texturepack.rs  (636 L)  Texture pack loader: atlas builder, per-face tile map
+  texturepack.rs  (447 L)  Texture pack loader: atlas builder, per-face tile map
+                           (the layout contract itself is voxel-core's)
   journal.rs      (542 L)  WAL / autosave journal wire format (shared by both)
   signs.rs        (255 L)  Sign sidecar decode
-  vmf_export.rs  (1688 L)  Source Engine VMF (Hammer brushwork) export
 
 src/                        React + TypeScript frontend
   App.tsx        (~4570 L)  Global state, keyboard shortcuts, orchestration
@@ -60,9 +78,11 @@ src/                        React + TypeScript frontend
 
 Line counts are approximate and drift with every change — treat them as
 order-of-magnitude, not exact. Rust `lib.rs` was intentionally split into
-submodules (`colors`, `worldgen`, `schematic`, `export`, `network`,
-`texturepack`, `journal`, `signs`, `vmf_export`); `lib.rs` still owns the world
-model, the editing commands, and `with_edit`.
+submodules (`colors`, `worldgen`, `geometry`, `network`, `texturepack`,
+`journal`, `signs`); `lib.rs` still owns the world model, the editing commands,
+and `with_edit`. (`schematic` and `vmf_export` — Minecraft schematic import and
+Source Engine VMF export — were removed; that functionality now lives in the
+sibling `EdenToMC` project, not this repo.)
 
 ## The `WorldState` and the app lock
 
@@ -104,7 +124,7 @@ run off-thread and don't stall the UI:
   `expand_world_from_template`
 - The heavy renders: `render_selection_view`, `render_full_height_view`,
   `render_axo_region`
-- All of `export.rs`
+- All of `geometry.rs`'s commands
 - All worldgen `create_*` / `preview_*`
 - `fetch_template_tile` (a first pan over virgin template can decode ~1,000 chunk
   columns)

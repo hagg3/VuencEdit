@@ -48,7 +48,7 @@ them consistent. If you change behavior, update both.
 | 07 | [Editing, Undo & Clipboard](./07-editing-undo-clipboard.md) | `with_edit`, delta undo, copy/paste, prefabs, drawing/sculpt tools |
 | 08 | [World Generation](./08-world-generation.md) | Flat / Natural / Classic / Tg2 generators |
 | 09 | [Frontend Guide](./09-frontend.md) | React component map, App.tsx state, UI conventions |
-| 10 | [Features](./10-features.md) | Texture packs, schematic import, template overlay/expand, network, export |
+| 10 | [Features](./10-features.md) | Texture packs, template overlay/expand, network, PNG export |
 | 11 | [Development](./11-development.md) | Build/test/CI, tooling, guardrails, versioning, open work |
 
 ## The elevator pitch

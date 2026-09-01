@@ -9,7 +9,7 @@
   text: "The four-pane editor, the fly-through pane, and building in 3D."
 - title: "Prefabs & Clipboard"
   url: /docs/prefabs-and-clipboard/
-  text: "Copy/paste, the prefab library, and schematic import/export."
+  text: "Copy/paste and the prefab library."
 - title: "World Compatibility"
   url: /docs/world-compatibility/
   text: "Legacy64z, New Dawn 256z, and NewFormat256z — what each means for you."

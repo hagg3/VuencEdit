@@ -47,7 +47,6 @@ site, because they're newer, more performance-sensitive, or more likely to chang
 - **Terrain sculpting** — the full 16-tool sculpt system.
 - **Night lighting & sun shadows** — the 3D pane's lighting previews, including the GPU shadow-map
   mode.
-- **Source Engine VMF export** — brushwork export for Hammer.
 - **Texture packs** — real block textures in the 3D views.
 - **Eden.eden template expansion** — baking the bundled template into a full world file.
 

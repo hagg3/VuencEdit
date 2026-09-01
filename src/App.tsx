@@ -27,9 +27,7 @@ import { TOUR_STEPS, TOUR_VERSION, type TourCtx } from "./tour/steps";
 import AboutModal from "./AboutModal";
 import WorldBrowserModal from "./WorldBrowserModal";
 import UploadModal from "./UploadModal";
-import VmfExportModal, { type VmfExportBounds } from "./VmfExportModal";
 import NewWorldModal from "./NewWorldModal";
-import SchematicImportModal, { type SchematicInfo, type MappingEntry } from "./SchematicImportModal";
 import Ribbon, { ribbonHeight, EDEN_TEAL, EDEN_TEAL_READABLE, type RibbonTab, type MapViewMode } from "./Ribbon";
 import QuickActionsBar, { QUICK_ACTIONS_BAR_H } from "./QuickActionsBar";
 import SettingsModal, { loadSettings, saveSettings, MEMORY_PRESETS, type AppSettings } from "./SettingsModal";
@@ -422,7 +420,6 @@ function App() {
   /// booleans and two bespoke progress shapes these used to need, and the four hand-rolled
   /// overlays that read them.
   const [longOp, setLongOp] = useState<LongOpState | null>(null);
-  const [vmfExportBounds, setVmfExportBounds] = useState<VmfExportBounds | null>(null);
   const [saving, setSaving] = useState(false);
   const [saveCompressed, setSaveCompressed] = useState(() => loadSettings().defaultSaveCompressed);
   const [backupCompressed, setBackupCompressed] = useState(() => loadSettings().backupCompressed);
@@ -739,7 +736,6 @@ function App() {
   const [autoOrient3d, setAutoOrient3d] = useState(() => loadSettings().autoOrient3d);
   const [floodFillLimit, setFloodFillLimit] = useState(() => loadSettings().floodFillLimit);
   const [buildReach, setBuildReach] = useState(() => loadSettings().buildReach);
-  const [enableExperimentalExport, setEnableExperimentalExport] = useState(() => loadSettings().enableExperimentalExport);
   // Memory-budget preset (§6 of the 2026-08 memory-efficiency pass) — only the undo budget reaches
   // Rust (via set_undo_budget below); tile/vertex budgets stay frontend-side as MapCanvas/FlyView3D props.
   const [memoryBudget, setMemoryBudget] = useState<AppSettings["memoryBudget"]>(() => loadSettings().memoryBudget);
@@ -780,7 +776,6 @@ function App() {
     setAutoOrient3d(s.autoOrient3d);
     setFloodFillLimit(s.floodFillLimit);
     setBuildReach(s.buildReach);
-    setEnableExperimentalExport(s.enableExperimentalExport);
     setMemoryBudget(s.memoryBudget);
     invoke("set_undo_budget", { bytes: MEMORY_PRESETS[s.memoryBudget].undoBudgetBytes }).catch(() => {});
     if (s.templatePath !== templatePath) setTemplatePath(s.templatePath);
@@ -828,9 +823,6 @@ function App() {
   const [showWorldBrowser, setShowWorldBrowser] = useState(false);
   const [showUploadModal, setShowUploadModal] = useState(false);
   const [showNewWorld, setShowNewWorld] = useState(false);
-  const [schematicInfo, setSchematicInfo] = useState<SchematicInfo | null>(null);
-  const [schematicPath, setSchematicPath] = useState<string | null>(null);
-  const [schematicApplying, setSchematicApplying] = useState(false);
   const [spawnPos, setSpawnPos] = useState<{ px: number; py: number } | null>(null);
   // `pos` (header bytes 4–15) — the last-walked player position, a *different* field from `home`
   // (16–27). Home ▸ Set Point writes one each; see `set_player_pos` / `set_spawn_pos` in lib.rs.
@@ -1425,6 +1417,10 @@ function App() {
       pushToast("This edit was too large to undo — undo history has been cleared. " +
                 "Raise the memory budget in Settings ▸ General to keep undo for edits this size.", "error");
     }
+    // Risky-block density warnings (dense doors/flowers packed into one footprint — see
+    // RISKY_BLOCK_GROUPS in lib.rs). Advisory only, shown regardless of `silent` since it's a safety
+    // signal rather than a routine operation label.
+    for (const w of raw.warnings) pushToast(w, "error");
   }, [showToast, pushToast]);
 
   async function openFile() {
@@ -1540,85 +1536,6 @@ function App() {
       reportExportError(e);
     }
   }
-
-  async function exportObj() {
-    if (!world) return;
-    const defaultName = selection ? `${world.name}_selection.obj` : `${world.name}.obj`;
-    const savePath = await save({
-      filters: [{ name: "Wavefront OBJ", extensions: ["obj"] }],
-      defaultPath: defaultName,
-    });
-    if (!savePath) return;
-    const x1 = selection ? selection.x1 : 0;
-    const y1 = selection ? selection.y1 : 0;
-    const x2 = selection ? selection.x2 : chunkToWorld(world.width_chunks) - 1;
-    const y2 = selection ? selection.y2 : chunkToWorld(world.height_chunks) - 1;
-    const zMin = selection ? selection.z_min : 0;
-    const zMax = selection ? selection.z_max : world.max_z;
-    try {
-      await invoke("export_obj", { path: savePath, x1, y1, x2, y2, zMin, zMax });
-    } catch (e) {
-      reportExportError(e);
-    }
-  }
-
-  async function exportJson() {
-    if (!world) return;
-    const defaultName = selection ? `${world.name}_selection.json.gz` : `${world.name}.json.gz`;
-    const savePath = await save({
-      filters: [{ name: "Gzipped JSON", extensions: ["json.gz", "gz"] }],
-      defaultPath: defaultName,
-    });
-    if (!savePath) return;
-    const x1 = selection ? selection.x1 : 0;
-    const y1 = selection ? selection.y1 : 0;
-    const x2 = selection ? selection.x2 : chunkToWorld(world.width_chunks) - 1;
-    const y2 = selection ? selection.y2 : chunkToWorld(world.height_chunks) - 1;
-    const zMin = selection ? selection.z_min : 0;
-    const zMax = selection ? selection.z_max : world.max_z;
-    try {
-      await invoke("export_json", { path: savePath, x1, y1, x2, y2, zMin, zMax });
-    } catch (e) {
-      reportExportError(e);
-    }
-  }
-
-  // VMF export is selection-scale only (Source caps a map at 8,192 brushes; whole-world export
-  // is a footgun, not a feature) — opening the modal without a selection would just let the user
-  // hit the brush-count guard after already filling out options, so the guard fires up front.
-  function exportVmf() {
-    if (!world) return;
-    if (!selection) {
-      showToast("Select a region first — VMF export works on a selection, not the whole world");
-      return;
-    }
-    setVmfExportBounds({
-      x1: selection.x1, y1: selection.y1, x2: selection.x2, y2: selection.y2,
-      zMin: selection.z_min, zMax: selection.z_max,
-    });
-  }
-
-  // VOX export hidden pending better test coverage — prefixed to silence TS unused warning
-  const _exportVox = async () => {
-    if (!world) return;
-    const defaultName = selection ? `${world.name}_selection.vox` : `${world.name}.vox`;
-    const savePath = await save({
-      filters: [{ name: "MagicaVoxel VOX", extensions: ["vox"] }],
-      defaultPath: defaultName,
-    });
-    if (!savePath) return;
-    const x1 = selection ? selection.x1 : 0;
-    const y1 = selection ? selection.y1 : 0;
-    const x2 = selection ? selection.x2 : chunkToWorld(world.width_chunks) - 1;
-    const y2 = selection ? selection.y2 : chunkToWorld(world.height_chunks) - 1;
-    const zMin = selection ? selection.z_min : 0;
-    const zMax = selection ? selection.z_max : world.max_z;
-    try {
-      await invoke("export_vox", { path: savePath, x1, y1, x2, y2, zMin, zMax });
-    } catch (e) {
-      reportExportError(e);
-    }
-  }; void _exportVox;
 
   function commitZSlice(z: number) {
     setZSliceZ(z);
@@ -2485,8 +2402,8 @@ function App() {
   // When one is up it owns the keyboard, so editor shortcuts must not fire underneath it.
   const anyModalOpen =
     showAbout || showSettings || showWorldInfo || showWorldBrowser || showUploadModal ||
-    showNewWorld || !!schematicInfo || showExpandModal || !!recoveryInfo || prefabNameModal ||
-    !!vmfExportBounds || tourOpen;
+    showNewWorld || showExpandModal || !!recoveryInfo || prefabNameModal ||
+    tourOpen;
   const anyModalOpenRef = useRef(false);
   useEffect(() => { anyModalOpenRef.current = anyModalOpen; }, [anyModalOpen]);
 
@@ -2899,10 +2816,11 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
         setPrefabOverwrite(true);
         return;
       }
-      await invoke("save_prefab", { path });
+      const warnings = await invoke<string[]>("save_prefab", { path });
       setPrefabRefreshToken((t) => t + 1);
       setPrefabNameModal(false);
       showToast(`Saved prefab “${safe}”`);
+      for (const w of warnings) pushToast(w, "error");
     } catch (e) {
       reportError(e);
     } finally {
@@ -2918,8 +2836,11 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
       defaultPath: `${world?.name ?? "prefab"}.epfab`,
     });
     if (!path) return;
-    await invoke("save_prefab", { path })
-      .then(() => setPrefabRefreshToken((t) => t + 1))
+    await invoke<string[]>("save_prefab", { path })
+      .then((warnings) => {
+        setPrefabRefreshToken((t) => t + 1);
+        for (const w of warnings) pushToast(w, "error");
+      })
       .catch((e) => reportError(e));
   }
 
@@ -2934,37 +2855,6 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
     if (!info) return;
     setClipboard(info);
     setTool("paste");
-  }
-
-  async function importSchematic() {
-    const path = await open({
-      filters: [{ name: "Minecraft Schematic / Sponge / Litematica", extensions: ["schematic", "schem", "litematic"] }],
-      multiple: false,
-    });
-    if (!path || typeof path !== "string") return;
-    const info = await invoke<SchematicInfo>("import_schematic_info", { path })
-      .catch((e: unknown) => { reportError(e); return null; });
-    if (!info) return;
-    setSchematicPath(path);
-    setSchematicInfo(info);
-  }
-
-  async function applySchematic(mapping: MappingEntry[]) {
-    if (!schematicPath) return;
-    setSchematicApplying(true);
-    try {
-      const info = await invoke<ClipboardInfo>("import_schematic_apply", {
-        path: schematicPath, mapping,
-      });
-      setClipboard(info);
-      setTool("paste");
-      setSchematicInfo(null);
-      setSchematicPath(null);
-    } catch (e) {
-      reportError(e);
-    } finally {
-      setSchematicApplying(false);
-    }
   }
 
   async function deleteBlocks() {
@@ -3398,7 +3288,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           // `mounted3d`. Its only live occupant then is FlyView3D, suspended; the map/slice cells
           // render nothing, and the map moves to the non-quad wrapper below.
           <div ref={quadGridRef} style={{
-            position: "absolute", top: effectiveRibbonHeight, left: 0, right: sidebarInsetPx, bottom: STATUS_BAR_HEIGHT,
+            position: "absolute", top: effectiveRibbonHeight + (showQuickActions ? QUICK_ACTIONS_BAR_H : 0), left: 0, right: sidebarInsetPx, bottom: STATUS_BAR_HEIGHT,
             display: showSlicePanels ? "grid" : "none",
             gridTemplateColumns: quadCols, gridTemplateRows: quadRows,
             gap: 2, background: "#0a0f1e",
@@ -3852,12 +3742,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           saveWorld={saveWorld}
           saveWorldAs={saveWorldAs}
           exportPng={exportPng}
-          exportObj={exportObj}
-          exportJson={exportJson}
-          exportVmf={exportVmf}
-          enableExperimentalExport={enableExperimentalExport}
           loadPrefab={loadPrefab}
-          importSchematic={importSchematic}
           showPrefabLibrary={sidebarOpen && sidebarTab === "prefabs"}
           onTogglePrefabLibrary={() => {
             if (sidebarOpen && sidebarTab === "prefabs") {
@@ -4056,26 +3941,10 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
             onClose={() => setShowUploadModal(false)}
           />
         )}
-        {vmfExportBounds && world && (
-          <VmfExportModal
-            worldName={world.name}
-            bounds={vmfExportBounds}
-            onClose={() => setVmfExportBounds(null)}
-          />
-        )}
         {showNewWorld && (
           <NewWorldModal
             onClose={() => setShowNewWorld(false)}
             onCreated={(path) => { setShowNewWorld(false); openFileAt(path); }}
-          />
-        )}
-        {schematicInfo && schematicPath && (
-          <SchematicImportModal
-            info={schematicInfo}
-            path={schematicPath}
-            applying={schematicApplying}
-            onApply={(mapping) => applySchematic(mapping)}
-            onCancel={() => { setSchematicInfo(null); setSchematicPath(null); }}
           />
         )}
 
