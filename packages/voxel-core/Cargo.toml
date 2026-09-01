@@ -1,0 +1,17 @@
+[package]
+name = "voxel-core"
+version = "0.1.0"
+description = "Eden voxel primitives shared by the vuenc apps"
+edition = "2021"
+
+# Deliberately free of a `tauri` dependency. This crate is pure voxel/colour logic; anything
+# that needs `tauri::State`, `#[tauri::command]` or an app's world type stays in that app.
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+# `rayon` is used strictly inside the pure render/scan functions here. The "never re-lock app
+# state inside a rayon closure" rule the apps follow holds trivially in this crate — nothing here
+# can see an app's lock.
+rayon = "1"
+# `FxHashMap`/`FxHashSet` for the (i32, i32) chunk keys hashed on every voxel read. Not
+# security-sensitive maps (no untrusted external keys).
+rustc-hash = "2"

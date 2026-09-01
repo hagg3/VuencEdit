@@ -16,7 +16,7 @@
  * has, and none of that chrome carried information the text doesn't.
  */
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { EDEN_TEAL_READABLE, expBadge, glassPanel, spinnerStyle } from "./designTokens";
+import { EDEN_TEAL_READABLE, glassPanel, spinnerStyle } from "./designTokens";
 import AboutPanel from "./panels/AboutPanel";
 import WorldInfoPanel from "./panels/WorldInfoPanel";
 import { Icon, type IconName } from "./ribbon/icons";
@@ -374,25 +374,7 @@ function Pane({ row, onClose, infoKey, bumpInfo }: { row: AppMenuRow; onClose: (
           <ExportRow icon="fullmap" title="PNG image" busy={p.longOpKind === "png"}
             desc="A top-down render of the whole map at one pixel per block, using the same colours the 2D view draws."
             onExport={() => { onClose(); p.exportPng(); }} />
-          <ExportRow icon="properties" title="JSON" busy={p.longOpKind === "json"} disabled={!p.world}
-            desc="The world header plus a chunk index, for scripting and diffing. Human-readable and small."
-            onExport={() => { onClose(); p.exportJson(); }} />
-          {p.enableExperimentalExport && (
-            <ExportRow icon="axo" title="OBJ mesh" badge={<span style={expBadge()}>exp</span>} busy={p.longOpKind === "obj"} disabled={!p.world}
-              desc="Face-culled cubes plus ramp prisms and wedge pyramids, one material per block/paint combination. Opens in Blender."
-              onExport={() => { onClose(); p.exportObj(); }} />
-          )}
-          {p.enableExperimentalExport && (
-            <ExportRow icon="build" title="VMF (Source / Hammer)" badge={<span style={expBadge()}>exp</span>} disabled={!p.world}
-              desc="The selection as editable Hammer brushwork — a 3D greedy box merge into cuboid brushes, with an optional skybox shell, light_environment and player start."
-              onExport={() => { onClose(); p.exportVmf(); }} />
-          )}
         </div>
-        {!p.enableExperimentalExport && (
-          <div style={{ fontSize: 11.5, color: TEXT_LABEL, lineHeight: 1.5 }}>
-            JSON and additional hidden export features are experimental. Turn on <strong>experimental exports</strong> in Settings to see all of them.
-          </div>
-        )}
       </>);
 
     // ── Upload ───────────────────────────────────────────────────────────
@@ -436,8 +418,6 @@ function Pane({ row, onClose, infoKey, bumpInfo }: { row: AppMenuRow; onClose: (
             hint="Inspector, prefab library, elevation preview and undo history." />
           <QuickToggle label="Quick Actions bar" on={p.showQuickActions} onToggle={p.onToggleQuickActions}
             hint="Floating selection/clipboard pill under the ribbon." />
-          <QuickToggle label="Experimental exports" on={p.enableExperimentalExport} onToggle={() => { onClose(); p.setShowSettings(true); }}
-            hint="OBJ and VMF export. Changed in the full Settings dialog." readOnly />
         </div>
         <Primary icon="settings" label="Open Settings…" onClick={() => { onClose(); p.setShowSettings(true); }} />
       </>);
