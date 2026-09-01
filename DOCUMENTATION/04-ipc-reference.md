@@ -149,11 +149,15 @@ See [05 — 2D Rendering](./05-rendering-2d.md).
 | `delete_prefab` / `rename_prefab` / `prefab_exists` | | Guard on `.epfab` extension. |
 | `render_prefab_thumbnail` | `PreviewData` | Gallery thumbnail. |
 
-## 3D geometry, lighting & picking (`export.rs`)
+## 3D geometry, lighting & picking (`geometry.rs`)
+
+Formerly `export.rs` — renamed when static-format export (OBJ/JSON/VOX) was removed
+from this repo (that functionality now lives in the sibling `EdenToMC` project). What
+remains is the live 3D geometry pipeline `FlyView3D`/`SliceViewport`/block picking
+depend on.
 
 | Command | Returns | Notes |
 |---|---|---|
-| `get_obj_geometry` | geometry b64 | Selection preview (≤64³), `ThreeDPreview`. Always `LightMode::default()`. |
 | `get_chunk_geometry` | multi-stream geometry | One 16×16 chunk column for `FlyView3D`; opaque + transparent + emissive streams. Optional `zMin`/`zMax` clip the emitted band (omitted = full `0..=world_max_z`); the cutaway cap `view_cap_z` is intersected in server-side. See [06](./06-rendering-3d.md). |
 | `get_light_constants` | `LightConstants` | `LAMP_LIGHT_RADIUS`, `SHADOW_RAY_STEPS` — for the edit-sync reload rect. |
 | `get_lamps_near` | `Vec<LampLight>` | Nearest lamps for GPU point lighting (cap 64). |
@@ -166,14 +170,13 @@ See [06 — 3D Rendering](./06-rendering-3d.md).
 
 | Command | Notes |
 |---|---|
-| `export_obj` **(async)** | Wavefront OBJ + MTL; face-culled cubes, ramp prisms, wedge pyramids. Long-op `kind: "obj"`, cancellable. |
-| `export_json` **(async)** | JSON geometry dump. Long-op `kind: "json"`, cancellable. |
-| `export_vox` **(async)** | MagicaVoxel `.vox` (menu item currently disabled). Long-op `kind: "vox"`, cancellable. |
 | `export_png` **(async)** | Renders + encodes in Rust. Long-op `kind: "png"`, *not* cancellable. |
 
-All four refuse a region over `MAX_EXPORT_VOXELS` (256 M, matching
-`MAX_CLIPBOARD_VOLUME`) up front via `check_export_volume`, with the estimate spelled
-out in the message — see [10](./10-features.md#export) (audit C6).
+PNG is the only export left in this repo — a screenshot of the editor's own
+top-down view, not a format conversion. OBJ/JSON/VOX export moved to `EdenToMC`
+along with the `MAX_EXPORT_VOXELS`/`check_export_volume` guard that bounded them;
+PNG never needed it (it renders the whole map at a fixed resolution regardless of
+selection).
 
 ## Long operations (`LongOps`, audit C6 + M14, 2026-08-20)
 
@@ -188,8 +191,8 @@ UI and only one runs at a time. Storing the *id* rather than a bare bool means a
 that arrives just after an operation finished can never leak onto the next one.
 
 ```rust
-let op = ops.begin(&app, "obj", "Exporting OBJ".into(), total_rows, /* cancellable */ true);
-op.step(done, "Writing geometry")?;   // emits (throttled) AND returns Err(LONG_OP_CANCELLED)
+let op = ops.begin(&app, kind, label.into(), total_rows, cancellable);
+op.step(done, "Writing chunks")?;   // emits (throttled) AND returns Err(LONG_OP_CANCELLED)
 ```
 
 - Event name: **`long-op`**. The opening event carries
@@ -199,10 +202,13 @@ op.step(done, "Writing geometry")?;   // emits (throttled) AND returns Err(LONG_
   `label`/`cancellable` survive the run.
 - Throttled to whole-percent changes **and** a `LONG_OP_MIN_INTERVAL_MS` (80 ms) floor.
 - `cancel_long_op(id)` sets the flag; `step` turns it into `Err("Cancelled")`, which
-  propagates through the usual `?`. `ExportCleanup` (export.rs) deletes the
-  half-written file unless `keep()` was called, so a cancel never leaves a truncated
-  export that looks real.
-- `kind` values: `"png" | "obj" | "json" | "vox" | "save"`.
+  propagates through the usual `?`.
+- `kind` values: `"png" | "obj" | "json" | "vox" | "save"` — the `"obj"`/`"json"`/
+  `"vox"` kinds are unused now that OBJ/JSON/VOX export moved to `EdenToMC`; the enum
+  was deliberately left permissive (not narrowed) rather than churned for a cosmetic
+  cleanup. `ExportCleanup`, the half-written-file-deleter those three export commands
+  used, was removed along with them — `export_png` never needed it (it writes the
+  file in one shot at the end, not incrementally).
 - **Saves report progress but are not cancellable** — `try_incremental_save` writes in
   place through a committed WAL that the next load rolls forward, so "cancel" has no
   coherent meaning there. `atomic_write_progress` / `save_world_compressed` chunk their
@@ -231,13 +237,6 @@ See [08 — World Generation](./08-world-generation.md).
 | `fetch_template_tile` **(async)** | `PixelPatch`; alpha=0 where no template chunk. Takes `lod`; decodes only the template columns the sampled grid touches. |
 | `expand_world_from_template` **(async)** | Bake template chunks into a new world file. `"expand_progress"` events. |
 | `cancel_expand` | Sets a separate `ExpandCancel` AtomicBool; deletes partial output. |
-
-## Schematic import (`schematic.rs`)
-
-| Command | Notes |
-|---|---|
-| `import_schematic_info` | Parse `.schematic`/`.litematic`/`.schem` header → mapping table. |
-| `import_schematic_apply` | Apply mapping → clipboard → paste. |
 
 ## Network (`network.rs`)
 

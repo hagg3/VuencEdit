@@ -98,8 +98,6 @@ Pre-built installers for macOS (Apple Silicon + Intel universal), Windows, and L
 - **Compressed world support** — reads and writes `.eden.zip` (deflate-9) alongside plain `.eden`
 - **Browse Worlds** — search and download any world from the Eden community servers with preview images, date range filters, quality sorting, and a *Hide junk* toggle
 - **Upload** — share your world back to the Eden servers with a PNG thumbnail
-- **OBJ export** *(experimental)* — export a selection or the whole world as a Wavefront OBJ + MTL file with face-culled geometry and per-block materials; ramps and wedges export as correct prism/pyramid geometry
-- **Schematic import** — import Minecraft `.schematic` and `.litematic` builds with a block-mapping table, colour-substrate selector, preset save/load, and a top-down preview before applying
 - **Template overlay** *(experimental)* — sparse worlds (which only store edited chunks) leave gaps in the top-down map; point VuencEdit at the game's bundled `Eden.eden` pre-generated template to render the surrounding terrain faded behind your edits. PNG exports bake the template at full opacity where your world has no chunks
 - **Expand from Template** *(experimental)* — fill a sparse world out to the full template extent (or just within its current bounds), writing all the missing terrain chunks into a new world file
 
@@ -159,11 +157,10 @@ Most actions live on the **Ribbon** — a tabbed toolbar (Home / Selection / Vie
 15. **Axo view** — **View** tab → render mode *Axo* switches to an isometric perspective; drag the Skew slider to change it.
 16. **Texture pack** — **View** tab → *Texture Pack* → Load a ZIP of block PNGs to texture the 3D views and picker swatches.
 17. **Template overlay** — **View** tab → *Template Overlay* → point at the game's `Eden.eden` file to show surrounding terrain behind a sparse world. **File** tab → *Expand from Template* bakes that terrain into a new world file.
-18. **Import Schematic** — **File** tab → *Import Schematic* lets you bring in a Minecraft build, remap blocks, and paste it in.
-19. **Export** — **File** tab → *Export* writes PNG, OBJ (+MTL), or JSON. OBJ/JSON export the current selection if one is active, otherwise the full world.
-20. **Save** — *Save* writes changes back to the original file, *Save As* writes to a new file. Saves are atomic — an interrupted save (crash, power loss) can't corrupt the file — and closing a world, opening a different one, or quitting all warn you first if you have unsaved changes. Toggle *Compressed* to write a `.eden.zip`.
-21. **Upload** — **File** tab → *Upload* lets you share the current world to the Eden servers. A PNG thumbnail is required.
-22. **Right-click** — right-click the map for a context menu: set spawn here, copy, paste here, fill/delete/clear selection, teleport the 3D camera, and quick tool switches.
+18. **Export** — **File** tab → *Export* writes a PNG image of the map.
+19. **Save** — *Save* writes changes back to the original file, *Save As* writes to a new file. Saves are atomic — an interrupted save (crash, power loss) can't corrupt the file — and closing a world, opening a different one, or quitting all warn you first if you have unsaved changes. Toggle *Compressed* to write a `.eden.zip`.
+20. **Upload** — **File** tab → *Upload* lets you share the current world to the Eden servers. A PNG thumbnail is required.
+21. **Right-click** — right-click the map for a context menu: set spawn here, copy, paste here, fill/delete/clear selection, teleport the 3D camera, and quick tool switches.
 
 ### Keyboard shortcuts
 
@@ -215,7 +212,6 @@ src/
   MapCanvas.tsx              — Canvas: tiled rendering, pan/zoom/select/paste/draw input, right-click menu
   SelectionInspector.tsx     — floating stats + orthographic preview + extrude + trees + 3D view
   ElevationPreviewPanel.tsx  — resizable front/side elevation cross-section, draw support
-  ThreeDPreview.tsx          — on-demand Three.js 3D render of a selection (currently unmounted/dead code)
   FlyView3D.tsx              — streaming fly-through 3D pane (quad view)
   SliceViewport.tsx          — front/side slab + ortho viewports for quad view
   texturePack.ts             — texture-pack atlas decoder + tinted picker swatches
@@ -223,7 +219,6 @@ src/
   WorldBrowserModal.tsx      — search/download worlds from Eden servers
   UploadModal.tsx            — upload world + thumbnail to Eden server
   NewWorldModal.tsx          — new world dialog (Flat / Natural / Classic / Tg2 tabs)
-  SchematicImportModal.tsx   — Minecraft .schematic/.litematic import with block mapping
   SettingsModal.tsx          — persistent app settings
   HelpModal.tsx              — shortcuts + texture-pack help
   Modal.tsx                  — shared modal shell (backdrop, Escape, focus-trap, ARIA)

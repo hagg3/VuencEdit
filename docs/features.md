@@ -132,13 +132,10 @@ each block's colour on the GPU.
 - **Prefab library** — a dockable gallery of your saved prefabs with thumbnails, search, sort, and
   inline rename/delete.
 - **Extrude** — repeat a selection N times along any of 6 axes in one undo step.
-- **Schematic import** — Minecraft `.schematic`/`.litematic` builds with a block-mapping table and
-  top-down preview.
-- **OBJ export**<span class="tag-exp">exp</span> — Wavefront OBJ + MTL with face-culled geometry
-  and correct ramp/wedge prisms.
-- **Source Engine VMF export**<span class="tag-exp">exp</span> — a selection becomes editable
-  Hammer brushwork, with a greedy box merge, dev or flat-colour texturing, and an optional skybox
-  shell.
+- **PNG export** — a top-down render of the map at one pixel per block.
+
+Minecraft schematic import and OBJ/Source Engine VMF export moved to the sibling
+[EdenToMC](https://github.com/hagg3/EdenToMC) project.
 
 ## Texture packs <span class="tag-exp">experimental</span>
 

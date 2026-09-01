@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = ["src-tauri", "packages/voxel-core"]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+
+# Keep incremental dev compiles fast, but optimise dependencies and (mildly) our own code.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

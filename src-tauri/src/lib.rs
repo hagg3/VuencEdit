@@ -1,22 +1,63 @@
-mod colors;
-mod export;
+// `colors` now lives in the shared `voxel-core` crate (plan PR-C). Re-exported under its old
+// path so every `crate::colors::…` / `use colors::*` call site is unchanged.
+pub(crate) use voxel_core::colors;
+// The `VoxelView` abstraction and the block-addressing helpers built on it also live in
+// `voxel-core` now (plan PR-C). Re-exported unqualified so the ~20 existing call sites — and the
+// `impl VoxelView for LoadedWorld` / `for ChunkScratch` below, which stay here because those
+// types are app-specific — read exactly as they did before the extraction.
+pub(crate) use voxel_core::view::{
+    get_block_at, read_block_abs, read_paint_abs, set_block_abs, surface_z, surface_z_capped,
+    world_max_z, ViewMeta, VoxelView, VoxelViewMut,
+};
+// The rest of PR-C: the fluid block family, the shaped-selection footprint, the lamp spatial index
+// and the whole 3D/2D render layer are all `voxel-core`'s now, generic over `VoxelView`. Each is
+// re-exported under the path its ~200 existing call sites already use; what stayed here is the
+// `LoadedWorld`-shaped glue (see `LoadedWorld::meta`, `apply_lamp_delta`, and the `render_*`
+// wrappers that wrap a `Raster` back up as a `PixelPatch`).
+pub(crate) use voxel_core::blocks::{fluid_base, fluid_level, fluid_type_for};
+pub(crate) use voxel_core::lamps::LampIndex;
+pub(crate) use voxel_core::mask::SelectionMask;
+pub(crate) use voxel_core::render::{self as render, Raster, MAX_LOD};
+// Test-only: the geometry/lamp internals this crate's own suite still exercises against a real
+// parsed `LoadedWorld` (the crate's tests use a synthetic `VoxelView` instead).
+#[cfg(test)]
+pub(crate) use voxel_core::geometry::{obj_occludes, LAMP_BLOCK_TYPE};
+#[cfg(test)]
+pub(crate) use voxel_core::lamps::{scan_chunk_lamps, LampMap};
+
+/// The populated chunks of a world. `VoxelView` deliberately doesn't enumerate chunks (a
+/// network-backed world materialises them on demand), so the two whole-world lamp helpers below
+/// take the list from the app that has one. Test-only — production builds the index lazily,
+/// per-chunk, through `LampIndex::lamps_in_region`.
+#[cfg(test)]
+fn world_chunk_coords(world: &LoadedWorld) -> Vec<(i32, i32)> {
+    world.chunk_map.keys().copied().collect()
+}
+
+/// Whole-world lamp scan — the parity oracle `LampIndex::lamps_in_region` is checked against.
+#[cfg(test)]
+fn build_lamp_index(world: &LoadedWorld) -> LampMap {
+    voxel_core::lamps::build_lamp_index(world, &world_chunk_coords(world))
+}
+
+/// Force a full rebuild of `index` over every populated chunk of `world`.
+#[cfg(test)]
+fn lamp_build_now(index: &LampIndex, world: &LoadedWorld) {
+    index.build_now(world, &world_chunk_coords(world));
+}
+mod geometry;
 mod journal;
 mod network;
-mod schematic;
 mod signs;
 mod texturepack;
-mod vmf_export;
 mod worldgen;
 
 use colors::*;
-use export::*;
+use geometry::*;
 use network::*;
-use schematic::*;
-use vmf_export::{estimate_vmf, export_vmf};
 use worldgen::*;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use memmap2::{Mmap, MmapMut, MmapOptions};
-use rayon::prelude::*;
 use serde::Serialize;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -335,6 +376,13 @@ impl LoadedWorld {
         let &addr = self.chunk_map.get(&(cx, cy))?;
         Some((addr, addr + self.span_of(cx, cy)))
     }
+
+    /// The whole-world facts `voxel-core`'s renderers need beyond block addressing (plan PR-C).
+    /// Cheap and `Copy`, so call sites pass it by value rather than caching it.
+    #[inline]
+    pub(crate) fn meta(&self) -> ViewMeta {
+        ViewMeta { w_chunks: self.w_chunks, h_chunks: self.h_chunks, sky: self.sky }
+    }
 }
 
 // ── Voxel views (audit H1) ────────────────────────────────────────────────────
@@ -350,20 +398,6 @@ impl LoadedWorld {
 // only **applied under the exclusive write guard** (`sculpt_terrain`): the compute phase writes
 // into the scratch, never into the mmap, so panning, hovering, tile fetches and 3D chunk
 // streaming keep running for the ~99% of a stamp that is arithmetic.
-pub(crate) trait VoxelView {
-    fn num_bands(&self) -> usize;
-    /// The world's chunk-coordinate origin (`min_x`, `min_y`).
-    fn chunk_origin(&self) -> (i32, i32);
-    /// The bytes chunk `(cx, cy)` owns — length is the chunk's *real* span (see `chunk_span`),
-    /// so an intra-chunk index is in bounds iff it is `< slice.len()`.
-    fn chunk_bytes(&self, cx: i32, cy: i32) -> Option<&[u8]>;
-}
-
-pub(crate) trait VoxelViewMut: VoxelView {
-    /// Writable twin of `chunk_bytes`. `None` means "this view does not own that chunk" and the
-    /// write is dropped — same contract `set_block_abs` has always had for a missing chunk.
-    fn chunk_bytes_mut(&mut self, cx: i32, cy: i32) -> Option<&mut [u8]>;
-}
 
 impl VoxelView for LoadedWorld {
     #[inline]
@@ -706,56 +740,12 @@ fn bit_set(bits: &[u8], i: usize) -> bool {
     bits.get(i >> 3).is_some_and(|b| b & (1u8 << (i & 7)) != 0)
 }
 
-/// Non-rectangular selection footprint (magic-wand shape, lasso). Absolute-world bounding box
-/// (`x1..=x2`, `y1..=y2`) plus a row-major bitset — `width*height` bits, bit set = that column is
-/// selected. It's 2D (per-column), like the selection itself; z range still comes from the slider.
-/// Memory is `w·h/8` bytes: 200×200 ≈ 5 KB, 1000×1000 ≈ 122 KB — negligible, no compression.
-///
-/// Lives on `WorldState` (same pattern as `view_cap_z`) so mask-aware edit commands read it off
-/// state instead of growing a base64 IPC param on ~13 signatures.
-///
-/// ⚠️ **Fail-safe contract (corruption-critical).** A command applies the mask ONLY when the rect
-/// the frontend passed *exactly* equals this bbox (`matches_rect`). Any mismatch → the edit behaves
-/// rect-only, exactly as before masks existed, so a stale mask can never mis-filter an unrelated
-/// selection; worst case is a silent fall-back to current behaviour. This is defense-in-depth: the
-/// frontend is *also* expected to `clear_selection_mask` on every selection reshape (it keys the
-/// clear off a per-rect diff), but the backend never trusts that — it re-checks the rect every edit.
-/// Cleared on world load/close (see `load_world`/`close_world`).
-#[derive(Clone)]
-pub(crate) struct SelectionMask {
-    pub(crate) x1: i32,
-    pub(crate) y1: i32,
-    pub(crate) x2: i32,
-    pub(crate) y2: i32,
-    /// Row-major bitset over the bbox, `ceil(width*height/8)` bytes. Bit `(y-y1)*width+(x-x1)`.
-    pub(crate) bits: Vec<u8>,
-}
-
-impl SelectionMask {
-    #[inline]
-    fn width(&self) -> i32 { self.x2 - self.x1 + 1 }
-
-    /// The fail-safe rule: does this mask's bbox exactly equal the rect the caller passed?
-    #[inline]
-    fn matches_rect(&self, x1: i32, y1: i32, x2: i32, y2: i32) -> bool {
-        self.x1 == x1 && self.y1 == y1 && self.x2 == x2 && self.y2 == y2
-    }
-
-    /// Is absolute column `(x, y)` inside the footprint AND its bit set? Out-of-bbox → false.
-    #[inline]
-    pub(crate) fn contains(&self, x: i32, y: i32) -> bool {
-        if x < self.x1 || x > self.x2 || y < self.y1 || y > self.y2 { return false; }
-        let idx = ((y - self.y1) * self.width() + (x - self.x1)) as usize;
-        self.bits.get(idx >> 3).is_some_and(|b| b & (1u8 << (idx & 7)) != 0)
-    }
-
-    /// Number of set (selected) cells — for honest selection stats.
-    fn count(&self) -> u32 {
-        self.bits.iter().map(|b| b.count_ones()).sum()
-    }
-}
-
 /// Resolve the mask an edit should honour, given the selection rect the frontend passed.
+///
+/// `SelectionMask` itself is `voxel-core`'s (the renderers and the mesher there consult it); what
+/// lives here is *when the mask is trusted*. It sits on `WorldState` (same pattern as `view_cap_z`)
+/// so mask-aware edit commands read it off state instead of growing a base64 IPC param on ~13
+/// signatures, and it is cleared on world load/close (see `load_world`/`close_world`).
 /// Returns an owned clone (5–122 KB) ONLY when a stored mask's bbox exactly matches the rect, so
 /// the caller can then `world.take()` (mutably borrowing `ws`) while still holding the mask across
 /// the edit closure. `None` → the command runs rect-only, its original behaviour. This is the single
@@ -942,6 +932,19 @@ pub(crate) struct WorldState {
     /// the whole stack (audit M2).
     pub(crate) undo_bytes: usize,
     pub(crate) redo_bytes: usize,
+    /// Cached logical-unit counts for `undo_stack`/`redo_stack` — what `count_undo_groups` would
+    /// return, maintained incrementally by the same four functions that maintain
+    /// `undo_bytes`/`redo_bytes` (`push_undo`/`pop_undo`/`trim_stack`, plus the two `clear_*`).
+    /// Every `EditResult` reports both depths, so recomputing them meant walking the whole
+    /// `VecDeque` twice per edit — and `trim_stack` won't evict a ~50-byte sparse entry until the
+    /// stack holds ~2M of them, so that walk is unbounded in practice (3D-pipeline audit Finding
+    /// 14; identical bug class to the byte accounting audit M2 fixed).
+    ///
+    /// ⚠️ This is **not** `stack.len()` — contiguous entries sharing the same `Some(g)` collapse.
+    /// Every mutation therefore goes through `starts_new_group` against the *neighbouring* entry:
+    /// the new back for a push/pop, the new front for a `trim_stack` eviction.
+    pub(crate) undo_groups: usize,
+    pub(crate) redo_groups: usize,
     /// Ceiling (bytes) each of `undo_stack`/`redo_stack` is trimmed to independently — see
     /// `trim_stack`. User-configurable via `set_undo_budget` (memory-budget presets, §1c of the
     /// 2026-08 memory-efficiency pass); clamped server-side to `16..=512 MB`.
@@ -1015,6 +1018,8 @@ impl WorldState {
             redo_stack: VecDeque::new(),
             undo_bytes: 0,
             redo_bytes: 0,
+            undo_groups: 0,
+            redo_groups: 0,
             undo_budget: DEFAULT_UNDO_BYTE_BUDGET,
             temp_path: None,
             template_bytes: None,
@@ -1040,285 +1045,48 @@ impl WorldState {
     pub(crate) fn clear_redo(&mut self) {
         self.redo_stack.clear();
         self.redo_bytes = 0;
+        self.redo_groups = 0;
     }
 
     /// Clear the undo stack and its byte counter together (mirrors `clear_redo`).
     pub(crate) fn clear_undo(&mut self) {
         self.undo_stack.clear();
         self.undo_bytes = 0;
+        self.undo_groups = 0;
     }
 }
 
-// ── Lamp spatial index ──────────────────────────────────────────────────────────
+// ── Lamp spatial index (bridge) ─────────────────────────────────────────────────
 //
-// Night lighting lights up Lamp blocks (type 72). Finding the lamps near a chunk used to be an
-// O((16+2r)³) voxel scan per chunk-geometry request, which is why the lamp radius was a hard-coded
-// constant. This chunk-keyed index gathers lamps by iterating actual lamp positions in the handful
-// of chunks within reach, so the radius can be a user slider (and it's the shared foundation the
-// experimental GPU night point-lights need too).
+// The index itself — `LampIndex`, the per-chunk lazy scan, the pure gather — is `voxel-core`'s
+// (plan PR-C), generic over `VoxelView`. What has to stay here is the one thing it can't be
+// generic over: *this* app's undo delta. `LampDeltaBatch` is the crate's seam for that.
 
-/// Map from chunk coord to the lamp positions (editor-local block coords) inside that chunk.
-pub(crate) type LampMap = FxHashMap<(i32, i32), Vec<[i32; 3]>>;
-
-/// Decode a chunk-relative byte offset into `(lx, ly, z)`, or `None` if it addresses a *paint*
-/// byte rather than a block byte. Inverse of `addr + band*8192 + lx*256 + ly*16 + lz`; the paint
-/// half of each 8192-byte band sits at `+4096`, so only the low half carries block types.
-#[inline]
-fn decode_block_offset(off: usize) -> Option<(usize, usize, usize)> {
-    let rem = off % 8192;
-    if rem >= 4096 { return None; } // paint half-band
-    Some((rem / 256, (rem % 256) / 16, (off / 8192) * 16 + rem % 16))
-}
-
-/// Scan one populated chunk's voxels for Lamp blocks, returning their editor-local block coords.
+/// Bring the index in line with an edit, using the undo delta that edit just produced (audit H3):
+/// `snaps` hold each changed byte's **previous** value, and `world` already holds the new one, so
+/// the lamp set changes at exactly the offsets the delta lists. This replaces a full 65,536-probe
+/// rescan of every affected chunk with O(bytes actually changed) — a large fill used to re-scan
+/// thousands of whole chunks per edit once the index existed.
 ///
-/// Walks each band's 4096-byte *block* half **linearly** (audit H3): the old form probed
-/// `addr + band*8192 + lx*256 + ly*16 + lz` with `z` innermost, which jumps 8192 bytes every 16
-/// steps — the worst possible order for a 131 KB chunk. Scanning the contiguous half-band with
-/// `position` lets the search vectorise, halves the bytes touched (the paint halves are skipped
-/// outright rather than skipped-by-indexing), and reads the mapping sequentially so a cold chunk
-/// costs one streaming page-in instead of a strided walk over every page.
-fn scan_chunk_lamps(world: &LoadedWorld, cx: i32, cy: i32) -> Vec<[i32; 3]> {
-    let Some((addr, cend)) = world.chunk_range(cx, cy) else { return Vec::new() };
-    let base_x = (cx - world.min_x) * 16;
-    let base_y = (cy - world.min_y) * 16;
-    let mut out = Vec::new();
-    for band in 0..world.num_bands {
-        let lo = addr + band * 8192;
-        if lo >= cend { break; }
-        let hi = (lo + 4096).min(cend);
-        let half = &world.bytes[lo..hi];
-        let mut i = 0usize;
-        while let Some(rel) = half[i..].iter().position(|&b| b == LAMP_BLOCK_TYPE) {
-            let rem = i + rel;
-            out.push([
-                base_x + (rem / 256) as i32,
-                base_y + ((rem % 256) / 16) as i32,
-                (band * 16 + rem % 16) as i32,
-            ]);
-            i = rem + 1;
-            if i >= half.len() { break; }
-        }
-    }
-    out
-}
-
-/// Build the full lamp index by scanning only populated chunks (sparse worlds store just edited
-/// chunks, so this is bounded by the actual world size, not the 180×180 template grid).
-///
-/// Parallel over chunks — they are independent `&LoadedWorld` reads, and nothing in the closure
-/// touches `AppState`, so the "no re-locking inside a rayon closure" rule holds.
-///
-/// Production always builds lazily and per-chunk via `LampIndex::lamps_in_region` (§4 of the
-/// 2026-08 memory-efficiency pass) — this whole-world scan is now only the test/parity oracle.
-#[cfg(test)]
-pub(crate) fn build_lamp_index(world: &LoadedWorld) -> LampMap {
-    let coords: Vec<(i32, i32)> = world.chunk_map.keys().copied().collect();
-    coords
-        .par_iter()
-        .filter_map(|&(cx, cy)| {
-            let lamps = scan_chunk_lamps(world, cx, cy);
-            if lamps.is_empty() { None } else { Some(((cx, cy), lamps)) }
-        })
-        .collect::<Vec<_>>()
-        .into_iter()
-        .collect()
-}
-
-/// Interior state behind `LampIndex`: the lamp buckets built so far, plus which chunks have been
-/// scanned. A `scanned` set rather than an `Unscanned/Scanned(Vec)` enum per chunk, because
-/// `apply_delta` already deletes empty buckets to keep `lamps` small (§4) — an enum would force a
-/// permanent `Scanned(vec![])` entry per lamp-free chunk, which on a sparse world is most of them.
-#[derive(Default)]
-struct LampIndexState {
-    lamps: LampMap,
-    scanned: FxHashSet<(i32, i32)>,
-}
-
-/// Lazily, *per-chunk* built, interior-mutable lamp spatial index (§4 of the 2026-08
-/// memory-efficiency pass — replaced a whole-world `build_lamp_index` scan on the first night-lit
-/// request, which forced ~half the mmap resident in one burst).
-///
-/// The `Mutex` is what lets scanning happen while its caller holds only a **read** guard on
-/// `WorldState` (audit C1 step 2 + H3): tile fetches, cursor reads and other chunk-geometry
-/// requests keep running concurrently instead of queueing behind a write lock. Correctness comes
-/// from the read guard being held continuously across scan *and* install — every mutating path
-/// takes the `WorldState` write lock, so no edit can slip in between and leave a freshly scanned
-/// chunk describing a world that no longer exists.
-#[derive(Default)]
-pub(crate) struct LampIndex(Mutex<LampIndexState>);
-
-impl LampIndex {
-    fn guard(&self) -> std::sync::MutexGuard<'_, LampIndexState> {
-        self.0.lock().unwrap_or_else(|p| p.into_inner())
-    }
-
-    /// Gather lamps within reach of a pixel-space region, scanning any chunk in that neighbourhood
-    /// not already seen and memoising the result before delegating to the pure `lamps_in_region`
-    /// gather. `&self` keeps this usable under a `WorldState` read guard, same contract as the
-    /// `build_lamp_index`-based `with` it replaces.
-    pub(crate) fn lamps_in_region(
-        &self, world: &LoadedWorld, sx1: i32, sy1: i32, sx2: i32, sy2: i32, radius: f32,
-    ) -> Vec<[i32; 3]> {
-        let (cx_lo, cx_hi, cy_lo, cy_hi) = region_chunk_box(world, sx1, sy1, sx2, sy2, radius);
-        let mut st = self.guard();
-        let LampIndexState { lamps, scanned } = &mut *st;
-        let todo: Vec<(i32, i32)> = (cx_lo..=cx_hi)
-            .flat_map(|cx| (cy_lo..=cy_hi).map(move |cy| (cx, cy)))
-            .filter(|coord| !scanned.contains(coord))
-            .collect();
-        if !todo.is_empty() {
-            // Same shape as the old `build_lamp_index`: independent `&LoadedWorld` reads, nothing
-            // in the closure touches `AppState`, so the "no re-locking inside a rayon closure"
-            // rule holds even though we're under a read guard here.
-            let scans: Vec<((i32, i32), Vec<[i32; 3]>)> = todo
-                .par_iter()
-                .map(|&(cx, cy)| ((cx, cy), scan_chunk_lamps(world, cx, cy)))
-                .collect();
-            for (key, v) in scans {
-                if !v.is_empty() { lamps.insert(key, v); }
-                scanned.insert(key);
-            }
-        }
-        lamps_in_region(lamps, world, sx1, sy1, sx2, sy2, radius)
-    }
-
-    /// Drop the index (world load/close). Rebuilt on-demand for the new world.
-    pub(crate) fn clear(&self) {
-        *self.guard() = LampIndexState::default();
-    }
-
-    #[cfg(test)]
-    pub(crate) fn snapshot(&self) -> LampMap {
-        self.guard().lamps.clone()
-    }
-
-    /// Force a full rebuild, marking every populated chunk scanned (tests only — production
-    /// always builds lazily, per-chunk, via `lamps_in_region`).
-    #[cfg(test)]
-    pub(crate) fn build_now(&self, world: &LoadedWorld) {
-        let mut st = self.guard();
-        st.lamps = build_lamp_index(world);
-        st.scanned = world.chunk_map.keys().copied().collect();
-    }
-
-    /// Bring the index in line with an edit, using the undo delta that edit just produced
-    /// (audit H3): `snaps` hold each changed byte's **previous** value, and `world` already holds
-    /// the new one, so the lamp set changes at exactly the offsets the delta lists. This replaces
-    /// a full 65,536-probe rescan of every affected chunk with O(bytes actually changed) — a large
-    /// fill used to re-scan thousands of whole chunks per edit once the index existed.
-    ///
-    /// A chunk that hasn't been scanned yet is skipped outright, *before* touching its snapshot —
-    /// applying a delta to an unscanned chunk would `entry().or_default()` a bucket holding only
-    /// this edit's lamps and wrongly mark the chunk fully known. Skipping it is correct because
-    /// `world.bytes` already holds post-edit bytes at every one of `apply_delta`'s three call
-    /// sites, so the eventual on-demand scan re-derives the chunk from truth.
-    pub(crate) fn apply_delta(&self, world: &LoadedWorld, snaps: &[ChunkSnapshot]) {
-        let mut st = self.guard();
-        let LampIndexState { lamps: index, scanned } = &mut *st;
-        // Reused inflate buffer for the `FullZ` case. In practice every caller runs before
-        // `UndoEntry::new` has compressed anything, so this stays empty — it exists so the match
-        // below is total rather than silently skipping a compressed delta's lamp transitions.
-        let mut scratch: Vec<u8> = Vec::new();
-        for snap in snaps {
-            let key = (snap.cx, snap.cy);
-            if !scanned.contains(&key) { continue; }
-            let Some((addr, cend)) = world.chunk_range(snap.cx, snap.cy) else { continue };
-            let base_x = (snap.cx - world.min_x) * 16;
-            let base_y = (snap.cy - world.min_y) * 16;
-            // `off` is chunk-relative; `prev`/`now` are its byte value before/after the edit.
-            // Only a transition into or out of `LAMP_BLOCK_TYPE` moves the index.
-            let mut visit = |off: usize, prev: u8, now: u8| {
-                let is_lamp = now == LAMP_BLOCK_TYPE;
-                if (prev == LAMP_BLOCK_TYPE) == is_lamp { return; }
-                let Some((lx, ly, z)) = decode_block_offset(off) else { return };
-                let pos = [base_x + lx as i32, base_y + ly as i32, z as i32];
-                if is_lamp {
-                    let bucket = index.entry(key).or_default();
-                    if !bucket.contains(&pos) { bucket.push(pos); }
-                } else if let Some(bucket) = index.get_mut(&key) {
-                    bucket.retain(|p| *p != pos);
-                    if bucket.is_empty() { index.remove(&key); }
-                }
-            };
-            match &snap.delta {
-                ChunkDelta::Sparse(pairs) => {
-                    for &(off, prev) in pairs {
-                        let off = off as usize;
-                        // Paint bytes can't hold a block type, so they can't create or destroy a lamp.
-                        if off % 8192 >= 4096 { continue; }
-                        let idx = addr + off;
-                        if idx >= cend { continue; }
-                        visit(off, prev, world.bytes[idx]);
-                    }
-                }
-                // Dense-edit fallback: walk the *block* half of each band the span covers as a pair
-                // of slices, so the paint halves are skipped as whole ranges (not re-tested per byte)
-                // and the pre/post comparison stays a straight zip with no per-byte bounds check.
-                dense => {
-                    let Some((start_off, data)) = dense.full_bytes(&mut scratch) else { continue };
-                    let start = start_off as usize;
-                    let end = (start + data.len()).min(cend - addr);
-                    let mut band = start / 8192;
-                    while band * 8192 < end {
-                        let lo = (band * 8192).max(start);
-                        let hi = (band * 8192 + 4096).min(end);
-                        band += 1;
-                        if hi <= lo { continue; }
-                        let pre = &data[lo - start..hi - start];
-                        let post = &world.bytes[addr + lo..addr + hi];
-                        for (j, (&p, &q)) in pre.iter().zip(post).enumerate() {
-                            if p != q { visit(lo + j, p, q); }
-                        }
-                    }
+/// One `delta_batch()` for the whole edit, so a fill touching a thousand chunks is still one lock
+/// acquisition. The unscanned-chunk skip and the paint-byte skip live in the crate; see
+/// `voxel_core::lamps::LampDeltaBatch`.
+pub(crate) fn apply_lamp_delta(index: &LampIndex, world: &LoadedWorld, snaps: &[ChunkSnapshot]) {
+    let mut batch = index.delta_batch();
+    // Reused inflate buffer for the `FullZ` case. In practice every caller runs before
+    // `UndoEntry::new` has compressed anything, so this stays empty — it exists so the match below
+    // is total rather than silently skipping a compressed delta's lamp transitions.
+    let mut scratch: Vec<u8> = Vec::new();
+    for snap in snaps {
+        match &snap.delta {
+            ChunkDelta::Sparse(pairs) => batch.sparse(world, snap.cx, snap.cy, pairs),
+            dense => {
+                if let Some((start, pre)) = dense.full_bytes(&mut scratch) {
+                    batch.dense(world, snap.cx, snap.cy, start, pre);
                 }
             }
         }
     }
-}
-
-/// The chunk box a region's lamp gather needs: chunks overlapping `[sx1..=sx2] × [sy1..=sy2]`
-/// expanded by `ceil(radius/16)` chunks (plus a safety chunk). Shared by the scanning path
-/// (`LampIndex::lamps_in_region`) and the pure gather below so they can't compute different
-/// neighbourhoods.
-fn region_chunk_box(
-    world: &LoadedWorld, sx1: i32, sy1: i32, sx2: i32, sy2: i32, radius: f32,
-) -> (i32, i32, i32, i32) {
-    let r = radius.ceil() as i32;
-    let cr = r.div_euclid(16) + 1;
-    let cx_lo = sx1.div_euclid(16) + world.min_x - cr;
-    let cx_hi = sx2.div_euclid(16) + world.min_x + cr;
-    let cy_lo = sy1.div_euclid(16) + world.min_y - cr;
-    let cy_hi = sy2.div_euclid(16) + world.min_y + cr;
-    (cx_lo, cx_hi, cy_lo, cy_hi)
-}
-
-/// Gather lamp positions (local block coords) within reach of a pixel-space region — every lamp
-/// that could light a voxel in `[sx1..=sx2] × [sy1..=sy2]` given `radius`. Collects from the chunks
-/// overlapping the region expanded by `ceil(radius/16)` chunks, then filters to the exact expanded
-/// box so the result matches the old inline voxel scan exactly (parity). Pure gather — the free
-/// function tests key on, and what `LampIndex::lamps_in_region` delegates to once its on-demand
-/// chunks are scanned.
-pub(crate) fn lamps_in_region(
-    index: &LampMap,
-    world: &LoadedWorld,
-    sx1: i32, sy1: i32, sx2: i32, sy2: i32,
-    radius: f32,
-) -> Vec<[i32; 3]> {
-    let r = radius.ceil() as i32;
-    let (cx_lo, cx_hi, cy_lo, cy_hi) = region_chunk_box(world, sx1, sy1, sx2, sy2, radius);
-    let mut out = Vec::new();
-    for cx in cx_lo..=cx_hi {
-        for cy in cy_lo..=cy_hi {
-            if let Some(v) = index.get(&(cx, cy)) {
-                out.extend_from_slice(v);
-            }
-        }
-    }
-    // Filter to the exact expanded xy box (z spans the full column for chunk geometry, so no z
-    // filter is needed) — makes this a drop-in match for the old `(sx1-r ..= sx2+r)` voxel scan.
-    out.retain(|p| p[0] >= sx1 - r && p[0] <= sx2 + r && p[1] >= sy1 - r && p[1] <= sy2 + r);
-    out
 }
 
 // ── The global world lock ──────────────────────────────────────────────────────
@@ -1817,9 +1585,6 @@ fn parse_world_inner(bytes: MmapMut) -> Result<LoadedWorld, String> {
     })
 }
 
-pub(crate) fn world_max_z(world: &impl VoxelView) -> i32 {
-    (world.num_bands() * 16 - 1) as i32
-}
 
 // ── Pixel patch (partial re-render returned by all edit commands) ─────────────
 //
@@ -1827,6 +1592,11 @@ pub(crate) fn world_max_z(world: &impl VoxelView) -> i32 {
 // is 243 MB for a 451×528-chunk world → ~850 MB JSON → 1.9 GB JS heap), edit
 // commands now return only the changed rectangle. The frontend applies it with
 // putImageData at (x, y) on the existing offscreen canvas.
+//
+// The pixels themselves come from `voxel_core::render` (plan PR-C); `PixelPatch` is this app's IPC
+// skin over the crate's `Raster`. The two can't be one type — `IpcResponse` is tauri's trait and
+// `Raster` is the crate's, so an impl for the pair would be an orphan — and they must not be, since
+// `voxel-core` stays `tauri`-free. Everything below `From<Raster>` is framing, not rendering.
 
 struct PixelPatch {
     x: u32, y: u32,
@@ -1836,6 +1606,12 @@ struct PixelPatch {
     /// world blocks starting at (x, y) and must be drawn upscaled by `lod`.
     lod: u32,
     pixels: Vec<u8>,  // RGBA, row-major, (y, x) order
+}
+
+impl From<Raster> for PixelPatch {
+    fn from(r: Raster) -> Self {
+        PixelPatch { x: r.x, y: r.y, width: r.width, height: r.height, lod: r.lod, pixels: r.pixels }
+    }
 }
 
 #[derive(Serialize)]
@@ -1853,270 +1629,42 @@ impl tauri::ipc::IpcResponse for PixelPatch {
     }
 }
 
-/// Largest level-of-detail step any render command will honour. A tile is always ~`TILE` output
-/// pixels regardless of zoom, so the frontend grows the tile's *world* footprint by `lod` rather
-/// than shrinking the tile; this cap bounds that footprint (and the clamp keeps a bad IPC arg from
-/// producing a one-pixel patch covering the whole world).
-pub(crate) const MAX_LOD: u32 = 32;
-
 /// Re-render just the sub-rectangle [px1,px2] × [py1,py2] of the top-down map.
-/// Bounds are clamped to [0, world_W-1] × [0, world_H-1].
 ///
-/// `cap` is the cutaway ceiling (`WorldState::view_cap_z`): blocks above it are treated as absent,
-/// so the map draws whatever is directly under the cap plane (cave roofs vanish, floors show).
-/// `None` = normal render.
+/// `cap` is the cutaway ceiling (`WorldState::view_cap_z`): blocks above it are treated as absent.
 fn render_pixels_patch(world: &LoadedWorld, px1: i32, py1: i32, px2: i32, py2: i32, cap: Option<i32>) -> PixelPatch {
-    render_pixels_patch_lod(world, px1, py1, px2, py2, cap, 1)
+    render::pixels_patch(world, world.meta(), px1, py1, px2, py2, cap).into()
 }
 
-/// `render_pixels_patch` with a level-of-detail step (audit H6): only every `lod`-th block on each
-/// axis is scanned, so the output is `lod²` times smaller and `lod²` times cheaper. Nearest-neighbour
-/// point sampling, which matches the frontend's `imageSmoothingEnabled = false` upscale — at
-/// zoomed-out scales the discarded columns were never visible anyway.
+/// `render_pixels_patch` with a level-of-detail step (audit H6).
 fn render_pixels_patch_lod(
     world: &LoadedWorld, px1: i32, py1: i32, px2: i32, py2: i32, cap: Option<i32>, lod: u32,
 ) -> PixelPatch {
-    let lod = lod.clamp(1, MAX_LOD);
-    let world_w = (world.w_chunks * 16) as i32;
-    let world_h = (world.h_chunks * 16) as i32;
-    let x1 = px1.clamp(0, world_w - 1) as u32;
-    let y1 = py1.clamp(0, world_h - 1) as u32;
-    let x2 = px2.clamp(0, world_w - 1) as u32;
-    let y2 = py2.clamp(0, world_h - 1) as u32;
-    let width  = (x2 - x1) / lod + 1;
-    let height = (y2 - y1) / lod + 1;
-    let mut pixels = vec![0u8; (width * height * 4) as usize];
-
-    // One row per rayon task — rows are disjoint slices of `pixels`, and each pixel is an
-    // independent O(1) lookup into `world`, so this is embarrassingly parallel.
-    pixels.par_chunks_mut((width * 4) as usize).enumerate().for_each(|(row, row_pixels)| {
-        let py = y1 + row as u32 * lod;
-        let cy = (py / 16) as i32 + world.min_y;
-        let ly = (py % 16) as usize;
-        // `chunk_range` is a hash lookup; at lod 1 `cx` only changes every 16 pixels, so memoize
-        // it across the run instead of calling it for every sample (audit M3 (1)) — ~16× fewer
-        // lookups on a wide patch. At lod ≥ 16 every sample lands in a new chunk and the memo
-        // simply never hits, which costs one integer compare.
-        let mut last_cx = i32::MIN;
-        let mut chunk: Option<(usize, usize)> = None;
-        for ox in 0..width {
-            let px = x1 + ox * lod;
-            let cx = (px / 16) as i32 + world.min_x;
-            if cx != last_cx {
-                last_cx = cx;
-                chunk = world.chunk_range(cx, cy);
-            }
-            let Some((addr, cend)) = chunk else { continue };
-            let lx = (px % 16) as usize;
-            let mut top_bt = 0u8; let mut top_paint = 0u8;
-            let mut under_bt = 0u8; let mut under_paint = 0u8;
-            'outer: for band in (0..world.num_bands).rev() {
-                if let Some(c) = cap {
-                    if (band * 16) as i32 > c { continue; }
-                }
-                for z in (0..16usize).rev() {
-                    if let Some(c) = cap {
-                        if (band * 16 + z) as i32 > c { continue; }
-                    }
-                    let bi = addr + band * 8192 + lx * 256 + ly * 16 + z;
-                    let pi = bi + 4096;
-                    if pi >= cend { continue; }
-                    let bt = world.bytes[bi];
-                    if bt == 0 { continue; }
-                    if top_bt == 0 {
-                        top_bt = bt; top_paint = world.bytes[pi];
-                        if transparent_alpha(bt).is_none() { break 'outer; }
-                    } else {
-                        under_bt = bt; under_paint = world.bytes[pi];
-                        break 'outer;
-                    }
-                }
-            }
-            if top_bt == 0 { continue; }
-            let c1 = block_color(top_bt, top_paint, world.sky);
-            let [r, g, b] = if under_bt != 0 {
-                if let Some(alpha) = transparent_alpha(top_bt) {
-                    let c2 = block_color(under_bt, under_paint, world.sky);
-                    [
-                        (c1[0] as f32 * alpha + c2[0] as f32 * (1.0 - alpha)) as u8,
-                        (c1[1] as f32 * alpha + c2[1] as f32 * (1.0 - alpha)) as u8,
-                        (c1[2] as f32 * alpha + c2[2] as f32 * (1.0 - alpha)) as u8,
-                    ]
-                } else { c1 }
-            } else { c1 };
-            let off = (ox * 4) as usize;
-            row_pixels[off] = r; row_pixels[off + 1] = g; row_pixels[off + 2] = b; row_pixels[off + 3] = 255;
-        }
-    });
-    PixelPatch { x: x1, y: y1, width, height, lod, pixels }
+    render::pixels_patch_lod(world, world.meta(), px1, py1, px2, py2, cap, lod).into()
 }
 
 /// Re-render a sub-rectangle of a z-slice cross-section.
 fn render_zslice_patch_inner(world: &LoadedWorld, z: i32, px1: i32, py1: i32, px2: i32, py2: i32) -> PixelPatch {
-    render_zslice_patch_lod(world, z, px1, py1, px2, py2, 1)
+    render::zslice_patch(world, world.meta(), z, px1, py1, px2, py2).into()
 }
 
-/// `render_zslice_patch_inner` with a level-of-detail step — see `render_pixels_patch_lod`. The
-/// z-slice view is tiled by the same `MapCanvas` cache, so it takes the same `lod` its tiles do.
+/// `render_zslice_patch_inner` with a level-of-detail step.
 fn render_zslice_patch_lod(
     world: &LoadedWorld, z: i32, px1: i32, py1: i32, px2: i32, py2: i32, lod: u32,
 ) -> PixelPatch {
-    let lod = lod.clamp(1, MAX_LOD);
-    let world_w = (world.w_chunks * 16) as i32;
-    let world_h = (world.h_chunks * 16) as i32;
-    let x1 = px1.clamp(0, world_w - 1) as u32;
-    let y1 = py1.clamp(0, world_h - 1) as u32;
-    let x2 = px2.clamp(0, world_w - 1) as u32;
-    let y2 = py2.clamp(0, world_h - 1) as u32;
-    let width  = (x2 - x1) / lod + 1;
-    let height = (y2 - y1) / lod + 1;
-    const VOID: [u8; 4] = [20, 20, 35, 255];
-    let mut pixels = vec![0u8; (width * height * 4) as usize];
-    for p in pixels.chunks_exact_mut(4) { p.copy_from_slice(&VOID); }
-
-    let band = (z as usize) / 16;
-    let lz   = (z as usize) % 16;
-
-    pixels.par_chunks_mut((width * 4) as usize).enumerate().for_each(|(row, row_pixels)| {
-        let py = y1 + row as u32 * lod;
-        let cy = (py / 16) as i32 + world.min_y;
-        let ly = (py % 16) as usize;
-        // Memoize `chunk_range` across the run the same way as `render_pixels_patch_lod`
-        // (audit M3 (1)) — at lod 1 `cx` only changes every 16 pixels.
-        let mut last_cx = i32::MIN;
-        let mut chunk: Option<(usize, usize)> = None;
-        for ox in 0..width {
-            let px = x1 + ox * lod;
-            let cx = (px / 16) as i32 + world.min_x;
-            if cx != last_cx {
-                last_cx = cx;
-                chunk = world.chunk_range(cx, cy);
-            }
-            let Some((addr, cend)) = chunk else { continue };
-            let lx = (px % 16) as usize;
-            let bi = addr + band * 8192 + lx * 256 + ly * 16 + lz;
-            let pi = bi + 4096;
-            if pi >= cend { continue; }
-            let bt = world.bytes[bi];
-            if bt == 0 { continue; }
-            let paint = world.bytes[pi];
-            let [r, g, b] = block_color(bt, paint, world.sky);
-            let off = (ox * 4) as usize;
-            row_pixels[off]     = r;
-            row_pixels[off + 1] = g;
-            row_pixels[off + 2] = b;
-            row_pixels[off + 3] = 255;
-        }
-    });
-    PixelPatch { x: x1, y: y1, width, height, lod, pixels }
+    render::zslice_patch_lod(world, world.meta(), z, px1, py1, px2, py2, lod).into()
 }
 
 /// Front slab (constant world-Y plane). Horizontal axis = world X, vertical axis = world Z.
-/// One O(1) voxel read per pixel — the X/Z analog of `render_zslice_patch_inner`, fully tileable.
-/// Image row 0 = top = highest Z (`pz2`); `row = pz2 - z`. The returned `PixelPatch.x` is the
-/// horizontal world-X start and `.y` is the vertical world-Z start (`pz1`).
 fn render_yslice_patch_inner(world: &LoadedWorld, sy: i32, px1: i32, pz1: i32, px2: i32, pz2: i32) -> PixelPatch {
-    let world_w = (world.w_chunks * 16) as i32;
-    let world_h = (world.h_chunks * 16) as i32;
-    let max_z   = world_max_z(world);
-    if sy < 0 || sy >= world_h {
-        return PixelPatch { x: 0, y: 0, width: 1, height: 1, lod: 1, pixels: vec![20, 20, 35, 255] };
-    }
-    let x1 = px1.clamp(0, world_w - 1);
-    let x2 = px2.clamp(0, world_w - 1);
-    let z1 = pz1.clamp(0, max_z);
-    let z2 = pz2.clamp(0, max_z);
-    let width  = (x2 - x1 + 1) as u32;
-    let height = (z2 - z1 + 1) as u32;
-    const VOID: [u8; 4] = [20, 20, 35, 255];
-    let mut pixels = vec![0u8; (width * height * 4) as usize];
-    for p in pixels.chunks_exact_mut(4) { p.copy_from_slice(&VOID); }
-
-    let cy = (sy.div_euclid(16)) + world.min_y;
-    let ly = sy.rem_euclid(16) as usize;
-    // Each world-X column writes a strided set of bytes across the row-major image, so instead
-    // of chunking `pixels` directly we compute one (row, rgba) list per column in parallel and
-    // splat them into `pixels` afterward (cheap — only non-void hits produce entries).
-    let hits: Vec<Vec<(u32, [u8; 4])>> = (x1..=x2).into_par_iter().map(|px| {
-        let mut col = Vec::new();
-        let cx = px.div_euclid(16) + world.min_x;
-        let lx = px.rem_euclid(16) as usize;
-        let Some((addr, cend)) = world.chunk_range(cx, cy) else { return col };
-        for z in z1..=z2 {
-            let band = (z as usize) / 16;
-            let lz   = (z as usize) % 16;
-            let bi = addr + band * 8192 + lx * 256 + ly * 16 + lz;
-            let pi = bi + 4096;
-            if pi >= cend { continue; }
-            let bt = world.bytes[bi];
-            if bt == 0 { continue; }
-            let [r, g, b] = block_color(bt, world.bytes[pi], world.sky);
-            let row = (z2 - z) as u32;
-            col.push((row, [r, g, b, 255]));
-        }
-        col
-    }).collect();
-    for (i, col) in hits.into_iter().enumerate() {
-        let px_off = i as u32;
-        for (row, rgba) in col {
-            let off = ((row * width + px_off) * 4) as usize;
-            pixels[off..off + 4].copy_from_slice(&rgba);
-        }
-    }
-    PixelPatch { x: x1 as u32, y: z1 as u32, width, height, lod: 1, pixels }
+    render::yslice_patch(world, world.meta(), sy, px1, pz1, px2, pz2).into()
 }
 
 /// Side slab (constant world-X plane). Horizontal axis = world Y, vertical axis = world Z.
-/// One O(1) voxel read per pixel. Image row 0 = top = highest Z (`pz2`); `row = pz2 - z`.
-/// Returned `PixelPatch.x` is the horizontal world-Y start and `.y` is the vertical world-Z start.
 fn render_xslice_patch_inner(world: &LoadedWorld, sx: i32, py1: i32, pz1: i32, py2: i32, pz2: i32) -> PixelPatch {
-    let world_w = (world.w_chunks * 16) as i32;
-    let world_h = (world.h_chunks * 16) as i32;
-    let max_z   = world_max_z(world);
-    if sx < 0 || sx >= world_w {
-        return PixelPatch { x: 0, y: 0, width: 1, height: 1, lod: 1, pixels: vec![20, 20, 35, 255] };
-    }
-    let y1 = py1.clamp(0, world_h - 1);
-    let y2 = py2.clamp(0, world_h - 1);
-    let z1 = pz1.clamp(0, max_z);
-    let z2 = pz2.clamp(0, max_z);
-    let width  = (y2 - y1 + 1) as u32;
-    let height = (z2 - z1 + 1) as u32;
-    const VOID: [u8; 4] = [20, 20, 35, 255];
-    let mut pixels = vec![0u8; (width * height * 4) as usize];
-    for p in pixels.chunks_exact_mut(4) { p.copy_from_slice(&VOID); }
-
-    let cx = sx.div_euclid(16) + world.min_x;
-    let lx = sx.rem_euclid(16) as usize;
-    // Same per-column-parallel / sequential-splat approach as render_yslice_patch_inner.
-    let hits: Vec<Vec<(u32, [u8; 4])>> = (y1..=y2).into_par_iter().map(|py| {
-        let mut col = Vec::new();
-        let cy = py.div_euclid(16) + world.min_y;
-        let ly = py.rem_euclid(16) as usize;
-        let Some((addr, cend)) = world.chunk_range(cx, cy) else { return col };
-        for z in z1..=z2 {
-            let band = (z as usize) / 16;
-            let lz   = (z as usize) % 16;
-            let bi = addr + band * 8192 + lx * 256 + ly * 16 + lz;
-            let pi = bi + 4096;
-            if pi >= cend { continue; }
-            let bt = world.bytes[bi];
-            if bt == 0 { continue; }
-            let [r, g, b] = block_color(bt, world.bytes[pi], world.sky);
-            let row = (z2 - z) as u32;
-            col.push((row, [r, g, b, 255]));
-        }
-        col
-    }).collect();
-    for (i, col) in hits.into_iter().enumerate() {
-        let py_off = i as u32;
-        for (row, rgba) in col {
-            let off = ((row * width + py_off) * 4) as usize;
-            pixels[off..off + 4].copy_from_slice(&rgba);
-        }
-    }
-    PixelPatch { x: y1 as u32, y: z1 as u32, width, height, lod: 1, pixels }
+    render::xslice_patch(world, world.meta(), sx, py1, pz1, py2, pz2).into()
 }
+
 
 /// Compute the pixel-space bounding box of a set of chunk coordinates and
 /// return a freshly rendered top-down patch for that rectangle.
@@ -2186,6 +1734,9 @@ fn edit_patch_capped(
 }
 
 // ── Orthographic selection preview ────────────────────────────────────────────
+//
+// The projections themselves are `voxel_core::render::view_{front,side,top}` (plan PR-C); what
+// stays here is `PreviewData`, this app's IPC skin for a bare (w, h, RGBA) raster.
 
 struct PreviewData {
     width: u32,
@@ -2202,189 +1753,6 @@ impl tauri::ipc::IpcResponse for PreviewData {
     }
 }
 
-/// Front view: X=horizontal, Z=vertical; scans Y front-to-back, stops at first non-air block.
-/// Z=z_max maps to row 0 (top), Z=z_min maps to row (ph-1) (bottom).
-///
-/// HashMap lookups are amortized over 16-block chunk rows: one lookup per chunk row rather
-/// than one per block, reducing calls from O(W×D×H) to O(W×D×H/16).
-///
-/// Takes a **scan buffer**, never the mmapped world: the callers (`render_selection_view`,
-/// `render_full_height_view`) clone the relevant chunks into a full-span local world first, with
-/// short spans zero-padded — so these loops bound on `bytes.len()` and never see a `chunk_span`.
-fn render_view_front(
-    world: &LoadedWorld,
-    x1: i32, x2: i32, y1: i32, y2: i32, z_min: i32, z_max: i32,
-    b_lo: usize,
-    mask: Option<&SelectionMask>,
-) -> (u32, u32, Vec<u8>) {
-    let pw = (x2 - x1 + 1) as u32;
-    let ph = (z_max - z_min + 1) as u32;
-    const VOID: [u8; 4] = [20, 20, 35, 255];
-    let mut pixels = vec![0u8; (pw * ph * 4) as usize];
-    for p in pixels.chunks_exact_mut(4) { p.copy_from_slice(&VOID); }
-    let bytes_len = world.bytes.len();
-
-    for x in x1..=x2 {
-        let cx     = x / 16 + world.min_x;
-        let lx_256 = (x & 15) as usize * 256;     // lx * 256, constant for this X column
-        let col    = (x - x1) as usize;
-        for z in z_min..=z_max {
-            let band  = (z as usize) / 16;
-            let lz    = (z as usize) & 15;
-            let z_off = (band - b_lo) * 8192 + lz; // offset into band-scoped clone
-            let row   = (z_max - z) as usize;
-            let out   = (row * pw as usize + col) * 4;
-            // Scan Y in 16-block chunk rows — one HashMap lookup per row instead of per block
-            let mut y = y1;
-            'y_scan: while y <= y2 {
-                let cy          = y / 16 + world.min_y;
-                let chunk_y_end = (y | 15).min(y2);    // last y index in same chunk row
-                match world.chunk_map.get(&(cx, cy)) {
-                    None => { y = chunk_y_end + 1; }   // chunk absent, skip row
-                    Some(&addr) => {
-                        let base = addr + z_off + lx_256;   // constant for this chunk×x×z
-                        while y <= chunk_y_end {
-                            // Shaped selection: an unmasked (x,y) column is see-through, so a
-                            // masked block on a chunk row behind it shows correctly.
-                            if mask.is_some_and(|m| !m.contains(x, y)) { y += 1; continue; }
-                            let bi = base + (y & 15) as usize * 16;
-                            let pi = bi + 4096;
-                            if bi < bytes_len && pi < bytes_len {
-                                let bt = world.bytes[bi];
-                                if bt != 0 {
-                                    let [r, g, b] = block_color(bt, world.bytes[pi], world.sky);
-                                    pixels[out]     = r;
-                                    pixels[out + 1] = g;
-                                    pixels[out + 2] = b;
-                                    pixels[out + 3] = 255;
-                                    break 'y_scan;
-                                }
-                            }
-                            y += 1;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    (pw, ph, pixels)
-}
-
-/// Side view: Y=horizontal, Z=vertical; scans X left-to-right, stops at first non-air block.
-///
-/// Takes a **scan buffer**, never the mmapped world: the callers (`render_selection_view`,
-/// `render_full_height_view`) clone the relevant chunks into a full-span local world first, with
-/// short spans zero-padded — so these loops bound on `bytes.len()` and never see a `chunk_span`.
-fn render_view_side(
-    world: &LoadedWorld,
-    x1: i32, x2: i32, y1: i32, y2: i32, z_min: i32, z_max: i32,
-    b_lo: usize,
-    mask: Option<&SelectionMask>,
-) -> (u32, u32, Vec<u8>) {
-    let pw = (y2 - y1 + 1) as u32;
-    let ph = (z_max - z_min + 1) as u32;
-    const VOID: [u8; 4] = [20, 20, 35, 255];
-    let mut pixels = vec![0u8; (pw * ph * 4) as usize];
-    for p in pixels.chunks_exact_mut(4) { p.copy_from_slice(&VOID); }
-    let bytes_len = world.bytes.len();
-
-    for y in y1..=y2 {
-        let cy    = y / 16 + world.min_y;
-        let ly_16 = (y & 15) as usize * 16;        // ly * 16, constant for this Y column
-        let col   = (y - y1) as usize;
-        for z in z_min..=z_max {
-            let band  = (z as usize) / 16;
-            let lz    = (z as usize) & 15;
-            let z_off = (band - b_lo) * 8192 + lz; // offset into band-scoped clone
-            let row   = (z_max - z) as usize;
-            let out   = (row * pw as usize + col) * 4;
-            let mut x = x1;
-            'x_scan: while x <= x2 {
-                let cx          = x / 16 + world.min_x;
-                let chunk_x_end = (x | 15).min(x2);
-                match world.chunk_map.get(&(cx, cy)) {
-                    None => { x = chunk_x_end + 1; }
-                    Some(&addr) => {
-                        let base = addr + z_off + ly_16;    // constant for this chunk×y×z
-                        while x <= chunk_x_end {
-                            // Shaped selection: an unmasked (x,y) column is see-through so a
-                            // masked block behind it along X shows correctly.
-                            if mask.is_some_and(|m| !m.contains(x, y)) { x += 1; continue; }
-                            let bi = base + (x & 15) as usize * 256;
-                            let pi = bi + 4096;
-                            if bi < bytes_len && pi < bytes_len {
-                                let bt = world.bytes[bi];
-                                if bt != 0 {
-                                    let [r, g, b] = block_color(bt, world.bytes[pi], world.sky);
-                                    pixels[out]     = r;
-                                    pixels[out + 1] = g;
-                                    pixels[out + 2] = b;
-                                    pixels[out + 3] = 255;
-                                    break 'x_scan;
-                                }
-                            }
-                            x += 1;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    (pw, ph, pixels)
-}
-
-/// Top view: X=horizontal, Y=vertical; scans Z from z_max down to z_min.
-/// One HashMap lookup per (x,y) pair, amortized over the full z-depth scan.
-///
-/// Takes a **scan buffer**, never the mmapped world: the callers (`render_selection_view`,
-/// `render_full_height_view`) clone the relevant chunks into a full-span local world first, with
-/// short spans zero-padded — so these loops bound on `bytes.len()` and never see a `chunk_span`.
-fn render_view_top(
-    world: &LoadedWorld,
-    x1: i32, x2: i32, y1: i32, y2: i32, z_min: i32, z_max: i32,
-    b_lo: usize,
-    mask: Option<&SelectionMask>,
-) -> (u32, u32, Vec<u8>) {
-    let pw = (x2 - x1 + 1) as u32;
-    let ph = (y2 - y1 + 1) as u32;
-    const VOID: [u8; 4] = [20, 20, 35, 255];
-    let mut pixels = vec![0u8; (pw * ph * 4) as usize];
-    for p in pixels.chunks_exact_mut(4) { p.copy_from_slice(&VOID); }
-    let bytes_len = world.bytes.len();
-
-    for x in x1..=x2 {
-        let cx     = x / 16 + world.min_x;
-        let lx_256 = (x & 15) as usize * 256;
-        let col    = (x - x1) as usize;
-        for y in y1..=y2 {
-            let cy   = y / 16 + world.min_y;
-            let row  = (y - y1) as usize;
-            let out  = (row * pw as usize + col) * 4;
-            // Shaped selection: an unmasked (x,y) column isn't part of the selection, so it stays
-            // VOID — the top view shows the actual footprint, not the enclosing bbox.
-            if mask.is_some_and(|m| !m.contains(x, y)) { continue; }
-            if let Some(&addr) = world.chunk_map.get(&(cx, cy)) {
-                let base = addr + lx_256 + (y & 15) as usize * 16;     // constant for this x,y
-                for z in (z_min..=z_max).rev() {
-                    let bi = base + (z as usize / 16 - b_lo) * 8192 + (z as usize & 15);
-                    let pi = bi + 4096;
-                    if pi < bytes_len {
-                        let bt = world.bytes[bi];
-                        if bt != 0 {
-                            let [r, g, b] = block_color(bt, world.bytes[pi], world.sky);
-                            pixels[out]     = r;
-                            pixels[out + 1] = g;
-                            pixels[out + 2] = b;
-                            pixels[out + 3] = 255;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    (pw, ph, pixels)
-}
 
 // ── Tauri commands ─────────────────────────────────────────────────────────────
 
@@ -3518,9 +2886,9 @@ fn set_undo_budget(bytes: usize, state: tauri::State<'_, AppState>) -> Result<()
     ws.undo_budget = budget;
     // Split the guard's single `DerefMut` into disjoint field borrows up front — the borrow
     // checker can't see through a custom Deref impl to know `undo_stack`/`redo_stack` don't alias.
-    let WorldState { undo_stack, undo_bytes, redo_stack, redo_bytes, .. } = &mut *ws;
-    trim_stack(undo_stack, undo_bytes, budget);
-    trim_stack(redo_stack, redo_bytes, budget);
+    let WorldState { undo_stack, undo_bytes, undo_groups, redo_stack, redo_bytes, redo_groups, .. } = &mut *ws;
+    trim_stack(undo_stack, undo_bytes, undo_groups, budget);
+    trim_stack(redo_stack, redo_bytes, redo_groups, budget);
     Ok(())
 }
 
@@ -3680,151 +3048,15 @@ fn render_selection_view(
     let t_scan = Instant::now();
     let mask = sel_mask.as_ref();
     let (width, height, pixels) = match view.as_str() {
-        "front" => render_view_front(&scan_world, x1, x2, y1, y2, z_min, z_max, b_lo, mask),
-        "side"  => render_view_side(&scan_world, x1, x2, y1, y2, z_min, z_max, b_lo, mask),
-        _       => render_view_top(&scan_world, x1, x2, y1, y2, z_min, z_max, b_lo, mask),
+        "front" => render::view_front(&scan_world, scan_world.meta(), x1, x2, y1, y2, z_min, z_max, b_lo, mask),
+        "side"  => render::view_side(&scan_world, scan_world.meta(), x1, x2, y1, y2, z_min, z_max, b_lo, mask),
+        _       => render::view_top(&scan_world, scan_world.meta(), x1, x2, y1, y2, z_min, z_max, b_lo, mask),
     };
     timing_log!("[SCAN] end  cmd=render_selection_view  elapsed={}ms  result={}×{}", t_scan.elapsed().as_millis(), width, height);
     timing_log!("[PREVIEW] end  cmd=render_selection_view  pixels={}B  total={}ms", pixels.len(), t0.elapsed().as_millis());
     Ok(PreviewData { width, height, pixels })
 }
 
-/// Front view with `ctx` context columns on each side at 50% alpha. b_lo always 0.
-///
-/// Takes a **scan buffer**, never the mmapped world: the callers (`render_selection_view`,
-/// `render_full_height_view`) clone the relevant chunks into a full-span local world first, with
-/// short spans zero-padded — so these loops bound on `bytes.len()` and never see a `chunk_span`.
-fn render_view_front_ctx(
-    world: &LoadedWorld,
-    sel_x1: i32, sel_x2: i32, y1: i32, y2: i32,
-    z_max: i32, ctx: i32,
-) -> (u32, u32, Vec<u8>) {
-    let rx1 = sel_x1 - ctx;
-    let rx2 = sel_x2 + ctx;
-    let pw = (rx2 - rx1 + 1) as u32;
-    let ph = (z_max + 1) as u32;
-    const VOID: [u8; 4] = [20, 20, 35, 255];
-    let mut pixels = vec![0u8; (pw * ph * 4) as usize];
-    for p in pixels.chunks_exact_mut(4) { p.copy_from_slice(&VOID); }
-    let bytes_len = world.bytes.len();
-
-    for x in rx1..=rx2 {
-        // div_euclid handles negative x (context left of world origin).
-        // x & 15 == x.rem_euclid(16) for all i32 (two's-complement property).
-        let cx     = x.div_euclid(16) + world.min_x;
-        let lx_256 = (x & 15) as usize * 256;
-        let col    = (x - rx1) as usize;
-        for z in 0..=z_max {
-            let band  = (z as usize) / 16;
-            let lz    = (z as usize) & 15;
-            let z_off = band * 8192 + lz; // b_lo=0 always
-            let row   = (z_max - z) as usize;
-            let out   = (row * pw as usize + col) * 4;
-            let mut y = y1;
-            'y_scan: while y <= y2 {
-                let cy          = y / 16 + world.min_y;
-                let chunk_y_end = (y | 15).min(y2);
-                match world.chunk_map.get(&(cx, cy)) {
-                    None => { y = chunk_y_end + 1; }
-                    Some(&addr) => {
-                        let base = addr + z_off + lx_256;
-                        while y <= chunk_y_end {
-                            let bi = base + (y & 15) as usize * 16;
-                            let pi = bi + 4096;
-                            if bi < bytes_len && pi < bytes_len {
-                                let bt = world.bytes[bi];
-                                if bt != 0 {
-                                    let [r, g, b] = block_color(bt, world.bytes[pi], world.sky);
-                                    pixels[out]     = r;
-                                    pixels[out + 1] = g;
-                                    pixels[out + 2] = b;
-                                    break 'y_scan;
-                                }
-                            }
-                            y += 1;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    // Post-process: dim context columns to 50% opacity.
-    let left_ctx  = (sel_x1 - rx1) as usize;
-    let right_ctx = (sel_x2 + 1 - rx1) as usize;
-    for col in (0..left_ctx).chain(right_ctx..(pw as usize)) {
-        for row in 0..(ph as usize) {
-            pixels[(row * pw as usize + col) * 4 + 3] = 128;
-        }
-    }
-    (pw, ph, pixels)
-}
-
-/// Side view with `ctx` context columns on each side at 50% alpha. b_lo always 0.
-///
-/// Takes a **scan buffer**, never the mmapped world: the callers (`render_selection_view`,
-/// `render_full_height_view`) clone the relevant chunks into a full-span local world first, with
-/// short spans zero-padded — so these loops bound on `bytes.len()` and never see a `chunk_span`.
-fn render_view_side_ctx(
-    world: &LoadedWorld,
-    x1: i32, x2: i32, sel_y1: i32, sel_y2: i32,
-    z_max: i32, ctx: i32,
-) -> (u32, u32, Vec<u8>) {
-    let ry1 = sel_y1 - ctx;
-    let ry2 = sel_y2 + ctx;
-    let pw = (ry2 - ry1 + 1) as u32;
-    let ph = (z_max + 1) as u32;
-    const VOID: [u8; 4] = [20, 20, 35, 255];
-    let mut pixels = vec![0u8; (pw * ph * 4) as usize];
-    for p in pixels.chunks_exact_mut(4) { p.copy_from_slice(&VOID); }
-    let bytes_len = world.bytes.len();
-
-    for y in ry1..=ry2 {
-        let cy    = y.div_euclid(16) + world.min_y;
-        let ly_16 = (y & 15) as usize * 16;
-        let col   = (y - ry1) as usize;
-        for z in 0..=z_max {
-            let band  = (z as usize) / 16;
-            let lz    = (z as usize) & 15;
-            let z_off = band * 8192 + lz;
-            let row   = (z_max - z) as usize;
-            let out   = (row * pw as usize + col) * 4;
-            let mut x = x1;
-            'x_scan: while x <= x2 {
-                let cx          = x / 16 + world.min_x;
-                let chunk_x_end = (x | 15).min(x2);
-                match world.chunk_map.get(&(cx, cy)) {
-                    None => { x = chunk_x_end + 1; }
-                    Some(&addr) => {
-                        let base = addr + z_off + ly_16;
-                        while x <= chunk_x_end {
-                            let bi = base + (x & 15) as usize * 256;
-                            let pi = bi + 4096;
-                            if bi < bytes_len && pi < bytes_len {
-                                let bt = world.bytes[bi];
-                                if bt != 0 {
-                                    let [r, g, b] = block_color(bt, world.bytes[pi], world.sky);
-                                    pixels[out]     = r;
-                                    pixels[out + 1] = g;
-                                    pixels[out + 2] = b;
-                                    break 'x_scan;
-                                }
-                            }
-                            x += 1;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    let left_ctx  = (sel_y1 - ry1) as usize;
-    let right_ctx = (sel_y2 + 1 - ry1) as usize;
-    for col in (0..left_ctx).chain(right_ctx..(pw as usize)) {
-        for row in 0..(ph as usize) {
-            pixels[(row * pw as usize + col) * 4 + 3] = 128;
-        }
-    }
-    (pw, ph, pixels)
-}
 
 /// Full-height contextual front/side view. `context_blocks` columns outside the
 /// selection are rendered at 50% opacity to show surrounding terrain.
@@ -3896,8 +3128,8 @@ fn render_full_height_view(
     };
 
     let (width, height, pixels) = match view.as_str() {
-        "front" => render_view_front_ctx(&scan_world, x1, x2, y1, y2, z_max, ctx),
-        _       => render_view_side_ctx(&scan_world,  x1, x2, y1, y2, z_max, ctx),
+        "front" => render::view_front_ctx(&scan_world, scan_world.meta(), x1, x2, y1, y2, z_max, ctx),
+        _       => render::view_side_ctx(&scan_world, scan_world.meta(), x1, x2, y1, y2, z_max, ctx),
     };
     Ok(PreviewData { width, height, pixels })
 }
@@ -4510,40 +3742,66 @@ fn restore_and_invert(world: &mut LoadedWorld, entry: &UndoEntry) -> Vec<ChunkSn
     }).collect()
 }
 
+/// Does an entry with group `entry` sit in a different logical undo unit from the adjacent entry
+/// whose group is `neighbour` (`None` = there is no adjacent entry, i.e. the stack end)? This is
+/// `count_undo_groups`'s collapsing rule expressed for a single boundary: only two contiguous
+/// entries carrying the *same* `Some(g)` share a unit.
+///
+/// It is deliberately symmetric, so one predicate serves both ends of the deque: pushing/popping at
+/// the back adds/removes a unit exactly when this is true against the new back, and `trim_stack`
+/// evicting at the front removes one exactly when it is true against the new front.
+fn starts_new_group(entry: Option<u64>, neighbour: Option<Option<u64>>) -> bool {
+    !matches!((entry, neighbour), (Some(g), Some(Some(ng))) if g == ng)
+}
+
 /// Evict oldest entries until `running` is back under `budget`, always keeping at least one entry
 /// (dropping the floor would make a single large edit non-undoable). Extracted from `push_undo` so
 /// `set_undo_budget` can re-trim an already-populated stack when the user lowers the budget.
-fn trim_stack(stack: &mut VecDeque<UndoEntry>, running: &mut usize, budget: usize) {
+///
+/// `groups` is the stack's cached logical-unit count (`WorldState::undo_groups`/`redo_groups`) —
+/// evicting from the **front** only drops a unit when the evicted entry didn't already share one
+/// with the entry that becomes the new front.
+fn trim_stack(stack: &mut VecDeque<UndoEntry>, running: &mut usize, groups: &mut usize, budget: usize) {
     while *running > budget && stack.len() > 1 {
         if let Some(evicted) = stack.pop_front() {
             *running -= evicted.bytes;
+            if starts_new_group(evicted.group, stack.front().map(|e| e.group)) {
+                *groups -= 1;
+            }
         }
     }
 }
 
 /// Push an entry onto an undo/redo stack, evicting oldest entries to keep it under `budget`. Used
 /// for both `undo_stack` and `redo_stack` so neither can grow unbounded. `running` is the stack's
-/// cached total (`WorldState::undo_bytes`/`redo_bytes`) — updated incrementally here instead of
-/// re-summing every chunk in the stack on every push, which used to make bookkeeping for an
-/// n-stamp sculpt stroke O(n²) (audit M2).
+/// cached total (`WorldState::undo_bytes`/`redo_bytes`) and `groups` its cached logical-unit count
+/// (`undo_groups`/`redo_groups`) — both updated incrementally here instead of re-walking the stack
+/// on every push, which used to make bookkeeping for an n-stamp sculpt stroke O(n²) (audit M2 for
+/// the bytes; 3D-pipeline audit Finding 14 for the group count).
 ///
 /// ⚠️ One large edit's snapshot can still park arbitrarily far above `budget`: `trim_stack` keeps
 /// a `len() > 1` floor, so a single ⌘A-fill entry that alone exceeds the budget is never evicted.
-fn push_undo(stack: &mut VecDeque<UndoEntry>, running: &mut usize, entry: UndoEntry, budget: usize) {
+fn push_undo(stack: &mut VecDeque<UndoEntry>, running: &mut usize, groups: &mut usize, entry: UndoEntry, budget: usize) {
+    if starts_new_group(entry.group, stack.back().map(|e| e.group)) {
+        *groups += 1;
+    }
     *running += entry.bytes;
     stack.push_back(entry);
-    trim_stack(stack, running, budget);
+    trim_stack(stack, running, groups, budget);
     if stack.len() == 1 && *running > budget {
         timing_log!("[UNDO] single entry ({} bytes) alone exceeds the {} byte budget; kept anyway", running, budget);
     }
 }
 
-/// Pops the most recent entry off an undo/redo stack, keeping `running` (the stack's cached
-/// byte total) in sync. Counterpart to `push_undo` — every direct `pop_back` on `undo_stack`/
-/// `redo_stack` must go through this so the cached total never drifts.
-fn pop_undo(stack: &mut VecDeque<UndoEntry>, running: &mut usize) -> Option<UndoEntry> {
+/// Pops the most recent entry off an undo/redo stack, keeping `running`/`groups` (the stack's
+/// cached byte total and logical-unit count) in sync. Counterpart to `push_undo` — every direct
+/// `pop_back` on `undo_stack`/`redo_stack` must go through this so the caches never drift.
+fn pop_undo(stack: &mut VecDeque<UndoEntry>, running: &mut usize, groups: &mut usize) -> Option<UndoEntry> {
     let entry = stack.pop_back()?;
     *running -= entry.bytes;
+    if starts_new_group(entry.group, stack.back().map(|e| e.group)) {
+        *groups -= 1;
+    }
     Some(entry)
 }
 
@@ -4569,6 +3827,8 @@ struct EditResult {
     /// See `EditResultHeader::undo_dropped`. Only ever `true` for a fresh edit, never for
     /// undo/redo (those consume an entry that was already within budget when it was pushed).
     undo_dropped: bool,
+    /// See `EditResultHeader::warnings`. Empty for undo/redo.
+    warnings: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -4581,6 +3841,10 @@ struct EditResultHeader {
     /// `true` = this edit's undo delta exceeded the whole undo budget and was dropped, taking the
     /// rest of the history with it (audit C1 step 3). The frontend warns; nothing is undoable.
     undo_dropped: bool,
+    /// Non-fatal advisory toasts — currently just `risky_block_warnings` (dense doors/flowers in one
+    /// footprint, a block family suspected of a fixed client-side capacity). The edit already applied;
+    /// this doesn't block or undo anything, it just tells the user before they repeat the paste.
+    warnings: Vec<String>,
 }
 
 impl tauri::ipc::IpcResponse for EditResult {
@@ -4592,6 +3856,7 @@ impl tauri::ipc::IpcResponse for EditResult {
             redo_depth: self.redo_depth,
             operation: self.operation,
             undo_dropped: self.undo_dropped,
+            warnings: self.warnings,
         };
         ipc_envelope_one(&header, self.patch.pixels)
     }
@@ -4650,21 +3915,27 @@ where
 }
 
 /// Group-tagged sibling of `with_edit`: identical, but stamps the resulting `UndoEntry` with
-/// `group` so a run of these (one sculpt stroke = many timer stamps) coalesces on undo/redo.
-/// Only `sculpt_terrain` uses this; every other editing command goes through `with_edit` (group
-/// `None`). Both funnel into `with_edit_inner` so there is one owner of the take/reinstall sequence.
+/// `group` so a run of these (one sculpt stroke = many timer stamps, or one 3D build sweep = many
+/// per-stamp paints) coalesces on undo/redo. Both funnel into `with_edit_inner` so there is one
+/// owner of the take/reinstall sequence.
+///
+/// `z_range` is `with_edit_zscoped`'s band scoping, plumbed through rather than given its own
+/// fourth wrapper: `paint_blocks` needs *both* knobs, since a 3D build sweep is grouped **and**
+/// supplies concrete z coordinates. `None` = whole-chunk snapshot, which is what every caller whose
+/// vertical extent isn't statically known must pass.
 fn with_edit_grouped<F>(
     ws: &mut WorldState,
     operation: &str,
     snap_rect: (i32, i32, i32, i32),
     patch_rect: (i32, i32, i32, i32),
     group: Option<u64>,
+    z_range: Option<(i32, i32)>,
     edit: F,
 ) -> Result<EditResult, String>
 where
     F: FnOnce(&mut LoadedWorld) -> Result<(), String>,
 {
-    with_edit_inner(ws, operation, snap_rect, patch_rect, group, None, edit)
+    with_edit_inner(ws, operation, snap_rect, patch_rect, group, z_range, edit)
 }
 
 fn with_edit_inner<F>(
@@ -4711,6 +3982,94 @@ where
     finish_edit(ws, operation, group, patch, invalidate, pre_snap)
 }
 
+/// A block-type family suspected of a fixed client-side capacity (verified empirically for doors —
+/// see the ComBlock crash writeup — and reported historically for dense NewFlower placement during
+/// worldgen work; the flower threshold is therefore a conservative guess, not a measured ceiling).
+/// `threshold` is per contiguous edit footprint (one paste/fill/gen call), not a world total — the
+/// crash only reproduced when many were packed into one visible area, not spread across the map.
+struct RiskyBlockGroup {
+    name: &'static str,
+    types: &'static [u8],
+    threshold: u32,
+}
+
+const RISKY_BLOCK_GROUPS: &[RiskyBlockGroup] = &[
+    // Doors: 66–69 directional bases only — 70 (DoorTop) is deliberately excluded. paint_blocks
+    // auto-places one DoorTop for every base placed (and paste/gen copy both halves together), so
+    // counting both would double-count every real door; the interactive object the crash theory
+    // implicates is keyed to the base block's position/direction, not the cosmetic top. 242 doors in
+    // one ComBlock building, repeated along a road, reproducibly crashed Eden ~1s after the buildings
+    // entered view — consistent with a fixed-size door/interactive-object array overflowing once too
+    // many come into view at once.
+    RiskyBlockGroup { name: "doors", types: &[66, 67, 68, 69], threshold: 120 },
+    // NewFlower — anecdotally linked to worldgen crashes at high density. No confirmed threshold;
+    // picked conservatively pending a reproduction like the door case above.
+    RiskyBlockGroup { name: "New Flower blocks", types: &[73], threshold: 4000 },
+    // Portals: 75–78 directional bases only — 79 (PortalTop) excluded for the same reason as
+    // DoorTop above. Share the door family's S/W/N/E encoding and are the same kind of interactive
+    // object (open/trigger state, likely teleport logic) — plausibly the same or a sibling
+    // fixed-size array. Not independently reproduced; threshold mirrors doors' measured one pending
+    // a dedicated repro.
+    RiskyBlockGroup { name: "portals", types: &[75, 76, 77, 78], threshold: 120 },
+    // Treasure Cube (71) — a single-ID spawnable/interactive object (loot logic), same suspected
+    // class of fixed-capacity client array as doors/portals. No confirmed threshold.
+    RiskyBlockGroup { name: "Treasure Cubes", types: &[71], threshold: 120 },
+];
+
+/// Tallies how many of each byte value 0–127 the changed offsets in `snaps` now hold (post-edit),
+/// restricted to the block half of each band (paint bytes can't hold a block type). Mirrors
+/// `LampIndex::apply_delta`'s delta-walk, including its `Full`/`FullZ` branch comparing every cell
+/// against its pre-edit value — a `Full` delta stores the *whole* captured span, not just the cells
+/// that changed (chosen once ≥20% of a band differs, per `diff_span`), so without that comparison a
+/// large edit would count every pre-existing block in the span as "newly placed", not just its own.
+fn count_new_block_types(world: &LoadedWorld, snaps: &[ChunkSnapshot]) -> [u32; 128] {
+    let mut counts = [0u32; 128];
+    let mut scratch: Vec<u8> = Vec::new();
+    for snap in snaps {
+        let Some((addr, cend)) = world.chunk_range(snap.cx, snap.cy) else { continue };
+        match &snap.delta {
+            ChunkDelta::Sparse(pairs) => {
+                for &(off, _prev) in pairs {
+                    let off = off as usize;
+                    if off % 8192 >= 4096 { continue; } // paint byte
+                    let idx = addr + off;
+                    if idx >= cend { continue; }
+                    counts[world.bytes[idx] as usize] += 1;
+                }
+            }
+            dense => {
+                let Some((start_off, data)) = dense.full_bytes(&mut scratch) else { continue };
+                let start = start_off as usize;
+                let end = (start + data.len()).min(cend - addr);
+                let mut band = start / 8192;
+                while band * 8192 < end {
+                    let lo = (band * 8192).max(start);
+                    let hi = (band * 8192 + 4096).min(end); // block half only
+                    band += 1;
+                    if hi <= lo { continue; }
+                    let pre = &data[lo - start..hi - start];
+                    let post = &world.bytes[addr + lo..addr + hi];
+                    for (&p, &q) in pre.iter().zip(post) {
+                        if p != q { counts[q as usize] += 1; }
+                    }
+                }
+            }
+        }
+    }
+    counts
+}
+
+/// Human-readable warnings for whichever `RISKY_BLOCK_GROUPS` this edit's footprint exceeded.
+fn risky_block_warnings(counts: &[u32; 128]) -> Vec<String> {
+    RISKY_BLOCK_GROUPS.iter().filter_map(|g| {
+        let total: u32 = g.types.iter().map(|&t| counts[t as usize]).sum();
+        (total > g.threshold).then(|| format!(
+            "This placed {total} {} in one area — Eden has been known to crash with dense placements like this. Consider thinning them out.",
+            g.name
+        ))
+    }).collect()
+}
+
 /// The tail every edit path shares, once the world has been mutated and the undo delta computed:
 /// fold the delta into the lamp index and the dirty set, enforce the undo budget, and assemble the
 /// `EditResult`. Split out of `with_edit_inner` (audit H1) so the sculpt read/write split — which
@@ -4733,8 +4092,15 @@ fn finish_edit(
     // offsets and their pre-edit values), so this costs O(changed bytes) rather than a full rescan
     // of every affected chunk — audit H3.
     if let Some(w) = ws.world.as_ref() {
-        ws.lamp_index.apply_delta(w, &pre_snap);
+        apply_lamp_delta(&ws.lamp_index, w, &pre_snap);
     }
+
+    // Risky-block density check (dense doors/flowers in one edit footprint — see
+    // `RISKY_BLOCK_GROUPS`), computed the same way as the lamp index above: from the undo delta's
+    // changed offsets against the post-edit world, before `pre_snap` is consumed by `UndoEntry::new`.
+    let warnings = ws.world.as_ref()
+        .map(|w| risky_block_warnings(&count_new_block_types(w, &pre_snap)))
+        .unwrap_or_default();
 
     // Dirty tracking for incremental autosave/save (audit C2): pre_snap is exactly the chunks
     // diff_chunk found to have actually changed, which is more precise than `affected` (a no-op
@@ -4760,7 +4126,7 @@ fn finish_edit(
             ws.clear_redo();
             undo_dropped = true;
         } else {
-            push_undo(&mut ws.undo_stack, &mut ws.undo_bytes, entry, budget);
+            push_undo(&mut ws.undo_stack, &mut ws.undo_bytes, &mut ws.undo_groups, entry, budget);
             ws.clear_redo();
         }
     }
@@ -4768,16 +4134,24 @@ fn finish_edit(
     Ok(EditResult {
         patch,
         invalidate,
-        undo_depth: count_undo_groups(&ws.undo_stack),
-        redo_depth: count_undo_groups(&ws.redo_stack),
+        undo_depth: ws.undo_groups,
+        redo_depth: ws.redo_groups,
         operation: operation.into(),
         undo_dropped,
+        warnings,
     })
 }
 
-/// Count logical undo/redo units: contiguous entries sharing the same `Some(g)` group collapse to
-/// one; `None`-group entries always count individually (never coalesce, including with each other).
-/// This is what the Ribbon's undo/redo indicators reflect — strokes, not per-stamp edits.
+/// Count logical undo/redo units by walking the stack: contiguous entries sharing the same `Some(g)`
+/// group collapse to one; `None`-group entries always count individually (never coalesce, including
+/// with each other). This is what the Ribbon's undo/redo indicators reflect — strokes, not per-stamp
+/// edits.
+///
+/// ⚠️ **Test-only oracle.** Production reads `WorldState::undo_groups`/`redo_groups`, which
+/// `push_undo`/`pop_undo`/`trim_stack` maintain incrementally via `starts_new_group` — every
+/// `EditResult` carries both depths, and this walk is O(stack), unbounded in practice (3D-pipeline
+/// audit Finding 14). `test_cached_group_counts_match_the_oracle` pins the two against each other.
+#[cfg(test)]
 fn count_undo_groups(stack: &VecDeque<UndoEntry>) -> usize {
     let mut count = 0usize;
     let mut prev: Option<u64> = None;
@@ -4928,6 +4302,32 @@ fn gradient_fill_inner(
     }
 }
 
+/// The vertical extent `paint_blocks` will write, when it's knowable before the edit runs — the
+/// `z_range` handed to `with_edit_grouped` so the undo snapshot copies only the bands this batch can
+/// touch instead of whole 131 KB chunks (3D-pipeline audit Finding 13). Every block placed by a 3D
+/// build sweep carries a concrete `z` and a sweep fires one `paint_blocks` per stamp, so this is the
+/// per-stamp cost that matters.
+///
+/// `None` = not statically knowable, snapshot the whole chunk (the pre-existing behaviour).
+///
+/// ⚠️ Three things this range has to get exactly right. `snapshot_chunks_full` rounds it *out* to
+/// whole 16-block bands, and a range that is merely too **narrow** doesn't fail — it silently leaves
+/// the writes outside it out of the undo delta, so undoing restores part of the edit and keeps the
+/// rest:
+///  - `z_offset` is **not** part of it. `paint_blocks` applies `z_offset` only on the `b.z == None`
+///    (surface-relative) branch; an explicit `Some(z)` is an absolute coordinate, written unshifted.
+///  - Doors and portals auto-place their paired top block one above, so `top_type != 0` grows the
+///    high end by 1 — and that one block is routinely what crosses a band boundary.
+///  - A single `None` anywhere in the batch resolves its z from `surface_z_capped` *inside* the edit
+///    closure, so the extent isn't knowable up front and the whole batch must fall back.
+fn paint_z_range(blocks: &[PaintBlock], top_type: u8) -> Option<(i32, i32)> {
+    if blocks.is_empty() { return None; } // an empty fold would seed a degenerate (MAX, MIN) range
+    let (lo, hi) = blocks.iter().try_fold((i32::MAX, i32::MIN), |(lo, hi), b| {
+        b.z.map(|z| (lo.min(z), hi.max(z)))
+    })?;
+    Some((lo, hi + if top_type != 0 { 1 } else { 0 }))
+}
+
 /// Paint a batch of blocks in one operation — one undo entry for the whole stroke.
 /// For each block, if z is None the topmost non-air block at (x,y) is used (surface paint);
 /// if z is Some the block is placed at that exact z level.
@@ -4968,11 +4368,13 @@ fn paint_blocks(
     let is_portal = (75..=78).contains(&block_type);
     let top_type: u8 = if is_door { 70 } else if is_portal { 79 } else { 0 };
 
+    let z_range = paint_z_range(&blocks, top_type);
+
     // In cutaway view the "surface" a z-less paint targets is the highest block under the cap —
     // so drawing underground behaves exactly like drawing on the true surface.
     let cap = ws.view_cap_z;
     let label = format!("Paint {} block{}", blocks.len(), if blocks.len() == 1 { "" } else { "s" });
-    with_edit_grouped(&mut ws, &label, rect, rect, group, |world| {
+    with_edit_grouped(&mut ws, &label, rect, rect, group, z_range, |world| {
         let max_z = world_max_z(world);
         for b in &blocks {
             let z = match b.z {
@@ -5774,7 +5176,7 @@ fn undo_edit_inner(ws: &mut WorldState) -> Result<EditResult, String> {
     // stray call with no world can't silently discard an entry (harmless today since the stacks
     // are cleared with the world, but fragile ordering otherwise).
     let mut world = ws.world.take().ok_or("No world loaded")?;
-    let entry = match pop_undo(&mut ws.undo_stack, &mut ws.undo_bytes) {
+    let entry = match pop_undo(&mut ws.undo_stack, &mut ws.undo_bytes, &mut ws.undo_groups) {
         Some(e) => e,
         None => { ws.world = Some(world); return Err("Nothing to undo".into()); }
     };
@@ -5788,12 +5190,12 @@ fn undo_edit_inner(ws: &mut WorldState) -> Result<EditResult, String> {
         let redo_snaps = restore_and_invert(&mut world, &entry);
         // Same delta-driven lamp maintenance as `with_edit_inner`: the inverse snapshots hold the
         // pre-restore bytes and `world` now holds the restored ones (audit H3).
-        ws.lamp_index.apply_delta(&world, &redo_snaps);
-        push_undo(&mut ws.redo_stack, &mut ws.redo_bytes, UndoEntry::new(entry.operation, redo_snaps, entry.group), ws.undo_budget);
+        apply_lamp_delta(&ws.lamp_index, &world, &redo_snaps);
+        push_undo(&mut ws.redo_stack, &mut ws.redo_bytes, &mut ws.redo_groups, UndoEntry::new(entry.operation, redo_snaps, entry.group), ws.undo_budget);
         // Continue only for a group whose next entry down matches the same id.
         if let Some(g) = group {
             if ws.undo_stack.back().map(|e| e.group) == Some(Some(g)) {
-                current = pop_undo(&mut ws.undo_stack, &mut ws.undo_bytes);
+                current = pop_undo(&mut ws.undo_stack, &mut ws.undo_bytes, &mut ws.undo_groups);
             }
         }
     }
@@ -5805,10 +5207,11 @@ fn undo_edit_inner(ws: &mut WorldState) -> Result<EditResult, String> {
     Ok(EditResult {
         patch,
         invalidate,
-        undo_depth: count_undo_groups(&ws.undo_stack),
-        redo_depth: count_undo_groups(&ws.redo_stack),
+        undo_depth: ws.undo_groups,
+        redo_depth: ws.redo_groups,
         operation: label,
         undo_dropped: false,
+        warnings: Vec::new(),
     })
 }
 
@@ -5817,7 +5220,7 @@ fn undo_edit_inner(ws: &mut WorldState) -> Result<EditResult, String> {
 fn redo_edit_inner(ws: &mut WorldState) -> Result<EditResult, String> {
     ws.sculpt_session = None; // bypasses with_edit_inner — clear the live-sculpt workspace (see SculptSession)
     let mut world = ws.world.take().ok_or("No world loaded")?;
-    let entry = match pop_undo(&mut ws.redo_stack, &mut ws.redo_bytes) {
+    let entry = match pop_undo(&mut ws.redo_stack, &mut ws.redo_bytes, &mut ws.redo_groups) {
         Some(e) => e,
         None => { ws.world = Some(world); return Err("Nothing to redo".into()); }
     };
@@ -5829,11 +5232,11 @@ fn redo_edit_inner(ws: &mut WorldState) -> Result<EditResult, String> {
     while let Some(entry) = current.take() {
         for s in &entry.chunks { affected.push((s.cx, s.cy)); }
         let undo_snaps = restore_and_invert(&mut world, &entry);
-        ws.lamp_index.apply_delta(&world, &undo_snaps); // delta-driven lamp maintenance (audit H3)
-        push_undo(&mut ws.undo_stack, &mut ws.undo_bytes, UndoEntry::new(entry.operation, undo_snaps, entry.group), ws.undo_budget);
+        apply_lamp_delta(&ws.lamp_index, &world, &undo_snaps); // delta-driven lamp maintenance (audit H3)
+        push_undo(&mut ws.undo_stack, &mut ws.undo_bytes, &mut ws.undo_groups, UndoEntry::new(entry.operation, undo_snaps, entry.group), ws.undo_budget);
         if let Some(g) = group {
             if ws.redo_stack.back().map(|e| e.group) == Some(Some(g)) {
-                current = pop_undo(&mut ws.redo_stack, &mut ws.redo_bytes);
+                current = pop_undo(&mut ws.redo_stack, &mut ws.redo_bytes, &mut ws.redo_groups);
             }
         }
     }
@@ -5845,10 +5248,11 @@ fn redo_edit_inner(ws: &mut WorldState) -> Result<EditResult, String> {
     Ok(EditResult {
         patch,
         invalidate,
-        undo_depth: count_undo_groups(&ws.undo_stack),
-        redo_depth: count_undo_groups(&ws.redo_stack),
+        undo_depth: ws.undo_groups,
+        redo_depth: ws.redo_groups,
         operation: label,
         undo_dropped: false,
+        warnings: Vec::new(),
     })
 }
 
@@ -5983,40 +5387,7 @@ fn mirror_ramp_id_y(bt: u8) -> u8 {
     }
 }
 
-/// Returns the z of the topmost non-air block at pixel position (px, py),
-/// or None if the column has no chunk or is entirely air.
-pub(crate) fn surface_z(world: &impl VoxelView, px: i32, py: i32) -> Option<i32> {
-    surface_z_capped(world, px, py, None)
-}
 
-/// `surface_z` with a cutaway ceiling: the topmost non-air block at or below `cap`. With `cap`
-/// set, "the surface" becomes the floor of whatever cavity the cap plane cuts into, which is what
-/// makes drawing / terrain-paste / the cursor readout work underground exactly as they do on top.
-pub(crate) fn surface_z_capped(world: &impl VoxelView, px: i32, py: i32, cap: Option<i32>) -> Option<i32> {
-    if px < 0 || py < 0 { return None; }
-    let (mnx, mny) = world.chunk_origin();
-    let cx = px / 16 + mnx;
-    let cy = py / 16 + mny;
-    let chunk = world.chunk_bytes(cx, cy)?;
-    let lx = (px % 16) as usize;
-    let ly = (py % 16) as usize;
-    for band in (0..world.num_bands()).rev() {
-        if let Some(c) = cap {
-            if (band * 16) as i32 > c { continue; }
-        }
-        for lz in (0..16usize).rev() {
-            if let Some(c) = cap {
-                if (band * 16 + lz) as i32 > c { continue; }
-            }
-            let bi = band * 8192 + lx * 256 + ly * 16 + lz;
-            if bi >= chunk.len() { continue; }
-            if chunk[bi] != 0 {
-                return Some((band * 16 + lz) as i32);
-            }
-        }
-    }
-    None
-}
 
 #[tauri::command(async)]
 fn rename_world(state: tauri::State<'_, AppState>, name: String) -> Result<(), String> {
@@ -6613,27 +5984,6 @@ impl Rng64 {
     }
 }
 
-/// Write one block at absolute world pixel coordinates using the correct band formula.
-/// Out-of-bounds writes (missing chunk, z > max) are silently dropped.
-#[inline]
-pub(crate) fn set_block_abs(world: &mut impl VoxelViewMut, wx: i32, wy: i32, wz: i32, bt: u8, paint: u8) {
-    if wz < 0 || wz as usize >= world.num_bands() * 16 { return; }
-    let (mnx, mny) = world.chunk_origin();
-    let cx = wx.div_euclid(16) + mnx;
-    let cy = wy.div_euclid(16) + mny;
-    let lx   = wx.rem_euclid(16) as usize;
-    let ly   = wy.rem_euclid(16) as usize;
-    let band = wz as usize / 16;
-    let lz   = wz as usize % 16;
-    if let Some(chunk) = world.chunk_bytes_mut(cx, cy) {
-        let bi = band * 8192 + lx * 256 + ly * 16 + lz;
-        let pi = bi + 4096;
-        if pi < chunk.len() {
-            chunk[bi] = bt;
-            chunk[pi] = paint;
-        }
-    }
-}
 
 #[inline]
 fn place_leaf_abs(sink: &mut impl VoxelSink, wx: i32, wy: i32, wz: i32, paint: u8) {
@@ -6917,11 +6267,8 @@ fn generate_trees_inner(
     }
 }
 
-/// Top-down render of the current clipboard (highest non-air block per column).
-/// Axonometric top-down render for the visible region.
-/// For each output pixel (px, py), rays descend from max_z. At depth dz = max_z - z,
-/// the sample point drifts: sample_px = px + ski*0.5*dz, sample_py = py - ski*dz.
-/// This creates a south-east viewing angle with depth-derived parallax (ski=0 is flat top-down).
+/// Axonometric top-down render for the visible region — see `voxel_core::render::axo_region` for
+/// the parallax math. `ski = 0` is a flat top-down render; `dir` picks the viewing corner.
 #[tauri::command(async)]
 fn render_axo_region(
     x1: i32, y1: i32, x2: i32, y2: i32,
@@ -6931,77 +6278,9 @@ fn render_axo_region(
 ) -> Result<PixelPatch, String> {
     let ws = read_ws(&state);
     let world = ws.world.as_ref().ok_or("No world loaded")?;
-    let world_w = (world.w_chunks * 16) as i32;
-    let world_h = (world.h_chunks * 16) as i32;
-    let ox1 = x1.clamp(0, world_w - 1) as u32;
-    let oy1 = y1.clamp(0, world_h - 1) as u32;
-    let ox2 = x2.clamp(0, world_w - 1) as u32;
-    let oy2 = y2.clamp(0, world_h - 1) as u32;
-    let width  = ox2 - ox1 + 1;
-    let height = oy2 - oy1 + 1;
-    let max_z = world_max_z(world) as f32;
-    let mut pixels = vec![30u8; (width * height * 4) as usize];
-    for p in pixels.chunks_exact_mut(4) { p[3] = 255; }
-    let (sx_sgn, sy_sgn): (f32, f32) = match dir {
-        1 => (-1.0, -1.0), // SW
-        2 => ( 1.0,  1.0), // NE
-        3 => (-1.0,  1.0), // NW
-        _ => ( 1.0, -1.0), // SE (default)
-    };
-
-    // Each row is a disjoint slice of `pixels` and each pixel does its own independent
-    // (comparatively expensive, up-to-max_z) raycast, so this parallelizes well per row.
-    pixels.par_chunks_mut((width * 4) as usize).enumerate().for_each(|(row, row_pixels)| {
-        let py = oy1 + row as u32;
-        for px in ox1..=ox2 {
-            let mut top_bt = 0u8; let mut top_paint = 0u8;
-            let mut under_bt = 0u8; let mut under_paint = 0u8;
-
-            'zray: for dz in 0..=(max_z as i32) {
-                let wz = (max_z as i32) - dz;
-                let sx = (px as f32 + sx_sgn * ski * 0.5 * dz as f32).round() as i32;
-                let sy = (py as f32 + sy_sgn * ski * dz as f32).round() as i32;
-                if sx < 0 || sx >= world_w || sy < 0 || sy >= world_h { continue; }
-                let cx = (sx / 16) + world.min_x;
-                let cy = (sy / 16) + world.min_y;
-                let lx = (sx % 16) as usize;
-                let ly = (sy % 16) as usize;
-                let Some((addr, cend)) = world.chunk_range(cx, cy) else { continue };
-                let band = wz as usize / 16;
-                let lz   = wz as usize % 16;
-                let bi = addr + band * 8192 + lx * 256 + ly * 16 + lz;
-                let pi = bi + 4096;
-                if pi >= cend { continue; }
-                let bt = world.bytes[bi];
-                if bt == 0 { continue; }
-                if top_bt == 0 {
-                    top_bt = bt; top_paint = world.bytes[pi];
-                    if transparent_alpha(bt).is_none() { break 'zray; }
-                } else {
-                    under_bt = bt; under_paint = world.bytes[pi];
-                    break 'zray;
-                }
-            }
-
-            if top_bt == 0 { continue; }
-            let c1 = block_color(top_bt, top_paint, world.sky);
-            let [r, g, b] = if under_bt != 0 {
-                if let Some(alpha) = transparent_alpha(top_bt) {
-                    let c2 = block_color(under_bt, under_paint, world.sky);
-                    [
-                        (c1[0] as f32 * alpha + c2[0] as f32 * (1.0 - alpha)) as u8,
-                        (c1[1] as f32 * alpha + c2[1] as f32 * (1.0 - alpha)) as u8,
-                        (c1[2] as f32 * alpha + c2[2] as f32 * (1.0 - alpha)) as u8,
-                    ]
-                } else { c1 }
-            } else { c1 };
-
-            let off = ((px - ox1) * 4) as usize;
-            row_pixels[off] = r; row_pixels[off + 1] = g; row_pixels[off + 2] = b; row_pixels[off + 3] = 255;
-        }
-    });
-    Ok(PixelPatch { x: ox1, y: oy1, width, height, lod: 1, pixels })
+    Ok(render::axo_region(world, world.meta(), x1, y1, x2, y2, ski, dir).into())
 }
+
 
 /// Axonometric preview of the clipboard contents for the 3D tab in SelectionInspector.
 /// Same projection math as render_axo_region but iterates in-memory clipboard voxels.
@@ -7179,41 +6458,6 @@ fn render_clipboard_elevation_preview_inner(cb: &Clipboard, sky: u8, view: &str)
 const FLOW_MAX_STEPS: usize = 200_000;
 /// Safety cap on flooded cells for `pool_fill` — a 3D volumetric flood, so larger than the wand's 2D cap.
 const POOL_FILL_MAX_CELLS: usize = 200_000;
-
-/// `(base, level)` → block type. `base` is 20 (water) or 23 (lava); `level` 4 = source, 3/2/1 =
-/// ¾/½/¼, 0 = air. Mirrors `Liquids.mm`'s `genLevel`.
-#[inline]
-pub(crate) fn fluid_type_for(base: u8, level: u8) -> u8 {
-    match (base, level) {
-        (20, 4) => 20, (20, 3) => 59, (20, 2) => 60, (20, 1) => 61,
-        (23, 4) => 23, (23, 3) => 62, (23, 2) => 63, (23, 1) => 64,
-        _ => 0,
-    }
-}
-
-/// Block type → fluid level (4 = source … 1 = ¼), 0 for anything that isn't water/lava. Mirrors
-/// `Liquids.mm`'s `getLevel`.
-#[inline]
-pub(crate) fn fluid_level(bt: u8) -> u8 {
-    match bt {
-        20 | 23 => 4,
-        59 | 62 => 3,
-        60 | 63 => 2,
-        61 | 64 => 1,
-        _ => 0,
-    }
-}
-
-/// Block type → its fluid base (20 water / 23 lava), or `None` if not a fluid. Mirrors `Liquids.mm`'s
-/// `getBaseType`.
-#[inline]
-pub(crate) fn fluid_base(bt: u8) -> Option<u8> {
-    match bt {
-        20 | 59 | 60 | 61 => Some(20),
-        23 | 62 | 63 | 64 => Some(23),
-        _ => None,
-    }
-}
 
 /// Cellular flood that reproduces `Liquids.mm`'s `updateNode`: seed with `sources` (each already
 /// carrying its own resolved type/paint — level 4 for a fresh source, or a lower level to resume an
@@ -7762,11 +7006,14 @@ fn deserialize_prefab(data: &[u8]) -> Result<Clipboard, String> {
 }
 
 #[tauri::command(async)]
-fn save_prefab(path: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
+fn save_prefab(path: String, state: tauri::State<'_, AppState>) -> Result<Vec<String>, String> {
     let ws = read_ws(&state);
     let cb = ws.clipboard.as_ref().ok_or("Clipboard is empty")?;
     let bytes = serialize_prefab(cb);
-    atomic_write(std::path::Path::new(&path), &bytes)
+    atomic_write(std::path::Path::new(&path), &bytes)?;
+    let mut counts = [0u32; 128];
+    for &b in &cb.block_types { counts[b as usize] += 1; }
+    Ok(risky_block_warnings(&counts))
 }
 
 #[tauri::command(async)]
@@ -7900,6 +7147,16 @@ fn prefab_exists(path: String) -> bool {
     std::path::Path::new(&path).exists()
 }
 
+/// Canonical block/paint colour tables, shipped to the frontend at startup so the TS side
+/// (`blockDefs.ts`) never hand-mirrors these values. Ends the Rust↔TS dual-maintenance drift (C6).
+///
+/// The tables themselves live in the shared `voxel-core` crate; only this IPC wrapper is
+/// app-specific, which is what keeps that crate free of a Tauri dependency (plan PR-C).
+#[tauri::command]
+fn get_block_tables() -> colors::BlockTables {
+    colors::block_tables()
+}
+
 /// Top-down thumbnail for a prefab file on disk — doesn't touch the clipboard or undo state.
 #[tauri::command(async)]
 fn render_prefab_thumbnail(path: String, state: tauri::State<'_, AppState>) -> Result<PreviewData, String> {
@@ -7942,7 +7199,7 @@ impl tauri::ipc::IpcResponse for TexturePackInfo {
 
 /// Load a texture pack zip and return the atlas RGBA + name→row map.
 /// The pack is stored in AppState (world-independent) and automatically used by subsequent
-/// get_chunk_geometry / get_obj_geometry calls.
+/// get_chunk_geometry calls.
 #[tauri::command(async)]
 fn load_texture_pack(path: String, state: tauri::State<'_, AppState>) -> Result<TexturePackInfo, String> {
     let pack = texturepack::load_pack(&path)?;
@@ -7968,36 +7225,7 @@ fn unload_texture_pack(state: tauri::State<'_, AppState>) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 // ── Terrain helpers ───────────────────────────────────────────────────────────
 
-/// Read block type at absolute world coords (0 if out of bounds or missing chunk).
-fn read_block_abs(world: &impl VoxelView, wx: i32, wy: i32, wz: i32) -> u8 {
-    if wz < 0 || wz as usize >= world.num_bands() * 16 { return 0; }
-    let (mnx, mny) = world.chunk_origin();
-    let cx = wx.div_euclid(16) + mnx;
-    let cy = wy.div_euclid(16) + mny;
-    if let Some(chunk) = world.chunk_bytes(cx, cy) {
-        let lx = wx.rem_euclid(16) as usize;
-        let ly = wy.rem_euclid(16) as usize;
-        let bi = (wz as usize / 16) * 8192 + lx * 256 + ly * 16 + wz as usize % 16;
-        if bi < chunk.len() { return chunk[bi]; }
-    }
-    0
-}
 
-/// Read paint byte at absolute world coords (0 if out of bounds or missing chunk).
-fn read_paint_abs(world: &impl VoxelView, wx: i32, wy: i32, wz: i32) -> u8 {
-    if wz < 0 || wz as usize >= world.num_bands() * 16 { return 0; }
-    let (mnx, mny) = world.chunk_origin();
-    let cx = wx.div_euclid(16) + mnx;
-    let cy = wy.div_euclid(16) + mny;
-    if let Some(chunk) = world.chunk_bytes(cx, cy) {
-        let lx = wx.rem_euclid(16) as usize;
-        let ly = wy.rem_euclid(16) as usize;
-        let bi = (wz as usize / 16) * 8192 + lx * 256 + ly * 16 + wz as usize % 16;
-        let pi = bi + 4096;
-        if pi < chunk.len() { return chunk[pi]; }
-    }
-    0
-}
 
 /// Bulk column read: fills `out_bt[0..depth]`/`out_paint[0..depth]` with the block/paint bytes at
 /// world column `(wx,wy)`, z levels `z0..z0+depth` (audit M8). One chunk lookup for the whole column
@@ -9655,7 +8883,7 @@ fn run_sculpt_in_guard(
     // stamps instead of being rounded away every call. Taken out of `ws` here so the edit closure
     // can borrow it mutably alongside `world` (which `with_edit_inner` takes out of `ws`).
     let mut session = take_sculpt_session(ws, group_id);
-    let result = with_edit_grouped(ws, label, rect, rect, group_id, |world| {
+    let result = with_edit_grouped(ws, label, rect, rect, group_id, None, |world| {
         run_sculpt_flush(world, &mut session, &args, &stamps)
     });
     // Persist the float workspace only for a real (grouped) live stroke — a one-shot call (group
@@ -10089,6 +9317,7 @@ pub fn run() {
             search_worlds,
             list_worlds,
             fetch_featured_worlds,
+            fetch_world_preview,
             list_legacy_featured_lists,
             load_legacy_featured_list,
             download_world,
@@ -10104,12 +9333,6 @@ pub fn run() {
             get_selection_mask,
             scatter_paste,
             array_paste,
-            export_obj,
-            export_json,
-            export_vox,
-            export_vmf,
-            estimate_vmf,
-            get_obj_geometry,
             get_chunk_geometry,
             get_light_constants,
             get_lamps_near,
@@ -10124,8 +9347,6 @@ pub fn run() {
             set_spawn_pos,
             set_player_pos,
             get_player_pos,
-            import_schematic_info,
-            import_schematic_apply,
             get_sky_grid,
             set_sky_grid,
             get_signs,
@@ -10348,6 +9569,13 @@ mod tests {
         HEADER + band * 8192 + lx * 256 + ly * 16 + lz
     }
     fn pnt(lx: usize, ly: usize, z: i32) -> usize { blk(lx, ly, z) + 4096 }
+
+    /// Lamp buckets are `FxHashSet`s (unordered); tests compare a sorted `Vec`.
+    fn sorted_lamps(s: &FxHashSet<[i32; 3]>) -> Vec<[i32; 3]> {
+        let mut v: Vec<[i32; 3]> = s.iter().copied().collect();
+        v.sort_unstable();
+        v
+    }
 
     /// `make_test_world()` plus a *second* directory entry for chunk (1, 0) whose offset carries a
     /// nonzero high word (`chunk_off + 2^32`) — the signature of a chunk stored past the 4 GiB
@@ -10855,7 +10083,7 @@ mod tests {
 
     /// All four block-indexed tables must agree on covering exactly 128 types (0–111 known,
     /// 112–127 new-format) — a length mismatch would silently reintroduce the "flood fill errors,
-    /// VMF export drops the cell, occlusion is wrong" hazard class for whichever table lagged.
+    /// 3D geometry drops the cell, occlusion is wrong" hazard class for whichever table lagged.
     #[test]
     fn test_block_tables_cover_all_128_types() {
         assert_eq!(BLOCK_RGB.len(), 128);
@@ -10885,7 +10113,7 @@ mod tests {
 
     /// New-format blocks must occlude like a normal solid cube — `BLOCK_INFO[112..=127] == 0` (no
     /// `BI_NOTSOLID`/`BI_RAMPORSIDE`) — so neighbours cull hidden faces, they cast sun shadows, and
-    /// VMF/OBJ export include them instead of treating them as air-like out-of-range types.
+    /// the 3D geometry pipeline includes them instead of treating them as air-like out-of-range types.
     #[test]
     fn test_obj_occludes_treats_new_blocks_as_solid() {
         for bt in 112u8..=127 {
@@ -11156,6 +10384,105 @@ mod tests {
         assert_eq!(ws.world.as_ref().unwrap().bytes[blk(1, 1, 0)], 0x2A, "the edit itself is not rolled back");
     }
 
+    /// Placing more doors than `RISKY_BLOCK_GROUPS`' threshold in one edit footprint surfaces a
+    /// warning (the ComBlock crash writeup); staying under it stays silent, and a different block
+    /// type entirely never warns.
+    #[test]
+    fn test_risky_block_density_warns_on_dense_doors() {
+        let mut ws = ws_with(make_test_world());
+        let rect = (0, 0, 15, 15);
+
+        let door_threshold = RISKY_BLOCK_GROUPS.iter().find(|g| g.name == "doors").unwrap().threshold;
+        let over = (door_threshold + 1) as i32;
+
+        let r = with_edit(&mut ws, "dense doors", rect, rect, |w| {
+            for i in 0..over { set_block_abs(w, i % 16, i / 16, 0, 66, 0); }
+            Ok(())
+        }).expect("edit applies");
+        assert!(r.warnings.iter().any(|w| w.contains("doors")),
+                "placing {over} doors in one footprint must warn");
+
+        let r = with_edit(&mut ws, "sparse doors", rect, rect, |w| {
+            set_block_abs(w, 0, 0, 1, 66, 0);
+            Ok(())
+        }).expect("edit applies");
+        assert!(r.warnings.is_empty(), "a single door must not warn");
+
+        let r = with_edit(&mut ws, "dense non-risky", rect, rect, |w| {
+            for i in 0..over { set_block_abs(w, i % 16, i / 16, 2, 2, 0); } // plain Stone
+            Ok(())
+        }).expect("edit applies");
+        assert!(r.warnings.is_empty(), "a dense placement of a non-risky block type must not warn");
+    }
+
+    /// Doors are placed as two physical blocks — a directional base plus a `DoorTop` one z above it
+    /// (`paint_blocks`'s auto-pairing; paste/gen copy both halves too). The "doors" group only sums
+    /// the base types (66–69), so the density check counts real door objects, not doubled block
+    /// cells. Before this fix the group summed base+top together, so `threshold` real doors reported
+    /// as `2×threshold` and warned at half the intended door count.
+    #[test]
+    fn test_risky_block_density_counts_real_doors_not_paired_blocks() {
+        let door_threshold = RISKY_BLOCK_GROUPS.iter().find(|g| g.name == "doors").unwrap().threshold;
+        let rect = (0, 0, 15, 15);
+
+        let mut ws = ws_with(make_test_world());
+        let r = with_edit(&mut ws, "doors at threshold", rect, rect, |w| {
+            for i in 0..door_threshold as i32 {
+                set_block_abs(w, i % 16, i / 16, 0, 66, 0); // base
+                set_block_abs(w, i % 16, i / 16, 1, 70, 0); // paired DoorTop
+            }
+            Ok(())
+        }).expect("edit applies");
+        assert!(r.warnings.is_empty(), "{door_threshold} real doors (base+paired top) must not warn");
+
+        let mut ws = ws_with(make_test_world());
+        let over = door_threshold as i32 + 1;
+        let r = with_edit(&mut ws, "doors over threshold", rect, rect, |w| {
+            for i in 0..over {
+                set_block_abs(w, i % 16, i / 16, 0, 66, 0);
+                set_block_abs(w, i % 16, i / 16, 1, 70, 0);
+            }
+            Ok(())
+        }).expect("edit applies");
+        assert!(r.warnings.iter().any(|w| w.contains(&format!("{over} doors"))),
+                "must report the real door count ({over}), not doubled by the paired top blocks: {:?}",
+                r.warnings);
+    }
+
+    /// Regression for the `Full`/`FullZ` dense-delta branch of `count_new_block_types`: it must only
+    /// tally cells that actually changed, not every cell in the captured pre-edit span. A `Full`
+    /// delta captures the *whole* chunk once enough of it differs (`diff_span`'s 20% rule) — before
+    /// this fix, any edit that pushed a chunk's delta into `Full` form swept every pre-existing block
+    /// in that chunk into the "just placed" tally, including risky blocks the edit never touched.
+    #[test]
+    fn test_dense_delta_only_counts_changed_cells_not_whole_span() {
+        let mut world = parse_world_inner(mmap_from_bytes(make_test_world())).expect("parse failed");
+
+        // Pre-existing doors from an earlier, unrelated edit — well above the "doors" threshold on
+        // their own, but not part of the edit under test.
+        for i in 0..200i32 {
+            set_block_abs(&mut world, i % 16, i / 16, 0, 66, 0);
+        }
+        let pre_full = snapshot_chunks_full(&world, &[(0, 0)], None);
+
+        // An unrelated large edit in a disjoint z-range — fill enough of the chunk with Stone to
+        // force a Full/dense delta (> 20% of the 32768-byte chunk, i.e. > 6553 changed bytes).
+        for z in 16..48i32 {
+            for x in 0..16i32 {
+                for y in 0..16i32 {
+                    set_block_abs(&mut world, x, y, z, 2, 0); // Stone
+                }
+            }
+        }
+        let snap = diff_chunk(&world, 0, 0, pre_full[0].2, &pre_full[0].3).expect("dense change diffs");
+        assert!(matches!(snap.delta, ChunkDelta::Full(..)), "edit must have produced a Full delta");
+
+        let counts = count_new_block_types(&world, std::slice::from_ref(&snap));
+        assert_eq!(counts[66], 0, "pre-existing, untouched doors must not be tallied as newly placed");
+        assert!(risky_block_warnings(&counts).is_empty(),
+                "a Stone fill must never warn about doors it never touched");
+    }
+
     /// C2 — an edit patch larger than `MAX_EDIT_PATCH_PIXELS` ships as an `invalidate` rect with no
     /// pixels at all, instead of the 243 MB RGBA buffer a ⌘A fill used to build.
     #[test]
@@ -11295,7 +10622,7 @@ mod tests {
         let group = Some(42u64);
         for i in 0..5 {
             let (x, y) = (i, 0);
-            with_edit_grouped(&mut ws, "Paint 1 block", (x, y, x, y), (x, y, x, y), group, |world| {
+            with_edit_grouped(&mut ws, "Paint 1 block", (x, y, x, y), (x, y, x, y), group, None, |world| {
                 set_block_abs(world, x, y, 21, 2, 0);
                 Ok(())
             }).expect("grouped stamp");
@@ -11318,7 +10645,7 @@ mod tests {
         let mut ws = ws_with(make_bumpy_world_grid(1, 8, |_, _| 20));
         for i in 0..5 {
             let (x, y) = (i, 0);
-            with_edit_grouped(&mut ws, "Paint 1 block", (x, y, x, y), (x, y, x, y), None, |world| {
+            with_edit_grouped(&mut ws, "Paint 1 block", (x, y, x, y), (x, y, x, y), None, None, |world| {
                 set_block_abs(world, x, y, 21, 2, 0);
                 Ok(())
             }).expect("ungrouped stamp");
@@ -11370,12 +10697,142 @@ mod tests {
         assert!(ws.undo_stack.len() > 1, "need multiple entries for trimming to be observable");
 
         let low_budget = 64usize; // far below any real entry — trim_stack's len()>1 floor kicks in
-        trim_stack(&mut ws.undo_stack, &mut ws.undo_bytes, low_budget);
+        trim_stack(&mut ws.undo_stack, &mut ws.undo_bytes, &mut ws.undo_groups, low_budget);
         ws.undo_budget = low_budget;
 
         let resummed: usize = ws.undo_stack.iter().map(|e| e.bytes).sum();
         assert_eq!(ws.undo_bytes, resummed, "cached total must match a fresh re-sum after trimming");
         assert_eq!(ws.undo_stack.len(), 1, "trims down to the len()>1 floor when every entry alone exceeds budget");
+    }
+
+    /// Phase 4.2 — `WorldState::undo_groups`/`redo_groups` are maintained incrementally by
+    /// `push_undo`/`pop_undo`/`trim_stack`, so they must agree with the `count_undo_groups` walk
+    /// after *every* shape of stack mutation, not just the easy ones. Same idiom as
+    /// `test_snapshot_bytes_matches_real_capacity`: assert the cache against a fresh recomputation.
+    ///
+    /// The sequence deliberately mixes the cases the incremental rule can get almost right:
+    /// two different groups back to back, an ungrouped edit splitting one group id into two
+    /// non-adjacent runs (which must count as **two** units, not one), budget-driven front
+    /// eviction inside a group, and undo/redo moving whole groups between the stacks.
+    #[test]
+    fn test_cached_group_counts_match_the_oracle() {
+        let mut ws = ws_with(make_bumpy_world_grid(1, 8, |_, _| 20));
+        let mut n = 0i32;
+        let mut edit = |ws: &mut WorldState, group: Option<u64>, n: &mut i32| {
+            let (x, y, z) = (*n % 16, (*n / 16) % 16, 21 + *n % 8);
+            *n += 1;
+            with_edit_grouped(ws, "stamp", (x, y, x, y), (x, y, x, y), group, None, |world| {
+                set_block_abs(world, x, y, z, 2, 0);
+                Ok(())
+            }).expect("edit");
+        };
+        let check = |ws: &WorldState, what: &str| {
+            assert_eq!(ws.undo_groups, count_undo_groups(&ws.undo_stack), "undo_groups after {what}");
+            assert_eq!(ws.redo_groups, count_undo_groups(&ws.redo_stack), "redo_groups after {what}");
+        };
+
+        // Group 1 (3 stamps) → group 2 (2 stamps) → ungrouped → group 1 again (2 stamps).
+        // The trailing run of group 1 is *not* contiguous with the first, so it's its own unit.
+        for _ in 0..3 { edit(&mut ws, Some(1), &mut n); }
+        check(&ws, "one group of 3");
+        assert_eq!(ws.undo_groups, 1);
+        for _ in 0..2 { edit(&mut ws, Some(2), &mut n); }
+        edit(&mut ws, None, &mut n);
+        for _ in 0..2 { edit(&mut ws, Some(1), &mut n); }
+        check(&ws, "mixed grouped/ungrouped pushes");
+        assert_eq!(ws.undo_groups, 4, "group1 | group2 | ungrouped | group1-again");
+        assert_eq!(ws.undo_stack.len(), 8, "the stack still holds one entry per stamp");
+
+        // Undo/redo move whole groups across the stacks, one logical unit at a time.
+        undo_edit_inner(&mut ws).expect("undo the trailing group-1 run");
+        check(&ws, "one undo");
+        assert_eq!((ws.undo_groups, ws.redo_groups), (3, 1));
+        undo_edit_inner(&mut ws).expect("undo the ungrouped edit");
+        check(&ws, "two undos");
+        assert_eq!((ws.undo_groups, ws.redo_groups), (2, 2));
+        redo_edit_inner(&mut ws).expect("redo");
+        check(&ws, "redo");
+        assert_eq!((ws.undo_groups, ws.redo_groups), (3, 1));
+
+        // A fresh edit clears redo — the counter must clear with the stack.
+        edit(&mut ws, None, &mut n);
+        check(&ws, "a new edit clearing redo");
+        assert_eq!(ws.redo_groups, 0);
+
+        // Budget-driven eviction from the *front*: entries leave oldest-first, so a group only
+        // stops counting once its last member is gone. Trim one entry at a time so the boundary
+        // case (evicting the first of a same-group pair) is actually exercised.
+        while ws.undo_stack.len() > 1 {
+            let budget = ws.undo_bytes - ws.undo_stack.front().unwrap().bytes;
+            trim_stack(&mut ws.undo_stack, &mut ws.undo_bytes, &mut ws.undo_groups, budget);
+            check(&ws, "an incremental front eviction");
+        }
+
+        ws.clear_undo();
+        ws.clear_redo();
+        check(&ws, "clear");
+        assert_eq!((ws.undo_groups, ws.redo_groups), (0, 0));
+    }
+
+    /// Phase 4.1 — the z-range `paint_blocks` hands to `with_edit_grouped`. `z_offset` must stay out
+    /// of it (it only applies on the surface-relative branch), a door/portal's auto-placed top block
+    /// must extend it, and one `None` anywhere must collapse the whole batch to a whole-chunk
+    /// snapshot.
+    #[test]
+    fn test_paint_z_range_covers_every_written_block() {
+        let at = |z: Option<i32>| PaintBlock { x: 0, y: 0, z };
+
+        assert_eq!(paint_z_range(&[at(Some(20)), at(Some(4)), at(Some(50))], 0), Some((4, 50)),
+                   "an all-explicit batch spans min..max of its own coordinates");
+        assert_eq!(paint_z_range(&[at(Some(31))], 70), Some((31, 32)),
+                   "a door's paired top block sits one above the base and must be inside the range");
+        assert_eq!(paint_z_range(&[at(Some(31))], 79), Some((31, 32)), "…and the same for portals");
+        assert_eq!(paint_z_range(&[at(Some(5)), at(None), at(Some(9))], 0), None,
+                   "one surface-relative block makes the whole batch's extent unknowable");
+        assert_eq!(paint_z_range(&[], 0), None);
+    }
+
+    /// Phase 4.1 — the band-scoped snapshot must be exactly invertible for every block the edit
+    /// writes. `snapshot_chunks_full` rounds the range out to whole 16-block bands, so a range that
+    /// is too *narrow* fails silently: the writes outside it never reach the undo delta and survive
+    /// the undo. `test_delta_undo_round_trip` can't catch that (it snapshots with `None`), so this
+    /// test deliberately writes at both ends of the range *and across a band boundary* — a door base
+    /// at z=31 (band 1, top lz) whose auto-placed top lands at z=32 (band 2).
+    #[test]
+    fn test_paint_z_scoped_undo_restores_writes_outside_the_base_band() {
+        let mut ws = ws_with(make_bumpy_world_grid(1, 8, |_, _| 20));
+        let before = world_bytes(&ws);
+
+        // Same write pattern `paint_blocks`' closure produces for a door batch, with the range it
+        // would have derived. z=4 exercises the low end (band 0) in the same edit.
+        let blocks = vec![
+            PaintBlock { x: 3, y: 5, z: Some(31) },
+            PaintBlock { x: 6, y: 2, z: Some(4) },
+        ];
+        let z_range = paint_z_range(&blocks, 70).expect("an all-explicit batch has a known range");
+        assert_eq!(z_range, (4, 32), "the door top at z=32 must widen the range past its base band");
+
+        with_edit_grouped(&mut ws, "Paint 2 blocks", (3, 2, 6, 5), (3, 2, 6, 5), Some(7), Some(z_range), |world| {
+            for b in &blocks {
+                let z = b.z.unwrap();
+                set_block_abs(world, b.x, b.y, z, 66, 0);
+                set_block_abs(world, b.x, b.y, z + 1, 70, 0);
+            }
+            Ok(())
+        }).expect("z-scoped paint");
+
+        {
+            let world = ws.world.as_ref().unwrap();
+            assert_eq!(read_block_abs(world, 3, 5, 31), 66);
+            assert_eq!(read_block_abs(world, 3, 5, 32), 70, "the top block crosses into band 2");
+            assert_eq!(read_block_abs(world, 6, 2, 4), 66);
+            assert_eq!(read_block_abs(world, 6, 2, 5), 70);
+        }
+
+        undo_edit_inner(&mut ws).expect("undo");
+        assert_eq!(world_bytes(&ws), before,
+                   "a band-scoped snapshot must restore the world byte-for-byte — including the \
+                    door top one band above the highest block the batch was asked to place");
     }
 
     /// §1b — `chunk_snapshot_bytes` must report real heap capacity (post `shrink_to_fit`), not an
@@ -13394,7 +12851,7 @@ mod tests {
         // Place a lamp (type 72) at lx=4, ly=6, z=5 in chunk (0,0).
         world.bytes[blk(4, 6, 5)] = 72;
         let index = build_lamp_index(&world);
-        assert_eq!(index.get(&(0, 0)), Some(&vec![[4, 6, 5]]), "lamp bucketed at its chunk with local coords");
+        assert_eq!(index.get(&(0, 0)).map(sorted_lamps), Some(vec![[4, 6, 5]]), "lamp bucketed at its chunk with local coords");
 
         // The band-major linear scan (audit H3) must decode `(lx, ly, lz)` back out of a flat
         // half-band offset correctly in *every* band, and must never read the paint half — a paint
@@ -13402,8 +12859,7 @@ mod tests {
         world.bytes[blk(15, 15, 63)] = 72; // last voxel of the last band
         world.bytes[blk(0, 0, 16)] = 72;   // first voxel of band 1
         world.bytes[pnt(1, 1, 20)] = 72;   // paint byte — must be ignored
-        let mut lamps = build_lamp_index(&world).remove(&(0, 0)).expect("lamps present");
-        lamps.sort_unstable();
+        let lamps = sorted_lamps(&build_lamp_index(&world).remove(&(0, 0)).expect("lamps present"));
         assert_eq!(lamps, vec![[0, 0, 16], [4, 6, 5], [15, 15, 63]],
                    "every band decoded, paint half-band skipped");
     }
@@ -13444,7 +12900,7 @@ mod tests {
         let snaps: Vec<ChunkSnapshot> = pre.into_iter()
             .filter_map(|(cx, cy, start, data)| diff_chunk(world, cx, cy, start, &data))
             .collect();
-        ws.lamp_index.apply_delta(world, &snaps);
+        apply_lamp_delta(&ws.lamp_index, world, &snaps);
     }
 
     /// The lamp index must follow a placed/removed lamp — the core correctness invariant the
@@ -13454,11 +12910,11 @@ mod tests {
     fn lamp_index_delta_tracks_place_and_remove() {
         let mut ws = WorldState::new();
         ws.world = Some(parse_world_inner(mmap_from_bytes(make_test_world())).expect("parse failed"));
-        ws.lamp_index.build_now(ws.world.as_ref().unwrap());
+        lamp_build_now(&ws.lamp_index, ws.world.as_ref().unwrap());
         assert!(ws.lamp_index.snapshot().is_empty(), "starts with no lamps");
 
         edit_and_replay_delta(&mut ws, None, &[(blk(4, 6, 5), 72)]);
-        assert_eq!(ws.lamp_index.snapshot().get(&(0, 0)), Some(&vec![[4, 6, 5]]),
+        assert_eq!(ws.lamp_index.snapshot().get(&(0, 0)).map(sorted_lamps), Some(vec![[4, 6, 5]]),
                    "placed lamp indexed from the delta");
         assert_eq!(ws.lamp_index.snapshot(), build_lamp_index(ws.world.as_ref().unwrap()),
                    "delta path agrees with a from-scratch rescan");
@@ -13475,7 +12931,7 @@ mod tests {
     fn lamp_index_delta_handles_full_delta_and_skips_paint() {
         let mut ws = WorldState::new();
         ws.world = Some(parse_world_inner(mmap_from_bytes(make_test_world())).expect("parse failed"));
-        ws.lamp_index.build_now(ws.world.as_ref().unwrap());
+        lamp_build_now(&ws.lamp_index, ws.world.as_ref().unwrap());
 
         // Fill band 0's entire block half with lamps → 4096 changed bytes over an 8192-byte
         // band-scoped snapshot, so `diff_chunk` picks `Full` rather than `Sparse`.
@@ -13485,10 +12941,8 @@ mod tests {
         edit_and_replay_delta(&mut ws, Some((0, 15)), &writes);
         let rescan = build_lamp_index(ws.world.as_ref().unwrap());
         assert_eq!(rescan.get(&(0, 0)).map(|v| v.len()), Some(4096), "the whole band is lamps");
-        let mut from_delta = ws.lamp_index.snapshot().remove(&(0, 0)).unwrap();
-        let mut from_scan = rescan.get(&(0, 0)).unwrap().clone();
-        from_delta.sort_unstable();
-        from_scan.sort_unstable();
+        let from_delta = sorted_lamps(&ws.lamp_index.snapshot().remove(&(0, 0)).unwrap());
+        let from_scan = sorted_lamps(rescan.get(&(0, 0)).unwrap());
         assert_eq!(from_delta, from_scan, "Full-delta replay matches a from-scratch rescan");
 
         // Paint byte holding 72 must not register as a lamp.
@@ -13528,9 +12982,8 @@ mod tests {
         }
         let check = |ws: &WorldState, label: &str| {
             let mut rescan = scan_chunk_lamps(ws.world.as_ref().unwrap(), 0, 0);
-            let mut from_index = ws.lamp_index.snapshot().remove(&(0, 0)).unwrap_or_default();
             rescan.sort_unstable();
-            from_index.sort_unstable();
+            let from_index = sorted_lamps(&ws.lamp_index.snapshot().remove(&(0, 0)).unwrap_or_default());
             assert_eq!(from_index, rescan, "{label}: index must match a from-scratch rescan");
         };
 
@@ -13546,7 +12999,7 @@ mod tests {
 
         redo_edit_inner(&mut ws).expect("redo");
         check(&ws, "after redo");
-        assert_eq!(ws.lamp_index.snapshot().get(&(0, 0)), Some(&vec![[4, 6, 5]]), "lamp back after redo");
+        assert_eq!(ws.lamp_index.snapshot().get(&(0, 0)).map(sorted_lamps), Some(vec![[4, 6, 5]]), "lamp back after redo");
     }
 
     /// The set-vs-enum design choice §4 hinges on: a chunk with zero lamps must still be marked
@@ -13571,7 +13024,7 @@ mod tests {
     fn lamp_index_clear_resets_scanned() {
         let mut ws = WorldState::new();
         ws.world = Some(parse_world_inner(mmap_from_bytes(make_test_world())).expect("parse failed"));
-        ws.lamp_index.build_now(ws.world.as_ref().unwrap());
+        lamp_build_now(&ws.lamp_index, ws.world.as_ref().unwrap());
         ws.lamp_index.clear();
         // A delta into (0,0) after clear must be dropped again — proof `scanned` was reset, not
         // just `lamps`.
@@ -13594,11 +13047,40 @@ mod tests {
             let base_y = (cy - world.min_y) * 16;
             index.lamps_in_region(&world, base_x, base_y, base_x + 15, base_y + 15, 1.0);
         }
-        let mut on_demand = index.snapshot();
-        for v in on_demand.values_mut() { v.sort_unstable(); }
-        let mut expected = full;
-        for v in expected.values_mut() { v.sort_unstable(); }
-        assert_eq!(on_demand, expected, "on-demand scan must agree with a from-scratch build");
+        assert_eq!(index.snapshot(), full, "on-demand scan must agree with a from-scratch build");
+    }
+
+    /// 5.2: the `full_box` fast path must not change any result. A wide query scans a box; a
+    /// subsequent query whose box is contained in it takes the no-scan path and must still return
+    /// exactly the lamps a fresh index finds, and a post-`apply_delta` query must see the edit
+    /// (the `lamps` map stays current even when the `todo` sweep is skipped).
+    #[test]
+    fn lamp_full_box_fast_path_preserves_results() {
+        let mut ws = WorldState::new();
+        let mut world = parse_world_inner(mmap_from_bytes(make_test_world())).expect("parse failed");
+        world.bytes[blk(4, 6, 5)] = LAMP_BLOCK_TYPE;
+        ws.world = Some(world);
+        let w = ws.world.as_ref().unwrap();
+
+        // Wide query — scans the whole neighbourhood of chunk (0,0) and records a `full_box`.
+        let wide = ws.lamp_index.lamps_in_region(w, 0, 0, 15, 15, 64.0);
+        // Contained query (radius 1 ⊂ radius 64 box) — must hit the fast path and agree.
+        let mut narrow = ws.lamp_index.lamps_in_region(w, 0, 0, 15, 15, 1.0);
+        let mut fresh = {
+            let idx = LampIndex::default();
+            idx.lamps_in_region(w, 0, 0, 15, 15, 1.0)
+        };
+        narrow.sort_unstable();
+        fresh.sort_unstable();
+        assert_eq!(narrow, fresh, "fast-path result must match a fresh scan");
+        assert!(wide.contains(&[4, 6, 5]), "wide query found the lamp");
+
+        // An edit that removes the lamp, replayed as a delta, must still be visible through the
+        // fast path (chunk (0,0) is already scanned, so `apply_delta` maintains its bucket).
+        edit_and_replay_delta(&mut ws, None, &[(blk(4, 6, 5), 0)]);
+        let w = ws.world.as_ref().unwrap();
+        let after = ws.lamp_index.lamps_in_region(w, 0, 0, 15, 15, 1.0);
+        assert!(after.is_empty(), "fast path must still reflect the removed lamp");
     }
 
     // ── Sculpt engine (Pass 1) test fixtures ──────────────────────────────────────
@@ -14275,7 +13757,7 @@ mod tests {
 
         // Front view: pw = 2 (x4,x5), ph over z 0..=20. Column 0 = x4 (masked out → see-through),
         // column 1 = x5 (masked in). With x4 masked out, the brick behind at x5,z15 renders in col 1.
-        let (pw, _ph, px_masked) = render_view_front(world, 4, 5, 4, 4, 0, 20, 0, Some(&mask));
+        let (pw, _ph, px_masked) = render::view_front(world, world.meta(), 4, 5, 4, 4, 0, 20, 0, Some(&mask));
         assert_eq!(pw, 2);
         // Unmasked path: x4 column is a solid grass wall to z=20, occluding nothing behind it in
         // its own column — but col 0 (x4) should be VOID since x4 is masked *out*.
@@ -14286,7 +13768,7 @@ mod tests {
         assert_ne!(px(1, 15), [20, 20, 35], "masked block behind shows through in its column");
 
         // None mask ⇒ front column x4 renders its grass wall (not VOID) at z=20.
-        let (_pw2, _ph2, px_none) = render_view_front(world, 4, 5, 4, 4, 0, 20, 0, None);
+        let (_pw2, _ph2, px_none) = render::view_front(world, world.meta(), 4, 5, 4, 4, 0, 20, 0, None);
         let o = (row_z(20) * 2) * 4;
         assert_ne!([px_none[o], px_none[o+1], px_none[o+2]], [20, 20, 35], "None mask renders the full box");
     }
@@ -14300,7 +13782,7 @@ mod tests {
         let world = ws.world.as_ref().unwrap();
         // 2×2 rect (4,4)-(5,5); select only the main diagonal (4,4) and (5,5).
         let mask = mask_from(4, 4, 5, 5, |x, y| x - 4 == y - 4);
-        let (pw, ph, px_masked) = render_view_top(world, 4, 5, 4, 5, 0, 20, 0, Some(&mask));
+        let (pw, ph, px_masked) = render::view_top(world, world.meta(), 4, 5, 4, 5, 0, 20, 0, Some(&mask));
         assert_eq!((pw, ph), (2, 2));
         let px = |col: usize, row: usize| { let o = (row * pw as usize + col) * 4; [px_masked[o], px_masked[o+1], px_masked[o+2]] };
         assert_ne!(px(0, 0), [20, 20, 35], "masked-in (4,4) renders its surface block");
@@ -14309,7 +13791,7 @@ mod tests {
         assert_eq!(px(0, 1), [20, 20, 35], "unmasked (4,5) is VOID");
 
         // None mask ⇒ the whole 2×2 box renders (no VOID columns).
-        let (_pw2, _ph2, px_none) = render_view_top(world, 4, 5, 4, 5, 0, 20, 0, None);
+        let (_pw2, _ph2, px_none) = render::view_top(world, world.meta(), 4, 5, 4, 5, 0, 20, 0, None);
         for i in 0..4 { let o = i * 4; assert_ne!([px_none[o], px_none[o+1], px_none[o+2]], [20, 20, 35], "None mask fills every column"); }
     }
 

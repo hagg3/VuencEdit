@@ -110,6 +110,39 @@ pub(crate) async fn list_worlds(start: u32, sort: u32, server: String) -> Result
     Ok(parse_world_list_response(&text))
 }
 
+/// Fetch a world's preview thumbnail (`{download_base_url}/{id}.eden.png`) and hand the raw PNG
+/// bytes back over IPC as an `ArrayBuffer`. The `WorldBrowserModal` can't load this URL directly:
+/// the Eden file host is HTTP-only, and the release build's strict CSP (`img-src 'self' data:
+/// blob:`) blocks a remote `<img src>` — it only worked in `tauri dev` because `devCsp` is null.
+/// Proxying through Rust (like `download_world`) sidesteps both; the frontend wraps the bytes in a
+/// `blob:` URL, which the CSP does allow.
+const MAX_PREVIEW_BYTES: u64 = 32 * 1024 * 1024;
+
+#[tauri::command(async)]
+pub(crate) async fn fetch_world_preview(id: String, server: String) -> Result<tauri::ipc::Response, String> {
+    let srv = get_server(&server)?;
+    let url = format!("{}/{}.eden.png", srv.download_base_url, id);
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .read_timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let response = client.get(&url).send().await
+        .map_err(|e| format!("Preview request failed: {e}"))?;
+    if !response.status().is_success() {
+        return Err(format!("Server returned {}", response.status()));
+    }
+    if response.content_length().is_some_and(|n| n > MAX_PREVIEW_BYTES) {
+        return Err("Preview image exceeds size limit".into());
+    }
+    let bytes = response.bytes().await.map_err(|e| format!("Preview download failed: {e}"))?;
+    if bytes.len() as u64 > MAX_PREVIEW_BYTES {
+        return Err("Preview image exceeds size limit".into());
+    }
+    Ok(tauri::ipc::Response::new(bytes.to_vec()))
+}
+
 /// Fetch the server's live featured/popular world list — `GET {download_base_url}/popularlist.txt`,
 /// same alternating `<id>.eden` / `<name>.name` plain-text format as `list2.php`, served from the
 /// download host rather than the search host (confirmed by the user against the live URLs).

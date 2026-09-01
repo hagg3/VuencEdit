@@ -1,73 +1,27 @@
-//! Static geometry export: OBJ, JSON block dump, and MagicaVoxel .vox.
+//! Live 3D geometry pipeline: per-chunk face-culled/greedy-meshed mesh generation, directional
+//! face-shading, optional night-lighting + sun-shadow previews, and voxel picking (DDA raycast).
+//! This is what a fly-through pane's chunk streaming (`get_chunk_geometry`), the ortho/slab
+//! viewports and block picking all depend on — it is *not* an export module despite the filename it
+//! used to have (`export.rs`); static-format export (OBJ/JSON/VOX) was removed and now lives in the
+//! sibling `EdenToMC` project, which ported `obj_geometry_region`'s predecessor logic on its own
+//! terms rather than depending on this file.
+//!
+//! **Everything here is generic over [`VoxelView`]** (plan PR-C): the app owns the world type, the
+//! `#[tauri::command]` wrappers and the IPC envelope; this module owns the meshing. The only
+//! whole-world facts it needs beyond block addressing arrive in a [`ViewMeta`].
 use crate::colors::{block_color, transparent_alpha, BI_NOTSOLID, BI_RAMPORSIDE, BLOCK_INFO};
-use crate::{fluid_base, fluid_level, read_ws, world_max_z, AppState, LoadedWorld, LongOps};
-use crate::texturepack;
+use crate::blocks::{fluid_base, fluid_level};
+use crate::mask::SelectionMask;
+use crate::texture::{self, TexturePack};
+use crate::view::{world_max_z, ViewMeta, VoxelView};
+#[cfg(test)]
+use crate::view::get_block_at;
 use rustc_hash::FxHashMap;
 use std::cell::Cell;
-use std::collections::{HashMap, HashSet};
-use std::fs;
-use std::io::{BufWriter, Write};
+#[cfg(test)]
+use std::collections::HashSet;
 
-/// Ceiling on the voxel volume one OBJ / JSON / VOX export may span (audit C6).
-///
-/// All three are linear in the volume and emit a per-voxel record, so a whole-world export on a
-/// populated 256z world (7216 × 8448 × 256 ≈ 1.6 × 10¹⁰ blocks) is billions of records and hundreds
-/// of gigabytes — it does not finish, and it holds the read guard while not finishing, so no edit,
-/// undo, save or autosave can run either. The frontend defaults these exports to the whole world
-/// when there is no selection, which is how that gets reached by accident. 256 M matches the
-/// clipboard's own `MAX_CLIPBOARD_VOLUME`, i.e. the volume this codebase already treats as the
-/// largest single region worth materialising.
-pub(crate) const MAX_EXPORT_VOXELS: u64 = 256_000_000;
-
-/// Refuse an over-budget export up front, with the estimate spelled out — the user's next move is
-/// to select a region, so say so rather than starting something that can't finish.
-fn check_export_volume(sx1: i32, sy1: i32, sz1: i32, sx2: i32, sy2: i32, sz2: i32, what: &str) -> Result<u64, String> {
-    let w = (sx2 - sx1 + 1).max(0) as u64;
-    let h = (sy2 - sy1 + 1).max(0) as u64;
-    let d = (sz2 - sz1 + 1).max(0) as u64;
-    let volume = w.saturating_mul(h).saturating_mul(d);
-    if volume > MAX_EXPORT_VOXELS {
-        return Err(format!(
-            "This region is {w}×{h}×{d} = {} blocks — more than the {} block {what} export limit. \
-             Select a smaller region first.",
-            fmt_big(volume), fmt_big(MAX_EXPORT_VOXELS),
-        ));
-    }
-    Ok(volume)
-}
-
-/// "1.6 trillion" / "256 million" / "12,800" — readable magnitudes for the message above.
-fn fmt_big(n: u64) -> String {
-    const T: u64 = 1_000_000_000_000;
-    const B: u64 = 1_000_000_000;
-    const M: u64 = 1_000_000;
-    if n >= T { format!("{:.1} trillion", n as f64 / T as f64) }
-    else if n >= B { format!("{:.1} billion", n as f64 / B as f64) }
-    else if n >= M { format!("{:.0} million", n as f64 / M as f64) }
-    else { n.to_string() }
-}
-
-// ── OBJ Export ────────────────────────────────────────────────────────────────
-
-pub(crate) fn get_block_at(world: &LoadedWorld, wx: i32, wy: i32, wz: i32) -> (u8, u8) {
-    if wz < 0 || wz as usize >= world.num_bands * 16 { return (0, 0); }
-    let cx = wx.div_euclid(16) + world.min_x;
-    let cy = wy.div_euclid(16) + world.min_y;
-    if let Some((addr, cend)) = world.chunk_range(cx, cy) {
-        let lx = wx.rem_euclid(16) as usize;
-        let ly = wy.rem_euclid(16) as usize;
-        let band = wz as usize / 16;
-        let lz   = wz as usize % 16;
-        let bi = addr + band * 8192 + lx * 256 + ly * 16 + lz;
-        let pi = bi + 4096;
-        if pi < cend {
-            return (world.bytes[bi], world.bytes[pi]);
-        }
-    }
-    (0, 0)
-}
-
-/// Single-entry memo for the `chunk_map` lookup that dominates [`get_block_at`].
+/// Single-entry memo for the chunk lookup that dominates [`get_block_at`].
 ///
 /// The geometry loops walk voxel by voxel, and each voxel also probes its six neighbours — so
 /// consecutive queries nearly always land in the same 16×16 chunk column, and the hash lookup is
@@ -76,757 +30,111 @@ pub(crate) fn get_block_at(world: &LoadedWorld, wx: i32, wy: i32, wz: i32) -> (u
 ///
 /// Uses `Cell` rather than `&mut` so the `&`-capturing lighting/shadow closures can share one
 /// cache. That makes it `!Sync`: it is for single-threaded scans only — do not hand it to rayon.
-pub(crate) struct ChunkCache<'w> {
-    world: &'w LoadedWorld,
-    last: Cell<Option<(i32, i32, Option<(usize, usize)>)>>,
+pub struct ChunkCache<'w, V: VoxelView> {
+    world: &'w V,
+    last: Cell<Option<(i32, i32, Option<&'w [u8]>)>>,
 }
 
-impl<'w> ChunkCache<'w> {
-    pub(crate) fn new(world: &'w LoadedWorld) -> Self {
+impl<'w, V: VoxelView> ChunkCache<'w, V> {
+    pub fn new(world: &'w V) -> Self {
         Self { world, last: Cell::new(None) }
     }
 
     /// Identical in result to `get_block_at(self.world, wx, wy, wz)`.
     #[inline]
-    pub(crate) fn get(&self, wx: i32, wy: i32, wz: i32) -> (u8, u8) {
-        let w = self.world;
-        if wz < 0 || wz as usize >= w.num_bands * 16 { return (0, 0); }
-        let cx = wx.div_euclid(16) + w.min_x;
-        let cy = wy.div_euclid(16) + w.min_y;
-        let range = match self.last.get() {
+    pub fn get(&self, wx: i32, wy: i32, wz: i32) -> (u8, u8) {
+        let w: &'w V = self.world;
+        if wz < 0 || wz as usize >= w.num_bands() * 16 { return (0, 0); }
+        let (mnx, mny) = w.chunk_origin();
+        let cx = wx.div_euclid(16) + mnx;
+        let cy = wy.div_euclid(16) + mny;
+        let slot = match self.last.get() {
             Some((lcx, lcy, r)) if lcx == cx && lcy == cy => r,
             _ => {
-                let r = w.chunk_range(cx, cy);
+                let r = w.chunk_bytes(cx, cy);
                 self.last.set(Some((cx, cy, r)));
                 r
             }
         };
-        let Some((addr, cend)) = range else { return (0, 0) };
+        let Some(chunk) = slot else { return (0, 0) };
         let lx = wx.rem_euclid(16) as usize;
         let ly = wy.rem_euclid(16) as usize;
-        let bi = addr + (wz as usize / 16) * 8192 + lx * 256 + ly * 16 + (wz as usize % 16);
+        let bi = (wz as usize / 16) * 8192 + lx * 256 + ly * 16 + (wz as usize % 16);
         let pi = bi + 4096;
-        if pi < cend {
-            return (w.bytes[bi], w.bytes[pi]);
+        if pi < chunk.len() {
+            return (chunk[bi], chunk[pi]);
         }
         (0, 0)
     }
 }
 
 /// True if this block fully occludes an adjacent face (not air, not notsolid, not ramp/wedge).
-pub(crate) fn obj_occludes(bt: u8) -> bool {
+pub fn obj_occludes(bt: u8) -> bool {
     let idx = bt as usize;
     idx != 0 && idx < BLOCK_INFO.len() && (BLOCK_INFO[idx] & (BI_NOTSOLID | BI_RAMPORSIDE)) == 0
 }
 
-/// Eden (X right, Y south, Z up) → OBJ (X right, Y up, Z toward viewer)
-pub(crate) fn ov(ex: f32, ey: f32, ez: f32) -> (f32, f32, f32) { (ex, ez, -ey) }
 
-pub(crate) fn obj_v(w: &mut impl Write, (x, y, z): (f32, f32, f32)) -> std::io::Result<()> {
-    writeln!(w, "v {x} {y} {z}")
-}
-
-pub(crate) fn obj_quad(w: &mut impl Write) -> std::io::Result<()> { writeln!(w, "f -4 -3 -2 -1") }
-pub(crate) fn obj_tri(w: &mut impl Write)  -> std::io::Result<()> { writeln!(w, "f -3 -2 -1") }
-
-pub(crate) fn write_vox_chunk(buf: &mut Vec<u8>, id: &[u8; 4], content: &[u8]) {
-    buf.extend_from_slice(id);
-    buf.extend_from_slice(&(content.len() as i32).to_le_bytes());
-    buf.extend_from_slice(&0i32.to_le_bytes()); // children_size always 0 for leaf chunks
-    buf.extend_from_slice(content);
-}
-
-/// Emit a cube block with face culling (skips faces adjacent to fully-opaque neighbors).
-pub(crate) fn emit_cube(w: &mut impl Write, wx: i32, wy: i32, wz: i32, world: &LoadedWorld) -> std::io::Result<()> {
-    let (x0, x1) = (wx as f32, wx as f32 + 1.0);
-    let (y0, y1) = (wy as f32, wy as f32 + 1.0);
-    let (z0, z1) = (wz as f32, wz as f32 + 1.0);
-    if !obj_occludes(get_block_at(world,wx,wy,wz+1).0) {
-        obj_v(w,ov(x0,y0,z1))?; obj_v(w,ov(x1,y0,z1))?; obj_v(w,ov(x1,y1,z1))?; obj_v(w,ov(x0,y1,z1))?; obj_quad(w)?;
-    }
-    if !obj_occludes(get_block_at(world,wx,wy,wz-1).0) {
-        obj_v(w,ov(x0,y1,z0))?; obj_v(w,ov(x1,y1,z0))?; obj_v(w,ov(x1,y0,z0))?; obj_v(w,ov(x0,y0,z0))?; obj_quad(w)?;
-    }
-    if !obj_occludes(get_block_at(world,wx,wy+1,wz).0) {
-        obj_v(w,ov(x0,y1,z0))?; obj_v(w,ov(x1,y1,z0))?; obj_v(w,ov(x1,y1,z1))?; obj_v(w,ov(x0,y1,z1))?; obj_quad(w)?;
-    }
-    if !obj_occludes(get_block_at(world,wx,wy-1,wz).0) {
-        obj_v(w,ov(x1,y0,z0))?; obj_v(w,ov(x0,y0,z0))?; obj_v(w,ov(x0,y0,z1))?; obj_v(w,ov(x1,y0,z1))?; obj_quad(w)?;
-    }
-    if !obj_occludes(get_block_at(world,wx+1,wy,wz).0) {
-        obj_v(w,ov(x1,y1,z0))?; obj_v(w,ov(x1,y0,z0))?; obj_v(w,ov(x1,y0,z1))?; obj_v(w,ov(x1,y1,z1))?; obj_quad(w)?;
-    }
-    if !obj_occludes(get_block_at(world,wx-1,wy,wz).0) {
-        obj_v(w,ov(x0,y0,z0))?; obj_v(w,ov(x0,y1,z0))?; obj_v(w,ov(x0,y1,z1))?; obj_v(w,ov(x0,y0,z1))?; obj_quad(w)?;
-    }
-    Ok(())
-}
-
-/// Emit a ramp as a triangular prism. dir: 0=South 1=West 2=North 3=East (high edge direction).
-/// The vertical wall and end-cap triangles are culled against adjacent solid blocks to prevent z-fighting.
-pub(crate) fn emit_ramp(w: &mut impl Write, wx: i32, wy: i32, wz: i32, dir: u8, world: &LoadedWorld) -> std::io::Result<()> {
-    let (x0, x1) = (wx as f32, wx as f32 + 1.0);
-    let (y0, y1) = (wy as f32, wy as f32 + 1.0);
-    let (z0, z1) = (wz as f32, wz as f32 + 1.0);
-    let solid_s = obj_occludes(get_block_at(world, wx, wy + 1, wz).0);
-    let solid_n = obj_occludes(get_block_at(world, wx, wy - 1, wz).0);
-    let solid_e = obj_occludes(get_block_at(world, wx + 1, wy, wz).0);
-    let solid_w = obj_occludes(get_block_at(world, wx - 1, wy, wz).0);
-    // Bottom — cull if solid below
-    if !obj_occludes(get_block_at(world, wx, wy, wz - 1).0) {
-        obj_v(w, ov(x0,y1,z0))?; obj_v(w, ov(x1,y1,z0))?;
-        obj_v(w, ov(x1,y0,z0))?; obj_v(w, ov(x0,y0,z0))?;
-        obj_quad(w)?;
-    }
-    match dir {
-        0 => { // South: high edge at +Y
-            if !solid_s { obj_v(w,ov(x0,y1,z0))?; obj_v(w,ov(x1,y1,z0))?; obj_v(w,ov(x1,y1,z1))?; obj_v(w,ov(x0,y1,z1))?; obj_quad(w)?; }
-            if !solid_w { obj_v(w,ov(x0,y0,z0))?; obj_v(w,ov(x0,y1,z0))?; obj_v(w,ov(x0,y1,z1))?; obj_tri(w)?; }
-            if !solid_e { obj_v(w,ov(x1,y1,z0))?; obj_v(w,ov(x1,y0,z0))?; obj_v(w,ov(x1,y1,z1))?; obj_tri(w)?; }
-            obj_v(w,ov(x0,y0,z0))?; obj_v(w,ov(x1,y0,z0))?; obj_v(w,ov(x1,y1,z1))?; obj_v(w,ov(x0,y1,z1))?; obj_quad(w)?;
-        }
-        1 => { // West: high edge at -X
-            if !solid_w { obj_v(w,ov(x0,y0,z0))?; obj_v(w,ov(x0,y1,z0))?; obj_v(w,ov(x0,y1,z1))?; obj_v(w,ov(x0,y0,z1))?; obj_quad(w)?; }
-            if !solid_s { obj_v(w,ov(x0,y1,z0))?; obj_v(w,ov(x1,y1,z0))?; obj_v(w,ov(x0,y1,z1))?; obj_tri(w)?; }
-            if !solid_n { obj_v(w,ov(x1,y0,z0))?; obj_v(w,ov(x0,y0,z0))?; obj_v(w,ov(x0,y0,z1))?; obj_tri(w)?; }
-            obj_v(w,ov(x1,y0,z0))?; obj_v(w,ov(x1,y1,z0))?; obj_v(w,ov(x0,y1,z1))?; obj_v(w,ov(x0,y0,z1))?; obj_quad(w)?;
-        }
-        2 => { // North: high edge at -Y
-            if !solid_n { obj_v(w,ov(x1,y0,z0))?; obj_v(w,ov(x0,y0,z0))?; obj_v(w,ov(x0,y0,z1))?; obj_v(w,ov(x1,y0,z1))?; obj_quad(w)?; }
-            if !solid_e { obj_v(w,ov(x1,y0,z0))?; obj_v(w,ov(x1,y1,z0))?; obj_v(w,ov(x1,y0,z1))?; obj_tri(w)?; }
-            if !solid_w { obj_v(w,ov(x0,y1,z0))?; obj_v(w,ov(x0,y0,z0))?; obj_v(w,ov(x0,y0,z1))?; obj_tri(w)?; }
-            obj_v(w,ov(x1,y1,z0))?; obj_v(w,ov(x0,y1,z0))?; obj_v(w,ov(x0,y0,z1))?; obj_v(w,ov(x1,y0,z1))?; obj_quad(w)?;
-        }
-        _ => { // East (dir=3): high edge at +X
-            if !solid_e { obj_v(w,ov(x1,y1,z0))?; obj_v(w,ov(x1,y0,z0))?; obj_v(w,ov(x1,y0,z1))?; obj_v(w,ov(x1,y1,z1))?; obj_quad(w)?; }
-            if !solid_n { obj_v(w,ov(x1,y0,z0))?; obj_v(w,ov(x0,y0,z0))?; obj_v(w,ov(x1,y0,z1))?; obj_tri(w)?; }
-            if !solid_s { obj_v(w,ov(x0,y1,z0))?; obj_v(w,ov(x1,y1,z0))?; obj_v(w,ov(x1,y1,z1))?; obj_tri(w)?; }
-            obj_v(w,ov(x0,y1,z0))?; obj_v(w,ov(x0,y0,z0))?; obj_v(w,ov(x1,y0,z1))?; obj_v(w,ov(x1,y1,z1))?; obj_quad(w)?;
-        }
-    }
-    Ok(())
-}
-
-/// Emit a wedge as a pyramid (1 apex, 4 base corners). dir: 0=SE 1=SW 2=NW 3=NE (apex at opposite corner).
-/// The two vertical faces at the apex corner are culled against adjacent solid blocks.
-pub(crate) fn emit_wedge(w: &mut impl Write, wx: i32, wy: i32, wz: i32, dir: u8, world: &LoadedWorld) -> std::io::Result<()> {
-    let (x0, x1) = (wx as f32, wx as f32 + 1.0);
-    let (y0, y1) = (wy as f32, wy as f32 + 1.0);
-    let (z0, z1) = (wz as f32, wz as f32 + 1.0);
-    let solid_s = obj_occludes(get_block_at(world, wx, wy + 1, wz).0);
-    let solid_n = obj_occludes(get_block_at(world, wx, wy - 1, wz).0);
-    let solid_e = obj_occludes(get_block_at(world, wx + 1, wy, wz).0);
-    let solid_w = obj_occludes(get_block_at(world, wx - 1, wy, wz).0);
-    // Wedges are vertical triangular prisms (full Z height, triangle footprint in XY).
-    // Each wedge occupies the diagonal half named by its direction.
-    // Two axis-aligned rectangular faces at the named sides + one diagonal 45° rectangular face.
-    match dir {
-        0 => { // SE: triangle NE(x1,y0)-SE(x1,y1)-SW(x0,y1). East+South faces; diagonal NE↔SW.
-            // Bottom triangle
-            if !obj_occludes(get_block_at(world, wx, wy, wz-1).0) {
-                obj_v(w,ov(x1,y0,z0))?; obj_v(w,ov(x1,y1,z0))?; obj_v(w,ov(x0,y1,z0))?; obj_tri(w)?;
-            }
-            // Top triangle
-            if !obj_occludes(get_block_at(world, wx, wy, wz+1).0) {
-                obj_v(w,ov(x1,y0,z1))?; obj_v(w,ov(x0,y1,z1))?; obj_v(w,ov(x1,y1,z1))?; obj_tri(w)?;
-            }
-            if !solid_e { obj_v(w,ov(x1,y0,z0))?; obj_v(w,ov(x1,y1,z0))?; obj_v(w,ov(x1,y1,z1))?; obj_v(w,ov(x1,y0,z1))?; obj_quad(w)?; }
-            if !solid_s { obj_v(w,ov(x1,y1,z0))?; obj_v(w,ov(x0,y1,z0))?; obj_v(w,ov(x0,y1,z1))?; obj_v(w,ov(x1,y1,z1))?; obj_quad(w)?; }
-            obj_v(w,ov(x1,y0,z0))?; obj_v(w,ov(x0,y1,z0))?; obj_v(w,ov(x0,y1,z1))?; obj_v(w,ov(x1,y0,z1))?; obj_quad(w)?; // diag
-        }
-        1 => { // SW: triangle NW(x0,y0)-SW(x0,y1)-SE(x1,y1). West+South faces; diagonal NW↔SE.
-            if !obj_occludes(get_block_at(world, wx, wy, wz-1).0) {
-                obj_v(w,ov(x0,y0,z0))?; obj_v(w,ov(x0,y1,z0))?; obj_v(w,ov(x1,y1,z0))?; obj_tri(w)?;
-            }
-            if !obj_occludes(get_block_at(world, wx, wy, wz+1).0) {
-                obj_v(w,ov(x0,y0,z1))?; obj_v(w,ov(x1,y1,z1))?; obj_v(w,ov(x0,y1,z1))?; obj_tri(w)?;
-            }
-            if !solid_w { obj_v(w,ov(x0,y0,z0))?; obj_v(w,ov(x0,y1,z0))?; obj_v(w,ov(x0,y1,z1))?; obj_v(w,ov(x0,y0,z1))?; obj_quad(w)?; }
-            if !solid_s { obj_v(w,ov(x0,y1,z0))?; obj_v(w,ov(x1,y1,z0))?; obj_v(w,ov(x1,y1,z1))?; obj_v(w,ov(x0,y1,z1))?; obj_quad(w)?; }
-            obj_v(w,ov(x0,y0,z0))?; obj_v(w,ov(x1,y1,z0))?; obj_v(w,ov(x1,y1,z1))?; obj_v(w,ov(x0,y0,z1))?; obj_quad(w)?; // diag
-        }
-        2 => { // NW: triangle NE(x1,y0)-NW(x0,y0)-SW(x0,y1). North+West faces; diagonal NE↔SW.
-            if !obj_occludes(get_block_at(world, wx, wy, wz-1).0) {
-                obj_v(w,ov(x1,y0,z0))?; obj_v(w,ov(x0,y0,z0))?; obj_v(w,ov(x0,y1,z0))?; obj_tri(w)?;
-            }
-            if !obj_occludes(get_block_at(world, wx, wy, wz+1).0) {
-                obj_v(w,ov(x1,y0,z1))?; obj_v(w,ov(x0,y1,z1))?; obj_v(w,ov(x0,y0,z1))?; obj_tri(w)?;
-            }
-            if !solid_n { obj_v(w,ov(x1,y0,z0))?; obj_v(w,ov(x0,y0,z0))?; obj_v(w,ov(x0,y0,z1))?; obj_v(w,ov(x1,y0,z1))?; obj_quad(w)?; }
-            if !solid_w { obj_v(w,ov(x0,y0,z0))?; obj_v(w,ov(x0,y1,z0))?; obj_v(w,ov(x0,y1,z1))?; obj_v(w,ov(x0,y0,z1))?; obj_quad(w)?; }
-            obj_v(w,ov(x1,y0,z0))?; obj_v(w,ov(x0,y1,z0))?; obj_v(w,ov(x0,y1,z1))?; obj_v(w,ov(x1,y0,z1))?; obj_quad(w)?; // diag
-        }
-        _ => { // NE: triangle NW(x0,y0)-NE(x1,y0)-SE(x1,y1). North+East faces; diagonal NW↔SE.
-            if !obj_occludes(get_block_at(world, wx, wy, wz-1).0) {
-                obj_v(w,ov(x0,y0,z0))?; obj_v(w,ov(x1,y0,z0))?; obj_v(w,ov(x1,y1,z0))?; obj_tri(w)?;
-            }
-            if !obj_occludes(get_block_at(world, wx, wy, wz+1).0) {
-                obj_v(w,ov(x0,y0,z1))?; obj_v(w,ov(x1,y1,z1))?; obj_v(w,ov(x1,y0,z1))?; obj_tri(w)?;
-            }
-            if !solid_n { obj_v(w,ov(x0,y0,z0))?; obj_v(w,ov(x1,y0,z0))?; obj_v(w,ov(x1,y0,z1))?; obj_v(w,ov(x0,y0,z1))?; obj_quad(w)?; }
-            if !solid_e { obj_v(w,ov(x1,y0,z0))?; obj_v(w,ov(x1,y1,z0))?; obj_v(w,ov(x1,y1,z1))?; obj_v(w,ov(x1,y0,z1))?; obj_quad(w)?; }
-            obj_v(w,ov(x0,y0,z0))?; obj_v(w,ov(x1,y1,z0))?; obj_v(w,ov(x1,y1,z1))?; obj_v(w,ov(x0,y0,z1))?; obj_quad(w)?; // diag
-        }
-    }
-    Ok(())
-}
-
-/// Greedy 2-D rectangle merger. Covers every cell in `cells` with non-overlapping axis-aligned
-/// rectangles. Returns (u_min, v_min, u_max, v_max) in inclusive coordinates.
-pub(crate) fn greedy_mesh_2d(cells: &HashSet<(i32, i32)>) -> Vec<(i32, i32, i32, i32)> {
-    let mut remaining = cells.clone();
-    let mut sorted: Vec<(i32, i32)> = remaining.iter().cloned().collect();
-    sorted.sort_unstable();
-    let mut rects = Vec::new();
-    for (u0, v0) in sorted {
-        if !remaining.contains(&(u0, v0)) { continue; }
-        let mut u1 = u0;
-        while remaining.contains(&(u1 + 1, v0)) { u1 += 1; }
-        let mut v1 = v0;
-        loop {
-            if !(u0..=u1).all(|u| remaining.contains(&(u, v1 + 1))) { break; }
-            v1 += 1;
-        }
-        for u in u0..=u1 { for v in v0..=v1 { remaining.remove(&(u, v)); } }
-        rects.push((u0, v0, u1, v1));
-    }
-    rects
-}
-
-/// Emit one merged quad for a greedy-meshed transparent face.
-/// dir: 0=+Z(top) 1=-Z(bot) 2=+Y(S) 3=-Y(N) 4=+X(E) 5=-X(W)
-/// plane: the block coordinate perpendicular to the face.
-/// u/v are the two in-plane block coordinates (inclusive range u0..=u1, v0..=v1).
-pub(crate) fn emit_merged_quad(w: &mut impl Write, dir: u8, plane: i32, u0: i32, v0: i32, u1: i32, v1: i32) -> std::io::Result<()> {
-    let (u0f, u1f) = (u0 as f32, (u1 + 1) as f32);
-    let (v0f, v1f) = (v0 as f32, (v1 + 1) as f32);
-    let pf = plane as f32;
-    match dir {
-        0 => { // +Z top  — plane=wz, u=wx, v=wy, face at z=plane+1
-            obj_v(w,ov(u0f,v0f,pf+1.0))?; obj_v(w,ov(u1f,v0f,pf+1.0))?;
-            obj_v(w,ov(u1f,v1f,pf+1.0))?; obj_v(w,ov(u0f,v1f,pf+1.0))?; obj_quad(w)?;
-        }
-        1 => { // -Z bot  — plane=wz, u=wx, v=wy, face at z=plane
-            obj_v(w,ov(u0f,v1f,pf))?; obj_v(w,ov(u1f,v1f,pf))?;
-            obj_v(w,ov(u1f,v0f,pf))?; obj_v(w,ov(u0f,v0f,pf))?; obj_quad(w)?;
-        }
-        2 => { // +Y S    — plane=wy, u=wx, v=wz, face at y=plane+1
-            obj_v(w,ov(u0f,pf+1.0,v0f))?; obj_v(w,ov(u1f,pf+1.0,v0f))?;
-            obj_v(w,ov(u1f,pf+1.0,v1f))?; obj_v(w,ov(u0f,pf+1.0,v1f))?; obj_quad(w)?;
-        }
-        3 => { // -Y N    — plane=wy, u=wx, v=wz, face at y=plane
-            obj_v(w,ov(u1f,pf,v0f))?; obj_v(w,ov(u0f,pf,v0f))?;
-            obj_v(w,ov(u0f,pf,v1f))?; obj_v(w,ov(u1f,pf,v1f))?; obj_quad(w)?;
-        }
-        4 => { // +X E    — plane=wx, u=wy, v=wz, face at x=plane+1
-            obj_v(w,ov(pf+1.0,u1f,v0f))?; obj_v(w,ov(pf+1.0,u0f,v0f))?;
-            obj_v(w,ov(pf+1.0,u0f,v1f))?; obj_v(w,ov(pf+1.0,u1f,v1f))?; obj_quad(w)?;
-        }
-        _ => { // -X W    — plane=wx, u=wy, v=wz, face at x=plane
-            obj_v(w,ov(pf,u0f,v0f))?; obj_v(w,ov(pf,u1f,v0f))?;
-            obj_v(w,ov(pf,u1f,v1f))?; obj_v(w,ov(pf,u0f,v1f))?; obj_quad(w)?;
-        }
-    }
-    Ok(())
-}
-
-#[tauri::command(async)]
-pub(crate) fn export_obj(
-    app: tauri::AppHandle,
-    ops: tauri::State<'_, LongOps>,
-    state: tauri::State<'_, AppState>,
-    path: String,
-    x1: i32, y1: i32, x2: i32, y2: i32,
-    z_min: i32, z_max: i32,
-) -> Result<(), String> {
-    let ws = read_ws(&state);
-    let world = ws.world.as_ref().ok_or("No world loaded")?;
-
-    let sx1 = x1.min(x2); let sx2 = x1.max(x2);
-    let sy1 = y1.min(y2); let sy2 = y1.max(y2);
-    let sz1 = z_min.min(z_max).max(0);
-    let sz2 = z_min.max(z_max).min(world_max_z(world));
-    check_export_volume(sx1, sy1, sz1, sx2, sy2, sz2, "OBJ")?;
-
-    // Two full passes over the volume (materials, then geometry), reported as one 0–100% bar.
-    let rows = (sz2 - sz1 + 1).max(0) as u64 * 2;
-    let op = ops.begin(&app, "obj", "Exporting OBJ".into(), rows, true);
-    let cleanup = ExportCleanup::new(&path);
-
-    // Collect unique (block_type, paint) combos for the MTL file.
-    let mut mat_set: HashSet<(u8, u8)> = HashSet::new();
-    for wz in sz1..=sz2 {
-        op.step((wz - sz1) as u64, "Scanning materials")?;
-        for wy in sy1..=sy2 {
-            for wx in sx1..=sx2 {
-                let (bt, paint) = get_block_at(world, wx, wy, wz);
-                if bt != 0 { mat_set.insert((bt, paint)); }
-            }
-        }
-    }
-    let mut mat_list: Vec<(u8, u8)> = mat_set.into_iter().collect();
-    mat_list.sort();
-
-    let obj_path = std::path::Path::new(&path);
-    let stem = obj_path.file_stem().and_then(|s| s.to_str()).unwrap_or("world");
-    let mtl_path = obj_path.with_extension("mtl");
-    let mtl_filename = format!("{stem}.mtl");
-
-    // Write MTL
-    {
-        let f = fs::File::create(&mtl_path).map_err(|e| format!("Cannot create MTL: {e}"))?;
-        let mut mw = BufWriter::new(f);
-        writeln!(mw, "# Eden World Editor — material library").map_err(|e| e.to_string())?;
-        for &(bt, paint) in &mat_list {
-            let [r, g, b] = block_color(bt, paint, world.sky);
-            writeln!(mw, "\nnewmtl m_{bt}_{paint}").map_err(|e| e.to_string())?;
-            writeln!(mw, "Kd {:.4} {:.4} {:.4}", r as f32/255.0, g as f32/255.0, b as f32/255.0)
-                .map_err(|e| e.to_string())?;
-            writeln!(mw, "Ka 0.1 0.1 0.1\nKs 0.0 0.0 0.0").map_err(|e| e.to_string())?;
-            if let Some(a) = transparent_alpha(bt) {
-                writeln!(mw, "d {a:.2}").map_err(|e| e.to_string())?;
-            }
-        }
-    }
-
-    // Write OBJ
-    let f = fs::File::create(&path).map_err(|e| format!("Cannot create OBJ: {e}"))?;
-    let mut ow = BufWriter::new(f);
-    writeln!(ow, "# Eden World Editor OBJ export").map_err(|e| e.to_string())?;
-    writeln!(ow, "# Bounds ({sx1},{sy1},{sz1})–({sx2},{sy2},{sz2})").map_err(|e| e.to_string())?;
-    writeln!(ow, "mtllib {mtl_filename}").map_err(|e| e.to_string())?;
-
-    // Transparent block faces are collected for greedy meshing (avoids per-block seam artifacts).
-    // Layout: [face_dir 0..6][plane coord][material (bt,paint)] → set of (u,v) in-plane cells.
-    // dir: 0=+Z(top) 1=-Z(bot) 2=+Y(S) 3=-Y(N) 4=+X(E) 5=-X(W)
-    type MatCells = HashMap<(u8, u8), HashSet<(i32, i32)>>;
-    let mut trans_faces: [HashMap<i32, MatCells>; 6] = Default::default();
-
-    // Returns true if a face of a transparent block should be visible toward the given neighbour.
-    let trans_visible = |nbt: u8, npaint: u8, self_bt: u8, self_paint: u8| -> bool {
-        if nbt == 0 { return true; }
-        if obj_occludes(nbt) { return false; }
-        nbt != self_bt || npaint != self_paint
-    };
-
-    let mut cur_mat = String::new();
-
-    for wz in sz1..=sz2 {
-        op.step((sz2 - sz1 + 1) as u64 + (wz - sz1) as u64, "Writing geometry")?;
-        for wy in sy1..=sy2 {
-            for wx in sx1..=sx2 {
-                let (bt, paint) = get_block_at(world, wx, wy, wz);
-                if bt == 0 { continue; }
-
-                // Transparent non-ramp blocks → collect faces for greedy meshing.
-                if transparent_alpha(bt).is_some() && !matches!(bt, 24..=55) {
-                    let m = (bt, paint);
-                    macro_rules! collect {
-                        ($dir:expr, $plane:expr, $u:expr, $v:expr, $nbt:expr, $npaint:expr) => {
-                            if trans_visible($nbt, $npaint, bt, paint) {
-                                trans_faces[$dir].entry($plane).or_default()
-                                    .entry(m).or_default().insert(($u, $v));
-                            }
-                        };
-                    }
-                    let (nbt, npaint) = get_block_at(world, wx, wy, wz + 1);
-                    collect!(0, wz, wx, wy, nbt, npaint);
-                    let (nbt, npaint) = get_block_at(world, wx, wy, wz - 1);
-                    collect!(1, wz, wx, wy, nbt, npaint);
-                    let (nbt, npaint) = get_block_at(world, wx, wy + 1, wz);
-                    collect!(2, wy, wx, wz, nbt, npaint);
-                    let (nbt, npaint) = get_block_at(world, wx, wy - 1, wz);
-                    collect!(3, wy, wx, wz, nbt, npaint);
-                    let (nbt, npaint) = get_block_at(world, wx + 1, wy, wz);
-                    collect!(4, wx, wy, wz, nbt, npaint);
-                    let (nbt, npaint) = get_block_at(world, wx - 1, wy, wz);
-                    collect!(5, wx, wy, wz, nbt, npaint);
-                    continue;
-                }
-
-                let mat = format!("m_{bt}_{paint}");
-                if mat != cur_mat {
-                    writeln!(ow, "\nusemtl {mat}").map_err(|e| e.to_string())?;
-                    cur_mat = mat;
-                }
-
-                if matches!(bt, 24..=39) {
-                    let base = 24 + ((bt - 24) / 4) * 4;
-                    emit_ramp(&mut ow, wx, wy, wz, bt - base, world).map_err(|e| e.to_string())?;
-                } else if matches!(bt, 40..=55) {
-                    let base = 40 + ((bt - 40) / 4) * 4;
-                    emit_wedge(&mut ow, wx, wy, wz, bt - base, world).map_err(|e| e.to_string())?;
-                } else {
-                    emit_cube(&mut ow, wx, wy, wz, world).map_err(|e| e.to_string())?;
-                }
-            }
-        }
-    }
-
-    // Greedy-mesh transparent faces and emit as merged quads.
-    for dir in 0u8..6 {
-        for (&plane, mat_cells) in &trans_faces[dir as usize] {
-            let mut mats: Vec<(u8, u8)> = mat_cells.keys().cloned().collect();
-            mats.sort_unstable();
-            for &(bt, paint) in &mats {
-                let mat = format!("m_{bt}_{paint}");
-                if mat != cur_mat {
-                    writeln!(ow, "\nusemtl {mat}").map_err(|e| e.to_string())?;
-                    cur_mat = mat;
-                }
-                let rects = greedy_mesh_2d(&mat_cells[&(bt, paint)]);
-                for (u0, v0, u1, v1) in rects {
-                    emit_merged_quad(&mut ow, dir, plane, u0, v0, u1, v1)
-                        .map_err(|e| e.to_string())?;
-                }
-            }
-        }
-    }
-
-    ow.flush().map_err(|e| e.to_string())?;
-    cleanup.keep();
-    Ok(())
-}
-
-/// Deletes a half-written export file unless `keep()` was called (audit C6). A cancelled or failed
-/// export used to leave a truncated `.obj`/`.json.gz`/`.vox` behind that looks like a real one.
-pub(crate) struct ExportCleanup { path: std::path::PathBuf, keep: Cell<bool> }
-impl ExportCleanup {
-    pub(crate) fn new(path: &str) -> Self {
-        ExportCleanup { path: std::path::PathBuf::from(path), keep: Cell::new(false) }
-    }
-    pub(crate) fn keep(&self) { self.keep.set(true); }
-}
-impl Drop for ExportCleanup {
-    fn drop(&mut self) {
-        if !self.keep.get() { let _ = fs::remove_file(&self.path); }
-    }
-}
-
-// ── JSON Export ────────────────────────────────────────────────────────────────
-
-#[tauri::command(async)]
-pub(crate) fn export_json(
-    app: tauri::AppHandle,
-    ops: tauri::State<'_, LongOps>,
-    state: tauri::State<'_, AppState>,
-    path: String,
-    x1: i32, y1: i32, x2: i32, y2: i32,
-    z_min: i32, z_max: i32,
-) -> Result<u32, String> {
-    use flate2::write::GzEncoder;
-    use flate2::Compression;
-    use std::io::Write;
-
-    let ws = read_ws(&state);
-    let world = ws.world.as_ref().ok_or("No world loaded")?;
-
-    let sx1 = x1.min(x2); let sx2 = x1.max(x2);
-    let sy1 = y1.min(y2); let sy2 = y1.max(y2);
-    let sz1 = z_min.min(z_max).max(0);
-    let sz2 = z_min.max(z_max).min(world_max_z(world));
-    check_export_volume(sx1, sy1, sz1, sx2, sy2, sz2, "JSON")?;
-
-    let op = ops.begin(&app, "json", "Exporting JSON".into(), (sz2 - sz1 + 1).max(0) as u64, true);
-    let cleanup = ExportCleanup::new(&path);
-
-    let format_str = if world.chunk_size >= 131072 { "256z" } else { "64z" };
-
-    let f = fs::File::create(&path).map_err(|e| format!("Cannot create file: {e}"))?;
-    let mut gz = GzEncoder::new(f, Compression::best());
-
-    // Write header manually to avoid building a giant serde_json::Value in memory.
-    let header = format!(
-        "{{\n\
-         \"generator\":\"VuencEdit\",\n\
-         \"world_name\":{},\n\
-         \"format\":\"{format_str}\",\n\
-         \"width_blocks\":{},\n\
-         \"height_blocks\":{},\n\
-         \"max_z\":{},\n\
-         \"sky\":{},\n\
-         \"exported_bounds\":{{\"x1\":{sx1},\"y1\":{sy1},\"x2\":{sx2},\"y2\":{sy2},\"z_min\":{sz1},\"z_max\":{sz2}}},\n\
-         \"blocks\":[\n",
-        serde_json::to_string(&world.name).unwrap(),
-        world.w_chunks * 16,
-        world.h_chunks * 16,
-        world_max_z(world),
-        world.sky,
-    );
-    gz.write_all(header.as_bytes()).map_err(|e| e.to_string())?;
-
-    let mut count: u32 = 0;
-    let mut first = true;
-    for wz in sz1..=sz2 {
-        op.step((wz - sz1) as u64, "Writing blocks")?;
-        for wy in sy1..=sy2 {
-            for wx in sx1..=sx2 {
-                let (bt, paint) = get_block_at(world, wx, wy, wz);
-                if bt == 0 { continue; }
-                if !first { gz.write_all(b",\n").map_err(|e| e.to_string())?; }
-                first = false;
-                let line = format!("{{\"x\":{wx},\"y\":{wy},\"z\":{wz},\"t\":{bt},\"p\":{paint}}}");
-                gz.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
-                count += 1;
-            }
-        }
-    }
-
-    gz.write_all(b"\n]}\n").map_err(|e| e.to_string())?;
-    let mut f = gz.finish().map_err(|e| e.to_string())?;
-    f.flush().map_err(|e| e.to_string())?;
-    cleanup.keep();
-    Ok(count)
-}
-
-// ── VOX Export ────────────────────────────────────────────────────────────────
-
-#[tauri::command(async)]
-pub(crate) fn export_vox(
-    app: tauri::AppHandle,
-    ops: tauri::State<'_, LongOps>,
-    state: tauri::State<'_, AppState>,
-    path: String,
-    x1: i32, y1: i32, x2: i32, y2: i32,
-    z_min: i32, z_max: i32,
-) -> Result<u32, String> {
-    let ws = read_ws(&state);
-    let world = ws.world.as_ref().ok_or("No world loaded")?;
-
-    let sx1 = x1.min(x2); let sx2 = x1.max(x2);
-    let sy1 = y1.min(y2); let sy2 = y1.max(y2);
-    let sz1 = z_min.min(z_max).max(0);
-    let sz2 = z_min.max(z_max).min(world_max_z(world));
-    check_export_volume(sx1, sy1, sz1, sx2, sy2, sz2, "VOX")?;
-    let total_z = (sz2 - sz1 + 1) as f32;
-
-    // Progress and cancellation now go through the shared long-operation contract (audit C6/M14)
-    // rather than this command's own private `vox-progress` event — VOX was the one export that
-    // already had a progress bar, and it is what the contract was modelled on.
-    let op = ops.begin(&app, "vox", "Exporting VOX".into(), 1000, true);
-    let cleanup = ExportCleanup::new(&path);
-    let emit_progress = |phase: &str, frac: f32| -> Result<(), String> {
-        op.step((frac.clamp(0.0, 1.0) * 1000.0) as u64, phase)
-    };
-
-    // Pass 1: collect unique RGB values in encounter order (0–45% of progress).
-    let mut unique_colors: Vec<[u8; 3]> = Vec::new();
-    let mut seen: HashSet<[u8; 3]> = HashSet::new();
-    for wz in sz1..=sz2 {
-        emit_progress("Scanning colors", (wz - sz1) as f32 / total_z * 0.45)?;
-        for wy in sy1..=sy2 {
-            for wx in sx1..=sx2 {
-                let (bt, paint) = get_block_at(world, wx, wy, wz);
-                if bt == 0 { continue; }
-                let rgb = block_color(bt, paint, world.sky);
-                if seen.insert(rgb) { unique_colors.push(rgb); }
-            }
-        }
-    }
-    if unique_colors.is_empty() {
-        return Err("No non-air blocks in the selected region".into());
-    }
-
-    // Build palette (max 255 entries; VOX color index 0 = empty).
-    let n_colors = unique_colors.len();
-    let palette: Vec<[u8; 3]> = unique_colors.iter().copied().take(255).collect();
-    let mut color_to_idx: HashMap<[u8; 3], u8> = palette.iter().enumerate()
-        .map(|(i, &rgb)| (rgb, (i + 1) as u8))
-        .collect();
-
-    // Nearest-neighbor quantization for any overflow colors (>255 unique).
-    let overflow_count = n_colors.saturating_sub(255);
-    if overflow_count > 0 {
-        emit_progress(&format!("Quantizing palette ({overflow_count} overflow colors)"), 0.46)?;
-        for &rgb in unique_colors.iter().skip(255) {
-            let best = palette.iter().enumerate()
-                .min_by_key(|(_, &p)| {
-                    let d = |a: u8, b: u8| (a as i32 - b as i32).pow(2);
-                    d(p[0], rgb[0]) + d(p[1], rgb[1]) + d(p[2], rgb[2])
-                })
-                .map(|(i, _)| (i + 1) as u8)
-                .unwrap_or(1);
-            color_to_idx.insert(rgb, best);
-        }
-    }
-
-    let w_blocks     = (sx2 - sx1 + 1) as usize;
-    let h_blocks     = (sy2 - sy1 + 1) as usize;
-    let z_depth      = (sz2 - sz1 + 1) as usize; // always ≤ 256
-    let gx_count     = w_blocks.div_ceil(256);
-    let gy_count     = h_blocks.div_ceil(256);
-    let total_models = (gx_count * gy_count) as f32;
-
-    // Pass 2: build children buffer (SIZE+XYZI per sub-model, then RGBA) — 47–97%.
-    let mut children_buf: Vec<u8> = Vec::new();
-    let mut total_voxels: u32 = 0;
-    let mut model_idx: usize = 0;
-
-    for gy in 0..gy_count {
-        for gx in 0..gx_count {
-            let wx_start = sx1 + (gx * 256) as i32;
-            let wx_end   = (wx_start + 255).min(sx2);
-            let wy_start = sy1 + (gy * 256) as i32;
-            let wy_end   = (wy_start + 255).min(sy2);
-            let model_w  = (wx_end - wx_start + 1);
-            let model_h  = (wy_end - wy_start + 1);
-            let model_z  = z_depth as i32;
-
-            let label = if total_models > 1.0 {
-                format!("Building model {}/{}", model_idx + 1, gx_count * gy_count)
-            } else {
-                "Building model".to_string()
-            };
-            emit_progress(&label, 0.47 + model_idx as f32 / total_models * 0.50)?;
-            model_idx += 1;
-
-            let mut voxels: Vec<[u8; 4]> = Vec::new();
-            for wz in sz1..=sz2 {
-                for wy in wy_start..=wy_end {
-                    for wx in wx_start..=wx_end {
-                        let (bt, paint) = get_block_at(world, wx, wy, wz);
-                        if bt == 0 { continue; }
-                        let rgb  = block_color(bt, paint, world.sky);
-                        let cidx = *color_to_idx.get(&rgb).unwrap_or(&1);
-                        let lx   = (wx - wx_start) as u8;
-                        let ly   = (wy - wy_start) as u8;
-                        let lz   = (wz - sz1) as u8;
-                        voxels.push([lx, ly, lz, cidx]);
-                    }
-                }
-            }
-            if voxels.is_empty() { continue; }
-            total_voxels += voxels.len() as u32;
-
-            let mut size_content = Vec::with_capacity(12);
-            size_content.extend_from_slice(&model_w.to_le_bytes());
-            size_content.extend_from_slice(&model_h.to_le_bytes());
-            size_content.extend_from_slice(&model_z.to_le_bytes());
-            write_vox_chunk(&mut children_buf, b"SIZE", &size_content);
-
-            let n = voxels.len() as i32;
-            let mut xyzi_content = Vec::with_capacity(4 + voxels.len() * 4);
-            xyzi_content.extend_from_slice(&n.to_le_bytes());
-            for v in &voxels { xyzi_content.extend_from_slice(v); }
-            write_vox_chunk(&mut children_buf, b"XYZI", &xyzi_content);
-        }
-    }
-
-    // RGBA palette chunk (always 1024 bytes; index 0 is unused per spec).
-    let mut rgba = vec![0u8; 1024];
-    for (i, &[r, g, b]) in palette.iter().enumerate() {
-        let s = (i + 1) * 4;
-        rgba[s] = r; rgba[s + 1] = g; rgba[s + 2] = b; rgba[s + 3] = 255;
-    }
-    write_vox_chunk(&mut children_buf, b"RGBA", &rgba);
-
-    // Write file: magic + version + MAIN chunk.
-    emit_progress("Writing file", 0.97)?;
-    let f = fs::File::create(&path).map_err(|e| format!("Cannot create .vox: {e}"))?;
-    let mut w = BufWriter::with_capacity(1 << 20, f);
-    w.write_all(b"VOX ").map_err(|e| e.to_string())?;
-    w.write_all(&150i32.to_le_bytes()).map_err(|e| e.to_string())?;
-    w.write_all(b"MAIN").map_err(|e| e.to_string())?;
-    w.write_all(&0i32.to_le_bytes()).map_err(|e| e.to_string())?; // MAIN content_size
-    w.write_all(&(children_buf.len() as i32).to_le_bytes()).map_err(|e| e.to_string())?;
-    w.write_all(&children_buf).map_err(|e| e.to_string())?;
-    w.flush().map_err(|e| e.to_string())?;
-    emit_progress("Done", 1.0)?;
-    cleanup.keep();
-    Ok(total_voxels)
-}
-
-pub(crate) struct ObjGeometryResult {
-    positions: Vec<u8>, // LE f32 triplets (x,y,z) per vertex
-    colors: Vec<u8>,    // LE f32 triplets (r,g,b 0..1) per vertex
-    uvs: Vec<u8>,       // LE f32 pairs (u,v) per vertex; empty when no texture pack loaded
-    vertex_count: u32,
+/// The nine vertex buffers one region's mesh becomes, ready for the app to frame into its binary
+/// IPC envelope. Deliberately **not** `Serialize` — an app opts a payload into raw-`Response`
+/// framing by implementing `tauri::ipc::IpcResponse` on its own newtype over this, and a stray
+/// `Serialize` would let tauri's blanket impl silently revert it to base64-in-JSON.
+pub struct ObjGeometryResult {
+    pub positions: Vec<u8>, // LE f32 triplets (x,y,z) per vertex
+    pub colors: Vec<u8>,    // LE f32 triplets (r,g,b 0..1) per vertex
+    pub uvs: Vec<u8>,       // LE f32 pairs (u,v) per vertex; empty when no texture pack loaded
+    pub vertex_count: u32,
     // Blocks with `transparent_alpha()` (water/fence/glass/new-flower) — mirrors the game's
     // second ATLAS2 vertex buffer, kept separate so the frontend can render them with their own
     // `transparent:true` material instead of blending into the opaque draw call.
-    positions_t: Vec<u8>,
-    colors_t: Vec<u8>,  // LE f32 quadruplets (r,g,b,a 0..1) per vertex
-    uvs_t: Vec<u8>,
-    vertex_count_t: u32,
+    pub positions_t: Vec<u8>,
+    pub colors_t: Vec<u8>,  // LE f32 quadruplets (r,g,b,a 0..1) per vertex
+    pub uvs_t: Vec<u8>,
+    pub vertex_count_t: u32,
     // Emissive stream (RGB, like the opaque one) — populated only in `flat` (GPU-shadow) mode and
     // only with `LAMP_BLOCK_TYPE` faces. Lamps must render fullbright in GPU mode: the flat opaque
     // stream is shaded by Three.js's lit material + ambient, which would darken lamps like any other
     // block, so the frontend draws these faces with an unlit `MeshBasicMaterial` instead. Empty (0)
-    // whenever `!flat` — OBJ/JSON export and `ThreeDPreview` pass `LightMode::default()`, so their
-    // output is byte-for-byte unchanged and lamp faces stay in the opaque stream as before.
-    positions_e: Vec<u8>,
-    colors_e: Vec<u8>,
-    uvs_e: Vec<u8>,
-    vertex_count_e: u32,
+    // whenever `!flat` — `get_chunk_geometry` passes `flat: false` unless the GPU-shadow path is on,
+    // so the default is a `LightMode::default()`-equivalent render with lamp faces staying in the
+    // opaque stream.
+    pub positions_e: Vec<u8>,
+    pub colors_e: Vec<u8>,
+    pub uvs_e: Vec<u8>,
+    pub vertex_count_e: u32,
 }
 
 impl ObjGeometryResult {
+    /// The all-empty result: an out-of-grid or entirely unpopulated chunk.
+    pub fn empty() -> Self {
+        ObjGeometryResult {
+            positions: Vec::new(), colors: Vec::new(), uvs: Vec::new(), vertex_count: 0,
+            positions_t: Vec::new(), colors_t: Vec::new(), uvs_t: Vec::new(), vertex_count_t: 0,
+            positions_e: Vec::new(), colors_e: Vec::new(), uvs_e: Vec::new(), vertex_count_e: 0,
+        }
+    }
+
+    /// The nine buffers in the order they are concatenated into the IPC body. `uvs*` are empty
+    /// when no texture pack is loaded, and `colors_t` is 4 floats per vertex where the others are
+    /// 3 or 2 — so the app cannot re-derive these sizes from the vertex counts and must ship the
+    /// lengths in the header.
+    pub fn buffers(&self) -> [&[u8]; 9] {
+        [
+            &self.positions, &self.colors, &self.uvs,
+            &self.positions_t, &self.colors_t, &self.uvs_t,
+            &self.positions_e, &self.colors_e, &self.uvs_e,
+        ]
+    }
+
     /// Total wire bytes this result will occupy on the JS side (the nine buffers, exclusive of the
     /// envelope header). The frontend's geometry budget and its dev memory HUD count the same
     /// number — a GPU VBO is the size of the buffer it was uploaded from — so this is the honest
     /// per-chunk memory cost, unlike the vertex counts (which ignore UV/RGBA stream width).
-    pub(crate) fn wire_bytes(&self) -> usize {
+    pub fn wire_bytes(&self) -> usize {
         self.positions.len() + self.colors.len() + self.uvs.len()
             + self.positions_t.len() + self.colors_t.len() + self.uvs_t.len()
             + self.positions_e.len() + self.colors_e.len() + self.uvs_e.len()
     }
-}
-
-/// Scalar half of the binary envelope (audit H2). `lens` gives the byte length of each of the nine
-/// buffers, in the order they are concatenated into the body, so the JS side can slice them apart
-/// without re-deriving sizes from the vertex counts (`uvs*` are empty when no texture pack is loaded,
-/// and `colors_t` is 4 floats per vertex where the others are 3 or 2).
-#[derive(serde::Serialize)]
-pub(crate) struct ObjGeometryHeader {
-    vertex_count: u32,
-    vertex_count_t: u32,
-    vertex_count_e: u32,
-    lens: [u32; 9],
-}
-
-impl tauri::ipc::IpcResponse for ObjGeometryResult {
-    fn body(self) -> tauri::Result<tauri::ipc::InvokeResponseBody> {
-        let bufs: [&[u8]; 9] = [
-            &self.positions, &self.colors, &self.uvs,
-            &self.positions_t, &self.colors_t, &self.uvs_t,
-            &self.positions_e, &self.colors_e, &self.uvs_e,
-        ];
-        let mut lens = [0u32; 9];
-        for (i, b) in bufs.iter().enumerate() { lens[i] = b.len() as u32; }
-        let header = ObjGeometryHeader {
-            vertex_count: self.vertex_count,
-            vertex_count_t: self.vertex_count_t,
-            vertex_count_e: self.vertex_count_e,
-            lens,
-        };
-        crate::ipc_envelope(&header, &bufs)
-    }
-}
-
-#[tauri::command(async)]
-pub(crate) fn get_obj_geometry(
-    state: tauri::State<'_, AppState>,
-    x1: i32, y1: i32, x2: i32, y2: i32,
-    z_min: i32, z_max: i32,
-) -> Result<ObjGeometryResult, String> {
-    let ws = read_ws(&state);
-    let world = ws.world.as_ref().ok_or("No world loaded")?;
-
-    let sx1 = x1.min(x2); let sx2 = x1.max(x2);
-    let sy1 = y1.min(y2); let sy2 = y1.max(y2);
-    let sz1 = z_min.min(z_max).max(0);
-    let sz2 = z_min.max(z_max).min(world_max_z(world));
-
-    let vol = ((sx2-sx1+1) as u64) * ((sy2-sy1+1) as u64) * ((sz2-sz1+1) as u64);
-    if vol > 64*64*64 {
-        return Err(format!("Selection too large ({vol} blocks) — max 64×64×64 for 3D preview"));
-    }
-
-    // Shaped selection: honour the wand/lasso footprint so the floating 3D preview matches paste.
-    // Normalized rect (sx1..sx2, sy1..sy2) is what ThreeDPreview sends, so active_mask's exact-bbox
-    // check lines up; a mismatch degrades to the full box.
-    let mask = crate::active_mask(&ws, sx1, sy1, sx2, sy2);
-    Ok(obj_geometry_region(world, ws.texture_pack.as_ref(), sx1, sy1, sx2, sy2, sz1, sz2, &[], LightMode::default(), mask.as_ref()))
 }
 
 /// Which of the game's two shipped lighting behaviours a lamp's falloff follows. The original
@@ -836,7 +144,7 @@ pub(crate) fn get_obj_geometry(
 /// `LightMode` rather than a single hardcoded curve.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub(crate) enum LightingProfile {
+pub enum LightingProfile {
     Legacy,
     Modern,
 }
@@ -847,7 +155,7 @@ impl Default for LightingProfile {
 
 impl LightingProfile {
     /// The lamp radius (blocks) this profile snaps to when the user hasn't overridden it.
-    pub(crate) fn default_radius(self) -> f32 {
+    pub fn default_radius(self) -> f32 {
         match self {
             LightingProfile::Legacy => LEGACY_LAMP_RADIUS,
             LightingProfile::Modern => MODERN_LAMP_RADIUS,
@@ -869,10 +177,10 @@ impl LightingProfile {
 }
 
 /// Night-lighting/shadow preview toggles for `obj_geometry_region`. Both default off, reproducing
-/// today's flat fully-lit output exactly (OBJ/JSON export and `ThreeDPreview` always pass `default()`
-/// — only `FlyView3D`'s chunk streaming opts in).
+/// a flat fully-lit render exactly (`LightMode::default()`) — only `FlyView3D`'s chunk streaming
+/// (via `get_chunk_geometry`) opts in.
 #[derive(Clone, Copy, Default)]
-pub(crate) struct LightMode {
+pub struct LightMode {
     pub night: bool,
     pub shadows: bool,
     /// Simulated sun position, 0=sunrise, 0.5=noon, 1=sunset (see `sun_direction`). Inert whenever
@@ -885,8 +193,8 @@ pub(crate) struct LightMode {
     /// skipped. Mutually exclusive with `night`/`shadows` in practice (the frontend clears them).
     pub flat: bool,
     /// User-tunable lamp light radius (blocks). `<= 0.0` (the `Default`) falls back to
-    /// `profile.default_radius()`, so `LightMode::default()` output is byte-for-byte unchanged for
-    /// OBJ/JSON export and `ThreeDPreview`. Only `get_chunk_geometry` (FlyView3D) passes a live value.
+    /// `profile.default_radius()`, so `LightMode::default()` output stays byte-for-byte the flat
+    /// fully-lit render. Only `get_chunk_geometry` (FlyView3D) passes a live value.
     pub lamp_radius: f32,
     /// Which falloff curve/default-radius pairing to use (see `LightingProfile`). Independent of
     /// `lamp_radius` — the profile picks the *shape* of the pool; the radius slider can still
@@ -894,18 +202,83 @@ pub(crate) struct LightMode {
     pub profile: LightingProfile,
 }
 
-pub(crate) const LAMP_BLOCK_TYPE: u8 = 72; // TYPE_LIGHTBOX
+impl LightMode {
+    /// Resolve the frontend's raw toggles into the mode the mesher actually runs with.
+    ///
+    /// GPU-shadow mode emits flat colours (Three.js lights it), so it **overrides** the baked
+    /// night/shadow toggles, which would otherwise double-shade. The returned `lamp_radius` is
+    /// always concrete (clamped, or the profile's default), because the caller also needs it as the
+    /// gather radius for the lamp index — and the two must not be allowed to disagree.
+    pub fn resolve(
+        night: bool, shadows: bool, sun_t: f32,
+        gpu: bool, lamp_radius: Option<f32>, profile: LightingProfile,
+    ) -> Self {
+        LightMode {
+            night: night && !gpu,
+            shadows: shadows && !gpu,
+            sun_t: sun_t.clamp(0.0, 1.0),
+            flat: gpu,
+            lamp_radius: lamp_radius.unwrap_or_else(|| profile.default_radius()).clamp(1.0, 64.0),
+            profile,
+        }
+    }
+}
+
+pub const LAMP_BLOCK_TYPE: u8 = 72; // TYPE_LIGHTBOX
 const LEGACY_LAMP_RADIUS: f32 = 4.0;
 const MODERN_LAMP_RADIUS: f32 = 14.0;
 const NIGHT_AMBIENT: f32 = 0.35;
 const SHADOW_RAY_STEPS: i32 = 24; // unit steps marched toward the sun per voxel
 
+/// Baked-night per-voxel light is snapped to steps of `1/MERGE_LIGHT_STEPS` before anything reads it.
+///
+/// Lamp falloff is a continuous function of distance, so without this every lit voxel gets its own
+/// `f32` triple, every face lands in its own merge group, and greedy meshing degenerates to 1×1 quads
+/// on exactly the chunks that already produce the biggest payloads (audit 2026-08-26 Finding 7).
+/// Measured on a lamp-lit 16×16 interior: night geometry was **6×–118× the day payload**; snapping to
+/// this grid brings it back to ~1.2×–4× (see "Phase 5.3 results" in `TEST WORLDS/fixplan-3d-2026-08-26.md`).
+///
+/// ⚠️ **Quantize once, at the source.** The value stored in `FaceRec::lm` must be the value that is
+/// *rendered*, or merged faces would render as the group head's light while unmerged neighbours
+/// (ramps, wedges, partial-height fluid faces) kept their raw value and seamed against them. So this
+/// is applied to `lm` itself in the voxel loop, not to the merge key — which keeps `FaceRec`'s
+/// "faces merge only when they render bit-identically" contract exactly as written.
+///
+/// Only baked-night light is snapped. The day path (`[1,1,1]`) and shadows-only (two-tone
+/// `SUN_LIT`/`SUN_SHADOW`) are already constant-valued and merge perfectly on their own, so leaving
+/// them alone keeps their output byte-for-byte what it was.
+const MERGE_LIGHT_STEPS: f32 = 32.0;
+
+/// Snap a light triple onto the `MERGE_LIGHT_STEPS` grid. `1.0` and `0.0` are exact grid points, so
+/// fullbright (lamp blocks) and unlit stay exact.
+#[inline]
+fn quantize_light(lm: [f32; 3]) -> [f32; 3] {
+    lm.map(|c| (c * MERGE_LIGHT_STEPS).round() / MERGE_LIGHT_STEPS)
+}
+
+/// The largest light value worth distinguishing on a face whose directional shade is `sh`.
+///
+/// A face's rendered brightness is `(sh * lm).min(1.0)` (`lit_rgb!`), so once `lm` is past `1/sh`
+/// the face is fully bright and every larger value renders *identically*. Night light clamps at 1.5
+/// and overlapping lamps routinely saturate an interior, so without this cap the merge key
+/// distinguishes faces the renderer cannot — a pure loss.
+///
+/// Clamping `lm` to this cap is **exactly lossless**, not approximately: for `lm < cap` it is the
+/// identity, and for `lm >= cap` the emitted `sh * cap` is `>= 1.0` and clamps to the same `1.0` the
+/// unclamped value would have. The `to_bits() + 1` nudge is what guarantees the `>= 1.0` half in f32
+/// — `sh * (1.0 / sh)` is allowed to land one ULP low. Pinned by `test_merge_light_cap_is_lossless`.
+#[inline]
+fn merge_light_cap(sh: f32) -> f32 {
+    let c = 1.0 / sh;
+    if sh * c < 1.0 { f32::from_bits(c.to_bits() + 1) } else { c }
+}
+
 #[derive(serde::Serialize)]
-pub(crate) struct LightConstants {
-    lamp_light_radius: f32,
-    legacy_lamp_radius: f32,
-    modern_lamp_radius: f32,
-    shadow_ray_steps: i32,
+pub struct LightConstants {
+    pub lamp_light_radius: f32,
+    pub legacy_lamp_radius: f32,
+    pub modern_lamp_radius: f32,
+    pub shadow_ray_steps: i32,
 }
 
 /// Exposes the legacy/modern default lamp radii + `SHADOW_RAY_STEPS` to the frontend so the edit-sync
@@ -913,8 +286,7 @@ pub(crate) struct LightConstants {
 /// away when night lighting or shadows are on) can't silently drift out of sync with the Rust
 /// constants. `lamp_light_radius` is kept as an alias of `legacy_lamp_radius` for callers that haven't
 /// been updated to the per-profile fields yet.
-#[tauri::command]
-pub(crate) fn get_light_constants() -> LightConstants {
+pub fn light_constants() -> LightConstants {
     LightConstants {
         lamp_light_radius: LEGACY_LAMP_RADIUS,
         legacy_lamp_radius: LEGACY_LAMP_RADIUS,
@@ -978,7 +350,7 @@ fn dda_march(ox: f32, oy: f32, oz: f32, dir: [f32; 3], max_dist: f32, mut hit: i
 /// (`nx/ny/nz`). `hit + normal` is the empty voxel adjacent to that face — i.e. where a block
 /// placed against it goes.
 #[derive(serde::Serialize)]
-pub(crate) struct PickResult {
+pub struct PickResult {
     pub x: i32, pub y: i32, pub z: i32,
     pub block_type: u8,
     pub paint: u8,
@@ -999,21 +371,9 @@ const PICK_MAX_DIST: f32 = 512.0;
 /// prism/pyramid intersection per block type) buys very little for a picker whose result snaps to a
 /// voxel anyway. Non-solid blocks (water, glass, fence, flowers) are hits too — you can break and
 /// build against them, which matches what the block under the crosshair looks like.
-#[tauri::command(async)]
-pub(crate) fn pick_block(
-    state: tauri::State<'_, AppState>,
-    ox: f32, oy: f32, oz: f32,
-    dx: f32, dy: f32, dz: f32,
-    max_dist: f32,
-) -> Result<Option<PickResult>, String> {
-    let ws = read_ws(&state);
-    let world = ws.world.as_ref().ok_or("No world loaded")?;
-    pick_block_in(world, ox, oy, oz, dx, dy, dz, max_dist)
-}
-
-/// Lock-free core of [`pick_block`], so it can be tested against a bare `LoadedWorld`.
-pub(crate) fn pick_block_in(
-    world: &LoadedWorld,
+/// Lock-free core of the app's `pick_block` command, so it can be tested against a bare world.
+pub fn pick_block_in(
+    world: &impl VoxelView,
     ox: f32, oy: f32, oz: f32,
     dx: f32, dy: f32, dz: f32,
     max_dist: f32,
@@ -1028,13 +388,20 @@ pub(crate) fn pick_block_in(
     let dir = [dx / len, dy / len, dz / len];
     let dist = max_dist.clamp(0.0, PICK_MAX_DIST);
 
+    // One `ChunkCache` for the whole march: the DDA walks voxel by voxel and long runs stay in the
+    // same 16×16 column, so the per-step `chunk_range` hash lookup is almost always redundant. Worst
+    // case is a ray fired into open sky — the full ~890 steps with no early-out — which is also the
+    // common case for a hover pick aimed at the horizon. `ChunkCache` is `!Sync`; this march is
+    // single-threaded, so do not rayon-ize it.
+    let cache = ChunkCache::new(world);
+
     // `dda_march` never tests the origin voxel, so the voxel preceding the first visited one is the
     // origin voxel itself — seeding `prev` with it makes the entry normal correct even for a hit on
     // the very first step.
     let mut prev = (ox.floor() as i32, oy.floor() as i32, oz.floor() as i32);
     let mut found: Option<(i32, i32, i32)> = None;
     let hit = dda_march(ox, oy, oz, dir, dist, |vx, vy, vz| {
-        if get_block_at(world, vx, vy, vz).0 != 0 {
+        if cache.get(vx, vy, vz).0 != 0 {
             found = Some((vx, vy, vz));
             true
         } else {
@@ -1043,7 +410,7 @@ pub(crate) fn pick_block_in(
         }
     });
     let Some((x, y, z)) = hit.and(found) else { return Ok(None) };
-    let (bt, paint) = get_block_at(world, x, y, z);
+    let (bt, paint) = cache.get(x, y, z);
     Ok(Some(PickResult {
         x, y, z,
         block_type: bt,
@@ -1074,6 +441,13 @@ pub(crate) fn pick_block_in(
 /// exactly the scan order the greedy rectangle pass wants. `lm` is stored as raw bits because two
 /// faces may only merge when they render *bit-identically*; that is what keeps per-block lamp light
 /// and sun shadows intact through the merge instead of averaging them across a big quad.
+///
+/// Two things widen what counts as "identical" in baked-night mode, where a continuous lamp falloff
+/// would otherwise give every lit voxel its own group (audit 2026-08-26 Finding 7):
+/// `MERGE_LIGHT_STEPS` snaps the light itself onto a fixed grid at the point it is computed (so the
+/// stored bits stay exactly the rendered value, for merged and unmerged faces alike), and
+/// `merge_light_cap` clamps the key at the brightness where this face direction's shade already
+/// saturates — losslessly, since everything past it renders the same white.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct FaceRec {
     dir: u8,
@@ -1086,8 +460,11 @@ struct FaceRec {
 }
 
 /// Face-culled cube/ramp/wedge geometry for an arbitrary world box, encoded as LE f32 position +
-/// colour triplets (Three.js Y-up coords). Shared by `get_obj_geometry` (64³ selection preview) and
-/// `get_chunk_geometry` (world-scale fly-through chunk streaming).
+/// colour triplets (Three.js Y-up coords). The core of `get_chunk_geometry` (world-scale fly-through
+/// chunk streaming) — the shaped-selection `mask` param below is now exercised only by tests (it was
+/// also used by the removed `get_obj_geometry` 64³ selection-preview command; kept, unused by any
+/// live caller, because the mask-aware behaviour it gates is still covered by
+/// `test_obj_geometry_respects_mask`).
 ///
 /// Plain cube faces are **greedily meshed**: instead of six quads per voxel, coplanar adjacent faces
 /// that render identically fuse into one large quad, which is what keeps a 256z world's chunk
@@ -1095,15 +472,16 @@ struct FaceRec {
 /// rather than its voxel count. Ramps, wedges and partial-height fluid faces stay per-block — they
 /// are not unit squares, so there is nothing to tile. See `FaceRec`.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn obj_geometry_region(world: &LoadedWorld, pack: Option<&texturepack::TexturePack>, sx1: i32, sy1: i32, sx2: i32, sy2: i32, sz1: i32, sz2: i32, lamps: &[([i32; 3], [f32; 3])], mode: LightMode, mask: Option<&crate::SelectionMask>) -> ObjGeometryResult {
+pub fn obj_geometry_region(world: &impl VoxelView, meta: ViewMeta, pack: Option<&TexturePack>, sx1: i32, sy1: i32, sx2: i32, sy2: i32, sz1: i32, sz2: i32, lamps: &[([i32; 3], [f32; 3])], mode: LightMode, mask: Option<&SelectionMask>) -> ObjGeometryResult {
     // Every block read below goes through the chunk-address memo. Single-threaded by construction
     // (see ChunkCache) — this function is not parallelised.
     let cache = ChunkCache::new(world);
-    // Shaped selection (3D preview): an unmasked column reads as air here, so both emission and
-    // occlusion see the hole through the single block-getter — side faces at hole edges emit
-    // correctly without a separate emission-loop gate. `None` (FlyView3D streaming, export) is a
-    // no-op. Fail-safe is upstream: `get_obj_geometry` resolves the mask via `active_mask` (exact
-    // bbox), so a mismatched selection never reaches here masked.
+    // Shaped selection: an unmasked column reads as air here, so both emission and occlusion see
+    // the hole through the single block-getter — side faces at hole edges emit correctly without a
+    // separate emission-loop gate. `None` (the only value `get_chunk_geometry`'s FlyView3D streaming
+    // ever passes) is a no-op. Exercised directly by tests, since the mask-resolving caller
+    // (`active_mask`) it used to sit behind — the removed `get_obj_geometry` 64³ selection-preview
+    // command — no longer exists.
     let gb = |wx: i32, wy: i32, wz: i32| {
         if mask.is_some_and(|m| !m.contains(wx, wy)) { return (0u8, 0u8); }
         cache.get(wx, wy, wz)
@@ -1204,6 +582,11 @@ pub(crate) fn obj_geometry_region(world: &LoadedWorld, pack: Option<&texturepack
     const SH_S:   f32 = 0.549; // south (+Y)
     const SH_N:   f32 = 0.749; // north (-Y)
 
+    // Per-`FaceRec::dir` saturation cap for the greedy-merge light key — see `merge_light_cap` and
+    // the `FaceRec` doc comment. Indexed by `dir` (0 top, 1 bottom, 2 south, 3 north, 4 east, 5 west),
+    // which is why the order here has to match `MERGE_DIRS`/the emission `match` at the end.
+    let light_cap: [f32; 6] = [SH_TOP, SH_BOT, SH_S, SH_N, SH_E, SH_W].map(merge_light_cap);
+
     // Detect face kind from shade constant so per-face textures work without touching every call site.
     // SH_TOP → top face (2), SH_BOT → bottom face (1), anything else → side face (0).
     // Wedge diagonal blended shades ((SH_N+SH_W)*0.5 etc.) are not equal to SH_TOP/SH_BOT → side.
@@ -1265,7 +648,7 @@ pub(crate) fn obj_geometry_region(world: &LoadedWorld, pack: Option<&texturepack
         ($verts:expr, $rgb:expr, $sh:expr, $lm:expr, $btype:expr, $bpaint:expr) => {{
             let fk = face_kind!($sh);
             let (rgb2, row_opt) = if let Some(p) = pack {
-                texturepack::face_color_and_row(p, $btype, $bpaint, fk, $rgb)
+                texture::face_color_and_row(p, $btype, $bpaint, fk, $rgb)
             } else { ($rgb, None) };
             let [r,g,b] = lit_rgb!(rgb2, $sh, $lm);
             if flat && $btype == LAMP_BLOCK_TYPE {
@@ -1299,7 +682,7 @@ pub(crate) fn obj_geometry_region(world: &LoadedWorld, pack: Option<&texturepack
         ($a:expr,$b:expr,$c:expr,$d:expr,$rgb:expr,$sh:expr,$lm:expr,$btype:expr,$bpaint:expr,$nu:expr) => {{
             let fk = face_kind!($sh);
             let (rgb2, row_opt) = if let Some(p) = pack {
-                texturepack::face_color_and_row(p, $btype, $bpaint, fk, $rgb)
+                texture::face_color_and_row(p, $btype, $bpaint, fk, $rgb)
             } else { ($rgb, None) };
             let [r,g,b_] = lit_rgb!(rgb2, $sh, $lm);
             if flat && $btype == LAMP_BLOCK_TYPE {
@@ -1371,10 +754,13 @@ pub(crate) fn obj_geometry_region(world: &LoadedWorld, pack: Option<&texturepack
                     continue;
                 }
 
-                let rgb = block_color(bt, paint, world.sky);
+                let rgb = block_color(bt, paint, meta.sky);
                 let base_lm = light_at(wx, wy, wz, bt);
                 let shadow = shadow_at(wx, wy, wz);
                 let lm = [base_lm[0] * shadow, base_lm[1] * shadow, base_lm[2] * shadow];
+                // Baked-night light varies continuously with distance-to-lamp; snap it so that
+                // near-identical neighbours can fuse in the greedy mesh pass. See MERGE_LIGHT_STEPS.
+                let lm = if mode.night { quantize_light(lm) } else { lm };
                 let (x0,x1f) = (wx as f32, wx as f32+1.0);
                 let (y0,y1f) = (wy as f32, wy as f32+1.0);
                 let (z0,z1f) = (wz as f32, wz as f32+1.0);
@@ -1506,13 +892,26 @@ pub(crate) fn obj_geometry_region(world: &LoadedWorld, pack: Option<&texturepack
                     // whole unit cell — i.e. it is a real 1×1 square that can tile with its neighbours.
                     // Partial-height fluid faces (a ¾/½/¼ surface, or a lateral sliver stepping down to
                     // a shallower neighbour) are not squares, so they emit immediately and unmerged,
-                    // exactly as before. `key_lm` is the light the merge key compares: in flat mode
-                    // `lit_rgb!` discards `lm` entirely, so folding it to a constant there lets a
-                    // GPU-shadow render merge across lamp light it isn't going to bake anyway.
+                    // exactly as before. `key_lm` is the light the merge key compares — and, because
+                    // the merge pass rebuilds the emitted colour from it, also the light the merged
+                    // quad renders with. Two adjustments, both of which only ever make more faces
+                    // compare equal:
+                    //   • flat (GPU-shadow) mode: `lit_rgb!` discards `lm` entirely, so folding the
+                    //     key to a constant lets a GPU-shadow render merge across lamp light it was
+                    //     never going to bake.
+                    //   • otherwise: clamp to this direction's saturation cap, which is exactly
+                    //     lossless (see `merge_light_cap`) — `lm` above `1/sh` renders identically.
+                    // The other half of the night-mode merge story, snapping `lm` to the
+                    // `MERGE_LIGHT_STEPS` grid, happens once per voxel where `lm` is computed, so
+                    // that unmerged faces (ramps, wedges, partial fluids) can't seam against merged
+                    // neighbours. See `MERGE_LIGHT_STEPS`.
                     let full_top = ztop == z1f;
-                    let key_lm = if flat { [1.0f32, 1.0, 1.0] } else { lm };
-                    let key_lm = [key_lm[0].to_bits(), key_lm[1].to_bits(), key_lm[2].to_bits()];
                     let mut defer = |dir: u8, slice: i32, u: i32, v: i32| {
+                        let key_lm = if flat { [1.0f32, 1.0, 1.0] } else {
+                            let cap = light_cap[dir as usize];
+                            [lm[0].min(cap), lm[1].min(cap), lm[2].min(cap)]
+                        };
+                        let key_lm = [key_lm[0].to_bits(), key_lm[1].to_bits(), key_lm[2].to_bits()];
                         faces.push(FaceRec { dir, slice, bt, paint, lm: key_lm, v, u });
                     };
 
@@ -1583,7 +982,7 @@ pub(crate) fn obj_geometry_region(world: &LoadedWorld, pack: Option<&texturepack
         let group = &faces[gi..gj];
         gi = gj;
 
-        let rgb = block_color(head.bt, head.paint, world.sky);
+        let rgb = block_color(head.bt, head.paint, meta.sky);
         let lm = [f32::from_bits(head.lm[0]), f32::from_bits(head.lm[1]), f32::from_bits(head.lm[2])];
 
         idx.clear();
@@ -1667,179 +1066,81 @@ pub(crate) fn obj_geometry_region(world: &LoadedWorld, pack: Option<&texturepack
 /// The frontend still has to invalidate its chunk cache when the cap changes (it does — `viewCapZ`
 /// is a `reloadAllChunks()` trigger in FlyView3D), which is why the band itself stays an explicit
 /// parameter rather than being derived here too.
-#[tauri::command(async)]
+///
+/// The app keeps only the lock/state/instrumentation shell around this: it resolves the world, the
+/// texture pack, the cutaway cap and the lamp gather (see [`crate::lamps`]) and hands them in.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn get_chunk_geometry(
-    state: tauri::State<'_, AppState>,
+pub fn chunk_geometry(
+    world: &impl VoxelView,
+    meta: ViewMeta,
+    pack: Option<&TexturePack>,
+    lamps: &[([i32; 3], [f32; 3])],
     cx: i32, cy: i32,
-    night: bool, shadows: bool, sun_t: f32,
-    gpu: Option<bool>,
-    lamp_radius: Option<f32>,
-    lighting_profile: Option<LightingProfile>,
+    mode: LightMode,
     z_min: Option<i32>, z_max: Option<i32>,
-) -> Result<ObjGeometryResult, String> {
-    let profile = lighting_profile.unwrap_or_default();
-    // Read guard: the lazily-built lamp index is interior-mutable (`LampIndex`), so streaming
-    // chunk geometry for the 3D pane never blocks — or is blocked by — other readers.
-    let ws = read_ws(&state);
-    let empty = || ObjGeometryResult {
-        positions: Vec::new(), colors: Vec::new(), uvs: Vec::new(), vertex_count: 0,
-        positions_t: Vec::new(), colors_t: Vec::new(), uvs_t: Vec::new(), vertex_count_t: 0,
-        positions_e: Vec::new(), colors_e: Vec::new(), uvs_e: Vec::new(), vertex_count_e: 0,
-    };
-    {
-        let world = ws.world.as_ref().ok_or("No world loaded")?;
-        // Defensive: only serve chunks inside the world's chunk grid. Out-of-range indices already scan
-        // to all-air (empty geometry), but bailing early avoids the wasted 16×16×Z probe and documents
-        // the frontend contract (local 0-based chunk indices).
-        if cx < 0 || cy < 0 || cx as u32 >= world.w_chunks || cy as u32 >= world.h_chunks {
-            return Ok(empty());
-        }
-        // Early-out on an unpopulated chunk. Eden only saves edited chunks, so on sparse worlds most
-        // chunks streamed by the fly-through pane's radius sweep are entirely unwritten — without this
-        // check they'd still pay the full 16×16×maxZ scan (~460K get_block_at lookups) just to discover
-        // every voxel is air. This is the single biggest win available for fly-mode hitching on sparse
-        // worlds; it does not affect worlds with contiguous chunk coverage (chunk_map hit on the first try).
-        if !world.chunk_map.contains_key(&(cx + world.min_x, cy + world.min_y)) {
-            return Ok(empty());
-        }
+    cap: Option<i32>,
+) -> ObjGeometryResult {
+    // Defensive: only serve chunks inside the world's chunk grid. Out-of-range indices already scan
+    // to all-air (empty geometry), but bailing early avoids the wasted 16×16×Z probe and documents
+    // the frontend contract (local 0-based chunk indices).
+    if cx < 0 || cy < 0 || cx as u32 >= meta.w_chunks || cy as u32 >= meta.h_chunks {
+        return ObjGeometryResult::empty();
     }
-    // GPU-shadow mode emits flat colours (Three.js lights it); it overrides the baked night/shadow
-    // toggles, which would otherwise double-shade. Baked night lamps are only gathered when night is
-    // on and we're NOT in flat/GPU mode (GPU night uses real point lights on the frontend instead).
-    let flat = gpu.unwrap_or(false);
-    let baked_night = night && !flat;
-    let lamp_r = lamp_radius.unwrap_or_else(|| profile.default_radius()).clamp(1.0, 64.0);
-    let sx1 = cx * 16; let sy1 = cy * 16;
+    // Early-out on an unpopulated chunk. Eden only saves edited chunks, so on sparse worlds most
+    // chunks streamed by the fly-through pane's radius sweep are entirely unwritten — without this
+    // check they'd still pay the full 16×16×maxZ scan (~460K get_block_at lookups) just to discover
+    // every voxel is air. This is the single biggest win available for fly-mode hitching on sparse
+    // worlds; it does not affect worlds with contiguous chunk coverage (a hit on the first try).
+    let (min_x, min_y) = world.chunk_origin();
+    if world.chunk_bytes(cx + min_x, cy + min_y).is_none() {
+        return ObjGeometryResult::empty();
+    }
+    let sx1 = cx * 16;
+    let sy1 = cy * 16;
+    let (sz1, sz2) = emitted_band(world, z_min, z_max, cap);
+    // Fly-through streaming stays unmasked.
+    obj_geometry_region(world, meta, pack, sx1, sy1, sx1 + 15, sy1 + 15, sz1, sz2, lamps, mode, None)
+}
 
-    let world = ws.world.as_ref().unwrap();
-    // Gather lamps within reach of this chunk from the spatial index (O(lamps), not an O((16+2r)³)
-    // voxel scan), resolving each lamp's colour from its own paint. `LampIndex::lamps_in_region`
-    // scans just the handful of chunks this request needs, on demand — interior-mutable, so this
-    // whole command needs only a read guard.
-    let lamps: Vec<([i32; 3], [f32; 3])> = if baked_night {
-        ws.lamp_index
-            .lamps_in_region(world, sx1, sy1, sx1 + 15, sy1 + 15, lamp_r)
-            .into_iter()
-            .map(|p| {
-                let (_, paint) = get_block_at(world, p[0], p[1], p[2]);
-                let rgb = block_color(LAMP_BLOCK_TYPE, paint, world.sky);
-                (p, [rgb[0] as f32 / 255.0, rgb[1] as f32 / 255.0, rgb[2] as f32 / 255.0])
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
-
-    let mode = LightMode {
-        night: baked_night,
-        shadows: shadows && !flat,
-        sun_t: sun_t.clamp(0.0, 1.0),
-        flat,
-        lamp_radius: lamp_r,
-        profile,
-    };
-    let t0 = std::time::Instant::now();
-    // Emitted z band: the caller's camera band ∩ the cutaway cap ∩ the world's real z range. Clamped
-    // (not rejected) so a nonsensical band degrades to a smaller render, never an error mid-stream;
-    // an inverted or fully out-of-range band collapses to sz1 > sz2, and the emission loop then emits
-    // nothing — the same empty result an all-air chunk gives.
+/// The z band [`chunk_geometry`] will emit: the caller's camera band ∩ the cutaway `cap` ∩ the
+/// world's real z range.
+///
+/// Clamped (not rejected) so a nonsensical band degrades to a smaller render, never an error
+/// mid-stream; an inverted or fully out-of-range band collapses to `sz1 > sz2`, and the emission
+/// loop then emits nothing — the same empty result an all-air chunk gives. Public so an app's
+/// instrumentation can report the band that was actually rendered rather than the one requested.
+pub fn emitted_band(
+    world: &impl VoxelView, z_min: Option<i32>, z_max: Option<i32>, cap: Option<i32>,
+) -> (i32, i32) {
     let max_z = world_max_z(world);
-    let cap = ws.view_cap_z.unwrap_or(max_z);
-    let sz1 = z_min.unwrap_or(0).clamp(0, max_z);
-    let sz2 = z_max.unwrap_or(max_z).min(cap).clamp(0, max_z);
-    let res = obj_geometry_region(world, ws.texture_pack.as_ref(), sx1, sy1, sx1 + 15, sy1 + 15, sz1, sz2, &lamps, mode, None); // FlyView3D streaming stays unmasked
-    // Stage 0 instrumentation: per-chunk payload size, so a pathological chunk (a tall 256z cliff
-    // face can emit >1 M verts / tens of MB) is identifiable next to the frontend's resident-bytes
-    // HUD. Debug builds only — `timing_log!` compiles to nothing in release.
-    crate::timing_log!(
-        "[GEOM] chunk ({},{}) z{}..{} verts {}/{}/{} payload {:.2} MB in {:?}",
-        cx, cy, sz1, sz2,
-        res.vertex_count, res.vertex_count_t, res.vertex_count_e,
-        res.wire_bytes() as f64 / (1 << 20) as f64,
-        t0.elapsed(),
-    );
-    Ok(res)
-}
-
-/// One lamp light for the experimental GPU night path (real `THREE.PointLight`s). Position is in
-/// Eden local block coords (voxel centre); the frontend maps Eden(x,y,z)→THREE(x,z,y). Colour is the
-/// lamp's own paint, normalized 0..1.
-#[derive(serde::Serialize)]
-pub(crate) struct LampLight {
-    pub x: f32, pub y: f32, pub z: f32,
-    pub r: f32, pub g: f32, pub b: f32,
-}
-
-/// Returns the lamp blocks within `radius` blocks of a point, nearest-first (capped), for the GPU
-/// night path. Reads the chunk-keyed lamp index (built lazily), so this is O(nearby lamps) rather
-/// than a voxel scan. The frontend assigns the nearest N to a fixed pool of point lights.
-#[tauri::command(async)]
-pub(crate) fn get_lamps_near(
-    state: tauri::State<'_, AppState>,
-    x: f32, y: f32, z: f32, radius: f32,
-) -> Result<Vec<LampLight>, String> {
-    let ws = read_ws(&state);
-    if ws.world.is_none() { return Err("No world loaded".into()); }
-    let radius = radius.clamp(1.0, 512.0);
-    let world = ws.world.as_ref().unwrap();
-    let sx = x.floor() as i32;
-    let sy = y.floor() as i32;
-    let mut lamps: Vec<(f32, LampLight)> = ws.lamp_index
-        .lamps_in_region(world, sx, sy, sx, sy, radius)
-        .into_iter()
-        .filter_map(|p| {
-            let dx = p[0] as f32 + 0.5 - x;
-            let dy = p[1] as f32 + 0.5 - y;
-            let dz = p[2] as f32 + 0.5 - z;
-            let d2 = dx * dx + dy * dy + dz * dz;
-            if d2 > radius * radius { return None; }
-            let (_, paint) = get_block_at(world, p[0], p[1], p[2]);
-            let rgb = block_color(LAMP_BLOCK_TYPE, paint, world.sky);
-            Some((d2, LampLight {
-                x: p[0] as f32 + 0.5, y: p[1] as f32 + 0.5, z: p[2] as f32 + 0.5,
-                r: rgb[0] as f32 / 255.0, g: rgb[1] as f32 / 255.0, b: rgb[2] as f32 / 255.0,
-            }))
-        })
-        .collect();
-    lamps.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-    // Server-side cap — the frontend pool is smaller still, but bounding here keeps the IPC payload
-    // tiny even on a lamp-dense world.
-    const SERVER_CAP: usize = 64;
-    lamps.truncate(SERVER_CAP);
-    Ok(lamps.into_iter().map(|(_, l)| l).collect())
+    let cap = cap.unwrap_or(max_z);
+    (
+        z_min.unwrap_or(0).clamp(0, max_z),
+        z_max.unwrap_or(max_z).min(cap).clamp(0, max_z),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use memmap2::MmapMut;
+    use crate::testworld::TestWorld;
 
-    /// Minimal single-chunk world (same layout as lib.rs's `make_test_world`, duplicated here since
-    /// that helper lives in a `mod tests` private to lib.rs).
-    fn make_test_world() -> LoadedWorld {
-        const HEADER: usize = 4096;
-        const CHUNK: usize = 32768;
-        const ENTRY: usize = 16;
-        let chunk_off: u32 = HEADER as u32;
-        let ptr_off: u32 = (HEADER + CHUNK) as u32;
-        let mut b = vec![0u8; HEADER + CHUNK + ENTRY];
-        b[32..36].copy_from_slice(&ptr_off.to_le_bytes());
-        b[40..49].copy_from_slice(b"TestWorld");
-        let pe = HEADER + CHUNK;
-        b[pe..pe + 2].copy_from_slice(&0i16.to_le_bytes());
-        b[pe + 4..pe + 6].copy_from_slice(&0i16.to_le_bytes());
-        b[pe + 8..pe + 12].copy_from_slice(&chunk_off.to_le_bytes());
-        let mut m = MmapMut::map_anon(b.len()).expect("anon mmap");
-        m.copy_from_slice(&b);
-        crate::parse_world_inner(m).expect("parse failed")
+    /// Minimal single-chunk 64z world — the same 32 768-byte, 4-band shape both apps' tests use.
+    fn make_test_world() -> TestWorld {
+        TestWorld::new(1, 1, 4)
+    }
+
+    /// Byte index of block `(lx, ly, z)`'s *type* in `make_test_world`'s single chunk; `+ 4096` for
+    /// its paint byte.
+    fn block(lx: usize, ly: usize, z: i32) -> usize {
+        (z / 16) as usize * 8192 + lx * 256 + ly * 16 + (z % 16) as usize
     }
 
     /// Old-style voxel scan for lamps within `radius` of a region — the pre-index reference the
-    /// production path (`get_chunk_geometry`) used to run inline. Kept in the test module both to
-    /// build the lamp slice `obj_geometry_region` now expects and as the parity baseline for the
-    /// index-based gather (`lamps_in_region`).
-    fn scan_lamps(world: &LoadedWorld, sx1: i32, sy1: i32, sx2: i32, sy2: i32, sz1: i32, sz2: i32, radius: f32) -> Vec<([i32; 3], [f32; 3])> {
+    /// production path used to run inline. Kept in the test module both to build the lamp slice
+    /// `obj_geometry_region` now expects and as the parity baseline for the index-based gather
+    /// (`crate::lamps::lamps_in_region`).
+    fn scan_lamps(world: &TestWorld, sx1: i32, sy1: i32, sx2: i32, sy2: i32, sz1: i32, sz2: i32, radius: f32) -> Vec<([i32; 3], [f32; 3])> {
         let cache = ChunkCache::new(world);
         let r = radius.ceil() as i32;
         let mut found = Vec::new();
@@ -1859,10 +1160,10 @@ mod tests {
 
     /// A block's side-face color (any face other than top/bottom) under a given `LightMode`,
     /// found by matching the shading multiplier used for side faces (SH_S etc, all < 1.0 and != SH_BOT).
-    fn side_face_color(world: &LoadedWorld, x: i32, y: i32, z: i32, z2: i32, mode: LightMode) -> [f32; 3] {
+    fn side_face_color(world: &TestWorld, x: i32, y: i32, z: i32, z2: i32, mode: LightMode) -> [f32; 3] {
         let radius = if mode.lamp_radius > 0.0 { mode.lamp_radius } else { mode.profile.default_radius() };
         let lamps = if mode.night { scan_lamps(world, x, y, x, y, z, z2, radius) } else { Vec::new() };
-        let g = obj_geometry_region(world, None, x, y, x, y, z, z2, &lamps, mode, None);
+        let g = obj_geometry_region(world, world.meta(), None, x, y, x, y, z, z2, &lamps, mode, None);
         let floats: Vec<f32> = g.colors.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
         // Plain-cube push order (see the `else` branch in obj_geometry_region): top, bottom, south,
         // north, east, west quads, 6 vertices × 3 floats each. South is the 3rd quad (index 2).
@@ -1875,11 +1176,6 @@ mod tests {
     fn night_lighting_dims_and_lamps_dont_darken_faster_than_ambient() {
         let mut world = make_test_world();
         // Probe stone column at (3,5,0..1); lamp block directly above at z=3 (distance 3 < radius 5).
-        let block = |lx: usize, ly: usize, z: i32| -> usize {
-            let band = (z / 16) as usize;
-            let lz = (z % 16) as usize;
-            4096 + band * 8192 + lx * 256 + ly * 16 + lz
-        };
         world.bytes[block(3, 5, 0)] = 2; // Stone
         world.bytes[block(3, 5, 3)] = LAMP_BLOCK_TYPE;
 
@@ -1895,11 +1191,6 @@ mod tests {
     #[test]
     fn lamp_light_is_tinted_by_the_lamp_paint_not_a_separate_colour_table() {
         let mut world = make_test_world();
-        let block = |lx: usize, ly: usize, z: i32| -> usize {
-            let band = (z / 16) as usize;
-            let lz = (z % 16) as usize;
-            4096 + band * 8192 + lx * 256 + ly * 16 + lz
-        };
         let paint = |lx: usize, ly: usize, z: i32| -> usize {
             let band = (z / 16) as usize;
             let lz = (z % 16) as usize;
@@ -1921,22 +1212,17 @@ mod tests {
     #[test]
     fn flat_mode_routes_lamp_faces_to_the_emissive_stream() {
         let mut world = make_test_world();
-        let block = |lx: usize, ly: usize, z: i32| -> usize {
-            let band = (z / 16) as usize;
-            let lz = (z % 16) as usize;
-            4096 + band * 8192 + lx * 256 + ly * 16 + lz
-        };
         world.bytes[block(3, 5, 0)] = LAMP_BLOCK_TYPE; // isolated lamp in air → all 6 faces emit
 
         // Non-flat (baked default): lamp faces stay in the opaque stream; the emissive stream is
-        // untouched, so OBJ/JSON export and ThreeDPreview see byte-identical output.
-        let baked = obj_geometry_region(&world, None, 3, 5, 3, 5, 0, 0, &[], LightMode::default(), None);
+        // untouched, matching a plain flat fully-lit render (`LightMode::default()`).
+        let baked = obj_geometry_region(&world, world.meta(), None, 3, 5, 3, 5, 0, 0, &[], LightMode::default(), None);
         assert_eq!(baked.vertex_count_e, 0, "default (non-flat) mode must not populate the emissive stream");
         assert!(baked.vertex_count > 0, "lamp faces belong to the opaque stream in non-flat mode");
         assert_eq!(baked.vertex_count_t, 0, "a lamp is opaque — nothing in the transparent stream");
 
         // Flat (GPU) mode: the same lamp faces move to the emissive stream; the opaque stream is empty.
-        let flat = obj_geometry_region(&world, None, 3, 5, 3, 5, 0, 0, &[], LightMode { flat: true, ..Default::default() }, None);
+        let flat = obj_geometry_region(&world, world.meta(), None, 3, 5, 3, 5, 0, 0, &[], LightMode { flat: true, ..Default::default() }, None);
         assert!(flat.vertex_count_e > 0, "flat mode must route lamp faces into the emissive stream");
         assert_eq!(flat.vertex_count, 0, "no non-lamp opaque faces expected for an isolated lamp");
         assert_eq!(flat.vertex_count_e, baked.vertex_count, "same lamp geometry, just a different stream");
@@ -1948,20 +1234,15 @@ mod tests {
     #[test]
     fn test_obj_geometry_respects_mask() {
         let mut world = make_test_world();
-        let block = |lx: usize, ly: usize, z: i32| -> usize {
-            let band = (z / 16) as usize;
-            let lz = (z % 16) as usize;
-            4096 + band * 8192 + lx * 256 + ly * 16 + lz
-        };
         world.bytes[block(3, 5, 0)] = 2; // stone
         world.bytes[block(4, 5, 0)] = 2; // stone (adjacent in +x)
 
         // Full box (no mask): both cubes present; the shared face between them is culled.
-        let full = obj_geometry_region(&world, None, 3, 5, 4, 5, 0, 0, &[], LightMode::default(), None);
+        let full = obj_geometry_region(&world, world.meta(), None, 3, 5, 4, 5, 0, 0, &[], LightMode::default(), None);
 
         // Mask over bbox (3,5)-(4,5), only column (3,5) set.
-        let mask = crate::SelectionMask { x1: 3, y1: 5, x2: 4, y2: 5, bits: vec![0b01] };
-        let masked = obj_geometry_region(&world, None, 3, 5, 4, 5, 0, 0, &[], LightMode::default(), Some(&mask));
+        let mask = SelectionMask { x1: 3, y1: 5, x2: 4, y2: 5, bits: vec![0b01] };
+        let masked = obj_geometry_region(&world, world.meta(), None, 3, 5, 4, 5, 0, 0, &[], LightMode::default(), Some(&mask));
 
         assert!(masked.vertex_count > 0, "masked cell still emits geometry");
         // NB: vertex *counts* can't tell these apart any more — greedy meshing fuses the two cubes'
@@ -1978,7 +1259,7 @@ mod tests {
         // only solid block is (3,5,0), so its +x neighbour really is air.
         let mut lone_world = make_test_world();
         lone_world.bytes[block(3, 5, 0)] = 2;
-        let isolated = obj_geometry_region(&lone_world, None, 3, 5, 3, 5, 0, 0, &[], LightMode::default(), None);
+        let isolated = obj_geometry_region(&lone_world, lone_world.meta(), None, 3, 5, 3, 5, 0, 0, &[], LightMode::default(), None);
         assert_eq!(masked.vertex_count, isolated.vertex_count, "hole-facing side face emits (full cube)");
         assert_eq!(masked.positions, isolated.positions, "and is byte-identical to a genuinely lone cube");
     }
@@ -1994,21 +1275,16 @@ mod tests {
     /// render of the truncated world.
     #[test]
     fn test_obj_geometry_z_clip_emits_cap_faces() {
-        let block = |lx: usize, ly: usize, z: i32| -> usize {
-            let band = (z / 16) as usize;
-            let lz = (z % 16) as usize;
-            4096 + band * 8192 + lx * 256 + ly * 16 + lz
-        };
         // Tall column z=0..=5 at (3,5), rendered clipped to the middle slab z=2..=4.
         let mut tall = make_test_world();
         for z in 0..=5 { tall.bytes[block(3, 5, z)] = 2; }
-        let clipped = obj_geometry_region(&tall, None, 3, 5, 3, 5, 2, 4, &[], LightMode::default(), None);
+        let clipped = obj_geometry_region(&tall, tall.meta(), None, 3, 5, 3, 5, 2, 4, &[], LightMode::default(), None);
 
         // Same three blocks, but z=1 and z=5 really are air — rendered over the whole world column so
         // no clipping is in play at all.
         let mut short = make_test_world();
         for z in 2..=4 { short.bytes[block(3, 5, z)] = 2; }
-        let reference = obj_geometry_region(&short, None, 3, 5, 3, 5, 0, world_max_z(&short), &[], LightMode::default(), None);
+        let reference = obj_geometry_region(&short, short.meta(), None, 3, 5, 3, 5, 0, world_max_z(&short), &[], LightMode::default(), None);
 
         // 4 side faces (each greedy-merged into one 3-tall quad down the column) + the two cap faces
         // = 6 quads = 36 verts. Spelled out so a regression that silently drops the caps (24) or
@@ -2032,27 +1308,16 @@ mod tests {
     #[test]
     fn test_obj_geometry_z_clip_degenerate_bands() {
         let mut world = make_test_world();
-        let block = |lx: usize, ly: usize, z: i32| -> usize {
-            let band = (z / 16) as usize;
-            let lz = (z % 16) as usize;
-            4096 + band * 8192 + lx * 256 + ly * 16 + lz
-        };
         for z in 0..=5 { world.bytes[block(3, 5, z)] = 2; }
 
-        let above = obj_geometry_region(&world, None, 3, 5, 3, 5, 40, 48, &[], LightMode::default(), None);
+        let above = obj_geometry_region(&world, world.meta(), None, 3, 5, 3, 5, 40, 48, &[], LightMode::default(), None);
         assert_eq!(above.vertex_count, 0, "band above the terrain emits nothing");
-        let inverted = obj_geometry_region(&world, None, 3, 5, 3, 5, 4, 2, &[], LightMode::default(), None);
+        let inverted = obj_geometry_region(&world, world.meta(), None, 3, 5, 3, 5, 4, 2, &[], LightMode::default(), None);
         assert_eq!(inverted.vertex_count, 0, "inverted band emits nothing");
     }
 
     // ---- Greedy meshing (Stage 5 of the 3D-pane crash fix) --------------------------------------
 
-    /// Byte index of block `(lx, ly, z)`'s *type* in `make_test_world`'s single chunk.
-    fn tblock(lx: usize, ly: usize, z: i32) -> usize {
-        let band = (z / 16) as usize;
-        let lz = (z % 16) as usize;
-        4096 + band * 8192 + lx * 256 + ly * 16 + lz
-    }
 
     /// The emitted opaque quads as `[(three_x, three_y, three_z); 6]` vertex tuples. Positions are
     /// non-indexed, 6 verts per quad, so the stream chunks exactly.
@@ -2106,8 +1371,8 @@ mod tests {
     #[test]
     fn test_greedy_merge_flat_slab_collapses_to_one_quad_per_face() {
         let mut world = make_test_world();
-        for x in 3..=6 { for y in 5..=8 { world.bytes[tblock(x, y, 0)] = 2; } }
-        let g = obj_geometry_region(&world, None, 3, 5, 6, 8, 0, 0, &[], LightMode::default(), None);
+        for x in 3..=6 { for y in 5..=8 { world.bytes[block(x, y, 0)] = 2; } }
+        let g = obj_geometry_region(&world, world.meta(), None, 3, 5, 6, 8, 0, 0, &[], LightMode::default(), None);
         assert_eq!(g.vertex_count, 6 * 6, "top + bottom + four merged sides");
 
         // The single top quad really spans the whole 4×4 footprint, rather than six quads happening
@@ -2126,8 +1391,8 @@ mod tests {
     fn test_greedy_merge_tiles_an_l_shape_exactly() {
         let mut world = make_test_world();
         let shape = [(3, 5), (4, 5), (5, 5), (3, 6), (3, 7)];
-        for &(x, y) in &shape { world.bytes[tblock(x, y, 0)] = 2; }
-        let g = obj_geometry_region(&world, None, 3, 5, 5, 7, 0, 0, &[], LightMode::default(), None);
+        for &(x, y) in &shape { world.bytes[block(x, y, 0)] = 2; }
+        let g = obj_geometry_region(&world, world.meta(), None, 3, 5, 5, 7, 0, 0, &[], LightMode::default(), None);
 
         let top = quads_in_plane_y(&g, 1.0);
         let cells = covered_cells(&top);
@@ -2143,33 +1408,89 @@ mod tests {
     fn test_greedy_merge_splits_on_block_type() {
         let mut world = make_test_world();
         for x in 3..=6 { for y in 5..=8 {
-            world.bytes[tblock(x, y, 0)] = if (x + y) % 2 == 0 { 2 } else { 3 }; // stone / dirt
+            world.bytes[block(x, y, 0)] = if (x + y) % 2 == 0 { 2 } else { 3 }; // stone / dirt
         } }
-        let g = obj_geometry_region(&world, None, 3, 5, 6, 8, 0, 0, &[], LightMode::default(), None);
+        let g = obj_geometry_region(&world, world.meta(), None, 3, 5, 6, 8, 0, 0, &[], LightMode::default(), None);
         let top = quads_in_plane_y(&g, 1.0);
         assert_eq!(top.len(), 16, "no two same-type cells are edge-adjacent, so no top face merges");
         assert_eq!(covered_cells(&top).len(), 16);
     }
 
-    /// …and only when they are lit identically. Two adjacent stone blocks under night lighting sit at
-    /// different distances from a lamp, so their top faces carry different colours and must stay
-    /// separate quads — merging them would flatten the lamp falloff into one average.
+    /// …and only when they are lit identically — where "identically" means *after* the light has been
+    /// snapped onto the `MERGE_LIGHT_STEPS` grid (Phase 5.3). Four stone cells in a row under one
+    /// lamp: the two nearest it differ by less than one light step and therefore fuse, while the two
+    /// further out each fall a step and stay separate, so lamp falloff is still visible as distinct
+    /// quads rather than flattened into one average.
     #[test]
     fn test_greedy_merge_splits_on_per_block_light() {
         let mut world = make_test_world();
-        world.bytes[tblock(3, 5, 0)] = 2;
-        world.bytes[tblock(4, 5, 0)] = 2;
-        world.bytes[tblock(3, 5, 3)] = LAMP_BLOCK_TYPE;
+        for x in 3..=6 { world.bytes[block(x, 5, 0)] = 2; }
+        world.bytes[block(3, 5, 3)] = LAMP_BLOCK_TYPE;
 
-        let day = obj_geometry_region(&world, None, 3, 5, 4, 5, 0, 0, &[], LightMode::default(), None);
+        let day = obj_geometry_region(&world, world.meta(), None, 3, 5, 6, 5, 0, 0, &[], LightMode::default(), None);
         assert_eq!(quads_in_plane_y(&day, 1.0).len(), 1, "unlit: identical colour, one merged quad");
 
         let night_mode = LightMode { night: true, shadows: false, sun_t: 0.0, flat: false, lamp_radius: 0.0, profile: LightingProfile::Legacy };
-        let lamps = scan_lamps(&world, 3, 5, 4, 5, 0, 0, night_mode.profile.default_radius());
-        let night = obj_geometry_region(&world, None, 3, 5, 4, 5, 0, 0, &lamps, night_mode, None);
+        let lamps = scan_lamps(&world, 3, 5, 6, 5, 0, 0, night_mode.profile.default_radius());
+        let night = obj_geometry_region(&world, world.meta(), None, 3, 5, 6, 5, 0, 0, &lamps, night_mode, None);
         let top = quads_in_plane_y(&night, 1.0);
-        assert_eq!(top.len(), 2, "lit differently → not merged");
+        assert_eq!(covered_cells(&top).len(), 4, "the four top faces are still tiled exactly once each");
+        assert_eq!(top.len(), 3, "sub-step light difference fuses x=3..5; x=5 and x=6 each step down");
+
+        // Specifically: the fused quad is the two cells nearest the lamp, not some other pairing.
+        let spans: Vec<(i32, i32)> = top.iter().map(|q| {
+            let x0 = q.iter().map(|v| v.0).fold(f32::INFINITY, f32::min) as i32;
+            let x1 = q.iter().map(|v| v.0).fold(f32::NEG_INFINITY, f32::max) as i32;
+            (x0, x1)
+        }).collect();
+        assert!(spans.contains(&(3, 5)), "the two cells nearest the lamp merge into one 2-wide quad: {spans:?}");
+    }
+
+    /// `merge_light_cap` is the *lossless* half of the Phase 5.3 merge-key work: past `1/sh` a face is
+    /// already fully bright, so clamping the key there cannot change a single emitted colour bit. This
+    /// sweeps the whole night light range (`light_at` clamps at 1.5) against every face shade.
+    #[test]
+    fn test_merge_light_cap_is_lossless() {
+        for sh in [1.00f32, 0.60, 0.847, 0.447, 0.549, 0.749] {
+            let cap = merge_light_cap(sh);
+            assert!(sh * cap >= 1.0, "cap must actually saturate: sh={sh} cap={cap} -> {}", sh * cap);
+            for i in 0..=15_000 {
+                let lm = i as f32 / 10_000.0;
+                let before = (sh * lm).min(1.0);
+                let after = (sh * lm.min(cap)).min(1.0);
+                assert_eq!(before.to_bits(), after.to_bits(), "sh={sh} lm={lm}: {before} != {after}");
+            }
+        }
+    }
+
+    /// …and it earns its keep: two cells whose raw light differs by *more* than a quantization step
+    /// still merge on their top faces, because both are past the top face's saturation point and
+    /// render the same white. Their south faces (a dimmer shade, so a higher saturation point) are
+    /// below it and stay two quads — which is what shows the top-face merge came from the cap rather
+    /// than from the light being equal.
+    #[test]
+    fn test_greedy_merge_fuses_saturated_faces_only() {
+        let mut world = make_test_world();
+        world.bytes[block(3, 5, 0)] = 2;
+        world.bytes[block(4, 5, 0)] = 2;
+        // Two white-painted lamps placed asymmetrically over the pair, bright enough that both cells
+        // saturate a top face (light > 1.0) while still differing well past one MERGE_LIGHT_STEPS step.
+        for x in [3usize, 5] {
+            world.bytes[block(x, 5, 2)] = LAMP_BLOCK_TYPE;
+            world.bytes[block(x, 5, 2) + 4096] = 9; // PAINT_RGB[9] = white → equal light in all channels
+        }
+
+        let mode = LightMode { night: true, shadows: false, sun_t: 0.0, flat: false, lamp_radius: 6.0, profile: LightingProfile::Modern };
+        let lamps = scan_lamps(&world, 3, 5, 4, 5, 0, 0, mode.lamp_radius);
+        let g = obj_geometry_region(&world, world.meta(), None, 3, 5, 4, 5, 0, 0, &lamps, mode, None);
+
+        let top = quads_in_plane_y(&g, 1.0);
+        assert_eq!(top.len(), 1, "both top faces render fully bright → one merged quad");
         assert_eq!(covered_cells(&top).len(), 2);
+
+        // South (+Y) faces lie in the Eden-y = 6 plane → THREE z == 6.
+        let south: Vec<_> = quads(&g).into_iter().filter(|q| q.iter().all(|v| v.2 == 6.0)).collect();
+        assert_eq!(south.len(), 2, "the dimmer south shade is not saturated → the two cells stay apart");
     }
 
     /// Texture packs constrain the merge to one axis. The atlas is a vertical strip of per-block rows,
@@ -2180,9 +1501,9 @@ mod tests {
     #[test]
     fn test_greedy_merge_with_texture_pack_tiles_u_only() {
         let mut world = make_test_world();
-        for x in 3..=5 { for z in 0..=2 { world.bytes[tblock(x, 5, z)] = 2; } }
+        for x in 3..=5 { for z in 0..=2 { world.bytes[block(x, 5, z)] = 2; } }
 
-        let pack = texturepack::TexturePack {
+        let pack = TexturePack {
             tile: 1,
             atlas_rgba: vec![255u8; 3 * 4], // tile 1×1 RGBA × 3 rows; only `atlas_rows` is read here
             atlas_rows: 3, // row 0 sentinel + 1 colour row + 1 grayscale row
@@ -2195,10 +1516,10 @@ mod tests {
             quads(res).into_iter().filter(|q| q.iter().all(|v| v.2 == 6.0)).collect()
         };
 
-        let bare = obj_geometry_region(&world, None, 3, 5, 5, 5, 0, 2, &[], LightMode::default(), None);
+        let bare = obj_geometry_region(&world, world.meta(), None, 3, 5, 5, 5, 0, 2, &[], LightMode::default(), None);
         assert_eq!(south(&bare).len(), 1, "untextured: the 3×3 wall face is one quad");
 
-        let textured = obj_geometry_region(&world, Some(&pack), 3, 5, 5, 5, 0, 2, &[], LightMode::default(), None);
+        let textured = obj_geometry_region(&world, world.meta(), Some(&pack), 3, 5, 5, 5, 0, 2, &[], LightMode::default(), None);
         assert_eq!(south(&textured).len(), 3, "textured: 3-wide rows, never merged vertically");
 
         // U tiles up to the merged width; V never leaves the single row it started in.
@@ -2221,10 +1542,10 @@ mod tests {
     #[test]
     fn test_greedy_merge_leaves_ramps_unmerged_and_splits_the_run_around_them() {
         let mut world = make_test_world();
-        for x in 3..=7 { world.bytes[tblock(x, 5, 0)] = 2; } // stone row
-        world.bytes[tblock(5, 5, 0)] = 24; // Stone Ramp (south) in the middle
+        for x in 3..=7 { world.bytes[block(x, 5, 0)] = 2; } // stone row
+        world.bytes[block(5, 5, 0)] = 24; // Stone Ramp (south) in the middle
 
-        let g = obj_geometry_region(&world, None, 3, 5, 7, 5, 0, 0, &[], LightMode::default(), None);
+        let g = obj_geometry_region(&world, world.meta(), None, 3, 5, 7, 5, 0, 0, &[], LightMode::default(), None);
         let top = quads_in_plane_y(&g, 1.0);
         // The ramp's own top is a sloped quad, not in the z=1 plane, so only the cubes' tops appear.
         assert_eq!(top.len(), 2, "the ramp splits the cube run into two merged quads");
@@ -2243,16 +1564,16 @@ mod tests {
     #[test]
     fn test_greedy_merge_full_fluid_merges_partial_fluid_does_not() {
         let mut full = make_test_world();
-        for x in 3..=6 { full.bytes[tblock(x, 5, 0)] = 20; } // Water, level 4
-        let g = obj_geometry_region(&full, None, 3, 5, 6, 5, 0, 0, &[], LightMode::default(), None);
+        for x in 3..=6 { full.bytes[block(x, 5, 0)] = 20; } // Water, level 4
+        let g = obj_geometry_region(&full, full.meta(), None, 3, 5, 6, 5, 0, 0, &[], LightMode::default(), None);
         assert_eq!(g.vertex_count, 0, "water is transparent — nothing in the opaque stream");
         let top: Vec<_> = quads_t(&g).into_iter().filter(|q| q.iter().all(|v| v.1 == 1.0)).collect();
         assert_eq!(top.len(), 1, "full-height water tops merge into one quad");
         assert_eq!(covered_cells(&top).len(), 4);
 
         let mut half = make_test_world();
-        for x in 3..=6 { half.bytes[tblock(x, 5, 0)] = 60; } // Water ½, level 2
-        let g = obj_geometry_region(&half, None, 3, 5, 6, 5, 0, 0, &[], LightMode::default(), None);
+        for x in 3..=6 { half.bytes[block(x, 5, 0)] = 60; } // Water ½, level 2
+        let g = obj_geometry_region(&half, half.meta(), None, 3, 5, 6, 5, 0, 0, &[], LightMode::default(), None);
         let top: Vec<_> = quads_t(&g).into_iter().filter(|q| q.iter().all(|v| v.1 == 0.5)).collect();
         assert_eq!(top.len(), 4, "a ½-height surface is not a unit square — one quad per block");
         assert_eq!(covered_cells(&top).len(), 4);
@@ -2261,11 +1582,6 @@ mod tests {
     #[test]
     fn shadows_darken_a_block_directly_under_an_overhang_at_high_noon() {
         let mut world = make_test_world();
-        let block = |lx: usize, ly: usize, z: i32| -> usize {
-            let band = (z / 16) as usize;
-            let lz = (z % 16) as usize;
-            4096 + band * 8192 + lx * 256 + ly * 16 + lz
-        };
         world.bytes[block(3, 5, 0)] = 2; // probe
         for z in 1..=10 { world.bytes[block(3, 5, z)] = 2; } // solid overhang directly above
 
@@ -2282,11 +1598,6 @@ mod tests {
     #[test]
     fn low_sun_angle_does_not_darken_a_block_with_no_lateral_occluders() {
         let mut world = make_test_world();
-        let block = |lx: usize, ly: usize, z: i32| -> usize {
-            let band = (z / 16) as usize;
-            let lz = (z % 16) as usize;
-            4096 + band * 8192 + lx * 256 + ly * 16 + lz
-        };
         world.bytes[block(3, 5, 0)] = 2; // isolated probe, nothing else around
 
         let unshadowed = side_face_color(&world, 3, 5, 0, 0, LightMode::default());
@@ -2299,11 +1610,6 @@ mod tests {
     #[test]
     fn shadowed_colour_is_never_pure_black() {
         let mut world = make_test_world();
-        let block = |lx: usize, ly: usize, z: i32| -> usize {
-            let band = (z / 16) as usize;
-            let lz = (z % 16) as usize;
-            4096 + band * 8192 + lx * 256 + ly * 16 + lz
-        };
         world.bytes[block(3, 5, 0)] = 2;
         for z in 1..=10 { world.bytes[block(3, 5, z)] = 2; }
 
@@ -2323,10 +1629,6 @@ mod tests {
         assert!(sunset[2] < 0.3, "sun should be low-angle at t=1.0, got {sunset:?}");
     }
 
-    /// Raw block-byte index for the test world's single chunk.
-    fn tb(lx: usize, ly: usize, z: i32) -> usize {
-        4096 + (z / 16) as usize * 8192 + lx * 256 + ly * 16 + (z % 16) as usize
-    }
 
     /// The index-based lamp gather (`lamps_in_region`) must return exactly the same lamp positions
     /// as the old inline voxel scan for a given radius, and a larger radius must never drop lamps
@@ -2335,17 +1637,17 @@ mod tests {
     fn lamps_in_region_matches_full_scan_and_radius_only_widens() {
         let mut world = make_test_world();
         // Two lamps in the single chunk, plus a decoy stone block that must not be picked up.
-        world.bytes[tb(2, 3, 4)] = LAMP_BLOCK_TYPE;
-        world.bytes[tb(10, 12, 20)] = LAMP_BLOCK_TYPE;
-        world.bytes[tb(6, 6, 6)] = 2; // stone decoy
+        world.bytes[block(2, 3, 4)] = LAMP_BLOCK_TYPE;
+        world.bytes[block(10, 12, 20)] = LAMP_BLOCK_TYPE;
+        world.bytes[block(6, 6, 6)] = 2; // stone decoy
 
-        let index = crate::build_lamp_index(&world);
+        let index = crate::lamps::build_lamp_index(&world, &[(0, 0)]);
         // build_lamp_index buckets by absolute chunk coord (0,0 here).
         assert_eq!(index.get(&(0, 0)).map(|v| v.len()), Some(2), "both lamps land in chunk (0,0)");
 
         let region = (0, 0, 15, 15);
         for &radius in &[1.0f32, 5.0, 12.0, 40.0] {
-            let mut from_index = crate::lamps_in_region(&index, &world, region.0, region.1, region.2, region.3, radius);
+            let mut from_index = crate::lamps::lamps_in_region(&index, &world, region.0, region.1, region.2, region.3, radius);
             let mut from_scan: Vec<[i32; 3]> = scan_lamps(&world, region.0, region.1, region.2, region.3, 0, world_max_z(&world), radius)
                 .into_iter().map(|(p, _)| p).collect();
             from_index.sort();
@@ -2359,25 +1661,25 @@ mod tests {
     #[test]
     fn night_geometry_unchanged_between_index_and_scan_gather() {
         let mut world = make_test_world();
-        world.bytes[tb(3, 5, 0)] = 2; // stone probe
-        world.bytes[tb(3, 5, 3)] = LAMP_BLOCK_TYPE;
-        world.bytes[tb(3, 5, 3) + 4096] = 1; // red-ish paint on the lamp
+        world.bytes[block(3, 5, 0)] = 2; // stone probe
+        world.bytes[block(3, 5, 3)] = LAMP_BLOCK_TYPE;
+        world.bytes[block(3, 5, 3) + 4096] = 1; // red-ish paint on the lamp
 
         let mode = LightMode { night: true, shadows: false, sun_t: 0.0, flat: false, lamp_radius: 5.0, profile: LightingProfile::Legacy };
 
         // Old path: scan the region for lamps.
         let scan = scan_lamps(&world, 0, 0, 15, 15, 0, world_max_z(&world), 5.0);
-        let g_scan = obj_geometry_region(&world, None, 0, 0, 15, 15, 0, world_max_z(&world), &scan, mode, None);
+        let g_scan = obj_geometry_region(&world, world.meta(), None, 0, 0, 15, 15, 0, world_max_z(&world), &scan, mode, None);
 
         // New path: gather from the index and resolve colours exactly as get_chunk_geometry does.
-        let index = crate::build_lamp_index(&world);
-        let idx_lamps: Vec<([i32; 3], [f32; 3])> = crate::lamps_in_region(&index, &world, 0, 0, 15, 15, 5.0)
+        let index = crate::lamps::build_lamp_index(&world, &[(0, 0)]);
+        let idx_lamps: Vec<([i32; 3], [f32; 3])> = crate::lamps::lamps_in_region(&index, &world, 0, 0, 15, 15, 5.0)
             .into_iter().map(|p| {
                 let (_, paint) = get_block_at(&world, p[0], p[1], p[2]);
                 let rgb = block_color(LAMP_BLOCK_TYPE, paint, world.sky);
                 (p, [rgb[0] as f32 / 255.0, rgb[1] as f32 / 255.0, rgb[2] as f32 / 255.0])
             }).collect();
-        let g_idx = obj_geometry_region(&world, None, 0, 0, 15, 15, 0, world_max_z(&world), &idx_lamps, mode, None);
+        let g_idx = obj_geometry_region(&world, world.meta(), None, 0, 0, 15, 15, 0, world_max_z(&world), &idx_lamps, mode, None);
 
         assert_eq!(g_scan.colors, g_idx.colors, "night vertex colours must be identical (index vs scan gather)");
         assert_eq!(g_scan.positions, g_idx.positions, "geometry positions must be identical");
@@ -2389,10 +1691,10 @@ mod tests {
     #[test]
     fn chunk_cache_agrees_with_the_uncached_block_reader() {
         let mut world = make_test_world();
-        world.bytes[tb(3, 5, 2)] = 2;
-        world.bytes[tb(3, 5, 2) + 4096] = 7; // a paint byte, so we compare both halves of the tuple
-        world.bytes[tb(0, 0, 0)] = 1;
-        world.bytes[tb(15, 15, 17)] = 4; // crosses into the second band
+        world.bytes[block(3, 5, 2)] = 2;
+        world.bytes[block(3, 5, 2) + 4096] = 7; // a paint byte, so we compare both halves of the tuple
+        world.bytes[block(0, 0, 0)] = 1;
+        world.bytes[block(15, 15, 17)] = 4; // crosses into the second band
 
         let cache = ChunkCache::new(&world);
         // Deliberately interleave in-chunk and out-of-chunk probes so a stale memo would show up.
@@ -2412,7 +1714,7 @@ mod tests {
     #[test]
     fn pick_block_hits_the_first_solid_voxel_and_reports_the_entry_face() {
         let mut world = make_test_world();
-        world.bytes[tb(3, 5, 2)] = 2; // Stone
+        world.bytes[block(3, 5, 2)] = 2; // Stone
 
         // Ray from above, straight down: enters through the top face (+Z normal).
         let hit = pick_block_in(&world, 3.5, 5.5, 9.0, 0.0, 0.0, -1.0, 32.0).unwrap().expect("expected a hit");
@@ -2432,7 +1734,7 @@ mod tests {
     #[test]
     fn pick_block_misses_return_none_and_respect_max_dist() {
         let mut world = make_test_world();
-        world.bytes[tb(3, 5, 2)] = 2;
+        world.bytes[block(3, 5, 2)] = 2;
 
         // Parallel ray that never crosses the block.
         assert!(pick_block_in(&world, 0.5, 0.5, 8.5, 1.0, 0.0, 0.0, 32.0).unwrap().is_none());
@@ -2445,7 +1747,7 @@ mod tests {
     #[test]
     fn pick_block_hits_a_voxel_the_origin_is_already_touching() {
         let mut world = make_test_world();
-        world.bytes[tb(3, 5, 2)] = 2;
+        world.bytes[block(3, 5, 2)] = 2;
         // Origin sits in the air voxel directly above; the very first DDA step lands on the block,
         // so `prev` must still resolve to the origin voxel rather than an uninitialised one.
         let hit = pick_block_in(&world, 3.5, 5.5, 3.01, 0.0, 0.0, -1.0, 4.0).unwrap().expect("expected a hit");
@@ -2462,48 +1764,9 @@ mod tests {
     #[test]
     fn pick_block_hits_non_solid_blocks_like_water_and_glass() {
         let mut world = make_test_world();
-        world.bytes[tb(3, 5, 2)] = 20; // Water — BI_NOTSOLID, so `obj_occludes` is false for it
+        world.bytes[block(3, 5, 2)] = 20; // Water — BI_NOTSOLID, so `obj_occludes` is false for it
         let hit = pick_block_in(&world, 3.5, 5.5, 9.0, 0.0, 0.0, -1.0, 32.0).unwrap().expect("water is pickable");
         assert_eq!(hit.block_type, 20);
     }
 
-    // ── Audit C6: export volume guard ─────────────────────────────────────────
-
-    /// A whole-world 256z export is ~15 trillion voxels — `export_json` would emit one JSON record
-    /// each while holding the read guard, so it must be refused up front rather than started.
-    #[test]
-    fn test_export_volume_guard_refuses_whole_256z_world() {
-        let err = check_export_volume(0, 0, 0, 7215, 8447, 255, "JSON")
-            .expect_err("a whole 256z world is far past the budget");
-        assert!(err.contains("15.6 billion"), "the message states the magnitude: {err}");
-        assert!(err.contains("Select a smaller region"), "and what to do about it: {err}");
-    }
-
-    /// A selection at the budget is allowed; one voxel past it is not. The boundary matters —
-    /// this is the same 256 M figure the clipboard uses, so the two guards agree.
-    #[test]
-    fn test_export_volume_guard_boundary() {
-        let side = 16_000; // 16000 × 16000 × 1 = 256 M exactly
-        assert_eq!(
-            check_export_volume(0, 0, 0, side - 1, side - 1, 0, "OBJ").expect("at the budget"),
-            MAX_EXPORT_VOXELS,
-        );
-        assert!(check_export_volume(0, 0, 0, side, side - 1, 0, "OBJ").is_err(), "one row over");
-        // A realistic selection is nowhere near it.
-        assert!(check_export_volume(100, 100, 0, 355, 355, 63, "OBJ").is_ok());
-    }
-
-    /// Degenerate/inverted bounds must not wrap into a small volume that slips past the guard.
-    #[test]
-    fn test_export_volume_guard_handles_degenerate_bounds() {
-        assert_eq!(check_export_volume(10, 10, 5, 9, 9, 4, "OBJ").expect("empty"), 0);
-    }
-
-    #[test]
-    fn test_fmt_big_reads_naturally() {
-        assert_eq!(fmt_big(12_800), "12800");
-        assert_eq!(fmt_big(256_000_000), "256 million");
-        assert_eq!(fmt_big(1_600_000_000), "1.6 billion");
-        assert_eq!(fmt_big(15_600_000_000_000), "15.6 trillion");
-    }
 }

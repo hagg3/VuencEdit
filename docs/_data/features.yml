@@ -31,6 +31,5 @@
 - icon: "📦"
   title: "Import & export"
   text: >-
-    Copy/paste with rotate/mirror/scatter/array, a searchable prefab library, Minecraft
-    schematic import, and OBJ / Source-engine VMF export.
+    Copy/paste with rotate/mirror/scatter/array, a searchable prefab library, and PNG map export.
   exp: false

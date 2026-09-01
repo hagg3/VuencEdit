@@ -2,23 +2,34 @@
 
 > **Port reference.** This is the intended reference for a web-based Eden World
 > Builder renderer. `FlyView3D.tsx` (the streaming fly-through pane) plus
-> `export.rs`'s geometry functions together form a complete voxel-to-mesh pipeline
-> with face culling, directional shading, lamp lighting, sun shadows, texture
-> atlasing, and voxel picking. The Rust side is pure and world-space; the
+> the geometry functions together form a complete voxel-to-mesh
+> pipeline with face culling, directional shading, lamp lighting, sun shadows,
+> texture atlasing, and voxel picking. The Rust side is pure and world-space; the
 > Three.js side owns only camera, materials, and the coordinate permutation.
+>
+> **Where the code lives (2026-08-30, PR-C).** The pipeline moved to
+> `packages/voxel-core/src/{geometry,lamps,texture}.rs`, generic over the `VoxelView` trait —
+> which is exactly why it reads as a port reference: it no longer knows what a world file, a
+> lock or an IPC command is. `apps/vuencedit/src-tauri/src/geometry.rs` is now a 143-line Tauri
+> shell (`get_chunk_geometry`, `pick_block`, `get_lamps_near`, `get_light_constants`, and the
+> newtype carrying the binary envelope). Every function named below keeps its name; only its
+> module changed, plus a `ViewMeta` parameter carrying the world-level facts (`w_chunks`,
+> `h_chunks`, `sky`) that `VoxelView` deliberately doesn't name.
+> (`geometry.rs` was named `export.rs` until static-format export — OBJ/JSON/VOX —
+> was removed from this repo; that functionality now lives in the sibling
+> `EdenToMC` project, and the file was renamed to describe what actually remained.)
 
-There are two 3D consumers:
-- **`ThreeDPreview.tsx`** — on-demand render of a selection (≤ 64×64×64). Uses
-  `get_obj_geometry`. ⚠️ **Currently dead code**: nothing in `src/` imports or
-  mounts it, so `FlyView3D` is the only live WebGL context in the app. Kept as the
-  worked example of the `get_obj_geometry` path (and the reason that command still
-  exists); references to it below describe the code, not a mounted component.
-- **`FlyView3D.tsx`** — streaming fly-through of the whole world (quad-view 4th
-  cell). Uses `get_chunk_geometry` per chunk.
+`FlyView3D.tsx` — streaming fly-through of the whole world (quad-view 4th cell) —
+is the app's only live 3D consumer, and its only live WebGL context. It uses
+`get_chunk_geometry` per chunk. (A second consumer, `ThreeDPreview.tsx` — an
+on-demand render of a selection via `get_obj_geometry` — used to exist as the
+worked example of that command's path; both the component and the command were
+removed together with static export, since `get_obj_geometry` had no other
+caller.)
 
-Both build Three.js `BufferGeometry` from the f32 streams produced by the shared
-`obj_geometry_region` in `export.rs`, decoded by `decodeGeometry` (`src/types.ts`)
-as zero-copy `Float32Array` views over the raw IPC response — see
+`FlyView3D.tsx` builds Three.js `BufferGeometry` from the f32 streams produced by
+`obj_geometry_region` in `geometry.rs`, decoded by `decodeGeometry`
+(`src/types.ts`) as zero-copy `Float32Array` views over the raw IPC response — see
 [04](./04-ipc-reference.md#binary-payload-envelope-2026-08-05-audit-h2).
 
 ## Coordinate mapping (the one rule to get right)
@@ -37,18 +48,18 @@ Three −Z** and the camera faces −Z (north) with east (+X) on the right. The 
 helper `o(ex, ey, ez)` emits exactly this. Direction vectors transform the same
 way.
 
-⚠️ **Do not confuse this with the OBJ *file* writer.** `export.rs`'s `ov(ex, ey,
-ez) = (ex, ez, -ey)` **negates Y** and is used only when writing `.obj` files (X
-right, Y up, Z toward viewer). The live geometry / picking path uses the
-sign-free `o()` permutation. `pick_block` takes and returns **Eden** coords — the
-frontend owns the Three↔Eden transform, keeping `pick_block` a pure world-space
-query.
+⚠️ **A distinct `ov(ex, ey, ez) = (ex, ez, -ey)` — Y-negating — permutation used to
+exist for the OBJ *file* writer** (X right, Y up, Z toward viewer), separate from
+the sign-free `o()` the live geometry/picking path uses. It was removed along with
+the rest of the OBJ exporter; the only permutation left in `geometry.rs` is `o()`.
+`pick_block` takes and returns **Eden** coords — the frontend owns the Three↔Eden
+transform, keeping `pick_block` a pure world-space query.
 
 ## Geometry generation (`obj_geometry_region`)
 
-Shared by `get_obj_geometry` (selection preview) and `get_chunk_geometry`
-(fly-view). Emits face-culled cubes, ramp prisms, and wedge pyramids as vertex
-positions + colors (+ UVs when textured).
+The core of `get_chunk_geometry` (fly-view chunk streaming). Emits face-culled
+cubes, ramp prisms, and wedge pyramids as vertex positions + colors (+ UVs when
+textured).
 
 ### Directional face shading (baked into vertex color)
 
@@ -81,7 +92,7 @@ side.
   blocks in a second buffer.
 - **Emissive stream** (`positions_e`/`colors_e`, GPU/`flat` mode only) — lamp
   faces, so lamps stay fullbright under dim night ambient (see GPU section).
-  Empty when `!flat`, so OBJ/JSON export and `ThreeDPreview` are byte-identical.
+  Empty when `!flat`, matching a plain flat fully-lit render.
 
 ### Face culling
 
@@ -137,6 +148,32 @@ little, which is expected: there is genuinely nothing coplanar to fuse.
   **bit-identically**. That is what keeps per-block lamp falloff and sun shadows
   intact instead of averaging them across a big quad. In `flat` (GPU-shadow) mode
   the key folds to a constant, since `lit_rgb!` discards `lm` there anyway.
+- **Baked-night light is snapped and capped before it becomes a key** (Phase 5.3 of
+  the 2026-08-26 3D fixplan, audit Finding 7). Lamp falloff is continuous, so
+  without this every lit voxel gets its own group and the merge collapses back to
+  1×1 quads on exactly the chunks that already produce the biggest payloads.
+  Two mitigations, in different places on purpose:
+  - `MERGE_LIGHT_STEPS` (geometry.rs, **32** — i.e. steps of 1/32) rounds `lm`
+    itself, at the point it is computed in the voxel loop, and **only when
+    `mode.night`**. Doing it there rather than on the key keeps `FaceRec::lm`
+    exactly the value that gets rendered, so unmerged faces (ramps, wedges,
+    partial-height fluids) can't seam against merged neighbours. The day path and
+    the shadows-only path are constant-valued already and are left byte-identical.
+  - `merge_light_cap(sh)` clamps the key at the brightness where that face
+    direction's shade already saturates (`lit_rgb!` computes `(sh*lm).min(1.0)`, so
+    anything past `1/sh` renders the same white). This one is **exactly lossless**,
+    not approximate — pinned by `test_merge_light_cap_is_lossless`; the
+    `to_bits() + 1` nudge inside it exists because `sh * (1.0/sh)` may land one ULP
+    low in f32.
+
+  ⚠️ Quantization is a visual trade-off and 1/32 is deliberately conservative: at
+  both default lamp radii (Legacy 4, Modern 14) the natural *per-block* light step
+  along the falloff is 2–16× larger than 1/32, so the grid cannot introduce a
+  contour that block granularity did not already have. Only the extreme end of the
+  radius slider (≥32) has a per-block gradient finer than the grid, and light there
+  is mostly saturated anyway. Anything coarser than 1/32 bands visibly and was
+  rejected — see "Phase 5.3 results" in `TEST WORLDS/fixplan-3d-2026-08-26.md` for
+  the measurements behind that call.
 - Within a group the sweep widens along `u` through unconsumed cells, then grows
   the whole run along `v` while every cell of the next row is present and free —
   standard maximal-rectangle greedy meshing. Scanning in (v, u) order guarantees
@@ -152,8 +189,8 @@ neighbour). Those emit immediately and unmerged, exactly as before.
 The atlas is one tile wide × N rows tall, so U can tile by repeating that single
 column — but **V selects the row**, so growing V would run a merged quad straight
 into the next block's texture. Tiling U means UVs run `0..w` instead of `0..1`,
-which requires `tex.wrapS = THREE.RepeatWrapping` on the atlas texture, set in
-**both** `FlyView3D.tsx` and `ThreeDPreview.tsx`. `wrapT` must stay clamped.
+which requires `tex.wrapS = THREE.RepeatWrapping` on the atlas texture, set on
+`FlyView3D.tsx`'s atlas. `wrapT` must stay clamped.
 
 ⚠️ **Vertex counts stopped being a proxy for "how much is visible."** A 2×1 slab
 and a lone cube are both six quads now. Tests that compared `vertex_count` to
@@ -162,7 +199,7 @@ detect missing geometry compare the `positions` bytes instead — see
 
 ### `ChunkCache` (perf)
 
-`obj_geometry_region` reads every block through `ChunkCache` (export.rs): a
+`obj_geometry_region` reads every block through `ChunkCache` (geometry.rs): a
 single-entry `(cx,cy) → Option<addr>` memo collapsing the 7 `chunk_map` hash
 lookups per voxel (self + 6 neighbors) to one compare on the common path. It
 caches chunk **absence** too — the hot path on sparse worlds. It uses `Cell`, so
@@ -171,9 +208,9 @@ it is **`!Sync`** — single-threaded scans only, never hand it to rayon.
 ## Lighting & shadows (baked path) *(experimental)*
 
 `LightMode { night, shadows, sun_t, lamp_radius, flat, profile }` is baked into
-vertex colors inside `obj_geometry_region`. OBJ/JSON export and `ThreeDPreview`
-always pass `LightMode::default()` (unchanged output, `profile` defaults to
-`LightingProfile::Legacy`); only `get_chunk_geometry` opts in. Both multipliers
+vertex colors inside `obj_geometry_region`. `LightMode::default()` (`profile`
+defaults to `LightingProfile::Legacy`) is a flat fully-lit render; only
+`get_chunk_geometry` opts into night/shadows. Both multipliers
 are computed once per voxel and folded into the `push_tri!` / `push_quad!`
 macros via an `lm` (light-multiplier) argument, so every face of a block shares
 the same lighting.
@@ -230,8 +267,10 @@ behavior in the Settings modal's Lighting profile row.
 
 ### Lamp spatial index (`WorldState.lamp_index`)
 
-`LampIndex` wraps `LampIndexState { lamps: HashMap<(i32,i32), Vec<[i32;3]>>, scanned:
-HashSet<(i32,i32)> }` (chunk-keyed). **On-demand, per-chunk** (2026-08
+`LampIndex` wraps `LampIndexState { lamps: HashMap<(i32,i32), FxHashSet<[i32;3]>>,
+scanned: HashSet<(i32,i32)>, full_box: Option<(i32,i32,i32,i32)> }` (chunk-keyed).
+The per-chunk bucket is a set (not a `Vec`) so `apply_delta`'s lamp add/remove is
+O(1) rather than a linear `contains` + full-pass `retain`. **On-demand, per-chunk** (2026-08
 memory-efficiency pass — replaced a whole-world `build_lamp_index` scan on the
 first night-lit request): `LampIndex::lamps_in_region`, called from
 `get_chunk_geometry`/`get_lamps_near`, scans only the not-yet-`scanned` chunks a
@@ -245,6 +284,26 @@ into a bucket), since the next real query re-derives it from truth.
 expanded by `ceil(radius/16)` chunks (`region_chunk_box`), then filters to the
 exact xy box. `build_lamp_index` (whole-world scan) is now `#[cfg(test)]`-only —
 the parity oracle, no longer a production fallback.
+
+A third `LampIndexState` field, `full_box: Option<(cx_lo,cx_hi,cy_lo,cy_hi)>` (3D
+fixplan Phase 5.2), caches the last chunk box `lamps_in_region` verified fully
+scanned. A containment check against it lets the hot path (stationary re-fetch,
+the 25-chunk edit-sync halo, contiguous streaming steps) skip the per-call
+121-cell `todo` build and the rayon scan fan-out — only the pure gather runs. It
+grows to the bounding union of old ∪ new when the two boxes share one axis' full
+extent and overlap/touch on the other (that union is provably fully scanned),
+else it just replaces. Sound with no invalidation: `scanned` only ever grows
+(`apply_delta` prunes `lamps`, never `scanned`), and `clear()` drops `full_box`
+along with the rest of the state.
+
+### Voxel picking (`pick_block` / `pick_block_in`, `geometry.rs`)
+
+DDA raycast. The march builds one `ChunkCache` (3D fixplan Phase 5.1) so each step
+and the trailing hit read hit a single-entry `chunk_range` memo instead of an
+`FxHashMap` lookup — the win is largest on a miss (a ray into open sky pays the
+full ~890 steps with no early-out, the common case for a horizon-aimed hover
+pick). `ChunkCache` is `!Sync`; the march is single-threaded, so it must never be
+handed to rayon.
 
 ### Shadows (directional sun raymarch)
 
@@ -293,6 +352,14 @@ Not vertical sky-occlusion — a real directional sun:
   (1–16 / 2–32 / 2–32), so the ribbon slider could push `loadRadius` to 1 (below this
   pane's own floor, breaking `radiusToPos`) and couldn't reach 17–32, silently
   clamping a value Settings had just set the next time it was touched.
+  **Phase 3.2:** the in-pane slider has a display/commit split — `onChange` moves a
+  local `renderDistanceDisplay` only (the label, tooltip and high-distance warning
+  track it live), and `commitRenderDistance` fires on `onPointerUp`/`onKeyUp`,
+  routing through `sceneApi.setLoadRadius` (fog refresh + forced evicting sweep) and
+  `onRenderDistanceChange` (App re-render + persistence). A drag no longer dispatches
+  an App re-render and a scene re-sweep per pixel; `renderDistanceDisplay` re-syncs
+  from `loadRadius` whenever the committed value moves for another reason (Settings
+  revert, mount).
 - **Hard resident-geometry byte cap (all three streams + in-flight fetches)**,
   `geometryBudgetBytes` prop (default `GEOMETRY_BUDGET_BYTES = 512 MB`, the "Balanced"
   memory-budget preset — App.tsx wires it from
@@ -302,6 +369,33 @@ Not vertical sky-occlusion — a real directional sun:
   ref (`geometryBudgetRef`) inside the scene-setup effect's `pump()` closure so a
   mid-session preset change takes effect without growing that effect's own
   dependency array.
+  - **Eviction is budget-driven, not just radius-driven** (Phase 2.1 of
+    `TEST WORLDS/fixplan-3d-2026-08-26.md`, audit Finding 5). The radius pass alone
+    frees only what fell *outside* the disc, so at a render distance where the whole
+    disc is in range it frees nothing: the gate stayed shut permanently, lowering the
+    memory preset was inert, and the queued chunks never arrived — a *streaming stall*
+    rather than a slowdown, which is why it never presented as a performance bug
+    (confirmed by a 512 MB / 512 MB HUD reading at r=32 with the camera parked).
+    `streamSweep` now runs a second pass that drops chunks **farthest from the camera
+    first** while over budget (never an LRU — the chunk you just flew toward is the
+    newest *and* the one you need), skipping anything `inflight` or in `forceKeys`
+    (`reloadChunk` owns the budget interaction for those) and anything holding zero
+    bytes (an `emptyChunks` marker frees nothing and would be refetched forever).
+  - ⚠️ **`budgetHorizonSq` is what stops that pass from churning.** Evicting the
+    farthest chunk drops resident bytes just under the cap, which lets `pump()`
+    immediately refetch it as the nearest non-resident chunk — one pointless round
+    trip per sweep, forever, once the pane is pegged. So each budget eviction records
+    the squared chunk distance it reached, and the radius scan refuses to queue
+    anything at or beyond it (floored at 1, so the camera's own chunk stays
+    fetchable). The horizon is re-opened whenever the camera chunk, the z band, the
+    radius or the budget value changes — the only four things that change what fits.
+    Edit-sync reloads bypass it entirely (they never go through the radius scan).
+  - Both eviction passes now run **before** the queue is rebuilt and before the single
+    `pump()` at the end of the sweep, so a sweep that frees headroom resumes streaming
+    in the same tick (this subsumes the H6 follow-up's second `pump()` call).
+  - The "render distance limited by memory" pill tracks `overBudget || horizon set`,
+    not `overBudget` alone: after eviction the pane sits *just under* the cap with its
+    disc truncated, which is exactly when the user needs to be told.
   - Counted in **bytes, not vertices** (3D-pane crash fix): a vertex costs 24–36 B
     depending on stream and texture pack, and the old 30 M-vertex "Balanced" cap was
     ~1.9 GB of resident geometry — reachable within seconds on a 256z world, which is
@@ -334,6 +428,17 @@ Not vertical sky-occlusion — a real directional sun:
     resident mesh before sweeping — checked *before* the stationary-camera early-out,
     which compares chunk XY only and would miss a purely vertical climb. `Z_BAND_STEP`
     quantization is what keeps that full restream rare.
+  - ⚠️ **Quantization alone is not enough (Phase 3.1).** Rounding to `Z_BAND_STEP`
+    bounds how often the band *moves* but not how often the camera *crosses* a
+    boundary — hovering right on one (notably `camera.y ≈ 96` on a 256z world, the
+    `null`⇄bounded edge) full-restreams at sweep rate. `zBandTop()` adds hysteresis:
+    it holds the current band until `camera.y + Z_BAND_ABOVE` is more than
+    `Z_BAND_STEP / 2` outside it in **either** direction (the extra `Z_BAND_ABOVE`
+    headroom absorbs the upward lag). The `null` case compares against the pivot
+    `need` would have to fall back below to re-enter a bounded band
+    (`ceil(maxZ / STEP) * STEP - STEP`), so that edge gets the same margin. A 64z
+    world still returns `null` on every call, so its request is byte-for-byte
+    pre-Stage-3.
   - ⚠️ **The see-through-roof trap.** Face culling reads the *real* world, so the
     block just above `sz2` still occludes the top face of the topmost emitted one — a
     naive clip leaves a hole you look straight through into the terrain interior.
@@ -364,6 +469,17 @@ Not vertical sky-occlusion — a real directional sun:
   run at install time so frustum culling keeps working off the cached sphere.
   ⚠️ It also makes the geometry **unrecoverable after a context loss** — the
   `webglcontextrestored` handler below *must* call `reloadAllChunks()`.
+  ⚠️ The hook only fires for meshes three actually **draws**, and the frustum pass
+  hides most of the disc at a large render distance, so those chunks keep their CPU
+  copy (audit Finding 3). Closed as *accounted, not fixed* (Phase 2.2): an un-uploaded
+  mesh has no VBO yet, so `residentBytes` is its heap cost until it first draws and its
+  VRAM cost afterwards — never both — and this release is what keeps the two from
+  overlapping. Adding `jsBytes` to the gate would double-count every undrawn chunk and
+  roughly halve the resident chunk count at a given preset for no real saving. The
+  residual risk is *which pool* holds the bytes (a WKWebView JS heap is a far tighter
+  cap than VRAM); if a baked-lighting session — no GPU shadow pass, so no light-camera
+  render forcing uploads — ever crashes with `js` a large fraction of `gpu` on the HUD,
+  forcing the upload at install is the lever, not the accounting change.
 - **WebGL context loss/restore.** `webglcontextlost` → `preventDefault()` (without it
   the context is never restorable), cancel the rAF loop, park the sweep interval, set
   a `contextLost` flag that makes `frame()` bail, and toast via the `onNotice` prop
@@ -384,8 +500,8 @@ Not vertical sky-occlusion — a real directional sun:
   largest single-chunk payload. Fed imperatively like `CoordHud`. Its Rust counterpart
   is a `[GEOM]` `timing_log!` line per `get_chunk_geometry` (debug builds only).
 - Throttled sweep (`STREAM_MS = 150`) disposes chunks outside `(r+2)` **Euclidean**
-  distance (matches the loading disc's `d2 <= r*r` test). Air-only chunks tracked
-  in a `Set<string>`.
+  distance (matches the loading disc's `d2 <= r*r` test), then runs the budget pass
+  above. Air-only chunks tracked in a `Set<string>`.
 - **Adaptive concurrency:** `MAX_CONCURRENT_IDLE = 4` / `MAX_CONCURRENT_FLY = 2` —
   drops to 2 while flying so geometry callbacks don't hitch frames.
 - Frustum culling via `.visible` toggle (not disposal).
@@ -528,7 +644,14 @@ not add one more block at the release point.
   hold, because OrbitControls owned left-drag and had to be allowed to take over;
   with nothing left to yield to, that slop-kill is gone and every move is a stamp
   attempt instead. `buildRepeatBusy` (set *before* the `await pick`) collapses the
-  60–120 Hz move stream to exactly one pick+edit in flight.
+  60–120 Hz move stream to exactly one pick+edit in flight. ⚠️ **The sweep does not
+  start until the press outgrows a click** — `buildRepeatTick` returns early while
+  `withinClickSlop(cursorX, cursorY)` holds (still inside `CLICK_SLOP_MS` *and*
+  `CLICK_SLOP_PX`). Until then the click path owns the gesture and places exactly one
+  block. Without this gate the NaN-seeded `aimChanged` (always true on a gesture's
+  first move) turned a few-px hand-shake between `pointerdown` and `contextmenu` into
+  a stamp, and its own trailing-edge re-tick into a second one with no cooldown — the
+  "a single right-click places two blocks" report (fixed 2026-08-29).
 - **the interval** (`BUILD_REPEAT_DELAY_MS` → `BUILD_REPEAT_MS`) — the stationary
   airbrush fallback. It earns its keep in fly/look mode, where the pointer never
   moves but WASD/mouselook still re-aims the crosshair. Its delay stays longer than
@@ -577,9 +700,19 @@ guarantees the matching `pointerup` lands on this canvas even if released elsewh
 
 **H1 — one undo entry per gesture, not per stamp.** `paint_blocks` (lib.rs) takes an
 optional `group: Option<u64>` and routes through `with_edit_grouped` instead of
-`with_edit` — identical machinery to sculpt strokes (`count_undo_groups` already
-collapses contiguous same-group entries, so the History tab and undo/redo depth
-badges pick this up for free). FlyView3D mints one id per build gesture
+`with_edit` — identical machinery to sculpt strokes (contiguous same-group entries
+collapse into one logical unit, so the History tab and undo/redo depth badges pick
+this up for free; that collapsing is now a cached count on `WorldState` rather than
+a per-edit stack walk — 3D fixplan Phase 4.2, see
+`DOCUMENTATION/07-editing-undo-clipboard.md`).
+
+Since 3D fixplan Phase 4.1 the same call also **band-scopes its undo snapshot**:
+every build/break path passes an explicit `{x, y, z}`, so `paint_z_range` resolves a
+static range and `with_edit_grouped` forwards it as `z_range`. A one-voxel stamp on a
+256z world used to snapshot all 16 bands (131 KB) of every affected chunk, once per
+stamp — i.e. once per sweep tick. Details and the two silent traps (`z_offset` is
+*not* in the range; a door/portal top block *is*) live in
+`DOCUMENTATION/07-editing-undo-clipboard.md`. FlyView3D mints one id per build gesture
 (`buildGestureGroup = ++sculptGroupSeq`, shared counter with sculpt so the two
 families' ids never collide) in `onPickDown`'s arm branch — which runs for every
 build press regardless of whether it resolves as a plain click or a sweep, so both
@@ -691,8 +824,10 @@ load/close** (`resetHeavyLighting()`); not persisted. When on:
   grows reach, not just brightness). Re-queried on camera move, on enable, on
   `editEpoch`, and on profile switch.
 - **Shadow quality:** ortho half-extent clamped to `min(reach,
-  SHADOW_MAX_REACH=320)·1.1`; `mapSize` bumps to 4096 when `loadRadius > 16`;
-  `sun.shadow.radius = 3`.
+  SHADOW_MAX_REACH=320)·1.1`; `mapSize` bumps to 4096 when `loadRadius > 16`.
+  `renderer.shadowMap.type` is `PCFShadowMap` (a hard PCF kernel) — three r184
+  deprecated `PCFSoftShadowMap` and silently falls back to `PCFShadowMap` anyway,
+  which also made `sun.shadow.radius` inert, so both were dropped.
 - **Sun disc** (`sunDisc`, a billboarded Sprite) + warm sunrise/sunset tinting of
   sun/disc/ambient by `warmth = 1 - sin(π·sunT)`.
 
@@ -703,22 +838,44 @@ on the flag.
 ### Edit sync (3D)
 
 `editEpoch` + `lastEdit` reload chunk meshes overlapping the edit's top-down bounds,
-expanded by `ceil(max(lampRadius, shadowRayScan)/16)` chunks when night lighting or
-shadows are on (a placed lamp or new occluder affects the *next* chunk over). The
+expanded by `max(1, ceil(max(lampRadius, shadowRayScan)/16))` chunks. The floor of 1
+chunk applies **regardless of lighting** (fixed 2026-08-26): face culling for a voxel
+is decided against its neighbour, so a block added/removed at or near a chunk boundary
+changes which faces the *neighbouring* chunk's own mesh should be emitting — that
+neighbour is never part of `core` (below), and with night lighting/shadows both off,
+`reach` used to be `0`, so it was never reloaded at all. Left unfixed, that's a
+permanently stale culled (or wrongly-visible) face at the seam — not just until the
+next debounce, since nothing ever scheduled the reload — until something forces a full
+`reloadAllChunks()` (e.g. toggling the pane off/on). Night lighting/shadows still widen
+the pad further, since a placed lamp or new occluder affects the *next* chunk over. The
 two halves of that rect are **not** on the same schedule (C3 steps 2–3):
 
 - **core** — the chunks the edit's own bounds touch, usually 1. Reloaded
   immediately: this is the block you just placed appearing, so it can't be deferred.
-- **halo** — everything the reach adds on top. Accumulated into a `"cx,cy"` key set
-  and flushed on a trailing `HALO_FLUSH_MS` (350 ms) debounce. With baked shadows on,
-  `shadowRayScan = 24` makes the padded rect **5×5 = 25 chunks**; paying that per
-  *placed block* is the refetch storm that made building on a large world feel
-  broken. A build sweep stamps far faster than the debounce, so it now pays the halo
-  once, after release — the "coalesce per gesture" outcome with no gesture plumbing
-  between the scene closure and the effect, because the edit rate *is* the gesture
-  signal. A lone click pays it 350 ms later, and the seam it fixes was never visible
-  sooner than that. The flush no-ops on a suspended pane (which disposed every mesh
-  and emptied its queue; its resume path restreams from scratch).
+- **halo** — everything the reach adds on top (now always ≥1 ring). Accumulated into a
+  `"cx,cy"` key set and flushed on a trailing `HALO_FLUSH_MS` (350 ms) debounce. With
+  baked shadows on, `shadowRayScan = 24` makes the padded rect **5×5 = 25 chunks**;
+  paying that per *placed block* is the refetch storm that made building on a large
+  world feel broken. A build sweep stamps far faster than the debounce, so it now pays
+  the halo once, after release — the "coalesce per gesture" outcome with no gesture
+  plumbing between the scene closure and the effect, because the edit rate *is* the
+  gesture signal. A lone click pays it 350 ms later, and the seam it fixes was never
+  visible sooner than that. The flush no-ops on a suspended pane (which disposed every
+  mesh and emptied its queue; its resume path restreams from scratch).
+
+⚠️ **A forced reload can still be silently dropped by the periodic stream sweep** (fixed
+2026-08-26) — `reloadChunk` queues its target and returns, but the chunk isn't fetched
+until `pump()` reaches it, gated by `maxConcurrent()` (2–4). `streamSweep` itself runs
+unconditionally every `STREAM_MS` (150 ms) and used to unconditionally overwrite `queue`
+with a fresh radius scan (`needed`) — which, since a forced chunk is *resident* (stale
+mesh) and therefore excluded from `needed` by construction, discarded any forced reload
+that hadn't reached `active` yet. An edit large enough to force-reload more chunks than
+`maxConcurrent()` can start within one 150 ms tick (a big paste is the common case) would
+therefore only ever show the first couple of chunks — "an edit only partially appears
+until the 3D pane is toggled off/on". `streamSweep` now re-merges every `forceKeys` entry
+that isn't already `inflight` back into the rebuilt queue before pumping, so a pending
+forced reload survives any number of intervening sweep ticks until `pump()` actually
+starts it (which is also the point `forceKeys` itself is consumed).
 
 Both halves go through the same `reloadChunk`, and therefore the same
 `forceKeys`/`staleKeys` discipline: since **C3 step 1** the old mesh stays in the

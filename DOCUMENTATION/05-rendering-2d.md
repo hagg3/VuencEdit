@@ -5,6 +5,15 @@ API. All pixel data is rendered in Rust and shipped as `PixelPatch` /
 `PreviewData` binary envelopes (see [04](./04-ipc-reference.md#binary-payload-envelope-2026-08-05-audit-h2));
 the frontend only composites and transforms.
 
+> **Where the code lives (2026-08-30, PR-C).** Every renderer named below moved to
+> `packages/voxel-core/src/render.rs`, generic over the `VoxelView` trait, and returns a
+> `Raster`. `render_pixels_patch` / `render_zslice_patch_inner` / `render_yslice_patch_inner` /
+> `render_xslice_patch_inner` / `render_view_*` in `src-tauri/src/lib.rs` are now one-line
+> wrappers (`render::…(world, world.meta(), …).into()`) whose only job is turning the `Raster`
+> into a `PixelPatch`/`PreviewData` for IPC — the crate has no `tauri` dependency, so the
+> `IpcResponse` impl cannot live on its types. Names and behaviour are unchanged; the extraction
+> was verified byte-identical over three real worlds.
+
 ## Render modes (top-down map)
 
 `MapCanvas.tsx` supports three modes, all sharing one canvas:
@@ -112,7 +121,7 @@ callback and used purely as a cache-invalidation key, since keying refetch on
 `viewMode`/the raw slider value directly would refetch under the stale cap.
 Committing the cap clamps the selection's `zMax`; the template overlay is
 gated to top-down only. **The 3D pane is also clipped by the cutaway cap** —
-`get_chunk_geometry` (export.rs) intersects the caller's Z band with
+`get_chunk_geometry` (geometry.rs) intersects the caller's Z band with
 `ws.view_cap_z` server-side, so cutaway composes into the fly-view geometry too
 (see [06 — Rendering 3D](./06-rendering-3d.md)'s "Camera z band" section).
 

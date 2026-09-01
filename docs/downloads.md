@@ -54,7 +54,7 @@ systems will warn you the first time you open VuencEdit. This is expected, not a
 
 - **macOS** shows *"VuencEdit can't be opened because it is from an unidentified developer."*
   Right-click (or Control-click) the app and choose **Open**, then confirm in the dialog that
-  appears. You only need to do this once.
+  appears. You only need to do this once. **If that fails**,  open System Settings, go to Privacy & Security, scroll to the bottom and look for the 'Open anyway' button.
 - **Windows** shows a SmartScreen warning ("Windows protected your PC"). Click **More info**,
   then **Run anyway**.
 

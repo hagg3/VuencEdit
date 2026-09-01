@@ -6,7 +6,7 @@ use serde::Serialize;
 // Unpainted block base colours — blockColor[NUM_BLOCKS+1][3] from Globals.mm.
 // Index = block type ID (0–111 known; 112–127 new-format, see below). Zero entries
 // are unused/unset in the game.
-pub(crate) const BLOCK_RGB: [[u8; 3]; 128] = [
+pub const BLOCK_RGB: [[u8; 3]; 128] = [
     [  0,   0,   0], //   0 air (handled before table lookup)
     [ 90,  90,  90], //   1 bedrock
     [158, 156, 158], //   2 stone        #9e9c9e
@@ -143,7 +143,7 @@ pub(crate) const BLOCK_RGB: [[u8; 3]; 128] = [
 
 // Paint colour table — colorTable[54] from Hud::genColorTable() (Hud.mm:150-196).
 // Index 0 is the "no-paint" white sentinel; indices 1–54 are the game's paint palette.
-pub(crate) const PAINT_RGB: [[u8; 3]; 55] = [
+pub const PAINT_RGB: [[u8; 3]; 55] = [
     [255, 255, 255], //  0 unused (paint 0 = no paint; handled before lookup)
     [255, 170, 170], //  1
     [255, 233, 170], //  2
@@ -203,12 +203,12 @@ pub(crate) const PAINT_RGB: [[u8; 3]; 55] = [
 
 // ── blockinfo[] flags (Constants.h:175-191, Globals.mm:38-167) ────────────────
 
-pub(crate) const BI_NOTSOLID:   u32 = 0b0000_0000_0000_0010;
-pub(crate) const BI_RAMPORSIDE: u32 = 0b0000_0000_0001_0000;
+pub const BI_NOTSOLID:   u32 = 0b0000_0000_0000_0010;
+pub const BI_RAMPORSIDE: u32 = 0b0000_0000_0001_0000;
 
 // blockinfo[NUM_BLOCKS+1] — one entry per block type (0–111 known; 112–127 new-format).
 // Only the flags relevant to the editor are preserved verbatim; the rest stay zero.
-pub(crate) const BLOCK_INFO: [u32; 128] = [
+pub const BLOCK_INFO: [u32; 128] = [
     BI_NOTSOLID,                 //   0 air
     0,                           //   1 bedrock      IS_HARD
     0,                           //   2 stone         IS_HARD
@@ -343,7 +343,7 @@ pub(crate) const BLOCK_INFO: [u32; 128] = [
 
 /// Alpha (0–1) for a transparent block; None = opaque.
 /// Glass/water are 50% transparent; fence nearly opaque at 90%; flower mostly see-through at 25%.
-pub(crate) fn transparent_alpha(bt: u8) -> Option<f32> {
+pub fn transparent_alpha(bt: u8) -> Option<f32> {
     match bt {
         20 | 59..=61 | 107 => Some(0.50), // water variants
         21 | 106           => Some(0.90), // fence (nearly opaque)
@@ -359,7 +359,7 @@ pub(crate) fn transparent_alpha(bt: u8) -> Option<f32> {
 // Scales painted colours so the same paint reads differently on different
 // materials (e.g. dark stone 0.50 vs ice 0.90), preserving visual distinction
 // in the flat top-down renderer where no texture contributes that difference.
-pub(crate) const BLOCK_PAINT_SCALE: [f32; 128] = [
+pub const BLOCK_PAINT_SCALE: [f32; 128] = [
     1.00, // 0  air
     0.60, // 1  bedrock
     0.80, // 2  stone
@@ -491,7 +491,7 @@ pub(crate) const BLOCK_PAINT_SCALE: [f32; 128] = [
     0.90, // 127 unknown (new format) — matches 72 lightbox
 ];
 
-pub(crate) fn grass_color(sky: u8) -> [u8; 3] {
+pub fn grass_color(sky: u8) -> [u8; 3] {
     match sky {
         11 => [242, 220, 140], // desert sky
         13 => [255, 255, 255], // snow sky
@@ -499,7 +499,7 @@ pub(crate) fn grass_color(sky: u8) -> [u8; 3] {
     }
 }
 
-pub(crate) fn block_color(bt: u8, paint: u8, sky: u8) -> [u8; 3] {
+pub fn block_color(bt: u8, paint: u8, sky: u8) -> [u8; 3] {
     if bt == 0 { return [30, 30, 30]; }
     if (bt == 8 || bt == 82) && paint == 0 { return grass_color(sky); }
     if paint != 0 && (paint as usize) < PAINT_RGB.len() {
@@ -519,17 +519,78 @@ pub(crate) fn block_color(bt: u8, paint: u8, sky: u8) -> [u8; 3] {
 /// Rust↔TS dual-maintenance drift (C6): both the paint RGB rounding and the
 /// per-block brightness scale previously diverged.
 #[derive(Serialize)]
-pub(crate) struct BlockTables {
+pub struct BlockTables {
     block_rgb: Vec<[u8; 3]>,
     paint_rgb: Vec<[u8; 3]>,
     block_paint_scale: Vec<f32>,
 }
 
-#[tauri::command]
-pub(crate) fn get_block_tables() -> BlockTables {
+/// The tables as a serialisable bundle. Each app wraps this in its own `#[tauri::command]`
+/// (VuencEdit exposes it as `get_block_tables`) so this crate stays free of a Tauri dependency.
+pub fn block_tables() -> BlockTables {
     BlockTables {
         block_rgb: BLOCK_RGB.to_vec(),
         paint_rgb: PAINT_RGB.to_vec(),
         block_paint_scale: BLOCK_PAINT_SCALE.to_vec(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The table lengths are a load-bearing contract, not an implementation detail: every
+    /// indexing site in both apps bounds-checks against `.len()` and silently falls back to a
+    /// grey/default when an index is out of range. A table that quietly shrank would therefore
+    /// not panic — it would render wrong colours in two apps at once.
+    #[test]
+    fn table_sizes_are_the_documented_contract() {
+        assert_eq!(BLOCK_RGB.len(), 128, "block ids are 0..=127");
+        assert_eq!(BLOCK_INFO.len(), 128, "one flags entry per block id");
+        assert_eq!(BLOCK_PAINT_SCALE.len(), 128, "one brightness scale per block id");
+        assert_eq!(PAINT_RGB.len(), 55, "paint index 0 = white sentinel, 1..=54 = game colours");
+    }
+
+    #[test]
+    fn block_tables_bundle_matches_the_tables() {
+        let t = block_tables();
+        assert_eq!(t.block_rgb.len(), BLOCK_RGB.len());
+        assert_eq!(t.paint_rgb.len(), PAINT_RGB.len());
+        assert_eq!(t.block_paint_scale.len(), BLOCK_PAINT_SCALE.len());
+    }
+
+    #[test]
+    fn air_and_unpainted_blocks_take_their_block_colour() {
+        assert_eq!(block_color(0, 0, 0), [30, 30, 30], "air is the background grey");
+        assert_eq!(block_color(2, 0, 0), BLOCK_RGB[2], "unpainted stone = its table entry");
+    }
+
+    /// Grass is the one block whose unpainted colour depends on the world's sky, and painting it
+    /// must still win over that special case.
+    #[test]
+    fn grass_follows_sky_until_painted() {
+        assert_eq!(block_color(8, 0, 0), grass_color(0));
+        assert_eq!(block_color(8, 0, 11), grass_color(11), "desert sky");
+        assert_eq!(block_color(8, 0, 13), [255, 255, 255], "snow sky");
+        assert_ne!(block_color(8, 5, 11), grass_color(11), "a painted grass block is not sky-tinted");
+    }
+
+    /// Paint applies the *block's* brightness scale, which is why the same paint index reads
+    /// differently on two block types — the exact drift (C6) these shared tables exist to prevent.
+    #[test]
+    fn paint_is_scaled_by_the_block_not_the_paint() {
+        let paint = 5usize;
+        for bt in [2u8, 9, 74] {
+            let [r, _, _] = block_color(bt, paint as u8, 0);
+            let expected = (PAINT_RGB[paint][0] as f32 * BLOCK_PAINT_SCALE[bt as usize]).clamp(0.0, 255.0) as u8;
+            assert_eq!(r, expected, "block {bt} must use its own paint scale");
+        }
+    }
+
+    /// Out-of-range indices fall back rather than panicking — several call sites feed these
+    /// straight from untrusted world/wire bytes.
+    #[test]
+    fn out_of_range_paint_falls_back_to_the_block_colour() {
+        assert_eq!(block_color(2, 200, 0), BLOCK_RGB[2]);
     }
 }

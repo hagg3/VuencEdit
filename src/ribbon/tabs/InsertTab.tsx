@@ -1,10 +1,12 @@
 /**
  * INSERT — generate or bring content into the world.
  *
- * Prefab and Import Schematic moved off the File menu (inserting a `.schematic` puts content in
- * the world; it isn't a file operation on *your* world), Materialize moved off Home, and the
- * Fluid toolkit moved off Selection — it is selection-scoped *generation*, structurally identical
- * to Trees, which already lived here.
+ * Prefab moved off the File menu (loading a prefab puts content in the world; it isn't a file
+ * operation on *your* world), Materialize moved off Home, and the Fluid toolkit moved off
+ * Selection — it is selection-scoped *generation*, structurally identical to Trees, which already
+ * lived here. Groups: Prefab, Nature, Fluids, World Extent. (Schematic import — the former Import
+ * group — was removed along with the rest of VuencEdit's format-conversion features; see
+ * `~/EdenToMC`.)
  */
 import { useMemo, useState } from "react";
 import { solveLayout, type GroupMetrics } from "../layout";
@@ -17,7 +19,6 @@ import { ACCENT, GROUP_CONTENT_H, SMALL_H, SPACE } from "../tokens";
 
 const SPECS: GroupMetrics[] = [
   { id: "prefab", widths: { full: 230, medium: 156, compact: 44 }, minTier: "compact", priority: 1 },
-  { id: "import", widths: { full: 116, medium: 116, compact: 44 }, minTier: "medium", priority: 2 },
   { id: "nature", widths: { full: 338, medium: 240, compact: 44 }, minTier: "compact", priority: 0 },
   { id: "fluids", widths: { full: 372, medium: 250, compact: 44 }, minTier: "compact", priority: 3 },
   { id: "extent", widths: { full: 150, medium: 132, compact: 44 }, minTier: "medium", priority: 4 },
@@ -67,15 +68,6 @@ export default function InsertTab() {
             title={p.clipboard ? "Save the clipboard to any folder (native dialog)" : "Copy or cut something first"}
             onClick={p.onSavePrefabAs} />
         </Col>
-      </Group>
-      <GroupDivider />
-
-      {/* ── Import ────────────────────────────────────────────────────────── */}
-      <Group id="import" label={<>Import <Badge /></>} tier={tier.import} declaredWidth={116} icon="importFile">
-        <CommandButton tier={tier.import === "full" ? "full" : "medium"}
-          icon="importFile" label="Schematic"
-          title="Import a Minecraft .schematic / .litematic into the clipboard (experimental) — MC X→Eden X, MC Z→Eden Y, MC Y→Eden Z"
-          onClick={p.importSchematic} />
       </Group>
       <GroupDivider />
 

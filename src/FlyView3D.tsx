@@ -1,5 +1,5 @@
 import { decodeGeometry, type VoxelGeometry } from "./types";
-import { useEffect, useRef, useState, forwardRef, useImperativeHandle } from "react";
+import { useEffect, useRef, useState, useCallback, forwardRef, useImperativeHandle } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
@@ -90,6 +90,7 @@ export const RD_MIN = 2;               // slider floor (chunk radius)
 const LOOK_SENS_BASE = 0.006;
 const DRAG_SENS_BASE = 0.0025;
 const RENDER_DISTANCE_WARN_THRESHOLD = 16; // above this, chunk count grows enough to warn
+const FLY_SPEED_SCALE = 0.2; // rescales the flySpeed multiplier's range (0.1-3) down to the old 0.02-0.6 that felt right
 const FLY3D_LEGEND_SEEN_KEY = "eden_3dpane_legend_seen"; // M4: auto-open the legend once, ever
 // Piecewise slider-position ↔ chunk-radius mapping: positions 0…14 map 1:1 to chunks RD_MIN(2)…16
 // (the range where frame rate is cheap to buy), then two slider positions per chunk from 17…32 (the
@@ -474,7 +475,10 @@ const GeomMemHud = forwardRef<GeomMemHudRef>(function GeomMemHud(_props, ref) {
     <div
       title="Dev build only — resident 3D chunk geometry. gpu = uploaded VBO bytes, js = wire buffers still on the JS heap (should stay near 0 once uploads land), fly = in-flight fetch reservations."
       style={{
-        position: "absolute", bottom: 6, right: 6, zIndex: 1, pointerEvents: "none",
+        // Sits above the pane's view/select/fill control cluster (which shares the bottom-right
+        // corner) — it's the only instrument for the 3D-pipeline plan's memory findings, so it must
+        // be legible rather than squinted at from behind the control row.
+        position: "absolute", bottom: 36, right: 6, zIndex: 40, pointerEvents: "none",
         padding: "2px 7px", borderRadius: 4, fontSize: 9, fontVariantNumeric: "tabular-nums",
         background: "rgba(31,28,26,0.7)", border: "1px solid rgba(131,120,108,0.3)",
         color: frac > 0.9 ? "#ef4444" : "#83786c", lineHeight: 1.5,
@@ -678,7 +682,24 @@ const FlyView3D = forwardRef<FlyView3DRef, {
   const [flySpeed, setFlySpeed] = useState(initialFlySpeed ?? 1);
   const [loadRadius, setLoadRadius] = useState(initialRenderDistance ?? LOAD_RADIUS);
   const loadRadiusRef = useRef(initialRenderDistance ?? LOAD_RADIUS);
+  // Drag-time display value for the render-distance slider (Phase 3.2). The slider's onChange only
+  // touches this — the committed `loadRadius` (which drives an App re-render via onRenderDistanceChange
+  // and a scene re-sweep) is written on pointer/key release. Kept in sync whenever the committed value
+  // moves for any other reason (Settings revert, mount).
+  const [renderDistanceDisplay, setRenderDistanceDisplay] = useState(initialRenderDistance ?? LOAD_RADIUS);
+  useEffect(() => { setRenderDistanceDisplay(loadRadius); }, [loadRadius]);
   const [distanceWarnOpen, setDistanceWarnOpen] = useState(false);
+  // Commit a render-distance change on slider release (Phase 3.2). Routes through
+  // sceneApi.setLoadRadius (Phase 1.1) rather than writing loadRadiusRef directly: it folds in the
+  // fog-distance refresh and forces a sweep so a *lowered* radius actually evicts instead of leaving
+  // the old disc fully resident. Its own integer-equality guard makes a no-change release a no-op.
+  const commitRenderDistance = useCallback((v: number) => {
+    setRenderDistanceDisplay(v);
+    sceneApi.current?.setLoadRadius(v);
+    loadRadiusRef.current = v; // fallback in case sceneApi hasn't mounted yet
+    setLoadRadius(v);
+    onRenderDistanceChangeRef.current?.(v);
+  }, []);
   // Controls legend popover (D1) — a discoverable, always-available reminder for every pane binding,
   // including the ones with no on-canvas affordance (Alt-crawl, Esc drag-cancel precedence, etc.).
   // M4: the pane itself is easy to miss (two nested toggles, now one — see ViewTab) and once open its
@@ -725,7 +746,16 @@ const FlyView3D = forwardRef<FlyView3DRef, {
   // that's already current, which React no-ops.
   useEffect(() => {
     if (initialRenderDistance == null) return;
-    loadRadiusRef.current = initialRenderDistance;
+    // Phase 1.1: go through sceneApi.setLoadRadius so a Settings-driven revert actually re-sweeps and
+    // evicts (its guard compares against the *previous* loadRadiusRef value, so it must run before that
+    // ref is overwritten below — writing the ref first would make the comparison a no-op against itself).
+    // Before the scene mounts there's nothing to sweep; the ref write is enough, since scene init reads
+    // it fresh.
+    if (sceneApi.current) {
+      sceneApi.current.setLoadRadius(initialRenderDistance);
+    } else {
+      loadRadiusRef.current = initialRenderDistance;
+    }
     setLoadRadius(initialRenderDistance);
   }, [initialRenderDistance]);
   useEffect(() => {
@@ -889,6 +919,11 @@ const FlyView3D = forwardRef<FlyView3DRef, {
   // maximize state; the renderer's own `antialias` flag can't be toggled live (would need a full
   // context recreate), so this bumps DPR to 2 for supersample-style smoothing instead.
   const [antialias, setAntialias] = useState(false);
+  // Mirrored for the scene effect: a world-size change rebuilds the renderer at MAX_DPR, but the
+  // `[antialias]` effect doesn't re-fire, so without re-reading this at scene-init the toggle would
+  // read "on" while the DPR was reset to off (same idiom as suspendedRef at scene-init).
+  const antialiasRef = useRef(antialias);
+  antialiasRef.current = antialias;
 
   // Editor-only fog/sky color override — never written back to world.sky (the file's saved sky
   // color table). Defaults to a Minecraft-like light blue rather than the world's own (often muddy)
@@ -929,6 +964,10 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     setOverlays: (ovs: Overlay3D[] | null) => void;
     setFog: (enabled: boolean, color: readonly [number, number, number]) => void;
     setMaxDpr: (max: number) => void;
+    /** Phase 1.1: the single entry point for a render-distance change — writes loadRadiusRef, re-derives
+     *  fog distances, and forces a sweep so lowering the radius actually evicts (a revert-to-default
+     *  no-ops on identical radius). Never disposes chunks still inside the new radius. */
+    setLoadRadius: (r: number) => void;
     setGridVisible: (v: boolean) => void;
     setGpuShadows: (on: boolean) => void;
     /** Park/resume the pane while it's mounted but hidden (Stage 4). Suspending disposes every
@@ -1282,13 +1321,14 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     sun.shadow.mapSize.set(2048, 2048);
     sun.shadow.bias = -0.0006;           // pull the depth test back a hair to kill shadow acne on flats
     sun.shadow.normalBias = 0.6;         // and along steep faces (voxels have large flat facets)
-    sun.shadow.radius = 3;               // PCFSoft blur kernel — softer shadow edges than the default 1
     {
       const sc = sun.shadow.camera as THREE.OrthographicCamera;
       sc.near = 1; sc.far = 6000;        // wide range; the ortho box (left/right/top/bottom) tracks the camera
     }
     scene.add(ambient, sun, sun.target);
-    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    // PCFSoftShadowMap is deprecated in three r184 (warns once, silently falls back to PCFShadowMap
+    // and makes sun.shadow.radius inert), so ask for PCFShadowMap directly — a hard PCF kernel.
+    renderer.shadowMap.type = THREE.PCFShadowMap;
 
     // Sun disc — a bright billboarded sprite placed up-sun, just inside the sky dome, so the light
     // has a visible source. Occluded by terrain (drawn with depth test); `fog:false` keeps it crisp.
@@ -1341,6 +1381,14 @@ const FlyView3D = forwardRef<FlyView3DRef, {
         ambient.intensity = 1.5; sun.intensity = 2.0; sunDisc.visible = true;
       } else {
         ambient.intensity = 0; sun.intensity = 0; sunDisc.visible = false;
+        // GPU-shadow mode just turned off: renderer.shadowMap.enabled = false above already skips the
+        // shadow pass entirely (zero per-frame cost), but the render target itself — up to 4096² — was
+        // left allocated and VRAM-resident. Dispose it and reset mapSize to the init value (2048) so a
+        // future re-enable at a low render distance doesn't reallocate the old 4096 before the per-frame
+        // block above (which only shrinks, never grows, on its own) gets a chance to correct it.
+        sun.shadow.map?.dispose();
+        sun.shadow.map = null;
+        sun.shadow.mapSize.set(2048, 2048);
       }
       if (!gpuNight) {
         for (const pl of nightLights) { pl.visible = false; pl.intensity = 0; }
@@ -1464,6 +1512,18 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     // the cached sphere. ⚠️ This makes the geometry unrecoverable after a GPU context loss: three
     // re-uploads from `attribute.array`. The `webglcontextrestored` handler below therefore *must*
     // call reloadAllChunks() — the two changes are load-bearing on each other.
+    // ⚠️ It only fires for meshes three actually *draws*: the frustum pass hides most of the disc at a
+    // large render distance, and a hidden mesh is never uploaded, so its CPU copy stays pinned (audit
+    // Finding 3). Deliberately left that way — Phase 2.2, "accounted, not fixed". The bytes are still
+    // counted exactly once, because an un-uploaded mesh has no VBO yet: `residentBytes` is that
+    // chunk's heap cost until it first draws and its VRAM cost afterwards, never both, and this
+    // release is precisely what stops the two from overlapping. Folding `jsBytes` into pump()'s gate
+    // would therefore double-count every undrawn chunk and roughly halve the resident chunk count at
+    // a given preset for no real memory saving. The residual risk is *which pool* holds the bytes — a
+    // WKWebView JS heap is a much tighter cap than VRAM — so if a baked-lighting session (no GPU
+    // shadow pass, hence no light-camera render to force uploads) ever crashes with `js` a large
+    // fraction of `gpu` on the GeomMemHud, forcing the upload at install is the lever to reach for,
+    // not the accounting change.
     const releaseOnUpload = (mesh: THREE.Mesh) => {
       for (const attr of Object.values(mesh.geometry.attributes)) {
         if (!(attr instanceof THREE.BufferAttribute)) continue;
@@ -1506,6 +1566,12 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       invalidate();
     };
 
+    /** Wire bytes this key holds across the three mesh maps. 0 for an `emptyChunks`-only key. */
+    const chunkBytes = (k: string) =>
+      ((meshes.get(k)?.userData.geomBytes as number) ?? 0)
+      + ((meshesT.get(k)?.userData.geomBytes as number) ?? 0)
+      + ((meshesE.get(k)?.userData.geomBytes as number) ?? 0);
+
     // Push the dev memory readout. Called wherever the totals move; the HUD is its own leaf, so this
     // costs one small re-render and nothing else. No-ops entirely in a production build.
     const pushMemHud = import.meta.env.DEV
@@ -1537,6 +1603,16 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     // pass 6.7×/second for nothing (audit M6). Reset to an impossible value so the very first sweep
     // (and any forced sweep via reloadChunk/reloadAllChunks/camera-move) always runs in full.
     let lastSweepCcx = Number.NaN, lastSweepCcy = Number.NaN;
+    // Squared chunk distance the geometry budget could not reach past, measured from the sweep's own
+    // camera chunk (Phase 2.1). `Infinity` = unconstrained. Chunks at or beyond it are not queued,
+    // which is the hysteresis that stops the evict-then-immediately-refetch churn a bare
+    // budget-eviction pass would otherwise settle into once the pane is pegged: evict the farthest,
+    // refetch it as the nearest non-resident, evict it again, one round trip per sweep forever. It is
+    // re-opened whenever the camera chunk, the z band, the radius or the budget changes (streamSweep).
+    let budgetHorizonSq = Infinity;
+    // The budget the horizon above was derived under, so a Settings change re-opens it (a *raised*
+    // budget can reach farther; a lowered one has to re-derive from scratch anyway).
+    let budgetHorizonBudget = geometryBudgetRef.current;
 
     // ---- Camera z band (Stage 3) ----
     // Ceiling of the z range each chunk fetch scans, quantized so it only moves in Z_BAND_STEP jumps.
@@ -1545,8 +1621,21 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     // byte-for-byte the pre-Stage-3 one. The cutaway cap is NOT folded in here — the backend applies
     // `view_cap_z` itself; this pane only has to invalidate when it changes (see the viewCapZ effect).
     const zBandTop = (): number | null => {
-      const top = Math.ceil((camera.position.y + Z_BAND_ABOVE) / Z_BAND_STEP) * Z_BAND_STEP;
-      return top >= maxZ ? null : top;
+      const need = camera.position.y + Z_BAND_ABOVE;
+      const raw = Math.ceil(need / Z_BAND_STEP) * Z_BAND_STEP;
+      const rawBand = raw >= maxZ ? null : raw;
+      // First computation (Stage 3): take the quantized band as-is.
+      if (zBand === undefined) return rawBand;
+      // Hysteresis (Phase 3.1): quantizing to Z_BAND_STEP bounds how often the band *moves* but not
+      // how often the camera *crosses* a boundary — hovering right on one (notably y ≈ 96 on a 256z
+      // world, the null⇄bounded edge) full-restreams at sweep rate. Hold the current band until `need`
+      // is more than half a step outside it in either direction, including on the way up (the extra
+      // Z_BAND_ABOVE margin absorbs the lag). The `null` case compares against the pivot `need` would
+      // have to fall back below to re-enter a bounded band, so that edge gets the same margin.
+      const nullPivot = Math.ceil(maxZ / Z_BAND_STEP) * Z_BAND_STEP - Z_BAND_STEP;
+      const cur = zBand === null ? nullPivot : zBand;
+      if (need > cur + Z_BAND_STEP / 2 || need < cur - Z_BAND_STEP / 2) return rawBand;
+      return zBand;
     };
     // Band the resident meshes were actually built with. `undefined` = never computed, so the first
     // sweep always installs one (a legitimate value of `null` must not read as "unchanged").
@@ -1678,9 +1767,14 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       // fetch completion). In-flight reservations count too, so a burst of concurrent fetches on a
       // dense 256z world can't land collectively past the cap.
       const overBudget = residentBytes + inflightBytes >= geometryBudgetRef.current;
-      if (overBudget !== budgetLimited) {
-        budgetLimited = overBudget;
-        setBudgetLimitedRef.current(overBudget);
+      // The badge is not the fetch gate (Phase 2.1): budget eviction leaves the pane *just under* the
+      // cap with its disc truncated at `budgetHorizonSq`, so testing `overBudget` alone would blink
+      // the badge off in exactly the state the user most needs it — render distance silently reduced
+      // to what the budget can hold.
+      const limited = overBudget || budgetHorizonSq < Infinity;
+      if (limited !== budgetLimited) {
+        budgetLimited = limited;
+        setBudgetLimitedRef.current(limited);
       }
       if (overBudget) return;
       while (active < maxConcurrent() && queue.length) {
@@ -1721,27 +1815,26 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       if (!force && !bandMoved && ccx === lastSweepCcx && ccy === lastSweepCcy && queue.length === 0) {
         return;
       }
+      const cameraMoved = ccx !== lastSweepCcx || ccy !== lastSweepCcy;
       lastSweepCcx = ccx; lastSweepCcy = ccy;
-      // Rebuild the work queue each sweep (nearest-first) so the camera's current position drives
-      // priority and chunks that fell out of range stop being requested.
       const r = loadRadiusRef.current;
-      const needed: { cx: number; cy: number; d2: number }[] = [];
-      for (let cy = ccy - r; cy <= ccy + r; cy++) {
-        if (cy < 0 || cy >= world.height_chunks) continue;
-        for (let cx2 = ccx - r; cx2 <= ccx + r; cx2++) {
-          if (cx2 < 0 || cx2 >= world.width_chunks) continue;
-          const dx = cx2 - ccx, dy = cy - ccy;
-          const d2 = dx * dx + dy * dy;
-          if (d2 > r * r) continue;
-          if (isResident(key(cx2, cy)) || inflight.has(key(cx2, cy))) continue;
-          needed.push({ cx: cx2, cy, d2 });
-        }
+      // The budget horizon only describes what fits *from this camera chunk, at this radius, under
+      // this budget* — anything that changes one of those three re-opens it. `force` covers the
+      // radius/teleport/reload paths (setLoadRadius, resetCamera/teleport, reloadAllChunks).
+      if (force || bandMoved || cameraMoved || geometryBudgetRef.current !== budgetHorizonBudget) {
+        budgetHorizonBudget = geometryBudgetRef.current;
+        budgetHorizonSq = Infinity;
       }
-      needed.sort((a, b) => a.d2 - b.d2);
-      queue = needed;
-      pump();
-      // Dispose far chunks (keep a small hysteresis margin). Euclidean, matching the loading disc
-      // above (d2 <= r*r) — a Chebyshev/square test here would let chunks up to ~1.41r+2.8 away
+
+      // ---- Eviction (both passes run before the queue is rebuilt) ----
+      // Freeing first is what lets a sweep that unsticks the budget resume streaming — and clear the
+      // `budgetLimited` badge — inside the same tick rather than a STREAM_MS later, and it means the
+      // queue below is built against the post-eviction residency set instead of a stale one. (There
+      // used to be a pump() here and a second one after the radius pass for the same reason; one
+      // pump at the bottom now covers both.)
+
+      // Pass 1 — dispose far chunks (keep a small hysteresis margin). Euclidean, matching the loading
+      // disc below (d2 <= r*r) — a Chebyshev/square test here would let chunks up to ~1.41r+2.8 away
       // survive (the corners of the square), roughly doubling the resident set at large r.
       const dropSq = (r + 2) * (r + 2);
       // Union of all four residency maps. `meshes ∪ emptyChunks` alone happens to cover every key
@@ -1756,6 +1849,70 @@ const FlyView3D = forwardRef<FlyView3DRef, {
           disposeMesh(k);
         }
       }
+
+      // Pass 2 (Phase 2.1, audit Finding 5) — budget-driven eviction. Pass 1 only frees chunks that
+      // fell *outside* the disc, so at a render distance where the whole disc is in range it frees
+      // nothing: pump()'s gate stays shut permanently, lowering the memory preset is inert, and the
+      // queued chunks simply never arrive. That is a streaming stall rather than a slowdown, which is
+      // why it never read as a performance bug — confirmed by a 512 MB / 512 MB HUD reading at r=32
+      // with the camera parked. Drop the chunks *farthest* from the camera (deliberately not an LRU:
+      // the chunk you just flew toward is the most recently loaded and the one you most need) until
+      // the resident set is back inside the budget.
+      if (residentBytes + inflightBytes >= geometryBudgetRef.current) {
+        const evictable: { k: string; d2: number }[] = [];
+        for (const k of residentKeys()) {
+          // Off limits: a chunk with a fetch already in flight (disposing it would strand the pane on
+          // pre-edit geometry and leave its reservation double-counted) and any pending edit-sync
+          // reload target — reloadChunk owns the budget interaction for those, eagerly.
+          if (inflight.has(k) || forceKeys.has(k)) continue;
+          if (chunkBytes(k) === 0) continue; // an emptyChunks marker: frees nothing, refetched forever
+          const [kx, ky] = k.split(",").map(Number);
+          const dx = kx - ccx, dy = ky - ccy;
+          evictable.push({ k, d2: dx * dx + dy * dy });
+        }
+        evictable.sort((a, b) => b.d2 - a.d2);
+        for (const e of evictable) {
+          if (residentBytes + inflightBytes < geometryBudgetRef.current) break;
+          disposeMesh(e.k);
+          // Record how far the budget actually reached so the scan below doesn't re-queue what was
+          // just dropped (see budgetHorizonSq). Floored at 1 so the camera's own chunk (d2 = 0) stays
+          // fetchable no matter how small the budget is.
+          budgetHorizonSq = Math.max(1, Math.min(budgetHorizonSq, e.d2));
+        }
+      }
+
+      // Rebuild the work queue each sweep (nearest-first) so the camera's current position drives
+      // priority and chunks that fell out of range stop being requested.
+      const needed: { cx: number; cy: number; d2: number }[] = [];
+      for (let cy = ccy - r; cy <= ccy + r; cy++) {
+        if (cy < 0 || cy >= world.height_chunks) continue;
+        for (let cx2 = ccx - r; cx2 <= ccx + r; cx2++) {
+          if (cx2 < 0 || cx2 >= world.width_chunks) continue;
+          const dx = cx2 - ccx, dy = cy - ccy;
+          const d2 = dx * dx + dy * dy;
+          if (d2 > r * r) continue;
+          if (d2 >= budgetHorizonSq) continue; // the budget can't hold anything this far out
+          if (isResident(key(cx2, cy)) || inflight.has(key(cx2, cy))) continue;
+          needed.push({ cx: cx2, cy, d2 });
+        }
+      }
+      needed.sort((a, b) => a.d2 - b.d2);
+      // Re-merge any still-pending edit-sync reloads (reloadChunk) before overwriting the queue.
+      // Their target chunk is *resident* (carrying stale, pre-edit geometry) by construction, so the
+      // radius scan above always excludes it from `needed` — a forced reload that hasn't reached
+      // startFetch yet (still sitting in the old `queue`, not yet in `active`/`inflight`) would
+      // otherwise be silently discarded the moment this periodic sweep rebuilds `queue` from scratch.
+      // That's the bug behind "an edit only partially appears in the 3D pane until it's toggled
+      // off/on" — an edit (e.g. a large paste) can force-reload more chunks than `maxConcurrent()`
+      // can start within one STREAM_MS tick, and the next tick used to wipe out the rest.
+      const pendingForced: { cx: number; cy: number }[] = [];
+      for (const k of forceKeys) {
+        if (inflight.has(k)) continue; // already being fetched — startFetch's finally{} owns requeueing it
+        const [fx, fy] = k.split(",").map(Number);
+        pendingForced.push({ cx: fx, cy: fy });
+      }
+      queue = pendingForced.length ? [...pendingForced, ...needed] : needed;
+      pump();
       pushMemHud();
     };
 
@@ -2191,6 +2348,15 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     // counts if the pointer barely moved and the press was short. This keeps build/select working in
     // the drag-to-look fallback, which matters because pointer lock is exactly what webviews refuse.
     let downX = 0, downY = 0, downT = 0, downBtn = -1;
+    // True while a press is still small/short enough to be a click, not a drag or a hold. Split out
+    // of `isClick` so `contextmenu` — a MouseEvent, no reliable `button` in WKWebView — can apply
+    // the same slop test against the press it belongs to (C2), and so `buildRepeatTick` can defer
+    // the build sweep until the press outgrows a click. Declared here (above the build-gesture
+    // block) because the tick references it.
+    const withinClickSlop = (cx: number, cy: number) =>
+      performance.now() - downT < CLICK_SLOP_MS &&
+      Math.abs(cx - downX) <= CLICK_SLOP_PX &&
+      Math.abs(cy - downY) <= CLICK_SLOP_PX;
 
     // ---- Build gesture: Minecraft-style drag-sweep (H4) -------------------------------------------
     //
@@ -2294,6 +2460,15 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       // Absolute bound on one gesture: if the webview never delivers the pointerup (the failure this
       // whole handler family is defensive about), the hold ends here rather than living forever.
       if (performance.now() - buildRepeatStartT > BUILD_GESTURE_MAX_MS) { endBuildGesture(); return; }
+      // Don't let a click-sized twitch trigger the sweep. Until the press grows into a real hold
+      // (past CLICK_SLOP_MS) or a real drag (past CLICK_SLOP_PX), the click path (onPickUp /
+      // onPickContext) owns this gesture and places exactly one block. Without this, the NaN-seeded
+      // `aimChanged` (always true on the first move of a gesture) turned any few-px hand-shake
+      // between pointerdown and contextmenu into a stamp — and its own trailing-edge re-tick
+      // (`finally` below) into a second one right after, with no cooldown: the "right-click places
+      // two blocks" bug. The airbrush interval's first tick is delayed past CLICK_SLOP_MS
+      // (BUILD_REPEAT_DELAY_MS 300 > 250), so a stationary hold is unaffected.
+      if (withinClickSlop(cursorX, cursorY)) return;
       if (!aimChanged()) return; // nothing has moved — a pick would return the same cell
       recordAim();
       const gen = buildRepeatGen;
@@ -2465,12 +2640,6 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     // Safety net for a missed pointerup (webview-issued pointercancel, e.g. from an OS gesture or
     // focus loss mid-press) — without this the repeat interval above would run forever.
     const onPickCancel = () => endBuildGesture();
-    // Split out of isClick so `contextmenu` — a MouseEvent, with no reliable `button` of its own in
-    // WKWebView — can apply the same slop test against the press it belongs to (C2).
-    const withinClickSlop = (cx: number, cy: number) =>
-      performance.now() - downT < CLICK_SLOP_MS &&
-      Math.abs(cx - downX) <= CLICK_SLOP_PX &&
-      Math.abs(cy - downY) <= CLICK_SLOP_PX;
     const isClick = (e: PointerEvent) => e.button === downBtn && withinClickSlop(e.clientX, e.clientY);
 
     // Left-click. Select mode → pick a selection corner. Build mode → BREAK the picked block.
@@ -2711,7 +2880,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       if (!flyModeRef.current) return;
       e.preventDefault();
       const f = e.deltaY < 0 ? 1.15 : 1 / 1.15;
-      speedMultRef.current = THREE.MathUtils.clamp(speedMultRef.current * f, 0.1, 12);
+      speedMultRef.current = THREE.MathUtils.clamp(speedMultRef.current * f, 0.1, 3);
       const rounded = Math.round(speedMultRef.current * 10) / 10;
       setFlySpeed(rounded);
       onFlySpeedChangeRef.current?.(rounded);
@@ -2925,7 +3094,11 @@ const FlyView3D = forwardRef<FlyView3DRef, {
         // is already down-move, Shift is sprint), so it's the clash-free choice for a slow/precise
         // mode. Shift takes priority if both are somehow held.
         const boost = keys.has("shift") ? 3.5 : keys.has("alt") ? 0.25 : 1;
-        const speed = Math.max(12, maxZ * 0.6) * boost * speedMultRef.current * dt;
+        // Rescaled 2026-08-25: the old raw multiplier ran 0.1-12 against this base speed and made
+        // 1.0 (the default) feel like warp speed — 0.2 was the value that actually felt like "1.0"
+        // should. FLY_SPEED_SCALE folds that rescale in here so the multiplier's own range (now
+        // 0.1-3) can stay a plain, sensible-looking number everywhere it's surfaced (slider, HUD).
+        const speed = Math.max(12, maxZ * 0.6) * boost * speedMultRef.current * FLY_SPEED_SCALE * dt;
         const move = new THREE.Vector3();
         if (keys.has("w")) move.add(fwd);
         if (keys.has("s")) move.sub(fwd);
@@ -3544,8 +3717,28 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     canvas.addEventListener("pointerup", onGizmoPointerUp);
     canvas.addEventListener("pointercancel", cancelGizmoDrag);
 
+    // Phase 1.1: the one entry point for "render distance changed" — both the Settings-driven resync
+    // effect and the in-pane slider go through this instead of writing loadRadiusRef directly. Forcing
+    // a sweep is what actually re-evaluates dropSq/needed against the new radius (streamSweep's own
+    // early-out only fires on an unchanged camera chunk with an empty queue, which lowering the radius
+    // never satisfies on its own — nothing repopulates the queue to trigger the eviction pass). Does
+    // *not* call reloadAllChunks(): that disposes and refetches every resident chunk, which is exactly
+    // the spike a revert should avoid — streamSweep(true) evicts what fell outside the new radius and
+    // leaves everything still inside it resident.
+    // Guarded on integer-radius identity so a caller that fires per drag pixel (the in-pane slider,
+    // pre-3.2) can't force a sweep per pixel — the radius only ever changes in whole-chunk notches.
+    const setLoadRadius = (r: number) => {
+      if (r === loadRadiusRef.current) return;
+      loadRadiusRef.current = r;
+      // Fog's near/far distances are derived from the radius (fogDistances) — without this, reverting
+      // the render distance left fog fading in/out at the old, now-wrong distance.
+      setFog(fogEnabledRef.current, fogColorRef.current);
+      streamSweep(true);
+    };
+
     sceneApi.current = {
       scene, camera, reloadChunk, reloadAllChunks, resetCamera, teleport, setOverlays, setFog, setMaxDpr,
+      setLoadRadius,
       setGridVisible: (v) => { grid.visible = v; invalidate(); },
       // Flip the scene lighting, then rebuild every chunk mesh (material + normals + flat-vs-baked
       // geometry all differ between modes).
@@ -3575,6 +3768,8 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     sceneApi.current.setGizmoSelection(interact3dRef.current, selectionBounds3dRef.current ?? null);
     // Same for suspension: a world change rebuilds this closure while the pane may already be hidden.
     if (suspendedRef.current) setSuspended(true);
+    // And for antialiasing: the fresh renderer starts at MAX_DPR, so re-apply the toggle's DPR bump.
+    if (antialiasRef.current) sceneApi.current.setMaxDpr(2);
 
     return () => {
       disposed = true;
@@ -3758,12 +3953,14 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [worldLoadToken]);
 
-  // Edit sync: reload chunk meshes overlapping the last edit's top-down bounds. When night lighting
-  // or shadows are on, a placed lamp (LAMP_LIGHT_RADIUS) or a new occluder (SHADOW_RAY_STEPS, the
-  // shadow raymarch distance) can visibly affect blocks in the *next* chunk over — reloading only the
-  // chunk(s) the edit's own bounds touch would leave a lit/shadowed seam at that boundary until the
-  // camera flies away and back. The rect is therefore expanded by that reach, converted to whole
-  // chunks — but the two halves are **not** reloaded on the same schedule (C3 steps 2–3):
+  // Edit sync: reload chunk meshes overlapping the last edit's top-down bounds. The rect is always
+  // expanded by at least 1 chunk (face culling at a chunk boundary needs the *neighbour*'s mesh
+  // rebuilt too, independent of lighting — see the chunkPad comment below), and further when night
+  // lighting or shadows are on: a placed lamp (LAMP_LIGHT_RADIUS) or a new occluder (SHADOW_RAY_STEPS,
+  // the shadow raymarch distance) can visibly affect blocks in the *next* chunk over, so reloading
+  // only the chunk(s) the edit's own bounds touch would leave a lit/shadowed seam at that boundary
+  // until the camera flies away and back. The two halves are **not** reloaded on the same schedule
+  // (C3 steps 2–3):
   //
   //   • **core** (the edit's own chunks, usually 1) — immediately. This is the block you just placed
   //     appearing, so it can never be deferred.
@@ -3786,7 +3983,14 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       nightLighting ? lampRadiusRef.current : 0,
       shadows3d ? lightConstantsRef.current.shadowRayScan : 0,
     );
-    const chunkPad = Math.ceil(reach / 16);
+    // Padding is at minimum 1 chunk *regardless* of lighting: face culling for a voxel is decided
+    // against its neighbour, so deleting/adding a block at (or near) a chunk boundary changes which
+    // faces the *neighbouring* chunk's own mesh should be emitting — that neighbour was never in
+    // `core` (the edit's own bounds) and, with lighting off, `reach` used to be 0, so it was never
+    // reloaded at all. That's the "removing blocks near others leaves a see-through/culled face
+    // until the pane is toggled" bug: the halo below is what fixes it (still deferred by
+    // HALO_FLUSH_MS, since it isn't the block you just placed — that part shows immediately).
+    const chunkPad = Math.max(1, Math.ceil(reach / 16));
     const cx0 = worldToChunk(lastEdit.x);
     const cy0 = worldToChunk(lastEdit.y);
     const cx1 = worldToChunk(lastEdit.x + Math.max(0, lastEdit.w - 1));
@@ -3953,7 +4157,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
         )}
         {budgetLimited && (
           <span
-            title={`Resident chunk geometry hit the ${(geometryBudgetBytes / (1 << 20)).toFixed(0)} MB budget — streaming is paused until you fly away from some of it to free headroom. Raise it in Settings → Memory budget.`}
+            title={`Resident chunk geometry hit the ${(geometryBudgetBytes / (1 << 20)).toFixed(0)} MB budget — the farthest chunks are being dropped to stay inside it, so the pane is showing less than the render distance asks for. Raise it in Settings → Memory budget, or lower the render distance.`}
             style={{
               padding: "1px 5px", borderRadius: 4, fontSize: 9,
               background: "rgba(239,68,68,0.12)", border: "1px solid rgba(239,68,68,0.3)",
@@ -4056,21 +4260,20 @@ const FlyView3D = forwardRef<FlyView3DRef, {
         })}>
           <span style={{ fontSize: 9, color: "#83786c", userSelect: "none" }} aria-hidden="true">R</span>
           <input
-            type="range" min={0} max={radiusToPos(MAX_RENDER_DISTANCE)} step={1} value={radiusToPos(loadRadius)}
+            type="range" min={0} max={radiusToPos(MAX_RENDER_DISTANCE)} step={1} value={radiusToPos(renderDistanceDisplay)}
             onChange={e => {
-              const v = posToRadius(Number(e.target.value));
-              loadRadiusRef.current = v;
-              setLoadRadius(v);
-              onRenderDistanceChangeRef.current?.(v);
-              // Fog distance derives from render distance — refresh it live as the slider moves.
-              sceneApi.current?.setFog(fogEnabledRef.current, fogColorRef.current);
+              // Phase 3.2: drag only moves the local display value — no App re-render, no scene
+              // re-sweep. The commit below does the real work on release.
+              setRenderDistanceDisplay(posToRadius(Number(e.target.value)));
             }}
-            title={`Render distance: ${loadRadius} chunks`}
-            aria-label={`Render distance: ${loadRadius} chunks`}
+            onPointerUp={e => commitRenderDistance(posToRadius(Number((e.target as HTMLInputElement).value)))}
+            onKeyUp={e => commitRenderDistance(posToRadius(Number((e.target as HTMLInputElement).value)))}
+            title={`Render distance: ${renderDistanceDisplay} chunks`}
+            aria-label={`Render distance: ${renderDistanceDisplay} chunks`}
             style={{ width: 150, cursor: "pointer", accentColor: "#83786c" }}
           />
-          <span style={{ fontSize: 9, color: "#afa69d", minWidth: 14, textAlign: "right", userSelect: "none" }} aria-hidden="true">{loadRadius}</span>
-          {loadRadius > RENDER_DISTANCE_WARN_THRESHOLD && (
+          <span style={{ fontSize: 9, color: "#afa69d", minWidth: 14, textAlign: "right", userSelect: "none" }} aria-hidden="true">{renderDistanceDisplay}</span>
+          {renderDistanceDisplay > RENDER_DISTANCE_WARN_THRESHOLD && (
             <div style={{ position: "relative", display: "flex" }}>
               <button
                 onClick={() => setDistanceWarnOpen(o => !o)}

@@ -195,9 +195,8 @@ export interface RibbonProps {
   recentWorlds: RecentWorld[];
   openFile: () => void; openFileAt: (path: string) => void;
   saveWorld: (path: string) => void; saveWorldAs: () => void;
-  exportPng: () => void; exportObj: () => void; exportJson: () => void; exportVmf: () => void;
-  enableExperimentalExport: boolean;
-  loadPrefab: () => void; importSchematic: () => void;
+  exportPng: () => void;
+  loadPrefab: () => void;
   showPrefabLibrary: boolean; onTogglePrefabLibrary: () => void;
   moveWithContents: boolean; setMoveWithContents: (fn: (v: boolean) => boolean) => void;
   setShowNewWorld: (v: boolean) => void; setShowWorldBrowser: (v: boolean) => void;

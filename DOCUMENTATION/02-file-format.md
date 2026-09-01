@@ -20,11 +20,22 @@ before parsing.
 |--------|------|------|-------|
 | 0 | 4 | i32/f32 | `level_seed` |
 | 4 | 12 | 3× f32 | player `pos` (x, y, z) |
+| 16 | 12 | 3× f32 | `home` (x, y, z) — Set Point ▸ Home target, `set_spawn_pos` |
+| 28 | 4 | f32 | `yaw` — initial camera yaw |
 | 32 | 8 | **u64** | `directory_offset` — file offset of the chunk pointer table |
 | 40 | 50 | bytes | `name[50]` (ASCII, null-padded) |
 | 92 | 4 | i32 | `version` |
+| 96 | 36 | bytes | `hash[36]` — verification hash of the shared world preview image |
 | 132 | 16 | bytes | `skycolors[16]` — 16-band sky color palette |
 | 148 | 4 | — | `goldencubes` |
+
+> `home`/`yaw`/`hash[36]` are confirmed from the game creator's own reference
+> `EdenFileLoader` (2019, `EdenFileReader/`) rather than reverse-engineered —
+> its `WorldFileHeader` struct lines up byte-for-byte with the rest of this
+> table (12 B `Vector pos` + 12 B `Vector home` + 4 B `yaw` bringing
+> `directory_offset` to its known offset 32; `version` + 36 B `hash` bringing
+> `skycolors` to its known offset 132). `yaw` and `hash` aren't otherwise used
+> by this project.
 
 > The header is 192 bytes total (`0x0C0`). MROB's original dump calls it "3008
 > octal" = 192 decimal.

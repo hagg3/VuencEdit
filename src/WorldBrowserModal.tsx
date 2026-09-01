@@ -26,11 +26,6 @@ interface Props {
   onOpenWorld: (path: string) => void;
 }
 
-const FILES_BASE: Record<"current" | "legacy", string> = {
-  current: "http://files2.edengame.net",
-  legacy:  "http://files.edengame.net",
-};
-
 function formatDate(ts: number): string {
   return new Date(ts * 1000).toLocaleDateString(undefined, {
     year: "numeric", month: "short", day: "numeric",
@@ -118,6 +113,7 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
   const [fromDate, setFromDate] = useState("");
   const [toDate, setToDate] = useState("");
   const [hideJunk, setHideJunk] = useState(false);
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const unlistenRef = useRef<(() => void) | null>(null);
   // Gates onOpenWorld: even with dismissal blocked mid-download, the parent can still unmount us,
   // and a world-switch firing into a dead modal would be a surprise world change for the user.
@@ -130,9 +126,26 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
     return () => { mountedRef.current = false; unlistenRef.current?.(); };
   }, []);
 
-  // Reset preview whenever selection or server changes
+  // Fetch the preview thumbnail whenever selection or server changes. The image is proxied through
+  // Rust (`fetch_world_preview`) and wrapped in a blob: URL rather than pointed straight at the
+  // HTTP-only Eden file host — a remote `<img src>` is blocked by the release build's CSP (it only
+  // worked under `tauri dev`, where `devCsp` is null).
   useEffect(() => {
-    setPreviewStatus(selectedId ? "loading" : "empty");
+    if (!selectedId) { setPreviewUrl(null); setPreviewStatus("empty"); return; }
+    setPreviewStatus("loading");
+    let cancelled = false;
+    let objUrl: string | null = null;
+    (async () => {
+      try {
+        const buf = await invoke<ArrayBuffer>("fetch_world_preview", { id: selectedId, server });
+        if (cancelled) return;
+        objUrl = URL.createObjectURL(new Blob([buf], { type: "image/png" }));
+        setPreviewUrl(objUrl);
+      } catch {
+        if (!cancelled) { setPreviewUrl(null); setPreviewStatus("error"); }
+      }
+    })();
+    return () => { cancelled = true; if (objUrl) URL.revokeObjectURL(objUrl); };
   }, [selectedId, server]);
 
   async function doSearch() {
@@ -257,9 +270,6 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
   else if (sortBy === "quality") filteredResults = [...filteredResults].sort((a, b) => scoreWorld(b.name, b.timestamp) - scoreWorld(a.name, a.timestamp));
 
   const selectedResult = results.find(r => r.id === selectedId) ?? null;
-  const previewUrl = selectedResult
-    ? `${FILES_BASE[server]}/${selectedResult.id}.eden.png`
-    : null;
 
   return (
     // Dismissal is blocked while a download runs: closing wouldn't stop it, and "Save & Open"
