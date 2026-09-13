@@ -1070,6 +1070,30 @@ pub(crate) fn generate_flat_chunk(_cx: i32, _cy: i32, params: &FlatChunkParams) 
     data
 }
 
+/// Refuse, with a sized and named message, to start a generation whose peak transient memory
+/// (output chunks plus any full-grid generator workspace) would likely exceed what a modest
+/// machine can supply (audit E-2). Today the frontend/backend dimension caps (128×128, or 180×180
+/// for Tg2 — `NewWorldModal.tsx`, and the `width_chunks`/`size_chunks` checks in each generator
+/// below) are the only limits, and a failed allocation at that scale calls `handle_alloc_error`,
+/// which **aborts** the whole process with no panic, no toast, no `Result` — the same failure mode
+/// P-1 fixed for autosave. 6 GiB is generous headroom over the three non-Tg2 generators' worst case
+/// (128×128 chunks × 131,072 B ≈ 2.1 GB, no comparable extra workspace — see `heights` above, a few
+/// MB) while still refusing Tg2's pathological case: 180×180 at 256z is ~4.2 GB of chunk output
+/// *plus* ~4.2 GB of `Tg2Grid` workspace (two full `gsize × gsize × t_height` arrays), ~8.5 GB total.
+const MAX_WORLDGEN_BYTES: u64 = 6 * 1024 * 1024 * 1024;
+
+fn check_worldgen_budget(total_bytes: u64) -> Result<(), String> {
+    if total_bytes > MAX_WORLDGEN_BYTES {
+        let gb = |b: u64| b as f64 / (1u64 << 30) as f64;
+        return Err(format!(
+            "This world would need approximately {:.1} GB of memory to generate — the limit is \
+             {:.0} GB. Reduce the world size or turn off extended (256z) height.",
+            gb(total_bytes), gb(MAX_WORLDGEN_BYTES)
+        ));
+    }
+    Ok(())
+}
+
 /// Generate a flat world file at `path`.
 // Runs off the main thread (world generation takes seconds) so the UI doesn't freeze.
 #[tauri::command(async)]
@@ -1095,6 +1119,7 @@ pub(crate) fn create_world(
 
     let chunk_size = if extended_z { 131_072usize } else { 32_768usize };
     let n_chunks   = (width_chunks * height_chunks) as usize;
+    check_worldgen_budget(n_chunks as u64 * chunk_size as u64)?;
     let params = FlatChunkParams { chunk_size, stone_depth, dirt_depth, surface_z };
 
     pub(crate) const CENTER_CHUNK: i32 = 4096;
@@ -1305,6 +1330,7 @@ pub(crate) fn create_natural_world(
 
     let chunk_size = if extended_z { 131_072usize } else { 32_768usize };
     let n_chunks = (width_chunks * height_chunks) as usize;
+    check_worldgen_budget(n_chunks as u64 * chunk_size as u64)?;
 
     let (cfg, t_height) = natural_config_from_params(
         extended_z, seed, base_height, roughness_level, erosion_level, terrain_scale_level, extreme,
@@ -1769,6 +1795,7 @@ pub(crate) fn create_classic_world_inner(
     let t_height = (max_z + 1) as usize;
     let chunk_size = if extended_z { 131_072usize } else { 32_768usize };
     let n_chunks = (width_chunks * height_chunks) as usize;
+    check_worldgen_budget(n_chunks as u64 * chunk_size as u64)?;
 
     let variance = match variance_level { 0 => 1.0f64, 1 => 2.0, 2 => 3.0, 3 => 4.5, _ => 6.0 };
     let base_h = if base_height == 0 { t_height / 2 } else { (base_height as usize).min(t_height - 4).max(5) };
@@ -2773,6 +2800,12 @@ pub(crate) fn create_tg2_world(
     let wc=size_chunks as usize; let hc=wc;
     let t_height=if extended_z{256}else{64};
     let chunk_size=if extended_z{131_072usize}else{32_768usize};
+    // Include Tg2Grid's two full gsize×gsize×t_height workspace arrays (`blockz`+`colorz`), not
+    // just the output chunks — that workspace is what pushes a full-size 256z Tg2 world to ~8.5 GB
+    // total rather than the ~4.2 GB the chunk output alone suggests (audit E-2).
+    let gsize = wc * 16;
+    let tg2_workspace_bytes = 2u64 * (gsize as u64) * (gsize as u64) * (t_height as u64);
+    check_worldgen_budget((wc * hc) as u64 * chunk_size as u64 + tg2_workspace_bytes)?;
     let cb=custom_biomes.unwrap_or_default();
     let custom_biomes_arr=[
         cb.first().copied().unwrap_or(0),

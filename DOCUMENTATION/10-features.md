@@ -262,12 +262,43 @@ This repair is eager only on that specific path; if something else rewrites the
 destination between the crash and the next open, the stale WAL is still rolled
 forward (the `base_len` check only catches a length change).
 
-**Known gap:** the journaled autosave's own guard-drop-then-`retain` window (step
-1 drops the read guard for the journal I/O, then a write guard does
-`since_journal.retain(|c| !written_chunks.contains(c))`) has the same race the
-incremental save's `dirty.seq` was added to close, but hasn't been backported —
-worst case a crash recovery is missing one tick's worth of one chunk, never the
-user's own saved file.
+⚠️ **The whole journal write runs under one read guard** (audit P-1, 2026-09-13),
+so spans are borrowed straight out of the mapping rather than copied. The form this
+replaced captured `world.bytes[addr..end].to_vec()` per dirty chunk *before*
+dropping the guard — and on a compact tick the coord set is `since_base`, monotone
+for the session, so after a ⌘A + Fill that is an uncompressed copy of every chunk in
+the world (~11.8 GB on a 90k-chunk one, re-allocated every tick for the rest of the
+session). A failed Rust allocation calls `handle_alloc_error`, which **aborts** — on
+Windows, where a multi-GB transient must come from commit charge instead of being
+absorbed by compressed memory, that is the editor vanishing mid-session on a timer
+with no message. `try_incremental_save` rejects the same shape in its own doc for
+the same reason. Peak is now bounded by the largest single chunk. Read guards are
+shared, so rendering/panning/hovering and the 3D pane keep working for the duration
+exactly as they do during a save; only edits queue.
+
+That guard-hold is also what closed the **former known gap** here: the old
+guard-drop forced a `since_journal.retain(|c| !written_chunks.contains(c))`
+discharge, which had the same race `dirty.seq` was added to close for the
+incremental save (`TEST WORLDS/archive/c2-stage5-handoff-2026-08-05.md`
+§"Deviation from the plan") and never got the backport. A chunk both journalled
+this tick *and* re-dirtied during the I/O window was retained out of
+`since_journal` anyway, so its new bytes were never journalled again. Discharge is
+now `discharge_autosave_journal` — `record_full_write`'s twin, clearing both
+`since_journal` and `header_journal` wholesale on a `dirty.seq` match and **nothing
+at all** on a mismatch (the header byte-compare that stood in for the missing rule
+is gone with it). ⚠️ `autosave_base_id` is recorded outside that check: it names the
+base lineage, not the flushed edits, and gating it would make the next tick re-clone
+a multi-GB base. Pinned by `test_autosave_discharge_ignores_a_stale_capture` /
+`..._clears_on_a_matching_capture`, and the wire format by
+`test_autosave_journal_is_byte_identical_to_hand_encoded_records`.
+
+A tick whose spans exceed `AUTOSAVE_PROGRESS_MIN_BYTES` (64 MB) announces itself
+through the shared `LongOps` overlay as a non-cancellable **"Autosaving"** op —
+below that it stays silent, since an overlay every few minutes would be noise.
+Routing the span loop through `LongOpHandle::step` also stamps the working-set
+access clock, so a minutes-long tick isn't mistaken for idleness by the Windows
+trimmer. No frontend change was needed: `LongOpOverlay` is driven entirely by the
+`long-op` event stream.
 
 ## Dirty guard
 

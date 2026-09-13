@@ -13,7 +13,7 @@ use crate::colors::{block_color, transparent_alpha, BI_NOTSOLID, BI_RAMPORSIDE, 
 use crate::blocks::{fluid_base, fluid_level};
 use crate::mask::SelectionMask;
 use crate::texture::{self, TexturePack};
-use crate::view::{world_max_z, ViewMeta, VoxelView};
+use crate::view::{scan_z_ceiling, world_max_z, ViewMeta, VoxelView};
 #[cfg(test)]
 use crate::view::get_block_at;
 use rustc_hash::FxHashMap;
@@ -715,7 +715,29 @@ pub fn obj_geometry_region(world: &impl VoxelView, meta: ViewMeta, pack: Option<
         };
     }
 
-    for wz in sz1..=sz2 {
+    // Emission ceiling from the per-chunk top-occupied-band hint (`VoxelView::top_band_hint`),
+    // taken as the max over every chunk this region touches — in the live path that is one chunk,
+    // since `chunk_geometry` calls this with a single 16×16 footprint. Everything between this and
+    // `sz2` is air by contract, so skipping it changes nothing and saves a 16×16 scan per empty
+    // band (the whole cost a tall, mostly-empty 256z chunk pays before a single vertex exists).
+    //
+    // ⚠️ Deliberately does NOT narrow `gbz`, which keeps clipping at the caller's `sz2`: the
+    // face-culling contract ("a block outside [sz1, sz2] must not occlude the face it touches") is
+    // about the *requested* band, and narrowing it here would be a second, invisible cut plane.
+    // Since everything skipped is air, both getters agree anyway — this just keeps them provably
+    // independent.
+    let ez2 = {
+        let (mnx, mny) = world.chunk_origin();
+        let mut top = i32::MIN;
+        for cy in sy1.div_euclid(16) + mny..=sy2.div_euclid(16) + mny {
+            for cx in sx1.div_euclid(16) + mnx..=sx2.div_euclid(16) + mnx {
+                top = top.max(scan_z_ceiling(world, cx, cy));
+            }
+        }
+        sz2.min(top)
+    };
+
+    for wz in sz1..=ez2 {
         for wy in sy1..=sy2 {
             for wx in sx1..=sx2 {
                 let (bt, paint) = gb(wx, wy, wz);

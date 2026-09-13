@@ -96,6 +96,56 @@ the skipped columns were never visible. Cost drops by `lod²`.
   invalidates intersecting tiles at *every* level, the latter draws coarser
   levels first so a finer tile covering the same ground wins.
 
+## The scan ceiling (`top_band_hint`) *(2026-09-12, H1 working-set remediation)*
+
+LOD cut how many *columns* a tile scans. This cuts how deep each scan goes — and,
+more to the point, how many **pages of the world mapping** it touches.
+
+**The mechanism.** A 256z chunk is 16 bands, and each band's 4096-byte *block*
+half is exactly one page. `pixels_patch_lod`'s column scan walks bands from the
+top of the world down, so on a world whose terrain tops out around z ≈ 64-96 it
+touched ~10 pages of pure air before reaching anything — **per column**. One tile
+fetch therefore paged in 64 KB of every chunk it covered regardless of how much
+terrain was in it, and re-paged it on every re-fetch of an evicted tile. The pixel
+output was right; the cost was invisible until it showed up as ~10 GB of resident
+working set on an 11.8 GB world on Windows.
+
+**The fix** is `VoxelView::top_band_hint(cx, cy)` — an **upper bound** on the
+topmost band of that chunk holding anything. Scans start there instead of at
+`num_bands() - 1`, via `scan_band_ceiling` (exclusive band bound) or
+`scan_z_ceiling` (highest z worth considering).
+
+- ⚠️ **One-directional contract.** Too high is always correct and merely slower —
+  that *is* the trait default. Too low silently reports terrain as air to every
+  renderer and to `surface_z`, hence to paint, terrain-paste, sculpt and flood
+  fill. `voxel-core`'s `view::hint_tests` asserts a too-low hint is *observable*,
+  precisely so nobody later "tightens" the contract into an exact value.
+- **Adopted at:** `pixels_patch_lod` (the hint is fetched alongside the chunk in
+  the `cx != last_cx` memo block — probing per sample would give back much of what
+  it saves), `surface_z_capped`, `axo_region` (a one-entry `(cx,cy)` memo, since
+  the parallax ray changes chunk only every few steps), `scan_chunk_lamps`, and
+  `obj_geometry_region`'s emission loop.
+- **Deliberately not adopted at:** the ortho selection views
+  (`view_top`/`view_front`/`view_side`) — they run over a band-scoped *scan
+  buffer* addressed with a `b_lo` offset, not the mmap, so there are no pages to
+  save and mixing the two coordinate spaces would be a trap; and the `yslice`/
+  `xslice` slabs, which take an explicit caller z range over a single row of
+  chunks.
+- **Cache + invalidation** live in the app (`TopBandHints` in `lib.rs`), because
+  only the app knows when its bytes changed. See CLAUDE.md's "Resident world
+  pages" bullet for the two-halves invalidation rule — in particular that the
+  ceiling must be cleared *before* `edit_patch` renders the edit's own patch, not
+  in `finish_edit` afterwards.
+- **Measured** on `TEST WORLDS/TD0test.eden` (868 chunks, 16 bands): band scans
+  drop to **18.8%** of what they were. A 4-band 64z world sees 77% — little
+  headroom, which is the point: the win is specifically the 256z case. Output is
+  byte-identical, CRC-verified across every adopted renderer, all four geometry
+  lighting modes, three cutaway caps, three LODs, `surface_z` and lamp scans over
+  three real worlds.
+- A debug-only `[PAGES]` line on `fetch_tile` reports the live ratio. It `peek`s
+  the cache rather than querying it, so the instrumentation can't page in the
+  chunks it is supposed to be measuring.
+
 ## Slice / Z modes
 
 - **Z-slice.** `render_zslice_patch` renders a constant-Z horizontal layer; a

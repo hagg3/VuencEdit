@@ -488,8 +488,18 @@ changed; `undo_edit_inner`/`redo_edit_inner` mark `entry.chunks`; `set_spawn_pos
 (chunks changed since `disk_image.path` was last fully known-good) is what
 `try_incremental_save` reads. A `u64 seq`, bumped by every mark and by
 `clear_all`, guards the read-guard/write-guard gap described below — see the
-"Deviation from the plan" note in `TEST WORLDS/c2-stage5-handoff-2026-08-05.md`
-for why retain-by-written-coords wasn't enough.
+"Deviation from the plan" note in
+`TEST WORLDS/archive/c2-stage5-handoff-2026-08-05.md` for why
+retain-by-written-coords wasn't enough.
+
+**Both flush paths now obey that one rule.** The autosave journal was the last
+holdout — it kept a retain-by-written-coords discharge (with the same hole) until
+audit P-1, 2026-09-13. `discharge_autosave_journal` is now `record_full_write`'s
+twin: clear `since_journal`/`header_journal` wholesale on a `seq` match, clear
+**nothing** on a mismatch. Keep the asymmetry in both — re-writing an
+already-correct chunk costs a few KB; forgetting one loses that edit silently.
+Detail, and the read-guard hold that made it possible, in
+[10 — Features](./10-features.md#autosave--crash-recovery).
 
 **Eligibility** (`try_incremental_save`) — any failure declines to the full write
 below, never an error, and the destination is guaranteed untouched on a decline:

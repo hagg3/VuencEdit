@@ -65,6 +65,9 @@ src-tauri/src/             Rust backend (single library crate + thin main.rs)
                            (the layout contract itself is voxel-core's)
   journal.rs      (542 L)  WAL / autosave journal wire format (shared by both)
   signs.rs        (255 L)  Sign sidecar decode
+  working_set.rs  (175 L)  Windows-only working-set trim for the world mapping
+                           (VirtualUnlock, idle-debounced, off unless
+                           VUENCEDIT_TRIM=1). A no-op on every other target.
 
 src/                        React + TypeScript frontend
   App.tsx        (~4570 L)  Global state, keyboard shortcuts, orchestration
@@ -79,7 +82,7 @@ src/                        React + TypeScript frontend
 Line counts are approximate and drift with every change — treat them as
 order-of-magnitude, not exact. Rust `lib.rs` was intentionally split into
 submodules (`colors`, `worldgen`, `geometry`, `network`, `texturepack`,
-`journal`, `signs`); `lib.rs` still owns the world model, the editing commands,
+`journal`, `signs`, `working_set`); `lib.rs` still owns the world model, the editing commands,
 and `with_edit`. (`schematic` and `vmf_export` — Minecraft schematic import and
 Source Engine VMF export — were removed; that functionality now lives in the
 sibling `EdenToMC` project, not this repo.)

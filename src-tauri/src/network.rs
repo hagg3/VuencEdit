@@ -351,7 +351,12 @@ pub(crate) async fn download_world(
         return Err(size_limit_error("response"));
     }
     let mut downloaded: u64 = 0;
+    let mut last_emit: u64 = 0;
     let raw_tmp_path = format!("{}.download.tmp", dest_path);
+    // audit P-4: the 12 GiB cap above had no space check backing it. `total` is a server-declared
+    // upper bound when present; unknown falls back to the cap itself (the safe over-estimate).
+    crate::ensure_room_for(std::path::Path::new(&raw_tmp_path), total.unwrap_or(MAX_DOWNLOADED_WORLD_BYTES))
+        .map_err(|e| e.to_string())?;
     let mut raw_file = fs::File::create(&raw_tmp_path)
         .map_err(|e| write_error("create temporary download file", e))?;
     // First bytes only, to sniff gzip magic after the stream completes.
@@ -377,12 +382,22 @@ pub(crate) async fn download_world(
             let _ = fs::remove_file(&raw_tmp_path);
             return Err(write_error("write temporary download file", e));
         }
-        let _ = app.emit("download-progress", serde_json::json!({
-            "downloaded": downloaded,
-            "total": total
-        }));
+        // Throttled to one emit per UPLOAD_PROGRESS_STEP (audit I-2) — reqwest yields chunks at
+        // TCP/HTTP framing granularity (8-64 KB), so an unthrottled emit here is ~10^5 IPC events
+        // on a 2 GB download. Same idiom `upload_body_with_progress` already uses below.
+        if downloaded - last_emit >= UPLOAD_PROGRESS_STEP {
+            last_emit = downloaded;
+            let _ = app.emit("download-progress", serde_json::json!({
+                "downloaded": downloaded,
+                "total": total
+            }));
+        }
     }
     drop(raw_file);
+    let _ = app.emit("download-progress", serde_json::json!({
+        "downloaded": downloaded,
+        "total": total
+    }));
 
     let tmp_path = format!("{}.tmp", dest_path);
     let cleanup = |paths: &[&str]| { for p in paths { let _ = fs::remove_file(p); } };
@@ -393,6 +408,12 @@ pub(crate) async fn download_world(
         use flate2::read::GzDecoder;
         let src = fs::File::open(&raw_tmp_path).map_err(|e| format!("Failed to read temporary download file: {e}"))?;
         let mut dec = GzDecoder::new(std::io::BufReader::new(src));
+        // audit P-4: decompressed size isn't known ahead of time, but `copy_capped` below never lets
+        // it exceed the cap — the safe over-estimate to pre-flight against.
+        if let Err(e) = crate::ensure_room_for(std::path::Path::new(&tmp_path), MAX_DOWNLOADED_WORLD_BYTES) {
+            cleanup(&[&raw_tmp_path]);
+            return Err(e.to_string());
+        }
         let mut out = fs::File::create(&tmp_path).map_err(|e| write_error("create decompressed world file", e))?;
         let copy_result = copy_capped(&mut dec, &mut out, MAX_DOWNLOADED_WORLD_BYTES);
         drop(out);
