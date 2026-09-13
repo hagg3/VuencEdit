@@ -18,6 +18,10 @@ pub struct TestWorld {
     pub w_chunks: u32,
     pub h_chunks: u32,
     pub sky: u8,
+    /// Overrides `VoxelView::top_band_hint` when set — the only way to hand the scan sites a
+    /// deliberately wrong ceiling, which is what the hint-contract tests need (a too-high hint must
+    /// be invisible; a too-low one must be *visible*, so nobody later "tightens" the contract).
+    pub top_band_hint: Option<usize>,
 }
 
 impl TestWorld {
@@ -43,6 +47,7 @@ impl TestWorld {
             w_chunks,
             h_chunks,
             sky: 0,
+            top_band_hint: None,
         }
     }
 
@@ -62,6 +67,10 @@ impl VoxelView for TestWorld {
     fn chunk_bytes(&self, cx: i32, cy: i32) -> Option<&[u8]> {
         let &addr = self.chunks.get(&(cx, cy))?;
         Some(&self.bytes[addr..addr + self.chunk_size])
+    }
+    fn top_band_hint(&self, cx: i32, cy: i32) -> usize {
+        let _ = (cx, cy);
+        self.top_band_hint.unwrap_or_else(|| self.num_bands.saturating_sub(1))
     }
 }
 

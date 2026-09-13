@@ -14,7 +14,7 @@
 
 use crate::colors::block_color;
 use crate::geometry::LAMP_BLOCK_TYPE;
-use crate::view::{get_block_at, ViewMeta, VoxelView};
+use crate::view::{get_block_at, scan_band_ceiling, ViewMeta, VoxelView};
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::sync::Mutex;
@@ -46,7 +46,9 @@ pub fn scan_chunk_lamps(world: &impl VoxelView, cx: i32, cy: i32) -> Vec<[i32; 3
     let base_x = (cx - min_x) * 16;
     let base_y = (cy - min_y) * 16;
     let mut out = Vec::new();
-    for band in 0..world.num_bands() {
+    // Bands above the chunk's top-occupied-band hint hold no blocks at all, so they can hold no
+    // lamps either — capping here is free and cannot change the result (`VoxelView::top_band_hint`).
+    for band in 0..scan_band_ceiling(world, cx, cy) {
         let lo = band * 8192;
         if lo >= chunk.len() { break; }
         let hi = (lo + 4096).min(chunk.len());

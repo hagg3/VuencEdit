@@ -188,6 +188,21 @@ function clearTiles(cache: Map<string, HTMLCanvasElement>): void {
   cache.clear();
 }
 
+/** Remove one tile from the cache, freeing its backing store first (see `freeTileCanvas`). */
+function dropTile(cache: Map<string, HTMLCanvasElement>, key: string): void {
+  const c = cache.get(key);
+  if (c) freeTileCanvas(c);
+  cache.delete(key);
+}
+
+/** Replace the full-map canvas ref, freeing the outgoing canvas's backing store first (see
+ *  `freeTileCanvas`) — the full canvas is up to `mW*mH*4` bytes (256 MiB on a large world), so
+ *  dropping it via a bare `.current = null`/reassignment leaves that resident until GC gets to it. */
+function setFullCanvas(ref: { current: HTMLCanvasElement | null }, next: HTMLCanvasElement | null): void {
+  if (ref.current && ref.current !== next) freeTileCanvas(ref.current);
+  ref.current = next;
+}
+
 /** Bound on `materializeOccupancyRef` (§2): one entry per queried chunk, cleared only on world
  *  change — panning the materialize-select overlay across a huge world could otherwise grow it
  *  without limit. Insertion-order eviction, same idiom as the tile caches. */
@@ -1577,7 +1592,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     fc.width  = mW;
     fc.height = mH;
     const fctx = fc.getContext("2d")!;
-    fullCanvasRef.current = fc;
+    setFullCanvas(fullCanvasRef, fc);
     draw(); // dark canvas + bar at 0%
 
     const STRIP_H = 128;
@@ -1731,7 +1746,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     applyPatch(patch: PixelPatch) {
       if (renderModeRef.current === "axo") {
         // Axo: coordinate shift means flat patches land at wrong positions — force full reload
-        fullCanvasRef.current = null;
+        setFullCanvas(fullCanvasRef, null);
         loadFullCanvas();
         return;
       }
@@ -1779,7 +1794,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
         // A tile *finer* than the patch can't be repaired from it — upscaling coarse samples into
         // it would bake wrong pixels into a level the user will see again the moment they zoom in.
         // Drop it instead; `ensureTiles` re-fetches it at full detail when it's next visible.
-        if (lod < patch.lod) { tileCacheRef.current.delete(key); continue; }
+        if (lod < patch.lod) { dropTile(tileCacheRef.current, key); continue; }
         const ctx = tc.getContext("2d")!;
         if (lod === patch.lod) {
           // Same sampling grid (the backend floors the patch origin to a multiple of its lod), so
@@ -1808,14 +1823,14 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     },
     refetchRegion(x1: number, y1: number, x2: number, y2: number) {
       if (renderModeRef.current === "full" || renderModeRef.current === "axo") {
-        fullCanvasRef.current = null;
+        setFullCanvas(fullCanvasRef, null);
         loadFullCanvas();
         return;
       }
       for (const [key] of tileCacheRef.current) {
         const { wx, wy, span } = parseTileKey(key);
         if (wx < x2 && wx + span > x1 && wy < y2 && wy + span > y1) {
-          tileCacheRef.current.delete(key);
+          dropTile(tileCacheRef.current, key);
         }
       }
       ensureTiles();
@@ -1952,7 +1967,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     clearTiles(templateTileCacheRef.current);
     pendingRef.current.clear();
     queueRef.current = [];
-    fullCanvasRef.current = null;
+    setFullCanvas(fullCanvasRef, null);
     // `load_world`/`close_world` reset the backend's mirrored LOD to 1, so forget what we last
     // reported — otherwise the next `ensureTiles` would see no change and leave the backend
     // believing the map is at full resolution for the rest of the session.
@@ -1968,7 +1983,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     clearTiles(templateTileCacheRef.current);
     pendingRef.current.clear();
     queueRef.current = [];
-    fullCanvasRef.current = null;
+    setFullCanvas(fullCanvasRef, null);
     ensureTiles();
   }, [renderMode, ensureTiles]);
 
@@ -1977,7 +1992,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     axoSkewRef.current = axoSkew;
     if (renderModeRef.current !== "axo") return;
     tileEpoch.current.next();
-    fullCanvasRef.current = null;
+    setFullCanvas(fullCanvasRef, null);
     ensureTiles();
   }, [axoSkew, ensureTiles]);
 

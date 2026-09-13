@@ -6,8 +6,8 @@ pub(crate) use voxel_core::colors;
 // `impl VoxelView for LoadedWorld` / `for ChunkScratch` below, which stay here because those
 // types are app-specific — read exactly as they did before the extraction.
 pub(crate) use voxel_core::view::{
-    get_block_at, read_block_abs, read_paint_abs, set_block_abs, surface_z, surface_z_capped,
-    world_max_z, ViewMeta, VoxelView, VoxelViewMut,
+    get_block_at, read_block_abs, read_paint_abs, scan_band_ceiling, set_block_abs, surface_z,
+    surface_z_capped, world_max_z, ViewMeta, VoxelView, VoxelViewMut,
 };
 // The rest of PR-C: the fluid block family, the shaped-selection footprint, the lamp spatial index
 // and the whole 3D/2D render layer are all `voxel-core`'s now, generic over `VoxelView`. Each is
@@ -47,13 +47,16 @@ fn lamp_build_now(index: &LampIndex, world: &LoadedWorld) {
 }
 mod geometry;
 mod journal;
+mod mpworld;
 mod network;
 mod signs;
 mod texturepack;
+mod working_set;
 mod worldgen;
 
 use colors::*;
 use geometry::*;
+use mpworld::*;
 use network::*;
 use worldgen::*;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -62,7 +65,7 @@ use serde::Serialize;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
-use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::sync::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Instant;
 use tauri::Emitter;
@@ -161,12 +164,102 @@ fn stage_copy(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<(
     if rc == 0 {
         return Ok(());
     }
+    // The clone failed (different volume, unsupported filesystem, `dst` already exists), so this is
+    // about to become a real byte-for-byte copy — which is the only case that needs the space.
+    ensure_room_for(dst, fs::metadata(src).map(|m| m.len()).unwrap_or(0))?;
     fs::copy(src, dst).map(|_| ())
 }
 
 #[cfg(not(target_os = "macos"))]
 fn stage_copy(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    ensure_room_for(dst, fs::metadata(src).map(|m| m.len()).unwrap_or(0))?;
     fs::copy(src, dst).map(|_| ())
+}
+
+/// Free bytes available to this user on the volume holding `path`, or `None` when that can't be
+/// determined. `path` need not exist — its parent directory is queried, which is what makes this
+/// usable as a *pre*-flight for a file about to be created.
+///
+/// ⚠️ **`None` means "proceed"**, never "refuse". Every caller keeps that bias: a filesystem that
+/// misreports (or refuses to report) free space must not become a world you can no longer open.
+fn free_space_bytes(path: &std::path::Path) -> Option<u64> {
+    // Query the containing directory: the file itself usually doesn't exist yet.
+    let dir = if path.is_dir() { path } else { path.parent()? };
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let c_path = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
+        let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::statvfs(c_path.as_ptr(), &mut st) } != 0 { return None; }
+        // `f_bavail` (available to an unprivileged user), not `f_bfree` (includes the reserve).
+        Some((st.f_bavail as u64).saturating_mul(st.f_frsize as u64))
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        // kernel32 is already linked by std on MSVC targets — see `working_set` for the same
+        // reasoning about declaring a stable entry point directly instead of vendoring bindings.
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetDiskFreeSpaceExW(
+                lpDirectoryName: *const u16,
+                lpFreeBytesAvailableToCaller: *mut u64,
+                lpTotalNumberOfBytes: *mut u64,
+                lpTotalNumberOfFreeBytes: *mut u64,
+            ) -> i32;
+        }
+        let wide: Vec<u16> = dir.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        let mut avail: u64 = 0;
+        // SAFETY: `wide` is a NUL-terminated UTF-16 path that outlives the call; the three out
+        // params are owned locals. Only the first is read back.
+        let ok = unsafe {
+            GetDiskFreeSpaceExW(wide.as_ptr(), &mut avail, std::ptr::null_mut(), std::ptr::null_mut())
+        };
+        (ok != 0).then_some(avail)
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    { let _ = dir; None }
+}
+
+/// Refuse, up front and with an explanation, to start a copy the destination volume can't hold.
+///
+/// Opening a world stages a private working copy of it (see `load_world`), so on Windows — where
+/// `stage_copy` is a real `fs::copy`, with no APFS clone to fall back on — opening an 11.8 GB world
+/// writes 11.8 GB into `%TEMP%`. Before this, that ran with no check and no feedback and surfaced as
+/// a mid-copy `ENOSPC` (or a half-written temp) minutes in.
+///
+/// The slack over `needed` is **proportional** (1/16th, capped at 64 MB), not a flat margin. A flat
+/// one would be a regression at the small end: refusing to back up a 1 MB world onto a volume with
+/// 10 MB free would break a save that has always worked, to guard against a hazard only multi-GB
+/// worlds have. Unknown free space proceeds — see `free_space_bytes`.
+///
+/// ⚠️ Also reached by `make_backup_if_absent` (a world-sized `.bak`, once per path per session).
+/// **Not** transitively reached by every `.savetmp`/`.bak.zip.tmp`/download temp beyond the first —
+/// `make_backup_if_absent` short-circuits once a backup already exists, so from the second save to a
+/// path onward nothing upstream of `atomic_write_progress`/`save_world_compressed`/
+/// `zip_file_contents`/`download_world` calls this at all (audit P-4). Each of those now calls it
+/// directly for its own temp.
+pub(crate) fn ensure_room_for(dst: &std::path::Path, needed: u64) -> std::io::Result<()> {
+    let slack = (needed / 16).min(64 << 20);
+    let Some(free) = free_space_bytes(dst) else { return Ok(()) };
+    if free >= needed.saturating_add(slack) { return Ok(()); }
+    // MB below a gigabyte, so a refusal never reads "this needs 0.0 GB".
+    let size = |b: u64| if b >= 1 << 30 {
+        format!("{:.1} GB", b as f64 / (1u64 << 30) as f64)
+    } else {
+        format!("{:.0} MB", b as f64 / (1u64 << 20) as f64)
+    };
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Other,
+        format!(
+            "not enough free space on the drive holding {}: this needs {} but only {} is \
+             available. Free up space and try again.",
+            dst.parent().unwrap_or(dst).display(), size(needed), size(free)
+        ),
+    ))
 }
 
 /// How the load-time staged temp copy gets mapped into `LoadedWorld::bytes`.
@@ -191,14 +284,10 @@ enum MapMode {
 /// reason to give up the reclaimability win.
 #[cfg(target_os = "macos")]
 fn temp_volume_has_room_for(path: &std::path::Path, len: u64) -> bool {
-    use std::os::unix::ffi::OsStrExt;
-    let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else { return true };
-    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
-    if unsafe { libc::statvfs(c_path.as_ptr(), &mut st) } != 0 {
-        return true;
+    match free_space_bytes(path) {
+        Some(free) => free >= len.saturating_add(len / 4),
+        None => true,
     }
-    let free = (st.f_bavail as u64).saturating_mul(st.f_frsize as u64);
-    free >= len.saturating_add(len / 4)
 }
 
 /// `VUENCEDIT_MAP=private|shared` overrides the choice; anything else falls through to the
@@ -356,6 +445,97 @@ pub(crate) struct LoadedWorld {
     /// re-emit it instead of silently dropping the world's inline sign data. Empty for the
     /// overwhelming majority of worlds, which have no trailer at all.
     pub(crate) dir_trailer: Vec<u8>,
+    /// Per-chunk "topmost band that holds anything" ceiling — see `TopBandHints` and
+    /// `VoxelView::top_band_hint`. Lazily filled, interior-mutable, and invalidated per chunk by
+    /// `mark_dirty_chunks`. Lives *in* `LoadedWorld` so a world load/close disposes of it with the
+    /// world it describes, the way `template_surface_cache` (which does not) has to be cleared by
+    /// hand.
+    pub(crate) top_bands: TopBandHints,
+}
+
+/// The ceiling cache behind `impl VoxelView for LoadedWorld`'s `top_band_hint` (H1 remediation,
+/// `the-windows-mmap-working-set-lucid-heron.md` Stage 1).
+///
+/// **The problem it solves.** Every top-down column scan — the 2D map render above all, which runs
+/// per pixel of every tile — walks bands from the top of the world down. A 256z chunk is 16 bands
+/// and each band's 4096-byte *block* half is exactly one page, so on a world whose terrain tops out
+/// around z ≈ 64-96 every single rendered column touched ~10 pages of pure air before reaching
+/// terrain. One tile fetch therefore paged in 64 KB of every chunk it covered regardless of how
+/// much terrain was there, and re-paged it on every re-fetch of an evicted tile. That is what
+/// dragged ~10 GB of an 11.8 GB world into the Windows working set and kept re-warming it.
+///
+/// **Shape.** A flat `w_chunks × h_chunks` grid of `AtomicU8`, `UNKNOWN` (`u8::MAX`) until computed.
+/// Atomics rather than a `Mutex` because this is read from inside the render's rayon row loop while
+/// only the `WorldState` **read** guard is held — the same interior-mutability reason `LampIndex`
+/// has its own lock, except that a per-chunk mutex probe in *this* hot path would cost more than
+/// the air pages it saves. Races are benign: two threads compute the same value from the same
+/// bytes.
+///
+/// **Correctness.** The stored value is an *upper bound*, never an exact one (see the trait doc).
+/// Invalidation goes back to `UNKNOWN`, never to a raised value — see `mark_dirty_chunks`.
+pub(crate) struct TopBandHints {
+    w: u32,
+    h: u32,
+    min_x: i32,
+    min_y: i32,
+    /// Allocated on the first *query*, not at parse time: the two `LoadedWorld` scan buffers
+    /// `render_selection_view`/`render_full_height_view` build per preview carry the real world's
+    /// `w_chunks`/`h_chunks` but are never scanned through the hint, and eagerly allocating ~90 KB
+    /// per preview call for a table nothing reads would be pure waste.
+    cells: std::sync::OnceLock<Box<[std::sync::atomic::AtomicU8]>>,
+}
+
+impl TopBandHints {
+    /// "Not computed yet". `u8::MAX` rather than a separate flag array so a hint read is one
+    /// relaxed atomic load and one compare.
+    const UNKNOWN: u8 = u8::MAX;
+
+    /// Above this many cells the grid is abandoned and every query degrades to "no hint" (the
+    /// always-correct default). Chunk coordinates are gated to `0..CHUNK_COORD_LIMIT` (1<<15), so a
+    /// world with two far-flung chunks could otherwise declare a 32768×32768 grid — a 1 GB
+    /// allocation to describe two chunks. 4 M cells is 4 MB and is already ~1000× larger than any
+    /// real world's chunk grid (a 2048×2048-chunk world would be ~512 GB of voxels).
+    const MAX_CELLS: usize = 4 << 20;
+
+    fn new(min_x: i32, min_y: i32, w: u32, h: u32) -> Self {
+        TopBandHints { w, h, min_x, min_y, cells: std::sync::OnceLock::new() }
+    }
+
+    /// `None` when the chunk is outside the grid or the grid is disabled (see `MAX_CELLS`).
+    #[inline]
+    fn index(&self, cx: i32, cy: i32) -> Option<usize> {
+        let n = (self.w as usize).checked_mul(self.h as usize)?;
+        if n == 0 || n > Self::MAX_CELLS { return None; }
+        let ix = cx.checked_sub(self.min_x)?;
+        let iy = cy.checked_sub(self.min_y)?;
+        if ix < 0 || iy < 0 || ix as u32 >= self.w || iy as u32 >= self.h { return None; }
+        Some(iy as usize * self.w as usize + ix as usize)
+    }
+
+    fn cells(&self) -> &[std::sync::atomic::AtomicU8] {
+        self.cells.get_or_init(|| {
+            let n = (self.w as usize * self.h as usize).min(Self::MAX_CELLS);
+            (0..n).map(|_| std::sync::atomic::AtomicU8::new(Self::UNKNOWN)).collect()
+        })
+    }
+
+    /// Read without computing — for instrumentation only, so a `[PAGES]` log line can report what
+    /// the render actually knew instead of forcing scans the render itself would not have done.
+    fn peek(&self, cx: i32, cy: i32) -> Option<usize> {
+        let i = self.index(cx, cy)?;
+        let v = self.cells.get()?[i].load(std::sync::atomic::Ordering::Relaxed);
+        (v != Self::UNKNOWN).then_some(v as usize)
+    }
+
+    /// Drop chunk `(cx, cy)`'s entry back to `UNKNOWN`. Never raises a stored value — the next
+    /// query recomputes from the world's actual bytes, which is the only source that cannot be
+    /// wrong. Cheap and allocation-free when nothing has queried the grid yet.
+    fn invalidate(&self, cx: i32, cy: i32) {
+        let Some(cells) = self.cells.get() else { return };
+        if let Some(i) = self.index(cx, cy) {
+            cells[i].store(Self::UNKNOWN, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
 }
 
 impl LoadedWorld {
@@ -408,6 +588,60 @@ impl VoxelView for LoadedWorld {
     fn chunk_bytes(&self, cx: i32, cy: i32) -> Option<&[u8]> {
         let (a, e) = self.chunk_range(cx, cy)?;
         Some(&self.bytes[a..e])
+    }
+    /// See `TopBandHints`. Memoised per chunk; a miss costs one top-down walk of that chunk's band
+    /// *block* halves, which is exactly the work one column scan used to do — except it now happens
+    /// once per chunk per session instead of once per column per visit, so the air pages go cold
+    /// and stay cold.
+    #[inline]
+    fn top_band_hint(&self, cx: i32, cy: i32) -> usize {
+        use std::sync::atomic::Ordering::Relaxed;
+        let Some(i) = self.top_bands.index(cx, cy) else { return self.num_bands.saturating_sub(1) };
+        let cells = self.top_bands.cells();
+        let v = cells[i].load(Relaxed);
+        if v != TopBandHints::UNKNOWN { return v as usize; }
+        let computed = self.scan_top_band(cx, cy);
+        // A band index never exceeds 15 for either real format, but refuse to cache anything that
+        // would collide with the UNKNOWN sentinel rather than storing a silently wrong ceiling.
+        if computed < TopBandHints::UNKNOWN as usize {
+            cells[i].store(computed as u8, Relaxed);
+        }
+        computed
+    }
+}
+
+impl LoadedWorld {
+    /// Compute (never cache) chunk `(cx, cy)`'s topmost band holding any non-air block. `0` both
+    /// for an all-air chunk and for one the world doesn't have — both are valid upper bounds on
+    /// "nothing", and every scan site bails on a missing chunk before it gets here anyway.
+    ///
+    /// Walks only the 4096-byte **block** half of each band (the paint half can't make a column
+    /// non-air) and stops at the first band with a non-zero byte, so a chunk whose terrain tops out
+    /// in band 2 costs 14 half-band scans once and never again.
+    /// Drop the cached scan ceiling for every listed chunk.
+    ///
+    /// ⚠️ **Must be called at the moment the bytes change, before anything renders the post-edit
+    /// world** — not merely before the next user-facing render. `with_edit_inner` builds the edit's
+    /// own `PixelPatch` immediately after running the edit closure, so a ceiling cleared only later
+    /// (in `finish_edit`) would leave that patch drawn from a stale one: an edit that raises terrain
+    /// above the old ceiling would come back invisible in its own patch and stay that way until the
+    /// tile was refetched. `mark_dirty_chunks` clears them again from the precise changed set, which
+    /// is redundant by design — one wasted rescan is the price of the hook being impossible to miss.
+    pub(crate) fn invalidate_top_bands(&self, chunks: &[(i32, i32)]) {
+        for &(cx, cy) in chunks { self.top_bands.invalidate(cx, cy); }
+    }
+
+    fn scan_top_band(&self, cx: i32, cy: i32) -> usize {
+        let Some((addr, end)) = self.chunk_range(cx, cy) else { return 0 };
+        for band in (0..self.num_bands).rev() {
+            let lo = addr + band * 8192;
+            let hi = (lo + 4096).min(end);
+            // A short-span chunk (`chunk_span`) simply doesn't own its upper bands — keep walking
+            // down rather than treating the missing bytes as terrain.
+            if lo >= hi { continue; }
+            if self.bytes[lo..hi].iter().any(|&b| b != 0) { return band; }
+        }
+        0
     }
 }
 
@@ -810,7 +1044,32 @@ pub(crate) struct DirtyState {
     seq: u64,
 }
 
+/// Record that `chunks` bytes just changed: mark them dirty for the save/journal machinery **and**
+/// drop their `top_band_hint` entries. Every edit path must go through this rather than calling
+/// `DirtyState::mark_chunks` directly, because the two must never be done apart — a chunk whose
+/// bytes changed without its hint being cleared can read as air forever after (`TopBandHints`).
+///
+/// ⚠️ **`mark_chunks` completeness is the hint's correctness proof.** That property is already
+/// load-bearing for `try_incremental_save`, which self-detects a missed hook site ("⌘S becomes a
+/// silent no-op") and is guarded by the ground-truth diff test in this file's suite. Two consumers,
+/// one invariant, one existing test — a new edit path that forgets this breaks both at once, which
+/// is the point.
+///
+/// `world` is passed explicitly rather than reached through `ws.world` because `undo_edit_inner` /
+/// `redo_edit_inner` have `take()`n it out of the state by the time they call this.
+///
+/// Header-only writers (`set_spawn_pos`, `set_player_pos`, `rename_world`, `set_sky_grid`) touch
+/// bytes 0..192 — no chunk's bytes, hence no hint — and correctly call `mark_header` instead.
+fn mark_dirty_chunks(dirty: &mut DirtyState, world: Option<&LoadedWorld>, chunks: &[(i32, i32)]) {
+    if let Some(w) = world {
+        for &(cx, cy) in chunks { w.top_bands.invalidate(cx, cy); }
+    }
+    dirty.mark_chunks(chunks.iter().copied());
+}
+
 impl DirtyState {
+    /// ⚠️ Call `mark_dirty_chunks` instead from any path that changed a chunk's **bytes** — this
+    /// only updates the save/journal bookkeeping and leaves the `top_band_hint` cache stale.
     pub(crate) fn mark_chunks<I: IntoIterator<Item = (i32, i32)>>(&mut self, chunks: I) {
         self.seq = self.seq.wrapping_add(1);
         for c in chunks {
@@ -1114,12 +1373,14 @@ pub(crate) type AppState = RwLock<WorldState>;
 /// version used).
 #[inline]
 pub(crate) fn read_ws(state: &AppState) -> RwLockReadGuard<'_, WorldState> {
+    working_set::note_world_access();
     state.read().unwrap_or_else(|p| p.into_inner())
 }
 
 /// Exclusive (write) guard on the world. See `read_ws` for the poison policy.
 #[inline]
 pub(crate) fn write_ws(state: &AppState) -> RwLockWriteGuard<'_, WorldState> {
+    working_set::note_world_access();
     state.write().unwrap_or_else(|p| p.into_inner())
 }
 
@@ -1202,6 +1463,10 @@ impl LongOpHandle {
     /// Report progress and check for cancellation in one call — the shape every operation's inner
     /// loop wants. `Err(LONG_OP_CANCELLED)` propagates straight out through the usual `?`.
     pub(crate) fn step(&self, done: u64, phase: &str) -> Result<(), String> {
+        // A long save/export can hold one guard for many seconds; without this the idle
+        // working-set trimmer would see that as inactivity and trim the mapping out from under it
+        // (wasteful, not incorrect — but avoidable for free). See `working_set`.
+        working_set::note_world_access();
         if self.cancelled() { return Err(LONG_OP_CANCELLED.into()); }
         let pct = if self.total == 0 { 0 } else {
             ((done.min(self.total) as f64 / self.total as f64) * 100.0).round() as i32
@@ -1582,6 +1847,7 @@ fn parse_world_inner(bytes: MmapMut) -> Result<LoadedWorld, String> {
         name,
         sky,
         dir_trailer,
+        top_bands: TopBandHints::new(min_x, min_y, w_chunks, h_chunks),
     })
 }
 
@@ -1783,14 +2049,20 @@ fn load_world(path: String, state: tauri::State<'_, AppState>) -> Result<WorldMe
     let (mmap, maybe_temp, was_compressed): (MmapMut, Option<std::path::PathBuf>, bool) = if is_zip(&magic) {
         use zip::ZipArchive;
         timing_log!("[LOAD] detected zip archive, decompressing  t=+{}µs", us());
-        let raw = fs::read(&path).map_err(|e| format!("Failed to read file: {e}"))?;
-        let cursor = std::io::Cursor::new(&raw);
-        let mut archive = ZipArchive::new(cursor)
+        // Stream from a `File`, not `fs::read` into a `Vec` first — the archive's compressed size
+        // (1-2 GB on a large world) would otherwise be fully resident before extraction even starts
+        // (audit P-3). `ZipArchive` only seeks to the central directory; a `BufReader` keeps that cheap.
+        let file = fs::File::open(&path).map_err(|e| format!("Failed to read file: {e}"))?;
+        let mut archive = ZipArchive::new(std::io::BufReader::new(file))
             .map_err(|e| format!("Invalid zip archive: {e}"))?;
         if archive.is_empty() { return Err("Zip archive contains no files".into()); }
         let mut entry = archive.by_index(0)
             .map_err(|e| format!("Failed to read zip entry: {e}"))?;
         let temp_path = temp_world_path();
+        // A compressed world decompresses to many times its own size — check against the entry's
+        // declared uncompressed length, not the archive's, before writing a byte.
+        ensure_room_for(&temp_path, entry.size())
+            .map_err(|e| format!("Failed to stage world file: {e}"))?;
         {
             let mut tmp = fs::File::create(&temp_path)
                 .map_err(|e| format!("Failed to create temp file: {e}"))?;
@@ -2177,7 +2449,12 @@ fn describe_selection(
     let (max_z, cell_count) = {
         let ws = read_ws(&state);
         let max_z = ws.world.as_ref().map(world_max_z).unwrap_or(255);
-        let cell_count = active_mask(&ws, x1, y1, x2, y2).map(|m| m.count() as i32);
+        // Not `active_mask(…).map(|m| m.count())` — that clones the whole bitset (up to 8 MB, audit
+        // E-1) just to call `.count()` and drop it. `active_mask`'s owned-value contract stays for
+        // its twelve other callers, which need it across a guard drop; this one doesn't.
+        let cell_count = ws.selection_mask.as_ref()
+            .filter(|m| m.matches_rect(x1, y1, x2, y2))
+            .map(|m| m.count() as i32);
         (max_z, cell_count)
     };
     validate_selection(x1, y1, x2, y2, z_min, z_max, max_z)?;
@@ -2817,7 +3094,49 @@ fn fetch_tile(
 ) -> Result<PixelPatch, String> {
     let ws = read_ws(&state);
     let world = ws.world.as_ref().ok_or("No world loaded")?;
-    Ok(render_pixels_patch_lod(world, x1, y1, x2, y2, ws.view_cap_z, lod.unwrap_or(1)))
+    let patch = render_pixels_patch_lod(world, x1, y1, x2, y2, ws.view_cap_z, lod.unwrap_or(1));
+    log_band_scan_savings(world, x1, y1, x2, y2);
+    Ok(patch)
+}
+
+/// `[PAGES]` instrumentation for the H1 working-set work (Stage 0 of
+/// `the-windows-mmap-working-set-lucid-heron.md`): how many band *block halves* — i.e. pages — a
+/// tile's column scans were allowed to reach, versus how many they would have reached before the
+/// `top_band_hint` ceiling existed. The ratio is the whole fix, expressed as a number.
+///
+/// ⚠️ Reads hints with `peek`, never `top_band_hint`: forcing a scan here would make the
+/// instrumentation itself page in the chunks it is supposed to be measuring, and would report
+/// savings the render did not actually take. Chunks the render never looked at show up as
+/// `unknown` and are counted pessimistically (full band count), which is the honest direction.
+///
+/// Debug builds only, by `timing_log!`'s own definition.
+fn log_band_scan_savings(world: &LoadedWorld, x1: i32, y1: i32, x2: i32, y2: i32) {
+    // Same shape as `timing_log!` itself — a const-folded early return rather than a `#[cfg]`, so
+    // the code still type-checks in release builds and the optimiser drops it.
+    if !cfg!(debug_assertions) { return; }
+    {
+        let (x1, x2) = (x1.min(x2), x1.max(x2));
+        let (y1, y2) = (y1.min(y2), y1.max(y2));
+        let (cx1, cx2) = (x1.div_euclid(16) + world.min_x, x2.div_euclid(16) + world.min_x);
+        let (cy1, cy2) = (y1.div_euclid(16) + world.min_y, y2.div_euclid(16) + world.min_y);
+        let (mut chunks, mut unknown, mut hinted, mut full) = (0u64, 0u64, 0u64, 0u64);
+        for cy in cy1..=cy2 {
+            for cx in cx1..=cx2 {
+                if world.chunk_map.get(&(cx, cy)).is_none() { continue; }
+                chunks += 1;
+                full += world.num_bands as u64;
+                match world.top_bands.peek(cx, cy) {
+                    Some(b) => hinted += b as u64 + 1,
+                    None => { unknown += 1; hinted += world.num_bands as u64; }
+                }
+            }
+        }
+        if chunks > 0 {
+            timing_log!("[PAGES] fetch_tile  chunks={chunks}  unknown_hints={unknown}  \
+                         band_halves={hinted}/{full} ({:.0}%)",
+                hinted as f64 / full.max(1) as f64 * 100.0);
+        }
+    }
 }
 
 /// Report which chunks in the queried chunk-coordinate rectangle [x1,y1]–[x2,y2] actually exist
@@ -3037,6 +3356,10 @@ fn render_selection_view(
             w_chunks: world.w_chunks, h_chunks: world.h_chunks,
             chunk_size: local_band_bytes, num_bands: bands_per_chunk,
             sky: world.sky, name: String::new(), dir_trailer: Vec::new(),
+            // Inert here: the ortho renderers this scan buffer feeds address it in *clone*-band
+            // space (`b_lo`), never through `top_band_hint`, so the grid is never queried and
+            // therefore never allocated (see `TopBandHints::cells`).
+            top_bands: TopBandHints::new(world.min_x, world.min_y, world.w_chunks, world.h_chunks),
         };
         drop(ws);  // explicit drop — lock released here, before any scanning
         timing_log!("[LOCK] released  cmd=render_selection_view  held={}µs  cloned={}B  bands={}/{}  t=+{}µs",
@@ -3067,13 +3390,24 @@ fn render_full_height_view(
     context_blocks: i32,
     state: tauri::State<'_, AppState>,
 ) -> Result<PreviewData, String> {
+    render_full_height_view_inner(&state, x1, y1, x2, y2, view, context_blocks)
+}
+
+/// Core of `render_full_height_view`, factored out so it's callable from tests with a bare
+/// `AppState` (mirrors the `_inner` convention used elsewhere in this file, e.g. `autosave_world_inner`).
+fn render_full_height_view_inner(
+    state: &AppState,
+    x1: i32, y1: i32, x2: i32, y2: i32,
+    view: String,
+    context_blocks: i32,
+) -> Result<PreviewData, String> {
     if x2 < x1 || y2 < y1 {
         return Err("Invalid XY bounds".into());
     }
 
     let ctx = context_blocks.max(0);
     let (scan_world, z_max) = {
-        let ws = read_ws(&state);
+        let ws = read_ws(state);
         let world = ws.world.as_ref().ok_or("No world loaded")?;
 
         let z_max        = world_max_z(world);
@@ -3106,11 +3440,17 @@ fn render_full_height_view(
                 let Some((addr, cend)) = world.chunk_range(cx, cy) else { continue };
                 // Copy only what the chunk owns (`chunk_span`), zero-padding the rest: bytes past
                 // a short span are the next chunk's, and cloning them in would render another
-                // chunk's terrain inside this one.
+                // chunk's terrain inside this one. Also skip bands above `top_band_hint` (audit
+                // R2-3) — those are air by contract (`view.rs`'s one-directional hint guarantee),
+                // and `view_front_ctx`/`view_side_ctx` already skip air, so `fill(0)` there instead
+                // of `copy_from_slice` is output-identical while touching far fewer source pages
+                // (128 MB of fresh page touches per preview refresh on a tall, mostly-air world,
+                // repeated on every 150ms-debounced tick during a sculpt stroke).
                 let span = cend - addr;
+                let copy_end = span.min(scan_band_ceiling(world, cx, cy) * 8192);
                 let out = &mut local_bytes[local_addr..local_addr + chunk_size];
-                out[..span].copy_from_slice(&world.bytes[addr..cend]);
-                out[span..].fill(0);
+                out[..copy_end].copy_from_slice(&world.bytes[addr..addr + copy_end]);
+                out[copy_end..].fill(0);
                 local_map.insert((cx, cy), local_addr);
                 local_addr += chunk_size;
             }
@@ -3122,6 +3462,7 @@ fn render_full_height_view(
             min_x: world.min_x, min_y: world.min_y,
             w_chunks: world.w_chunks, h_chunks: world.h_chunks,
             chunk_size, num_bands, sky: world.sky, name: String::new(), dir_trailer: Vec::new(),
+            top_bands: TopBandHints::new(world.min_x, world.min_y, world.w_chunks, world.h_chunks),
         };
         drop(ws);
         (scan_world, z_max)
@@ -3224,6 +3565,8 @@ fn atomic_write_progress(
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".savetmp");
     let tmp = std::path::PathBuf::from(tmp);
+    // audit P-4: not covered transitively by `make_backup_if_absent` past the first save to a path.
+    ensure_room_for(&tmp, bytes.len() as u64).map_err(|e| e.to_string())?;
     let write_result = (|| -> Result<(), String> {
         let mut f = fs::File::create(&tmp).map_err(|e| format!("Failed to write temp file: {e}"))?;
         match op {
@@ -3294,21 +3637,26 @@ fn make_backup_if_absent(src: &std::path::Path, backup_compressed: bool) -> Resu
 /// `world.bytes`, which is what's about to be written, not what's there now.
 fn zip_file_contents(src: &std::path::Path, dst: &std::path::Path) -> Result<(), String> {
     use zip::write::{SimpleFileOptions, ZipWriter};
-    use std::io::Write;
     let inner_name = src.file_name().and_then(|f| f.to_str()).unwrap_or("world.eden").to_string();
     let mut tmp = dst.as_os_str().to_owned();
     tmp.push(".tmp");
     let tmp = std::path::PathBuf::from(tmp);
+    // audit P-4: `needed` is the *uncompressed* source size — the deflated output is never larger,
+    // so this over-estimates rather than under, keeping the "cannot tell ⇒ proceed" bias.
+    if let Ok(md) = fs::metadata(src) {
+        ensure_room_for(&tmp, md.len()).map_err(|e| e.to_string())?;
+    }
     let write_result = (|| -> Result<(), String> {
-        let mut src_bytes = Vec::new();
-        fs::File::open(src).and_then(|mut f| f.read_to_end(&mut src_bytes)).map_err(|e| format!("Failed to read backup source: {e}"))?;
+        // Stream the source straight into the zip entry rather than `read_to_end`-ing it into a
+        // `Vec` first (audit P-5) — `save_world_compressed` a few lines away already gets this right.
+        let mut src_file = fs::File::open(src).map_err(|e| format!("Failed to read backup source: {e}"))?;
         let file = fs::File::create(&tmp).map_err(|e| format!("Failed to create backup file: {e}"))?;
         let mut zip = ZipWriter::new(file);
         let options = SimpleFileOptions::default()
             .compression_method(zip::CompressionMethod::Deflated)
             .compression_level(Some(6));
         zip.start_file(&inner_name, options).map_err(|e| format!("Zip error: {e}"))?;
-        zip.write_all(&src_bytes).map_err(|e| format!("Write error: {e}"))?;
+        std::io::copy(&mut src_file, &mut zip).map_err(|e| format!("Write error: {e}"))?;
         let f = zip.finish().map_err(|e| format!("Zip finish error: {e}"))?;
         drop(f);
         Ok(())
@@ -3974,6 +4322,11 @@ where
         return Err(e);
     }
 
+    // The bytes have changed, so every scan ceiling over `affected` is now suspect — clear them
+    // *here*, before `edit_patch` renders from the post-edit world (see `invalidate_top_bands`).
+    // `affected` is a superset of the chunks that actually changed, which is the safe direction.
+    world.invalidate_top_bands(&affected);
+
     let (patch, invalidate) = edit_patch(&world, patch_rect, cap, view_lod);
     let pre_snap: Vec<ChunkSnapshot> = pre_full.into_iter()
         .filter_map(|(cx, cy, start_off, pre)| diff_chunk(&world, cx, cy, start_off, &pre))
@@ -4105,7 +4458,8 @@ fn finish_edit(
     // Dirty tracking for incremental autosave/save (audit C2): pre_snap is exactly the chunks
     // diff_chunk found to have actually changed, which is more precise than `affected` (a no-op
     // edit over a region touches nothing here).
-    ws.dirty.mark_chunks(pre_snap.iter().map(|s| (s.cx, s.cy)));
+    let touched: Vec<(i32, i32)> = pre_snap.iter().map(|s| (s.cx, s.cy)).collect();
+    mark_dirty_chunks(&mut ws.dirty, ws.world.as_ref(), &touched);
 
     // Budget enforcement at accumulation time (audit C1 step 3). `UndoEntry::new` has already
     // deflated every `Full` delta and priced the entry at its real heap cost, so this is the first
@@ -4553,6 +4907,9 @@ fn save_world_compressed(
     let mut tmp = std::ffi::OsString::from(path);
     tmp.push(".savetmp");
     let tmp = std::path::PathBuf::from(tmp);
+    // audit P-4: not covered transitively by `make_backup_if_absent` past the first save to a path.
+    // `needed` is the uncompressed size — the deflated output is never larger.
+    ensure_room_for(&tmp, world.bytes.len() as u64).map_err(|e| e.to_string())?;
     let write_result = (|| -> Result<(), String> {
         let file = fs::File::create(&tmp).map_err(|e| format!("Failed to create file: {e}"))?;
         let mut zip = ZipWriter::new(file);
@@ -4742,6 +5099,36 @@ fn random_base_id() -> [u8; 16] {
     (nanos ^ pid.rotate_left(64) ^ pid.wrapping_mul(0x9E37_79B9_7F4A_7C15)).to_le_bytes()
 }
 
+/// One tick's worth of journal records, borrowed straight out of the world mapping:
+/// `(file_off, cx, cy, bytes)`. ⚠️ These are **borrows, not copies** — that is the whole point of
+/// P-1 (see `autosave_world_inner`), so every writer below must be callable while the read guard
+/// that produced them is still held.
+type JournalSpans<'a> = [(u64, i32, i32, &'a [u8])];
+
+/// Shared record-emitting body of `write_fresh_journal`/`append_journal`. Reports progress against
+/// `op` as it goes: `LongOpHandle::step` also stamps the working-set access clock, which matters
+/// here because a world-sized tick can hold the read guard for minutes with no other lock traffic.
+fn append_journal_records<W: std::io::Write>(
+    writer: &mut journal::JournalWriter<W>,
+    header: Option<&[u8]>,
+    spans: &JournalSpans<'_>,
+    op: Option<&LongOpHandle>,
+) -> Result<(), String> {
+    let mut done: u64 = 0;
+    if let Some(h) = header {
+        writer.append_span(0, journal::HEADER_SPAN.0, journal::HEADER_SPAN.1, h)
+            .map_err(|e| format!("Failed to append autosave journal header span: {e}"))?;
+        done += h.len() as u64;
+    }
+    for (off, cx, cy, bytes) in spans {
+        writer.append_span(*off, *cx, *cy, bytes)
+            .map_err(|e| format!("Failed to append autosave journal span: {e}"))?;
+        done += bytes.len() as u64;
+        if let Some(op) = op { op.step(done, "")?; }
+    }
+    Ok(())
+}
+
 /// Write a brand-new journal (first tick of a session, or a compaction) atomically: build it as
 /// `<journal>.tmp`, fsync, then rename over the destination. Without this, a crash partway through
 /// a *compacting* rewrite (which truncates the file before it has written anything back) could
@@ -4751,26 +5138,26 @@ fn write_fresh_journal(
     path: &std::path::Path,
     base_len: u64,
     base_id: [u8; 16],
-    header: &Option<Vec<u8>>,
-    spans: &[(u64, i32, i32, Vec<u8>)],
+    header: Option<&[u8]>,
+    spans: &JournalSpans<'_>,
+    op: Option<&LongOpHandle>,
 ) -> Result<(), String> {
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
     let tmp = std::path::PathBuf::from(tmp);
-    {
+    let written = (|| -> Result<(), String> {
         let file = fs::File::create(&tmp).map_err(|e| format!("Failed to create autosave journal: {e}"))?;
         let mut writer = journal::JournalWriter::create(file, base_len, base_id, true)
             .map_err(|e| format!("Failed to write autosave journal header: {e}"))?;
-        if let Some(h) = header {
-            writer.append_span(0, journal::HEADER_SPAN.0, journal::HEADER_SPAN.1, h)
-                .map_err(|e| format!("Failed to append autosave journal header span: {e}"))?;
-        }
-        for (off, cx, cy, bytes) in spans {
-            writer.append_span(*off, *cx, *cy, bytes)
-                .map_err(|e| format!("Failed to append autosave journal span: {e}"))?;
-        }
+        append_journal_records(&mut writer, header, spans, op)?;
         writer.flush().map_err(|e| format!("Failed to flush autosave journal: {e}"))?;
-        writer.get_mut().sync_all().map_err(|e| format!("Failed to fsync autosave journal: {e}"))?;
+        writer.get_mut().sync_all().map_err(|e| format!("Failed to fsync autosave journal: {e}"))
+    })();
+    if let Err(e) = written {
+        // Never leave a half-built `.tmp` behind — the next compaction would overwrite it anyway,
+        // but on a failing volume it is world-sized garbage sitting in the app data dir.
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
     }
     fs::rename(&tmp, path).map_err(|e| {
         let _ = fs::remove_file(&tmp);
@@ -4783,32 +5170,63 @@ fn write_fresh_journal(
 /// doesn't need the create-temp-then-rename treatment `write_fresh_journal` needs.
 fn append_journal(
     path: &std::path::Path,
-    header: &Option<Vec<u8>>,
-    spans: &[(u64, i32, i32, Vec<u8>)],
+    header: Option<&[u8]>,
+    spans: &JournalSpans<'_>,
+    op: Option<&LongOpHandle>,
 ) -> Result<(), String> {
     let file = fs::OpenOptions::new().append(true).open(path)
         .map_err(|e| format!("Failed to open autosave journal: {e}"))?;
     let mut writer = journal::JournalWriter::resume(file, true);
-    if let Some(h) = header {
-        writer.append_span(0, journal::HEADER_SPAN.0, journal::HEADER_SPAN.1, h)
-            .map_err(|e| format!("Failed to append autosave journal header span: {e}"))?;
-    }
-    for (off, cx, cy, bytes) in spans {
-        writer.append_span(*off, *cx, *cy, bytes)
-            .map_err(|e| format!("Failed to append autosave journal span: {e}"))?;
-    }
+    append_journal_records(&mut writer, header, spans, op)?;
     writer.flush().map_err(|e| format!("Failed to flush autosave journal: {e}"))?;
     writer.get_mut().sync_all().map_err(|e| format!("Failed to fsync autosave journal: {e}"))
+}
+
+/// Span bytes above which an autosave tick announces itself through `LongOps`. Below it the tick is
+/// sub-second and an overlay every few minutes would be pure noise; above it the tick holds the read
+/// guard long enough to visibly block editing (see `autosave_world_inner`), and an unexplained
+/// freeze is worse than a progress bar. 64 MB is roughly 2–3 s of level-6 deflate.
+const AUTOSAVE_PROGRESS_MIN_BYTES: u64 = 64 * 1024 * 1024;
+
+/// What `autosave_world_inner` needs to open a `LongOpHandle` *after* it knows how big the tick is.
+/// `None` in tests, which have no `tauri::AppHandle` — the same reason this whole `_inner` exists.
+type AutosaveProgress<'a> = Option<(&'a tauri::AppHandle, &'a LongOps)>;
+
+/// Record that the journal now contains everything that was owed to it as of `seq_at_capture`, and
+/// that `base_id` is this session's base lineage. The twin of `record_full_write` for the autosave
+/// journal, and deliberately the same shape — both flush paths capture their work under a **read**
+/// guard, release it (a `std::sync::RwLock` is neither upgradable nor reentrant), and so must both
+/// prove nothing interleaved before discharging anything.
+///
+/// ⚠️ `autosave_base_id` is set **unconditionally**, outside the `seq` check: it records which base
+/// image on disk this session owns, not which edits were flushed. Gating it would make the next tick
+/// see `need_new_base` and re-clone a multi-GB base image for nothing.
+///
+/// ⚠️ The dirty clear is gated. A `seq` that moved means an edit — or a whole world load/close —
+/// landed after the capture, so **nothing** is cleared and the sets stay over-approximate: the next
+/// tick re-appends a handful of already-journalled chunks, which costs a few KB. Clearing one that
+/// wasn't written would drop that edit from crash recovery silently. This replaced a
+/// retain-by-written-coords discharge that had exactly that hole for any chunk re-dirtied during the
+/// I/O window — the same hole `try_incremental_save` was fixed for in audit C2 Stage 4 (see
+/// `TEST WORLDS/archive/c2-stage5-handoff-2026-08-05.md` §"Deviation from the plan"). Over-
+/// approximate is free; under-approximate is data loss.
+fn discharge_autosave_journal(state: &AppState, base_id: [u8; 16], seq_at_capture: u64) {
+    let mut ws = write_ws(state);
+    ws.autosave_base_id = Some(base_id);
+    if ws.dirty.seq != seq_at_capture { return; }
+    ws.dirty.since_journal.clear();
+    ws.dirty.header_journal = false;
 }
 
 /// Core of `autosave_world`, factored out so it's callable from tests with a bare `AppState` and a
 /// plain directory instead of a `tauri::AppHandle` (mirrors the `_inner` convention used elsewhere
 /// in this file). See the module doc above and the "Journaled Autosave" section of CLAUDE.md for
-/// the guard-drop/retain discipline this implements.
+/// the guard discipline this implements.
 fn autosave_world_inner(
     state: &AppState,
     paths: &AutosavePaths,
     source_path: Option<String>,
+    progress: AutosaveProgress<'_>,
 ) -> Result<(), String> {
     // ── Step 0: establish this session's base image BEFORE step 1 captures the tick's spans.
     //
@@ -4839,15 +5257,27 @@ fn autosave_world_inner(
         stage_copy(&temp_path, &paths.base).map_err(|e| format!("Failed to stage autosave base: {e}"))?;
     }
 
-    // ── Step 1: read guard — snapshot everything this tick needs, then drop the guard before any
-    // I/O. `std::sync::RwLock` is neither reentrant nor upgradable, so the write guard in step 4 is
-    // a fully separate, later acquisition — never nested with this one.
+    // ── Steps 1–3: ONE read guard, held across the whole journal write (audit P-1).
+    //
+    // Spans are **borrowed straight out of the mapping**, never copied. The copying form this
+    // replaced allocated an uncompressed `Vec<u8>` per dirty chunk — and on a compact tick the coord
+    // set is `since_base`, monotone for the session, so after a ⌘A + Fill that is every chunk in the
+    // world (~11.8 GB on a 90k-chunk one). A failed `Vec` allocation calls `handle_alloc_error`,
+    // which *aborts*: on Windows, where a multi-GB transient must come out of commit charge rather
+    // than being absorbed by compressed memory, that is the editor vanishing mid-session on a timer.
+    // `try_incremental_save` rejects the same shape for the same reason, and is right.
+    //
+    // Read guards are shared, so rendering/panning/hovering and the 3D pane keep working for the
+    // duration exactly as they do during a save (audit C1/C3); only edits, which need the write
+    // guard, are excluded. Holding it is also what lets step 4 discharge with a plain `seq`
+    // comparison instead of a retain — see `discharge_autosave_journal`.
     let journal_len_on_disk = fs::metadata(&paths.journal).map(|m| m.len()).unwrap_or(0);
 
-    let (base_len, world_name, compact, spans, header, written_chunks) = {
+    let tick = {
         let ws = read_ws(state);
         let world = ws.world.as_ref().ok_or("No world loaded")?;
         let base_len = world.bytes.len() as u64;
+        let seq_at_capture = ws.dirty.seq;
 
         let dirty_now = ws.dirty.since_journal.len() as u64;
         let compact_threshold = (base_len / 10).max(AUTOSAVE_COMPACT_MIN_JOURNAL_BYTES);
@@ -4862,37 +5292,49 @@ fn autosave_world_inner(
         };
         let header_dirty = if compact { ws.dirty.header_base } else { ws.dirty.header_journal };
 
-        let mut spans = Vec::with_capacity(coords.len());
-        let mut written_chunks = std::collections::HashSet::with_capacity(coords.len());
+        // `chunk_range`, never `bytes.len()` — a chunk's real span can be shorter than `chunk_size`
+        // (see "Per-chunk spans"), and journalling the nominal window would capture a neighbour's
+        // bytes and replay them over it.
+        let mut spans: Vec<(u64, i32, i32, &[u8])> = Vec::with_capacity(coords.len());
+        let mut total_bytes: u64 = 0;
         for (cx, cy) in coords {
             if let Some((addr, end)) = world.chunk_range(cx, cy) {
-                spans.push((addr as u64, cx, cy, world.bytes[addr..end].to_vec()));
-                written_chunks.insert((cx, cy));
+                spans.push((addr as u64, cx, cy, &world.bytes[addr..end]));
+                total_bytes += (end - addr) as u64;
             }
         }
-        let header = if header_dirty && world.bytes.len() >= 192 {
-            Some(world.bytes[0..192].to_vec())
+        let header: Option<&[u8]> = if header_dirty && world.bytes.len() >= 192 {
+            total_bytes += 192;
+            Some(&world.bytes[0..192])
         } else {
             None
         };
 
-        (base_len, world.name.clone(), compact, spans, header, written_chunks)
+        if spans.is_empty() && header.is_none() && !need_new_base {
+            // Nothing pending — matches the frontend's own dirty-gating, but a defensive no-op here
+            // means a stray call can never create an empty journal or an unnecessary meta rewrite.
+            // The `!need_new_base` term is load-bearing: a tick that just cloned a base in step 0
+            // must always go on to write the journal and meta that make it recoverable.
+            None
+        } else {
+            // Only a tick big enough to visibly block editing announces itself; an overlay on every
+            // ordinary few-chunk tick would be noise. `step` also stamps the working-set access
+            // clock, so a long tick can't be mistaken for idleness by the Windows trimmer.
+            let op = progress.filter(|_| total_bytes >= AUTOSAVE_PROGRESS_MIN_BYTES)
+                .map(|(app, ops)| ops.begin(app, "autosave", "Autosaving".into(), total_bytes, false));
+
+            if compact {
+                write_fresh_journal(&paths.journal, base_len, base_id, header, &spans, op.as_ref())?;
+            } else {
+                append_journal(&paths.journal, header, &spans, op.as_ref())?;
+            }
+            timing_log!("[SAVE] autosave  compact={}  spans={}  bytes={}", compact, spans.len(), total_bytes);
+            Some((seq_at_capture, world.name.clone()))
+        }
     };
     // read guard dropped here.
 
-    if spans.is_empty() && header.is_none() && !need_new_base {
-        // Nothing pending — matches the frontend's own dirty-gating, but a defensive no-op here
-        // means a stray call can never create an empty journal or an unnecessary meta rewrite.
-        // The `!need_new_base` term is load-bearing: a tick that just cloned a base in step 0 must
-        // always go on to write the journal and meta that make it recoverable.
-        return Ok(());
-    }
-
-    if compact {
-        write_fresh_journal(&paths.journal, base_len, base_id, &header, &spans)?;
-    } else {
-        append_journal(&paths.journal, &header, &spans)?;
-    }
+    let Some((seq_at_capture, world_name)) = tick else { return Ok(()) };
 
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
@@ -4904,26 +5346,9 @@ fn autosave_world_inner(
     // just wasted disk once this exists).
     let _ = fs::remove_file(&paths.legacy_data);
 
-    // ── Step 4: write guard, strictly after step 1's guard was dropped. `retain`, never a blanket
-    // clear: an edit can land in the gap between the drop above and the acquire below, and a
-    // blanket clear would silently drop it from the next tick (this is the one correctness rule
-    // this function exists to get right — see CLAUDE.md "World lock").
-    {
-        let mut ws = write_ws(state);
-        ws.autosave_base_id = Some(base_id);
-        ws.dirty.since_journal.retain(|c| !written_chunks.contains(c));
-        // Header has no coordinate to key a retain on, so a byte-compare substitutes for one: only
-        // clear header_journal if the header we captured (and just wrote) still matches what's
-        // live right now. If it doesn't, something wrote the header again during the I/O window
-        // above and that edit is still owed to the journal next tick.
-        if let Some(captured) = &header {
-            let still_matches = ws.world.as_ref()
-                .is_some_and(|w| w.bytes.len() >= 192 && &w.bytes[0..192] == captured.as_slice());
-            if still_matches {
-                ws.dirty.header_journal = false;
-            }
-        }
-    }
+    // ── Step 4: write guard, strictly after the read guard above was dropped. The only window an
+    // edit can land in is the small meta write just above, and `seq` covers it.
+    discharge_autosave_journal(state, base_id, seq_at_capture);
 
     Ok(())
 }
@@ -4931,11 +5356,12 @@ fn autosave_world_inner(
 #[tauri::command(async)]
 fn autosave_world(
     app: tauri::AppHandle,
+    ops: tauri::State<'_, LongOps>,
     source_path: Option<String>,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
     let paths = autosave_paths(&app)?;
-    autosave_world_inner(&state, &paths, source_path)
+    autosave_world_inner(&state, &paths, source_path, Some((&app, &ops)))
 }
 
 /// Core of `load_autosave`; see that command for the recovery procedure. Factored out for testing
@@ -5200,7 +5626,7 @@ fn undo_edit_inner(ws: &mut WorldState) -> Result<EditResult, String> {
         }
     }
 
-    ws.dirty.mark_chunks(affected.iter().copied());
+    mark_dirty_chunks(&mut ws.dirty, Some(&world), &affected);
     let (patch, invalidate) = patch_from_chunk_coords(&world, &affected, ws.view_cap_z, ws.view_lod);
     ws.world = Some(world);
 
@@ -5241,7 +5667,7 @@ fn redo_edit_inner(ws: &mut WorldState) -> Result<EditResult, String> {
         }
     }
 
-    ws.dirty.mark_chunks(affected.iter().copied());
+    mark_dirty_chunks(&mut ws.dirty, Some(&world), &affected);
     let (patch, invalidate) = patch_from_chunk_coords(&world, &affected, ws.view_cap_z, ws.view_lod);
     ws.world = Some(world);
 
@@ -8173,6 +8599,10 @@ fn sculpt_split(
         }
         scratch.into_chunks().commit(&mut world)
     };
+    // Same ordering rule as `with_edit_inner`: the commit changed bytes, so the scan ceilings over
+    // those chunks must go before the patch is rendered (see `invalidate_top_bands`).
+    let committed: Vec<(i32, i32)> = pre_snap.iter().map(|s| (s.cx, s.cy)).collect();
+    world.invalidate_top_bands(&committed);
     let (patch, invalidate) = edit_patch(&world, rect, ws.view_cap_z, ws.view_lod);
     ws.world = Some(world);
     if sculpt_persists_session(&args.mode, group) {
@@ -9259,6 +9689,11 @@ pub fn run() {
         .manage(MaterializeCancel::default())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .setup(|app| {
+            // Windows-only, and only when `VUENCEDIT_TRIM=1` — see `working_set`.
+            working_set::spawn_idle_trimmer(app.handle().clone());
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             load_world,
             get_world_info,
@@ -9344,6 +9779,7 @@ pub fn run() {
             create_classic_world,
             create_tg2_world,
             preview_tg2_world,
+            scan_mpworld,
             set_spawn_pos,
             set_player_pos,
             get_player_pos,
@@ -10999,7 +11435,7 @@ mod tests {
         }
         undo_edit_inner(&mut write_ws(&state)).expect("undo edit 2");
 
-        autosave_world_inner(&state, &paths, None).expect("autosave tick");
+        autosave_world_inner(&state, &paths, None, None).expect("autosave tick");
         assert!(paths.base.exists(), "tick must establish the base image");
 
         // The mapping really is shared: the edits must be visible in the temp file on disk. A
@@ -11064,7 +11500,7 @@ mod tests {
                 Ok(())
             }).expect("edit 1");
         }
-        autosave_world_inner(&state, &paths, None).expect("autosave tick 1");
+        autosave_world_inner(&state, &paths, None, None).expect("autosave tick 1");
         assert!(paths.base.exists(), "first tick must establish the base image");
         assert!(paths.journal.exists(), "first tick must create the journal");
 
@@ -11086,7 +11522,7 @@ mod tests {
         undo_edit_inner(&mut write_ws(&state)).expect("undo edit 2");
 
         // Tick 2: incremental append (base already established this session).
-        autosave_world_inner(&state, &paths, Some("source.eden".into())).expect("autosave tick 2");
+        autosave_world_inner(&state, &paths, Some("source.eden".into()), None).expect("autosave tick 2");
         assert!(read_ws(&state).dirty.since_journal.is_empty(), "tick 2 must flush everything pending");
         assert!(!read_ws(&state).dirty.header_journal, "tick 2 must flush the header too");
 
@@ -11129,7 +11565,7 @@ mod tests {
                 Ok(())
             }).expect("edit 1");
         }
-        autosave_world_inner(&state, &paths, None).expect("autosave tick 1");
+        autosave_world_inner(&state, &paths, None, None).expect("autosave tick 1");
         let base_len = fs::metadata(&paths.base).unwrap().len();
 
         // Before tick 2: re-touch chunk (0,0) and touch chunk (1,0) — 2 chunks * 32768B chunk_size
@@ -11145,7 +11581,7 @@ mod tests {
                 Ok(())
             }).expect("edit 3");
         }
-        autosave_world_inner(&state, &paths, None).expect("autosave tick 2 (compaction)");
+        autosave_world_inner(&state, &paths, None, None).expect("autosave tick 2 (compaction)");
 
         let journal_bytes = fs::read(&paths.journal).expect("read compacted journal");
         let replay = journal::replay(&journal_bytes, base_len).expect("replay compacted journal");
@@ -11165,6 +11601,123 @@ mod tests {
         let recovered_temp = read_ws(&fresh).temp_path.clone().expect("recovery must stage a temp file");
         let _ = fs::remove_file(&recovered_temp);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Audit P-1 — the wire format must not have moved when the span capture became a borrow.
+    /// Pins a whole tick's journal file against `journal.rs`'s encode primitives, byte for byte:
+    /// the header flags (compressed), `base_len`, `base_id`, the header span going first under its
+    /// `HEADER_SPAN` sentinel, and each chunk span's absolute offset. Deliberately one dirty chunk,
+    /// so there is no `FxHashSet` iteration order to depend on.
+    #[test]
+    fn test_autosave_journal_is_byte_identical_to_hand_encoded_records() {
+        let original = make_bumpy_world_grid(2, 8, |_, _| 20);
+        let dir = std::env::temp_dir().join(format!("vuencedit_autosave_wire_test_{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("create test sidecar dir");
+        let staged = dir.join("staged.eden");
+        let paths = autosave_paths_at(&dir);
+        let state: AppState = RwLock::new(ws_with_temp_path(original, &staged));
+
+        {
+            let mut ws = write_ws(&state);
+            with_edit(&mut ws, "delete", (0, 0, 5, 5), (0, 0, 5, 5), |world| {
+                delete_blocks_inner(world, 0, 0, 5, 5, 0, 63, None);
+                Ok(())
+            }).expect("edit");
+            write_spawn(ws.world.as_mut().unwrap(), 5.0, 5.0);
+            ws.dirty.mark_header();
+        }
+        autosave_world_inner(&state, &paths, None, None).expect("autosave tick");
+
+        let expected = {
+            let ws = read_ws(&state);
+            let world = ws.world.as_ref().unwrap();
+            let (addr, end) = world.chunk_range(0, 0).expect("chunk (0,0) must exist");
+            let base_id = ws.autosave_base_id.expect("the tick records its base lineage");
+            let mut buf = journal::JournalHeader::new(true, world.bytes.len() as u64, base_id)
+                .encode().to_vec();
+            buf.extend(journal::encode_span_record(
+                0, journal::HEADER_SPAN.0, journal::HEADER_SPAN.1, &world.bytes[0..192], true).unwrap());
+            buf.extend(journal::encode_span_record(
+                addr as u64, 0, 0, &world.bytes[addr..end], true).unwrap());
+            buf
+        };
+
+        let actual = fs::read(&paths.journal).expect("read journal");
+        assert_eq!(actual, expected,
+            "the journal wire format must be exactly what journal.rs's encoders produce — the P-1 \
+             capture rewrite changed how the bytes are *reached*, never what is written");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Audit P-1 — the regression test for the hole the `retain` discharge had: a chunk that was
+    /// both journalled this tick *and* re-dirtied before the discharge landed used to be retained
+    /// out of `since_journal` anyway, so its new bytes were never journalled again and a crash lost
+    /// them silently. `discharge_autosave_journal` must clear **nothing** when `dirty.seq` moved.
+    ///
+    /// Mirrors `test_record_full_write_ignores_a_stale_capture` — the save path's twin of this rule.
+    #[test]
+    fn test_autosave_discharge_ignores_a_stale_capture() {
+        let state: AppState = RwLock::new(ws_with(make_bumpy_world_grid(2, 8, |_, _| 20)));
+        let base_id = random_base_id();
+
+        // Stand in for a tick that captured the world at `stale`, having flushed chunk (0,0).
+        {
+            let mut ws = write_ws(&state);
+            ws.dirty.mark_chunks([(0, 0)]);
+            ws.dirty.mark_header();
+        }
+        let stale = read_ws(&state).dirty.seq;
+
+        // An edit to the *same* chunk lands during the tick's I/O window. This is the case the old
+        // retain got wrong.
+        {
+            let mut ws = write_ws(&state);
+            with_edit(&mut ws, "delete", (0, 0, 5, 5), (0, 0, 5, 5), |world| {
+                delete_blocks_inner(world, 0, 0, 5, 5, 0, 63, None);
+                Ok(())
+            }).expect("edit landing 'during' the autosave");
+            write_spawn(ws.world.as_mut().unwrap(), 5.0, 5.0);
+            ws.dirty.mark_header();
+        }
+
+        discharge_autosave_journal(&state, base_id, stale);
+
+        let ws = read_ws(&state);
+        assert!(ws.dirty.since_journal.contains(&(0, 0)),
+            "a chunk re-dirtied after the capture must stay owed to the journal — clearing it would \
+             drop that edit from crash recovery");
+        assert!(ws.dirty.header_journal, "a header re-written after the capture is still owed too");
+        assert_eq!(ws.autosave_base_id, Some(base_id),
+            "the base lineage is recorded regardless: gating it would make the next tick re-clone a \
+             multi-GB base image for nothing");
+    }
+
+    /// Audit P-1 — the positive half of the discharge rule, so nobody "fixes" the guard above into a
+    /// blanket no-op. Nothing touched the world between capture and discharge, so the journal holds
+    /// everything that was owed and both sets clear.
+    #[test]
+    fn test_autosave_discharge_clears_on_a_matching_capture() {
+        let state: AppState = RwLock::new(ws_with(make_bumpy_world_grid(2, 8, |_, _| 20)));
+        let base_id = random_base_id();
+        {
+            let mut ws = write_ws(&state);
+            ws.dirty.mark_chunks([(0, 0), (1, 0)]);
+            ws.dirty.mark_header();
+        }
+        let seq = read_ws(&state).dirty.seq;
+
+        discharge_autosave_journal(&state, base_id, seq);
+
+        let ws = read_ws(&state);
+        assert!(ws.dirty.since_journal.is_empty(), "a clean capture discharges every journalled chunk");
+        assert!(!ws.dirty.header_journal);
+        assert_eq!(ws.autosave_base_id, Some(base_id));
+        // `since_disk`/`since_base` advance on their own cadence and must be untouched by a journal
+        // flush — the whole reason `DirtyState` carries three independent sets.
+        assert_eq!(ws.dirty.since_disk.len(), 2, "a journal flush must not discharge the save path");
+        assert_eq!(ws.dirty.since_base.len(), 2, "nor the base-image compaction accounting");
+        assert!(ws.dirty.header_disk && ws.dirty.header_base);
     }
 
     // ── Audit C2 Stage 4: incremental in-place save ──────────────────────────────────────────────
@@ -13158,6 +13711,201 @@ mod tests {
 
     fn world_bytes(ws: &WorldState) -> Vec<u8> {
         ws.world.as_ref().unwrap().bytes.to_vec()
+    }
+
+    // ── top_band_hint: the per-chunk scan ceiling and its invalidation hook ────────────────
+    //
+    // The hint is an upper bound on "topmost band holding anything", consulted by every top-down
+    // scan (the 2D map render, `surface_z_capped`, the axo raycast, the lamp scan, the 3D mesher).
+    // It exists to stop those scans from touching ~10 pages of pure air per column on a 256z world
+    // — the mechanism behind the Windows working-set blowup (H1). A hint that is too *high* is
+    // merely slower; a hint that is too *low* reports real terrain as air, silently, everywhere.
+    // So the tests that matter are the invalidation ones: an edit that raises terrain into a band
+    // above the stored ceiling must clear it, and so must undoing and redoing that edit.
+
+    /// The staging pre-flight (H1 Stage 4). The volume-query half is inherently platform-specific
+    /// and can only be exercised on the platform running the test; what is pinned here is the
+    /// policy around it, which is the part that could refuse a load that should have succeeded.
+    #[test]
+    fn test_staging_room_preflight() {
+        let tmp = std::env::temp_dir().join("vuencedit_room_check.eden");
+
+        // The system temp volume must be readable on any platform CI runs on.
+        let free = free_space_bytes(&tmp).expect("temp volume free space must be readable");
+        assert!(free > 0, "a writable temp volume with zero bytes free is not a realistic fixture");
+
+        assert!(ensure_room_for(&tmp, 0).is_ok(), "a zero-byte stage always fits");
+        assert!(ensure_room_for(&tmp, free.saturating_sub(1 << 30)).is_ok(),
+            "a stage comfortably under the free space must be allowed");
+
+        let err = ensure_room_for(&tmp, u64::MAX).expect_err("an impossible stage must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("not enough free space"), "message must say why: {msg}");
+        assert!(msg.contains("GB") || msg.contains("MB"), "message must quantify it: {msg}");
+
+        // ⚠️ The bias that matters: an unreadable volume proceeds rather than refusing, so a
+        // filesystem that won't report free space can never make a world unopenable.
+        let nowhere = std::path::Path::new("/vuencedit-no-such-volume-0ac1/x.eden");
+        assert_eq!(free_space_bytes(nowhere), None, "an unreadable volume reports nothing");
+        assert!(ensure_room_for(nowhere, u64::MAX).is_ok(), "and \"cannot tell\" means proceed");
+    }
+
+    /// `scan_top_band` is the ground truth the cache memoises. Pin it against a hand-known world
+    /// and against the all-air / missing-chunk cases, which both legitimately answer `0`.
+    #[test]
+    fn test_scan_top_band_matches_the_world() {
+        let ws = ws_with(make_bumpy_world(8, |_, _| 20));
+        let w = ws.world.as_ref().unwrap();
+        assert_eq!(w.scan_top_band(0, 0), 1, "terrain tops out at z=20, which is band 1");
+        assert_eq!(w.scan_top_band(7, 7), 0, "a chunk the world doesn't have is a valid 0");
+
+        let air = ws_with(make_bumpy_world(8, |_, _| 0)); // clamped to 1 => a single z=1 layer
+        assert_eq!(air.world.as_ref().unwrap().scan_top_band(0, 0), 0);
+    }
+
+    /// The cached value must equal the oracle for every chunk, and must be reached lazily: nothing
+    /// is computed until something asks.
+    #[test]
+    fn test_top_band_hint_is_lazy_and_matches_the_oracle() {
+        let ws = ws_with(make_bumpy_world_grid(2, 8, |wx, _| 20 + wx % 30));
+        let w = ws.world.as_ref().unwrap();
+        for cy in 0..2 { for cx in 0..2 {
+            assert_eq!(w.top_bands.peek(cx, cy), None, "({cx},{cy}) must start uncomputed");
+        }}
+        for cy in 0..2 { for cx in 0..2 {
+            assert_eq!(w.top_band_hint(cx, cy), w.scan_top_band(cx, cy));
+            assert_eq!(w.top_bands.peek(cx, cy), Some(w.scan_top_band(cx, cy)), "and be memoised");
+        }}
+    }
+
+    /// Every cached ceiling must agree with the world's actual bytes. This is the invariant the
+    /// whole scheme rests on, and the one that fails *silently* — a stale-low ceiling doesn't
+    /// crash, it just makes terrain disappear from every renderer and from `surface_z`.
+    fn assert_hints_agree_with_world(ws: &WorldState, when: &str) {
+        let w = ws.world.as_ref().unwrap();
+        for &(cx, cy) in w.chunk_map.keys() {
+            if let Some(cached) = w.top_bands.peek(cx, cy) {
+                assert_eq!(cached, w.scan_top_band(cx, cy),
+                    "cached ceiling for chunk ({cx},{cy}) disagrees with the world {when}");
+            }
+        }
+    }
+
+    /// ⚠️ The load-bearing one. An edit that raises terrain into a band *above* the cached ceiling
+    /// must invalidate it — otherwise every renderer and `surface_z` go on reporting the new
+    /// terrain as air for the rest of the session. `with_edit_inner` clears it at the moment the
+    /// bytes change and `mark_dirty_chunks` (from `finish_edit`) clears it again from the precise
+    /// changed set; undo/redo must fire the hook too, since both bypass `with_edit_inner`.
+    #[test]
+    fn test_top_band_hint_invalidated_by_edit_undo_and_redo() {
+        let mut ws = ws_with(make_bumpy_world(8, |_, _| 20));
+        let base_surface = surf(&ws, 3, 3);
+        assert_eq!(base_surface, 20);
+        assert_eq!(ws.world.as_ref().unwrap().top_bands.peek(0, 0), Some(1),
+            "reading the surface computes and caches the ceiling");
+
+        // Raise a single column two bands higher than the cached ceiling.
+        with_edit(&mut ws, "paint", (3, 3, 3, 3), (3, 3, 3, 3), |world| {
+            set_block_abs(world, 3, 3, 50, 8, 0);
+            Ok(())
+        }).expect("edit");
+        assert_hints_agree_with_world(&ws, "after the edit");
+        assert_eq!(surf(&ws, 3, 3), 50, "the raised block must be visible");
+        assert_eq!(ws.world.as_ref().unwrap().top_bands.peek(0, 0), Some(3));
+
+        undo_edit_inner(&mut ws).expect("undo");
+        assert_hints_agree_with_world(&ws, "after undo");
+        assert_eq!(surf(&ws, 3, 3), base_surface);
+
+        redo_edit_inner(&mut ws).expect("redo");
+        assert_hints_agree_with_world(&ws, "after redo");
+        assert_eq!(surf(&ws, 3, 3), 50, "redo restores the raised block, hint and all");
+    }
+
+    /// ⚠️ The ordering half of the same invariant, and a real bug this caught: `with_edit_inner`
+    /// renders the edit's own `PixelPatch` *before* `finish_edit` runs, so clearing the ceiling only
+    /// in `finish_edit` left that patch drawn from a stale one — an edit raising terrain above the
+    /// old ceiling came back invisible in its own patch. The patch must match a render of the
+    /// post-edit world taken with a known-good cache.
+    #[test]
+    fn test_edit_patch_is_rendered_with_a_fresh_scan_ceiling() {
+        let mut ws = ws_with(make_bumpy_world(8, |_, _| 20));
+        assert_eq!(surf(&ws, 3, 3), 20, "warm the ceiling cache at the pre-edit height");
+
+        let result = with_edit(&mut ws, "paint", (0, 0, 15, 15), (0, 0, 15, 15), |world| {
+            set_block_abs(world, 3, 3, 50, 13, 0); // Brick, well above the cached ceiling
+            Ok(())
+        }).expect("edit");
+
+        // A freshly parsed copy of the post-edit bytes has no cache at all, so its render is the
+        // ground truth the edit's own patch has to match.
+        let fresh = ws_with(world_bytes(&ws));
+        let truth = render_pixels_patch(fresh.world.as_ref().unwrap(), 0, 0, 15, 15, None);
+        assert_eq!(result.patch.pixels, truth.pixels,
+            "the edit's own patch must show the block the edit just placed");
+    }
+
+    /// The whole point, end to end: a rendered tile must be byte-identical whether the hint cache
+    /// is cold (every chunk computed on the fly) or warm (every chunk already memoised), and must
+    /// still be identical after an edit that moves the ceiling. This is the app-side companion to
+    /// `voxel-core`'s `hint_tests`, which prove the same thing against a deliberately wrong hint.
+    #[test]
+    fn test_rendered_tile_is_identical_cold_warm_and_after_an_edit() {
+        let mut ws = ws_with(make_bumpy_world_grid(2, 8, |wx, wy| 8 + (wx * 3 + wy) % 40));
+        let render = |ws: &WorldState| {
+            render_pixels_patch(ws.world.as_ref().unwrap(), 0, 0, 31, 31, None).pixels
+        };
+        let cold = render(&ws);
+        let warm = render(&ws); // every hint is now memoised
+        assert_eq!(cold, warm, "warming the hint cache must not change a single pixel");
+
+        with_edit(&mut ws, "paint", (5, 5, 5, 5), (5, 5, 5, 5), |world| {
+            set_block_abs(world, 5, 5, 60, 13, 0);
+            Ok(())
+        }).expect("edit");
+        let after = render(&ws);
+        assert_ne!(after, warm, "the new top block must actually show up");
+
+        // A fresh parse of the same bytes has a cold cache; it must render identically.
+        let fresh = ws_with(world_bytes(&ws));
+        assert_eq!(render(&fresh), after, "post-edit render must match a cold-cache render");
+    }
+
+    /// Audit R2-3 — `render_full_height_view`'s scan-buffer clone now `fill(0)`s bands above
+    /// `top_band_hint` instead of copying them, consuming the same one-directional contract
+    /// `voxel-core`'s `hint_tests` establish. A loose (too-high) hint must be output-identical to
+    /// no hint at all; a deliberately too-low one must observably hide real terrain — proving the
+    /// test would actually catch a wrong-direction bug, not just that the code runs.
+    #[test]
+    fn test_full_height_view_hint_is_loose_safe_and_a_too_low_hint_is_observable() {
+        // A single-chunk 64z (4-band) world, terrain solid at z=1..=20 — real top band is 1
+        // (z 16..20). Deliberately one chunk, not a grid: `view_front_ctx` scans the full y range
+        // per column and takes the *first* non-air hit, so a grid fixture would let a neighbouring,
+        // un-poked chunk paper over the poked one at the same z — a single chunk has nothing else
+        // to fall back on, which is what makes the too-low case actually observable here.
+        let ws = ws_with(make_bumpy_world(8, |_, _| 20));
+        let state: AppState = RwLock::new(ws);
+
+        let render = |state: &AppState| {
+            render_full_height_view_inner(state, 0, 0, 15, 15, "front".into(), 0)
+                .expect("render").pixels
+        };
+        let truth = render(&state); // natural (correct) hint, freshly computed
+
+        let poke = |band: u8| {
+            let ws = read_ws(&state);
+            let world = ws.world.as_ref().unwrap();
+            let idx = world.top_bands.index(0, 0).expect("(0,0) must be in the hint grid");
+            world.top_bands.cells()[idx].store(band, std::sync::atomic::Ordering::Relaxed);
+        };
+
+        poke(3); // too high: num_bands - 1, i.e. "no hint" — must change nothing
+        assert_eq!(render(&state), truth, "a loose hint must not change a single pixel");
+
+        poke(0); // too low: excludes band 1, which is where the real terrain (z 16..20) lives
+        assert_ne!(render(&state), truth,
+            "a too-low hint must be observable, not silently absorbed — otherwise this test \
+             would pass even if the fill(0) optimization were reading past the wrong bound");
     }
 
     /// Filled disc footprint matching the backend's/frontend's `(dx² + dy²) <= (r + 0.5)²`.

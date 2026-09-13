@@ -37,6 +37,22 @@ EdenWorldManipulator2.0/**/obj/
 EdenWorldManipulator2.0/**/bin/
 uploadcode/
 
+# ewb-server (C++ Eden server) — track only the cleaned source subset
+# (*.cpp, *.sh, *.bat, worlds/); ignore the Visual Studio / build detritus.
+TEST WORLDS/ewb-server/serverREF/edenserver
+TEST WORLDS/ewb-server/serverREF/snapz_codec_test
+TEST WORLDS/ewb-server/serverREF/region_test
+TEST WORLDS/ewb-server/serverREF/protocol_test
+TEST WORLDS/ewb-server/serverREF/TCPServer.zip
+TEST WORLDS/ewb-server/serverREF/*.vcxproj
+TEST WORLDS/ewb-server/serverREF/x64/
+TEST WORLDS/ewb-server/serverREF/TCPServer/
+TEST WORLDS/ewb-server/serverREF/TCPServer 2/
+# but DO keep the live-test evidence logs (private tree, never published) —
+# overrides the global `logs` / `*.log` rules for this dir only.
+!TEST WORLDS/ewb-server/serverREF/logs/
+!TEST WORLDS/ewb-server/serverREF/logs/*.log
+
 # Jekyll site build output / gem vendoring (docs/ source is tracked)
 docs/_site/
 docs/.jekyll-cache/
