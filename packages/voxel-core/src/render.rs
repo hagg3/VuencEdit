@@ -11,7 +11,7 @@
 
 use crate::colors::{block_color, transparent_alpha};
 use crate::mask::SelectionMask;
-use crate::view::{world_max_z, ViewMeta, VoxelView};
+use crate::view::{scan_band_ceiling, scan_z_ceiling, world_max_z, ViewMeta, VoxelView};
 use rayon::prelude::*;
 
 /// The "no block here" colour every slice/ortho renderer fills with. The top-down map instead
@@ -95,18 +95,24 @@ pub fn pixels_patch_lod(
         // simply never hits, which costs one integer compare.
         let mut last_cx = i32::MIN;
         let mut chunk: Option<&[u8]> = None;
+        // The chunk's top-occupied-band ceiling (`VoxelView::top_band_hint`), fetched alongside the
+        // chunk and memoized with it — this loop is *the* reason the hint exists (it is the highest
+        // page-touch-rate scan in the program), and probing it per sample rather than per chunk
+        // would give back much of what it saves.
+        let mut hi_band = num_bands;
         for ox in 0..width {
             let px = x1 + ox * lod;
             let cx = (px / 16) as i32 + min_x;
             if cx != last_cx {
                 last_cx = cx;
                 chunk = world.chunk_bytes(cx, cy);
+                hi_band = scan_band_ceiling(world, cx, cy);
             }
             let Some(chunk) = chunk else { continue };
             let lx = (px % 16) as usize;
             let mut top_bt = 0u8; let mut top_paint = 0u8;
             let mut under_bt = 0u8; let mut under_paint = 0u8;
-            'outer: for band in (0..num_bands).rev() {
+            'outer: for band in (0..hi_band).rev() {
                 if let Some(c) = cap {
                     if (band * 16) as i32 > c { continue; }
                 }
@@ -141,7 +147,7 @@ pub fn pixels_patch_lod(
 /// glass, fence, flower) blends with its `alpha`; anything else is opaque and the under-block is
 /// only ever populated when the top was transparent, so this collapses to `c1` for solid terrain.
 #[inline]
-fn blend_top_over_under(top_bt: u8, top_paint: u8, under_bt: u8, under_paint: u8, sky: u8) -> [u8; 3] {
+pub fn blend_top_over_under(top_bt: u8, top_paint: u8, under_bt: u8, under_paint: u8, sky: u8) -> [u8; 3] {
     let c1 = block_color(top_bt, top_paint, sky);
     if under_bt == 0 { return c1; }
     let Some(alpha) = transparent_alpha(top_bt) else { return c1 };
@@ -251,7 +257,11 @@ pub fn yslice_patch(
         let cx = px.div_euclid(16) + min_x;
         let lx = px.rem_euclid(16) as usize;
         let Some(chunk) = world.chunk_bytes(cx, cy) else { return col };
-        for z in z1..=z2 {
+        // Everything above the hint's ceiling is air, which would take the `bt == 0` branch below
+        // anyway — so stopping here is output-identical and saves paging in whole bands of a
+        // 256z chunk for a caller that always asks for the full 0..=max_z column.
+        let z_top = z2.min(scan_z_ceiling(world, cx, cy));
+        for z in z1..=z_top {
             let band = (z as usize) / 16;
             let lz   = (z as usize) % 16;
             let bi = band * 8192 + lx * 256 + ly * 16 + lz;
@@ -306,7 +316,9 @@ pub fn xslice_patch(
         let cy = py.div_euclid(16) + min_y;
         let ly = py.rem_euclid(16) as usize;
         let Some(chunk) = world.chunk_bytes(cx, cy) else { return col };
-        for z in z1..=z2 {
+        // Same band ceiling as `yslice_patch` — see the note there.
+        let z_top = z2.min(scan_z_ceiling(world, cx, cy));
+        for z in z1..=z_top {
             let band = (z as usize) / 16;
             let lz   = (z as usize) % 16;
             let bi = band * 8192 + lx * 256 + ly * 16 + lz;
@@ -367,6 +379,11 @@ pub fn axo_region(
             let mut top_bt = 0u8; let mut top_paint = 0u8;
             let mut under_bt = 0u8; let mut under_paint = 0u8;
 
+            // The ray's parallax drift moves it between chunks only every few steps, so memoize the
+            // chunk lookup *and* its top-occupied-band ceiling together (`VoxelView::top_band_hint`)
+            // instead of re-probing both 256 times per pixel.
+            let mut memo_c = (i32::MIN, i32::MIN);
+            let mut memo: Option<(&[u8], usize)> = None;
             'zray: for dz in 0..=(max_z as i32) {
                 let wz = (max_z as i32) - dz;
                 let sx = (px as f32 + sx_sgn * ski * 0.5 * dz as f32).round() as i32;
@@ -376,8 +393,14 @@ pub fn axo_region(
                 let cy = (sy / 16) + min_y;
                 let lx = (sx % 16) as usize;
                 let ly = (sy % 16) as usize;
-                let Some(chunk) = world.chunk_bytes(cx, cy) else { continue };
+                if (cx, cy) != memo_c {
+                    memo_c = (cx, cy);
+                    memo = world.chunk_bytes(cx, cy).map(|c| (c, scan_band_ceiling(world, cx, cy)));
+                }
+                let Some((chunk, hi_band)) = memo else { continue };
                 let band = wz as usize / 16;
+                // Above the hint is air by contract — skip without touching the band's page.
+                if band >= hi_band { continue; }
                 let lz   = wz as usize % 16;
                 let bi = band * 8192 + lx * 256 + ly * 16 + lz;
                 let pi = bi + 4096;
