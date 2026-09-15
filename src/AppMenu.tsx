@@ -437,12 +437,13 @@ function Pane({ row, onClose, infoKey, bumpInfo }: { row: AppMenuRow; onClose: (
         ]} />
         <Primary icon="help" label="Open Help" onClick={() => { onClose(); p.setShowHelp(true); }} />
         <Primary icon="help" label="Replay the guided tour" onClick={() => { onClose(); p.startTour(); }} />
+        <Primary icon="help" label="Open Diagnostics…" onClick={() => { onClose(); p.setShowDiagnostics(true); }} />
       </>);
 
     // ── About ────────────────────────────────────────────────────────────
     case "about":
       return (<>
-        <AboutPanel version={p.appVersion} compact />
+        <AboutPanel version={p.appVersion} compact onOpenDiagnostics={() => { onClose(); p.setShowDiagnostics(true); }} />
       </>);
 
     // ── Close World ──────────────────────────────────────────────────────

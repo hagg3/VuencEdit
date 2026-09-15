@@ -15,15 +15,15 @@ describe("isNewFormatBlock", () => {
 
 describe("blockDisplayName", () => {
   it("names new-format blocks distinctly instead of the generic Type N fallback", () => {
-    expect(blockDisplayName(112)).toBe("New Block 112");
+    expect(blockDisplayName(112)).toBe("Ore Sand");
     expect(blockDisplayName(112)).not.toBe("Type 112");
   });
 });
 
 describe("resolveColor", () => {
-  it("returns the reused donor colour, not the generic grey fallback", () => {
+  it("returns the declared new-format colour, not the generic grey fallback", () => {
     expect(resolveColor(112, 0)).not.toEqual([128, 128, 128]);
-    expect(resolveColor(112, 0)).toEqual([158, 156, 158]); // reuses Stone
+    expect(resolveColor(112, 0)).toEqual([176, 84, 56]); // Ore Sand
   });
 
   it("every NEW_FORMAT_BLOCKS entry resolves to its declared colour unpainted", () => {

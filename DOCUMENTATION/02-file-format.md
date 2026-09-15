@@ -537,6 +537,18 @@ no-op); anything else — no commit, a torn tail, bad magic, a `base_len` that
 doesn't fit the destination — is discarded, because a torn log always predates
 the first destination byte being written.
 
+⚠️ **Two passes, and why** (audit P-2, 2026-09-13). The commit marker that gates
+the whole repair is a property of the *end* of the log, so nothing can be applied
+until the log has been read through once. The obvious way to get that — collect
+every span, then check — held the log in RAM twice over, and the WAL is
+**uncompressed** while `try_incremental_save` only declines past *half* the
+world: on an 11.8 GB world that is a ~5.9 GB file plus ~5.9 GB of owned spans, on
+the one path that runs precisely when the user's file is half-written. So
+`recover_wal` streams `journal::replay_each` twice — pass 1 validates with a
+no-op sink, pass 2 rewinds and `pwrite`s — and peak memory is one record. The
+second read is sequential and comes out of page cache. A pass-2 failure leaves
+the log on disk so the next open retries, which is what idempotency buys.
+
 **Known limitation:** the repair happens on the *next* `load_world` of that exact
 path, not eagerly. If something else rewrites the destination between a crash and
 the next open, `recover_wal` still rolls the stale spans forward — the `base_len`
@@ -575,6 +587,37 @@ applied. That's what makes an append-only journal crash-safe without an fsync
 per record. A `kind = 1` commit record marks "everything above is a complete
 set": the autosave journal ignores it (partial replay beats nothing); the save
 WAL requires it.
+
+**Replay is streaming** (`journal::replay_each`, audit P-2). It decodes one
+record at a time and hands each clean span to a caller-supplied sink as a
+**borrow of the decoder's own scratch buffer**, so peak allocation is the largest
+single *record* — one chunk — and not the journal. Both shipping consumers
+(`load_autosave_inner`, `recover_wal`) pwrite each span into the destination as
+it arrives. That matters because the autosave journal is capped at `base_len/10`
+*compressed* and voxel data deflates 5–20×, so a 1.2 GB journal on an 11.8 GB
+world decompresses to roughly the whole world; a `Vec` allocation that size which
+fails calls `handle_alloc_error`, i.e. **aborts** — no panic, no error dialog —
+on the one path that runs after the user has already lost a session.
+
+⚠️ Two properties that are easy to break and fail silently:
+
+- **A span reaches the sink only after its bounds and CRC checks pass**, so
+  interleaving decode with write never puts a corrupt record on disk. The
+  on-disk result is byte-identical to decoding everything first, including for a
+  torn journal — the clean-prefix-then-stop rule above is the contract being
+  honoured in a different order, not a new policy.
+- **`raw_len` and `comp_len` are `u32`s straight off disk.** The decoder must
+  never size a buffer from either up front, or one corrupt record asks the
+  allocator for gigabytes — reintroducing, in the recovery path, exactly the
+  hazard this change removed. Both are bounded with `Read::take`, so a bogus
+  length yields a short read (the truncation signal) instead of an allocation.
+
+`journal::replay` — the collecting `Vec<Span>` form — still exists but is
+**`#[cfg(test)]`-only**, in the same role `build_lamp_index` plays for the lamp
+index: the easy-to-read reference implementation that the shipping decoder is
+asserted to match (`streaming_replay_matches_the_collecting_form`, which pins each
+edge case's absolute outcome *and* the two forms' agreement). There is one
+decoder; the wrapper must never become a second one.
 
 ### Compressed flag vs. file extension (frontend)
 

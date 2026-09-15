@@ -139,25 +139,25 @@ pub const BLOCK_FACE_TEX: [[&str; 3]; 128] = [
     ["blocktnt", "blocktnt", "lightbox"],           // 110 BTLIGHTBOX
     ["blocktnt", "blocktnt", "steel"],              // 111 BTSTEEL
     // 112–127: new-format blocks — no atlas row (shipped game atlas has no free slots; a texture
-    // pack would need a `KNOWN_TEX_NAMES` extension once real names are known). Empty string ⇒
-    // `face_tile` returns None ⇒ falls back to atlas row 0 (white sentinel), so the placeholder
-    // BLOCK_RGB colour above shows through unmodulated.
-    ["", "", ""],                                   // 112 unknown (new format)
-    ["", "", ""],                                   // 113 unknown (new format)
-    ["", "", ""],                                   // 114 unknown (new format)
-    ["", "", ""],                                   // 115 unknown (new format)
-    ["", "", ""],                                   // 116 unknown (new format)
-    ["", "", ""],                                   // 117 unknown (new format)
-    ["", "", ""],                                   // 118 unknown (new format)
-    ["", "", ""],                                   // 119 unknown (new format)
-    ["", "", ""],                                   // 120 unknown (new format)
-    ["", "", ""],                                   // 121 unknown (new format)
-    ["", "", ""],                                   // 122 unknown (new format)
-    ["", "", ""],                                   // 123 unknown (new format)
-    ["", "", ""],                                   // 124 unknown (new format)
-    ["", "", ""],                                   // 125 unknown (new format)
-    ["", "", ""],                                   // 126 unknown (new format)
-    ["", "", ""],                                   // 127 unknown (new format)
+    // pack would need a `KNOWN_TEX_NAMES` extension to carry these). Empty string ⇒ `face_tile`
+    // returns None ⇒ falls back to atlas row 0 (white sentinel), so the approximated BLOCK_RGB
+    // colour above shows through unmodulated.
+    ["", "", ""],                                   // 112 Ore Sand (no texture yet)
+    ["", "", ""],                                   // 113 Space Stone (no texture yet)
+    ["", "", ""],                                   // 114 Carpet (no texture yet)
+    ["", "", ""],                                   // 115 Snakeskin (no texture yet)
+    ["", "", ""],                                   // 116 Obsidian (no texture yet)
+    ["", "", ""],                                   // 117 Cheese (no texture yet)
+    ["", "", ""],                                   // 118 Space Dirt (no texture yet)
+    ["", "", ""],                                   // 119 Space Grass (no texture yet)
+    ["", "", ""],                                   // 120 Moss (no texture yet)
+    ["", "", ""],                                   // 121 Dark Matter (no texture yet)
+    ["", "", ""],                                   // 122 Space Sand (no texture yet)
+    ["", "", ""],                                   // 123 Snow (no texture yet)
+    ["", "", ""],                                   // 124 Moonrock (no texture yet)
+    ["", "", ""],                                   // 125 Basalt (no texture yet)
+    ["", "", ""],                                   // 126 Dark Tile (no texture yet)
+    ["", "", ""],                                   // 127 Algae (no texture yet)
 ];
 
 pub struct TexturePack {

@@ -249,19 +249,30 @@ pub fn yslice_patch(
 
     let cy = sy.div_euclid(16) + min_y;
     let ly = sy.rem_euclid(16) as usize;
-    // Each world-X column writes a strided set of bytes across the row-major image, so instead
-    // of chunking `pixels` directly we compute one (row, rgba) list per column in parallel and
-    // splat them into `pixels` afterward (cheap — only non-void hits produce entries).
-    let hits: Vec<Vec<(u32, [u8; 4])>> = (x1..=x2).into_par_iter().map(|px| {
-        let mut col = Vec::new();
-        let cx = px.div_euclid(16) + min_x;
-        let lx = px.rem_euclid(16) as usize;
-        let Some(chunk) = world.chunk_bytes(cx, cy) else { return col };
-        // Everything above the hint's ceiling is air, which would take the `bt == 0` branch below
-        // anyway — so stopping here is output-identical and saves paging in whole bands of a
-        // 256z chunk for a caller that always asks for the full 0..=max_z column.
-        let z_top = z2.min(scan_z_ceiling(world, cx, cy));
-        for z in z1..=z_top {
+    // Row-parallel (audit R2-2): one rayon task per output row (constant world-Z), writing that
+    // row's contiguous slice of `pixels` directly — no per-column `Vec` and no post-hoc splat. The
+    // chunk lookup + band ceiling are memoized across each row's horizontal scan exactly as
+    // `pixels_patch_lod` memoizes them (`cx` only changes every 16 columns).
+    pixels.par_chunks_mut((width * 4) as usize).enumerate().for_each(|(row, row_pixels)| {
+        let z = z2 - row as i32;
+        let mut last_cx = i32::MIN;
+        let mut chunk: Option<&[u8]> = None;
+        let mut z_top = i32::MIN;
+        for (ox, out) in row_pixels.chunks_exact_mut(4).enumerate() {
+            let px = x1 + ox as i32;
+            let cx = px.div_euclid(16) + min_x;
+            if cx != last_cx {
+                last_cx = cx;
+                chunk = world.chunk_bytes(cx, cy);
+                // Everything above the hint's ceiling is air, which would take the `bt == 0`
+                // branch below anyway — so stopping here is output-identical and saves paging in
+                // whole bands of a 256z chunk for a caller that always asks for the full
+                // 0..=max_z column.
+                z_top = z2.min(scan_z_ceiling(world, cx, cy));
+            }
+            if z > z_top { continue; }
+            let Some(chunk) = chunk else { continue };
+            let lx = px.rem_euclid(16) as usize;
             let band = (z as usize) / 16;
             let lz   = (z as usize) % 16;
             let bi = band * 8192 + lx * 256 + ly * 16 + lz;
@@ -270,18 +281,9 @@ pub fn yslice_patch(
             let bt = chunk[bi];
             if bt == 0 { continue; }
             let [r, g, b] = block_color(bt, chunk[pi], meta.sky);
-            let row = (z2 - z) as u32;
-            col.push((row, [r, g, b, 255]));
+            out.copy_from_slice(&[r, g, b, 255]);
         }
-        col
-    }).collect();
-    for (i, col) in hits.into_iter().enumerate() {
-        let px_off = i as u32;
-        for (row, rgba) in col {
-            let off = ((row * width + px_off) * 4) as usize;
-            pixels[off..off + 4].copy_from_slice(&rgba);
-        }
-    }
+    });
     Raster { x: x1 as u32, y: z1 as u32, width, height, lod: 1, pixels }
 }
 
@@ -310,15 +312,25 @@ pub fn xslice_patch(
 
     let cx = sx.div_euclid(16) + min_x;
     let lx = sx.rem_euclid(16) as usize;
-    // Same per-column-parallel / sequential-splat approach as `yslice_patch`.
-    let hits: Vec<Vec<(u32, [u8; 4])>> = (y1..=y2).into_par_iter().map(|py| {
-        let mut col = Vec::new();
-        let cy = py.div_euclid(16) + min_y;
-        let ly = py.rem_euclid(16) as usize;
-        let Some(chunk) = world.chunk_bytes(cx, cy) else { return col };
-        // Same band ceiling as `yslice_patch` — see the note there.
-        let z_top = z2.min(scan_z_ceiling(world, cx, cy));
-        for z in z1..=z_top {
+    // Row-parallel (audit R2-2) — same transposition as `yslice_patch`, memoizing the chunk lookup
+    // + band ceiling across each row's horizontal (world-Y) scan since `cy` changes every 16 cols.
+    pixels.par_chunks_mut((width * 4) as usize).enumerate().for_each(|(row, row_pixels)| {
+        let z = z2 - row as i32;
+        let mut last_cy = i32::MIN;
+        let mut chunk: Option<&[u8]> = None;
+        let mut z_top = i32::MIN;
+        for (oy, out) in row_pixels.chunks_exact_mut(4).enumerate() {
+            let py = y1 + oy as i32;
+            let cy = py.div_euclid(16) + min_y;
+            if cy != last_cy {
+                last_cy = cy;
+                chunk = world.chunk_bytes(cx, cy);
+                // Same band ceiling as `yslice_patch` — see the note there.
+                z_top = z2.min(scan_z_ceiling(world, cx, cy));
+            }
+            if z > z_top { continue; }
+            let Some(chunk) = chunk else { continue };
+            let ly = py.rem_euclid(16) as usize;
             let band = (z as usize) / 16;
             let lz   = (z as usize) % 16;
             let bi = band * 8192 + lx * 256 + ly * 16 + lz;
@@ -327,18 +339,9 @@ pub fn xslice_patch(
             let bt = chunk[bi];
             if bt == 0 { continue; }
             let [r, g, b] = block_color(bt, chunk[pi], meta.sky);
-            let row = (z2 - z) as u32;
-            col.push((row, [r, g, b, 255]));
+            out.copy_from_slice(&[r, g, b, 255]);
         }
-        col
-    }).collect();
-    for (i, col) in hits.into_iter().enumerate() {
-        let py_off = i as u32;
-        for (row, rgba) in col {
-            let off = ((row * width + py_off) * 4) as usize;
-            pixels[off..off + 4].copy_from_slice(&rgba);
-        }
-    }
+    });
     Raster { x: y1 as u32, y: z1 as u32, width, height, lod: 1, pixels }
 }
 
@@ -439,7 +442,7 @@ pub fn axo_region(
 /// per block, reducing them from O(W×D×H) to O(W×D×H/16).
 #[allow(clippy::too_many_arguments)]
 pub fn view_front(
-    world: &impl VoxelView, meta: ViewMeta,
+    world: &(impl VoxelView + Sync), meta: ViewMeta,
     x1: i32, x2: i32, y1: i32, y2: i32, z_min: i32, z_max: i32,
     b_lo: usize,
     mask: Option<&SelectionMask>,
@@ -450,16 +453,18 @@ pub fn view_front(
     let mut pixels = vec![0u8; (pw * ph * 4) as usize];
     for p in pixels.chunks_exact_mut(4) { p.copy_from_slice(&VOID); }
 
-    for x in x1..=x2 {
-        let cx     = x / 16 + min_x;
-        let lx_256 = (x & 15) as usize * 256;     // lx * 256, constant for this X column
-        let col    = (x - x1) as usize;
-        for z in z_min..=z_max {
-            let band  = (z as usize) / 16;
-            let lz    = (z as usize) & 15;
-            let z_off = (band - b_lo) * 8192 + lz; // offset into band-scoped clone
-            let row   = (z_max - z) as usize;
-            let out   = (row * pw as usize + col) * 4;
+    // Row-parallel (audit R2-4): one rayon task per output row (constant Z), same transposition
+    // R2-2 applies to the slab renderers. Per-(x,z) chunk-lookup count is unchanged — only the loop
+    // nesting swapped, so this is output-identical.
+    pixels.par_chunks_mut((pw * 4) as usize).enumerate().for_each(|(row, row_pixels)| {
+        let z     = z_max - row as i32;
+        let band  = (z as usize) / 16;
+        let lz    = (z as usize) & 15;
+        let z_off = (band - b_lo) * 8192 + lz; // offset into band-scoped clone
+        for x in x1..=x2 {
+            let cx     = x / 16 + min_x;
+            let lx_256 = (x & 15) as usize * 256;     // lx * 256, constant for this X column
+            let out    = (x - x1) as usize * 4;
             // Scan Y in 16-block chunk rows — one chunk lookup per row instead of per block
             let mut y = y1;
             'y_scan: while y <= y2 {
@@ -479,10 +484,10 @@ pub fn view_front(
                                 let bt = chunk[bi];
                                 if bt != 0 {
                                     let [r, g, b] = block_color(bt, chunk[pi], meta.sky);
-                                    pixels[out]     = r;
-                                    pixels[out + 1] = g;
-                                    pixels[out + 2] = b;
-                                    pixels[out + 3] = 255;
+                                    row_pixels[out]     = r;
+                                    row_pixels[out + 1] = g;
+                                    row_pixels[out + 2] = b;
+                                    row_pixels[out + 3] = 255;
                                     break 'y_scan;
                                 }
                             }
@@ -492,14 +497,14 @@ pub fn view_front(
                 }
             }
         }
-    }
+    });
     (pw, ph, pixels)
 }
 
 /// Side view: Y=horizontal, Z=vertical; scans X left-to-right, stops at first non-air block.
 #[allow(clippy::too_many_arguments)]
 pub fn view_side(
-    world: &impl VoxelView, meta: ViewMeta,
+    world: &(impl VoxelView + Sync), meta: ViewMeta,
     x1: i32, x2: i32, y1: i32, y2: i32, z_min: i32, z_max: i32,
     b_lo: usize,
     mask: Option<&SelectionMask>,
@@ -510,16 +515,16 @@ pub fn view_side(
     let mut pixels = vec![0u8; (pw * ph * 4) as usize];
     for p in pixels.chunks_exact_mut(4) { p.copy_from_slice(&VOID); }
 
-    for y in y1..=y2 {
-        let cy    = y / 16 + min_y;
-        let ly_16 = (y & 15) as usize * 16;        // ly * 16, constant for this Y column
-        let col   = (y - y1) as usize;
-        for z in z_min..=z_max {
-            let band  = (z as usize) / 16;
-            let lz    = (z as usize) & 15;
-            let z_off = (band - b_lo) * 8192 + lz; // offset into band-scoped clone
-            let row   = (z_max - z) as usize;
-            let out   = (row * pw as usize + col) * 4;
+    // Row-parallel (audit R2-4) — same transposition as `view_front`.
+    pixels.par_chunks_mut((pw * 4) as usize).enumerate().for_each(|(row, row_pixels)| {
+        let z     = z_max - row as i32;
+        let band  = (z as usize) / 16;
+        let lz    = (z as usize) & 15;
+        let z_off = (band - b_lo) * 8192 + lz; // offset into band-scoped clone
+        for y in y1..=y2 {
+            let cy    = y / 16 + min_y;
+            let ly_16 = (y & 15) as usize * 16;        // ly * 16, constant for this Y column
+            let out   = (y - y1) as usize * 4;
             let mut x = x1;
             'x_scan: while x <= x2 {
                 let cx          = x / 16 + min_x;
@@ -538,10 +543,10 @@ pub fn view_side(
                                 let bt = chunk[bi];
                                 if bt != 0 {
                                     let [r, g, b] = block_color(bt, chunk[pi], meta.sky);
-                                    pixels[out]     = r;
-                                    pixels[out + 1] = g;
-                                    pixels[out + 2] = b;
-                                    pixels[out + 3] = 255;
+                                    row_pixels[out]     = r;
+                                    row_pixels[out + 1] = g;
+                                    row_pixels[out + 2] = b;
+                                    row_pixels[out + 3] = 255;
                                     break 'x_scan;
                                 }
                             }
@@ -551,7 +556,7 @@ pub fn view_side(
                 }
             }
         }
-    }
+    });
     (pw, ph, pixels)
 }
 
@@ -559,7 +564,7 @@ pub fn view_side(
 /// One chunk lookup per (x,y) pair, amortized over the full z-depth scan.
 #[allow(clippy::too_many_arguments)]
 pub fn view_top(
-    world: &impl VoxelView, meta: ViewMeta,
+    world: &(impl VoxelView + Sync), meta: ViewMeta,
     x1: i32, x2: i32, y1: i32, y2: i32, z_min: i32, z_max: i32,
     b_lo: usize,
     mask: Option<&SelectionMask>,
@@ -570,14 +575,16 @@ pub fn view_top(
     let mut pixels = vec![0u8; (pw * ph * 4) as usize];
     for p in pixels.chunks_exact_mut(4) { p.copy_from_slice(&VOID); }
 
-    for x in x1..=x2 {
-        let cx     = x / 16 + min_x;
-        let lx_256 = (x & 15) as usize * 256;
-        let col    = (x - x1) as usize;
-        for y in y1..=y2 {
-            let cy   = y / 16 + min_y;
-            let row  = (y - y1) as usize;
-            let out  = (row * pw as usize + col) * 4;
+    // Row-parallel (audit R2-4): one rayon task per output row (constant Y). Loop nesting swapped
+    // from column-outer/row-inner to row-outer/column-inner — the same (x,y) chunk-lookup count,
+    // just reordered for parallelism.
+    pixels.par_chunks_mut((pw * 4) as usize).enumerate().for_each(|(row, row_pixels)| {
+        let y  = y1 + row as i32;
+        let cy = y / 16 + min_y;
+        for x in x1..=x2 {
+            let cx     = x / 16 + min_x;
+            let lx_256 = (x & 15) as usize * 256;
+            let out    = (x - x1) as usize * 4;
             // Shaped selection: an unmasked (x,y) column isn't part of the selection, so it stays
             // VOID — the top view shows the actual footprint, not the enclosing bbox.
             if mask.is_some_and(|m| !m.contains(x, y)) { continue; }
@@ -590,17 +597,17 @@ pub fn view_top(
                         let bt = chunk[bi];
                         if bt != 0 {
                             let [r, g, b] = block_color(bt, chunk[pi], meta.sky);
-                            pixels[out]     = r;
-                            pixels[out + 1] = g;
-                            pixels[out + 2] = b;
-                            pixels[out + 3] = 255;
+                            row_pixels[out]     = r;
+                            row_pixels[out + 1] = g;
+                            row_pixels[out + 2] = b;
+                            row_pixels[out + 3] = 255;
                             break;
                         }
                     }
                 }
             }
         }
-    }
+    });
     (pw, ph, pixels)
 }
 
@@ -608,7 +615,7 @@ pub fn view_top(
 /// caller clones whole chunks rather than a band range, because the view spans the full height.
 #[allow(clippy::too_many_arguments)]
 pub fn view_front_ctx(
-    world: &impl VoxelView, meta: ViewMeta,
+    world: &(impl VoxelView + Sync), meta: ViewMeta,
     sel_x1: i32, sel_x2: i32, y1: i32, y2: i32,
     z_max: i32, ctx: i32,
 ) -> (u32, u32, Vec<u8>) {
@@ -620,18 +627,18 @@ pub fn view_front_ctx(
     let mut pixels = vec![0u8; (pw * ph * 4) as usize];
     for p in pixels.chunks_exact_mut(4) { p.copy_from_slice(&VOID); }
 
-    for x in rx1..=rx2 {
-        // div_euclid handles negative x (context left of world origin).
-        // x & 15 == x.rem_euclid(16) for all i32 (two's-complement property).
-        let cx     = x.div_euclid(16) + min_x;
-        let lx_256 = (x & 15) as usize * 256;
-        let col    = (x - rx1) as usize;
-        for z in 0..=z_max {
-            let band  = (z as usize) / 16;
-            let lz    = (z as usize) & 15;
-            let z_off = band * 8192 + lz; // b_lo=0 always
-            let row   = (z_max - z) as usize;
-            let out   = (row * pw as usize + col) * 4;
+    // Row-parallel (audit R2-4) — same transposition as `view_front`.
+    pixels.par_chunks_mut((pw * 4) as usize).enumerate().for_each(|(row, row_pixels)| {
+        let z     = z_max - row as i32;
+        let band  = (z as usize) / 16;
+        let lz    = (z as usize) & 15;
+        let z_off = band * 8192 + lz; // b_lo=0 always
+        for x in rx1..=rx2 {
+            // div_euclid handles negative x (context left of world origin).
+            // x & 15 == x.rem_euclid(16) for all i32 (two's-complement property).
+            let cx     = x.div_euclid(16) + min_x;
+            let lx_256 = (x & 15) as usize * 256;
+            let out    = (x - rx1) as usize * 4;
             let mut y = y1;
             'y_scan: while y <= y2 {
                 let cy          = y / 16 + min_y;
@@ -647,9 +654,9 @@ pub fn view_front_ctx(
                                 let bt = chunk[bi];
                                 if bt != 0 {
                                     let [r, g, b] = block_color(bt, chunk[pi], meta.sky);
-                                    pixels[out]     = r;
-                                    pixels[out + 1] = g;
-                                    pixels[out + 2] = b;
+                                    row_pixels[out]     = r;
+                                    row_pixels[out + 1] = g;
+                                    row_pixels[out + 2] = b;
                                     break 'y_scan;
                                 }
                             }
@@ -659,7 +666,7 @@ pub fn view_front_ctx(
                 }
             }
         }
-    }
+    });
     dim_context_columns(&mut pixels, pw, ph, (sel_x1 - rx1) as usize, (sel_x2 + 1 - rx1) as usize);
     (pw, ph, pixels)
 }
@@ -668,7 +675,7 @@ pub fn view_front_ctx(
 /// [`view_front_ctx`].
 #[allow(clippy::too_many_arguments)]
 pub fn view_side_ctx(
-    world: &impl VoxelView, meta: ViewMeta,
+    world: &(impl VoxelView + Sync), meta: ViewMeta,
     x1: i32, x2: i32, sel_y1: i32, sel_y2: i32,
     z_max: i32, ctx: i32,
 ) -> (u32, u32, Vec<u8>) {
@@ -680,16 +687,16 @@ pub fn view_side_ctx(
     let mut pixels = vec![0u8; (pw * ph * 4) as usize];
     for p in pixels.chunks_exact_mut(4) { p.copy_from_slice(&VOID); }
 
-    for y in ry1..=ry2 {
-        let cy    = y.div_euclid(16) + min_y;
-        let ly_16 = (y & 15) as usize * 16;
-        let col   = (y - ry1) as usize;
-        for z in 0..=z_max {
-            let band  = (z as usize) / 16;
-            let lz    = (z as usize) & 15;
-            let z_off = band * 8192 + lz;
-            let row   = (z_max - z) as usize;
-            let out   = (row * pw as usize + col) * 4;
+    // Row-parallel (audit R2-4) — same transposition as `view_front`.
+    pixels.par_chunks_mut((pw * 4) as usize).enumerate().for_each(|(row, row_pixels)| {
+        let z     = z_max - row as i32;
+        let band  = (z as usize) / 16;
+        let lz    = (z as usize) & 15;
+        let z_off = band * 8192 + lz;
+        for y in ry1..=ry2 {
+            let cy    = y.div_euclid(16) + min_y;
+            let ly_16 = (y & 15) as usize * 16;
+            let out   = (y - ry1) as usize * 4;
             let mut x = x1;
             'x_scan: while x <= x2 {
                 let cx          = x / 16 + min_x;
@@ -705,9 +712,9 @@ pub fn view_side_ctx(
                                 let bt = chunk[bi];
                                 if bt != 0 {
                                     let [r, g, b] = block_color(bt, chunk[pi], meta.sky);
-                                    pixels[out]     = r;
-                                    pixels[out + 1] = g;
-                                    pixels[out + 2] = b;
+                                    row_pixels[out]     = r;
+                                    row_pixels[out + 1] = g;
+                                    row_pixels[out + 2] = b;
                                     break 'x_scan;
                                 }
                             }
@@ -717,7 +724,7 @@ pub fn view_side_ctx(
                 }
             }
         }
-    }
+    });
     dim_context_columns(&mut pixels, pw, ph, (sel_y1 - ry1) as usize, (sel_y2 + 1 - ry1) as usize);
     (pw, ph, pixels)
 }

@@ -42,7 +42,12 @@ function Link({ href, children }: { href: string; children: React.ReactNode }) {
   );
 }
 
-export default function AboutPanel({ version, compact }: { version: string; compact?: boolean }) {
+export default function AboutPanel({ version, compact, onOpenDiagnostics }: {
+  version: string; compact?: boolean;
+  /** ROADMAP-EDIT Stage 9.5 — About is where a confused user already goes, so it gets a direct
+   *  link to the diagnostics report rather than making them find Help first. */
+  onOpenDiagnostics?: () => void;
+}) {
   const [checkState, setCheckState] = useState<UpdateCheckState>({ kind: "idle" });
 
   async function checkForUpdates() {
@@ -127,11 +132,20 @@ export default function AboutPanel({ version, compact }: { version: string; comp
         <p style={{ margin: "0 0 10px" }}>
           Eden World Builder was created by Ari Ronen and made open source in 2018.
         </p>
-        <p style={{ margin: 0 }}>
+        <p style={{ margin: onOpenDiagnostics ? "0 0 10px" : 0 }}>
           For support, visit the{" "}
           <Link href="https://discord.com/invite/rjYXwBC">Discord server</Link>
           {" "}for the game and community.
         </p>
+        {onOpenDiagnostics && (
+          <p style={{ margin: 0 }}>
+            Reporting a bug? <a href="#" onClick={e => { e.preventDefault(); onOpenDiagnostics(); }}
+              style={{ color: EDEN_TEAL_READABLE, textDecoration: "none" }}
+              onMouseEnter={e => (e.currentTarget.style.textDecoration = "underline")}
+              onMouseLeave={e => (e.currentTarget.style.textDecoration = "none")}
+            >Open Diagnostics…</a> for a report you can paste into it.
+          </p>
+        )}
       </div>
     </div>
   );
