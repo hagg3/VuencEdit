@@ -9,6 +9,8 @@ import type { WorldMeta } from "./types";
 import { chromeButton, glassMenuPanel } from "./designTokens";
 import { skyFogColor, rampFamilyBase, wedgeFamilyBase, rampDirIndex, orientBlockToFacing } from "./blockDefs";
 import { maskPrismPositions, type OutlinePt, type MaskRect } from "./maskUtils";
+import { perfCounters, recordGeometryFetchMs, recordFrameMs } from "./perfCounters";
+import { backoffBudget, backoffRadius, MAX_CONTEXT_LOSSES } from "./gfxBackoff";
 
 // Fog distance scales with the render distance slider (chunk radius × 16 blocks/chunk) so terrain
 // fades out at the edge of what's actually streamed in, instead of a fixed distance that either
@@ -142,6 +144,59 @@ const GEOMETRY_BUDGET_BYTES = 512 << 20;
 export interface FlyView3DRef {
   /** Move the camera to a world XY position (keeps current height). */
   teleport: (wx: number, wy: number) => void;
+  /** GPU identity off this pane's *own*, already-live WebGL context (ROADMAP-EDIT Stage 9.2) —
+   *  never allocates a context of its own. `null` only if the pane has never mounted a renderer;
+   *  a mounted pane with the extension unavailable reports `"unknown"` fields, never "hardware". */
+  getGpuInfo: () => GpuInfo | null;
+  /** One-shot snapshot of the resident-geometry counters `GeomMemHud` already tracks (Stage 9.3),
+   *  for the Diagnostics panel's Refresh button. `null` before the scene has ever run a frame. */
+  getPerfSnapshot: () => PerfSnapshot | null;
+}
+
+/** `WEBGL_debug_renderer_info` off the 3D pane's own renderer, plus the software-rendering verdict
+ *  Stage 10's "potato profile" also consumes. The extension can be absent (e.g. some Chromium
+ *  builds gate it behind a flag) — that is reported as `"unknown"`, deliberately distinct from a
+ *  real vendor/renderer string, and must never be treated as "confirmed hardware". */
+export interface GpuInfo {
+  vendor: string;
+  renderer: string;
+  /** True when `renderer` matches a known software rasterizer (SwiftShader/llvmpipe/Basic
+   *  Render/Microsoft Basic — see `SOFTWARE_RENDERER_RE`). `false` includes "unknown". */
+  softwareRendering: boolean;
+}
+
+/** Snapshot of `GeomMemHud`'s own counters, taken on demand rather than pushed on a timer — see
+ *  `TEST WORLDS/diagnostics-panel-plan-2026-09-14.md` §1c. */
+export interface PerfSnapshot {
+  residentBytes: number; jsBytes: number; inflightBytes: number; peakBytes: number;
+  maxChunkBytes: number; chunks: number; loadRadius: number;
+  /** The budget the streaming gates actually test against — the configured preset after Stage
+   *  10.1's per-context-loss halving, which is what makes a readout of it diagnostic. */
+  budgetBytes: number;
+  /** The configured preset before that back-off, so the two can be compared in the report. */
+  configuredBudgetBytes: number;
+  /** Ceiling of the camera z-band clip, or null when the whole world height is in play. */
+  zBand: number | null;
+  /** WebGL context losses this pane has recovered from since it mounted (Stage 10's H2). */
+  contextLossCount: number;
+  /** True once the back-off gave up (`MAX_CONTEXT_LOSSES` reached) and disabled the pane. */
+  contextDisabled: boolean;
+}
+
+/** Matches the handful of known software rasterizers a `UNMASKED_RENDERER_WEBGL` string can name.
+ *  Exported so Stage 10's potato-profile detector can reuse the exact same classification. */
+export const SOFTWARE_RENDERER_RE = /SwiftShader|Software|llvmpipe|Basic Render|Microsoft Basic/i;
+
+/** Shared `WEBGL_debug_renderer_info` read, used both by the on-demand `getGpuInfo()` (Stage 9.2,
+ *  the Diagnostics panel's Refresh button) and the one-time potato-profile check at scene init
+ *  (Stage 10.3) — same extension read, same "unknown" fallback, so the two can never disagree. */
+function readGpuInfo(renderer: THREE.WebGLRenderer): GpuInfo {
+  const gl = renderer.getContext();
+  const ext = gl.getExtension("WEBGL_debug_renderer_info");
+  if (!ext) return { vendor: "unknown", renderer: "unknown", softwareRendering: false };
+  const vendor = String(gl.getParameter(ext.UNMASKED_VENDOR_WEBGL) || "unknown");
+  const rendererStr = String(gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) || "unknown");
+  return { vendor, renderer: rendererStr, softwareRendering: SOFTWARE_RENDERER_RE.test(rendererStr) };
 }
 
 /** A voxel hit returned by the Rust `pick_block` command. Coords/normal are Eden world coords. */
@@ -638,6 +693,12 @@ const FlyView3D = forwardRef<FlyView3DRef, {
    *  the pane's only other escape hatch is *throwing*, which the ErrorBoundary turns into a full-pane
    *  replacement — wrong for a condition the pane recovers from on its own. */
   onNotice?: (msg: string) => void;
+  /** Fires once, the first time this pane's WebGL context is confirmed to be a software rasterizer
+   *  (Stage 10.3 — "potato profile"). App applies the render-distance/memory-preset defaults and
+   *  shows the explanatory notice; this callback only reports the verdict, it never mutates props
+   *  itself. Never fires again for the life of the pane (it mounts once and is suspended/resumed —
+   *  see "suspend-don't-unmount" — so "once" here really is "once per session"). */
+  onSoftwareRenderingDetected?: (info: GpuInfo) => void;
   /** Cutaway ceiling (App's `viewCapZ`), or null for none. Purely a cache-invalidation key here —
    *  the cap itself is backend state (`WorldState.view_cap_z`) and `get_chunk_geometry` applies it
    *  to the emitted z band on its own. Changing it reloads every resident chunk. */
@@ -647,6 +708,11 @@ const FlyView3D = forwardRef<FlyView3DRef, {
    *  essentially nothing — but keeps its WebGL context, which is the point: repeatedly creating and
    *  destroying contexts is what walks WKWebView into its live-context ceiling (Stage 4). */
   suspended?: boolean;
+  /** Promote `GeomMemHud`'s sampling out of dev-only (ROADMAP-EDIT Stage 9.3) — gates both the
+   *  overlay's own rendering and the counter maintenance that feeds it and `getPerfSnapshot()`.
+   *  Default false: sampling costs a handful of extra arithmetic ops per fetch/frame, which is
+   *  exactly the "never a performance problem" line the diagnostics plan draws. */
+  showPerfHud?: boolean;
 }>(function FlyView3D({
   world, editEpoch = 0, lastEdit = null, spawnAt = null, worldLoadToken = 0, onFlyModeChange, onCameraMove, overlays3d = null,
   texturePack = null, texEpoch = 0, fogEnabled = true,
@@ -664,8 +730,10 @@ const FlyView3D = forwardRef<FlyView3DRef, {
   gpuShadows = false,
   geometryBudgetBytes = GEOMETRY_BUDGET_BYTES,
   onNotice,
+  onSoftwareRenderingDetected,
   viewCapZ = null,
   suspended = false,
+  showPerfHud = false,
 }, ref) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [camMode, setCamMode] = useState<CamMode>("orbit");
@@ -716,6 +784,14 @@ const FlyView3D = forwardRef<FlyView3DRef, {
   const setLoadingCountRef = useRef(setLoadingCount);
   const [budgetLimited, setBudgetLimited] = useState(false);
   const setBudgetLimitedRef = useRef(setBudgetLimited);
+  // Stage 10.1: latched true once the context-loss back-off gives up (MAX_CONTEXT_LOSSES reached).
+  // Drives the in-pane explanation overlay below; the scene's own `contextGivenUp` is what actually
+  // keeps it parked, so this is presentation only and never gates anything.
+  const [contextDisabled, setContextDisabled] = useState(false);
+  const setContextDisabledRef = useRef(setContextDisabled);
+  // Lets the back-off write the committed render distance from inside the scene effect, where the
+  // local `setLoadRadius` (the scene's own radius applier) shadows this state setter.
+  const setLoadRadiusStateRef = useRef(setLoadRadius);
 
   const onRenderDistanceChangeRef = useRef(onRenderDistanceChange);
   onRenderDistanceChangeRef.current = onRenderDistanceChange;
@@ -730,6 +806,8 @@ const FlyView3D = forwardRef<FlyView3DRef, {
   // (SliceViewport's idiom). The context-loss handlers below are its only callers today.
   const onNoticeRef = useRef(onNotice);
   onNoticeRef.current = onNotice;
+  const onSoftwareRenderingDetectedRef = useRef(onSoftwareRenderingDetected);
+  onSoftwareRenderingDetectedRef.current = onSoftwareRenderingDetected;
   // Read once at the end of scene init: the scene effect re-runs on a world change, which builds a
   // fresh (unsuspended) closure while the `suspended` prop may already be true — and the prop-driven
   // effect below won't fire, because the prop itself didn't change.
@@ -814,6 +892,10 @@ const FlyView3D = forwardRef<FlyView3DRef, {
   // without tearing down the renderer every time the user switches tool or fill block.
   const interact3dRef = useRef(interact3d);
   interact3dRef.current = interact3d;
+  // Stage 9.3: gates GeomMemHud's *sampling*, not just its rendering — pushMemHud must stay a
+  // true no-op when off, so this has to be readable from inside the scene effect's closures.
+  const showPerfHudRef = useRef(showPerfHud);
+  showPerfHudRef.current = showPerfHud;
   const onPickSelectRef = useRef(onPickSelect);
   onPickSelectRef.current = onPickSelect;
   const onPickFloodFillRef = useRef(onPickFloodFill);
@@ -994,10 +1076,15 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     /** Show/hide + (re)lay out the Select-mode transform gizmo. No-op while a drag is in progress
      *  (the live preview box owns the visual until release). */
     setGizmoSelection: (mode: Interact3D, b: SelectionBounds3D | null) => void;
+    /** ROADMAP-EDIT Stage 9.2/9.3 — see `FlyView3DRef`'s own docs. */
+    getGpuInfo: () => GpuInfo | null;
+    getPerfSnapshot: () => PerfSnapshot | null;
   } | null>(null);
 
   useImperativeHandle(ref, () => ({
     teleport: (wx, wy) => sceneApi.current?.teleport(wx, wy),
+    getGpuInfo: () => sceneApi.current?.getGpuInfo() ?? null,
+    getPerfSnapshot: () => sceneApi.current?.getPerfSnapshot() ?? null,
   }), []);
 
   // Dispose + (re)build the texture-pack materials from `pack` (or leave them disposed if null).
@@ -1067,6 +1154,9 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     unmountingRef.current = false;
     return () => { unmountingRef.current = true; };
   }, []);
+  // Stage 10.3: fires `onSoftwareRenderingDetected` at most once per pane lifetime, even though the
+  // scene effect below can re-run (world-size change) without this component unmounting.
+  const swRenderingReportedRef = useRef(false);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -1083,7 +1173,23 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       // message to the error boundary instead of a cryptic THREE internal stack.
       throw new Error(`WebGL unavailable in this environment. (${(e as Error)?.message ?? e})`);
     }
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, MAX_DPR));
+    // Stage 10.3 — "potato profile". Checked once per pane lifetime (this effect can re-run on a
+    // world-size change, but the GPU doesn't), never again after the first verdict. A software
+    // rasterizer (SwiftShader/llvmpipe/Basic Render — see H1 in windows-3d-lag-report-2026-09-14.md)
+    // has a far lower allocation ceiling and no benefit from a high device pixel ratio, so DPR is
+    // forced to 1 here unconditionally — that's local to this renderer and not a persisted setting,
+    // so it carries no "clamp vs default" hazard. Render distance / memory preset are App's call
+    // (persisted settings, must respect an explicit user choice), reported via the callback below.
+    const gpuInfo = readGpuInfo(renderer);
+    if (gpuInfo.softwareRendering) {
+      renderer.setPixelRatio(1);
+      if (!swRenderingReportedRef.current) {
+        swRenderingReportedRef.current = true;
+        onSoftwareRenderingDetectedRef.current?.(gpuInfo);
+      }
+    } else {
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, MAX_DPR));
+    }
 
     // Guard the remainder of init: if anything throws after the context exists, release it before
     // rethrowing. React skips an effect's cleanup when the effect body throws, so without this a
@@ -1566,25 +1672,37 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       invalidate();
     };
 
+    // Stage 10.4 (audit R3-1 option 2): the budget gate used to test `residentBytes` alone, which —
+    // per the comment above — is charged at install time regardless of whether the mesh has actually
+    // drawn and uploaded yet. A frustum-culled chunk (most of a large render-distance disc, most of
+    // the time) never draws, so `releaseOnUpload` never fires for it and its full wire payload sits
+    // on the JS heap — `jsBytes` sees it, but the old gate didn't. `max`, not `+`: the two pools
+    // overlap (an uploaded mesh keeps counting in `residentBytes` after its `jsBytes` share is freed;
+    // an unuploaded one is charged in both), so adding them double-counts every resident chunk and
+    // would evict roughly twice as aggressively as the actual memory footprint warrants.
+    const committedBytes = () => Math.max(residentBytes, jsBytes);
+
     /** Wire bytes this key holds across the three mesh maps. 0 for an `emptyChunks`-only key. */
     const chunkBytes = (k: string) =>
       ((meshes.get(k)?.userData.geomBytes as number) ?? 0)
       + ((meshesT.get(k)?.userData.geomBytes as number) ?? 0)
       + ((meshesE.get(k)?.userData.geomBytes as number) ?? 0);
 
-    // Push the dev memory readout. Called wherever the totals move; the HUD is its own leaf, so this
-    // costs one small re-render and nothing else. No-ops entirely in a production build.
-    const pushMemHud = import.meta.env.DEV
-      ? () => {
-          const total = residentBytes + jsBytes + inflightBytes;
-          if (total > peakBytes) peakBytes = total;
-          memHudRef.current?.set({
-            chunks: meshes.size + emptyChunks.size,
-            gpu: residentBytes, js: jsBytes, inflight: inflightBytes,
-            peak: peakBytes, maxChunk: maxChunkBytes, budget: geometryBudgetRef.current,
-          });
-        }
-      : () => {};
+    // Push the perf readout. Called wherever the totals move; the HUD is its own leaf, so this costs
+    // one small re-render and nothing else. Gated on the *toggle*, not a build flag (Stage 9.3) — a
+    // true no-op when off, since a diagnostic that always samples is itself a performance problem.
+    const pushMemHud = () => {
+      if (!showPerfHudRef.current) return;
+      const total = residentBytes + jsBytes + inflightBytes;
+      if (total > peakBytes) peakBytes = total;
+      memHudRef.current?.set({
+        chunks: meshes.size + emptyChunks.size,
+        gpu: residentBytes, js: jsBytes, inflight: inflightBytes,
+        // The *effective* budget (Stage 10.1), not the configured preset — this readout exists to
+        // explain what the streaming gates are doing, and after a context loss those two differ.
+        peak: peakBytes, maxChunk: maxChunkBytes, budget: effectiveBudget(),
+      });
+    };
 
     // Bounded-concurrency fetch queue. The streaming sweep can need ~100 chunks; firing them all at
     // once floods the IPC bridge and the world mutex (each get_chunk_geometry locks it), tanking fps.
@@ -1610,9 +1728,24 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     // refetch it as the nearest non-resident, evict it again, one round trip per sweep forever. It is
     // re-opened whenever the camera chunk, the z band, the radius or the budget changes (streamSweep).
     let budgetHorizonSq = Infinity;
-    // The budget the horizon above was derived under, so a Settings change re-opens it (a *raised*
-    // budget can reach farther; a lowered one has to re-derive from scratch anyway).
-    let budgetHorizonBudget = geometryBudgetRef.current;
+
+    // ---- Context-loss back-off (Stage 10.1, H2) ----
+    // Recovered context losses this mount has seen. Stage 9's diagnostics readout reports it; the
+    // back-off below is what reads it every sweep. Declared here rather than beside the other
+    // frame-loop state further down because `effectiveBudget()` closes over it and the first
+    // streamSweep() runs before that point.
+    let contextLossCount = 0;
+    // Latched by the third loss: the pane stops restoring, suspends itself and stays parked for the
+    // rest of the session. Checked by `onContextRestored` (so a restore is ignored) and by
+    // `setSuspended`'s resume branch (so App toggling the pane back on can't revive a dead context).
+    let contextGivenUp = false;
+    /** The geometry budget every gate below tests against: the configured preset, halved once per
+     *  recovered context loss (floored — see gfxBackoff.ts). Restoring under the same budget that
+     *  just exhausted the GPU is what made one loss reproduce itself. */
+    const effectiveBudget = () => backoffBudget(geometryBudgetRef.current, contextLossCount);
+    // The budget the horizon above was derived under, so a Settings change or a back-off step
+    // re-opens it (a *raised* budget can reach farther; a lowered one has to re-derive anyway).
+    let budgetHorizonBudget = effectiveBudget();
 
     // ---- Camera z band (Stage 3) ----
     // Ceiling of the z range each chunk fetch scans, quantized so it only moves in Z_BAND_STEP jumps.
@@ -1669,10 +1802,13 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       inflightBytes += chunkEstimateBytes;
       setLoadingCountRef.current(inflight.size);
       const gen = fetchGen;
+      if (perfCounters.enabled) perfCounters.chunkFetchesIssued++;
+      const fetchT0 = performance.now();
       // zMax = the camera band's ceiling (Stage 3); zMin stays 0 — see Z_BAND_ABOVE on why the band
       // is one-sided. `undefined` means "no clip" and is what a 64z world always sends.
       invoke<ArrayBuffer>("get_chunk_geometry", { cx: cxk, cy: cyk, night: nightLightingRef.current, shadows: shadows3dRef.current, sunT: sunTRef.current, gpu: gpuShadowsRef.current, lampRadius: lampRadiusRef.current, lightingProfile: lightingProfileRef.current, zMax: zBand ?? undefined })
         .then((buf) => {
+          recordGeometryFetchMs(performance.now() - fetchT0);
           if (disposed) return;
           const g: VoxelGeometry = decodeGeometry(buf);
           // Feed the in-flight estimator from every landed payload, including the stale ones below —
@@ -1680,7 +1816,10 @@ const FlyView3D = forwardRef<FlyView3DRef, {
           const payload = g.bytes + g.bytes_t + g.bytes_e;
           if (payload > maxChunkBytes) maxChunkBytes = payload;
           chunkEstimateBytes = Math.round(chunkEstimateBytes * 0.8 + payload * 0.2);
-          if (gen !== fetchGen || staleKeys.has(k)) return; // stale — dropped; finally{} requeues if needed
+          if (gen !== fetchGen || staleKeys.has(k)) {
+            if (perfCounters.enabled) perfCounters.chunkFetchesDroppedStale++;
+            return; // stale — dropped; finally{} requeues if needed
+          }
           disposeMesh(k); // replace any existing mesh (reload path)
           if (g.vertex_count > 0) {
             const geom = new THREE.BufferGeometry();
@@ -1745,7 +1884,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
           }
           invalidate();
         })
-        .catch(() => { /* no world / out of range */ })
+        .catch(() => { if (perfCounters.enabled) perfCounters.chunkFetchesErrored++; /* no world / out of range */ })
         .finally(() => {
           inflight.delete(k);
           active--;
@@ -1766,7 +1905,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       // setState on an actual transition so this doesn't re-render every pump() (called on every
       // fetch completion). In-flight reservations count too, so a burst of concurrent fetches on a
       // dense 256z world can't land collectively past the cap.
-      const overBudget = residentBytes + inflightBytes >= geometryBudgetRef.current;
+      const overBudget = committedBytes() + inflightBytes >= effectiveBudget();
       // The badge is not the fetch gate (Phase 2.1): budget eviction leaves the pane *just under* the
       // cap with its disc truncated at `budgetHorizonSq`, so testing `overBudget` alone would blink
       // the badge off in exactly the state the user most needs it — render distance silently reduced
@@ -1775,12 +1914,13 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       if (limited !== budgetLimited) {
         budgetLimited = limited;
         setBudgetLimitedRef.current(limited);
+        if (perfCounters.enabled) perfCounters.budgetLimitedTransitions++;
       }
       if (overBudget) return;
       while (active < maxConcurrent() && queue.length) {
         // Re-test per iteration: each startFetch below adds its own reservation, so filling the
         // concurrency slots in one go could otherwise reserve past the cap in a single pump().
-        if (residentBytes + inflightBytes >= geometryBudgetRef.current) break;
+        if (committedBytes() + inflightBytes >= effectiveBudget()) break;
         const it = queue.shift()!;
         if (!wantsFetch(key(it.cx, it.cy))) continue;
         startFetch(it.cx, it.cy);
@@ -1821,8 +1961,8 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       // The budget horizon only describes what fits *from this camera chunk, at this radius, under
       // this budget* — anything that changes one of those three re-opens it. `force` covers the
       // radius/teleport/reload paths (setLoadRadius, resetCamera/teleport, reloadAllChunks).
-      if (force || bandMoved || cameraMoved || geometryBudgetRef.current !== budgetHorizonBudget) {
-        budgetHorizonBudget = geometryBudgetRef.current;
+      if (force || bandMoved || cameraMoved || effectiveBudget() !== budgetHorizonBudget) {
+        budgetHorizonBudget = effectiveBudget();
         budgetHorizonSq = Infinity;
       }
 
@@ -1858,7 +1998,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       // with the camera parked. Drop the chunks *farthest* from the camera (deliberately not an LRU:
       // the chunk you just flew toward is the most recently loaded and the one you most need) until
       // the resident set is back inside the budget.
-      if (residentBytes + inflightBytes >= geometryBudgetRef.current) {
+      if (committedBytes() + inflightBytes >= effectiveBudget()) {
         const evictable: { k: string; d2: number }[] = [];
         for (const k of residentKeys()) {
           // Off limits: a chunk with a fetch already in flight (disposing it would strand the pane on
@@ -1872,7 +2012,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
         }
         evictable.sort((a, b) => b.d2 - a.d2);
         for (const e of evictable) {
-          if (residentBytes + inflightBytes < geometryBudgetRef.current) break;
+          if (committedBytes() + inflightBytes < effectiveBudget()) break;
           disposeMesh(e.k);
           // Record how far the budget actually reached so the scan below doesn't re-queue what was
           // just dropped (see budgetHorizonSq). Floored at 1 so the camera's own chunk (d2 = 0) stays
@@ -1933,7 +2073,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       // the old mesh still counts against it, so keeping it resident would strand *pre-edit*
       // geometry indefinitely. There the eager dispose is still right — it frees the headroom the
       // refetch needs, at the cost of the visible hole this change otherwise removes.
-      if (residentBytes + inflightBytes >= geometryBudgetRef.current) disposeMesh(k);
+      if (committedBytes() + inflightBytes >= effectiveBudget()) disposeMesh(k);
       queue.unshift({ cx: cxk, cy: cyk });
       pump();
     };
@@ -2953,6 +3093,8 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     // leave the pane black with nothing thrown for the ErrorBoundary to catch), and streaming is
     // parked so we don't accumulate geometry nobody can upload.
     let contextLost = false;
+    // (`contextLossCount` / `contextGivenUp` / `effectiveBudget` live with the streaming budget
+    // further up — the back-off's whole job is to shrink what the next restore streams.)
     let lastEmitT = 0;
     let lastMemHudT = 0;
     let lastEmitExternalT = 0;
@@ -2991,18 +3133,56 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     const onContextLost = (e: Event) => {
       e.preventDefault();
       contextLost = true;
+      contextLossCount++;
+      if (perfCounters.enabled) perfCounters.contextLosses++;
       cancelAnimationFrame(raf);
       rafPending = false;
       clearInterval(sweepInterval);
-      onNoticeRef.current?.("3D view: the graphics context was lost (usually memory pressure). Recovering — lower the Memory budget preset or the render distance if it keeps happening.");
+
+      // ---- Stage 10.1 (H2): back off before restoring, or give up ----
+      // The restore path below re-streams the whole disc from scratch. Doing that at the same
+      // radius under the same budget that just exhausted the GPU reproduces the loss, and Chromium
+      // eventually kills the GPU process (then disables acceleration outright) after enough of
+      // them. So each loss makes the next attempt cheaper, and the third stops attempting.
+      if (contextLossCount >= MAX_CONTEXT_LOSSES) {
+        contextGivenUp = true;
+        // Suspend: disposes every resident mesh and parks the sweep, so the dead pane holds nothing.
+        // Safe to call while `contextLost` — it only touches scene graph state and timers, and its
+        // resume branch is already guarded on `contextLost` (now permanently, via contextGivenUp).
+        setSuspended(true);
+        setContextDisabledRef.current(true);
+        onNoticeRef.current?.(`3D view disabled for this session: the graphics context was lost ${MAX_CONTEXT_LOSSES} times. Restoring it again would most likely just lose it again, and repeated losses can make the system disable hardware acceleration entirely. The rest of the editor is unaffected — restart VuencEdit to try the 3D pane again.`);
+        return;
+      }
+      // Shrink the disc for the coming restore. The budget halving is implicit (`effectiveBudget()`
+      // reads `contextLossCount`, already incremented above); the radius has to be written.
+      // ⚠️ Deliberately *not* via `setLoadRadius`: that forces a streamSweep, and streaming while
+      // the context is dead would queue fetches nothing can upload. `reloadAllChunks()` in the
+      // restore handler picks the new radius up. ⚠️ And deliberately *not* via
+      // `onRenderDistanceChangeRef`: a transient recovery must never rewrite the user's persisted
+      // render distance. The in-pane slider is updated so the reduced picture is visibly on purpose.
+      const prevR = loadRadiusRef.current;
+      const nextR = backoffRadius(prevR, RD_MIN);
+      if (nextR !== prevR) {
+        loadRadiusRef.current = nextR;
+        setFog(fogEnabledRef.current, fogColorRef.current); // fog near/far derive from the radius
+        setLoadRadiusStateRef.current(nextR);
+      }
+      const budgetMb = (effectiveBudget() / (1 << 20)).toFixed(0);
+      onNoticeRef.current?.(`3D view: the graphics context was lost (usually memory pressure). Recovering with render distance ${nextR} and a ${budgetMb} MB geometry budget — reduced on purpose so it is less likely to happen again.`);
     };
     const onContextRestored = () => {
+      // The back-off gave up: stay parked (and leave `contextLost` set, so frame() and the resume
+      // branch of setSuspended both keep refusing) rather than walking back into the loop.
+      if (contextGivenUp) return;
       contextLost = false;
       // three re-initialises its own GL state and re-uploads textures from their source images, but
       // it re-uploads *geometry* from `attribute.array` — which the upload-release above set to null.
       // Every resident chunk is therefore unrecoverable and must be refetched; reloadAllChunks()
       // disposes them and bumps fetchGen so any fetch issued pre-loss is dropped rather than
-      // installed. This is the dependency Stage 1's release deliberately takes on.
+      // installed. This is the dependency Stage 1's release deliberately takes on. ⚠️ The back-off
+      // above changes *what* this reloads (a smaller disc, under a smaller budget) — never whether
+      // it reloads at all, which would strand the pane on unrecoverable geometry.
       if (atlasTexRef.current) atlasTexRef.current.needsUpdate = true;
       // A pane suspended while its context was lost stays parked — `setSuspended(false)` restarts
       // the sweep and refetches. Restarting it here would stream geometry into a hidden pane.
@@ -3050,7 +3230,10 @@ const FlyView3D = forwardRef<FlyView3DRef, {
         for (const k of residentKeys()) disposeMesh(k);
         zBand = undefined;
         pushMemHud();
-      } else if (!contextLost) {
+      } else if (!contextLost && !contextGivenUp) {
+        // `contextGivenUp` is redundant with `contextLost` today (the give-up path leaves the latter
+        // set forever, on purpose) and stated anyway: it is what must keep App re-showing the pane
+        // from reviving a context the back-off deliberately stopped restoring.
         // The canvas was `display:none`, so its ResizeObserver reported 0 and `resize()` clamped the
         // renderer to 1×1. Re-measure before the first frame or the pane comes back stretched.
         resize();
@@ -3069,6 +3252,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       rafPending = false;
       if (disposed || contextLost || suspendedNow) return;
       const now = performance.now();
+      recordFrameMs(now - prev); // unclamped — a stall this histogram exists to catch would vanish under the sim-step cap below
       const dt = Math.min(0.05, (now - prev) / 1000);
       prev = now;
 
@@ -3215,8 +3399,8 @@ const FlyView3D = forwardRef<FlyView3DRef, {
         }
         renderer.render(scene, camera);
         // Post-render, because the upload-release callbacks fire *inside* render() — this is the only
-        // point where the JS-heap total reflects what actually got freed. Dev-only and self-throttled
-        // (`pushMemHud` is an empty function in a production build).
+        // point where the JS-heap total reflects what actually got freed. Self-throttled and a no-op
+        // unless `showPerfHud` is on (Stage 9.3).
         if (now - lastMemHudT >= 250) { lastMemHudT = now; pushMemHud(); }
       }
 
@@ -3761,6 +3945,20 @@ const FlyView3D = forwardRef<FlyView3DRef, {
         else gizmoGroup.visible = false;
         invalidate();
       },
+      // Stage 9.2 — reads the extension off this renderer's *already-live* context. Never creates one.
+      getGpuInfo: () => readGpuInfo(renderer),
+      // Stage 9.3 — a snapshot, not a subscription: the Diagnostics panel samples on its own Refresh
+      // click, so this reads whatever the running totals currently are without pushing anything.
+      getPerfSnapshot: () => ({
+        residentBytes, jsBytes, inflightBytes, peakBytes, maxChunkBytes,
+        budgetBytes: effectiveBudget(),
+        configuredBudgetBytes: geometryBudgetRef.current,
+        chunks: meshes.size + emptyChunks.size,
+        loadRadius: loadRadiusRef.current,
+        zBand: zBand ?? null,
+        contextLossCount,
+        contextDisabled: contextGivenUp,
+      }),
     };
 
     // Apply initial gizmo state — a selection may already exist when the pane mounts (quad view /
@@ -4376,9 +4574,9 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       )}
       {/* Camera position / heading HUD (Eden coords) */}
       <CoordHud ref={hudRef} />
-      {/* Resident-geometry readout — dev builds only (tree-shaken out of a production bundle by the
-          constant `import.meta.env.DEV`, and the scene effect's pushMemHud() is a no-op there too). */}
-      {import.meta.env.DEV && <GeomMemHud ref={memHudRef} />}
+      {/* Resident-geometry readout — promoted out of dev-only behind `showPerfHud` (Stage 9.3), so a
+          release build's user can watch it while trying a lower render distance / memory preset. */}
+      {showPerfHud && <GeomMemHud ref={memHudRef} />}
       {/* In-pane hotbar (bottom-centre, build mode only) — 5 pinned + 5 recent, mirrors the Ribbon
           hotbar and the 1-5/6-0 digit keys so the active slot never needs a glance back at the Ribbon. */}
       {interact3d === "build" && hotbarSlots && hotbarSlots.length > 0 && (
@@ -4518,6 +4716,36 @@ const FlyView3D = forwardRef<FlyView3DRef, {
           </div>
         )}
       </div>
+      {/* Stage 10.1 (H2): the back-off gave up. The canvas below is a dead context that will never
+          paint again this session, so cover it with the explanation rather than leaving a black
+          rectangle — and swallow pointer events, so clicks can't drive picks/builds into a scene
+          that is no longer being rendered. The toast that fired at the same moment scrolls away;
+          this doesn't. */}
+      {contextDisabled && (
+        <div
+          role="alert"
+          style={{
+            position: "absolute", inset: 0, zIndex: 3, pointerEvents: "auto",
+            display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center",
+            gap: 8, padding: 24, textAlign: "center",
+            background: "rgba(10,15,30,0.94)",
+          }}
+        >
+          <div style={{ fontSize: 13, fontWeight: 700, color: "#ef4444", letterSpacing: "0.03em" }}>
+            3D view disabled for this session
+          </div>
+          <div style={{ fontSize: 11, color: "#afa69d", lineHeight: 1.7, maxWidth: 380 }}>
+            The graphics context was lost {MAX_CONTEXT_LOSSES} times — usually GPU memory pressure.
+            Each recovery already retried with a smaller render distance and geometry budget, so the
+            pane has stopped trying rather than risk the system disabling hardware acceleration
+            altogether.
+          </div>
+          <div style={{ fontSize: 10, color: "#83786c", lineHeight: 1.7, maxWidth: 380 }}>
+            The rest of the editor is unaffected. Restart VuencEdit to use the 3D pane again — and
+            before you do, lower <strong>Settings → Memory budget</strong> and the render distance.
+          </div>
+        </div>
+      )}
       <canvas
         ref={canvasRef}
         tabIndex={0}

@@ -207,6 +207,8 @@ export interface RibbonProps {
   setShowHelp: (v: boolean) => void;
   setShowAbout: (v: boolean) => void;
   setShowSettings: (v: boolean) => void;
+  /** ROADMAP-EDIT Stage 9.5 — `Help ▸ Diagnostics…`. */
+  setShowDiagnostics: (v: boolean) => void;
   /** Opens the onboarding coach-mark tour (`src/tour/`) — the application menu's Help pane and
    *  `HelpModal` both offer a "replay" entry point through this. */
   startTour: () => void;

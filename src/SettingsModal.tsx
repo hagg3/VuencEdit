@@ -78,6 +78,16 @@ export interface AppSettings {
    *  stored blob predates this field both trigger the tour once. `bump-version.sh` is the only
    *  thing that raises `TOUR_VERSION`, to re-onboard existing users after a UI change. */
   tourVersion: number;
+  /** Show the 3D pane's resident-geometry HUD + gate its sampling and the fetch/frame-time
+   *  histograms behind it (ROADMAP-EDIT Stage 9.3/9.4). Off by default — the whole point of the
+   *  toggle is that a diagnostic must never itself be a performance cost when nobody's watching. */
+  showPerfHud: boolean;
+  /** Set once the Stage 10.3 "potato profile" has run its one-time auto-adjustment (render distance
+   *  → `RD_MIN`, memory preset → "low") after detecting a software WebGL rasterizer. Gates the
+   *  adjustment to a single occurrence per install — without it, a user who deliberately raises
+   *  render distance or memory preset back up on a known-software-rendering machine would have that
+   *  choice silently reverted the next time the 3D pane mounts. Default false. */
+  potatoProfileApplied: boolean;
 }
 
 /** Memory-budget preset table — the single source of truth for what each preset actually bounds.
@@ -101,9 +111,11 @@ export const MEMORY_PRESETS: Record<AppSettings["memoryBudget"], {
 };
 
 /** Current settings schema version. Bump + add a case to `migrate()` when a stored default must change. */
-const SETTINGS_VERSION = 14;
+const SETTINGS_VERSION = 17;
 
-const DEFAULTS: AppSettings = {
+/** Exported so Stage 10.3's potato-profile check can test "still at the stock default" without
+ *  duplicating the magic numbers — the same heuristic `migrate()` itself uses per-field above. */
+export const DEFAULTS: AppSettings = {
   defaultQuadView: true,
   default3dPane: false,
   defaultSaveCompressed: false,
@@ -133,7 +145,27 @@ const DEFAULTS: AppSettings = {
   checkForUpdatesOnLaunch: true,
   settingsVersion: SETTINGS_VERSION,
   tourVersion: 0,
+  showPerfHud: false,
+  potatoProfileApplied: false,
 };
+
+/** Stage 10.5 — the flat "balanced" default asked for ~768 MB of GPU-backed memory (512 MB geometry
+ *  + 256 MB tile canvases) before a 2048²/4096² shadow map on top, tuned on a development Mac and
+ *  applied to completely unknown hardware. `deviceMemory` (Chromium only — undefined in Safari/
+ *  Firefox/older WebView2; spec-capped, so treat 8 as "8 or more", not exactly 8) and
+ *  `hardwareConcurrency` are the only two capability hints available synchronously, before any GPU
+ *  context exists — this can't see Stage 9.2/10.3's renderer-string verdict, which needs the 3D pane
+ *  to actually mount first and is handled separately by the potato-profile check. Deliberately
+ *  conservative: "low" trips on one weak signal, "high" needs both strong, everything else — including
+ *  every machine this can't read anything about — stays "balanced". */
+function deviceAwareDefaultMemoryBudget(): AppSettings["memoryBudget"] {
+  const nav = navigator as Navigator & { deviceMemory?: number };
+  const mem = nav.deviceMemory;
+  const cores = nav.hardwareConcurrency;
+  if ((mem != null && mem <= 4) || (cores != null && cores <= 2)) return "low";
+  if (mem != null && mem >= 8 && cores != null && cores >= 8) return "high";
+  return "balanced";
+}
 
 /** Push new defaults onto an install that already has a stored settings blob. A plain
  *  `{...DEFAULTS, ...parsed}` merge can't do this: `parsed` holds the *old* explicit value, which
@@ -195,6 +227,19 @@ function migrate(s: Record<string, unknown>): boolean {
   if (from < 14 && typeof s.flySpeed === "number") {
     s.flySpeed = Math.min(3, Math.max(0.1, s.flySpeed));
   }
+  // v14 → v15: added showPerfHud (release-build diagnostics, ROADMAP-EDIT Stage 9). No forced
+  // value needed — the `{...DEFAULTS, ...parsed}` merge supplies it (default false).
+  // v15 → v16: added potatoProfileApplied (Stage 10.3 software-renderer auto-adjustment gate). No
+  // forced value needed — the `{...DEFAULTS, ...parsed}` merge supplies it (default false), so every
+  // existing install is eligible for exactly one auto-adjustment the next time it mounts the 3D pane
+  // on a software-rendering machine, same as a fresh install.
+  // v16 → v17: memoryBudget's flat "balanced" default is retuned once, device-aware (Stage 10.5).
+  // Only touches installs still parked on "balanced" — the same "still at the old default" proxy for
+  // "never touched" every earlier per-field migration in this function already relies on (see
+  // lampRadius above); an install that explicitly *chose* Low or High is untouched either way.
+  if (from < 17 && s.memoryBudget === "balanced") {
+    s.memoryBudget = deviceAwareDefaultMemoryBudget();
+  }
   s.settingsVersion = SETTINGS_VERSION;
   return true;
 }
@@ -216,6 +261,10 @@ export function loadSettings(): AppSettings {
     if (raw && migrate(parsed)) {
       localStorage.setItem(SETTINGS_KEY, JSON.stringify({ ...DEFAULTS, ...parsed }));
     }
+    // A genuinely fresh install (no blob at all) never runs `migrate()` above — v17's device-aware
+    // memoryBudget pick has to be applied here instead, or every first launch would silently get the
+    // flat "balanced" DEFAULTS value forever (Stage 10.5).
+    if (!raw) return { ...DEFAULTS, memoryBudget: deviceAwareDefaultMemoryBudget() };
     return { ...DEFAULTS, ...parsed };
   } catch {
     return { ...DEFAULTS };
@@ -489,6 +538,14 @@ export default function SettingsModal({ onClose, onSave }: Props) {
               {/* Night lighting / Shadows / GPU shadow map are perf-heavy, session-only view modes —
                   they live in the Ribbon's 3D/View Lighting group (⚡ badged) and always start off,
                   so they're deliberately not persisted defaults here. */}
+
+              <div style={row}>
+                <Checkbox value={local.showPerfHud} onChange={v => set("showPerfHud", v)} label="3D performance HUD" />
+                <div style={labelCol}>
+                  <span style={labelText}>3D performance HUD</span>
+                  <span style={labelSub}>Resident-geometry readout in the 3D pane; also feeds Help ▸ Diagnostics</span>
+                </div>
+              </div>
 
               <div style={{ height: 6 }} />
               <div style={sectionLabel}>3D pane sliders</div>

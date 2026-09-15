@@ -47,6 +47,7 @@ fn lamp_build_now(index: &LampIndex, world: &LoadedWorld) {
 }
 mod geometry;
 mod journal;
+mod mem;
 mod mpworld;
 mod network;
 mod signs;
@@ -3744,6 +3745,15 @@ fn apply_spans_in_place(dest: &std::path::Path, spans: &[(u64, &[u8])]) -> std::
 /// failure to repair must not stop them opening it — worst case they get the partially-written
 /// version, exactly what they'd have got without any of this. The WAL is left in place on a *write*
 /// failure specifically so the next open can retry (replay being idempotent makes that safe).
+///
+/// **Two passes, streamed** (audit P-2). The commit marker that gates the whole repair is a property
+/// of the *end* of the log, so nothing can be applied until the log has been read through once —
+/// but the collect-then-check form that made that easy held the whole thing in RAM twice over. The
+/// WAL is **uncompressed** and `try_incremental_save` only declines past half the world
+/// (`lib.rs`'s dirty-set check below), so on a 11.8 GB world that was a ~5.9 GB file plus ~5.9 GB of
+/// owned spans — world-sized, on the path that runs precisely when the user's file is half-written.
+/// Pass 1 validates with a no-op sink; pass 2 rewinds and pwrites. The second read is sequential and
+/// comes straight out of page cache, which is a cheap price for a constant-memory recovery.
 fn recover_wal(dest: &std::path::Path) {
     let wal = wal_path(dest);
     if !wal.exists() { return; }
@@ -3755,18 +3765,40 @@ fn recover_wal(dest: &std::path::Path) {
     };
     // An unreadable log is a transient failure (permissions, a racing reader), not a corrupt one:
     // leave it alone rather than destroying recovery data we couldn't even look at.
-    let Ok(bytes) = fs::read(&wal) else { return };
-    let Ok(replay) = journal::replay(&bytes, dest_len) else {
-        let _ = fs::remove_file(&wal);
-        return;
+    let Ok(file) = fs::File::open(&wal) else { return };
+    let mut reader = std::io::BufReader::new(file);
+
+    // ── Pass 1: validate. The sink does nothing, so the only question this pass answers is whether
+    // the log is ours, intact, and committed.
+    let summary = match journal::replay_each(&mut reader, dest_len, |_| Ok::<(), std::convert::Infallible>(())) {
+        Ok(s) => s,
+        Err(journal::ReplayAbort::Journal(_)) => { let _ = fs::remove_file(&wal); return; }
+        // Total, not a panic: the sink above returns `Infallible`, so this arm is uninhabited.
+        Err(journal::ReplayAbort::Sink(never)) => match never {},
     };
-    if !replay.ended_with_commit || replay.spans.is_empty() {
+    if !summary.ended_with_commit || summary.spans == 0 {
         let _ = fs::remove_file(&wal);
         return;
     }
-    let spans: Vec<(u64, &[u8])> = replay.spans.iter().map(|s| (s.file_off, s.payload.as_slice())).collect();
-    timing_log!("[LOAD] recovering interrupted save  spans={}  dest={:?}", spans.len(), dest);
-    if apply_spans_in_place(dest, &spans).is_ok() {
+
+    // ── Pass 2: apply. Same positioned-write discipline as `apply_spans_in_place` (which stays as
+    // it is for `try_incremental_save`, whose spans are a genuine borrow of the mapping): open
+    // `write(true)` with no truncate/append, seek per span, and fsync once at the end.
+    if reader.rewind().is_err() { return; }
+    let Ok(mut f) = fs::OpenOptions::new().write(true).open(dest) else { return };
+    timing_log!("[LOAD] recovering interrupted save  spans={}  dest={:?}", summary.spans, dest);
+    let applied = journal::replay_each(&mut reader, dest_len, |span| {
+        f.seek(SeekFrom::Start(span.file_off))?;
+        f.write_all(span.payload)
+    });
+    // Anything short of a second clean, committed pass leaves the log on disk for the next open to
+    // retry — including the should-be-impossible case of pass 2 disagreeing with pass 1, which
+    // would mean something rewrote the log underneath us.
+    match applied {
+        Ok(s) if s.ended_with_commit && s.spans == summary.spans => {}
+        _ => return,
+    }
+    if f.sync_all().is_ok() {
         let _ = fs::remove_file(&wal);
     }
 }
@@ -5166,7 +5198,7 @@ fn write_fresh_journal(
 }
 
 /// Append to an existing journal in place. Safe to leave torn on a crash mid-write — that's the
-/// whole point of the journal's truncation-tolerant replay (see `journal::replay`) — so this
+/// whole point of the journal's truncation-tolerant replay (see `journal::replay_each`) — so this
 /// doesn't need the create-temp-then-rename treatment `write_fresh_journal` needs.
 fn append_journal(
     path: &std::path::Path,
@@ -5381,47 +5413,71 @@ fn load_autosave_inner(state: &AppState, paths: &AutosavePaths) -> Result<WorldM
     let temp_path = temp_world_path();
     stage_copy(&paths.base, &temp_path).map_err(|e| format!("Failed to stage autosave base: {e}"))?;
 
-    let journal_bytes = fs::read(&paths.journal).map_err(|e| {
-        let _ = fs::remove_file(&temp_path);
-        format!("Failed to read autosave journal: {e}")
-    })?;
-    if let Some(hdr) = journal::JournalHeader::decode(&journal_bytes) {
+    // ── Replay, streamed (audit P-2). The journal is decoded one record at a time and each span is
+    // pwritten into the staged temp as it arrives, so peak RAM here is the largest single *record*
+    // (one chunk) rather than every decompressed span at once. That distinction is the whole point:
+    // the journal is capped at base_len/10 *compressed*, voxel data deflates 5-20x, and a
+    // world-sized allocation that fails calls `handle_alloc_error` — an abort, with no error to
+    // show — on the one path that runs when the user has already lost a session to a crash.
+    //
+    // A span reaches the write below only after its bounds and CRC checks pass, so interleaving
+    // decode with write never puts a corrupt record on disk. The on-disk result is identical to the
+    // old decode-everything-then-write form, including for a torn journal: replay is documented to
+    // apply the clean prefix and stop, which is exactly what a streaming sink does.
+    use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+    let mut reader = fs::File::open(&paths.journal)
+        .map(std::io::BufReader::new)
+        .map_err(|e| {
+            let _ = fs::remove_file(&temp_path);
+            format!("Failed to read autosave journal: {e}")
+        })?;
+    {
         // A journal whose base_id doesn't match the meta sidecar belongs to a different lineage
         // than autosave.base.eden (e.g. the base survived a crash mid-compaction while the meta
         // pointed at an older journal generation) — refuse rather than replay mismatched history
-        // onto the wrong base.
-        if hdr.base_id != info.base_id {
-            let _ = fs::remove_file(&temp_path);
-            return Err("Autosave journal does not match its base image — recovery aborted for safety".into());
-        }
-    }
-    let replay = journal::replay(&journal_bytes, base_len).map_err(|e| {
-        let _ = fs::remove_file(&temp_path);
-        match e {
-            journal::JournalError::BadMagic => "Autosave journal is corrupt (bad header)".to_string(),
-            journal::JournalError::BaseLenMismatch { expected, found } => format!(
-                "Autosave journal doesn't match its base image (base is {expected}B, journal expects {found}B)"
-            ),
-        }
-    })?;
-    timing_log!("[LOAD] autosave replay  spans={}  truncated={}", replay.spans.len(), replay.truncated);
-
-    if !replay.spans.is_empty() {
-        use std::io::{Seek, SeekFrom, Write};
-        let mut f = fs::OpenOptions::new().write(true).open(&temp_path).map_err(|e| {
-            let _ = fs::remove_file(&temp_path);
-            format!("Failed to open staged temp for replay: {e}")
-        })?;
-        for span in &replay.spans {
-            let result = f.seek(SeekFrom::Start(span.file_off)).and_then(|_| f.write_all(&span.payload));
-            if let Err(e) = result {
-                drop(f);
+        // onto the wrong base. A header too short or malformed to decode is *not* handled here:
+        // it falls through to `replay_each`, which owns that rejection and its message.
+        let mut header_buf = [0u8; journal::HEADER_LEN];
+        let hdr = reader.read_exact(&mut header_buf).ok()
+            .and_then(|_| journal::JournalHeader::decode(&header_buf));
+        if let Some(hdr) = hdr {
+            if hdr.base_id != info.base_id {
                 let _ = fs::remove_file(&temp_path);
-                return Err(format!("Failed to replay autosave journal: {e}"));
+                return Err("Autosave journal does not match its base image — recovery aborted for safety".into());
             }
         }
-        f.sync_all().map_err(|e| format!("Failed to fsync staged temp: {e}"))?;
+        // `replay_each` reads the header itself; rewind so it sees the stream from the top.
+        reader.rewind().map_err(|e| {
+            let _ = fs::remove_file(&temp_path);
+            format!("Failed to read autosave journal: {e}")
+        })?;
     }
+
+    let mut temp_file = fs::OpenOptions::new().write(true).open(&temp_path).map_err(|e| {
+        let _ = fs::remove_file(&temp_path);
+        format!("Failed to open staged temp for replay: {e}")
+    })?;
+    let summary = journal::replay_each(&mut reader, base_len, |span| {
+        temp_file.seek(SeekFrom::Start(span.file_off))?;
+        temp_file.write_all(span.payload)
+    })
+    .map_err(|e| {
+        let _ = fs::remove_file(&temp_path);
+        match e {
+            journal::ReplayAbort::Journal(journal::JournalError::BadMagic) =>
+                "Autosave journal is corrupt (bad header)".to_string(),
+            journal::ReplayAbort::Journal(journal::JournalError::BaseLenMismatch { expected, found }) => format!(
+                "Autosave journal doesn't match its base image (base is {expected}B, journal expects {found}B)"
+            ),
+            journal::ReplayAbort::Sink(e) => format!("Failed to replay autosave journal: {e}"),
+        }
+    })?;
+    timing_log!("[LOAD] autosave replay  spans={}  truncated={}", summary.spans, summary.truncated);
+
+    if summary.spans > 0 {
+        temp_file.sync_all().map_err(|e| format!("Failed to fsync staged temp: {e}"))?;
+    }
+    drop(temp_file);
 
     let mmap = map_staged_temp(&temp_path)
         .map_err(|e| format!("Failed to map staged temp: {e}"))?;
@@ -9677,6 +9733,82 @@ fn array_paste(
     result
 }
 
+// ── Field diagnostics (ROADMAP-EDIT Stage 9.1) ──────────────────────────────
+
+/// Backs the `Help ▸ Diagnostics…` panel's native-memory section. Sampled on demand only (the
+/// panel's Refresh button) — never on a timer, per the "a diagnostic must never itself be a
+/// performance problem" rule in `TEST WORLDS/diagnostics-panel-plan-2026-09-14.md`.
+///
+/// Deliberately carries **no path** — the frontend already holds `sourcePath` for the basename it
+/// wants to show, and passing one through here would be one more place to remember the
+/// full-path-leaks-a-username privacy rule.
+#[derive(Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MemStats {
+    /// `std::env::consts::OS`/`ARCH` — cheap enough not to warrant `tauri_plugin_os` for two strings.
+    os: &'static str,
+    arch: &'static str,
+    process: mem::ProcessMemory,
+    system: mem::SystemMemory,
+    world_loaded: bool,
+    world_bytes: u64,
+    chunk_size: u64,
+    num_bands: u64,
+    w_chunks: u32,
+    h_chunks: u32,
+    /// Header `version` field — see `WorldMeta::version`'s doc for how the frontend turns this
+    /// (plus `max_z`) into a `NewFormat256z`/`NewDawn256z`/`Legacy64z` label.
+    world_version: i32,
+    undo_bytes: u64,
+    redo_bytes: u64,
+    undo_groups: u64,
+    redo_groups: u64,
+    undo_budget: u64,
+}
+
+#[tauri::command(async)]
+fn mem_stats(state: tauri::State<'_, AppState>) -> MemStats {
+    let ws = read_ws(&state);
+    let (world_loaded, world_bytes, chunk_size, num_bands, w_chunks, h_chunks, world_version) =
+        match ws.world.as_ref() {
+            Some(w) => (
+                true,
+                w.bytes.len() as u64,
+                w.chunk_size as u64,
+                w.num_bands as u64,
+                w.w_chunks,
+                w.h_chunks,
+                read_world_version(&w.bytes),
+            ),
+            None => (false, 0, 0, 0, 0, 0, 0),
+        };
+    MemStats {
+        os: std::env::consts::OS,
+        arch: std::env::consts::ARCH,
+        process: mem::process_memory(),
+        system: mem::system_memory(),
+        world_loaded,
+        world_bytes,
+        chunk_size,
+        num_bands,
+        w_chunks,
+        h_chunks,
+        world_version,
+        undo_bytes: ws.undo_bytes as u64,
+        redo_bytes: ws.redo_bytes as u64,
+        undo_groups: ws.undo_groups as u64,
+        redo_groups: ws.redo_groups as u64,
+        undo_budget: ws.undo_budget as u64,
+    }
+}
+
+/// Write text to a path the user picked in a save dialog — the Diagnostics panel's "Save as
+/// .txt…" escape hatch. No `AppState`, so plain sync.
+#[tauri::command]
+fn write_text_file(path: String, contents: String) -> Result<(), String> {
+    fs::write(&path, contents).map_err(|e| format!("write {path}: {e}"))
+}
+
 pub fn run() {
     sweep_stale_temps(); // clear staging temps leaked by a previous clean quit
     tauri::Builder::default()
@@ -9799,6 +9931,8 @@ pub fn run() {
             load_texture_pack,
             unload_texture_pack,
             get_block_tables,
+            mem_stats,
+            write_text_file,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -10526,13 +10660,16 @@ mod tests {
         assert_eq!(BLOCK_INFO.len(), 128);
         assert_eq!(BLOCK_PAINT_SCALE.len(), 128);
         assert_eq!(crate::texturepack::BLOCK_FACE_TEX.len(), 128);
-        // Per the project decision to reuse existing colours/scales rather than invent placeholder
-        // hues: every new-format entry must equal some existing 0–111 entry, not a novel colour.
+        // The 16 are named, distinct materials with hand-picked approximate colours (textures
+        // aren't supported yet). Two sharing a colour would make them indistinguishable on the 2D
+        // map and in the picker, which is the failure this pins; the scale must stay a sane
+        // brightness multiplier.
         for bt in 112u8..=127 {
             let rgb = BLOCK_RGB[bt as usize];
-            assert!(BLOCK_RGB[0..112].contains(&rgb), "block {bt}'s colour must reuse an existing 0–111 colour, got {rgb:?}");
+            let dupes = (112u8..=127).filter(|&o| o != bt && BLOCK_RGB[o as usize] == rgb).count();
+            assert_eq!(dupes, 0, "block {bt}'s colour {rgb:?} is shared with another new-format block");
             let scale = BLOCK_PAINT_SCALE[bt as usize];
-            assert!(BLOCK_PAINT_SCALE[0..112].contains(&scale), "block {bt}'s paint scale must reuse an existing 0–111 scale, got {scale}");
+            assert!((0.1..=1.0).contains(&scale), "block {bt}'s paint scale must be in 0.1..=1.0, got {scale}");
         }
     }
 
@@ -12010,6 +12147,69 @@ mod tests {
         write_test_wal(&dest, base_len, &spans, true);
         recover_wal(&dest);
         assert_eq!(fs::read(&dest).unwrap(), expected, "replaying an applied log must be a no-op");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Audit P-2 — `recover_wal` validates in one streaming pass and applies in a second, so that a
+    /// multi-GB uncompressed log never becomes a multi-GB allocation. The two things that split can
+    /// get wrong, and that the single-pass form couldn't: pass 2 must apply *every* span pass 1
+    /// validated (not stop at the first, and not re-order them away from last-write-wins), and a
+    /// pass-2 failure must leave the log on disk so the next open retries.
+    #[test]
+    fn test_wal_two_pass_applies_every_span_in_order_and_keeps_the_log_on_failure() {
+        let dir = stage4_dir("wal_two_pass");
+        let original = make_bumpy_world_grid(2, 8, |_, _| 20);
+        let dest = dir.join("world.eden");
+        let base_len = original.len() as u64;
+
+        // Enough spans that a "applies the first record then stops" bug is unmissable, plus a
+        // deliberate overwrite of an offset an earlier span already wrote — the last-write-wins
+        // semantic has to survive being replayed twice across two passes.
+        let mut spans: Vec<(u64, i32, i32, Vec<u8>)> = Vec::new();
+        let mut expected = original.clone();
+        for i in 0..8u64 {
+            let off = 4096 + i * 4096;
+            let payload = vec![0xA0 + i as u8; 4096];
+            expected[off as usize..off as usize + 4096].copy_from_slice(&payload);
+            spans.push((off, i as i32, 0, payload));
+        }
+        let overwrite = vec![0xFFu8; 4096];
+        expected[4096..4096 + 4096].copy_from_slice(&overwrite);
+        spans.push((4096, 0, 0, overwrite));
+
+        fs::write(&dest, &original).unwrap();
+        write_test_wal(&dest, base_len, &spans, true);
+        recover_wal(&dest);
+        assert_eq!(fs::read(&dest).unwrap(), expected,
+            "every span in a committed log must be applied, with the later span winning the overlap");
+        assert!(!wal_path(&dest).exists(), "a fully applied log must be removed");
+
+        // Pass 2 can't open the destination for writing: the repair must be abandoned *and the log
+        // kept*, because replay is idempotent and the next open is entitled to try again.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::write(&dest, &original).unwrap();
+            write_test_wal(&dest, base_len, &spans, true);
+            let mut perms = fs::metadata(&dest).unwrap().permissions();
+            perms.set_mode(0o444);
+            fs::set_permissions(&dest, perms).unwrap();
+
+            recover_wal(&dest);
+            assert!(wal_path(&dest).exists(),
+                "a log that could not be applied must survive for the next open to retry");
+            assert_eq!(fs::read(&dest).unwrap(), original, "the destination must be untouched");
+
+            // And the retry succeeds once the obstruction is gone — which is the whole point of
+            // keeping it.
+            let mut perms = fs::metadata(&dest).unwrap().permissions();
+            perms.set_mode(0o644);
+            fs::set_permissions(&dest, perms).unwrap();
+            recover_wal(&dest);
+            assert_eq!(fs::read(&dest).unwrap(), expected, "the retry must complete the repair");
+            assert!(!wal_path(&dest).exists());
+        }
 
         let _ = fs::remove_dir_all(&dir);
     }

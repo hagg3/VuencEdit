@@ -24,6 +24,19 @@ Pre-built installers for macOS (Apple Silicon + Intel universal), Windows, and L
 
 ---
 
+## Reporting a problem
+
+If something is slow, crashes, or looks wrong — especially the 3D pane, or a "lags a lot" /
+white-or-black-screen report — open **Help ▸ Diagnostics…** (also linked from the About pane),
+click **Refresh**, then **Copy to clipboard** or **Save as .txt…**, and paste that report along
+with a description of what happened into a [Discord](http://discord.gg/rjYXwBC) message or a
+GitHub issue. It's a plain-text snapshot of memory use, GPU identity, and fetch/frame timing for
+the current session — nothing is sent automatically, and it never includes your file paths or
+world contents, just filenames and sizes. Turning on **Settings ▸ 3D performance HUD** first
+also puts a live readout in the corner of the 3D pane while you reproduce the problem.
+
+---
+
 ## Screenshot
 
 <p align="center">

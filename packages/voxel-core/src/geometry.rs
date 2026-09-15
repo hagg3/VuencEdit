@@ -503,18 +503,28 @@ pub fn obj_geometry_region(world: &impl VoxelView, meta: ViewMeta, pack: Option<
         gb(wx, wy, wz)
     };
 
-    let mut pos_f: Vec<f32> = Vec::new();
-    let mut col_f: Vec<f32> = Vec::new();
-    let mut uv_f:  Vec<f32> = Vec::new();
+    // Emitted directly as LE bytes (audit I-1) rather than as `Vec<f32>` converted afterwards —
+    // that used to cost a doubling-realloc `Vec<f32>` *and* a `flat_map().collect()` pass per
+    // stream, ~3× the wire payload in transient allocator traffic per chunk. `push_f32!` is the one
+    // place a float becomes bytes.
+    let mut pos_f: Vec<u8> = Vec::new();
+    let mut col_f: Vec<u8> = Vec::new();
+    let mut uv_f:  Vec<u8> = Vec::new();
     // Transparent stream (water/glass/fence/new-flower) — same layout except colors are RGBA.
-    let mut pos_ft: Vec<f32> = Vec::new();
-    let mut col_ft: Vec<f32> = Vec::new();
-    let mut uv_ft:  Vec<f32> = Vec::new();
+    let mut pos_ft: Vec<u8> = Vec::new();
+    let mut col_ft: Vec<u8> = Vec::new();
+    let mut uv_ft:  Vec<u8> = Vec::new();
     // Emissive stream (lamp blocks in flat/GPU mode) — RGB, drawn unlit by the frontend so lamps
     // stay fullbright. Only populated when `mode.flat`.
-    let mut pos_ef: Vec<f32> = Vec::new();
-    let mut col_ef: Vec<f32> = Vec::new();
-    let mut uv_ef:  Vec<f32> = Vec::new();
+    let mut pos_ef: Vec<u8> = Vec::new();
+    let mut col_ef: Vec<u8> = Vec::new();
+    let mut uv_ef:  Vec<u8> = Vec::new();
+
+    // Push one f32 as LE bytes — the sole float→byte conversion site the macros below funnel
+    // through, so the wire format (`to_le_bytes`, explicit and endianness-correct) can't drift.
+    macro_rules! push_f32 {
+        ($buf:expr, $v:expr) => { $buf.extend_from_slice(&($v as f32).to_le_bytes()); };
+    }
 
     // Deferred plain-cube faces, merged and emitted after the voxel pass (see `FaceRec`). A record is
     // ~28 B where the six vertices it stands for cost ≥ 144 B, so collecting first is cheaper in peak
@@ -610,16 +620,14 @@ pub fn obj_geometry_region(world: &impl VoxelView, meta: ViewMeta, pack: Option<
     macro_rules! push_quad_uv {
         ($buf:expr, $v0:expr, $v1:expr, $nu:expr) => {{
             let nu: f32 = $nu;
-            $buf.extend_from_slice(&[
-                0.0, $v0,  nu, $v0,  0.0, $v1,
-                nu, $v0,   nu, $v1,  0.0, $v1,
-            ]);
+            for f in [0.0, $v0,  nu, $v0,  0.0, $v1,
+                      nu, $v0,   nu, $v1,  0.0, $v1] { push_f32!($buf, f); }
         }};
     }
     // Push UV coords for a triangle covering the same atlas row.
     macro_rules! push_tri_uv {
         ($buf:expr, $v0:expr, $v1:expr) => {
-            $buf.extend_from_slice(&[0.0, $v0,  1.0, $v0,  0.5, $v1]);
+            for f in [0.0, $v0,  1.0, $v0,  0.5, $v1] { push_f32!($buf, f); }
         };
     }
 
@@ -652,21 +660,21 @@ pub fn obj_geometry_region(world: &impl VoxelView, meta: ViewMeta, pack: Option<
             } else { ($rgb, None) };
             let [r,g,b] = lit_rgb!(rgb2, $sh, $lm);
             if flat && $btype == LAMP_BLOCK_TYPE {
-                for (x,y,z) in $verts { pos_ef.extend_from_slice(&[x,y,z]); col_ef.extend_from_slice(&[r,g,b]); }
+                for (x,y,z) in $verts { push_f32!(pos_ef, x); push_f32!(pos_ef, y); push_f32!(pos_ef, z); push_f32!(col_ef, r); push_f32!(col_ef, g); push_f32!(col_ef, b); }
                 if let Some(p) = pack {
                     let ar = p.atlas_rows as f32;
                     let (v0, v1) = match row_opt { Some(row) => (row as f32/ar, (row+1) as f32/ar), None => (0.0, 1.0/ar) };
                     push_tri_uv!(uv_ef, v1, v0);
                 }
             } else if let Some(alpha) = transparent_alpha($btype) {
-                for (x,y,z) in $verts { pos_ft.extend_from_slice(&[x,y,z]); col_ft.extend_from_slice(&[r,g,b,alpha]); }
+                for (x,y,z) in $verts { push_f32!(pos_ft, x); push_f32!(pos_ft, y); push_f32!(pos_ft, z); push_f32!(col_ft, r); push_f32!(col_ft, g); push_f32!(col_ft, b); push_f32!(col_ft, alpha); }
                 if let Some(p) = pack {
                     let ar = p.atlas_rows as f32;
                     let (v0, v1) = match row_opt { Some(row) => (row as f32/ar, (row+1) as f32/ar), None => (0.0, 1.0/ar) };
                     push_tri_uv!(uv_ft, v1, v0);
                 }
             } else {
-                for (x,y,z) in $verts { pos_f.extend_from_slice(&[x,y,z]); col_f.extend_from_slice(&[r,g,b]); }
+                for (x,y,z) in $verts { push_f32!(pos_f, x); push_f32!(pos_f, y); push_f32!(pos_f, z); push_f32!(col_f, r); push_f32!(col_f, g); push_f32!(col_f, b); }
                 if let Some(p) = pack {
                     let ar = p.atlas_rows as f32;
                     let (v0, v1) = match row_opt { Some(row) => (row as f32/ar, (row+1) as f32/ar), None => (0.0, 1.0/ar) };
@@ -686,21 +694,21 @@ pub fn obj_geometry_region(world: &impl VoxelView, meta: ViewMeta, pack: Option<
             } else { ($rgb, None) };
             let [r,g,b_] = lit_rgb!(rgb2, $sh, $lm);
             if flat && $btype == LAMP_BLOCK_TYPE {
-                for (x,y,z) in [$a,$b,$d, $b,$c,$d] { pos_ef.extend_from_slice(&[x,y,z]); col_ef.extend_from_slice(&[r,g,b_]); }
+                for (x,y,z) in [$a,$b,$d, $b,$c,$d] { push_f32!(pos_ef, x); push_f32!(pos_ef, y); push_f32!(pos_ef, z); push_f32!(col_ef, r); push_f32!(col_ef, g); push_f32!(col_ef, b_); }
                 if let Some(p) = pack {
                     let ar = p.atlas_rows as f32;
                     let (v0, v1) = match row_opt { Some(row) => (row as f32/ar, (row+1) as f32/ar), None => (0.0, 1.0/ar) };
                     push_quad_uv!(uv_ef, v1, v0, $nu);
                 }
             } else if let Some(alpha) = transparent_alpha($btype) {
-                for (x,y,z) in [$a,$b,$d, $b,$c,$d] { pos_ft.extend_from_slice(&[x,y,z]); col_ft.extend_from_slice(&[r,g,b_,alpha]); }
+                for (x,y,z) in [$a,$b,$d, $b,$c,$d] { push_f32!(pos_ft, x); push_f32!(pos_ft, y); push_f32!(pos_ft, z); push_f32!(col_ft, r); push_f32!(col_ft, g); push_f32!(col_ft, b_); push_f32!(col_ft, alpha); }
                 if let Some(p) = pack {
                     let ar = p.atlas_rows as f32;
                     let (v0, v1) = match row_opt { Some(row) => (row as f32/ar, (row+1) as f32/ar), None => (0.0, 1.0/ar) };
                     push_quad_uv!(uv_ft, v1, v0, $nu);
                 }
             } else {
-                for (x,y,z) in [$a,$b,$d, $b,$c,$d] { pos_f.extend_from_slice(&[x,y,z]); col_f.extend_from_slice(&[r,g,b_]); }
+                for (x,y,z) in [$a,$b,$d, $b,$c,$d] { push_f32!(pos_f, x); push_f32!(pos_f, y); push_f32!(pos_f, z); push_f32!(col_f, r); push_f32!(col_f, g); push_f32!(col_f, b_); }
                 if let Some(p) = pack {
                     let ar = p.atlas_rows as f32;
                     let (v0, v1) = match row_opt { Some(row) => (row as f32/ar, (row+1) as f32/ar), None => (0.0, 1.0/ar) };
@@ -983,6 +991,15 @@ pub fn obj_geometry_region(world: &impl VoxelView, meta: ViewMeta, pack: Option<
     // deterministic, which several tests lean on (a z-clipped render must be byte-identical to a
     // render of the equivalently truncated world).
     faces.sort_unstable();
+    // Capacity hint (audit I-1): every deferred face becomes at most one quad (6 verts, merging only
+    // ever reduces that count), so reserving for the fully-unmerged case up front avoids the opaque
+    // stream's doubling reallocs on any chunk with real terrain — the common case merging shrinks.
+    if !faces.is_empty() {
+        let max_verts = faces.len() * 6;
+        pos_f.reserve(max_verts * 12);
+        col_f.reserve(max_verts * 12);
+        if pack.is_some() { uv_f.reserve(max_verts * 8); }
+    }
     // The second in-plane axis may only grow when no texture pack is loaded: U tiles by repeating a
     // one-tile-wide atlas, but V *selects the row*, so growing it would run into the next block's
     // texture. See `push_quad_uv!`. Untextured (the default) gets the full 2D merge.
@@ -1055,20 +1072,15 @@ pub fn obj_geometry_region(world: &impl VoxelView, meta: ViewMeta, pack: Option<
         }
     }
 
-    let vertex_count = (pos_f.len()/3) as u32;
-    let positions: Vec<u8> = pos_f.iter().flat_map(|f| f.to_le_bytes()).collect();
-    let colors: Vec<u8> = col_f.iter().flat_map(|f| f.to_le_bytes()).collect();
-    let uvs: Vec<u8> = uv_f.iter().flat_map(|f| f.to_le_bytes()).collect();
+    // Already LE-byte buffers (audit I-1) — one vertex is 3 floats = 12 bytes, no conversion pass.
+    let vertex_count = (pos_f.len() / 12) as u32;
+    let (positions, colors, uvs) = (pos_f, col_f, uv_f);
 
-    let vertex_count_t = (pos_ft.len()/3) as u32;
-    let positions_t: Vec<u8> = pos_ft.iter().flat_map(|f| f.to_le_bytes()).collect();
-    let colors_t: Vec<u8> = col_ft.iter().flat_map(|f| f.to_le_bytes()).collect();
-    let uvs_t: Vec<u8> = uv_ft.iter().flat_map(|f| f.to_le_bytes()).collect();
+    let vertex_count_t = (pos_ft.len() / 12) as u32;
+    let (positions_t, colors_t, uvs_t) = (pos_ft, col_ft, uv_ft);
 
-    let vertex_count_e = (pos_ef.len()/3) as u32;
-    let positions_e: Vec<u8> = pos_ef.iter().flat_map(|f| f.to_le_bytes()).collect();
-    let colors_e: Vec<u8> = col_ef.iter().flat_map(|f| f.to_le_bytes()).collect();
-    let uvs_e: Vec<u8> = uv_ef.iter().flat_map(|f| f.to_le_bytes()).collect();
+    let vertex_count_e = (pos_ef.len() / 12) as u32;
+    let (positions_e, colors_e, uvs_e) = (pos_ef, col_ef, uv_ef);
 
     ObjGeometryResult {
         positions, colors, uvs, vertex_count,
