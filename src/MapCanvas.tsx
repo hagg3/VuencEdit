@@ -4,6 +4,7 @@ import { brushFootprint, bresenhamLine, linePixels, polygonPixels, rectPixels, e
 import { type WorldMeta, type PixelPatch, decodePixelPatch } from "./types";
 import { zoomAtPoint, resizeCanvasToContainer, makeSeqGuard, putPatchPixels, beginFrame, cssWidth, cssHeight, isTypingTarget, chunkToWorld, worldToChunk, CHUNK_SIZE_BLOCKS, tileWindowFits } from "./viewportUtils";
 import { maskOutline, type OutlinePt } from "./maskUtils";
+import { recordTileFetchMs } from "./perfCounters";
 
 export type { PixelPatch } from "./types";
 
@@ -258,6 +259,9 @@ export interface MapCanvasRef {
   zoomToBox: (x1: number, y1: number, x2: number, y2: number) => void;
   /** Recentre the view on a world-space point, keeping the current zoom level ("Center Map on 3D Camera"). */
   centerOn: (wx: number, wy: number) => void;
+  /** Update the 3D-camera dot position and redraw — imperative, bypasses React props/state so the
+   *  3.3Hz stream of camera moves from FlyView3D never triggers a parent re-render (Stage 10.2). */
+  setCameraDot: (wx: number, wy: number) => void;
   /** Recentre on a world-space point and zoom *in* to at least `minScale` px/block, never out —
    *  so clicking the same target twice is idempotent (clicking a sign in the Inspector). */
   focusOn: (wx: number, wy: number, minScale: number) => void;
@@ -1510,9 +1514,11 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     const myEpoch = tileEpoch.current.peek();
     pendingRef.current.add(key);
     try {
-      const tilePromise = viewModeRef.current === "zslice"
+      const tileFetchT0 = performance.now();
+      const tilePromise = (viewModeRef.current === "zslice"
         ? invoke<ArrayBuffer>("render_zslice_patch", { z: zSliceZRef.current, x1, y1, x2, y2, lod })
-        : invoke<ArrayBuffer>("fetch_tile", { x1, y1, x2, y2, lod });
+        : invoke<ArrayBuffer>("fetch_tile", { x1, y1, x2, y2, lod })
+      ).then((buf) => { recordTileFetchMs(performance.now() - tileFetchT0); return buf; });
 
       // Fire the template overlay fetch concurrently with the base tile rather than after it.
       const wantTemplate = showTemplateOverlayRef.current && viewModeRef.current !== "zslice" && !templateTileCacheRef.current.has(key);
@@ -1889,6 +1895,10 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
       const v = viewRef.current;
       viewRef.current = { scale: v.scale, x: cw / 2 - wx * v.scale, y: ch / 2 - wy * v.scale };
       ensureTiles();
+    },
+    setCameraDot(wx: number, wy: number) {
+      cameraPos3dRef.current = { x: wx, y: wy };
+      draw();
     },
     focusOn(wx: number, wy: number, minScale: number) {
       const canvas = canvasRef.current;

@@ -189,27 +189,26 @@ export function isExpansionBlock(blockType: number): boolean {
 }
 
 // New-format blocks (112–127): 16 types added by the updated game (see TEST WORLDS/newblocks).
-// Names are not yet known (`~/emod` reference source stops at 111) — per project decision these do
-// NOT get invented placeholder hues. Each reuses the exact colour of an existing known block
-// (mirrors BLOCK_RGB in colors.rs — keep the two in sync), so unpainted new blocks read as a
-// recognizable material and painting them behaves identically to the donor block.
+// Names are known; the game's textures are not supported yet, so each colour is an approximation of
+// the block's texture (mirrors BLOCK_RGB in colors.rs — keep the two in sync, the Rust table is
+// authoritative for rendering and is installed over these by applyBlockTables()).
 export const NEW_FORMAT_BLOCKS: readonly { type: number; name: string; color: [number, number, number] }[] = [
-  { type: 112, name: "New Block 112", color: [158, 156, 158] }, // reuses Stone
-  { type: 113, name: "New Block 113", color: [ 91,  61,   2] }, // reuses Dirt
-  { type: 114, name: "New Block 114", color: [245, 221, 141] }, // reuses Sand
-  { type: 115, name: "New Block 115", color: [ 20, 129,  28] }, // reuses Leaves
-  { type: 116, name: "New Block 116", color: [112,  81,  19] }, // reuses Trunk
-  { type: 117, name: "New Block 117", color: [167, 146,  79] }, // reuses Wood
-  { type: 118, name: "New Block 118", color: [195,  98,  94] }, // reuses Brick
-  { type: 119, name: "New Block 119", color: [ 49,  52,  54] }, // reuses Slate
-  { type: 120, name: "New Block 120", color: [120, 145, 167] }, // reuses Ice
-  { type: 121, name: "New Block 121", color: [255, 255, 255] }, // reuses Cloud
-  { type: 122, name: "New Block 122", color: [ 22,  31, 184] }, // reuses Water
-  { type: 123, name: "New Block 123", color: [216, 180, 101] }, // reuses Fence
-  { type: 124, name: "New Block 124", color: [244,  68,   0] }, // reuses Lava
-  { type: 125, name: "New Block 125", color: [129, 128, 128] }, // reuses Steel
-  { type: 126, name: "New Block 126", color: [235, 201,  52] }, // reuses Golden Cube
-  { type: 127, name: "New Block 127", color: [254, 251, 149] }, // reuses Lightbox
+  { type: 112, name: "Ore Sand", color: [176,  84,  56] },
+  { type: 113, name: "Space Stone", color: [ 86,  74,  88] },
+  { type: 114, name: "Carpet", color: [ 38, 176, 186] },
+  { type: 115, name: "Snakeskin", color: [124,  72,  30] },
+  { type: 116, name: "Obsidian", color: [ 58,  32,  74] },
+  { type: 117, name: "Cheese", color: [232, 194,  54] },
+  { type: 118, name: "Space Dirt", color: [104,  72,  44] },
+  { type: 119, name: "Space Grass", color: [ 44, 112,  48] },
+  { type: 120, name: "Moss", color: [ 38,  82,  36] },
+  { type: 121, name: "Dark Matter", color: [ 96,  44, 150] },
+  { type: 122, name: "Space Sand", color: [224, 134,  46] },
+  { type: 123, name: "Snow", color: [240, 246, 250] },
+  { type: 124, name: "Moonrock", color: [214, 180, 178] },
+  { type: 125, name: "Basalt", color: [ 62,  62,  66] },
+  { type: 126, name: "Dark Tile", color: [110, 110, 114] },
+  { type: 127, name: "Algae", color: [ 52, 118,  88] },
 ] as const;
 
 /** Returns true if blockType is any new-format block (112–127). */

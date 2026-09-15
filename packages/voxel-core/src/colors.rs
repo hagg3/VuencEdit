@@ -119,26 +119,26 @@ pub const BLOCK_RGB: [[u8; 3]; 128] = [
     [148,  15,   2], // 109 bt-firework
     [148,  15,   2], // 110 bt-lightbox
     [148,  15,   2], // 111 bt-steel
-    // 112–127: new-format blocks (updated game, `TEST WORLDS/newblocks/`). Real names/colours are
-    // unknown (`~/emod` reference source stops at 111) — per project decision these are NOT invented
-    // placeholder hues. Each reuses the exact RGB of an existing, visually distinct known block (and
-    // the matching BLOCK_PAINT_SCALE entry below), so paint behaves identically to that donor block.
-    [158, 156, 158], // 112 unknown (new format) — reuses  2 stone
-    [ 91,  61,   2], // 113 unknown (new format) — reuses  3 dirt
-    [245, 221, 141], // 114 unknown (new format) — reuses  4 sand
-    [ 20, 129,  28], // 115 unknown (new format) — reuses  5 leaves
-    [112,  81,  19], // 116 unknown (new format) — reuses  6 trunk
-    [167, 146,  79], // 117 unknown (new format) — reuses  7 wood
-    [195,  98,  94], // 118 unknown (new format) — reuses 13 brick
-    [ 49,  52,  54], // 119 unknown (new format) — reuses 14 slate
-    [120, 145, 167], // 120 unknown (new format) — reuses 15 ice
-    [255, 255, 255], // 121 unknown (new format) — reuses 19 cloud
-    [ 22,  31, 184], // 122 unknown (new format) — reuses 20 water
-    [216, 180, 101], // 123 unknown (new format) — reuses 21 fence
-    [244,  68,   0], // 124 unknown (new format) — reuses 23 lava
-    [129, 128, 128], // 125 unknown (new format) — reuses 74 steel
-    [235, 201,  52], // 126 unknown (new format) — reuses 71 golden cube
-    [254, 251, 149], // 127 unknown (new format) — reuses 72 lightbox
+    // 112–127: new-format blocks (updated game, `TEST WORLDS/newblocks/`). Names are known (reported
+    // in-game); the game's own textures are not yet supported, so each colour below is an
+    // approximation of the block's texture, matched to the description of it. These are the single
+    // source of truth for 2D map, 3D render and picker swatch alike.
+    [176,  84,  56], // 112 Ore Sand
+    [ 86,  74,  88], // 113 Space Stone
+    [ 38, 176, 186], // 114 Carpet
+    [124,  72,  30], // 115 Snakeskin
+    [ 58,  32,  74], // 116 Obsidian
+    [232, 194,  54], // 117 Cheese
+    [104,  72,  44], // 118 Space Dirt
+    [ 44, 112,  48], // 119 Space Grass
+    [ 38,  82,  36], // 120 Moss
+    [ 96,  44, 150], // 121 Dark Matter
+    [224, 134,  46], // 122 Space Sand
+    [240, 246, 250], // 123 Snow
+    [214, 180, 178], // 124 Moonrock
+    [ 62,  62,  66], // 125 Basalt
+    [110, 110, 114], // 126 Dark Tile
+    [ 52, 118,  88], // 127 Algae
 ];
 
 // Paint colour table — colorTable[54] from Hud::genColorTable() (Hud.mm:150-196).
@@ -323,22 +323,22 @@ pub const BLOCK_INFO: [u32; 128] = [
     0,                           // 111 bt-steel
     // 112–127: solid/occluding (0) — right for a plain decorative cube, wrong for whichever ID turns
     // out to be a sign or another non-solid; flips with one entry once identified (see signs.rs).
-    0,                           // 112 unknown (new format)
-    0,                           // 113 unknown (new format)
-    0,                           // 114 unknown (new format)
-    0,                           // 115 unknown (new format)
-    0,                           // 116 unknown (new format)
-    0,                           // 117 unknown (new format)
-    0,                           // 118 unknown (new format)
-    0,                           // 119 unknown (new format)
-    0,                           // 120 unknown (new format)
-    0,                           // 121 unknown (new format)
-    0,                           // 122 unknown (new format)
-    0,                           // 123 unknown (new format)
-    0,                           // 124 unknown (new format)
-    0,                           // 125 unknown (new format)
-    0,                           // 126 unknown (new format)
-    0,                           // 127 unknown (new format)
+    0,                           // 112 Ore Sand
+    0,                           // 113 Space Stone
+    0,                           // 114 Carpet
+    0,                           // 115 Snakeskin
+    0,                           // 116 Obsidian
+    0,                           // 117 Cheese
+    0,                           // 118 Space Dirt
+    0,                           // 119 Space Grass
+    0,                           // 120 Moss
+    0,                           // 121 Dark Matter
+    0,                           // 122 Space Sand
+    0,                           // 123 Snow
+    0,                           // 124 Moonrock
+    0,                           // 125 Basalt
+    0,                           // 126 Dark Tile
+    0,                           // 127 Algae
 ];
 
 /// Alpha (0–1) for a transparent block; None = opaque.
@@ -472,23 +472,23 @@ pub const BLOCK_PAINT_SCALE: [f32; 128] = [
     0.70, // 109 bt-firework
     0.90, // 110 bt-lightbox
     0.70, // 111 bt-steel
-    // 112–127: matches the donor block's scale (see BLOCK_RGB above) so paint reads identically to it.
-    0.80, // 112 unknown (new format) — matches  2 stone
-    0.60, // 113 unknown (new format) — matches  3 dirt
-    0.80, // 114 unknown (new format) — matches  4 sand
-    0.65, // 115 unknown (new format) — matches  5 leaves
-    0.70, // 116 unknown (new format) — matches  6 trunk
-    0.70, // 117 unknown (new format) — matches  7 wood
-    0.70, // 118 unknown (new format) — matches 13 brick
-    0.40, // 119 unknown (new format) — matches 14 slate
-    0.90, // 120 unknown (new format) — matches 15 ice
-    1.00, // 121 unknown (new format) — matches 19 cloud
-    0.90, // 122 unknown (new format) — matches 20 water
-    0.80, // 123 unknown (new format) — matches 21 fence
-    0.60, // 124 unknown (new format) — matches 23 lava
-    0.70, // 125 unknown (new format) — matches 74 steel
-    0.70, // 126 unknown (new format) — matches 71 golden cube
-    0.90, // 127 unknown (new format) — matches 72 lightbox
+    // 112–127: new-format blocks (see BLOCK_RGB above) — scale picked to match the material.
+    0.80, // 112 Ore Sand
+    0.80, // 113 Space Stone
+    0.70, // 114 Carpet
+    0.70, // 115 Snakeskin
+    0.60, // 116 Obsidian
+    0.80, // 117 Cheese
+    0.60, // 118 Space Dirt
+    0.65, // 119 Space Grass
+    0.65, // 120 Moss
+    0.70, // 121 Dark Matter
+    0.80, // 122 Space Sand
+    1.00, // 123 Snow
+    0.80, // 124 Moonrock
+    0.60, // 125 Basalt
+    0.70, // 126 Dark Tile
+    0.65, // 127 Algae
 ];
 
 pub fn grass_color(sky: u8) -> [u8; 3] {

@@ -6,14 +6,16 @@ import AboutPanel from "./panels/AboutPanel";
  * Thin `Modal` wrapper around `AboutPanel`. The application menu shows the same panel in its
  * About pane; this modal survives because the splash screen has no ribbon to open that menu from.
  */
-export default function AboutModal({ version, onClose }: { version: string; onClose: () => void }) {
+export default function AboutModal({ version, onClose, onOpenDiagnostics }: {
+  version: string; onClose: () => void; onOpenDiagnostics?: () => void;
+}) {
   return (
     <Modal onClose={onClose} zIndex={9999} label="About VuencEdit">
       <div style={glassPanel({
         padding: "40px 44px", width: 480, borderRadius: 16,
         display: "flex", flexDirection: "column", alignItems: "center",
       })}>
-        <AboutPanel version={version} />
+        <AboutPanel version={version} onOpenDiagnostics={onOpenDiagnostics} />
         <button
           onClick={onClose}
           style={chromeButton({ marginTop: 28, padding: "8px 32px", fontSize: 14 })}

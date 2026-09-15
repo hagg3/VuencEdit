@@ -48,37 +48,40 @@ type, plus a second `127`, all unpainted, on grass at z=33. See
 [02-file-format.md](02-file-format.md) for how such a world is detected
 (`NewFormat256z`: a 256z-sized world whose `version` byte is *not* 5/6).
 
-**Names and real colours are unknown.** The reference game source under
-`~/emod` is the 64z-era build and stops at 111, so there is no authoritative
-name or hue to port for any of the 16. Per project decision, VuencEdit does
-**not** invent placeholder hues for them (the initial plan draft's proposal —
-a low-saturation hue sweep — was superseded). Instead, **each of the 16 reuses
-the exact `BLOCK_RGB` colour and `BLOCK_PAINT_SCALE` value of an existing,
-visually distinct known block**, so an unpainted new block reads as a
-recognizable material and painting it behaves identically to its donor:
+**Names are known** (reported in-game, 2026-09-15); **textures are not yet
+supported.** The reference game source under `~/emod` is the 64z-era build and
+stops at 111, so there is no atlas tile or exact hue to port for any of the 16.
+Until texture support lands, each carries a single flat colour chosen to
+approximate its in-game texture, and `BLOCK_PAINT_SCALE` is picked to suit the
+material. The tables in `packages/voxel-core/src/colors.rs` are the single
+source of truth — 2D map, 3D render and picker swatch all read them:
 
-| Type | Reuses | Type | Reuses | Type | Reuses | Type | Reuses |
-|------|--------|------|--------|------|--------|------|--------|
-| 112 | Stone (2) | 116 | Trunk (6) | 120 | Ice (15) | 124 | Lava (23) |
-| 113 | Dirt (3) | 117 | Wood (7) | 121 | Cloud (19) | 125 | Steel (74) |
-| 114 | Sand (4) | 118 | Brick (13) | 122 | Water (20) | 126 | Golden Cube (71) |
-| 115 | Leaves (5) | 119 | Slate (14) | 123 | Fence (21) | 127 | Lightbox (72) |
+| Type | Name | Colour | Type | Name | Colour |
+|------|------|--------|------|------|--------|
+| 112 | Ore Sand | `#B05438` brick red | 120 | Moss | `#265224` darker green |
+| 113 | Space Stone | `#564A58` dark grey-plum | 121 | Dark Matter | `#602C96` purple |
+| 114 | Carpet | `#26B0BA` cyan | 122 | Space Sand | `#E0862E` orange |
+| 115 | Snakeskin | `#7C481E` orangey dark brown | 123 | Snow | `#F0F6FA` snowy white |
+| 116 | Obsidian | `#3A204A` dark purple | 124 | Moonrock | `#D6B4B2` light pink |
+| 117 | Cheese | `#E8C236` yellow | 125 | Basalt | `#3E3E42` dark grey |
+| 118 | Space Dirt | `#68482C` brown | 126 | Dark Tile | `#6E6E72` grey |
+| 119 | Space Grass | `#2C7030` dark green | 127 | Algae | `#347658` darkish green |
 
 `BLOCK_INFO` for all 16 is `0` — solid and occluding, the correct default for a
 plain decorative cube, but wrong for whichever ID (if any) turns out to be a
 sign or another non-solid special. It flips with one table entry once an ID is
 identified. `BLOCK_FACE_TEX` (`texturepack.rs`) is `["", "", ""]` for all 16 —
 no atlas row (the shipped game atlas has no free slots; a texture pack would
-need a `KNOWN_TEX_NAMES` extension once real names exist), so `face_tile`
-returns `None` and the reused `BLOCK_RGB` colour shows through unmodulated in
-the 3D pane exactly as it does in the flat 2D map.
+need a `KNOWN_TEX_NAMES` extension to carry these), so `face_tile` returns
+`None` and the approximated `BLOCK_RGB` colour shows through unmodulated in the
+3D pane exactly as it does in the flat 2D map.
 
 Frontend mirror: `src/blockDefs.ts` `NEW_FORMAT_BLOCKS` / `isNewFormatBlock`,
-displayed as `New Block 112` etc. rather than the generic `Type N` fallback.
-`BlockPaintPicker.tsx` shows them as an 8-wide swatch grid (not folded into one
-representative swatch the way ramp/expansion families are, since there's no
-single ID to represent all 16 with unknown names). They're also reachable in
-the Draw tab's mask block-type dropdown.
+displayed by name (`Ore Sand`, …) rather than the generic `Type N` fallback.
+`BlockPaintPicker.tsx` shows them as an 8-wide swatch grid behind a disclosure
+(not folded into one representative swatch the way ramp/expansion families are,
+since the 16 are unrelated materials). They're also reachable in the Draw tab's
+mask block-type dropdown.
 
 **Deliberately left alone**, correct by default for a plain cube and only
 worth revisiting once a specific ID's real identity is known: ramp/wedge

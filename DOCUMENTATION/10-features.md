@@ -245,6 +245,15 @@ Recovery: `get_autosave_info` offers it via `RecoveryModal`; the frontend calls
 in-memory mapping, so the recovered temp is the recovered world before it is ever
 mapped — then parse and swap in under lock.
 
+The replay is **streamed** (audit P-2, 2026-09-13): `journal::replay_each` decodes
+one record at a time and each span is written into the temp as it arrives, so peak
+memory is one chunk rather than every decompressed span at once. The journal is
+capped at `base_len/10` *compressed* and voxel data deflates 5–20×, so before this
+a large journal decompressed to roughly the whole world — a world-sized allocation
+whose failure **aborts the process**, on the one path that exists because the user
+already lost a session. Wire format and reject/truncate semantics are unchanged;
+see [02 — File format](./02-file-format.md#journal-wire-format-journalrs).
+
 ⚠️ **`recoverAutosave` does not delete the sidecar on recovery.** The autosave
 timer only refires on the *next edit* (`lastAutosavedEpochRef` already matches the
 just-loaded epoch), so a crash between recovery and the first edit/save would
@@ -306,6 +315,56 @@ trimmer. No frontend change was needed: `LongOpOverlay` is driven entirely by th
 `isDirty()` and prompt if there are unsaved changes. Header-only writes
 (rename-world, set-spawn) bump `editEpoch` so they aren't silently lost by the
 guard. `window.destroy()` needs `core:window:allow-destroy`.
+
+## Field diagnostics (`Help ▸ Diagnostics…`)
+
+**ROADMAP-EDIT Stage 9**, design doc `TEST WORLDS/diagnostics-panel-plan-2026-09-14.md`, trigger
+`TEST WORLDS/windows-3d-lag-report-2026-09-14.md`. Before this, a release build had no readout at
+all for RSS, page faults, GPU identity, or fetch/frame latency — a Windows report of "it lags and
+I got a white screen" could not be triaged past guessing, which is exactly the shape of failure
+that let the Windows working-set blowup (see "Resident world pages" in
+`apps/vuencedit/CLAUDE.md`) ship silently for months.
+
+- **`mem_stats` (Rust, `apps/vuencedit/src-tauri/src/lib.rs` + the new `mem.rs`)** — `os`/`arch`
+  (`std::env::consts`), a hand-written `extern "system"`/`extern "C"` process-memory probe
+  (`GetProcessMemoryInfo` on Windows incl. **page-fault count** — the number that separates "the
+  mmap is thrashing" from "the GPU is doing everything in software"; `mach_task_basic_info` +
+  `task_events_info` on macOS), a system-RAM probe (`GlobalMemoryStatusEx` / `sysctlbyname
+  hw.memsize`), and whatever's already tracked on `WorldState` (chunk size/bands/dimensions,
+  header version, undo/redo bytes and group counts). Same "no `windows-sys`/`sysinfo` dependency
+  for two syscalls" discipline as `working_set.rs`. Sampled only on the panel's Refresh click.
+- **GPU identity (`FlyView3D.tsx`)** — `getGpuInfo()` on `FlyView3DRef` reads
+  `WEBGL_debug_renderer_info` off the pane's own already-live `THREE.WebGLRenderer` context;
+  never allocates one. `SOFTWARE_RENDERER_RE` (exported) is the shared software-rasterizer
+  classification Stage 10's "potato profile" also consumes. Absent extension or never-mounted
+  pane both report `"unknown"`, deliberately distinct from "confirmed hardware".
+- **`showPerfHud` (`AppSettings`, Settings ▸ 3D, default off)** — promotes `GeomMemHud` (the
+  resident-geometry overlay) out of `import.meta.env.DEV` and, via `perfCounters.enabled`
+  (`src/perfCounters.ts`), gates the *sampling* everywhere, not just the overlay's own rendering:
+  `pushMemHud`, the three latency histograms below, and the plain counters are all true no-ops
+  when the toggle is off. A diagnostic must never itself be a performance problem.
+- **Latency histograms + counters (`src/perfCounters.ts`)** — three fixed-bucket
+  (`<1,<2,<4,…,<1024,≥1024 ms`) `Uint32Array(12)` histograms (`get_chunk_geometry` round-trip,
+  `fetch_tile`/`render_zslice_patch` round-trip, 3D frame time) plus plain counters (chunk
+  fetches issued/dropped-stale/errored, WebGL context losses, geometry-budget-limited
+  transitions). Deliberately histograms only — a per-event log is the thing that turns a
+  diagnostic into a leak. `bucketIndexForMs`/`formatHistogram`/`approxPercentile` are unit-tested
+  in `perfCounters.test.ts`, the `ribbon/layout.test.ts` idiom (pure logic pulled out of the
+  component it feeds).
+- **The modal (`DiagnosticsModal.tsx`)** — `Help ▸ Diagnostics…` (the application menu's Help
+  pane, and a link from the About pane since that's where a confused user already goes). One
+  **Refresh** button re-samples 1b/1c/1d; environment info is captured once at open. Plain-text
+  report (a human pastes this into Discord, and JSON braces survive that badly), with **Copy to
+  clipboard** (falls back to focusing + selecting the read-only textarea if the webview's
+  secure-context handling refuses `navigator.clipboard`) and **Save as .txt…** (`write_text_file`,
+  a plain `fs::write` command).
+  ⚠️ **Privacy**: the world path, template path, texture-pack path and prefab directory are
+  reported as **basename-only or `set`/`not set`** — never a full path (which leaks a Windows
+  username) — via the exported `basenameOnly()` helper. No world contents, ever.
+- **Explicitly out of scope** (see the plan doc §5): no network telemetry (nothing is sent
+  automatically — the user copies text and chooses where it goes) and no crash reporter (a
+  WebView2 renderer crash kills the page before any JS could report it; that needs a host-side
+  `ICoreWebView2.ProcessFailed` hook Tauri doesn't expose — a follow-up row, not this feature).
 
 ## Hidden / re-enableable features
 

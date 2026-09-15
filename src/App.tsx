@@ -19,9 +19,11 @@ import MaterializeModal from "./MaterializeModal";
 import Sidebar, { type SidebarTab } from "./Sidebar";
 import LeftToolbar from "./LeftToolbar";
 import SliceViewport from "./SliceViewport";
-import FlyView3D, { type FlyView3DRef, type Overlay3D, type Interact3D } from "./FlyView3D";
+import FlyView3D, { type FlyView3DRef, type Overlay3D, type Interact3D, type GpuInfo, RD_MIN } from "./FlyView3D";
+import { perfCounters } from "./perfCounters";
 import ErrorBoundary from "./ErrorBoundary";
 import HelpModal from "./HelpModal";
+import DiagnosticsModal from "./DiagnosticsModal";
 import TourOverlay from "./tour/TourOverlay";
 import { TOUR_STEPS, TOUR_VERSION, type TourCtx } from "./tour/steps";
 import AboutModal from "./AboutModal";
@@ -30,7 +32,7 @@ import UploadModal from "./UploadModal";
 import NewWorldModal from "./NewWorldModal";
 import Ribbon, { ribbonHeight, EDEN_TEAL, EDEN_TEAL_READABLE, type RibbonTab, type MapViewMode } from "./Ribbon";
 import QuickActionsBar, { QUICK_ACTIONS_BAR_H } from "./QuickActionsBar";
-import SettingsModal, { loadSettings, saveSettings, MEMORY_PRESETS, type AppSettings } from "./SettingsModal";
+import SettingsModal, { loadSettings, saveSettings, MEMORY_PRESETS, DEFAULTS as SETTINGS_DEFAULTS, type AppSettings } from "./SettingsModal";
 import WorldInfoModal from "./WorldInfoModal";
 import RecoveryModal from "./RecoveryModal";
 import { resolvePrefabDir } from "./PrefabLibraryPanel";
@@ -612,6 +614,7 @@ function App() {
   const [axoSkew, setAxoSkew] = useState(0.2);
   const [showHelp, setShowHelp] = useState(false);
   const [showAbout, setShowAbout] = useState(false);
+  const [showDiagnostics, setShowDiagnostics] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [showWorldInfo, setShowWorldInfo] = useState(false);
   const [prefabNameModal, setPrefabNameModal] = useState(false);
@@ -739,6 +742,10 @@ function App() {
   // Memory-budget preset (§6 of the 2026-08 memory-efficiency pass) — only the undo budget reaches
   // Rust (via set_undo_budget below); tile/vertex budgets stay frontend-side as MapCanvas/FlyView3D props.
   const [memoryBudget, setMemoryBudget] = useState<AppSettings["memoryBudget"]>(() => loadSettings().memoryBudget);
+  // 3D perf HUD toggle (ROADMAP-EDIT Stage 9.3/9.4) — mirrors into `perfCounters.enabled` so the
+  // histogram/counter recorders (which live outside React) gate on the same flag as the overlay.
+  const [showPerfHud, setShowPerfHud] = useState(() => loadSettings().showPerfHud);
+  useEffect(() => { perfCounters.enabled = showPerfHud; }, [showPerfHud]);
   // Push the undo budget once at startup (Rust's WorldState default is already "balanced", but a
   // saved Low/High preset must apply before the user's first edit, not just after their next Save).
   useEffect(() => {
@@ -754,6 +761,26 @@ function App() {
     if (saveSettingsDebounceRef.current) clearTimeout(saveSettingsDebounceRef.current);
     saveSettingsDebounceRef.current = setTimeout(() => saveSettings(patch), 250);
   }
+  // Stage 10.3 — FlyView3D's one-time software-renderer verdict. Runs at most once per install
+  // (gated on `potatoProfileApplied`, not a session flag, so it survives a relaunch): if render
+  // distance and memory preset are still both at their stock defaults, lower them to the "potato
+  // profile" (RD_MIN, Low) and say so; otherwise the user already made an explicit choice and this
+  // only shows the notice — it must be a default, not a clamp (migrate()'s own contract).
+  const handleSoftwareRenderingDetected = useCallback((info: GpuInfo) => {
+    const s = loadSettings();
+    if (s.potatoProfileApplied) return;
+    const untouched = s.renderDistance === SETTINGS_DEFAULTS.renderDistance && s.memoryBudget === SETTINGS_DEFAULTS.memoryBudget;
+    if (untouched) {
+      const next: AppSettings = { ...s, renderDistance: RD_MIN, memoryBudget: "low", potatoProfileApplied: true };
+      applySettings(next);
+      saveSettings(next);
+      showToast(`This machine's graphics driver is using software rendering (${info.renderer}) — 3D render distance and memory usage have been lowered to keep it usable. Raise them again in Settings ▸ 3D if you like, but performance will suffer.`);
+    } else {
+      saveSettings({ potatoProfileApplied: true });
+      showToast(`This machine's graphics driver is using software rendering (${info.renderer}) — 3D performance will be poor. Consider lowering render distance / memory preset in Settings ▸ 3D.`);
+    }
+  }, [showToast]);
+
   // Shared SettingsModal onSave handler — splash screen and in-editor Settings modals both need
   // the full set of setters applied identically (they drifted once when only one site was updated).
   function applySettings(s: AppSettings) {
@@ -777,6 +804,7 @@ function App() {
     setFloodFillLimit(s.floodFillLimit);
     setBuildReach(s.buildReach);
     setMemoryBudget(s.memoryBudget);
+    setShowPerfHud(s.showPerfHud);
     invoke("set_undo_budget", { bytes: MEMORY_PRESETS[s.memoryBudget].undoBudgetBytes }).catch(() => {});
     if (s.templatePath !== templatePath) setTemplatePath(s.templatePath);
     if (s.texturePackPath !== texturePackPath) {
@@ -817,7 +845,14 @@ function App() {
     window.addEventListener("pointermove", move);
     window.addEventListener("pointerup", up);
   };
-  const [cam3dPos, setCam3dPos] = useState<{ x: number; y: number } | null>(null);
+  // Stage 10.2: the 3D camera's world position streams at ~3.3Hz while the camera moves. It used
+  // to be React state (`setCam3dPos`), which re-rendered the entire editor tree — Ribbon's ~190
+  // prop bag, MapCanvas, Sidebar, FlyView3D's own overlay JSX — on every tick, precisely while the
+  // user is trying to move the camera. It's now a plain ref: MapCanvas.setCameraDot() updates the
+  // on-map dot imperatively (see MapCanvas.tsx), and `hasCam3dPos` is a rarely-changing boolean
+  // (flips false→true once) purely to gate the "Center Map on 3D Camera" context-menu item.
+  const cam3dPosRef = useRef<{ x: number; y: number } | null>(null);
+  const [hasCam3dPos, setHasCam3dPos] = useState(false);
   const [sliceFrontY, setSliceFrontY] = useState(0); // front slab depth (world Y)
   const [sliceSideX, setSliceSideX] = useState(0);   // side slab depth (world X)
   const [showWorldBrowser, setShowWorldBrowser] = useState(false);
@@ -3095,7 +3130,8 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
       pasteElevationOffset={pasteElevationOffset}
       onEyedropper={handleEyedropper}
       onPoolFillPick={handlePoolFillPick}
-      cameraPos3d={showSlicePanels && enable3dPane ? cam3dPos : null}
+      // No longer prop-driven per move (Stage 10.2) — MapCanvas.setCameraDot() is called
+      // imperatively from onCameraMove below. This only seeds the dot on (re)mount.
       onSetCamera3d={showSlicePanels && enable3dPane ? (wx, wy) => flyView3dRef.current?.teleport(wx, wy) : undefined}
       // Off in cutaway: the template is a surface map, so overlaying it under a cutaway would put
       // roof-level terrain behind the cave interior you're trying to see.
@@ -3348,6 +3384,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
                       // Non-fatal warnings (WebGL context lost/restored) — a toast, not the
                       // ErrorBoundary: the pane recovers on its own from both.
                       onNotice={showToast}
+                      onSoftwareRenderingDetected={handleSoftwareRenderingDetected}
                       // Cache-invalidation key only — the cap itself is backend state and
                       // `get_chunk_geometry` folds it into the streamed z band (Cutaway phase 2).
                       viewCapZ={viewCapZ}
@@ -3356,7 +3393,11 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
                       editEpoch={editEpoch}
                       lastEdit={lastEditBounds}
                       onFlyModeChange={(a) => { flyActiveRef.current = a; }}
-                      onCameraMove={(wx, wy) => setCam3dPos({ x: wx, y: wy })}
+                      onCameraMove={(wx, wy) => {
+                        cam3dPosRef.current = { x: wx, y: wy };
+                        mapCanvasRef.current?.setCameraDot(wx, wy);
+                        if (!hasCam3dPos) setHasCam3dPos(true);
+                      }}
                       overlays3d={overlays3d}
                       texturePack={texturePackInfo}
                       texEpoch={texEpoch}
@@ -3402,6 +3443,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
                       buildReach={buildReach}
                       hotbarSlots={hotbar3dSlots}
                       activeBlock={{ type: fillBlockType, paint: fillPaint }}
+                      showPerfHud={showPerfHud}
                       onHotbarSelect={(type, paint) => { setFillBlockType(type); setFillPaint(paint); }}
                     />
                   </ErrorBoundary>
@@ -3766,6 +3808,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           setShowHelp={setShowHelp}
           setShowAbout={setShowAbout}
           setShowSettings={setShowSettings}
+          setShowDiagnostics={setShowDiagnostics}
           startTour={startTour}
           onSavePrefab={openPrefabNameModal}
           onSavePrefabAs={savePrefabAs}
@@ -3914,10 +3957,28 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
         )}
 
         {showHelp && <HelpModal onClose={() => setShowHelp(false)} onStartTour={startTour} />}
+        {showDiagnostics && (
+          <DiagnosticsModal
+            onClose={() => setShowDiagnostics(false)}
+            appVersion={appVersion}
+            sourcePath={sourcePath}
+            world={world}
+            templatePath={templatePath}
+            texturePackPath={texturePackPath}
+            prefabDirectory={loadSettings().prefabDirectory}
+            showPerfHud={showPerfHud}
+            memoryBudget={memoryBudget}
+            getGpuInfo={() => flyView3dRef.current?.getGpuInfo() ?? null}
+            getPerfSnapshot={() => flyView3dRef.current?.getPerfSnapshot() ?? null}
+          />
+        )}
         {tourOpen && (
           <TourOverlay steps={TOUR_STEPS} ctx={tourCtx} onClose={() => setTourOpen(false)} />
         )}
-        {showAbout && <AboutModal version={appVersion} onClose={() => setShowAbout(false)} />}
+        {showAbout && (
+          <AboutModal version={appVersion} onClose={() => setShowAbout(false)}
+            onOpenDiagnostics={() => { setShowAbout(false); setShowDiagnostics(true); }} />
+        )}
         {showWorldInfo && <WorldInfoModal onClose={() => setShowWorldInfo(false)} />}
         {recoveryInfo && (
           <RecoveryModal info={recoveryInfo} recovering={recovering} onRecover={recoverAutosave} onDiscard={discardRecovery} onDismiss={dismissRecovery} />
@@ -4122,8 +4183,8 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
                   onClick={() => { close(); flyView3dRef.current?.teleport(ctxMenu.wx, ctxMenu.wy); }}>
                   {noIc()} Teleport 3D Camera Here
                 </button>
-                {cam3dPos && <button style={miBtnStyle} onMouseEnter={miHov} onMouseLeave={miLve}
-                  onClick={() => { close(); mapCanvasRef.current?.centerOn(cam3dPos.x, cam3dPos.y); }}>
+                {hasCam3dPos && <button style={miBtnStyle} onMouseEnter={miHov} onMouseLeave={miLve}
+                  onClick={() => { close(); const cp = cam3dPosRef.current; if (cp) mapCanvasRef.current?.centerOn(cp.x, cp.y); }}>
                   {noIc()} Center Map on 3D Camera
                 </button>}
               </>}
