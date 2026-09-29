@@ -2,8 +2,16 @@ import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
-import { EDEN_TEAL, EDEN_TEAL_READABLE, glassPanel, chromeButton, chromeButtonAccent } from "./designTokens";
-import Modal from "./Modal";
+import { MODAL_TEXT } from "./designTokens";
+import { ACCENTS, DANGER_HEX, RAMP, armedRecipe, mix, rgba } from "./theme/theme";
+import { Segmented } from "./ribbon/primitives";
+import Dialog, { DialogButton } from "./ui/Dialog";
+
+// Lightened tints for text on the warm modal surface (mechanical hex-literal migration, Stage
+// 14.15) — plain accent/danger hex fails AA there; these clear it with margin.
+const RED_LIGHT = mix(RAMP.white, DANGER_HEX, 0.5);
+const GREEN_TEXT = armedRecipe(ACCENTS.clipboard).text;
+const TEAL_LIGHT = mix(RAMP.white, ACCENTS.primary, 0.5);
 
 interface UploadProgress {
   bytes_sent: number;
@@ -14,18 +22,6 @@ interface Props {
   sourcePath: string | null;
   onClose: () => void;
 }
-
-
-const btn: React.CSSProperties = chromeButton({ padding: "5px 13px", fontSize: 13 });
-
-const radioLabel: React.CSSProperties = {
-  display: "flex",
-  alignItems: "center",
-  gap: 6,
-  cursor: "pointer",
-  color: "#ebe9e7",
-  fontSize: 13,
-};
 
 export default function UploadModal({ sourcePath, onClose }: Props) {
   const [server, setServer] = useState<"current" | "legacy">("current");
@@ -87,57 +83,23 @@ export default function UploadModal({ sourcePath, onClose }: Props) {
 
   return (
     // Blocked mid-upload — dismissing wouldn't cancel the request, it would just hide it.
-    <Modal onClose={onClose} zIndex={1000} label="Upload World"
-      closeOnEsc={!uploading} closeOnBackdrop={!uploading}
-      backdropStyle={{ background: "rgba(0,0,0,0.75)" }}>
-      <div
-        style={glassPanel({
-          padding: "18px 24px 20px", width: 400, maxWidth: "95vw",
-          display: "flex", flexDirection: "column", gap: 14, color: "#ebe9e7",
-        })}
-      >
-        {/* Header */}
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-          <span style={{ fontSize: 14, fontWeight: 600 }}>Upload World</span>
-          <button
-            onClick={onClose}
-            disabled={uploading}
-            title={uploading ? "An upload is in progress" : "Close"}
-            aria-label="Close"
-            onMouseEnter={e => (e.currentTarget.style.color = EDEN_TEAL_READABLE)}
-            onMouseLeave={e => (e.currentTarget.style.color = "#61584f")}
-            style={{ background: "none", border: "none", color: "#61584f", fontSize: 20, cursor: uploading ? "not-allowed" : "pointer", opacity: uploading ? 0.4 : 1, lineHeight: 1, transition: "color .1s" }}
-          >×</button>
-        </div>
-
+    <Dialog
+      size="sm" icon="upload" title="Upload World" onClose={onClose} busy={uploading}
+      footer={
+        <DialogButton variant="primary" onClick={doUpload} disabled={!canUpload}>
+          {uploading ? "Uploading…" : "Upload"}
+        </DialogButton>
+      }
+    >
+      <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
         {/* Server selection */}
         <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-          <span style={{ fontSize: 11, color: "#61584f", textTransform: "uppercase", letterSpacing: "0.06em" }}>Server</span>
-          <div style={{ display: "flex", gap: 16 }}>
-            <label style={radioLabel}>
-              <input
-                type="radio"
-                name="server"
-                value="current"
-                checked={server === "current"}
-                onChange={() => setServer("current")}
-                style={{ accentColor: `rgb(${EDEN_TEAL})` }}
-              />
-              Current
-            </label>
-            <label style={radioLabel}>
-              <input
-                type="radio"
-                name="server"
-                value="legacy"
-                checked={server === "legacy"}
-                onChange={() => setServer("legacy")}
-                style={{ accentColor: `rgb(${EDEN_TEAL})` }}
-              />
-              Legacy
-            </label>
-          </div>
-          <span style={{ fontSize: 10, color: "#83786c", lineHeight: 1.5 }}>
+          <span style={{ fontSize: 11, color: MODAL_TEXT.secondary, textTransform: "uppercase", letterSpacing: "0.06em" }}>Server</span>
+          <Segmented<"current" | "legacy">
+            ariaLabel="Server" value={server} onChange={setServer}
+            options={[{ id: "current", label: "Current" }, { id: "legacy", label: "Legacy" }]}
+          />
+          <span style={{ fontSize: 10, color: MODAL_TEXT.label, lineHeight: 1.5 }}>
             Uploads use plain HTTP — the world file, its name, and the preview travel unencrypted.
             Don't upload anything private.
           </span>
@@ -145,13 +107,13 @@ export default function UploadModal({ sourcePath, onClose }: Props) {
 
         {/* World file */}
         <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-          <span style={{ fontSize: 11, color: "#61584f", textTransform: "uppercase", letterSpacing: "0.06em" }}>World File</span>
+          <span style={{ fontSize: 11, color: MODAL_TEXT.secondary, textTransform: "uppercase", letterSpacing: "0.06em" }}>World File</span>
           {sourcePath ? (
-            <span style={{ color: "#afa69d", fontSize: 13, wordBreak: "break-all" }}>
+            <span style={{ color: MODAL_TEXT.secondary, fontSize: 13, wordBreak: "break-all" }}>
               {sourcePath.split(/[\\/]/).pop() ?? sourcePath}
             </span>
           ) : (
-            <span style={{ color: "#f87171", fontSize: 13 }}>
+            <span style={{ color: RED_LIGHT, fontSize: 13 }}>
               No world saved — use File → Save As… first.
             </span>
           )}
@@ -159,61 +121,47 @@ export default function UploadModal({ sourcePath, onClose }: Props) {
 
         {/* Preview image */}
         <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-          <span style={{ fontSize: 11, color: "#61584f", textTransform: "uppercase", letterSpacing: "0.06em" }}>Preview Image (required)</span>
+          <span style={{ fontSize: 11, color: MODAL_TEXT.secondary, textTransform: "uppercase", letterSpacing: "0.06em" }}>Preview Image (required)</span>
           <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-            <button onClick={choosePng} style={btn}>
-              Choose PNG…
-            </button>
+            <DialogButton onClick={choosePng}>Choose PNG…</DialogButton>
             {imageFilename && (
-              <span style={{ color: "#4ade80", fontSize: 12 }}>✓ {imageFilename}</span>
+              <span style={{ color: GREEN_TEXT, fontSize: 12 }}>✓ {imageFilename}</span>
             )}
           </div>
         </div>
 
-        {/* Upload button + progress */}
-        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-          <button
-            onClick={doUpload}
-            disabled={!canUpload}
-            style={canUpload
-              ? chromeButtonAccent(EDEN_TEAL, `rgb(${EDEN_TEAL})`, { color: EDEN_TEAL_READABLE, padding: "5px 13px", fontSize: 13 })
-              : { ...btn, opacity: 0.4, cursor: "not-allowed" }}
-          >
-            {uploading ? "Uploading…" : "Upload"}
-          </button>
-
-          {uploading && (
-            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-              <div style={{ flex: 1, background: "#312c28", borderRadius: 4, height: 6, overflow: "hidden" }}>
-                <div style={{
-                  height: "100%",
-                  background: `linear-gradient(90deg, rgb(${EDEN_TEAL}) 0%, ${EDEN_TEAL_READABLE} 100%)`,
-                  width: `${uploadProgress}%`,
-                  transition: "width 0.3s",
-                }} />
-              </div>
-              <span style={{ color: "#afa69d", fontSize: 12, minWidth: 36 }}>{uploadProgress}%</span>
+        {/* Progress + result */}
+        {uploading && (
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <div style={{ flex: 1, background: RAMP.mbtn1, borderRadius: 4, height: 6, overflow: "hidden" }}>
+              <div style={{
+                height: "100%",
+                background: `linear-gradient(90deg, ${ACCENTS.primary} 0%, ${TEAL_LIGHT} 100%)`,
+                width: `${uploadProgress}%`,
+                transition: "width 0.3s",
+              }} />
             </div>
-          )}
+            <span style={{ color: MODAL_TEXT.secondary, fontSize: 12, minWidth: 36 }}>{uploadProgress}%</span>
+          </div>
+        )}
 
-          {result && (
-            <div style={{
-              background: "rgba(34,197,94,0.1)",
-              border: "1px solid #166534",
-              borderRadius: 6,
-              padding: "6px 10px",
-              fontSize: 13,
-              color: "#86efac",
-            }}>
-              {result}
-            </div>
-          )}
+        {result && (
+          <div style={{
+            background: rgba(ACCENTS.clipboard, 0.1),
+            border: `1px solid ${rgba(ACCENTS.clipboard, 0.4)}`,
+            borderRadius: 6,
+            padding: "6px 10px",
+            fontSize: 13,
+            color: GREEN_TEXT,
+          }}>
+            {result}
+          </div>
+        )}
 
-          {error && (
-            <span style={{ color: "#f87171", fontSize: 13 }}>{error}</span>
-          )}
-        </div>
+        {error && (
+          <span style={{ color: RED_LIGHT, fontSize: 13 }}>{error}</span>
+        )}
       </div>
-    </Modal>
+    </Dialog>
   );
 }

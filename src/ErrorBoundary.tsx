@@ -1,4 +1,6 @@
 import { Component, type ReactNode } from "react";
+import { RAMP } from "./theme/theme";
+import { btnBase } from "./ribbon/tokens";
 
 // Generic error boundary. Without one, an uncaught error thrown during render or inside a
 // useEffect (e.g. WebGL context creation failing in FlyView3D) propagates to the React root and
@@ -36,21 +38,16 @@ export default class ErrorBoundary extends Component<Props, State> {
       <div style={{
         display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center",
         gap: 8, width: "100%", height: "100%", padding: 16, boxSizing: "border-box",
-        background: "#0a0f1e", color: "#afa69d", textAlign: "center",
+        background: RAMP.mapBg, color: RAMP.dim, textAlign: "center",
       }}>
-        <div style={{ fontSize: 12, fontWeight: 600, color: "#f87171" }}>
+        <div style={{ fontSize: 12, fontWeight: 600, color: RAMP.textDanger }}>
           {this.props.label ?? "This view"} failed to render
         </div>
-        <div style={{ fontSize: 10, color: "#83786c", maxWidth: 280, wordBreak: "break-word" }}>
+        <div style={{ fontSize: 10, color: RAMP.meta, maxWidth: 280, wordBreak: "break-word" }}>
           {error.message || String(error)}
         </div>
-        <button
-          onClick={this.retry}
-          style={{
-            background: "#312c28", color: "#dad6d2", border: "1px solid #61584f",
-            borderRadius: 6, padding: "4px 12px", fontSize: 11, cursor: "pointer",
-          }}
-        >Retry</button>
+        <button type="button" className="rbn-btn" onClick={this.retry}
+          style={btnBase({ padding: "0 12px", height: 24 })}>Retry</button>
       </div>
     );
   }

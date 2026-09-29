@@ -8,18 +8,20 @@
  * previous `marginTop: auto` label had whenever a group's rows added up to more than the body.
  */
 import {
-  useEffect, useId, useLayoutEffect, useRef, useState,
+  createContext, useCallback, useContext, useEffect, useId, useLayoutEffect, useRef, useState,
   type CSSProperties, type ReactNode,
 } from "react";
 import { createPortal } from "react-dom";
+import { DialogLayerContext } from "../ui/Dialog";
 import NumberField from "../NumberField";
 import { Icon, type IconName, type IconTone } from "./icons";
 import {
-  ACCENT, ARMED_RING, BORDER, BTN_RADIUS, COL_GAP, DANGER, FONT, FOCUS_RING, GROUP_CONTENT_H,
-  GROUP_LABEL_H, GROUP_PAD_BOTTOM, GROUP_PAD_TOP, GROUP_PAD_X, HAIRLINE, ICON, LARGE_H, RADIUS,
-  RAIL_W, ROW_GAP, SMALL_H, SPACE, SURFACE, TEXT, TEXT_DANGER, TEXT_DIM, TEXT_LABEL,
-  btnActive, btnBase, btnDisabled, hexToRgbTriplet,
+  ACCENT, ARMED_RING, BORDER, BTN_RADIUS, COL_GAP, DANGER, FONT, GRAD_HOVER, GRAD_PRESSED,
+  GROUP_CONTENT_H, GROUP_LABEL_H, GROUP_PAD_BOTTOM, GROUP_PAD_TOP, GROUP_PAD_X, HAIRLINE, ICON,
+  LARGE_H, POPUP_BTN_W, RADIUS, RAIL_W, ROW_GAP, SHADOW_HOVER, SHADOW_PRESSED, SMALL_H, SPACE, SURFACE, TEXT,
+  TEXT_DANGER, TEXT_DIM, TEXT_LABEL, TEXT_META, CUR_ICON, btnActive, btnBase, btnDisabled, currentRow, hexToRgbTriplet,
 } from "./tokens";
+import { MOTION, RAMP, rgba } from "../theme/theme";
 import type { Tier } from "./layout";
 
 export type Tone = "default" | "accent" | "danger";
@@ -35,40 +37,43 @@ const TONE_ICON: Record<Tone, IconTone> = { default: "default", accent: "accent"
  * without the `:not(...)` pair they would stomp the armed and disabled looks.
  */
 export const RIBBON_CSS = `
-.eden-ribbon .rbn-btn { transition: background .1s, box-shadow .1s, filter .1s; }
+.eden-ribbon .rbn-btn { transition: background .09s, box-shadow .09s, filter .09s; }
 .eden-ribbon .rbn-btn:not([data-active="true"]):not([aria-disabled="true"]):hover {
-  background: linear-gradient(180deg, #414c58 0%, #323b45 100%) !important;
-  box-shadow: inset 0 0 0 1px ${BORDER.outline}, inset 0 1px 0 rgba(255,255,255,.14) !important;
+  background: ${GRAD_HOVER} !important;
+  box-shadow: ${SHADOW_HOVER} !important;
 }
 .eden-ribbon .rbn-btn:not([data-active="true"]):not([aria-disabled="true"]):active {
-  background: linear-gradient(180deg, #262d35 0%, #2f3841 100%) !important;
-  box-shadow: inset 0 0 0 1px ${BORDER.outline}, inset 0 1px 2px rgba(0,0,0,.45) !important;
+  background: ${GRAD_PRESSED} !important;
+  box-shadow: ${SHADOW_PRESSED} !important;
 }
-/* Menu rows are rows, not buttons: they highlight, they don't grow a raised face. Higher
-   specificity than the two rules above, which would otherwise give every popover row a bevel. */
-.eden-ribbon .rbn-btn[role="menuitem"]:not([data-active="true"]):not([aria-disabled="true"]):hover {
-  background: rgba(255,255,255,.09) !important;
+/* Menu rows are rows, not buttons: hover is the faint lift, never a raised face; the current
+   option (data-active) is pushed in (Stage 14.2). Higher specificity than the two rules above,
+   which would otherwise give every popover row a bevel. */
+.eden-ribbon .rbn-btn[role="menuitem"]:not([data-active="true"]):not([aria-disabled="true"]):hover,
+.eden-ribbon .rbn-btn[role="option"]:not([data-active="true"]):not([aria-disabled="true"]):hover {
+  background: var(--vx-lift-bg) !important;
+  box-shadow: var(--vx-lift-shadow) !important;
+}
+.eden-ribbon .rbn-btn[role="menuitem"]:not([data-active="true"]):not([aria-disabled="true"]):active,
+.eden-ribbon .rbn-btn[role="option"]:not([data-active="true"]):not([aria-disabled="true"]):active {
+  background: rgba(255,255,255,.03) !important;
   box-shadow: none !important;
 }
-.eden-ribbon .rbn-btn[role="menuitem"]:not([data-active="true"]):not([aria-disabled="true"]):active {
-  background: rgba(255,255,255,.04) !important;
-  box-shadow: none !important;
-}
-.eden-ribbon .rbn-btn[data-active="true"]:hover { filter: brightness(1.15); }
-.eden-ribbon .rbn-btn[data-active="true"]:active { filter: brightness(0.88); }
+.eden-ribbon .rbn-btn[data-active="true"]:hover { filter: brightness(1.12); }
+.eden-ribbon .rbn-btn[data-active="true"]:active { filter: brightness(0.9); }
+.eden-ribbon .rbn-btn[role="menuitem"][data-active="true"]:hover,
+.eden-ribbon .rbn-btn[role="option"][data-active="true"]:hover { filter: none; }
 /* The brand/File button is deliberately NOT .rbn-btn: it is a filled accent tab (Office 2010's
    File tab), so the neutral hover gradient above would stomp its fill. It gets its own hover. */
 .eden-ribbon .rbn-brand { transition: filter .12s, box-shadow .12s; }
 .eden-ribbon .rbn-brand:hover { filter: brightness(1.14); }
 .eden-ribbon .rbn-brand:active { filter: brightness(0.92); }
-/* Focus is its own colour so "focused" is never mistaken for "armed" (both used to be #00dde9). */
-.eden-ribbon :focus-visible { outline: 1px solid ${FOCUS_RING}; outline-offset: 1px; }
+/* Focus: the theme stylesheet's app-wide near-white ring (FOCUS_RING ≠ ARMED_RING). */
 /* Unselected tabs are not .rbn-btn, so they had no hover state at all until now. */
 .eden-ribbon .rbn-tab:not([aria-selected="true"]):hover {
-  background: rgba(255,255,255,.07);
+  background: var(--vx-lift-bg);
   color: ${TEXT};
 }
-.eden-ribbon .rbn-range { accent-color: ${ACCENT.primary}; cursor: pointer; height: 14px; }
 .eden-ribbon .rbn-body::-webkit-scrollbar { height: 5px; }
 .eden-ribbon .rbn-body::-webkit-scrollbar-thumb { background: rgba(255,255,255,.16); border-radius: ${RADIUS.md}px; }
 /* Dual-thumb range: the two inputs are invisible hit targets over a painted track, so only the
@@ -79,17 +84,43 @@ export const RIBBON_CSS = `
   width: 14px; height: 14px; border-radius: 50%; cursor: pointer;
 }
 /* Colour comes from --rbn-pulse, set inline per tab — the pulse used to be hardcoded amber and so
-   flashed amber for the green Clipboard tab too. */
-.eden-ribbon .rbn-flash { animation: rbnCtxPulse .45s ease-out; }
+   flashed amber for the green Clipboard tab too. Gated on data-motion="full" (14.13's JS gate) —
+   static under reduced motion means simply no pulse, rather than a second reduced-motion mechanism
+   (an earlier @media (prefers-reduced-motion) block did this; removed in favour of the one JS gate
+   every other motion-gated rule in this file uses — see src/theme/motion.ts). */
+:root[data-motion="full"] .eden-ribbon .rbn-flash { animation: rbnCtxPulse .45s ease-out; }
 @keyframes rbnCtxPulse {
-  0%   { box-shadow: 0 0 0 0 var(--rbn-pulse, rgba(0,164,173,.6)); }
+  0%   { box-shadow: 0 0 0 0 var(--rbn-pulse, ${rgba(ACCENT.primary, 0.6)}); }
   60%  { box-shadow: 0 0 0 6px transparent; }
   100% { box-shadow: 0 0 0 0 transparent; }
 }
-@media (prefers-reduced-motion: reduce) {
-  .eden-ribbon .rbn-btn { transition: none; }
-  .eden-ribbon .rbn-brand { transition: none; }
-  .eden-ribbon .rbn-flash { animation: none; }
+/* ⌘K reveal (14.6): a static outline + glow for 1.3 s — unscoped, because a compact group's popup
+   is portaled outside .eden-ribbon. The pulse is motion, so it only runs under data-motion="full"
+   (14.13's JS gate); until then, and under reduced motion, the static outline is the whole cue. */
+.cmd-flash { outline: 2px solid ${ACCENT.primary} !important; outline-offset: 1px; box-shadow: 0 0 10px ${rgba(ACCENT.primary, 0.55)} !important; }
+:root[data-motion="full"] .cmd-flash { animation: cmdFlash 1.3s ease-out; }
+@keyframes cmdFlash {
+  0%, 30%, 60% { outline-color: ${ACCENT.primary}; }
+  15%, 45%     { outline-color: transparent; }
+}
+/* Motion profile B (Stage 14.13): a Popover's enter (fade + scale-in, ≤180ms — MOTION.chromeMs) and
+   a contextual tab's fade-in when it first appears. Both transform/opacity only, both gated on
+   data-motion="full" — under "reduced" (or before the app has resolved a value at all) the element
+   just appears, which is what makes reduced motion "the absence of a rule" rather than a second
+   code path. */
+:root[data-motion="full"] .vx-popover-enter {
+  animation: vxPopoverIn ${MOTION.chromeMs}ms ${MOTION.easeEnter} both;
+}
+@keyframes vxPopoverIn {
+  from { opacity: 0; transform: scale(0.96); }
+  to   { opacity: 1; transform: scale(1); }
+}
+:root[data-motion="full"] .rbn-tab.vx-ctx-tab-enter {
+  animation: vxCtxTabIn ${MOTION.chromeMs}ms ${MOTION.easeEnter} both;
+}
+@keyframes vxCtxTabIn {
+  from { opacity: 0; transform: translateY(-3px); }
+  to   { opacity: 1; transform: translateY(0); }
 }
 `;
 
@@ -125,9 +156,19 @@ export function MenuSeparator() {
 /** Slack allowed between a group's declared and rendered width before the dev guard complains. */
 const WIDTH_TOLERANCE = 8;
 
+/** `data-tier` on the group's own root div mirrors the rendered tier — read by both the dev
+ *  drift guard's console message and `widthHarvester.ts` (Stage 14.7), which has no other way to
+ *  know which tier a measured `[data-group]` element was rendered at. */
+
 export interface GroupProps {
   id: string;
   label: ReactNode;
+  /**
+   * Plain-text group name for the `popup` button's face, its tooltip and the popover's
+   * `aria-label`. Defaults to `label` when that is a string; pass it when `label` is JSX (a
+   * `Badge`) or a long/dynamic caption ("Z Range · 12 levels").
+   */
+  name?: string;
   tier?: Tier;
   /** Declared full-tier width, used only by the dev-mode drift warning. */
   declaredWidth?: number;
@@ -136,16 +177,35 @@ export interface GroupProps {
   /** Reason shown on the whole group while dimmed, and appended to the label. */
   dimNote?: ReactNode;
   children: ReactNode;
-  /** Icon shown on the `compact` chevron. Defaults to a generic "more". */
+  /** Icon on the `popup` button. Defaults to a generic "more". */
   icon?: IconName;
+  /**
+   * The children draw their own narrow form at `popup` tier instead of collapsing behind a popup
+   * button — MS guidance: a single-button group (the Block button) never becomes a popup icon,
+   * it just narrows. `data-tier` still reads `popup`.
+   */
+  selfCollapsing?: boolean;
   style?: CSSProperties;
 }
 
+/**
+ * Set inside a `popup` group's popover: running a command from it closes the popover (Office's
+ * behaviour). Settings (sliders, segmented sets) don't call it, so tuning several stays one open.
+ */
+const PopupGroupCloseCtx = createContext<(() => void) | null>(null);
+export function usePopupGroupClose(): (() => void) | null {
+  return useContext(PopupGroupCloseCtx);
+}
+/** For other command-holding popovers that should behave the same (the compact ribbon's overflow »). */
+export const PopupCloseProvider = PopupGroupCloseCtx.Provider;
+
 export function Group({
-  id, label, tier = "full", declaredWidth, dim, dimNote, children, icon = "more", style,
+  id, label, name, tier = "full", declaredWidth, dim, dimNote, children, icon = "more", selfCollapsing, style,
 }: GroupProps) {
   const ref = useRef<HTMLDivElement>(null);
   const [popupOpen, setPopupOpen] = useState(false);
+  const closePopup = useCallback(() => setPopupOpen(false), []);
+  const popup = tier === "popup" && !selfCollapsing;
 
   // Dev-only drift guard: declared widths (see each tab's SPECS) feed the pure solver, so they
   // must stay close to what the group actually renders. Warn rather than measure-and-relayout,
@@ -158,8 +218,8 @@ export function Group({
   // run yields the exact value to paste into the tab's SPECS **and** its `declaredWidth` prop —
   // the two copies must be updated together.
   //
-  // Only the `full` tier is checked: `medium`/`compact` widths live solely in SPECS and are never
-  // handed to a `Group`, so there is nothing here to compare them against.
+  // Only the `full` tier is checked: `medium` widths live solely in SPECS and are never handed to
+  // a `Group`, and `popup` widths are fixed by construction (`POPUP_GROUP_W`).
   useEffect(() => {
     if (!import.meta.env.DEV || declaredWidth == null || tier !== "full") return;
     const el = ref.current;
@@ -177,25 +237,54 @@ export function Group({
     return () => ro.disconnect();
   }, [id, declaredWidth, tier]);
 
-  if (tier === "compact") {
+  // A group that stops being a popup (window widened) mustn't leave its popover floating.
+  const [prevPopup, setPrevPopup] = useState(popup);
+  if (prevPopup !== popup) { setPrevPopup(popup); if (!popup) setPopupOpen(false); }
+
+  if (popup) {
+    const text = name ?? (typeof label === "string" ? label : id);
+    const why = dim && typeof dimNote === "string" ? ` ${dimNote}` : "";
     return (
-      <div ref={ref} data-group={id} style={{ ...groupShell, ...style }}>
-        <div style={groupBody}>
-          <IconButton
-            icon={icon}
-            label={typeof label === "string" ? label : id}
-            title={`${typeof label === "string" ? label : id} — click to open`}
-            active={popupOpen}
-            onClick={() => setPopupOpen(v => !v)}
-            style={{ height: GROUP_CONTENT_H, width: 30, flexDirection: "column", gap: SPACE.sm }}
-          />
-          {popupOpen && (
-            <Popover anchorRef={ref} onClose={() => setPopupOpen(false)}>
-              <div style={{ display: "flex", alignItems: "flex-start", gap: COL_GAP, padding: SPACE.md }}>{children}</div>
-            </Popover>
-          )}
-        </div>
-        <GroupLabel>{label}</GroupLabel>
+      <div ref={ref} data-group={id} data-tier={tier} style={{ ...groupShell, justifyContent: "flex-start", ...style }}>
+        {/* `data-group-chevron`: ⌘K's reveal clicks it to open the popup a command lives in. */}
+        <span data-group-chevron style={{ display: "contents" }}>
+          <button
+            className="rbn-btn" type="button" aria-label={text}
+            title={dim ? `${text}${why}` : `${text} — show this group's commands`}
+            aria-haspopup="dialog" aria-expanded={popupOpen}
+            {...a11y(popupOpen, dim)}
+            onClick={dim ? undefined : () => setPopupOpen(v => !v)}
+            style={btnBase({
+              width: POPUP_BTN_W, height: GROUP_CONTENT_H + GROUP_LABEL_H, padding: `${SPACE.md}px ${SPACE.xs}px ${SPACE.sm}px`,
+              display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "flex-start", gap: SPACE.sm,
+              flexShrink: 0, ...stateStyle(popupOpen, dim),
+            })}
+          >
+            {/* MS: a pop-up group icon is the group's most prominent command icon in a 32px container. */}
+            <span aria-hidden="true" style={{
+              width: 32, height: 32, flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center",
+              borderRadius: RADIUS.md, background: SURFACE.well, boxShadow: `inset 0 0 0 1px ${HAIRLINE}`,
+            }}>
+              <Icon name={icon} size={20} tone={popupOpen ? "inherit" : "default"} />
+            </span>
+            <span style={{
+              width: "100%", fontSize: FONT.label, lineHeight: "13px", textAlign: "center",
+              display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical", overflow: "hidden",
+              overflowWrap: "anywhere",
+            }}>{text}</span>
+            <Icon name="split" size={ICON.xs} tone="inherit" />
+          </button>
+        </span>
+        {popupOpen && (
+          <Popover anchorRef={ref} onClose={closePopup} role="dialog" ariaLabel={text} autoFocus>
+            <PopupGroupCloseCtx.Provider value={closePopup}>
+              <div data-group-popup={id} style={{ ...groupShell, padding: `${SPACE.md}px ${SPACE.lg}px ${SPACE.sm}px` }}>
+                <div style={groupBody}>{children}</div>
+                <GroupLabel>{label}</GroupLabel>
+              </div>
+            </PopupGroupCloseCtx.Provider>
+          </Popover>
+        )}
       </div>
     );
   }
@@ -204,8 +293,10 @@ export function Group({
     <div
       ref={ref}
       data-group={id}
+      data-tier={tier}
       style={{ ...groupShell, ...(dim ? { opacity: 0.4 } : null), ...style }}
       aria-disabled={dim || undefined}
+      title={dim && selfCollapsing && tier === "popup" && typeof dimNote === "string" ? dimNote : undefined}
     >
       {/* `inert` (not just pointerEvents:none) is what keeps a dimmed group's descendants out of
           the tab order — audit H7: pointerEvents only blocks the mouse, so a keyboard user could
@@ -214,7 +305,8 @@ export function Group({
       <div style={{ ...groupBody, ...(dim ? { pointerEvents: "none" as const } : null) }} inert={dim || undefined}>{children}</div>
       <GroupLabel>
         {label}
-        {dim && dimNote ? <span style={{ color: TEXT_DIM, opacity: 0.9, marginLeft: SPACE.sm }}>{dimNote}</span> : null}
+        {/* A self-collapsed group is narrow on purpose — the note moves to the tooltip above. */}
+        {dim && dimNote && tier !== "popup" ? <span style={{ color: TEXT_DIM, opacity: 0.9, marginLeft: SPACE.sm }}>{dimNote}</span> : null}
       </GroupLabel>
     </div>
   );
@@ -278,18 +370,18 @@ function a11y(active?: boolean, disabled?: boolean) {
   } as const;
 }
 
-/** Large: 82px tall, icon over label. The mockup's primary commands (Paste, Pan, Delete, Fill…). */
+/** Large: 76px tall, icon over label. The mockup's primary commands (Paste, Pan, Delete, Fill…). */
 export function LargeButton({
-  icon, label, title, onClick, active, disabled, tone = "default", accent, badge, style, iconNode,
-}: CommonBtn & { icon: IconName; iconNode?: ReactNode }) {
+  icon, label, title, onClick, active, disabled, tone = "default", accent, badge, style, iconNode, keycap,
+}: CommonBtn & { icon: IconName; iconNode?: ReactNode; keycap?: string }) {
   return (
     <button
       className="rbn-btn" type="button" title={title} aria-label={label} onClick={onClick}
       {...a11y(active, disabled)}
       style={btnBase({
-        height: LARGE_H, minWidth: 52, padding: `${SPACE.md}px ${SPACE.md}px 5px`,
+        height: LARGE_H, minWidth: 54, padding: `${SPACE.md}px ${SPACE.md}px 5px`,
         display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center",
-        gap: SPACE.md, fontSize: FONT.body, lineHeight: "13px",
+        gap: SPACE.md, fontSize: FONT.body, lineHeight: "13px", position: "relative",
         color: tone === "danger" ? TEXT_DANGER : TEXT,
         ...stateStyle(active, disabled, accent),
         ...style,
@@ -298,14 +390,39 @@ export function LargeButton({
       {iconNode ?? <Icon name={icon} size={ICON.lg} tone={active ? "inherit" : TONE_ICON[tone]} />}
       <span style={{ maxWidth: 86, overflow: "hidden", textOverflow: "ellipsis" }}>{label}</span>
       {badge}
+      {/* Keycap chip — `<Cmd>` (ribbon/Cmd.tsx) is the only caller that ever passes this, and only
+          at `tier="full"`: small/medium rows carry the shortcut in their tooltip instead, per the
+          plan's "keycaps on large buttons only". Absolutely positioned so it never affects the
+          label's centring or the button's measured width (the drift guard/width harvester read the
+          button's own rect, not this chip's). */}
+      {keycap && (
+        <span style={{ position: "absolute", top: 3, right: 3, pointerEvents: "none" }}>
+          <Keycap text={keycap} small />
+        </span>
+      )}
     </button>
   );
 }
 
-/** Small: 26px tall, icon + label on one line. Everything secondary. */
+/** A small `kbd` chip for a formatted chord (`formatChord`, `commands/keys.ts`). Shared by
+ *  `LargeButton`'s corner chip, ⌘K's result rows and the top bar's search-shortcut hint — one
+ *  implementation so the three never render a shortcut differently. */
+export function Keycap({ text, small }: { text: string; small?: boolean }) {
+  return (
+    <kbd style={{
+      fontFamily: "ui-monospace, 'SF Mono', Menlo, monospace", fontSize: small ? FONT.micro : FONT.label,
+      color: TEXT_DIM, background: SURFACE.well, border: `1px solid ${BORDER.hairline}`,
+      borderRadius: RADIUS.sm, padding: small ? "0 3px" : "1px 5px", whiteSpace: "nowrap", lineHeight: 1.3,
+    }}>{text}</kbd>
+  );
+}
+
+/** Small: 24px tall, icon + label on one line. Everything secondary.
+ *  `iconOnly` suppresses the visible label span but keeps `aria-label`/`title` at the full
+ *  registry label, so the tooltip, ⌘K and Help stay unaffected — placement-only compaction. */
 export function SmallButton({
-  icon, label, title, onClick, active, disabled, tone = "default", accent, badge, style, full,
-}: CommonBtn & { icon?: IconName; full?: boolean }) {
+  icon, label, title, onClick, active, disabled, tone = "default", accent, badge, style, full, iconOnly,
+}: CommonBtn & { icon?: IconName; full?: boolean; iconOnly?: boolean }) {
   return (
     <button
       className="rbn-btn" type="button" title={title} aria-label={label} onClick={onClick}
@@ -319,7 +436,7 @@ export function SmallButton({
       })}
     >
       {icon && <Icon name={icon} size={ICON.sm} tone={active ? "inherit" : TONE_ICON[tone]} />}
-      {label && <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>{label}</span>}
+      {!iconOnly && label && <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>{label}</span>}
       {badge}
     </button>
   );
@@ -350,10 +467,12 @@ export function IconButton({
  * `medium`. This is the only place the tier→size mapping lives, so every tab demotes identically.
  */
 export function CommandButton({
-  tier = "full", iconNode, full, ...rest
-}: CommonBtn & { icon: IconName; tier?: Tier; iconNode?: ReactNode; full?: boolean }) {
+  tier = "full", iconNode, full, keycap, ...rest
+}: CommonBtn & { icon: IconName; tier?: Tier; iconNode?: ReactNode; full?: boolean; keycap?: string }) {
+  // Keycaps are a `full`-tier-only affordance (plan §5.7 step 3) — `SmallButton` never receives one,
+  // even if a caller passes `keycap` regardless of tier, so this is the one place that's enforced.
   return tier === "full"
-    ? <LargeButton {...rest} iconNode={iconNode} />
+    ? <LargeButton {...rest} iconNode={iconNode} keycap={keycap} />
     : <SmallButton {...rest} full={full} />;
 }
 
@@ -433,7 +552,7 @@ export function MoreChevron({ title, children }: { title: string; children: () =
   const ref = useRef<HTMLDivElement>(null);
   const [open, setOpen] = useState(false);
   return (
-    <div ref={ref} style={{ position: "relative", display: "flex" }}>
+    <div ref={ref} data-no-cmd style={{ position: "relative", display: "flex" }}>
       <button
         className="rbn-btn" type="button" title={title} aria-label={title}
         aria-haspopup="menu" aria-expanded={open} onClick={() => setOpen(v => !v)}
@@ -461,6 +580,15 @@ export function MoreChevron({ title, children }: { title: string; children: () =
 // ── Popover ───────────────────────────────────────────────────────────────────
 
 /**
+ * Nested-popover registry (Stage 15.4). Popovers are portaled to `<body>`, so a `Select`/split
+ * menu opened *inside* another popover (every control in a `popup` group lives in one) is not a DOM
+ * descendant of its parent panel — without this, the parent's outside-click listener saw a click
+ * in the child menu as "outside", closed itself, and unmounted the child before the click landed.
+ * Each popover registers its panel with every ancestor popover (portals keep React context).
+ */
+const PopoverNestCtx = createContext<((el: HTMLElement) => () => void) | null>(null);
+
+/**
  * Portaled flyout anchored under `anchorRef`. Portaled for two reasons: the ribbon body clips
  * overflow, *and* the ribbon's own `z-index: 100` stacking context would otherwise trap the panel
  * underneath the docked sidebar (z-index 120) no matter how high its own z-index went.
@@ -471,6 +599,7 @@ export function MoreChevron({ title, children }: { title: string; children: () =
  */
 export function Popover({
   anchorRef, onClose, onEscape, children, align = "left", role = "menu", ariaLabel, style,
+  dismissDelayMs = 0, autoFocus = false,
 }: {
   anchorRef: React.RefObject<HTMLElement | null>;
   onClose: () => void;
@@ -482,14 +611,48 @@ export function Popover({
   onEscape?: () => void;
   children: ReactNode;
   align?: "left" | "right";
-  role?: "menu" | "dialog";
+  /** `listbox` gets the same roving keyboard model as `menu`, over `[role="option"]` rows, and
+   *  opens with focus on the selected option (`Select`). */
+  role?: "menu" | "dialog" | "listbox";
   ariaLabel?: string;
   style?: CSSProperties;
+  /**
+   * Delays registering the outside-click dismiss listener by this many ms (default 0, i.e. the
+   * pre-existing immediate behaviour). Needed by `ContextMenu` (Stage 14.14): a right-click can
+   * synthesize a trailing mousedown/mouseup on macOS WKWebView *after* the `contextmenu` event
+   * that opened the menu, which would otherwise read as an immediate outside click and dismiss
+   * the menu the instant it appears — the same 80ms guard the old hand-rolled context menu used.
+   */
+  dismissDelayMs?: number;
+  /**
+   * `role="dialog"` only: move focus to the panel's first enabled control on open (unless
+   * something inside already has it — ⌘K's reveal focuses its target first) and hand it back to
+   * the opener on close. Menus/listboxes always do this; a dialog opts in because the block
+   * picker and the world pill own their own focus order.
+   */
+  autoFocus?: boolean;
 }) {
   const panelRef = useRef<HTMLDivElement>(null);
+  // Panels of popovers opened from inside this one (and, transitively, theirs).
+  const childPanels = useRef(new Set<HTMLElement>());
+  const registerInParent = useContext(PopoverNestCtx);
+  const registerChild = useCallback((el: HTMLElement) => {
+    childPanels.current.add(el);
+    const unregisterUp = registerInParent?.(el);
+    return () => { childPanels.current.delete(el); unregisterUp?.(); };
+  }, [registerInParent]);
+  useLayoutEffect(() => {
+    const el = panelRef.current;
+    return el && registerInParent ? registerInParent(el) : undefined;
+  }, [registerInParent]);
   const [pos, setPos] = useState<{ top: number; left: number } | null>(null);
   /** Element focus should return to when the panel closes — captured before focus moves in. */
   const returnFocusRef = useRef<HTMLElement | null>(null);
+  // Stage 14.17: inside a `Dialog`, default above it (`dialogZIndex + 100`) instead of the flat 500
+  // — retires the "pass zIndex 1100 inside a modal" manual convention. An explicit `style.zIndex`
+  // below (Select's own `zIndex` prop) still wins.
+  const dialogZ = useContext(DialogLayerContext);
+  const defaultZIndex = dialogZ != null ? dialogZ + 100 : 500;
 
   useLayoutEffect(() => {
     const a = anchorRef.current;
@@ -506,21 +669,29 @@ export function Popover({
   }, [anchorRef, align]);
 
   useEffect(() => {
+    const inside = (t: Node) => panelRef.current?.contains(t) || [...childPanels.current].some(c => c.contains(t));
     const down = (e: MouseEvent) => {
-      if (panelRef.current?.contains(e.target as Node)) return;
+      if (inside(e.target as Node)) return;
       if (anchorRef.current?.contains(e.target as Node)) return;
       onClose();
     };
     const key = (e: KeyboardEvent) => {
-      if (e.key === "Escape") { e.stopPropagation(); (onEscape ?? onClose)(); }
+      // A child popover is open: Escape is its to handle — one press closes one level.
+      if (e.key === "Escape" && childPanels.current.size === 0) { e.stopPropagation(); (onEscape ?? onClose)(); }
     };
-    document.addEventListener("mousedown", down);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    if (dismissDelayMs > 0) {
+      timer = setTimeout(() => document.addEventListener("mousedown", down), dismissDelayMs);
+    } else {
+      document.addEventListener("mousedown", down);
+    }
     window.addEventListener("keydown", key, true);
     return () => {
+      if (timer) clearTimeout(timer);
       document.removeEventListener("mousedown", down);
       window.removeEventListener("keydown", key, true);
     };
-  }, [anchorRef, onClose, onEscape]);
+  }, [anchorRef, onClose, onEscape, dismissDelayMs]);
 
   /**
    * Keyboard model for `role="menu"` panels (audit M2). Every opener already declares
@@ -543,17 +714,35 @@ export function Popover({
   useEffect(() => { closeRef.current = onClose; }, [onClose]);
 
   useEffect(() => {
-    if (role !== "menu") return;
+    if (role === "dialog" && autoFocus) {
+      returnFocusRef.current = document.activeElement as HTMLElement | null;
+      const panel = panelRef.current;
+      const raf = requestAnimationFrame(() => {
+        if (panel?.contains(document.activeElement)) return;
+        panel?.querySelector<HTMLElement>(
+          'button:not([aria-disabled="true"]):not([disabled]), input:not([disabled]), [tabindex]:not([tabindex="-1"])',
+        )?.focus();
+      });
+      return () => {
+        cancelAnimationFrame(raf);
+        if (panel?.contains(document.activeElement)) returnFocusRef.current?.focus();
+      };
+    }
+    if (role !== "menu" && role !== "listbox") return;
     returnFocusRef.current = document.activeElement as HTMLElement | null;
     // Captured once: the panel node is stable for this effect's lifetime, and reading the ref in
     // the cleanup would read whatever it points at *after* unmount.
     const panel = panelRef.current;
+    const itemRole = role === "menu" ? "menuitem" : "option";
     const items = () => Array.from(
-      panel?.querySelectorAll<HTMLElement>('[role="menuitem"]:not([aria-disabled="true"])') ?? [],
+      panel?.querySelectorAll<HTMLElement>(`[role="${itemRole}"]:not([aria-disabled="true"])`) ?? [],
     );
     // Defer one frame: the panel is portaled and positioned in a layout effect, so focusing before
     // that lands would scroll the page to the off-screen (-9999) staging position.
-    const raf = requestAnimationFrame(() => items()[0]?.focus());
+    const raf = requestAnimationFrame(() => {
+      const list = items();
+      (list.find(el => el.getAttribute("aria-selected") === "true") ?? list[0])?.focus();
+    });
 
     const onKey = (e: KeyboardEvent) => {
       if (!panel?.contains(document.activeElement)) return;
@@ -579,14 +768,14 @@ export function Popover({
       // and yanking it back would fight the user.
       if (panel?.contains(document.activeElement)) returnFocusRef.current?.focus();
     };
-  }, [role]);
+  }, [role, autoFocus]);
 
   return createPortal(
     <div
       ref={panelRef}
       role={role}
       aria-label={ariaLabel}
-      className="eden-ribbon"
+      className="eden-ribbon vx-popover-enter"
       style={{
         background: SURFACE.popover,
         boxShadow: `inset 0 0 0 1px ${BORDER.outline}, inset 0 1px 0 ${BORDER.bevel}, 0 10px 28px rgba(0,0,0,.6)`,
@@ -594,11 +783,11 @@ export function Popover({
         position: "fixed",
         top: pos?.top ?? -9999, left: pos?.left ?? -9999,
         visibility: pos ? "visible" : "hidden",
-        zIndex: 500, color: TEXT, fontSize: FONT.body,
+        zIndex: defaultZIndex, color: TEXT, fontSize: FONT.body,
         ...style,
       }}
     >
-      {children}
+      <PopoverNestCtx.Provider value={registerChild}>{children}</PopoverNestCtx.Provider>
     </div>,
     document.body,
   );
@@ -606,7 +795,44 @@ export function Popover({
 
 // ── Composite controls ────────────────────────────────────────────────────────
 
-/** A labelled range slider on one 26px row — the ribbon's only single-value slider form. */
+/** Decimal places implied by a step value (0.1 → 1, 0.01 → 2, 1 → 0) — used to snap dragged/typed
+ *  values to `step` without floating-point noise (e.g. 0.1 + 0.2 artefacts). */
+function stepDecimals(step: number): number {
+  const s = String(step);
+  const i = s.indexOf(".");
+  return i < 0 ? 0 : s.length - i - 1;
+}
+
+/**
+ * A labelled single-value slider — the ribbon's (and every modal's) one slider primitive. Draws
+ * `RangeSlider`'s painted-track/thumb look with a single thumb, but — unlike `RangeSlider` — isn't
+ * built on a real `<input type="range">`: the Windows field report (Stage 15.5) was that the native
+ * element felt jumpy on a narrow track (0–255 over ~60px ≈ 4 levels/px), and the fix set below
+ * (shift-drag fine mode, wheel/arrow stepping, a track-width floor) needs pointer-delta control a
+ * native range element can't give mid-drag without fighting the browser's own drag algorithm.
+ * Accessibility is hand-rolled instead (`role="slider"` + `aria-value*` + arrow/Home/End keys),
+ * the standard ARIA slider pattern.
+ *
+ * Pointer model:
+ *  - `pointerdown`: capture the pointer, jump straight to the clicked position (click-to-position,
+ *    same as a native slider), and record that as the drag anchor.
+ *  - `pointermove` **without** Shift: absolute — value tracks the pointer's position over the
+ *    track, same as a native slider drag.
+ *  - `pointermove` **with** Shift: relative — accumulates the pixel delta since the last move at
+ *    1/4 rate, so a full track's width of travel only covers a quarter of the range (fine
+ *    adjustment). Toggling Shift mid-drag re-anchors from the current pointer position, so there's
+ *    no jump when the modifier changes.
+ *  - `pointerup` / `pointercancel` / `lostpointercapture`: whichever fires first commits (via
+ *    `onCommit`) and clears the drag state, so the others are no-ops — guards the WebView2 case
+ *    where releasing the pointer outside the track can drop a plain `pointerup`.
+ *  - Wheel and ←/→ (also ↑/↓) step by one `step` increment and commit immediately; Shift+wheel
+ *    steps by ten. Home/End jump to `min`/`max`. These are discrete actions, not a drag, so each
+ *    one calls `onChange` then `onCommit` in the same tick (no separate release step).
+ *  - The value label is a click-to-type `NumField` unless `format` is given — `NumField` shows the
+ *    raw number, so a slider with a custom display string (e.g. FlyView3D's non-linear
+ *    render-distance mapping, or a "z=" prefix) keeps its old static formatted label instead of an
+ *    editable field that would show the wrong number while typing.
+ */
 export function SliderRow({
   label, value, min, max, step = 1, onChange, onCommit, format, disabled, accent = ACCENT.primary,
   width = 78, labelWidth = 46, title,
@@ -617,20 +843,138 @@ export function SliderRow({
   width?: number; labelWidth?: number; title?: string;
 }) {
   const id = useId();
+  const labelId = `${id}-label`;
+  const trackRef = useRef<HTMLDivElement>(null);
+  // Mirrors `value` on every onChange call so pointerup/lostpointercapture/pointercancel — whichever
+  // fires first — commits what's actually shown, not a possibly-stale `value` prop (the parent's
+  // re-render from the last onChange may not have landed by the time the pointer lifts).
+  const latestRef = useRef(value);
+  latestRef.current = value;
+  const dragRef = useRef<{ pointerId: number; lastX: number; lastValue: number } | null>(null);
+
+  const range = Math.max(1e-9, max - min);
+  const decimals = stepDecimals(step);
+  const snap = useCallback((v: number) => {
+    const snapped = min + Math.round((v - min) / step) * step;
+    const bounded = Math.min(max, Math.max(min, snapped));
+    return decimals > 0 ? Number(bounded.toFixed(decimals)) : Math.round(bounded);
+  }, [min, max, step, decimals]);
+
+  // Track-width floor (the Windows sensitivity fix): at least 1px per step so a drag never has to
+  // cross more than one pixel per level, floored at 96px and capped at 160px — past that a wide
+  // slider (e.g. a 0–255 cutaway cap) buys no more usable precision than a mouse can place.
+  const steps = step > 0 ? range / step : 0;
+  const minTrackWidth = Math.max(96, Math.min(160, steps));
+  const trackWidth = Math.max(width, minTrackWidth);
+
+  const valueFromClientX = useCallback((clientX: number) => {
+    const el = trackRef.current;
+    if (!el) return value;
+    const r = el.getBoundingClientRect();
+    const pct = r.width > 0 ? (clientX - r.left) / r.width : 0;
+    return snap(min + pct * range);
+  }, [min, range, snap, value]);
+
+  const endDrag = useCallback(() => {
+    if (!dragRef.current) return;
+    dragRef.current = null;
+    onCommit?.(latestRef.current);
+  }, [onCommit]);
+
+  const pct = ((value - min) / range) * 100;
+  const rgb = hexToRgbTriplet(accent);
+  const thumbLeft = (pct / 100) * (trackWidth - 10);
+  const maxDigits = String(Math.trunc(Math.max(Math.abs(min), Math.abs(max)))).length;
+  const valueWidth = Math.max(26, 16 + maxDigits * 7 + (decimals > 0 ? (decimals + 1) * 7 : 0) + (min < 0 ? 6 : 0));
+
   return (
     <div title={title} style={{ display: "flex", alignItems: "center", gap: 5, height: SMALL_H, ...(disabled ? btnDisabled : null) }}>
-      <label htmlFor={id} style={{ color: TEXT_DIM, fontSize: FONT.label, minWidth: labelWidth, userSelect: "none" }}>{label}</label>
-      <input
-        id={id} type="range" className="rbn-range" min={min} max={max} step={step} value={value}
-        disabled={disabled}
-        onChange={e => onChange(Number(e.target.value))}
-        onPointerUp={e => onCommit?.(Number((e.target as HTMLInputElement).value))}
-        onKeyUp={e => onCommit?.(Number((e.target as HTMLInputElement).value))}
-        style={{ width, accentColor: accent }}
-      />
-      <span style={{ color: TEXT, fontSize: FONT.label, fontVariantNumeric: "tabular-nums", minWidth: 26, textAlign: "right" }}>
-        {format ? format(value) : value}
-      </span>
+      <label id={labelId} style={{ color: TEXT_DIM, fontSize: FONT.label, minWidth: labelWidth, userSelect: "none" }}>{label}</label>
+      <div
+        ref={trackRef}
+        role="slider"
+        aria-labelledby={labelId}
+        aria-valuemin={min}
+        aria-valuemax={max}
+        aria-valuenow={value}
+        aria-valuetext={format ? format(value) : String(value)}
+        aria-disabled={disabled || undefined}
+        aria-orientation="horizontal"
+        tabIndex={disabled ? -1 : 0}
+        style={{
+          position: "relative", width: trackWidth, height: SMALL_H, flexShrink: 0,
+          cursor: disabled ? "default" : "pointer", touchAction: "none",
+        }}
+        onPointerDown={e => {
+          if (disabled) return;
+          e.currentTarget.focus();
+          e.currentTarget.setPointerCapture(e.pointerId);
+          const v = valueFromClientX(e.clientX);
+          dragRef.current = { pointerId: e.pointerId, lastX: e.clientX, lastValue: v };
+          latestRef.current = v;
+          onChange(v);
+        }}
+        onPointerMove={e => {
+          const d = dragRef.current;
+          if (!d || e.pointerId !== d.pointerId) return;
+          let next: number;
+          if (e.shiftKey) {
+            const deltaPx = e.clientX - d.lastX;
+            next = snap(d.lastValue + (deltaPx / trackWidth) * range * 0.25);
+          } else {
+            next = valueFromClientX(e.clientX);
+          }
+          d.lastX = e.clientX;
+          d.lastValue = next;
+          latestRef.current = next;
+          onChange(next);
+        }}
+        onPointerUp={endDrag}
+        onPointerCancel={endDrag}
+        onLostPointerCapture={endDrag}
+        onWheel={e => {
+          if (disabled) return;
+          e.preventDefault();
+          const dir = e.deltaY < 0 ? 1 : -1;
+          const next = snap(value + dir * (e.shiftKey ? step * 10 : step));
+          onChange(next);
+          onCommit?.(next);
+        }}
+        onKeyDown={e => {
+          if (disabled) return;
+          let next: number | null = null;
+          if (e.key === "ArrowRight" || e.key === "ArrowUp") next = snap(value + step);
+          else if (e.key === "ArrowLeft" || e.key === "ArrowDown") next = snap(value - step);
+          else if (e.key === "Home") next = min;
+          else if (e.key === "End") next = max;
+          if (next == null) return;
+          e.preventDefault();
+          onChange(next);
+          onCommit?.(next);
+        }}
+      >
+        <div aria-hidden="true" style={{
+          position: "absolute", top: 11, left: 4, right: 4, height: 4, borderRadius: RADIUS.sm,
+          pointerEvents: "none", boxShadow: `inset 0 0 0 1px ${BORDER.outline}`,
+          background: `linear-gradient(to right, rgb(${rgb}) 0%, rgb(${rgb}) ${pct}%, ${SURFACE.well} ${pct}%, ${SURFACE.well} 100%)`,
+        }} />
+        <div aria-hidden="true" style={{
+          position: "absolute", top: 7, left: thumbLeft, width: 10, height: 10, borderRadius: "50%",
+          pointerEvents: "none", background: `rgb(${rgb})`,
+          boxShadow: `0 0 0 1px ${BORDER.outline}, inset 0 1px 0 rgba(255,255,255,.35)`,
+        }} />
+      </div>
+      {!disabled && !format ? (
+        <NumField
+          value={value} min={min} max={max} width={valueWidth} ariaLabel={`${label} value`}
+          onChange={v => { const n = snap(v); onChange(n); onCommit?.(n); }}
+          style={{ height: 18, fontSize: FONT.label, padding: "0 3px" }}
+        />
+      ) : (
+        <span style={{ color: TEXT, fontSize: FONT.label, fontVariantNumeric: "tabular-nums", minWidth: 26, textAlign: "right" }}>
+          {format ? format(value) : value}
+        </span>
+      )}
     </div>
   );
 }
@@ -767,23 +1111,104 @@ export function MenuItem({
         display: "flex", alignItems: "center", gap: 7, width: "100%", textAlign: "left",
         padding: `0 ${SPACE.lg}px`, height: 24, background: "none", boxShadow: "none",
         color: danger ? TEXT_DANGER : TEXT,
-        ...(active ? btnActive() : null),
+        // The current option is pushed in (Stage 14.2), not armed-accent: a menu row is a list
+        // item, and "current" has one look app-wide.
+        ...(active ? currentRow() : null),
         ...(disabled ? btnDisabled : null),
       })}
     >
-      {icon && <Icon name={icon} size={ICON.sm} tone={danger ? "danger" : "default"} />}
+      {icon && <Icon name={icon} size={ICON.sm} tone={danger ? "danger" : active ? "inherit" : "default"}
+        style={active ? { color: CUR_ICON } : undefined} />}
       <span style={{ flex: 1 }}>{label}</span>
       {shortcut && <span style={{ fontSize: FONT.micro, color: TEXT_LABEL }}>{shortcut}</span>}
     </button>
   );
 }
 
+/**
+ * A dropdown that picks one value (Stage 14.2) — the primitive native `<select>`s move onto
+ * (Settings ▸ Sounds' pack, Prefab sort, the picker's Expansion sub-type).
+ *
+ * Button + portaled `Popover` listbox, reusing the Popover's keyboard model: ↓ / Enter / Space on
+ * the button opens it with focus on the current option, arrows/Home/End move, Enter picks, Escape
+ * and Tab close. The current option is **pushed in** with a check icon (the current-item recipe).
+ * Inside a `Dialog` (`src/ui/Dialog.tsx`) the listbox defaults above it automatically via
+ * `DialogLayerContext` — an explicit `zIndex` prop is only needed to override that.
+ */
+export function Select<T extends string>({
+  value, options, onChange, ariaLabel, width = 170, disabled, zIndex, title,
+}: {
+  value: T; ariaLabel: string;
+  options: { id: T; label: string; title?: string }[];
+  onChange: (v: T) => void;
+  width?: number; disabled?: boolean; zIndex?: number; title?: string;
+}) {
+  const ref = useRef<HTMLDivElement>(null);
+  const btnRef = useRef<HTMLButtonElement>(null);
+  const [open, setOpen] = useState(false);
+  const current = options.find(o => o.id === value);
+  const pick = (id: T) => {
+    setOpen(false);
+    if (id !== value) onChange(id);
+    btnRef.current?.focus();
+  };
+  return (
+    <div ref={ref} style={{ position: "relative", display: "inline-flex", width }}>
+      <button
+        ref={btnRef} type="button" className="rbn-btn" title={title ?? ariaLabel}
+        aria-haspopup="listbox" aria-expanded={open} aria-label={`${ariaLabel}: ${current?.label ?? value}`}
+        onClick={() => setOpen(o => !o)}
+        onKeyDown={e => {
+          if (!open && (e.key === "ArrowDown" || e.key === "ArrowUp")) { e.preventDefault(); setOpen(true); }
+        }}
+        {...a11y(false, disabled)}
+        style={btnBase({
+          width: "100%", height: SMALL_H, padding: "0 6px 0 8px", display: "flex", alignItems: "center",
+          gap: SPACE.sm, justifyContent: "space-between", ...(disabled ? btnDisabled : null),
+        })}
+      >
+        <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>{current?.label ?? value}</span>
+        <Icon name="split" size={ICON.xs} tone="inherit" />
+      </button>
+      {open && (
+        <Popover anchorRef={ref} onClose={() => setOpen(false)} role="listbox" ariaLabel={ariaLabel}
+          style={{ padding: SPACE.sm, minWidth: width, ...(zIndex != null ? { zIndex } : null) }}>
+          {/* Capped + scrollable so a long list (the Draw mask's block/paint pickers) can't outgrow the
+              viewport; the short lists every earlier caller passes never reach the cap. */}
+          <div style={{ display: "flex", flexDirection: "column", gap: 1, maxHeight: "min(320px, 60vh)", overflowY: "auto" }}>
+            {options.map(o => {
+              const cur = o.id === value;
+              return (
+                <button
+                  key={o.id} type="button" role="option" aria-selected={cur} className="rbn-btn"
+                  title={o.title} data-active={cur ? "true" : undefined}
+                  onClick={() => pick(o.id)}
+                  style={btnBase({
+                    display: "flex", alignItems: "center", gap: 7, width: "100%", textAlign: "left",
+                    padding: `0 ${SPACE.lg}px`, height: 26, background: "none", boxShadow: "none",
+                    ...(cur ? currentRow() : null),
+                  })}
+                >
+                  <span style={{ width: ICON.sm, display: "flex" }}>
+                    {cur && <Icon name="check" size={ICON.sm} tone="inherit" style={{ color: CUR_ICON }} />}
+                  </span>
+                  <span style={{ flex: 1 }}>{o.label}</span>
+                </button>
+              );
+            })}
+          </div>
+        </Popover>
+      )}
+    </div>
+  );
+}
+
 // ── Small shared parts ────────────────────────────────────────────────────────
 
 const BADGE_TONE: Record<"exp" | "perf" | "ok", { fg: string; rgb: string; text: string; title: string }> = {
-  exp: { fg: "#e0a95a", rgb: hexToRgbTriplet(ACCENT.warm), text: "exp", title: "Experimental" },
+  exp: { fg: RAMP.badgeExp, rgb: hexToRgbTriplet(ACCENT.warm), text: "exp", title: "Experimental" },
   perf: { fg: TEXT_DANGER, rgb: hexToRgbTriplet(DANGER), text: "⚡", title: "Performance-intensive" },
-  ok: { fg: "#7fc994", rgb: hexToRgbTriplet(ACCENT.green), text: "✓", title: "" },
+  ok: { fg: RAMP.badgeOk, rgb: hexToRgbTriplet(ACCENT.clipboard), text: "✓", title: "" },
 };
 
 /**
@@ -861,19 +1286,33 @@ export function NumField({
   );
 }
 
-/** Labelled checkbox. Replaces raw `<input type="checkbox" style={{accentColor:"#3b82f6"}}>`. */
+/**
+ * Labelled checkbox. Replaces raw `<input type="checkbox" style={{accentColor:"#3b82f6"}}>`.
+ *
+ * `hint` (optional) adds a second, dimmer line under the label — the app menu's "Save compressed /
+ * what that means" rows. With a hint the row is top-aligned and grows to fit instead of holding the
+ * fixed `SMALL_H` height; without one nothing changes.
+ */
 export function Check({
-  checked, onChange, label, title, disabled,
-}: { checked: boolean; onChange: (v: boolean) => void; label: ReactNode; title?: string; disabled?: boolean }) {
+  checked, onChange, label, title, disabled, hint,
+}: { checked: boolean; onChange: (v: boolean) => void; label: ReactNode; title?: string; disabled?: boolean; hint?: ReactNode }) {
   return (
     <label title={title} style={{
-      display: "flex", alignItems: "center", gap: 5, height: SMALL_H, userSelect: "none",
+      display: "flex", alignItems: hint ? "flex-start" : "center", gap: 5, height: hint ? undefined : SMALL_H,
+      userSelect: "none",
       cursor: disabled ? "default" : "pointer", ...(disabled ? btnDisabled : null),
     }}>
       <input type="checkbox" checked={checked} disabled={disabled}
         onChange={e => onChange(e.target.checked)}
-        style={{ accentColor: ACCENT.primary, margin: 0 }} />
-      <span style={{ color: TEXT_DIM, fontSize: FONT.label }}>{label}</span>
+        style={{ accentColor: ACCENT.primary, margin: hint ? "2px 0 0" : 0 }} />
+      {hint ? (
+        <span>
+          <span style={{ color: TEXT_DIM, fontSize: FONT.label }}>{label}</span>
+          <span style={{ display: "block", color: TEXT_META, fontSize: FONT.label, lineHeight: 1.45 }}>{hint}</span>
+        </span>
+      ) : (
+        <span style={{ color: TEXT_DIM, fontSize: FONT.label }}>{label}</span>
+      )}
     </label>
   );
 }

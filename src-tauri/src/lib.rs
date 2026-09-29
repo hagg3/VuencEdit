@@ -17,7 +17,7 @@ pub(crate) use voxel_core::view::{
 pub(crate) use voxel_core::blocks::{fluid_base, fluid_level, fluid_type_for};
 pub(crate) use voxel_core::lamps::LampIndex;
 pub(crate) use voxel_core::mask::SelectionMask;
-pub(crate) use voxel_core::render::{self as render, Raster, MAX_LOD};
+pub(crate) use voxel_core::render::{self as render, MapStyle, Raster, MAX_LOD};
 // Test-only: the geometry/lamp internals this crate's own suite still exercises against a real
 // parsed `LoadedWorld` (the crate's tests use a synthetic `VoxelView` instead).
 #[cfg(test)]
@@ -48,6 +48,8 @@ fn lamp_build_now(index: &LampIndex, world: &LoadedWorld) {
 mod geometry;
 mod journal;
 mod mem;
+#[cfg(test)]
+mod alloc_probe;
 mod mpworld;
 mod network;
 mod signs;
@@ -479,10 +481,9 @@ pub(crate) struct TopBandHints {
     h: u32,
     min_x: i32,
     min_y: i32,
-    /// Allocated on the first *query*, not at parse time: the two `LoadedWorld` scan buffers
-    /// `render_selection_view`/`render_full_height_view` build per preview carry the real world's
-    /// `w_chunks`/`h_chunks` but are never scanned through the hint, and eagerly allocating ~90 KB
-    /// per preview call for a table nothing reads would be pure waste.
+    /// Allocated on the first *query*, not at parse time: throwaway `LoadedWorld`s (scan buffers,
+    /// test fixtures) carry the real world's `w_chunks`/`h_chunks` but are never scanned through
+    /// the hint, and eagerly allocating ~90 KB per one for a table nothing reads would be waste.
     cells: std::sync::OnceLock<Box<[std::sync::atomic::AtomicU8]>>,
 }
 
@@ -686,6 +687,9 @@ impl<'a> ChunkScratch<'a> {
 
     /// Drop the borrow of the world the copies came from, keeping the copies. This is what lets
     /// the compute phase run under a read guard and the commit under a write guard.
+    /// Bytes held by the scratch buffer (18.0 `sculpt_scratch` counter).
+    pub(crate) fn buf_len(&self) -> usize { self.buf.len() }
+
     pub(crate) fn into_chunks(self) -> ScratchChunks {
         ScratchChunks { owned: self.owned, buf: self.buf }
     }
@@ -711,8 +715,23 @@ impl ScratchChunks {
             let post = &buf[off..off + span];
             let pre = &world.bytes[addr..cend];
             if let Some(delta) = diff_span(0, pre, post) {
+                // Write only the bytes that actually changed rather than the whole span — on a
+                // 256z chunk (131,072 B = 32 pages) over a MAP_SHARED mapping, a full-span write
+                // dirties every page for writeback even when a sculpt stamp touched a handful of
+                // them (the v1.0.11→v1.0.14 regression, ROADMAP-EDIT 11.1). `Sparse`'s pairs
+                // already enumerate exactly those offsets; `Full`/`FullZ` mean ≥20% of the span
+                // differs, so the span write is no worse and avoids re-decoding the delta.
+                match &delta {
+                    ChunkDelta::Sparse(pairs) => {
+                        for &(off, _pre_byte) in pairs {
+                            world.bytes[addr + off as usize] = post[off as usize];
+                        }
+                    }
+                    ChunkDelta::Full(..) | ChunkDelta::FullZ(..) | ChunkDelta::SparseZ(..) => {
+                        world.bytes[addr..cend].copy_from_slice(post);
+                    }
+                }
                 out.push(ChunkSnapshot { cx, cy, delta });
-                world.bytes[addr..cend].copy_from_slice(post);
             }
         }
         // Deterministic order regardless of hash iteration order, so an undo entry's chunk list is
@@ -827,6 +846,54 @@ pub(crate) enum ChunkDelta {
     /// only ever sees the two uncompressed variants. A chunk filled with one block type deflates
     /// ~100×, which is exactly the ⌘A-fill case that used to park a world-sized copy in the stack.
     FullZ(u32, Vec<u8>, u32),
+    /// Packed + deflated `Sparse` (ROADMAP-EDIT 18.5 / audit RAM-5) — `(deflated, entry_count)`.
+    /// Payload before deflate: `entry_count` LEB128 varints of wrapping offset deltas (ascending
+    /// offsets from `diff_span` cost ~1 byte each), then `entry_count` original bytes. ~1-2 B per
+    /// changed byte vs the 8 B a `(u32, u8)` really occupies. Like `FullZ`, only `UndoEntry::new`
+    /// produces it; pre-push consumers see plain `Sparse`.
+    SparseZ(Vec<u8>, u32),
+}
+
+/// Pack sparse pairs (see `ChunkDelta::SparseZ`) and deflate. `None` if deflate fails.
+fn pack_sparse(pairs: &[(u32, u8)]) -> Option<Vec<u8>> {
+    let mut raw = Vec::with_capacity(pairs.len() * 2 + 8);
+    let mut prev = 0u32;
+    for &(off, _) in pairs {
+        let mut d = off.wrapping_sub(prev);
+        prev = off;
+        while d >= 0x80 { raw.push((d as u8 & 0x7f) | 0x80); d >>= 7; }
+        raw.push(d as u8);
+    }
+    raw.extend(pairs.iter().map(|&(_, v)| v));
+    let mut enc = flate2::write::DeflateEncoder::new(
+        Vec::with_capacity(raw.len() / 2 + 32), flate2::Compression::new(UNDO_DEFLATE_LEVEL));
+    let mut z = std::io::Write::write_all(&mut enc, &raw).and_then(|_| enc.finish()).ok()?;
+    z.shrink_to_fit();
+    Some(z)
+}
+
+/// Inverse of `pack_sparse`. `None` on any malformed/truncated payload.
+fn unpack_sparse(z: &[u8], count: u32) -> Option<Vec<(u32, u8)>> {
+    let mut raw = Vec::new();
+    std::io::Read::read_to_end(&mut flate2::read::DeflateDecoder::new(z), &mut raw).ok()?;
+    let n = count as usize;
+    let mut offs = Vec::with_capacity(n);
+    let (mut pos, mut prev) = (0usize, 0u32);
+    for _ in 0..n {
+        let (mut d, mut shift) = (0u32, 0u32);
+        loop {
+            let b = *raw.get(pos)?;
+            pos += 1;
+            d |= ((b & 0x7f) as u32).checked_shl(shift)?;
+            if b & 0x80 == 0 { break; }
+            shift += 7;
+            if shift > 28 { return None; }
+        }
+        prev = prev.wrapping_add(d);
+        offs.push(prev);
+    }
+    let vals = raw.get(pos..pos + n)?;
+    Some(offs.into_iter().zip(vals.iter().copied()).collect())
 }
 
 /// Deflate level for undo payloads. Level 1, not `journal.rs`'s 6: an undo entry is compressed
@@ -836,10 +903,22 @@ pub(crate) enum ChunkDelta {
 const UNDO_DEFLATE_LEVEL: u32 = 1;
 
 impl ChunkDelta {
-    /// Deflate a `Full` payload, keeping whichever of the two is smaller. `Sparse` and an already
-    /// compressed `FullZ` pass through untouched.
+    /// Compress a delta, keeping whichever representation is smaller *by real heap cost*: `Full` ->
+    /// `FullZ` when deflate wins; `Sparse` -> `SparseZ` when the packed+deflated form is smaller
+    /// than the pairs' true 8 B each. Already-compressed variants pass through untouched.
+    /// (`Sparse` vs `Full` is decided earlier, in `diff_span`, where the post bytes still exist.)
     fn compressed(self) -> ChunkDelta {
-        let ChunkDelta::Full(start, data) = self else { return self };
+        let (start, data) = match self {
+            ChunkDelta::Sparse(pairs) => {
+                return match pack_sparse(&pairs) {
+                    Some(z) if z.capacity() + 16 < pairs.capacity() * 8 =>
+                        ChunkDelta::SparseZ(z, pairs.len() as u32),
+                    _ => ChunkDelta::Sparse(pairs),
+                };
+            }
+            ChunkDelta::Full(start, data) => (start, data),
+            other => return other,
+        };
         let raw_len = data.len();
         let mut enc = flate2::write::DeflateEncoder::new(
             Vec::with_capacity(raw_len / 4 + 64), flate2::Compression::new(UNDO_DEFLATE_LEVEL));
@@ -855,12 +934,24 @@ impl ChunkDelta {
         }
     }
 
+    /// The `(offset, original_byte)` pairs behind a `Sparse`/`SparseZ`; `None` for dense variants.
+    fn sparse_pairs(&self) -> Option<std::borrow::Cow<'_, [(u32, u8)]>> {
+        match self {
+            ChunkDelta::Sparse(v) => Some(std::borrow::Cow::Borrowed(v.as_slice())),
+            ChunkDelta::SparseZ(z, n) => match unpack_sparse(z, *n) {
+                Some(v) => Some(std::borrow::Cow::Owned(v)),
+                None => { timing_log!("[UNDO] sparse inflate failed; dropping this chunk's delta"); None }
+            },
+            _ => None,
+        }
+    }
+
     /// The `Full` payload behind this delta, inflating a `FullZ` into `scratch` and borrowing from
     /// it. `None` for `Sparse`. The borrow keeps the inflated buffer alive for exactly one chunk at
     /// a time — restoring a whole stack's worth at once would defeat the point of compressing them.
     fn full_bytes<'a>(&'a self, scratch: &'a mut Vec<u8>) -> Option<(u32, &'a [u8])> {
         match self {
-            ChunkDelta::Sparse(_) => None,
+            ChunkDelta::Sparse(_) | ChunkDelta::SparseZ(..) => None,
             ChunkDelta::Full(start, data) => Some((*start, data.as_slice())),
             ChunkDelta::FullZ(start, z, raw_len) => {
                 scratch.clear();
@@ -893,6 +984,7 @@ fn chunk_snapshot_bytes(s: &ChunkSnapshot) -> usize {
         ChunkDelta::Sparse(v) => v.capacity() * 8 + 40,
         ChunkDelta::Full(_, d) => d.capacity() + 40,
         ChunkDelta::FullZ(_, z, _) => z.capacity() + 40,
+        ChunkDelta::SparseZ(z, _) => z.capacity() + 40,
     }
 }
 
@@ -1235,6 +1327,11 @@ pub(crate) struct WorldState {
     /// terrain-paste / the cursor readout target the highest block *at or below* the cap. `None`
     /// (the default) = normal "true surface" behaviour. Cleared on world load/close.
     pub(crate) view_cap_z: Option<i32>,
+    /// Relief (hillshade) strength for the top-down map, percent of `render::RELIEF_BASE`; `None` =
+    /// off (Stage 13.2). Same idiom as `view_cap_z` — backend state, so `fetch_tile` and every edit
+    /// patch agree without a per-command argument — but a *preference*, not per-world: it survives
+    /// world load/close, and the frontend re-sends it after every load anyway.
+    pub(crate) view_relief: Option<u8>,
     /// The 2D map's current level-of-detail step, mirrored from the frontend by `set_view_lod`
     /// (audit M3). Edit patches are rendered at this LOD instead of always at full resolution:
     /// editing while zoomed out to 0.1 px/block used to ship 100× more pixels than the screen can
@@ -1270,6 +1367,11 @@ pub(crate) struct WorldState {
 }
 
 impl WorldState {
+    /// How every top-down render and edit patch should draw right now (cutaway cap + relief).
+    pub(crate) fn map_style(&self) -> MapStyle {
+        MapStyle { cap: self.view_cap_z, relief: self.view_relief }
+    }
+
     pub(crate) fn new() -> Self {
         WorldState {
             world: None,
@@ -1288,6 +1390,7 @@ impl WorldState {
             texture_pack: None,
             lamp_index: LampIndex::default(),
             view_cap_z: None,
+            view_relief: None,
             view_lod: 1,
             sculpt_session: None,
             selection_mask: None,
@@ -1340,6 +1443,9 @@ pub(crate) fn apply_lamp_delta(index: &LampIndex, world: &LoadedWorld, snaps: &[
     for snap in snaps {
         match &snap.delta {
             ChunkDelta::Sparse(pairs) => batch.sparse(world, snap.cx, snap.cy, pairs),
+            ChunkDelta::SparseZ(..) => {
+                if let Some(pairs) = snap.delta.sparse_pairs() { batch.sparse(world, snap.cx, snap.cy, &pairs); }
+            }
             dense => {
                 if let Some((start, pre)) = dense.full_bytes(&mut scratch) {
                     batch.dense(world, snap.cx, snap.cy, start, pre);
@@ -1903,11 +2009,20 @@ fn render_pixels_patch(world: &LoadedWorld, px1: i32, py1: i32, px2: i32, py2: i
     render::pixels_patch(world, world.meta(), px1, py1, px2, py2, cap).into()
 }
 
-/// `render_pixels_patch` with a level-of-detail step (audit H6).
+/// `render_pixels_patch` with a level-of-detail step (audit H6). Test-only since 13.2 — production
+/// renders go through `render_pixels_patch_styled`.
+#[cfg(test)]
 fn render_pixels_patch_lod(
     world: &LoadedWorld, px1: i32, py1: i32, px2: i32, py2: i32, cap: Option<i32>, lod: u32,
 ) -> PixelPatch {
     render::pixels_patch_lod(world, world.meta(), px1, py1, px2, py2, cap, lod).into()
+}
+
+/// `render_pixels_patch_lod` with the full map style (cutaway cap + relief shading, Stage 13.2).
+fn render_pixels_patch_styled(
+    world: &LoadedWorld, px1: i32, py1: i32, px2: i32, py2: i32, style: MapStyle, lod: u32,
+) -> PixelPatch {
+    render::pixels_patch_styled(world, world.meta(), px1, py1, px2, py2, style, lod).into()
 }
 
 /// Re-render a sub-rectangle of a z-slice cross-section.
@@ -1922,22 +2037,11 @@ fn render_zslice_patch_lod(
     render::zslice_patch_lod(world, world.meta(), z, px1, py1, px2, py2, lod).into()
 }
 
-/// Front slab (constant world-Y plane). Horizontal axis = world X, vertical axis = world Z.
-fn render_yslice_patch_inner(world: &LoadedWorld, sy: i32, px1: i32, pz1: i32, px2: i32, pz2: i32) -> PixelPatch {
-    render::yslice_patch(world, world.meta(), sy, px1, pz1, px2, pz2).into()
-}
-
-/// Side slab (constant world-X plane). Horizontal axis = world Y, vertical axis = world Z.
-fn render_xslice_patch_inner(world: &LoadedWorld, sx: i32, py1: i32, pz1: i32, py2: i32, pz2: i32) -> PixelPatch {
-    render::xslice_patch(world, world.meta(), sx, py1, pz1, py2, pz2).into()
-}
-
-
 /// Compute the pixel-space bounding box of a set of chunk coordinates and
 /// return a freshly rendered top-down patch for that rectangle.
 /// Used by undo/redo where the affected region is known only as chunk coords.
 fn patch_from_chunk_coords(
-    world: &LoadedWorld, chunks: &[(i32, i32)], cap: Option<i32>, lod: u32,
+    world: &LoadedWorld, chunks: &[(i32, i32)], style: MapStyle, lod: u32,
 ) -> (PixelPatch, bool) {
     if chunks.is_empty() {
         return (PixelPatch { x: 0, y: 0, width: 1, height: 1, lod: 1, pixels: vec![30, 30, 30, 255] }, false);
@@ -1946,7 +2050,7 @@ fn patch_from_chunk_coords(
     let py1 = chunks.iter().map(|&(_, cy)| (cy as i32 - world.min_y) * 16).min().unwrap();
     let px2 = chunks.iter().map(|&(cx, _)| (cx as i32 - world.min_x) * 16 + 15).max().unwrap();
     let py2 = chunks.iter().map(|&(_, cy)| (cy as i32 - world.min_y) * 16 + 15).max().unwrap();
-    edit_patch(world, (px1, py1, px2, py2), cap, lod)
+    edit_patch(world, (px1, py1, px2, py2), style, lod)
 }
 
 /// Largest patch, in *output pixels*, any editing command will ship over IPC (audit C2). Above
@@ -1965,18 +2069,26 @@ const MAX_EDIT_PATCH_PIXELS: u64 = 2_000_000;
 /// tiles at that LOD do — a patch whose origin sat mid-step would be half a step out of phase with
 /// every tile it lands in, which nearest-neighbour blitting cannot correct for.
 fn edit_patch(
-    world: &LoadedWorld, rect: (i32, i32, i32, i32), cap: Option<i32>, lod: u32,
+    world: &LoadedWorld, rect: (i32, i32, i32, i32), style: MapStyle, lod: u32,
 ) -> (PixelPatch, bool) {
-    edit_patch_capped(world, rect, cap, lod, MAX_EDIT_PATCH_PIXELS)
+    edit_patch_capped(world, rect, style, lod, MAX_EDIT_PATCH_PIXELS)
 }
 
 /// `edit_patch` with an explicit pixel ceiling — the cap is a parameter purely so tests can drive
 /// the oversized branch without a fixture world big enough to reach `MAX_EDIT_PATCH_PIXELS`.
 fn edit_patch_capped(
-    world: &LoadedWorld, rect: (i32, i32, i32, i32), cap: Option<i32>, lod: u32, max_pixels: u64,
+    world: &LoadedWorld, rect: (i32, i32, i32, i32), style: MapStyle, lod: u32, max_pixels: u64,
 ) -> (PixelPatch, bool) {
     let lod = lod.clamp(1, MAX_LOD);
-    let (px1, py1, px2, py2) = rect;
+    let (px1, py1, mut px2, mut py2) = rect;
+    // Relief (13.2): a sample's shade reads its W and N neighbours, so an edited column also changes
+    // the samples one step **east and south** of it. Grow the rect by one LOD step there — before
+    // the clamps, the LOD floor and the size ceiling, so all three see the rect actually rendered.
+    // Every edit/undo/redo patch passes through here (`patch_from_chunk_coords` included).
+    if style.relief_on().is_some() {
+        px2 = px2.saturating_add(lod as i32);
+        py2 = py2.saturating_add(lod as i32);
+    }
     let world_w = (world.w_chunks * 16) as i32;
     let world_h = (world.h_chunks * 16) as i32;
     let x1 = px1.clamp(0, world_w - 1);
@@ -1997,7 +2109,7 @@ fn edit_patch_capped(
                     width, height, lod, max_pixels);
         return (PixelPatch { x: x1 as u32, y: y1 as u32, width, height, lod, pixels: Vec::new() }, true);
     }
-    (render_pixels_patch_lod(world, x1, y1, x2, y2, cap, lod), false)
+    (render_pixels_patch_styled(world, x1, y1, x2, y2, style, lod), false)
 }
 
 // ── Orthographic selection preview ────────────────────────────────────────────
@@ -2572,12 +2684,20 @@ fn decode_template_surface(data: &[u8], col_offset: usize, sky: u8) -> Option<Bo
 /// regular saves which use i16+u16+u32). Stores mmap + directory in WorldState.
 /// Grab/release the OS cursor at the window level for the 3D pane's mouselook camera.
 ///
-/// WKWebView on macOS doesn't grant the browser Pointer Lock API, so we lock at the Tauri window
-/// layer instead — identical behaviour on macOS/Windows/Linux. macOS `set_cursor_grab` disassociates
-/// the cursor via `CGAssociateMouseAndMouseCursorPosition`, so mouse *delta* events keep flowing to
-/// JS (`movementX/Y`) even while the cursor is frozen — exactly what the look camera reads.
-/// `set_cursor_visible(false)` hides it across the whole app while grabbed. The frontend must always
-/// release (`locked:false`) on exit/blur/unmount, or the cursor stays frozen app-wide.
+/// ⚠️ **Not identical across platforms, and the frontend now only calls this as a fallback.**
+/// WKWebView on macOS doesn't grant the browser Pointer Lock API, so macOS always falls back to this
+/// window-level grab: `set_cursor_grab` there disassociates the cursor via
+/// `CGAssociateMouseAndMouseCursorPosition`, so mouse *delta* events keep flowing to JS
+/// (`movementX/Y`) even while the cursor is frozen in place — exactly what the look camera reads.
+/// On Windows, tao's `set_cursor_grab(true)` is `ClipCursor` to the whole window's *client rect*
+/// (`CursorFlags::GRABBED`) — that **confines**, it doesn't lock: the hidden cursor keeps moving,
+/// wanders off the 3D pane onto the ribbon/map/sidebar (clicks land there), and once it reaches the
+/// window edge `movementX/Y` go to 0 so mouselook stops turning. WebView2 (Chromium) supports the
+/// standard Pointer Lock API, which both confines *and* locks — `FlyView3D.tsx`'s
+/// `setNativeCursorLock` tries `canvas.requestPointerLock()` first and only calls this command when
+/// that's unavailable or refused (i.e. WKWebView). `set_cursor_visible(false)` hides the cursor
+/// across the whole app while grabbed. The frontend must always release (`locked:false`) on
+/// exit/blur/unmount, or the cursor stays frozen app-wide.
 #[tauri::command]
 fn set_cursor_lock(window: tauri::Window, locked: bool) -> Result<(), String> {
     window.set_cursor_grab(locked).map_err(|e| e.to_string())?;
@@ -3095,7 +3215,7 @@ fn fetch_tile(
 ) -> Result<PixelPatch, String> {
     let ws = read_ws(&state);
     let world = ws.world.as_ref().ok_or("No world loaded")?;
-    let patch = render_pixels_patch_lod(world, x1, y1, x2, y2, ws.view_cap_z, lod.unwrap_or(1));
+    let patch = render_pixels_patch_styled(world, x1, y1, x2, y2, ws.map_style(), lod.unwrap_or(1));
     log_band_scan_savings(world, x1, y1, x2, y2);
     Ok(patch)
 }
@@ -3170,6 +3290,15 @@ fn chunk_occupancy(
 /// Set (or clear) the cutaway ceiling. `None` restores the normal "true surface" view.
 /// Every top-down render and every surface-consulting edit path reads this off `WorldState`,
 /// so the frontend only has to set it once per mode/slider change (then refetch its tiles).
+/// Set the top-down map's relief (hillshade) strength — percent of the default, `None`/0 = off
+/// (Stage 13.2). A preference, so it's allowed with no world loaded and survives loads; the
+/// frontend refetches its tiles once this resolves, exactly as after `set_view_cap`.
+#[tauri::command(async)]
+fn set_view_relief(strength: Option<u8>, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    write_ws(&state).view_relief = strength.filter(|&s| s > 0);
+    Ok(())
+}
+
 #[tauri::command(async)]
 fn set_view_cap(cap: Option<i32>, state: tauri::State<'_, AppState>) -> Result<(), String> {
     let mut ws = write_ws(&state);
@@ -3228,50 +3357,35 @@ fn render_zslice_patch(
     Ok(render_zslice_patch_lod(world, z, x1 as i32, y1 as i32, x2 as i32, y2 as i32, lod.unwrap_or(1)))
 }
 
-/// Front-slab tile: constant world-Y plane. Horizontal = X (x1..x2), vertical = Z (z1..z2).
-/// Tiled, O(1) per pixel. Used by the front viewport in multi-viewport mode.
-#[tauri::command(async)]
-fn render_yslice_patch(
-    y: i32, x1: i32, z1: i32, x2: i32, z2: i32,
-    state: tauri::State<'_, AppState>,
-) -> Result<PixelPatch, String> {
-    let t0 = Instant::now();
-    let ws = read_ws(&state);
-    let world = ws.world.as_ref().ok_or("No world loaded")?;
-    let world_h = (world.h_chunks * 16) as i32;
-    if y < 0 || y >= world_h {
-        return Err(format!("Y must be 0–{}, got {y}", world_h - 1));
-    }
-    let patch = render_yslice_patch_inner(world, y, x1, z1, x2, z2);
-    timing_log!("[SLAB] render_yslice_patch  {}×{}  elapsed={}µs",
-        patch.width, patch.height, t0.elapsed().as_micros());
-    Ok(patch)
-}
-
-/// Side-slab tile: constant world-X plane. Horizontal = Y (y1..y2), vertical = Z (z1..z2).
-/// Tiled, O(1) per pixel. Used by the side viewport in multi-viewport mode.
-#[tauri::command(async)]
-fn render_xslice_patch(
-    x: i32, y1: i32, z1: i32, y2: i32, z2: i32,
-    state: tauri::State<'_, AppState>,
-) -> Result<PixelPatch, String> {
-    let t0 = Instant::now();
-    let ws = read_ws(&state);
-    let world = ws.world.as_ref().ok_or("No world loaded")?;
-    let world_w = (world.w_chunks * 16) as i32;
-    if x < 0 || x >= world_w {
-        return Err(format!("X must be 0–{}, got {x}", world_w - 1));
-    }
-    let patch = render_xslice_patch_inner(world, x, y1, z1, y2, z2);
-    timing_log!("[SLAB] render_xslice_patch  {}×{}  elapsed={}µs",
-        patch.width, patch.height, t0.elapsed().as_micros());
-    Ok(patch)
-}
-
-/// Cap on the scan-buffer clone `render_selection_view`/`render_full_height_view` build before
-/// rendering a preview. Without this, ⌘A on a large world with the sidebar open clones the whole
-/// world (potentially the full mmap) under the lock on every selection/edit change (audit C5).
+/// Cap on the selection area `render_selection_view`/`render_full_height_view` will render under
+/// the read guard. Since the 2026-09 preview-hygiene pass (RAM-6 / 11.5) neither command clones
+/// the world into a scan buffer any more — they render straight off the real world — so this no
+/// longer bounds an allocation, only how long one preview may hold the read guard (which blocks
+/// edits, not other readers). The unit is unchanged (chunks × the bytes a scan would have
+/// copied) so the error thresholds users already see stay the same.
 const MAX_PREVIEW_BYTES: usize = 128 * 1024 * 1024; // 128 MB
+
+/// Read-only `VoxelView` over the real world for the preview renderers: `chunk_bytes` is truncated
+/// at each chunk's `top_band_hint` ceiling, so the renderers' `pi < chunk.len()` guard reads every
+/// band above it as air *without touching those pages*. That is what the old scan-buffer clone
+/// achieved with `fill(0)` (audit R2-3), minus the copy — same one-directional hint contract, so a
+/// too-low hint is still observable (see the hint test) and a too-high one is merely slower.
+struct HintClamped<'a>(&'a LoadedWorld);
+
+impl VoxelView for HintClamped<'_> {
+    #[inline]
+    fn num_bands(&self) -> usize { self.0.num_bands() }
+    #[inline]
+    fn chunk_origin(&self) -> (i32, i32) { self.0.chunk_origin() }
+    #[inline]
+    fn chunk_bytes(&self, cx: i32, cy: i32) -> Option<&[u8]> {
+        let chunk = self.0.chunk_bytes(cx, cy)?;
+        let ceil = scan_band_ceiling(self.0, cx, cy) * 8192;
+        Some(&chunk[..chunk.len().min(ceil)])
+    }
+    #[inline]
+    fn top_band_hint(&self, cx: i32, cy: i32) -> usize { self.0.top_band_hint(cx, cy) }
+}
 
 #[tauri::command(async)]
 fn render_selection_view(
@@ -3286,96 +3400,44 @@ fn render_selection_view(
     timing_log!("[PREVIEW] start  cmd=render_selection_view  view={view}  sel={}×{}×{}  z={z_min}–{z_max}",
         x2-x1+1, y2-y1+1, z_max-z_min+1);
 
-    // Only the bands that overlap [z_min, z_max] are needed. Cloning a band-scoped
-    // slice cuts the mutex hold time proportionally (e.g. 4× for a z=0–63 query
-    // in a 256-layer world, where only 4 of 16 bands are relevant).
+    // Rendered under the read guard directly off the real world (RAM-6 / 11.5): no band-scoped
+    // scan-buffer clone, so an edit burst no longer allocates and page-touches up to 128 MB per
+    // refresh. Only writers wait, and only for one preview render (bounded by the size cap below).
     let b_lo = (z_min as usize) / 16;
     let b_hi = (z_max as usize) / 16;
-    let bands_per_chunk = b_hi - b_lo + 1;
-    let local_band_bytes = bands_per_chunk * 8192;
+    let local_band_bytes = (b_hi - b_lo + 1) * 8192;
 
     timing_log!("[LOCK] acquire_start  cmd=render_selection_view  t=+{}µs", us());
     let t_lock = Instant::now();
-    let mut sel_mask: Option<SelectionMask> = None;
-    let scan_world = {
-        let ws = read_ws(&state);
-        let wait = t_lock.elapsed().as_micros();
-        timing_log!("[LOCK] acquired  cmd=render_selection_view  wait={}µs", wait);
-        let t_held = Instant::now();
+    let ws = read_ws(&state);
+    timing_log!("[LOCK] acquired  cmd=render_selection_view  wait={}µs", t_lock.elapsed().as_micros());
+    let world = ws.world.as_ref().ok_or("No world loaded")?;
+    validate_selection(x1, y1, x2, y2, z_min, z_max, world_max_z(world))?;
+    // Resolve the shaped-selection mask while we still hold the lock (fail-safe: exact bbox).
+    let sel_mask = active_mask(&ws, x1, y1, x2, y2);
 
-        let world = ws.world.as_ref().ok_or("No world loaded")?;
-        validate_selection(x1, y1, x2, y2, z_min, z_max, world_max_z(world))?;
-        // Resolve the shaped-selection mask while we still hold the lock (fail-safe: exact bbox).
-        sel_mask = active_mask(&ws, x1, y1, x2, y2);
-
-        let cx_lo = x1 / 16 + world.min_x;
-        let cx_hi = x2 / 16 + world.min_x;
-        let cy_lo = y1 / 16 + world.min_y;
-        let cy_hi = y2 / 16 + world.min_y;
-
-        let n_sel = ((cx_hi - cx_lo + 1) as i64 * (cy_hi - cy_lo + 1) as i64).max(0) as usize;
-        let total_bytes = n_sel.saturating_mul(local_band_bytes);
-        if total_bytes > MAX_PREVIEW_BYTES {
-            return Err(format!(
-                "Selection too large to preview ({} chunks, {} MB) — the preview limit is {} MB. Select a smaller region.",
-                n_sel, total_bytes / (1024 * 1024), MAX_PREVIEW_BYTES / (1024 * 1024)
-            ));
-        }
-        // Fill the anon mmap directly instead of building an intermediate Vec and copying it in —
-        // that used to be a 2× peak allocation for no benefit (audit C5). Iterate the bounded
-        // cx/cy window (not the whole `chunk_map`) so cost scales with the selection, not the
-        // world's total chunk count.
-        let mut local_bytes = MmapOptions::new().len(n_sel * local_band_bytes.max(1)).map_anon()
-            .map_err(|e| format!("Failed to allocate scan buffer: {e}"))?;
-        let mut local_map: FxHashMap<(i32, i32), usize> = FxHashMap::with_capacity_and_hasher(n_sel, Default::default());
-        let mut local_addr = 0usize;
-        for cx in cx_lo..=cx_hi {
-            for cy in cy_lo..=cy_hi {
-                let Some((addr, cend)) = world.chunk_range(cx, cy) else { continue };
-                let dst = local_addr;
-                for band in b_lo..=b_hi {
-                    let src = addr + band * 8192;
-                    let out = &mut local_bytes[dst + (band - b_lo) * 8192..dst + (band - b_lo + 1) * 8192];
-                    if src + 8192 <= cend {
-                        out.copy_from_slice(&world.bytes[src..src + 8192]);
-                    } else {
-                        // Bands past the chunk's real span belong to the *next* chunk (see
-                        // `LoadedWorld::chunk_span`) — zero-fill instead of cloning a neighbour's
-                        // data in, so the scan world stays a full-span buffer the renderers can
-                        // read without knowing about spans at all.
-                        out.fill(0);
-                    }
-                }
-                local_map.insert((cx, cy), local_addr);
-                local_addr += local_band_bytes;
-            }
-        }
-        let result = LoadedWorld {
-            // Full-span scratch buffer by construction (short-span bands were zero-filled above).
-            bytes: local_bytes, chunk_map: local_map, chunk_span: FxHashMap::default(),
-            min_x: world.min_x, min_y: world.min_y,
-            w_chunks: world.w_chunks, h_chunks: world.h_chunks,
-            chunk_size: local_band_bytes, num_bands: bands_per_chunk,
-            sky: world.sky, name: String::new(), dir_trailer: Vec::new(),
-            // Inert here: the ortho renderers this scan buffer feeds address it in *clone*-band
-            // space (`b_lo`), never through `top_band_hint`, so the grid is never queried and
-            // therefore never allocated (see `TopBandHints::cells`).
-            top_bands: TopBandHints::new(world.min_x, world.min_y, world.w_chunks, world.h_chunks),
-        };
-        drop(ws);  // explicit drop — lock released here, before any scanning
-        timing_log!("[LOCK] released  cmd=render_selection_view  held={}µs  cloned={}B  bands={}/{}  t=+{}µs",
-            t_held.elapsed().as_micros(), result.bytes.len(), bands_per_chunk, (b_hi - b_lo + 1), us());
-        result
-    };
+    let n_sel = (((x2 / 16 - x1 / 16 + 1) as i64) * ((y2 / 16 - y1 / 16 + 1) as i64)).max(0) as usize;
+    let total_bytes = n_sel.saturating_mul(local_band_bytes);
+    if total_bytes > MAX_PREVIEW_BYTES {
+        return Err(format!(
+            "Selection too large to preview ({} chunks, {} MB) — the preview limit is {} MB. Select a smaller region.",
+            n_sel, total_bytes / (1024 * 1024), MAX_PREVIEW_BYTES / (1024 * 1024)
+        ));
+    }
 
     timing_log!("[SCAN] start  cmd=render_selection_view  t=+{}µs", us());
     let t_scan = Instant::now();
     let mask = sel_mask.as_ref();
+    // `b_lo = 0`: the real chunk slice starts at band 0 (the old clone was band-scoped, so it
+    // passed the real `b_lo`).
+    let clamped = HintClamped(world);
+    let meta = world.meta();
     let (width, height, pixels) = match view.as_str() {
-        "front" => render::view_front(&scan_world, scan_world.meta(), x1, x2, y1, y2, z_min, z_max, b_lo, mask),
-        "side"  => render::view_side(&scan_world, scan_world.meta(), x1, x2, y1, y2, z_min, z_max, b_lo, mask),
-        _       => render::view_top(&scan_world, scan_world.meta(), x1, x2, y1, y2, z_min, z_max, b_lo, mask),
+        "front" => render::view_front(&clamped, meta, x1, x2, y1, y2, z_min, z_max, 0, mask),
+        "side"  => render::view_side(&clamped, meta, x1, x2, y1, y2, z_min, z_max, 0, mask),
+        _       => render::view_top(&clamped, meta, x1, x2, y1, y2, z_min, z_max, 0, mask),
     };
+    drop(ws);
     timing_log!("[SCAN] end  cmd=render_selection_view  elapsed={}ms  result={}×{}", t_scan.elapsed().as_millis(), width, height);
     timing_log!("[PREVIEW] end  cmd=render_selection_view  pixels={}B  total={}ms", pixels.len(), t0.elapsed().as_millis());
     Ok(PreviewData { width, height, pixels })
@@ -3396,6 +3458,10 @@ fn render_full_height_view(
 
 /// Core of `render_full_height_view`, factored out so it's callable from tests with a bare
 /// `AppState` (mirrors the `_inner` convention used elsewhere in this file, e.g. `autosave_world_inner`).
+///
+/// Renders under the read guard straight off the real world (RAM-6): the front and side panels each
+/// used to clone the same chunks into their own anonymous scan buffer (up to 128 MB apiece); now
+/// neither copies anything, and `HintClamped` keeps the air pages above each chunk's terrain cold.
 fn render_full_height_view_inner(
     state: &AppState,
     x1: i32, y1: i32, x2: i32, y2: i32,
@@ -3407,72 +3473,33 @@ fn render_full_height_view_inner(
     }
 
     let ctx = context_blocks.max(0);
-    let (scan_world, z_max) = {
-        let ws = read_ws(state);
-        let world = ws.world.as_ref().ok_or("No world loaded")?;
+    let ws = read_ws(state);
+    let world = ws.world.as_ref().ok_or("No world loaded")?;
 
-        let z_max        = world_max_z(world);
-        let chunk_size   = world.chunk_size;
-        let num_bands    = world.num_bands;
-        // Expand clone region by one extra chunk in all directions to cover context blocks.
-        let ctx_chunks = ctx / 16 + 1;
-        let cx_lo = x1.div_euclid(16) + world.min_x - ctx_chunks;
-        let cx_hi = x2.div_euclid(16) + world.min_x + ctx_chunks;
-        let cy_lo = y1.div_euclid(16) + world.min_y - ctx_chunks;
-        let cy_hi = y2.div_euclid(16) + world.min_y + ctx_chunks;
+    let z_max = world_max_z(world);
+    // Same size guard as before (one chunk of margin each side for the context columns) — now a
+    // read-guard hold bound rather than an allocation bound; see `MAX_PREVIEW_BYTES`.
+    let ctx_chunks = ctx / 16 + 1;
+    let cx_lo = x1.div_euclid(16) - ctx_chunks;
+    let cx_hi = x2.div_euclid(16) + ctx_chunks;
+    let cy_lo = y1.div_euclid(16) - ctx_chunks;
+    let cy_hi = y2.div_euclid(16) + ctx_chunks;
+    let n_sel = ((cx_hi - cx_lo + 1) as i64 * (cy_hi - cy_lo + 1) as i64).max(0) as usize;
+    let total_bytes = n_sel.saturating_mul(world.chunk_size);
+    if total_bytes > MAX_PREVIEW_BYTES {
+        return Err(format!(
+            "Selection too large to preview ({} chunks, {} MB) — the preview limit is {} MB. Select a smaller region.",
+            n_sel, total_bytes / (1024 * 1024), MAX_PREVIEW_BYTES / (1024 * 1024)
+        ));
+    }
 
-        let n_sel = ((cx_hi - cx_lo + 1) as i64 * (cy_hi - cy_lo + 1) as i64).max(0) as usize;
-        let total_bytes = n_sel.saturating_mul(chunk_size);
-        if total_bytes > MAX_PREVIEW_BYTES {
-            return Err(format!(
-                "Selection too large to preview ({} chunks, {} MB) — the preview limit is {} MB. Select a smaller region.",
-                n_sel, total_bytes / (1024 * 1024), MAX_PREVIEW_BYTES / (1024 * 1024)
-            ));
-        }
-        // Fill the anon mmap directly (no intermediate Vec) and iterate the bounded cx/cy window
-        // (not the whole `chunk_map`) instead of scanning every chunk in the world to find the
-        // handful in range — audit C5, same fix as `render_selection_view`.
-        let mut local_bytes = MmapOptions::new().len(n_sel.max(1) * chunk_size).map_anon()
-            .map_err(|e| format!("Failed to allocate scan buffer: {e}"))?;
-        let mut local_map: FxHashMap<(i32, i32), usize> = FxHashMap::with_capacity_and_hasher(n_sel, Default::default());
-        let mut local_addr = 0usize;
-        for cx in cx_lo..=cx_hi {
-            for cy in cy_lo..=cy_hi {
-                let Some((addr, cend)) = world.chunk_range(cx, cy) else { continue };
-                // Copy only what the chunk owns (`chunk_span`), zero-padding the rest: bytes past
-                // a short span are the next chunk's, and cloning them in would render another
-                // chunk's terrain inside this one. Also skip bands above `top_band_hint` (audit
-                // R2-3) — those are air by contract (`view.rs`'s one-directional hint guarantee),
-                // and `view_front_ctx`/`view_side_ctx` already skip air, so `fill(0)` there instead
-                // of `copy_from_slice` is output-identical while touching far fewer source pages
-                // (128 MB of fresh page touches per preview refresh on a tall, mostly-air world,
-                // repeated on every 150ms-debounced tick during a sculpt stroke).
-                let span = cend - addr;
-                let copy_end = span.min(scan_band_ceiling(world, cx, cy) * 8192);
-                let out = &mut local_bytes[local_addr..local_addr + chunk_size];
-                out[..copy_end].copy_from_slice(&world.bytes[addr..addr + copy_end]);
-                out[copy_end..].fill(0);
-                local_map.insert((cx, cy), local_addr);
-                local_addr += chunk_size;
-            }
-        }
-
-        let scan_world = LoadedWorld {
-            // Full-span scratch buffer by construction (see the span-clamped copy above).
-            bytes: local_bytes, chunk_map: local_map, chunk_span: FxHashMap::default(),
-            min_x: world.min_x, min_y: world.min_y,
-            w_chunks: world.w_chunks, h_chunks: world.h_chunks,
-            chunk_size, num_bands, sky: world.sky, name: String::new(), dir_trailer: Vec::new(),
-            top_bands: TopBandHints::new(world.min_x, world.min_y, world.w_chunks, world.h_chunks),
-        };
-        drop(ws);
-        (scan_world, z_max)
-    };
-
+    let clamped = HintClamped(world);
+    let meta = world.meta();
     let (width, height, pixels) = match view.as_str() {
-        "front" => render::view_front_ctx(&scan_world, scan_world.meta(), x1, x2, y1, y2, z_max, ctx),
-        _       => render::view_side_ctx(&scan_world, scan_world.meta(), x1, x2, y1, y2, z_max, ctx),
+        "front" => render::view_front_ctx(&clamped, meta, x1, x2, y1, y2, z_max, ctx),
+        _       => render::view_side_ctx(&clamped, meta, x1, x2, y1, y2, z_max, ctx),
     };
+    drop(ws);
     Ok(PreviewData { width, height, pixels })
 }
 
@@ -4007,26 +4034,90 @@ fn snapshot_chunks_full(
     z_range: Option<(i32, i32)>,
 ) -> Vec<(i32, i32, u32, Vec<u8>)> {
     coords.iter().filter_map(|&(cx, cy)| {
-        // The chunk's *real* span, not `chunk_size`: capturing a short-span chunk's nominal window
-        // would pull the next chunk's bytes into this chunk's undo delta, and restoring it would
-        // then write them back at the same (wrong) address.
-        let (addr, cend) = world.chunk_range(cx, cy)?;
-        let (start, end) = match z_range {
-            Some((z_min, z_max)) => {
-                let last_band = world.num_bands.saturating_sub(1);
-                let band_lo = (z_min.max(0) as usize / 16).min(last_band);
-                let band_hi = (z_max.max(0) as usize / 16).min(last_band);
-                let s = (addr + band_lo * 8192).min(cend);
-                let e = (addr + (band_hi + 1) * 8192).min(cend);
-                (s, e)
-            }
-            None => (addr, cend),
-        };
-        if end <= start { return None; }
-        let start_off = (start - addr) as u32;
+        let (addr, start, end) = preimage_span(world, cx, cy, z_range)?;
         let data = world.bytes[start..end].to_vec();
-        Some((cx, cy, start_off, data))
+        Some((cx, cy, (start - addr) as u32, data))
     }).collect()
+}
+
+/// The absolute byte window `snapshot_chunks_full` captures for one chunk: `(chunk addr, start,
+/// end)`. Shared with `preimage_bytes` so the byte guard prices exactly what the snapshot copies.
+///
+/// The chunk's *real* span (`chunk_range`), not `chunk_size`: capturing a short-span chunk's nominal
+/// window would pull the next chunk's bytes into this chunk's undo delta, and restoring it would
+/// then write them back at the same (wrong) address.
+fn preimage_span(
+    world: &LoadedWorld,
+    cx: i32, cy: i32,
+    z_range: Option<(i32, i32)>,
+) -> Option<(usize, usize, usize)> {
+    let (addr, cend) = world.chunk_range(cx, cy)?;
+    let (start, end) = match z_range {
+        Some((z_min, z_max)) => {
+            let last_band = world.num_bands.saturating_sub(1);
+            let band_lo = (z_min.max(0) as usize / 16).min(last_band);
+            let band_hi = (z_max.max(0) as usize / 16).min(last_band);
+            let s = (addr + band_lo * 8192).min(cend);
+            let e = (addr + (band_hi + 1) * 8192).min(cend);
+            (s, e)
+        }
+        None => (addr, cend),
+    };
+    if end <= start { return None; }
+    Some((addr, start, end))
+}
+
+/// Total bytes `snapshot_chunks_full(world, coords, z_range)` would allocate.
+fn preimage_bytes(world: &LoadedWorld, coords: &[(i32, i32)], z_range: Option<(i32, i32)>) -> usize {
+    coords.iter()
+        .filter_map(|&(cx, cy)| preimage_span(world, cx, cy, z_range))
+        .map(|(_, s, e)| e - s)
+        .sum()
+}
+
+/// Multiple of `undo_budget` above which an unbounded-pre-image edit is refused (audit RAM-1 /
+/// row 18.2). The pre-image is transient and uncompressed while the stored entry is usually far
+/// smaller, so this is deliberately looser than the budget itself — but an edit whose *pre-image*
+/// alone is this large would have its (equally huge) undo entry dropped by `finish_edit` anyway,
+/// and the allocation can abort the process on a low-memory machine.
+const PREIMAGE_GUARD_FACTOR: usize = 4;
+
+/// Refuse an edit whose pre-image would exceed `PREIMAGE_GUARD_FACTOR × undo_budget`.
+fn check_preimage_budget(bytes: usize, undo_budget: usize) -> Result<(), String> {
+    let limit = undo_budget.saturating_mul(PREIMAGE_GUARD_FACTOR);
+    if bytes > limit {
+        let mb = |b: usize| b as f64 / (1024.0 * 1024.0);
+        return Err(format!(
+            "This edit would need to snapshot {:.0} MB of world data for undo, over the {:.0} MB limit. Select a smaller region.",
+            mb(bytes), mb(limit)
+        ));
+    }
+    Ok(())
+}
+
+/// Unique existing chunks covered by a set of world-pixel cells, sorted for determinism.
+fn chunks_for_cells(world: &LoadedWorld, cells: impl Iterator<Item = (i32, i32)>) -> Vec<(i32, i32)> {
+    let mut set: HashSet<(i32, i32)> = HashSet::new();
+    for (x, y) in cells {
+        if x < 0 || y < 0 { continue; }
+        let key = (x / 16 + world.min_x, y / 16 + world.min_y);
+        if world.chunk_map.contains_key(&key) { set.insert(key); }
+    }
+    let mut v: Vec<_> = set.into_iter().collect();
+    v.sort_unstable();
+    v
+}
+
+/// Unique existing chunks under the union of pixel rects (`(x1, y1, x2, y2)` inclusive), sorted.
+fn chunks_for_rects(world: &LoadedWorld, rects: impl Iterator<Item = (i32, i32, i32, i32)>) -> Vec<(i32, i32)> {
+    let mut set: HashSet<(i32, i32)> = HashSet::new();
+    for (x1, y1, x2, y2) in rects {
+        if x2 < 0 || y2 < 0 || x1 > x2 || y1 > y2 { continue; }
+        set.extend(affected_chunk_coords(world, x1.max(0), y1.max(0), x2, y2));
+    }
+    let mut v: Vec<_> = set.into_iter().collect();
+    v.sort_unstable();
+    v
 }
 
 /// Compares `pre` (bytes captured before an edit, starting at chunk-relative offset `start_off`)
@@ -4092,9 +4183,10 @@ fn restore_and_invert(world: &mut LoadedWorld, entry: &UndoEntry) -> Vec<ChunkSn
     entry.chunks.iter().filter_map(|snap| {
         let (addr, cend) = world.chunk_range(snap.cx, snap.cy)?;
         match &snap.delta {
-            ChunkDelta::Sparse(pairs) => {
+            ChunkDelta::Sparse(_) | ChunkDelta::SparseZ(..) => {
+                let pairs = snap.delta.sparse_pairs()?;
                 let mut inverse = Vec::with_capacity(pairs.len());
-                for &(off, orig) in pairs {
+                for &(off, orig) in pairs.iter() {
                     let idx = addr + off as usize;
                     if idx >= cend { continue; }
                     inverse.push((off, world.bytes[idx]));
@@ -4262,6 +4354,7 @@ impl tauri::ipc::IpcResponse for EditResult {
 /// beyond `patch_rect`, e.g. tree canopies spilling into neighboring chunks); `patch_rect`
 /// bounds the pixels returned to the frontend. If `edit` returns `Err`, the world is
 /// still reinstalled before the error propagates — callers can bail mid-edit freely.
+#[cfg_attr(not(test), allow(dead_code))]
 fn with_edit<F>(
     ws: &mut WorldState,
     operation: &str,
@@ -4272,7 +4365,45 @@ fn with_edit<F>(
 where
     F: FnOnce(&mut LoadedWorld) -> Result<(), String>,
 {
-    with_edit_inner(ws, operation, snap_rect, patch_rect, None, None, edit)
+    with_edit_inner(ws, operation, SnapScope::Rect(snap_rect), patch_rect, None, None, false, edit)
+}
+
+/// `with_edit` for edits whose write region is known to a *chunk set* (and optionally a z interval)
+/// tighter than any rect — flood/surface fill, scatter, array, terrain paste (row 18.2). The
+/// pre-image covers exactly `chunks`, and the pre-image byte guard is on.
+fn with_edit_chunks<F>(
+    ws: &mut WorldState,
+    operation: &str,
+    chunks: Vec<(i32, i32)>,
+    patch_rect: (i32, i32, i32, i32),
+    z_range: Option<(i32, i32)>,
+    edit: F,
+) -> Result<EditResult, String>
+where
+    F: FnOnce(&mut LoadedWorld) -> Result<(), String>,
+{
+    with_edit_inner(ws, operation, SnapScope::Chunks(chunks), patch_rect, None, z_range, true, edit)
+}
+
+/// `with_edit` plus the pre-image byte guard, for edits whose rect can be far larger than what they
+/// write and that aren't otherwise volume-validated (trees, flow, pool, wavy, extrude — row 18.2).
+fn with_edit_guarded<F>(
+    ws: &mut WorldState,
+    operation: &str,
+    snap_rect: (i32, i32, i32, i32),
+    patch_rect: (i32, i32, i32, i32),
+    edit: F,
+) -> Result<EditResult, String>
+where
+    F: FnOnce(&mut LoadedWorld) -> Result<(), String>,
+{
+    with_edit_inner(ws, operation, SnapScope::Rect(snap_rect), patch_rect, None, None, true, edit)
+}
+
+/// What `with_edit_inner` snapshots for undo: every chunk under a rect, or an explicit chunk set.
+enum SnapScope {
+    Rect((i32, i32, i32, i32)),
+    Chunks(Vec<(i32, i32)>),
 }
 
 /// `with_edit`, but scoped to the z-bands `z_min..=z_max` overlap for the undo snapshot/diff
@@ -4291,7 +4422,7 @@ fn with_edit_zscoped<F>(
 where
     F: FnOnce(&mut LoadedWorld) -> Result<(), String>,
 {
-    with_edit_inner(ws, operation, snap_rect, patch_rect, None, Some(z_range), edit)
+    with_edit_inner(ws, operation, SnapScope::Rect(snap_rect), patch_rect, None, Some(z_range), false, edit)
 }
 
 /// Group-tagged sibling of `with_edit`: identical, but stamps the resulting `UndoEntry` with
@@ -4315,16 +4446,17 @@ fn with_edit_grouped<F>(
 where
     F: FnOnce(&mut LoadedWorld) -> Result<(), String>,
 {
-    with_edit_inner(ws, operation, snap_rect, patch_rect, group, z_range, edit)
+    with_edit_inner(ws, operation, SnapScope::Rect(snap_rect), patch_rect, group, z_range, false, edit)
 }
 
 fn with_edit_inner<F>(
     ws: &mut WorldState,
     operation: &str,
-    snap_rect: (i32, i32, i32, i32),
+    scope: SnapScope,
     patch_rect: (i32, i32, i32, i32),
     group: Option<u64>,
     z_range: Option<(i32, i32)>,
+    guard_preimage: bool,
     edit: F,
 ) -> Result<EditResult, String>
 where
@@ -4337,17 +4469,26 @@ where
         ws.sculpt_session = None;
     }
 
-    let cap = ws.view_cap_z;
+    let style = ws.map_style();
     let view_lod = ws.view_lod;
     let mut world = ws.world.take().ok_or("No world loaded")?;
 
-    let (sx1, sy1, sx2, sy2) = snap_rect;
-    let affected = if sx1 > sx2 || sy1 > sy2 {
-        vec![]
-    } else {
-        affected_chunk_coords(&world, sx1, sy1, sx2, sy2)
+    let affected = match scope {
+        SnapScope::Rect((sx1, sy1, sx2, sy2)) => if sx1 > sx2 || sy1 > sy2 {
+            vec![]
+        } else {
+            affected_chunk_coords(&world, sx1, sy1, sx2, sy2)
+        },
+        SnapScope::Chunks(c) => c,
     };
+    if guard_preimage {
+        if let Err(e) = check_preimage_budget(preimage_bytes(&world, &affected, z_range), ws.undo_budget) {
+            ws.world = Some(world);
+            return Err(e);
+        }
+    }
     let pre_full = snapshot_chunks_full(&world, &affected, z_range);
+    mem::PEAKS.edit_preimage.record(pre_full.iter().map(|p| p.3.len() as u64).sum());
 
     if let Err(e) = edit(&mut world) {
         ws.world = Some(world);
@@ -4359,7 +4500,7 @@ where
     // `affected` is a superset of the chunks that actually changed, which is the safe direction.
     world.invalidate_top_bands(&affected);
 
-    let (patch, invalidate) = edit_patch(&world, patch_rect, cap, view_lod);
+    let (patch, invalidate) = edit_patch(&world, patch_rect, style, view_lod);
     let pre_snap: Vec<ChunkSnapshot> = pre_full.into_iter()
         .filter_map(|(cx, cy, start_off, pre)| diff_chunk(&world, cx, cy, start_off, &pre))
         .collect();
@@ -4413,8 +4554,9 @@ fn count_new_block_types(world: &LoadedWorld, snaps: &[ChunkSnapshot]) -> [u32; 
     for snap in snaps {
         let Some((addr, cend)) = world.chunk_range(snap.cx, snap.cy) else { continue };
         match &snap.delta {
-            ChunkDelta::Sparse(pairs) => {
-                for &(off, _prev) in pairs {
+            ChunkDelta::Sparse(_) | ChunkDelta::SparseZ(..) => {
+                let Some(pairs) = snap.delta.sparse_pairs() else { continue };
+                for &(off, _prev) in pairs.iter() {
                     let off = off as usize;
                     if off % 8192 >= 4096 { continue; } // paint byte
                     let idx = addr + off;
@@ -4505,6 +4647,7 @@ fn finish_edit(
     if !pre_snap.is_empty() {
         let budget = ws.undo_budget;
         let entry = UndoEntry::new(operation, pre_snap, group);
+        mem::PEAKS.edit_delta.record(entry.bytes as u64);
         if entry.bytes > budget {
             timing_log!("[UNDO] entry ({} bytes) exceeds the {} byte budget — dropping history", entry.bytes, budget);
             drop(entry);
@@ -4987,12 +5130,15 @@ fn save_world(
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
     let dest = std::path::PathBuf::from(&path);
+    let t0 = std::time::Instant::now(); // 18.0 `save_*` counters
 
     // Fast path: rewrite only what changed since this file was last written (audit C2 Stage 4). It
     // declines — falling through to the full write below — for a compressed target, an unknown or
     // stale on-disk image, an externally modified destination, or a dirty set too large to be worth
     // patching. Declining never touches the destination.
     if !compressed && try_incremental_save(&state, &path, backup_compressed)? {
+        mem::PEAKS.save_kind.store(1, std::sync::atomic::Ordering::Relaxed);
+        mem::PEAKS.save_ms.record(t0.elapsed().as_millis() as u64);
         return Ok(());
     }
 
@@ -5000,6 +5146,7 @@ fn save_world(
         let ws = read_ws(&state);
         let world = ws.world.as_ref().ok_or("No world loaded")?;
         let seq = ws.dirty.seq;
+        mem::PEAKS.save_bytes.record(world.bytes.len() as u64);
         let op = ops.begin(
             &app, "save",
             if compressed { "Saving (compressed)".into() } else { "Saving".into() },
@@ -5016,7 +5163,10 @@ fn save_world(
     // published a whole, self-consistent file, so an older log's spans could now only *revert* the
     // chunks they cover (they hold bytes captured before whatever went into this write).
     let _ = fs::remove_file(wal_path(&dest));
-    record_full_write(&state, &dest, compressed, seq_at_capture)
+    let r = record_full_write(&state, &dest, compressed, seq_at_capture);
+    mem::PEAKS.save_kind.store(if compressed { 3 } else { 2 }, std::sync::atomic::Ordering::Relaxed);
+    mem::PEAKS.save_ms.record(t0.elapsed().as_millis() as u64);
+    r
 }
 
 /// Release the currently loaded world and everything tied to it — the mmap, clipboard, and the
@@ -5260,6 +5410,7 @@ fn autosave_world_inner(
     source_path: Option<String>,
     progress: AutosaveProgress<'_>,
 ) -> Result<(), String> {
+    let t0 = std::time::Instant::now(); // 18.0 `autosave_*` counters
     // ── Step 0: establish this session's base image BEFORE step 1 captures the tick's spans.
     //
     // The world is mapped MAP_SHARED over the staged temp, so an edit landing while `stage_copy`
@@ -5361,6 +5512,8 @@ fn autosave_world_inner(
                 append_journal(&paths.journal, header, &spans, op.as_ref())?;
             }
             timing_log!("[SAVE] autosave  compact={}  spans={}  bytes={}", compact, spans.len(), total_bytes);
+            mem::PEAKS.autosave_bytes.record(total_bytes);
+            if compact { mem::PEAKS.autosave_compactions.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
             Some((seq_at_capture, world.name.clone()))
         }
     };
@@ -5381,6 +5534,7 @@ fn autosave_world_inner(
     // ── Step 4: write guard, strictly after the read guard above was dropped. The only window an
     // edit can land in is the small meta write just above, and `seq` covers it.
     discharge_autosave_journal(state, base_id, seq_at_capture);
+    mem::PEAKS.autosave_ms.record(t0.elapsed().as_millis() as u64);
 
     Ok(())
 }
@@ -5585,16 +5739,35 @@ fn get_autosave_path(app: tauri::AppHandle) -> Result<String, String> {
     Ok(paths.legacy_data.to_string_lossy().into_owned())
 }
 
-/// Clears the pending autosave — every sidecar format might have left behind. Called after a
-/// successful manual Save/Save As (nothing left to recover) or when the user declines the recovery
-/// prompt.
-#[tauri::command]
-fn discard_autosave(app: tauri::AppHandle) -> Result<(), String> {
-    let paths = autosave_paths(&app)?;
+/// Removes every autosave sidecar file (legacy data, meta, base, journal). Best effort.
+fn remove_autosave_files(paths: &AutosavePaths) {
     let _ = fs::remove_file(&paths.legacy_data);
     let _ = fs::remove_file(&paths.meta);
     let _ = fs::remove_file(&paths.base);
     let _ = fs::remove_file(&paths.journal);
+}
+
+/// Deletes the autosave files **and** forgets the base lineage (audit X-1). `autosave_base_id`
+/// names the `autosave.base.eden` the journal replays onto; once that file is gone the id is a
+/// dangling reference, and the next tick would append to a missing journal or write a journal
+/// against a missing base. Resetting it makes the next tick re-clone the staged temp as a fresh
+/// base. Files are removed *under* the write guard so a tick's `need_new_base` read can't
+/// interleave and see the old id with the files gone. Takes only the write guard, never nests.
+fn discard_autosave_inner(state: &AppState, paths: &AutosavePaths) {
+    let mut ws = write_ws(state);
+    remove_autosave_files(paths);
+    ws.autosave_base_id = None;
+}
+
+/// Clears the pending autosave — every sidecar format might have left behind — and resets the
+/// in-memory base lineage with it. Called after a successful manual Save/Save As (nothing left to
+/// recover), when the user declines the recovery prompt, and on world close. The single entry
+/// point so the files and `autosave_base_id` can never diverge.
+#[tauri::command(async)]
+fn discard_autosave(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let paths = autosave_paths(&app)?;
+    discard_autosave_inner(&state, &paths);
+    timing_log!("[AUTOSAVE] discarded sidecar files, base lineage reset");
     Ok(())
 }
 
@@ -5683,7 +5856,7 @@ fn undo_edit_inner(ws: &mut WorldState) -> Result<EditResult, String> {
     }
 
     mark_dirty_chunks(&mut ws.dirty, Some(&world), &affected);
-    let (patch, invalidate) = patch_from_chunk_coords(&world, &affected, ws.view_cap_z, ws.view_lod);
+    let (patch, invalidate) = patch_from_chunk_coords(&world, &affected, ws.map_style(), ws.view_lod);
     ws.world = Some(world);
 
     Ok(EditResult {
@@ -5724,7 +5897,7 @@ fn redo_edit_inner(ws: &mut WorldState) -> Result<EditResult, String> {
     }
 
     mark_dirty_chunks(&mut ws.dirty, Some(&world), &affected);
-    let (patch, invalidate) = patch_from_chunk_coords(&world, &affected, ws.view_cap_z, ws.view_lod);
+    let (patch, invalidate) = patch_from_chunk_coords(&world, &affected, ws.map_style(), ws.view_lod);
     ws.world = Some(world);
 
     Ok(EditResult {
@@ -5750,20 +5923,32 @@ fn copy_selection(
 ) -> Result<ClipboardInfo, String> {
     // The volume copy (audit H3) only needs a shared read guard — up to 512 MB of scanning that
     // used to hold the exclusive write guard for its entire duration, starving every edit/render.
-    // Only the final clipboard install below needs the write guard.
-    let cb = {
-        let ws = read_ws(&state);
+    // Only the clipboard drop/install below need the write guard.
+    let width  = x2 - x1 + 1;
+    let height = y2 - y1 + 1;
+    let depth  = z_max - z_min + 1;
+    let check = |ws: &WorldState| -> Result<usize, String> {
         let max_z = ws.world.as_ref().map(world_max_z).unwrap_or(63);
         validate_selection(x1, y1, x2, y2, z_min, z_max, max_z)?;
+        ws.world.as_ref().ok_or("No world loaded")?;
+        Ok(validate_volume(width, height, depth)? as usize)
+    };
+    // 18.6: drop the previous clipboard once the request is known-valid and *before* allocating the
+    // new buffers, so a re-copy peaks at one clipboard, not old + new. A rejected copy (bad
+    // selection, over the volume cap, no world) returns above this line and keeps the old one.
+    // std's RwLock can't upgrade, so validate under a read guard, release, drop under a write
+    // guard, then re-take the read guard and re-validate (the world may have changed in the gap).
+    check(&read_ws(&state))?;
+    let old = write_ws(&state).clipboard.take();
+    drop(old);
+    let cb = {
+        let ws = read_ws(&state);
+        let vol = check(&ws)?;
         let world = ws.world.as_ref().ok_or("No world loaded")?;
-
-        let width  = x2 - x1 + 1;
-        let height = y2 - y1 + 1;
-        let depth  = z_max - z_min + 1;
-        let vol    = validate_volume(width, height, depth)? as usize;
 
         let mut block_types = vec![0u8; vol];
         let mut paints      = vec![0u8; vol];
+        mem::PEAKS.clipboard_op.record(2 * vol as u64); // 18.0: the clipboard being built
 
         // Column-major bulk read (audit M8): one chunk lookup per (dx,dy) column instead of one per
         // voxel, and the z run copied via `read_column_bulk`'s per-band `copy_from_slice`s instead of
@@ -5939,9 +6124,13 @@ fn rotate_clipboard_inner(cb: &mut Clipboard) {
     let depth = cb.depth as usize;
     let new_w = old_h;
     let new_h = old_w;
-    let vol = new_w * new_h * depth;
-    let mut new_types = vec![0u8; vol];
-    let mut new_paints = vec![0u8; vol];
+    // A z-slice is `w*h` bytes before and after the rotation (only its shape changes), so each
+    // slice is rotated through one slice-sized scratch and written back over itself — the transient
+    // is one slice per array, not a second copy of the clipboard (18.6).
+    let slice = old_w * old_h;
+    mem::PEAKS.clipboard_op.record(2 * slice as u64);
+    let mut tmp_types = vec![0u8; slice];
+    let mut tmp_paints = vec![0u8; slice];
     // Transform the footprint mask with the SAME (dx,dy)→(ndx,ndy) map as the data (dropping dz —
     // the mask is per-column), or corruption results: a paste would skip the wrong columns.
     let new_mask = cb.mask.as_ref().map(|old| {
@@ -5958,21 +6147,22 @@ fn rotate_clipboard_inner(cb: &mut Clipboard) {
         nm
     });
     for dz in 0..depth {
+        let base = dz * slice;
+        let types = &mut cb.block_types[base..base + slice];
+        let paints = &mut cb.paints[base..base + slice];
         for dy in 0..old_h {
             for dx in 0..old_w {
-                let src = dz * old_h * old_w + dy * old_w + dx;
-                let ndx = dy;
-                let ndy = old_w - 1 - dx;
-                let dst = dz * new_h * new_w + ndy * new_w + ndx;
-                new_types[dst] = rotate_ramp_id_cw(cb.block_types[src]);
-                new_paints[dst] = cb.paints[src];
+                let src = dy * old_w + dx;
+                let dst = (old_w - 1 - dx) * new_w + dy;
+                tmp_types[dst] = rotate_ramp_id_cw(types[src]);
+                tmp_paints[dst] = paints[src];
             }
         }
+        types.copy_from_slice(&tmp_types);
+        paints.copy_from_slice(&tmp_paints);
     }
     cb.width = new_w as i32;
     cb.height = new_h as i32;
-    cb.block_types = new_types;
-    cb.paints = new_paints;
     cb.mask = new_mask;
 }
 
@@ -5988,9 +6178,9 @@ fn mirror_clipboard_x_inner(cb: &mut Clipboard) {
     let w = cb.width as usize;
     let h = cb.height as usize;
     let depth = cb.depth as usize;
-    let vol = w * h * depth;
-    let mut new_types = vec![0u8; vol];
-    let mut new_paints = vec![0u8; vol];
+    // In place (18.6): each row is reversed by swapping its mirrored pairs, so the data needs no
+    // second copy — only the (tiny, per-column) footprint mask is rebuilt.
+    mem::PEAKS.clipboard_op.record(0);
     if let Some(old) = cb.mask.as_ref() {
         let mut nm = vec![0u8; (w * h).div_ceil(8)];
         for dy in 0..h {
@@ -6003,19 +6193,20 @@ fn mirror_clipboard_x_inner(cb: &mut Clipboard) {
         }
         cb.mask = Some(nm);
     }
-    for dz in 0..depth {
-        for dy in 0..h {
-            for dx in 0..w {
-                let src = dz * h * w + dy * w + dx;
-                let ndx = w - 1 - dx;
-                let dst = dz * h * w + dy * w + ndx;
-                new_types[dst] = mirror_ramp_id_x(cb.block_types[src]);
-                new_paints[dst] = cb.paints[src];
-            }
+    for row in 0..depth * h {
+        let r = row * w;
+        for dx in 0..w / 2 {
+            let (a, b) = (r + dx, r + w - 1 - dx);
+            let (ta, tb) = (cb.block_types[a], cb.block_types[b]);
+            cb.block_types[a] = mirror_ramp_id_x(tb);
+            cb.block_types[b] = mirror_ramp_id_x(ta);
+            cb.paints.swap(a, b);
+        }
+        if w % 2 == 1 {
+            let m = r + w / 2;
+            cb.block_types[m] = mirror_ramp_id_x(cb.block_types[m]);
         }
     }
-    cb.block_types = new_types;
-    cb.paints = new_paints;
 }
 
 /// Mirror clipboard on the X axis (left↔right on the map): (dx,dy,dz) → (width-1-dx, dy, dz).
@@ -6032,9 +6223,8 @@ fn mirror_clipboard_y_inner(cb: &mut Clipboard) {
     let w = cb.width as usize;
     let h = cb.height as usize;
     let depth = cb.depth as usize;
-    let vol = w * h * depth;
-    let mut new_types = vec![0u8; vol];
-    let mut new_paints = vec![0u8; vol];
+    // In place (18.6): swap each row with its mirror row; only the footprint mask is rebuilt.
+    mem::PEAKS.clipboard_op.record(0);
     if let Some(old) = cb.mask.as_ref() {
         let mut nm = vec![0u8; (w * h).div_ceil(8)];
         for dy in 0..h {
@@ -6048,18 +6238,23 @@ fn mirror_clipboard_y_inner(cb: &mut Clipboard) {
         cb.mask = Some(nm);
     }
     for dz in 0..depth {
-        for dy in 0..h {
+        let base = dz * h * w;
+        for dy in 0..h / 2 {
+            let (a, b) = (base + dy * w, base + (h - 1 - dy) * w);
             for dx in 0..w {
-                let src = dz * h * w + dy * w + dx;
-                let ndy = h - 1 - dy;
-                let dst = dz * h * w + ndy * w + dx;
-                new_types[dst] = mirror_ramp_id_y(cb.block_types[src]);
-                new_paints[dst] = cb.paints[src];
+                let (ta, tb) = (cb.block_types[a + dx], cb.block_types[b + dx]);
+                cb.block_types[a + dx] = mirror_ramp_id_y(tb);
+                cb.block_types[b + dx] = mirror_ramp_id_y(ta);
+                cb.paints.swap(a + dx, b + dx);
+            }
+        }
+        if h % 2 == 1 {
+            let m = base + (h / 2) * w;
+            for dx in 0..w {
+                cb.block_types[m + dx] = mirror_ramp_id_y(cb.block_types[m + dx]);
             }
         }
     }
-    cb.block_types = new_types;
-    cb.paints = new_paints;
 }
 
 /// Mirror clipboard on the Y axis (top↔bottom on the map): (dx,dy,dz) → (dx, height-1-dy, dz).
@@ -6156,7 +6351,16 @@ fn paste_terrain(
     state: tauri::State<'_, AppState>,
 ) -> Result<EditResult, String> {
     let mut ws = write_ws(&state);
+    paste_terrain_inner(&mut ws, paste_x, paste_y, elevation_offset, ignore_air, above_surface)
+}
 
+fn paste_terrain_inner(
+    ws: &mut WorldState,
+    paste_x: i32, paste_y: i32,
+    elevation_offset: i32,
+    ignore_air: bool,
+    above_surface: bool,
+) -> Result<EditResult, String> {
     // See paste_at's comment (audit H4) — take instead of clone, restore after the edit.
     let cb = ws.clipboard.take().ok_or("Clipboard is empty")?;
     let (width, height, depth) = (cb.width, cb.height, cb.depth);
@@ -6165,13 +6369,17 @@ fn paste_terrain(
     let x2_paste = paste_x + width  - 1;
     let y2_paste = paste_y + height - 1;
 
-    let snap_rect = (paste_x.max(0), paste_y.max(0), x2_paste, y2_paste);
     let patch_rect = (paste_x, paste_y, x2_paste, y2_paste);
-    let surf_nudge: i32 = if above_surface { 1 } else { 0 };
     let cap = ws.view_cap_z; // cutaway: follow the sub-cap surface (cave floor), not the true surface
 
     let label = format!("Paste (terrain) {width}×{height}×{depth}");
-    let result = with_edit(&mut ws, &label, snap_rect, patch_rect, |world| {
+    // Pre-image = the chunks of columns that actually have a surface, over the surface-height range
+    // plus the clipboard's depth (row 18.2) — not every band of every chunk under the footprint.
+    let scope = ws.world.as_ref().map(|w| terrain_paste_snapshot_scope(
+        w, paste_x, paste_y, width, height, depth, elevation_offset, above_surface, cap, mask.as_deref(),
+    ));
+    let Some((chunks, z_range)) = scope else { ws.clipboard = Some(cb); return Err("No world loaded".into()); };
+    let result = with_edit_chunks(ws, &label, chunks, patch_rect, Some(z_range), |world| {
         let max_z = world_max_z(world);
         for dy in 0..height {
             let py = paste_y + dy;
@@ -6188,11 +6396,11 @@ fn paste_terrain(
                 let Some((addr, cend)) = world.chunk_range(chunk_cx, chunk_cy) else { continue };
                 // Read surface before writing this column — other columns' writes never
                 // affect (px, py) since each (dx, dy) maps to a unique world position.
-                let surf = match surface_z_capped(world, px, py, cap) {
-                    Some(z) => z,
-                    None    => continue, // all-air column — skip
+                // `terrain_paste_base` is shared with `render_paste_lens`, so the lens can't drift.
+                let Some(surf_base) = terrain_paste_base(world, px, py, cap, above_surface) else {
+                    continue; // all-air column — skip
                 };
-                let z_base = surf + surf_nudge + elevation_offset;
+                let z_base = surf_base + elevation_offset;
 
                 for dz in 0..depth {
                     let z = z_base + dz;
@@ -6214,6 +6422,54 @@ fn paste_terrain(
     });
     ws.clipboard = Some(cb);
     result
+}
+
+/// Undo pre-image scope for `paste_terrain`: the existing chunks holding at least one footprint
+/// column with a surface, and the z interval `[min_base + elev, max_base + elev + depth - 1]` over
+/// those columns. Uses `terrain_paste_base` — the same function the paste writes with — so it can't
+/// disagree with the edit. Columns write nothing until the closure runs, and never affect each
+/// other's surface (each maps to a unique world position), so precomputing is exact.
+/// With no surfaced column the scope is empty (and the z range a harmless `(0, 0)`).
+#[allow(clippy::too_many_arguments)]
+fn terrain_paste_snapshot_scope(
+    world: &LoadedWorld,
+    paste_x: i32, paste_y: i32,
+    width: i32, height: i32, depth: i32,
+    elevation_offset: i32, above_surface: bool,
+    cap: Option<i32>,
+    mask: Option<&[u8]>,
+) -> (Vec<(i32, i32)>, (i32, i32)) {
+    let mut cols: Vec<(i32, i32)> = Vec::new();
+    let mut span: Option<(i32, i32)> = None;
+    for dy in 0..height {
+        let py = paste_y + dy;
+        if py < 0 { continue; }
+        for dx in 0..width {
+            let px = paste_x + dx;
+            if px < 0 { continue; }
+            if let Some(m) = mask { if !bit_set(m, (dy * width + dx) as usize) { continue; } }
+            if world.chunk_range(px / 16 + world.min_x, py / 16 + world.min_y).is_none() { continue; }
+            let Some(base) = terrain_paste_base(world, px, py, cap, above_surface) else { continue };
+            cols.push((px, py));
+            span = Some(match span { None => (base, base), Some((lo, hi)) => (lo.min(base), hi.max(base)) });
+        }
+    }
+    let chunks = chunks_for_cells(world, cols.into_iter());
+    let z = match span {
+        Some((lo, hi)) => (lo + elevation_offset, hi + elevation_offset + depth - 1),
+        None => (0, 0),
+    };
+    (chunks, z)
+}
+
+/// Where a terrain paste puts column `(px, py)`'s `dz = 0` cell, before `elevation_offset`: the
+/// (cutaway-capped) surface, plus one with `above_surface`. `None` = the column has no surface and
+/// the paste skips it. ⚠️ **The single definition** — `paste_terrain` writes with it and
+/// `render_paste_lens` previews with it, which is the whole guarantee the lens and the paste agree.
+pub(crate) fn terrain_paste_base(
+    world: &impl VoxelView, px: i32, py: i32, cap: Option<i32>, above_surface: bool,
+) -> Option<i32> {
+    surface_z_capped(world, px, py, cap).map(|s| s + i32::from(above_surface))
 }
 
 /// Copies the selection N times in the given axis direction.
@@ -6289,7 +6545,7 @@ fn extrude_selection(
     let rect = (ax1, ay1, ax2, ay2);
 
     let label = format!("Extrude {axis} ×{count}");
-    with_edit(&mut ws, &label, rect, rect, |world| {
+    with_edit_guarded(&mut ws, &label, rect, rect, |world| {
         extrude_write(world, x1, y1, &src_types, &src_paints, width, height, depth, z_min, max_z, &axis, count, ignore_air, mask.as_ref());
         Ok(())
     })
@@ -6676,7 +6932,7 @@ fn generate_trees(
     let patch_rect = snap_rect;
 
     let label = format!("Generate trees ({}×{})", x2 - x1 + 1, y2 - y1 + 1);
-    with_edit(&mut ws, &label, snap_rect, patch_rect, |world| {
+    with_edit_guarded(&mut ws, &label, snap_rect, patch_rect, |world| {
         generate_trees_inner(world, x1, y1, x2, y2, &tree_types, density, &leaf_paints, seed, smart_placement, mask.as_ref());
         Ok(())
     })
@@ -6749,18 +7005,27 @@ fn generate_trees_inner(
     }
 }
 
+/// Long-side pixel cap of the Inspector's axo preview (Stage 13.3) — ~2.5× its 200 px panel.
+const AXO_PREVIEW_MAX_SIDE: u32 = 512;
+
 /// Axonometric top-down render for the visible region — see `voxel_core::render::axo_region` for
 /// the parallax math. `ski = 0` is a flat top-down render; `dir` picks the viewing corner.
+///
+/// Only the Inspector's axo preview calls this (13.3), so it is bounded: the output long side is
+/// capped at `AXO_PREVIEW_MAX_SIDE` px (the patch's `lod` says how far to upscale it) and rays start
+/// at `z_max` — the selection's top — instead of the world's.
 #[tauri::command(async)]
 fn render_axo_region(
     x1: i32, y1: i32, x2: i32, y2: i32,
     ski: f32,
     dir: u8, // 0=SE 1=SW 2=NE 3=NW
+    z_max: Option<i32>,
     state: tauri::State<'_, AppState>,
 ) -> Result<PixelPatch, String> {
     let ws = read_ws(&state);
     let world = ws.world.as_ref().ok_or("No world loaded")?;
-    Ok(render::axo_region(world, world.meta(), x1, y1, x2, y2, ski, dir).into())
+    let lod = render::axo_lod_for((x2 - x1 + 1).max(1) as u32, (y2 - y1 + 1).max(1) as u32, AXO_PREVIEW_MAX_SIDE);
+    Ok(render::axo_region_bounded(world, world.meta(), x1, y1, x2, y2, ski, dir, lod, z_max).into())
 }
 
 
@@ -6835,48 +7100,59 @@ fn render_axo_clipboard_inner(cb: &Clipboard, sky: u8, ski: f32, dir: u8) -> Pre
 /// Used to show a block preview inside the paste ghost box.
 /// Reads only from clipboard + sky — no world mutation.
 #[tauri::command(async)]
-fn render_clipboard_preview(state: tauri::State<'_, AppState>) -> Result<PreviewData, String> {
+fn render_clipboard_preview(max_side: Option<u32>, state: tauri::State<'_, AppState>) -> Result<PreviewData, String> {
     let ws = read_ws(&state);
     let sky = ws.world.as_ref().map(|w| w.sky).unwrap_or(0);
     let cb  = ws.clipboard.as_ref().ok_or("Clipboard is empty")?;
-    Ok(render_clipboard_preview_inner(cb, sky))
+    Ok(render_clipboard_preview_inner(cb, sky, max_side))
 }
+
+/// Long-side cap (px) for thumbnails/ghost previews of a clipboard (row 18.3).
+const CLIPBOARD_PREVIEW_MAX_SIDE: u32 = 512;
 
 /// Top-down preview of a clipboard buffer (highest non-air block per column). Shared by
 /// `render_clipboard_preview` (current clipboard) and `render_prefab_thumbnail` (a prefab
 /// file on disk, deserialized without touching the clipboard/undo state).
-fn render_clipboard_preview_inner(cb: &Clipboard, sky: u8) -> PreviewData {
+///
+/// `max_side` (row 18.3) bounds the long side of the output: the smallest power-of-two `lod`
+/// (`render::axo_lod_for`) is chosen and each output pixel point-samples the column at the
+/// pixel's top-left, so a 61 M-column clipboard costs ≤ max_side² columns instead of a 244 MB
+/// image. `None` = 1:1.
+fn render_clipboard_preview_inner(cb: &Clipboard, sky: u8, max_side: Option<u32>) -> PreviewData {
     let (w, h, d) = (cb.width, cb.height, cb.depth);
+    let lod = max_side.map_or(1, |m| render::axo_lod_for(w as u32, h as u32, m)) as usize;
+    let (w, h, d) = (w as usize, h as usize, d as usize);
+    let (ow, oh) = (w.div_ceil(lod), h.div_ceil(lod));
     const VOID: [u8; 4] = [20, 20, 35, 255];
-    let mut pixels = vec![0u8; (w * h * 4) as usize];
+    let mut pixels = vec![0u8; ow * oh * 4];
     // Shaped clipboard: leave unmasked columns fully transparent (alpha 0) so the paste ghost
     // shows only the traced footprint — masked-but-air columns keep the dark VOID look. A None
     // mask (prefab thumbnails, rectangular copies) fills the whole box with VOID as before.
     if cb.mask.is_none() {
         for p in pixels.chunks_exact_mut(4) { p.copy_from_slice(&VOID); }
     }
-    for dy in 0..h {
-        for dx in 0..w {
-            let col = (dy * w + dx) as usize;
+    for oy in 0..oh {
+        let dy = oy * lod;
+        for ox in 0..ow {
+            let dx = ox * lod;
+            let col = dy * w + dx;
+            let po = (oy * ow + ox) * 4;
             if let Some(m) = &cb.mask {
                 if !bit_set(m, col) { continue; } // outside footprint → stays alpha 0
-                pixels[col * 4..col * 4 + 4].copy_from_slice(&VOID); // masked → dark VOID base
+                pixels[po..po + 4].copy_from_slice(&VOID); // masked → dark VOID base
             }
             for dz in (0..d).rev() { // highest dz = topmost z layer
-                let idx = (dz * h * w + dy * w + dx) as usize;
+                let idx = dz * h * w + col;
                 let bt  = cb.block_types[idx];
                 if bt != 0 {
-                    let [r, g, b]       = block_color(bt, cb.paints[idx], sky);
-                    pixels[col * 4]     = r;
-                    pixels[col * 4 + 1] = g;
-                    pixels[col * 4 + 2] = b;
-                    pixels[col * 4 + 3] = 255;
+                    let [r, g, b] = block_color(bt, cb.paints[idx], sky);
+                    pixels[po] = r; pixels[po + 1] = g; pixels[po + 2] = b; pixels[po + 3] = 255;
                     break;
                 }
             }
         }
     }
-    PreviewData { width: w as u32, height: h as u32, pixels }
+    PreviewData { width: ow as u32, height: oh as u32, pixels }
 }
 
 // Renders the front (X-Z) or side (Y-Z) face of the clipboard for use as a
@@ -6926,6 +7202,133 @@ fn render_clipboard_elevation_preview_inner(cb: &Clipboard, sky: u8, view: &str)
         }
     }
     PreviewData { width: img_w as u32, height: img_h as u32, pixels }
+}
+
+// ── Paste lens (UI redesign r3, 14.8) ────────────────────────────────────────────────────────
+//
+// The render is `voxel_core::render::paste_lens`; what lives here is the part that knows what a
+// paste *is* — the per-column base Z, computed with the same code the paste commands write with —
+// and the IPC skin. Sub-plan: `TEST WORLDS/ui-redesign-r3-paste-lens-plan-2026-09-26.md` §2.
+
+/// ⚠️ Deliberately **not** `Serialize` — see "Binary payloads" in CLAUDE.md (a derive would let
+/// tauri's blanket impl silently turn this back into base64-in-JSON). Only the header serialises.
+struct PasteLensPatch {
+    header: PasteLensHeader,
+    pixels: Vec<u8>,
+}
+
+#[derive(Serialize)]
+struct PasteLensHeader {
+    width: u32,
+    height: u32,
+    /// Image columns per world column (column axis only — Z rows are always 1:1).
+    lod: u32,
+    col_lo: i32,
+    z_lo: i32,
+    z_hi: i32,
+    footprint_lo: i32,
+    footprint_hi: i32,
+    ghost_z_min: Option<i32>,
+    ghost_z_max: Option<i32>,
+    buried: u64,
+    cleared: u64,
+    floating_cols: u64,
+    approx: bool,
+}
+
+impl tauri::ipc::IpcResponse for PasteLensPatch {
+    fn body(self) -> tauri::Result<tauri::ipc::InvokeResponseBody> {
+        ipc_envelope_one(&self.header, self.pixels)
+    }
+}
+
+/// Per-column base Z for the lens (`render::LENS_SKIP` = not pasted), exactly as the paste
+/// commands would place each column: `paste_at` → `z_anchor + offset`; `paste_terrain` →
+/// [`terrain_paste_base`] + offset. Columns outside a shaped clipboard's footprint are skipped by both.
+#[allow(clippy::too_many_arguments)]
+fn paste_lens_bases(
+    world: &LoadedWorld, cb: &Clipboard, x: i32, y: i32,
+    terrain: bool, elevation_offset: i32, above_surface: bool, cap: Option<i32>,
+) -> Vec<i32> {
+    let (w, h) = (cb.width.max(0) as usize, cb.height.max(0) as usize);
+    let mut base = vec![render::LENS_SKIP; w * h];
+    for dy in 0..h {
+        for dx in 0..w {
+            let i = dy * w + dx;
+            if cb.mask.as_ref().is_some_and(|m| !bit_set(m, i)) { continue; }
+            base[i] = if terrain {
+                let (px, py) = (x + dx as i32, y + dy as i32);
+                if px < 0 || py < 0 { continue; } // paste_terrain skips these before anything else
+                match terrain_paste_base(world, px, py, cap, above_surface) {
+                    Some(b) => b + elevation_offset,
+                    None => continue,
+                }
+            } else {
+                cb.z_anchor + elevation_offset
+            };
+        }
+    }
+    base
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_paste_lens_inner(
+    ws: &WorldState, x: i32, y: i32, view: &str, elevation_offset: i32, mode: &str,
+    above_surface: bool, ignore_air: bool, context: i32, max_px: Option<u32>,
+) -> Result<PasteLensPatch, String> {
+    let world = ws.world.as_ref().ok_or("No world loaded")?;
+    let cb = ws.clipboard.as_ref().ok_or("Clipboard is empty")?;
+    let view = match view {
+        "front" => render::LensView::Front,
+        "side" => render::LensView::Side,
+        other => return Err(format!("Unknown lens view: {other}")),
+    };
+    let terrain = match mode {
+        "normal" => false,
+        "terrain" => true,
+        other => return Err(format!("Unknown paste mode: {other}")),
+    };
+    let base = paste_lens_bases(world, cb, x, y, terrain, elevation_offset, above_surface, ws.view_cap_z);
+    let clip = render::ClipRef {
+        w: cb.width as usize, h: cb.height as usize, d: cb.depth as usize,
+        types: &cb.block_types, paints: &cb.paints, base: &base,
+    };
+    let (r, st) = render::paste_lens(
+        world, world.meta(), x, y, &clip, view,
+        context.clamp(0, 16), ignore_air, max_px.unwrap_or(512).clamp(16, 4096),
+    );
+    Ok(PasteLensPatch {
+        header: PasteLensHeader {
+            width: r.width, height: r.height, lod: r.lod,
+            col_lo: st.col_lo, z_lo: st.z_lo, z_hi: st.z_hi,
+            footprint_lo: st.footprint_lo, footprint_hi: st.footprint_hi,
+            ghost_z_min: st.ghost_z_min, ghost_z_max: st.ghost_z_max,
+            buried: st.buried, cleared: st.cleared, floating_cols: st.floating_cols, approx: st.approx,
+        },
+        pixels: r.pixels,
+    })
+}
+
+/// Front (`view = "front"`, looking north) or side (`"side"`, looking east) elevation of the armed
+/// paste at origin `(x, y)`: terrain, the ghost at its paste Z, and the cells where they collide.
+/// `mode` is `"normal"` (`paste_at`) or `"terrain"` (`paste_terrain`, which also takes
+/// `above_surface`); `ignore_air` mirrors "Skip air". One read guard for the whole render — the
+/// volume is footprint-bounded, so there's no scan-buffer clone to release it early for.
+#[allow(clippy::too_many_arguments)]
+#[tauri::command(async)]
+fn render_paste_lens(
+    x: i32, y: i32,
+    view: String,
+    elevation_offset: i32,
+    mode: String,
+    above_surface: bool,
+    ignore_air: bool,
+    context: i32,
+    max_px: Option<u32>,
+    state: tauri::State<'_, AppState>,
+) -> Result<PasteLensPatch, String> {
+    let ws = read_ws(&state);
+    render_paste_lens_inner(&ws, x, y, &view, elevation_offset, &mode, above_surface, ignore_air, context, max_px)
 }
 
 // ── Fluid Flow Toolkit ───────────────────────────────────────────────────────────
@@ -7052,7 +7455,7 @@ fn simulate_flow(
         "Simulate {} flow ({}×{})",
         if base == 20 { "water" } else { "lava" }, x2 - x1 + 1, y2 - y1 + 1,
     );
-    with_edit(&mut ws, &label, rect, rect, |world| {
+    with_edit_guarded(&mut ws, &label, rect, rect, |world| {
         simulate_flow_inner(world, x1, y1, x2, y2, fx1, fy1, fx2, fy2, z_min, z_max, include_existing_sources, base, mask.as_ref());
         Ok(())
     })
@@ -7129,7 +7532,7 @@ fn pool_fill(
     let mask = active_mask(&ws, x1, y1, x2, y2);
     let rect = (x1, y1, x2, y2);
     let label = format!("Pool fill ({}×{})", x2 - x1 + 1, y2 - y1 + 1);
-    with_edit(&mut ws, &label, rect, rect, |world| {
+    with_edit_guarded(&mut ws, &label, rect, rect, |world| {
         pool_fill_inner(world, x1, y1, x2, y2, click_x, click_y, click_z, target_z, base, paint, mask.as_ref())
     })
 }
@@ -7238,6 +7641,14 @@ fn flood_fill_bfs(
     Ok(visited.into_iter().collect())
 }
 
+/// Everything `flood_fill_3d` discovers under the read guard and consumes under the write guard.
+struct FloodPlan {
+    cells: Vec<(i32, i32, i32)>,
+    rect: (i32, i32, i32, i32),
+    chunks: Vec<(i32, i32)>,
+    z_range: Option<(i32, i32)>,
+}
+
 /// Axiom-style flood fill for the 3D pane: spreads the armed block through air connected to
 /// `(start_x,start_y,start_z)`, bounded to `limit` cells. Unlike Pool Fill, no selection or target Z
 /// is needed: `limit` is the only safety bound, and an unenclosed basin simply stops at the cap
@@ -7261,20 +7672,35 @@ fn flood_fill_3d(
     }
     let limit = (limit as usize).clamp(1, FLOOD_FILL_MAX_CELLS);
 
-    let mut ws = write_ws(&state);
-
-    // Phase A: read-only BFS under an immutable borrow. Phase B (below) takes the world for editing.
-    let cells: Vec<(i32, i32, i32)> = {
-        let world = ws.world.as_ref().ok_or("No world loaded")?;
-        flood_fill_bfs(world, start_x, start_y, start_z, limit)?
+    // Phase A (row 18.7): the BFS + undo-scope discovery run under the *read* guard so tiles/3D
+    // fetches aren't stalled behind a 200 k-cell flood. `dirty.seq` is captured with it; the write
+    // guard below re-checks it and redoes the (cheap-by-comparison, rare) discovery if a writer
+    // landed in the gap — `RwLock` isn't upgradable, so the guard has to be dropped in between.
+    let plan = |world: &LoadedWorld| -> Result<FloodPlan, String> {
+        let cells = flood_fill_bfs(world, start_x, start_y, start_z, limit)?;
+        let (mut x_min, mut y_min, mut x_max, mut y_max) = (start_x, start_y, start_x, start_y);
+        for &(x, y, _) in &cells {
+            x_min = x_min.min(x); y_min = y_min.min(y);
+            x_max = x_max.max(x); y_max = y_max.max(y);
+        }
+        // Pre-image = the chunks the collected cells actually live in, scoped to their z extent (row
+        // 18.2) — not every chunk in the bbox, which a thin diagonal tunnel inflates enormously.
+        let (chunks, z_range) = cells_snapshot_scope(world, &cells);
+        Ok(FloodPlan { cells, rect: (x_min, y_min, x_max, y_max), chunks, z_range })
     };
-
-    let (mut x_min, mut y_min, mut x_max, mut y_max) = (start_x, start_y, start_x, start_y);
-    for &(x, y, _) in &cells {
-        x_min = x_min.min(x); y_min = y_min.min(y);
-        x_max = x_max.max(x); y_max = y_max.max(y);
-    }
-    let rect = (x_min, y_min, x_max, y_max);
+    let (seq_seen, first) = {
+        let ws = read_ws(&state);
+        let world = ws.world.as_ref().ok_or("No world loaded")?;
+        (ws.dirty.seq, plan(world)?)
+    };
+    let mut ws = write_ws(&state);
+    let FloodPlan { cells, rect, chunks, z_range } = if ws.dirty.seq == seq_seen {
+        first
+    } else {
+        timing_log!("[FLOOD] world changed during BFS (seq {} -> {}) — redoing under the write guard", seq_seen, ws.dirty.seq);
+        drop(first);
+        plan(ws.world.as_ref().ok_or("No world loaded")?)?
+    };
     let n = cells.len();
     // `flood_fill_bfs` stops as soon as it reaches `limit`, so hitting it exactly (rather than the
     // BFS frontier simply running out first) means the fill was capped, not finished — surface that
@@ -7284,12 +7710,23 @@ fn flood_fill_3d(
     } else {
         format!("Flood fill ({n} blocks)")
     };
-    with_edit(&mut ws, &label, rect, rect, |world| {
+    with_edit_chunks(&mut ws, &label, chunks, rect, z_range, |world| {
         for &(x, y, z) in &cells {
             set_block_abs(world, x, y, z, block_type, paint);
         }
         Ok(())
     })
+}
+
+/// Undo pre-image scope for an edit that writes exactly `cells` (`(x, y, z)`): the chunks they live
+/// in and their z interval (row 18.2). `None` z when `cells` is empty.
+fn cells_snapshot_scope(world: &LoadedWorld, cells: &[(i32, i32, i32)]) -> (Vec<(i32, i32)>, Option<(i32, i32)>) {
+    let chunks = chunks_for_cells(world, cells.iter().map(|&(x, y, _)| (x, y)));
+    let z = cells.iter().fold(None, |acc: Option<(i32, i32)>, &(_, _, z)| match acc {
+        None => Some((z, z)),
+        Some((lo, hi)) => Some((lo.min(z), hi.max(z))),
+    });
+    (chunks, z)
 }
 
 /// Maps a normalized 0..1 height sample to a fluid level (1 = ¼ … 4 = full/source).
@@ -7346,7 +7783,7 @@ fn generate_wavy_surface(
         "Wavy {} surface ({}×{})",
         if base == 20 { "water" } else { "lava" }, x2 - x1 + 1, y2 - y1 + 1,
     );
-    with_edit(&mut ws, &label, rect, rect, |world| {
+    with_edit_guarded(&mut ws, &label, rect, rect, |world| {
         generate_wavy_surface_inner(world, x1, y1, x2, y2, max_z, base, paint, wavelength, amplitude, seed, &mode, mask.as_ref());
         Ok(())
     })
@@ -7646,7 +8083,7 @@ fn render_prefab_thumbnail(path: String, state: tauri::State<'_, AppState>) -> R
     let cb = deserialize_prefab(&data)?;
     let ws = read_ws(&state);
     let sky = ws.world.as_ref().map(|w| w.sky).unwrap_or(0);
-    Ok(render_clipboard_preview_inner(&cb, sky))
+    Ok(render_clipboard_preview_inner(&cb, sky, Some(CLIPBOARD_PREVIEW_MAX_SIDE)))
 }
 
 // ── Texture pack commands ────────────────────────────────────────────────────
@@ -8632,6 +9069,7 @@ fn sculpt_split(
         let world = ws.world.as_ref().ok_or("No world loaded")?;
         let coords = affected_chunk_coords(world, rect.0, rect.1, rect.2, rect.3);
         let mut scratch = ChunkScratch::new(world, &coords);
+        mem::PEAKS.sculpt_scratch.record(scratch.buf_len() as u64);
         // A failed stamp abandons the float workspace, exactly as the in-guard path does by never
         // writing it back — the `?` drops `session` along with the guard.
         run_sculpt_flush(&mut scratch, &mut session, args, stamps)?;
@@ -8649,6 +9087,7 @@ fn sculpt_split(
         session = SculptSession { group_id: group.unwrap_or(0), fheight: HashMap::new() };
         let coords = affected_chunk_coords(&world, rect.0, rect.1, rect.2, rect.3);
         let mut scratch = ChunkScratch::new(&world, &coords);
+        mem::PEAKS.sculpt_scratch.record(scratch.buf_len() as u64);
         if let Err(e) = run_sculpt_flush(&mut scratch, &mut session, args, stamps) {
             ws.world = Some(world);
             return Err(e);
@@ -8659,7 +9098,7 @@ fn sculpt_split(
     // those chunks must go before the patch is rendered (see `invalidate_top_bands`).
     let committed: Vec<(i32, i32)> = pre_snap.iter().map(|s| (s.cx, s.cy)).collect();
     world.invalidate_top_bands(&committed);
-    let (patch, invalidate) = edit_patch(&world, rect, ws.view_cap_z, ws.view_lod);
+    let (patch, invalidate) = edit_patch(&world, rect, ws.map_style(), ws.view_lod);
     ws.world = Some(world);
     if sculpt_persists_session(&args.mode, group) {
         ws.sculpt_session = Some(session);
@@ -9384,6 +9823,44 @@ fn run_sculpt_in_guard(
 
 // ── Fill surface (flood fill) ─────────────────────────────────────────────────
 
+/// Read-only BFS over the 4-connected surface region matching the seed column's top block (and its
+/// paint when `match_paint`), capped at `max` cells. Cells are `(x, y, surface_z)`. Errors only when
+/// the seed has no surface / is air; an empty `Ok` can't happen for a valid seed but callers handle it.
+/// Split out so `fill_surface` and `magic_wand_select` share it and it runs on a bare `LoadedWorld`.
+fn surface_region_bfs(
+    world: &LoadedWorld,
+    wx: i32, wy: i32,
+    match_paint: bool,
+    max: u32,
+) -> Result<Vec<(i32, i32, i32)>, &'static str> {
+    let seed_z     = surface_z(world, wx, wy).ok_or("No surface at position")?;
+    let seed_bt    = read_block_abs(world, wx, wy, seed_z);
+    let seed_paint = read_paint_abs(world, wx, wy, seed_z);
+    if seed_bt == 0 { return Err("No block at surface"); }
+    let ww = (world.w_chunks * 16) as i32;
+    let wh = (world.h_chunks * 16) as i32;
+
+    let mut visited: HashSet<(i32, i32)> = HashSet::new();
+    let mut queue: VecDeque<(i32, i32)> = VecDeque::new();
+    let mut cells: Vec<(i32, i32, i32)> = Vec::new();
+    queue.push_back((wx, wy));
+    visited.insert((wx, wy));
+
+    while let Some((x, y)) = queue.pop_front() {
+        if cells.len() as u32 >= max { break; }
+        let Some(sz) = surface_z(world, x, y) else { continue };
+        if read_block_abs(world, x, y, sz) != seed_bt { continue; }
+        if match_paint && read_paint_abs(world, x, y, sz) != seed_paint { continue; }
+        cells.push((x, y, sz));
+        for (dx, dy) in [(-1i32,0i32),(1,0),(0,-1),(0,1)] {
+            let nx = x + dx; let ny = y + dy;
+            if nx < 0 || ny < 0 || nx >= ww || ny >= wh { continue; }
+            if visited.insert((nx, ny)) { queue.push_back((nx, ny)); }
+        }
+    }
+    Ok(cells)
+}
+
 /// Flood-fill connected surface blocks of the same type as the seed position.
 #[tauri::command(async)]
 fn fill_surface(
@@ -9395,50 +9872,35 @@ fn fill_surface(
     if new_paint > 54 { return Err("Invalid paint".into()); }
     let max_fill = max_fill.clamp(1, 50_000);
 
-    let mut ws = write_ws(&state);
-
-    // Phase 1: BFS to collect all cells to fill (read-only pass).
-    let (fill_cells, x_min, y_min, x_max, y_max) = {
-        let world = ws.world.as_ref().ok_or("No world loaded")?;
-        let seed_z     = surface_z(world, wx, wy).ok_or("No surface at position")?;
-        let seed_bt    = read_block_abs(world, wx, wy, seed_z);
-        let seed_paint = read_paint_abs(world, wx, wy, seed_z);
-        if seed_bt == 0 { return Err("No block at surface".into()); }
-        let ww = (world.w_chunks * 16) as i32;
-        let wh = (world.h_chunks * 16) as i32;
-
-        let mut visited: std::collections::HashSet<(i32, i32)> = std::collections::HashSet::new();
-        let mut queue: VecDeque<(i32, i32)> = VecDeque::new();
-        let mut cells: Vec<(i32, i32, i32)> = Vec::new();
-        queue.push_back((wx, wy));
-        visited.insert((wx, wy));
-
-        while let Some((x, y)) = queue.pop_front() {
-            if cells.len() as u32 >= max_fill { break; }
-            let Some(sz) = surface_z(world, x, y) else { continue };
-            if read_block_abs(world, x, y, sz) != seed_bt { continue; }
-            if read_paint_abs(world, x, y, sz) != seed_paint { continue; }
-            cells.push((x, y, sz));
-            for (dx, dy) in [(-1i32,0i32),(1,0),(0,-1),(0,1)] {
-                let nx = x + dx; let ny = y + dy;
-                if nx < 0 || ny < 0 || nx >= ww || ny >= wh { continue; }
-                if visited.insert((nx, ny)) { queue.push_back((nx, ny)); }
-            }
-        }
-
-        if cells.is_empty() {
+    // Row 18.7: discovery under the read guard, then the write guard re-validates via `dirty.seq`
+    // (redoing the discovery if a writer landed in the gap) — see `flood_fill_3d`.
+    let plan = |world: &LoadedWorld| -> Result<FloodPlan, String> {
+        let fill_cells = surface_region_bfs(world, wx, wy, true, max_fill)?;
+        if fill_cells.is_empty() {
             return Err("No fillable surface found".into());
         }
-        let (x0, y0, x1, y1) = cells.iter().fold(
+        let (x0, y0, x1, y1) = fill_cells.iter().fold(
             (i32::MAX, i32::MAX, i32::MIN, i32::MIN),
             |(x0,y0,x1,y1), &(x,y,_)| (x0.min(x), y0.min(y), x1.max(x), y1.max(y))
         );
-        (cells, x0, y0, x1, y1)
+        let (chunks, z_range) = cells_snapshot_scope(world, &fill_cells);
+        Ok(FloodPlan { cells: fill_cells, rect: (x0, y0, x1, y1), chunks, z_range })
     };
-
-    let rect = (x_min, y_min, x_max, y_max);
+    let (seq_seen, first) = {
+        let ws = read_ws(&state);
+        let world = ws.world.as_ref().ok_or("No world loaded")?;
+        (ws.dirty.seq, plan(world)?)
+    };
+    let mut ws = write_ws(&state);
+    let FloodPlan { cells: fill_cells, rect, chunks, z_range } = if ws.dirty.seq == seq_seen {
+        first
+    } else {
+        timing_log!("[FLOOD] world changed during BFS (seq {} -> {}) — redoing under the write guard", seq_seen, ws.dirty.seq);
+        drop(first);
+        plan(ws.world.as_ref().ok_or("No world loaded")?)?
+    };
     let label = format!("Fill {} blocks", fill_cells.len());
-    with_edit(&mut ws, &label, rect, rect, |world| {
+    with_edit_chunks(&mut ws, &label, chunks, rect, z_range, |world| {
         for &(x, y, z) in &fill_cells {
             set_block_abs(world, x, y, z, new_type, new_paint);
         }
@@ -9463,73 +9925,54 @@ fn magic_wand_select(
     match_paint: bool,
     state: tauri::State<'_, AppState>,
 ) -> Result<Option<SelectRect>, String> {
-    let mut ws = write_ws(&state);
-
-    // Phase A: run the BFS under an immutable world borrow, collecting every *matched* cell (not the
-    // whole `visited` frontier, which includes rejected neighbours). Then drop the borrow so Phase B
-    // can install the mask on `ws`.
-    let outcome: Option<(SelectRect, Vec<(i32, i32)>)> = {
-        let world = ws.world.as_ref().ok_or("No world loaded")?;
-        let seed_z     = match surface_z(world, wx, wy) { Some(z) => z, None => return Ok(None) };
-        let seed_bt    = read_block_abs(world, wx, wy, seed_z);
-        let seed_paint = read_paint_abs(world, wx, wy, seed_z);
-        if seed_bt == 0 { return Ok(None); }
-
-        let ww = (world.w_chunks * 16) as i32;
-        let wh = (world.h_chunks * 16) as i32;
-        const MAX_CELLS: u32 = 50_000;
-
-        let mut visited: std::collections::HashSet<(i32, i32)> = std::collections::HashSet::new();
-        let mut queue:   VecDeque<(i32, i32)> = VecDeque::new();
-        let mut matched: Vec<(i32, i32)> = Vec::new();
+    // Row 18.7: BFS + mask rasterisation run under the *read* guard; only installing the mask takes
+    // the write guard, which re-checks `dirty.seq` and redoes the discovery if a writer landed in the
+    // gap (see `flood_fill_3d`). Result: `Ok(None)` = nothing matched (existing mask left alone).
+    const MAX_CELLS: u32 = 50_000;
+    let plan = |world: &LoadedWorld| -> Result<Option<(SelectRect, Vec<u8>)>, String> {
+        // Seed with no surface / air → no selection, same as an empty match.
+        let matched = match surface_region_bfs(world, wx, wy, match_paint, MAX_CELLS) {
+            Ok(m) => m,
+            Err(_) => return Ok(None),
+        };
+        if matched.is_empty() { return Ok(None); }
         let (mut x_min, mut y_min, mut x_max, mut y_max) = (wx, wy, wx, wy);
-        let mut count = 0u32;
-
-        queue.push_back((wx, wy));
-        visited.insert((wx, wy));
-
-        while let Some((x, y)) = queue.pop_front() {
-            if count >= MAX_CELLS { break; }
-            let Some(sz) = surface_z(world, x, y) else { continue };
-            if read_block_abs(world, x, y, sz) != seed_bt { continue; }
-            if match_paint && read_paint_abs(world, x, y, sz) != seed_paint { continue; }
-            matched.push((x, y));
+        for &(x, y, _) in &matched {
             x_min = x_min.min(x); y_min = y_min.min(y);
             x_max = x_max.max(x); y_max = y_max.max(y);
-            count += 1;
-            for (dx, dy) in [(-1i32,0i32),(1,0),(0,-1),(0,1)] {
-                let nx = x + dx; let ny = y + dy;
-                if nx < 0 || ny < 0 || nx >= ww || ny >= wh { continue; }
-                if visited.insert((nx, ny)) { queue.push_back((nx, ny)); }
-            }
         }
-
-        if count == 0 { None }
-        else { Some((SelectRect { x1: x_min, y1: y_min, x2: x_max, y2: y_max }, matched)) }
+        let rect = SelectRect { x1: x_min, y1: y_min, x2: x_max, y2: y_max };
+        // Rasterise the matched cells into a bitset over the bbox. `w`/`h` come from the BFS bbox,
+        // which (unlike the BFS cell count) is not itself capped — a diagonal or ring-shaped run can
+        // span the whole world, so the area must be computed in `usize`/`saturating_mul` (audit H8),
+        // matching `set_selection_mask`'s sibling path, not `i32`.
+        let w = (rect.x2 - rect.x1 + 1) as usize;
+        let h = (rect.y2 - rect.y1 + 1) as usize;
+        const MAX_MASK_BBOX_AREA: usize = 64 * 1024 * 1024; // 64M cells ≈ 8 MB bitset
+        if w.saturating_mul(h) > MAX_MASK_BBOX_AREA {
+            return Err(format!("Wand match bbox too large ({w}×{h}) to store as a shaped selection"));
+        }
+        let mut bits = vec![0u8; w.saturating_mul(h).div_ceil(8)];
+        for (x, y, _) in matched {
+            let idx = (y - rect.y1) as usize * w + (x - rect.x1) as usize;
+            bits[idx >> 3] |= 1u8 << (idx & 7);
+        }
+        Ok(Some((rect, bits)))
     };
-
-    // Phase B: nothing matched → leave any existing mask alone and report no selection.
-    let (rect, matched) = match outcome {
-        Some(v) => v,
-        None => return Ok(None),
+    let (seq_seen, first) = {
+        let ws = read_ws(&state);
+        let world = ws.world.as_ref().ok_or("No world loaded")?;
+        (ws.dirty.seq, plan(world)?)
     };
-
-    // Rasterise the matched cells into a bitset over the bbox and install it as the active mask.
-    // `w`/`h` come from the BFS bbox, which (unlike the BFS cell count) is not itself capped — a
-    // diagonal or ring-shaped run can span the whole world, so the area must be computed in
-    // `usize`/`saturating_mul` (audit H8), matching `set_selection_mask`'s sibling path, not `i32`
-    // (which silently overflows into a garbage allocation size at ~4x today's world dimensions).
-    let w = (rect.x2 - rect.x1 + 1) as usize;
-    let h = (rect.y2 - rect.y1 + 1) as usize;
-    const MAX_MASK_BBOX_AREA: usize = 64 * 1024 * 1024; // 64M cells ≈ 8 MB bitset
-    if w.saturating_mul(h) > MAX_MASK_BBOX_AREA {
-        return Err(format!("Wand match bbox too large ({w}×{h}) to store as a shaped selection"));
-    }
-    let mut bits = vec![0u8; w.saturating_mul(h).div_ceil(8)];
-    for (x, y) in matched {
-        let idx = (y - rect.y1) as usize * w + (x - rect.x1) as usize;
-        bits[idx >> 3] |= 1u8 << (idx & 7);
-    }
+    let mut ws = write_ws(&state);
+    let outcome = if ws.dirty.seq == seq_seen {
+        first
+    } else {
+        timing_log!("[FLOOD] world changed during wand BFS (seq {} -> {}) — redoing under the write guard", seq_seen, ws.dirty.seq);
+        drop(first);
+        plan(ws.world.as_ref().ok_or("No world loaded")?)?
+    };
+    let Some((rect, bits)) = outcome else { return Ok(None) };
     ws.selection_mask = Some(SelectionMask { x1: rect.x1, y1: rect.y1, x2: rect.x2, y2: rect.y2, bits });
 
     Ok(Some(rect))
@@ -9645,6 +10088,31 @@ fn paste_clipboard_at(
     }
 }
 
+/// The seeded placement sequence `scatter_paste` uses: `count` top-left positions drawn from
+/// `x1..x1+range_x` × `y1..y1+range_y`. Split out so the pre-image scope can be computed before the
+/// edit from the *same* draws the edit makes.
+fn scatter_placements(x1: i32, y1: i32, range_x: i32, range_y: i32, count: i32, seed: u64) -> Vec<(i32, i32)> {
+    let (range_x, range_y) = (range_x.max(1) as u64, range_y.max(1) as u64);
+    let mut rng = Rng64::new(if seed == 0 { 0xdeadbeef_cafebabe } else { seed });
+    (0..count).map(|_| {
+        let px = x1 + (rng.next() % range_x) as i32;
+        let py = y1 + (rng.next() % range_y) as i32;
+        (px, py)
+    }).collect()
+}
+
+/// Undo pre-image scope for a multi-placement paste (scatter/array): the chunks under the union of
+/// the `width × height` footprints at `placements`, and the clipboard's z interval (row 18.2).
+fn paste_snapshot_scope(
+    world: &LoadedWorld,
+    placements: &[(i32, i32)],
+    width: i32, height: i32, depth: i32, z_anchor: i32, elevation_offset: i32,
+) -> (Vec<(i32, i32)>, (i32, i32)) {
+    let chunks = chunks_for_rects(world, placements.iter().map(|&(px, py)| (px, py, px + width - 1, py + height - 1)));
+    let z0 = z_anchor + elevation_offset;
+    (chunks, (z0, z0 + depth - 1))
+}
+
 /// Paste clipboard at `count` random positions within the bounding box.
 #[tauri::command(async)]
 fn scatter_paste(
@@ -9673,15 +10141,16 @@ fn scatter_paste(
     let max_py = y1 + range_y - 1;
     let rect = (x1, y1, x2.max(max_px + width - 1), y2.max(max_py + height - 1));
     let label = format!("Scatter paste ×{count}");
-    let result = with_edit(&mut ws, &label, rect, rect, |world| {
+    // Seeded, so the placements are known before the edit: snapshot only the chunks their footprints
+    // touch, and only the clipboard's z bands (row 18.2) — not the whole scatter box.
+    let placements = scatter_placements(x1, y1, range_x, range_y, count, seed);
+    let scope = ws.world.as_ref().map(|w| paste_snapshot_scope(
+        w, &placements, width, height, depth, z_anchor, elevation_offset,
+    ));
+    let Some((chunks, z_range)) = scope else { ws.clipboard = Some(cb); return Err("No world loaded".into()); };
+    let result = with_edit_chunks(&mut ws, &label, chunks, rect, Some(z_range), |world| {
         let max_z = world_max_z(world);
-        let range_x = range_x as u64;
-        let range_y = range_y as u64;
-        let mut rng = Rng64::new(if seed == 0 { 0xdeadbeef_cafebabe } else { seed });
-
-        for _ in 0..count {
-            let px = x1 + (rng.next() % range_x) as i32;
-            let py = y1 + (rng.next() % range_y) as i32;
+        for &(px, py) in &placements {
             paste_clipboard_at(world, px, py, block_types, paints,
                 width, height, depth, z_anchor, elevation_offset, ignore_air, max_z, mask.as_deref());
         }
@@ -9717,15 +10186,19 @@ fn array_paste(
 
     let rect = (origin_x, origin_y, x2, y2);
     let label = format!("Array paste {cols}×{rows}");
-    let result = with_edit(&mut ws, &label, rect, rect, |world| {
+    // Grid cells only (not the gaps between them), and only the clipboard's z bands (row 18.2).
+    let placements: Vec<(i32, i32)> = (0..rows).flat_map(|row| (0..cols).map(move |col| (col, row)))
+        .map(|(col, row)| (origin_x + col * step_x, origin_y + row * step_y))
+        .collect();
+    let scope = ws.world.as_ref().map(|w| paste_snapshot_scope(
+        w, &placements, width, height, depth, z_anchor, elevation_offset,
+    ));
+    let Some((chunks, z_range)) = scope else { ws.clipboard = Some(cb); return Err("No world loaded".into()); };
+    let result = with_edit_chunks(&mut ws, &label, chunks, rect, Some(z_range), |world| {
         let max_z = world_max_z(world);
-        for row in 0..rows {
-            for col in 0..cols {
-                let px = origin_x + col * step_x;
-                let py = origin_y + row * step_y;
-                paste_clipboard_at(world, px, py, block_types, paints,
-                    width, height, depth, z_anchor, elevation_offset, ignore_air, max_z, mask.as_deref());
-            }
+        for &(px, py) in &placements {
+            paste_clipboard_at(world, px, py, block_types, paints,
+                width, height, depth, z_anchor, elevation_offset, ignore_air, max_z, mask.as_deref());
         }
         Ok(())
     });
@@ -9750,6 +10223,7 @@ struct MemStats {
     arch: &'static str,
     process: mem::ProcessMemory,
     system: mem::SystemMemory,
+    platform: mem::PlatformState,
     world_loaded: bool,
     world_bytes: u64,
     chunk_size: u64,
@@ -9764,6 +10238,11 @@ struct MemStats {
     undo_groups: u64,
     redo_groups: u64,
     undo_budget: u64,
+    /// Live clipboard / selection-mask sizes (18.0). Read straight off `WorldState` — no counter.
+    clipboard_bytes: u64,
+    selection_mask_bytes: u64,
+    /// The 18.0 peak counters (`mem::PEAKS`).
+    peaks: mem::PeakSnapshot,
 }
 
 #[tauri::command(async)]
@@ -9787,6 +10266,7 @@ fn mem_stats(state: tauri::State<'_, AppState>) -> MemStats {
         arch: std::env::consts::ARCH,
         process: mem::process_memory(),
         system: mem::system_memory(),
+        platform: mem::platform_state(),
         world_loaded,
         world_bytes,
         chunk_size,
@@ -9799,6 +10279,10 @@ fn mem_stats(state: tauri::State<'_, AppState>) -> MemStats {
         undo_groups: ws.undo_groups as u64,
         redo_groups: ws.redo_groups as u64,
         undo_budget: ws.undo_budget as u64,
+        clipboard_bytes: ws.clipboard.as_ref().map_or(0, |c|
+            (c.block_types.len() + c.paints.len() + c.mask.as_ref().map_or(0, |m| m.len())) as u64),
+        selection_mask_bytes: ws.selection_mask.as_ref().map_or(0, |m| m.bits.len() as u64),
+        peaks: mem::PEAKS.snapshot(),
     }
 }
 
@@ -9832,6 +10316,7 @@ pub fn run() {
             fetch_tile,
             chunk_occupancy,
             set_view_cap,
+            set_view_relief,
             set_view_lod,
             set_undo_budget,
             export_png,
@@ -9858,14 +10343,13 @@ pub fn run() {
             paste_at,
             paste_terrain,
             render_zslice_patch,
-            render_yslice_patch,
-            render_xslice_patch,
             render_selection_view,
             render_full_height_view,
             extrude_selection,
             move_selection,
             render_clipboard_preview,
             render_clipboard_elevation_preview,
+            render_paste_lens,
             save_prefab,
             load_prefab,
             get_default_prefab_dir,
@@ -10957,6 +11441,176 @@ mod tests {
         assert_eq!(ws.world.as_ref().unwrap().bytes[blk(1, 1, 0)], 0x2A, "the edit itself is not rolled back");
     }
 
+    // ── Row 18.2: bounded non-z-scoped edit pre-images ─────────────────────────────────────
+
+    /// `n × n` contiguous 64z chunks (32768 B each), chunk (cx, cy) at directory slot `cy * n + cx`.
+    /// Every chunk is empty except a stone floor at z=0 so `surface_z` finds terrain.
+    fn make_grid_world(n: usize) -> Vec<u8> {
+        const CHUNK: usize = 32768;
+        let ptr_off = HEADER + n * n * CHUNK;
+        let mut b = vec![0u8; ptr_off + n * n * 16];
+        b[32..36].copy_from_slice(&(ptr_off as u32).to_le_bytes());
+        b[40..49].copy_from_slice(b"GridWorld");
+        for cy in 0..n {
+            for cx in 0..n {
+                let i = cy * n + cx;
+                let off = HEADER + i * CHUNK;
+                for lx in 0..16 { for ly in 0..16 { b[off + lx * 256 + ly * 16] = 2; } }
+                let pe = ptr_off + i * 16;
+                b[pe..pe + 2].copy_from_slice(&(cx as i16).to_le_bytes());
+                b[pe + 4..pe + 6].copy_from_slice(&(cy as i16).to_le_bytes());
+                b[pe + 8..pe + 12].copy_from_slice(&(off as u32).to_le_bytes());
+            }
+        }
+        b
+    }
+
+    #[test]
+    fn test_preimage_guard_names_the_size_and_scales_with_budget() {
+        let mb = 1024 * 1024;
+        assert!(check_preimage_budget(4 * 96 * mb, 96 * mb).is_ok(), "exactly k x budget is allowed");
+        let e = check_preimage_budget(4 * 96 * mb + 1, 96 * mb).unwrap_err();
+        assert!(e.contains("384 MB"), "message names the limit: {e}");
+        assert!(check_preimage_budget(2000 * mb, 512 * mb).is_ok(), "a bigger budget raises the ceiling");
+        assert!(check_preimage_budget(usize::MAX, usize::MAX).is_ok(), "no overflow on saturating math");
+    }
+
+    #[test]
+    fn test_guarded_edit_refuses_oversized_preimage_and_keeps_the_world() {
+        let mut ws = ws_with(make_grid_world(2));
+        ws.undo_budget = 1024; // limit = 4 KiB; the 2x2 rect is 128 KiB
+        let before = world_bytes(&ws);
+        let rect = (0, 0, 31, 31);
+        let mut ran = false;
+        let err = match with_edit_guarded(&mut ws, "trees", rect, rect, |_| { ran = true; Ok(()) }) {
+            Err(e) => e,
+            Ok(_) => panic!("over-budget pre-image must be refused"),
+        };
+        assert!(!ran, "the edit closure must not run");
+        assert!(err.contains("MB"), "{err}");
+        assert!(ws.world.is_some(), "the world is reinstalled on refusal");
+        assert_eq!(world_bytes(&ws), before);
+        // Plain with_edit is unchanged (no guard), so existing callers behave as before.
+        with_edit(&mut ws, "delete", rect, rect, |_| Ok(())).expect("unguarded path unaffected");
+        // And a guarded edit under budget still applies + undoes.
+        ws.undo_budget = DEFAULT_UNDO_BYTE_BUDGET;
+        with_edit_guarded(&mut ws, "trees", rect, rect, |w| { w.bytes[blk(1, 1, 5)] = 9; Ok(()) }).expect("in budget");
+        assert_eq!(ws.undo_stack.len(), 1);
+    }
+
+    #[test]
+    fn test_explicit_chunk_set_snapshots_only_those_chunks_and_undoes() {
+        let mut ws = ws_with(make_grid_world(3));
+        let before = world_bytes(&ws);
+        // Bbox of these two corner chunks is the whole 3x3 grid; only the corners are listed.
+        let chunks = vec![(0, 0), (2, 2)];
+        let world = ws.world.as_ref().unwrap();
+        assert_eq!(preimage_bytes(world, &chunks, Some((0, 15))), 2 * 8192, "one band per listed chunk");
+        assert_eq!(preimage_bytes(world, &chunks, None), 2 * 32768);
+        let (a0, _) = world.chunk_range(0, 0).unwrap();
+        let (a2, _) = world.chunk_range(2, 2).unwrap();
+        with_edit_chunks(&mut ws, "cells", chunks, (0, 0, 47, 47), Some((0, 15)), |w| {
+            w.bytes[a0 + 8192 * 0 + 3] = 7;
+            w.bytes[a2 + 5] = 7;
+            Ok(())
+        }).expect("edit");
+        let snapped: Vec<(i32, i32)> = ws.undo_stack.back().unwrap().chunks.iter().map(|s| (s.cx, s.cy)).collect();
+        assert_eq!(snapped.len(), 2);
+        assert!(snapped.contains(&(0, 0)) && snapped.contains(&(2, 2)) && !snapped.contains(&(1, 1)));
+        undo_edit_inner(&mut ws).expect("undo");
+        assert_eq!(world_bytes(&ws), before, "undo restores the exact pre-edit bytes");
+    }
+
+    #[test]
+    fn test_cells_snapshot_scope_is_footprint_not_bbox() {
+        let ws = ws_with(make_grid_world(4));
+        let world = ws.world.as_ref().unwrap();
+        // A diagonal tunnel: bbox spans all 16 chunks, cells touch only the diagonal 4.
+        let cells: Vec<(i32, i32, i32)> = (0..64).map(|i| (i, i, 20 + i / 16)).collect();
+        let (chunks, z) = cells_snapshot_scope(world, &cells);
+        assert_eq!(chunks, vec![(0, 0), (1, 1), (2, 2), (3, 3)]);
+        assert_eq!(z, Some((20, 23)));
+        assert_eq!(cells_snapshot_scope(world, &[]), (vec![], None));
+    }
+
+    #[test]
+    fn test_scatter_scope_matches_the_edit_draws_and_is_small() {
+        let placements = scatter_placements(0, 0, 200, 200, 5, 42);
+        assert_eq!(placements, scatter_placements(0, 0, 200, 200, 5, 42), "seeded and repeatable");
+        assert_eq!(placements.len(), 5);
+        assert!(placements.iter().all(|&(x, y)| (0..200).contains(&x) && (0..200).contains(&y)));
+        // seed 0 maps to the fixed fallback stream, same as the edit used
+        assert_eq!(scatter_placements(0, 0, 9, 9, 3, 0).len(), 3);
+
+        // A 4x4 chunk world, 3x3 clipboard, 4 placements: scope is far below the 16-chunk box.
+        let ws = ws_with(make_grid_world(4));
+        let world = ws.world.as_ref().unwrap();
+        let spots = [(1, 1), (17, 1), (60, 60), (33, 20)];
+        let (chunks, z) = paste_snapshot_scope(world, &spots, 3, 3, 5, 10, 2);
+        assert_eq!(z, (12, 16));
+        assert!(chunks.len() <= 4, "footprint chunks only, got {chunks:?}");
+        assert!(chunks.contains(&(0, 0)) && chunks.contains(&(1, 0)) && chunks.contains(&(3, 3)) && chunks.contains(&(2, 1)));
+        // A footprint straddling a chunk seam pulls in both chunks.
+        let (seam, _) = paste_snapshot_scope(world, &[(14, 0)], 4, 1, 1, 0, 0);
+        assert_eq!(seam, vec![(0, 0), (1, 0)]);
+    }
+
+    #[test]
+    fn test_scatter_and_array_edits_undo_exactly_under_chunk_scope() {
+        let mut ws = ws_with(make_grid_world(4));
+        let before = world_bytes(&ws);
+        let (w, h, d, za) = (3, 3, 2, 1);
+        let bt = vec![13u8; (w * h * d) as usize];
+        let pt = vec![4u8; (w * h * d) as usize];
+        let spots = vec![(5, 5), (30, 14), (50, 50)]; // (30,14): footprint spans chunk seam x 30..32
+        let (chunks, z) = paste_snapshot_scope(ws.world.as_ref().unwrap(), &spots, w, h, d, za, 0);
+        with_edit_chunks(&mut ws, "scatter", chunks, (0, 0, 63, 63), Some(z), |world| {
+            let mz = world_max_z(world);
+            for &(px, py) in &spots {
+                paste_clipboard_at(world, px, py, &bt, &pt, w, h, d, za, 0, false, mz, None);
+            }
+            Ok(())
+        }).expect("scatter");
+        let world = ws.world.as_ref().unwrap();
+        for &(px, py) in &spots {
+            assert_eq!(read_block_abs(world, px + 2, py + 2, za + 1), 13, "pasted at {px},{py}");
+        }
+        assert_eq!(read_block_abs(world, 32, 14, za), 13, "seam-straddling cell landed in the neighbour chunk");
+        undo_edit_inner(&mut ws).expect("undo");
+        assert_eq!(world_bytes(&ws), before, "every chunk the paste touched was captured");
+    }
+
+    #[test]
+    fn test_terrain_paste_scope_tracks_surface_range_and_undoes() {
+        // Two 16x16 chunks side by side; chunk (1,0) terrain sits at z=20, chunk (0,0) at z=1.
+        let mut bytes = make_grid_world(2);
+        for lx in 0..16usize { for ly in 0..16usize {
+            let off = HEADER + 32768 * 1; // chunk (1,0) is slot 1
+            bytes[off + lx * 256 + ly * 16 + 4] = 2; // z=4 solid
+            bytes[off + 8192 + lx * 256 + ly * 16 + 4] = 2; // z=20 solid
+        }}
+        let mut ws = ws_with(bytes);
+        let before = world_bytes(&ws);
+        let world = ws.world.as_ref().unwrap();
+        let (chunks, z) = terrain_paste_snapshot_scope(world, 10, 2, 12, 2, 3, 0, true, None, None);
+        assert_eq!(chunks, vec![(0, 0), (1, 0)]);
+        let lo = surface_z(world, 10, 2).unwrap() + 1;
+        let hi = surface_z(world, 25, 2).unwrap() + 1;
+        assert_eq!(z, (lo.min(hi), lo.max(hi) + 2), "surface range plus clipboard depth");
+        // Footprint entirely outside the world: empty scope.
+        let (none, _) = terrain_paste_snapshot_scope(world, 500, 500, 4, 4, 2, 0, true, None, None);
+        assert!(none.is_empty());
+
+        let cb = Clipboard { width: 12, height: 2, depth: 3, z_anchor: 0,
+            block_types: vec![13u8; 72], paints: vec![0u8; 72], mask: None };
+        ws.clipboard = Some(cb);
+        paste_terrain_inner(&mut ws, 10, 2, 0, false, true).expect("terrain paste");
+        assert_eq!(ws.undo_stack.len(), 1);
+        assert_eq!(read_block_abs(ws.world.as_ref().unwrap(), 10, 2, lo), 13);
+        undo_edit_inner(&mut ws).expect("undo");
+        assert_eq!(world_bytes(&ws), before);
+    }
+
     /// Placing more doors than `RISKY_BLOCK_GROUPS`' threshold in one edit footprint surfaces a
     /// warning (the ComBlock crash writeup); staying under it stays silent, and a different block
     /// type entirely never warns.
@@ -11056,6 +11710,46 @@ mod tests {
                 "a Stone fill must never warn about doors it never touched");
     }
 
+    /// 13.2 — with relief on, an edited column changes the shade of the samples one LOD step east
+    /// and south of it, so `edit_patch` must grow its rect there. The patch has to match a fresh
+    /// full render over that grown rect, pixel for pixel, at every LOD — otherwise an edit leaves a
+    /// stale-shaded seam beside it until the tile is refetched.
+    #[test]
+    fn test_relief_edit_patch_covers_east_and_south_neighbours() {
+        let mut b = make_test_world();
+        let at = |lx: usize, ly: usize, z: usize| 4096 + (z / 16) * 8192 + lx * 256 + ly * 16 + z % 16;
+        for lx in 0..16 { for ly in 0..16 { for z in 0..=4 { b[at(lx, ly, z)] = 1; } } }
+        for z in 5..=12 { b[at(6, 6, z)] = 1; } // the "edited" column, much higher than its neighbours
+        let world = parse_world_inner(mmap_from_bytes(b)).expect("parse failed");
+        let relief = MapStyle { cap: None, relief: Some(100) };
+
+        for (lod, rect) in [(1u32, (6, 6, 6, 6)), (2, (6, 6, 6, 6)), (4, (4, 4, 7, 7))] {
+            let (p, invalidated) = edit_patch(&world, rect, relief, lod);
+            assert!(!invalidated);
+            let full = render_pixels_patch_styled(&world, 0, 0, 15, 15, relief, lod);
+            // Grown by one step east and south of the (lod-floored) edit rect.
+            let fx = (rect.0 as u32 / lod) * lod;
+            assert_eq!(p.x, fx, "lod {lod}");
+            assert_eq!(p.width, (rect.2 as u32 + lod - fx) / lod + 1, "lod {lod}");
+            assert_eq!(p.height, (rect.3 as u32 + lod - fx) / lod + 1, "lod {lod}");
+            for oy in 0..p.height {
+                for ox in 0..p.width {
+                    let po = ((oy * p.width + ox) * 4) as usize;
+                    let fo = (((p.y / lod + oy) * full.width + p.x / lod + ox) * 4) as usize;
+                    assert_eq!(&p.pixels[po..po + 4], &full.pixels[fo..fo + 4], "lod {lod} ({ox},{oy})");
+                }
+            }
+        }
+        // …and the grown column really is shaded by the edit: the sample east of the column sits
+        // in its shadow, so it differs from the plain render.
+        let plain = render_pixels_patch_styled(&world, 7, 6, 7, 6, MapStyle::default(), 1);
+        let shaded = render_pixels_patch_styled(&world, 7, 6, 7, 6, relief, 1);
+        assert_ne!(plain.pixels, shaded.pixels);
+        // Relief off: no growth — the pre-13.2 rect exactly.
+        let (p, _) = edit_patch(&world, (6, 6, 6, 6), MapStyle::default(), 1);
+        assert_eq!((p.width, p.height), (1, 1));
+    }
+
     /// C2 — an edit patch larger than `MAX_EDIT_PATCH_PIXELS` ships as an `invalidate` rect with no
     /// pixels at all, instead of the 243 MB RGBA buffer a ⌘A fill used to build.
     #[test]
@@ -11064,13 +11758,13 @@ mod tests {
         // A rect far larger than the cap. `edit_patch` clamps to the world first, so ask it
         // directly with the cap lowered by raising the LOD instead: at lod 1 this 1-chunk world
         // can't produce an oversized patch, so drive the arithmetic through the helper's own guard.
-        let (small, invalidated) = edit_patch(&world, (0, 0, 15, 15), None, 1);
+        let (small, invalidated) = edit_patch(&world, (0, 0, 15, 15), MapStyle::default(), 1);
         assert!(!invalidated && !small.pixels.is_empty(), "a 16×16 patch is nowhere near the cap");
         assert_eq!((small.width, small.height, small.lod), (16, 16, 1));
 
         // Same rect against a cap it *does* exceed (a fixture large enough to reach the real
         // 2 M-pixel ceiling would be a 260 MB world, hence the parameterised cap).
-        let (big, invalidated) = edit_patch_capped(&world, (0, 0, 15, 15), None, 1, 100);
+        let (big, invalidated) = edit_patch_capped(&world, (0, 0, 15, 15), MapStyle::default(), 1, 100);
         assert!(invalidated, "a patch past the cap must ask the frontend to refetch instead");
         assert!(big.pixels.is_empty(), "an invalidate patch must carry no pixels at all");
         assert_eq!((big.x, big.y, big.width, big.height, big.lod), (0, 0, 16, 16, 1),
@@ -11083,7 +11777,7 @@ mod tests {
     #[test]
     fn test_edit_patch_lod_aligns_origin_and_samples() {
         let world = parse_world_inner(mmap_from_bytes(make_test_world())).expect("parse failed");
-        let (p, invalidated) = edit_patch(&world, (5, 6, 12, 12), None, 4);
+        let (p, invalidated) = edit_patch(&world, (5, 6, 12, 12), MapStyle::default(), 4);
         assert!(!invalidated);
         assert_eq!((p.x, p.y), (4, 4), "origin must floor to the LOD grid");
         assert_eq!(p.lod, 4);
@@ -11136,6 +11830,7 @@ mod tests {
             ChunkDelta::Sparse(v) => format!("Sparse({} entries)", v.len()),
             ChunkDelta::Full(_, b) => format!("Full({} bytes)", b.len()),
             ChunkDelta::FullZ(_, z, raw) => format!("FullZ({} bytes, raw {raw})", z.len()),
+            ChunkDelta::SparseZ(z, n) => format!("SparseZ({} bytes, {n} entries)", z.len()),
         }
     }
 
@@ -11181,6 +11876,56 @@ mod tests {
         restore_and_invert(&mut world, &UndoEntry::new("test", vec![snap2], None));
         assert_eq!(&world.bytes[HEADER..HEADER + 32768], &pre_full2[0].3[..],
             "Full-delta undo must restore the whole chunk");
+    }
+
+    /// 18.5 — pack/unpack is exact, including unsorted and large-gap offsets.
+    #[test]
+    fn test_sparse_pack_round_trip() {
+        let pairs: Vec<(u32, u8)> = vec![(0, 1), (5, 2), (4, 3), (131_071, 255), (70_000, 0), (70_001, 9)];
+        let z = pack_sparse(&pairs).unwrap();
+        assert_eq!(unpack_sparse(&z, pairs.len() as u32).unwrap(), pairs);
+        assert!(unpack_sparse(&z, 1000).is_none(), "wrong count must fail, not panic");
+        assert_eq!(unpack_sparse(&pack_sparse(&[]).unwrap(), 0).unwrap(), vec![]);
+    }
+
+    /// 18.5 — a ~15% sparse edit is stored as `SparseZ` well under its old 8 B/entry price, the byte
+    /// accounting matches the real payload, and undo/redo/undo round-trips exactly. A tiny edit
+    /// stays plain `Sparse` (packing wouldn't pay for itself).
+    #[test]
+    fn test_sparse_delta_compresses_and_round_trips() {
+        let mut world = parse_world_inner(mmap_from_bytes(make_test_world())).expect("parse failed");
+        let pre_full = snapshot_chunks_full(&world, &[(0, 0)], None);
+        let orig: Vec<u8> = world.bytes[HEADER..HEADER + 32768].to_vec();
+        let mut changed = 0usize;
+        for i in (0..32768).step_by(7) {
+            world.bytes[HEADER + i] = world.bytes[HEADER + i].wrapping_add(1);
+            changed += 1;
+        }
+        let edited: Vec<u8> = world.bytes[HEADER..HEADER + 32768].to_vec();
+        let snap = diff_chunk(&world, 0, 0, pre_full[0].2, &pre_full[0].3).unwrap();
+        assert!(matches!(snap.delta, ChunkDelta::Sparse(ref p) if p.len() == changed),
+            "~14% edit must be Sparse pre-push, got {}", delta_kind(&snap.delta));
+        let old_cost = changed * 8;
+        let entry = UndoEntry::new("t", vec![snap], None);
+        match &entry.chunks[0].delta {
+            ChunkDelta::SparseZ(z, n) => {
+                assert_eq!(*n as usize, changed);
+                assert!(entry.bytes == z.capacity() + 40 && entry.bytes < old_cost / 2,
+                    "SparseZ must be honestly priced and far below 8 B/entry: {} vs {old_cost}", entry.bytes);
+            }
+            other => panic!("expected SparseZ, got {}", delta_kind(other)),
+        }
+        let redo = restore_and_invert(&mut world, &entry);
+        assert_eq!(&world.bytes[HEADER..HEADER + 32768], &orig[..], "undo restores original");
+        let redo_entry = UndoEntry::new("t", redo, None);
+        let undo2 = restore_and_invert(&mut world, &redo_entry);
+        assert_eq!(&world.bytes[HEADER..HEADER + 32768], &edited[..], "redo restores edit");
+        restore_and_invert(&mut world, &UndoEntry::new("t", undo2, None));
+        assert_eq!(&world.bytes[HEADER..HEADER + 32768], &orig[..], "second undo restores original");
+
+        // Tiny edit stays plain Sparse.
+        let one = ChunkDelta::Sparse(vec![(3, 7)]).compressed();
+        assert!(matches!(one, ChunkDelta::Sparse(_)), "1-entry delta must not be packed: {}", delta_kind(&one));
     }
 
     /// H1 (3D fly-view build-gesture audit) — `paint_blocks` accepts a `group: Option<u64>` routed
@@ -11734,6 +12479,51 @@ mod tests {
         load_autosave_inner(&fresh, &paths).expect("load_autosave_inner after compaction");
         let recovered = world_bytes(&read_ws(&fresh));
         assert_eq!(recovered, expected, "post-compaction recovery must match the live world");
+
+        let recovered_temp = read_ws(&fresh).temp_path.clone().expect("recovery must stage a temp file");
+        let _ = fs::remove_file(&recovered_temp);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Audit X-1 — after a manual save the frontend discards the autosave files; the lineage must be
+    /// forgotten with them, or the next tick appends to a deleted journal / journals against a
+    /// deleted base and recovery fails with "Failed to stat autosave base".
+    #[test]
+    fn test_autosave_survives_discard_after_save() {
+        let original = make_bumpy_world_grid(2, 8, |_, _| 20);
+        let dir = std::env::temp_dir().join(format!("vuencedit_autosave_x1_test_{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("create test sidecar dir");
+        let staged = dir.join("staged.eden");
+        let paths = autosave_paths_at(&dir);
+        let state: AppState = RwLock::new(ws_with_temp_path(original, &staged));
+
+        let edit = |x0: i32, x1: i32| {
+            let mut ws = write_ws(&state);
+            with_edit(&mut ws, "delete", (x0, 0, x1, 5), (x0, 0, x1, 5), |world| {
+                delete_blocks_inner(world, x0, 0, x1, 5, 0, 63, None);
+                Ok(())
+            }).expect("edit");
+        };
+
+        edit(0, 5);
+        autosave_world_inner(&state, &paths, None, None).expect("tick 1");
+
+        // The manual-save aftermath: the discharge the save records, then the discard command.
+        let seq = read_ws(&state).dirty.seq;
+        let saved = dir.join("saved.eden");
+        fs::write(&saved, world_bytes(&read_ws(&state))).expect("write saved file");
+        record_full_write(&state, &saved, false, seq).expect("record_full_write");
+        discard_autosave_inner(&state, &paths);
+        assert!(!paths.base.exists() && !paths.journal.exists() && !paths.meta.exists());
+
+        edit(16, 20);
+        autosave_world_inner(&state, &paths, None, None).expect("tick after discard must succeed");
+        assert!(paths.base.exists() && paths.journal.exists(), "the tick must re-establish its lineage");
+
+        let expected = world_bytes(&read_ws(&state));
+        let fresh: AppState = RwLock::new(WorldState::new());
+        load_autosave_inner(&fresh, &paths).expect("recovery after save + discard + edit must load");
+        assert_eq!(world_bytes(&read_ws(&fresh)), expected);
 
         let recovered_temp = read_ws(&fresh).temp_path.clone().expect("recovery must stage a temp file");
         let _ = fs::remove_file(&recovered_temp);
@@ -12396,37 +13186,6 @@ mod tests {
         let img = image::load_from_memory(&png).expect("decode failed");
         assert_eq!(img.width(), w as u32);
         assert_eq!(img.height(), h as u32);
-    }
-
-    /// X/Y slice renderers place the known column (px=3, py=5) blocks at the right pixels.
-    /// Column has Wood@z0, Stone@z17, Dirt@z48; image row = z2 - z (row 0 = top).
-    #[test]
-    fn test_xy_slice_patches() {
-        let world = parse_world_inner(mmap_from_bytes(make_test_world())).expect("parse failed");
-        let at = |p: &PixelPatch, col: u32, row: u32| -> (u8, u8, u8, u8) {
-            let off = ((row * p.width + col) * 4) as usize;
-            (p.pixels[off], p.pixels[off + 1], p.pixels[off + 2], p.pixels[off + 3])
-        };
-
-        // Front slab at world Y=5, X range 0..7, Z range 0..63. Column X=3.
-        let front = render_yslice_patch_inner(&world, 5, 0, 0, 7, 63);
-        assert_eq!(front.width, 8);
-        assert_eq!(front.height, 64);
-        // Wood@z0 → row 63; Stone@z17 → row 46; Dirt@z48 → row 15; all at col=3.
-        assert_eq!(at(&front, 3, 63).3, 255, "wood present at z0 (row 63)");
-        assert_eq!(at(&front, 3, 46).3, 255, "stone present at z17 (row 46)");
-        assert_eq!(at(&front, 3, 15).3, 255, "dirt present at z48 (row 15)");
-        // Empty cell (col 0, row 0) is VOID background.
-        assert_eq!(at(&front, 0, 0), (20, 20, 35, 255), "void background");
-
-        // Side slab at world X=3, Y range 0..7, Z range 0..63. Column Y=5.
-        let side = render_xslice_patch_inner(&world, 3, 0, 0, 7, 63);
-        assert_eq!(side.width, 8);
-        assert_eq!(side.height, 64);
-        assert_eq!(at(&side, 5, 63).3, 255, "wood present at z0 (row 63)");
-        assert_eq!(at(&side, 5, 46).3, 255, "stone present at z17 (row 46)");
-        assert_eq!(at(&side, 5, 15).3, 255, "dirt present at z48 (row 15)");
-        assert_eq!(at(&side, 0, 0), (20, 20, 35, 255), "void background");
     }
 
     /// Cutaway view: a cap hides everything above it, so both the top-down render and the
@@ -13521,6 +14280,61 @@ mod tests {
         assert_eq!(cb_y.paints, original.paints, "2x Y-mirror restores paints");
     }
 
+    /// 18.6: the in-place mirrors and slice-wise rotate must equal a naive out-of-place reference
+    /// on multi-slice clipboards with odd and even sides (odd = a self-mapped middle row/column
+    /// that is remapped but not swapped) and a footprint mask.
+    #[test]
+    fn test_clipboard_transforms_match_reference() {
+        for &(w, h, d) in &[(1usize, 1usize, 1usize), (3, 5, 4), (4, 6, 3), (5, 2, 2), (2, 5, 1), (7, 7, 2)] {
+            let vol = w * h * d;
+            let mk = || Clipboard {
+                width: w as i32, height: h as i32, depth: d as i32, z_anchor: 0,
+                // Cycle through ramps/wedges/doors/portals/plain so every remap arm is exercised.
+                block_types: (0..vol).map(|i| ((i * 5) % 80) as u8).collect(),
+                paints: (0..vol).map(|i| (i % 251) as u8).collect(),
+                mask: Some((0..(w * h).div_ceil(8)).map(|i| (i as u8).wrapping_mul(37) | 1).collect()),
+            };
+            let mask_bit = |m: &Option<Vec<u8>>, i: usize| bit_set(m.as_ref().unwrap(), i);
+            let src = mk();
+            let at = |c: &Clipboard, x: usize, y: usize, z: usize| {
+                let i = z * (c.width * c.height) as usize + y * c.width as usize + x;
+                (c.block_types[i], c.paints[i])
+            };
+
+            let mut cb = mk();
+            mirror_clipboard_x_inner(&mut cb);
+            for z in 0..d { for y in 0..h { for x in 0..w {
+                let (bt, p) = at(&src, x, y, z);
+                assert_eq!(at(&cb, w - 1 - x, y, z), (mirror_ramp_id_x(bt), p), "mirror X {w}x{h}x{d} at {x},{y},{z}");
+            }}}
+            for y in 0..h { for x in 0..w {
+                assert_eq!(mask_bit(&cb.mask, y * w + (w - 1 - x)), mask_bit(&src.mask, y * w + x), "mirror X mask");
+            }}
+
+            let mut cb = mk();
+            mirror_clipboard_y_inner(&mut cb);
+            for z in 0..d { for y in 0..h { for x in 0..w {
+                let (bt, p) = at(&src, x, y, z);
+                assert_eq!(at(&cb, x, h - 1 - y, z), (mirror_ramp_id_y(bt), p), "mirror Y {w}x{h}x{d} at {x},{y},{z}");
+            }}}
+            for y in 0..h { for x in 0..w {
+                assert_eq!(mask_bit(&cb.mask, (h - 1 - y) * w + x), mask_bit(&src.mask, y * w + x), "mirror Y mask");
+            }}
+
+            let mut cb = mk();
+            rotate_clipboard_inner(&mut cb);
+            assert_eq!((cb.width as usize, cb.height as usize), (h, w));
+            assert_eq!(cb.block_types.len(), vol);
+            for z in 0..d { for y in 0..h { for x in 0..w {
+                let (bt, p) = at(&src, x, y, z);
+                assert_eq!(at(&cb, y, w - 1 - x, z), (rotate_ramp_id_cw(bt), p), "rotate {w}x{h}x{d} at {x},{y},{z}");
+            }}}
+            for y in 0..h { for x in 0..w {
+                assert_eq!(mask_bit(&cb.mask, (w - 1 - x) * h + y), mask_bit(&src.mask, y * w + x), "rotate mask");
+            }}
+        }
+    }
+
     /// The sculpt "noise" branch must sample *spatially coherent* noise (fbm/ridged), not
     /// per-column white noise. Coherence = adjacent columns get near-identical displacements,
     /// so the mean step between horizontal neighbours is far smaller than the field's range.
@@ -13871,7 +14685,7 @@ mod tests {
     /// Rock/Carve field-fusion tests need this: their terrain estimate is sampled just *outside*
     /// the stamp's own padded bbox (see `field_stamp`'s `stable_h`), which for anything but a tiny
     /// radius runs past a single 16×16 chunk's bounds on the single-chunk fixture.
-    fn make_bumpy_world_grid<F: Fn(i32, i32) -> i32>(chunks_side: i32, surf_bt: u8, height: F) -> Vec<u8> {
+    pub(crate) fn make_bumpy_world_grid<F: Fn(i32, i32) -> i32>(chunks_side: i32, surf_bt: u8, height: F) -> Vec<u8> {
         const HEADER: usize = 4096;
         const CHUNK: usize = 32768;
         let n = (chunks_side * chunks_side) as usize;
@@ -13903,7 +14717,7 @@ mod tests {
         b
     }
 
-    fn ws_with(bytes: Vec<u8>) -> WorldState {
+    pub(crate) fn ws_with(bytes: Vec<u8>) -> WorldState {
         let mut ws = WorldState::new();
         ws.world = Some(parse_world_inner(mmap_from_bytes(bytes)).expect("parse"));
         ws
@@ -14570,6 +15384,122 @@ mod tests {
         assert_eq!(read_block_abs(w, 10, 11, 30), 0, "off-diagonal (0,1) skipped");
     }
 
+    // ── Paste lens (14.8) ───────────────────────────────────────────────────────────────────
+
+    /// A 5×4×3 clipboard with a mix of air and solids and one column masked out of the footprint.
+    fn lens_test_clipboard(z_anchor: i32) -> Clipboard {
+        let (w, h, d) = (5, 4, 3);
+        let n = (w * h * d) as usize;
+        let block_types = (0..n).map(|i| if i % 4 == 1 { 0 } else { 13 + (i % 3) as u8 }).collect();
+        let paints = (0..n).map(|i| (i % 7) as u8).collect();
+        let mut bits = vec![0xffu8; 3];
+        bits[0] &= !(1 << 6); // (dx 1, dy 1) outside the footprint
+        Clipboard { width: w, height: h, depth: d, z_anchor, block_types, paints, mask: Some(bits) }
+    }
+
+    /// The lens's terrain-mode bases are the paste's: after a real `paste_terrain`, exactly the
+    /// cells `terrain_paste_base + offset + dz` predicts were written (and nothing else changed),
+    /// and the lens rendered against the pre-paste world counted exactly the solid-over-solid ones.
+    #[test]
+    fn test_terrain_paste_base_matches_paste_terrain() {
+        let heights = |lx: usize, ly: usize| 4 + ((lx * 3 + ly * 5) % 11) as i32;
+        for (ignore_air, above_surface, offset) in [(true, true, -2), (false, false, -1), (false, true, -3)] {
+            let pre_bytes = make_bumpy_world(2, heights);
+            let pre = parse_world_inner(mmap_from_bytes(pre_bytes.clone())).expect("parse");
+            let mut ws = ws_with(pre_bytes);
+            ws.clipboard = Some(lens_test_clipboard(0));
+            let (px, py) = (6, 7);
+
+            let lens = render_paste_lens_inner(&ws, px, py, "front", offset, "terrain", above_surface, ignore_air, 2, None)
+                .expect("lens");
+            let cb = ws.clipboard.as_ref().unwrap();
+            let bases = paste_lens_bases(&pre, cb, px, py, true, offset, above_surface, None);
+            let (w, h, d) = (cb.width as usize, cb.height as usize, cb.depth as usize);
+            let (types, paints) = (cb.block_types.clone(), cb.paints.clone());
+
+            paste_terrain_inner(&mut ws, px, py, offset, ignore_air, above_surface).expect("paste");
+            let post = ws.world.as_ref().unwrap();
+
+            let mut predicted = std::collections::HashSet::new();
+            let mut solid_over_solid = 0u64;
+            for dy in 0..h { for dx in 0..w {
+                let b = bases[dy * w + dx];
+                if b == render::LENS_SKIP { continue; }
+                for dz in 0..d {
+                    let idx = dz * h * w + dy * w + dx;
+                    if ignore_air && types[idx] == 0 { continue; }
+                    let (x, y, z) = (px + dx as i32, py + dy as i32, b + dz as i32);
+                    predicted.insert((x, y, z));
+                    assert_eq!(get_block_at(post, x, y, z), (types[idx], paints[idx]),
+                        "cell ({x},{y},{z}) must hold the pasted block");
+                    if types[idx] != 0 && read_block_abs(&pre, x, y, z) != 0 { solid_over_solid += 1; }
+                }
+            }}
+            for x in 0..16 { for y in 0..16 { for z in 0..64 {
+                if predicted.contains(&(x, y, z)) { continue; }
+                assert_eq!(get_block_at(post, x, y, z), get_block_at(&pre, x, y, z),
+                    "({x},{y},{z}) outside the predicted cells must be untouched");
+            }}}
+            assert!(solid_over_solid > 0, "fixture must actually bury something");
+            assert_eq!(lens.header.buried, solid_over_solid, "lens buried count = cells the paste overwrote");
+            // The masked-out column (dx 1, dy 1) is skipped by both.
+            assert_eq!(bases[w + 1], render::LENS_SKIP);
+        }
+    }
+
+    /// On an empty world the lens's ghost is the Inspector's clipboard silhouette, shifted to the
+    /// paste Z — the two renders share axes, handedness and the mask gate.
+    #[test]
+    fn test_paste_lens_no_terrain_ghost_equals_clipboard_silhouette() {
+        let mut ws = ws_with(make_bumpy_world(0, |_, _| 1)); // surf_bt 0 = all air
+        let cb = lens_test_clipboard(20);
+        let (w, h, d) = (cb.width as u32, cb.height as u32, cb.depth as u32);
+        let sil_front = render_clipboard_elevation_preview_inner(&cb, 0, "front");
+        let sil_side = render_clipboard_elevation_preview_inner(&cb, 0, "side");
+        ws.clipboard = Some(cb);
+        for (view, sil, cols) in [("front", sil_front, w), ("side", sil_side, h)] {
+            let lens = render_paste_lens_inner(&ws, 3, 4, view, 5, "normal", false, true, 0, None).expect("lens");
+            let hd = &lens.header;
+            assert_eq!((hd.width, sil.width), (cols, cols));
+            assert_eq!((hd.buried, hd.cleared), (0, 0));
+            for col in 0..cols {
+                for srow in 0..d {
+                    let z = 25 + (d - 1 - srow) as i32; // z_anchor 20 + offset 5
+                    let lrow = (hd.z_hi - z) as u32;
+                    let sa = sil.pixels[((srow * cols + col) * 4 + 3) as usize];
+                    let la = lens.pixels[((lrow * hd.width + col) * 4 + 3) as usize];
+                    assert_eq!(la == 255, sa == 255, "{view} col {col} z {z}");
+                }
+            }
+        }
+    }
+
+    /// `PasteLensPatch` frames as the binary envelope (header JSON + raw RGBA), never base64.
+    #[test]
+    fn test_render_paste_lens_envelope() {
+        use tauri::ipc::InvokeResponseBody;
+        let mut ws = ws_with(make_bumpy_world(2, |_, _| 10));
+        ws.clipboard = Some(lens_test_clipboard(8));
+        let lens = render_paste_lens_inner(&ws, 2, 2, "side", 0, "normal", false, false, 3, Some(64)).expect("lens");
+        let (w, h) = (lens.header.width, lens.header.height);
+        let bytes = match tauri::ipc::IpcResponse::body(lens).expect("frame") {
+            InvokeResponseBody::Raw(v) => v,
+            InvokeResponseBody::Json(_) => panic!("lens must be a raw envelope"),
+        };
+        let hlen = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
+        assert_eq!((4 + hlen) % 4, 0);
+        let hdr: serde_json::Value = serde_json::from_slice(&bytes[4..4 + hlen]).unwrap();
+        assert_eq!(hdr["width"], w);
+        assert_eq!(hdr["height"], h);
+        assert_eq!(hdr["col_lo"], -1, "side view: y 2 − 3 context columns");
+        assert_eq!(hdr["footprint_lo"], 2);
+        assert_eq!(hdr["footprint_hi"], 5);
+        assert!(hdr["buried"].as_u64().unwrap() > 0 && hdr["cleared"].as_u64().unwrap() > 0);
+        assert_eq!(bytes.len() - 4 - hlen, (w * h * 4) as usize);
+        assert!(render_paste_lens_inner(&ws, 0, 0, "top", 0, "normal", false, false, 0, None).is_err());
+        assert!(render_paste_lens_inner(&ws, 0, 0, "front", 0, "scatter", false, false, 0, None).is_err());
+    }
+
     /// Rotating a shaped clipboard 90° CW transforms the footprint with the SAME map as the data, so
     /// the mask still lines up with the blocks it gates.
     #[test]
@@ -14643,7 +15573,7 @@ mod tests {
         bits[0] |= 1 << 0; bits[0] |= 1 << 3;
         let cb = Clipboard { width: 2, height: 2, depth: 1, z_anchor: 0,
             block_types: vec![13u8; 4], paints: vec![0u8; 4], mask: Some(bits) };
-        let pd = render_clipboard_preview_inner(&cb, 0);
+        let pd = render_clipboard_preview_inner(&cb, 0, None);
         let a = |dx: usize, dy: usize| pd.pixels[(dy * 2 + dx) * 4 + 3];
         assert_eq!(a(0, 0), 255, "masked block column is opaque");
         assert_eq!(a(1, 1), 255, "far masked block column is opaque");
@@ -14652,8 +15582,32 @@ mod tests {
 
         // None mask ⇒ every column filled (VOID for the air columns), matching prefab thumbnails.
         let cb2 = Clipboard { mask: None, ..cb };
-        let pd2 = render_clipboard_preview_inner(&cb2, 0);
+        let pd2 = render_clipboard_preview_inner(&cb2, 0, None);
         for i in 0..4 { assert_eq!(pd2.pixels[i * 4 + 3], 255, "None mask fills the whole box"); }
+    }
+
+    /// Row 18.3: `max_side` bounds the preview and samples the right column.
+    #[test]
+    fn test_clipboard_preview_lod_bounded() {
+        // 1024x2x1, brick only in column 0 and column 512 (both on lod-2 sample points).
+        let (w, h) = (1024usize, 2usize);
+        let mut bt = vec![0u8; w * h];
+        bt[0] = 13; bt[512] = 13;
+        let cb = Clipboard { width: w as _, height: h as _, depth: 1, z_anchor: 0,
+            block_types: bt, paints: vec![0u8; w * h], mask: None };
+        let full = render_clipboard_preview_inner(&cb, 0, None);
+        assert_eq!((full.width, full.height), (1024, 2));
+        let pd = render_clipboard_preview_inner(&cb, 0, Some(512));
+        assert_eq!((pd.width, pd.height), (512, 1));
+        assert_eq!(pd.pixels.len(), 512 * 4);
+        assert_ne!(&pd.pixels[0..3], &[20, 20, 35], "column 0 is a block");
+        assert_ne!(&pd.pixels[256 * 4..256 * 4 + 3], &[20, 20, 35], "column 512 samples at ox=256");
+        assert_eq!(&pd.pixels[4..7], &[20, 20, 35], "air column stays VOID");
+        // Small clipboard is unaffected by the cap.
+        let small = Clipboard { width: 2, height: 2, depth: 1, z_anchor: 0,
+            block_types: vec![13u8; 4], paints: vec![0u8; 4], mask: None };
+        let ps = render_clipboard_preview_inner(&small, 0, Some(512));
+        assert_eq!((ps.width, ps.height), (2, 2));
     }
 
     /// The front/side clipboard elevation ghost treats an unmasked column as air, so its silhouette
@@ -15267,6 +16221,26 @@ mod tests {
             let touches_set = neighbours.iter().any(|&(dx, dy, dz)| set.contains(&(x + dx, y + dy, z + dz)));
             assert!(touches_set, "cell {:?} isn't adjacent to any other flooded cell", (x, y, z));
         }
+    }
+
+    /// `surface_region_bfs` (shared by fill_surface + magic wand, row 18.7) is read-only, respects the
+    /// paint filter and the cap, and reports seedless columns as errors.
+    #[test]
+    fn test_surface_region_bfs_paint_filter_cap_and_seed_errors() {
+        let world = parse_world_inner(mmap_from_bytes(make_test_world())).expect("parse failed");
+        let mut world = world;
+        for x in 0..16 { for y in 0..16 { set_block_abs(&mut world, x, y, 0, 2, 0); } }
+        // A 3x3 patch with a different paint.
+        for x in 4..=6 { for y in 4..=6 { set_block_abs(&mut world, x, y, 0, 2, 5); } }
+
+        let all = surface_region_bfs(&world, 0, 0, false, 50_000).expect("seed ok");
+        assert!(all.len() >= 250, "paint-agnostic fill covers the whole same-type surface (got {})", all.len());
+        let painted = surface_region_bfs(&world, 5, 5, true, 50_000).expect("seed ok");
+        assert_eq!(painted.len(), 9, "paint filter isolates the patch");
+        assert!(painted.iter().all(|&(x, y, z)| (4..=6).contains(&x) && (4..=6).contains(&y) && z == 0));
+        let capped = surface_region_bfs(&world, 0, 0, false, 10).expect("seed ok");
+        assert_eq!(capped.len(), 10);
+        assert!(surface_region_bfs(&world, -1, 0, false, 10).is_err(), "out-of-world seed has no surface");
     }
 
     /// The wavy-surface quantizer must span all four fluid levels (full/¾/½/¼) as its noise input

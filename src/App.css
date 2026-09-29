@@ -4,35 +4,46 @@
   box-sizing: border-box;
 }
 
+/* Background + text colour come from the theme stylesheet (src/theme/cssVars.ts THEME_CSS). */
 body {
   margin: 0;
-  background: #282420;
-  color: #ebe9e7;
   font-family: system-ui, sans-serif;
   overflow: hidden;
 }
 
-/* X Design System — dark teal-tinted scrollbars (WebKit) */
+/* X Design System — themed scrollbars (Stage 15.1). WebKit only: setting the standard
+   scrollbar-color/scrollbar-width properties on any engine that also supports
+   ::-webkit-scrollbar (Chromium >=121 / WebView2, Safari >=18.2 / WKWebView) disables the
+   pseudo-element styling for that element, so those standard properties must never appear
+   outside the @supports fallback below. Colours come from src/theme/theme.ts SCROLLBAR_ROLE via
+   the --vx-scrollbar-* vars (src/theme/cssVars.ts) — no rgba literals here. */
 ::-webkit-scrollbar {
   width: 10px;
   height: 10px;
 }
 ::-webkit-scrollbar-track {
-  background: rgba(0, 0, 0, 0.25);
+  background: var(--vx-scrollbar-track);
 }
 ::-webkit-scrollbar-thumb {
-  background: linear-gradient(180deg, rgba(0, 164, 173, 0.35), rgba(0, 164, 173, 0.15));
+  background: var(--vx-scrollbar-thumb);
   border-radius: 6px;
   border: 2px solid transparent;
   background-clip: padding-box;
+  min-height: 20px;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: linear-gradient(180deg, rgba(0, 221, 233, 0.55), rgba(0, 164, 173, 0.3));
+  background: var(--vx-scrollbar-thumbHover);
+  border: 1px solid transparent;
   background-clip: padding-box;
 }
-* {
-  scrollbar-color: rgba(0, 164, 173, 0.35) rgba(0, 0, 0, 0.25);
-  scrollbar-width: thin;
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+@supports not selector(::-webkit-scrollbar) {
+  * {
+    scrollbar-color: var(--vx-scrollbar-thumb) var(--vx-scrollbar-track);
+    scrollbar-width: thin;
+  }
 }
 
 /* X Design System — shared spinner keyframe (see designTokens.ts Spinner) */
@@ -55,14 +66,9 @@ body {
   100% { transform: translateX(350%); }
 }
 
-/* Keyboard focus should be visible app-wide, not just in the ribbon — modals, panels, and the
-   canvas chrome are all reachable by Tab. :focus-visible only fires for keyboard focus, so this
-   never draws a ring on a mouse click. */
-:focus-visible {
-  outline: 2px solid #00dde9;
-  outline-offset: 1px;
-  border-radius: 3px;
-}
+/* The app-wide :focus-visible ring lives in the theme stylesheet (src/theme/cssVars.ts), one
+   near-white ring everywhere. The cyan #00dde9 rule that used to be here made two competing rings
+   (this one and the ribbon's blue one) — see the r3 FINDINGS "Two focus rings". */
 
 /* Pressed/clicked feedback for plain dialog & menu buttons (Settings, App menu, World Browser,
    New World, Schematic Import, Prefab Library, VMF Export, etc.) — these are inline-styled via

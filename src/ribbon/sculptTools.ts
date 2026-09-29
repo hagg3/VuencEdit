@@ -26,7 +26,7 @@ export const SCULPT_PRIMARY: SculptToolDef[] = [
 export const SCULPT_MORE: SculptToolDef[] = [
   { id: "smooth", icon: "smooth", label: "Smooth", title: "Smooth — average neighbouring heights" },
   { id: "flatten", icon: "flatten", label: "Flatten", title: "Flatten — level terrain to the height you clicked" },
-  { id: "slope", icon: "slope", label: "Slope", title: "Slope — flatten to a tilted plane (set Slope X/Y in Tool Options)" },
+  { id: "slope", icon: "slope", label: "Slope", title: "Slope — flatten to a tilted plane (set Slope X/Y in the Brush shape panel)" },
   { id: "noise", icon: "noise", label: "Noise", title: "Noise — coherent hills or mountains" },
   { id: "erode", icon: "erode", label: "Erode", title: "Erode — drop each column toward its lowest neighbour" },
   { id: "thermal", icon: "thermal", label: "Thermal", title: "Thermal — talus-angle erosion, scree slopes" },

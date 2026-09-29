@@ -4,7 +4,10 @@ import { brushFootprint, bresenhamLine, linePixels, polygonPixels, rectPixels, e
 import { type WorldMeta, type PixelPatch, decodePixelPatch } from "./types";
 import { zoomAtPoint, resizeCanvasToContainer, makeSeqGuard, putPatchPixels, beginFrame, cssWidth, cssHeight, isTypingTarget, chunkToWorld, worldToChunk, CHUNK_SIZE_BLOCKS, tileWindowFits } from "./viewportUtils";
 import { maskOutline, type OutlinePt } from "./maskUtils";
-import { recordTileFetchMs } from "./perfCounters";
+import { recordTileFetchMs, recordMapDrawMs, bumpPerf, perfCounters } from "./perfCounters";
+import { MAP, rgba } from "./theme/theme";
+import { sfx, type HoldHandle } from "./sound/sfx";
+import type { IconName } from "./ribbon/icons";
 
 export type { PixelPatch } from "./types";
 
@@ -27,6 +30,44 @@ export const TOOL_LABELS: Record<Tool, string> = {
   raise: "Raise", lower: "Lower", terrace: "Terrace", sharpen: "Sharpen",
   slope: "Slope", smear: "Smear", rock: "Rock", carve: "Carve", fill: "Fill", eyedropper: "Eyedropper",
   poolfill: "Pool Fill", materialize: "Materialize",
+};
+
+/**
+ * Icon per tool for the status bar's tool chip (Stage 14.11) — reuses the same `ribbon/icons`
+ * glyph a tool's ribbon button already carries, so the chip and the button agree. `Record<Tool,…>`
+ * for the same reason as `TOOL_LABELS`: a new Tool is a compile error until it's given one.
+ */
+export const TOOL_ICON: Record<Tool, IconName> = {
+  pan: "pan", select: "select", wand: "wand", lasso: "lasso", polyselect: "polyselect", paste: "paste",
+  pen: "pen", brush: "brush", spray: "spray", line: "line",
+  rect: "rect", ellipse: "ellipse", polygon: "polygon",
+  smooth: "smooth", noise: "noise", flatten: "flatten", erode: "erode",
+  thermal: "thermal", hydro: "hydro", stamp: "stamp", grab: "grab",
+  raise: "raise", lower: "lower", terrace: "terrace", sharpen: "sharpen",
+  slope: "slope", smear: "smear", rock: "rock", carve: "carve", fill: "fill", eyedropper: "eyedropper",
+  poolfill: "poolFill", materialize: "materialize",
+};
+
+/**
+ * Tool-family hue key for the status bar's tool chip (Stage 14.11) — "an accent names the tool
+ * *family*, not the command" (CLAUDE.md "Visual system"). Resolved to an actual hex by the status
+ * bar via `ribbon/tokens`' `ACCENT`, kept as a plain string here so this file (canvas-heavy,
+ * imports colours only from `theme/theme`) doesn't gain a second colour source.
+ */
+export type ToolFamily = "primary" | "warm" | "selection" | "clipboard";
+export const TOOL_FAMILY: Record<Tool, ToolFamily> = {
+  // Selection tools — blue.
+  select: "selection", wand: "selection", lasso: "selection", polyselect: "selection",
+  // Clipboard — green.
+  paste: "clipboard",
+  // Sculpt (16 tools) — warm.
+  smooth: "warm", noise: "warm", flatten: "warm", erode: "warm", thermal: "warm", hydro: "warm",
+  stamp: "warm", grab: "warm", raise: "warm", lower: "warm", terrace: "warm", sharpen: "warm",
+  slope: "warm", smear: "warm", rock: "warm", carve: "warm",
+  // Everything else (pan, draw, fill, eyedropper, pool fill, materialize) — teal, draw/generic.
+  pan: "primary", pen: "primary", brush: "primary", spray: "primary", line: "primary",
+  rect: "primary", ellipse: "primary", polygon: "primary", fill: "primary", eyedropper: "primary",
+  poolfill: "primary", materialize: "primary",
 };
 
 /**
@@ -196,14 +237,6 @@ function dropTile(cache: Map<string, HTMLCanvasElement>, key: string): void {
   cache.delete(key);
 }
 
-/** Replace the full-map canvas ref, freeing the outgoing canvas's backing store first (see
- *  `freeTileCanvas`) — the full canvas is up to `mW*mH*4` bytes (256 MiB on a large world), so
- *  dropping it via a bare `.current = null`/reassignment leaves that resident until GC gets to it. */
-function setFullCanvas(ref: { current: HTMLCanvasElement | null }, next: HTMLCanvasElement | null): void {
-  if (ref.current && ref.current !== next) freeTileCanvas(ref.current);
-  ref.current = next;
-}
-
 /** Bound on `materializeOccupancyRef` (§2): one entry per queried chunk, cleared only on world
  *  change — panning the materialize-select overlay across a huge world could otherwise grow it
  *  without limit. Insertion-order eviction, same idiom as the tile caches. */
@@ -246,6 +279,15 @@ const SIGN_LABEL_MIN_SCALE = 4;
 /** Longest sign label drawn on the map — the full text is always in the sidebar's Inspector tab. */
 const SIGN_LABEL_MAX_CHARS = 24;
 
+/** The paste ghost's current world origin and screen (viewport, client-coordinate) rect — the
+ *  paste lens's attach-follow input (Stage 14.9). `screen` is a plain object rather than a real
+ *  `DOMRect` so a consumer doesn't need a DOM `DOMRect` polyfill in a node-environment test. */
+export interface GhostInfo {
+  x: number;
+  y: number;
+  screen: { left: number; top: number; width: number; height: number };
+}
+
 export interface MapCanvasRef {
   /** Write top-down pixel patch directly into the affected tiles/canvas (top-down mode edit). */
   applyPatch: (patch: PixelPatch) => void;
@@ -261,13 +303,40 @@ export interface MapCanvasRef {
   centerOn: (wx: number, wy: number) => void;
   /** Update the 3D-camera dot position and redraw — imperative, bypasses React props/state so the
    *  3.3Hz stream of camera moves from FlyView3D never triggers a parent re-render (Stage 10.2). */
-  setCameraDot: (wx: number, wy: number) => void;
+  setCameraDot: (wx: number, wy: number, yaw?: number, hfov?: number) => void;
+  /** Drop the cached canvas client rect. The map can now *move* without resizing (it sits in a
+   *  draggable window, or swaps between the main pane and the 3D window), which the
+   *  ResizeObserver-driven refresh can't see — hover readouts would be offset until the next
+   *  gesture. Also refreshed on every pointerenter. (UI redesign r3, Stage 14.4.) */
+  invalidateRect: () => void;
   /** Recentre on a world-space point and zoom *in* to at least `minScale` px/block, never out —
    *  so clicking the same target twice is idempotent (clicking a sign in the Inspector). */
   focusOn: (wx: number, wy: number, minScale: number) => void;
+  /** Paste lens (Stage 14.9): subscribe to the paste ghost's world origin + screen rect, called from
+   *  draw()'s existing ghost-box section whenever either changes (pan/zoom move the screen rect even
+   *  when the world origin doesn't) — `null` when no ghost is currently shown (not paste tool, no
+   *  preview, or nothing hovered/locked yet). Returns an unsubscribe function. Purely a ref fan-out —
+   *  no React state, no App re-render. */
+  subscribeGhost: (cb: (g: GhostInfo | null) => void) => () => void;
+  /** Status bar's zoom badge (Stage 15.6): subscribe to `viewRef.current.scale` (px/block, default
+   *  2). Called back immediately with the current scale on subscribe, then again on every value
+   *  change (deduped) from resetView/zoomBy/zoomToBox/focusOn/the initial fit/the wheel handler.
+   *  Same ref-fan-out contract as `subscribeGhost` — no React state, no App re-render. */
+  subscribeZoom: (cb: (scale: number) => void) => () => void;
+  /** World-rect → viewport client-rect, the same `rect.left + wx*scale + vx` transform the paste
+   *  ghost's `screen` field above is computed with (Stage 14.9) — reused here rather than a second
+   *  conversion. Backs the completion outline (`src/ui/DoneOutline.tsx`, Stage 14.13), a DOM overlay
+   *  positioned over the map rather than drawn into its canvas. `null` before the canvas has been
+   *  measured (`rectRef` unset). */
+  worldRectToScreen: (x1: number, y1: number, x2: number, y2: number) => { left: number; top: number; width: number; height: number } | null;
 }
 
 interface WorldPoint { x: number; y: number }
+
+/** Selection-shaped drags that get a hold loop (Stage 15.7); paste-tool placement is handled
+ *  separately (it has no `DragOp`, the paste fires on pointer-up). */
+const HOLD_DRAG_KINDS: string[] = ["select", "lasso", "moveSel", "resizeEdge", "materialize-select"];
+const HOLD_DRAG_PX = 4;
 
 type DragOp =
   | { kind: "pan"; startX: number; startY: number; viewX: number; viewY: number }
@@ -368,15 +437,14 @@ interface Props {
    *  already renders capped — it's purely a cache-invalidation key: when it changes, every tile
    *  must be refetched. App only advances it once `set_view_cap` has resolved. */
   viewCapZ?: number | null;
+  /** Relief shading strength applied in the backend (Stage 13.2), or null = off. Same contract as
+   *  `viewCapZ`: an invalidation key only, advanced by App once `set_view_relief` resolves. */
+  viewRelief?: number | null;
   committedSelection: SelectionBounds | null;
   onSelectionChange: (bounds: SelectionBounds | null) => void;
   pastePreview: { width: number; height: number } | null;
   clipboardPreviewPixels: { width: number; height: number; pixels: Uint8Array } | null;
   onPasteAt: (pos: { x: number; y: number }) => void;
-  /** "tiled": fetch map in 512px tiles (low RAM). "full": single canvas (instant pan/zoom). "axo": axonometric 3D view. */
-  renderMode: "tiled" | "full" | "axo";
-  /** Axonometric skew (depth) factor — only used when renderMode="axo". */
-  axoSkew?: number;
   /** When set, the paste ghost box is fixed here (amber) instead of following the cursor (green). */
   lockedPastePos?: { x: number; y: number } | null;
   /** Draw tool configuration — only read when tool is pen/brush/rect/ellipse. */
@@ -424,8 +492,6 @@ interface Props {
   onEyedropper?: (wx: number, wy: number) => void;
   /** Called when the Pool Fill tool clicks a world coordinate (the basin floor cell). */
   onPoolFillPick?: (wx: number, wy: number) => void;
-  /** Slice-viewport cut lines: vertical at world X, horizontal at world Y (the slab depths). */
-  sliceLines?: { x: number | null; y: number | null } | null;
   /** 3D fly-camera world XY position — drawn as a teal dot on the map. */
   cameraPos3d?: { x: number; y: number } | null;
   /** Called when the user clicks or drags the 3D camera icon to move it. */
@@ -453,13 +519,13 @@ interface Props {
 type TileJob = { key: string; lod: number; x1: number; y1: number; x2: number; y2: number };
 
 const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
-  { world, worldEpoch, tool, viewMode, zSliceZ, viewCapZ = null,
+  { world, worldEpoch, tool, viewMode, zSliceZ, viewCapZ = null, viewRelief = null,
     committedSelection, onSelectionChange, pastePreview, clipboardPreviewPixels, onPasteAt,
-    renderMode, axoSkew = 0.2, lockedPastePos = null,
+    lockedPastePos = null,
     drawConfig, onDrawStroke, onSculptStroke, onCancelStroke, drawZOverride = null,
     extrudePreview = null, lastPasteDelta = null, onCursorMove, onMagicWand, onLassoSelect, onPolySelect, selectionMask = null,
     spawnPos = null, playerPos = null, creatures = [], signs = [],
-    pasteElevationOffset = 0, onEyedropper, onPoolFillPick, sliceLines = null,
+    pasteElevationOffset = 0, onEyedropper, onPoolFillPick,
     cameraPos3d = null, onSetCamera3d,
     showTemplateOverlay = false, onMapContextMenu, onSelectDragUpdate, onMoveSelection, moveWithContents = false,
     committedMaterializeSelection = null, onMaterializeSelectionChange,
@@ -478,7 +544,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   // Live LRU caps, recomputed by ensureTiles from the current visible tile count (see TILE_CACHE_LIMIT).
   const tileLimitRef  = useRef(TILE_CACHE_LIMIT);
   const templateLimitRef = useRef(TEMPLATE_CACHE_LIMIT);
-  // Bumped whenever mode/z/world/renderMode changes — lets in-flight fetches detect staleness
+  // Bumped whenever mode/z/world changes — lets in-flight fetches detect staleness
   const tileEpoch = useRef(makeSeqGuard());
 
   // Concurrency-capped fetch queue (tiled mode)
@@ -498,19 +564,21 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     invoke("set_view_lod", { lod }).catch(() => { reportedLodRef.current = null; });
   }, []);
 
-  // Full-canvas state (used in "full" and "axo" modes)
-  const renderModeRef     = useRef(renderMode);
-  const axoSkewRef        = useRef(axoSkew);
-  const fullCanvasRef     = useRef<HTMLCanvasElement | null>(null);
-  // null = not loading; 0–1 = loading in progress (drives progress bar)
-  const fullProgressRef   = useRef<number | null>(null);
-
   const dragRef = useRef<DragOp>(null);
   // Set true whenever a gesture's pointerdown actually landed on this canvas. Guards the
   // paste-on-pointerup branch below: without it, a gesture that started on other chrome (e.g. a
   // slider) and was released by dragging over the canvas would fire an accidental paste, since a
   // native pointerup with no capture set targets whatever's under the cursor at release.
   const pointerDownOnCanvasRef = useRef(false);
+  // Hold-while-dragging sound (Stage 15.7): one loop per selection/paste-placement gesture, started
+  // once the pointer travels past `HOLD_DRAG_PX` from `holdDownRef` and stopped on pointer-up,
+  // Escape and unmount. `sfx.hold`'s window-level guard also ends it on cancel/blur/lost-capture.
+  // `holdSpentRef` makes it once-per-gesture, so an Escape-cancelled drag doesn't restart it.
+  const holdRef = useRef<HoldHandle | null>(null);
+  const holdDownRef = useRef({ x: 0, y: 0 });
+  const holdSpentRef = useRef(true);
+  const stopHold = useCallback(() => { holdRef.current?.stop(); holdRef.current = null; }, []);
+  useEffect(() => stopHold, [stopHold]);
   // Hold-to-build: interval id while a sculpt stroke re-stamps the cursor; flag = a tick fired
   // (so pointer-up skips the final one-shot stroke to avoid a double application).
   const accumTimerRef = useRef<number | null>(null);
@@ -551,6 +619,23 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   const camHoverRef = useRef(false);
   const pastePreviewRef = useRef(pastePreview);
   const pasteHoverRef   = useRef<WorldPoint | null>(null);
+  // Paste-lens ghost subscription (Stage 14.9): imperative, ref-based fan-out so a subscriber (the
+  // lens window) can follow the ghost's screen rect without App re-rendering per pointer move/pan —
+  // see `subscribeGhost` on `MapCanvasRef` and its notify site in draw()'s ghost-box section below.
+  const ghostSubscribersRef = useRef<Set<(g: GhostInfo | null) => void>>(new Set());
+  const lastGhostNotifyRef  = useRef<GhostInfo | null>(null);
+  // Zoom subscription (Stage 15.6 — status bar): same fan-out idea as the ghost subscription above,
+  // for the status bar's zoom-% badge. `viewRef.current.scale` is purely imperative (mutated by
+  // resetView/zoomBy/zoomToBox/focusOn/the initial fit/the wheel handler, none of which necessarily
+  // trigger a synchronous draw()), so every one of those sites calls `notifyZoom` itself rather than
+  // relying on a single choke point the way `notifyGhost` can (it only ever fires from inside draw()).
+  const zoomSubscribersRef = useRef<Set<(scale: number) => void>>(new Set());
+  const lastZoomNotifyRef  = useRef<number | null>(null);
+  const notifyZoom = useCallback((scale: number) => {
+    if (lastZoomNotifyRef.current === scale) return;
+    lastZoomNotifyRef.current = scale;
+    for (const cb of zoomSubscribersRef.current) cb(scale);
+  }, []);
   const cursorPosRef    = useRef<WorldPoint | null>(null);
   const onSelChangeRef    = useRef(onSelectionChange);
   const onPasteAtRef      = useRef(onPasteAt);
@@ -571,11 +656,10 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   const playerPosRef        = useRef(playerPos);
   const creaturesRef        = useRef(creatures);
   const signsRef            = useRef(signs);
-  const sliceLinesRef       = useRef(sliceLines);
   const pasteElevOffsetRef  = useRef(pasteElevationOffset);
   const onEyedropperRef     = useRef(onEyedropper);
   const onPoolFillPickRef   = useRef(onPoolFillPick);
-  const cameraPos3dRef      = useRef(cameraPos3d ?? null);
+  const cameraPos3dRef      = useRef<{ x: number; y: number; yaw?: number; hfov?: number } | null>(cameraPos3d ?? null);
   const onSetCamera3dRef    = useRef(onSetCamera3d);
   const onSelectDragUpdateRef = useRef(onSelectDragUpdate);
   const onMoveSelectionRef = useRef(onMoveSelection);
@@ -660,7 +744,6 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   useEffect(() => { playerPosRef.current       = playerPos;           }, [playerPos]);
   useEffect(() => { creaturesRef.current       = creatures;           }, [creatures]);
   useEffect(() => { signsRef.current           = signs;               }, [signs]);
-  useEffect(() => { sliceLinesRef.current      = sliceLines;           }, [sliceLines]);
   useEffect(() => { pasteElevOffsetRef.current = pasteElevationOffset; }, [pasteElevationOffset]);
   useEffect(() => { onEyedropperRef.current    = onEyedropper;        }, [onEyedropper]);
   useEffect(() => { onPoolFillPickRef.current  = onPoolFillPick;      }, [onPoolFillPick]);
@@ -698,11 +781,13 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   }, [world.abs_min_x, world.abs_min_y]);
 
   // Convert clientX/clientY (viewport coords) to canvas-local coords. The canvas is no longer
-  // guaranteed to fill the window at origin (0,0) — in quad/multi-viewport mode it lives in a
-  // grid cell — so we subtract its bounding-rect offset.
+  // guaranteed to fill the window at origin (0,0) — when it lives in the floating map window it sits in a
+  // window body — so we subtract its bounding-rect offset.
   // Cached rect avoids a layout read on every pointermove (getBoundingClientRect forces reflow);
   // refreshed on resize (ResizeObserver) and at the start of each pointer gesture.
   const rectRef = useRef<DOMRect | null>(null);
+  /** A world-load fit waiting for the canvas to be attached somewhere with a real size. */
+  const pendingFitRef = useRef<((w: number, h: number) => void) | null>(null);
   const toLocal = useCallback((cx: number, cy: number): { x: number; y: number } => {
     const r = rectRef.current ?? canvasRef.current?.getBoundingClientRect() ?? null;
     return { x: cx - (r?.left ?? 0), y: cy - (r?.top ?? 0) };
@@ -738,6 +823,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   const draw = useCallback(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
+    const drawT0 = performance.now();
     const ctx = canvas.getContext("2d")!;
     const { x: vx, y: vy, scale } = viewRef.current;
 
@@ -748,72 +834,61 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     ctx.fillStyle = "#1e1814";
     ctx.fillRect(0, 0, cw, ch);
 
+    // Paste-lens ghost fan-out (Stage 14.9) — dedupes against the last-notified value so a
+    // subscriber's own state update isn't fired every single draw() while nothing about the ghost
+    // actually changed (draw() runs on plenty of causes that don't move it).
+    const notifyGhost = (g: GhostInfo | null) => {
+      const last = lastGhostNotifyRef.current;
+      const same = g === last || (g != null && last != null &&
+        g.x === last.x && g.y === last.y &&
+        g.screen.left === last.screen.left && g.screen.top === last.screen.top &&
+        g.screen.width === last.screen.width && g.screen.height === last.screen.height);
+      if (same) return;
+      lastGhostNotifyRef.current = g;
+      for (const cb of ghostSubscribersRef.current) cb(g);
+    };
+
     ctx.save();
     ctx.translate(vx, vy);
     ctx.scale(scale, scale);
     ctx.imageSmoothingEnabled = false;
 
-    if (renderModeRef.current === "full" || renderModeRef.current === "axo") {
-      const fc = fullCanvasRef.current;
-      if (fc) ctx.drawImage(fc, 0, 0);
-    } else {
-      // The cache holds several LOD levels at once (audit H6), so a zoom change has something to
-      // show immediately: draw the coarser levels first and let finer ones paint over them, with
-      // the level this view actually wants (`curLod`) last. Off-screen tiles are skipped — the
-      // cache is an LRU bounded well past the visible window, not the visible set.
-      const curLod = lodForScale(scale);
-      const visX1 = -vx / scale, visY1 = -vy / scale;
-      const visX2 = (cw - vx) / scale, visY2 = (ch - vy) / scale;
-      const drawLayer = (cache: Map<string, HTMLCanvasElement>) => {
-        const entries: { tile: HTMLCanvasElement; wx: number; wy: number; lod: number; order: number }[] = [];
-        for (const [key, tile] of cache) {
-          const { lod, wx, wy } = parseTileKey(key);
-          const w = tile.width * lod, h = tile.height * lod;
-          if (wx >= visX2 || wy >= visY2 || wx + w <= visX1 || wy + h <= visY1) continue;
-          entries.push({ tile, wx, wy, lod, order: lod === curLod ? Infinity : -lod });
-        }
-        entries.sort((a, b) => a.order - b.order);
-        for (const e of entries) {
-          ctx.drawImage(e.tile, e.wx, e.wy, e.tile.width * e.lod, e.tile.height * e.lod);
-        }
-      };
-      // Draw template layer first at 35% opacity. User tile's transparent pixels (no chunk)
-      // let the template show through; opaque user pixels naturally cover it.
-      if (showTemplateOverlayRef.current && templateTileCacheRef.current.size > 0) {
-        ctx.globalAlpha = 0.35;
-        drawLayer(templateTileCacheRef.current);
-        ctx.globalAlpha = 1.0;
+    // The cache holds several LOD levels at once (audit H6), so a zoom change has something to
+    // show immediately: draw the coarser levels first and let finer ones paint over them, with
+    // the level this view actually wants (`curLod`) last. Off-screen tiles are skipped — the
+    // cache is an LRU bounded well past the visible window, not the visible set.
+    const curLod = lodForScale(scale);
+    const visX1 = -vx / scale, visY1 = -vy / scale;
+    const visX2 = (cw - vx) / scale, visY2 = (ch - vy) / scale;
+    const lodCounts: Record<number, number> = {};
+    const drawLayer = (cache: Map<string, HTMLCanvasElement>) => {
+      const entries: { tile: HTMLCanvasElement; wx: number; wy: number; lod: number; order: number }[] = [];
+      for (const [key, tile] of cache) {
+        const { lod, wx, wy } = parseTileKey(key);
+        const w = tile.width * lod, h = tile.height * lod;
+        if (wx >= visX2 || wy >= visY2 || wx + w <= visX1 || wy + h <= visY1) continue;
+        entries.push({ tile, wx, wy, lod, order: lod === curLod ? Infinity : -lod });
+        lodCounts[lod] = (lodCounts[lod] ?? 0) + 1;
       }
-      drawLayer(tileCacheRef.current);
+      entries.sort((a, b) => a.order - b.order);
+      for (const e of entries) {
+        ctx.drawImage(e.tile, e.wx, e.wy, e.tile.width * e.lod, e.tile.height * e.lod);
+      }
+    };
+    // Draw template layer first at 35% opacity. User tile's transparent pixels (no chunk)
+    // let the template show through; opaque user pixels naturally cover it.
+    if (showTemplateOverlayRef.current && templateTileCacheRef.current.size > 0) {
+      ctx.globalAlpha = 0.35;
+      drawLayer(templateTileCacheRef.current);
+      ctx.globalAlpha = 1.0;
     }
+    drawLayer(tileCacheRef.current);
+    perfCounters.tilesByLod = lodCounts;
+    bumpPerf("mapDraws");
+    const drawMs = performance.now() - drawT0; // tile blit only — the overlays below are not the overdraw suspect (V7)
+    recordMapDrawMs(drawMs);
 
     ctx.restore();
-
-    // Progress bar while full-map or axo is loading (screen coords, outside world transform)
-    const loadProgress = fullProgressRef.current;
-    if ((renderModeRef.current === "full" || renderModeRef.current === "axo") && loadProgress !== null) {
-      const cx = cw / 2;
-      const cy = ch / 2;
-      ctx.font = "13px monospace";
-      ctx.fillStyle = "#afa69d";
-      ctx.textAlign = "center";
-      ctx.fillText("Loading full map…", cx, cy - 12);
-      ctx.textAlign = "left";
-      const barW = Math.min(300, cw * 0.5);
-      const barH = 6;
-      const barX = cx - barW / 2;
-      const barY = cy + 2;
-      ctx.fillStyle = "rgba(255,255,255,0.08)";
-      ctx.beginPath();
-      ctx.roundRect(barX, barY, barW, barH, 3);
-      ctx.fill();
-      if (loadProgress > 0) {
-        ctx.fillStyle = "#d97706";
-        ctx.beginPath();
-        ctx.roundRect(barX, barY, barW * loadProgress, barH, 3);
-        ctx.fill();
-      }
-    }
 
     // Selection overlay
     const drag = dragRef.current;
@@ -886,14 +961,14 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
           ctx.stroke();
         };
         strokeOutline("rgba(255, 255, 255, 0.9)", 2);
-        strokeOutline("rgba(59, 130, 246, 1)", 1);
+        strokeOutline(MAP.selection, 1);
       } else {
-        ctx.fillStyle   = "rgba(59, 130, 246, 0.18)";
+        ctx.fillStyle   = rgba(MAP.selection, 0.18);
         ctx.fillRect(rx, ry, rw, rh);
         ctx.strokeStyle = "rgba(255, 255, 255, 0.9)";
         ctx.lineWidth   = 2;
         ctx.strokeRect(rx + 0.5, ry + 0.5, rw - 1, rh - 1);
-        ctx.strokeStyle = "rgba(59, 130, 246, 1)";
+        ctx.strokeStyle = MAP.selection;
         ctx.lineWidth   = 1;
         ctx.strokeRect(rx + 2.5, ry + 2.5, rw - 5, rh - 5);
       }
@@ -1101,6 +1176,27 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
         const cpx = cp.x * scale + vx;
         const cpy = cp.y * scale + vy;
         ctx.save();
+        // View wedge (Stage 14.4): which way the 3D camera looks, and roughly how wide — so the
+        // 3D window's picture can be matched to the map at a glance. Drawn under the dot.
+        if (cp.yaw != null) {
+          const half = Math.min(Math.PI / 2.2, (cp.hfov ?? 1.2) / 2);
+          const len = 46;
+          ctx.beginPath();
+          ctx.moveTo(cpx, cpy);
+          ctx.arc(cpx, cpy, len, cp.yaw - half, cp.yaw + half);
+          ctx.closePath();
+          const g = ctx.createRadialGradient(cpx, cpy, 4, cpx, cpy, len);
+          g.addColorStop(0, rgba(MAP.camera, 0.45));
+          g.addColorStop(1, rgba(MAP.camera, 0));
+          ctx.fillStyle = g;
+          ctx.fill();
+          ctx.strokeStyle = rgba(MAP.camera, 0.55);
+          ctx.lineWidth = 1;
+          ctx.beginPath();
+          ctx.moveTo(cpx, cpy); ctx.lineTo(cpx + Math.cos(cp.yaw - half) * len, cpy + Math.sin(cp.yaw - half) * len);
+          ctx.moveTo(cpx, cpy); ctx.lineTo(cpx + Math.cos(cp.yaw + half) * len, cpy + Math.sin(cp.yaw + half) * len);
+          ctx.stroke();
+        }
         // Dark halo so the marker reads on grass, sand, snow, etc.
         ctx.beginPath();
         ctx.arc(cpx, cpy, 9, 0, Math.PI * 2);
@@ -1141,25 +1237,6 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
             ctx.fillStyle = "#6ee7b7";
             ctx.fillText(label, cpx + 19, cpy + 0.5);
           }
-        }
-        ctx.restore();
-      }
-    }
-
-    // Slice cut-lines — where the front (world Y) / side (world X) slabs cut the map
-    {
-      const sl = sliceLinesRef.current;
-      if (sl) {
-        ctx.save();
-        ctx.lineWidth = 1;
-        ctx.strokeStyle = "rgba(168,85,247,0.8)";
-        if (sl.x != null) {
-          const sx = Math.round((sl.x + 0.5) * scale + vx) + 0.5;
-          ctx.beginPath(); ctx.moveTo(sx, 0); ctx.lineTo(sx, ch); ctx.stroke();
-        }
-        if (sl.y != null) {
-          const sy = Math.round((sl.y + 0.5) * scale + vy) + 0.5;
-          ctx.beginPath(); ctx.moveTo(0, sy); ctx.lineTo(cw, sy); ctx.stroke();
         }
         ctx.restore();
       }
@@ -1235,7 +1312,9 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
       }
     }
 
-    // Paste ghost box — amber when XY is locked, green when hovering
+    // Paste ghost box — amber when XY is locked, green when hovering. Also the paste lens's ghost
+    // subscription notify site (Stage 14.9) — one place computes the ghost's screen rect, whether
+    // for drawing or for a subscriber, so the two can never disagree.
     if (toolRef.current === "paste" && pastePreviewRef.current) {
       const locked = lockedPastePosRef.current;
       const ghostPos = locked ?? pasteHoverRef.current;
@@ -1245,6 +1324,10 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
         const gy = Math.round(ghostPos.y * scale + vy);
         const gw = Math.round(pw * scale);
         const gh = Math.round(ph * scale);
+        const rect = rectRef.current;
+        notifyGhost(rect
+          ? { x: ghostPos.x, y: ghostPos.y, screen: { left: rect.left + gx, top: rect.top + gy, width: gw, height: gh } }
+          : null);
         if (clipboardImgRef.current) {
           ctx.save();
           ctx.globalAlpha = 0.5;
@@ -1262,19 +1345,19 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
           ctx.lineWidth   = 1;
           ctx.strokeRect(gx + 2.5, gy + 2.5, gw - 5, gh - 5);
         } else {
-          ctx.fillStyle   = "rgba(34, 197, 94, 0.12)";
+          ctx.fillStyle   = rgba(MAP.clipboard, 0.12);
           ctx.fillRect(gx, gy, gw, gh);
           ctx.strokeStyle = "rgba(255, 255, 255, 0.9)";
           ctx.lineWidth   = 2;
           ctx.strokeRect(gx + 0.5, gy + 0.5, gw - 1, gh - 1);
-          ctx.strokeStyle = "rgba(34, 197, 94, 1)";
+          ctx.strokeStyle = MAP.clipboard;
           ctx.lineWidth   = 1;
           ctx.strokeRect(gx + 2.5, gy + 2.5, gw - 5, gh - 5);
         }
         // Z-offset label above the ghost rect
         const off = pasteElevOffsetRef.current;
         const label = off === 0 ? "z+0" : off > 0 ? `z+${off}` : `z${off}`;
-        const labelColor = locked ? "rgba(251,191,36,1)" : "rgba(34,197,94,1)";
+        const labelColor = locked ? "rgba(251,191,36,1)" : MAP.clipboard;
         ctx.save();
         ctx.font = "bold 11px monospace";
         ctx.textAlign = "center";
@@ -1301,7 +1384,11 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
           ctx.fillText(warnLabel, lx, ly - 14);
           ctx.restore();
         }
+      } else {
+        notifyGhost(null);
       }
+    } else if (lastGhostNotifyRef.current) {
+      notifyGhost(null);
     }
 
     // Repeat-paste trail: 3 faded ghost copies in the last-paste direction
@@ -1320,9 +1407,9 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
             const gy = Math.round((ghostPos.y + delta.dy * k) * scale + vy);
             const gw = Math.round(pw * scale);
             const gh = Math.round(ph * scale);
-            ctx.fillStyle   = `rgba(34, 197, 94, ${alpha})`;
+            ctx.fillStyle   = rgba(MAP.clipboard, alpha);
             ctx.fillRect(gx, gy, gw, gh);
-            ctx.strokeStyle = `rgba(34, 197, 94, ${Math.min(1, alpha * 3)})`;
+            ctx.strokeStyle = rgba(MAP.clipboard, Math.min(1, alpha * 3));
             ctx.strokeRect(gx + 0.5, gy + 0.5, gw - 1, gh - 1);
           }
           ctx.restore();
@@ -1583,69 +1670,10 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
 
   useEffect(() => { drainRef.current = drain; }, [drain]);
 
-  // ── loadFullCanvas ────────────────────────────────────────────────────────
-  // Fetches the entire world as a single canvas, loading in horizontal strips
-  // so each IPC response is small (no main-thread freeze) and the map fills
-  // in progressively. Only used in "full" render mode.
-
-  const loadFullCanvas = useCallback(async () => {
-    const myEpoch = tileEpoch.current.peek();
-    const mW = mapWRef.current;
-    const mH = mapHRef.current;
-
-    fullProgressRef.current = 0; // show bar immediately (synchronous before first await)
-    const fc = document.createElement("canvas");
-    fc.width  = mW;
-    fc.height = mH;
-    const fctx = fc.getContext("2d")!;
-    setFullCanvas(fullCanvasRef, fc);
-    draw(); // dark canvas + bar at 0%
-
-    const STRIP_H = 128;
-    try {
-      for (let y = 0; y < mH; y += STRIP_H) {
-        if (tileEpoch.current.isStale(myEpoch)) return;
-        const y2 = Math.min(mH - 1, y + STRIP_H - 1);
-        let buf: ArrayBuffer;
-        if (viewModeRef.current === "zslice") {
-          buf = await invoke<ArrayBuffer>("render_zslice_patch", {
-            z: zSliceZRef.current, x1: 0, y1: y, x2: mW - 1, y2,
-          });
-        } else if (renderModeRef.current === "axo") {
-          buf = await invoke<ArrayBuffer>("render_axo_region", {
-            x1: 0, y1: y, x2: mW - 1, y2, ski: axoSkewRef.current,
-          });
-        } else {
-          buf = await invoke<ArrayBuffer>("fetch_tile", { x1: 0, y1: y, x2: mW - 1, y2 });
-        }
-        const raw = decodePixelPatch(buf);
-        if (tileEpoch.current.isStale(myEpoch)) return;
-        putPatchPixels(fctx, raw, 0, y);
-        fullProgressRef.current = Math.min(1, (y + STRIP_H) / mH);
-        draw();
-      }
-    } catch {
-      // world not loaded
-    } finally {
-      fullProgressRef.current = null; // hide bar when done or cancelled
-      draw();
-    }
-  }, [draw]);
-
   // ── ensureTiles ───────────────────────────────────────────────────────────
-  // In "tiled" mode: computes needed tiles, evicts stale ones, queues missing fetches.
-  // In "full" mode: triggers a full-canvas load if not already cached, then redraws.
+  // Computes needed tiles, evicts stale ones, queues missing fetches.
 
   const ensureTiles = useCallback(() => {
-    if (renderModeRef.current === "full" || renderModeRef.current === "axo") {
-      // Both of these canvases are 1:1 with world blocks — an edit patch sampled coarser than that
-      // would have to be upscaled into them, so report full resolution while they're up.
-      reportViewLod(1);
-      if (!fullCanvasRef.current) loadFullCanvas();
-      draw();
-      return;
-    }
-
     const canvas = canvasRef.current;
     if (!canvas) return;
     const { x: vx, y: vy, scale } = viewRef.current;
@@ -1730,7 +1758,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     });
     queueRef.current = jobs;
     drain();
-  }, [draw, drain, loadFullCanvas]);
+  }, [draw, drain]);
   ensureTilesRef.current = ensureTiles;
 
   // rAF-coalesced ensureTiles for the pan-drag hot path — panning fires pointermove far faster
@@ -1750,12 +1778,6 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
 
   useImperativeHandle(ref, () => ({
     applyPatch(patch: PixelPatch) {
-      if (renderModeRef.current === "axo") {
-        // Axo: coordinate shift means flat patches land at wrong positions — force full reload
-        setFullCanvas(fullCanvasRef, null);
-        loadFullCanvas();
-        return;
-      }
       // A patch is `patch.width × patch.height` *sampled* pixels covering `×patch.lod` that many
       // world blocks (audit M3 — edit patches are rendered at the view's own LOD now, not always
       // at full resolution).
@@ -1776,24 +1798,6 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
         }
         return patchCanvas;
       };
-      if (renderModeRef.current === "full") {
-        const fc = fullCanvasRef.current;
-        if (!fc) return;
-        const fctx = fc.getContext("2d")!;
-        if (patch.lod === 1) {
-          const img = fctx.createImageData(patch.width, patch.height);
-          img.data.set(patch.pixels);
-          fctx.putImageData(img, patch.x, patch.y);
-        } else {
-          // The full canvas is 1:1 with world blocks, so a sampled patch has to be upscaled into
-          // it. MapCanvas reports lod 1 to the backend in this mode, so this is only reachable if
-          // the mode changed between the edit dispatching and its result landing.
-          fctx.imageSmoothingEnabled = false;
-          fctx.drawImage(sourceCanvas(), patch.x, patch.y, pw, ph);
-        }
-        draw();
-        return;
-      }
       for (const [key, tc] of tileCacheRef.current) {
         const { lod, wx, wy, span } = parseTileKey(key);
         if (wx >= patch.x + pw || wy >= patch.y + ph || wx + span <= patch.x || wy + span <= patch.y) continue;
@@ -1828,11 +1832,6 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
       draw();
     },
     refetchRegion(x1: number, y1: number, x2: number, y2: number) {
-      if (renderModeRef.current === "full" || renderModeRef.current === "axo") {
-        setFullCanvas(fullCanvasRef, null);
-        loadFullCanvas();
-        return;
-      }
       for (const [key] of tileCacheRef.current) {
         const { wx, wy, span } = parseTileKey(key);
         if (wx < x2 && wx + span > x1 && wy < y2 && wy + span > y1) {
@@ -1853,6 +1852,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
         x: (cw - mW * scale) / 2,
         y: (ch - mH * scale) / 2,
       };
+      notifyZoom(scale);
       ensureTiles();
     },
     zoomBy(factor: number) {
@@ -1870,6 +1870,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
         x: cw / 2 - (cw / 2 - v.x) * (next / v.scale),
         y: ch / 2 - (ch / 2 - v.y) * (next / v.scale),
       };
+      notifyZoom(next);
       ensureTiles();
     },
     zoomToBox(x1: number, y1: number, x2: number, y2: number) {
@@ -1885,6 +1886,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
         x: cw / 2 - (x1 + bw / 2) * scale,
         y: ch / 2 - (y1 + bh / 2) * scale,
       };
+      notifyZoom(scale);
       ensureTiles();
     },
     centerOn(wx: number, wy: number) {
@@ -1896,9 +1898,12 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
       viewRef.current = { scale: v.scale, x: cw / 2 - wx * v.scale, y: ch / 2 - wy * v.scale };
       ensureTiles();
     },
-    setCameraDot(wx: number, wy: number) {
-      cameraPos3dRef.current = { x: wx, y: wy };
-      draw();
+    setCameraDot(wx: number, wy: number, yaw?: number, hfov?: number) {
+      cameraPos3dRef.current = { x: wx, y: wy, yaw, hfov };
+      scheduleDraw();
+    },
+    invalidateRect() {
+      rectRef.current = canvasRef.current?.getBoundingClientRect() ?? null;
     },
     focusOn(wx: number, wy: number, minScale: number) {
       const canvas = canvasRef.current;
@@ -1909,9 +1914,36 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
       // user has already set — repeat clicks on the same target then settle instead of ratcheting.
       const scale = Math.min(MAX_SCALE, Math.max(v.scale, minScale));
       viewRef.current = { scale, x: cw / 2 - wx * scale, y: ch / 2 - wy * scale };
+      notifyZoom(scale);
       ensureTiles();
     },
-  }), [draw, ensureTiles, loadFullCanvas]);
+    subscribeGhost(cb: (g: GhostInfo | null) => void) {
+      ghostSubscribersRef.current.add(cb);
+      // Replay the last-known value immediately — a subscriber that mounts mid-hover (opening the
+      // lens window while already hovering with a paste armed) shouldn't have to wait for the next
+      // draw() to learn where the ghost is.
+      cb(lastGhostNotifyRef.current);
+      return () => { ghostSubscribersRef.current.delete(cb); };
+    },
+    subscribeZoom(cb: (scale: number) => void) {
+      zoomSubscribersRef.current.add(cb);
+      // Replay the current scale immediately, same reasoning as subscribeGhost above — a subscriber
+      // mounting after the first zoom shouldn't have to wait for the next scale change to learn it.
+      cb(viewRef.current.scale);
+      return () => { zoomSubscribersRef.current.delete(cb); };
+    },
+    worldRectToScreen(x1: number, y1: number, x2: number, y2: number) {
+      const rect = rectRef.current;
+      if (!rect) return null;
+      const { x: vx, y: vy, scale } = viewRef.current;
+      return {
+        left: rect.left + x1 * scale + vx,
+        top: rect.top + y1 * scale + vy,
+        width: (x2 - x1) * scale,
+        height: (y2 - y1) * scale,
+      };
+    },
+  }), [draw, ensureTiles, notifyZoom]);
 
   // ── Effects ───────────────────────────────────────────────────────────────
 
@@ -1930,6 +1962,9 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     scheduleDraw();
   });
   useEffect(() => {
+    // Free the replaced ghost canvas's backing store right away rather than waiting for GC.
+    const old = clipboardImgRef.current;
+    if (old) { old.width = 0; old.height = 0; }
     if (!clipboardPreviewPixels) { clipboardImgRef.current = null; return; }
     const c = document.createElement("canvas");
     c.width  = clipboardPreviewPixels.width;
@@ -1954,12 +1989,16 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     // the lag-on-load regression this clamp fixes. DEFAULT_LOAD_MIN_SCALE keeps the initial view from
     // zooming out past a sane tile budget; explicit Home/Fit still goes through the real fitScale via
     // the imperative resetView() below, so a user who *wants* the full map is never blocked from it.
-    const scale = Math.min(2, Math.max(fitScale(cw, ch, mapW, mapH), DEFAULT_LOAD_MIN_SCALE));
-    viewRef.current = {
-      x: (cw - mapW * scale) / 2,
-      y: (ch - mapH * scale) / 2,
-      scale,
+    const fit = (w: number, h: number) => {
+      const scale = Math.min(2, Math.max(fitScale(w, h, mapW, mapH), DEFAULT_LOAD_MIN_SCALE));
+      viewRef.current = { x: (w - mapW * scale) / 2, y: (h - mapH * scale) / 2, scale };
+      notifyZoom(scale);
     };
+    // The map can be *detached* when a world loads (swapped to the 3D view with the map window
+    // closed — UI redesign r3, Stage 14.4), and then it measures 0×0. Fitting to that would park the
+    // view off-screen; defer the fit to the first real measurement instead (the resize handler).
+    if (cw > 1 && ch > 1) { fit(cw, ch); pendingFitRef.current = null; }
+    else pendingFitRef.current = fit;
     dragRef.current = null;
     // Occupancy is per-world: the same absolute chunk coord is occupied in one world and a hole in
     // the next, so carrying the cache across a load would mis-tint the overlay.
@@ -1968,7 +2007,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [worldEpoch]);
 
-  // Invalidate everything when view mode, z-level, cutaway cap, or world changes
+  // Invalidate everything when view mode, z-level, cutaway cap, relief, or world changes
   useEffect(() => {
     viewModeRef.current = viewMode;
     zSliceZRef.current  = zSliceZ;
@@ -1977,43 +2016,39 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     clearTiles(templateTileCacheRef.current);
     pendingRef.current.clear();
     queueRef.current = [];
-    setFullCanvas(fullCanvasRef, null);
     // `load_world`/`close_world` reset the backend's mirrored LOD to 1, so forget what we last
     // reported — otherwise the next `ensureTiles` would see no change and leave the backend
     // believing the map is at full resolution for the rest of the session.
     reportedLodRef.current = null;
     ensureTiles();
-  }, [viewMode, zSliceZ, viewCapZ, worldEpoch, ensureTiles]);
-
-  // Invalidate everything when render mode changes
-  useEffect(() => {
-    renderModeRef.current = renderMode;
-    tileEpoch.current.next();
-    clearTiles(tileCacheRef.current);
-    clearTiles(templateTileCacheRef.current);
-    pendingRef.current.clear();
-    queueRef.current = [];
-    setFullCanvas(fullCanvasRef, null);
-    ensureTiles();
-  }, [renderMode, ensureTiles]);
-
-  // Re-render axo canvas when skew slider changes
-  useEffect(() => {
-    axoSkewRef.current = axoSkew;
-    if (renderModeRef.current !== "axo") return;
-    tileEpoch.current.next();
-    setFullCanvas(fullCanvasRef, null);
-    ensureTiles();
-  }, [axoSkew, ensureTiles]);
+  }, [viewMode, zSliceZ, viewCapZ, viewRelief, worldEpoch, ensureTiles]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     // Size the backing store to the canvas's own laid-out box (CSS 100%/100% of its parent),
-    // not the window — so the canvas works both full-screen and inside a quad-view grid cell.
+    // not the window — so the canvas works both full-screen and inside the floating map window.
+    // Keep the view's *centre* fixed across a resize (Stage 14.4): the map now changes size by
+    // moving between the main pane, the 3D window and the map window, and a top-left-anchored view
+    // would slide the thing you were looking at off to one side on every swap. A detached host
+    // measures 0 — skipped, and not recorded, so a detach/re-attach compares against the last
+    // real size and the centre survives the round trip.
+    let lastW = 0, lastH = 0;
     const resize = () => {
       resizeCanvasToContainer(canvas);
-      rectRef.current = canvas.getBoundingClientRect();
+      const r = canvas.getBoundingClientRect();
+      rectRef.current = r;
+      if (r.width > 1 && r.height > 1) {
+        const pendingFit = pendingFitRef.current;
+        if (pendingFit) {
+          pendingFitRef.current = null;
+          pendingFit(r.width, r.height);
+        } else if (lastW > 1 && lastH > 1 && (r.width !== lastW || r.height !== lastH)) {
+          const v = viewRef.current;
+          viewRef.current = { scale: v.scale, x: v.x + (r.width - lastW) / 2, y: v.y + (r.height - lastH) / 2 };
+        }
+        lastW = r.width; lastH = r.height;
+      }
       ensureTiles();
     };
     resize();
@@ -2024,32 +2059,25 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
 
   /**
    * Terrain pixels under a selection, at 1 px per block, for the "Move: Box + Contents" drag
-   * ghost. Read from the offscreen tile/full-map sources — NOT the composited canvas, which
+   * ghost. Read from the offscreen tile sources — NOT the composited canvas, which
    * already has the blue selection fill and its outlines painted on top from the previous frame;
    * snapshotting that baked the overlay into the dragged preview and read as a rendering glitch.
-   * Axo is a skewed projection with no 1:1 world mapping, so it gets outline-only dragging.
    */
   const snapshotSelectionPixels = useCallback((sel: SelectionBounds): HTMLCanvasElement | null => {
     const w = sel.x2 - sel.x1 + 1;
     const h = sel.y2 - sel.y1 + 1;
-    if (w <= 0 || h <= 0 || renderModeRef.current === "axo") return null;
+    if (w <= 0 || h <= 0) return null;
     const off = document.createElement("canvas");
     off.width = w;
     off.height = h;
     const octx = off.getContext("2d");
     if (!octx) return null;
     octx.imageSmoothingEnabled = false;
-    if (renderModeRef.current === "full") {
-      const fc = fullCanvasRef.current;
-      if (!fc) return null;
-      octx.drawImage(fc, sel.x1, sel.y1, w, h, 0, 0, w, h);
-    } else {
-      // Coarser levels first so a finer tile covering the same ground wins (audit H6).
-      const tiles = [...tileCacheRef.current].map(([key, tile]) => ({ tile, ...parseTileKey(key) }));
-      tiles.sort((a, b) => b.lod - a.lod);
-      for (const t of tiles) {
-        octx.drawImage(t.tile, t.wx - sel.x1, t.wy - sel.y1, t.tile.width * t.lod, t.tile.height * t.lod);
-      }
+    // Coarser levels first so a finer tile covering the same ground wins (audit H6).
+    const tiles = [...tileCacheRef.current].map(([key, tile]) => ({ tile, ...parseTileKey(key) }));
+    tiles.sort((a, b) => b.lod - a.lod);
+    for (const t of tiles) {
+      octx.drawImage(t.tile, t.wx - sel.x1, t.wy - sel.y1, t.tile.width * t.lod, t.tile.height * t.lod);
     }
     // Shaped selection: punch the ghost down to the mask so holes reveal the map beneath during a
     // move-drag. Build a fresh binary-alpha stencil (not the violet overlay cache) and keep only
@@ -2128,6 +2156,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
         return;
       }
       if (drag && CANCELLABLE_DRAGS.includes(drag.kind)) {
+        stopHold();
         e.stopPropagation();
         dragRef.current = null;
         if (drag.kind === "select" || drag.kind === "moveSel") onSelectDragUpdateRef.current?.(null);
@@ -2146,12 +2175,14 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     };
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
-  }, [draw]);
+  }, [draw, stopHold]);
 
   const onPointerDown = useCallback((e: React.PointerEvent) => {
     // Refresh the cached rect at the start of each gesture (toLocal reads it for the duration).
     rectRef.current = (e.target as HTMLCanvasElement).getBoundingClientRect();
     pointerDownOnCanvasRef.current = true;
+    holdDownRef.current = { x: e.clientX, y: e.clientY };
+    holdSpentRef.current = e.button !== 0;
     if (e.button === 1) {
       (e.target as HTMLCanvasElement).setPointerCapture(e.pointerId);
       e.preventDefault();
@@ -2243,6 +2274,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
       const wp = screenToWorld(e.clientX, e.clientY);
       dragRef.current = { kind: "select", start: wp, end: wp };
       onSelectDragUpdateRef.current?.({ x1: wp.x, y1: wp.y, x2: wp.x, y2: wp.y });
+      sfx.play("drag");
       draw();
     } else if (toolRef.current === "paste") {
       // paste fires on pointer-up
@@ -2364,6 +2396,13 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     cursorPosRef.current = wp;
     onCursorMoveRef.current?.(wp.x, wp.y);
     const drag = dragRef.current;
+    if (!holdSpentRef.current && pointerDownOnCanvasRef.current
+        && (e.buttons & 1) !== 0
+        && (drag ? HOLD_DRAG_KINDS.includes(drag.kind) : toolRef.current === "paste")
+        && Math.hypot(e.clientX - holdDownRef.current.x, e.clientY - holdDownRef.current.y) >= HOLD_DRAG_PX) {
+      holdSpentRef.current = true;
+      holdRef.current = sfx.hold();
+    }
     // Cursor: show "move" when hovering the 3D camera icon with no active drag.
     if (!drag && onSetCamera3dRef.current) {
       const cp = cameraPos3dRef.current;
@@ -2515,6 +2554,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   }, [scheduleDraw, scheduleEnsureTiles, screenToWorld, screenToWorldLoose, scheduleMaterializeOccupancyFetch]);
 
   const onPointerUp = useCallback((e: React.PointerEvent) => {
+    stopHold();
     const drag = dragRef.current;
     // This pointerup ends the current gesture chain either way — capture whether it started on
     // the canvas for the paste check below, then reset for the next gesture.
@@ -2565,6 +2605,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
       const end = screenToWorld(e.clientX, e.clientY);
       dragRef.current = null;
       onSelectDragUpdateRef.current?.(null);
+      sfx.play("drop");
       // A bare click (drag never left the starting cell) shouldn't commit a 1x1 selection —
       // deselect instead, so it doesn't yank the ribbon to the Selection tab.
       if (drag.start.x === end.x && drag.start.y === end.y) {
@@ -2599,6 +2640,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
           return [parseInt(k.slice(0, ci)), parseInt(k.slice(ci + 1))] as [number, number];
         });
         onDrawStrokeRef.current(pts, drawZOverrideRef.current, [drag.cx, drag.cy], drag.delta, strokeIdRef.current);
+        sfx.play("stroke"); // stroke's final commit — once per gesture, not per intermediate batch
       }
       return;
     }
@@ -2616,6 +2658,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
           lastStampPosRef.current = { x: end.x, y: end.y };
         }
         flushSculptRef.current(strokeIdRef.current);
+        sfx.play("stroke"); // once at release, not once per flushSculptRef batch during the hold
       }
       draw();
       return;
@@ -2644,6 +2687,9 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
         });
         onDrawStrokeRef.current(pts, drawZOverrideRef.current, [drag.startWX, drag.startWY], undefined, strokeIdRef.current);
       }
+      // Fires once per gesture whether the edit came from these final points or from the
+      // hold-to-build ticks that already fired during the drag (`fired`) — never both.
+      if (fired || drag.pts.size > 0) sfx.play("stroke");
       return;
     }
     if (drag?.kind === "draw-shape") {
@@ -2672,7 +2718,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     if (toolRef.current === "paste" && startedOnCanvas) {
       onPasteAtRef.current(screenToWorld(e.clientX, e.clientY));
     }
-  }, [draw, screenToWorld, screenToWorldLoose, fetchMaterializeOccupancy]);
+  }, [draw, screenToWorld, screenToWorldLoose, fetchMaterializeOccupancy, stopHold]);
 
   const onPointerLeave = useCallback(() => {
     cursorPosRef.current = null;
@@ -2695,17 +2741,19 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
       // back out to its full extent instead of getting stuck mid-way (see minScaleFor).
       const min = minScaleFor(cssWidth(canvas), cssHeight(canvas), mapWRef.current, mapHRef.current);
       viewRef.current = zoomAtPoint(viewRef.current, lp.x, lp.y, e.deltaY, { min, max: MAX_SCALE, factor: 1.1 });
+      notifyZoom(viewRef.current.scale);
       scheduleEnsureTiles(); // rAF-coalesced; loads new tiles in tiled mode, just draws in full mode
     };
     canvas.addEventListener("wheel", handler, { passive: false });
     return () => canvas.removeEventListener("wheel", handler);
-  }, [scheduleEnsureTiles, toLocal]);
+  }, [scheduleEnsureTiles, toLocal, notifyZoom]);
 
   return (
     <canvas
       ref={canvasRef}
       style={{ display: "block", width: "100%", height: "100%", cursor: TOOL_CURSOR[tool] }}
       onPointerDown={onPointerDown}
+      onPointerEnter={() => { rectRef.current = canvasRef.current?.getBoundingClientRect() ?? null; }}
       onPointerMove={onPointerMove}
       onPointerUp={onPointerUp}
       onPointerLeave={onPointerLeave}

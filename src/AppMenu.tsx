@@ -16,14 +16,16 @@
  * has, and none of that chrome carried information the text doesn't.
  */
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { EDEN_TEAL_READABLE, glassPanel, spinnerStyle } from "./designTokens";
+import { spinnerStyle } from "./designTokens";
 import AboutPanel from "./panels/AboutPanel";
 import WorldInfoPanel from "./panels/WorldInfoPanel";
 import { Icon, type IconName } from "./ribbon/icons";
 import { useRibbon } from "./ribbon/context";
 import {
-  ACCENT, BORDER, MOD, RADIUS, SHIFT, SURFACE, TEXT, TEXT_DIM, TEXT_LABEL, btnBase, hexToRgbTriplet,
+  BORDER, CUR_ICON, MOD, RADIUS, SHIFT, SURFACE, TEXT, TEXT_ARMED, TEXT_DANGER, TEXT_DIM, TEXT_LABEL,
+  btnBase, currentRow,
 } from "./ribbon/tokens";
+import { Check } from "./ribbon/primitives";
 import { timeAgo } from "./useRecentWorlds";
 
 export type AppMenuRow =
@@ -38,7 +40,6 @@ export type AppMenuRow =
 const MENU_W = 720;
 const MENU_H = 540;
 const LIST_W = 208;
-const ACCENT_RGB = hexToRgbTriplet(ACCENT.primary);
 
 export default function AppMenu({
   initialRow, onClose, anchorTop,
@@ -112,7 +113,10 @@ export default function AppMenu({
     <div
       ref={panelRef}
       role="menu" aria-label="Application menu"
-      style={glassPanel({
+      // Slate popover material (palette A: menu = popover). It used to be the warm modal glass,
+      // which read as a foreign object dropped over the cool ribbon.
+      style={{
+        background: SURFACE.popover,
         position: "fixed", top: anchorTop, left: 6, zIndex: 500,
         boxShadow: `inset 0 0 0 1px ${BORDER.outline}, inset 0 1px 0 ${BORDER.bevel}, 0 20px 50px rgba(0,0,0,.55)`,
         borderRadius: RADIUS.lg,
@@ -120,13 +124,13 @@ export default function AppMenu({
         width: MENU_W, height: MENU_H,
         maxWidth: "96vw", maxHeight: `calc(100vh - ${anchorTop + 12}px)`,
         display: "flex", overflow: "hidden", color: TEXT,
-      })}
+      }}
     >
       {/* ── Left: command column ──────────────────────────────────────────── */}
       <div ref={listRef} onKeyDown={onListKeyDown}
         style={{
           width: LIST_W, flexShrink: 0, padding: "8px 6px", display: "flex", flexDirection: "column", gap: 1,
-          background: "linear-gradient(180deg, rgba(255,255,255,.045) 0%, rgba(255,255,255,.015) 100%)",
+          background: "rgba(0,0,0,.10)",
           borderRight: `1px solid ${BORDER.hairline}`, overflowY: "auto",
         }}>
         {rows.map((r, i) => r.kind === "sep" ? (
@@ -144,18 +148,17 @@ export default function AppMenu({
               padding: "0 10px", height: 34, borderRadius: 5, border: "none", outline: "none",
               cursor: r.disabled ? "default" : "pointer", fontSize: 14,
               opacity: r.disabled ? 0.4 : 1,
-              color: r.danger ? "#e39c99" : row === r.id ? "#ffffff" : "#d6dcde",
-              background: row === r.id
-                ? `linear-gradient(180deg, rgba(${ACCENT_RGB},.38) 0%, rgba(${ACCENT_RGB},.16) 100%)`
-                : "transparent",
-              boxShadow: row === r.id ? `inset 0 0 0 1px rgba(${ACCENT_RGB},.7)` : "none",
+              color: r.danger ? TEXT_DANGER : TEXT,
+              // Current row = pushed in (Stage 14.2) — no accent fill or ring.
+              ...(row === r.id ? currentRow() : { background: "transparent", boxShadow: "none" }),
               fontWeight: row === r.id ? 600 : 400,
             }}
           >
-            <Icon name={r.icon} size={16} tone={r.danger ? "danger" : "default"} />
+            <Icon name={r.icon} size={16} tone={r.danger ? "danger" : row === r.id ? "inherit" : "default"}
+              style={!r.danger && row === r.id ? { color: CUR_ICON } : undefined} />
             <span style={{ flex: 1 }}>{r.label}</span>
             {r.accel && (
-              <span style={{ fontSize: 11.5, color: row === r.id ? "rgba(255,255,255,.7)" : TEXT_DIM, fontFamily: "ui-monospace, 'SF Mono', monospace" }}>
+              <span style={{ fontSize: 11.5, color: TEXT_DIM, fontFamily: "ui-monospace, 'SF Mono', monospace" }}>
                 {r.accel}
               </span>
             )}
@@ -176,7 +179,7 @@ export default function AppMenu({
 function PaneHead({ title, sub }: { title: string; sub?: ReactNode }) {
   return (
     <div style={{ marginBottom: 14 }}>
-      <h2 style={{ margin: 0, fontSize: 17, fontWeight: 700, color: EDEN_TEAL_READABLE }}>{title}</h2>
+      <h2 style={{ margin: 0, fontSize: 17, fontWeight: 700, color: TEXT_ARMED }}>{title}</h2>
       {sub && <div style={{ marginTop: 4, fontSize: 12.5, color: TEXT_DIM, lineHeight: 1.5, maxWidth: 620 }}>{sub}</div>}
     </div>
   );
@@ -212,7 +215,7 @@ function Primary({ label, icon, onClick, disabled, busy, tone = "teal", title }:
   label: string; icon: IconName; onClick: () => void; disabled?: boolean; busy?: boolean;
   tone?: "teal" | "danger"; title?: string;
 }) {
-  const accent = tone === "danger" ? "#ef4444" : EDEN_TEAL_READABLE;
+  const accent = tone === "danger" ? "#ef4444" : TEXT_ARMED;
   return (
     <button type="button" onClick={onClick} disabled={disabled} title={title}
       style={btnBase({
@@ -232,14 +235,10 @@ function Primary({ label, icon, onClick, disabled, busy, tone = "teal", title }:
 
 function CheckRow({ checked, onChange, label, hint }: { checked: boolean; onChange: (v: boolean) => void; label: string; hint: string }) {
   return (
-    <label style={{ display: "flex", gap: 9, alignItems: "flex-start", cursor: "pointer", padding: "5px 0" }}>
-      <input type="checkbox" checked={checked} onChange={e => onChange(e.target.checked)}
-        style={{ accentColor: EDEN_TEAL_READABLE, marginTop: 2 }} />
-      <span>
-        <span style={{ fontSize: 12.5, color: TEXT }}>{label}</span>
-        <span style={{ display: "block", fontSize: 11.5, color: TEXT_DIM, lineHeight: 1.45 }}>{hint}</span>
-      </span>
-    </label>
+    <div style={{ padding: "5px 0" }}>
+      <Check checked={checked} onChange={onChange} hint={hint}
+        label={<span style={{ fontSize: 12.5, color: TEXT }}>{label}</span>} />
+    </div>
   );
 }
 
@@ -410,14 +409,10 @@ function Pane({ row, onClose, infoKey, bumpInfo }: { row: AppMenuRow; onClose: (
         <PaneHead title="Settings"
           sub="The full preferences dialog covers appearance, memory budget, autosave, experimental features and the prefab folder. A few view toggles are repeated here because they change what you see immediately." />
         <div style={{ display: "flex", flexDirection: "column", gap: 2, marginBottom: 16, maxWidth: 620 }}>
-          <QuickToggle label="Quad view" on={p.showSlicePanels} onToggle={() => p.setShowSlicePanels(!p.showSlicePanels)}
-            hint="Hammer-style Top + Front + Side + 3D panes." />
-          <QuickToggle label="3D fly-through pane" on={p.enable3dPane} onToggle={() => p.setEnable3dPane(!p.enable3dPane)}
-            hint="Fills the fourth quad cell. Requires quad view." />
+          <QuickToggle label="3D view" on={p.view3dWindowOpen} onToggle={p.onToggle3dWindow}
+            hint="A floating window over the map — swap them with Tab or ⇄." />
           <QuickToggle label="Docked sidebar" on={p.sidebarOpen} onToggle={p.onToggleSidebar}
             hint="Inspector, prefab library, elevation preview and undo history." />
-          <QuickToggle label="Quick Actions bar" on={p.showQuickActions} onToggle={p.onToggleQuickActions}
-            hint="Floating selection/clipboard pill under the ribbon." />
         </div>
         <Primary icon="settings" label="Open Settings…" onClick={() => { onClose(); p.setShowSettings(true); }} />
       </>);
@@ -512,7 +507,7 @@ function QuickToggle({ label, hint, on, onToggle, readOnly }: {
       <span style={{
         width: 28, height: 16, borderRadius: 8, flexShrink: 0, marginTop: 1, position: "relative",
         background: on ? "rgba(0,164,173,.55)" : "rgba(255,255,255,.09)",
-        boxShadow: `inset 0 0 0 1px ${on ? EDEN_TEAL_READABLE : "rgba(255,255,255,.16)"}`,
+        boxShadow: `inset 0 0 0 1px ${on ? TEXT_ARMED : "rgba(255,255,255,.16)"}`,
       }}>
         <span style={{
           position: "absolute", top: 2, left: on ? 14 : 2, width: 12, height: 12, borderRadius: "50%",

@@ -3,9 +3,10 @@ import { invoke } from "@tauri-apps/api/core";
 import { openPath } from "@tauri-apps/plugin-opener";
 import { Icon } from "./ribbon/icons";
 import {
-  ACCENT, BORDER, RADIUS, SPACE, TEXT, TEXT_DANGER, TEXT_DIM, TEXT_DISABLED, TEXT_LABEL,
+  ACCENT, BORDER, RADIUS, SPACE, TEXT, TEXT_DANGER, TEXT_DIM, TEXT_META, TEXT_LABEL,
   btnBase, hexToRgbTriplet,
 } from "./ribbon/tokens";
+import { Select } from "./ribbon/primitives";
 
 /** The panel's own button treatment — `ribbon/primitives`' recipe at this panel's proportions
  *  (audit H10 step 3). Replaces `chromeButton`, the app-wide warm-brown glass. */
@@ -56,7 +57,7 @@ function Thumbnail({ url, failed, size }: { url: string | null; failed: boolean;
       {url ? (
         <img src={url} alt="" style={{ width: "100%", height: "100%", objectFit: "contain", imageRendering: "pixelated" }} />
       ) : (
-        <span style={{ color: failed ? TEXT_DANGER : TEXT_DISABLED, fontSize: 16 }}>{failed ? "!" : "…"}</span>
+        <span style={{ color: failed ? TEXT_DANGER : TEXT_META, fontSize: 16 }}>{failed ? "!" : "…"}</span>
       )}
     </div>
   );
@@ -300,14 +301,9 @@ export default function PrefabLibraryPanel({
     color: TEXT, fontSize: 12, height: "100%", minHeight: 0,
   };
 
-  const selectStyle: React.CSSProperties = {
-    background: "rgba(0,0,0,0.4)", border: `1px solid ${BORDER.outline}`, borderRadius: 5,
-    color: TEXT_DIM, padding: "4px 6px", fontSize: 11, outline: "none", cursor: "pointer",
-  };
-
   return (
     <div ref={panelRef} role="region" aria-label="Prefab Library" tabIndex={-1} style={panelStyle}>
-      <div style={{ fontSize: 10, color: TEXT_DISABLED, wordBreak: "break-all" }}>{dir ?? "…"}</div>
+      <div style={{ fontSize: 10, color: TEXT_META, wordBreak: "break-all" }}>{dir ?? "…"}</div>
       {entries.length > 0 && (
         <>
           <input
@@ -320,11 +316,15 @@ export default function PrefabLibraryPanel({
             }}
           />
           <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
-            <select value={sort} onChange={(e) => setSort(e.target.value as SortKey)} title="Sort by" style={{ ...selectStyle, flex: 1 }}>
-              <option value="name">Name</option>
-              <option value="newest">Newest</option>
-              <option value="size">Size</option>
-            </select>
+            <div style={{ flex: 1, minWidth: 0, display: "flex" }}>
+              <Select value={sort} ariaLabel="Sort by" title="Sort by" width={200}
+                options={[
+                  { id: "name", label: "Name" },
+                  { id: "newest", label: "Newest" },
+                  { id: "size", label: "Size" },
+                ]}
+                onChange={(v) => setSort(v)} />
+            </div>
             <button
               onClick={() => setView((v) => (v === "list" ? "grid" : "list"))}
               title={view === "list" ? "Switch to grid view" : "Switch to list view"}
@@ -339,14 +339,17 @@ export default function PrefabLibraryPanel({
       <div style={{ overflowY: "auto", flex: 1 }}>
         {loading && <div style={{ color: TEXT_LABEL }}>Loading…</div>}
         {!loading && entries.length === 0 && !error && (
-          <div style={{ color: TEXT_DISABLED, fontSize: 11 }}>No .epfab files found. Save a prefab from a selection to populate this folder.</div>
+          <div style={{ color: TEXT_META, fontSize: 11 }}>No .epfab files found. Save a prefab from a selection to populate this folder.</div>
         )}
         {!loading && entries.length > 0 && shown.length === 0 && (
-          <div style={{ color: TEXT_DISABLED, fontSize: 11 }}>No prefabs match “{query}”.</div>
+          <div style={{ color: TEXT_META, fontSize: 11 }}>No prefabs match “{query}”.</div>
         )}
 
         {view === "list" && (
-          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+          // Denser rows + a smaller 28px thumbnail (Stage 14.11 property-grid pass) — the old
+          // 40px thumb + 5px padding read as a card grid pretending to be a list; this row now
+          // reads at a glance, closer to a file-manager detail list than a gallery.
+          <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
             {shown.map((entry) => {
               const isRenaming = renaming === entry.path;
               return (
@@ -358,12 +361,12 @@ export default function PrefabLibraryPanel({
                   title={isRenaming ? undefined : `${entry.width}×${entry.height}×${entry.depth} — click to paste`}
                   role="button"
                   style={{
-                    display: "flex", alignItems: "center", gap: 4, borderRadius: 5, padding: 5,
+                    display: "flex", alignItems: "center", gap: 4, borderRadius: 3, padding: "3px 6px",
                     cursor: isRenaming ? "default" : "pointer", color: TEXT_DIM,
                     background: hovered === entry.path ? "rgba(255,255,255,0.08)" : "rgba(255,255,255,0.03)",
                   }}
                 >
-                  <Thumbnail url={typeof thumbs[entry.path] === "string" ? thumbs[entry.path] : null} failed={thumbs[entry.path] === null} size={40} />
+                  <Thumbnail url={typeof thumbs[entry.path] === "string" ? thumbs[entry.path] : null} failed={thumbs[entry.path] === null} size={28} />
                   <div style={{ display: "flex", flexDirection: "column", minWidth: 0, flex: 1 }}
                     onClick={(e) => { if (isRenaming) e.stopPropagation(); }}
                   >
@@ -425,8 +428,8 @@ export default function PrefabLibraryPanel({
         </button>
       </div>
       <button onClick={onSaveAs} style={panelBtn({
-        color: ACCENT.green,
-        boxShadow: `inset 0 0 0 1px rgba(${hexToRgbTriplet(ACCENT.green)},.55), inset 0 1px 0 ${BORDER.bevel}`,
+        color: ACCENT.clipboard,
+        boxShadow: `inset 0 0 0 1px rgba(${hexToRgbTriplet(ACCENT.clipboard)},.55), inset 0 1px 0 ${BORDER.bevel}`,
       })}>
         Save Selection As…
       </button>

@@ -6,6 +6,12 @@ import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { PAINT_COLORS } from "../blockDefs";
 import { classifyWorldFormat } from "../types";
+import { MODAL_TEXT } from "../designTokens";
+import { ACCENTS, DANGER_HEX, RAMP, mix } from "../theme/theme";
+
+/** Lightened danger tint for text on the warm modal surface (mechanical hex-literal migration,
+ *  Stage 14.15) — plain `DANGER_HEX` fails AA there. */
+const RED_LIGHT = mix(RAMP.white, DANGER_HEX, 0.5);
 
 export interface WorldInfo {
   name: string;
@@ -23,8 +29,8 @@ export interface WorldInfo {
 }
 
 function paintColor(idx: number): string {
-  if (idx === 0 || idx === 14) return "#a0c8ff"; // default sky blue
-  if (idx < 1 || idx > 54) return "#333";
+  if (idx === 0 || idx === 14) return ACCENTS.selection; // default sky blue
+  if (idx < 1 || idx > 54) return RAMP.mbtn1;
   const [r, g, b] = PAINT_COLORS[idx - 1];
   return `rgb(${r},${g},${b})`;
 }
@@ -55,8 +61,8 @@ const rowStyle: React.CSSProperties = {
 function Row({ k, v }: { k: string; v: React.ReactNode }) {
   return (
     <div style={rowStyle}>
-      <span style={{ color: "#afa69d", flexShrink: 0 }}>{k}</span>
-      <span style={{ color: "#ebe9e7", textAlign: "right", wordBreak: "break-all" }}>{v}</span>
+      <span style={{ color: MODAL_TEXT.secondary, flexShrink: 0 }}>{k}</span>
+      <span style={{ color: MODAL_TEXT.primary, textAlign: "right", wordBreak: "break-all" }}>{v}</span>
     </div>
   );
 }
@@ -64,8 +70,8 @@ function Row({ k, v }: { k: string; v: React.ReactNode }) {
 const section: React.CSSProperties = { marginBottom: 14 };
 const sectionLabel: React.CSSProperties = {
   fontSize: 10, fontWeight: 700, letterSpacing: "0.08em",
-  color: "#61584f", textTransform: "uppercase", marginBottom: 6,
-  borderBottom: "1px solid #312c28", paddingBottom: 3,
+  color: MODAL_TEXT.label, textTransform: "uppercase", marginBottom: 6,
+  borderBottom: `1px solid ${RAMP.mbtn1}`, paddingBottom: 3,
 };
 
 /** `refreshKey` re-fetches — the menu bumps it after a rename so the pane doesn't go stale. */
@@ -80,9 +86,9 @@ export default function WorldInfoPanel({ refreshKey = 0 }: { refreshKey?: number
   }, [refreshKey]);
 
   return (
-    <div style={{ color: "#ebe9e7", fontFamily: "monospace", fontSize: 12 }}>
-      {err && <div style={{ color: "#f87171", marginBottom: 12 }}>{err}</div>}
-      {!info && !err && <div style={{ color: "#83786c" }}>Loading…</div>}
+    <div style={{ color: MODAL_TEXT.primary, fontFamily: "monospace", fontSize: 12 }}>
+      {err && <div style={{ color: RED_LIGHT, marginBottom: 12 }}>{err}</div>}
+      {!info && !err && <div style={{ color: MODAL_TEXT.label }}>Loading…</div>}
 
       {info && <>
         <div style={section}>
@@ -92,7 +98,7 @@ export default function WorldInfoPanel({ refreshKey = 0 }: { refreshKey?: number
             <span title={formatLabel(info).title}>{formatLabel(info).label}</span>
           } />
           <Row k="Version" v={info.version} />
-          <Row k="Level seed" v={info.level_seed === 0 ? <span style={{ color: "#61584f" }}>0 (unset)</span> : info.level_seed} />
+          <Row k="Level seed" v={info.level_seed === 0 ? <span style={{ color: MODAL_TEXT.label }}>0 (unset)</span> : info.level_seed} />
         </div>
 
         <div style={section}>
@@ -108,7 +114,7 @@ export default function WorldInfoPanel({ refreshKey = 0 }: { refreshKey?: number
           <div style={sectionLabel}>Positions</div>
           {info.spawn_px != null
             ? <Row k="Home / spawn (XY)" v={`(${fmt1(info.spawn_px)}, ${fmt1(info.spawn_py!)})`} />
-            : <Row k="Home / spawn" v={<span style={{ color: "#61584f" }}>not set</span>} />}
+            : <Row k="Home / spawn" v={<span style={{ color: MODAL_TEXT.label }}>not set</span>} />}
           <Row k="Home height (Z)" v={fmt1(info.home_height)} />
           <Row k="Start / last pos (XY)" v={`(${fmt1(info.pos_local_x)}, ${fmt1(info.pos_local_y)})`} />
           <Row k="Start height (Z)" v={fmt1(info.pos_height)} />
@@ -118,8 +124,8 @@ export default function WorldInfoPanel({ refreshKey = 0 }: { refreshKey?: number
         <div style={section}>
           <div style={sectionLabel}>Progress</div>
           <Row k="Golden cubes" v={info.golden_cubes === 0
-            ? <span style={{ color: "#61584f" }}>0</span>
-            : <span style={{ color: "#fbbf24" }}>⬡ {info.golden_cubes}</span>} />
+            ? <span style={{ color: MODAL_TEXT.label }}>0</span>
+            : <span style={{ color: ACCENTS.warm }}>⬡ {info.golden_cubes}</span>} />
         </div>
 
         <div style={section}>
@@ -132,7 +138,7 @@ export default function WorldInfoPanel({ refreshKey = 0 }: { refreshKey?: number
                 <div key={i} title={`Band ${i}: paint ${idx}${isDefault ? " (default)" : ""}`}
                   style={{
                     width: 20, height: 20, borderRadius: 3, background: color,
-                    border: isDefault ? "1px solid #453f38" : "1px solid rgba(255,255,255,0.2)",
+                    border: isDefault ? `1px solid ${RAMP.mbtn0}` : "1px solid rgba(255,255,255,0.2)",
                     position: "relative",
                   }}>
                   <span style={{ position: "absolute", bottom: 0, right: 1, fontSize: 7, color: "rgba(0,0,0,0.5)", lineHeight: 1 }}>{i}</span>

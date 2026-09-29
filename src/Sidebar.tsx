@@ -11,12 +11,12 @@ import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Icon, type IconName } from "./ribbon/icons";
 import {
-  ACCENT, BORDER, FONT, HAIRLINE, RADIUS, SPACE, SURFACE, TEXT, TEXT_DIM, TEXT_DISABLED,
-  TEXT_LABEL, btnBase, hexToRgbTriplet,
+  BORDER, FONT, HAIRLINE, RADIUS, SPACE, SURFACE, TEXT, TEXT_DIM, TEXT_META,
+  CUR_ICON, currentRow, TEXT_LABEL, btnBase,
 } from "./ribbon/tokens";
 import SelectionInspector from "./SelectionInspector";
 import PrefabLibraryPanel from "./PrefabLibraryPanel";
-import type { SelectionInfo, ClipboardInfo, SignInfo } from "./types";
+import type { SelectionInfo, ClipboardInfo, SignInfo, ExtrudeAxis } from "./types";
 
 export type SidebarTab = "inspector" | "prefabs" | "history";
 
@@ -28,7 +28,9 @@ const TABS: { id: SidebarTab; label: string; icon: IconName }[] = [
   { id: "history", label: "History", icon: "history" },
 ];
 
-/** Section heading shared by the History and Signs lists — the ribbon's `FieldLabel` treatment. */
+/** Section heading for the History tab's undo/redo stacks — the ribbon's `FieldLabel` treatment.
+ *  (The Inspector tab's own sections use `ui/PropertyGrid`'s `Section` instead, since those are
+ *  collapsible and persist their open/closed state — History's two stacks are always both shown.) */
 function SectionLabel({ children }: { children: React.ReactNode }) {
   return (
     <span style={{
@@ -65,25 +67,27 @@ function HistoryTab({ editEpoch, worldEpoch }: { editEpoch: number; worldEpoch: 
     return () => { cancelled = true; clearTimeout(t); };
   }, [editEpoch, worldEpoch]);
 
-  const rowStyle = (highlight: boolean): React.CSSProperties => ({
+  // The current history entry (top of the undo stack) is pushed in — the app-wide current-item
+  // recipe (Stage 14.2), no accent fill/ring.
+  const rowStyle = (current: boolean): React.CSSProperties => ({
     padding: "3px 6px", borderRadius: RADIUS.md, fontSize: FONT.body,
-    color: highlight ? TEXT : TEXT_DIM,
-    background: highlight ? `rgba(${hexToRgbTriplet(ACCENT.primary)},.16)` : "transparent",
-    boxShadow: highlight ? `inset 0 0 0 1px rgba(${hexToRgbTriplet(ACCENT.primary)},.35)` : undefined,
+    color: current ? TEXT : TEXT_DIM,
+    ...(current ? currentRow() : null),
   });
 
-  if (!info) return <div style={{ color: TEXT_DISABLED, fontSize: FONT.body }}>Loading…</div>;
+  if (!info) return <div style={{ color: TEXT_META, fontSize: FONT.body }}>Loading…</div>;
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: SPACE.lg + 2, fontSize: FONT.body }}>
       <div>
         <div style={{ marginBottom: SPACE.sm }}><SectionLabel>UNDO STACK</SectionLabel></div>
         {info.undo.length === 0 ? (
-          <div style={{ color: TEXT_DISABLED }}>Nothing to undo.</div>
+          <div style={{ color: TEXT_META }}>Nothing to undo.</div>
         ) : (
           <div style={{ display: "flex", flexDirection: "column-reverse", gap: 1 }}>
             {info.undo.map((label, i) => (
-              <div key={i} style={rowStyle(i === info.undo.length - 1)}>{label}</div>
+              <div key={i} style={rowStyle(i === info.undo.length - 1)}
+                aria-current={i === info.undo.length - 1 ? "step" : undefined}>{label}</div>
             ))}
           </div>
         )}
@@ -91,72 +95,15 @@ function HistoryTab({ editEpoch, worldEpoch }: { editEpoch: number; worldEpoch: 
       <div>
         <div style={{ marginBottom: SPACE.sm }}><SectionLabel>REDO STACK</SectionLabel></div>
         {info.redo.length === 0 ? (
-          <div style={{ color: TEXT_DISABLED }}>Nothing to redo.</div>
+          <div style={{ color: TEXT_META }}>Nothing to redo.</div>
         ) : (
           <div style={{ display: "flex", flexDirection: "column", gap: 1 }}>
             {info.redo.map((label, i) => (
-              <div key={i} style={rowStyle(i === info.redo.length - 1)}>{label}</div>
+              <div key={i} style={rowStyle(false)}>{label}</div>
             ))}
           </div>
         )}
       </div>
-    </div>
-  );
-}
-
-/** Read-only sign list (256z-format plan, Phase 4) — shown only when the world actually has
- *  signs, which is the overwhelming minority. `facing` is a strong-but-unproven hypothesis (see
- *  CLAUDE.md's "File Format" section), shown as a raw number rather than decoded further.
- *  Collapsible like the Inspector tab's other sections (elevation view — `SelectionInspector`),
- *  same ▼/▶ header idiom, open by default. */
-const SIGNS_COLLAPSED_COUNT = 3;
-
-function SignsList({ signs, onSignClick }: { signs: SignInfo[]; onSignClick?: (s: SignInfo) => void }) {
-  const [open, setOpen] = useState(true);
-  const [showAll, setShowAll] = useState(false);
-  if (signs.length === 0) return null;
-  const visible = showAll ? signs : signs.slice(0, SIGNS_COLLAPSED_COUNT);
-  const hiddenCount = signs.length - visible.length;
-  return (
-    <div style={{ display: "flex", flexDirection: "column", gap: SPACE.sm, fontSize: FONT.body, marginBottom: SPACE.lg + 2 }}>
-      <div
-        onClick={() => setOpen(v => !v)}
-        style={{ display: "flex", alignItems: "center", gap: SPACE.sm, cursor: "pointer", userSelect: "none" }}
-      >
-        <Icon name={open ? "expandBar" : "right"} size={FONT.body} tone="default" />
-        <SectionLabel>SIGNS ({signs.length})</SectionLabel>
-      </div>
-      {open && <>
-        {visible.map((s, i) => (
-          <div key={i}
-            onClick={onSignClick ? () => onSignClick(s) : undefined}
-            title={onSignClick ? "Click to centre the map on this sign" : undefined}
-            style={{
-              padding: "4px 6px", borderRadius: RADIUS.md,
-              background: `rgba(${hexToRgbTriplet(ACCENT.warm)},.10)`,
-              boxShadow: `inset 0 0 0 1px rgba(${hexToRgbTriplet(ACCENT.warm)},.30)`,
-              cursor: onSignClick ? "pointer" : "default",
-            }}>
-            <div style={{ color: TEXT, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
-              {s.text || <span style={{ color: TEXT_DISABLED, fontStyle: "italic" }}>(empty)</span>}
-            </div>
-            <div style={{ color: TEXT_LABEL, fontSize: FONT.label, marginTop: 2 }}>
-              ({Math.round(s.x)}, {Math.round(s.y)}, {s.z}) · facing {s.facing}
-            </div>
-          </div>
-        ))}
-        {signs.length > SIGNS_COLLAPSED_COUNT && (
-          <div
-            onClick={() => setShowAll(v => !v)}
-            style={{
-              textAlign: "center", padding: "3px 0", cursor: "pointer", userSelect: "none",
-              color: TEXT_LABEL, fontSize: FONT.label,
-            }}
-          >
-            {showAll ? "Show less" : `Show ${hiddenCount} more…`}
-          </div>
-        )}
-      </>}
     </div>
   );
 }
@@ -177,7 +124,7 @@ export interface SidebarProps {
   // Inspector tab
   selection: SelectionInfo | null;
   clipboard: ClipboardInfo | null;
-  quadMode: boolean;
+  clipboardPreview: { width: number; height: number; pixels: Uint8Array } | null;
 
   // Prefabs tab
   onArmPaste: (info: ClipboardInfo) => void;
@@ -194,6 +141,16 @@ export interface SidebarProps {
   drawActive: boolean;
   onDrawElevation: (x: number, y: number, z: number) => void;
   onZRangeChange?: (zMin: number, zMax: number) => void;
+
+  // Extrude section (Inspector tab) — mirrors the ribbon Selection tab's Extrude group, same
+  // lifted App state. `extrudeCount` above is *gated* (zeroed unless the Selection ribbon tab is
+  // active and not mid-paste-preview) for the elevation ghost's benefit — the section's own
+  // editable field needs the real, ungated value or it would show 0 while the user's actual
+  // extrude count sits unseen. Omitted = the field falls back to the gated value.
+  extrudeCountRaw?: number;
+  setExtrudeCount?: (n: number) => void;
+  setExtrudeAxis?: (a: ExtrudeAxis) => void;
+  onExtrude?: (ignoreAir: boolean) => void;
 
   // History tab
   worldEpoch: number;
@@ -268,29 +225,29 @@ export default function Sidebar(p: SidebarProps) {
         }}
       />
 
-      {/* Tab strip. `role="tablist"` + the ribbon's own armed treatment (accent underline, lit
-          icon) rather than the old bespoke `glassTab`, so a selected sidebar tab reads the same
-          way a selected ribbon tab does. */}
+      {/* Tab strip. `role="tablist"`; the selected tab is **pushed in** (Stage 14.2 — the
+          app-wide current-item recipe). The accent underline it used to carry is gone: current
+          items carry no accent strips anywhere. Hover is the `.vx-row` lift. */}
       <div className="eden-ribbon" role="tablist" aria-label="Sidebar panels" style={{
-        display: "flex", alignItems: "stretch", background: SURFACE.topbar,
+        display: "flex", alignItems: "stretch", gap: 3, padding: 3, background: SURFACE.topbar,
         boxShadow: `inset 0 -1px 0 ${HAIRLINE}`,
       }}>
         {TABS.map((t) => {
           const on = p.tab === t.id;
           return (
             <button
-              key={t.id} className="rbn-tab" type="button" role="tab" aria-selected={on}
-              data-active={on ? "true" : undefined} data-tab={t.id}
+              key={t.id} className="vx-row" type="button" role="tab" aria-selected={on}
+              data-cur={on ? "" : undefined} data-tab={t.id}
               onClick={() => p.onTabChange(t.id)}
               title={t.label}
               style={btnBase({
-                flex: 1, height: 28, padding: 0, borderRadius: 0, background: "none",
-                boxShadow: on ? `inset 0 -2px 0 ${ACCENT.primary}` : "none",
+                flex: 1, height: 22, padding: 0, borderRadius: RADIUS.md, background: "none",
+                boxShadow: "none", textShadow: "none",
                 display: "flex", alignItems: "center", justifyContent: "center", gap: SPACE.sm,
                 color: on ? TEXT : TEXT_LABEL, fontWeight: on ? 700 : 400, fontSize: FONT.body,
               })}
             >
-              <Icon name={t.icon} size={13} tone={on ? "accent" : "default"} />
+              <Icon name={t.icon} size={13} tone={on ? "inherit" : "default"} style={on ? { color: CUR_ICON } : undefined} />
               {t.label}
             </button>
           );
@@ -311,12 +268,10 @@ export default function Sidebar(p: SidebarProps) {
 
       <div style={{ flex: 1, minHeight: 0, overflowY: "auto", padding: PAD, color: TEXT }}>
         {p.tab === "inspector" && (
-          <>
-          <SignsList signs={p.signs} onSignClick={p.onSignClick} />
           <SelectionInspector
             selection={p.selection}
             clipboard={p.clipboard}
-            quadMode={p.quadMode}
+            clipboardPreview={p.clipboardPreview}
             elevationSelection={p.elevationSelection}
             elevationWidth={contentWidth}
             maxZ={p.maxZ}
@@ -327,8 +282,13 @@ export default function Sidebar(p: SidebarProps) {
             drawActive={p.drawActive}
             onDrawElevation={p.onDrawElevation}
             onZRangeChange={p.onZRangeChange}
+            extrudeCountRaw={p.extrudeCountRaw}
+            setExtrudeCount={p.setExtrudeCount}
+            setExtrudeAxis={p.setExtrudeAxis}
+            onExtrude={p.onExtrude}
+            signs={p.signs}
+            onSignClick={p.onSignClick}
           />
-          </>
         )}
         {p.tab === "prefabs" && (
           <PrefabLibraryPanel
