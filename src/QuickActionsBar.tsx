@@ -1,4 +1,5 @@
 import NumberField from "./NumberField";
+import { sfx } from "./sound/sfx";
 import type { ClipboardInfo } from "./types";
 import type { SelectionBounds } from "./MapCanvas";
 import { FieldLabel, GroupDivider, IconButton, SmallButton } from "./ribbon/primitives";
@@ -22,7 +23,7 @@ export const QUICK_ACTIONS_BAR_H = SMALL_H + 6;
  * rather than the bar disappearing or the group vanishing, so the strip is a stable, predictable
  * fixture instead of something that pops in and shifts the map underneath it. Left-aligned, not
  * centered — a docked toolbar reads left-to-right like the ribbon above it, not like a floating
- * pill hunting for the window's midpoint. `SMALL_H` (26px, the ribbon's own row height) keeps the
+ * pill hunting for the window's midpoint. `SMALL_H` (the ribbon's own row height) keeps the
  * strip's vertical density identical to the old floating pill — nothing about this got taller.
  */
 
@@ -67,7 +68,7 @@ const groupLabel: React.CSSProperties = {
 export default function QuickActionsBar(p: QuickActionsBarProps) {
   const hasSel = !!p.rawBounds;
   const hasClip = !!p.clipboard;
-  const nudge = (d: number) => p.setPasteElevationOffset(p.pasteElevationOffset + d);
+  const nudge = (d: number) => { p.setPasteElevationOffset(p.pasteElevationOffset + d); sfx.play("nudge"); };
 
   return (
     <div className="eden-ribbon" data-tour="quick-actions" style={{
@@ -94,7 +95,7 @@ export default function QuickActionsBar(p: QuickActionsBarProps) {
       <span style={groupLabel}>Clip</span>
       {p.pasteLocked
         ? <SmallButton icon="paste" label="Confirm paste" title="Paste at the locked-in position (second click)" disabled={!hasClip} active accent={ACCENT.warm} onClick={p.onConfirmPaste} />
-        : <SmallButton icon="paste" label="Paste" title={`Arm the paste tool (${MOD}V)`} disabled={!hasClip} active={hasClip} accent={ACCENT.green} onClick={p.onPaste} />}
+        : <SmallButton icon="paste" label="Paste" title={`Arm the paste tool (${MOD}V)`} disabled={!hasClip} active={hasClip} accent={ACCENT.clipboard} onClick={p.onPaste} />}
       <FieldLabel>Z offset</FieldLabel>
       <IconButton icon="down" label="Lower paste" title={`Lower the paste (PgDn — ${SHIFT} for ±5)`} disabled={!hasClip} onClick={() => nudge(-1)} />
       <NumberField

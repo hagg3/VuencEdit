@@ -6,7 +6,15 @@ import { useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import appIcon from "../assets/app-icon.png";
-import { EDEN_TEAL_READABLE } from "../designTokens";
+import { MODAL_TEXT } from "../designTokens";
+import { ACCENTS, DANGER_HEX, RAMP, mix } from "../theme/theme";
+
+/** Lightened danger tint for text on the warm modal surface (mechanical hex-literal migration,
+ *  Stage 14.15) — plain `DANGER_HEX` fails AA there. */
+const RED_LIGHT = mix(RAMP.white, DANGER_HEX, 0.5);
+/** Lightened teal tint (same recipe as `RED_LIGHT`, replacing the retired `EDEN_TEAL_READABLE` —
+ *  UI redesign r3, Stage 14.17 D5b) for link/accent text on the warm modal surface. */
+const TEAL_LIGHT = mix(RAMP.white, ACCENTS.primary, 0.5);
 
 /** Plain MAJOR.MINOR.PATCH comparison — mirrors `isNewerVersion` in App.tsx (the startup check),
  *  kept as its own small copy here rather than exported/shared since this is the only other
@@ -33,7 +41,7 @@ function Link({ href, children }: { href: string; children: React.ReactNode }) {
     <a
       href="#"
       onClick={e => { e.preventDefault(); openUrl(href); }}
-      style={{ color: EDEN_TEAL_READABLE, textDecoration: "none" }}
+      style={{ color: TEAL_LIGHT, textDecoration: "none" }}
       onMouseEnter={e => (e.currentTarget.style.textDecoration = "underline")}
       onMouseLeave={e => (e.currentTarget.style.textDecoration = "none")}
     >
@@ -79,17 +87,17 @@ export default function AboutPanel({ version, compact, onOpenDiagnostics }: {
         />
         <div>
           <div style={{ fontSize: compact ? 24 : 28, letterSpacing: -0.5, lineHeight: 1.1 }}>
-            <span style={{ fontWeight: 800, color: "#ffffff", textShadow: "0 -1px 0 rgba(0,0,0,.5)" }}>Vuenc</span>
-            <span style={{ fontWeight: 400, color: EDEN_TEAL_READABLE, textShadow: "0 -1px 0 rgba(0,0,0,.5)" }}>Edit</span>
+            <span style={{ fontWeight: 800, color: RAMP.white, textShadow: "0 -1px 0 rgba(0,0,0,.5)" }}>Vuenc</span>
+            <span style={{ fontWeight: 400, color: TEAL_LIGHT, textShadow: "0 -1px 0 rgba(0,0,0,.5)" }}>Edit</span>
           </div>
-          <div style={{ fontSize: 12, color: "#83786c", marginTop: 3 }}>v{version}</div>
+          <div style={{ fontSize: 12, color: MODAL_TEXT.label, marginTop: 3 }}>v{version}</div>
           <div style={{ marginTop: 6, display: "flex", flexDirection: "column", gap: 4, alignItems: compact ? "flex-start" : "center" }}>
             <button
               onClick={checkForUpdates}
               disabled={checkState.kind === "checking"}
               style={{
-                background: "none", border: "1px solid #3d3630", borderRadius: 5,
-                color: EDEN_TEAL_READABLE, fontSize: 11, padding: "3px 9px",
+                background: "none", border: `1px solid ${RAMP.mbtn0}`, borderRadius: 5,
+                color: TEAL_LIGHT, fontSize: 11, padding: "3px 9px",
                 cursor: checkState.kind === "checking" ? "default" : "pointer",
                 opacity: checkState.kind === "checking" ? 0.6 : 1,
               }}
@@ -97,13 +105,13 @@ export default function AboutPanel({ version, compact, onOpenDiagnostics }: {
               {checkState.kind === "checking" ? "Checking…" : "Check for updates"}
             </button>
             {checkState.kind === "upToDate" && (
-              <span style={{ fontSize: 11, color: "#83786c" }}>You're up to date.</span>
+              <span style={{ fontSize: 11, color: MODAL_TEXT.label }}>You're up to date.</span>
             )}
             {checkState.kind === "error" && (
-              <span style={{ fontSize: 11, color: "#f87171" }}>Couldn't check for updates.</span>
+              <span style={{ fontSize: 11, color: RED_LIGHT }}>Couldn't check for updates.</span>
             )}
             {checkState.kind === "available" && (
-              <span style={{ fontSize: 11, color: "#83786c" }}>
+              <span style={{ fontSize: 11, color: MODAL_TEXT.label }}>
                 v{checkState.latestVersion} available — <Link href={checkState.releaseUrl}>download</Link>
               </span>
             )}
@@ -112,9 +120,9 @@ export default function AboutPanel({ version, compact, onOpenDiagnostics }: {
       </div>
 
       <div style={{
-        fontSize: 13, color: "#afa69d", lineHeight: 1.65,
+        fontSize: 13, color: MODAL_TEXT.secondary, lineHeight: 1.65,
         textAlign: compact ? "left" : "center",
-        borderTop: "1px solid #2d2824", paddingTop: 16, width: "100%",
+        borderTop: `1px solid ${RAMP.mbtn1}`, paddingTop: 16, width: "100%",
       }}>
         <p style={{ margin: "0 0 10px" }}>
           <Link href="https://hagg3.github.io/VuencEdit/">Website</Link>
@@ -140,7 +148,7 @@ export default function AboutPanel({ version, compact, onOpenDiagnostics }: {
         {onOpenDiagnostics && (
           <p style={{ margin: 0 }}>
             Reporting a bug? <a href="#" onClick={e => { e.preventDefault(); onOpenDiagnostics(); }}
-              style={{ color: EDEN_TEAL_READABLE, textDecoration: "none" }}
+              style={{ color: TEAL_LIGHT, textDecoration: "none" }}
               onMouseEnter={e => (e.currentTarget.style.textDecoration = "underline")}
               onMouseLeave={e => (e.currentTarget.style.textDecoration = "none")}
             >Open Diagnostics…</a> for a report you can paste into it.

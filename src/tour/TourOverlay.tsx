@@ -7,6 +7,8 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useFocusTrap } from "../Modal";
 import { ACCENT, BORDER, FONT, RADIUS, SPACE, SURFACE, TEXT, TEXT_DIM, btnBase } from "../ribbon/tokens";
+import { loadSettings } from "../SettingsModal";
+import { useMotionPref } from "../theme/motion";
 import type { TourCtx, TourStep } from "./steps";
 
 /** Plain object, not a live `DOMRect` — keeps `placeCard` pure and node-testable. */
@@ -70,14 +72,15 @@ export function placeCard(
 }
 
 /**
- * Just the keyframes — whether they're applied is decided in JS (see `usesReducedMotion` below),
- * not by a `prefers-reduced-motion` media query in this block. An earlier version put the opt-out
- * in CSS (`@media (prefers-reduced-motion: reduce) { animation: none !important; ... }` on the
- * same class the animation lives on) and that combination froze the whole app — a dimmed overlay
- * with no card ever appearing — on a real device with Reduce Motion on, even though nothing here
- * reads that media query in JS. Root cause not chased down (WKWebView-specific `@media` + inline
- * `<style>` + `!important` interaction is the leading suspect); the JS branch sidesteps it and is
- * no more code.
+ * Just the keyframes — whether they're applied is decided in JS (`useMotionPref`,
+ * `src/theme/motion.ts`), never by a `prefers-reduced-motion` media query in this block. An earlier
+ * version put the opt-out in CSS (`@media (prefers-reduced-motion: reduce) { animation: none
+ * !important; ... }` on the same class the animation lives on) and that combination froze the whole
+ * app — a dimmed overlay with no card ever appearing — on a real device with Reduce Motion on, even
+ * though nothing here read that media query in JS. Root cause not chased down (WKWebView-specific
+ * `@media` + inline `<style>` + `!important` interaction is the leading suspect); the JS gate
+ * sidesteps it, and is now the one resolver every motion-gated recipe in the app shares (Stage
+ * 14.13) rather than a copy of this workaround per component.
  */
 const TOUR_CSS = `
 @keyframes eden-tour-pulse {
@@ -86,11 +89,6 @@ const TOUR_CSS = `
 }
 .eden-tour-ring { animation: eden-tour-pulse 1.6s ease-in-out infinite; }
 `;
-
-function prefersReducedMotion(): boolean {
-  try { return window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false; }
-  catch { return false; }
-}
 
 /** Bounding box containing every rect in `rects` (ignoring nulls). `null` if none measured. */
 function unionRects(rects: (Rect | null)[]): Rect | null {
@@ -113,7 +111,13 @@ export default function TourOverlay({
   const cardRef = useRef<HTMLDivElement>(null);
   const step = steps[stepIndex];
   const total = steps.length;
-  const [reducedMotion] = useState(prefersReducedMotion);
+  // The tour is mounted/unmounted per session rather than kept alive for the app's lifetime, so a
+  // one-time read of the stored setting (like the old `useState(prefersReducedMotion)`) is enough —
+  // a Settings ▸ General change made *while* a tour is open re-renders the app but not this read;
+  // the next tour picks it up. `useMotionPref` still tracks the OS's live `prefers-reduced-motion`
+  // for the session this mounts in, and is the one thing that writes `<html data-motion>`.
+  const [motionSetting] = useState(() => loadSettings().motion);
+  const reducedMotion = useMotionPref(motionSetting) === "reduced";
   // Spotlight cutout — the primary target unioned with any secondary ones (e.g. the ribbon's tab
   // strip, folded in so it isn't dimmed into illegibility while a step points at a group below
   // it). The pulsing ring below still tracks the primary `rect` alone. Memoized: an unmemoized

@@ -9,19 +9,25 @@
 import { useRef, type CSSProperties } from "react";
 import appIcon from "../assets/app-icon.png";
 import WorldNamePill from "../WorldNamePill";
+import { sfx } from "../sound/sfx";
 import { useRibbon } from "./context";
 import { Icon } from "./icons";
 import type { RibbonTab } from "./props";
 import {
-  ACCENT, BORDER, CTX_ACCENT, FONT, HAIRLINE, ICON, IS_MAC, MAC_TRAFFIC_LIGHT_CLEARANCE, MOD,
+  BORDER, CTX_ACCENT, FONT, HAIRLINE, ICON, IS_MAC, MAC_TRAFFIC_LIGHT_CLEARANCE, MOD,
   RADIUS, SHIFT,
-  TAB_ACTIVE_BOT, TAB_ACTIVE_TOP, TEXT, TEXT_DIM, TEXT_LABEL, TOPBAR_BTN_H, TOP_BAR_HEIGHT, btnBase,
+  TEXT, TEXT_DIM, TEXT_LABEL, TOPBAR_BTN_H, TOP_BAR_HEIGHT, btnBase,
   btnDisabled, hexToRgbTriplet, lighten,
 } from "./tokens";
+import { BRAND, RAMP, TAB } from "../theme/theme";
+import { Keycap } from "./primitives";
+import { formatChord } from "../commands/keys";
+import { meta } from "../commands/meta";
 
-/** The brand button's fill. Office 2010's File tab is *always* the app's accent colour, not a
- *  neutral control that lights up when open — it is the one permanently-coloured thing up here. */
-const BRAND_RGB = hexToRgbTriplet(ACCENT.primary);
+const searchChord = formatChord(meta("app.commandSearch").keys![0]);
+
+// The brand button's fill (`BRAND`, theme.ts): Office 2010's File tab is *always* the app's accent
+// colour, not a neutral control that lights up when open — the one permanently-coloured thing here.
 
 const PERMANENT: { id: RibbonTab; label: string }[] = [
   { id: "home", label: "Home" },
@@ -41,9 +47,11 @@ const QAT_W_LABELLED = 74;
 const QAT_W_ICON = 46;
 
 export default function TopBar({
-  menuOpen, onToggleMenu, selFlash, clipFlash,
+  menuOpen, onToggleMenu, selFlash, clipFlash, onOpenSearch,
 }: {
   menuOpen: boolean;
+  /** Opens ⌘K (14.6). */
+  onOpenSearch: () => void;
   onToggleMenu: () => void;
   selFlash: number;
   clipFlash: number;
@@ -51,7 +59,7 @@ export default function TopBar({
   const { p, activeTab, setActiveTab } = useRibbon();
   const stripRef = useRef<HTMLDivElement>(null);
 
-  const show3d = p.showSlicePanels && p.enable3dPane;
+  const show3d = p.pane3dLive;
   const visible: RibbonTab[] = [
     ...PERMANENT.map(t => t.id),
     ...(show3d ? (["3d"] as RibbonTab[]) : []),
@@ -95,15 +103,11 @@ export default function TopBar({
           display: "flex", alignItems: "center", gap: 7, padding: "0 12px 0 9px",
           border: "none", cursor: "pointer", outline: "none", flexShrink: 0,
           margin: "3px 6px 3px 4px", borderRadius: RADIUS.md,
-          background: menuOpen
-            ? `linear-gradient(180deg, rgba(${BRAND_RGB},.55) 0%, rgba(${BRAND_RGB},.68) 100%)`
-            : `linear-gradient(180deg, rgba(${BRAND_RGB},.30) 0%, rgba(${BRAND_RGB},.48) 100%)`,
-          boxShadow: [
-            `inset 0 0 0 1px rgba(${BRAND_RGB},.35)`,
-            "inset 0 1px 0 rgba(255,255,255,.30)",
-            `0 0 ${menuOpen ? 16 : 9}px rgba(${BRAND_RGB},${menuOpen ? 0.65 : 0.38})`,
-          ].join(", "),
-          color: "#ffffff", textShadow: "0 1px 1px rgba(0,0,0,.45)",
+          // gloss-lite (Stage 14.2): an opaque accent face with a soft highlight; the glow widens
+          // while the menu is open. `filter` in RIBBON_CSS handles hover/press.
+          background: BRAND.bg,
+          boxShadow: BRAND.shadow(menuOpen),
+          color: RAMP.white, textShadow: "0 1px 0 rgba(0,0,0,.3)",
         }}
       >
         <img src={appIcon} alt="" style={{ width: 20, height: 20, borderRadius: RADIUS.md, imageRendering: "pixelated", flexShrink: 0 }} />
@@ -123,7 +127,10 @@ export default function TopBar({
 
       {/* Tab strip */}
       <div ref={stripRef} role="tablist" aria-label="Ribbon tabs" onKeyDown={onKeyDown}
-        style={{ display: "flex", alignItems: "stretch", gap: 1, minWidth: 0, overflow: "hidden" }}>
+        // A near-zero shrink weight: flex shrink is proportional, so the search field's 50 only
+        // *mostly* protected the strip. This way the strip gives up width only once the search
+        // field is frozen at its minWidth.
+        style={{ display: "flex", alignItems: "stretch", gap: 1, minWidth: 0, flexShrink: 0.001, overflow: "hidden" }}>
         {PERMANENT.map(t => <Tab key={t.id} id={t.id} label={t.label} />)}
         {show3d && <Tab id="3d" label="3D" accent={CTX_ACCENT["3d"]} contextual />}
         {p.rawBounds && <Tab key={`sel-${selFlash}`} id="selection" label="Selection" accent={CTX_ACCENT.selection} contextual flash={selFlash > 0} />}
@@ -135,7 +142,24 @@ export default function TopBar({
 
       <div {...(IS_MAC ? { "data-tauri-drag-region": true } : null)} style={{ flex: 1, minWidth: 8 }} />
 
-      {/* Right cluster: world pill · Help · collapse */}
+      {/* Right cluster: ⌘K search · world pill · Help · collapse */}
+      <button
+        className="rbn-btn" type="button" onClick={onOpenSearch}
+        title={`Search commands (${searchChord})`} aria-label="Search commands" aria-haspopup="dialog"
+        style={btnBase({
+          display: "flex", alignItems: "center", gap: 6, padding: "0 6px 0 8px", alignSelf: "center",
+          // Shrinks long before the tab strip does (15.4): at the 900px minimum it goes down to its
+          // icon, which is what keeps every tab on screen (the strip used to clip Insert/View/3D).
+          height: TOPBAR_BTN_H, width: 176, minWidth: 34, flexShrink: 50, marginRight: 4,
+          fontSize: FONT.body, color: TEXT_DIM, overflow: "hidden",
+        })}
+      >
+        <Icon name="search" size={ICON.xs} tone="inherit" />
+        <span style={{ flex: 1, minWidth: 0, textAlign: "left", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+          Search commands
+        </span>
+        <Keycap text={searchChord} small />
+      </button>
       <WorldNamePill />
       <button
         className="rbn-btn" type="button" onClick={() => p.setShowHelp(true)}
@@ -211,8 +235,9 @@ function QatButton({
  * the outline ring is reserved for the selected state so selection reads unambiguously.
  *
  * ⚠️ The glow is `inset`, not an outer `box-shadow`. The tab strip is `overflow: hidden` — which
- * is load-bearing, since at the 900px `minWidth` the strip must clip rather than run over the
- * world pill — so an outer glow would be sliced off at the strip's edges and along the bottom.
+ * is load-bearing, since the strip must clip rather than run over the world pill if even
+ * truncated tabs don't fit (15.4: they do at the 900px `minWidth`, with the search field shrunk to
+ * its icon first) — so an outer glow would be sliced off at the strip's edges and along the bottom.
  * A selected contextual tab still ends on `TAB_ACTIVE_BOT` so it merges into the body exactly
  * like a permanent tab; only its top half is tinted.
  */
@@ -226,39 +251,40 @@ function Tab({
   const selected = activeTab === id;
   const rgb = accent ? hexToRgbTriplet(accent) : null;
 
-  const background = rgb
-    ? selected
-      ? `linear-gradient(180deg, rgba(${rgb},.55) 0%, ${TAB_ACTIVE_BOT} 100%)`
-      : `linear-gradient(180deg, rgba(${rgb},.20) 0%, rgba(${rgb},.05) 100%)`
-    : selected
-      ? `linear-gradient(180deg, ${TAB_ACTIVE_TOP} 0%, ${TAB_ACTIVE_BOT} 100%)`
-      : "transparent";
+  // gloss-lite (Stage 14.2, proposal.css `.gloss-lite .vx-tab`): the selected tab is a soft
+  // three-stop face ending on the body's top stop; a contextual tab is tinted by its family hue,
+  // opaque when selected. The inset side/top outline keeps the selected tab merging into the body.
+  const background = accent
+    ? selected ? TAB.ctxActive(accent) : TAB.ctxIdle(accent)
+    : selected ? TAB.active : "transparent";
 
   const glow = rgb
     ? selected
-      // No bottom inset border here (unlike the unselected state below) — a selected tab's
-      // bottom edge must sit flush with the body below it, not read as a floating outlined box.
-      ? `inset 1px 0 0 rgba(${rgb},.9), inset -1px 0 0 rgba(${rgb},.9), inset 0 1px 0 rgba(${rgb},.9), inset 0 0 18px 2px rgba(${rgb},.55), inset 0 1px 0 rgba(255,255,255,.22)`
-      // Unselected: glow fill only, no outline — and extended down flush with the
-      // ribbon body (same height as the selected state) rather than floating with a gap.
-      : `inset 0 0 9px rgba(${rgb},.28)`
+      // No bottom inset border here — a selected tab's bottom edge must sit flush with the body
+      // below it, not read as a floating outlined box.
+      ? `inset 1px 0 0 rgba(${rgb},.75), inset -1px 0 0 rgba(${rgb},.75), inset 0 1px 0 rgba(${rgb},.75), inset 0 0 12px 1px rgba(${rgb},.3), inset 0 2px 0 rgba(255,255,255,.14)`
+      // Unselected: tint only, no outline, extended flush with the ribbon body.
+      : `inset 0 0 7px rgba(${rgb},.18)`
     : null;
 
   const style: CSSProperties = {
-    border: "none", cursor: "pointer", outline: "none", flexShrink: 0,
+    // Past the search field's own shrink, tabs truncate rather than disappear off the clipped
+    // strip (MS ribbon guidelines: scaled-down tab names show truncated text).
+    border: "none", cursor: "pointer", outline: "none", flexShrink: 1, minWidth: 40,
+    overflow: "hidden", textOverflow: "ellipsis",
     alignSelf: "flex-end", position: "relative",
     height: selected || contextual ? TOP_BAR_HEIGHT - 3 : TOP_BAR_HEIGHT - 10,
     marginBottom: selected || contextual ? 0 : 3,
-    padding: "0 13px", fontSize: FONT.tab, fontWeight: selected ? 600 : 500,
+    // 13px sides from a ~1040px window up, tightening to 6px at the 900px minimum — at 900 the
+    // strip has ~300px, and six tabs' padding alone was 156px of it.
+    padding: "0 clamp(6px, calc((100vw - 900px) / 20 + 6px), 13px)", fontSize: FONT.tab, fontWeight: selected ? 600 : 500,
     borderRadius: `${RADIUS.lg}px ${RADIUS.lg}px 0 0`, whiteSpace: "nowrap",
     background,
-    color: selected ? "#ffffff" : contextual ? lighten(accent!, 0.4) : TEXT_DIM,
+    color: selected ? RAMP.white : contextual ? lighten(accent!, 0.4) : TEXT_DIM,
     boxShadow: glow ?? (selected
-      ? `inset 1px 0 0 ${BORDER.outline}, inset -1px 0 0 ${BORDER.outline}, inset 0 1px 0 ${BORDER.bevel}`
+      ? `inset 1px 0 0 ${BORDER.outline}, inset -1px 0 0 ${BORDER.outline}, inset 0 1px 0 rgba(255,255,255,.16)`
       : "none"),
-    textShadow: rgb
-      ? selected ? `0 0 10px rgba(${rgb},.95), 0 1px 1px rgba(0,0,0,.5)` : `0 0 7px rgba(${rgb},.55)`
-      : selected ? "0 1px 1px rgba(0,0,0,.4)" : undefined,
+    textShadow: selected ? "0 1px 0 rgba(0,0,0,.35)" : undefined,
     // Consumed by @keyframes rbnCtxPulse, so the Clipboard tab flashes green instead of amber.
     ...(rgb ? ({ "--rbn-pulse": `rgba(${rgb},.6)` } as Record<string, string>) : null),
   };
@@ -266,10 +292,14 @@ function Tab({
   return (
     <button
       role="tab" type="button" data-tab={id} aria-selected={selected}
-      className={`rbn-tab${flash ? " rbn-flash" : ""}`}
+      // `vx-ctx-tab-enter` (Stage 14.13): every contextual tab mounts fresh when it first appears
+      // (show3d flipping true, a selection/clipboard existing) — a plain unconditional class works
+      // because React only replays the CSS animation on mount, not on every re-render.
+      className={`rbn-tab${flash ? " rbn-flash" : ""}${contextual ? " vx-ctx-tab-enter" : ""}`}
       aria-controls="ribbon-tabpanel" tabIndex={selected ? 0 : -1}
       title={contextual ? `${label} — contextual tab` : `${label} (double-click to collapse/expand the ribbon)`}
       onClick={() => {
+        if (!selected) sfx.play("tab");
         setActiveTab(id);
         onActivate?.();
         if (p.collapsed) requestPeek();

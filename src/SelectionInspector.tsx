@@ -1,9 +1,14 @@
 import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { decodePixelPatch, decodePreviewData, type SelectionInfo, type ClipboardInfo, type PreviewData } from "./types";
+import { decodePixelPatch, decodePreviewData, type SelectionInfo, type ClipboardInfo, type PreviewData, type SignInfo, type ExtrudeAxis } from "./types";
+import { previewCanvas } from "./previewCanvas";
+import { Icon } from "./ribbon/icons";
+import { Segmented, NumField, Check, SliderRow } from "./ribbon/primitives";
 import {
-  ACCENT, TEXT, TEXT_ARMED, TEXT_DIM, TEXT_DISABLED, TEXT_LABEL,
+  ACCENT, TEXT, TEXT_ARMED, TEXT_DIM, TEXT_META, TEXT_LABEL, TEXT_DISABLED,
+  BORDER, RADIUS, SPACE, SMALL_H, btnBase, hexToRgbTriplet,
 } from "./ribbon/tokens";
+import { Section, PropGrid, PROP_MONO } from "./ui/PropertyGrid";
 import ElevationPreviewPanel from "./ElevationPreviewPanel";
 
 type PreviewView = "front" | "side" | "top" | "axo";
@@ -13,9 +18,11 @@ interface Props {
    *  selection existed — null renders the empty state instead. */
   selection: SelectionInfo | null;
   clipboard: ClipboardInfo | null;
-  quadMode: boolean;
+  clipboardPreview: { width: number; height: number; pixels: Uint8Array } | null;
 
-  // Elevation view — folded in from the old standalone Elevation tab.
+  // Elevation view — folded in from the old standalone Elevation tab. Independent of `selection`:
+  // during a paste preview `elevationSelection` is the ghost's footprint while `selection` (the
+  // real marquee) stays null, so the Elevation section is gated on this prop, not on `selection`.
   elevationSelection: SelectionInfo | null;
   elevationWidth: number;
   maxZ: number;
@@ -26,6 +33,20 @@ interface Props {
   drawActive: boolean;
   onDrawElevation: (x: number, y: number, z: number) => void;
   onZRangeChange?: (zMin: number, zMax: number) => void;
+
+  // Extrude section (mirrors the ribbon Selection tab's Extrude group — same lifted App state,
+  // so the two stay in sync; "skip air" is local to whichever control last ran it, same as the
+  // ribbon's own Extrude group keeps its checkbox state ribbon-local). `extrudeCount` above is
+  // gated for the elevation ghost's benefit; `extrudeCountRaw`, when given, is the real value the
+  // editable field should show/edit.
+  extrudeCountRaw?: number;
+  setExtrudeCount?: (n: number) => void;
+  setExtrudeAxis?: (a: ExtrudeAxis) => void;
+  onExtrude?: (ignoreAir: boolean) => void;
+
+  // Signs (256z-format plan, Phase 4) — read-only list, collapsible, only shown when non-empty.
+  signs: SignInfo[];
+  onSignClick?: (s: SignInfo) => void;
 }
 
 const CW = 190;
@@ -33,50 +54,34 @@ const CH = 120;
 const LABEL_H = 16;
 const CLIP_PREV_W = 140;
 const CLIP_PREV_H = 140;
+const SIGNS_COLLAPSED_COUNT = 3;
+
+const POS_AXES: { id: ExtrudeAxis; label: string; title: string }[] = [
+  { id: "z+", label: "↑Z+", title: "Repeat upward" },
+  { id: "x+", label: "→X+", title: "Repeat east" },
+  { id: "y+", label: "↓Y+", title: "Repeat south" },
+];
+const NEG_AXES: { id: ExtrudeAxis; label: string; title: string }[] = [
+  { id: "z-", label: "↓Z−", title: "Repeat downward" },
+  { id: "x-", label: "←X−", title: "Repeat west" },
+  { id: "y-", label: "↑Y−", title: "Repeat north" },
+];
 
 const panelStyle: React.CSSProperties = {
   display: "flex",
   flexDirection: "column",
-  gap: 6,
+  gap: 2,
   fontSize: 12,
   color: TEXT,
   userSelect: "none",
 };
 
-/** Selection info — moved here from the Selection ribbon tab's "Info" group: dimensions,
- *  X/Y bounds, block count, and (if shaped) the mask cell count. */
-function SelectionInfoBlock({ sel }: { sel: SelectionInfo }) {
-  return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 11 }}>
-      <div style={{ display: "flex", gap: 4, fontVariantNumeric: "tabular-nums" }}>
-        {[["W", sel.width], ["H", sel.height], ["D", sel.depth]].map(([l, v]) => (
-          <div key={l as string} style={{ textAlign: "center", background: "rgba(255,255,255,0.04)", borderRadius: 3, padding: "2px 6px", minWidth: 30 }}>
-            <div style={{ color: TEXT_LABEL, fontSize: 8 }}>{l}</div>
-            <div style={{ color: l === "D" ? TEXT_ARMED : TEXT, fontSize: 12, fontWeight: 700 }}>{v}</div>
-          </div>
-        ))}
-      </div>
-      <div style={{ fontVariantNumeric: "tabular-nums", fontSize: 10, color: TEXT_LABEL, lineHeight: 1.3 }}>
-        <div>X {sel.x1}–{sel.x2}  Y {sel.y1}–{sel.y2}</div>
-        <div style={{ color: TEXT_DISABLED }}>
-          {sel.width * sel.height * sel.depth} blocks
-          {sel.masked && sel.cell_count != null ? ` — ◆ shaped (${sel.cell_count} cells)` : ""}
-        </div>
-      </div>
-    </div>
-  );
-}
-
 /** Clipboard info + top-down preview — mirrored here from the Clipboard ribbon tab (kept there too). */
-function ClipboardInfoBlock({ clipboard }: { clipboard: ClipboardInfo }) {
-  const [pixels, setPixels] = useState<{ width: number; height: number; pixels: Uint8Array } | null>(null);
+function ClipboardInfoBlock({ clipboard, pixels }: {
+  clipboard: ClipboardInfo;
+  pixels: { width: number; height: number; pixels: Uint8Array } | null;
+}) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-
-  useEffect(() => {
-    invoke<ArrayBuffer>("render_clipboard_preview")
-      .then((buf) => setPixels(decodePreviewData(buf)))
-      .catch(() => setPixels(null));
-  }, [clipboard]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -86,13 +91,7 @@ function ClipboardInfoBlock({ clipboard }: { clipboard: ClipboardInfo }) {
     ctx.fillStyle = "#14181c";
     ctx.fillRect(0, 0, CLIP_PREV_W, CLIP_PREV_H);
     if (pixels && pixels.width > 0 && pixels.height > 0) {
-      const off = document.createElement("canvas");
-      off.width = pixels.width;
-      off.height = pixels.height;
-      const offCtx = off.getContext("2d")!;
-      const img = offCtx.createImageData(pixels.width, pixels.height);
-      img.data.set(pixels.pixels);
-      offCtx.putImageData(img, 0, 0);
+      const off = previewCanvas(pixels);
       const scale = Math.min(CLIP_PREV_W / pixels.width, CLIP_PREV_H / pixels.height);
       const dw = Math.round(pixels.width * scale);
       const dh = Math.round(pixels.height * scale);
@@ -105,13 +104,13 @@ function ClipboardInfoBlock({ clipboard }: { clipboard: ClipboardInfo }) {
     <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
       <div style={{ color: TEXT_DIM, fontWeight: 700, fontSize: 10, letterSpacing: "0.08em" }}>CLIPBOARD</div>
       <div style={{ fontSize: 11 }}>
-        <span style={{ color: ACCENT.green, fontVariantNumeric: "tabular-nums", fontWeight: 700 }}>
+        <span style={{ color: ACCENT.clipboard, fontVariantNumeric: "tabular-nums", fontWeight: 700 }}>
           {clipboard.width}×{clipboard.height}×{clipboard.depth}
         </span>
-        <span style={{ color: ACCENT.green, fontSize: 10, marginLeft: 6 }}>
+        <span style={{ color: ACCENT.clipboard, fontSize: 10, marginLeft: 6 }}>
           z{clipboard.z_anchor}–{clipboard.z_anchor + clipboard.depth - 1}
         </span>
-        {clipboard.masked && <span style={{ color: ACCENT.green, fontSize: 10, marginLeft: 6 }}>◆ shaped</span>}
+        {clipboard.masked && <span style={{ color: ACCENT.clipboard, fontSize: 10, marginLeft: 6 }}>◆ shaped</span>}
       </div>
       <canvas
         ref={canvasRef}
@@ -124,17 +123,104 @@ function ClipboardInfoBlock({ clipboard }: { clipboard: ClipboardInfo }) {
   );
 }
 
+/** Read-only sign list body (256z-format plan, Phase 4) — the section chrome itself (▶/▼, open
+ *  persistence) is the shared `Section` component; this is just its rows + "show more" disclosure,
+ *  which is a *different* kind of collapse (truncation, not open/closed) so it stays local state. */
+function SignsBody({ signs, onSignClick }: { signs: SignInfo[]; onSignClick?: (s: SignInfo) => void }) {
+  const [showAll, setShowAll] = useState(false);
+  const visible = showAll ? signs : signs.slice(0, SIGNS_COLLAPSED_COUNT);
+  const hiddenCount = signs.length - visible.length;
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: SPACE.sm, fontSize: 11 }}>
+      {visible.map((s, i) => (
+        <div key={i}
+          onClick={onSignClick ? () => onSignClick(s) : undefined}
+          title={onSignClick ? "Click to centre the map on this sign" : undefined}
+          style={{
+            padding: "4px 6px", borderRadius: RADIUS.md,
+            background: `rgba(${hexToRgbTriplet(ACCENT.warm)},.10)`,
+            boxShadow: `inset 0 0 0 1px rgba(${hexToRgbTriplet(ACCENT.warm)},.30)`,
+            cursor: onSignClick ? "pointer" : "default",
+          }}>
+          <div style={{ color: TEXT, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
+            {s.text || <span style={{ color: TEXT_META, fontStyle: "italic" }}>(empty)</span>}
+          </div>
+          <div style={{ color: TEXT_LABEL, fontSize: 10, marginTop: 2, fontFamily: PROP_MONO }}>
+            ({Math.round(s.x)}, {Math.round(s.y)}, {s.z}) · facing {s.facing}
+          </div>
+        </div>
+      ))}
+      {signs.length > SIGNS_COLLAPSED_COUNT && (
+        <div
+          onClick={() => setShowAll(v => !v)}
+          style={{
+            textAlign: "center", padding: "3px 0", cursor: "pointer", userSelect: "none",
+            color: TEXT_LABEL, fontSize: 10,
+          }}
+        >
+          {showAll ? "Show less" : `Show ${hiddenCount} more…`}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Extrude section body — mirrors the ribbon Selection tab's Extrude group so both surfaces drive
+ *  the same App-level `extrudeCount`/`extrudeAxis` state; "ignore air" is local (same as the
+ *  ribbon's own copy is Ribbon-local), since `onExtrude` already takes it as a parameter. */
+function ExtrudeBody({
+  extrudeCount, extrudeAxis, setExtrudeCount, setExtrudeAxis, onExtrude, hasSelection,
+}: {
+  extrudeCount: number; extrudeAxis: string;
+  setExtrudeCount?: (n: number) => void; setExtrudeAxis?: (a: ExtrudeAxis) => void;
+  onExtrude?: (ignoreAir: boolean) => void; hasSelection: boolean;
+}) {
+  const [ignoreAir, setIgnoreAir] = useState(false);
+  const axis = extrudeAxis as ExtrudeAxis;
+  const canRun = hasSelection && extrudeCount > 0 && !!onExtrude;
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: SPACE.sm }}>
+      <Segmented ariaLabel="Extrude axis, positive" accent={ACCENT.selection} value={axis}
+        onChange={a => setExtrudeAxis?.(a)} options={POS_AXES} />
+      <Segmented ariaLabel="Extrude axis, negative" accent={ACCENT.selection} value={axis}
+        onChange={a => setExtrudeAxis?.(a)} options={NEG_AXES} />
+      <div style={{ display: "flex", alignItems: "center", gap: SPACE.md, height: SMALL_H }}>
+        <span style={{ color: TEXT_LABEL, fontSize: 11 }}>Copies</span>
+        <NumField min={0} max={20} value={extrudeCount} title="0 = preview off"
+          onChange={n => setExtrudeCount?.(n)} ariaLabel="Extrude copies" width={40} />
+        <Check checked={ignoreAir} onChange={setIgnoreAir} label="Ignore air"
+          title="Leave existing blocks where the source cell is air" />
+      </div>
+      <button
+        onClick={() => onExtrude?.(ignoreAir)}
+        disabled={!canRun}
+        title={!hasSelection ? "Make a selection first" : extrudeCount === 0 ? "Set the number of copies above 0" : `Repeat the selection ${extrudeCount}× along ${extrudeAxis}`}
+        style={btnBase({
+          padding: "5px 10px", fontSize: 11, borderRadius: RADIUS.md, width: "100%",
+          display: "flex", alignItems: "center", justifyContent: "center", gap: SPACE.sm,
+          color: canRun ? ACCENT.selection : TEXT_DISABLED,
+          boxShadow: canRun
+            ? `inset 0 0 0 1px rgba(${hexToRgbTriplet(ACCENT.selection)},.55), inset 0 1px 0 ${BORDER.bevel}`
+            : `inset 0 0 0 1px ${BORDER.outline}`,
+          opacity: canRun ? 1 : 0.5, cursor: canRun ? "pointer" : "default",
+        })}
+      >
+        <Icon name="extrude" size={13} tone="inherit" />
+        Extrude {extrudeCount > 0 ? `${extrudeCount}×` : ""}
+      </button>
+    </div>
+  );
+}
+
 export default function SelectionInspector({
-  selection: sel, clipboard, quadMode,
+  selection: sel, clipboard, clipboardPreview,
   elevationSelection, elevationWidth, maxZ, extrudeCount, extrudeAxis, isPastePreview,
   editEpoch, drawActive, onDrawElevation, onZRangeChange,
+  extrudeCountRaw, setExtrudeCount, setExtrudeAxis, onExtrude,
+  signs, onSignClick,
 }: Props) {
-  void quadMode;
   const [view, setView] = useState<PreviewView>("top");
   const [previewData, setPreviewData] = useState<PreviewData | null>(null);
-  // Ortho view is always auto-expanded now (previously collapsed by default in quad mode).
-  const [orthoOpen, setOrthoOpen] = useState(true);
-  const [elevationOpen, setElevationOpen] = useState(false);
   const [axoSki, setAxoSki] = useState(0.2);
   const [axoDir, setAxoDir] = useState(0);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -166,13 +252,13 @@ export default function SelectionInspector({
     const timer = setTimeout(() => {
       const p = clipboard
         ? invoke<ArrayBuffer>("render_axo_clipboard", { ski: axoSki, dir: axoDir }).then(decodePreviewData)
-        : invoke<ArrayBuffer>("render_axo_region", { x1: sel.x1, y1: sel.y1, x2: sel.x2, y2: sel.y2, ski: axoSki, dir: axoDir }).then(decodePixelPatch);
+        : invoke<ArrayBuffer>("render_axo_region", { x1: sel.x1, y1: sel.y1, x2: sel.x2, y2: sel.y2, ski: axoSki, dir: axoDir, zMax: sel.z_max }).then(decodePixelPatch);
       p.then((data) => { if (!cancelled) setPreviewData({ width: data.width, height: data.height, pixels: data.pixels }); })
        .catch(() => { if (!cancelled) setPreviewData(null); });
     }, 150);
     return () => { cancelled = true; clearTimeout(timer); };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sel?.x1, sel?.y1, sel?.x2, sel?.y2, clipboard?.width, clipboard?.height, clipboard?.depth, view, axoSki, axoDir, editEpoch]);
+  }, [sel?.x1, sel?.y1, sel?.x2, sel?.y2, clipboard?.width, clipboard?.height, clipboard?.depth, sel?.z_max, view, axoSki, axoDir, editEpoch]);
 
   // Render preview onto canvas.
   useEffect(() => {
@@ -186,13 +272,7 @@ export default function SelectionInspector({
     ctx.fillRect(0, 0, CW, CH);
 
     if (previewData && previewData.width > 0 && previewData.height > 0) {
-      const off = document.createElement("canvas");
-      off.width = previewData.width;
-      off.height = previewData.height;
-      const offCtx = off.getContext("2d")!;
-      const img = offCtx.createImageData(previewData.width, previewData.height);
-      img.data.set(previewData.pixels);
-      offCtx.putImageData(img, 0, 0);
+      const off = previewCanvas(previewData);
       const availH = CH - LABEL_H;
       const scale = Math.min(CW / previewData.width, availH / previewData.height);
       const dw = Math.round(previewData.width * scale);
@@ -230,29 +310,33 @@ export default function SelectionInspector({
     borderRadius: 3,
   });
 
-  if (!sel) {
-    return (
-      <div style={panelStyle}>
-        <div style={{ color: TEXT_DISABLED, fontSize: 11, textAlign: "center", padding: "16px 4px" }}>
-          No selection. Drag on the map (Select tool) or use the Wand/Lasso to inspect a region here.
-        </div>
-      </div>
-    );
-  }
-
   return (
     <div style={panelStyle}>
-      <SelectionInfoBlock sel={sel} />
-      {/* Collapsible ortho view */}
-      <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
-        <div
-          onClick={() => setOrthoOpen(v => !v)}
-          style={{ display: "flex", alignItems: "center", gap: 5, cursor: "pointer", userSelect: "none" }}
-        >
-          <span style={{ color: TEXT_DISABLED, fontSize: 9 }}>{orthoOpen ? "▼" : "▶"}</span>
-          <span style={{ color: TEXT_DIM, fontWeight: 700, fontSize: 10, letterSpacing: "0.08em" }}>ORTHO VIEW</span>
+      {!sel && (
+        <div style={{ color: TEXT_META, fontSize: 11, textAlign: "center", padding: "16px 4px" }}>
+          No selection. Drag on the map (Select tool) or use the Wand/Lasso to inspect a region here.
         </div>
-        {orthoOpen && (<>
+      )}
+
+      {sel && (
+        <Section id="selection" title="Selection" meta={`${sel.width}×${sel.height}`} icon="select">
+          <PropGrid rows={[
+            { label: "Size", value: `${sel.width} × ${sel.height} × ${sel.depth}` },
+            { label: "Z range", value: `${sel.z_min} – ${sel.z_max}` },
+            { label: "Volume", value: (sel.width * sel.height * sel.depth).toLocaleString() },
+            { label: "Bounds", value: `x${sel.x1}–${sel.x2} y${sel.y1}–${sel.y2}` },
+            {
+              label: "Shape",
+              value: sel.masked && sel.cell_count != null
+                ? `shaped (${sel.cell_count.toLocaleString()} cells)`
+                : "rectangular",
+            },
+          ]} />
+        </Section>
+      )}
+
+      {sel && (
+        <Section id="view" title="Front view" meta="ortho">
           <div style={{ display: "flex", gap: 3 }}>
             {(["front", "side", "top", "axo"] as PreviewView[]).map((v) => (
               <button key={v} style={tabBtn(v)} onClick={() => setView(v)}>
@@ -276,15 +360,8 @@ export default function SelectionInspector({
                   >{label}</button>
                 ))}
               </div>
-              <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
-                <span style={{ color: TEXT_LABEL, fontSize: 10, whiteSpace: "nowrap" }}>Depth</span>
-                <input type="range" min={0.05} max={0.5} step={0.01} value={axoSki}
-                  onChange={e => setAxoSki(parseFloat(e.target.value))}
-                  style={{ flex: 1, accentColor: ACCENT.violet }} />
-                <span style={{ color: ACCENT.violet, fontSize: 10, minWidth: 28, textAlign: "right", fontVariantNumeric: "tabular-nums" }}>
-                  {axoSki.toFixed(2)}
-                </span>
-              </div>
+              <SliderRow label="Depth" min={0.05} max={0.5} step={0.01} value={axoSki}
+                onChange={setAxoSki} accent={ACCENT.violet} width={118} labelWidth={38} />
             </div>
           )}
           <canvas
@@ -294,41 +371,47 @@ export default function SelectionInspector({
             style={{ display: "block", width: CW, height: CH, borderRadius: 4, border: "none", boxShadow: "inset 0 0 0 1px rgba(0,0,0,.4)" }}
             title={`${view} view — actual block colors`}
           />
-        </>)}
-      </div>
+        </Section>
+      )}
 
-      {/* Collapsible elevation view — folded in from the old standalone Elevation tab. */}
-      <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
-        <div
-          onClick={() => setElevationOpen(v => !v)}
-          style={{ display: "flex", alignItems: "center", gap: 5, cursor: "pointer", userSelect: "none" }}
-        >
-          <span style={{ color: TEXT_DISABLED, fontSize: 9 }}>{elevationOpen ? "▼" : "▶"}</span>
-          <span style={{ color: TEXT_DIM, fontWeight: 700, fontSize: 10, letterSpacing: "0.08em" }}>ELEVATION VIEW</span>
-        </div>
-        {elevationOpen && (
-          elevationSelection ? (
-            <ElevationPreviewPanel
-              selection={elevationSelection}
-              maxZ={maxZ}
-              width={elevationWidth}
-              extrudeCount={extrudeCount}
-              extrudeAxis={extrudeAxis}
-              isPastePreview={isPastePreview}
-              editEpoch={editEpoch}
-              drawActive={drawActive}
-              onDrawElevation={onDrawElevation}
-              onZRangeChange={onZRangeChange}
-            />
-          ) : (
-            <div style={{ color: TEXT_DISABLED, fontSize: 11, textAlign: "center", padding: "8px 4px" }}>
-              No selection. Make a selection to see its front/side elevation.
-            </div>
-          )
+      {sel && (
+        <Section id="extrude" title="Extrude" icon="extrude">
+          <ExtrudeBody
+            extrudeCount={extrudeCountRaw ?? extrudeCount} extrudeAxis={extrudeAxis}
+            setExtrudeCount={setExtrudeCount} setExtrudeAxis={setExtrudeAxis} onExtrude={onExtrude}
+            hasSelection={!!sel}
+          />
+        </Section>
+      )}
+
+      {signs.length > 0 && (
+        <Section id="signs" title="Signs" meta={String(signs.length)} icon="signs">
+          <SignsBody signs={signs} onSignClick={onSignClick} />
+        </Section>
+      )}
+
+      <Section id="elevation" title="Elevation" defaultOpen={false} meta={isPastePreview ? "paste ghost" : undefined}>
+        {elevationSelection ? (
+          <ElevationPreviewPanel
+            selection={elevationSelection}
+            maxZ={maxZ}
+            width={elevationWidth}
+            extrudeCount={extrudeCount}
+            extrudeAxis={extrudeAxis}
+            isPastePreview={isPastePreview}
+            editEpoch={editEpoch}
+            drawActive={drawActive}
+            onDrawElevation={onDrawElevation}
+            onZRangeChange={onZRangeChange}
+          />
+        ) : (
+          <div style={{ color: TEXT_META, fontSize: 11, textAlign: "center", padding: "8px 4px" }}>
+            No selection. Make a selection to see its front/side elevation.
+          </div>
         )}
-      </div>
+      </Section>
 
-      {clipboard && <ClipboardInfoBlock clipboard={clipboard} />}
+      {clipboard && <div style={{ padding: "8px 2px 2px" }}><ClipboardInfoBlock clipboard={clipboard} pixels={clipboardPreview} /></div>}
     </div>
   );
 }

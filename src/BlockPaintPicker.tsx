@@ -8,9 +8,10 @@ import {
 } from "./blockDefs";
 import { tintedSwatch, type AtlasData } from "./texturePack";
 import {
-  ACCENT, TEXT, TEXT_DIM, TEXT_LABEL, TEXT_ARMED, ARMED_RING, BORDER, SURFACE, DIVIDER,
+  ACCENT, TEXT_DIM, TEXT_LABEL, TEXT_ARMED, ARMED_RING, BORDER, DIVIDER,
   btnActive, hexToRgbTriplet,
 } from "./ribbon/tokens";
+import { Select } from "./ribbon/primitives";
 
 const ACCENT_RGB = hexToRgbTriplet(ACCENT.primary);
 function gradAccent(alpha: number): string {
@@ -115,7 +116,7 @@ export default function BlockPaintPicker({
                 {isFill && (
                   <span style={{
                     position: "absolute", bottom: 0, left: 1,
-                    fontSize: 7, fontWeight: 700, lineHeight: 1,
+                    fontSize: 8, fontWeight: 700, lineHeight: 1,
                     color: "rgba(255,255,255,0.65)", textShadow: "0 0 2px rgba(0,0,0,1)",
                     pointerEvents: "none", userSelect: "none",
                   }}>{b.name[0]?.toUpperCase()}</span>
@@ -240,20 +241,11 @@ export default function BlockPaintPicker({
         {/* Expansion sub-type dropdown */}
         {bt !== null && isExpansionBlock(bt) && (
           <div style={{ marginTop: 2 }}>
-            <select
-              value={bt}
-              onChange={e => onBlockTypeChange(Number(e.target.value))}
-              style={{
-                background: SURFACE.well,
-                boxShadow: `inset 0 0 0 1px ${BORDER.outline}, inset 0 2px 3px rgba(0,0,0,.35)`,
-                border: "none", color: TEXT,
-                fontSize: 10, borderRadius: 3, padding: "1px 3px", width: "100%", cursor: "pointer",
-              }}
-            >
-              {EXPANSION_BLOCKS.map(eb => (
-                <option key={eb.type} value={eb.type}>{eb.name}</option>
-              ))}
-            </select>
+            <Select
+              value={String(bt)} ariaLabel="Expansion sub-type" width={176}
+              options={EXPANSION_BLOCKS.map(eb => ({ id: String(eb.type), label: eb.name }))}
+              onChange={v => onBlockTypeChange(Number(v))}
+            />
           </div>
         )}
 
@@ -421,7 +413,7 @@ export default function BlockPaintPicker({
               {selectionExists && (
                 <button
                   onClick={onFill}
-                  style={btnActive(ACCENT.green, { padding: "2px 10px", fontSize: 12, lineHeight: "20px", whiteSpace: "nowrap", borderRadius: 3 })}
+                  style={btnActive(ACCENT.selection, { padding: "2px 10px", fontSize: 12, lineHeight: "20px", whiteSpace: "nowrap", borderRadius: 3 })}
                   title="Fill every block in the selection with the chosen type and paint"
                 >Fill Selection</button>
               )}

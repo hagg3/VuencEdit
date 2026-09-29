@@ -1,13 +1,23 @@
-import { useRef, useState } from "react";
-import type { Tool } from "./MapCanvas";
-import { IconButton, MenuItem, Popover } from "./ribbon/primitives";
-import { BORDER, COL_GAP, RADIUS, SMALL_H, SPACE, SURFACE } from "./ribbon/tokens";
-import { Icon, type IconName } from "./ribbon/icons";
+/**
+ * The **Tools** window (UI redesign r3, Stage 14.3) — the six-button quick-tools pane that used to
+ * be `LeftToolbar.tsx`, now a floating window like the others. Its own collapse badge and
+ * single-icon collapsed state are gone: window-shade collapse (title-bar button / double-click)
+ * replaces them, and the window's ✕ / View ▸ Windows ▸ Tools / ⌥T replace the old View-tab toggle.
+ *
+ * Illustrator-style tool families: click to arm the last-used (or default) variant, press-and-hold
+ * to pop a menu of the alternatives (the `Popover` is portaled, so it escapes the window layer).
+ * The grid reflows 2×3 / 3×2 / 6×1 / 1×6 to the window's shape (`toolsGridCols`); the buttons are
+ * the ribbon's `IconButton`s and never scale.
+ */
+import { useCallback, useRef, useState } from "react";
+import type { Tool } from "../MapCanvas";
+import { IconButton, MenuItem, Popover } from "../ribbon/primitives";
+import { SPACE, SURFACE } from "../ribbon/tokens";
+import type { IconName } from "../ribbon/icons";
+import FloatingWindow from "./FloatingWindow";
+import { TOOL_CELL, TOOL_GAP, TOOL_PAD, toolsGridCols } from "./windowGeometry";
 
 const HOLD_MS = 350;
-/** Raw localStorage key, not an `AppSettings` field — mirrors the `ribbon_collapsed` idiom
- *  (CLAUDE.md's UI Shell notes): a lightweight per-session UI preference, not schema-migrated. */
-const COLLAPSE_KEY = "left_toolbar_collapsed";
 
 interface Variant {
   tool: Tool;
@@ -143,85 +153,46 @@ function FamilyButton({
   );
 }
 
-export interface LeftToolbarProps {
-  tool: Tool;
-  setTool: (t: Tool) => void;
-  /** Top offset (px): below the ribbon and, when it's visible, the Quick Actions bar — App computes
-   *  this (`effectiveRibbonHeight` + `QUICK_ACTIONS_BAR_H` when shown), not this component. */
-  top: number;
-}
-
-const panelShell = {
-  position: "fixed" as const, left: SPACE.lg, zIndex: 60,
-  background: SURFACE.popover,
-  boxShadow: `inset 0 0 0 1px ${BORDER.outline}, inset 0 1px 0 ${BORDER.bevel}, 0 6px 16px rgba(0,0,0,.35)`,
-  borderRadius: RADIUS.lg,
-};
-
-/**
- * Floating Illustrator-style tool palette — quick-access rail built from the ribbon's own
- * `IconButton`/`Popover`/`MenuItem` primitives (not `designTokens.glassPanel`, which is the
- * app-wide modal material the docked right `Sidebar` uses). Two columns, three rows, six families.
- *
- * Deliberately **not** a full-height docked rail like `Sidebar`: at six buttons the content is a
- * ~90px-tall card, so anchoring it top-to-bottom against the left edge (the first cut of this
- * component) left most of the window as dead reserved space down the left side. Floating below the
- * ribbon/Quick-Actions strip instead sizes it to its own content and never reserves canvas width —
- * same idiom as `QuickActionsBar`, which already floats over the map rather than inset it.
- *
- * Two independent ways to get it out of the way: the View tab's "Toolbar" toggle unmounts it
- * entirely (persisted in `AppSettings.leftToolbarOpen`), while the chevron in its own corner
- * collapses it to a single icon-sized handle for a quick "shrink but keep it reachable" (persisted
- * to the raw `left_toolbar_collapsed` key, mirroring the ribbon's own `ribbon_collapsed` idiom —
- * a per-session UI preference, not schema state worth a settings migration).
- */
-export default function LeftToolbar({ tool, setTool, top }: LeftToolbarProps) {
+export default function ToolsWindow({ tool, setTool }: { tool: Tool; setTool: (t: Tool) => void }) {
   const [lastVariant, setLastVariantState] = useState<Record<string, Tool>>({});
   const setLastVariant = (familyId: string, t: Tool) =>
     setLastVariantState(prev => (prev[familyId] === t ? prev : { ...prev, [familyId]: t }));
 
-  const [collapsed, setCollapsed] = useState(() => {
-    try { return localStorage.getItem(COLLAPSE_KEY) === "1"; } catch { return false; }
-  });
-  const toggleCollapsed = () => setCollapsed(v => {
-    const next = !v;
-    try { localStorage.setItem(COLLAPSE_KEY, next ? "1" : "0"); } catch { /* ignore */ }
-    return next;
-  });
+  // Reflow to the body's live size (a resize drag resizes the body imperatively, so a
+  // ResizeObserver, not the store's committed rect, is what keeps the grid in step with it).
+  // A callback ref, not an effect: the body unmounts while the window is collapsed and remounts
+  // on expand, and the observer has to follow the element, not this component's lifetime.
+  const [cols, setCols] = useState(2);
+  const roRef = useRef<ResizeObserver | null>(null);
+  const bodyRef = useCallback((el: HTMLDivElement | null) => {
+    roRef.current?.disconnect();
+    roRef.current = null;
+    if (!el) return;
+    const measure = () => {
+      const next = toolsGridCols(el.clientWidth, el.clientHeight);
+      setCols(c => (c === next ? c : next));
+    };
+    measure();
+    roRef.current = new ResizeObserver(measure);
+    roRef.current.observe(el);
+  }, []);
 
-  if (collapsed) {
-    return (
-      <div style={{ ...panelShell, top, padding: 2 }}>
-        <IconButton icon="toolbar" label="Show tool rail" title="Show tool rail" onClick={toggleCollapsed} />
-      </div>
-    );
-  }
-
-  // The minimise control is a small corner badge overlapping the card, not a dedicated header row —
-  // a full 26px row above a 78px (3-row) grid was a third of the card's height spent on one control.
-  const MINI = 14;
   return (
-    <div data-tour="left-toolbar" style={{ ...panelShell, top, padding: SPACE.sm }}>
-      <button
-        type="button" title="Minimise" aria-label="Minimise tool rail" onClick={toggleCollapsed}
-        style={{
-          position: "absolute", top: -6, right: -6, width: MINI, height: MINI, padding: 0,
-          display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer",
-          borderRadius: RADIUS.sm, border: "none", background: SURFACE.raised,
-          boxShadow: `inset 0 0 0 1px ${BORDER.outline}`, color: "inherit",
-        }}
-      >
-        <Icon name="collapse" size={9} tone="default" />
-      </button>
-      <div style={{ display: "grid", gridTemplateColumns: `repeat(2, ${SMALL_H}px)`, gap: COL_GAP }}>
-        {FAMILIES.map(family => (
-          <FamilyButton
-            key={family.id} family={family} tool={tool} setTool={setTool}
-            lastVariant={lastVariant[family.id]}
-            setLastVariant={(t) => setLastVariant(family.id, t)}
-          />
-        ))}
+    <FloatingWindow id="tools" title="Tools" icon="toolbar" dataTour="left-toolbar">
+      <div ref={bodyRef} style={{
+        flex: 1, display: "flex", alignItems: "flex-start", justifyContent: "center",
+        padding: TOOL_PAD, background: SURFACE.popover, overflow: "hidden",
+      }}>
+        <div style={{ display: "grid", gridTemplateColumns: `repeat(${cols}, ${TOOL_CELL}px)`, gap: TOOL_GAP }}>
+          {FAMILIES.map(family => (
+            <FamilyButton
+              key={family.id} family={family} tool={tool} setTool={setTool}
+              lastVariant={lastVariant[family.id]}
+              setLastVariant={(t) => setLastVariant(family.id, t)}
+            />
+          ))}
+        </div>
       </div>
-    </div>
+    </FloatingWindow>
   );
 }

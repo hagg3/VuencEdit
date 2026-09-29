@@ -9,9 +9,12 @@
 import { createContext, useContext } from "react";
 import type { Tool } from "../MapCanvas";
 import type { RibbonProps, RibbonTab } from "./props";
+import type { PickerKind } from "../picker/PickerHost";
 
-/** Which block/paint picker the shared portal is currently showing. */
-export type PickerKind = "block-draw" | "block-fill" | "filter" | "gradient-to" | "build-3d";
+/** Which block/paint picker the shared portal is currently showing — canonical definition now
+ *  lives with the portal itself (`src/picker/PickerHost.tsx`, Stage 14.5), re-exported here since
+ *  every tab already imports it from `./context`. */
+export type { PickerKind };
 
 export interface RibbonShell {
   p: RibbonProps;

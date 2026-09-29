@@ -2,8 +2,12 @@ import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { save } from "@tauri-apps/plugin-dialog";
-import { EDEN_TEAL, EDEN_TEAL_READABLE, glassPanel, chromeButton, chromeButtonAccent, recessedWell, spinnerStyle, expBadge } from "./designTokens";
-import Modal from "./Modal";
+import { MODAL_TEXT, recessedWell, spinnerStyle, expBadge } from "./designTokens";
+import { ACCENTS, DANGER_HEX, RAMP, armedRecipe, mix, rgba } from "./theme/theme";
+import { btnBase, btnDisabled, FONT } from "./ribbon/tokens";
+import { Check, Select } from "./ribbon/primitives";
+import Dialog, { DialogButton } from "./ui/Dialog";
+import { DialogNav, type DialogNavItem } from "./ui/DialogNav";
 
 interface WorldSearchResult {
   id: string;
@@ -59,12 +63,34 @@ function scoreWorld(name: string, timestamp: number): number {
   return score;
 }
 
+// Lightened tints for text on the warm modal surface (mechanical hex-literal migration, Stage
+// 14.15) — plain accent/danger hex fails AA there; these clear it with margin.
+const TEAL_LIGHT = mix(RAMP.white, ACCENTS.primary, 0.5);
+const RED_LIGHT = mix(RAMP.white, DANGER_HEX, 0.5);
 
-const btn: React.CSSProperties = chromeButton({ padding: "5px 13px", fontSize: 13 });
+const SERVER_OPTIONS: { id: "current" | "legacy"; label: string }[] = [
+  { id: "current", label: "Current Server" },
+  { id: "legacy", label: "Legacy Server" },
+];
 
-const btnActive: React.CSSProperties = chromeButtonAccent(EDEN_TEAL, EDEN_TEAL_READABLE, {
-  padding: "5px 13px", fontSize: 13, color: EDEN_TEAL_READABLE,
-});
+const NAV_ITEMS: DialogNavItem[] = [
+  { id: "featured", icon: "sparkle", label: "Featured", description: "Curated popular worlds" },
+  { id: "browse", icon: "history", label: "Browse", description: "Latest worlds from the server" },
+  { id: "search", icon: "search", label: "Search", description: "Find a world by name" },
+];
+
+/** "Save & Open" is `ACCENTS.clipboard` (green — an "open" action), distinct from "Save to File"'s
+ *  `DialogButton variant="primary"` teal. `DialogButton` only ships neutral/primary/danger, so this
+ *  mirrors its own armed-recipe recipe for the one extra accent this dialog needs. */
+function accentButtonStyle(accent: string, disabled: boolean): React.CSSProperties {
+  const armed = armedRecipe(accent);
+  return btnBase({
+    height: 28, width: "100%", padding: "0 16px", fontSize: FONT.body, fontWeight: 600,
+    color: armed.text, background: armed.bg, boxShadow: armed.shadow,
+    textShadow: "0 1px 0 rgba(0,0,0,.35)",
+    ...(disabled ? btnDisabled : null),
+  });
+}
 
 export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
   const [server, setServer] = useState<"current" | "legacy">("current");
@@ -72,7 +98,7 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
   // "you haven't looked yet".
   const [searched, setSearched] = useState(false);
   // Featured (server-published popularlist.txt, or one of the bundled historic snapshots) is the
-  // default view; Browse and Search are reachable via their own tabs.
+  // default view; Browse and Search are reachable via their own nav rows.
   const [viewMode, setViewMode] = useState<"featured" | "browse" | "search">("featured");
   const switchServer = (s: "current" | "legacy") => {
     if (s === server) return;
@@ -169,7 +195,7 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
   }
 
   // Browse mode (C2 of the 256z-format plan): the real client's own default listing —
-  // `GET /list2.php?start=<start>&sort=2`, paginated via `start`. Reachable via its own tab
+  // `GET /list2.php?start=<start>&sort=2`, paginated via `start`. Reachable via its own nav row
   // (Featured is the default view now — see `doFeatured` below).
   const BROWSE_SORT = 2; // the value the real client sent when captured (Part C2/C6); unconfirmed beyond that
 
@@ -210,7 +236,7 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
     }
   }
 
-  // Load the archive of bundled historic snapshots once, for the Featured tab's dropdown.
+  // Load the archive of bundled historic snapshots once, for the Featured nav row's dropdown.
   useEffect(() => {
     invoke<LegacyFeaturedList[]>("list_legacy_featured_lists").then(setLegacyLists).catch(() => {});
   }, []);
@@ -271,180 +297,140 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
 
   const selectedResult = results.find(r => r.id === selectedId) ?? null;
 
+  const fl: React.CSSProperties = {
+    fontSize: 9, color: MODAL_TEXT.secondary, textTransform: "uppercase",
+    letterSpacing: "0.06em", fontWeight: 600,
+  };
+  const fi: React.CSSProperties = {
+    ...recessedWell,
+    color: MODAL_TEXT.primary, borderRadius: 5, padding: "3px 7px", fontSize: 11,
+    colorScheme: "dark",
+  } as React.CSSProperties;
+
   return (
     // Dismissal is blocked while a download runs: closing wouldn't stop it, and "Save & Open"
     // would still fire onOpenWorld when it lands — switching worlds (and raising an unsaved-changes
     // prompt) long after the user thought they'd backed out.
-    <Modal onClose={onClose} zIndex={1000} label="World Browser"
-      closeOnEsc={!downloading} closeOnBackdrop={!downloading}
-      backdropStyle={{ background: "rgba(0,0,0,0.75)" }}>
-      <div
-        style={glassPanel({
-          padding: "18px 20px", width: 900, maxWidth: "96vw", maxHeight: "88vh",
-          display: "flex", flexDirection: "column", gap: 12, color: "#ebe9e7",
-        })}
-      >
-        {/* Header */}
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-          <span style={{ fontSize: 14, fontWeight: 600 }}>World Browser</span>
-          <button
-            onClick={onClose}
-            disabled={downloading}
-            title={downloading ? "A download is in progress" : "Close"}
-            aria-label="Close"
-            onMouseEnter={e => (e.currentTarget.style.color = EDEN_TEAL_READABLE)}
-            onMouseLeave={e => (e.currentTarget.style.color = "#61584f")}
-            style={{ background: "none", border: "none", color: "#61584f", fontSize: 20, cursor: downloading ? "not-allowed" : "pointer", opacity: downloading ? 0.4 : 1, lineHeight: 1, transition: "color .1s" }}
-          >×</button>
-        </div>
+    <Dialog
+      size="lg" icon="world" title="World Browser" onClose={onClose} busy={downloading}
+      nav={
+        <DialogNav
+          items={NAV_ITEMS}
+          value={viewMode}
+          onChange={id => switchMode(id as "featured" | "browse" | "search")}
+          footer={
+            <Select<"current" | "legacy">
+              value={server} ariaLabel="Server" options={SERVER_OPTIONS}
+              onChange={switchServer} width={172}
+            />
+          }
+        />
+      }
+    >
+      <div style={{ display: "flex", flexDirection: "column", gap: 12, height: "100%", minHeight: 0 }}>
 
-        {/* Server tabs. Switching servers drops the previous server's results — they belong to a
-            different host, so their thumbnails 404 and downloading one hits the wrong endpoint. */}
-        <div style={{ display: "flex", gap: 6 }}>
-          <button onClick={() => switchServer("current")} style={server === "current" ? btnActive : btn}>
-            Current Server
-          </button>
-          <button onClick={() => switchServer("legacy")} style={server === "legacy" ? btnActive : btn}>
-            Legacy Server
-          </button>
-        </div>
+        {/* Content header — per-tab controls. The search field lives here (Search only), moved out
+            of an always-visible top strip per the modal redesign (plan §3.4). */}
+        {viewMode === "search" && (
+          <div style={{ display: "flex", gap: 6 }}>
+            <input
+              type="text"
+              value={query}
+              onChange={e => setQuery(e.target.value)}
+              onKeyDown={e => { if (e.key === "Enter") doSearch(); }}
+              placeholder="Search worlds…"
+              autoFocus
+              style={{
+                ...recessedWell,
+                flex: 1,
+                color: MODAL_TEXT.primary,
+                borderRadius: 6,
+                padding: "5px 10px",
+                fontSize: 13,
+                outline: "none",
+              }}
+            />
+            <DialogButton variant="primary" onClick={doSearch} disabled={searching || !query.trim()}>
+              {searching ? "Searching…" : "Search"}
+            </DialogButton>
+          </div>
+        )}
+        {viewMode === "featured" && (
+          <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+            <span style={fl}>Snapshot</span>
+            <Select<string>
+              ariaLabel="Snapshot" width={170}
+              value={featuredSource}
+              onChange={setFeaturedSource}
+              options={[
+                { id: "live", label: "Live (current)" },
+                ...legacyLists.map(l => ({ id: l.filename, label: l.date })),
+              ]}
+            />
+          </div>
+        )}
 
-        {/* View mode tabs: Featured (default) / Browse / Search. */}
-        <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
-          <button onClick={() => switchMode("featured")} style={viewMode === "featured" ? btnActive : btn}>
-            ★ Featured
-          </button>
-          <button onClick={() => switchMode("browse")} style={viewMode === "browse" ? btnActive : btn}>
-            Latest
-          </button>
-          {viewMode === "featured" && (
-            <>
-              <div style={{ flex: 1 }} />
-              <span style={{ fontSize: 9, color: "#61584f", textTransform: "uppercase", letterSpacing: "0.06em", fontWeight: 600 }}>
-                Snapshot
-              </span>
-              <select
-                value={featuredSource}
-                onChange={e => setFeaturedSource(e.target.value)}
-                style={{
-                  ...recessedWell,
-                  color: "#ebe9e7", borderRadius: 5, padding: "3px 7px", fontSize: 12,
-                  colorScheme: "dark",
-                } as React.CSSProperties}
-              >
-                <option value="live">Live (current)</option>
-                {legacyLists.map(l => (
-                  <option key={l.filename} value={l.filename}>{l.date}</option>
-                ))}
-              </select>
-            </>
+        {/* Sort + filter controls */}
+        <div style={{ borderTop: `1px solid ${RAMP.mbtn1}`, borderBottom: `1px solid ${RAMP.mbtn1}`, padding: "5px 0", display: "flex", flexDirection: "column", gap: 6 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+            <span style={fl}>Sort</span>
+            {([
+              { key: "relevance", label: "Relevance" },
+              { key: "date_desc", label: "Newest" },
+              { key: "date_asc", label: "Oldest" },
+              { key: "quality",  label: "Quality" },
+            ] as const).map(m => (
+              <button key={m.key} onClick={() => setSortBy(m.key)} style={{
+                background: sortBy === m.key ? rgba(ACCENTS.primary, 0.15) : "transparent",
+                border: "1px solid " + (sortBy === m.key ? TEAL_LIGHT : "transparent"),
+                color: sortBy === m.key ? TEAL_LIGHT : MODAL_TEXT.label,
+                padding: "2px 7px", borderRadius: 5, cursor: "pointer", fontSize: 11,
+                display: "flex", alignItems: "center", gap: 4,
+              }}>
+                {m.label}
+                {m.key === "quality" && (
+                  <span style={expBadge({ fontSize: 9 })}>exp</span>
+                )}
+              </button>
+            ))}
+            <div style={{ flex: 1 }} />
+            <DialogButton
+              onClick={() => setShowFilters(!showFilters)}
+              style={activeFilters > 0 ? {
+                boxShadow: `inset 0 0 0 1px ${TEAL_LIGHT}, 0 .5px .5px rgba(255,255,255,.2)`,
+                color: TEAL_LIGHT,
+              } : undefined}
+            >
+              Filters{activeFilters > 0 ? ` (${activeFilters})` : ""}
+            </DialogButton>
+          </div>
+          {showFilters && (
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 10, alignItems: "center", padding: "4px 0" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+                <span style={fl}>Date</span>
+                <input type="date" value={fromDate} onChange={e => setFromDate(e.target.value)} style={fi} />
+                <span style={{ color: MODAL_TEXT.secondary, fontSize: 11 }}>→</span>
+                <input type="date" value={toDate} onChange={e => setToDate(e.target.value)} style={fi} />
+              </div>
+              <Check
+                checked={hideJunk} onChange={setHideJunk}
+                label={<><span style={fl}>Hide junk</span><span style={expBadge({ fontSize: 9, marginLeft: 5 })}>exp</span></>}
+              />
+              {activeFilters > 0 && (
+                <DialogButton
+                  onClick={() => { setFromDate(""); setToDate(""); setHideJunk(false); }}
+                  style={{ marginLeft: "auto" }}
+                >
+                  Clear filters
+                </DialogButton>
+              )}
+            </div>
           )}
         </div>
 
-        {/* Search bar */}
-        <div style={{ display: "flex", gap: 6 }}>
-          <input
-            type="text"
-            value={query}
-            onChange={e => setQuery(e.target.value)}
-            onKeyDown={e => { if (e.key === "Enter") doSearch(); }}
-            placeholder="Search worlds…"
-            style={{
-              ...recessedWell,
-              flex: 1,
-              color: "#ebe9e7",
-              borderRadius: 6,
-              padding: "5px 10px",
-              fontSize: 13,
-              outline: "none",
-            }}
-          />
-          <button
-            onClick={doSearch}
-            disabled={searching || !query.trim()}
-            style={{
-              ...btn,
-              opacity: (!query.trim() || searching) ? 0.5 : 1,
-              cursor: (!query.trim() || searching) ? "not-allowed" : "pointer",
-            }}
-          >
-            {searching ? "Searching…" : "Search"}
-          </button>
-        </div>
-
-        {/* Sort + filter controls */}
-        {(() => {
-          const sortModes = [
-            { key: "relevance", label: "Relevance" },
-            { key: "date_desc", label: "Newest" },
-            { key: "date_asc", label: "Oldest" },
-            { key: "quality",  label: "Quality" },
-          ] as const;
-          const fi: React.CSSProperties = {
-            ...recessedWell,
-            color: "#ebe9e7", borderRadius: 5, padding: "3px 7px", fontSize: 11,
-            colorScheme: "dark",
-          } as React.CSSProperties;
-          const fl: React.CSSProperties = {
-            fontSize: 9, color: "#61584f", textTransform: "uppercase",
-            letterSpacing: "0.06em", fontWeight: 600,
-          };
-          return (
-            <div style={{ borderTop: "1px solid #312c28", borderBottom: "1px solid #312c28", padding: "5px 0", display: "flex", flexDirection: "column", gap: 6 }}>
-              <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                <span style={fl}>Sort</span>
-                {sortModes.map(m => (
-                  <button key={m.key} onClick={() => setSortBy(m.key)} style={{
-                    background: sortBy === m.key ? "rgba(0,164,173,0.15)" : "transparent",
-                    border: "1px solid " + (sortBy === m.key ? "#00dde9" : "transparent"),
-                    color: sortBy === m.key ? "#00dde9" : "#83786c",
-                    padding: "2px 7px", borderRadius: 5, cursor: "pointer", fontSize: 11,
-                    display: "flex", alignItems: "center", gap: 4,
-                  }}>
-                    {m.label}
-                    {m.key === "quality" && (
-                      <span style={expBadge({ fontSize: 9 })}>exp</span>
-                    )}
-                  </button>
-                ))}
-                <div style={{ flex: 1 }} />
-                <button onClick={() => setShowFilters(!showFilters)} style={{
-                  ...btn, fontSize: 11, padding: "2px 9px",
-                  background: (activeFilters > 0 || showFilters) ? "rgba(0,164,173,0.1)" : btn.background,
-                  boxShadow: activeFilters > 0 ? `inset 0 0 0 1px #00dde9, 0 .5px .5px rgba(255,255,255,.2)` : btn.boxShadow,
-                  color: activeFilters > 0 ? "#00dde9" : "#ebe9e7",
-                }}>
-                  Filters{activeFilters > 0 ? ` (${activeFilters})` : ""}
-                </button>
-              </div>
-              {showFilters && (
-                <div style={{ display: "flex", flexWrap: "wrap", gap: 10, alignItems: "center", padding: "4px 0" }}>
-                  <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
-                    <span style={fl}>Date</span>
-                    <input type="date" value={fromDate} onChange={e => setFromDate(e.target.value)} style={fi} />
-                    <span style={{ color: "#61584f", fontSize: 11 }}>→</span>
-                    <input type="date" value={toDate} onChange={e => setToDate(e.target.value)} style={fi} />
-                  </div>
-                  <label style={{ display: "flex", alignItems: "center", gap: 5, cursor: "pointer" }}>
-                    <input type="checkbox" checked={hideJunk} onChange={e => setHideJunk(e.target.checked)} />
-                    <span style={fl}>Hide junk</span>
-                    <span style={expBadge({ fontSize: 9 })}>exp</span>
-                  </label>
-                  {activeFilters > 0 && (
-                    <button onClick={() => { setFromDate(""); setToDate(""); setHideJunk(false); }}
-                      style={{ ...btn, fontSize: 11, padding: "2px 8px", marginLeft: "auto" }}>
-                      Clear filters
-                    </button>
-                  )}
-                </div>
-              )}
-            </div>
-          );
-        })()}
-
         {/* Filter count */}
         {results.length > 0 && filteredResults.length !== results.length && (
-          <div style={{ fontSize: 11, color: "#83786c", textAlign: "right" }}>
+          <div style={{ fontSize: 11, color: MODAL_TEXT.label, textAlign: "right" }}>
             Showing {filteredResults.length} of {results.length}
           </div>
         )}
@@ -457,10 +443,10 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
             {filteredResults.length > 0 ? (
               <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
                 <thead>
-                  <tr style={{ background: "#1e1b18", borderBottom: "1px solid #312c28", position: "sticky", top: 0, zIndex: 1 }}>
-                    <th style={{ textAlign: "left", padding: "6px 10px", color: "#61584f", fontWeight: 600 }}>Name</th>
-                    <th style={{ textAlign: "left", padding: "6px 10px", color: "#61584f", fontWeight: 600 }}>ID</th>
-                    <th style={{ textAlign: "left", padding: "6px 10px", color: "#61584f", fontWeight: 600 }}>Date</th>
+                  <tr style={{ background: RAMP.modal1, borderBottom: `1px solid ${RAMP.mbtn1}`, position: "sticky", top: 0, zIndex: 1 }}>
+                    <th style={{ textAlign: "left", padding: "6px 10px", color: MODAL_TEXT.secondary, fontWeight: 600 }}>Name</th>
+                    <th style={{ textAlign: "left", padding: "6px 10px", color: MODAL_TEXT.secondary, fontWeight: 600 }}>ID</th>
+                    <th style={{ textAlign: "left", padding: "6px 10px", color: MODAL_TEXT.secondary, fontWeight: 600 }}>Date</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -471,23 +457,23 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
                         key={`${r.id}-${i}`}
                         onClick={() => setSelectedId(r.id)}
                         style={{
-                          background: isSelected ? "rgba(0,164,173,0.18)" : i % 2 === 0 ? "rgba(255,255,255,0.02)" : "transparent",
+                          background: isSelected ? rgba(ACCENTS.primary, 0.18) : i % 2 === 0 ? "rgba(255,255,255,0.02)" : "transparent",
                           cursor: "pointer",
-                          borderBottom: "1px solid #312c28",
+                          borderBottom: `1px solid ${RAMP.mbtn1}`,
                         }}
                       >
-                        <td style={{ padding: "6px 10px", color: isSelected ? "#00dde9" : "#ebe9e7" }}>
+                        <td style={{ padding: "6px 10px", color: isSelected ? TEAL_LIGHT : MODAL_TEXT.primary }}>
                           {isSelected ? "▶ " : "  "}{r.name}
                         </td>
-                        <td style={{ padding: "6px 10px", color: "#83786c", fontVariantNumeric: "tabular-nums" }}>{r.id}</td>
-                        <td style={{ padding: "6px 10px", color: "#afa69d" }}>{formatDate(r.timestamp)}</td>
+                        <td style={{ padding: "6px 10px", color: MODAL_TEXT.label, fontVariantNumeric: "tabular-nums" }}>{r.id}</td>
+                        <td style={{ padding: "6px 10px", color: MODAL_TEXT.secondary }}>{formatDate(r.timestamp)}</td>
                       </tr>
                     );
                   })}
                 </tbody>
               </table>
             ) : (
-              <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: 120, color: "#61584f", fontSize: 13 }}>
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: 120, color: MODAL_TEXT.secondary, fontSize: 13 }}>
                 {searching ? "Searching…" :
                  browsing || featuredLoading ? "Loading worlds…" :
                  results.length > 0 ? "No results match your filters" :
@@ -497,10 +483,9 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
             )}
             {viewMode === "browse" && hasMoreToBrowse && filteredResults.length > 0 && !searching && (
               <div style={{ display: "flex", justifyContent: "center", padding: "8px 0" }}>
-                <button onClick={() => doBrowse(false)} disabled={browsing}
-                  style={{ ...btn, fontSize: 12, opacity: browsing ? 0.5 : 1, cursor: browsing ? "not-allowed" : "pointer" }}>
+                <DialogButton onClick={() => doBrowse(false)} disabled={browsing}>
                   {browsing ? "Loading…" : "Load more"}
-                </button>
+                </DialogButton>
               </div>
             )}
           </div>
@@ -511,7 +496,7 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
             {/* Preview image — fixed height */}
             <div style={{
               height: 200,
-              background: "#1e1b18",
+              background: RAMP.modal1,
               boxShadow: "inset 0 0 0 1px rgba(0,0,0,.4)",
               borderRadius: 8,
               overflow: "hidden",
@@ -523,13 +508,13 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
             }}>
               {/* Placeholder / error state */}
               {(previewStatus === "empty" || previewStatus === "error") && (
-                <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 8, color: "#312c28" }}>
+                <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 8, color: RAMP.mbtn1 }}>
                   <svg width="38" height="38" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.2">
                     <rect x="3" y="3" width="18" height="18" rx="2"/>
                     <circle cx="8.5" cy="8.5" r="1.5"/>
                     <polyline points="21 15 16 10 5 21"/>
                   </svg>
-                  <span style={{ fontSize: 11, color: "#4b443d" }}>
+                  <span style={{ fontSize: 11, color: MODAL_TEXT.secondary }}>
                     {previewStatus === "error" ? "No preview available" : "No world selected"}
                   </span>
                 </div>
@@ -565,7 +550,7 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
 
             {/* World details card */}
             <div style={{
-              background: "#1e1b18",
+              background: RAMP.modal1,
               boxShadow: "inset 0 0 0 1px rgba(0,0,0,.4)",
               borderRadius: 8,
               padding: "12px 14px",
@@ -576,22 +561,22 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
             }}>
               {selectedResult ? (
                 <>
-                  <div style={{ fontSize: 13, fontWeight: 600, color: "#ebe9e7", lineHeight: 1.3, wordBreak: "break-word" }}>
+                  <div style={{ fontSize: 13, fontWeight: 600, color: MODAL_TEXT.primary, lineHeight: 1.3, wordBreak: "break-word" }}>
                     {selectedResult.name}
                   </div>
 
                   <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-                    <span style={{ fontSize: 9, color: "#61584f", textTransform: "uppercase", letterSpacing: "0.06em", fontWeight: 600 }}>Date</span>
-                    <span style={{ fontSize: 12, color: "#afa69d" }}>{formatDate(selectedResult.timestamp)}</span>
+                    <span style={{ fontSize: 9, color: MODAL_TEXT.secondary, textTransform: "uppercase", letterSpacing: "0.06em", fontWeight: 600 }}>Date</span>
+                    <span style={{ fontSize: 12, color: MODAL_TEXT.secondary }}>{formatDate(selectedResult.timestamp)}</span>
                   </div>
 
                   <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-                    <span style={{ fontSize: 9, color: "#61584f", textTransform: "uppercase", letterSpacing: "0.06em", fontWeight: 600 }}>ID</span>
-                    <span style={{ fontSize: 11, color: "#83786c", fontVariantNumeric: "tabular-nums" }}>{selectedResult.id}</span>
+                    <span style={{ fontSize: 9, color: MODAL_TEXT.secondary, textTransform: "uppercase", letterSpacing: "0.06em", fontWeight: 600 }}>ID</span>
+                    <span style={{ fontSize: 11, color: MODAL_TEXT.label, fontVariantNumeric: "tabular-nums" }}>{selectedResult.id}</span>
                   </div>
                 </>
               ) : (
-                <div style={{ fontSize: 12, color: "#4b443d", textAlign: "center", marginTop: 8 }}>
+                <div style={{ fontSize: 12, color: MODAL_TEXT.secondary, textAlign: "center", marginTop: 8 }}>
                   Select a world to see details
                 </div>
               )}
@@ -599,21 +584,19 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
 
             {/* Download buttons */}
             <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-              <button
+              <DialogButton
+                variant="primary"
                 onClick={() => startDownload(false)}
                 disabled={!selectedId || downloading}
-                style={(!selectedId || downloading)
-                  ? { ...btn, width: "100%", opacity: 0.4, cursor: "not-allowed" }
-                  : chromeButtonAccent(EDEN_TEAL, EDEN_TEAL_READABLE, { width: "100%", color: EDEN_TEAL_READABLE, fontSize: 13 })}
+                style={{ width: "100%", fontSize: 13 }}
               >
                 Save to File
-              </button>
+              </DialogButton>
               <button
+                type="button"
                 onClick={() => startDownload(true)}
                 disabled={!selectedId || downloading}
-                style={(!selectedId || downloading)
-                  ? { ...btn, width: "100%", opacity: 0.4, cursor: "not-allowed" }
-                  : chromeButtonAccent("74,222,128", "#22c55e", { width: "100%", color: "#86efac", fontSize: 13 })}
+                style={accentButtonStyle(ACCENTS.clipboard, !selectedId || downloading)}
               >
                 Save &amp; Open
               </button>
@@ -621,17 +604,17 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
               {/* Progress bar */}
               {downloading && downloadProgress && (
                 <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                  <div style={{ flex: 1, background: "#312c28", borderRadius: 4, height: 5, overflow: "hidden" }}>
+                  <div style={{ flex: 1, background: RAMP.mbtn1, borderRadius: 4, height: 5, overflow: "hidden" }}>
                     <div style={{
                       height: "100%",
-                      background: `linear-gradient(90deg, rgb(${EDEN_TEAL}) 0%, ${EDEN_TEAL_READABLE} 100%)`,
+                      background: `linear-gradient(90deg, ${ACCENTS.primary} 0%, ${TEAL_LIGHT} 100%)`,
                       width: downloadProgress.total
                         ? `${Math.min(100, (downloadProgress.downloaded / downloadProgress.total) * 100).toFixed(0)}%`
                         : "40%",
                       transition: "width 0.2s",
                     }} />
                   </div>
-                  <span style={{ color: "#afa69d", fontSize: 11, whiteSpace: "nowrap" }}>
+                  <span style={{ color: MODAL_TEXT.secondary, fontSize: 11, whiteSpace: "nowrap" }}>
                     {downloadProgress.total
                       ? `${(downloadProgress.downloaded / 1_048_576).toFixed(1)} / ${(downloadProgress.total / 1_048_576).toFixed(1)} MB`
                       : `${(downloadProgress.downloaded / 1_048_576).toFixed(1)} MB`}
@@ -640,7 +623,7 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
               )}
 
               {error && (
-                <span style={{ color: "#f87171", fontSize: 11 }}>{error}</span>
+                <span style={{ color: RED_LIGHT, fontSize: 11 }}>{error}</span>
               )}
             </div>
 
@@ -648,6 +631,6 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
         </div>{/* /body row */}
 
       </div>
-    </Modal>
+    </Dialog>
   );
 }

@@ -1,16 +1,19 @@
 import { decodeGeometry, type VoxelGeometry } from "./types";
-import { useEffect, useRef, useState, useCallback, forwardRef, useImperativeHandle } from "react";
+import { SKY_3D } from "./theme/theme";
+import { useEffect, useRef, useState, useCallback, forwardRef, useImperativeHandle, type CSSProperties } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import type { AtlasData } from "./texturePack";
 import { isTypingTarget, chunkToWorld, worldToChunk, gridDivisions } from "./viewportUtils";
 import type { WorldMeta } from "./types";
-import { chromeButton, glassMenuPanel } from "./designTokens";
+import { BORDER, IS_MAC, RADIUS, SURFACE, btnBase } from "./ribbon/tokens";
+import { SliderRow } from "./ribbon/primitives";
 import { skyFogColor, rampFamilyBase, wedgeFamilyBase, rampDirIndex, orientBlockToFacing } from "./blockDefs";
 import { maskPrismPositions, type OutlinePt, type MaskRect } from "./maskUtils";
-import { perfCounters, recordGeometryFetchMs, recordFrameMs } from "./perfCounters";
+import { perfCounters, recordGeometryFetchMs, recordFrameMs, recordRenderMs, recordRenderStats, recordReload, bumpPerf, type ReloadReason } from "./perfCounters";
 import { backoffBudget, backoffRadius, MAX_CONTEXT_LOSSES } from "./gfxBackoff";
+import { GESTURE_MAX_MS, gestureTimedOut } from "./gestureWatchdog";
 
 // Fog distance scales with the render distance slider (chunk radius × 16 blocks/chunk) so terrain
 // fades out at the edge of what's actually streamed in, instead of a fixed distance that either
@@ -19,6 +22,24 @@ const fogDistances = (radiusChunks: number) => {
   const far = Math.max(20, chunkToWorld(radiusChunks) * 0.9);
   const near = far * 0.3;
   return { near, far };
+};
+
+// Local replacement for the retired `chromeButton` (UI redesign r3, Stage 14.17 D5b) — this
+// pane's small HUD toggle buttons (render distance / fog / AA / grid / reset row), now built on
+// the shared `ribbon/tokens` `btnBase` recipe instead of the warm modal-ramp `chromeButton`. Every
+// call site already overrides `color` explicitly, so only the raised-face recipe moves.
+function hudBtn(extra?: CSSProperties): CSSProperties {
+  return btnBase(extra);
+}
+
+// Local replacement for the retired `glassMenuPanel` — the same slate popover chrome
+// `ribbon/primitives.tsx`'s `Popover` uses (SURFACE.popover material; see its comment at the
+// Popover definition for the exact recipe this mirrors).
+const hudPopover: CSSProperties = {
+  background: SURFACE.popover,
+  border: "none",
+  borderRadius: RADIUS.lg,
+  boxShadow: `inset 0 0 0 1px ${BORDER.outline}, inset 0 1px 0 ${BORDER.bevel}, 0 10px 28px rgba(0,0,0,.6)`,
 };
 
 // Patch a MeshDepthMaterial (used as a mesh's customDepthMaterial in the shadow pass) so the
@@ -49,7 +70,21 @@ const hexToRgb = (hex: string): [number, number, number] => {
 
 // A sensible light-blue default for the 3D pane's sky/fog color — Minecraft's clear-sky blue,
 // used until the user picks a custom color or reverts to the world's own (often muddy) sky paint.
-const DEFAULT_SKY_COLOR = "#8cbeff";
+const DEFAULT_SKY_COLOR: string = SKY_3D.fog;
+
+/** Editor-only 3D look prefs (Stage 15.8) — persisted by App as flat `AppSettings` keys, never
+ *  written to the world file's own sky. `fogColor: null` = follow the world's sky paint. */
+export interface Sky3dPrefs {
+  /** Sky-dome colour straight overhead. */
+  zenith: string;
+  /** Sky-dome colour at the horizon. */
+  horizon: string;
+  fogColor: string | null;
+  /** Soft (exponential) vs hard (linear) fog. */
+  fogSoft: boolean;
+}
+/** The dome's original hard-coded gradient + the pane's original fog colour/model. */
+export const DEFAULT_SKY3D: Sky3dPrefs = { zenith: SKY_3D.zenith, horizon: SKY_3D.horizon, fogColor: DEFAULT_SKY_COLOR, fogSoft: false };
 
 /** A lamp light for the experimental GPU night path — Eden local block coords (voxel centre) + colour 0..1. */
 interface LampLight { x: number; y: number; z: number; r: number; g: number; b: number }
@@ -61,7 +96,7 @@ const MAX_NIGHT_LIGHTS = 16;
 /** Max world-unit radius the GPU shadow map covers around the camera. Beyond this, terrain doesn't
  *  self-shadow — trades distant shadows (mostly fog-hidden) for texel density on near ones. */
 const SHADOW_MAX_REACH = 320;
-// World-scale 3D fly-through viewport — the 4th quad-view pane.
+// World-scale 3D fly-through viewport — the 3D pane (main pane or floating 3D window).
 //
 // Coordinate mapping: Eden (X east, Y south, Z up) → Three.js (x = wx, y = wz, z = wy).
 // Eden north = Three.js −Z; camera starts south of the world looking north (−Z), so Eden east
@@ -141,9 +176,22 @@ const Z_BAND_STEP = 64;
 // envelope header (`VoxelGeometry.bytes*`) rather than being re-derived.
 const GEOMETRY_BUDGET_BYTES = 512 << 20;
 
+/** Below this pane size the HUD compacts (see `compactHud`). */
+// The windows sub-plan guessed 420×260; measured in the 3D window, the hint line and the
+// Render/Fog/AA/Grid row already collide below ~720 px wide.
+const COMPACT_HUD_W = 720;
+const COMPACT_HUD_H = 300;
+
 export interface FlyView3DRef {
   /** Move the camera to a world XY position (keeps current height). */
   teleport: (wx: number, wy: number) => void;
+  /** Leave mouselook (releases the pointer lock / native cursor grab) if it is active. Called before
+   *  the pane's canvas is *moved* in the DOM — a view swap or 3D-window toggle (UI redesign r3, Stage 14.4) —
+   *  because moving a pointer-locked element silently drops the lock out from under look mode. */
+  exitLook: () => void;
+  /** Leave fly *or* look for orbit. App calls it when the map is clicked while the 3D camera is
+   *  flying, so the click edits the map instead of the fly controls keeping the keyboard. */
+  exitWalk: () => void;
   /** GPU identity off this pane's *own*, already-live WebGL context (ROADMAP-EDIT Stage 9.2) —
    *  never allocates a context of its own. `null` only if the pane has never mounted a renderer;
    *  a mounted pane with the extension unavailable reports `"unknown"` fields, never "hardware". */
@@ -181,6 +229,14 @@ export interface PerfSnapshot {
   contextLossCount: number;
   /** True once the back-off gave up (`MAX_CONTEXT_LOSSES` reached) and disabled the pane. */
   contextDisabled: boolean;
+  /** Pane state at report time (17.1), filled in by the component rather than the scene closure. */
+  state: PerfState;
+}
+
+export interface PerfState {
+  camMode: string; interact3d: string; night: boolean; shadows: boolean; gpuShadows: boolean;
+  lightingProfile: string; cutaway: number | null; texturePack: boolean; suspended: boolean;
+  canvasPx: string;
 }
 
 /** Matches the handful of known software rasterizers a `UNMASKED_RENDERER_WEBGL` string can name.
@@ -415,12 +471,14 @@ const CLICK_SLOP_MS = 250;
  *  pointermove, so it stamps at pointer rate rather than every BUILD_REPEAT_MS. */
 const BUILD_REPEAT_DELAY_MS = 300;
 const BUILD_REPEAT_MS = 220;
+/** Keys that translate the fly camera — the only ones that keep frame() self-scheduling (17.5). */
+const FLY_MOVE_KEYS: ReadonlySet<string> = new Set(["w", "a", "s", "d", " ", "e", "control", "q"]);
 /** Hard watchdog on one build gesture. Replaces C1's BUILD_REPEAT_IDLE_TICKS, which parked the hold
  *  after 3 no-op ticks — correct for the old "stationary hold marches a tower" model, but it would
  *  now kill a sweep that merely paused. The IPC-spin half of that fix is covered better by the
  *  aim-change gate in `buildRepeatTick` (an unchanged aim doesn't even issue a pick); this bounds the
  *  remaining case, a hold whose pointerup the webview never delivers at all. */
-const BUILD_GESTURE_MAX_MS = 20_000;
+const BUILD_GESTURE_MAX_MS = GESTURE_MAX_MS;
 /** Trailing debounce on the *lighting halo* half of an edit's chunk reload (C3 steps 2–3). Long
  *  enough that a build sweep — whose stamps arrive far faster than this — pays the halo exactly once,
  *  on release, instead of once per placed block. Short enough that a single click's lit/shadowed seam
@@ -454,18 +512,20 @@ interface CoordHudRef { set: (d: HudData | null) => void }
 const CompassDial = ({ angleDeg }: { angleDeg: number }) => {
   const pt = (deg: number, label: string, dim: boolean) => {
     const rad = (deg * Math.PI) / 180;
-    const r = 8;
+    const r = 9;
     return (
       <span key={label} style={{
         position: "absolute", left: `calc(50% + ${Math.sin(rad) * r}px)`, top: `calc(50% - ${Math.cos(rad) * r}px)`,
-        transform: "translate(-50%,-50%)", fontSize: 7, fontWeight: dim ? 400 : 700,
+        transform: "translate(-50%,-50%)", fontSize: 10, fontWeight: dim ? 400 : 700,
         color: dim ? "#61584f" : "#dad6d2",
       }}>{label}</span>
     );
   };
   return (
+    // Stage 14.14: the ring grew 22→26px so the bumped-to-10px labels (from the app's type floor)
+    // have room without clipping the ring's own border.
     <div title="Camera heading" style={{
-      position: "relative", width: 22, height: 22, borderRadius: "50%", flexShrink: 0,
+      position: "relative", width: 26, height: 26, borderRadius: "50%", flexShrink: 0,
       background: "rgba(0,0,0,0.25)", border: "1px solid rgba(131,120,108,0.35)",
     }}>
       <div style={{ position: "absolute", inset: 0, transform: `rotate(${-angleDeg}deg)` }}>
@@ -477,7 +537,7 @@ const CompassDial = ({ angleDeg }: { angleDeg: number }) => {
       {/* Fixed forward arrow — doesn't rotate; represents "up on screen = where the camera looks". */}
       <span style={{
         position: "absolute", left: "50%", top: 2, transform: "translateX(-50%)",
-        fontSize: 8, color: "#34d399", lineHeight: 1,
+        fontSize: 10, color: "#34d399", lineHeight: 1,
       }}>▲</span>
     </div>
   );
@@ -494,7 +554,7 @@ const CoordHud = forwardRef<CoordHudRef>(function CoordHud(_props, ref) {
   return (
     <div style={{
       position: "absolute", bottom: 6, left: 6, zIndex: 1, pointerEvents: "none",
-      padding: "2px 7px", borderRadius: 4, fontSize: 9, fontVariantNumeric: "tabular-nums",
+      padding: "2px 7px", borderRadius: 4, fontSize: 10, fontVariantNumeric: "tabular-nums",
       background: "rgba(31,28,26,0.7)", border: "1px solid rgba(131,120,108,0.3)", color: "#afa69d",
       display: "flex", alignItems: "center", gap: 6,
     }}>
@@ -508,6 +568,42 @@ const CoordHud = forwardRef<CoordHudRef>(function CoordHud(_props, ref) {
         }}>{hud.boost === "sprint" ? "SPRINT" : "CRAWL"}</span>
       )}
     </div>
+  );
+});
+
+/// Self-contained leaf for the "loading N…" / "render distance limited" badges. Streaming pushes
+/// into it imperatively so a fetch completing (or the budget gate flipping) re-renders only these
+/// two spans, not the whole 3D pane. Same pattern as CoordHud.
+interface StreamBadgesRef { setLoading: (n: number) => void; setLimited: (b: boolean) => void }
+
+const StreamBadges = forwardRef<StreamBadgesRef, { budgetBytes: number }>(function StreamBadges({ budgetBytes }, ref) {
+  const [loadingCount, setLoadingCount] = useState(0);
+  const [budgetLimited, setBudgetLimited] = useState(false);
+  useImperativeHandle(ref, () => ({ setLoading: setLoadingCount, setLimited: setBudgetLimited }), []);
+  return (
+    <>
+        {loadingCount > 0 && (
+          <span style={{
+            padding: "1px 5px", borderRadius: 4, fontSize: 10,
+            background: "rgba(131,120,108,0.12)", border: "1px solid rgba(131,120,108,0.25)",
+            color: "#83786c",
+          }}>
+            loading {loadingCount}…
+          </span>
+        )}
+        {budgetLimited && (
+          <span
+            title={`Resident chunk geometry hit the ${(budgetBytes / (1 << 20)).toFixed(0)} MB budget — the farthest chunks are being dropped to stay inside it, so the pane is showing less than the render distance asks for. Raise it in Settings → Memory budget, or lower the render distance.`}
+            style={{
+              padding: "1px 5px", borderRadius: 4, fontSize: 10,
+              background: "rgba(239,68,68,0.12)", border: "1px solid rgba(239,68,68,0.3)",
+              color: "#ef4444",
+            }}
+          >
+            render distance limited by memory
+          </span>
+        )}
+    </>
   );
 });
 
@@ -528,13 +624,13 @@ const GeomMemHud = forwardRef<GeomMemHudRef>(function GeomMemHud(_props, ref) {
   const frac = d.budget > 0 ? (d.gpu + d.inflight) / d.budget : 0;
   return (
     <div
-      title="Dev build only — resident 3D chunk geometry. gpu = uploaded VBO bytes, js = wire buffers still on the JS heap (should stay near 0 once uploads land), fly = in-flight fetch reservations."
+      title="Dev build only — resident 3D chunk geometry. gpu = bytes installed in the scene, js = wire buffers still on the JS heap (should stay near 0 once uploads land), fly = in-flight fetch reservations."
       style={{
         // Sits above the pane's view/select/fill control cluster (which shares the bottom-right
         // corner) — it's the only instrument for the 3D-pipeline plan's memory findings, so it must
         // be legible rather than squinted at from behind the control row.
         position: "absolute", bottom: 36, right: 6, zIndex: 40, pointerEvents: "none",
-        padding: "2px 7px", borderRadius: 4, fontSize: 9, fontVariantNumeric: "tabular-nums",
+        padding: "2px 7px", borderRadius: 4, fontSize: 10, fontVariantNumeric: "tabular-nums",
         background: "rgba(31,28,26,0.7)", border: "1px solid rgba(131,120,108,0.3)",
         color: frac > 0.9 ? "#ef4444" : "#83786c", lineHeight: 1.5,
       }}>
@@ -554,7 +650,12 @@ const FlyView3D = forwardRef<FlyView3DRef, {
    *  coordinates — so setting a spawn point or clearing it while flying doesn't yank the camera. */
   worldLoadToken?: number;
   onFlyModeChange?: (active: boolean) => void;
-  onCameraMove?: (wx: number, wy: number) => void;
+  /** Mouselook (the cursor-grabbing mode) entered/left. Floating windows only go click-through
+   *  while this is true — in fly mode the cursor is free and must still reach them. */
+  onLookChange?: (looking: boolean) => void;
+  /** Throttled camera broadcast for the map's camera dot. `yaw` (radians, map space: 0 = +X, π/2 =
+   *  +Y) and `hfov` (horizontal field of view, radians) draw the view wedge (Stage 14.4). */
+  onCameraMove?: (wx: number, wy: number, yaw: number, hfov: number) => void;
   overlays3d?: Overlay3D[] | null;
   /** Decoded atlas data from a loaded texture pack, or null when none loaded. */
   texturePack?: AtlasData | null;
@@ -649,6 +750,19 @@ const FlyView3D = forwardRef<FlyView3DRef, {
   /** Whether auto-orient is on (mirrors App's `autoOrient3d` setting) — the placement preview shows
    *  the oriented shape auto-orient would place, or the raw armed variant verbatim when off. */
   autoOrient3d?: boolean;
+  /** Flips App's `autoOrient3d` (15.3: the ribbon's Mode-group checkbox moved into this pane's own
+   *  `…` HUD disclosure, next to Fog/AA/Grid) — same source of truth the Ribbon's `3d.mode.autoOrient`
+   *  command still writes for ⌘K, just a second consumer. */
+  onSetAutoOrient3d?: (v: boolean) => void;
+  /** Sky gradient + fog colour/model (15.8). Controlled by App so it persists; defaults to `DEFAULT_SKY3D`. */
+  sky3d?: Sky3dPrefs;
+  onSky3dChange?: (patch: Partial<Sky3dPrefs>) => void;
+  /** HUD visibility (15.8): hides the camera pill + key legend, compass/coords and the perf readout.
+   *  Never the build crosshair, and never the options row (that's how you turn it back on). Default true. */
+  showHud?: boolean;
+  /** Floor grid visibility (15.8). Default true. */
+  showGrid?: boolean;
+  onSetShowGrid?: (v: boolean) => void;
   /** Max distance (blocks) a build-mode break/place may reach (H5, `AppSettings.buildReach`).
    *  Build-mode *hover* picks at the same distance, so the placement outline simply doesn't appear
    *  past the cap and a click there does nothing — the refusal is visible, not silent. Select mode,
@@ -658,6 +772,11 @@ const FlyView3D = forwardRef<FlyView3DRef, {
    *  slot, digit key 1-5), index 5-9 recent (digit key 6-0). Precomputed by App so this component
    *  doesn't need its own resolveColor/tintedSwatch import. */
   hotbarSlots?: ({ type: number; paint: number; css: string; label: string } | null)[];
+  /** Suppress the in-pane overlay (Stage 14.5): `!(wins.hotbar.open && !wins.hotbar.collapsed)` —
+   *  no duplicate hotbar on screen once the floating Hotbar window is up. Default true (show), so
+   *  callers that don't pass it (there are none left in this repo, but the type is optional for the
+   *  same reason every other prop here is) keep the old behaviour. */
+  showHotbarOverlay?: boolean;
   /** Currently-armed block+paint, to ring-highlight the matching hotbar slot. */
   activeBlock?: { type: number; paint: number };
   /** Click a hotbar slot to arm it (mirrors the Ribbon hotbar / digit keys). */
@@ -703,7 +822,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
    *  the cap itself is backend state (`WorldState.view_cap_z`) and `get_chunk_geometry` applies it
    *  to the emitted z band on its own. Changing it reloads every resident chunk. */
   viewCapZ?: number | null;
-  /** Suspended = mounted but not visible (3D pane switched off, or quad view left). Parks the rAF
+  /** Suspended = mounted but not visible (3D view switched off or its window closed). Parks the rAF
    *  loop and the streaming sweep and drops every resident chunk mesh, so a hidden pane costs
    *  essentially nothing — but keeps its WebGL context, which is the point: repeatedly creating and
    *  destroying contexts is what walks WKWebView into its live-context ceiling (Stage 4). */
@@ -714,17 +833,18 @@ const FlyView3D = forwardRef<FlyView3DRef, {
    *  exactly the "never a performance problem" line the diagnostics plan draws. */
   showPerfHud?: boolean;
 }>(function FlyView3D({
-  world, editEpoch = 0, lastEdit = null, spawnAt = null, worldLoadToken = 0, onFlyModeChange, onCameraMove, overlays3d = null,
+  world, editEpoch = 0, lastEdit = null, spawnAt = null, worldLoadToken = 0, onFlyModeChange, onLookChange, onCameraMove, overlays3d = null,
   texturePack = null, texEpoch = 0, fogEnabled = true,
   nightLighting = false, shadows3d = false, sunT = 0.5, lampRadius = 4, lightingProfile = "legacy", lightEpoch = 0,
   initialRenderDistance, initialFlySpeed, onRenderDistanceChange, onFlySpeedChange, anyModalOpen = false,
   lookSensitivity = 1, dragSensitivity = 1, invertY = false,
   interact3d = "none", onPickSelect, onPickFloodFill, onPickBreak, onPickPlace, onBuildGestureEnd, onPickEyedrop, armedSwatch = null, armedLabel = "",
   onPickBreakBatch, onPickPlaceBatch, onPickFillFace,
-  armedBlockType = 0, autoOrient3d = true, buildReach = 64,
+  armedBlockType = 0, autoOrient3d = true, onSetAutoOrient3d,
+  sky3d = DEFAULT_SKY3D, onSky3dChange, showHud = true, showGrid = true, onSetShowGrid, buildReach = 64,
   selectionBounds3d = null, onGizmoRegionChange, onGizmoMoveBlocks,
   moveWithContents = false, setMoveWithContents,
-  hotbarSlots, activeBlock, onHotbarSelect,
+  hotbarSlots, activeBlock, onHotbarSelect, showHotbarOverlay = true,
   onSetInteract3d,
   sculptTool = "raise", sculptRadius = 6, sculptStrength = 2, onSculptStamp3d,
   gpuShadows = false,
@@ -735,6 +855,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
   suspended = false,
   showPerfHud = false,
 }, ref) {
+  bumpPerf("flyRenders");
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [camMode, setCamMode] = useState<CamMode>("orbit");
   const camModeRef = useRef<CamMode>("orbit");
@@ -780,10 +901,27 @@ const FlyView3D = forwardRef<FlyView3DRef, {
   useEffect(() => {
     try { localStorage.setItem(FLY3D_LEGEND_SEEN_KEY, "true"); } catch { /* quota / private mode */ }
   }, []);
-  const [loadingCount, setLoadingCount] = useState(0);
-  const setLoadingCountRef = useRef(setLoadingCount);
-  const [budgetLimited, setBudgetLimited] = useState(false);
-  const setBudgetLimitedRef = useRef(setBudgetLimited);
+  // Responsive HUD (UI redesign r3, Stage 14.4): the pane now also lives in a small floating window.
+  // Below COMPACT_HUD_W × COMPACT_HUD_H the control hints and the Render/Fog/AA/Grid row fold behind
+  // a "⋯" toggle so the HUD stops overlapping itself. DOM only — no scene change.
+  const [compactHud, setCompactHud] = useState(false);
+  const [hudMore, setHudMore] = useState(false);
+  // Auto-orient disclosure (15.3): the Ribbon Mode group's checkbox moved in here, behind its own
+  // "…" toggle next to Fog/AA/Grid — collapsed by default so it doesn't add to this row's own
+  // collision risk (see COMPACT_HUD_W's note above).
+  const [autoOrientOpen, setAutoOrientOpen] = useState(false);
+  useEffect(() => {
+    const el = wrapRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver(() => {
+      const w = el.clientWidth, h = el.clientHeight;
+      if (w === 0 || h === 0) return; // detached / hidden — keep the last verdict
+      setCompactHud(w < COMPACT_HUD_W || h < COMPACT_HUD_H);
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+  const badgesRef = useRef<StreamBadgesRef | null>(null);
   // Stage 10.1: latched true once the context-loss back-off gives up (MAX_CONTEXT_LOSSES reached).
   // Drives the in-pane explanation overlay below; the scene's own `contextGivenUp` is what actually
   // keeps it parked, so this is presentation only and never gates anything.
@@ -874,6 +1012,8 @@ const FlyView3D = forwardRef<FlyView3DRef, {
 
   const onFlyModeChangeRef = useRef(onFlyModeChange);
   onFlyModeChangeRef.current = onFlyModeChange;
+  const onLookChangeRef = useRef(onLookChange);
+  onLookChangeRef.current = onLookChange;
   const onCameraMoveRef = useRef(onCameraMove);
   onCameraMoveRef.current = onCameraMove;
   const anyModalOpenRef = useRef(anyModalOpen);
@@ -966,7 +1106,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
 
   // Floor grid visibility (D3) — pane-local, default on. World-bounds box + axes stay on regardless;
   // the grid is the noisiest of the three at a glance, so it's the one worth an opt-out.
-  const [gridVisible, setGridVisible] = useState(true);
+  const gridVisible = showGrid;
   const gridVisibleRef = useRef(gridVisible);
   gridVisibleRef.current = gridVisible;
 
@@ -993,7 +1133,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
   gpuShadowsRef.current = gpuShadows;
 
   // Fog model: soft = exponential (FogExp2, hazier / more fog-like); hard = linear (the default).
-  const [fogSoft, setFogSoft] = useState(false);
+  const fogSoft = sky3d.fogSoft;
   const fogSoftRef = useRef(fogSoft);
   fogSoftRef.current = fogSoft;
 
@@ -1010,7 +1150,11 @@ const FlyView3D = forwardRef<FlyView3DRef, {
   // Editor-only fog/sky color override — never written back to world.sky (the file's saved sky
   // color table). Defaults to a Minecraft-like light blue rather than the world's own (often muddy)
   // sky paint; the ↺ button reverts to the world's actual sky color on request.
-  const [fogColorOverride, setFogColorOverride] = useState<string | null>(DEFAULT_SKY_COLOR);
+  const fogColorOverride = sky3d.fogColor;
+  // Sky-dome gradient, read at scene-init through a ref (a world-size change rebuilds the scene) and
+  // pushed live by the `[sky3d.zenith, sky3d.horizon]` effect below.
+  const skyGradientRef = useRef({ zenith: sky3d.zenith, horizon: sky3d.horizon });
+  skyGradientRef.current = { zenith: sky3d.zenith, horizon: sky3d.horizon };
   // Night lighting darkens the fog/clear color toward the same ambient level baked into block
   // colors server-side, so distant terrain doesn't fade into a bright daytime sky while lit dim.
   const effectiveFogColor = (): readonly [number, number, number] => {
@@ -1040,9 +1184,11 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     scene: THREE.Scene;
     camera: THREE.PerspectiveCamera;
     reloadChunk: (cx: number, cy: number) => void;
-    reloadAllChunks: () => void;
+    reloadAllChunks: (reason: ReloadReason, keepMeshes?: boolean) => void;
     resetCamera: () => void;
     teleport: (wx: number, wy: number) => void;
+    exitLook: () => void;
+    exitWalk: () => void;
     setOverlays: (ovs: Overlay3D[] | null) => void;
     setFog: (enabled: boolean, color: readonly [number, number, number]) => void;
     setMaxDpr: (max: number) => void;
@@ -1051,6 +1197,8 @@ const FlyView3D = forwardRef<FlyView3DRef, {
      *  no-ops on identical radius). Never disposes chunks still inside the new radius. */
     setLoadRadius: (r: number) => void;
     setGridVisible: (v: boolean) => void;
+    /** Repaint the sky dome's gradient (15.8) — no scene rebuild. */
+    setSkyGradient: (zenith: string, horizon: string) => void;
     setGpuShadows: (on: boolean) => void;
     /** Park/resume the pane while it's mounted but hidden (Stage 4). Suspending disposes every
      *  resident chunk mesh; resuming re-measures the canvas and restreams from the camera. */
@@ -1078,13 +1226,26 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     setGizmoSelection: (mode: Interact3D, b: SelectionBounds3D | null) => void;
     /** ROADMAP-EDIT Stage 9.2/9.3 — see `FlyView3DRef`'s own docs. */
     getGpuInfo: () => GpuInfo | null;
-    getPerfSnapshot: () => PerfSnapshot | null;
+    getPerfSnapshot: () => Omit<PerfSnapshot, "state"> | null;
   } | null>(null);
+
+  // Live props for the Diagnostics state snapshot — refreshed each render (ref assign, no state).
+  const diagStateRef = useRef<() => PerfState>(() => ({} as PerfState));
+  diagStateRef.current = () => ({
+    camMode, interact3d, night: nightLighting, shadows: shadows3d, gpuShadows,
+    lightingProfile, cutaway: viewCapZ, texturePack: texturePack != null, suspended,
+    canvasPx: `${canvasRef.current?.width ?? 0}x${canvasRef.current?.height ?? 0}`,
+  });
 
   useImperativeHandle(ref, () => ({
     teleport: (wx, wy) => sceneApi.current?.teleport(wx, wy),
+    exitLook: () => sceneApi.current?.exitLook(),
+    exitWalk: () => sceneApi.current?.exitWalk(),
     getGpuInfo: () => sceneApi.current?.getGpuInfo() ?? null,
-    getPerfSnapshot: () => sceneApi.current?.getPerfSnapshot() ?? null,
+    getPerfSnapshot: () => {
+      const p = sceneApi.current?.getPerfSnapshot();
+      return p ? { ...p, state: diagStateRef.current() } : null;
+    },
   }), []);
 
   // Dispose + (re)build the texture-pack materials from `pack` (or leave them disposed if null).
@@ -1165,8 +1326,8 @@ const FlyView3D = forwardRef<FlyView3DRef, {
 
     let renderer: THREE.WebGLRenderer;
     try {
-      // antialias:false — at DPR ≤1.5 in a small quad-view cell, MSAA's fragment cost outweighs the
-      // marginal edge quality. Disabling it buys steady-state fps headroom next to 3 other panes.
+      // antialias:false — at DPR ≤1.5 in a small 3D window, MSAA's fragment cost outweighs the
+      // marginal edge quality. Disabling it buys steady-state fps headroom next to the map pane.
       renderer = new THREE.WebGLRenderer({ canvas, antialias: false, powerPreference: "high-performance" });
     } catch (e) {
       // Genuine WebGL-unavailable (driver/webview without a usable context). Surface a clear
@@ -1181,14 +1342,15 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     // so it carries no "clamp vs default" hazard. Render distance / memory preset are App's call
     // (persisted settings, must respect an explicit user choice), reported via the callback below.
     const gpuInfo = readGpuInfo(renderer);
+    // Render-to-CSS pixel ratio. Not handed to `renderer.setPixelRatio` — `resize()` sizes the
+    // drawing buffer in device pixels itself (see there) and keeps three's own ratio at 1.
+    let pixelRatio = Math.min(window.devicePixelRatio, MAX_DPR);
     if (gpuInfo.softwareRendering) {
-      renderer.setPixelRatio(1);
+      pixelRatio = 1;
       if (!swRenderingReportedRef.current) {
         swRenderingReportedRef.current = true;
         onSoftwareRenderingDetectedRef.current?.(gpuInfo);
       }
-    } else {
-      renderer.setPixelRatio(Math.min(window.devicePixelRatio, MAX_DPR));
     }
 
     // Guard the remainder of init: if anything throws after the context exists, release it before
@@ -1197,7 +1359,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     try {
 
     // Render-on-demand: only draw when something actually changed (camera moved, chunks streamed,
-    // resize) or while actively flying. Avoids burning the GPU at 60fps next to 3 other quad-view panes.
+    // resize) or while actively flying. Avoids burning the GPU at 60fps next to the map and other windows.
     // `invalidate` schedules a single rAF frame; `frame` reschedules itself only while fly/damping
     // need continuous updates. `frame` is a hoisted function declaration so `invalidate` can safely
     // reference it before the definition site.
@@ -1225,13 +1387,13 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     // normal attribute buffer (~⅓ of geometry RAM).
 
     // ---- Gradient sky dome ----
-    // A large inverted sphere painted with a fixed vertical gradient (#c5d5eb horizon → #347ee3
-    // zenith) that follows the camera, so the background reads as sky rather than a flat wall — and
+    // A large inverted sphere painted with a vertical gradient (horizon → zenith; defaults #c5d5eb →
+    // #347ee3, user-editable from the `…` menu, Stage 15.8) that follows the camera, so the background reads as sky rather than a flat wall — and
     // stays visible when fog is off. `fog:false` keeps the dome itself unfogged. The gradient is
     // independent of the fog/sky color, which only drives the renderer clear color and terrain fog.
     const skyUniforms = {
-      topColor: { value: new THREE.Color(0x347ee3) },
-      bottomColor: { value: new THREE.Color(0xc5d5eb) },
+      topColor: { value: new THREE.Color(skyGradientRef.current.zenith) },
+      bottomColor: { value: new THREE.Color(skyGradientRef.current.horizon) },
       offset: { value: 0.0 },
       exponent: { value: 0.7 },
     };
@@ -1283,8 +1445,17 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     };
     setFog(fogEnabledRef.current, fogColorRef.current);
 
-    const setMaxDpr = (max: number) => {
-      renderer.setPixelRatio(Math.min(window.devicePixelRatio, max));
+    const setMaxDpr = (target: number) => {
+      // `target` is a *floor* when it exceeds MAX_DPR (the AA-on supersample request) and a
+      // *ceiling* otherwise (the AA-off/default case, which must never render above native
+      // resolution). Clamping both cases to `Math.min(devicePixelRatio, target)` — the old
+      // behaviour — made AA-on a no-op on any standard-DPI display (devicePixelRatio 1, e.g. a
+      // plain 1080p monitor): `min(1, 2)` is still 1, so the "supersample" never exceeded native
+      // pixels there. It only ever did anything on a HiDPI/scaled display whose devicePixelRatio
+      // already sat between MAX_DPR and the AA target.
+      // A software rasterizer stays pinned at 1 either way (Stage 10.3's potato profile).
+      if (gpuInfo.softwareRendering) return;
+      pixelRatio = target > MAX_DPR ? Math.max(window.devicePixelRatio, target) : Math.min(window.devicePixelRatio, target);
       resize();
     };
 
@@ -1369,18 +1540,31 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       controls.target.set(s.x, Math.min(maxZ, 28), s.y);
     }
 
-    const resize = () => {
+    // Size the drawing buffer in *device* pixels, matching the canvas's on-screen box exactly. The
+    // a resizable 3D window (and fractional DPR scaling) makes the canvas's CSS box routinely
+    // fractional (713.6px); the old `setSize(floor(cssW), …)` left a buffer a fraction of a pixel
+    // smaller than its box, which the compositor then resampled across the whole view — plainly
+    // blurry at devicePixelRatio 1, masked by the finer pixels on a Retina panel. At native ratio,
+    // `devicePixelContentBoxSize` (Chromium/WebView2) is the exact snapped size; elsewhere, and when
+    // supersampling for AA, round rather than floor. three's own pixel ratio stays 1 throughout.
+    const resize = (entries?: ResizeObserverEntry[]) => {
       const r = canvas.getBoundingClientRect();
-      const w = Math.max(1, Math.floor(r.width));
-      const h = Math.max(1, Math.floor(r.height));
-      renderer.setSize(w, h, false);
+      const exact = entries?.[0]?.devicePixelContentBoxSize?.[0];
+      const native = pixelRatio === window.devicePixelRatio;
+      const w = Math.max(1, exact && native ? exact.inlineSize : Math.round(r.width * pixelRatio));
+      const h = Math.max(1, exact && native ? exact.blockSize : Math.round(r.height * pixelRatio));
+      renderer.setDrawingBufferSize(w, h, 1);
       camera.aspect = w / h;
       camera.updateProjectionMatrix();
       invalidate();
     };
     resize();
     const ro = new ResizeObserver(resize);
-    ro.observe(canvas);
+    try {
+      ro.observe(canvas, { box: "device-pixel-content-box" });
+    } catch {
+      ro.observe(canvas); // WebKit: no device-pixel-content-box — the rounded CSS path covers it
+    }
 
     // Unlit material — vertex colours carry baked directional shading from Rust.
     // DoubleSide kept: the face winding was designed for the old coordinate convention and is not
@@ -1510,7 +1694,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     let nightQueryPending = false;
     const lastNightQueryPos = new THREE.Vector3(1e9, 0, 0);
     const updateNightLights = () => {
-      if (nightQueryPending) return;
+      if (nightQueryPending || suspendedNow) return; // 16.3 — resume re-queries
       if (!(gpuShadowsRef.current && nightLightingRef.current)) return;
       nightQueryPending = true;
       lastNightQueryPos.copy(camera.position);
@@ -1650,6 +1834,10 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       residentBytes += bytes;
       jsBytes += bytes;
       releaseOnUpload(mesh);
+      // Chunk meshes never move (positions are baked in world space): compose the identity matrix
+      // once and skip the per-frame matrix recompose for the whole resident set.
+      mesh.matrixAutoUpdate = false;
+      mesh.updateMatrix();
       scene.add(mesh);
       map.set(k, mesh);
     };
@@ -1692,9 +1880,9 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     // one small re-render and nothing else. Gated on the *toggle*, not a build flag (Stage 9.3) — a
     // true no-op when off, since a diagnostic that always samples is itself a performance problem.
     const pushMemHud = () => {
-      if (!showPerfHudRef.current) return;
       const total = residentBytes + jsBytes + inflightBytes;
       if (total > peakBytes) peakBytes = total;
+      if (!showPerfHudRef.current) return;
       memHudRef.current?.set({
         chunks: meshes.size + emptyChunks.size,
         gpu: residentBytes, js: jsBytes, inflight: inflightBytes,
@@ -1800,7 +1988,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       // dense chunks can land past the cap together.
       reserved.set(k, chunkEstimateBytes);
       inflightBytes += chunkEstimateBytes;
-      setLoadingCountRef.current(inflight.size);
+      badgesRef.current?.setLoading(inflight.size);
       const gen = fetchGen;
       if (perfCounters.enabled) perfCounters.chunkFetchesIssued++;
       const fetchT0 = performance.now();
@@ -1894,12 +2082,13 @@ const FlyView3D = forwardRef<FlyView3DRef, {
           if (disposed) return;
           if (wasStale) queue.unshift({ cx: cxk, cy: cyk }); // requeue immediately — its result was dropped
           pump();
-          setLoadingCountRef.current(inflight.size);
+          badgesRef.current?.setLoading(inflight.size);
           pushMemHud();
         });
     };
 
     const pump = () => {
+      if (suspendedNow) return; // 16.3 — see streamSweep
       // H6: once resident geometry crosses the byte budget, stop pulling new chunks — the queue
       // stays populated and resumes once eviction (moving the camera) frees headroom. Only calls
       // setState on an actual transition so this doesn't re-render every pump() (called on every
@@ -1913,7 +2102,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       const limited = overBudget || budgetHorizonSq < Infinity;
       if (limited !== budgetLimited) {
         budgetLimited = limited;
-        setBudgetLimitedRef.current(limited);
+        badgesRef.current?.setLimited(limited);
         if (perfCounters.enabled) perfCounters.budgetLimitedTransitions++;
       }
       if (overBudget) return;
@@ -1933,6 +2122,11 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     // moving the camera (reloadAllChunks) or that intentionally want a sweep even though the
     // camera hasn't visibly moved yet (resetCamera/teleport fire this before their tween ticks).
     const streamSweep = (force = false) => {
+      // 16.3: a suspended pane streams nothing. Every external trigger (world load → resetCamera,
+      // texture/cutaway/lighting → reloadAllChunks, Settings → setLoadRadius) funnels through here,
+      // and whatever it fetched would sit resident in a hidden pane with no sweep left to evict it.
+      // The resume branch of setSuspended restreams from scratch.
+      if (suspendedNow) return;
       const ccx = worldToChunk(camera.position.x);
       const ccy = worldToChunk(camera.position.z); // Three.js Z = Eden Y
       // Vertical travel moves the z band (Stage 3). Every resident mesh was built against the old
@@ -1943,6 +2137,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       const nextBand = zBandTop();
       const bandMoved = nextBand !== zBand;
       if (bandMoved) {
+        recordReload("band");
         zBand = nextBand;
         fetchGen++;
         queue = [];
@@ -2060,6 +2255,9 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     // fetch. If a fetch for this chunk is already in flight, its (possibly pre-edit) result must not
     // land — mark it stale so the .finally{} in startFetch drops it and requeues instead.
     const reloadChunk = (cxk: number, cyk: number) => {
+      // 16.3: a suspended pane holds no meshes to be stale — resume refetches everything. Without
+      // this, every 2D edit made with the 3D view closed fetched its chunk into the hidden pane.
+      if (suspendedNow) return;
       const k = key(cxk, cyk);
       // Set on both paths: the requeue in startFetch's finally{} runs while the *old* mesh is still
       // resident now that the dispose is no longer eager, so without the force flag the requeued
@@ -2083,16 +2281,29 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     // (issued under the old pack/lighting) is dropped by startFetch instead of installing stale
     // geometry; it naturally gets re-requested by the next streamSweep tick once its inflight entry
     // clears (no explicit unshift needed here — everything is about to be re-swept anyway).
-    const reloadAllChunks = () => {
+    //
+    // `keepMeshes` (cutaway/lighting reloads): leave the old meshes up and force-refetch each resident
+    // key instead (the reloadChunk idiom), so the pane doesn't blank and every resident chunk isn't
+    // re-uploaded from zero. ⚠️ Never on the context-restore path — the upload-release nulls the
+    // attribute arrays, so those meshes are unrecoverable and must be disposed. Also falls back to
+    // dispose near the geometry budget: pump() refuses to start a fetch while the old meshes still
+    // count against it, which would strand pre-change geometry.
+    const reloadAllChunks = (reason: ReloadReason, keepMeshes = false) => {
+      recordReload(reason);
       fetchGen++;
       queue = [];
       forceKeys.clear();
-      for (const k of residentKeys()) disposeMesh(k);
+      if (keepMeshes && committedBytes() < effectiveBudget() * 0.85) {
+        for (const k of residentKeys()) forceKeys.add(k);
+      } else {
+        for (const k of residentKeys()) disposeMesh(k);
+      }
       streamSweep(true); // meshes were just disposed with the camera unmoved — must not early-out
     };
 
     // ---- Fly controller ----
     const keys = new Set<string>();
+    let hudForce = false; // 17.5: a key change refreshes the HUD's SPRINT/CRAWL badge past its 100 ms throttle
     const euler = new THREE.Euler(0, 0, 0, "YXZ");
     let pitch = 0, yaw = 0;
 
@@ -2104,9 +2315,71 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     // flag that first event whips the view around instead of doing nothing.
     let lookJustEngaged = false;
 
-    // Grab/release the OS cursor for look mode via the Tauri window (see set_cursor_lock in lib.rs).
-    // Fire-and-forget; swallow errors (e.g. no window focus) — the CSS `cursor:none` still applies.
-    const setNativeCursorLock = (locked: boolean) => { void invoke("set_cursor_lock", { locked }).catch(() => {}); };
+    // Grab/release the cursor for look mode. WebView2 (Windows/Linux, Chromium) supports the
+    // standard Pointer Lock API — that both confines *and* locks the cursor to a point, so it never
+    // wanders off this pane the way the window-level grab does (see `set_cursor_lock` in lib.rs: on
+    // Windows that call is only `ClipCursor` to the whole *window's* client rect, which confines but
+    // doesn't lock — the hidden cursor keeps drifting onto the ribbon/map/sidebar, clicks land there,
+    // and once it reaches the window edge movementX/Y go to 0). WKWebView on macOS never grants
+    // Pointer Lock, so macOS always uses the native window-level grab, which is
+    // fine — that path disassociates and freezes the OS cursor on macOS, unlike its confine-only
+    // behaviour on Windows. `usingPointerLock` records which path is live so release/cleanup undoes
+    // the right one.
+    //
+    // ⚠️ Never *assume* Pointer Lock engaged. Modern WebKit exposes `requestPointerLock` but WKWebView
+    // denies it (no UI-delegate grant) by firing `pointerlockerror` and returning `undefined` — the old
+    // "non-Promise return = it worked" branch therefore took neither path and the cursor roamed free
+    // in look mode (2026-09-27 user report). Now: macOS goes straight to the native grab, and
+    // everywhere else a lock only counts once `pointerLockElement` says so; an error, a rejection or
+    // a 400 ms watchdog falls back to the native grab (only while still in look mode — grabbing after
+    // look was left freezes the cursor with nothing left to release it).
+    let usingPointerLock = false;
+    let lockWatchdog: ReturnType<typeof setTimeout> | null = null;
+    const clearLockWatchdog = () => { if (lockWatchdog !== null) { clearTimeout(lockWatchdog); lockWatchdog = null; } };
+    const nativeGrab = (locked: boolean) => { void invoke("set_cursor_lock", { locked }).catch(() => {}); };
+    const pointerLockFailed = () => {
+      clearLockWatchdog();
+      if (document.pointerLockElement === canvas) { usingPointerLock = true; return; }
+      usingPointerLock = false;
+      if (camModeRef.current === "look") nativeGrab(true);
+    };
+    const setNativeCursorLock = (locked: boolean) => {
+      clearLockWatchdog();
+      if (!locked) {
+        usingPointerLock = false;
+        if (document.pointerLockElement === canvas) document.exitPointerLock();
+        // Idempotent — releasing a grab that was never taken just re-shows the cursor.
+        nativeGrab(false);
+        return;
+      }
+      if (IS_MAC || typeof canvas.requestPointerLock !== "function") { usingPointerLock = false; nativeGrab(true); return; }
+      try {
+        const res = canvas.requestPointerLock() as unknown;
+        if (res && typeof (res as Promise<void>).then === "function") {
+          (res as Promise<void>).then(
+            () => { if (document.pointerLockElement === canvas) { clearLockWatchdog(); usingPointerLock = true; } },
+            pointerLockFailed,
+          );
+        }
+      } catch {
+        pointerLockFailed();
+        return;
+      }
+      lockWatchdog = setTimeout(pointerLockFailed, 400);
+    };
+    // Pointer lock can be released out from under us — Chromium itself releases it on Escape, and
+    // the user can alt-tab away. Without this, look mode's internal state would keep thinking the
+    // cursor is grabbed after the browser silently let go of it.
+    const onPointerLockChange = () => {
+      if (document.pointerLockElement === canvas) { clearLockWatchdog(); usingPointerLock = true; return; }
+      if (usingPointerLock) {
+        usingPointerLock = false;
+        if (camModeRef.current === "look") applyMode("orbit");
+      }
+    };
+    const onPointerLockError = () => { if (lockWatchdog !== null) pointerLockFailed(); };
+    document.addEventListener("pointerlockchange", onPointerLockChange);
+    document.addEventListener("pointerlockerror", onPointerLockError);
 
     // Single transition function for every camera-mode change (Z key, pill button, Esc, reset).
     const applyMode = (next: CamMode) => {
@@ -2155,6 +2428,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       setCamMode(next);
       flyModeRef.current = nowWalking;
       if (wasWalking !== nowWalking) onFlyModeChangeRef.current?.(nowWalking);
+      if ((prev === "look") !== (next === "look")) onLookChangeRef.current?.(next === "look");
 
       // CRITICAL: wake the render loop. The pane renders on demand and the loop only self-sustains
       // once a frame is executing (frame() sets keepGoing while walking). Without this, entering a
@@ -2180,9 +2454,12 @@ const FlyView3D = forwardRef<FlyView3DRef, {
         lastMx = e.clientX; lastMy = e.clientY;
         s = DRAG_SENS_BASE * dragSensitivityRef.current;
       } else return;
+      const y0 = yaw, p0 = pitch;
       yaw -= dx * s;
       pitch -= (invertYRef.current ? -dy : dy) * s;
       pitch = THREE.MathUtils.clamp(pitch, -Math.PI / 2 + 0.01, Math.PI / 2 - 0.01);
+      // 17.5: frame() no longer free-runs while flying — a look change is what wakes it.
+      if (yaw !== y0 || pitch !== p0) invalidate();
     };
     document.addEventListener("mousemove", onMouseMove);
 
@@ -2359,6 +2636,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     //                                              strokeIdRef ids never collide with these.
     let sculptTimer: number | null = null;
     let sculptBusy = false;   // a stamp's async edit is in flight — skip overlapping ticks
+    let sculptStartT = 0;     // hold-timer stroke start, for the BUILD_GESTURE_MAX_MS-style watchdog
     let sculptActive = false; // a hold-timer stroke is live
     let sculptGroupId = 0;
     let sculptAnchor: [number, number] | null = null; // stroke-start column (flatten/stamp read it)
@@ -2442,6 +2720,9 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     // pointer is locked and never moves) as well as the pointer while orbiting.
     let cursorX = 0, cursorY = 0;
     let lastPickT = 0;
+    // 17.5: the camera pose the last fly-mode hover pick was launched for (see frame()).
+    const pickPos = new THREE.Vector3(), pickQuat = new THREE.Quaternion();
+    let pickPoseValid = false;
     let pickInflight = false;
     // M2: the hover pick refreshHighlight just ran drove the outline the user was looking at when
     // they clicked — reusing it for the click itself removes a redundant `pick_block` round trip from
@@ -2457,6 +2738,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       return pick(cx, cy, maxDist);
     };
     const refreshHighlight = async () => {
+      if (suspendedNow) return; // 16.3 — no pick_block round-trips for a hidden pane
       const mode = interact3dRef.current;
       // In fly mode the crosshair is the cursor and the pointer may be locked (no pointerenter/leave,
       // no meaningful clientX/Y), so hover isn't a precondition there.
@@ -2937,6 +3219,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       }
       sculptActive = true;
       sculptBusy = false;
+      sculptStartT = performance.now();
       sculptGroupId = groupId;
       // Anchor = stroke-start column, fixed for the whole stroke (flatten/stamp read it; harmless for
       // the others). Captured once here so it never drifts to the live cursor on later ticks.
@@ -2948,6 +3231,9 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       // both slip past the guard during the pick's await window.
       sculptTimer = window.setInterval(() => {
         if (!sculptActive || sculptBusy) return;
+        // Absolute bound, mirroring buildRepeatTick: a release the webview never delivered ends the
+        // stroke here instead of stamping forever.
+        if (gestureTimedOut(sculptStartT, performance.now(), BUILD_GESTURE_MAX_MS)) { cancelSculptStroke(); return; }
         sculptBusy = true;
         (async () => {
           const hit = await pick(cursorX, cursorY); // crosshair while flying, pointer otherwise
@@ -2975,7 +3261,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       setGrabReadout(sculptGrabDelta);
     };
 
-    const onSculptUp = (e: PointerEvent) => {
+    const onSculptUp = (e: MouseEvent) => {
       if (e.button !== 0) return;
       if (sculptGrab) {
         const hit = sculptGrabPick, delta = sculptGrabDelta, gid = sculptGrabGroup;
@@ -3005,6 +3291,16 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     canvas.addEventListener("pointerdown", onSculptDown);
     canvas.addEventListener("pointermove", onSculptMove);
     canvas.addEventListener("pointerup", onSculptUp);
+    // Termination parity with the build path (onPickCancel / onPickMouseUpFallback): a pointercancel,
+    // or a capture lost without a pointerup (the pane moved between hosts mid-stroke, release outside
+    // the window), would otherwise leave the hold-timer stamping until the watchdog. A no-op after a
+    // normal release (pointerup already cleared the stroke; lostpointercapture then fires too).
+    const onSculptAbort = () => cancelSculptStroke();
+    // Legacy `mouseup` is a separate WebKit dispatch path — finish like a release if pointerup was dropped.
+    const onSculptMouseUpFallback = (e: MouseEvent) => { if (sculptActive || sculptGrab) onSculptUp(e); };
+    canvas.addEventListener("pointercancel", onSculptAbort);
+    canvas.addEventListener("lostpointercapture", onSculptAbort);
+    canvas.addEventListener("mouseup", onSculptMouseUpFallback);
 
     canvas.addEventListener("pointerdown", onPickDown);
     canvas.addEventListener("mousedown", onPickMouseDownFallback);
@@ -3056,19 +3352,23 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       if (e.key === "Escape") { cancelSculptStroke(); cancelGizmoDrag(); clearBuildShapeAnchor(); }
       if (e.key.toLowerCase() === "z" && !e.repeat && !e.metaKey && !e.ctrlKey) {
         // Z cycles camera mode (orbit → look → fly → orbit). Advancing *into* a walking mode from
-        // orbit requires the pointer to be over this pane (so Z while working in another quad-view
-        // pane is ignored); once walking, Z keeps cycling regardless of hover.
+        // orbit requires the pointer to be over this pane (so Z while working in another
+        // window is ignored); once walking, Z keeps cycling regardless of hover.
         if (flyModeRef.current || hoverRef.current) { cycleMode(); e.preventDefault(); }
         return;
       }
       // Esc leaves any walking mode back to orbit (releasing the OS cursor grab if look mode held it).
       if (flyModeRef.current && e.key === "Escape") { applyMode("orbit"); e.preventDefault(); return; }
       if (!flyModeRef.current) return;
-      keys.add(e.key.toLowerCase());
+      // A Ctrl-combo (Ctrl+Z/Y/S/…) is an accelerator, not the descend key — don't let it also sink
+      // the camera downward for the length of the keypress, and don't swallow it, so App's own
+      // Ctrl-shortcut handling (which now lets these through while flying, see App.tsx) still fires.
+      if (e.ctrlKey && e.key !== "Control") { keys.delete("control"); return; }
+      if (!keys.has(e.key.toLowerCase())) { keys.add(e.key.toLowerCase()); hudForce = true; invalidate(); } // 17.5: wake the loop
       // Swallow movement keys so they don't trigger app shortcuts.
       if (["w", "a", "s", "d", "e", "q", " ", "control", "shift", "alt"].includes(e.key.toLowerCase())) e.preventDefault();
     };
-    const onKeyUp = (e: KeyboardEvent) => { keys.delete(e.key.toLowerCase()); };
+    const onKeyUp = (e: KeyboardEvent) => { if (keys.delete(e.key.toLowerCase())) { hudForce = true; invalidate(); } };
     window.addEventListener("keydown", onKeyDown);
     window.addEventListener("keyup", onKeyUp);
 
@@ -3098,7 +3398,8 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     let lastEmitT = 0;
     let lastMemHudT = 0;
     let lastEmitExternalT = 0;
-    let lastEmitEX = NaN, lastEmitEY = NaN;
+    let lastEmitEX = NaN, lastEmitEY = NaN, lastEmitYaw = NaN;
+    const emitDir = new THREE.Vector3();
 
     // ---- Smooth camera transitions (C2) ------------------------------------------------------------
     // Tweens a programmatic camera jump (teleport, reset) instead of snapping — only while orbiting;
@@ -3107,7 +3408,9 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     const TWEEN_MS = 250;
     let camTween: { fromPos: THREE.Vector3; toPos: THREE.Vector3; fromTarget: THREE.Vector3; toTarget: THREE.Vector3; t0: number } | null = null;
     const startCamTween = (toPos: THREE.Vector3, toTarget: THREE.Vector3) => {
-      if (flyModeRef.current) {
+      // Suspended (16.3): snap, since no frame will tick a tween — and resume's restream must sweep
+      // around where the camera is going, not where it was when the pane was hidden.
+      if (flyModeRef.current || suspendedNow) {
         camera.position.copy(toPos);
         controls.target.copy(toTarget);
         controls.update();
@@ -3188,7 +3491,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       // the sweep and refetches. Restarting it here would stream geometry into a hidden pane.
       if (suspendedNow) return;
       sweepInterval = setInterval(streamSweep, STREAM_MS);
-      reloadAllChunks();
+      reloadAllChunks("restore");
       invalidate();
       onNoticeRef.current?.("3D view: graphics context restored — reloading terrain.");
     };
@@ -3196,7 +3499,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     canvas.addEventListener("webglcontextrestored", onContextRestored);
 
     // ---- Suspend / resume (Stage 4) ---------------------------------------------------------------
-    // App keeps this pane mounted when it's switched off or the user leaves quad view, so the WebGL
+    // App keeps this pane mounted when it's switched off or the user closes the 3D window, so the WebGL
     // context isn't destroyed and recreated on every toggle (WKWebView has a low ceiling on live
     // contexts, and churning them is a plausible contributor to the crash). Suspension is what makes
     // that free: no rAF, no streaming interval, and — the part that matters for memory — the whole
@@ -3229,6 +3532,10 @@ const FlyView3D = forwardRef<FlyView3DRef, {
         forceKeys.clear();
         for (const k of residentKeys()) disposeMesh(k);
         zBand = undefined;
+        // The GPU-shadow render target (up to 4096², two attachments) is the largest thing left once
+        // the meshes are gone. three.js reallocates it lazily on the first shadowed frame after resume.
+        sun.shadow.map?.dispose();
+        sun.shadow.map = null;
         pushMemHud();
       } else if (!contextLost && !contextGivenUp) {
         // `contextGivenUp` is redundant with `contextLost` today (the give-up path leaves the latter
@@ -3238,21 +3545,33 @@ const FlyView3D = forwardRef<FlyView3DRef, {
         // renderer to 1×1. Re-measure before the first frame or the pane comes back stretched.
         resize();
         sweepInterval = setInterval(streamSweep, STREAM_MS);
+        recordReload("resume");
         streamSweep(true); // meshes were disposed with the camera unmoved — must not early-out
+        // Lamps may have been placed/broken while hidden (updateNightLights refuses while suspended).
+        lastNightQueryPos.set(1e9, 0, 0);
+        updateNightLights();
         invalidate();
       }
     };
 
-    // Kick off: first chunk load + first render.
-    streamSweep();
-    invalidate();
+    // Kick off: first chunk load + first render — unless this closure is being rebuilt (world change)
+    // while the pane is hidden; the setSuspended(true) at the end of init parks it, and the fetches a
+    // kick-off issued here would only be dropped as stale (16.3).
+    if (!suspendedRef.current) {
+      streamSweep();
+      invalidate();
+    }
 
     // Hoisted function declaration so `invalidate` (defined above) can reference `frame` safely.
+    let prevContinuous = false; // did the previous frame schedule this one itself (vs. an idle wake)?
     function frame() {
       rafPending = false;
-      if (disposed || contextLost || suspendedNow) return;
+      if (disposed || contextLost || suspendedNow) { prevContinuous = false; return; }
       const now = performance.now();
-      recordFrameMs(now - prev); // unclamped — a stall this histogram exists to catch would vanish under the sim-step cap below
+      bumpPerf("sceneFrames");
+      // 9.7: only continuous frames count as an interval. After an idle gap `now - prev` is the time
+      // since the user last did anything, not a frame time, and used to land in the top buckets.
+      if (prevContinuous) recordFrameMs(now - prev); // unclamped — a stall this histogram exists to catch would vanish under the sim-step cap below
       const dt = Math.min(0.05, (now - prev) / 1000);
       prev = now;
 
@@ -3291,7 +3610,9 @@ const FlyView3D = forwardRef<FlyView3DRef, {
         if (keys.has(" ") || keys.has("e")) move.add(WORLD_UP);
         if (keys.has("control") || keys.has("q")) move.sub(WORLD_UP);
         if (move.lengthSq() > 0) camera.position.addScaledVector(move.normalize(), speed);
-        keepGoing = true; // actively flying — look/move may change every frame
+        // 17.5: only a held movement key keeps the loop alive. Look changes wake it via onMouseMove's
+        // invalidate(), key presses via onKeyDown/onKeyUp — a stationary camera stops redrawing.
+        for (const k of keys) if (FLY_MOVE_KEYS.has(k)) { keepGoing = true; break; }
       } else {
         if (controls.update()) keepGoing = true; // orbit damping still settling
       }
@@ -3347,10 +3668,23 @@ const FlyView3D = forwardRef<FlyView3DRef, {
 
       // While flying, the crosshair's target changes as the camera moves — with the pointer locked
       // there's no pointermove to drive it, so repick from the loop. Self-throttled to PICK_HOVER_MS.
-      if (flyModeRef.current && interact3dRef.current !== "none") void refreshHighlight();
+      // 17.5: only when the pose actually changed since the last pick (a stationary camera has the same
+      // target; edits/mode changes repick through api.refreshHighlight). A pick swallowed by the
+      // throttle/in-flight guard keeps the loop alive so the change isn't lost.
+      if (flyModeRef.current && interact3dRef.current !== "none") {
+        const p = camera.position, q = camera.quaternion;
+        if (!pickPoseValid || p.distanceToSquared(pickPos) > 0 || q.angleTo(pickQuat) > 0) {
+          const t0 = lastPickT;
+          void refreshHighlight();
+          if (lastPickT !== t0) { pickPos.copy(p); pickQuat.copy(q); pickPoseValid = true; }
+          else if (pickInflight || now - lastPickT < PICK_HOVER_MS) keepGoing = true;
+          else pickPoseValid = false; // gated out (no target to show) — repick when it opens up
+        }
+      }
 
       // Throttled HUD update (~10fps) — a self-contained re-render of this pane only, cheap.
-      if (now - lastEmitT >= 100) {
+      if (now - lastEmitT >= 100 || hudForce) {
+        hudForce = false;
         const ex = camera.position.x, ey = camera.position.z; // Three.js Z = Eden Y
         // Compass heading from the camera's forward direction (Eden north = Three.js −Z).
         camera.getWorldDirection(fwd);
@@ -3372,9 +3706,13 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       // update — a coarse map-dot position doesn't need 10Hz for that cost.
       if (now - lastEmitExternalT >= 300) {
         const ex = camera.position.x, ey = camera.position.z;
-        if (ex !== lastEmitEX || ey !== lastEmitEY) {
-          lastEmitEX = ex; lastEmitEY = ey;
-          onCameraMoveRef.current?.(ex, ey);
+        // Map-space heading for the view wedge: Eden X is three's X, Eden Y is three's Z.
+        camera.getWorldDirection(emitDir);
+        const yaw = Math.atan2(emitDir.z, emitDir.x);
+        if (ex !== lastEmitEX || ey !== lastEmitEY || Math.abs(yaw - lastEmitYaw) > 0.02) {
+          lastEmitEX = ex; lastEmitEY = ey; lastEmitYaw = yaw;
+          const hfov = 2 * Math.atan(Math.tan(THREE.MathUtils.degToRad(camera.fov) / 2) * camera.aspect);
+          onCameraMoveRef.current?.(ex, ey, yaw, hfov);
         }
         lastEmitExternalT = now;
       }
@@ -3397,7 +3735,16 @@ const FlyView3D = forwardRef<FlyView3DRef, {
           if (!m.geometry.boundingSphere) continue;
           m.visible = frustum.intersectsObject(m);
         }
+        const renderT0 = performance.now();
         renderer.render(scene, camera);
+        recordRenderMs(performance.now() - renderT0);
+        {
+          let visible = 0;
+          for (const m of meshes.values()) if (m.visible) visible++;
+          for (const m of meshesT.values()) if (m.visible) visible++;
+          for (const m of meshesE.values()) if (m.visible) visible++;
+          recordRenderStats(renderer.info.render.calls, visible);
+        }
         // Post-render, because the upload-release callbacks fire *inside* render() — this is the only
         // point where the JS-heap total reflects what actually got freed. Self-throttled and a no-op
         // unless `showPerfHud` is on (Stage 9.3).
@@ -3408,6 +3755,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       // Guarded on !rafPending: controls.update() above can synchronously dispatch "change" →
       // invalidate(), which already scheduled a callback for next tick — scheduling a second one
       // here would double the in-flight callback count every tick until damping settles.
+      prevContinuous = keepGoing || dirty;
       if ((keepGoing || dirty) && !rafPending) {
         rafPending = true;
         raf = requestAnimationFrame(frame);
@@ -3922,11 +4270,18 @@ const FlyView3D = forwardRef<FlyView3DRef, {
 
     sceneApi.current = {
       scene, camera, reloadChunk, reloadAllChunks, resetCamera, teleport, setOverlays, setFog, setMaxDpr,
+      exitLook: () => { if (camModeRef.current === "look") applyMode("orbit"); },
+      exitWalk: () => applyMode("orbit"),
       setLoadRadius,
       setGridVisible: (v) => { grid.visible = v; invalidate(); },
+      setSkyGradient: (zenith, horizon) => {
+        skyUniforms.topColor.value.set(zenith);
+        skyUniforms.bottomColor.value.set(horizon);
+        invalidate();
+      },
       // Flip the scene lighting, then rebuild every chunk mesh (material + normals + flat-vs-baked
       // geometry all differ between modes).
-      setGpuShadows: () => { applyGpuLighting(); reloadAllChunks(); },
+      setGpuShadows: () => { applyGpuLighting(); reloadAllChunks("gpuShadows"); },
       setSuspended,
       updateGpuLighting: () => applyGpuLighting(),
       refreshNightLights: () => updateNightLights(),
@@ -3961,8 +4316,8 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       }),
     };
 
-    // Apply initial gizmo state — a selection may already exist when the pane mounts (quad view /
-    // 3D pane toggled on with a selection already committed from the 2D map).
+    // Apply initial gizmo state — a selection may already exist when the pane mounts (3D view /
+    // window toggled on with a selection already committed from the 2D map).
     sceneApi.current.setGizmoSelection(interact3dRef.current, selectionBounds3dRef.current ?? null);
     // Same for suspension: a world change rebuilds this closure while the pane may already be hidden.
     if (suspendedRef.current) setSuspended(true);
@@ -3971,13 +4326,13 @@ const FlyView3D = forwardRef<FlyView3DRef, {
 
     return () => {
       disposed = true;
-      // If the pane unmounts while in a walking mode (e.g. closing the 3D pane or quad view via a
+      // If the pane unmounts while in a walking mode (e.g. closing the 3D window via a
       // click), notify the parent — otherwise its flyActiveRef never clears and every editor keyboard
       // shortcut stays disabled for the rest of the session. Also release any OS cursor grab so it's
       // never left frozen app-wide.
       if (flyModeRef.current) {
         flyModeRef.current = false;
-        if (camModeRef.current === "look") setNativeCursorLock(false);
+        if (camModeRef.current === "look") { setNativeCursorLock(false); onLookChangeRef.current?.(false); }
         onFlyModeChangeRef.current?.(false);
       }
       cancelSculptStroke();
@@ -3987,6 +4342,9 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       controls.removeEventListener("change", invalidate);
       ro.disconnect();
       document.removeEventListener("mousemove", onMouseMove);
+      document.removeEventListener("pointerlockchange", onPointerLockChange);
+      document.removeEventListener("pointerlockerror", onPointerLockError);
+      clearLockWatchdog();
       canvas.removeEventListener("wheel", onWheel);
       wrap.removeEventListener("pointerenter", onEnter);
       wrap.removeEventListener("pointerleave", onLeave);
@@ -3996,6 +4354,9 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       canvas.removeEventListener("pointerdown", onSculptDown);
       canvas.removeEventListener("pointermove", onSculptMove);
       canvas.removeEventListener("pointerup", onSculptUp);
+      canvas.removeEventListener("pointercancel", onSculptAbort);
+      canvas.removeEventListener("lostpointercapture", onSculptAbort);
+      canvas.removeEventListener("mouseup", onSculptMouseUpFallback);
       canvas.removeEventListener("pointerdown", onPickDown);
       canvas.removeEventListener("mousedown", onPickMouseDownFallback);
       canvas.removeEventListener("mouseup", onPickMouseUpFallback);
@@ -4064,7 +4425,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       //
       // On a real unmount React discards the canvas, so nothing can reuse the context and releasing
       // it explicitly is both safe and necessary: WKWebView holds a low ceiling on simultaneously
-      // live contexts, and toggling the 3D pane / quad view repeatedly used to strand one per
+      // live contexts, and toggling the 3D view repeatedly used to strand one per
       // teardown until the GC eventually collected the canvas. `unmountingRef` (set by the
       // definition-order-earlier effect above) is the signal; the deferred `isConnected` re-check is
       // the belt-and-braces guard, since React's StrictMode remount looks identical from in here at
@@ -4134,6 +4495,11 @@ const FlyView3D = forwardRef<FlyView3DRef, {
   useEffect(() => {
     sceneApi.current?.setMaxDpr(antialias ? 2 : MAX_DPR);
   }, [antialias]);
+
+  // Sky-dome gradient sync (15.8).
+  useEffect(() => {
+    sceneApi.current?.setSkyGradient(sky3d.zenith, sky3d.horizon);
+  }, [sky3d.zenith, sky3d.horizon]);
 
   // Floor grid visibility toggle (D3).
   useEffect(() => {
@@ -4256,7 +4622,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
 
   // Reload all chunk meshes when the texture epoch changes (pack loaded / unloaded / toggled).
   useEffect(() => {
-    sceneApi.current?.reloadAllChunks();
+    sceneApi.current?.reloadAllChunks("tex");
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [texEpoch]);
 
@@ -4267,10 +4633,10 @@ const FlyView3D = forwardRef<FlyView3DRef, {
   const capMountedRef = useRef(false);
   useEffect(() => {
     if (!capMountedRef.current) { capMountedRef.current = true; return; }
-    sceneApi.current?.reloadAllChunks();
+    sceneApi.current?.reloadAllChunks("cap", true);
   }, [viewCapZ]);
 
-  // Suspend/resume (Stage 4). App keeps this component mounted across the 3D-pane and quad-view
+  // Suspend/resume (Stage 4). App keeps this component mounted across the 3D-pane and 3D-window
   // toggles instead of unmounting it, so the WebGL context survives; `suspended` is what makes a
   // hidden pane free.
   useEffect(() => {
@@ -4280,8 +4646,19 @@ const FlyView3D = forwardRef<FlyView3DRef, {
   // Reload all chunk meshes when the night-lighting/shadow preview toggles change — but NOT in
   // GPU-shadow mode, where geometry is flat and independent of night/shadows/sunT. That's what makes
   // sunT free there: the per-frame sun-follow moves the light; no reload is needed.
+  // 17.6a: baked geometry reads `sunT` only while baked shadows are on, and lamp radius/profile only
+  // while baked night is on (`LightMode` in voxel-core geometry.rs), so a change to an input the
+  // current mode ignores must not restream the disc. `lightKeyRef` holds the last *effective* inputs.
+  const lightKeyRef = useRef<string | null>(null);
   useEffect(() => {
-    if (!gpuShadowsRef.current) { sceneApi.current?.reloadAllChunks(); return; }
+    if (!gpuShadowsRef.current) {
+      const key = `${nightLighting}|${shadows3d}|${shadows3d ? sunT : ""}|${nightLighting ? `${lampRadius}|${lightingProfile}` : ""}`;
+      if (key === lightKeyRef.current) return;
+      lightKeyRef.current = key;
+      sceneApi.current?.reloadAllChunks("light", true);
+      return;
+    }
+    lightKeyRef.current = null; // GPU mode reloads nothing; the first CPU-mode change after it must reload
     // GPU mode: geometry is flat regardless of night/shadows/sunT, so no chunk reload. Re-apply the
     // scene light state (a night toggle or lamp-radius change flips the point-light pool) then repaint.
     sceneApi.current?.updateGpuLighting();
@@ -4299,7 +4676,16 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       {/* Mode hint — pill badge style (A5) */}
       <div style={{
         position: "absolute", top: 6, left: 6, zIndex: 1, pointerEvents: "none",
-        display: "flex", alignItems: "center", gap: 6,
+        // HUD off (15.8): hidden, not unmounted — the pill/legend keep their state and refs.
+        display: showHud ? "flex" : "none", alignItems: "center", gap: 6,
+        // Stage 14.14: this row and the right-anchored Render/Fog/AA/Grid row are two independent
+        // `position: absolute` bands sharing the same top edge whenever `compactHud` is false — the
+        // right row's own full expanded width (render-distance slider + fog controls + AA/Grid/Reset,
+        // ~550-580px) was never subtracted from this one's available space, so a long WASD legend
+        // line (fly mode's, or a rare `loading`/`budgetLimited` badge alongside it) could run right
+        // into it. `flexWrap` lets this row grow *down* instead of *into* the other one; the
+        // `maxWidth` reservation is the fixed cost of that row at its full (non-`compactHud`) width.
+        flexWrap: "wrap", maxWidth: compactHud ? undefined : "calc(100% - 580px)",
       }}>
         {/* Clickable mirror of the Z key — click to cycle orbit → look → fly. A discoverable way
             into mouselook, and a way back when Z is being swallowed by whatever holds focus. */}
@@ -4317,54 +4703,34 @@ const FlyView3D = forwardRef<FlyView3DRef, {
         >
           {CAM_MODE_LABEL[camMode]}
         </button>
-        {camMode === "look" ? (
-          <span style={{ fontSize: 9, color: "#6ee7b7", pointerEvents: "none", lineHeight: 1.6 }}>
+        {compactHud ? null : camMode === "look" ? (
+          <span style={{ fontSize: 10, color: "#6ee7b7", pointerEvents: "none", lineHeight: 1.6 }}>
             WASD move · Space/E up · Ctrl/Q down · Shift boost<br />
             mouse look (free) · scroll speed · Z or Esc exit
           </span>
         ) : camMode === "fly" ? (
-          <span style={{ fontSize: 9, color: "#6ee7b7", pointerEvents: "none", lineHeight: 1.6 }}>
+          <span style={{ fontSize: 10, color: "#6ee7b7", pointerEvents: "none", lineHeight: 1.6 }}>
             WASD move · Space/E up · Ctrl/Q down · Shift boost<br />
             {interact3d === "sculpt"
               ? "left = sculpt (drag-look off) · Z→look to move+aim · scroll speed"
               : "drag look · scroll speed · Z or Esc exit"}
           </span>
         ) : (
-          <span style={{ fontSize: 9, color: "#61584f", pointerEvents: "none" }}>
+          <span style={{ fontSize: 10, color: "#61584f", pointerEvents: "none" }}>
             drag to orbit · scroll zoom · Z cycles mouselook → fly → orbit
           </span>
         )}
         {/* Speed indicator (A6) */}
         {camMode !== "orbit" && (
           <span style={{
-            padding: "1px 5px", borderRadius: 4, fontSize: 9, fontWeight: 700,
+            padding: "1px 5px", borderRadius: 4, fontSize: 10, fontWeight: 700,
             background: "rgba(52,211,153,0.12)", border: "1px solid rgba(52,211,153,0.3)",
             color: "#34d399",
           }}>
             {flySpeed.toFixed(1)}×
           </span>
         )}
-        {loadingCount > 0 && (
-          <span style={{
-            padding: "1px 5px", borderRadius: 4, fontSize: 9,
-            background: "rgba(131,120,108,0.12)", border: "1px solid rgba(131,120,108,0.25)",
-            color: "#83786c",
-          }}>
-            loading {loadingCount}…
-          </span>
-        )}
-        {budgetLimited && (
-          <span
-            title={`Resident chunk geometry hit the ${(geometryBudgetBytes / (1 << 20)).toFixed(0)} MB budget — the farthest chunks are being dropped to stay inside it, so the pane is showing less than the render distance asks for. Raise it in Settings → Memory budget, or lower the render distance.`}
-            style={{
-              padding: "1px 5px", borderRadius: 4, fontSize: 9,
-              background: "rgba(239,68,68,0.12)", border: "1px solid rgba(239,68,68,0.3)",
-              color: "#ef4444",
-            }}
-          >
-            render distance limited by memory
-          </span>
-        )}
+        <StreamBadges ref={badgesRef} budgetBytes={geometryBudgetBytes} />
         {/* Controls legend (D1) — the authoritative, always-available reference for every pane
             binding, including the ones with no on-canvas affordance. */}
         <div style={{ position: "relative", display: "flex", pointerEvents: "auto" }}>
@@ -4391,7 +4757,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
               role="dialog"
               aria-label="3D pane controls legend"
               style={{
-                ...glassMenuPanel,
+                ...hudPopover,
                 position: "absolute", top: 28, left: 0, zIndex: 10,
                 width: 300, maxHeight: 420, overflowY: "auto",
                 padding: 10, fontSize: 10, lineHeight: 1.5, color: "#dad6d2", fontWeight: 400,
@@ -4447,30 +4813,46 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       {/* Camera reset button (A4) — faded to stay out of the way of the viewport, full opacity on hover
           so the render-distance number and fog swatch are still legible when you look at this row. */}
       <div
-        style={{ position: "absolute", top: 6, right: 6, zIndex: 1, display: "flex", alignItems: "center", gap: 6, opacity: 0.5, transition: "opacity .12s" }}
+        style={{
+          position: "absolute", top: compactHud ? 34 : 6, right: 6, zIndex: 1, display: "flex", alignItems: "center", gap: 6,
+          flexWrap: compactHud ? "wrap" : undefined, justifyContent: "flex-end", maxWidth: "calc(100% - 12px)",
+          opacity: 0.5, transition: "opacity .12s",
+        }}
         onMouseEnter={e => { e.currentTarget.style.opacity = "1"; }}
         onMouseLeave={e => { e.currentTarget.style.opacity = "0.5"; }}
       >
+        {compactHud && (
+          <button
+            onClick={() => setHudMore(m => !m)}
+            title={hudMore ? "Hide view options" : "View options: render distance, fog, AA, grid"}
+            aria-label={hudMore ? "Hide view options" : "Show view options"}
+            aria-expanded={hudMore}
+            style={hudBtn({ padding: "2px 7px", fontSize: 10, color: "#afa69d" })}
+          >⋯</button>
+        )}
+        {(!compactHud || hudMore) && (<>
         {/* Render distance slider */}
-        <div style={chromeButton({
+        <div style={hudBtn({
           display: "flex", alignItems: "center", gap: 4,
           padding: "2px 6px", cursor: "default",
         })}>
-          <span style={{ fontSize: 9, color: "#83786c", userSelect: "none" }} aria-hidden="true">R</span>
-          <input
-            type="range" min={0} max={radiusToPos(MAX_RENDER_DISTANCE)} step={1} value={radiusToPos(renderDistanceDisplay)}
-            onChange={e => {
+          {/* `value`/`min`/`max` are all in the non-linear "pos" domain (`radiusToPos`/`posToRadius`)
+              — the displayed chunk count only matches 1:1 with slider position below pos 15, so the
+              label stays a formatted, non-editable span rather than becoming a click-to-type field
+              that would show the wrong number while typing. */}
+          <SliderRow
+            label="R" min={0} max={radiusToPos(MAX_RENDER_DISTANCE)} step={1}
+            value={radiusToPos(renderDistanceDisplay)}
+            onChange={v => {
               // Phase 3.2: drag only moves the local display value — no App re-render, no scene
               // re-sweep. The commit below does the real work on release.
-              setRenderDistanceDisplay(posToRadius(Number(e.target.value)));
+              setRenderDistanceDisplay(posToRadius(v));
             }}
-            onPointerUp={e => commitRenderDistance(posToRadius(Number((e.target as HTMLInputElement).value)))}
-            onKeyUp={e => commitRenderDistance(posToRadius(Number((e.target as HTMLInputElement).value)))}
+            onCommit={v => commitRenderDistance(posToRadius(v))}
+            format={v => String(posToRadius(v))}
+            accent="#83786c" width={150} labelWidth={10}
             title={`Render distance: ${renderDistanceDisplay} chunks`}
-            aria-label={`Render distance: ${renderDistanceDisplay} chunks`}
-            style={{ width: 150, cursor: "pointer", accentColor: "#83786c" }}
           />
-          <span style={{ fontSize: 9, color: "#afa69d", minWidth: 14, textAlign: "right", userSelect: "none" }} aria-hidden="true">{renderDistanceDisplay}</span>
           {renderDistanceDisplay > RENDER_DISTANCE_WARN_THRESHOLD && (
             <div style={{ position: "relative", display: "flex" }}>
               <button
@@ -4482,7 +4864,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
                 style={{
                   display: "flex", alignItems: "center", justifyContent: "center",
                   width: 13, height: 13, borderRadius: "50%", border: "none", padding: 0,
-                  background: "rgba(239,68,68,0.18)", color: "#ef4444", fontSize: 9, fontWeight: 700,
+                  background: "rgba(239,68,68,0.18)", color: "#ef4444", fontSize: 10, fontWeight: 700,
                   cursor: "pointer", lineHeight: 1,
                 }}
               >!</button>
@@ -4491,7 +4873,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
                   id="fly3d-distance-warning"
                   role="tooltip"
                   style={{
-                    ...glassMenuPanel,
+                    ...hudPopover,
                     position: "absolute", top: 18, right: 0, zIndex: 10,
                     width: 200, padding: 8, fontSize: 10, lineHeight: 1.4,
                     color: "#dad6d2", fontWeight: 400,
@@ -4505,7 +4887,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
           )}
         </div>
         {/* Fog/sky color override — editor viewer preference only, never written to world.sky */}
-        <div style={chromeButton({
+        <div style={hudBtn({
           display: "flex", alignItems: "center", gap: 4,
           padding: "2px 6px", cursor: "default",
         })}>
@@ -4514,34 +4896,34 @@ const FlyView3D = forwardRef<FlyView3DRef, {
             onClick={() => setFogOverride(!effectiveFogEnabled)}
             title={effectiveFogEnabled ? "Fog on — click to disable" : "Fog off — click to enable"}
             aria-label={effectiveFogEnabled ? "Fog on — click to disable" : "Fog off — click to enable"}
-            style={chromeButton({
-              padding: "1px 5px", fontSize: 9,
+            style={hudBtn({
+              padding: "1px 5px", fontSize: 10,
               color: effectiveFogEnabled ? "#afa69d" : "#61584f",
             })}
           >Fog {effectiveFogEnabled ? "✓" : "✗"}</button>
           {/* Fog model — soft (exponential haze) vs hard (linear cut) */}
           {effectiveFogEnabled && (
             <button
-              onClick={() => setFogSoft(s => !s)}
+              onClick={() => onSky3dChange?.({ fogSoft: !fogSoft })}
               title={fogSoft ? "Soft fog (exponential) — click for hard/linear" : "Hard fog (linear) — click for soft/exponential"}
               aria-label={fogSoft ? "Soft exponential fog — click to switch to hard linear fog" : "Hard linear fog — click to switch to soft exponential fog"}
-              style={chromeButton({ padding: "1px 5px", fontSize: 9, color: "#afa69d" })}
+              style={hudBtn({ padding: "1px 5px", fontSize: 10, color: "#afa69d" })}
             >{fogSoft ? "∿" : "│"}</button>
           )}
           <input
             type="color"
             value={rgbToHex(effectiveFogColor())}
-            onChange={e => setFogColorOverride(e.target.value)}
+            onChange={e => onSky3dChange?.({ fogColor: e.target.value })}
             title="Fog / sky color (editor view only — not saved to the world file)"
             aria-label="Fog and sky color (editor view only — not saved to the world file)"
             style={{ width: 20, height: 16, padding: 0, border: "none", background: "none", cursor: "pointer" }}
           />
           {fogColorOverride && (
             <button
-              onClick={() => setFogColorOverride(null)}
+              onClick={() => onSky3dChange?.({ fogColor: null })}
               title="Reset to world sky color"
               aria-label="Reset fog color to the world's own sky color"
-              style={chromeButton({ padding: "1px 5px", fontSize: 9, color: "#afa69d" })}
+              style={hudBtn({ padding: "1px 5px", fontSize: 10, color: "#afa69d" })}
             >↺</button>
           )}
         </div>
@@ -4549,19 +4931,81 @@ const FlyView3D = forwardRef<FlyView3DRef, {
           onClick={() => setAntialias(a => !a)}
           title={antialias ? "Antialiasing on — click to disable" : "Antialiasing off — click to enable (higher GPU cost)"}
           aria-label={antialias ? "Antialiasing on — click to disable" : "Antialiasing off — click to enable (higher GPU cost)"}
-          style={chromeButton({ padding: "2px 7px", fontSize: 10, color: antialias ? "#afa69d" : "#61584f" })}
+          style={hudBtn({ padding: "2px 7px", fontSize: 10, color: antialias ? "#afa69d" : "#61584f" })}
         >AA {antialias ? "✓" : "✗"}</button>
         <button
-          onClick={() => setGridVisible(v => !v)}
+          onClick={() => onSetShowGrid?.(!gridVisible)}
           title={gridVisible ? "Floor grid on — click to hide" : "Floor grid off — click to show"}
           aria-label={gridVisible ? "Floor grid on — click to hide" : "Floor grid off — click to show"}
-          style={chromeButton({ padding: "2px 7px", fontSize: 10, color: gridVisible ? "#afa69d" : "#61584f" })}
+          style={hudBtn({ padding: "2px 7px", fontSize: 10, color: gridVisible ? "#afa69d" : "#61584f" })}
         >Grid {gridVisible ? "✓" : "✗"}</button>
+        {/* Auto-orient disclosure (15.3) — moved out of the Ribbon's Mode group, which had no room
+            for a second row once it lost the old fixed-width mode slot's neighbour. Collapsed by
+            default; the command itself still lives in meta.ts/bind.ts for ⌘K. */}
+        <div style={{ position: "relative", display: "flex" }}>
+          <button
+            onClick={() => setAutoOrientOpen(o => !o)}
+            title={autoOrientOpen ? "Hide more options" : "More options — sky colours, Auto-orient"}
+            aria-label={autoOrientOpen ? "Hide more view options" : "Show more view options"}
+            aria-expanded={autoOrientOpen}
+            style={hudBtn({ padding: "2px 7px", fontSize: 10, color: "#afa69d" })}
+          >…</button>
+          {autoOrientOpen && (
+            <div
+              role="menu"
+              style={{
+                ...hudPopover,
+                position: "absolute", top: 18, right: 0, zIndex: 10, padding: 6, display: "flex",
+                flexDirection: "column", gap: 6, alignItems: "stretch", whiteSpace: "nowrap",
+              }}
+            >
+              {/* Sky gradient (15.8) — editor view only, like the fog colour: never written to world.sky */}
+              <div style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 10, color: "#afa69d" }}>
+                <span>Sky</span>
+                <input
+                  type="color"
+                  value={sky3d.zenith}
+                  onChange={e => onSky3dChange?.({ zenith: e.target.value })}
+                  title="Sky colour overhead (zenith) — editor view only, not saved to the world file"
+                  aria-label="Sky zenith colour (editor view only — not saved to the world file)"
+                  style={{ width: 20, height: 16, padding: 0, border: "none", background: "none", cursor: "pointer" }}
+                />
+                <input
+                  type="color"
+                  value={sky3d.horizon}
+                  onChange={e => onSky3dChange?.({ horizon: e.target.value })}
+                  title="Sky colour at the horizon — editor view only, not saved to the world file"
+                  aria-label="Sky horizon colour (editor view only — not saved to the world file)"
+                  style={{ width: 20, height: 16, padding: 0, border: "none", background: "none", cursor: "pointer" }}
+                />
+                <button
+                  onClick={() => onSky3dChange?.({ horizon: rgbToHex(effectiveFogColor()) })}
+                  title="Set the horizon colour to the current fog colour, so distant terrain fades into the sky seamlessly"
+                  aria-label="Match the sky horizon colour to the fog colour"
+                  style={hudBtn({ padding: "1px 5px", fontSize: 10, color: "#afa69d" })}
+                >match fog</button>
+                <button
+                  onClick={() => onSky3dChange?.({ zenith: DEFAULT_SKY3D.zenith, horizon: DEFAULT_SKY3D.horizon })}
+                  title="Reset the sky gradient to the default"
+                  aria-label="Reset the sky gradient to the default colours"
+                  style={hudBtn({ padding: "1px 5px", fontSize: 10, color: "#afa69d" })}
+                >↺</button>
+              </div>
+              <button
+                onClick={() => onSetAutoOrient3d?.(!autoOrient3d)}
+                title="Auto-orient ramps, wedges and doors to your facing when placing. Off = they keep the orientation picked in the Block picker."
+                aria-label={autoOrient3d ? "Auto-orient on — click to disable" : "Auto-orient off — click to enable"}
+                style={hudBtn({ padding: "2px 7px", fontSize: 10, color: autoOrient3d ? "#afa69d" : "#61584f" })}
+              >Auto-orient {autoOrient3d ? "✓" : "✗"}</button>
+            </div>
+          )}
+        </div>
+        </>)}
         <button
           onClick={() => sceneApi.current?.resetCamera()}
           title="Reset camera to world overview"
           aria-label="Reset camera to world overview"
-          style={chromeButton({ padding: "2px 7px", fontSize: 10, color: "#afa69d" })}
+          style={hudBtn({ padding: "2px 7px", fontSize: 10, color: "#afa69d" })}
         >⌂ Reset</button>
       </div>
       {camMode !== "orbit" && (
@@ -4573,13 +5017,13 @@ const FlyView3D = forwardRef<FlyView3DRef, {
         }}>+</div>
       )}
       {/* Camera position / heading HUD (Eden coords) */}
-      <CoordHud ref={hudRef} />
+      <div style={{ display: showHud ? "contents" : "none" }}><CoordHud ref={hudRef} /></div>
       {/* Resident-geometry readout — promoted out of dev-only behind `showPerfHud` (Stage 9.3), so a
           release build's user can watch it while trying a lower render distance / memory preset. */}
-      {showPerfHud && <GeomMemHud ref={memHudRef} />}
+      {showPerfHud && <div style={{ display: showHud ? "contents" : "none" }}><GeomMemHud ref={memHudRef} /></div>}
       {/* In-pane hotbar (bottom-centre, build mode only) — 5 pinned + 5 recent, mirrors the Ribbon
           hotbar and the 1-5/6-0 digit keys so the active slot never needs a glance back at the Ribbon. */}
-      {interact3d === "build" && hotbarSlots && hotbarSlots.length > 0 && (
+      {interact3d === "build" && showHotbarOverlay && hotbarSlots && hotbarSlots.length > 0 && (
         <div style={{
           position: "absolute", bottom: 6, left: "50%", transform: "translateX(-50%)", zIndex: 1,
           display: "flex", gap: 3, pointerEvents: "auto",
@@ -4600,7 +5044,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
                   outline: active ? `1px solid ${i < 5 ? "#a78bfa" : "#f472b6"}` : "none", outlineOffset: 1,
                 }}
               >
-                <span style={{ position: "absolute", top: 0, left: 2, fontSize: 6, color: "rgba(255,255,255,0.35)", lineHeight: 1, pointerEvents: "none", userSelect: "none" }}>{digit}</span>
+                <span style={{ position: "absolute", top: 0, left: 2, fontSize: 10, color: "rgba(255,255,255,0.35)", lineHeight: 1, pointerEvents: "none", userSelect: "none" }}>{digit}</span>
               </div>
             );
           })}
@@ -4628,7 +5072,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
                 aria-pressed={active}
                 onClick={(e) => { e.currentTarget.blur(); onSetInteract3d?.(seg.mode); }}
                 style={{
-                  padding: "2px 8px", borderRadius: 4, fontSize: 9, fontWeight: 700, letterSpacing: "0.05em",
+                  padding: "2px 8px", borderRadius: 4, fontSize: 10, fontWeight: 700, letterSpacing: "0.05em",
                   cursor: "pointer",
                   background: active ? `${seg.accent}2b` : "transparent",
                   border: `1px solid ${active ? seg.accent + "80" : "transparent"}`,
@@ -4659,7 +5103,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
                   aria-pressed={active}
                   onClick={(e) => { e.currentTarget.blur(); setBuildShape(s); }}
                   style={{
-                    padding: "2px 7px", borderRadius: 4, fontSize: 9, fontWeight: 700, letterSpacing: "0.03em",
+                    padding: "2px 7px", borderRadius: 4, fontSize: 10, fontWeight: 700, letterSpacing: "0.03em",
                     cursor: "pointer",
                     background: active ? "rgba(245,158,11,0.2)" : "transparent",
                     border: `1px solid ${active ? "rgba(245,158,11,0.5)" : "transparent"}`,
@@ -4681,7 +5125,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
               ? "Gizmo arrows move the selection region only (2D/slab views follow). Click to switch to moving its blocks (undoable). Same toggle as the Selection tab's Move: Box/Contents."
               : "Gizmo arrows relocate the selection's blocks (undoable move_selection). Click to switch to moving the region only. Same toggle as the Selection tab's Move: Box/Contents."}
             style={{
-              padding: "2px 8px", borderRadius: 4, fontSize: 9, fontWeight: 700, letterSpacing: "0.03em",
+              padding: "2px 8px", borderRadius: 4, fontSize: 10, fontWeight: 700, letterSpacing: "0.03em",
               pointerEvents: "auto", cursor: "pointer",
               background: moveWithContents ? "rgba(251,191,36,0.18)" : "rgba(131,120,108,0.18)",
               border: `1px solid ${moveWithContents ? "rgba(251,191,36,0.5)" : "rgba(131,120,108,0.35)"}`,
@@ -4692,7 +5136,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
         {interact3d !== "none" && (
           <div style={{
             display: "flex", alignItems: "center", gap: 6, pointerEvents: "none",
-            padding: "3px 7px", borderRadius: 4, fontSize: 9,
+            padding: "3px 7px", borderRadius: 4, fontSize: 10,
             background: "rgba(31,28,26,0.7)", border: "1px solid rgba(131,120,108,0.3)",
             color: interact3d === "sculpt" ? "#fdba74" : "#afa69d",
           }}>

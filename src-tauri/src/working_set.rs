@@ -102,15 +102,30 @@ mod imp {
                 // are going to make it.
                 if seen == TRIMMED_FOR.load(Relaxed) { continue; }
                 if now_ms().saturating_sub(seen) < IDLE_MS { continue; }
-                // Latch *before* acting, so every outcome — trimmed, no world loaded, mapping too
-                // small — stops this cycle repeating once a second until something real happens.
-                TRIMMED_FOR.store(seen, Relaxed);
 
+                // ⚠️ Do **not** latch `TRIMMED_FOR` yet. `state.read()` below can block for the
+                // duration of an in-flight write-guarded operation (a save, an edit, a sculpt
+                // stroke) — and `note_world_access()` keeps stamping `LAST_ACCESS` the whole time
+                // that write holds the lock. Latching `seen` before blocking would earn a trim at
+                // the exact moment the write finishes — the single least-idle instant possible —
+                // once we finally get the guard. Re-check after acquiring it instead: only treat
+                // `seen` as still valid, and only then latch, if nothing touched the lock while we
+                // waited for it.
                 let state = app.state::<crate::AppState>();
                 // ⚠️ Deliberately **not** `read_ws`: that stamps `LAST_ACCESS`, and the trimmer
                 // stamping its own clock would make `seen` advance every cycle and defeat the latch
-                // above. Same poison policy as `read_ws` — a panic elsewhere must not brick this.
+                // below. Same poison policy as `read_ws` — a panic elsewhere must not brick this.
                 let ws = state.read().unwrap_or_else(|p| p.into_inner());
+                if LAST_ACCESS.load(Relaxed) != seen {
+                    // Real activity landed while we waited for the guard (or the guard itself was
+                    // held by that activity) — this cycle's `seen` is stale. Don't latch: the next
+                    // poll will re-derive a fresh `seen` and re-apply the idle threshold to it.
+                    continue;
+                }
+                // Latch now that `seen` is confirmed current — every outcome from here (trimmed, no
+                // world loaded, mapping too small) stops this cycle repeating once a second until
+                // something real happens.
+                TRIMMED_FOR.store(seen, Relaxed);
                 let Some(world) = ws.world.as_ref() else { continue };
                 let len = world.bytes.len();
                 if len < MIN_TRIM_BYTES { continue; }

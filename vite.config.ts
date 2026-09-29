@@ -6,8 +6,19 @@ import tailwindcss from "@tailwindcss/vite";
 const host = process.env.TAURI_DEV_HOST;
 
 // https://vite.dev/config/
+// Short git hash for the Diagnostics report (17.1). Falls back to "unknown" where there is no .git
+// (the flattened public mirror, a source tarball) rather than failing the build.
+async function gitShortHash(): Promise<string> {
+  try {
+    // @ts-expect-error node builtin; no @types/node in this project
+    const { execSync } = await import("node:child_process");
+    return String(execSync("git rev-parse --short HEAD", { stdio: ["ignore", "pipe", "ignore"] })).trim() || "unknown";
+  } catch { return "unknown"; }
+}
+
 export default defineConfig(async () => ({
   plugins: [react(), tailwindcss()],
+  define: { __GIT_HASH__: JSON.stringify(await gitShortHash()) },
 
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
   //

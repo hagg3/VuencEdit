@@ -9,15 +9,15 @@
  * 2400 lines, and the same command had different glyphs on different tabs.
  */
 import {
-  Anvil, ArrowDown, ArrowLeft, ArrowRight, ArrowUp, Blend, Blocks, Box, Brush, Camera,
-  ChevronDown, ChevronUp, ChevronsUpDown, Circle, CircleHelp, ClipboardPaste,
+  Anvil, AppWindow, ArrowDown, ArrowLeft, ArrowLeftRight, ArrowRight, ArrowUp, Blend, Blocks, Box, Brush, Camera,
+  Check, ChevronDown, ChevronUp, ChevronsUpDown, Circle, CircleHelp, ClipboardPaste,
   Copy, CopyPlus, Crosshair, Cuboid, Download, Droplet, Droplets, Expand, Feather, FileInput,
-  FileOutput, FilePlus, Filter, Flag, Flame, FlipHorizontal2, FlipVertical2, FolderOpen, Frame,
+  FileOutput, FilePlus, Filter, Flag, Flame, FlipHorizontal2, FlipVertical2, FolderOpen, Frame, Gauge,
   Globe2, Grid2x2, Grid3x3, Hammer, Hand, History, House, Image, Info, Lasso, LayoutGrid, Layers,
-  Layers2, LibraryBig, Map, Maximize, Minimize2, Minus, Moon, Mountain, Move,
+  Layers2, LibraryBig, Link2, Link2Off, Map, Maximize, Maximize2, Minimize2, Minus, Moon, Mountain, Move,
   MoveHorizontal, Package, PaintBucket, PanelLeft, PanelRight, Pencil, Pentagon, Pickaxe, Pipette, Repeat,
-  Replace, RotateCw, Rows3, Save, SaveAll, Scissors, Settings, Shuffle, Slash, Snowflake,
-  Signpost, Sparkles, SprayCan, Square, SquareDashed, SquareSplitVertical, Stamp, Sun, Target,
+  Replace, RotateCcw, RotateCw, Rows3, Save, SaveAll, Scissors, Search, Settings, Shuffle, Slash, Snowflake,
+  Signpost, Sparkles, SprayCan, Square, SquareDashed, SquareSplitVertical, Stamp, Sun, Target, TriangleAlert,
   TrendingUp, Trash2, TreePine, Triangle, Undo2, Redo2, Upload, Wand2, Waves, Wind, X, ZoomIn,
   ZoomOut, Zap,
 } from "lucide-react";
@@ -65,10 +65,17 @@ const MAP = {
   more: ChevronsUpDown, split: ChevronDown,
   new: FilePlus, open: FolderOpen, download: Download, save: Save, saveAs: SaveAll,
   export: FileOutput, upload: Upload, properties: Info, settings: Settings, about: Info,
-  close: X, history: History, filter: Filter, sparkle: Sparkles, snow: Snowflake,
+  close: X, warning: TriangleAlert, history: History, filter: Filter, sparkle: Sparkles, snow: Snowflake,
   left: ArrowLeft, right: ArrowRight, up: ArrowUp, down: ArrowDown,
   // Splash / launcher
   world: Globe2,
+  // Floating windows (Stage 14.3/14.4) + Select
+  check: Check, swap: ArrowLeftRight, enlarge: Maximize2, restore: Minimize2, windows: AppWindow,
+  resetWindows: RotateCcw, link: Link2, linkOff: Link2Off,
+  // Command search (⌘K, Stage 14.6)
+  search: Search,
+  // Status bar segments (Stage 14.11)
+  fps: Gauge,
 } as const;
 
 export type IconName = keyof typeof MAP;
