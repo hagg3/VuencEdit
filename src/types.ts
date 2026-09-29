@@ -164,6 +164,55 @@ export function decodeSelectionMask(buf: IpcBinary): SelectionMaskInfo | null {
   return header === null ? null : { ...header, bits: body };
 }
 
+// ---- Paste lens (UI redesign r3, Stage 14.9 — `render_paste_lens`) ----
+
+/**
+ * One decoded front/side elevation from `render_paste_lens`. `pixels` is RGBA, row-major, already
+ * coloured server-side (terrain / ghost tinted toward clipboard green / buried red / cleared amber
+ * hatch — see the backend's `voxel_core::render::paste_lens` doc comment) — the frontend only blits
+ * it and draws the Z ruler + ghost-bottom line on top; it does no compositing of its own.
+ *
+ * `lod` is world columns per output-image column (Z rows are always 1:1, per `PixelPatch`'s LOD
+ * convention elsewhere in this file). `colLo` is the world coordinate (X for front, Y for side) of
+ * image column 0; `zLo`/`zHi` are the world Z of the image's last/first row. `ghostZMin`/`ghostZMax`
+ * are null when every clipboard column is skipped (nothing would be pasted — e.g. every column
+ * fell outside a shaped clipboard's mask, or terrain mode found no surface anywhere).
+ */
+export interface PasteLensResult {
+  width: number; height: number; lod: number;
+  colLo: number; zLo: number; zHi: number;
+  footprintLo: number; footprintHi: number;
+  ghostZMin: number | null; ghostZMax: number | null;
+  /** Cell counts over the whole clipboard volume (not pixels) — see `approx`. */
+  buried: number; cleared: number; floatingCols: number;
+  /** The three counts above were estimated from a strided sample (a huge clipboard) — show "≈". */
+  approx: boolean;
+  pixels: Uint8Array;
+}
+
+type PasteLensHeader = {
+  width: number; height: number; lod: number;
+  col_lo: number; z_lo: number; z_hi: number;
+  footprint_lo: number; footprint_hi: number;
+  ghost_z_min: number | null; ghost_z_max: number | null;
+  buried: number; cleared: number; floating_cols: number;
+  approx: boolean;
+};
+
+/** Decode a `render_paste_lens` binary response (audit H2 framing — see codec.ts). */
+export function decodePasteLens(buf: IpcBinary): PasteLensResult {
+  const { header: h, body } = decodeEnvelope<PasteLensHeader>(buf);
+  return {
+    width: h.width, height: h.height, lod: h.lod,
+    colLo: h.col_lo, zLo: h.z_lo, zHi: h.z_hi,
+    footprintLo: h.footprint_lo, footprintHi: h.footprint_hi,
+    ghostZMin: h.ghost_z_min, ghostZMax: h.ghost_z_max,
+    buried: h.buried, cleared: h.cleared, floatingCols: h.floating_cols,
+    approx: h.approx,
+    pixels: body,
+  };
+}
+
 export interface ClipboardInfo {
   width: number;
   height: number;

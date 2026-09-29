@@ -1,10 +1,23 @@
-// Shared "X Design System" chrome recipes — dense adaptation (see Ribbon.tsx
-// header comment). Buttons/panels/menus across modals reuse these so the
-// whole app reads as one consistent glass/gradient chrome language.
+// Modal chrome recipes. Since UI redesign r3 (Stage 14.1) these are re-backed by the theme module
+// (`src/theme/`): the warm modal glass is **the official second surface** (`surface.modal`, with
+// its own AA text ramp `modalText.*`), not a leftover. The app menu moved off it onto the slate
+// popover material. Every dialog now renders through `src/ui/Dialog.tsx`, which owns the actual
+// panel/button chrome (`glassPanel`/`chromeButton`/`chromeButtonAccent`/`glassTab`/`glassMenuPanel`
+// and `EDEN_TEAL_READABLE` were retired with Stage 14.17's last caller) — this file is down to the
+// backdrop scrim, the modal text ramp, and small stateless recipes (badges, the spinner, the well
+// input chrome, the accent-ring helper) that `Dialog`-based bodies still reach for directly.
 import type { CSSProperties } from "react";
+import { ACCENTS, MODAL_TEXT_ROLES, RAMP, mix } from "./theme/theme";
+
+/** Modal text ramp (warm). Every step passes AA on both modal surfaces (contrast.test.ts). */
+export const MODAL_TEXT = MODAL_TEXT_ROLES;
 
 export const EDEN_TEAL = "0,164,173";
-export const EDEN_TEAL_READABLE = "#00dde9";
+
+/** Lightened teal tint (same recipe as `AboutPanel.tsx`'s `TEAL_LIGHT`, replacing the retired
+ *  `EDEN_TEAL_READABLE` — UI redesign r3, Stage 14.17 cleanup) for the loading spinner, which
+ *  renders on both the warm modal surface and the slate popover material. */
+const TEAL_LIGHT = mix(RAMP.white, ACCENTS.primary, 0.5);
 
 // Dialog/panel backdrop — dims + very slightly blurs the app behind a modal.
 export const glassBackdrop: CSSProperties = {
@@ -13,39 +26,6 @@ export const glassBackdrop: CSSProperties = {
   backdropFilter: "blur(2px)", WebkitBackdropFilter: "blur(2px)",
   display: "flex", alignItems: "center", justifyContent: "center",
 };
-
-// Glass panel chrome for modal bodies — gradient fill, bright top hairline,
-// deep inner vignette, teal-tinted outer glow ring.
-export function glassPanel(extra?: CSSProperties): CSSProperties {
-  return {
-    background: "linear-gradient(180deg, rgb(34,29,25) 0%, rgb(24,20,17) 100%)",
-    boxShadow: "inset 0 1px 0 rgba(255,255,255,.06), inset 0 0 30px rgba(0,0,0,.35), 0 20px 50px rgba(0,0,0,.5)",
-    borderRadius: 6,
-    ...extra,
-  };
-}
-
-// Neutral gradient chrome button (matches Ribbon's `rb`).
-export function chromeButton(extra?: CSSProperties): CSSProperties {
-  return {
-    background: "linear-gradient(180deg, rgb(46,58,82) 0%, rgb(26,34,52) 100%)",
-    border: "none",
-    boxShadow: "inset 0 0 0 1px rgba(0,0,0,.5), 0 .5px .5px rgba(255,255,255,.15)",
-    color: "#dad6d2", borderRadius: 6, cursor: "pointer", outline: "none",
-    ...extra,
-  };
-}
-
-// Accent-tinted "primary" chrome button — pass an accent hex + its rgb triplet.
-export function chromeButtonAccent(rgb: string, accent: string, extra?: CSSProperties): CSSProperties {
-  return {
-    background: `linear-gradient(180deg, rgba(${rgb},0.32) 0%, rgba(${rgb},0.10) 100%)`,
-    border: "none",
-    boxShadow: `inset 0 0 0 1px ${accent}, 0 .5px .5px rgba(255,255,255,.2)`,
-    borderRadius: 6, cursor: "pointer", outline: "none",
-    ...extra,
-  };
-}
 
 /**
  * Accent hairline for a `chromeButton`. ⚠️ Chrome buttons set `border: none` and draw their
@@ -66,37 +46,14 @@ export const recessedWell: CSSProperties = {
   boxShadow: "inset 0 0 0 1px rgba(0,0,0,.4), inset 0 2px 3px rgba(0,0,0,.35)",
 };
 
-// Glass dropdown/context-menu panel (matches Ribbon's `dropStyle`).
-export const glassMenuPanel: CSSProperties = {
-  background: "linear-gradient(180deg, rgba(34,29,25,.95) 0%, rgba(20,17,14,.95) 100%)",
-  backdropFilter: "blur(12px)", WebkitBackdropFilter: "blur(12px)",
-  border: "1px solid rgba(255,255,255,.12)",
-  borderRadius: 6,
-  boxShadow: "0 10px 28px rgba(0,0,0,0.75), inset 0 1px 0 rgba(255,255,255,.06)",
-};
-
-export function menuHoverOn(e: React.MouseEvent<HTMLElement>) { e.currentTarget.style.background = `rgba(${EDEN_TEAL},0.18)`; }
+export function menuHoverOn(e: React.MouseEvent<HTMLElement>) { e.currentTarget.style.background = "rgba(255,255,255,.07)"; }
 export function menuHoverOff(e: React.MouseEvent<HTMLElement>) { e.currentTarget.style.background = ""; }
-
-// Tab strip for modal-internal tabs (New World, Help, etc.) — same idiom as
-// the ribbon's top-level tabs: gradient fill + accent framing the top corners.
-export function glassTab(active: boolean, accent = `rgb(${EDEN_TEAL})`, accentRgb = EDEN_TEAL): CSSProperties {
-  return {
-    background: active
-      ? `linear-gradient(180deg, rgba(${accentRgb},0.30) 0%, rgba(${accentRgb},0.09) 45%, rgb(24,20,17) 100%)`
-      : "linear-gradient(180deg, rgba(255,255,255,0.05) 0%, rgba(255,255,255,0.02) 100%)",
-    border: "none",
-    borderTop: `1px solid ${active ? accent : "transparent"}`,
-    boxShadow: active ? "inset 0 1px 0 rgba(255,255,255,.12)" : "none",
-    cursor: "pointer", outline: "none",
-  };
-}
 
 // Experimental-feature badge ("exp") — amber. One shared style so every "exp" tag
 // across the app (Ribbon, New World, World Browser, app menu) renders identically.
 export function expBadge(extra?: CSSProperties): CSSProperties {
   return {
-    fontSize: 8, color: "#f59e0b", background: "rgba(245,158,11,0.12)",
+    fontSize: 8, color: RAMP.badgeExpModal, background: "rgba(245,158,11,0.12)",
     border: "1px solid rgba(245,158,11,0.3)", borderRadius: 3, padding: "0 3px", lineHeight: "14px",
     ...extra,
   };
@@ -106,7 +63,7 @@ export function expBadge(extra?: CSSProperties): CSSProperties {
 // toggle (night lighting, shadows) reads differently from a merely-experimental one.
 export function perfBadge(extra?: CSSProperties): CSSProperties {
   return {
-    fontSize: 8, color: "#f87171", background: "rgba(248,113,113,0.12)",
+    fontSize: 8, color: RAMP.badgePerfModal, background: "rgba(248,113,113,0.12)",
     border: "1px solid rgba(248,113,113,0.35)", borderRadius: 3, padding: "0 3px", lineHeight: "14px",
     ...extra,
   };
@@ -125,7 +82,7 @@ export function spinnerStyle(size = 20, extra?: CSSProperties): CSSProperties {
   return {
     width: size, height: size,
     border: "2px solid rgba(255,255,255,0.08)",
-    borderTopColor: EDEN_TEAL_READABLE,
+    borderTopColor: TEAL_LIGHT,
     borderRadius: "50%",
     animation: "eden-spin 0.7s linear infinite",
     ...extra,

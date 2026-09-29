@@ -16,7 +16,10 @@ export interface TourCtx {
   setRibbonCollapsed: (v: boolean) => void;
   setSidebarOpen: (v: boolean) => void;
   setSidebarTab: (t: SidebarTab) => void;
-  setLeftToolbarOpen: (v: boolean) => void;
+  /** Open (and expand) the Tools window — the floating six-button quick-tools pane (Stage 14.3). */
+  openToolsWindow: () => void;
+  /** Open (and expand) the Hotbar window — pinned/recent block slots (Stage 14.5). */
+  openHotbarWindow: () => void;
 }
 
 export interface TourStep {
@@ -37,9 +40,33 @@ export interface TourStep {
   before?: (c: TourCtx) => void;
 }
 
+/**
+ * Every selector a tour step points at, in one place (Stage 14.16), so moving a target is one edit
+ * here plus the `data-tour`/`data-group` attribute it names — and `tour/anchors.test.ts` checks the
+ * two still agree. `data-tour` values are set by the component that owns the surface
+ * (`FloatingWindow`'s `dataTour`, App's map pane, …); `data-group` ids are the ribbon's group ids.
+ */
+export const TOUR_ANCHORS = {
+  /** The main pane — the map, or the 3D view while swapped. */
+  map: '[data-tour="map"]',
+  ribbonTabs: '[role="tablist"][aria-label="Ribbon tabs"]',
+  fileMenu: ".rbn-brand",
+  toolsWindow: '[data-tour="left-toolbar"]',
+  hotbarWindow: '[data-tour="hotbar"]',
+  blockGroup: '#ribbon-tabpanel [data-group="block"]',
+  toolsGroup: '#ribbon-tabpanel [data-group="tools"]',
+  maskGroup: '#ribbon-tabpanel [data-group="mask"]',
+  selectionGroup: '#ribbon-tabpanel [data-group="selection"]',
+  navigationGroup: '#ribbon-tabpanel [data-group="navigation"]',
+  layoutGroup: '#ribbon-tabpanel [data-group="layout"]',
+  sidebar: '[data-tour="sidebar"]',
+  undo: '.rbn-btn[aria-label="Undo"]',
+  help: '[aria-label="Help"]',
+} as const;
+
 /** The ribbon's tab strip — folded into every ribbon-group step's cutout (see `secondaryTargets`
  *  above) so the active tab stays legible while the step spotlights a group beneath it. */
-const RIBBON_TABLIST = '[role="tablist"][aria-label="Ribbon tabs"]';
+const RIBBON_TABLIST = TOUR_ANCHORS.ribbonTabs;
 
 function Kbd({ children }: { children: ReactNode }) {
   return (
@@ -58,7 +85,7 @@ export const TOUR_STEPS: TourStep[] = [
     target: null,
     body: (
       <>
-        A quick, ~13-step tour of the main surfaces — about a minute. Press <Kbd>Esc</Kbd> to skip
+        A quick tour of the main surfaces — about a minute. Press <Kbd>Esc</Kbd> to skip
         at any point; you can replay this any time from the Help window.
       </>
     ),
@@ -66,7 +93,7 @@ export const TOUR_STEPS: TourStep[] = [
   {
     id: "map",
     title: "The map",
-    target: '[data-tour="map"]',
+    target: TOUR_ANCHORS.map,
     body: (
       <>
         Top-down view of the world. Middle-drag (or hold <Kbd>Space</Kbd>) to pan, scroll to zoom,
@@ -77,7 +104,7 @@ export const TOUR_STEPS: TourStep[] = [
   {
     id: "ribbon",
     title: "The ribbon",
-    target: '[role="tablist"][aria-label="Ribbon tabs"]',
+    target: TOUR_ANCHORS.ribbonTabs,
     before: (c) => c.setRibbonCollapsed(false),
     body: (
       <>
@@ -89,34 +116,42 @@ export const TOUR_STEPS: TourStep[] = [
   {
     id: "file-menu",
     title: "The File menu",
-    target: ".rbn-brand",
+    target: TOUR_ANCHORS.fileMenu,
     body: "New, Open, Download, Save, Upload, Export, Settings and Help all live behind this button.",
   },
   {
     id: "left-toolbar",
-    title: "The tool rail",
-    target: '[data-tour="left-toolbar"]',
-    before: (c) => c.setLeftToolbarOpen(true),
-    body: "Everyday draw and select tools, one click away — each with its own one-key shortcut.",
+    title: "The Tools window",
+    target: TOUR_ANCHORS.toolsWindow,
+    before: (c) => c.openToolsWindow(),
+    body: "Everyday draw and select tools, one click away — each with its own one-key shortcut. Drag its title bar to move it; hold a button for its variants.",
   },
   {
-    id: "palette",
+    id: "block",
     title: "Active block",
-    target: '#ribbon-tabpanel [data-group="palette"]',
+    target: TOUR_ANCHORS.blockGroup,
     secondaryTargets: [RIBBON_TABLIST],
     before: (c) => c.setRibbonTab("home"),
+    body: "The block and paint you're currently placing. Click it to browse every block & paint.",
+  },
+  {
+    id: "hotbar",
+    title: "The Hotbar window",
+    target: TOUR_ANCHORS.hotbarWindow,
+    before: (c) => c.openHotbarWindow(),
     body: (
       <>
-        The block and paint you're currently placing. <Kbd>1</Kbd>–<Kbd>5</Kbd> arm pinned
-        blocks, <Kbd>6</Kbd>–<Kbd>0</Kbd> jump to recently used ones.
+        Pinned blocks and recently used ones, always one keystroke away: <Kbd>1</Kbd>–<Kbd>5</Kbd> arm
+        pinned slots, <Kbd>6</Kbd>–<Kbd>0</Kbd> jump to recent ones. Hover a slot to pin or unpin it,
+        or click ▣ to open the full picker from here.
       </>
     ),
   },
   {
     id: "draw-tools",
     title: "Draw tools",
-    target: '#ribbon-tabpanel [data-group="tools"]',
-    secondaryTargets: [RIBBON_TABLIST, '#ribbon-tabpanel [data-group="mask"]'],
+    target: TOUR_ANCHORS.toolsGroup,
+    secondaryTargets: [RIBBON_TABLIST, TOUR_ANCHORS.maskGroup],
     before: (c) => c.setRibbonTab("draw"),
     body: (
       <>
@@ -128,7 +163,7 @@ export const TOUR_STEPS: TourStep[] = [
   {
     id: "sculpt-tools",
     title: "Sculpt tools",
-    target: '#ribbon-tabpanel [data-group="tools"]',
+    target: TOUR_ANCHORS.toolsGroup,
     secondaryTargets: [RIBBON_TABLIST],
     before: (c) => c.setRibbonTab("sculpt"),
     body: (
@@ -142,8 +177,8 @@ export const TOUR_STEPS: TourStep[] = [
   {
     id: "selection",
     title: "Selecting",
-    target: '#ribbon-tabpanel [data-group="selection"]',
-    secondaryTargets: [RIBBON_TABLIST, '#ribbon-tabpanel [data-group="navigation"]'],
+    target: TOUR_ANCHORS.selectionGroup,
+    secondaryTargets: [RIBBON_TABLIST, TOUR_ANCHORS.navigationGroup],
     before: (c) => c.setRibbonTab("home"),
     body: (
       <>
@@ -156,22 +191,34 @@ export const TOUR_STEPS: TourStep[] = [
   {
     id: "view-layout",
     title: "View layouts",
-    target: '#ribbon-tabpanel [data-group="layout"]',
-    secondaryTargets: [RIBBON_TABLIST, '[data-tour="map"]'],
+    target: TOUR_ANCHORS.layoutGroup,
+    secondaryTargets: [RIBBON_TABLIST, TOUR_ANCHORS.map],
     before: (c) => c.setRibbonTab("view"),
-    body: "Quad view (Hammer-style Top/Front/Side/3D), the 3D fly-through pane, and cutaway view for working on caves and interiors.",
+    body: "The 3D view floats over the map as a window — swap them with Tab or ⇄ — plus which floating windows are shown. The Render group's Relief shades the map's slopes so hills and cliffs read at a glance.",
+  },
+  {
+    id: "context-panels",
+    title: "Mode panels",
+    target: null,
+    body: (
+      <>
+        Some modes bring a small panel of their own — the brush shape while sculpting, the level
+        while in Z-slice or Cutaway, the build slot in the 3D view. It appears with the mode and
+        its ✕ leaves the mode, so there's nothing to hunt for in the ribbon.
+      </>
+    ),
   },
   {
     id: "sidebar",
     title: "The sidebar",
-    target: '[data-tour="sidebar"]',
+    target: TOUR_ANCHORS.sidebar,
     before: (c) => c.setSidebarOpen(true),
     body: "Docked to the right edge: Inspector, Prefabs and undo History, all in one tabbed panel.",
   },
   {
     id: "undo",
     title: "Undo & autosave",
-    target: '.rbn-btn[aria-label="Undo"]',
+    target: TOUR_ANCHORS.undo,
     body: (
       <>
         <Kbd>{MOD}Z</Kbd> / <Kbd>{MOD}{SHIFT}Z</Kbd> undo and redo — also listed in the sidebar's
@@ -182,7 +229,7 @@ export const TOUR_STEPS: TourStep[] = [
   {
     id: "help",
     title: "Help",
-    target: '[aria-label="Help"]',
+    target: TOUR_ANCHORS.help,
     body: "The full keyboard map and tool reference live here — and you can replay this tour any time from this button.",
   },
 ];

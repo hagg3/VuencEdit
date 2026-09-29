@@ -2,9 +2,11 @@ import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { decodePreviewData, type SelectionInfo, type PreviewData } from "./types";
 import { MAX_CANVAS_DPR } from "./viewportUtils";
+import { previewCanvas } from "./previewCanvas";
 import {
   ACCENT, BORDER, TEXT, TEXT_ARMED, TEXT_LABEL, hexToRgbTriplet,
 } from "./ribbon/tokens";
+import { Check } from "./ribbon/primitives";
 
 /** HiDPI backing store for this panel's canvas — see viewportUtils. The element keeps its CSS
  *  size (canvasW × canvasH); only the backing store and the base transform are scaled. */
@@ -98,13 +100,7 @@ function drawSection(
   let scale = 1, dw = 0, dh = 0, ox = 0, oy = yStart;
 
   if (data && data.width > 0 && data.height > 0) {
-    const off = document.createElement("canvas");
-    off.width  = data.width;
-    off.height = data.height;
-    const offCtx = off.getContext("2d")!;
-    const img = offCtx.createImageData(data.width, data.height);
-    img.data.set(data.pixels);
-    offCtx.putImageData(img, 0, 0);
+    const off = previewCanvas(data);
 
     const baseScale = Math.min(sectionW / data.width, availH / data.height);
     scale = baseScale * zoom;
@@ -123,13 +119,7 @@ function drawSection(
     const hH   = Math.max(1, (sel.z_max - sel.z_min + 1) * scale);
     if (isPastePreview) {
       if (clipData) {
-        const clipOff = document.createElement("canvas");
-        clipOff.width  = clipData.width;
-        clipOff.height = clipData.height;
-        const clipOffCtx = clipOff.getContext("2d")!;
-        const clipImg = clipOffCtx.createImageData(clipData.width, clipData.height);
-        clipImg.data.set(clipData.pixels);
-        clipOffCtx.putImageData(clipImg, 0, 0);
+        const clipOff = previewCanvas(clipData);
         const selAxisSize = view === "front" ? sel.width : sel.height;
         const ctxCols = (data.width - selAxisSize) / 2;
         ctx.save();
@@ -335,7 +325,7 @@ export default function ElevationPreviewPanel({
     ctx.fillText("FRONT", 3, 3);
     ctx.fillStyle = "rgba(0,0,0,0.55)";
     ctx.fillRect(0, topH, 38, 14);
-    ctx.fillStyle = ACCENT.green;
+    ctx.fillStyle = ACCENT.clipboard;
     ctx.fillText("SIDE", 3, topH + 3);
     // Divider line between sections
     ctx.strokeStyle = "rgba(175,166,157,0.3)";
@@ -436,18 +426,15 @@ export default function ElevationPreviewPanel({
             title="Reset zoom and pan"
           >{zoom.toFixed(1)}× ✕</button>
         )}
-        <label
-          style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 3, cursor: "pointer" }}
-          title="Show ±7 context columns outside the selection boundary"
-        >
-          <input
-            type="checkbox"
-            checked={showContext}
-            onChange={e => setShowContext(e.target.checked)}
-            style={{ accentColor: ACCENT.primary }}
+        {/* Fixed short height: Check is SMALL_H tall, and this header row is only ~14px — centre it
+            so it overhangs rather than growing the row. */}
+        <div style={{ marginLeft: "auto", height: 16, display: "flex", alignItems: "center" }}>
+          <Check
+            checked={showContext} onChange={setShowContext}
+            title="Show ±7 context columns outside the selection boundary"
+            label={<span style={{ color: TEXT_LABEL, fontSize: 10, whiteSpace: "nowrap" }}>± context cols</span>}
           />
-          <span style={{ color: TEXT_LABEL, fontSize: 10, whiteSpace: "nowrap" }}>± context cols</span>
-        </label>
+        </div>
       </div>
 
       <canvas

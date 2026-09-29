@@ -2,10 +2,18 @@ import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { save } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
-import Modal from "./Modal";
 import type { WorldMeta } from "./types";
 import type { MaterializeSelectionBounds } from "./MapCanvas";
 import { MAX_MATERIALIZE_CHUNKS } from "./MapCanvas";
+import { MODAL_TEXT } from "./designTokens";
+import { ACCENTS, DANGER_HEX, RAMP, armedRecipe, mix } from "./theme/theme";
+import { SliderRow } from "./ribbon/primitives";
+import Dialog, { DialogButton } from "./ui/Dialog";
+
+// Lightened tints for text sitting directly on the warm modal surface (mechanical hex-literal
+// migration, Stage 14.15) — plain accent/danger hex fails AA there; these clear it with margin.
+const RED_LIGHT = mix(RAMP.white, DANGER_HEX, 0.5);
+const GREEN_TEXT = armedRecipe(ACCENTS.clipboard).text;
 
 interface Props {
   world: WorldMeta;
@@ -92,140 +100,108 @@ export default function MaterializeModal({ world, bounds, onClose, onMaterialize
     invoke("cancel_materialize").catch(() => {});
   }
 
+  const footer = running ? (
+    <DialogButton onClick={cancel}>Cancel</DialogButton>
+  ) : (
+    <>
+      <DialogButton onClick={onClose}>Cancel</DialogButton>
+      <DialogButton variant="primary" onClick={run} disabled={tooLarge || depthTooLarge}>
+        Choose Output File &amp; Materialize
+      </DialogButton>
+    </>
+  );
+
   return (
-    <Modal onClose={onClose} zIndex={1000} labelledBy="materialize-title"
-      closeOnBackdrop={false} closeOnEsc={!running} backdropStyle={{ background: "rgba(0,0,0,0.7)" }}>
-      <div style={{
-        background: "#1e1b18", border: "1px solid #71665c", borderRadius: 10,
-        padding: "24px 28px", minWidth: 380, maxWidth: 460,
-        boxShadow: "0 16px 48px rgba(0,0,0,0.7)",
-      }}>
-        <div id="materialize-title" style={{ fontSize: 15, fontWeight: 600, color: "#ebe9e7", marginBottom: 12 }}>
-          Materialize Chunk Space
-        </div>
+    <Dialog size="sm" icon="materialize" title="Materialize Chunk Space" onClose={onClose} busy={running} footer={footer}>
+      {!running && result === null && (
+        <>
+          <div style={{ fontSize: 12, color: MODAL_TEXT.secondary, marginBottom: 14, lineHeight: 1.5 }}>
+            Writes {nChunks.toLocaleString()} ungenerated chunk{nChunks === 1 ? "" : "s"} as real flat
+            terrain{beyond ? " (this selection extends beyond the current map edge)" : ""}, to a
+            <strong style={{ color: MODAL_TEXT.primary }}> new output file</strong>. This is non-undoable and
+            cannot edit the currently open world in place.
+          </div>
+          <div style={{
+            fontSize: 12, color: RED_LIGHT, background: "rgba(220,38,38,0.12)",
+            border: "1px solid rgba(220,38,38,0.35)", borderRadius: 6, padding: "8px 10px", marginBottom: 16, lineHeight: 1.5,
+          }}>
+            Completing this will <strong>replace the currently open world</strong> with the new file —
+            save any unsaved work first. Write time scales with the world size and the number of
+            chunks selected, so this may take a while on a large selection.
+          </div>
 
-        {!running && result === null && (
-          <>
-            <div style={{ fontSize: 12, color: "#afa69d", marginBottom: 14, lineHeight: 1.5 }}>
-              Writes {nChunks.toLocaleString()} ungenerated chunk{nChunks === 1 ? "" : "s"} as real flat
-              terrain{beyond ? " (this selection extends beyond the current map edge)" : ""}, to a
-              <strong style={{ color: "#ebe9e7" }}> new output file</strong>. This is non-undoable and
-              cannot edit the currently open world in place.
+          <div style={{ display: "flex", flexDirection: "column", gap: 10, marginBottom: 16 }}>
+            <SliderRow label="Stone depth" min={0} max={Math.max(1, world.max_z - 6)} value={stoneDepth}
+              onChange={setStoneDepth} width={260} labelWidth={80} />
+            <SliderRow label="Dirt depth" min={0} max={Math.max(1, world.max_z - 6)} value={dirtDepth}
+              onChange={setDirtDepth} width={260} labelWidth={80} />
+            {/* The layers are only meaningful relative to the terrain being extended, and the
+                mismatch is invisible from the top-down map — it only shows up in the 3D view or
+                a slab once the world has already been rewritten. Surfacing the resulting z here
+                makes it checkable against a neighbouring column beforehand. */}
+            {!depthTooLarge && (
+              <div style={{ fontSize: 11, color: MODAL_TEXT.label, lineHeight: 1.5 }}>
+                Bedrock z0
+                {stoneDepth > 0 && ` · stone z1–${stoneDepth}`}
+                {dirtDepth > 0 && ` · dirt z${1 + stoneDepth}–${surfaceZ - 1}`}
+                {" · grass surface at "}
+                <span style={{ color: MODAL_TEXT.secondary }}>z{surfaceZ}</span>
+                {stoneDepth === 15 && dirtDepth === 16 && " — matches the game's own flat terrain"}
+              </div>
+            )}
+          </div>
+
+          {tooLarge && (
+            <div style={{ fontSize: 12, color: RED_LIGHT, marginBottom: 12 }}>
+              Selection too large: {nChunks.toLocaleString()} chunks exceeds the{" "}
+              {MAX_MATERIALIZE_CHUNKS.toLocaleString()}-chunk limit for one materialize operation.
+              Narrow the selection and try again.
             </div>
+          )}
+          {depthTooLarge && (
+            <div style={{ fontSize: 12, color: RED_LIGHT, marginBottom: 12 }}>
+              Layer depths too large: surface would be at z={surfaceZ} but this world's max z is {world.max_z}.
+            </div>
+          )}
+          {growsBbox && !tooLarge && (
             <div style={{
-              fontSize: 12, color: "#fca5a5", background: "rgba(220,38,38,0.12)",
-              border: "1px solid rgba(220,38,38,0.35)", borderRadius: 6, padding: "8px 10px", marginBottom: 16, lineHeight: 1.5,
+              fontSize: 12, marginBottom: 12, lineHeight: 1.5,
+              color: bboxBlowup ? RED_LIGHT : MODAL_TEXT.secondary,
+              ...(bboxBlowup ? {
+                background: "rgba(220,38,38,0.12)", border: "1px solid rgba(220,38,38,0.35)",
+                borderRadius: 6, padding: "8px 10px",
+              } : {}),
             }}>
-              Completing this will <strong>replace the currently open world</strong> with the new file —
-              save any unsaved work first. Write time scales with the world size and the number of
-              chunks selected, so this may take a while on a large selection.
+              Map grows from {world.width_chunks}×{world.height_chunks} to {newWChunks}×{newHChunks} chunks
+              ({(newWChunks * 16).toLocaleString()}×{(newHChunks * 16).toLocaleString()} blocks).
+              {bboxBlowup && " That's mostly empty space — the 2D map will zoom right out and tiles" +
+                " will load slowly. Consider a selection closer to the existing map."}
             </div>
+          )}
+        </>
+      )}
 
-            <div style={{ display: "flex", flexDirection: "column", gap: 10, marginBottom: 16 }}>
-              <label style={{ fontSize: 12, color: "#ebe9e7", display: "flex", justifyContent: "space-between" }}>
-                <span>Stone depth</span><span>{stoneDepth}</span>
-              </label>
-              <input type="range" min={0} max={Math.max(1, world.max_z - 6)} value={stoneDepth}
-                onChange={(e) => setStoneDepth(Number(e.target.value))} />
-              <label style={{ fontSize: 12, color: "#ebe9e7", display: "flex", justifyContent: "space-between" }}>
-                <span>Dirt depth</span><span>{dirtDepth}</span>
-              </label>
-              <input type="range" min={0} max={Math.max(1, world.max_z - 6)} value={dirtDepth}
-                onChange={(e) => setDirtDepth(Number(e.target.value))} />
-              {/* The layers are only meaningful relative to the terrain being extended, and the
-                  mismatch is invisible from the top-down map — it only shows up in the 3D view or
-                  a slab once the world has already been rewritten. Surfacing the resulting z here
-                  makes it checkable against a neighbouring column beforehand. */}
-              {!depthTooLarge && (
-                <div style={{ fontSize: 11, color: "#83786c", lineHeight: 1.5 }}>
-                  Bedrock z0
-                  {stoneDepth > 0 && ` · stone z1–${stoneDepth}`}
-                  {dirtDepth > 0 && ` · dirt z${1 + stoneDepth}–${surfaceZ - 1}`}
-                  {" · grass surface at "}
-                  <span style={{ color: "#afa69d" }}>z{surfaceZ}</span>
-                  {stoneDepth === 15 && dirtDepth === 16 && " — matches the game's own flat terrain"}
-                </div>
-              )}
-            </div>
+      {running && (
+        <>
+          <div style={{ fontSize: 12, color: MODAL_TEXT.secondary, marginBottom: 12 }}>
+            Writing chunks… {progress}%
+          </div>
+          <div style={{ background: RAMP.mbtn1, borderRadius: 4, height: 8, overflow: "hidden" }}>
+            <div style={{ height: "100%", background: ACCENTS.warm, borderRadius: 4, width: `${progress}%`, transition: "width 0.2s" }} />
+          </div>
+        </>
+      )}
 
-            {tooLarge && (
-              <div style={{ fontSize: 12, color: "#fca5a5", marginBottom: 12 }}>
-                Selection too large: {nChunks.toLocaleString()} chunks exceeds the{" "}
-                {MAX_MATERIALIZE_CHUNKS.toLocaleString()}-chunk limit for one materialize operation.
-                Narrow the selection and try again.
-              </div>
-            )}
-            {depthTooLarge && (
-              <div style={{ fontSize: 12, color: "#fca5a5", marginBottom: 12 }}>
-                Layer depths too large: surface would be at z={surfaceZ} but this world's max z is {world.max_z}.
-              </div>
-            )}
-            {growsBbox && !tooLarge && (
-              <div style={{
-                fontSize: 12, marginBottom: 12, lineHeight: 1.5,
-                color: bboxBlowup ? "#fca5a5" : "#afa69d",
-                ...(bboxBlowup ? {
-                  background: "rgba(220,38,38,0.12)", border: "1px solid rgba(220,38,38,0.35)",
-                  borderRadius: 6, padding: "8px 10px",
-                } : {}),
-              }}>
-                Map grows from {world.width_chunks}×{world.height_chunks} to {newWChunks}×{newHChunks} chunks
-                ({(newWChunks * 16).toLocaleString()}×{(newHChunks * 16).toLocaleString()} blocks).
-                {bboxBlowup && " That's mostly empty space — the 2D map will zoom right out and tiles" +
-                  " will load slowly. Consider a selection closer to the existing map."}
-              </div>
-            )}
+      {errorMsg && !running && (
+        <div style={{ fontSize: 12, color: RED_LIGHT, marginTop: 8 }}>{errorMsg}</div>
+      )}
 
-            <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
-              <button onClick={onClose} style={{
-                padding: "6px 14px", borderRadius: 6, border: "1px solid #4b443d",
-                background: "transparent", color: "#afa69d", cursor: "pointer", fontSize: 13,
-              }}>
-                Cancel
-              </button>
-              <button onClick={run} disabled={tooLarge || depthTooLarge} style={{
-                padding: "6px 14px", borderRadius: 6, border: "none",
-                background: tooLarge || depthTooLarge ? "#4b443d" : "#d97706", color: "#ebe9e7",
-                cursor: tooLarge || depthTooLarge ? "not-allowed" : "pointer", fontSize: 13,
-              }}>
-                Choose Output File & Materialize
-              </button>
-            </div>
-          </>
-        )}
-
-        {running && (
-          <>
-            <div style={{ fontSize: 12, color: "#afa69d", marginBottom: 12 }}>
-              Writing chunks… {progress}%
-            </div>
-            <div style={{ background: "#312c28", borderRadius: 4, height: 8, overflow: "hidden", marginBottom: 12 }}>
-              <div style={{ height: "100%", background: "#d97706", borderRadius: 4, width: `${progress}%`, transition: "width 0.2s" }} />
-            </div>
-            <div style={{ display: "flex", justifyContent: "flex-end" }}>
-              <button onClick={cancel} style={{
-                padding: "6px 14px", borderRadius: 6, border: "1px solid #4b443d",
-                background: "transparent", color: "#afa69d", cursor: "pointer", fontSize: 13,
-              }}>
-                Cancel
-              </button>
-            </div>
-          </>
-        )}
-
-        {errorMsg && !running && (
-          <div style={{ fontSize: 12, color: "#fca5a5", marginTop: 8 }}>{errorMsg}</div>
-        )}
-
-        {result !== null && !running && (
-          <>
-            <div style={{ fontSize: 13, color: "#86efac", marginTop: 12, marginBottom: 16 }}>
-              Done — {result.chunksAdded.toLocaleString()} chunks added ({result.totalChunks.toLocaleString()} total).
-              Reloading…
-            </div>
-          </>
-        )}
-      </div>
-    </Modal>
+      {result !== null && !running && (
+        <div style={{ fontSize: 13, color: GREEN_TEXT, marginTop: 12 }}>
+          Done — {result.chunksAdded.toLocaleString()} chunks added ({result.totalChunks.toLocaleString()} total).
+          Reloading…
+        </div>
+      )}
+    </Dialog>
   );
 }

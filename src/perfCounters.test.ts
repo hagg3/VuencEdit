@@ -46,3 +46,33 @@ describe("approxPercentile", () => {
     expect(approxPercentile(h, 0.95)).toBe(Infinity); // p95 spills into the tail bucket
   });
 });
+
+describe("17.1 additions", () => {
+  it("annotates frame histograms with the fps each bucket implies", async () => {
+    const { formatHistogram: fmt } = await import("./perfCounters");
+    const s = fmt(newHistogram(), true);
+    expect(s).toContain("<16ms(>63fps)=0");
+    expect(s).toContain(">=1024ms=0");
+    expect(s).not.toContain("Infinity");
+  });
+
+  it("samples by default and resets everything but enabled and the session start", async () => {
+    const pc = await import("./perfCounters");
+    expect(pc.perfCounters.enabled).toBe(true);
+    const started = pc.perfCounters.startedAt;
+    pc.recordRenderMs(3); pc.recordReload("cap"); pc.bumpPerf("editsApplied"); pc.recordRenderStats(12, 5);
+    expect(pc.perfCounters.renderMs[bucketIndexForMs(3)]).toBe(1);
+    expect(pc.perfCounters.reloads.cap).toBe(1);
+    expect(pc.perfCounters.drawCallsMax).toBe(12);
+    pc.recordRenderStats(4, 9);
+    expect(pc.perfCounters.drawCallsLast).toBe(4);
+    expect(pc.perfCounters.drawCallsMax).toBe(12);
+    expect(pc.perfCounters.visibleMeshesMax).toBe(9);
+    pc.resetPerfCounters();
+    expect(pc.perfCounters.renderMs[bucketIndexForMs(3)]).toBe(0);
+    expect(pc.perfCounters.reloads.cap).toBe(0);
+    expect(pc.perfCounters.editsApplied).toBe(0);
+    expect(pc.perfCounters.enabled).toBe(true);
+    expect(pc.perfCounters.startedAt).toBe(started);
+  });
+});

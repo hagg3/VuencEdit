@@ -5,6 +5,7 @@
  */
 import type { Tool, SelectionBounds, MaterializeSelectionBounds } from "../MapCanvas";
 import type { SelectionInfo, ClipboardInfo, ExtrudeAxis, WorldMeta, RecentWorld } from "../types";
+import type { SettingsTab } from "../SettingsModal";
 
 export type RibbonTab =
   | "home" | "draw" | "sculpt" | "insert" | "view"
@@ -61,12 +62,9 @@ export interface RibbonProps {
   prevToolRef: React.RefObject<Tool>;
   fillBlockType: number; fillPaint: number;
   setFillBlockType: (v: number) => void; setFillPaint: (v: number) => void;
-  // Hotbar
-  pinnedBlocks: ({ type: number; paint: number } | null)[];
-  recentBlocks: { type: number; paint: number }[];
-  hotbarHover: string | null;
-  setPinnedBlocks: React.Dispatch<React.SetStateAction<({ type: number; paint: number } | null)[]>>;
-  setHotbarHover: (v: string | null) => void;
+  // Hotbar (Stage 14.5): pinned/recent state and the picker portal moved out of Ribbon — see
+  // `src/hotbar/useHotbar.ts` and `src/picker/PickerHost.tsx`. Nothing here needs them any more;
+  // the Block button only reads/writes `fillBlockType`/`fillPaint` above.
   // Mask
   maskEnabled: boolean; setMaskEnabled: (v: boolean) => void;
   maskBlockType: number | null; setMaskBlockType: (v: number | null) => void;
@@ -80,10 +78,17 @@ export interface RibbonProps {
   // dragging the slider re-renders only that tab. Same for sunT/lampRadius/flySpeed/renderDistance.
   zSliceZ: number; commitZSlice: (v: number) => void;
   followSurface: boolean; setFollowSurface: (v: boolean) => void;
-  renderMode: "tiled" | "full" | "axo"; setRenderMode: (v: "tiled" | "full" | "axo") => void;
-  axoSkew: number; setAxoSkew: (v: number) => void;
-  showSlicePanels: boolean; setShowSlicePanels: (v: boolean) => void;
-  enable3dPane: boolean; setEnable3dPane: (v: boolean) => void;
+  /** Relief (hillshade) shading on the tiled map (Stage 13.2) — a toggle layered on Tiled, persisted. */
+  reliefShading: boolean; setReliefShading: (on: boolean) => void;
+  /** The one "3D view is on screen" flag (windows/layoutState.ts) — gates the contextual 3D tab. */
+  pane3dLive: boolean;
+  /** Windows layout: 3D is the main pane and the map is in the window. */
+  swapped: boolean; onSwapViews: () => void;
+  view3dWindowOpen: boolean; onToggle3dWindow: () => void;
+  toolsWindowOpen: boolean; onToggleToolsWindow: () => void;
+  hotbarWindowOpen: boolean; onToggleHotbarWindow: () => void;
+  lensWindowOpen: boolean; onToggleLensWindow: () => void;
+  onResetWindows: () => void;
   // View ▸ Zoom — all three already existed on MapCanvas's ref but were keyboard-only.
   onFitMap: () => void;
   onZoomToSelection: () => void;
@@ -91,12 +96,13 @@ export interface RibbonProps {
   onZoomOut: () => void;
   // View ▸ Layout — persisted state previously reachable only through Settings.
   sidebarOpen: boolean; onToggleSidebar: () => void;
-  showQuickActions: boolean; onToggleQuickActions: () => void;
-  leftToolbarOpen: boolean; onToggleLeftToolbar: () => void;
   // 3D fly-view interaction (the contextual "3D" tab). Decoupled from the map's Draw/Select tools.
   mode3d: "off" | "select" | "build" | "sculpt" | "floodfill"; setMode3d: (v: "off" | "select" | "build" | "sculpt" | "floodfill") => void;
   /** Auto-orient directional blocks (ramps/wedges/doors) to the player's facing when placing in 3D build. */
   autoOrient3d: boolean; setAutoOrient3d: (v: boolean) => void;
+  /** 3D pane HUD / floor-grid visibility (Stage 15.8) — persisted, the same flags the pane's own `…` row drives. */
+  show3dHud: boolean; setShow3dHud: (v: boolean) => void;
+  show3dGrid: boolean; setShow3dGrid: (v: boolean) => void;
   floodFillLimit: number; setFloodFillLimit: (v: number) => void;
   nightLighting: boolean; setNightLighting: (v: boolean) => void;
   shadows3d: boolean; setShadows3d: (v: boolean) => void;
@@ -148,6 +154,8 @@ export interface RibbonProps {
   setFilterInvert: (v: boolean) => void;
   // Paste / Clipboard
   clipboard: ClipboardInfo | null;
+  /** Shared LOD-bounded top-down clipboard preview (fetched once by App, row 18.3). */
+  clipboardPreview: { width: number; height: number; pixels: Uint8Array } | null;
   pasteElevationOffset: number; setPasteElevationOffset: (v: number) => void;
   pasteIgnoreAir: boolean; setPasteIgnoreAir: (v: boolean) => void;
   pasteTerrain: boolean; setPasteTerrain: (v: boolean) => void;
@@ -207,6 +215,10 @@ export interface RibbonProps {
   setShowHelp: (v: boolean) => void;
   setShowAbout: (v: boolean) => void;
   setShowSettings: (v: boolean) => void;
+  /** Open Settings on a specific tab (⌘K "Sound Settings…"). */
+  openSettingsTab: (tab: SettingsTab) => void;
+  /** Info toast — ⌘K explains why a disabled command didn't run. */
+  onNotice: (text: string) => void;
   /** ROADMAP-EDIT Stage 9.5 — `Help ▸ Diagnostics…`. */
   setShowDiagnostics: (v: boolean) => void;
   /** Opens the onboarding coach-mark tour (`src/tour/`) — the application menu's Help pane and
@@ -214,6 +226,10 @@ export interface RibbonProps {
   startTour: () => void;
   // Collapse
   collapsed: boolean; onCollapse: (v: boolean) => void;
+  /** Opt-in compact command-bar ribbon (UI redesign r3, Stage 14.10) — an icon-only command row +
+   *  a settings row, replacing the labelled body. Never the default; persisted via
+   *  `AppSettings.ribbonCompact`. */
+  compact: boolean; onToggleCompact: (v: boolean) => void;
   /** Called once on mount with a setter for the active tab, so outside chrome (the Quick Actions
    *  bar's "More…") can switch tabs without lifting `activeTab` out of the Ribbon. */
   registerTabSetter?: (fn: (t: RibbonTab) => void) => void;

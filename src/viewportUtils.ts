@@ -1,4 +1,4 @@
-// Shared plumbing for the canvas-imperative viewport panes (MapCanvas, SliceViewport):
+// Shared plumbing for the canvas-imperative viewport panes (MapCanvas, the paste lens):
 // pan/zoom math, canvas-to-container sizing, async-fetch staleness guards, and pixel-patch
 // decoding. Pure functions only — both callers manage their own refs/draw loops, so a shared
 // hook would just relocate state without removing duplication. See CLAUDE.md M4.
@@ -8,45 +8,6 @@ export interface ViewTransform { x: number; y: number; scale: number; }
 
 /** Blocks per chunk edge (both X and Y) — every chunk is a 16×16 column of blocks. */
 export const CHUNK_SIZE_BLOCKS = 16;
-
-/**
- * Fetch window along a slab's horizontal world axis (`SliceViewport`'s front/side panes).
- * Two modes, chosen by whether `selRange` is set:
- *  - Selection-scoped: the window covers the selection + 50% context each side, capped at `maxWin`
- *    and re-centred on the selection's midpoint when the natural span would exceed it (so a huge
- *    selection still gets a bounded, centred fetch instead of either an unbounded one or a window
- *    pinned to one edge).
- *  - Free-scroll: a `maxWin`-wide window clamped to `[0, planeW - freeWinW]`, anchored at `winOrigin`.
- * Always returns `hi >= lo` inside `[0, planeW - 1]` (or `{lo:0,hi:0}` when `planeW <= 0`).
- */
-export function slabFetchWindow(args: {
-  planeW: number;
-  selRange: { lo: number; hi: number } | null;
-  winOrigin: number;
-  maxWin: number;
-}): { lo: number; hi: number } {
-  const { planeW, selRange, winOrigin, maxWin } = args;
-  if (planeW <= 0) return { lo: 0, hi: 0 };
-  const pMax = planeW - 1;
-  if (selRange) {
-    const lo0 = Math.max(0, Math.min(pMax, Math.min(selRange.lo, selRange.hi)));
-    const hi0 = Math.max(0, Math.min(pMax, Math.max(selRange.lo, selRange.hi)));
-    const ctxCols = Math.max(1, Math.round((hi0 - lo0 + 1) * 0.5));
-    let lo = Math.max(0, lo0 - ctxCols);
-    let hi = Math.min(pMax, hi0 + ctxCols);
-    if (hi - lo + 1 > maxWin) {
-      const mid = Math.round((lo0 + hi0) / 2);
-      hi = Math.min(pMax, mid + Math.floor(maxWin / 2));
-      lo = Math.max(0, hi - maxWin + 1);
-      hi = Math.min(pMax, lo + maxWin - 1);
-    }
-    return { lo, hi: Math.max(lo, hi) };
-  }
-  const freeWinW = Math.min(planeW, maxWin);
-  const lo = Math.max(0, Math.min(planeW - freeWinW, winOrigin));
-  const hi = lo + freeWinW - 1;
-  return { lo, hi };
-}
 
 /** World-block coordinate → the chunk coordinate that contains it. */
 export function worldToChunk(wCoord: number): number {
@@ -60,7 +21,7 @@ export function chunkToWorld(cCoord: number): number {
 
 /**
  * Zoom a pan/zoom view transform around a local (canvas-space) point — the "zoom toward
- * cursor" formula shared by MapCanvas's and SliceViewport's wheel handlers.
+ * cursor" formula shared by MapCanvas's wheel handler.
  */
 export function zoomAtPoint(
   view: ViewTransform,
@@ -133,7 +94,7 @@ export function beginFrame(
 
 /**
  * Sizes a canvas's backing store to match its laid-out CSS box (not the window), so it works
- * both full-screen and inside a quad-view grid cell, scaled by the device pixel ratio. Returns
+ * both full-screen and inside a floating window, scaled by the device pixel ratio. Returns
  * whether the size actually changed. The element's CSS box is left to the layout (100%/flex) —
  * only the backing store is touched.
  */

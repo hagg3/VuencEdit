@@ -1,16 +1,30 @@
-import { useState } from "react";
+import { useState, type CSSProperties, type ReactNode } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
-import { EDEN_TEAL, EDEN_TEAL_READABLE, glassPanel, glassTab, chromeButton, chromeButtonAccent, recessedWell, expBadge } from "./designTokens";
-import Modal from "./Modal";
+import { MODAL_TEXT, expBadge, recessedWell } from "./designTokens";
 // M1: shared floor/ceiling with FlyView3D's own in-pane slider and the ribbon 3D tab, so a value set
 // here can never be silently clamped by a stricter range on either of the other two.
 import { MAX_RENDER_DISTANCE, RD_MIN } from "./FlyView3D";
+import { openView3dEverywhere, seedLastLayout } from "./windows/windowSeed";
+import { Check, Segmented, Select, SliderRow } from "./ribbon/primitives";
+import { ACCENT, FONT, ICON, RADIUS, TEXT_LABEL } from "./ribbon/tokens";
+import { Icon } from "./ribbon/icons";
+import { v } from "./theme/cssVars";
+import { SKY_3D } from "./theme/theme";
+import { SOUND_PACK_OPTIONS, type PackId } from "./sound/packs";
+import { sfx } from "./sound/sfx";
+import Dialog, { DialogButton } from "./ui/Dialog";
+import { DialogNav, type DialogNavItem } from "./ui/DialogNav";
 
 export const SETTINGS_KEY = "eden_settings";
+/** The retired left tool rail's raw collapse key — read once by the v18 migration, then deleted. */
+const LEFT_TOOLBAR_COLLAPSED_KEY = "left_toolbar_collapsed";
 
 export interface AppSettings {
-  defaultQuadView: boolean;
-  default3dPane: boolean;
+  /** Floating windows snap to the work-area edges and centre line (~12 px). Default true. */
+  snapWindows: boolean;
+  /** Set by the v23 migration for a user who was on the retired Quad layout: show the one-shot
+   *  "Quad view was retired" toast on the next world load, then cleared (Stage 16.4). */
+  pendingQuadRetiredNotice: boolean;
   defaultSaveCompressed: boolean;
   /** Compress the one-time `.bak` snapshot as `<path>.bak.zip` (deflate level 6) instead of a plain
    *  copy. Off by default — a plain copy is faster to create and, on APFS, an O(1) clone. */
@@ -36,8 +50,6 @@ export interface AppSettings {
    *  Switching profiles snaps `lampRadius` to that profile's default (see App.tsx commitLightingProfile).
    *  Default "legacy". */
   lightingProfile: "legacy" | "modern";
-  /** Floating Quick Actions bar under the ribbon while a selection or clipboard exists. Default true. */
-  showQuickActions: boolean;
   /** Mouse-look sensitivity multiplier in grabbed-cursor LOOK mode. Default 1 (see FlyView3D's
    *  LOOK_SENS_BASE for the underlying rad/px rate this scales). */
   lookSensitivity: number;
@@ -47,8 +59,25 @@ export interface AppSettings {
   invertY: boolean;
   /** Autosave interval in minutes. 0 disables autosave. Default 3 (the old hardcoded AUTOSAVE_MS). */
   autosaveIntervalMin: number;
+  /** Relief (hillshade) shading on the top-down map (Stage 13.2), toggled by View ▸ Render ▸ Relief.
+   *  Default on. Additive — the defaults merge supplies it, no settings-version bump. */
+  reliefShading: boolean;
   /** Auto-orient ramps/wedges/doors to the player's facing when placing in 3D build mode. Default true. */
   autoOrient3d: boolean;
+  /** 3D pane sky-dome zenith / horizon colours (Stage 15.8). Editor-only viewer preferences — never
+   *  written to the world file's sky. Defaults are the dome's original hard-coded gradient. */
+  sky3dZenith: string;
+  sky3dHorizon: string;
+  /** Editor-only fog/sky-clear colour override; `null` = follow the world's own sky colour. Default
+   *  `#8cbeff`, the Minecraft-like light blue the pane always started with. */
+  fog3dColor: string | null;
+  /** Soft (exponential) vs hard (linear) fog. Default false (hard). */
+  fog3dSoft: boolean;
+  /** 3D pane HUD (camera pill + key legend, compass/coords, perf readout). Default true. Never hides
+   *  the build crosshair. */
+  show3dHud: boolean;
+  /** 3D pane floor grid. Default true. */
+  show3dGrid: boolean;
   /** 3D pane Flood Fill mode's max air cells filled per click. Default 1000. */
   floodFillLimit: number;
   /** How far (blocks) a 3D build-mode break/place can reach. Deliberately *not* the pick reach:
@@ -63,8 +92,6 @@ export interface AppSettings {
   sidebarWidth: number;
   /** Docked sidebar's active tab on load. Default "inspector". */
   sidebarTab: "inspector" | "prefabs" | "history";
-  /** Thin docked-left tool rail (Pan/Select/Draw families — see `LeftToolbar.tsx`) open on load. Default true. */
-  leftToolbarOpen: boolean;
   /** Memory-budget preset (§6 of the 2026-08 memory-efficiency pass) — trades resident RAM against
    *  undo depth / cache hit rate / 3D streaming range. See `MEMORY_PRESETS`. Default "balanced". */
   memoryBudget: "low" | "balanced" | "high";
@@ -88,6 +115,25 @@ export interface AppSettings {
    *  render distance or memory preset back up on a known-software-rendering machine would have that
    *  choice silently reverted the next time the 3D pane mounts. Default false. */
   potatoProfileApplied: boolean;
+  /** UI sound cues (UI redesign r3, Stage 14.12) — completion sounds only, never hover/pointer-rate.
+   *  Default true: `{...DEFAULTS, ...parsed}` supplying this to every existing install *is* the
+   *  "on by default" decision (§1 "Sounds"), same idiom as `enableFog`'s "matches the game" default. */
+  uiSounds: boolean;
+  /** Which synthesised pack (`src/sound/packs.ts`) plays the cues. Default "classic". */
+  uiSoundPack: PackId;
+  /** Master cue volume, 0–1. Default 0.8. */
+  uiSoundVolume: number;
+  /** Opt-in compact command-bar ribbon (UI redesign r3, Stage 14.10): a 32px icon-only command row
+   *  over a 28px settings row, in place of the labelled ~96px body. Never the default — off means
+   *  byte-for-byte the pre-14.10 ribbon. Also toggleable live from the ribbon's own bottom-right
+   *  "Compact"/"Labels" chip and from ⌘K ("Compact Ribbon"), both of which write straight through
+   *  `saveSettings` rather than waiting for this modal's Save button. */
+  ribbonCompact: boolean;
+  /** Motion preference (UI redesign r3, Stage 14.13): "system" defers to the OS's prefers-reduced-
+   *  motion; "reduced"/"full" force it regardless of what the OS reports. Default "system". A JS
+   *  gate (`src/theme/motion.ts`'s `useMotionPref`), never a CSS media query — see that file's
+   *  header for why. */
+  motion: "system" | "reduced" | "full";
 }
 
 /** Memory-budget preset table — the single source of truth for what each preset actually bounds.
@@ -111,13 +157,13 @@ export const MEMORY_PRESETS: Record<AppSettings["memoryBudget"], {
 };
 
 /** Current settings schema version. Bump + add a case to `migrate()` when a stored default must change. */
-const SETTINGS_VERSION = 17;
+const SETTINGS_VERSION = 23;
 
 /** Exported so Stage 10.3's potato-profile check can test "still at the stock default" without
  *  duplicating the magic numbers — the same heuristic `migrate()` itself uses per-field above. */
 export const DEFAULTS: AppSettings = {
-  defaultQuadView: true,
-  default3dPane: false,
+  snapWindows: true,
+  pendingQuadRetiredNotice: false,
   defaultSaveCompressed: false,
   backupCompressed: false,
   templatePath: null,
@@ -129,24 +175,34 @@ export const DEFAULTS: AppSettings = {
   sunT: 0.5,
   lampRadius: 4,
   lightingProfile: "legacy",
-  showQuickActions: true,
   lookSensitivity: 1,
   dragSensitivity: 1,
   invertY: false,
   autosaveIntervalMin: 3,
+  reliefShading: true,
   autoOrient3d: true,
+  sky3dZenith: SKY_3D.zenith,
+  sky3dHorizon: SKY_3D.horizon,
+  fog3dColor: SKY_3D.fog,
+  fog3dSoft: false,
+  show3dHud: true,
+  show3dGrid: true,
   floodFillLimit: 1000,
   buildReach: 64,
   sidebarOpen: true,
   sidebarWidth: 260,
   sidebarTab: "inspector",
-  leftToolbarOpen: true,
   memoryBudget: "balanced",
   checkForUpdatesOnLaunch: true,
   settingsVersion: SETTINGS_VERSION,
   tourVersion: 0,
   showPerfHud: false,
   potatoProfileApplied: false,
+  uiSounds: true,
+  uiSoundPack: "classic",
+  uiSoundVolume: 0.8,
+  ribbonCompact: false,
+  motion: "system",
 };
 
 /** Stage 10.5 — the flat "balanced" default asked for ~768 MB of GPU-backed memory (512 MB geometry
@@ -158,7 +214,7 @@ export const DEFAULTS: AppSettings = {
  *  to actually mount first and is handled separately by the potato-profile check. Deliberately
  *  conservative: "low" trips on one weak signal, "high" needs both strong, everything else — including
  *  every machine this can't read anything about — stays "balanced". */
-function deviceAwareDefaultMemoryBudget(): AppSettings["memoryBudget"] {
+export function deviceAwareDefaultMemoryBudget(): AppSettings["memoryBudget"] {
   const nav = navigator as Navigator & { deviceMemory?: number };
   const mem = nav.deviceMemory;
   const cores = nav.hardwareConcurrency;
@@ -240,6 +296,58 @@ function migrate(s: Record<string, unknown>): boolean {
   if (from < 17 && s.memoryBudget === "balanced") {
     s.memoryBudget = deviceAwareDefaultMemoryBudget();
   }
+  // v17 → v18: UI redesign r3's layout (ROADMAP-EDIT 14.3/14.4, open question 1). Every install
+  // moves to the map + floating windows layout (`defaultQuadView` was force-set true for *every*
+  // install at v1, so "chose quad" was undetectable). The old quad-only toggles seed the window layout the
+  // user inherits on their next world (`seedLastLayout`): the 3D window opens iff they had the 3D
+  // pane on by default (open question 2's existing-install rule), and the Tools window keeps the
+  // old left tool rail's open/collapsed state (its raw `left_toolbar_collapsed` key is retired).
+  if (from < 18) {
+    const toolsCollapsed = (() => {
+      try { return localStorage.getItem(LEFT_TOOLBAR_COLLAPSED_KEY) === "1"; } catch { return false; }
+    })();
+    seedLastLayout({
+      view3dOpen: s.default3dPane === true,
+      toolsOpen: s.leftToolbarOpen !== false,
+      toolsCollapsed,
+    });
+    delete s.defaultQuadView;
+    delete s.default3dPane;
+    delete s.leftToolbarOpen;
+    try { localStorage.removeItem(LEFT_TOOLBAR_COLLAPSED_KEY); } catch { /* ignore */ }
+  }
+  // v18 → v19: added uiSounds/uiSoundPack/uiSoundVolume (UI redesign r3, Stage 14.12). No forced
+  // value needed — the `{...DEFAULTS, ...parsed}` merge below supplies `uiSounds: true` to every
+  // existing install, which *is* the "on by default" decision (§1 "Sounds": on, Classic pack). A
+  // user who then turns it off keeps that choice, same as every other additive-default migration
+  // in this function.
+  // v19 → v20: added ribbonCompact (UI redesign r3, Stage 14.10, the opt-in compact command-bar
+  // ribbon). No forced value needed — the `{...DEFAULTS, ...parsed}` merge below supplies `false`
+  // to every existing install, so nobody's ribbon changes shape on upgrade; it's purely opt-in.
+  // v20 → v21: added `motion` (UI redesign r3, Stage 14.13). No forced value needed — the
+  // `{...DEFAULTS, ...parsed}` merge below supplies "system" to every existing install, which just
+  // continues to follow the OS's Reduce Motion setting as it always implicitly did.
+  // v21 → v22: removed showQuickActions (UI polish r4, Stage 15.2) — the Quick Actions bar can no
+  // longer be hidden, so the toggle and its stored value are gone. Strip the stale key so it
+  // doesn't linger forever in localStorage, same as the v12 → v13 precedent above.
+  if (from < 22) delete s.showQuickActions;
+  // v22 → v23: Quad (legacy) was retired (UI polish r4, Stage 16.4). `workLayout`, `quad3dEnabled`
+  // and `pendingLayoutNotice` are gone. A user who had switched to Quad (`workLayout === "quad"`;
+  // v18 forced everyone else to "windows") gets their 3D view as an *open* 3D window and a one-shot
+  // toast; `openView3dEverywhere` also covers a layout they already have stored. Everyone else just
+  // has the dead keys stripped (v12 → v13 idiom).
+  if (from < 23) {
+    if (s.workLayout === "quad") {
+      openView3dEverywhere({ view3dOpen: true, toolsOpen: true, toolsCollapsed: false });
+      s.pendingQuadRetiredNotice = true;
+    }
+    delete s.workLayout;
+    delete s.quad3dEnabled;
+    delete s.pendingLayoutNotice;
+  }
+  // (Stage 15.8 added sky3dZenith/sky3dHorizon/fog3dColor/fog3dSoft/show3dHud/show3dGrid with no
+  // version bump: purely additive, so the `{...DEFAULTS, ...parsed}` merge below supplies every
+  // existing install the same look the pane always had.)
   s.settingsVersion = SETTINGS_VERSION;
   return true;
 }
@@ -276,74 +384,89 @@ export function saveSettings(patch: Partial<AppSettings>) {
   localStorage.setItem(SETTINGS_KEY, JSON.stringify({ ...current, ...patch }));
 }
 
-const modal: React.CSSProperties = glassPanel({
-  padding: "20px 26px 18px", width: 520, maxHeight: "84vh", borderRadius: 12, color: "#ebe9e7",
-  display: "flex", flexDirection: "column",
-});
+// ── Layout primitives (UI redesign r3, Stage 14.17 — Dialog/DialogNav chrome) ────────────────────
 
-const sectionLabel: React.CSSProperties = {
-  fontSize: 10, fontWeight: 700, letterSpacing: "0.1em",
-  color: "#61584f", textTransform: "uppercase", marginBottom: 8,
-};
+const rowDivider = `1px solid ${v("border-modalHairline")}`;
 
-const row: React.CSSProperties = {
-  display: "flex", alignItems: "center", justifyContent: "flex-start", gap: 10,
-  padding: "6px 0", borderBottom: "1px solid #312c28",
-};
-
-const labelCol: React.CSSProperties = { display: "flex", flexDirection: "column", gap: 1 };
-const labelText: React.CSSProperties = { fontSize: 13, color: "#ebe9e7" };
-const labelSub: React.CSSProperties = { fontSize: 11, color: "#83786c" };
-
-/** Checkbox, not the old pill switch: switches are a touchscreen affordance (a large drag/tap
- *  target for thumbs) and read as mobile-coded in a desktop preferences panel. `role="checkbox"`
- *  + `aria-checked` gives the same screen-reader state a switch did; `label` names it since the
- *  visible text sits in a sibling row, not inside the control. */
-function Checkbox({ value, onChange, label }: { value: boolean; onChange: (v: boolean) => void; label?: string }) {
+/** Two-column settings row (plan §3.3): label + one-line description on the left, one control
+ *  right-aligned. Replaces the old "checkbox + stacked label" rows. */
+function SettingRow({
+  label, badge, description, children, last, align = "center",
+}: {
+  label: string; badge?: ReactNode; description?: ReactNode; children: ReactNode;
+  last?: boolean; align?: CSSProperties["alignItems"];
+}) {
   return (
-    <button
-      onClick={() => onChange(!value)}
-      role="checkbox"
-      aria-checked={value}
-      aria-label={label}
-      style={{
-        width: 16, height: 16, borderRadius: 4, border: "none", cursor: "pointer",
-        padding: 0, flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center",
-        background: value
-          ? `linear-gradient(180deg, rgba(${EDEN_TEAL},0.9) 0%, rgb(0,68,72) 100%)`
-          : "rgb(30,27,25)",
-        boxShadow: value
-          ? `inset 0 0 0 1px rgba(${EDEN_TEAL},.7)`
-          : "inset 0 0 0 1px rgba(0,0,0,.5), inset 0 1px 2px rgba(0,0,0,.4)",
-        transition: "background 0.1s, box-shadow 0.1s",
-      }}
-    >
-      {value && (
-        <svg width="10" height="10" viewBox="0 0 10 10" style={{ display: "block" }}>
-          <path d="M1.5 5 L4 7.5 L8.5 2" stroke="#fff" strokeWidth="1.6" fill="none" strokeLinecap="round" strokeLinejoin="round" />
-        </svg>
-      )}
-    </button>
+    <div style={{
+      display: "flex", alignItems: align, justifyContent: "space-between", gap: 16,
+      padding: "9px 0", borderBottom: last ? "none" : rowDivider,
+    }}>
+      <div style={{ display: "flex", flexDirection: "column", gap: 2, minWidth: 0, flex: 1 }}>
+        <span style={{ fontSize: FONT.body, color: MODAL_TEXT.primary, display: "flex", alignItems: "center" }}>
+          {label}{badge}
+        </span>
+        {description && (
+          <span style={{ fontSize: FONT.label, color: MODAL_TEXT.secondary, lineHeight: 1.4 }}>
+            {description}
+          </span>
+        )}
+      </div>
+      <div style={{ flexShrink: 0, display: "flex", alignItems: "center" }}>{children}</div>
+    </div>
   );
 }
 
-/** Staged sliders write straight into `local` (no live IPC to debounce, unlike the Ribbon's
- *  display/commit split) — a plain controlled input is fine here since nothing applies until Save. */
-function Slider({ label, value, min, max, step, format, onChange }: {
-  label: string; value: number; min: number; max: number; step: number;
-  format?: (v: number) => string; onChange: (v: number) => void;
+/** Small-caps section heading (`FONT.label`/`TEXT_LABEL`), the plan's `md-sec`/`md-cap`. */
+function SectionHeading({ children, first }: { children: ReactNode; first?: boolean }) {
+  return (
+    <div style={{
+      fontSize: FONT.label, fontWeight: 700, letterSpacing: "0.08em", textTransform: "uppercase",
+      color: TEXT_LABEL, margin: first ? "0 0 6px" : "16px 0 6px",
+    }}>
+      {children}
+    </div>
+  );
+}
+
+/** A file/directory path setting: label + description on top, a recessed path well + Browse +
+ *  optional Clear below. Kept as its own row shape (not the plain two-column `SettingRow`) since a
+ *  full path needs more width than a right-aligned control column leaves it. */
+function PathRow({
+  label, badge, description, value, placeholder, onBrowse, onClear, last,
+}: {
+  label: string; badge?: ReactNode; description: ReactNode; value: string | null; placeholder: string;
+  onBrowse: () => void; onClear?: () => void; last?: boolean;
 }) {
   return (
-    <div style={{ ...row, flexDirection: "column", alignItems: "stretch", gap: 4 }}>
-      <div style={{ display: "flex", justifyContent: "space-between" }}>
-        <span style={labelText}>{label}</span>
-        <span style={{ ...labelSub, fontVariantNumeric: "tabular-nums" }}>{(format ?? String)(value)}</span>
+    <div style={{ padding: "9px 0", borderBottom: last ? "none" : rowDivider }}>
+      <div style={{ fontSize: FONT.body, color: MODAL_TEXT.primary, display: "flex", alignItems: "center" }}>
+        {label}{badge}
       </div>
-      <input
-        type="range" min={min} max={max} step={step} value={value}
-        onChange={e => onChange(Number(e.target.value))}
-        style={{ width: "100%", accentColor: `rgb(${EDEN_TEAL})` }}
-      />
+      <div style={{ fontSize: FONT.label, color: MODAL_TEXT.secondary, lineHeight: 1.4, marginTop: 2 }}>
+        {description}
+      </div>
+      <div style={{ marginTop: 8, display: "flex", gap: 8, alignItems: "center" }}>
+        <div style={{
+          ...recessedWell, flex: 1, fontSize: FONT.body,
+          color: value ? MODAL_TEXT.secondary : MODAL_TEXT.label,
+          borderRadius: RADIUS.md, padding: "5px 10px", overflow: "hidden", textOverflow: "ellipsis",
+          whiteSpace: "nowrap", direction: "rtl", textAlign: "left",
+        }}>
+          {value ?? placeholder}
+        </div>
+        <DialogButton onClick={onBrowse}>Browse…</DialogButton>
+        {value && onClear && (
+          <button
+            type="button" onClick={onClear} title="Clear" aria-label="Clear this path"
+            style={{
+              background: "none", border: "none", color: MODAL_TEXT.secondary, cursor: "pointer",
+              padding: "0 4px", display: "flex", flexShrink: 0,
+            }}
+          >
+            <Icon name="close" size={ICON.xs} tone="inherit" />
+          </button>
+        )}
+      </div>
     </div>
   );
 }
@@ -351,14 +474,35 @@ function Slider({ label, value, min, max, step, format, onChange }: {
 interface Props {
   onClose: () => void;
   onSave: (s: AppSettings) => void;
+  /** Settings ▸ Layout ▸ Reset window positions — applies immediately (not staged until Save);
+   *  omitted on the splash screen, where there are no windows to reset. */
+  onResetWindows?: () => void;
+  /** Paste lens (14.9): live `wins.lens.open` state + toggle, mirroring the View ▸ Windows ▸ Paste
+   *  Lens command — the *window*, not visibility (it only actually shows while a paste is armed).
+   *  Applies immediately, like `onResetWindows`; omitted on the splash screen for the same reason. */
+  lensWindowOpen?: boolean;
+  onToggleLensWindow?: () => void;
+  /** Which tab to open on (⌘K "Sound Settings…" opens straight on Sounds). */
+  initialTab?: SettingsTab;
 }
 
-type SettingsTab = "general" | "3d" | "editor" | "files";
+export type SettingsTab = "general" | "layout" | "3d" | "editor" | "sounds" | "files";
 
-export default function SettingsModal({ onClose, onSave }: Props) {
+const NAV_ITEMS: DialogNavItem[] = [
+  { id: "general", icon: "settings", label: "General" },
+  { id: "layout", icon: "windows", label: "Layout & windows" },
+  { id: "3d", icon: "pane3d", label: "3D View" },
+  { id: "editor", icon: "pen", label: "Editor" },
+  { id: "sounds", icon: "wavy", label: "Sounds" },
+  { id: "files", icon: "open", label: "Files" },
+];
+
+export default function SettingsModal({
+  onClose, onSave, onResetWindows, lensWindowOpen, onToggleLensWindow, initialTab = "general",
+}: Props) {
   const [local, setLocal] = useState<AppSettings>(() => loadSettings());
   const [resetHint, setResetHint] = useState(false);
-  const [tab, setTab] = useState<SettingsTab>("general");
+  const [tab, setTab] = useState<SettingsTab>(initialTab);
 
   function set<K extends keyof AppSettings>(key: K, value: AppSettings[K]) {
     setLocal(s => ({ ...s, [key]: value }));
@@ -393,401 +537,280 @@ export default function SettingsModal({ onClose, onSave }: Props) {
     onClose();
   }
 
-  const TABS: { id: SettingsTab; label: string }[] = [
-    { id: "general", label: "General" },
-    { id: "3d", label: "3D View" },
-    { id: "editor", label: "Editor" },
-    { id: "files", label: "Files" },
-  ];
-
   return (
-    <Modal onClose={onClose} zIndex={1000} labelledBy="settings-title">
-      <div style={modal}>
-        {/* Header */}
-        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
-          <span id="settings-title" style={{ fontSize: 18, fontWeight: 700 }}>Settings</span>
-          <button
-            onClick={onClose}
-            title="Close settings" aria-label="Close settings"
-            onMouseEnter={e => (e.currentTarget.style.color = EDEN_TEAL_READABLE)}
-            onMouseLeave={e => (e.currentTarget.style.color = "#83786c")}
-            style={{ background: "none", border: "none", color: "#83786c", fontSize: 20, cursor: "pointer", lineHeight: 1, transition: "color .1s" }}
-          >✕</button>
-        </div>
-
-        {/* Tab strip */}
-        <div style={{ display: "flex", gap: 2, marginBottom: 4, flexShrink: 0 }}>
-          {TABS.map(t => (
-            <button
-              key={t.id}
-              onClick={() => setTab(t.id)}
-              style={{
-                ...glassTab(tab === t.id),
-                color: tab === t.id ? EDEN_TEAL_READABLE : "#61584f",
-                fontSize: 13, fontWeight: tab === t.id ? 600 : 400,
-                padding: "6px 14px", borderRadius: "4px 4px 0 0",
-              }}
-            >
-              {t.label}
-            </button>
-          ))}
-        </div>
-
-        {/* Tab body (scrolls; header/tabs/footer stay put) */}
-        <div style={{ flex: 1, overflowY: "auto", paddingTop: 8, minHeight: 0 }}>
-          {tab === "general" && (
-            <>
-              <div style={row}>
-                <Checkbox value={local.defaultQuadView} onChange={v => set("defaultQuadView", v)} label="Default to Quad view" />
-                <div style={labelCol}>
-                  <span style={labelText}>
-                    Default to Quad view
-                    <span style={expBadge({ marginLeft: 7, verticalAlign: "middle" })}>exp</span>
-                  </span>
-                  <span style={labelSub}>Opens the editor in 4-pane layout (Top + Front + Side + 3D)</span>
-                </div>
-              </div>
-
-              <div style={row}>
-                <Checkbox value={local.default3dPane} onChange={v => set("default3dPane", v)} label="Enable 3D pane by default" />
-                <div style={labelCol}>
-                  <span style={labelText}>
-                    Enable 3D pane by default
-                    <span style={expBadge({ marginLeft: 7, verticalAlign: "middle" })}>exp</span>
-                  </span>
-                  <span style={labelSub}>Streams 3D geometry — can be slow on large worlds</span>
-                </div>
-              </div>
-
-              <div style={row}>
-                <Checkbox value={local.showQuickActions} onChange={v => set("showQuickActions", v)} label="Quick Actions bar" />
-                <div style={labelCol}>
-                  <span style={labelText}>Quick Actions bar</span>
-                  <span style={labelSub}>Floating copy/fill/paste + paste Z-offset bar, shown while a selection or clipboard exists</span>
-                </div>
-              </div>
-
-              <div style={row}>
-                <Checkbox value={local.checkForUpdatesOnLaunch} onChange={v => set("checkForUpdatesOnLaunch", v)} label="Check for updates on launch" />
-                <div style={labelCol}>
-                  <span style={labelText}>Check for updates on launch</span>
-                  <span style={labelSub}>Checks github.com/hagg3/VuencEdit/releases and shows a banner on the splash screen if a newer version is out</span>
-                </div>
-              </div>
-
-              <div style={{ ...row, borderBottom: "none" }}>
-                <div style={labelCol}>
-                  <span style={labelText}>Memory budget</span>
-                  <span style={labelSub}>
-                    Trades resident RAM against undo depth, tile-cache hit rate, and 3D streaming range.
-                    {" "}{MEMORY_PRESETS[local.memoryBudget].label} ≈ {MEMORY_PRESETS[local.memoryBudget].undoBudgetBytes / (1 << 20)} MB undo
-                    + {MEMORY_PRESETS[local.memoryBudget].tileBudgetBytes / (1 << 20)} MB tiles
-                    + {MEMORY_PRESETS[local.memoryBudget].geometryBudgetBytes / (1 << 20)} MB 3D geometry.
-                  </span>
-                </div>
-                <div style={{ display: "flex", gap: 4, marginLeft: "auto" }}>
-                  {(Object.keys(MEMORY_PRESETS) as (keyof typeof MEMORY_PRESETS)[]).map(key => (
-                    <button
-                      key={key}
-                      onClick={() => set("memoryBudget", key)}
-                      style={local.memoryBudget === key ? chromeButtonAccent(EDEN_TEAL, `rgb(${EDEN_TEAL})`, { padding: "4px 10px", fontSize: 12 }) : chromeButton({ padding: "4px 10px", fontSize: 12 })}>
-                      {MEMORY_PRESETS[key].label}
-                    </button>
-                  ))}
-                </div>
-              </div>
-            </>
-          )}
-
-          {tab === "3d" && (
-            <>
-              <Slider
-                label="Look sensitivity" value={local.lookSensitivity} min={0.25} max={4} step={0.05}
-                format={v => `${v.toFixed(2)}×`}
-                onChange={v => set("lookSensitivity", v)}
-              />
-              <div style={{ ...labelSub, marginTop: -2, marginBottom: 10 }}>
-                Mouselook speed in grabbed-cursor LOOK mode (Z from orbit)
-              </div>
-
-              <Slider
-                label="Fly-drag sensitivity" value={local.dragSensitivity} min={0.25} max={4} step={0.05}
-                format={v => `${v.toFixed(2)}×`}
-                onChange={v => set("dragSensitivity", v)}
-              />
-              <div style={{ ...labelSub, marginTop: -2, marginBottom: 10 }}>
-                Look speed while drag-looking (left-drag) in FLY mode
-              </div>
-
-              <div style={row}>
-                <Checkbox value={local.invertY} onChange={v => set("invertY", v)} label="Invert Y axis" />
-                <div style={labelCol}>
-                  <span style={labelText}>Invert Y axis</span>
-                  <span style={labelSub}>Flips pitch: mouse up looks down</span>
-                </div>
-              </div>
-
-              <div style={row}>
-                <Checkbox value={local.enableFog} onChange={v => set("enableFog", v)} label="Fog in 3D views" />
-                <div style={labelCol}>
-                  <span style={labelText}>Fog in 3D views</span>
-                  <span style={labelSub}>Fades distant terrain like the game does; turn off to inspect far terrain</span>
-                </div>
-              </div>
-
-              {/* Night lighting / Shadows / GPU shadow map are perf-heavy, session-only view modes —
-                  they live in the Ribbon's 3D/View Lighting group (⚡ badged) and always start off,
-                  so they're deliberately not persisted defaults here. */}
-
-              <div style={row}>
-                <Checkbox value={local.showPerfHud} onChange={v => set("showPerfHud", v)} label="3D performance HUD" />
-                <div style={labelCol}>
-                  <span style={labelText}>3D performance HUD</span>
-                  <span style={labelSub}>Resident-geometry readout in the 3D pane; also feeds Help ▸ Diagnostics</span>
-                </div>
-              </div>
-
-              <div style={{ height: 6 }} />
-              <div style={sectionLabel}>3D pane sliders</div>
-
-              <Slider
-                label="Render distance" value={local.renderDistance} min={RD_MIN} max={MAX_RENDER_DISTANCE} step={1}
-                format={v => `${Math.round(v)} chunks`}
-                onChange={v => set("renderDistance", Math.round(v))}
-              />
-              <div style={{ height: 8 }} />
-
-              <Slider
-                label="Fly speed" value={local.flySpeed} min={0.1} max={3} step={0.1}
-                format={v => `${v.toFixed(1)}×`}
-                onChange={v => set("flySpeed", v)}
-              />
-              <div style={{ height: 8 }} />
-
-              <Slider
-                label="Sun angle" value={local.sunT} min={0} max={1} step={0.01}
-                format={v => (v < 0.03 ? "sunrise" : v > 0.97 ? "sunset" : v === 0.5 ? "noon" : v.toFixed(2))}
-                onChange={v => set("sunT", v)}
-              />
-              <div style={{ height: 8 }} />
-
-              <Slider
-                label="Lamp radius" value={local.lampRadius} min={2} max={32} step={1}
-                format={v => `${Math.round(v)} blocks`}
-                onChange={v => set("lampRadius", Math.round(v))}
-              />
-              <div style={{ height: 8 }} />
-
-              <Slider
-                label="Build reach" value={local.buildReach} min={8} max={256} step={8}
-                format={v => `${Math.round(v)} blocks`}
-                onChange={v => set("buildReach", Math.round(v))}
-              />
-              <div style={{ ...labelSub, marginTop: -2, marginBottom: 10 }}>
-                How far a 3D build-mode break/place can reach. Past it the placement outline doesn&apos;t
-                appear and a click does nothing. Select, eyedropper and flood fill still reach 256.
-              </div>
-
-              <div style={row}>
-                <div style={labelCol}>
-                  <span style={labelText}>Lighting profile</span>
-                  <span style={labelSub}>Legacy (~4-tile, steep falloff) vs Modern/New Dawn (~14-tile, gradual falloff). Switching snaps Lamp radius to that profile's default.</span>
-                </div>
-                <div style={{ display: "flex", gap: 4, marginLeft: "auto" }}>
-                  <button
-                    onClick={() => { set("lightingProfile", "legacy"); set("lampRadius", 4); }}
-                    style={local.lightingProfile === "legacy" ? chromeButtonAccent(EDEN_TEAL, `rgb(${EDEN_TEAL})`, { padding: "4px 10px", fontSize: 12 }) : chromeButton({ padding: "4px 10px", fontSize: 12 })}>
-                    Legacy
-                  </button>
-                  <button
-                    onClick={() => { set("lightingProfile", "modern"); set("lampRadius", 14); }}
-                    style={local.lightingProfile === "modern" ? chromeButtonAccent(EDEN_TEAL, `rgb(${EDEN_TEAL})`, { padding: "4px 10px", fontSize: 12 }) : chromeButton({ padding: "4px 10px", fontSize: 12 })}>
-                    New Dawn
-                  </button>
-                </div>
-              </div>
-
-              <div style={{ ...labelSub, marginTop: 4 }}>
-                These are also editable from the 3D pane / Ribbon directly — surfaced here so Reset to defaults has somewhere visible to reset them to.
-              </div>
-            </>
-          )}
-
-          {tab === "editor" && (
-            <>
-              <div style={row}>
-                <Checkbox value={local.defaultSaveCompressed} onChange={v => set("defaultSaveCompressed", v)} label="Save compressed by default" />
-                <div style={labelCol}>
-                  <span style={labelText}>Save compressed by default</span>
-                  <span style={labelSub}>New worlds save as .zip; overridden by the loaded world's format</span>
-                </div>
-              </div>
-
-              <div style={row}>
-                <Checkbox value={local.backupCompressed} onChange={v => set("backupCompressed", v)} label="Compress backups" />
-                <div style={labelCol}>
-                  <span style={labelText}>Compress backups</span>
-                  <span style={labelSub}>The one-time pre-save snapshot is written as .bak.zip instead of a plain .bak copy</span>
-                </div>
-              </div>
-
-              <div style={{ height: 6 }} />
-              <Slider
-                label="Autosave interval" value={local.autosaveIntervalMin} min={0} max={15} step={1}
-                format={v => (v === 0 ? "Off" : `${Math.round(v)} min`)}
-                onChange={v => set("autosaveIntervalMin", Math.round(v))}
-              />
-              <div style={{ ...labelSub, marginTop: 4 }}>
-                How often an in-progress world is snapshotted to a recovery sidecar. 0 disables autosave.
-              </div>
-            </>
-          )}
-
-          {tab === "files" && (
-            <>
-              <div style={{ ...row, alignItems: "flex-start", paddingTop: 4 }}>
-                <div style={{ ...labelCol, flex: 1, marginRight: 12 }}>
-                  <span style={labelText}>Eden.eden template path <span style={expBadge({ fontSize: 10, fontWeight: 600, padding: "1px 5px", verticalAlign: "middle" })}>exp</span></span>
-                  <span style={labelSub}>Eden.eden is the pre-generated template bundled with the game. Point this at your copy to show its terrain faded behind the gaps in a sparse/normal world's map (View ▾ → Template Overlay), or to "Expand from Template" and bake it into a full world file.</span>
-                  <div style={{
-                    marginTop: 8, display: "flex", gap: 8, alignItems: "center",
-                  }}>
-                    <div style={{
-                      ...recessedWell,
-                      flex: 1, fontSize: 12, color: local.templatePath ? "#afa69d" : "#61584f",
-                      borderRadius: 6,
-                      padding: "5px 10px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
-                      direction: "rtl", textAlign: "left",
-                    }}>
-                      {local.templatePath ?? "Not set"}
-                    </div>
-                    <button
-                      onClick={browsePath}
-                      style={chromeButton({ padding: "5px 12px", fontSize: 12, flexShrink: 0 })}
-                      onMouseEnter={e => (e.currentTarget.style.boxShadow = `inset 0 0 0 1px rgba(${EDEN_TEAL},.6), 0 .5px .5px rgba(255,255,255,.2)`)}
-                      onMouseLeave={e => (e.currentTarget.style.boxShadow = "inset 0 0 0 1px rgba(0,0,0,.5), 0 .5px .5px rgba(255,255,255,.15)")}
-                    >
-                      Browse…
-                    </button>
-                    {local.templatePath && (
-                      <button
-                        onClick={() => set("templatePath", null)}
-                        style={{
-                          background: "none", border: "none", color: "#61584f",
-                          fontSize: 16, cursor: "pointer", padding: "0 4px", lineHeight: 1, flexShrink: 0,
-                        }}
-                        title="Clear" aria-label="Clear this path"
-                      >✕</button>
-                    )}
-                  </div>
-                </div>
-              </div>
-
-              <div style={{ ...row, alignItems: "flex-start", paddingTop: 8 }}>
-                <div style={{ ...labelCol, flex: 1, marginRight: 12 }}>
-                  <span style={labelText}>Texture pack path</span>
-                  <span style={labelSub}>ZIP of PNGs — adds textures to 3D views and block picker icons</span>
-                  <div style={{ marginTop: 8, display: "flex", gap: 8, alignItems: "center" }}>
-                    <div style={{
-                      ...recessedWell,
-                      flex: 1, fontSize: 12, color: local.texturePackPath ? "#afa69d" : "#61584f",
-                      borderRadius: 6,
-                      padding: "5px 10px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
-                      direction: "rtl", textAlign: "left",
-                    }}>
-                      {local.texturePackPath ?? "Not set"}
-                    </div>
-                    <button
-                      onClick={browseTexturePack}
-                      style={chromeButton({ padding: "5px 12px", fontSize: 12, flexShrink: 0 })}
-                      onMouseEnter={e => (e.currentTarget.style.boxShadow = `inset 0 0 0 1px rgba(${EDEN_TEAL},.6), 0 .5px .5px rgba(255,255,255,.2)`)}
-                      onMouseLeave={e => (e.currentTarget.style.boxShadow = "inset 0 0 0 1px rgba(0,0,0,.5), 0 .5px .5px rgba(255,255,255,.15)")}
-                    >
-                      Browse…
-                    </button>
-                    {local.texturePackPath && (
-                      <button
-                        onClick={() => set("texturePackPath", null)}
-                        style={{
-                          background: "none", border: "none", color: "#61584f",
-                          fontSize: 16, cursor: "pointer", padding: "0 4px", lineHeight: 1, flexShrink: 0,
-                        }}
-                        title="Clear" aria-label="Clear this path"
-                      >✕</button>
-                    )}
-                  </div>
-                </div>
-              </div>
-
-              <div style={{ ...row, borderBottom: "none", alignItems: "flex-start", paddingTop: 8 }}>
-                <div style={{ ...labelCol, flex: 1, marginRight: 12 }}>
-                  <span style={labelText}>Prefab library folder</span>
-                  <span style={labelSub}>Scanned by the Prefab Library panel. Leave unset to use the app's own folder.</span>
-                  <div style={{ marginTop: 8, display: "flex", gap: 8, alignItems: "center" }}>
-                    <div style={{
-                      ...recessedWell,
-                      flex: 1, fontSize: 12, color: local.prefabDirectory ? "#afa69d" : "#61584f",
-                      borderRadius: 6,
-                      padding: "5px 10px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
-                      direction: "rtl", textAlign: "left",
-                    }}>
-                      {local.prefabDirectory ?? "App default"}
-                    </div>
-                    <button
-                      onClick={browsePrefabDir}
-                      style={chromeButton({ padding: "5px 12px", fontSize: 12, flexShrink: 0 })}
-                      onMouseEnter={e => (e.currentTarget.style.boxShadow = `inset 0 0 0 1px rgba(${EDEN_TEAL},.6), 0 .5px .5px rgba(255,255,255,.2)`)}
-                      onMouseLeave={e => (e.currentTarget.style.boxShadow = "inset 0 0 0 1px rgba(0,0,0,.5), 0 .5px .5px rgba(255,255,255,.15)")}
-                    >
-                      Browse…
-                    </button>
-                    {local.prefabDirectory && (
-                      <button
-                        onClick={() => set("prefabDirectory", null)}
-                        style={{
-                          background: "none", border: "none", color: "#61584f",
-                          fontSize: 16, cursor: "pointer", padding: "0 4px", lineHeight: 1, flexShrink: 0,
-                        }}
-                        title="Clear" aria-label="Clear this path"
-                      >✕</button>
-                    )}
-                  </div>
-                </div>
-              </div>
-            </>
-          )}
-        </div>
-
-        {/* Footer */}
-        <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 12, paddingTop: 10, borderTop: "1px solid #312c28", flexShrink: 0 }}>
+    <Dialog
+      size="md" icon="settings" title="Settings" onClose={onClose}
+      nav={<DialogNav items={NAV_ITEMS} value={tab} onChange={id => setTab(id as SettingsTab)} />}
+      footer={
+        <>
           {/* Restores every persisted setting, including ones surfaced in the 3D View tab. Staged
-              like any other edit: it doesn't persist until Save. */}
-          <button
-            onClick={() => { setLocal({ ...DEFAULTS }); setResetHint(true); }}
-            style={chromeButton({ color: "#afa69d", padding: "7px 18px", fontSize: 13 })}
-          >
-            Reset to defaults
-          </button>
-          {resetHint && (
-            <span style={{ color: "#f59e0b", fontSize: 11 }}>
-              Defaults restored — Save to apply.
-            </span>
+              like any other edit: it doesn't persist until Save. D0's left-slot convention: a
+              footer child with marginRight:"auto" — no dedicated slot component. */}
+          <div style={{ display: "flex", alignItems: "center", gap: 10, marginRight: "auto" }}>
+            <DialogButton onClick={() => { setLocal({ ...DEFAULTS }); setResetHint(true); }}>
+              Reset to defaults
+            </DialogButton>
+            {resetHint && (
+              <span style={{ color: ACCENT.warm, fontSize: FONT.label }}>
+                Defaults restored — Save to apply.
+              </span>
+            )}
+          </div>
+          <DialogButton onClick={onClose}>Cancel</DialogButton>
+          <DialogButton variant="primary" onClick={handleSave}>Save</DialogButton>
+        </>
+      }
+    >
+      {tab === "general" && (
+        <>
+          <SettingRow label="Check for updates on launch"
+            description="Checks github.com/hagg3/VuencEdit/releases and shows a banner on the splash screen if a newer version is out">
+            <Check checked={local.checkForUpdatesOnLaunch} onChange={v => set("checkForUpdatesOnLaunch", v)} label="" title="Check for updates on launch" />
+          </SettingRow>
+
+          <SettingRow label="Motion"
+            description={<>Chrome animations — popover open, contextual tabs appearing, the edit-completion outline. "System" follows the OS's Reduce Motion setting.</>}>
+            <Segmented
+              ariaLabel="Motion"
+              value={local.motion}
+              onChange={v => set("motion", v)}
+              options={[
+                { id: "system", label: "System" },
+                { id: "reduced", label: "Reduced" },
+                { id: "full", label: "Full" },
+              ]}
+            />
+          </SettingRow>
+
+          <SettingRow last label="Memory budget"
+            description={
+              <>
+                Trades resident RAM against undo depth, tile-cache hit rate, and 3D streaming range.
+                {" "}{MEMORY_PRESETS[local.memoryBudget].label} ≈ {MEMORY_PRESETS[local.memoryBudget].undoBudgetBytes / (1 << 20)} MB undo
+                + {MEMORY_PRESETS[local.memoryBudget].tileBudgetBytes / (1 << 20)} MB tiles
+                + {MEMORY_PRESETS[local.memoryBudget].geometryBudgetBytes / (1 << 20)} MB 3D geometry.
+              </>
+            }>
+            <Segmented
+              ariaLabel="Memory budget"
+              value={local.memoryBudget}
+              onChange={v => set("memoryBudget", v)}
+              options={(Object.keys(MEMORY_PRESETS) as (keyof typeof MEMORY_PRESETS)[]).map(key => ({
+                id: key, label: MEMORY_PRESETS[key].label,
+              }))}
+            />
+          </SettingRow>
+        </>
+      )}
+
+      {tab === "layout" && (
+        <>
+          <SectionHeading first>Ribbon</SectionHeading>
+          <SettingRow
+            label="Compact ribbon (command bar)" badge={<Badge>exp</Badge>}
+            description="An icon-only command row over a settings row, instead of the labelled ribbon. Experimental and disabled for now (2026-09-28) — the ribbon's own corner toggle was removed.">
+            <Check checked={local.ribbonCompact} onChange={v => set("ribbonCompact", v)} label="" title="Compact ribbon (command bar) — experimental, disabled" disabled />
+          </SettingRow>
+
+          <SectionHeading>Work area</SectionHeading>
+          <SettingRow last={!onToggleLensWindow && !onResetWindows} label="Snap windows"
+            description="Floating windows snap to the work-area edges and centre line while you drag them">
+            <Check checked={local.snapWindows} onChange={v => set("snapWindows", v)} label="" title="Snap windows" />
+          </SettingRow>
+
+          {onToggleLensWindow && (
+            <SettingRow last={!onResetWindows} label="Paste lens: show while pasting"
+              description="Front/side elevations with Z controls, appearing at the paste ghost — same as View ▸ Windows ▸ Paste Lens (⌥P)">
+              <Check checked={lensWindowOpen ?? false} onChange={() => onToggleLensWindow()} label="" title="Paste lens: show while pasting" />
+            </SettingRow>
           )}
-          <div style={{ flex: 1 }} />
-          <button
-            onClick={onClose}
-            style={chromeButton({ color: "#afa69d", padding: "7px 18px", fontSize: 13 })}
-          >
-            Cancel
-          </button>
-          <button
-            onClick={handleSave}
-            style={chromeButtonAccent(EDEN_TEAL, `rgb(${EDEN_TEAL})`, { color: "#fff", padding: "7px 18px", fontSize: 13, fontWeight: 600 })}
-          >
-            Save
-          </button>
-        </div>
-      </div>
-    </Modal>
+
+          {onResetWindows && (
+            <SettingRow last label="Reset window positions"
+              description="Puts every window back where it starts on a fresh install (this world only; takes effect now).">
+              <DialogButton onClick={onResetWindows}>Reset window positions</DialogButton>
+            </SettingRow>
+          )}
+        </>
+      )}
+
+      {tab === "3d" && (
+        <>
+          <SettingRow label="Look sensitivity" description="Mouselook speed in grabbed-cursor LOOK mode (Z from orbit)">
+            <SliderRow label="" labelWidth={0} width={130}
+              value={local.lookSensitivity} min={0.25} max={4} step={0.05}
+              format={v => `${v.toFixed(2)}×`}
+              onChange={v => set("lookSensitivity", v)}
+            />
+          </SettingRow>
+
+          <SettingRow label="Fly-drag sensitivity" description="Look speed while drag-looking (left-drag) in FLY mode">
+            <SliderRow label="" labelWidth={0} width={130}
+              value={local.dragSensitivity} min={0.25} max={4} step={0.05}
+              format={v => `${v.toFixed(2)}×`}
+              onChange={v => set("dragSensitivity", v)}
+            />
+          </SettingRow>
+
+          <SettingRow label="Invert Y axis" description="Flips pitch: mouse up looks down">
+            <Check checked={local.invertY} onChange={v => set("invertY", v)} label="" title="Invert Y axis" />
+          </SettingRow>
+
+          <SettingRow label="Fog in 3D views" description="Fades distant terrain like the game does; turn off to inspect far terrain">
+            <Check checked={local.enableFog} onChange={v => set("enableFog", v)} label="" title="Fog in 3D views" />
+          </SettingRow>
+
+          {/* Night lighting / Shadows / GPU shadow map are perf-heavy, session-only view modes —
+              they live in the Ribbon's 3D/View Lighting group (⚡ badged) and always start off,
+              so they're deliberately not persisted defaults here. */}
+
+          <SettingRow last label="3D performance HUD" description="Resident-geometry readout in the 3D pane; also feeds Help ▸ Diagnostics">
+            <Check checked={local.showPerfHud} onChange={v => set("showPerfHud", v)} label="" title="3D performance HUD" />
+          </SettingRow>
+
+          <SectionHeading>3D pane sliders</SectionHeading>
+
+          <SettingRow label="Render distance">
+            <SliderRow label="" labelWidth={0} width={130}
+              value={local.renderDistance} min={RD_MIN} max={MAX_RENDER_DISTANCE} step={1}
+              format={v => `${Math.round(v)} chunks`}
+              onChange={v => set("renderDistance", Math.round(v))}
+            />
+          </SettingRow>
+
+          <SettingRow label="Fly speed">
+            <SliderRow label="" labelWidth={0} width={130}
+              value={local.flySpeed} min={0.1} max={3} step={0.1}
+              format={v => `${v.toFixed(1)}×`}
+              onChange={v => set("flySpeed", v)}
+            />
+          </SettingRow>
+
+          <SettingRow label="Sun angle">
+            <SliderRow label="" labelWidth={0} width={130}
+              value={local.sunT} min={0} max={1} step={0.01}
+              format={v => (v < 0.03 ? "sunrise" : v > 0.97 ? "sunset" : v === 0.5 ? "noon" : v.toFixed(2))}
+              onChange={v => set("sunT", v)}
+            />
+          </SettingRow>
+
+          <SettingRow label="Lamp radius">
+            <SliderRow label="" labelWidth={0} width={130}
+              value={local.lampRadius} min={2} max={32} step={1}
+              format={v => `${Math.round(v)} blocks`}
+              onChange={v => set("lampRadius", Math.round(v))}
+            />
+          </SettingRow>
+
+          <SettingRow label="Build reach"
+            description="How far a 3D build-mode break/place can reach. Past it the placement outline doesn't appear and a click does nothing. Select, eyedropper and flood fill still reach 256.">
+            <SliderRow label="" labelWidth={0} width={130}
+              value={local.buildReach} min={8} max={256} step={8}
+              format={v => `${Math.round(v)} blocks`}
+              onChange={v => set("buildReach", Math.round(v))}
+            />
+          </SettingRow>
+
+          <SettingRow last label="Lighting profile"
+            description="Legacy (~4-tile, steep falloff) vs Modern/New Dawn (~14-tile, gradual falloff). Switching snaps Lamp radius to that profile's default.">
+            <Segmented
+              ariaLabel="Lighting profile"
+              value={local.lightingProfile}
+              onChange={v => {
+                set("lightingProfile", v);
+                set("lampRadius", v === "legacy" ? 4 : 14);
+              }}
+              options={[
+                { id: "legacy", label: "Legacy" },
+                { id: "modern", label: "New Dawn" },
+              ]}
+            />
+          </SettingRow>
+
+          <div style={{ fontSize: FONT.label, color: MODAL_TEXT.secondary, marginTop: 8 }}>
+            These are also editable from the 3D pane / Ribbon directly — surfaced here so Reset to defaults has somewhere visible to reset them to.
+          </div>
+        </>
+      )}
+
+      {tab === "editor" && (
+        <>
+          <SettingRow label="Save compressed by default" description="New worlds save as .zip; overridden by the loaded world's format">
+            <Check checked={local.defaultSaveCompressed} onChange={v => set("defaultSaveCompressed", v)} label="" title="Save compressed by default" />
+          </SettingRow>
+
+          <SettingRow last label="Compress backups" description="The one-time pre-save snapshot is written as .bak.zip instead of a plain .bak copy">
+            <Check checked={local.backupCompressed} onChange={v => set("backupCompressed", v)} label="" title="Compress backups" />
+          </SettingRow>
+
+          <SectionHeading>Autosave</SectionHeading>
+          <SettingRow last label="Autosave interval" description="How often an in-progress world is snapshotted to a recovery sidecar. 0 disables autosave.">
+            <SliderRow label="" labelWidth={0} width={130}
+              value={local.autosaveIntervalMin} min={0} max={15} step={1}
+              format={v => (v === 0 ? "Off" : `${Math.round(v)} min`)}
+              onChange={v => set("autosaveIntervalMin", Math.round(v))}
+            />
+          </SettingRow>
+        </>
+      )}
+
+      {tab === "sounds" && (
+        <>
+          <SettingRow label="UI sounds"
+            description="Synthesised completion cues (tab/menu switches, copy/paste, save, rotate/mirror, undo/redo, drag start and drop, errors). Never on hover, never at pointer or stamp rate.">
+            <Check checked={local.uiSounds} onChange={v => set("uiSounds", v)} label="" title="UI sounds" />
+          </SettingRow>
+
+          <SettingRow label="Sound pack" description="Choosing a pack plays a sample">
+            <Select<PackId>
+              value={local.uiSoundPack}
+              options={SOUND_PACK_OPTIONS}
+              onChange={id => { set("uiSoundPack", id); sfx.preview("copy", id, local.uiSoundVolume); }}
+              ariaLabel="Sound pack"
+              width={170}
+            />
+          </SettingRow>
+
+          <SettingRow last label="Volume">
+            <SliderRow label="" labelWidth={0} width={130}
+              value={local.uiSoundVolume} min={0} max={1} step={0.05}
+              format={v => `${Math.round(v * 100)}%`}
+              onChange={v => set("uiSoundVolume", v)}
+            />
+          </SettingRow>
+        </>
+      )}
+
+      {tab === "files" && (
+        <>
+          <PathRow
+            label="Eden.eden template path" badge={<Badge>exp</Badge>}
+            description="Eden.eden is the pre-generated template bundled with the game. Point this at your copy to show its terrain faded behind the gaps in a sparse/normal world's map (View ▾ → Template Overlay), or to &quot;Expand from Template&quot; and bake it into a full world file."
+            value={local.templatePath} placeholder="Not set"
+            onBrowse={browsePath} onClear={() => set("templatePath", null)}
+          />
+
+          <PathRow
+            label="Texture pack path"
+            description="ZIP of PNGs — adds textures to 3D views and block picker icons"
+            value={local.texturePackPath} placeholder="Not set"
+            onBrowse={browseTexturePack} onClear={() => set("texturePackPath", null)}
+          />
+
+          <PathRow last
+            label="Prefab library folder"
+            description="Scanned by the Prefab Library panel. Leave unset to use the app's own folder."
+            value={local.prefabDirectory} placeholder="App default"
+            onBrowse={browsePrefabDir} onClear={() => set("prefabDirectory", null)}
+          />
+        </>
+      )}
+    </Dialog>
   );
+}
+
+/** Local alias — `Badge` from `ribbon/primitives.tsx` is the one "exp" badge treatment app-wide,
+ *  keeping the same visual as `designTokens.ts`'s `expBadge()` recipe it's re-backed by. */
+function Badge({ children }: { children: ReactNode }) {
+  return <span style={expBadge({ marginLeft: 7, verticalAlign: "middle" })}>{children}</span>;
 }

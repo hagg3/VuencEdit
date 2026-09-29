@@ -35,9 +35,33 @@ pub struct SystemMemory {
     pub available_bytes: u64,
 }
 
+/// Platform state that can explain a throttled or memory-starved machine (ROADMAP-EDIT 17.2, H-E1
+/// and H-D1 in `TEST WORLDS/perf-degradation-investigation-2026-09-29.md`). Every field is
+/// "unknown" (`None`/0) where the platform doesn't expose it, so the report can say so instead of
+/// guessing. Thermal state and Low Power Mode are deliberately **not** here: on macOS they need
+/// `NSProcessInfo` (an `objc2` dependency), so 17.0 reads `pmset -g therm` by hand instead.
+#[derive(Default, Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlatformState {
+    /// macOS `kern.memorystatus_vm_pressure_level`: 1 normal, 2 warn, 4 critical. 0 = unknown.
+    pub memory_pressure_level: u32,
+    /// macOS swap file usage (`vm.swapusage`). 0/0 where unavailable.
+    pub swap_used_bytes: u64,
+    pub swap_total_bytes: u64,
+    /// Windows commit charge and limit (`GlobalMemoryStatusEx` total/avail page file). 0/0 elsewhere.
+    pub commit_used_bytes: u64,
+    pub commit_limit_bytes: u64,
+    /// Windows `GetSystemPowerStatus`: `Some(true)` on AC, `Some(false)` on battery.
+    pub on_ac_power: Option<bool>,
+    /// Battery charge 0–100 when a battery is present.
+    pub battery_percent: Option<u8>,
+    /// Windows Battery Saver (`SystemStatusFlag`), which throttles background and frame work.
+    pub battery_saver: Option<bool>,
+}
+
 #[cfg(target_os = "windows")]
 mod imp {
-    use super::{ProcessMemory, SystemMemory};
+    use super::{PlatformState, ProcessMemory, SystemMemory};
 
     // psapi.dll and kernel32.dll are both linked by the standard library on every MSVC target —
     // same rationale as `working_set.rs`: two stable entry points don't justify a vendored crate.
@@ -120,11 +144,61 @@ mod imp {
         }
         SystemMemory { total_bytes: status.ull_total_phys, available_bytes: status.ull_avail_phys }
     }
+
+    // <winbase.h> SYSTEM_POWER_STATUS.
+    #[repr(C)]
+    #[derive(Default)]
+    struct SystemPowerStatus {
+        ac_line_status: u8,
+        battery_flag: u8,
+        battery_life_percent: u8,
+        system_status_flag: u8,
+        battery_life_time: u32,
+        battery_full_life_time: u32,
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetSystemPowerStatus(status: *mut SystemPowerStatus) -> i32;
+    }
+
+    pub(super) fn platform_state() -> PlatformState {
+        let mut state = PlatformState::default();
+
+        let mut status = MemoryStatusEx {
+            dw_length: std::mem::size_of::<MemoryStatusEx>() as u32,
+            ..Default::default()
+        };
+        // SAFETY: as in `system_memory`.
+        if unsafe { GlobalMemoryStatusEx(&mut status) } != 0 {
+            state.commit_limit_bytes = status.ull_total_page_file;
+            state.commit_used_bytes =
+                status.ull_total_page_file.saturating_sub(status.ull_avail_page_file);
+        }
+
+        let mut power = SystemPowerStatus::default();
+        // SAFETY: `power` matches SYSTEM_POWER_STATUS's layout, which is all this call requires.
+        if unsafe { GetSystemPowerStatus(&mut power) } != 0 {
+            // ACLineStatus: 0 offline, 1 online, 255 unknown.
+            state.on_ac_power = match power.ac_line_status {
+                0 => Some(false),
+                1 => Some(true),
+                _ => None,
+            };
+            // BatteryLifePercent: 255 unknown; BatteryFlag bit 7 (128) = no system battery.
+            if power.battery_life_percent <= 100 && power.battery_flag & 128 == 0 {
+                state.battery_percent = Some(power.battery_life_percent);
+            }
+            // SystemStatusFlag: 1 = Battery Saver on.
+            state.battery_saver = Some(power.system_status_flag & 1 != 0);
+        }
+        state
+    }
 }
 
 #[cfg(target_os = "macos")]
 mod imp {
-    use super::{ProcessMemory, SystemMemory};
+    use super::{PlatformState, ProcessMemory, SystemMemory};
 
     // <mach/task_info.h>: MACH_TASK_BASIC_INFO = 20, 10 natural_t words
     // (virtual_size/resident_size/resident_size_max as u64 pairs, then
@@ -235,14 +309,176 @@ mod imp {
         // only; available stays 0 (rendered as "unknown" by the frontend) rather than guessing.
         SystemMemory { total_bytes: sysctl_u64("hw.memsize").unwrap_or(0), available_bytes: 0 }
     }
+
+    // <sys/sysctl.h> `struct xsw_usage`, the payload of `vm.swapusage`.
+    #[repr(C)]
+    #[derive(Default)]
+    struct XswUsage {
+        total: u64,
+        avail: u64,
+        used: u64,
+        pagesize: u32,
+        encrypted: u8,
+    }
+
+    fn sysctl_swap() -> Option<XswUsage> {
+        let name = std::ffi::CString::new("vm.swapusage").ok()?;
+        let mut value = XswUsage::default();
+        let mut len = std::mem::size_of::<XswUsage>();
+        // SAFETY: `value`/`len` describe each other's size; `name` is a valid C string.
+        let rc = unsafe {
+            sysctlbyname(
+                name.as_ptr(),
+                &mut value as *mut XswUsage as *mut core::ffi::c_void,
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        (rc == 0).then_some(value)
+    }
+
+    pub(super) fn platform_state() -> PlatformState {
+        let mut state = PlatformState::default();
+        // The level is a 4-byte int; `sysctl_u64` would fail with ENOMEM on the size mismatch.
+        let level = std::ffi::CString::new("kern.memorystatus_vm_pressure_level").unwrap();
+        let mut v: i32 = 0;
+        let mut len = std::mem::size_of::<i32>();
+        // SAFETY: `v`/`len` describe each other's size; `level` is a valid C string.
+        let rc = unsafe {
+            sysctlbyname(
+                level.as_ptr(),
+                &mut v as *mut i32 as *mut core::ffi::c_void,
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if rc == 0 && v > 0 {
+            state.memory_pressure_level = v as u32;
+        }
+        if let Some(swap) = sysctl_swap() {
+            state.swap_used_bytes = swap.used;
+            state.swap_total_bytes = swap.total;
+        }
+        state
+    }
 }
 
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
 mod imp {
-    use super::{ProcessMemory, SystemMemory};
+    use super::{PlatformState, ProcessMemory, SystemMemory};
     pub(super) fn process_memory() -> ProcessMemory { ProcessMemory::default() }
     pub(super) fn system_memory() -> SystemMemory { SystemMemory::default() }
+    pub(super) fn platform_state() -> PlatformState { PlatformState::default() }
 }
 
 pub fn process_memory() -> ProcessMemory { imp::process_memory() }
 pub fn system_memory() -> SystemMemory { imp::system_memory() }
+pub fn platform_state() -> PlatformState { imp::platform_state() }
+
+// ── Stage 18.0: peak/size counters ──────────────────────────────────────────
+//
+// Plain atomics, set at the operation (never a per-event log, never a poll) and read on demand by
+// `mem_stats`. The peak working set can't attribute a spike to an operation; these can. `_last` is
+// the most recent occurrence, `_max` the session high-water mark. Relaxed everywhere: they are
+// diagnostics, not synchronisation.
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+/// One `_last`/`_max` pair.
+#[derive(Default)]
+pub struct Peak { last: AtomicU64, max: AtomicU64 }
+
+impl Peak {
+    pub const fn new() -> Self { Peak { last: AtomicU64::new(0), max: AtomicU64::new(0) } }
+    pub fn record(&self, v: u64) { self.last.store(v, Relaxed); self.max.fetch_max(v, Relaxed); }
+    fn snap(&self) -> PeakPair { PeakPair { last: self.last.load(Relaxed), max: self.max.load(Relaxed) } }
+}
+
+#[derive(Default, Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PeakPair { pub last: u64, pub max: u64 }
+
+/// Every 18.0 counter. `static PEAKS` below is the one instance.
+pub struct Peaks {
+    /// Pre-image bytes copied by `with_edit_inner` (RAM-1).
+    pub edit_preimage: Peak,
+    /// `UndoEntry::bytes` of the entry `finish_edit` kept (RAM-1 ratio, RAM-5).
+    pub edit_delta: Peak,
+    /// `ChunkScratch` buffer bytes per sculpt flush (RAM-2).
+    pub sculpt_scratch: Peak,
+    /// Bytes copied into a preview scan buffer (RAM-6).
+    pub preview_scan: Peak,
+    /// Peak transient bytes a clipboard mutation (copy/rotate/mirror) allocated beyond the
+    /// clipboard itself (RAM-4).
+    pub clipboard_op: Peak,
+    /// Autosave tick payload bytes / wall ms (C-2).
+    pub autosave_bytes: Peak,
+    pub autosave_ms: Peak,
+    pub autosave_compactions: AtomicU64,
+    /// Full/incremental/compressed save: 0 = none yet, 1 = incremental, 2 = full, 3 = compressed.
+    pub save_kind: AtomicU64,
+    pub save_bytes: Peak,
+    pub save_ms: Peak,
+}
+
+impl Peaks {
+    const fn new() -> Self {
+        Peaks {
+            edit_preimage: Peak::new(), edit_delta: Peak::new(), sculpt_scratch: Peak::new(),
+            preview_scan: Peak::new(), clipboard_op: Peak::new(),
+            autosave_bytes: Peak::new(), autosave_ms: Peak::new(),
+            autosave_compactions: AtomicU64::new(0), save_kind: AtomicU64::new(0),
+            save_bytes: Peak::new(), save_ms: Peak::new(),
+        }
+    }
+    pub fn snapshot(&self) -> PeakSnapshot {
+        PeakSnapshot {
+            edit_preimage_bytes: self.edit_preimage.snap(),
+            edit_delta_bytes: self.edit_delta.snap(),
+            sculpt_scratch_bytes: self.sculpt_scratch.snap(),
+            preview_scan_bytes: self.preview_scan.snap(),
+            clipboard_op_bytes: self.clipboard_op.snap(),
+            autosave_bytes: self.autosave_bytes.snap(),
+            autosave_ms: self.autosave_ms.snap(),
+            autosave_compactions: self.autosave_compactions.load(Relaxed),
+            save_kind: match self.save_kind.load(Relaxed) {
+                1 => "incremental", 2 => "full", 3 => "compressed", _ => "none",
+            },
+            save_bytes: self.save_bytes.snap(),
+            save_ms: self.save_ms.snap(),
+        }
+    }
+}
+
+pub static PEAKS: Peaks = Peaks::new();
+
+/// Serialisable copy of `PEAKS` for `mem_stats`.
+#[derive(Default, Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PeakSnapshot {
+    pub edit_preimage_bytes: PeakPair,
+    pub edit_delta_bytes: PeakPair,
+    pub sculpt_scratch_bytes: PeakPair,
+    pub preview_scan_bytes: PeakPair,
+    pub clipboard_op_bytes: PeakPair,
+    pub autosave_bytes: PeakPair,
+    pub autosave_ms: PeakPair,
+    pub autosave_compactions: u64,
+    pub save_kind: &'static str,
+    pub save_bytes: PeakPair,
+    pub save_ms: PeakPair,
+}
+
+#[cfg(test)]
+mod peak_tests {
+    use super::*;
+
+    #[test]
+    fn peak_tracks_last_and_max() {
+        let p = Peak::new();
+        p.record(10); p.record(50); p.record(20);
+        let s = p.snap();
+        assert_eq!((s.last, s.max), (20, 50));
+    }
+}
