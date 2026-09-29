@@ -26,6 +26,25 @@ pub trait VoxelView {
     /// so an intra-chunk index is in bounds iff it is `< slice.len()`.
     fn chunk_bytes(&self, cx: i32, cy: i32) -> Option<&[u8]>;
 
+    /// Does this view have chunk `(cx, cy)` at all? Default: `chunk_bytes(..).is_some()`.
+    #[inline]
+    fn has_chunk(&self, cx: i32, cy: i32) -> bool { self.chunk_bytes(cx, cy).is_some() }
+
+    /// Band `band` of chunk `(cx, cy)`: `chunk_bytes[band*8192 .. min((band+1)*8192, len)]`, empty
+    /// when the chunk's real span doesn't reach that band, `None` for a missing chunk.
+    ///
+    /// Every per-block accessor in this file goes through this rather than `chunk_bytes`, so a view
+    /// that stores a chunk as *separately-materialised bands* (the sculpt `ChunkScratch`) never has
+    /// to present a contiguous whole-chunk slice. The default derives it from `chunk_bytes`, so
+    /// contiguous views need no change and index arithmetic is identical (`local < band.len()`
+    /// iff `band*8192 + local < chunk.len()`).
+    #[inline]
+    fn band_bytes(&self, cx: i32, cy: i32, band: usize) -> Option<&[u8]> {
+        let c = self.chunk_bytes(cx, cy)?;
+        let lo = band.saturating_mul(8192);
+        Some(if lo >= c.len() { &[] } else { &c[lo..(lo + 8192).min(c.len())] })
+    }
+
     /// An **upper bound** on the index of the topmost band of chunk `(cx, cy)` that holds any
     /// non-air block. A top-down scan may start here instead of at `num_bands() - 1`.
     ///
@@ -70,6 +89,14 @@ pub trait VoxelViewMut: VoxelView {
     /// Writable twin of `chunk_bytes`. `None` means "this view does not own that chunk" and the
     /// write is dropped — same contract `set_block_abs` has always had for a missing chunk.
     fn chunk_bytes_mut(&mut self, cx: i32, cy: i32) -> Option<&mut [u8]>;
+
+    /// Writable twin of `band_bytes` — the hook a lazy view uses to materialise just this band.
+    #[inline]
+    fn band_bytes_mut(&mut self, cx: i32, cy: i32, band: usize) -> Option<&mut [u8]> {
+        let c = self.chunk_bytes_mut(cx, cy)?;
+        let lo = band.saturating_mul(8192);
+        Some(if lo >= c.len() { &mut [] } else { let hi = (lo + 8192).min(c.len()); &mut c[lo..hi] })
+    }
 }
 
 /// The handful of *whole-world* facts the renderers need that `VoxelView` deliberately doesn't
@@ -106,10 +133,10 @@ pub fn get_block_at(world: &impl VoxelView, wx: i32, wy: i32, wz: i32) -> (u8, u
     let (mnx, mny) = world.chunk_origin();
     let cx = wx.div_euclid(16) + mnx;
     let cy = wy.div_euclid(16) + mny;
-    if let Some(chunk) = world.chunk_bytes(cx, cy) {
+    if let Some(chunk) = world.band_bytes(cx, cy, wz as usize / 16) {
         let lx = wx.rem_euclid(16) as usize;
         let ly = wy.rem_euclid(16) as usize;
-        let bi = (wz as usize / 16) * 8192 + lx * 256 + ly * 16 + wz as usize % 16;
+        let bi = lx * 256 + ly * 16 + wz as usize % 16;
         let pi = bi + 4096;
         if pi < chunk.len() { return (chunk[bi], chunk[pi]); }
     }
@@ -134,7 +161,7 @@ pub fn surface_z_capped(world: &impl VoxelView, px: i32, py: i32, cap: Option<i3
     let (mnx, mny) = world.chunk_origin();
     let cx = px / 16 + mnx;
     let cy = py / 16 + mny;
-    let chunk = world.chunk_bytes(cx, cy)?;
+    if !world.has_chunk(cx, cy) { return None; }
     let lx = (px % 16) as usize;
     let ly = (py % 16) as usize;
     // Start at the chunk's top-occupied-band hint rather than the top of the world — see
@@ -144,11 +171,12 @@ pub fn surface_z_capped(world: &impl VoxelView, px: i32, py: i32, cap: Option<i3
         if let Some(c) = cap {
             if (band * 16) as i32 > c { continue; }
         }
+        let Some(chunk) = world.band_bytes(cx, cy, band) else { continue };
         for lz in (0..16usize).rev() {
             if let Some(c) = cap {
                 if (band * 16 + lz) as i32 > c { continue; }
             }
-            let bi = band * 8192 + lx * 256 + ly * 16 + lz;
+            let bi = lx * 256 + ly * 16 + lz;
             if bi >= chunk.len() { continue; }
             if chunk[bi] != 0 {
                 return Some((band * 16 + lz) as i32);
@@ -170,8 +198,8 @@ pub fn set_block_abs(world: &mut impl VoxelViewMut, wx: i32, wy: i32, wz: i32, b
     let ly   = wy.rem_euclid(16) as usize;
     let band = wz as usize / 16;
     let lz   = wz as usize % 16;
-    if let Some(chunk) = world.chunk_bytes_mut(cx, cy) {
-        let bi = band * 8192 + lx * 256 + ly * 16 + lz;
+    if let Some(chunk) = world.band_bytes_mut(cx, cy, band) {
+        let bi = lx * 256 + ly * 16 + lz;
         let pi = bi + 4096;
         if pi < chunk.len() {
             chunk[bi] = bt;
@@ -186,10 +214,10 @@ pub fn read_block_abs(world: &impl VoxelView, wx: i32, wy: i32, wz: i32) -> u8 {
     let (mnx, mny) = world.chunk_origin();
     let cx = wx.div_euclid(16) + mnx;
     let cy = wy.div_euclid(16) + mny;
-    if let Some(chunk) = world.chunk_bytes(cx, cy) {
+    if let Some(chunk) = world.band_bytes(cx, cy, wz as usize / 16) {
         let lx = wx.rem_euclid(16) as usize;
         let ly = wy.rem_euclid(16) as usize;
-        let bi = (wz as usize / 16) * 8192 + lx * 256 + ly * 16 + wz as usize % 16;
+        let bi = lx * 256 + ly * 16 + wz as usize % 16;
         if bi < chunk.len() { return chunk[bi]; }
     }
     0
@@ -201,10 +229,10 @@ pub fn read_paint_abs(world: &impl VoxelView, wx: i32, wy: i32, wz: i32) -> u8 {
     let (mnx, mny) = world.chunk_origin();
     let cx = wx.div_euclid(16) + mnx;
     let cy = wy.div_euclid(16) + mny;
-    if let Some(chunk) = world.chunk_bytes(cx, cy) {
+    if let Some(chunk) = world.band_bytes(cx, cy, wz as usize / 16) {
         let lx = wx.rem_euclid(16) as usize;
         let ly = wy.rem_euclid(16) as usize;
-        let bi = (wz as usize / 16) * 8192 + lx * 256 + ly * 16 + wz as usize % 16;
+        let bi = lx * 256 + ly * 16 + wz as usize % 16;
         let pi = bi + 4096;
         if pi < chunk.len() { return chunk[pi]; }
     }
