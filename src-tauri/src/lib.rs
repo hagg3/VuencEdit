@@ -328,6 +328,14 @@ fn staged_map_mode(path: &std::path::Path) -> MapMode {
 /// filesystem that won't take a writable mapping — falls back to the old `map_copy` behaviour rather
 /// than failing the load.
 fn map_staged_temp(path: &std::path::Path) -> std::io::Result<MmapMut> {
+    map_staged_temp_ex(path).map(|(m, _)| m)
+}
+
+/// `map_staged_temp` plus whether the mapping came out `MAP_SHARED` (file-backed by `path`). Only
+/// then is the temp file, after an msync, a byte-exact image of the mapping — which is what lets
+/// `save_world` produce a full save by cloning/copying the file (18.11) instead of writing every
+/// page through the mapping. `MAP_PRIVATE` edits never reach the temp, so that path can't.
+fn map_staged_temp_ex(path: &std::path::Path) -> std::io::Result<(MmapMut, bool)> {
     if staged_map_mode(path) == MapMode::Shared {
         // SAFETY: the temp file is private to this process, written by us, and stays alive for the
         // duration of the mapping (deleted only after the LoadedWorld holding it has been dropped).
@@ -339,7 +347,7 @@ fn map_staged_temp(path: &std::path::Path) -> std::io::Result<MmapMut> {
         match shared {
             Ok(m) => {
                 timing_log!("[LOAD] mapped staged temp MAP_SHARED  bytes={}B", m.len());
-                return Ok(m);
+                return Ok((m, true));
             }
             Err(e) => {
                 timing_log!("[LOAD] MAP_SHARED failed ({e}) — falling back to MAP_PRIVATE");
@@ -350,7 +358,7 @@ fn map_staged_temp(path: &std::path::Path) -> std::io::Result<MmapMut> {
     let file = fs::File::open(path)?;
     let m = unsafe { MmapOptions::new().map_copy(&file) }?;
     timing_log!("[LOAD] mapped staged temp MAP_PRIVATE  bytes={}B", m.len());
-    Ok(m)
+    Ok((m, false))
 }
 
 /// Delete `vuencedit_*` staging files left in the system temp dir by a previous session that quit
@@ -655,84 +663,136 @@ impl VoxelViewMut for LoadedWorld {
     }
 }
 
-/// A private, writable copy of a bounded set of chunks, layered over a live world (audit H1).
+/// A private, writable overlay of a bounded set of chunks, layered over a live world (audit H1),
+/// **lazy and band-granular** (ROADMAP-EDIT 18.10 / audit RAM-2).
 ///
-/// Reads of an owned chunk see the scratch; reads of any other chunk fall through to the world —
-/// so a brush that reads its 8-neighbourhood across a chunk boundary gets real terrain, never
-/// silent air. Writes to a chunk the scratch does not own are **dropped**, which is why every
-/// caller must build the scratch from a rect that provably covers the stamp's whole write extent
+/// Construction copies nothing. A band (one 8 KiB block+paint pair, `band*8192 ..`) is copied out of
+/// the world the first time something asks to *write* it (`band_bytes_mut`); reads of an owned
+/// chunk see the scratch copy of a band if it has one and otherwise fall straight through to the
+/// world's bytes (identical, because the world isn't mutated during the compute phase — the
+/// `dirty.seq` staleness check guards that window). So a brush flush copies, holds and later diffs
+/// only the bands it actually wrote, instead of every 128 KB chunk in its union rect, and the air
+/// pages above the terrain are never touched.
+///
+/// Writes to a chunk the scratch does not own are **dropped**, which is why every caller must build
+/// the scratch from a rect that provably covers the stamp's whole write extent
 /// (`sculpt_write_rect`).
+///
+/// ⚠️ **Never call `chunk_bytes` on a scratch that has copied bands** — a whole-chunk slice can't
+/// represent a chunk that is part scratch, part world, so it asserts. Every per-block accessor
+/// goes through `band_bytes`/`band_bytes_mut`/`has_chunk` instead.
+///
+/// ⚠️ **`top_band_hint` must cover the scratch's own writes**: a stamp that raises terrain above
+/// the world's hint would otherwise be read back as air by the very next `surface_z` in the same
+/// flush. The hint here is `max(world hint, highest band made writable)` — too high is safe.
 pub(crate) struct ChunkScratch<'a> {
     base: &'a LoadedWorld,
-    /// chunk coord → (offset into `buf`, span length)
-    owned: FxHashMap<(i32, i32), (usize, usize)>,
-    buf: Vec<u8>,
+    owned: FxHashMap<(i32, i32), ScratchChunk>,
+    /// Total bytes of copied bands (the 18.0 `sculpt_scratch` counter).
+    copied: usize,
+}
+
+/// One owned chunk: its span in the world at build time, the copied bands, and the highest band
+/// ever made writable (the `top_band_hint` floor).
+struct ScratchChunk {
+    span: usize,
+    bands: Vec<Option<Box<[u8]>>>,
+    top_written: usize,
+}
+
+#[inline]
+fn band_range(span: usize, band: usize) -> (usize, usize) {
+    let lo = band.saturating_mul(8192).min(span);
+    (lo, (lo + 8192).min(span))
 }
 
 impl<'a> ChunkScratch<'a> {
-    /// Copy each listed chunk's bytes out of `base`. Coordinates the world has no chunk for are
-    /// skipped (reads there already returned air, writes there were already dropped).
+    /// Own each listed chunk (copying nothing). Coordinates the world has no chunk for are skipped
+    /// (reads there already returned air, writes there were already dropped).
     pub(crate) fn new(base: &'a LoadedWorld, chunks: &[(i32, i32)]) -> Self {
-        let mut owned: FxHashMap<(i32, i32), (usize, usize)> = FxHashMap::default();
-        let mut buf: Vec<u8> = Vec::new();
+        let mut owned: FxHashMap<(i32, i32), ScratchChunk> = FxHashMap::default();
         for &(cx, cy) in chunks {
             if owned.contains_key(&(cx, cy)) { continue; }
             let Some((a, e)) = base.chunk_range(cx, cy) else { continue };
-            let off = buf.len();
-            buf.extend_from_slice(&base.bytes[a..e]);
-            owned.insert((cx, cy), (off, e - a));
+            let span = e - a;
+            let n = span.div_ceil(8192);
+            owned.insert((cx, cy), ScratchChunk { span, bands: vec![None; n], top_written: 0 });
         }
-        ChunkScratch { base, owned, buf }
+        ChunkScratch { base, owned, copied: 0 }
     }
+
+    /// Bytes held by copied bands (18.0 `sculpt_scratch` counter). Only meaningful *after* the
+    /// stamp has run — construction copies nothing.
+    pub(crate) fn buf_len(&self) -> usize { self.copied }
 
     /// Drop the borrow of the world the copies came from, keeping the copies. This is what lets
     /// the compute phase run under a read guard and the commit under a write guard.
-    /// Bytes held by the scratch buffer (18.0 `sculpt_scratch` counter).
-    pub(crate) fn buf_len(&self) -> usize { self.buf.len() }
-
     pub(crate) fn into_chunks(self) -> ScratchChunks {
-        ScratchChunks { owned: self.owned, buf: self.buf }
+        ScratchChunks { owned: self.owned }
     }
 }
 
-/// A `ChunkScratch`'s buffers, detached from the world they were copied out of (audit H1).
+/// A `ChunkScratch`'s copied bands, detached from the world they were copied out of (audit H1).
 pub(crate) struct ScratchChunks {
-    owned: FxHashMap<(i32, i32), (usize, usize)>,
-    buf: Vec<u8>,
+    owned: FxHashMap<(i32, i32), ScratchChunk>,
 }
 
 impl ScratchChunks {
-    /// Write every owned chunk back into `world`, returning one `ChunkSnapshot` per chunk whose
-    /// bytes actually changed (the undo delta, holding the *pre*-write bytes — same encoding
-    /// `diff_chunk` produces, via the shared `diff_span`). Chunks whose span in `world` no longer
-    /// matches the copy are skipped rather than written back at the wrong length.
+    /// Write every copied band back into `world`, returning one `ChunkSnapshot` per chunk whose
+    /// bytes actually changed (the undo delta, holding the *pre*-write bytes). Only copied bands
+    /// are compared. Deltas use chunk-relative offsets; a dense one is a band-scoped
+    /// `Full(start, ..)` covering the lowest..highest changed band (the same shape
+    /// `with_edit_zscoped` produces). Chunks whose span in `world` no longer matches are skipped
+    /// rather than written back at the wrong length.
     pub(crate) fn commit(self, world: &mut LoadedWorld) -> Vec<ChunkSnapshot> {
-        let ScratchChunks { owned, buf } = self;
         let mut out = Vec::new();
-        for (&(cx, cy), &(off, span)) in owned.iter() {
+        for (&(cx, cy), sc) in self.owned.iter() {
             let Some((addr, cend)) = world.chunk_range(cx, cy) else { continue };
-            if cend - addr != span { continue; }
-            let post = &buf[off..off + span];
-            let pre = &world.bytes[addr..cend];
-            if let Some(delta) = diff_span(0, pre, post) {
-                // Write only the bytes that actually changed rather than the whole span — on a
-                // 256z chunk (131,072 B = 32 pages) over a MAP_SHARED mapping, a full-span write
-                // dirties every page for writeback even when a sculpt stamp touched a handful of
-                // them (the v1.0.11→v1.0.14 regression, ROADMAP-EDIT 11.1). `Sparse`'s pairs
-                // already enumerate exactly those offsets; `Full`/`FullZ` mean ≥20% of the span
-                // differs, so the span write is no worse and avoids re-decoding the delta.
-                match &delta {
-                    ChunkDelta::Sparse(pairs) => {
-                        for &(off, _pre_byte) in pairs {
-                            world.bytes[addr + off as usize] = post[off as usize];
+            if cend - addr != sc.span { continue; }
+            // Pass 1: diff copied bands against the world (pre-image of each changed byte).
+            let mut pairs: Vec<(u32, u8)> = Vec::new();
+            let (mut first, mut last) = (usize::MAX, 0usize);
+            for (band, slot) in sc.bands.iter().enumerate() {
+                let Some(post) = slot else { continue };
+                let (lo, hi) = band_range(sc.span, band);
+                let pre = &world.bytes[addr + lo..addr + hi];
+                let before = pairs.len();
+                let mut i = 0usize;
+                while i + 8 <= pre.len() {
+                    if pre[i..i + 8] != post[i..i + 8] {
+                        for j in i..i + 8 {
+                            if pre[j] != post[j] { pairs.push(((lo + j) as u32, pre[j])); }
                         }
                     }
-                    ChunkDelta::Full(..) | ChunkDelta::FullZ(..) | ChunkDelta::SparseZ(..) => {
-                        world.bytes[addr..cend].copy_from_slice(post);
-                    }
+                    i += 8;
                 }
-                out.push(ChunkSnapshot { cx, cy, delta });
+                while i < pre.len() {
+                    if pre[i] != post[i] { pairs.push(((lo + i) as u32, pre[i])); }
+                    i += 1;
+                }
+                if pairs.len() != before {
+                    first = first.min(band);
+                    last = last.max(band);
+                }
             }
+            if pairs.is_empty() { continue; }
+            // Pass 2: build the delta (captures pre bytes before anything is overwritten).
+            let (rlo, _) = band_range(sc.span, first);
+            let (_, rhi) = band_range(sc.span, last);
+            let delta = if pairs.len() * 5 < rhi - rlo {
+                pairs.shrink_to_fit();
+                ChunkDelta::Sparse(pairs.clone())
+            } else {
+                ChunkDelta::Full(rlo as u32, world.bytes[addr + rlo..addr + rhi].to_vec())
+            };
+            // Pass 3: write only the bytes that changed (a full-span write would dirty every page
+            // of a MAP_SHARED mapping — ROADMAP-EDIT 11.1).
+            for &(off, _) in &pairs {
+                let off = off as usize;
+                let post = sc.bands[off / 8192].as_ref().expect("changed byte lives in a copied band");
+                world.bytes[addr + off] = post[off % 8192];
+            }
+            out.push(ChunkSnapshot { cx, cy, delta });
         }
         // Deterministic order regardless of hash iteration order, so an undo entry's chunk list is
         // reproducible (tests compare them, and `patch_from_chunk_coords` folds them into a rect).
@@ -746,20 +806,48 @@ impl VoxelView for ChunkScratch<'_> {
     fn num_bands(&self) -> usize { self.base.num_bands }
     #[inline]
     fn chunk_origin(&self) -> (i32, i32) { (self.base.min_x, self.base.min_y) }
-    #[inline]
     fn chunk_bytes(&self, cx: i32, cy: i32) -> Option<&[u8]> {
+        if let Some(sc) = self.owned.get(&(cx, cy)) {
+            assert!(sc.bands.iter().all(|b| b.is_none()),
+                    "ChunkScratch::chunk_bytes on a chunk with copied bands — use band_bytes");
+        }
+        self.base.chunk_bytes(cx, cy)
+    }
+    #[inline]
+    fn has_chunk(&self, cx: i32, cy: i32) -> bool { self.base.chunk_range(cx, cy).is_some() }
+    #[inline]
+    fn band_bytes(&self, cx: i32, cy: i32, band: usize) -> Option<&[u8]> {
+        if let Some(sc) = self.owned.get(&(cx, cy)) {
+            if let Some(Some(b)) = sc.bands.get(band) { return Some(b); }
+        }
+        self.base.band_bytes(cx, cy, band)
+    }
+    #[inline]
+    fn top_band_hint(&self, cx: i32, cy: i32) -> usize {
+        let h = self.base.top_band_hint(cx, cy);
         match self.owned.get(&(cx, cy)) {
-            Some(&(off, span)) => Some(&self.buf[off..off + span]),
-            None => self.base.chunk_bytes(cx, cy),
+            Some(sc) => h.max(sc.top_written),
+            None => h,
         }
     }
 }
 
 impl VoxelViewMut for ChunkScratch<'_> {
+    fn chunk_bytes_mut(&mut self, _cx: i32, _cy: i32) -> Option<&mut [u8]> {
+        unreachable!("ChunkScratch is band-granular — use band_bytes_mut")
+    }
     #[inline]
-    fn chunk_bytes_mut(&mut self, cx: i32, cy: i32) -> Option<&mut [u8]> {
-        let &(off, span) = self.owned.get(&(cx, cy))?;
-        Some(&mut self.buf[off..off + span])
+    fn band_bytes_mut(&mut self, cx: i32, cy: i32, band: usize) -> Option<&mut [u8]> {
+        let sc = self.owned.get_mut(&(cx, cy))?;
+        let (lo, hi) = band_range(sc.span, band);
+        if lo >= hi { return Some(&mut []); }
+        if sc.bands[band].is_none() {
+            let (addr, _) = self.base.chunk_range(cx, cy)?;
+            sc.bands[band] = Some(self.base.bytes[addr + lo..addr + hi].into());
+            self.copied += hi - lo;
+        }
+        sc.top_written = sc.top_written.max(band);
+        sc.bands[band].as_deref_mut()
     }
 }
 
@@ -1304,6 +1392,10 @@ pub(crate) struct WorldState {
     /// Path to the decompressed temp file when the current world was opened from a zip.
     /// Deleted after the mmap is dropped on next world load.
     pub(crate) temp_path: Option<std::path::PathBuf>,
+    /// True when `world.bytes` is a `MAP_SHARED` mapping of `temp_path` (18.11), so after an msync
+    /// the temp file *is* the world image and a full save can clone/copy it. False for
+    /// `MAP_PRIVATE` fallback (edits never reach the temp) and for anything not staged by a load.
+    pub(crate) temp_shared: bool,
     /// Read-only mmap of Eden.eden template (loaded on demand via load_eden_template).
     /// Arc'd so long-running readers (e.g. expand_world_from_template) can clone a cheap
     /// reference and release the AppState lock instead of holding it for the whole operation.
@@ -1384,6 +1476,7 @@ impl WorldState {
             redo_groups: 0,
             undo_budget: DEFAULT_UNDO_BYTE_BUDGET,
             temp_path: None,
+            temp_shared: false,
             template_bytes: None,
             template_dir: FxHashMap::default(),
             template_surface_cache: TemplateSurfaceCache::default(),
@@ -2159,6 +2252,7 @@ fn load_world(path: String, state: tauri::State<'_, AppState>) -> Result<WorldMe
         recover_wal(std::path::Path::new(&path));
     }
 
+    let mut temp_shared = false;
     let (mmap, maybe_temp, was_compressed): (MmapMut, Option<std::path::PathBuf>, bool) = if is_zip(&magic) {
         use zip::ZipArchive;
         timing_log!("[LOAD] detected zip archive, decompressing  t=+{}µs", us());
@@ -2183,8 +2277,9 @@ fn load_world(path: String, state: tauri::State<'_, AppState>) -> Result<WorldMe
                 .map_err(|e| format!("Failed to decompress: {e}"))?;
         } // tmp closed here before mmap
         timing_log!("[LOAD] decompressed to {:?}  t=+{}µs", temp_path, us());
-        let mmap = map_staged_temp(&temp_path)
+        let (mmap, shared) = map_staged_temp_ex(&temp_path)
             .map_err(|e| format!("Failed to map temp file: {e}"))?;
+        temp_shared = shared;
         (mmap, Some(temp_path), true)
     } else {
         // Copy the source into a private temp file and map THAT — never the user's file directly.
@@ -2199,8 +2294,9 @@ fn load_world(path: String, state: tauri::State<'_, AppState>) -> Result<WorldMe
         stage_copy(std::path::Path::new(&path), &temp_path).map_err(|e| format!(
             "Failed to stage world file: {e}. Opening a world creates a private working copy; check available space for another copy on the system temporary-files drive."
         ))?;
-        let mmap = map_staged_temp(&temp_path)
+        let (mmap, shared) = map_staged_temp_ex(&temp_path)
             .map_err(|e| format!("Failed to map staged file: {e}"))?;
+        temp_shared = shared;
         (mmap, Some(temp_path), false)
     };
     timing_log!("[LOAD] file_mmap  bytes={}B  compressed={}  t=+{}µs", mmap.len(), was_compressed, us());
@@ -2291,6 +2387,7 @@ fn load_world(path: String, state: tauri::State<'_, AppState>) -> Result<WorldMe
         ws.selection_mask = None; // a wand/lasso shape belongs to the old world's coordinates
         let old_temp = ws.temp_path.take();
         ws.temp_path = maybe_temp;
+        ws.temp_shared = temp_shared;
         ws.dirty.clear_all();
         ws.autosave_base_id = None; // the new world's autosave lineage starts fresh, not the old one's
         ws.signs = signs;
@@ -3621,20 +3718,66 @@ fn atomic_write_progress(
     Ok(())
 }
 
+/// Full-save body for a `MAP_SHARED` world (18.11): `msync` the mapping so the temp file holds every
+/// edit, then produce `<path>.savetmp` with `stage_copy` (APFS `clonefile` on macOS, a kernel copy
+/// elsewhere) and rename it over the destination — same stage-then-rename atomicity as
+/// `atomic_write_progress`. The mapping is only *flushed*, never read, so the save doesn't pull the
+/// whole world into the working set. Caller holds the world read guard, so no edit lands between
+/// the flush and the copy. Same on-disk bytes as writing `mmap` directly.
+fn atomic_copy_from_temp(
+    mmap: &MmapMut, temp: &std::path::Path, path: &std::path::Path, op: Option<&LongOpHandle>,
+) -> Result<(), String> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".savetmp");
+    let tmp = std::path::PathBuf::from(tmp);
+    if let Some(op) = op { op.step(0, "Flushing")?; }
+    mmap.flush().map_err(|e| format!("Failed to flush working copy: {e}"))?;
+    if let Some(op) = op { op.step(0, "Copying")?; }
+    let copy_result = (|| -> Result<(), String> {
+        let _ = fs::remove_file(&tmp); // clonefile fails onto an existing destination
+        // `stage_copy` does its own `ensure_room_for` (only when a clone isn't possible).
+        stage_copy(temp, &tmp).map_err(|e| format!("Failed to write temp file: {e}"))?;
+        let f = fs::OpenOptions::new().write(true).open(&tmp)
+            .map_err(|e| format!("Failed to sync temp file: {e}"))?;
+        f.sync_all().map_err(|e| format!("Failed to sync temp file: {e}"))
+    })();
+    if let Err(e) = copy_result {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    fs::rename(&tmp, path).map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        format!("Failed to finalize save: {e}")
+    })?;
+    if let Some(parent) = path.parent() { fsync_dir(parent); }
+    Ok(())
+}
+
 /// Write `world.bytes` to `path`.  Before overwriting an existing file, copies
 /// it to `path.bak` (or, when `backup_compressed`, zips it to `path.bak.zip`) — but only if that
 /// backup doesn't already exist, so the first-save snapshot is preserved across multiple saves.
 #[cfg(test)]
 fn save_world_inner(world: &LoadedWorld, path: &str, backup_compressed: bool) -> Result<(), String> {
-    save_world_progress(world, path, backup_compressed, None)
+    save_world_progress(world, path, backup_compressed, None, None)
 }
 
 /// `save_world_inner` with an optional progress handle — see `atomic_write_progress`.
+///
+/// `shared_temp` (18.11): the staged temp file `world.bytes` is `MAP_SHARED` over, if any. When it's
+/// given and the same length as the mapping, the destination is produced from that *file* — msync,
+/// clone/copy, rename — so the write never streams the whole mapping through this process's working
+/// set. Anything unexpected falls back to `atomic_write_progress` over the mapping.
 fn save_world_progress(
     world: &LoadedWorld, path: &str, backup_compressed: bool, op: Option<&LongOpHandle>,
+    shared_temp: Option<&std::path::Path>,
 ) -> Result<(), String> {
     if let Some(op) = op { op.step(0, "Backing up")?; }
     make_backup_if_absent(std::path::Path::new(path), backup_compressed)?;
+    if let Some(temp) = shared_temp {
+        if fs::metadata(temp).map(|m| m.len()).ok() == Some(world.bytes.len() as u64) {
+            return atomic_copy_from_temp(&world.bytes, temp, std::path::Path::new(path), op);
+        }
+    }
     atomic_write_progress(std::path::Path::new(path), &world.bytes, op)
 }
 
@@ -5155,7 +5298,8 @@ fn save_world(
         if compressed {
             save_world_compressed(world, &path, backup_compressed, Some(&op))?
         } else {
-            save_world_progress(world, &path, backup_compressed, Some(&op))?
+            let shared = if ws.temp_shared { ws.temp_path.as_deref() } else { None };
+            save_world_progress(world, &path, backup_compressed, Some(&op), shared)?
         }
         seq
     };
@@ -5190,6 +5334,7 @@ fn close_world(state: tauri::State<'_, AppState>) {
         ws.disk_image = None;
         ws.autosave_base_id = None;
         ws.signs.clear();
+        ws.temp_shared = false;
         (ws.world.take(), ws.temp_path.take())
     };
     drop(old_world); // release the mmap before deleting its backing temp file
@@ -5633,7 +5778,7 @@ fn load_autosave_inner(state: &AppState, paths: &AutosavePaths) -> Result<WorldM
     }
     drop(temp_file);
 
-    let mmap = map_staged_temp(&temp_path)
+    let (mmap, temp_shared) = map_staged_temp_ex(&temp_path)
         .map_err(|e| format!("Failed to map staged temp: {e}"))?;
 
     let loaded = match parse_world_inner(mmap) {
@@ -5687,6 +5832,7 @@ fn load_autosave_inner(state: &AppState, paths: &AutosavePaths) -> Result<WorldM
         ws.selection_mask = None;
         let old_temp = ws.temp_path.take();
         ws.temp_path = Some(temp_path);
+        ws.temp_shared = temp_shared;
         ws.dirty.clear_all();
         // The recovered world isn't known to correspond byte-for-byte to any file on disk yet — no
         // DiskImage until a real Save succeeds. Likewise `autosave_base_id`: this recovered session
@@ -9069,10 +9215,11 @@ fn sculpt_split(
         let world = ws.world.as_ref().ok_or("No world loaded")?;
         let coords = affected_chunk_coords(world, rect.0, rect.1, rect.2, rect.3);
         let mut scratch = ChunkScratch::new(world, &coords);
-        mem::PEAKS.sculpt_scratch.record(scratch.buf_len() as u64);
         // A failed stamp abandons the float workspace, exactly as the in-guard path does by never
         // writing it back — the `?` drops `session` along with the guard.
-        run_sculpt_flush(&mut scratch, &mut session, args, stamps)?;
+        let ran = run_sculpt_flush(&mut scratch, &mut session, args, stamps);
+        mem::PEAKS.sculpt_scratch.record(scratch.buf_len() as u64); // bands copied (lazy, 18.10)
+        ran?;
         scratch.into_chunks()
     };
 
@@ -9087,8 +9234,9 @@ fn sculpt_split(
         session = SculptSession { group_id: group.unwrap_or(0), fheight: HashMap::new() };
         let coords = affected_chunk_coords(&world, rect.0, rect.1, rect.2, rect.3);
         let mut scratch = ChunkScratch::new(&world, &coords);
+        let ran = run_sculpt_flush(&mut scratch, &mut session, args, stamps);
         mem::PEAKS.sculpt_scratch.record(scratch.buf_len() as u64);
-        if let Err(e) = run_sculpt_flush(&mut scratch, &mut session, args, stamps) {
+        if let Err(e) = ran {
             ws.world = Some(world);
             return Err(e);
         }
@@ -12289,6 +12437,65 @@ mod tests {
     /// Asserts both halves: the containment property directly, and that recovery is still
     /// byte-identical. Reversing step 0 back below the read guard leaves this test's containment
     /// assertion passing but is exactly the ordering the assertion exists to pin.
+    /// 18.11 — a full save of a MAP_SHARED world is produced by msync + clone/copy of the staged temp
+    /// and must be byte-identical to the old write-through-the-mapping path, including after edits,
+    /// over a pre-existing destination (`.bak` made, no `.savetmp` left behind).
+    #[test]
+    fn test_full_save_from_shared_temp_matches_mapping_write() {
+        let original = make_bumpy_world_grid(2, 8, |_, _| 20);
+        let dir = std::env::temp_dir().join(format!("vuencedit_save_from_temp_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create test dir");
+        let staged = dir.join("staged.eden");
+        fs::write(&staged, &original).expect("stage temp");
+        let (mmap, shared) = map_staged_temp_ex(&staged).expect("map staged temp");
+        let mut ws = WorldState::new();
+        ws.world = Some(parse_world_inner(mmap).expect("parse"));
+        ws.temp_path = Some(staged.clone());
+        ws.temp_shared = shared;
+
+        for round in 0..2 {
+            if round == 1 {
+                // Edits (incl. a header write) land in the shared mapping only.
+                with_edit(&mut ws, "delete", (0, 0, 5, 5), (0, 0, 5, 5), |world| {
+                    delete_blocks_inner(world, 0, 0, 5, 5, 0, 63, None);
+                    Ok(())
+                }).expect("edit");
+                write_spawn(ws.world.as_mut().unwrap(), 5.0, 5.0);
+            }
+            let world = ws.world.as_ref().unwrap();
+            let old_path = dir.join(format!("old_{round}.eden"));
+            let new_path = dir.join(format!("new_{round}.eden"));
+            // Pre-existing destination: exercises backup + replace.
+            fs::write(&new_path, b"previous contents").unwrap();
+            save_world_progress(world, old_path.to_str().unwrap(), false, None, None).expect("old-path save");
+            let temp = if ws.temp_shared { ws.temp_path.as_deref() } else { None };
+            save_world_progress(world, new_path.to_str().unwrap(), false, None, temp).expect("temp-path save");
+            let old_bytes = fs::read(&old_path).unwrap();
+            let new_bytes = fs::read(&new_path).unwrap();
+            assert_eq!(&old_bytes[..], &world.bytes[..], "old path must equal the mapping");
+            assert!(old_bytes == new_bytes, "clone/copy save differs from write-through-mapping (round {round})");
+            assert!(dir.join(format!("new_{round}.eden.bak")).exists(), "backup of the previous file");
+            assert!(!dir.join(format!("new_{round}.eden.savetmp")).exists(), "no stray .savetmp");
+        }
+        // Editing after a save must not disturb the already-saved (possibly cloned) destination.
+        let saved_before = fs::read(dir.join("new_1.eden")).unwrap();
+        with_edit(&mut ws, "delete", (16, 0, 20, 5), (16, 0, 20, 5), |world| {
+            delete_blocks_inner(world, 16, 0, 20, 5, 0, 63, None);
+            Ok(())
+        }).expect("edit after save");
+        assert!(saved_before == fs::read(dir.join("new_1.eden")).unwrap(), "saved file changed by a later edit");
+        // A length mismatch (stale temp) must fall back to the mapping write rather than corrupt.
+        let stale = dir.join("stale.eden");
+        fs::write(&stale, b"short").unwrap();
+        let fb = dir.join("fallback.eden");
+        let world = ws.world.as_ref().unwrap();
+        save_world_progress(world, fb.to_str().unwrap(), false, None, Some(&stale)).expect("fallback save");
+        assert!(fs::read(&fb).unwrap() == world.bytes[..], "fallback must write the mapping");
+        drop(ws);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn test_shared_temp_divergence_is_covered_by_since_base() {
         let original = make_bumpy_world_grid(2, 8, |_, _| 20); // 2×2 chunks
@@ -15117,6 +15324,75 @@ mod tests {
 
         assert_eq!(via_scratch.bytes.to_vec(), direct.bytes.to_vec(),
                    "a stamp computed against a scratch must be byte-identical to one computed in place");
+    }
+
+    /// 18.10: the lazy scratch, over several modes, must equal the direct in-place stamp byte for
+    /// byte, its undo snapshots must restore the pre-stamp world exactly, and it must copy only the
+    /// bands it wrote (construction copies nothing).
+    #[test]
+    fn test_lazy_scratch_matches_reference_across_modes_and_undoes() {
+        let base = make_bumpy_world_grid(2, 8, |x, y| 18 + ((x * 3 + y) % 5));
+        for mode in ["raise", "lower", "smooth", "flatten", "erode", "noise", "thermal"] {
+            let args = || SculptArgs {
+                mode: mode.into(), strength: 4, strength_eff: 4.0, seed: 7,
+                block_type: None, paint: None, freq: None, noise_mode: None,
+                softness: 0.5, profile: "smooth".into(), grab_delta: None,
+                anchor_x: None, anchor_y: None, slope_dx: None, slope_dy: None,
+                smear_dx: None, smear_dy: None, clip_rect: None, rock: None, cap: None,
+            };
+            let stamps = || vec![
+                SculptStamp { points: disc_points(14, 14, 6), dial: Some((14, 14, 6)) },
+                SculptStamp { points: disc_points(17, 15, 6), dial: Some((17, 15, 6)) },
+            ];
+            let mut direct = parse_world_inner(mmap_from_bytes(base.clone())).expect("parse");
+            let mut sa = SculptSession { group_id: 1, fheight: HashMap::new() };
+            run_sculpt_flush(&mut direct, &mut sa, &args(), &stamps()).expect("direct");
+
+            let mut lazy = parse_world_inner(mmap_from_bytes(base.clone())).expect("parse");
+            let rect = sculpt_flush_rect(&args(), &stamps()).expect("rect");
+            let coords = affected_chunk_coords(&lazy, rect.0, rect.1, rect.2, rect.3);
+            let mut scratch = ChunkScratch::new(&lazy, &coords);
+            assert_eq!(scratch.buf_len(), 0, "construction copies nothing");
+            let mut sb = SculptSession { group_id: 1, fheight: HashMap::new() };
+            run_sculpt_flush(&mut scratch, &mut sb, &args(), &stamps()).expect("scratch");
+            let copied = scratch.buf_len();
+            let whole: usize = coords.iter().filter_map(|&(x, y)| lazy.chunk_range(x, y)).map(|(a, e)| e - a).sum();
+            assert!(copied < whole, "{mode}: copied {copied} B of {whole} B — must be band-granular");
+            let snaps = scratch.into_chunks().commit(&mut lazy);
+            assert_eq!(lazy.bytes.to_vec(), direct.bytes.to_vec(), "{mode}: lazy != reference");
+
+            let entry = UndoEntry::new("lazy", snaps, None);
+            restore_and_invert(&mut lazy, &entry);
+            assert_eq!(lazy.bytes.to_vec(), base[..lazy.bytes.len()].to_vec(), "{mode}: undo must restore");
+        }
+    }
+
+    /// 18.10 hint safety: a write into a band above the world's `top_band_hint` must be visible to
+    /// the scratch's own `surface_z` (a too-low hint would read it back as air), and a dense write
+    /// must still undo.
+    #[test]
+    fn test_lazy_scratch_hint_covers_own_writes() {
+        let mut world = parse_world_inner(mmap_from_bytes(make_bumpy_world_grid(2, 8, |_, _| 20)))
+            .expect("parse");
+        let before = world.bytes.to_vec();
+        assert_eq!(world.top_band_hint(0, 0), 1, "fixture terrain tops out in band 1");
+        let mut scratch = ChunkScratch::new(&world, &[(0, 0)]);
+        assert_eq!(scratch.top_band_hint(0, 0), 1);
+        set_block_abs(&mut scratch, 3, 3, 50, 2, 1); // band 3
+        assert_eq!(scratch.top_band_hint(0, 0), 3, "hint must rise with the scratch's own writes");
+        assert_eq!(surface_z_capped(&scratch, 3, 3, None), Some(50));
+        assert_eq!(surface_z_capped(&scratch, 4, 3, None), Some(20), "untouched column reads through");
+        assert_eq!(scratch.buf_len(), 8192, "exactly one band copied");
+        // Dense fill of two far-apart bands → Full delta spanning both, still restorable.
+        for lx in 0..16 { for ly in 0..16 {
+            set_block_abs(&mut scratch, lx, ly, 3, 5, 1);
+            set_block_abs(&mut scratch, lx, ly, 50, 5, 1);
+        } }
+        let snaps = scratch.into_chunks().commit(&mut world);
+        assert_eq!(snaps.len(), 1);
+        assert_eq!(read_block_abs(&world, 9, 9, 50), 5);
+        restore_and_invert(&mut world, &UndoEntry::new("hint", snaps, None));
+        assert_eq!(world.bytes.to_vec(), before);
     }
 
     /// Rock/Carve write a `rock_stamp_pad` ring *outside* their nominal radius. `sculpt_write_rect`
