@@ -124,18 +124,18 @@ mod tests {
         assert!(extra <= 64 * 64 * 4 + 64 * 1024, "a 64 px preview allocated {extra} B");
     }
 
-    // ── M-1 whole-world edit probes (RAM-1) ─────────────────────────────────────────────────
+    // ── M-1 whole-world edit probes (RAM-1) → 18.12 guards ─────────────────────────────────
     //
-    // Each runs an edit over the *entire* world through `with_edit_inner` (guard off, so it's the
-    // raw cost) and reports peak transient vs the world size, the pre-image bytes, and the undo
-    // entry the edit kept. RAM-1 is "transient sized by the edit's rect, not its change": the
-    // ratio `transient / kept` is what 18.12 (CoW band-granular pre-image) should collapse.
+    // Each runs an edit over the *entire* world through `with_edit_inner` and reports peak transient
+    // vs the world size, the old rect-sized pre-image (every band of every chunk), the bands the
+    // edit actually changed, and the undo entry it kept. Before 18.12 the transient was the rect
+    // pre-image (1.03x world for ONE changed block); the copy-on-write `EditView` captures only
+    // written bands, so these now assert transient = O(changed bands).
     // The counting allocator is per-thread and blind to `mmap`, so these under-count rayon work and
     // anonymous maps (the preview scan buffer is one — read `PEAKS.preview_scan` for that).
 
     use crate::tests::{make_bumpy_world_grid, ws_with};
-    use crate::{SnapScope, WorldState, LoadedWorld, generate_trees_inner, generate_wavy_surface_inner,
-                preimage_bytes, with_edit_inner};
+    use crate::{EditView, WorldState, generate_trees_inner, generate_wavy_surface_inner, with_edit_inner};
 
     /// 32 × 32 chunks = 512 × 512 columns, 64z, 32 MiB, every column solid to z=20.
     fn big_world() -> (WorldState, u64) {
@@ -144,54 +144,76 @@ mod tests {
         (ws_with(bytes), n)
     }
 
-    /// (transient, pre-image bytes, kept undo bytes, world bytes) for `edit` over the whole map.
-    fn whole_world_edit(name: &str, edit: impl FnOnce(&mut LoadedWorld)) -> (u64, u64, u64, u64) {
+    /// Bytes of the distinct bands the newest undo entry changed (a `Full` range counts every band
+    /// it spans) — the floor any pre-image must pay.
+    fn changed_band_bytes(ws: &WorldState) -> u64 {
+        let mut scratch = Vec::new();
+        let Some(e) = ws.undo_stack.back() else { return 0 };
+        e.chunks.iter().map(|s| {
+            let mut bands = std::collections::BTreeSet::new();
+            if let Some(p) = s.delta.sparse_pairs() {
+                for &(off, _) in p.iter() { bands.insert(off as usize / 8192); }
+            } else if let Some((st, d)) = s.delta.full_bytes(&mut scratch) {
+                let st = st as usize;
+                if !d.is_empty() { bands.extend(st / 8192..=(st + d.len() - 1) / 8192); }
+            }
+            bands.len() as u64 * 8192
+        }).sum()
+    }
+
+    /// (transient, changed-band bytes, kept undo bytes, world bytes) for `edit` over the whole map.
+    fn whole_world_edit(name: &str, edit: impl FnOnce(&mut EditView)) -> (u64, u64, u64, u64) {
         let (mut ws, world_bytes) = big_world();
         let rect = (0, 0, 511, 511);
-        let pre = {
+        let rect_preimage = {
             let w = ws.world.as_ref().unwrap();
-            let all: Vec<(i32, i32)> = (0..32).flat_map(|y| (0..32).map(move |x| (x, y))).collect();
-            preimage_bytes(w, &all, None) as u64
+            w.chunk_map.len() as u64 * w.chunk_size as u64
         };
-        let (r, extra) = measure(|| with_edit_inner(&mut ws, name, SnapScope::Rect(rect), rect, None, None,
-            false, |w| { edit(w); Ok(()) }));
+        let (r, extra) = measure(|| with_edit_inner(&mut ws, name, rect, None, |w| { edit(w); Ok(()) }));
         r.expect("edit ok");
         let kept = ws.undo_bytes as u64;
-        eprintln!("[alloc_probe] {name:<26} world {world_bytes} B  preimage {pre} B  transient {extra} B \
-            ({:.2}x world)  kept undo {kept} B  ({:.1}x kept)",
-            extra as f64 / world_bytes as f64, extra as f64 / kept.max(1) as f64);
-        (extra, pre, kept, world_bytes)
+        let changed = changed_band_bytes(&ws);
+        eprintln!("[alloc_probe] {name:<26} world {world_bytes} B  old rect pre-image {rect_preimage} B  \
+            changed bands {changed} B  transient {extra} B ({:.2}x world, {:.2}x changed)  kept undo {kept} B",
+            extra as f64 / world_bytes as f64, extra as f64 / changed.max(1) as f64);
+        (extra, changed, kept, world_bytes)
     }
+
+    /// Transient cap for a CoW edit: the captured bands, plus the delta built from them (at most a
+    /// second copy), plus slack for the returned patch — a whole-world rect renders a ~1 MiB patch
+    /// here, which is sized by the rect by design (it's what the map repaints), not by the change.
+    fn cow_cap(changed: u64, world: u64) -> u64 { 3 * changed + world / 16 }
 
     #[test]
     fn alloc_probe_whole_world_trees() {
-        let (extra, pre, kept, world) = whole_world_edit("trees(2%)", |w| {
+        let (extra, changed, kept, world) = whole_world_edit("trees(2%)", |w| {
             generate_trees_inner(w, 0, 0, 511, 511, &["normal".to_string()], 0.02, &[], 7, true, None);
         });
         assert!(kept > 0, "the edit must have changed something");
-        // Regression cap at today's behaviour: pre-image ≈ every touched chunk, once.
-        assert!(extra <= pre + pre / 16 + world / 64, "trees transient {extra} B exceeds pre-image {pre} B + slack ({world} B world)");
+        assert!(extra <= cow_cap(changed, world), "trees transient {extra} B exceeds 3x changed bands {changed} B + slack ({world} B world)");
     }
 
     #[test]
     fn alloc_probe_whole_world_wavy() {
-        let (extra, pre, kept, world) = whole_world_edit("wavy water", |w| {
+        let (extra, changed, kept, world) = whole_world_edit("wavy water", |w| {
             generate_wavy_surface_inner(w, 0, 0, 511, 511, 63, 20, 0, 24.0, 0.5, 3, "fill", None);
         });
         assert!(kept > 0, "the edit must have changed something");
-        assert!(extra <= pre + pre / 16 + world / 64, "wavy transient {extra} B exceeds pre-image {pre} B + slack ({world} B world)");
+        assert!(extra <= cow_cap(changed, world), "wavy transient {extra} B exceeds 3x changed bands {changed} B + slack ({world} B world)");
     }
 
     /// The RAM-1 pathology in one number: a rect over the whole world, an edit that changes ONE
-    /// block. Transient ≈ the whole pre-image, kept ≈ a few bytes. 18.12 should drop the transient
-    /// to O(change); tighten this cap then.
+    /// block. Before 18.12 the transient was the whole 32 MiB rect pre-image (1.03x world) for a
+    /// 48 B undo entry; now it's one 8 KiB band plus the patch.
     #[test]
     fn alloc_probe_whole_world_single_block() {
-        let (extra, pre, kept, world) = whole_world_edit("one block in a whole rect", |w| {
+        let (extra, changed, kept, world) = whole_world_edit("one block in a whole rect", |w| {
             voxel_core::view::set_block_abs(w, 100, 100, 30, 5, 0);
         });
         assert!(kept > 0 && kept < 4096, "one block should keep a tiny undo entry, kept {kept}");
-        assert!(extra <= pre + pre / 16 + world / 64, "single-block transient {extra} B exceeds pre-image {pre} B + slack ({world} B world)");
+        assert_eq!(changed, 8192, "one block = one band");
+        assert!(extra <= cow_cap(changed, world), "single-block transient {extra} B exceeds one band + slack ({world} B world)");
+        assert!(extra < world / 16, "single-block transient {extra} B must be nowhere near the world ({world} B)");
     }
 
     /// The harness itself: a known allocation must be seen, and freeing it must not lower the peak.

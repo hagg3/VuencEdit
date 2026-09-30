@@ -12,7 +12,7 @@
  * `uiSoundVolume` (the same "individual `useState(() => loadSettings()...)`" pattern every other
  * setting in App.tsx already uses — see `applySettings`).
  */
-import { HOLD_MAX_GAIN, SOUND_PACKS, type CueId, type PackId } from "./packs";
+import { HOLD_MAX_GAIN, SOUND_PACKS, type CueId, type PackId, type Voice } from "./packs";
 
 export interface SfxSettings {
   enabled: boolean;
@@ -48,44 +48,48 @@ function getContext(): AudioContext {
   return ctx;
 }
 
+/** Schedule one voice on the context clock at `st`; returns its source so a caller that may need to
+ *  cancel it before it plays (the hold loop) can. `maxPeak` optionally caps the voice's gain. */
+function emitVoice(a: AudioContext, voice: Voice, st: number, volume: number, maxPeak = Infinity): AudioScheduledSourceNode {
+  const g = a.createGain();
+  const peak = Math.min(voice.g, maxPeak) * volume;
+  const attack = voice.a ?? Math.min(0.004, voice.d / 4);
+  // Exponential ramps can't target exactly 0 (WebAudio throws) — the 0.0001/0.0002 floors mirror
+  // the source mock's engine and are inaudible in practice, including at volume 0.
+  g.gain.setValueAtTime(0.0001, st);
+  g.gain.exponentialRampToValueAtTime(Math.max(peak, 0.0002), st + attack);
+  g.gain.exponentialRampToValueAtTime(0.0001, st + voice.d);
+  g.connect(a.destination);
+  let src: AudioScheduledSourceNode;
+  if (voice.w === "noise") {
+    const bufSrc = a.createBufferSource();
+    bufSrc.buffer = noiseBuf;
+    const filt = a.createBiquadFilter();
+    filt.type = "bandpass";
+    filt.frequency.value = voice.bp ?? 2000;
+    filt.Q.value = voice.q ?? 1;
+    bufSrc.connect(filt);
+    filt.connect(g);
+    src = bufSrc;
+  } else {
+    const osc = a.createOscillator();
+    osc.type = voice.w;
+    osc.frequency.setValueAtTime(voice.f, st);
+    if (voice.f2) osc.frequency.exponentialRampToValueAtTime(voice.f2, st + voice.d);
+    osc.connect(g);
+    src = osc;
+  }
+  src.start(st);
+  src.stop(st + voice.d + 0.02);
+  return src;
+}
+
 function synth(pack: PackId, cue: CueId, volume: number) {
   const voices = SOUND_PACKS[pack]?.cues[cue];
   if (!voices || voices.length === 0) return;
   const a = getContext();
   const t0 = a.currentTime + 0.005;
-  for (const voice of voices) {
-    const g = a.createGain();
-    const st = t0 + voice.t;
-    const peak = voice.g * volume;
-    const attack = voice.a ?? Math.min(0.004, voice.d / 4);
-    // Exponential ramps can't target exactly 0 (WebAudio throws) — the 0.0001/0.0002 floors mirror
-    // the source mock's engine and are inaudible in practice, including at volume 0.
-    g.gain.setValueAtTime(0.0001, st);
-    g.gain.exponentialRampToValueAtTime(Math.max(peak, 0.0002), st + attack);
-    g.gain.exponentialRampToValueAtTime(0.0001, st + voice.d);
-    g.connect(a.destination);
-    let src: AudioScheduledSourceNode;
-    if (voice.w === "noise") {
-      const bufSrc = a.createBufferSource();
-      bufSrc.buffer = noiseBuf;
-      const filt = a.createBiquadFilter();
-      filt.type = "bandpass";
-      filt.frequency.value = voice.bp ?? 2000;
-      filt.Q.value = voice.q ?? 1;
-      bufSrc.connect(filt);
-      filt.connect(g);
-      src = bufSrc;
-    } else {
-      const osc = a.createOscillator();
-      osc.type = voice.w;
-      osc.frequency.setValueAtTime(voice.f, st);
-      if (voice.f2) osc.frequency.exponentialRampToValueAtTime(voice.f2, st + voice.d);
-      osc.connect(g);
-      src = osc;
-    }
-    src.start(st);
-    src.stop(st + voice.d + 0.02);
-  }
+  for (const voice of voices) emitVoice(a, voice, t0 + voice.t, volume);
 }
 
 /** Per-cue minimum interval (ms) — a belt-and-braces guard against an accidental pointer/stamp-rate
@@ -129,7 +133,12 @@ export interface HoldHandle {
 
 const activeHolds = new Set<HoldHandle>();
 const NOOP_HOLD: HoldHandle = { stop() {} };
-const HOLD_FADE_S = 0.03;
+/** How far ahead of the audio clock ticks are scheduled, and how often the schedule is topped up.
+ *  Ticks ride the `AudioContext` clock, not `setInterval`, whose timing jitters. */
+const HOLD_LOOKAHEAD_S = 0.1;
+const HOLD_REFILL_MS = 25;
+/** ±fraction applied to each tick's period. */
+const HOLD_JITTER = 0.03;
 
 /** Every event that must end a held gesture, whatever the call site forgot to do. Installed once,
  *  on the first real hold, on `window` in the capture phase so a `stopPropagation()` deeper in the
@@ -149,58 +158,62 @@ function installHoldGuard() {
   window.addEventListener("keydown", (e: KeyboardEvent) => { if (e.key === "Escape") stopAllHolds(); }, true);
 }
 
-/** Begin a quiet looped voice for a gesture that is *still held* (window move/resize, selection
- *  drag, paste-ghost drag). Call once the pointer has moved past the drag threshold; call `stop()`
- *  on release. A global guard (`HOLD_END_EVENTS` + Escape) stops every live hold too, so a missed
- *  end path can never leave a drone playing. No-ops (no `AudioContext`) while sound is off or the
- *  pack has no hold voice. */
-export function hold(): HoldHandle {
-  if (!settings.enabled || settings.pack === "none") return NOOP_HOLD;
-  const voice = SOUND_PACKS[settings.pack]?.hold;
+/** The tick loop itself, for `pack` at `volume`. Shared by `hold()` and `previewHold()`. */
+function startHold(pack: PackId, volume: number): HoldHandle {
+  const voice = SOUND_PACKS[pack]?.hold;
   if (!voice) return NOOP_HOLD;
   const a = getContext();
   installHoldGuard();
-  const g = a.createGain();
-  const peak = Math.min(voice.g, HOLD_MAX_GAIN) * settings.volume;
-  const t0 = a.currentTime;
-  g.gain.setValueAtTime(0, t0);
-  g.gain.linearRampToValueAtTime(peak, t0 + HOLD_FADE_S);
-  g.connect(a.destination);
-  let src: AudioScheduledSourceNode;
-  if (voice.w === "noise") {
-    const bufSrc = a.createBufferSource();
-    bufSrc.buffer = noiseBuf;
-    bufSrc.loop = true;
-    const filt = a.createBiquadFilter();
-    filt.type = "bandpass";
-    filt.frequency.value = voice.bp ?? 1000;
-    filt.Q.value = voice.q ?? 1;
-    bufSrc.connect(filt);
-    filt.connect(g);
-    src = bufSrc;
-  } else {
-    const osc = a.createOscillator();
-    osc.type = voice.w;
-    osc.frequency.value = voice.f;
-    osc.connect(g);
-    src = osc;
-  }
-  src.start(t0);
+  let next = a.currentTime + 0.01;
   let stopped = false;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  // Sources scheduled but possibly not yet started, so `stop()` can cancel the lookahead window.
+  let pending: { src: AudioScheduledSourceNode; at: number }[] = [];
+  const pump = () => {
+    timer = null;
+    if (stopped) return;
+    const now = a.currentTime;
+    pending = pending.filter(p => p.at > now);
+    while (next < now + HOLD_LOOKAHEAD_S) {
+      for (const vc of voice.voices) {
+        pending.push({ src: emitVoice(a, vc, next + vc.t, volume, HOLD_MAX_GAIN), at: next + vc.t });
+      }
+      next += (voice.period / 1000) * (1 + (Math.random() * 2 - 1) * HOLD_JITTER);
+    }
+    timer = setTimeout(pump, HOLD_REFILL_MS);
+  };
+  pump();
   const handle: HoldHandle = {
     stop() {
       if (stopped) return;
       stopped = true;
       activeHolds.delete(handle);
-      const t = a.currentTime;
-      g.gain.cancelScheduledValues(t);
-      g.gain.setValueAtTime(g.gain.value, t);
-      g.gain.linearRampToValueAtTime(0, t + HOLD_FADE_S);
-      try { src.stop(t + HOLD_FADE_S + 0.01); } catch { /* already stopped */ }
+      if (timer !== null) { clearTimeout(timer); timer = null; }
+      // A tick already sounding rings out (it's ≤ ~30 ms); ones still queued ahead are cancelled.
+      const now = a.currentTime;
+      for (const p of pending) if (p.at > now) { try { p.src.stop(); } catch { /* already stopped */ } }
+      pending = [];
     },
   };
   activeHolds.add(handle);
   return handle;
+}
+
+/** Begin a quiet tick loop for a gesture that is *still held* (window move/resize, selection
+ *  drag, paste-ghost drag). Call once the pointer has moved past the drag threshold; call `stop()`
+ *  on release (the last tick rings out). A global guard (`HOLD_END_EVENTS` + Escape) stops every
+ *  live hold too, so a missed end path can never leave it ticking. No-ops (no `AudioContext`)
+ *  while sound is off or the pack has no hold voice. */
+export function hold(): HoldHandle {
+  if (!settings.enabled || settings.pack === "none") return NOOP_HOLD;
+  return startHold(settings.pack, settings.volume);
+}
+
+/** Settings ▸ Sounds' "Hold" audition: ticks for about a second with the given pack, bypassing the
+ *  enabled gate like `preview` does. Stops itself, and the global hold guard stops it early too. */
+export function previewHold(pack: PackId, volume: number, ms = 1000) {
+  const h = startHold(pack, volume);
+  if (h !== NOOP_HOLD) setTimeout(() => h.stop(), ms);
 }
 
 /** Test/debug-only: number of hold loops currently running. */
@@ -229,4 +242,4 @@ export function _resetForTests() {
   debugCounters.contextsCreated = 0;
 }
 
-export const sfx = { play, hold, preview, configure, debugCounters };
+export const sfx = { play, hold, preview, previewHold, configure, debugCounters };

@@ -26,7 +26,7 @@ function timeAgoShort(unixSeconds: number): string {
  * confirm step — this is the one dialog whose entire job is protecting that work.
  */
 export default function RecoveryModal({
-  info, recovering, onRecover, onDiscard, onDismiss,
+  info, recovering, onRecover, onDiscard, onDismiss, onOpenBase,
 }: {
   info: AutosaveInfo;
   recovering: boolean;
@@ -35,9 +35,16 @@ export default function RecoveryModal({
   onDiscard: () => void;
   /** Closes the dialog, keeping the sidecar. Esc, backdrop, and "Not now". */
   onDismiss: () => void;
+  /** `base_status === "changed"` only: drop the stale autosave and open the world file instead. */
+  onOpenBase: () => void;
 }) {
   const [confirmDiscard, setConfirmDiscard] = useState(false);
   const when = timeAgoShort(info.timestamp);
+  // 18.9: a format-2 autosave can build on the user's world file. If that file moved or changed
+  // since, recovery would refuse, so say why up front.
+  const status = info.base_status ?? "ok";
+  const basePath = info.base?.kind === "source" ? info.base.path : null;
+  const baseName = basePath?.split(/[\\/]/).pop() ?? "The world file";
 
   const footer = confirmDiscard ? (
     <>
@@ -48,9 +55,13 @@ export default function RecoveryModal({
     <>
       <DialogButton onClick={onDismiss} disabled={recovering}>Not now</DialogButton>
       <DialogButton onClick={() => setConfirmDiscard(true)} disabled={recovering}>Discard</DialogButton>
-      <DialogButton variant="primary" onClick={onRecover} disabled={recovering}>
-        {recovering ? "Recovering…" : "Recover"}
-      </DialogButton>
+      {status === "changed" ? (
+        <DialogButton variant="primary" onClick={onOpenBase} disabled={recovering}>Open file</DialogButton>
+      ) : (
+        <DialogButton variant="primary" onClick={onRecover} disabled={recovering}>
+          {recovering ? "Recovering…" : status === "missing" ? "Try again" : "Recover"}
+        </DialogButton>
+      )}
     </>
   );
 
@@ -67,6 +78,16 @@ export default function RecoveryModal({
         <div><span style={{ color: MODAL_TEXT.label }}>Autosaved: </span>{when}</div>
         {info.source_path && <div style={{ color: MODAL_TEXT.label, wordBreak: "break-all" }}>{info.source_path}</div>}
       </div>
+      {status === "changed" && !confirmDiscard && (
+        <p style={{ margin: "0 0 8px", color: MODAL_TEXT.secondary, lineHeight: 1.5 }}>
+          {baseName} was saved or changed after this autosave, so the autosave no longer applies. Open the file instead.
+        </p>
+      )}
+      {status === "missing" && !confirmDiscard && (
+        <p style={{ margin: "0 0 8px", color: MODAL_TEXT.secondary, lineHeight: 1.5 }}>
+          This autosave needs the world file it was made from, which isn't at {basePath ?? "its saved location"}. Put it back or reconnect its drive, then try again.
+        </p>
+      )}
       {confirmDiscard && (
         <p style={{ margin: 0, color: RED_LIGHT, lineHeight: 1.5 }}>
           Permanently delete the autosave from {when}? This can't be undone.

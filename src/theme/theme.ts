@@ -282,6 +282,8 @@ export const MOTION = {
   chromeMs: 150,
   /** The completion outline. ≤400ms per the plan. */
   doneMs: 350,
+  /** The selection-commit flash (19.6): lighter and shorter than an edit's. */
+  selectMs: 240,
   easeEnter: "cubic-bezier(0.16, 1, 0.3, 1)",
   easeExit: "cubic-bezier(0.4, 0, 1, 1)",
 } as const;

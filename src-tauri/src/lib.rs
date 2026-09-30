@@ -6,7 +6,7 @@ pub(crate) use voxel_core::colors;
 // `impl VoxelView for LoadedWorld` / `for ChunkScratch` below, which stay here because those
 // types are app-specific — read exactly as they did before the extraction.
 pub(crate) use voxel_core::view::{
-    get_block_at, read_block_abs, read_paint_abs, scan_band_ceiling, set_block_abs, surface_z,
+    get_block_at, read_block_abs, read_paint_abs, scan_band_ceiling, set_block_abs, set_block_in_band, surface_z,
     surface_z_capped, world_max_z, ViewMeta, VoxelView, VoxelViewMut,
 };
 // The rest of PR-C: the fluid block family, the shaped-selection footprint, the lamp spatial index
@@ -52,6 +52,7 @@ mod mem;
 mod alloc_probe;
 mod mpworld;
 mod network;
+mod overview;
 mod signs;
 mod texturepack;
 mod working_set;
@@ -462,6 +463,11 @@ pub(crate) struct LoadedWorld {
     /// world it describes, the way `template_surface_cache` (which does not) has to be cleared by
     /// hand.
     pub(crate) top_bands: TopBandHints,
+    /// The zoomed-out map's per-chunk scan summary (18.15, `overview.rs`). Built on the first tile
+    /// fetch that can use it (`ensure_overview`), at the granularity the memory preset's budget
+    /// allows; `Some(None)` = this world can't have one. Invalidated per chunk together with
+    /// `top_bands` (`invalidate_derived`), and disposed with the world.
+    pub(crate) overview: std::sync::OnceLock<Option<overview::OverviewRaster>>,
 }
 
 /// The ceiling cache behind `impl VoxelView for LoadedWorld`'s `top_band_hint` (H1 remediation,
@@ -546,6 +552,22 @@ impl TopBandHints {
             cells[i].store(Self::UNKNOWN, std::sync::atomic::Ordering::Relaxed);
         }
     }
+
+    /// Lift chunk `(cx, cy)`'s stored ceiling to at least `band` — what `EditView::band_bytes_mut`
+    /// does on every write, so a `surface_z` later in the *same* edit sees blocks it just placed
+    /// above the old ceiling (18.12). `UNKNOWN` stays `UNKNOWN` (the next query scans the post-edit
+    /// bytes). Raising is always safe — too high is the harmless direction — and the edit
+    /// invalidates the cell once it finishes.
+    #[inline]
+    fn raise(&self, cx: i32, cy: i32, band: usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let Some(cells) = self.cells.get() else { return };
+        let Some(i) = self.index(cx, cy) else { return };
+        let v = cells[i].load(Relaxed);
+        if v != Self::UNKNOWN && (v as usize) < band {
+            cells[i].store(band.min(Self::UNKNOWN as usize - 1) as u8, Relaxed);
+        }
+    }
 }
 
 impl LoadedWorld {
@@ -621,14 +643,10 @@ impl VoxelView for LoadedWorld {
 }
 
 impl LoadedWorld {
-    /// Compute (never cache) chunk `(cx, cy)`'s topmost band holding any non-air block. `0` both
-    /// for an all-air chunk and for one the world doesn't have — both are valid upper bounds on
-    /// "nothing", and every scan site bails on a missing chunk before it gets here anyway.
-    ///
-    /// Walks only the 4096-byte **block** half of each band (the paint half can't make a column
-    /// non-air) and stops at the first band with a non-zero byte, so a chunk whose terrain tops out
-    /// in band 2 costs 14 half-band scans once and never again.
-    /// Drop the cached scan ceiling for every listed chunk.
+    /// Drop everything cached *about* the listed chunks' bytes: the scan ceiling (`top_bands`) and
+    /// the overview raster's cells (18.15). One hook for both, so no path can clear one and forget
+    /// the other — the raster must be exact, and this is the choke point the hint's correctness
+    /// already rests on.
     ///
     /// ⚠️ **Must be called at the moment the bytes change, before anything renders the post-edit
     /// world** — not merely before the next user-facing render. `with_edit_inner` builds the edit's
@@ -637,10 +655,35 @@ impl LoadedWorld {
     /// above the old ceiling would come back invisible in its own patch and stay that way until the
     /// tile was refetched. `mark_dirty_chunks` clears them again from the precise changed set, which
     /// is redundant by design — one wasted rescan is the price of the hook being impossible to miss.
-    pub(crate) fn invalidate_top_bands(&self, chunks: &[(i32, i32)]) {
-        for &(cx, cy) in chunks { self.top_bands.invalidate(cx, cy); }
+    pub(crate) fn invalidate_derived(&self, chunks: &[(i32, i32)]) {
+        for &(cx, cy) in chunks { self.invalidate_derived_one(cx, cy); }
     }
 
+    #[inline]
+    pub(crate) fn invalidate_derived_one(&self, cx: i32, cy: i32) {
+        self.top_bands.invalidate(cx, cy);
+        if let Some(Some(r)) = self.overview.get() { r.invalidate(cx, cy); }
+    }
+
+    /// The overview raster, if one has been built — renders use it only then; building it is
+    /// `ensure_overview`'s job (the tile fetch, which knows the budget).
+    #[inline]
+    pub(crate) fn overview(&self) -> Option<&overview::OverviewRaster> {
+        self.overview.get().and_then(Option::as_ref)
+    }
+
+    /// Build the overview raster on first use, at the finest granularity `budget` allows.
+    pub(crate) fn ensure_overview(&self, budget: usize) -> Option<&overview::OverviewRaster> {
+        self.overview.get_or_init(|| overview::OverviewRaster::build(self, budget)).as_ref()
+    }
+
+    /// Compute (never cache) chunk `(cx, cy)`'s topmost band holding any non-air block. `0` both
+    /// for an all-air chunk and for one the world doesn't have — both are valid upper bounds on
+    /// "nothing", and every scan site bails on a missing chunk before it gets here anyway.
+    ///
+    /// Walks only the 4096-byte **block** half of each band (the paint half can't make a column
+    /// non-air) and stops at the first band with a non-zero byte, so a chunk whose terrain tops out
+    /// in band 2 costs 14 half-band scans once and never again.
     fn scan_top_band(&self, cx: i32, cy: i32) -> usize {
         let Some((addr, end)) = self.chunk_range(cx, cy) else { return 0 };
         for band in (0..self.num_bands).rev() {
@@ -692,11 +735,25 @@ pub(crate) struct ChunkScratch<'a> {
     copied: usize,
 }
 
-/// One owned chunk: its span in the world at build time, the copied bands, and the highest band
-/// ever made writable (the `top_band_hint` floor).
-struct ScratchChunk {
+/// One chunk's lazily-copied bands: `bands[b]` is `Some` once band `b` has been copied out of the
+/// world. `span` is the chunk's real span when the copies were started. Shared by `ChunkScratch`,
+/// whose copies are the edit's **post**-image, and `EditView`, whose copies are its **pre**-image —
+/// so both build their undo delta through the one `band_delta`.
+struct BandCopies {
     span: usize,
     bands: Vec<Option<Box<[u8]>>>,
+}
+
+impl BandCopies {
+    fn new(span: usize) -> Self {
+        BandCopies { span, bands: vec![None; span.div_ceil(8192)] }
+    }
+}
+
+/// One owned scratch chunk: its copied bands and the highest band ever made writable (the
+/// `top_band_hint` floor).
+struct ScratchChunk {
+    copies: BandCopies,
     top_written: usize,
 }
 
@@ -704,6 +761,63 @@ struct ScratchChunk {
 fn band_range(span: usize, band: usize) -> (usize, usize) {
     let lo = band.saturating_mul(8192).min(span);
     (lo, (lo + 8192).min(span))
+}
+
+/// Diff one chunk's copied bands against `chunk` (its bytes in the world) and build the undo delta.
+/// `copies_are_pre`: the copies hold the pre-image and `chunk` the post-image (`EditView`), or the
+/// reverse (`ChunkScratch`). Only copied bands are compared — an uncopied band was never written.
+///
+/// Returns `(delta, pairs)`, `pairs` being every changed byte as `(chunk-relative offset, pre
+/// byte)`, or `None` when nothing changed. The delta is `Sparse`, or a band-scoped `Full` over the
+/// lowest..highest changed band holding the pre bytes; an uncopied band between those two is
+/// unchanged, so its current bytes *are* its pre bytes.
+fn band_delta(chunk: &[u8], copies: &BandCopies, copies_are_pre: bool) -> Option<(ChunkDelta, Vec<(u32, u8)>)> {
+    debug_assert_eq!(chunk.len(), copies.span);
+    let mut pairs: Vec<(u32, u8)> = Vec::new();
+    let (mut first, mut last) = (usize::MAX, 0usize);
+    for (band, slot) in copies.bands.iter().enumerate() {
+        let Some(copy) = slot else { continue };
+        let (lo, hi) = band_range(copies.span, band);
+        let cur = &chunk[lo..hi];
+        let (pre, post): (&[u8], &[u8]) = if copies_are_pre { (copy, cur) } else { (cur, copy) };
+        let before = pairs.len();
+        let mut i = 0usize;
+        while i + 8 <= pre.len() {
+            if pre[i..i + 8] != post[i..i + 8] {
+                for j in i..i + 8 {
+                    if pre[j] != post[j] { pairs.push(((lo + j) as u32, pre[j])); }
+                }
+            }
+            i += 8;
+        }
+        while i < pre.len() {
+            if pre[i] != post[i] { pairs.push(((lo + i) as u32, pre[i])); }
+            i += 1;
+        }
+        if pairs.len() != before {
+            first = first.min(band);
+            last = last.max(band);
+        }
+    }
+    if pairs.is_empty() { return None; }
+    let (rlo, _) = band_range(copies.span, first);
+    let (_, rhi) = band_range(copies.span, last);
+    let delta = if pairs.len() * 5 < rhi - rlo {
+        // shrink_to_fit before the bytes are priced (see `diff_span`).
+        pairs.shrink_to_fit();
+        ChunkDelta::Sparse(pairs.clone())
+    } else {
+        let mut data = Vec::with_capacity(rhi - rlo);
+        for band in first..=last {
+            let (lo, hi) = band_range(copies.span, band);
+            match (&copies.bands[band], copies_are_pre) {
+                (Some(copy), true) => data.extend_from_slice(copy),
+                _ => data.extend_from_slice(&chunk[lo..hi]),
+            }
+        }
+        ChunkDelta::Full(rlo as u32, data)
+    };
+    Some((delta, pairs))
 }
 
 impl<'a> ChunkScratch<'a> {
@@ -714,9 +828,7 @@ impl<'a> ChunkScratch<'a> {
         for &(cx, cy) in chunks {
             if owned.contains_key(&(cx, cy)) { continue; }
             let Some((a, e)) = base.chunk_range(cx, cy) else { continue };
-            let span = e - a;
-            let n = span.div_ceil(8192);
-            owned.insert((cx, cy), ScratchChunk { span, bands: vec![None; n], top_written: 0 });
+            owned.insert((cx, cy), ScratchChunk { copies: BandCopies::new(e - a), top_written: 0 });
         }
         ChunkScratch { base, owned, copied: 0 }
     }
@@ -740,56 +852,19 @@ pub(crate) struct ScratchChunks {
 impl ScratchChunks {
     /// Write every copied band back into `world`, returning one `ChunkSnapshot` per chunk whose
     /// bytes actually changed (the undo delta, holding the *pre*-write bytes). Only copied bands
-    /// are compared. Deltas use chunk-relative offsets; a dense one is a band-scoped
-    /// `Full(start, ..)` covering the lowest..highest changed band (the same shape
-    /// `with_edit_zscoped` produces). Chunks whose span in `world` no longer matches are skipped
+    /// are compared (`band_delta`). Chunks whose span in `world` no longer matches are skipped
     /// rather than written back at the wrong length.
     pub(crate) fn commit(self, world: &mut LoadedWorld) -> Vec<ChunkSnapshot> {
         let mut out = Vec::new();
         for (&(cx, cy), sc) in self.owned.iter() {
             let Some((addr, cend)) = world.chunk_range(cx, cy) else { continue };
-            if cend - addr != sc.span { continue; }
-            // Pass 1: diff copied bands against the world (pre-image of each changed byte).
-            let mut pairs: Vec<(u32, u8)> = Vec::new();
-            let (mut first, mut last) = (usize::MAX, 0usize);
-            for (band, slot) in sc.bands.iter().enumerate() {
-                let Some(post) = slot else { continue };
-                let (lo, hi) = band_range(sc.span, band);
-                let pre = &world.bytes[addr + lo..addr + hi];
-                let before = pairs.len();
-                let mut i = 0usize;
-                while i + 8 <= pre.len() {
-                    if pre[i..i + 8] != post[i..i + 8] {
-                        for j in i..i + 8 {
-                            if pre[j] != post[j] { pairs.push(((lo + j) as u32, pre[j])); }
-                        }
-                    }
-                    i += 8;
-                }
-                while i < pre.len() {
-                    if pre[i] != post[i] { pairs.push(((lo + i) as u32, pre[i])); }
-                    i += 1;
-                }
-                if pairs.len() != before {
-                    first = first.min(band);
-                    last = last.max(band);
-                }
-            }
-            if pairs.is_empty() { continue; }
-            // Pass 2: build the delta (captures pre bytes before anything is overwritten).
-            let (rlo, _) = band_range(sc.span, first);
-            let (_, rhi) = band_range(sc.span, last);
-            let delta = if pairs.len() * 5 < rhi - rlo {
-                pairs.shrink_to_fit();
-                ChunkDelta::Sparse(pairs.clone())
-            } else {
-                ChunkDelta::Full(rlo as u32, world.bytes[addr + rlo..addr + rhi].to_vec())
-            };
-            // Pass 3: write only the bytes that changed (a full-span write would dirty every page
-            // of a MAP_SHARED mapping — ROADMAP-EDIT 11.1).
+            if cend - addr != sc.copies.span { continue; }
+            let Some((delta, pairs)) = band_delta(&world.bytes[addr..cend], &sc.copies, false) else { continue };
+            // Write only the bytes that changed (a full-span write would dirty every page of a
+            // MAP_SHARED mapping — ROADMAP-EDIT 11.1).
             for &(off, _) in &pairs {
                 let off = off as usize;
-                let post = sc.bands[off / 8192].as_ref().expect("changed byte lives in a copied band");
+                let post = sc.copies.bands[off / 8192].as_ref().expect("changed byte lives in a copied band");
                 world.bytes[addr + off] = post[off % 8192];
             }
             out.push(ChunkSnapshot { cx, cy, delta });
@@ -808,7 +883,7 @@ impl VoxelView for ChunkScratch<'_> {
     fn chunk_origin(&self) -> (i32, i32) { (self.base.min_x, self.base.min_y) }
     fn chunk_bytes(&self, cx: i32, cy: i32) -> Option<&[u8]> {
         if let Some(sc) = self.owned.get(&(cx, cy)) {
-            assert!(sc.bands.iter().all(|b| b.is_none()),
+            assert!(sc.copies.bands.iter().all(|b| b.is_none()),
                     "ChunkScratch::chunk_bytes on a chunk with copied bands — use band_bytes");
         }
         self.base.chunk_bytes(cx, cy)
@@ -818,7 +893,7 @@ impl VoxelView for ChunkScratch<'_> {
     #[inline]
     fn band_bytes(&self, cx: i32, cy: i32, band: usize) -> Option<&[u8]> {
         if let Some(sc) = self.owned.get(&(cx, cy)) {
-            if let Some(Some(b)) = sc.bands.get(band) { return Some(b); }
+            if let Some(Some(b)) = sc.copies.bands.get(band) { return Some(b); }
         }
         self.base.band_bytes(cx, cy, band)
     }
@@ -839,16 +914,172 @@ impl VoxelViewMut for ChunkScratch<'_> {
     #[inline]
     fn band_bytes_mut(&mut self, cx: i32, cy: i32, band: usize) -> Option<&mut [u8]> {
         let sc = self.owned.get_mut(&(cx, cy))?;
-        let (lo, hi) = band_range(sc.span, band);
+        let (lo, hi) = band_range(sc.copies.span, band);
         if lo >= hi { return Some(&mut []); }
-        if sc.bands[band].is_none() {
+        if sc.copies.bands[band].is_none() {
             let (addr, _) = self.base.chunk_range(cx, cy)?;
-            sc.bands[band] = Some(self.base.bytes[addr + lo..addr + hi].into());
+            sc.copies.bands[band] = Some(self.base.bytes[addr + lo..addr + hi].into());
             self.copied += hi - lo;
         }
         sc.top_written = sc.top_written.max(band);
-        sc.bands[band].as_deref_mut()
+        sc.copies.bands[band].as_deref_mut()
     }
+}
+
+// ── EditView: copy-on-write, band-granular edit pre-image (ROADMAP-EDIT 18.12) ─────────────────
+
+/// What every `with_edit*` closure edits through: the live world, plus a **copy-on-write pre-image**
+/// of exactly the bands the edit writes (audit RAM-1). The first `band_bytes_mut` of a band copies
+/// that band's current (= pre-edit) bytes aside and then hands out the *world's* band, so:
+///  - the world is the post-image at every instant, and **every read is correct for free** — through
+///    the `VoxelView` impl, or through `Deref` to `&LoadedWorld` (`chunk_range`, `bytes[i]` as an
+///    rvalue, `surface_z(&*view, ..)`);
+///  - the undo pre-image is sized by what the edit **changed**, not by its rect — `set_block_in_band`
+///    compares before it asks for a writable band, so a no-op write captures nothing;
+///  - an edit that returns `Err` (or trips the limit) is rolled back **exactly** by writing the
+///    captured bands back (`with_edit_inner`).
+///
+/// ⚠️ **`Deref`, deliberately no `DerefMut`.** A raw `view.bytes[i] = v` or a `&mut LoadedWorld`
+/// helper call doesn't compile, so no write can bypass the capture — every writer goes through
+/// `VoxelViewMut` (`set_block_abs`/`set_block_in_band`/`band_bytes_mut`).
+///
+/// ⚠️ **`top_band_hint`**: a write can raise terrain above a chunk's cached ceiling, and the next
+/// `surface_z` in the same edit (trees stacking, flow, pool) would read the new blocks as air. An
+/// override on this view alone isn't enough — `Deref` reads hit the world's own hint cell — so
+/// `band_bytes_mut` **raises the world's cell** (`TopBandHints::raise`). Raising is always safe, and
+/// no reader can observe it mid-edit (the edit holds the write guard); `with_edit_inner` then
+/// invalidates every captured chunk back to `UNKNOWN` before the patch renders.
+pub(crate) struct EditView<'w> {
+    world: &'w mut LoadedWorld,
+    /// Pre-images of every band written so far, per chunk.
+    pre: FxHashMap<(i32, i32), BandCopies>,
+    /// (cx, cy, band) most recently made writable — the per-voxel hot path is a compare, not a probe.
+    last: Option<(i32, i32, usize)>,
+    /// Bytes held in `pre` (the 18.0 `edit_preimage` counter).
+    captured: usize,
+    /// Capture ceiling (`PREIMAGE_GUARD_FACTOR × undo_budget`).
+    limit: usize,
+    /// A capture would have exceeded `limit`: every later write is dropped and the edit is rolled
+    /// back and refused.
+    tripped: bool,
+}
+
+/// What an `EditView` leaves behind once the closure has run.
+struct EditCapture {
+    pre: FxHashMap<(i32, i32), BandCopies>,
+    captured: usize,
+    tripped: bool,
+}
+
+impl<'w> EditView<'w> {
+    pub(crate) fn new(world: &'w mut LoadedWorld, limit: usize) -> Self {
+        EditView { world, pre: FxHashMap::default(), last: None, captured: 0, limit, tripped: false }
+    }
+
+    /// An `EditView` with no capture ceiling — for tests that drive a writer directly.
+    #[cfg(test)]
+    pub(crate) fn unbounded(world: &'w mut LoadedWorld) -> Self { Self::new(world, usize::MAX) }
+
+    fn into_capture(self) -> EditCapture {
+        EditCapture { pre: self.pre, captured: self.captured, tripped: self.tripped }
+    }
+
+    /// Test-only raw byte write at absolute offset `abs` (which must lie inside a chunk), captured
+    /// like any other write — the replacement for the old `world.bytes[i] = v` in test closures.
+    #[cfg(test)]
+    pub(crate) fn set_byte(&mut self, abs: usize, v: u8) {
+        let (cx, cy, addr) = self.world.chunk_map.iter()
+            .map(|(&(cx, cy), &addr)| (cx, cy, addr))
+            .find(|&(cx, cy, addr)| abs >= addr && abs < addr + self.world.span_of(cx, cy))
+            .expect("set_byte: offset is not inside any chunk");
+        let off = abs - addr;
+        if self.world.bytes[abs] == v { return; }
+        if let Some(b) = self.band_bytes_mut(cx, cy, off / 8192) { b[off % 8192] = v; }
+    }
+}
+
+impl std::ops::Deref for EditView<'_> {
+    type Target = LoadedWorld;
+    #[inline]
+    fn deref(&self) -> &LoadedWorld { self.world }
+}
+
+impl VoxelView for EditView<'_> {
+    #[inline]
+    fn num_bands(&self) -> usize { self.world.num_bands }
+    #[inline]
+    fn chunk_origin(&self) -> (i32, i32) { (self.world.min_x, self.world.min_y) }
+    #[inline]
+    fn chunk_bytes(&self, cx: i32, cy: i32) -> Option<&[u8]> { self.world.chunk_bytes(cx, cy) }
+    #[inline]
+    fn has_chunk(&self, cx: i32, cy: i32) -> bool { self.world.chunk_range(cx, cy).is_some() }
+    #[inline]
+    fn band_bytes(&self, cx: i32, cy: i32, band: usize) -> Option<&[u8]> { self.world.band_bytes(cx, cy, band) }
+    #[inline]
+    fn top_band_hint(&self, cx: i32, cy: i32) -> usize { self.world.top_band_hint(cx, cy) }
+}
+
+impl VoxelViewMut for EditView<'_> {
+    /// Correct but not lean: captures every band of the chunk. Nothing calls it today; it exists so
+    /// a whole-chunk writer is still *correct* under the view.
+    fn chunk_bytes_mut(&mut self, cx: i32, cy: i32) -> Option<&mut [u8]> {
+        let (a, e) = self.world.chunk_range(cx, cy)?;
+        for band in 0..(e - a).div_ceil(8192) {
+            self.band_bytes_mut(cx, cy, band)?;
+        }
+        Some(&mut self.world.bytes[a..e])
+    }
+
+    #[inline]
+    fn band_bytes_mut(&mut self, cx: i32, cy: i32, band: usize) -> Option<&mut [u8]> {
+        if self.tripped { return None; }
+        let (a, e) = self.world.chunk_range(cx, cy)?;
+        let (lo, hi) = band_range(e - a, band);
+        if lo >= hi { return Some(&mut []); }
+        if self.last != Some((cx, cy, band)) {
+            let copies = self.pre.entry((cx, cy)).or_insert_with(|| BandCopies::new(e - a));
+            if copies.bands[band].is_none() {
+                if self.captured + (hi - lo) > self.limit {
+                    self.tripped = true;
+                    return None;
+                }
+                copies.bands[band] = Some(self.world.bytes[a + lo..a + hi].into());
+                self.captured += hi - lo;
+            }
+            self.last = Some((cx, cy, band));
+        }
+        self.world.top_bands.raise(cx, cy, band);
+        Some(&mut self.world.bytes[a + lo..a + hi])
+    }
+}
+
+/// Write every captured pre-band back into `world` — exact rollback of an edit that failed or
+/// tripped — and return the chunks touched (their hints must be invalidated).
+fn rollback_capture(world: &mut LoadedWorld, pre: &FxHashMap<(i32, i32), BandCopies>) -> Vec<(i32, i32)> {
+    let mut chunks = Vec::with_capacity(pre.len());
+    for (&(cx, cy), copies) in pre {
+        chunks.push((cx, cy));
+        let Some((addr, _)) = world.chunk_range(cx, cy) else { continue };
+        for (band, slot) in copies.bands.iter().enumerate() {
+            let Some(copy) = slot else { continue };
+            let (lo, hi) = band_range(copies.span, band);
+            world.bytes[addr + lo..addr + hi].copy_from_slice(copy);
+        }
+    }
+    chunks.sort_unstable();
+    chunks
+}
+
+/// The undo delta of a finished edit: one `ChunkSnapshot` per captured chunk that actually changed,
+/// sorted by chunk.
+fn capture_deltas(world: &LoadedWorld, pre: &FxHashMap<(i32, i32), BandCopies>) -> Vec<ChunkSnapshot> {
+    let mut out: Vec<ChunkSnapshot> = pre.iter().filter_map(|(&(cx, cy), copies)| {
+        let (addr, cend) = world.chunk_range(cx, cy)?;
+        let (delta, _) = band_delta(&world.bytes[addr..cend], copies, true)?;
+        Some(ChunkSnapshot { cx, cy, delta })
+    }).collect();
+    out.sort_unstable_by_key(|s| (s.cx, s.cy));
+    out
 }
 
 /// Read the respawn/home position from header `home` field (bytes 16–27: X f32, Y f32, Z f32 LE).
@@ -921,12 +1152,12 @@ fn write_spawn(world: &mut LoadedWorld, px: f32, py: f32) {
 /// fraction of a chunk's 32/131 KB, so `Sparse` stores only the changed (offset, original_byte)
 /// pairs — restoring means writing each `orig` back at `addr+offset`. `Full` is a dense-edit
 /// fallback (terrain gen, paste, fill covering most of the chunk) where per-byte entries would
-/// cost more than just keeping the whole buffer; chosen in `diff_chunk` by comparing sizes.
+/// cost more than just keeping the whole buffer; chosen in `band_delta` by comparing sizes.
 pub(crate) enum ChunkDelta {
     Sparse(Vec<(u32, u8)>),
     /// `(start, data)` — `start` is the byte offset within the chunk (relative to its `addr`)
-    /// where `data` begins. Band-scoped snapshots (see `with_edit_zscoped`) only capture the
-    /// z-bands an edit's `z_min..z_max` actually touches, so this is rarely 0.
+    /// where `data` begins. Edits capture only the bands they write (`EditView`, `ChunkScratch`),
+    /// so a dense delta covers lowest..highest changed band and this is rarely 0.
     Full(u32, Vec<u8>),
     /// Deflated `Full` — `(start, deflated, raw_len)` (audit C1 step 2). Produced by
     /// `UndoEntry::new`, which is the only place a snapshot becomes long-lived, so every consumer
@@ -1019,6 +1250,24 @@ impl ChunkDelta {
                 ChunkDelta::FullZ(start, z, raw_len as u32)
             }
             _ => ChunkDelta::Full(start, data),
+        }
+    }
+
+    /// The bands this delta's bytes lie in (18.13): exactly the bands the edit (or the undo/redo
+    /// restore that produced it) wrote, so the dirty masks are complete by construction. A dense
+    /// delta covers its whole lowest..highest span, a safe superset. Only ever called on the raw
+    /// variants (`finish_edit` before `UndoEntry::new`; `restore_and_invert`'s inverses);
+    /// `SparseZ` would need an inflate, so it over-marks instead.
+    fn band_mask(&self) -> BandMask {
+        let dense = |start: u32, len: usize| {
+            if len == 0 { BandMask::default() }
+            else { BandMask::range(start as usize / BAND_SPAN, (start as usize + len - 1) / BAND_SPAN) }
+        };
+        match self {
+            ChunkDelta::Sparse(v) => v.iter().fold(BandMask::default(), |m, &(off, _)| m | BandMask::band(off as usize / BAND_SPAN)),
+            ChunkDelta::Full(start, data) => dense(*start, data.len()),
+            ChunkDelta::FullZ(start, _, raw_len) => dense(*start, *raw_len as usize),
+            ChunkDelta::SparseZ(..) => { debug_assert!(false, "band_mask on a compressed Sparse"); BandMask::ALL }
         }
     }
 
@@ -1196,22 +1445,109 @@ pub(crate) struct SculptSession {
     pub(crate) fheight: HashMap<(i32, i32), f64>,
 }
 
-/// Chunk-level (and header) dirty tracking for incremental autosave/save (audit C2). Three
-/// independent "since X" sets exist because the journal, the on-disk file, and the autosave base
-/// image each advance on their own cadence and get cleared at different times — a chunk can be
-/// flushed to the journal (clearing `since_journal`) while still owing a write to `disk_image.path`
-/// (`since_disk` untouched) and still counting toward journal-compaction accounting (`since_base`).
-/// `header_*` mirror the three sets for header bytes 0..192, which have no `(cx,cy)` of their own —
+/// Bytes in one band (8 KiB: 4 KiB of block bytes, then 4 KiB of paint).
+const BAND_SPAN: usize = 8192;
+
+/// Which bands of one chunk changed — bit `b` = band `b`. `num_bands ≤ 16` for both real formats
+/// (`parse_world_inner` refuses anything larger, so the mask can't silently truncate). Over-marking
+/// a band costs a few KB of redundant I/O; under-marking is data loss, so every producer errs wide.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub(crate) struct BandMask(u16);
+
+impl BandMask {
+    const ALL: BandMask = BandMask(u16::MAX);
+    const MAX_BANDS: usize = 16;
+
+    fn band(b: usize) -> BandMask { BandMask(1 << b.min(Self::MAX_BANDS - 1)) }
+    /// Bands `lo..=hi`.
+    fn range(lo: usize, hi: usize) -> BandMask {
+        let (lo, hi) = (lo.min(Self::MAX_BANDS - 1), hi.min(Self::MAX_BANDS - 1));
+        BandMask(((1u32 << (hi + 1)) - (1u32 << lo)) as u16)
+    }
+    fn contains(self, b: usize) -> bool { b < Self::MAX_BANDS && self.0 & (1 << b) != 0 }
+    fn count(self) -> u32 { self.0.count_ones() }
+    /// Maximal runs of set bits as inclusive `(first, last)` band pairs, ascending.
+    fn runs(self) -> impl Iterator<Item = (usize, usize)> {
+        let mut m = self.0 as u32;
+        std::iter::from_fn(move || {
+            if m == 0 { return None; }
+            let lo = m.trailing_zeros();
+            let run = (m >> lo).trailing_ones();
+            m &= !(((1u32 << run) - 1) << lo);
+            Some((lo as usize, (lo + run - 1) as usize))
+        })
+    }
+}
+
+impl std::ops::BitOr for BandMask {
+    type Output = BandMask;
+    fn bitor(self, o: BandMask) -> BandMask { BandMask(self.0 | o.0) }
+}
+
+/// A dirty set: chunk → the bands of it that changed.
+type DirtyMap = FxHashMap<(i32, i32), BandMask>;
+
+/// Bytes the set owes, clamped to each chunk's real span (so `BandMask::ALL` on a 64z world is 32 KB,
+/// not 128 KB). Drives the compaction and incremental-save decline thresholds, which used to be
+/// `chunks × chunk_size`.
+fn dirty_bytes(world: &LoadedWorld, dirty: &DirtyMap) -> u64 {
+    let mut total = 0u64;
+    for (&(cx, cy), &mask) in dirty {
+        let Some((addr, cend)) = world.chunk_range(cx, cy) else { continue };
+        for (b0, b1) in mask.runs() {
+            let s = addr + b0 * BAND_SPAN;
+            if s < cend { total += ((addr + (b1 + 1) * BAND_SPAN).min(cend) - s) as u64; }
+        }
+    }
+    total
+}
+
+/// The dirty set as absolute file spans `(file_off, cx, cy, bytes)`, one per maximal run of dirty
+/// bands, sorted by offset. The one emitter all three sinks (journal tick, WAL, in-place save) share
+/// so they can't drift. Borrowed from the mapping, never copied. ⚠️ Clamped to `chunk_range`'s real
+/// end, never `bytes.len()` or the nominal chunk size: a short-span chunk ends early, and a run
+/// reaching past it would capture the neighbour's bytes. Overlapping spans (a chunk overlapping its
+/// neighbour) stay correct because every span is read from the same mapping at one instant.
+fn dirty_spans<'a>(world: &'a LoadedWorld, dirty: &DirtyMap) -> Vec<(u64, i32, i32, &'a [u8])> {
+    let mut out = Vec::with_capacity(dirty.len());
+    for (&(cx, cy), &mask) in dirty {
+        // A dirty coord the world doesn't have can't happen (the layout is fixed for a loaded
+        // world's lifetime), but skipping beats writing at a bogus offset if it ever did.
+        let Some((addr, cend)) = world.chunk_range(cx, cy) else { continue };
+        for (b0, b1) in mask.runs() {
+            let s = addr + b0 * BAND_SPAN;
+            if s >= cend { continue; }
+            let e = (addr + (b1 + 1) * BAND_SPAN).min(cend);
+            out.push((s as u64, cx, cy, &world.bytes[s..e]));
+        }
+    }
+    out.sort_unstable_by_key(|s| s.0);
+    out
+}
+
+/// Chunk-level (and header) dirty tracking for incremental autosave/save (audit C2). Four
+/// independent "since X" sets exist because the journal, the on-disk file, the autosave base image
+/// and the load each advance on their own cadence and get cleared at different times — a chunk can
+/// be flushed to the journal (clearing `since_journal`) while still owing a write to
+/// `disk_image.path` (`since_disk` untouched) and still counting toward journal-compaction
+/// accounting (`since_base`, reset when a save re-bases a *Source* autosave lineage, 18.9) and
+/// toward a *Clone* lineage's (`since_load`, monotone for the session — see `AutosaveBase`).
+/// `header_*` mirror the four sets for header bytes 0..192, which have no `(cx,cy)` of their own —
 /// `set_spawn_pos`/`rename_world`/`set_sky_grid` write header fields directly and bypass
 /// `with_edit`, so they mark this explicitly rather than going through `mark_chunks`.
+///
+/// Each set is band-granular (18.13): a chunk maps to the `BandMask` of bands that changed, and a
+/// merge ORs the masks, so a one-block edit owes the journal/WAL/file one 8 KB band, not the chunk.
 #[derive(Default)]
 pub(crate) struct DirtyState {
-    since_journal: FxHashSet<(i32, i32)>,
-    since_disk: FxHashSet<(i32, i32)>,
-    since_base: FxHashSet<(i32, i32)>,
+    since_journal: DirtyMap,
+    since_disk: DirtyMap,
+    since_base: DirtyMap,
+    since_load: DirtyMap,
     header_journal: bool,
     header_disk: bool,
     header_base: bool,
+    header_load: bool,
     /// Monotonic counter bumped by every `mark_*` **and** by `clear_all`, i.e. by every event that
     /// can make a previously-captured view of this struct stale. A flush that captured its work
     /// under a *read* guard and released it before mutating this struct (the save path in
@@ -1241,23 +1577,30 @@ pub(crate) struct DirtyState {
 ///
 /// Header-only writers (`set_spawn_pos`, `set_player_pos`, `rename_world`, `set_sky_grid`) touch
 /// bytes 0..192 — no chunk's bytes, hence no hint — and correctly call `mark_header` instead.
-fn mark_dirty_chunks(dirty: &mut DirtyState, world: Option<&LoadedWorld>, chunks: &[(i32, i32)]) {
+fn mark_dirty_chunks(dirty: &mut DirtyState, world: Option<&LoadedWorld>, chunks: &[(i32, i32, BandMask)]) {
     if let Some(w) = world {
-        for &(cx, cy) in chunks { w.top_bands.invalidate(cx, cy); }
+        for &(cx, cy, _) in chunks { w.invalidate_derived_one(cx, cy); }
     }
-    dirty.mark_chunks(chunks.iter().copied());
+    dirty.mark_bands(chunks.iter().copied());
 }
 
 impl DirtyState {
     /// ⚠️ Call `mark_dirty_chunks` instead from any path that changed a chunk's **bytes** — this
     /// only updates the save/journal bookkeeping and leaves the `top_band_hint` cache stale.
-    pub(crate) fn mark_chunks<I: IntoIterator<Item = (i32, i32)>>(&mut self, chunks: I) {
+    pub(crate) fn mark_bands<I: IntoIterator<Item = (i32, i32, BandMask)>>(&mut self, chunks: I) {
         self.seq = self.seq.wrapping_add(1);
-        for c in chunks {
-            self.since_journal.insert(c);
-            self.since_disk.insert(c);
-            self.since_base.insert(c);
+        for (cx, cy, m) in chunks {
+            for set in [&mut self.since_journal, &mut self.since_disk, &mut self.since_base, &mut self.since_load] {
+                let e = set.entry((cx, cy)).or_default();
+                *e = *e | m;
+            }
         }
+    }
+
+    /// Whole-chunk form of `mark_bands`, for callers that only know which chunks changed (journal
+    /// recovery replays spans by offset) — over-marks every band, which is always safe.
+    pub(crate) fn mark_chunks<I: IntoIterator<Item = (i32, i32)>>(&mut self, chunks: I) {
+        self.mark_bands(chunks.into_iter().map(|(cx, cy)| (cx, cy, BandMask::ALL)));
     }
 
     pub(crate) fn mark_header(&mut self) {
@@ -1265,6 +1608,7 @@ impl DirtyState {
         self.header_journal = true;
         self.header_disk = true;
         self.header_base = true;
+        self.header_load = true;
     }
 
     /// Called on world load/close — nothing prior to this instant is owed to anything, since
@@ -1274,9 +1618,11 @@ impl DirtyState {
         self.since_journal.clear();
         self.since_disk.clear();
         self.since_base.clear();
+        self.since_load.clear();
         self.header_journal = false;
         self.header_disk = false;
         self.header_base = false;
+        self.header_load = false;
     }
 }
 
@@ -1296,6 +1642,92 @@ pub(crate) struct DiskImage {
     mtime: std::time::SystemTime,
     /// Last write to `path` was a zip — an incremental in-place update is impossible from it.
     compressed: bool,
+    /// `file_id_of` at the same instant (18.9) — what lets this image seed an autosave *Source*
+    /// lineage (`FileIdentity`) without a second, racier `metadata()` call.
+    file_id: (u64, u64),
+}
+
+impl DiskImage {
+    fn from_metadata(path: &std::path::Path, md: &fs::Metadata, compressed: bool) -> Self {
+        DiskImage {
+            path: path.to_path_buf(),
+            len: md.len(),
+            mtime: md.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+            compressed,
+            file_id: file_id_of(md),
+        }
+    }
+
+    fn from_identity(id: FileIdentity, compressed: bool) -> Self {
+        DiskImage {
+            mtime: std::time::UNIX_EPOCH + std::time::Duration::from_nanos(id.mtime_ns),
+            path: id.path, len: id.len, compressed, file_id: id.file_id,
+        }
+    }
+
+    fn identity(&self) -> FileIdentity {
+        FileIdentity { path: self.path.clone(), len: self.len, mtime_ns: system_time_ns(self.mtime), file_id: self.file_id }
+    }
+}
+
+/// A stable-ish identity for a file on disk: `(dev, ino)` on Unix; on Windows `creation_time` from
+/// the stable `MetadataExt` (`file_index` is still unstable). Our atomic saves rename a fresh file
+/// into place, so this changes on every full save — it is what catches a sync client replacing the
+/// file with an identical length and mtime. Belt and braces with `len` + `mtime`, never alone: NTFS
+/// "tunnelling" can hand a replacement file the old creation time, and other platforms get `(0, 0)`.
+fn file_id_of(md: &fs::Metadata) -> (u64, u64) {
+    #[cfg(unix)]
+    { use std::os::unix::fs::MetadataExt; (md.dev(), md.ino()) }
+    #[cfg(windows)]
+    { use std::os::windows::fs::MetadataExt; (md.creation_time(), 0) }
+    #[cfg(not(any(unix, windows)))]
+    { let _ = md; (0, 0) }
+}
+
+fn system_time_ns(t: std::time::SystemTime) -> u64 {
+    t.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0)
+}
+
+/// Identity of the user's world file as last written (or loaded) by us — the base an autosave
+/// *Source* lineage replays onto (18.9). Persisted in `autosave.meta.json` so recovery can prove the
+/// file is still byte-for-byte that base before replaying anything over it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub(crate) struct FileIdentity {
+    path: std::path::PathBuf,
+    len: u64,
+    mtime_ns: u64,
+    file_id: (u64, u64),
+}
+
+/// Whether an autosave base file still matches its recorded `FileIdentity`. Reported to the
+/// Recovery modal as `base_status` so it can explain a refusal before the user clicks Recover.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum BaseStatus {
+    Ok,
+    /// The file exists but something (a later save, the game, a sync client) wrote it since.
+    Changed,
+    /// The file can't be stat'ed at all — moved, deleted, or on a drive that isn't mounted.
+    Missing,
+}
+
+impl FileIdentity {
+    fn of(path: &std::path::Path, md: &fs::Metadata) -> Self {
+        FileIdentity {
+            path: path.to_path_buf(),
+            len: md.len(),
+            mtime_ns: md.modified().map(system_time_ns).unwrap_or(0),
+            file_id: file_id_of(md),
+        }
+    }
+
+    fn check(&self) -> BaseStatus {
+        match fs::metadata(&self.path) {
+            Err(_) => BaseStatus::Missing,
+            Ok(md) if FileIdentity::of(&self.path, &md) == *self => BaseStatus::Ok,
+            Ok(_) => BaseStatus::Changed,
+        }
+    }
 }
 
 /// Bound on `template_surface_cache` entries (§5, 2026-08 memory-efficiency pass): each entry is a
@@ -1362,6 +1794,30 @@ impl TemplateSurfaceCache {
     }
 }
 
+/// Where an autosave journal's base image lives (18.9, `TEST WORLDS/autosave-rebase-plan-2026-09-30.md`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub(crate) enum AutosaveBase {
+    /// `autosave.base.eden`, a clone of the staged temp — the fallback for everything without a
+    /// known on-disk twin (zip loads, recovered sessions, compressed saves, an externally modified
+    /// source). Compacts from the monotone `since_load`: that is what makes a clone of a temp being
+    /// mutated under MAP_SHARED (or stale under MAP_PRIVATE) sound — see `autosave_world_inner`.
+    Clone,
+    /// The user's world file itself, still matching this identity. No copy at all; compacts from
+    /// `since_base`, which a save's re-base resets — that reset is what bounds compaction by the
+    /// edits since the last save (Stage 8 P-1b).
+    Source(FileIdentity),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct AutosaveLineage {
+    base_id: [u8; 16],
+    base: AutosaveBase,
+    /// False until a tick has written this lineage's journal (a re-base or recovery establishes
+    /// the lineage before any journal exists) — the next tick then writes a fresh one.
+    journal_written: bool,
+}
+
 pub(crate) struct WorldState {
     pub(crate) world: Option<LoadedWorld>,
     pub(crate) clipboard: Option<Clipboard>,
@@ -1389,6 +1845,9 @@ pub(crate) struct WorldState {
     /// `trim_stack`. User-configurable via `set_undo_budget` (memory-budget presets, §1c of the
     /// 2026-08 memory-efficiency pass); clamped server-side to `16..=512 MB`.
     pub(crate) undo_budget: usize,
+    /// Byte budget for the overview raster (18.15): the memory preset's Low 16 / Balanced 32 /
+    /// High 64 MB, via `set_overview_budget`. Picks the raster's granularity when it is built.
+    pub(crate) overview_budget: usize,
     /// Path to the decompressed temp file when the current world was opened from a zip.
     /// Deleted after the mmap is dropped on next world load.
     pub(crate) temp_path: Option<std::path::PathBuf>,
@@ -1445,12 +1904,17 @@ pub(crate) struct WorldState {
     /// What we believe is currently on disk at the loaded world's source path — see `DiskImage`.
     /// `None` until `load_world` establishes it (or after a zip load, where it stays `None`).
     pub(crate) disk_image: Option<DiskImage>,
-    /// Random id of the currently-established journaled-autosave base image (`autosave.base.eden`),
-    /// or `None` if this session hasn't autosaved yet. Set by the first `autosave_world` tick after
-    /// load/recovery; cleared on load/close/recovery so the next session (or the next world) always
-    /// starts its own fresh base+journal lineage rather than silently extending a stale one whose
-    /// on-disk image no longer corresponds to `temp_path`.
-    pub(crate) autosave_base_id: Option<[u8; 16]>,
+    /// The journaled-autosave lineage this session is writing — which base the journal replays onto
+    /// and under what id — or `None` if none is established. Set by an `autosave_world` tick's
+    /// discharge, by a save's re-base (`rebase_after_save_inner`, 18.9) and by recovery; cleared on
+    /// load/close/discard so the next world always starts its own lineage rather than silently
+    /// extending a stale one. Every change bumps `lineage_gen`.
+    pub(crate) autosave: Option<AutosaveLineage>,
+    /// Bumped by every change to `autosave` other than a tick's own discharge (re-base, load,
+    /// close, recovery, discard). A tick captures it before its I/O and discharges only if it is
+    /// unchanged — otherwise a tick in flight across a save or discard would restore a lineage
+    /// whose files were just deleted (18.9 phase 0, plan §1.1). Never reset.
+    pub(crate) lineage_gen: u64,
     /// Signs for the currently-loaded world (256z-format plan, Phase 4) — sidecar preferred if
     /// present beside the world's source path, else decoded from `LoadedWorld::dir_trailer`.
     /// Populated once by `load_world`, read by `get_signs`. Empty for the overwhelming majority
@@ -1475,6 +1939,7 @@ impl WorldState {
             undo_groups: 0,
             redo_groups: 0,
             undo_budget: DEFAULT_UNDO_BYTE_BUDGET,
+            overview_budget: overview::DEFAULT_OVERVIEW_BUDGET,
             temp_path: None,
             temp_shared: false,
             template_bytes: None,
@@ -1489,7 +1954,8 @@ impl WorldState {
             selection_mask: None,
             dirty: DirtyState::default(),
             disk_image: None,
-            autosave_base_id: None,
+            autosave: None,
+            lineage_gen: 0,
             signs: Vec::new(),
         }
     }
@@ -1957,7 +2423,11 @@ fn parse_world_inner(bytes: MmapMut) -> Result<LoadedWorld, String> {
         let min_gap = offsets.windows(2).map(|w| w[1] - w[0]).min().unwrap_or(32768);
         if min_gap >= 131072 { 131072 } else { 32768 }
     };
-    let num_bands = chunk_size / 8192;
+    let num_bands = chunk_size / BAND_SPAN;
+    // `BandMask` is a u16; a format with more bands would truncate dirty tracking (data loss).
+    if num_bands > BandMask::MAX_BANDS {
+        return Err(format!("Unsupported chunk size: {num_bands} bands (at most {} supported)", BandMask::MAX_BANDS));
+    }
 
     // ── Pass B: validate against the now-known chunk_size, then index ─────────────────────────
     //
@@ -2048,6 +2518,7 @@ fn parse_world_inner(bytes: MmapMut) -> Result<LoadedWorld, String> {
         sky,
         dir_trailer,
         top_bands: TopBandHints::new(min_x, min_y, w_chunks, h_chunks),
+        overview: std::sync::OnceLock::new(),
     })
 }
 
@@ -2112,9 +2583,19 @@ fn render_pixels_patch_lod(
 }
 
 /// `render_pixels_patch_lod` with the full map style (cutaway cap + relief shading, Stage 13.2).
+///
+/// Uncapped renders at a LOD the overview raster covers read the raster instead of the world
+/// (18.15) — byte-identical by construction (`overview.rs`). Tiles and edit/undo patches both land
+/// here, so an edit patch refills the cells its own edit just invalidated.
 fn render_pixels_patch_styled(
     world: &LoadedWorld, px1: i32, py1: i32, px2: i32, py2: i32, style: MapStyle, lod: u32,
 ) -> PixelPatch {
+    if style.cap.is_none() {
+        if let Some(r) = world.overview().filter(|r| r.serves(lod)) {
+            let src = overview::RasterSource::new(r, world);
+            return render::pixels_patch_styled_from(&src, world.meta(), px1, py1, px2, py2, style.relief, lod).into();
+        }
+    }
     render::pixels_patch_styled(world, world.meta(), px1, py1, px2, py2, style, lod).into()
 }
 
@@ -2253,6 +2734,7 @@ fn load_world(path: String, state: tauri::State<'_, AppState>) -> Result<WorldMe
     }
 
     let mut temp_shared = false;
+    let mut staged_identity: Option<FileIdentity> = None;
     let (mmap, maybe_temp, was_compressed): (MmapMut, Option<std::path::PathBuf>, bool) = if is_zip(&magic) {
         use zip::ZipArchive;
         timing_log!("[LOAD] detected zip archive, decompressing  t=+{}µs", us());
@@ -2291,9 +2773,14 @@ fn load_world(path: String, state: tauri::State<'_, AppState>) -> Result<WorldMe
         // ours alone, `map_staged_temp` maps it MAP_SHARED — edits land in the temp and stay
         // file-backed and reclaimable rather than piling up as anonymous COW pages.
         let temp_path = temp_world_path();
+        // Identity before and after the copy (18.9): the recorded `DiskImage` — and through it an
+        // autosave Source lineage, whose recovery replays onto this very file — is only sound if the
+        // file we staged is the file we then describe. Anything that wrote it mid-copy leaves no image.
+        let before = fs::metadata(&path).ok().map(|md| FileIdentity::of(std::path::Path::new(&path), &md));
         stage_copy(std::path::Path::new(&path), &temp_path).map_err(|e| format!(
             "Failed to stage world file: {e}. Opening a world creates a private working copy; check available space for another copy on the system temporary-files drive."
         ))?;
+        staged_identity = before.filter(|id| id.check() == BaseStatus::Ok);
         let (mmap, shared) = map_staged_temp_ex(&temp_path)
             .map_err(|e| format!("Failed to map staged file: {e}"))?;
         temp_shared = shared;
@@ -2301,7 +2788,7 @@ fn load_world(path: String, state: tauri::State<'_, AppState>) -> Result<WorldMe
     };
     timing_log!("[LOAD] file_mmap  bytes={}B  compressed={}  t=+{}µs", mmap.len(), was_compressed, us());
 
-    let loaded = match parse_world_inner(mmap) {
+    let mut loaded = match parse_world_inner(mmap) {
         Ok(l) => l,
         Err(e) => {
             // Parsing failed after we already staged a temp copy (or decompressed one) — the
@@ -2313,6 +2800,17 @@ fn load_world(path: String, state: tauri::State<'_, AppState>) -> Result<WorldMe
     };
     timing_log!("[LOAD] parsed  {}×{} chunks  count={}  world_bytes={}B  t=+{}µs",
         loaded.w_chunks, loaded.h_chunks, loaded.chunk_map.len(), loaded.bytes.len(), us());
+
+    // The overview raster persisted for exactly this file (18.15 phase 2), so the first zoomed-out
+    // view reads tens of MB of `.vxr` instead of every chunk's pages. Only with a proven identity
+    // (a non-zip load that didn't change mid-copy); a stale or damaged entry is dropped, never an error.
+    if let (Some(id), Some(dir)) = (staged_identity.as_ref(), overview::store_dir()) {
+        let budget = read_ws(&state).overview_budget;
+        if let Some(r) = overview::preload(&loaded, id, budget, dir) {
+            loaded.overview = std::sync::OnceLock::from(Some(r));
+        }
+        timing_log!("[LOAD] overview preload  t=+{}µs", us());
+    }
 
     // Signs (256z-format plan, Phase 4): sidecar preferred if it exists beside the *source* path
     // (never the staged temp — the sidecar travels with the user's file, not our private copy),
@@ -2369,12 +2867,13 @@ fn load_world(path: String, state: tauri::State<'_, AppState>) -> Result<WorldMe
     // point at which we commit to discarding the previous world.
     timing_log!("[LOCK] acquire_start  cmd=load_world/step3  t=+{}µs", us());
     let t_s3 = Instant::now();
-    let (old_world, old_temp) = {
+    let (old_world, old_temp, old_persist) = {
         let mut ws = write_ws(&state);
         let wait = t_s3.elapsed().as_micros();
         timing_log!("[LOCK] acquired  cmd=load_world/step3  wait={}µs  prev_undo={}B  prev_redo={}B",
             wait, ws.undo_bytes, ws.redo_bytes);
         let t_held = Instant::now();
+        let old_persist = overview_persist_candidate(&ws); // before the dirty/disk state is reset
         let old_world = ws.world.replace(loaded);  // pointer swap only — dealloc happens outside the lock
         ws.clipboard = None;
         ws.clear_undo();
@@ -2389,7 +2888,8 @@ fn load_world(path: String, state: tauri::State<'_, AppState>) -> Result<WorldMe
         ws.temp_path = maybe_temp;
         ws.temp_shared = temp_shared;
         ws.dirty.clear_all();
-        ws.autosave_base_id = None; // the new world's autosave lineage starts fresh, not the old one's
+        ws.autosave = None; // the new world's autosave lineage starts fresh, not the old one's
+        ws.lineage_gen += 1;
         ws.signs = signs;
         // Non-zip loads: the staged temp is an exact copy of the source file, which is exactly
         // world.bytes, so the source path is a known-good disk image the instant load succeeds.
@@ -2397,17 +2897,13 @@ fn load_world(path: String, state: tauri::State<'_, AppState>) -> Result<WorldMe
         ws.disk_image = if was_compressed {
             None
         } else {
-            fs::metadata(&path).ok().map(|md| DiskImage {
-                path: std::path::PathBuf::from(&path),
-                len: md.len(),
-                mtime: md.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH),
-                compressed: false,
-            })
+            staged_identity.map(|id| DiskImage::from_identity(id, false))
         };
         drop(ws);
         timing_log!("[LOCK] released  cmd=load_world/step3  held={}µs  t=+{}µs", t_held.elapsed().as_micros(), us());
-        (old_world, old_temp)
+        (old_world, old_temp, old_persist)
     };
+    persist_overview_on_close(old_world.as_ref(), old_persist);
     // Release the old mmap before unlinking its backing temp. This drop must be explicit: a named
     // binding lives to the end of the function, so `let (_old_world, ..)` left the mapping alive
     // across the remove_file below — contrary to what the comment here used to claim. `close_world`
@@ -2625,9 +3121,9 @@ fn validate_selection(x1: i32, y1: i32, x2: i32, y2: i32, z_min: i32, z_max: i32
 
 /// Voxel cap for whole-volume allocations: 256M voxels ≈ 512 MB for a block_types+paints pair.
 /// Originally clipboard-only (copy/move); also gates `delete_blocks`/`replace_blocks`/
-/// `gradient_fill`'s undo snapshot (audit C1's cheapest immediate mitigation — the real fix is
-/// streaming the snapshot per chunk instead of capping the edit, but that's a larger restructuring
-/// left for a follow-up; this at least turns an OOM kill into a catchable error). `width`/`height`/
+/// `gradient_fill` (audit C1). It was added to bound their rect-sized undo snapshot; since 18.12 the
+/// pre-image is copy-on-write and sized by the bands actually changed (`EditView`, with its own
+/// trip), so this cap now bounds the edit's CPU time and returned patch instead. `width`/`height`/
 /// `depth` are validated i32 selection extents, but the product must be computed in i64 — on a
 /// large enough world it overflows i32 (and, cast to usize, sign-extends into a multi-exabyte
 /// allocation request that aborts the process; see audit C3).
@@ -3312,8 +3808,13 @@ fn fetch_tile(
 ) -> Result<PixelPatch, String> {
     let ws = read_ws(&state);
     let world = ws.world.as_ref().ok_or("No world loaded")?;
-    let patch = render_pixels_patch_styled(world, x1, y1, x2, y2, ws.map_style(), lod.unwrap_or(1));
-    log_band_scan_savings(world, x1, y1, x2, y2);
+    let style = ws.map_style();
+    let lod = lod.unwrap_or(1);
+    // The first zoomed-out, uncapped tile builds the overview raster (18.15); LOD 1 and cutaway
+    // views never need one, so a session that stays zoomed in never allocates it.
+    if lod >= 2 && style.cap.is_none() { world.ensure_overview(ws.overview_budget); }
+    let patch = render_pixels_patch_styled(world, x1, y1, x2, y2, style, lod);
+    log_band_scan_savings(world, x1, y1, x2, y2, lod, style.cap.is_none());
     Ok(patch)
 }
 
@@ -3328,7 +3829,7 @@ fn fetch_tile(
 /// `unknown` and are counted pessimistically (full band count), which is the honest direction.
 ///
 /// Debug builds only, by `timing_log!`'s own definition.
-fn log_band_scan_savings(world: &LoadedWorld, x1: i32, y1: i32, x2: i32, y2: i32) {
+fn log_band_scan_savings(world: &LoadedWorld, x1: i32, y1: i32, x2: i32, y2: i32, lod: u32, uncapped: bool) {
     // Same shape as `timing_log!` itself — a const-folded early return rather than a `#[cfg]`, so
     // the code still type-checks in release builds and the optimiser drops it.
     if !cfg!(debug_assertions) { return; }
@@ -3350,9 +3851,14 @@ fn log_band_scan_savings(world: &LoadedWorld, x1: i32, y1: i32, x2: i32, y2: i32
             }
         }
         if chunks > 0 {
-            timing_log!("[PAGES] fetch_tile  chunks={chunks}  unknown_hints={unknown}  \
-                         band_halves={hinted}/{full} ({:.0}%)",
-                hinted as f64 / full.max(1) as f64 * 100.0);
+            // `overview()` is a plain `OnceLock` read — it never builds the raster.
+            let raster = world.overview();
+            let served_by = uncapped && raster.is_some_and(|r| r.serves(lod));
+            let (rs, rm) = raster.map_or((0, 0), |r| r.counters());
+            timing_log!("[PAGES] fetch_tile  lod={lod}  chunks={chunks}  unknown_hints={unknown}  \
+                         band_halves={hinted}/{full} ({:.0}%)  raster={}  raster_samples={rs}/{rm}",
+                hinted as f64 / full.max(1) as f64 * 100.0,
+                if served_by { "served" } else { "off" });
         }
     }
 }
@@ -3435,6 +3941,23 @@ fn set_undo_budget(bytes: usize, state: tauri::State<'_, AppState>) -> Result<()
     let WorldState { undo_stack, undo_bytes, undo_groups, redo_stack, redo_bytes, redo_groups, .. } = &mut *ws;
     trim_stack(undo_stack, undo_bytes, undo_groups, budget);
     trim_stack(redo_stack, redo_bytes, redo_groups, budget);
+    Ok(())
+}
+
+/// Set the overview raster's byte budget (memory-budget preset, 18.15). Clamped server-side. If the
+/// open world's raster would now get a different granularity it is dropped, and the next zoomed-out
+/// tile rebuilds it (from the world — the cells aren't convertible between granularities).
+#[tauri::command(async)]
+fn set_overview_budget(bytes: usize, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let mut ws = write_ws(&state);
+    let budget = bytes.clamp(overview::MIN_OVERVIEW_BUDGET, overview::MAX_OVERVIEW_BUDGET);
+    ws.overview_budget = budget;
+    if let Some(w) = ws.world.as_mut() {
+        let current = w.overview().map(|r| r.granularity());
+        let grid = w.w_chunks as usize * w.h_chunks as usize;
+        let wanted = overview::choose_granularity(w.chunk_map.len(), grid, budget);
+        if w.overview.get().is_some() && current != wanted { w.overview = std::sync::OnceLock::new(); }
+    }
     Ok(())
 }
 
@@ -3603,34 +4126,20 @@ fn render_full_height_view_inner(
 // ── Editing — pure inner functions (also called by tests) ─────────────────────
 
 fn delete_blocks_inner(
-    world: &mut LoadedWorld,
+    world: &mut impl VoxelViewMut,
     x1: i32, y1: i32, x2: i32, y2: i32,
     z_min: i32, z_max: i32,
     mask: Option<&SelectionMask>,
 ) {
-    for px in x1..=x2 {
-        for py in y1..=y2 {
-            if let Some(m) = mask { if !m.contains(px, py) { continue; } }
-            let chunk_cx = px / 16 + world.min_x;
-            let chunk_cy = py / 16 + world.min_y;
-            let lx = (px % 16) as usize;
-            let ly = (py % 16) as usize;
-            let Some((addr, cend)) = world.chunk_range(chunk_cx, chunk_cy) else { continue };
-            for z in z_min..=z_max {
-                let band = (z / 16) as usize;
-                let lz   = (z % 16) as usize;
-                let bi = addr + band * 8192 + lx * 256 + ly * 16 + lz;
-                let pi = bi + 4096;
-                if pi >= cend { continue; }
-                world.bytes[bi] = 0;
-                world.bytes[pi] = 0;
-            }
-        }
-    }
+    // Per column, per band run: probe the band read-only first and only ask for a writable band
+    // when some cell in the run isn't already air — under `EditView` that's what keeps a delete over
+    // air from capturing (and a `MAP_SHARED` page from being dirtied) for nothing (18.12).
+    rewrite_column_runs(world, x1, y1, x2, y2, z_min, z_max, mask, |_, _| Some((0, 0)));
 }
 
+#[allow(clippy::too_many_arguments)]
 fn replace_blocks_inner(
-    world: &mut LoadedWorld,
+    world: &mut impl VoxelViewMut,
     x1: i32, y1: i32, x2: i32, y2: i32,
     z_min: i32, z_max: i32,
     new_block_type: u8,
@@ -3640,26 +4149,55 @@ fn replace_blocks_inner(
     filter_invert: bool,
     mask: Option<&SelectionMask>,
 ) {
+    rewrite_column_runs(world, x1, y1, x2, y2, z_min, z_max, mask, |bt, pt| {
+        let type_ok  = filter_block_type.is_none_or(|ft| bt == ft);
+        let paint_ok = filter_paint.is_none_or(|fp| pt == fp);
+        // passes==filter_invert means "skip": skip matching when normal, skip non-matching when inverted
+        if (type_ok && paint_ok) == filter_invert { None } else { Some((new_block_type, new_paint)) }
+    });
+}
+
+/// The shared loop behind delete/replace: for every (masked) column of the rect and every band run
+/// of `z_min..=z_max`, `f(block, paint)` says what the cell becomes (`None` = leave it). Each run is
+/// checked on the read-only band first; a writable band is requested only when some cell would
+/// actually change, and only changed cells are stored.
+#[allow(clippy::too_many_arguments)]
+fn rewrite_column_runs(
+    world: &mut impl VoxelViewMut,
+    x1: i32, y1: i32, x2: i32, y2: i32,
+    z_min: i32, z_max: i32,
+    mask: Option<&SelectionMask>,
+    f: impl Fn(u8, u8) -> Option<(u8, u8)>,
+) {
+    let (mnx, mny) = world.chunk_origin();
+    let z_min = z_min.max(0);
+    let changes = |bt: u8, pt: u8| f(bt, pt).is_some_and(|n| n != (bt, pt));
     for px in x1..=x2 {
         for py in y1..=y2 {
             if let Some(m) = mask { if !m.contains(px, py) { continue; } }
-            let chunk_cx = px / 16 + world.min_x;
-            let chunk_cy = py / 16 + world.min_y;
-            let lx = (px % 16) as usize;
-            let ly = (py % 16) as usize;
-            let Some((addr, cend)) = world.chunk_range(chunk_cx, chunk_cy) else { continue };
-            for z in z_min..=z_max {
+            let cx = px / 16 + mnx;
+            let cy = py / 16 + mny;
+            let col = (px % 16) as usize * 256 + (py % 16) as usize * 16;
+            let mut z = z_min;
+            while z <= z_max {
                 let band = (z / 16) as usize;
-                let lz   = (z % 16) as usize;
-                let bi = addr + band * 8192 + lx * 256 + ly * 16 + lz;
-                let pi = bi + 4096;
-                if pi >= cend { continue; }
-                let type_ok  = filter_block_type.is_none_or(|ft| world.bytes[bi] == ft);
-                let paint_ok = filter_paint.is_none_or(|fp| world.bytes[pi] == fp);
-                // passes==filter_invert means "skip": skip matching when normal, skip non-matching when inverted
-                if (type_ok && paint_ok) == filter_invert { continue; }
-                world.bytes[bi] = new_block_type;
-                world.bytes[pi] = new_paint;
+                let z_end = z_max.min(band as i32 * 16 + 15);
+                let (lz0, lz1) = ((z % 16) as usize, (z_end % 16) as usize);
+                z = z_end + 1;
+                let Some(b) = world.band_bytes(cx, cy, band) else { break };
+                let any = (lz0..=lz1).any(|lz| {
+                    let bi = col + lz;
+                    bi + 4096 < b.len() && changes(b[bi], b[bi + 4096])
+                });
+                if !any { continue; }
+                let Some(b) = world.band_bytes_mut(cx, cy, band) else { continue };
+                for lz in lz0..=lz1 {
+                    let (bi, pi) = (col + lz, col + lz + 4096);
+                    if pi >= b.len() { continue; }
+                    if let Some(n) = f(b[bi], b[pi]) {
+                        if n != (b[bi], b[pi]) { b[bi] = n.0; b[pi] = n.1; }
+                    }
+                }
             }
         }
     }
@@ -3786,24 +4324,57 @@ fn save_world_progress(
 /// compressed, and the incremental step 1 — so the "only if absent" rule and the choice of backup
 /// format can't drift between them.
 fn make_backup_if_absent(src: &std::path::Path, backup_compressed: bool) -> Result<(), String> {
-    if !src.exists() { return Ok(()); }
+    if !src.exists() || existing_backup(src, backup_compressed).is_some() { return Ok(()); }
+    let (plain_bak, zip_bak) = backup_paths(src);
     if backup_compressed {
-        let zip_bak = { let mut b = src.as_os_str().to_owned(); b.push(".bak.zip"); std::path::PathBuf::from(b) };
-        if zip_bak.exists() { return Ok(()); }
-        // A plain (uncompressed) .bak from an earlier session with backupCompressed off still
-        // counts as "already backed up" — don't produce a second backup in the other format.
-        let plain_bak = { let mut b = src.as_os_str().to_owned(); b.push(".bak"); std::path::PathBuf::from(b) };
-        if plain_bak.exists() { return Ok(()); }
         zip_file_contents(src, &zip_bak)
     } else {
-        let bak = { let mut b = src.as_os_str().to_owned(); b.push(".bak"); std::path::PathBuf::from(b) };
-        if bak.exists() { return Ok(()); }
-        stage_copy(src, &bak).map_err(|e| format!("Failed to create backup: {e}"))
+        stage_copy(src, &plain_bak).map_err(|e| format!("Failed to create backup: {e}"))
+    }
+}
+
+/// `(<src>.bak, <src>.bak.zip)`.
+fn backup_paths(src: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let with = |ext: &str| { let mut b = src.as_os_str().to_owned(); b.push(ext); std::path::PathBuf::from(b) };
+    (with(".bak"), with(".bak.zip"))
+}
+
+/// The backup that makes `make_backup_if_absent` a no-op for `src`, if any. With `backup_compressed`
+/// a plain `.bak` from an earlier session with it off still counts as "already backed up" (don't
+/// produce a second backup in the other format); without it only a plain `.bak` counts.
+fn existing_backup(src: &std::path::Path, backup_compressed: bool) -> Option<std::path::PathBuf> {
+    let (plain_bak, zip_bak) = backup_paths(src);
+    if backup_compressed && zip_bak.exists() { return Some(zip_bak); }
+    plain_bak.exists().then_some(plain_bak)
+}
+
+/// 18.8 (audit S-1 `.bak` policy): what the next save to `path` does about its one-time backup, so
+/// the Save pane can say how big it is instead of changing the default. A plain `.bak` is a
+/// world-sized copy that stays beside the user's file forever.
+#[derive(Serialize)]
+struct BackupStatus {
+    /// File name of the backup already beside `path` (the next save leaves it alone), if any.
+    existing_name: Option<String>,
+    existing_bytes: u64,
+    /// Current size of the file at `path` — what the next save copies (or zips) when there's no
+    /// backup yet. 0 when `path` doesn't exist (a first save makes no backup).
+    source_bytes: u64,
+}
+
+#[tauri::command(async)]
+fn backup_status(path: String, backup_compressed: bool) -> BackupStatus {
+    let src = std::path::Path::new(&path);
+    let existing = existing_backup(src, backup_compressed);
+    BackupStatus {
+        existing_name: existing.as_ref()
+            .and_then(|p| p.file_name()).map(|f| f.to_string_lossy().into_owned()),
+        existing_bytes: existing.and_then(|p| fs::metadata(p).ok()).map_or(0, |m| m.len()),
+        source_bytes: fs::metadata(src).map_or(0, |m| m.len()),
     }
 }
 
 /// Zip `src`'s *current on-disk contents* into `dst` at deflate level 6 (level 9 buys ~1% on voxel
-/// data for several times the time — not worth it for a backup nobody reads until disaster strikes).
+/// data for several times the time — see `SAVE_DEFLATE_LEVEL`).
 /// Used for `.bak.zip` backups, which must capture what's on disk *before* a save touches it — never
 /// `world.bytes`, which is what's about to be written, not what's there now.
 fn zip_file_contents(src: &std::path::Path, dst: &std::path::Path) -> Result<(), String> {
@@ -3825,7 +4396,7 @@ fn zip_file_contents(src: &std::path::Path, dst: &std::path::Path) -> Result<(),
         let mut zip = ZipWriter::new(file);
         let options = SimpleFileOptions::default()
             .compression_method(zip::CompressionMethod::Deflated)
-            .compression_level(Some(6));
+            .compression_level(Some(SAVE_DEFLATE_LEVEL));
         zip.start_file(&inner_name, options).map_err(|e| format!("Zip error: {e}"))?;
         std::io::copy(&mut src_file, &mut zip).map_err(|e| format!("Write error: {e}"))?;
         let f = zip.finish().map_err(|e| format!("Zip finish error: {e}"))?;
@@ -3986,7 +4557,14 @@ fn recover_wal(dest: &std::path::Path) {
 /// interleave, the dirty set can't shift underneath the write, and every span is read straight out of
 /// the mapping with no intermediate copy (a plan-shaped "snapshot the bytes, drop the guard" variant
 /// would allocate up to half the world before writing a byte).
+#[cfg(test)]
 fn try_incremental_save(state: &AppState, path: &str, backup_compressed: bool) -> Result<bool, String> {
+    Ok(try_incremental_save_seq(state, path, backup_compressed)?.is_some())
+}
+
+/// `try_incremental_save`, returning the `dirty.seq` the save captured (`Some`) instead of `true`,
+/// which `save_world` hands on to the autosave re-base (18.9).
+fn try_incremental_save_seq(state: &AppState, path: &str, backup_compressed: bool) -> Result<Option<u64>, String> {
     let dest = std::path::Path::new(path);
     let wal = wal_path(dest);
 
@@ -3996,49 +4574,48 @@ fn try_incremental_save(state: &AppState, path: &str, backup_compressed: bool) -
 
         // ── Eligibility. Every check below is a decline (`Ok(false)`), never an error: the caller's
         // full atomic write is always a correct way to save.
-        let Some(di) = ws.disk_image.as_ref() else { return Ok(false) };
-        if di.compressed { return Ok(false); }
+        let Some(di) = ws.disk_image.as_ref() else { return Ok(None) };
+        if di.compressed { return Ok(None); }
         if di.path != dest {
             // Tolerate different spellings of the same file (a symlink, a `..`, a case-insensitive
             // volume) — but only when both sides actually resolve. Anything else declines.
             match (fs::canonicalize(&di.path), fs::canonicalize(dest)) {
                 (Ok(a), Ok(b)) if a == b => {}
-                _ => return Ok(false),
+                _ => return Ok(None),
             }
         }
         // The recorded image must still describe both the world in memory and the file on disk. A
         // length or mtime that has moved means something outside this editor wrote to the
         // destination since our last save, and its contents are no longer a base we can patch.
-        if di.len != world.bytes.len() as u64 { return Ok(false); }
-        let Ok(md) = fs::metadata(dest) else { return Ok(false) };
-        if md.len() != di.len || md.modified().ok() != Some(di.mtime) { return Ok(false); }
+        if di.len != world.bytes.len() as u64 { return Ok(None); }
+        let Ok(md) = fs::metadata(dest) else { return Ok(None) };
+        if md.len() != di.len || md.modified().ok() != Some(di.mtime) { return Ok(None); }
 
-        let dirty: Vec<(i32, i32)> = ws.dirty.since_disk.iter().copied().collect();
+        let dirty = &ws.dirty.since_disk;
         let header_dirty = ws.dirty.header_disk;
         // Nothing tracked as dirty. The file *should* already be byte-identical, but taking the full
         // write here is the cheap insurance against the one bug class this whole feature can't
         // self-detect: a missed `mark_chunks` hook site would otherwise turn ⌘S into a silent no-op.
-        if dirty.is_empty() && !header_dirty { return Ok(false); }
+        if dirty.is_empty() && !header_dirty { return Ok(None); }
         // Past roughly half the world, patching stops paying for itself against a single sequential
         // rewrite — and a ⌘A-scale fill lands here by design (see the plan's manual check 6).
-        if (dirty.len() as u64).saturating_mul(world.chunk_size as u64) >= world.bytes.len() as u64 / 2 {
-            return Ok(false);
+        if dirty_bytes(world, dirty) >= world.bytes.len() as u64 / 2 {
+            return Ok(None);
         }
-        if header_dirty && world.bytes.len() < 192 { return Ok(false); }
+        if header_dirty && world.bytes.len() < 192 { return Ok(None); }
 
-        let mut spans: Vec<(u64, &[u8])> = Vec::with_capacity(dirty.len() + 1);
-        let mut coords: Vec<(i32, i32)> = Vec::with_capacity(dirty.len() + 1);
+        // One span per run of dirty bands (18.13), not per chunk; `dirty_spans` clamps to each
+        // chunk's real end.
+        let band_spans = dirty_spans(world, dirty);
+        let mut spans: Vec<(u64, &[u8])> = Vec::with_capacity(band_spans.len() + 1);
+        let mut coords: Vec<(i32, i32)> = Vec::with_capacity(band_spans.len() + 1);
         if header_dirty {
             spans.push((0, &world.bytes[0..192]));
             coords.push(journal::HEADER_SPAN);
         }
-        for (cx, cy) in dirty {
-            // A dirty coord the world doesn't have can't happen (the layout is fixed for a loaded
-            // world's lifetime), but skipping beats writing at a bogus offset if it ever did.
-            if let Some((addr, end)) = world.chunk_range(cx, cy) {
-                spans.push((addr as u64, &world.bytes[addr..end]));
-                coords.push((cx, cy));
-            }
+        for (off, cx, cy, bytes) in band_spans {
+            spans.push((off, bytes));
+            coords.push((cx, cy));
         }
 
         // ── Step 1: `.bak`/`.bak.zip`, before anything is written. It matters more here than for a
@@ -4048,7 +4625,7 @@ fn try_incremental_save(state: &AppState, path: &str, backup_compressed: bool) -
         // contents either way.
         if make_backup_if_absent(dest, backup_compressed).is_err() {
             // Let the full-save path re-attempt it and own the error message.
-            return Ok(false);
+            return Ok(None);
         }
 
         // ── Step 2: the redo log, committed and fsynced before the destination is touched at all.
@@ -4068,7 +4645,7 @@ fn try_incremental_save(state: &AppState, path: &str, backup_compressed: bool) -
             // The destination is still untouched, so the safest response is to leave it that way and
             // let the caller write the whole world atomically.
             let _ = fs::remove_file(&wal);
-            return Ok(false);
+            return Ok(None);
         }
         if let Some(parent) = dest.parent() { fsync_dir(parent); }
 
@@ -4091,7 +4668,7 @@ fn try_incremental_save(state: &AppState, path: &str, backup_compressed: bool) -
 
     record_full_write(state, dest, false, seq_at_capture)?;
     timing_log!("[SAVE] incremental  spans={}  dest={:?}", span_count, dest);
-    Ok(true)
+    Ok(Some(seq_at_capture))
 }
 
 /// Record that `dest` now holds exactly the world that was in memory at the moment `seq_at_capture`
@@ -4116,12 +4693,7 @@ fn record_full_write(
     if ws.dirty.seq != seq_at_capture { return Ok(()); }
     ws.dirty.since_disk.clear();
     ws.dirty.header_disk = false;
-    ws.disk_image = Some(DiskImage {
-        path: dest.to_path_buf(),
-        len: md.len(),
-        mtime: md.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH),
-        compressed,
-    });
+    ws.disk_image = Some(DiskImage::from_metadata(dest, &md, compressed));
     Ok(())
 }
 
@@ -4161,16 +4733,12 @@ fn affected_chunk_coords(world: &LoadedWorld, x1: i32, y1: i32, x2: i32, y2: i32
     out
 }
 
-/// Copies chunk block data for each listed chunk coordinate — used only as the "before" buffer
-/// that `diff_chunk` compares against post-edit bytes to build a sparse delta. Never itself
-/// stored in the undo stack.
-///
-/// `z_range`, when given, scopes the copy to just the z-bands `z_min..=z_max` overlap (rounded
-/// out to whole 8192-byte bands) instead of the entire chunk. Most edits only ever touch a
-/// handful of a 256-layer world's 16 bands, so this is a 4–16× cut in the transient snapshot
-/// allocation and in `diff_chunk`'s comparison work (audit C4 step 1). `None` keeps the old
-/// whole-chunk behaviour — used by edits (paste, generate_trees, sculpt, …) whose write region
-/// isn't a simple static z interval.
+/// **Test-only oracle** (ROADMAP-EDIT 18.12): the pre-CoW undo snapshot. Copies each listed chunk
+/// (or, with `z_range`, just the bands `z_min..=z_max` overlap) *before* an edit, for `diff_chunk`
+/// to compare against the post-edit bytes. Production captures its pre-image lazily through
+/// `EditView` instead; `with_edit_inner_oracle` and the delta/compression tests still build deltas
+/// this way, which is what the differential tests compare the CoW path against.
+#[cfg(test)]
 fn snapshot_chunks_full(
     world: &LoadedWorld,
     coords: &[(i32, i32)],
@@ -4184,11 +4752,8 @@ fn snapshot_chunks_full(
 }
 
 /// The absolute byte window `snapshot_chunks_full` captures for one chunk: `(chunk addr, start,
-/// end)`. Shared with `preimage_bytes` so the byte guard prices exactly what the snapshot copies.
-///
-/// The chunk's *real* span (`chunk_range`), not `chunk_size`: capturing a short-span chunk's nominal
-/// window would pull the next chunk's bytes into this chunk's undo delta, and restoring it would
-/// then write them back at the same (wrong) address.
+/// end)` — bounded by the chunk's *real* span (`chunk_range`), never `chunk_size`.
+#[cfg(test)]
 fn preimage_span(
     world: &LoadedWorld,
     cx: i32, cy: i32,
@@ -4210,69 +4775,27 @@ fn preimage_span(
     Some((addr, start, end))
 }
 
-/// Total bytes `snapshot_chunks_full(world, coords, z_range)` would allocate.
-fn preimage_bytes(world: &LoadedWorld, coords: &[(i32, i32)], z_range: Option<(i32, i32)>) -> usize {
-    coords.iter()
-        .filter_map(|&(cx, cy)| preimage_span(world, cx, cy, z_range))
-        .map(|(_, s, e)| e - s)
-        .sum()
-}
-
-/// Multiple of `undo_budget` above which an unbounded-pre-image edit is refused (audit RAM-1 /
-/// row 18.2). The pre-image is transient and uncompressed while the stored entry is usually far
-/// smaller, so this is deliberately looser than the budget itself — but an edit whose *pre-image*
-/// alone is this large would have its (equally huge) undo entry dropped by `finish_edit` anyway,
-/// and the allocation can abort the process on a low-memory machine.
+/// Multiple of `undo_budget` an edit's copy-on-write pre-image may reach before the edit is rolled
+/// back and refused (audit RAM-1; rows 18.2 → 18.12). Since 18.12 this counts the bands the edit
+/// actually **changed**, not its rect. The pre-image is transient and uncompressed while the stored
+/// entry is usually far smaller, so this is deliberately looser than the budget itself — but an
+/// edit whose pre-image alone is this large would have its (equally huge) undo entry dropped by
+/// `finish_edit` anyway, and the allocation can abort the process on a low-memory machine.
 const PREIMAGE_GUARD_FACTOR: usize = 4;
 
-/// Refuse an edit whose pre-image would exceed `PREIMAGE_GUARD_FACTOR × undo_budget`.
-fn check_preimage_budget(bytes: usize, undo_budget: usize) -> Result<(), String> {
-    let limit = undo_budget.saturating_mul(PREIMAGE_GUARD_FACTOR);
-    if bytes > limit {
-        let mb = |b: usize| b as f64 / (1024.0 * 1024.0);
-        return Err(format!(
-            "This edit would need to snapshot {:.0} MB of world data for undo, over the {:.0} MB limit. Select a smaller region.",
-            mb(bytes), mb(limit)
-        ));
-    }
-    Ok(())
-}
-
-/// Unique existing chunks covered by a set of world-pixel cells, sorted for determinism.
-fn chunks_for_cells(world: &LoadedWorld, cells: impl Iterator<Item = (i32, i32)>) -> Vec<(i32, i32)> {
-    let mut set: HashSet<(i32, i32)> = HashSet::new();
-    for (x, y) in cells {
-        if x < 0 || y < 0 { continue; }
-        let key = (x / 16 + world.min_x, y / 16 + world.min_y);
-        if world.chunk_map.contains_key(&key) { set.insert(key); }
-    }
-    let mut v: Vec<_> = set.into_iter().collect();
-    v.sort_unstable();
-    v
-}
-
-/// Unique existing chunks under the union of pixel rects (`(x1, y1, x2, y2)` inclusive), sorted.
-fn chunks_for_rects(world: &LoadedWorld, rects: impl Iterator<Item = (i32, i32, i32, i32)>) -> Vec<(i32, i32)> {
-    let mut set: HashSet<(i32, i32)> = HashSet::new();
-    for (x1, y1, x2, y2) in rects {
-        if x2 < 0 || y2 < 0 || x1 > x2 || y1 > y2 { continue; }
-        set.extend(affected_chunk_coords(world, x1.max(0), y1.max(0), x2, y2));
-    }
-    let mut v: Vec<_> = set.into_iter().collect();
-    v.sort_unstable();
-    v
+/// The refusal an edit gets when its pre-image passes `limit` (`EditView::tripped`).
+fn preimage_trip_message(limit: usize) -> String {
+    format!(
+        "This edit changes more than {:.0} MB of world data, over the undo limit. Select a smaller region.",
+        limit as f64 / (1024.0 * 1024.0)
+    )
 }
 
 /// Compares `pre` (bytes captured before an edit, starting at chunk-relative offset `start_off`)
 /// against the chunk's current bytes and builds a `ChunkSnapshot` describing only what changed.
-/// Returns `None` if the edit left this span byte-for-byte unchanged (e.g. deleting air, filling
-/// with the same block) — replaces the old full-chunk `filter_unchanged_snapshots` pass. Falls
-/// back to `Full` when the sparse encoding (5 bytes/changed byte) wouldn't actually be smaller
-/// than just keeping the whole span.
-///
-/// Compares 8 bytes at a time and only descends to a byte-wise scan inside a differing word
-/// (audit C4 step 2) — chunks are usually >99% identical, so this skips most of the span at
-/// 1/8th the comparison count instead of touching every byte individually.
+/// Returns `None` if the edit left this span byte-for-byte unchanged. Test-only since 18.12 (the
+/// oracle half of `snapshot_chunks_full`); production diffs captured bands in `band_delta`.
+#[cfg(test)]
 fn diff_chunk(world: &LoadedWorld, cx: i32, cy: i32, start_off: u32, pre: &[u8]) -> Option<ChunkSnapshot> {
     let (addr, cend) = world.chunk_range(cx, cy)?;
     let start = addr + start_off as usize;
@@ -4284,9 +4807,9 @@ fn diff_chunk(world: &LoadedWorld, cx: i32, cy: i32, start_off: u32, pre: &[u8])
 }
 
 /// The byte-comparison half of `diff_chunk`, over two equal-length spans that both start at
-/// chunk-relative offset `start_off`. Split out (audit H1) so the sculpt scratch — which holds
-/// the *post* bytes in its own buffer rather than in the world — can build an identical delta
-/// without first writing into the world and diffing it back out.
+/// chunk-relative offset `start_off`. Falls back to `Full` when the sparse encoding (5 bytes per
+/// changed byte) wouldn't be smaller than keeping the whole span — the same rule `band_delta` uses.
+#[cfg(test)]
 fn diff_span(start_off: u32, pre: &[u8], post: &[u8]) -> Option<ChunkDelta> {
     debug_assert_eq!(pre.len(), post.len());
     if post == pre { return None; }
@@ -4306,9 +4829,6 @@ fn diff_span(start_off: u32, pre: &[u8], post: &[u8]) -> Option<ChunkDelta> {
     }
     if sparse.is_empty() { return None; }
     Some(if sparse.len() * 5 < pre.len() {
-        // shrink_to_fit before this snapshot's bytes are ever counted (chunk_snapshot_bytes reads
-        // `capacity()`, not `len()`) — a `push`-grown Vec's capacity can otherwise run to 2× len,
-        // and `UndoEntry::new` computes `bytes` once and never recomputes it.
         sparse.shrink_to_fit();
         ChunkDelta::Sparse(sparse)
     } else {
@@ -4481,9 +5001,10 @@ impl tauri::ipc::IpcResponse for EditResult {
 //
 // Pattern for every editing command:
 //  1. Validate inputs / pre-read anything needed from a shared `&World` borrow.
-//  2. Call `with_edit()`, which owns take → snapshot → run edit closure → render
-//     patch → reinstall → push undo / clear redo → return EditResult.
-//  3. The edit closure just mutates `&mut LoadedWorld` and returns `Result<(), String>`.
+//  2. Call `with_edit()`, which owns take → run edit closure (capturing a copy-on-write
+//     pre-image) → render patch → reinstall → push undo / clear redo → return EditResult.
+//  3. The edit closure writes through `&mut EditView` (reads via `Deref` to `LoadedWorld`,
+//     writes only via `VoxelViewMut`) and returns `Result<(), String>`.
 //
 // `with_edit()` is the single place that owns the take/reinstall sequence, so no call
 // site can accidentally skip the reinstall on an early return (previously an audited
@@ -4492,118 +5013,49 @@ impl tauri::ipc::IpcResponse for EditResult {
 // stack rather than snapshotting a fresh edit — but have no fallible op between their
 // take/reinstall either.
 
-/// Runs an edit against the currently loaded world, owning the take/snapshot/reinstall
-/// sequence. `snap_rect` bounds the chunks snapshotted for undo (some ops widen this
-/// beyond `patch_rect`, e.g. tree canopies spilling into neighboring chunks); `patch_rect`
-/// bounds the pixels returned to the frontend. If `edit` returns `Err`, the world is
-/// still reinstalled before the error propagates — callers can bail mid-edit freely.
-#[cfg_attr(not(test), allow(dead_code))]
+/// Runs an edit against the currently loaded world, owning the take/capture/reinstall sequence.
+/// `patch_rect` bounds the pixels returned to the frontend (some ops widen it past the selection,
+/// e.g. tree canopies spilling ±3). The undo pre-image needs no bound: `EditView` captures exactly
+/// the bands the edit writes (18.12). If `edit` returns `Err`, its writes are rolled back exactly
+/// and the world is reinstalled before the error propagates — callers can bail mid-edit freely.
 fn with_edit<F>(
     ws: &mut WorldState,
     operation: &str,
-    snap_rect: (i32, i32, i32, i32),
     patch_rect: (i32, i32, i32, i32),
     edit: F,
 ) -> Result<EditResult, String>
 where
-    F: FnOnce(&mut LoadedWorld) -> Result<(), String>,
+    F: FnOnce(&mut EditView) -> Result<(), String>,
 {
-    with_edit_inner(ws, operation, SnapScope::Rect(snap_rect), patch_rect, None, None, false, edit)
-}
-
-/// `with_edit` for edits whose write region is known to a *chunk set* (and optionally a z interval)
-/// tighter than any rect — flood/surface fill, scatter, array, terrain paste (row 18.2). The
-/// pre-image covers exactly `chunks`, and the pre-image byte guard is on.
-fn with_edit_chunks<F>(
-    ws: &mut WorldState,
-    operation: &str,
-    chunks: Vec<(i32, i32)>,
-    patch_rect: (i32, i32, i32, i32),
-    z_range: Option<(i32, i32)>,
-    edit: F,
-) -> Result<EditResult, String>
-where
-    F: FnOnce(&mut LoadedWorld) -> Result<(), String>,
-{
-    with_edit_inner(ws, operation, SnapScope::Chunks(chunks), patch_rect, None, z_range, true, edit)
-}
-
-/// `with_edit` plus the pre-image byte guard, for edits whose rect can be far larger than what they
-/// write and that aren't otherwise volume-validated (trees, flow, pool, wavy, extrude — row 18.2).
-fn with_edit_guarded<F>(
-    ws: &mut WorldState,
-    operation: &str,
-    snap_rect: (i32, i32, i32, i32),
-    patch_rect: (i32, i32, i32, i32),
-    edit: F,
-) -> Result<EditResult, String>
-where
-    F: FnOnce(&mut LoadedWorld) -> Result<(), String>,
-{
-    with_edit_inner(ws, operation, SnapScope::Rect(snap_rect), patch_rect, None, None, true, edit)
-}
-
-/// What `with_edit_inner` snapshots for undo: every chunk under a rect, or an explicit chunk set.
-enum SnapScope {
-    Rect((i32, i32, i32, i32)),
-    Chunks(Vec<(i32, i32)>),
-}
-
-/// `with_edit`, but scoped to the z-bands `z_min..=z_max` overlap for the undo snapshot/diff
-/// (audit C4 step 1) — use when the edit's entire vertical extent is known statically (delete,
-/// replace/fill, gradient, move). Skips the transient whole-chunk copy+diff for every band the
-/// edit can't possibly touch. Edits whose write region isn't a simple static z interval (paste,
-/// tree canopies, sculpt, flood/pool fill, …) should keep using plain `with_edit`.
-fn with_edit_zscoped<F>(
-    ws: &mut WorldState,
-    operation: &str,
-    snap_rect: (i32, i32, i32, i32),
-    patch_rect: (i32, i32, i32, i32),
-    z_range: (i32, i32),
-    edit: F,
-) -> Result<EditResult, String>
-where
-    F: FnOnce(&mut LoadedWorld) -> Result<(), String>,
-{
-    with_edit_inner(ws, operation, SnapScope::Rect(snap_rect), patch_rect, None, Some(z_range), false, edit)
+    with_edit_inner(ws, operation, patch_rect, None, edit)
 }
 
 /// Group-tagged sibling of `with_edit`: identical, but stamps the resulting `UndoEntry` with
 /// `group` so a run of these (one sculpt stroke = many timer stamps, or one 3D build sweep = many
 /// per-stamp paints) coalesces on undo/redo. Both funnel into `with_edit_inner` so there is one
 /// owner of the take/reinstall sequence.
-///
-/// `z_range` is `with_edit_zscoped`'s band scoping, plumbed through rather than given its own
-/// fourth wrapper: `paint_blocks` needs *both* knobs, since a 3D build sweep is grouped **and**
-/// supplies concrete z coordinates. `None` = whole-chunk snapshot, which is what every caller whose
-/// vertical extent isn't statically known must pass.
 fn with_edit_grouped<F>(
     ws: &mut WorldState,
     operation: &str,
-    snap_rect: (i32, i32, i32, i32),
     patch_rect: (i32, i32, i32, i32),
     group: Option<u64>,
-    z_range: Option<(i32, i32)>,
     edit: F,
 ) -> Result<EditResult, String>
 where
-    F: FnOnce(&mut LoadedWorld) -> Result<(), String>,
+    F: FnOnce(&mut EditView) -> Result<(), String>,
 {
-    with_edit_inner(ws, operation, SnapScope::Rect(snap_rect), patch_rect, group, z_range, false, edit)
+    with_edit_inner(ws, operation, patch_rect, group, edit)
 }
 
 fn with_edit_inner<F>(
     ws: &mut WorldState,
     operation: &str,
-    scope: SnapScope,
     patch_rect: (i32, i32, i32, i32),
     group: Option<u64>,
-    z_range: Option<(i32, i32)>,
-    guard_preimage: bool,
     edit: F,
 ) -> Result<EditResult, String>
 where
-    F: FnOnce(&mut LoadedWorld) -> Result<(), String>,
+    F: FnOnce(&mut EditView) -> Result<(), String>,
 {
     // Invalidate the live-sculpt float workspace whenever this edit isn't the stroke that owns it
     // (a different group, or `None` = any non-sculpt command). This is the single choke point every
@@ -4614,41 +5066,75 @@ where
 
     let style = ws.map_style();
     let view_lod = ws.view_lod;
+    let limit = ws.undo_budget.saturating_mul(PREIMAGE_GUARD_FACTOR);
     let mut world = ws.world.take().ok_or("No world loaded")?;
 
-    let affected = match scope {
-        SnapScope::Rect((sx1, sy1, sx2, sy2)) => if sx1 > sx2 || sy1 > sy2 {
-            vec![]
-        } else {
-            affected_chunk_coords(&world, sx1, sy1, sx2, sy2)
-        },
-        SnapScope::Chunks(c) => c,
-    };
-    if guard_preimage {
-        if let Err(e) = check_preimage_budget(preimage_bytes(&world, &affected, z_range), ws.undo_budget) {
-            ws.world = Some(world);
-            return Err(e);
-        }
-    }
-    let pre_full = snapshot_chunks_full(&world, &affected, z_range);
-    mem::PEAKS.edit_preimage.record(pre_full.iter().map(|p| p.3.len() as u64).sum());
+    let mut view = EditView::new(&mut world, limit);
+    let result = edit(&mut view);
+    let cap = view.into_capture();
+    mem::PEAKS.edit_preimage.record(cap.captured as u64);
 
-    if let Err(e) = edit(&mut world) {
+    // A failed or over-limit edit is rolled back **exactly** — every captured band written back —
+    // so it leaves no partial writes behind (before 18.12 an `Err` after the first write left them
+    // in the world with no undo entry, no dirty mark and stale scan ceilings).
+    if result.is_err() || cap.tripped {
+        let chunks = rollback_capture(&mut world, &cap.pre);
+        world.invalidate_derived(&chunks);
+        ws.world = Some(world);
+        return Err(match result {
+            Err(e) => e,
+            Ok(()) => preimage_trip_message(limit),
+        });
+    }
+
+    // The bytes have changed, so every scan ceiling over a captured chunk is now suspect (and the
+    // view raised some mid-edit) — clear them *here*, before `edit_patch` renders from the post-edit
+    // world (see `invalidate_derived`). A captured chunk is a superset of a changed one.
+    let mut captured_chunks: Vec<(i32, i32)> = cap.pre.keys().copied().collect();
+    captured_chunks.sort_unstable();
+    world.invalidate_derived(&captured_chunks);
+
+    let (patch, invalidate) = edit_patch(&world, patch_rect, style, view_lod);
+    let pre_snap = capture_deltas(&world, &cap.pre);
+    drop(cap);
+    ws.world = Some(world);
+    finish_edit(ws, operation, group, patch, invalidate, pre_snap)
+}
+
+/// **Test-only oracle** for the differential tests (ROADMAP-EDIT 18.12): the pre-CoW
+/// `with_edit_inner` — snapshot every chunk under `snap_rect` (all bands, or the bands `z_range`
+/// overlaps) up front, run the edit, diff. The closure still receives an `EditView` (unbounded) so
+/// the very same writer code runs on both paths; its capture is simply discarded.
+#[cfg(test)]
+fn with_edit_inner_oracle<F>(
+    ws: &mut WorldState,
+    operation: &str,
+    snap_rect: (i32, i32, i32, i32),
+    patch_rect: (i32, i32, i32, i32),
+    z_range: Option<(i32, i32)>,
+    edit: F,
+) -> Result<EditResult, String>
+where
+    F: FnOnce(&mut EditView) -> Result<(), String>,
+{
+    ws.sculpt_session = None;
+    let style = ws.map_style();
+    let view_lod = ws.view_lod;
+    let mut world = ws.world.take().ok_or("No world loaded")?;
+    let (sx1, sy1, sx2, sy2) = snap_rect;
+    let affected = if sx1 > sx2 || sy1 > sy2 { vec![] } else { affected_chunk_coords(&world, sx1, sy1, sx2, sy2) };
+    let pre_full = snapshot_chunks_full(&world, &affected, z_range);
+    if let Err(e) = edit(&mut EditView::unbounded(&mut world)) {
         ws.world = Some(world);
         return Err(e);
     }
-
-    // The bytes have changed, so every scan ceiling over `affected` is now suspect — clear them
-    // *here*, before `edit_patch` renders from the post-edit world (see `invalidate_top_bands`).
-    // `affected` is a superset of the chunks that actually changed, which is the safe direction.
-    world.invalidate_top_bands(&affected);
-
+    world.invalidate_derived(&affected);
     let (patch, invalidate) = edit_patch(&world, patch_rect, style, view_lod);
     let pre_snap: Vec<ChunkSnapshot> = pre_full.into_iter()
         .filter_map(|(cx, cy, start_off, pre)| diff_chunk(&world, cx, cy, start_off, &pre))
         .collect();
     ws.world = Some(world);
-    finish_edit(ws, operation, group, patch, invalidate, pre_snap)
+    finish_edit(ws, operation, None, patch, invalidate, pre_snap)
 }
 
 /// A block-type family suspected of a fixed client-side capacity (verified empirically for doors —
@@ -4704,7 +5190,8 @@ fn count_new_block_types(world: &LoadedWorld, snaps: &[ChunkSnapshot]) -> [u32; 
                     if off % 8192 >= 4096 { continue; } // paint byte
                     let idx = addr + off;
                     if idx >= cend { continue; }
-                    counts[world.bytes[idx] as usize] += 1;
+                    // `get_mut`: a block byte ≥ 128 (an unknown type in a damaged file) is not a panic.
+                    if let Some(c) = counts.get_mut(world.bytes[idx] as usize) { *c += 1; }
                 }
             }
             dense => {
@@ -4720,7 +5207,7 @@ fn count_new_block_types(world: &LoadedWorld, snaps: &[ChunkSnapshot]) -> [u32; 
                     let pre = &data[lo - start..hi - start];
                     let post = &world.bytes[addr + lo..addr + hi];
                     for (&p, &q) in pre.iter().zip(post) {
-                        if p != q { counts[q as usize] += 1; }
+                        if p != q { if let Some(c) = counts.get_mut(q as usize) { *c += 1; } }
                     }
                 }
             }
@@ -4775,7 +5262,7 @@ fn finish_edit(
     // Dirty tracking for incremental autosave/save (audit C2): pre_snap is exactly the chunks
     // diff_chunk found to have actually changed, which is more precise than `affected` (a no-op
     // edit over a region touches nothing here).
-    let touched: Vec<(i32, i32)> = pre_snap.iter().map(|s| (s.cx, s.cy)).collect();
+    let touched: Vec<(i32, i32, BandMask)> = pre_snap.iter().map(|s| (s.cx, s.cy, s.delta.band_mask())).collect();
     mark_dirty_chunks(&mut ws.dirty, ws.world.as_ref(), &touched);
 
     // Budget enforcement at accumulation time (audit C1 step 3). `UndoEntry::new` has already
@@ -4846,16 +5333,16 @@ fn delete_blocks(
     let mut ws = write_ws(&state);
     let max_z = ws.world.as_ref().map(world_max_z).unwrap_or(63);
     validate_selection(x1, y1, x2, y2, z_min, z_max, max_z)?;
-    // Undo-snapshot volume guard (audit C1, cheapest immediate mitigation): the undo delta for this
-    // edit is captured over the same volume the clipboard would refuse, so cap it the same way
-    // rather than let a ⌘A fill on a huge world OOM mid-edit — see `validate_volume`.
+    // Volume guard (audit C1): the same cap the clipboard uses. It no longer sizes the undo
+    // pre-image (18.12 — `EditView` captures changed bands only, and trips on its own limit); it
+    // bounds this edit's CPU time and patch — see `validate_volume`.
     validate_volume(x2 - x1 + 1, y2 - y1 + 1, z_max - z_min + 1)?;
     let rect = (x1, y1, x2, y2);
     // Non-rectangular selection: honour a wand/lasso mask whose bbox matches this rect, so Delete
     // only clears the shaped cells. No match → rect-only, exactly as before (see `active_mask`).
     let mask = active_mask(&ws, x1, y1, x2, y2);
     let label = format!("Delete {}×{}×{}", x2 - x1 + 1, y2 - y1 + 1, z_max - z_min + 1);
-    with_edit_zscoped(&mut ws, &label, rect, rect, (z_min, z_max), |world| {
+    with_edit(&mut ws, &label, rect, |world| {
         delete_blocks_inner(world, x1, y1, x2, y2, z_min, z_max, mask.as_ref());
         Ok(())
     })
@@ -4883,13 +5370,13 @@ fn replace_blocks(
     let mut ws = write_ws(&state);
     let max_z = ws.world.as_ref().map(world_max_z).unwrap_or(63);
     validate_selection(x1, y1, x2, y2, z_min, z_max, max_z)?;
-    // Undo-snapshot volume guard (audit C1 mitigation) — see `delete_blocks`.
+    // Volume guard (audit C1) — see `delete_blocks`.
     validate_volume(x2 - x1 + 1, y2 - y1 + 1, z_max - z_min + 1)?;
     let rect = (x1, y1, x2, y2);
     // Fill / filtered-delete also honour the shaped selection (see `active_mask`).
     let mask = active_mask(&ws, x1, y1, x2, y2);
     let label = format!("Replace {}×{}×{}", x2 - x1 + 1, y2 - y1 + 1, z_max - z_min + 1);
-    with_edit_zscoped(&mut ws, &label, rect, rect, (z_min, z_max), |world| {
+    with_edit(&mut ws, &label, rect, |world| {
         replace_blocks_inner(world, x1, y1, x2, y2, z_min, z_max, new_block_type, new_paint, filter_block_type, filter_paint, filter_invert, mask.as_ref());
         Ok(())
     })
@@ -4929,7 +5416,7 @@ fn gradient_fill(
     let mut ws = write_ws(&state);
     let max_z = ws.world.as_ref().map(world_max_z).unwrap_or(63);
     validate_selection(x1, y1, x2, y2, z_min, z_max, max_z)?;
-    // Undo-snapshot volume guard (audit C1 mitigation) — see `delete_blocks`.
+    // Volume guard (audit C1) — see `delete_blocks`.
     validate_volume(x2 - x1 + 1, y2 - y1 + 1, z_max - z_min + 1)?;
     let rect = (x1, y1, x2, y2);
     // Non-rectangular selection: gate on the shaped footprint. The gradient fraction is still
@@ -4937,7 +5424,7 @@ fn gradient_fill(
     // colour ramp stays consistent with the visible selection box. No match → rect-only.
     let mask = active_mask(&ws, x1, y1, x2, y2);
     let label = format!("Gradient {}×{}×{}", x2 - x1 + 1, y2 - y1 + 1, z_max - z_min + 1);
-    with_edit_zscoped(&mut ws, &label, rect, rect, (z_min, z_max), |world| {
+    with_edit(&mut ws, &label, rect, |world| {
         gradient_fill_inner(world, x1, y1, x2, y2, z_min, z_max, bt1, paint1, bt2, paint2, &axis, include_air, mask.as_ref());
         Ok(())
     })
@@ -4948,7 +5435,7 @@ fn gradient_fill(
 /// only clips which columns receive it, so the colour ramp stays consistent with the selection box.
 #[allow(clippy::too_many_arguments)]
 fn gradient_fill_inner(
-    world: &mut LoadedWorld,
+    world: &mut impl VoxelViewMut,
     x1: i32, y1: i32, x2: i32, y2: i32, z_min: i32, z_max: i32,
     bt1: u8, paint1: u8, bt2: u8, paint2: u8,
     axis: &str, include_air: bool, mask: Option<&SelectionMask>,
@@ -4972,32 +5459,6 @@ fn gradient_fill_inner(
             }
         }
     }
-}
-
-/// The vertical extent `paint_blocks` will write, when it's knowable before the edit runs — the
-/// `z_range` handed to `with_edit_grouped` so the undo snapshot copies only the bands this batch can
-/// touch instead of whole 131 KB chunks (3D-pipeline audit Finding 13). Every block placed by a 3D
-/// build sweep carries a concrete `z` and a sweep fires one `paint_blocks` per stamp, so this is the
-/// per-stamp cost that matters.
-///
-/// `None` = not statically knowable, snapshot the whole chunk (the pre-existing behaviour).
-///
-/// ⚠️ Three things this range has to get exactly right. `snapshot_chunks_full` rounds it *out* to
-/// whole 16-block bands, and a range that is merely too **narrow** doesn't fail — it silently leaves
-/// the writes outside it out of the undo delta, so undoing restores part of the edit and keeps the
-/// rest:
-///  - `z_offset` is **not** part of it. `paint_blocks` applies `z_offset` only on the `b.z == None`
-///    (surface-relative) branch; an explicit `Some(z)` is an absolute coordinate, written unshifted.
-///  - Doors and portals auto-place their paired top block one above, so `top_type != 0` grows the
-///    high end by 1 — and that one block is routinely what crosses a band boundary.
-///  - A single `None` anywhere in the batch resolves its z from `surface_z_capped` *inside* the edit
-///    closure, so the extent isn't knowable up front and the whole batch must fall back.
-fn paint_z_range(blocks: &[PaintBlock], top_type: u8) -> Option<(i32, i32)> {
-    if blocks.is_empty() { return None; } // an empty fold would seed a degenerate (MAX, MIN) range
-    let (lo, hi) = blocks.iter().try_fold((i32::MAX, i32::MIN), |(lo, hi), b| {
-        b.z.map(|z| (lo.min(z), hi.max(z)))
-    })?;
-    Some((lo, hi + if top_type != 0 { 1 } else { 0 }))
 }
 
 /// Paint a batch of blocks in one operation — one undo entry for the whole stroke.
@@ -5028,7 +5489,7 @@ fn paint_blocks(
     }
     let mut ws = write_ws(&state);
 
-    // Compute bounding rect for chunk snapshot + patch render.
+    // Bounding rect for the patch render.
     let (mut x_min, mut y_min, mut x_max, mut y_max) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
     for b in &blocks {
         x_min = x_min.min(b.x); y_min = y_min.min(b.y);
@@ -5040,13 +5501,11 @@ fn paint_blocks(
     let is_portal = (75..=78).contains(&block_type);
     let top_type: u8 = if is_door { 70 } else if is_portal { 79 } else { 0 };
 
-    let z_range = paint_z_range(&blocks, top_type);
-
     // In cutaway view the "surface" a z-less paint targets is the highest block under the cap —
     // so drawing underground behaves exactly like drawing on the true surface.
     let cap = ws.view_cap_z;
     let label = format!("Paint {} block{}", blocks.len(), if blocks.len() == 1 { "" } else { "s" });
-    with_edit_grouped(&mut ws, &label, rect, rect, group, z_range, |world| {
+    with_edit_grouped(&mut ws, &label, rect, group, |world| {
         let max_z = world_max_z(world);
         for b in &blocks {
             let z = match b.z {
@@ -5206,6 +5665,11 @@ fn get_player_pos(state: tauri::State<'_, AppState>) -> Result<Option<(f32, f32)
     Ok(read_player_pos(world))
 }
 
+/// Deflate level for compressed saves and `.bak.zip` backups. 18.8 (audit C-4): was 9 for saves,
+/// which buys ~1 % on voxel data for several times the time — minutes of one core, under the read
+/// guard, on a multi-GB world. Any level decodes the same, so the game doesn't care.
+const SAVE_DEFLATE_LEVEL: i64 = 6;
+
 fn save_world_compressed(
     world: &LoadedWorld, path: &str, backup_compressed: bool, op: Option<&LongOpHandle>,
 ) -> Result<(), String> {
@@ -5233,7 +5697,7 @@ fn save_world_compressed(
         let mut zip = ZipWriter::new(file);
         let options = SimpleFileOptions::default()
             .compression_method(zip::CompressionMethod::Deflated)
-            .compression_level(Some(9));
+            .compression_level(Some(SAVE_DEFLATE_LEVEL));
         zip.start_file(&inner_name, options).map_err(|e| format!("Zip error: {e}"))?;
         match op {
             None => zip.write_all(&world.bytes).map_err(|e| format!("Write error: {e}"))?,
@@ -5272,17 +5736,31 @@ fn save_world(
     backup_compressed: bool,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
+    // The whole save runs under the durability mutex (18.9): an autosave tick can't interleave with
+    // it, and the re-base below can't race a tick's discharge.
+    let _durable = durability_lock();
     let dest = std::path::PathBuf::from(&path);
     let t0 = std::time::Instant::now(); // 18.0 `save_*` counters
+    // The file just written becomes the autosave journal's new base (or, compressed, no lineage) —
+    // replaces the frontend's old post-save `discard_autosave`. Best effort: the save itself already
+    // succeeded, and without a re-base the old lineage stays valid or falls back on its own.
+    let rebase = |seq: u64| match autosave_paths(&app) {
+        Ok(paths) => rebase_after_save_inner(&state, &paths, &dest, compressed, seq),
+        Err(e) => timing_log!("[AUTOSAVE] re-base skipped: {}", e),
+    };
 
     // Fast path: rewrite only what changed since this file was last written (audit C2 Stage 4). It
     // declines — falling through to the full write below — for a compressed target, an unknown or
     // stale on-disk image, an externally modified destination, or a dirty set too large to be worth
     // patching. Declining never touches the destination.
-    if !compressed && try_incremental_save(&state, &path, backup_compressed)? {
-        mem::PEAKS.save_kind.store(1, std::sync::atomic::Ordering::Relaxed);
-        mem::PEAKS.save_ms.record(t0.elapsed().as_millis() as u64);
-        return Ok(());
+    if !compressed {
+        if let Some(seq) = try_incremental_save_seq(&state, &path, backup_compressed)? {
+            rebase(seq);
+            persist_overview_after_save(&state, &dest, seq);
+            mem::PEAKS.save_kind.store(1, std::sync::atomic::Ordering::Relaxed);
+            mem::PEAKS.save_ms.record(t0.elapsed().as_millis() as u64);
+            return Ok(());
+        }
     }
 
     let seq_at_capture = {
@@ -5308,9 +5786,44 @@ fn save_world(
     // chunks they cover (they hold bytes captured before whatever went into this write).
     let _ = fs::remove_file(wal_path(&dest));
     let r = record_full_write(&state, &dest, compressed, seq_at_capture);
+    if r.is_ok() {
+        rebase(seq_at_capture);
+        if !compressed { persist_overview_after_save(&state, &dest, seq_at_capture); }
+    }
     mem::PEAKS.save_kind.store(if compressed { 3 } else { 2 }, std::sync::atomic::Ordering::Relaxed);
     mem::PEAKS.save_ms.record(t0.elapsed().as_millis() as u64);
     r
+}
+
+/// The identity under which the open world's overview raster may be persisted when the world is
+/// closed or replaced (18.15): no chunk changed since the last load or save, and that load/save was
+/// an uncompressed file we know. The caller re-checks it against the file once the guard is gone.
+fn overview_persist_candidate(ws: &WorldState) -> Option<FileIdentity> {
+    if !ws.dirty.since_disk.is_empty() { return None; }
+    ws.disk_image.as_ref().filter(|d| !d.compressed).map(DiskImage::identity)
+}
+
+/// Persist the raster of a world being closed or switched away from, if `id` still names the file
+/// on disk and the raster learned anything since it was loaded or last persisted.
+fn persist_overview_on_close(world: Option<&LoadedWorld>, id: Option<FileIdentity>) {
+    let (Some(w), Some(id), Some(dir)) = (world, id, overview::store_dir()) else { return };
+    if id.check() != BaseStatus::Ok { return; }
+    if let Some(job) = overview::PersistJob::capture(w, &id, false) { job.spawn_write(dir); }
+}
+
+/// After a successful uncompressed save: persist the raster under the file's new identity. Seq-gated
+/// like `record_full_write` — if anything was edited since the save captured the world, the file no
+/// longer equals the world and nothing is written.
+fn persist_overview_after_save(state: &AppState, dest: &std::path::Path, seq: u64) {
+    let Some(dir) = overview::store_dir() else { return };
+    if let Some(job) = overview_job_after_save(state, dest, seq) { job.spawn_write(dir); }
+}
+
+fn overview_job_after_save(state: &AppState, dest: &std::path::Path, seq: u64) -> Option<overview::PersistJob> {
+    let ws = read_ws(state);
+    if ws.dirty.seq != seq || !ws.dirty.since_disk.is_empty() { return None; }
+    let di = ws.disk_image.as_ref().filter(|d| !d.compressed && d.path == dest)?;
+    overview::PersistJob::capture(ws.world.as_ref()?, &di.identity(), true)
 }
 
 /// Release the currently loaded world and everything tied to it — the mmap, clipboard, and the
@@ -5319,8 +5832,9 @@ fn save_world(
 /// World-independent state (texture pack, Eden.eden template) is intentionally left loaded.
 #[tauri::command(async)]
 fn close_world(state: tauri::State<'_, AppState>) {
-    let (old_world, old_temp) = {
+    let (old_world, old_temp, old_persist) = {
         let mut ws = write_ws(&state);
+        let old_persist = overview_persist_candidate(&ws);
         ws.clipboard = None;
         ws.clear_undo();
         ws.clear_redo();
@@ -5332,38 +5846,62 @@ fn close_world(state: tauri::State<'_, AppState>) {
         ws.selection_mask = None;
         ws.dirty.clear_all();
         ws.disk_image = None;
-        ws.autosave_base_id = None;
+        ws.autosave = None;
+        ws.lineage_gen += 1;
         ws.signs.clear();
         ws.temp_shared = false;
-        (ws.world.take(), ws.temp_path.take())
+        (ws.world.take(), ws.temp_path.take(), old_persist)
     };
+    persist_overview_on_close(old_world.as_ref(), old_persist);
     drop(old_world); // release the mmap before deleting its backing temp file
     if let Some(p) = old_temp { let _ = fs::remove_file(&p); }
 }
 
-// ── Autosave / crash recovery (audit C2 Stage 3) ────────────────────────────
+// ── Autosave / crash recovery (audit C2 Stage 3; re-based on the saved file in 18.9) ─────────
 //
 // Sidecars in `<app_data_dir>`, not the user's save file:
-//   - `autosave.base.eden` — established once per session, on the first autosave tick, as an
-//     O(1)/zero-extra-bytes APFS clone (`stage_copy`) of the load-time staged temp. ⚠️ The temp is
-//     **not** a pristine as-loaded image: the world is mapped MAP_SHARED over it (`map_staged_temp`),
-//     so edits land in it, and this clone can catch a chunk mid-edit or torn at page granularity.
-//     What makes the base sound anyway is ordering — see step 0 of `autosave_world_inner`.
 //   - `autosave.journal` — an append-only `journal::JournalWriter` stream of the chunk (+header)
-//     spans that have changed since the base, compressed per-record. Ticks normally just append;
-//     periodically (or once, on the first tick) the whole journal is rewritten from `since_base` —
-//     see `autosave_world_inner`.
-//   - `autosave.meta.json` — `AutosaveInfo`, written *last* so its mere existence at next launch
-//     means a previous tick's base+journal are already fully durable.
+//     spans that differ from the lineage's **base image**, compressed per-record. Ticks normally just
+//     append; periodically (or on a lineage's first tick) the whole journal is rewritten — see
+//     `autosave_world_inner`.
+//   - The base image the journal replays onto (`AutosaveBase`, 18.9):
+//       * **Source** — the user's world file itself, as last loaded or saved by us, pinned by a
+//         `FileIdentity` (path, len, mtime, file id). No copy at all. Every uncompressed save
+//         re-bases onto the file it just wrote (`rebase_after_save_inner`), so the journal only
+//         ever holds edits since the last save. Recovery refuses if the file moved or changed.
+//       * **Clone** — `autosave.base.eden`, a clone of the staged temp (O(1) on APFS, a real copy
+//         elsewhere). The fallback when the world has no known on-disk twin: zip loads, recovered
+//         Clone sessions, compressed saves, a source file someone else wrote. ⚠️ The temp is **not**
+//         a pristine as-loaded image (the world is mapped MAP_SHARED over it), so the clone can catch
+//         a chunk mid-edit; what makes it sound is ordering — see step 0 of `autosave_world_inner`.
+//   - `autosave.meta.json` — `AutosaveInfo`, written *last* (atomically) so its existence at next
+//     launch means a tick's journal (and, for Clone, base) are already fully durable. Format 2 names
+//     the base kind; format 1 (always Clone) is still read.
 //   - `autosave.eden` — the pre-Stage-3 legacy format (one full-world copy per tick). No longer
 //     written, but still recognised by `get_autosave_info`/`discard_autosave` so an autosave left
 //     over from before this change is still offered for recovery (via the ordinary `load_world`
 //     path) and still gets cleaned up.
 //
-// Written on a frontend timer while a world is loaded and dirty; cleared whenever the user performs
-// a real Save/Save As. If `autosave.meta.json` still exists at next launch, the previous session
+// Written on a frontend timer while a world is loaded and dirty. A real Save/Save As re-bases the
+// lineage in the backend (the frontend no longer discards after a save); close and a declined
+// recovery prompt discard. If `autosave.meta.json` still exists at next launch, the previous session
 // ended without a clean save (crash, force-quit, or forgot to save) and the frontend offers to
-// recover it via `load_autosave` (format 1) or the legacy `load_world` path (format 0).
+// recover it via `load_autosave` (formats 1–2) or the legacy `load_world` path (format 0).
+//
+// **Durability mutex** (`DURABILITY`, 18.9 phase 0): save, autosave, discard and recovery all run
+// under read guards or none, so without it a tick could interleave with a save's re-base and
+// resurrect a lineage whose files were just deleted (plan §1.1). Lock order is always durability →
+// world guard, never the reverse; readers and edits never take it. `lineage_gen` is the second
+// line of defence, for the paths that don't take it (load/close) and for tests.
+
+/// Serialises the autosave/save file lifecycle — see the module comment above. A plain static
+/// rather than managed state so the `_inner` functions stay callable from tests without it (they
+/// never take it; only the Tauri commands do).
+static DURABILITY: Mutex<()> = Mutex::new(());
+
+fn durability_lock() -> std::sync::MutexGuard<'static, ()> {
+    DURABILITY.lock().unwrap_or_else(|p| p.into_inner())
+}
 
 #[derive(Serialize, serde::Deserialize, Clone)]
 struct AutosaveInfo {
@@ -5371,14 +5909,22 @@ struct AutosaveInfo {
     source_path: Option<String>,
     timestamp: u64, // unix seconds
     /// 0 = legacy single-file autosave (`autosave.eden`); 1 = base+journal (`autosave.base.eden` +
-    /// `autosave.journal`). Absent in metadata written before this field existed — `serde(default)`
-    /// reads that back as 0, which is exactly the legacy format it describes.
+    /// `autosave.journal`); 2 = journal + `base` naming its base image (18.9). Absent in metadata
+    /// written before this field existed — `serde(default)` reads that back as 0, which is exactly
+    /// the legacy format it describes. An older build rejects 2 and leaves the sidecar alone.
     #[serde(default)]
     format: u32,
     /// The journal's own `base_id`, duplicated here so `load_autosave` can refuse to replay a
-    /// journal that doesn't actually belong to `autosave.base.eden` (format 1 only).
+    /// journal that doesn't actually belong to this lineage (formats 1–2).
     #[serde(default)]
     base_id: [u8; 16],
+    /// Format 2: which image the journal replays onto. `None` for formats 0–1.
+    #[serde(default)]
+    base: Option<AutosaveBase>,
+    /// Computed by `get_autosave_info` for the Recovery modal, never meaningful on disk: whether a
+    /// Source base still matches (`Ok` for a Clone base). `None` for formats 0–1.
+    #[serde(default)]
+    base_status: Option<BaseStatus>,
 }
 
 struct AutosavePaths {
@@ -5520,35 +6066,54 @@ const AUTOSAVE_PROGRESS_MIN_BYTES: u64 = 64 * 1024 * 1024;
 type AutosaveProgress<'a> = Option<(&'a tauri::AppHandle, &'a LongOps)>;
 
 /// Record that the journal now contains everything that was owed to it as of `seq_at_capture`, and
-/// that `base_id` is this session's base lineage. The twin of `record_full_write` for the autosave
-/// journal, and deliberately the same shape — both flush paths capture their work under a **read**
-/// guard, release it (a `std::sync::RwLock` is neither upgradable nor reentrant), and so must both
-/// prove nothing interleaved before discharging anything.
+/// that `lineage` is this session's autosave lineage. The twin of `record_full_write` for the
+/// autosave journal, and deliberately the same shape — both flush paths capture their work under a
+/// **read** guard, release it (a `std::sync::RwLock` is neither upgradable nor reentrant), and so
+/// must both prove nothing interleaved before discharging anything.
 ///
-/// ⚠️ `autosave_base_id` is set **unconditionally**, outside the `seq` check: it records which base
-/// image on disk this session owns, not which edits were flushed. Gating it would make the next tick
-/// see `need_new_base` and re-clone a multi-GB base image for nothing.
+/// ⚠️ **Nothing at all** happens if `lineage_gen` moved since the tick captured `gen_at_start`: a
+/// save re-based, a discard deleted the files, or a load/close/recovery swapped the world. The
+/// tick's journal then belongs to a lineage that no longer exists, and recording it would point
+/// the next tick at deleted files (18.9 phase 0; the X-1 race of plan §1.1).
 ///
-/// ⚠️ The dirty clear is gated. A `seq` that moved means an edit — or a whole world load/close —
-/// landed after the capture, so **nothing** is cleared and the sets stay over-approximate: the next
-/// tick re-appends a handful of already-journalled chunks, which costs a few KB. Clearing one that
-/// wasn't written would drop that edit from crash recovery silently. This replaced a
-/// retain-by-written-coords discharge that had exactly that hole for any chunk re-dirtied during the
-/// I/O window — the same hole `try_incremental_save` was fixed for in audit C2 Stage 4 (see
+/// ⚠️ Otherwise the lineage is recorded **unconditionally**, outside the `seq` check: it records
+/// which base on disk this session's journal belongs to, not which edits were flushed. Gating it
+/// would make the next tick establish a new lineage — for a Clone, re-copying a multi-GB base.
+///
+/// ⚠️ The dirty clear is gated. A `seq` that moved means an edit landed after the capture, so
+/// **nothing** is cleared and the sets stay over-approximate: the next tick re-appends a handful
+/// of already-journalled chunks, which costs a few KB. Clearing one that wasn't written would drop
+/// that edit from crash recovery silently. This replaced a retain-by-written-coords discharge that
+/// had exactly that hole for any chunk re-dirtied during the I/O window — the same hole
+/// `try_incremental_save` was fixed for in audit C2 Stage 4 (see
 /// `TEST WORLDS/archive/c2-stage5-handoff-2026-08-05.md` §"Deviation from the plan"). Over-
 /// approximate is free; under-approximate is data loss.
-fn discharge_autosave_journal(state: &AppState, base_id: [u8; 16], seq_at_capture: u64) {
+fn discharge_autosave_journal(state: &AppState, gen_at_start: u64, lineage: AutosaveLineage, seq_at_capture: u64) {
     let mut ws = write_ws(state);
-    ws.autosave_base_id = Some(base_id);
+    if ws.lineage_gen != gen_at_start { return; }
+    ws.autosave = Some(AutosaveLineage { journal_written: true, ..lineage });
     if ws.dirty.seq != seq_at_capture { return; }
     ws.dirty.since_journal.clear();
     ws.dirty.header_journal = false;
 }
 
+/// Write `autosave.meta.json` via a temp + rename, so a crash mid-write can never leave a torn meta
+/// (which `get_autosave_info` would fail to parse, hiding a perfectly good journal).
+fn write_autosave_meta(path: &std::path::Path, info: &AutosaveInfo) -> Result<(), String> {
+    let json = serde_json::to_string(info).map_err(|e| format!("Failed to serialize autosave meta: {e}"))?;
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = std::path::PathBuf::from(tmp);
+    fs::write(&tmp, json).map_err(|e| format!("Failed to write autosave meta: {e}"))?;
+    fs::rename(&tmp, path).map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        format!("Failed to write autosave meta: {e}")
+    })
+}
+
 /// Core of `autosave_world`, factored out so it's callable from tests with a bare `AppState` and a
 /// plain directory instead of a `tauri::AppHandle` (mirrors the `_inner` convention used elsewhere
-/// in this file). See the module doc above and the "Journaled Autosave" section of CLAUDE.md for
-/// the guard discipline this implements.
+/// in this file). See the module doc above for the lineage model and guard discipline.
 fn autosave_world_inner(
     state: &AppState,
     paths: &AutosavePaths,
@@ -5556,81 +6121,117 @@ fn autosave_world_inner(
     progress: AutosaveProgress<'_>,
 ) -> Result<(), String> {
     let t0 = std::time::Instant::now(); // 18.0 `autosave_*` counters
-    // ── Step 0: establish this session's base image BEFORE step 1 captures the tick's spans.
+    // ── Step 0: pick this tick's lineage (and, for a new Clone, establish its base image) BEFORE
+    // step 1 captures the tick's spans.
     //
-    // The world is mapped MAP_SHARED over the staged temp, so an edit landing while `stage_copy`
-    // runs can be cloned into the base half-old and half-new (page granularity). Cloning *first* is
-    // what makes that harmless: `dirty.since_base`/`header_base` are monotone for the session
-    // (`mark_chunks`/`mark_header` only insert; the tick cleanup below touches only the `_journal`
-    // sets, `record_full_write` only the `_disk` sets, and the sole reset is `clear_all` on
-    // load/close). So every byte where the base differs from the as-loaded image was written by an
-    // edit that called `mark_*` before releasing its write guard — hence it is already in
-    // `since_base` when step 1's read guard captures spans, ends up in `spans`, and is fully
-    // overwritten on replay. Reversing this order would let an edit slip between capture and clone,
-    // landing in the base while being absent from that tick's journal: a silently torn chunk that
-    // still loads. No guard is held across the I/O.
-    let (need_new_base, base_id, base_temp_path) = {
+    // Source: the recorded base must still be the file on disk (one `metadata()`), else fall back
+    // to a Clone. A `None` lineage becomes Source when the world has an uncompressed `DiskImage`
+    // that still matches its file: `since_base` is only ever cleared together with that image being
+    // (re-)established (load, or a seq-clean save's re-base), so it covers every chunk where the
+    // world differs from that file.
+    //
+    // Clone: the world is mapped MAP_SHARED over the staged temp, so an edit landing while
+    // `stage_copy` runs can be cloned into the base half-old and half-new (page granularity); under
+    // MAP_PRIVATE the temp is simply stale. Cloning *first* is what makes both harmless: a Clone
+    // compacts from `dirty.since_load`/`header_load`, which are monotone for the session
+    // (`mark_*` only insert; the only reset is `clear_all` on load/close). So every byte where the
+    // base differs from the as-loaded image was written by an edit that called `mark_*` before
+    // releasing its write guard — hence it is already in `since_load` when step 1's read guard
+    // captures spans, ends up in `spans`, and is fully overwritten on replay. Reversing this order
+    // would let an edit slip between capture and clone, landing in the base while being absent from
+    // that tick's journal: a silently torn chunk that still loads. No guard is held across the I/O.
+    let (gen_at_start, current, disk_ident, base_temp_path, world_len) = {
         let ws = read_ws(state);
-        if ws.world.is_none() { return Err("No world loaded".into()); }
+        let world = ws.world.as_ref().ok_or("No world loaded")?;
         (
-            ws.autosave_base_id.is_none(),
-            ws.autosave_base_id.unwrap_or_else(random_base_id),
+            ws.lineage_gen,
+            ws.autosave.clone(),
+            ws.disk_image.as_ref().filter(|d| !d.compressed).map(DiskImage::identity),
             ws.temp_path.clone(),
+            world.bytes.len() as u64,
         )
     };
-
-    if need_new_base {
-        let temp_path = base_temp_path.ok_or("No staged world file to autosave from")?;
-        let _ = fs::remove_file(&paths.base); // stage_copy's clonefile fails if the destination exists
-        stage_copy(&temp_path, &paths.base).map_err(|e| format!("Failed to stage autosave base: {e}"))?;
-    }
+    // A Source base must be a UTF-8 path (the meta stores it as JSON) of exactly the world's length.
+    let source_usable = |id: &FileIdentity| {
+        id.len == world_len && id.path.to_str().is_some() && id.check() == BaseStatus::Ok
+    };
+    let kept = match current {
+        Some(l) => match &l.base {
+            AutosaveBase::Source(id) if !source_usable(id) => {
+                timing_log!("[AUTOSAVE] source base {:?} changed or missing; falling back to a clone", id.path);
+                None
+            }
+            _ => Some(l),
+        },
+        None => disk_ident.filter(|id| source_usable(id)).map(|id| AutosaveLineage {
+            base_id: random_base_id(), base: AutosaveBase::Source(id), journal_written: false,
+        }),
+    };
+    let lineage = match kept {
+        Some(l) => l,
+        None => {
+            let temp_path = base_temp_path.ok_or("No staged world file to autosave from")?;
+            // Never leave a meta on disk that describes the base about to be overwritten: a crash
+            // mid-copy would otherwise replay an old journal onto a half-new base.
+            let _ = fs::remove_file(&paths.meta);
+            let _ = fs::remove_file(&paths.base); // stage_copy's clonefile fails if the destination exists
+            stage_copy(&temp_path, &paths.base).map_err(|e| format!("Failed to stage autosave base: {e}"))?;
+            AutosaveLineage { base_id: random_base_id(), base: AutosaveBase::Clone, journal_written: false }
+        }
+    };
+    let is_clone = lineage.base == AutosaveBase::Clone;
 
     // ── Steps 1–3: ONE read guard, held across the whole journal write (audit P-1).
     //
     // Spans are **borrowed straight out of the mapping**, never copied. The copying form this
-    // replaced allocated an uncompressed `Vec<u8>` per dirty chunk — and on a compact tick the coord
-    // set is `since_base`, monotone for the session, so after a ⌘A + Fill that is every chunk in the
-    // world (~11.8 GB on a 90k-chunk one). A failed `Vec` allocation calls `handle_alloc_error`,
-    // which *aborts*: on Windows, where a multi-GB transient must come out of commit charge rather
-    // than being absorbed by compressed memory, that is the editor vanishing mid-session on a timer.
-    // `try_incremental_save` rejects the same shape for the same reason, and is right.
+    // replaced allocated an uncompressed `Vec<u8>` per dirty chunk — and on a compact tick of a
+    // Clone lineage the coord set is `since_load`, monotone for the session, so after a ⌘A + Fill
+    // that is every chunk in the world (~11.8 GB on a 90k-chunk one). A failed `Vec` allocation
+    // calls `handle_alloc_error`, which *aborts*: on Windows, where a multi-GB transient must come
+    // out of commit charge rather than being absorbed by compressed memory, that is the editor
+    // vanishing mid-session on a timer. `try_incremental_save` rejects the same shape for the same
+    // reason, and is right.
     //
     // Read guards are shared, so rendering/panning/hovering and the 3D pane keep working for the
     // duration exactly as they do during a save (audit C1/C3); only edits, which need the write
     // guard, are excluded. Holding it is also what lets step 4 discharge with a plain `seq`
     // comparison instead of a retain — see `discharge_autosave_journal`.
-    let journal_len_on_disk = fs::metadata(&paths.journal).map(|m| m.len()).unwrap_or(0);
+    let journal_len_on_disk = if lineage.journal_written {
+        fs::metadata(&paths.journal).map(|m| m.len()).unwrap_or(0)
+    } else {
+        0
+    };
 
     let tick = {
         let ws = read_ws(state);
+        // A load/close/save/discard landed since step 0: this tick's lineage no longer exists.
+        if ws.lineage_gen != gen_at_start { return Ok(()); }
         let world = ws.world.as_ref().ok_or("No world loaded")?;
         let base_len = world.bytes.len() as u64;
         let seq_at_capture = ws.dirty.seq;
 
-        let dirty_now = ws.dirty.since_journal.len() as u64;
+        let dirty_now = dirty_bytes(world, &ws.dirty.since_journal);
         let compact_threshold = (base_len / 10).max(AUTOSAVE_COMPACT_MIN_JOURNAL_BYTES);
-        let compact = need_new_base
-            || dirty_now.saturating_mul(world.chunk_size as u64) > base_len / 4
+        let compact = !lineage.journal_written
+            || dirty_now > base_len / 4
             || journal_len_on_disk > compact_threshold;
 
-        let coords: Vec<(i32, i32)> = if compact {
-            ws.dirty.since_base.iter().copied().collect()
+        // Compaction rewrites the journal from everything that differs from the base: since the
+        // load for a Clone, since the last save for a Source (the P-1b fix).
+        let (set, header_dirty) = if !compact {
+            (&ws.dirty.since_journal, ws.dirty.header_journal)
+        } else if is_clone {
+            (&ws.dirty.since_load, ws.dirty.header_load)
         } else {
-            ws.dirty.since_journal.iter().copied().collect()
+            (&ws.dirty.since_base, ws.dirty.header_base)
         };
-        let header_dirty = if compact { ws.dirty.header_base } else { ws.dirty.header_journal };
 
-        // `chunk_range`, never `bytes.len()` — a chunk's real span can be shorter than `chunk_size`
-        // (see "Per-chunk spans"), and journalling the nominal window would capture a neighbour's
-        // bytes and replay them over it.
-        let mut spans: Vec<(u64, i32, i32, &[u8])> = Vec::with_capacity(coords.len());
-        let mut total_bytes: u64 = 0;
-        for (cx, cy) in coords {
-            if let Some((addr, end)) = world.chunk_range(cx, cy) {
-                spans.push((addr as u64, cx, cy, &world.bytes[addr..end]));
-                total_bytes += (end - addr) as u64;
-            }
-        }
+        // One record per run of dirty bands (18.13), clamped to `chunk_range` — never
+        // `bytes.len()`: a chunk's real span can be shorter than `chunk_size` (see "Per-chunk
+        // spans"), and journalling the nominal window would capture a neighbour's bytes and replay
+        // them over it.
+        let spans = dirty_spans(world, set);
+        let mut total_bytes: u64 = spans.iter().map(|s| s.3.len() as u64).sum();
         let header: Option<&[u8]> = if header_dirty && world.bytes.len() >= 192 {
             total_bytes += 192;
             Some(&world.bytes[0..192])
@@ -5638,11 +6239,12 @@ fn autosave_world_inner(
             None
         };
 
-        if spans.is_empty() && header.is_none() && !need_new_base {
+        if spans.is_empty() && header.is_none() && (lineage.journal_written || !is_clone) {
             // Nothing pending — matches the frontend's own dirty-gating, but a defensive no-op here
             // means a stray call can never create an empty journal or an unnecessary meta rewrite.
-            // The `!need_new_base` term is load-bearing: a tick that just cloned a base in step 0
-            // must always go on to write the journal and meta that make it recoverable.
+            // The Clone term is load-bearing: a tick that just cloned a base in step 0 must always
+            // go on to write the journal and meta that make it recoverable. A Source lineage with
+            // nothing to say just waits (the world *is* its base).
             None
         } else {
             // Only a tick big enough to visibly block editing announces itself; an overlay on every
@@ -5652,11 +6254,12 @@ fn autosave_world_inner(
                 .map(|(app, ops)| ops.begin(app, "autosave", "Autosaving".into(), total_bytes, false));
 
             if compact {
-                write_fresh_journal(&paths.journal, base_len, base_id, header, &spans, op.as_ref())?;
+                write_fresh_journal(&paths.journal, base_len, lineage.base_id, header, &spans, op.as_ref())?;
             } else {
                 append_journal(&paths.journal, header, &spans, op.as_ref())?;
             }
-            timing_log!("[SAVE] autosave  compact={}  spans={}  bytes={}", compact, spans.len(), total_bytes);
+            timing_log!("[SAVE] autosave  base={}  compact={}  spans={}  bytes={}",
+                if is_clone { "clone" } else { "source" }, compact, spans.len(), total_bytes);
             mem::PEAKS.autosave_bytes.record(total_bytes);
             if compact { mem::PEAKS.autosave_compactions.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
             Some((seq_at_capture, world.name.clone()))
@@ -5668,31 +6271,124 @@ fn autosave_world_inner(
 
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-    let info = AutosaveInfo { world_name, source_path, timestamp, format: 1, base_id };
-    let json = serde_json::to_string(&info).map_err(|e| format!("Failed to serialize autosave meta: {e}"))?;
-    fs::write(&paths.meta, json).map_err(|e| format!("Failed to write autosave meta: {e}"))?;
-    // Format-1 sidecars are now fully durable — a stale legacy sidecar would otherwise shadow them
-    // (get_autosave_info reads whichever format the meta claims, but a leftover autosave.eden is
-    // just wasted disk once this exists).
+    let info = AutosaveInfo {
+        world_name, source_path, timestamp, format: 2, base_id: lineage.base_id,
+        base: Some(lineage.base.clone()), base_status: None,
+    };
+    write_autosave_meta(&paths.meta, &info)?;
+    // The sidecars are now fully durable. A stale legacy sidecar would otherwise shadow them, and a
+    // Source lineage leaves any earlier lineage's world-sized clone unreferenced — reclaim both.
     let _ = fs::remove_file(&paths.legacy_data);
+    if !is_clone { let _ = fs::remove_file(&paths.base); }
 
     // ── Step 4: write guard, strictly after the read guard above was dropped. The only window an
     // edit can land in is the small meta write just above, and `seq` covers it.
-    discharge_autosave_journal(state, base_id, seq_at_capture);
+    discharge_autosave_journal(state, gen_at_start, lineage, seq_at_capture);
     mem::PEAKS.autosave_ms.record(t0.elapsed().as_millis() as u64);
 
     Ok(())
 }
 
+/// Returns whether a tick actually ran: `false` means it was skipped because a save (or another
+/// durability operation) holds `DURABILITY` — the frontend then leaves its "autosaved" marker alone
+/// so the next timer tick retries, rather than queueing a tick behind a multi-minute save.
 #[tauri::command(async)]
 fn autosave_world(
     app: tauri::AppHandle,
     ops: tauri::State<'_, LongOps>,
     source_path: Option<String>,
     state: tauri::State<'_, AppState>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
+    let _durable = match DURABILITY.try_lock() {
+        Ok(g) => g,
+        Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            timing_log!("[AUTOSAVE] tick skipped: a save is running");
+            return Ok(false);
+        }
+    };
     let paths = autosave_paths(&app)?;
-    autosave_world_inner(&state, &paths, source_path, Some((&app, &ops)))
+    autosave_world_inner(&state, &paths, source_path, Some((&app, &ops)))?;
+    Ok(true)
+}
+
+/// Re-base the autosave lineage onto the file a save just made durable (18.9 phase 2). Replaces
+/// the frontend's old post-save `discard_autosave`, whose reset made the next tick re-copy the whole
+/// world into a new Clone base after every save.
+///
+/// Runs after the destination is durable and after `record_full_write`, under `DURABILITY` (its
+/// caller, `save_world`, holds it). Order matters:
+/// 1. Remove the sidecars, **meta first** (`remove_autosave_files`) — a crash between the deletes
+///    leaves nothing offered for recovery, never a meta pointing at a half-deleted lineage. The
+///    file just saved holds everything they did.
+/// 2. Under the write guard: an uncompressed save becomes the new Source base (a fresh `base_id`,
+///    no journal yet); a compressed one leaves no lineage, so the next tick clones. `lineage_gen`
+///    bumps either way, so a tick in flight can't resurrect the old lineage.
+/// 3. `since_base` is cleared **only if `seq` is unchanged since the save captured the world**. If
+///    it moved it stays over-approximate, which is safe: every chunk where the world now differs
+///    from the saved file was edited after the capture, and every such edit marked it. The lineage
+///    is set regardless — the file is a valid snapshot of the world at capture either way.
+///    `since_load` is never touched (a later Clone fallback still needs it).
+fn rebase_after_save_inner(
+    state: &AppState,
+    paths: &AutosavePaths,
+    dest: &std::path::Path,
+    compressed: bool,
+    seq_at_capture: u64,
+) {
+    remove_autosave_files(paths);
+    let identity = if compressed {
+        None
+    } else {
+        fs::metadata(dest).ok().map(|md| FileIdentity::of(dest, &md))
+    };
+    let mut ws = write_ws(state);
+    ws.autosave = identity.map(|id| AutosaveLineage {
+        base_id: random_base_id(), base: AutosaveBase::Source(id), journal_written: false,
+    });
+    ws.lineage_gen += 1;
+    if ws.dirty.seq == seq_at_capture {
+        ws.dirty.since_base.clear();
+        ws.dirty.header_base = false;
+    }
+}
+
+/// True if a committed, non-empty save WAL sits beside `dest` — i.e. `recover_wal` would roll it
+/// forward and change the file. Read-only (pass 1 of `recover_wal` without its deletes), so
+/// `get_autosave_info` can report a Source base as `Changed` before recovery touches anything.
+fn has_committed_wal(dest: &std::path::Path) -> bool {
+    let Ok(dest_len) = fs::metadata(dest).map(|m| m.len()) else { return false };
+    let Ok(file) = fs::File::open(wal_path(dest)) else { return false };
+    let mut reader = std::io::BufReader::new(file);
+    matches!(
+        journal::replay_each(&mut reader, dest_len, |_| Ok::<(), std::convert::Infallible>(())),
+        Ok(s) if s.ended_with_commit && s.spans > 0
+    )
+}
+
+/// `BaseStatus` of a Source base as recovery would see it: a committed WAL beside the file means an
+/// incremental save happened after the last tick, so the file is about to become newer than the base.
+fn source_base_status(id: &FileIdentity) -> BaseStatus {
+    match id.check() {
+        BaseStatus::Ok if has_committed_wal(&id.path) => BaseStatus::Changed,
+        s => s,
+    }
+}
+
+/// The refusal a Source-base recovery reports. The Recovery modal pre-checks `base_status` and
+/// explains this before the user clicks; these strings cover the race where it changes in between.
+fn source_base_error(id: &FileIdentity, status: BaseStatus) -> String {
+    let name = id.path.file_name().map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| id.path.to_string_lossy().into_owned());
+    match status {
+        BaseStatus::Missing => format!(
+            "Can't find the world file this autosave builds on: {}. Put the file back or reconnect its drive, then try again. The autosave has been kept.",
+            id.path.display()
+        ),
+        _ => format!(
+            "{name} was saved or changed after this autosave was taken, so the autosave no longer applies. Open the file instead."
+        ),
+    }
 }
 
 /// Core of `load_autosave`; see that command for the recovery procedure. Factored out for testing
@@ -5700,17 +6396,43 @@ fn autosave_world(
 fn load_autosave_inner(state: &AppState, paths: &AutosavePaths) -> Result<WorldMeta, String> {
     let meta_json = fs::read_to_string(&paths.meta).map_err(|e| format!("Failed to read autosave meta: {e}"))?;
     let info: AutosaveInfo = serde_json::from_str(&meta_json).map_err(|e| format!("Failed to parse autosave meta: {e}"))?;
-    if info.format != 1 {
-        return Err("This autosave is in the legacy single-file format; open it directly instead of recovering".into());
-    }
-
-    let base_len = fs::metadata(&paths.base).map_err(|e| format!("Failed to stat autosave base: {e}"))?.len();
+    // Which file the journal replays onto, and (Source only) the identity it must still have.
+    let source: Option<FileIdentity> = match (info.format, &info.base) {
+        (0, _) => return Err("This autosave is in the legacy single-file format; open it directly instead of recovering".into()),
+        (1, _) | (2, Some(AutosaveBase::Clone)) => None,
+        (2, Some(AutosaveBase::Source(id))) => {
+            // A committed WAL means an incremental save got at least as far as committing after
+            // this autosave's last tick. Rolling it forward changes the file's identity, so the
+            // check below reports it as changed; an uncommitted WAL is discarded and the file,
+            // untouched, is still a valid base.
+            recover_wal(&id.path);
+            match id.check() {
+                BaseStatus::Ok => Some(id.clone()),
+                status => return Err(source_base_error(id, status)),
+            }
+        }
+        _ => return Err("This autosave was written by a newer version of VuencEdit and can't be recovered here".into()),
+    };
+    let (base_file, base_len) = match &source {
+        Some(id) => (id.path.clone(), id.len),
+        None => {
+            let len = fs::metadata(&paths.base).map_err(|e| format!("Failed to stat autosave base: {e}"))?.len();
+            (paths.base.clone(), len)
+        }
+    };
 
     // Stage into a fresh temp file exactly like load_world does, then replay the journal into
-    // THAT file — never into a live mmap — so the temp on disk stays the pristine "as-loaded"
-    // image the *next* session's own base-establishment depends on.
+    // THAT file — never into a live mmap, and never into the user's file.
     let temp_path = temp_world_path();
-    stage_copy(&paths.base, &temp_path).map_err(|e| format!("Failed to stage autosave base: {e}"))?;
+    stage_copy(&base_file, &temp_path).map_err(|e| format!("Failed to stage autosave base: {e}"))?;
+    // TOCTOU: the user's file could have changed while it was being copied.
+    if let Some(id) = &source {
+        let status = id.check();
+        if status != BaseStatus::Ok {
+            let _ = fs::remove_file(&temp_path);
+            return Err(source_base_error(id, status));
+        }
+    }
 
     // ── Replay, streamed (audit P-2). The journal is decoded one record at a time and each span is
     // pwritten into the staged temp as it arrives, so peak RAM here is the largest single *record*
@@ -5732,10 +6454,10 @@ fn load_autosave_inner(state: &AppState, paths: &AutosavePaths) -> Result<WorldM
         })?;
     {
         // A journal whose base_id doesn't match the meta sidecar belongs to a different lineage
-        // than autosave.base.eden (e.g. the base survived a crash mid-compaction while the meta
-        // pointed at an older journal generation) — refuse rather than replay mismatched history
-        // onto the wrong base. A header too short or malformed to decode is *not* handled here:
-        // it falls through to `replay_each`, which owns that rejection and its message.
+        // (e.g. the base survived a crash mid-compaction while the meta pointed at an older journal
+        // generation) — refuse rather than replay mismatched history onto the wrong base. A header
+        // too short or malformed to decode is *not* handled here: it falls through to
+        // `replay_each`, which owns that rejection and its message.
         let mut header_buf = [0u8; journal::HEADER_LEN];
         let hdr = reader.read_exact(&mut header_buf).ok()
             .and_then(|_| journal::JournalHeader::decode(&header_buf));
@@ -5756,7 +6478,12 @@ fn load_autosave_inner(state: &AppState, paths: &AutosavePaths) -> Result<WorldM
         let _ = fs::remove_file(&temp_path);
         format!("Failed to open staged temp for replay: {e}")
     })?;
+    // Which chunks (and whether the header) the replay changed relative to the base — for a Source
+    // base, exactly where the recovered world differs from the user's file.
+    let mut replayed: FxHashSet<(i32, i32)> = FxHashSet::default();
+    let mut header_replayed = false;
     let summary = journal::replay_each(&mut reader, base_len, |span| {
+        if span.is_header() { header_replayed = true; } else { replayed.insert((span.cx, span.cy)); }
         temp_file.seek(SeekFrom::Start(span.file_off))?;
         temp_file.write_all(span.payload)
     })
@@ -5771,7 +6498,8 @@ fn load_autosave_inner(state: &AppState, paths: &AutosavePaths) -> Result<WorldM
             journal::ReplayAbort::Sink(e) => format!("Failed to replay autosave journal: {e}"),
         }
     })?;
-    timing_log!("[LOAD] autosave replay  spans={}  truncated={}", summary.spans, summary.truncated);
+    timing_log!("[LOAD] autosave replay  spans={}  truncated={}  base={}",
+        summary.spans, summary.truncated, if source.is_some() { "source" } else { "clone" });
 
     if summary.spans > 0 {
         temp_file.sync_all().map_err(|e| format!("Failed to fsync staged temp: {e}"))?;
@@ -5834,13 +6562,34 @@ fn load_autosave_inner(state: &AppState, paths: &AutosavePaths) -> Result<WorldM
         ws.temp_path = Some(temp_path);
         ws.temp_shared = temp_shared;
         ws.dirty.clear_all();
-        // The recovered world isn't known to correspond byte-for-byte to any file on disk yet — no
-        // DiskImage until a real Save succeeds. Likewise `autosave_base_id`: this recovered session
-        // starts its own fresh base+journal lineage on its first autosave tick rather than
-        // resuming appends into a journal whose `since_base` bookkeeping no longer matches (see
-        // `autosave_base_id`'s doc comment).
-        ws.disk_image = None;
-        ws.autosave_base_id = None;
+        ws.lineage_gen += 1;
+        match source {
+            // Source base (18.9 phase 3): the recovered world is *exactly* the user's file plus the
+            // replayed spans, so keep that lineage. Marking the replayed chunks dirty makes every
+            // set exact — `since_disk` (⌘S after recovery is an incremental patch of the file),
+            // `since_base` (the next tick's fresh journal reproduces this one) and `since_load`
+            // (a later Clone fallback). The same `base_id` is kept because the base is the same
+            // file, so a crash between that fresh journal's rename and its meta write still
+            // recovers. `journal_written: false` makes that next tick write fresh rather than append
+            // after a possibly torn tail.
+            Some(id) => {
+                let coords: Vec<(i32, i32)> = replayed.into_iter().collect();
+                if !coords.is_empty() { ws.dirty.mark_chunks(coords); }
+                if header_replayed { ws.dirty.mark_header(); }
+                ws.disk_image = Some(DiskImage::from_identity(id.clone(), false));
+                ws.autosave = Some(AutosaveLineage {
+                    base_id: info.base_id, base: AutosaveBase::Source(id), journal_written: false,
+                });
+            }
+            // Clone base: the recovered world isn't known to correspond byte-for-byte to any file on
+            // disk yet — no DiskImage until a real Save succeeds, and the first tick starts a fresh
+            // Clone lineage rather than resuming appends into a journal whose bookkeeping no longer
+            // matches this session's dirty sets.
+            None => {
+                ws.disk_image = None;
+                ws.autosave = None;
+            }
+        }
         drop(ws);
         (old_world, old_temp)
     };
@@ -5852,68 +6601,90 @@ fn load_autosave_inner(state: &AppState, paths: &AutosavePaths) -> Result<WorldM
 
 #[tauri::command(async)]
 fn load_autosave(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<WorldMeta, String> {
+    let _durable = durability_lock();
     let paths = autosave_paths(&app)?;
     load_autosave_inner(&state, &paths)
 }
 
-/// Checked once at startup. Returns `None` if no autosave is pending recovery.
-#[tauri::command]
-fn get_autosave_info(app: tauri::AppHandle) -> Result<Option<AutosaveInfo>, String> {
-    let paths = autosave_paths(&app)?;
+/// Core of `get_autosave_info`: `None` if no autosave is pending recovery. Side-effect free (the
+/// Source base is checked, never repaired). A Source lineage has no base sidecar — the user's file
+/// is the base — so "sidecars present" means meta + journal there, and `base_status` says whether
+/// that file can still be used.
+fn autosave_info_at(paths: &AutosavePaths) -> Result<Option<AutosaveInfo>, String> {
     if !paths.meta.exists() {
         return Ok(None);
     }
     let json = fs::read_to_string(&paths.meta).map_err(|e| format!("Failed to read autosave meta: {e}"))?;
-    let info: AutosaveInfo = serde_json::from_str(&json).map_err(|e| format!("Failed to parse autosave meta: {e}"))?;
-    let sidecars_present = if info.format == 1 {
-        paths.base.exists() && paths.journal.exists()
-    } else {
-        paths.legacy_data.exists()
+    let mut info: AutosaveInfo = serde_json::from_str(&json).map_err(|e| format!("Failed to parse autosave meta: {e}"))?;
+    let sidecars_present = match (info.format, &info.base) {
+        (0, _) => paths.legacy_data.exists(),
+        (2, Some(AutosaveBase::Source(_))) => paths.journal.exists(),
+        _ => paths.base.exists() && paths.journal.exists(),
     };
     if !sidecars_present {
         return Ok(None);
     }
+    info.base_status = match &info.base {
+        Some(AutosaveBase::Source(id)) => Some(source_base_status(id)),
+        Some(AutosaveBase::Clone) => Some(BaseStatus::Ok),
+        None => None,
+    };
     Ok(Some(info))
 }
 
+/// Checked once at startup. Returns `None` if no autosave is pending recovery. Async: the Source
+/// check may read a save WAL beside the user's file, which must not stall the main thread.
+#[tauri::command(async)]
+fn get_autosave_info(app: tauri::AppHandle) -> Result<Option<AutosaveInfo>, String> {
+    let paths = autosave_paths(&app)?;
+    autosave_info_at(&paths)
+}
+
 /// The path to load a *legacy* (format 0) pending autosave from — the caller feeds this into the
-/// existing `load_world` command to recover it, exactly like opening any other file. Format 1
-/// recovers via `load_autosave` instead, which needs no path (it resolves its own sidecars).
+/// existing `load_world` command to recover it, exactly like opening any other file. Formats 1–2
+/// recover via `load_autosave` instead, which needs no path (it resolves its own sidecars).
 #[tauri::command]
 fn get_autosave_path(app: tauri::AppHandle) -> Result<String, String> {
     let paths = autosave_paths(&app)?;
     Ok(paths.legacy_data.to_string_lossy().into_owned())
 }
 
-/// Removes every autosave sidecar file (legacy data, meta, base, journal). Best effort.
+/// Removes every autosave sidecar file (meta, journal and its `.tmp`, base, legacy data). Best
+/// effort. **Meta first**: its existence is what offers recovery, so a crash partway through the
+/// deletes leaves nothing offered rather than a meta over half-deleted files.
 fn remove_autosave_files(paths: &AutosavePaths) {
-    let _ = fs::remove_file(&paths.legacy_data);
     let _ = fs::remove_file(&paths.meta);
-    let _ = fs::remove_file(&paths.base);
     let _ = fs::remove_file(&paths.journal);
+    let mut journal_tmp = paths.journal.as_os_str().to_owned();
+    journal_tmp.push(".tmp");
+    let _ = fs::remove_file(std::path::PathBuf::from(journal_tmp));
+    let _ = fs::remove_file(&paths.base);
+    let _ = fs::remove_file(&paths.legacy_data);
 }
 
-/// Deletes the autosave files **and** forgets the base lineage (audit X-1). `autosave_base_id`
-/// names the `autosave.base.eden` the journal replays onto; once that file is gone the id is a
-/// dangling reference, and the next tick would append to a missing journal or write a journal
-/// against a missing base. Resetting it makes the next tick re-clone the staged temp as a fresh
-/// base. Files are removed *under* the write guard so a tick's `need_new_base` read can't
-/// interleave and see the old id with the files gone. Takes only the write guard, never nests.
+/// Deletes the autosave files **and** forgets the lineage (audit X-1). Once the files are gone the
+/// lineage is a dangling reference, and the next tick would append to a missing journal or write a
+/// journal against a missing base. Resetting it makes the next tick establish a fresh lineage
+/// (Source if the world still matches its file, else a Clone). Files are removed *under* the write
+/// guard so a tick can't read the old lineage with the files gone; `lineage_gen` makes a tick
+/// already past that read discard its result. Takes only the write guard, never nests.
 fn discard_autosave_inner(state: &AppState, paths: &AutosavePaths) {
     let mut ws = write_ws(state);
     remove_autosave_files(paths);
-    ws.autosave_base_id = None;
+    ws.autosave = None;
+    ws.lineage_gen += 1;
 }
 
 /// Clears the pending autosave — every sidecar format might have left behind — and resets the
-/// in-memory base lineage with it. Called after a successful manual Save/Save As (nothing left to
-/// recover), when the user declines the recovery prompt, and on world close. The single entry
-/// point so the files and `autosave_base_id` can never diverge.
+/// in-memory lineage with it. Called when the user declines the recovery prompt and on world close
+/// (a save re-bases in the backend instead, 18.9). The single entry point so the files and
+/// `WorldState::autosave` can never diverge.
 #[tauri::command(async)]
 fn discard_autosave(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let _durable = durability_lock();
     let paths = autosave_paths(&app)?;
     discard_autosave_inner(&state, &paths);
-    timing_log!("[AUTOSAVE] discarded sidecar files, base lineage reset");
+    timing_log!("[AUTOSAVE] discarded sidecar files, lineage reset");
     Ok(())
 }
 
@@ -5984,11 +6755,14 @@ fn undo_edit_inner(ws: &mut WorldState) -> Result<EditResult, String> {
     let group = entry.group;
     let label = entry.operation.clone();
     let mut affected: Vec<(i32, i32)> = Vec::new();
+    let mut written: Vec<(i32, i32, BandMask)> = Vec::new();
 
     let mut current = Some(entry);
     while let Some(entry) = current.take() {
         for s in &entry.chunks { affected.push((s.cx, s.cy)); }
         let redo_snaps = restore_and_invert(&mut world, &entry);
+        // The inverse names exactly the bytes just rewritten (band-granular dirty marks, 18.13).
+        written.extend(redo_snaps.iter().map(|s| (s.cx, s.cy, s.delta.band_mask())));
         // Same delta-driven lamp maintenance as `with_edit_inner`: the inverse snapshots hold the
         // pre-restore bytes and `world` now holds the restored ones (audit H3).
         apply_lamp_delta(&ws.lamp_index, &world, &redo_snaps);
@@ -6001,7 +6775,8 @@ fn undo_edit_inner(ws: &mut WorldState) -> Result<EditResult, String> {
         }
     }
 
-    mark_dirty_chunks(&mut ws.dirty, Some(&world), &affected);
+    // `affected` stays the repaint/hint set; the dirty marks come from what was actually written.
+    mark_dirty_chunks(&mut ws.dirty, Some(&world), &written);
     let (patch, invalidate) = patch_from_chunk_coords(&world, &affected, ws.map_style(), ws.view_lod);
     ws.world = Some(world);
 
@@ -6028,11 +6803,13 @@ fn redo_edit_inner(ws: &mut WorldState) -> Result<EditResult, String> {
     let group = entry.group;
     let label = entry.operation.clone();
     let mut affected: Vec<(i32, i32)> = Vec::new();
+    let mut written: Vec<(i32, i32, BandMask)> = Vec::new();
 
     let mut current = Some(entry);
     while let Some(entry) = current.take() {
         for s in &entry.chunks { affected.push((s.cx, s.cy)); }
         let undo_snaps = restore_and_invert(&mut world, &entry);
+        written.extend(undo_snaps.iter().map(|s| (s.cx, s.cy, s.delta.band_mask())));
         apply_lamp_delta(&ws.lamp_index, &world, &undo_snaps); // delta-driven lamp maintenance (audit H3)
         push_undo(&mut ws.undo_stack, &mut ws.undo_bytes, &mut ws.undo_groups, UndoEntry::new(entry.operation, undo_snaps, entry.group), ws.undo_budget);
         if let Some(g) = group {
@@ -6042,7 +6819,8 @@ fn redo_edit_inner(ws: &mut WorldState) -> Result<EditResult, String> {
         }
     }
 
-    mark_dirty_chunks(&mut ws.dirty, Some(&world), &affected);
+    // `affected` stays the repaint/hint set; the dirty marks come from what was actually written.
+    mark_dirty_chunks(&mut ws.dirty, Some(&world), &written);
     let (patch, invalidate) = patch_from_chunk_coords(&world, &affected, ws.map_style(), ws.view_lod);
     ws.world = Some(world);
 
@@ -6439,13 +7217,10 @@ fn paste_at(
     let x2_paste = paste_x + width  - 1;
     let y2_paste = paste_y + height - 1;
 
-    // Clamp to non-negative for affected_chunk_coords (negative coords have no chunks).
-    let snap_rect = (paste_x.max(0), paste_y.max(0), x2_paste, y2_paste);
     let patch_rect = (paste_x, paste_y, x2_paste, y2_paste);
-    let z_range = (z_anchor + elevation_offset, z_anchor + elevation_offset + depth - 1);
 
     let label = format!("Paste {width}×{height}×{depth}");
-    let result = with_edit_zscoped(&mut ws, &label, snap_rect, patch_rect, z_range, |world| {
+    let result = with_edit(&mut ws, &label, patch_rect, |world| {
         for dz in 0..depth {
             let z = z_anchor + elevation_offset + dz;
             if z < 0 || z > world_max_z(world) { continue; }
@@ -6464,17 +7239,10 @@ fn paste_at(
                     if let Some(m) = mask { if !bit_set(m, (dy * width + dx) as usize) { continue; } }
                     let chunk_cx = px / 16 + world.min_x;
                     let lx       = (px % 16) as usize;
-                    let Some((addr, cend)) = world.chunk_range(chunk_cx, chunk_cy) else {
-                        continue; // outside world boundary — clip silently
-                    };
                     let idx = (dz * height * width + dy * width + dx) as usize;
                     if ignore_air && block_types[idx] == 0 { continue; }
-                    let bi  = addr + band * 8192 + lx * 256 + ly * 16 + lz;
-                    let pi  = bi + 4096;
-                    if pi < cend {
-                        world.bytes[bi] = block_types[idx];
-                        world.bytes[pi] = paints[idx];
-                    }
+                    // Outside the world boundary (no chunk) the write is clipped silently.
+                    set_block_in_band(world, chunk_cx, chunk_cy, band, lx * 256 + ly * 16 + lz, block_types[idx], paints[idx]);
                 }
             }
         }
@@ -6519,13 +7287,7 @@ fn paste_terrain_inner(
     let cap = ws.view_cap_z; // cutaway: follow the sub-cap surface (cave floor), not the true surface
 
     let label = format!("Paste (terrain) {width}×{height}×{depth}");
-    // Pre-image = the chunks of columns that actually have a surface, over the surface-height range
-    // plus the clipboard's depth (row 18.2) — not every band of every chunk under the footprint.
-    let scope = ws.world.as_ref().map(|w| terrain_paste_snapshot_scope(
-        w, paste_x, paste_y, width, height, depth, elevation_offset, above_surface, cap, mask.as_deref(),
-    ));
-    let Some((chunks, z_range)) = scope else { ws.clipboard = Some(cb); return Err("No world loaded".into()); };
-    let result = with_edit_chunks(ws, &label, chunks, patch_rect, Some(z_range), |world| {
+    let result = with_edit(ws, &label, patch_rect, |world| {
         let max_z = world_max_z(world);
         for dy in 0..height {
             let py = paste_y + dy;
@@ -6539,7 +7301,7 @@ fn paste_terrain_inner(
                 if let Some(m) = mask { if !bit_set(m, (dy * width + dx) as usize) { continue; } }
                 let chunk_cx = px / 16 + world.min_x;
                 let lx       = (px % 16) as usize;
-                let Some((addr, cend)) = world.chunk_range(chunk_cx, chunk_cy) else { continue };
+                if !world.has_chunk(chunk_cx, chunk_cy) { continue; }
                 // Read surface before writing this column — other columns' writes never
                 // affect (px, py) since each (dx, dy) maps to a unique world position.
                 // `terrain_paste_base` is shared with `render_paste_lens`, so the lens can't drift.
@@ -6555,12 +7317,7 @@ fn paste_terrain_inner(
                     let lz   = (z as usize) % 16;
                     let idx  = (dz * height * width + dy * width + dx) as usize;
                     if ignore_air && block_types[idx] == 0 { continue; }
-                    let bi = addr + band * 8192 + lx * 256 + ly * 16 + lz;
-                    let pi = bi + 4096;
-                    if pi < cend {
-                        world.bytes[bi] = block_types[idx];
-                        world.bytes[pi] = paints[idx];
-                    }
+                    set_block_in_band(world, chunk_cx, chunk_cy, band, lx * 256 + ly * 16 + lz, block_types[idx], paints[idx]);
                 }
             }
         }
@@ -6568,44 +7325,6 @@ fn paste_terrain_inner(
     });
     ws.clipboard = Some(cb);
     result
-}
-
-/// Undo pre-image scope for `paste_terrain`: the existing chunks holding at least one footprint
-/// column with a surface, and the z interval `[min_base + elev, max_base + elev + depth - 1]` over
-/// those columns. Uses `terrain_paste_base` — the same function the paste writes with — so it can't
-/// disagree with the edit. Columns write nothing until the closure runs, and never affect each
-/// other's surface (each maps to a unique world position), so precomputing is exact.
-/// With no surfaced column the scope is empty (and the z range a harmless `(0, 0)`).
-#[allow(clippy::too_many_arguments)]
-fn terrain_paste_snapshot_scope(
-    world: &LoadedWorld,
-    paste_x: i32, paste_y: i32,
-    width: i32, height: i32, depth: i32,
-    elevation_offset: i32, above_surface: bool,
-    cap: Option<i32>,
-    mask: Option<&[u8]>,
-) -> (Vec<(i32, i32)>, (i32, i32)) {
-    let mut cols: Vec<(i32, i32)> = Vec::new();
-    let mut span: Option<(i32, i32)> = None;
-    for dy in 0..height {
-        let py = paste_y + dy;
-        if py < 0 { continue; }
-        for dx in 0..width {
-            let px = paste_x + dx;
-            if px < 0 { continue; }
-            if let Some(m) = mask { if !bit_set(m, (dy * width + dx) as usize) { continue; } }
-            if world.chunk_range(px / 16 + world.min_x, py / 16 + world.min_y).is_none() { continue; }
-            let Some(base) = terrain_paste_base(world, px, py, cap, above_surface) else { continue };
-            cols.push((px, py));
-            span = Some(match span { None => (base, base), Some((lo, hi)) => (lo.min(base), hi.max(base)) });
-        }
-    }
-    let chunks = chunks_for_cells(world, cols.into_iter());
-    let z = match span {
-        Some((lo, hi)) => (lo + elevation_offset, hi + elevation_offset + depth - 1),
-        None => (0, 0),
-    };
-    (chunks, z)
 }
 
 /// Where a terrain paste puts column `(px, py)`'s `dz = 0` cell, before `elevation_offset`: the
@@ -6680,7 +7399,7 @@ fn extrude_selection(
         (max_z, src_types, src_paints, width, height, depth)
     };
 
-    // Full XY footprint covering source + all copies (for chunk snapshot + render patch).
+    // Full XY footprint covering source + all copies (the render patch).
     let (ax1, ay1, ax2, ay2) = match axis.as_str() {
         "x+" => (x1, y1, x2 + count * width,  y2),
         "x-" => ((x1 - count * width).max(0), y1, x2, y2),
@@ -6691,7 +7410,7 @@ fn extrude_selection(
     let rect = (ax1, ay1, ax2, ay2);
 
     let label = format!("Extrude {axis} ×{count}");
-    with_edit_guarded(&mut ws, &label, rect, rect, |world| {
+    with_edit(&mut ws, &label, rect, |world| {
         extrude_write(world, x1, y1, &src_types, &src_paints, width, height, depth, z_min, max_z, &axis, count, ignore_air, mask.as_ref());
         Ok(())
     })
@@ -6702,7 +7421,7 @@ fn extrude_selection(
 /// destination coords (it only exists over the source bbox).
 #[allow(clippy::too_many_arguments)]
 fn extrude_write(
-    world: &mut LoadedWorld,
+    world: &mut impl VoxelViewMut,
     x1: i32, y1: i32, src_types: &[u8], src_paints: &[u8],
     width: i32, height: i32, depth: i32, z_min: i32, max_z: i32,
     axis: &str, count: i32, ignore_air: bool, mask: Option<&SelectionMask>,
@@ -6717,6 +7436,7 @@ fn extrude_write(
             _    => ( 0,  0,        k * depth), // "z+"
         };
 
+        let (mnx, mny) = world.chunk_origin();
         for dz in 0..depth {
             let tz = z_min + dz + dz_step;
             if tz < 0 || tz > max_z { continue; }
@@ -6725,25 +7445,19 @@ fn extrude_write(
             for dy in 0..height {
                 let ty = y1 + dy + dy_step;
                 if ty < 0 { continue; }
-                let chunk_cy = ty / 16 + world.min_y;
+                let chunk_cy = ty / 16 + mny;
                 let ly       = (ty % 16) as usize;
                 for dx in 0..width {
                     let tx = x1 + dx + dx_step;
                     if tx < 0 { continue; }
-                    let chunk_cx = tx / 16 + world.min_x;
+                    let chunk_cx = tx / 16 + mnx;
                     let lx       = (tx % 16) as usize;
                     // Gate on the source cell (x1+dx, y1+dy) — the shape is what repeats.
                     if mask.is_some_and(|m| !m.contains(x1 + dx, y1 + dy)) { continue; }
                     let idx      = (dz * height * width + dy * width + dx) as usize;
                     let src_bt   = src_types[idx];
                     if ignore_air && src_bt == 0 { continue; }
-                    let Some((addr, cend)) = world.chunk_range(chunk_cx, chunk_cy) else { continue };
-                    let bi = addr + band * 8192 + lx * 256 + ly * 16 + lz;
-                    let pi = bi + 4096;
-                    if pi < cend {
-                        world.bytes[bi] = src_bt;
-                        world.bytes[pi] = src_paints[idx];
-                    }
+                    set_block_in_band(world, chunk_cx, chunk_cy, band, lx * 256 + ly * 16 + lz, src_bt, src_paints[idx]);
                 }
             }
         }
@@ -6774,10 +7488,7 @@ fn move_selection(
     let depth  = z_max - z_min + 1;
     validate_volume(width, height, depth)?;
     let (x1d, y1d, x2d, y2d) = (x1 + dx, y1 + dy, x2 + dx, y2 + dy);
-    let snap_rect = (x1.min(x1d), y1.min(y1d), x2.max(x2d), y2.max(y2d));
-    // Source and destination bands both need to survive in the undo snapshot — a nonzero dz shifts
-    // the write's z interval away from the read's, so the union of both is the true vertical extent.
-    let z_range = (z_min.min(z_min + dz), z_max.max(z_max + dz));
+    let patch_rect = (x1.min(x1d), y1.min(y1d), x2.max(x2d), y2.max(y2d));
     let label = format!("Move {width}×{height}×{depth}");
 
     // A shaped selection moves only its footprint (dragging the box was the wand bug's twin). The
@@ -6786,7 +7497,7 @@ fn move_selection(
     let mask = active_mask(&ws, x1, y1, x2, y2);
     let masked = mask.is_some();
 
-    let result = with_edit_zscoped(&mut ws, &label, snap_rect, snap_rect, z_range, |world| {
+    let result = with_edit(&mut ws, &label, patch_rect, |world| {
         // Column-major buffer (lx,ly,lz) with lz innermost — audit M8: this is what lets each
         // column's read/write go through one chunk lookup and per-band `copy_from_slice`s
         // (`read_column_bulk`/`write_column_bulk`) instead of `width*height*depth` individual
@@ -7071,14 +7782,12 @@ fn generate_trees(
     // mask is accepted, same as the existing ±3 rect spill. No match → rect-only.
     let mask = active_mask(&ws, x1, y1, x2, y2);
 
-    // Expand both the snapshot and the returned patch by 3 to include chunks where leaves may
-    // spill over — a patch limited to the bare selection would leave spilled leaves invisible on
-    // the map until an unrelated refetch.
-    let snap_rect = ((x1 - 3).max(0), (y1 - 3).max(0), x2 + 3, y2 + 3);
-    let patch_rect = snap_rect;
+    // Expand the returned patch by 3 to include leaves that spill over — a patch limited to the
+    // bare selection would leave spilled leaves invisible on the map until an unrelated refetch.
+    let patch_rect = ((x1 - 3).max(0), (y1 - 3).max(0), x2 + 3, y2 + 3);
 
     let label = format!("Generate trees ({}×{})", x2 - x1 + 1, y2 - y1 + 1);
-    with_edit_guarded(&mut ws, &label, snap_rect, patch_rect, |world| {
+    with_edit(&mut ws, &label, patch_rect, |world| {
         generate_trees_inner(world, x1, y1, x2, y2, &tree_types, density, &leaf_paints, seed, smart_placement, mask.as_ref());
         Ok(())
     })
@@ -7089,7 +7798,7 @@ fn generate_trees(
 /// existing ±3 rect spill).
 #[allow(clippy::too_many_arguments)]
 fn generate_trees_inner(
-    world: &mut LoadedWorld,
+    world: &mut EditView,
     x1: i32, y1: i32, x2: i32, y2: i32,
     tree_types: &[String], density: f32, leaf_paints: &[u8], seed: u64,
     smart_placement: bool, mask: Option<&SelectionMask>,
@@ -7601,7 +8310,7 @@ fn simulate_flow(
         "Simulate {} flow ({}×{})",
         if base == 20 { "water" } else { "lava" }, x2 - x1 + 1, y2 - y1 + 1,
     );
-    with_edit_guarded(&mut ws, &label, rect, rect, |world| {
+    with_edit(&mut ws, &label, rect, |world| {
         simulate_flow_inner(world, x1, y1, x2, y2, fx1, fy1, fx2, fy2, z_min, z_max, include_existing_sources, base, mask.as_ref());
         Ok(())
     })
@@ -7612,7 +8321,7 @@ fn simulate_flow(
 /// write back only the cells the mask still covers (the engine itself only knows the rect bbox).
 #[allow(clippy::too_many_arguments)]
 fn simulate_flow_inner(
-    world: &mut LoadedWorld,
+    world: &mut EditView,
     sx1: i32, sy1: i32, sx2: i32, sy2: i32,
     fx1: i32, fy1: i32, fx2: i32, fy2: i32,
     z_min: i32, z_max: i32,
@@ -7678,7 +8387,7 @@ fn pool_fill(
     let mask = active_mask(&ws, x1, y1, x2, y2);
     let rect = (x1, y1, x2, y2);
     let label = format!("Pool fill ({}×{})", x2 - x1 + 1, y2 - y1 + 1);
-    with_edit_guarded(&mut ws, &label, rect, rect, |world| {
+    with_edit(&mut ws, &label, rect, |world| {
         pool_fill_inner(world, x1, y1, x2, y2, click_x, click_y, click_z, target_z, base, paint, mask.as_ref())
     })
 }
@@ -7686,7 +8395,7 @@ fn pool_fill(
 /// Core of `pool_fill`: 3D BFS through air, then flat fill + shoreline rim pass. See `pool_fill` doc.
 #[allow(clippy::too_many_arguments)]
 fn pool_fill_inner(
-    world: &mut LoadedWorld,
+    world: &mut EditView,
     x1: i32, y1: i32, x2: i32, y2: i32,
     click_x: i32, click_y: i32, click_z: i32,
     target_z: i32,
@@ -7791,8 +8500,6 @@ fn flood_fill_bfs(
 struct FloodPlan {
     cells: Vec<(i32, i32, i32)>,
     rect: (i32, i32, i32, i32),
-    chunks: Vec<(i32, i32)>,
-    z_range: Option<(i32, i32)>,
 }
 
 /// Axiom-style flood fill for the 3D pane: spreads the armed block through air connected to
@@ -7818,7 +8525,7 @@ fn flood_fill_3d(
     }
     let limit = (limit as usize).clamp(1, FLOOD_FILL_MAX_CELLS);
 
-    // Phase A (row 18.7): the BFS + undo-scope discovery run under the *read* guard so tiles/3D
+    // Phase A (row 18.7): the BFS discovery runs under the *read* guard so tiles/3D
     // fetches aren't stalled behind a 200 k-cell flood. `dirty.seq` is captured with it; the write
     // guard below re-checks it and redoes the (cheap-by-comparison, rare) discovery if a writer
     // landed in the gap — `RwLock` isn't upgradable, so the guard has to be dropped in between.
@@ -7829,10 +8536,7 @@ fn flood_fill_3d(
             x_min = x_min.min(x); y_min = y_min.min(y);
             x_max = x_max.max(x); y_max = y_max.max(y);
         }
-        // Pre-image = the chunks the collected cells actually live in, scoped to their z extent (row
-        // 18.2) — not every chunk in the bbox, which a thin diagonal tunnel inflates enormously.
-        let (chunks, z_range) = cells_snapshot_scope(world, &cells);
-        Ok(FloodPlan { cells, rect: (x_min, y_min, x_max, y_max), chunks, z_range })
+        Ok(FloodPlan { cells, rect: (x_min, y_min, x_max, y_max) })
     };
     let (seq_seen, first) = {
         let ws = read_ws(&state);
@@ -7840,7 +8544,7 @@ fn flood_fill_3d(
         (ws.dirty.seq, plan(world)?)
     };
     let mut ws = write_ws(&state);
-    let FloodPlan { cells, rect, chunks, z_range } = if ws.dirty.seq == seq_seen {
+    let FloodPlan { cells, rect } = if ws.dirty.seq == seq_seen {
         first
     } else {
         timing_log!("[FLOOD] world changed during BFS (seq {} -> {}) — redoing under the write guard", seq_seen, ws.dirty.seq);
@@ -7856,23 +8560,12 @@ fn flood_fill_3d(
     } else {
         format!("Flood fill ({n} blocks)")
     };
-    with_edit_chunks(&mut ws, &label, chunks, rect, z_range, |world| {
+    with_edit(&mut ws, &label, rect, |world| {
         for &(x, y, z) in &cells {
             set_block_abs(world, x, y, z, block_type, paint);
         }
         Ok(())
     })
-}
-
-/// Undo pre-image scope for an edit that writes exactly `cells` (`(x, y, z)`): the chunks they live
-/// in and their z interval (row 18.2). `None` z when `cells` is empty.
-fn cells_snapshot_scope(world: &LoadedWorld, cells: &[(i32, i32, i32)]) -> (Vec<(i32, i32)>, Option<(i32, i32)>) {
-    let chunks = chunks_for_cells(world, cells.iter().map(|&(x, y, _)| (x, y)));
-    let z = cells.iter().fold(None, |acc: Option<(i32, i32)>, &(_, _, z)| match acc {
-        None => Some((z, z)),
-        Some((lo, hi)) => Some((lo.min(z), hi.max(z))),
-    });
-    (chunks, z)
 }
 
 /// Maps a normalized 0..1 height sample to a fluid level (1 = ¼ … 4 = full/source).
@@ -7929,7 +8622,7 @@ fn generate_wavy_surface(
         "Wavy {} surface ({}×{})",
         if base == 20 { "water" } else { "lava" }, x2 - x1 + 1, y2 - y1 + 1,
     );
-    with_edit_guarded(&mut ws, &label, rect, rect, |world| {
+    with_edit(&mut ws, &label, rect, |world| {
         generate_wavy_surface_inner(world, x1, y1, x2, y2, max_z, base, paint, wavelength, amplitude, seed, &mode, mask.as_ref());
         Ok(())
     })
@@ -7939,7 +8632,7 @@ fn generate_wavy_surface(
 /// noise, quantize to a fluid level, and stamp it.
 #[allow(clippy::too_many_arguments)]
 fn generate_wavy_surface_inner(
-    world: &mut LoadedWorld,
+    world: &mut EditView,
     x1: i32, y1: i32, x2: i32, y2: i32, max_z: i32,
     base: u8, paint: u8, wavelength: f32, amplitude: f32, seed: u64, mode: &str,
     mask: Option<&SelectionMask>,
@@ -8341,12 +9034,12 @@ fn read_column_bulk(world: &LoadedWorld, wx: i32, wy: i32, z0: i32, depth: i32, 
 /// lookup and per-band `copy_from_slice` instead of `depth` calls to `set_block_abs`. Silently drops
 /// writes to a missing chunk or past a short chunk span's tail, exactly like `set_block_abs`. Same
 /// caller-guaranteed `z0`/`depth` bounds as `read_column_bulk`.
-fn write_column_bulk(world: &mut LoadedWorld, wx: i32, wy: i32, z0: i32, depth: i32, bt: &[u8], paint: &[u8]) {
-    let cx = wx.div_euclid(16) + world.min_x;
-    let cy = wy.div_euclid(16) + world.min_y;
-    let Some((addr, cend)) = world.chunk_range(cx, cy) else { return };
-    let lx = wx.rem_euclid(16) as usize;
-    let ly = wy.rem_euclid(16) as usize;
+fn write_column_bulk(world: &mut impl VoxelViewMut, wx: i32, wy: i32, z0: i32, depth: i32, bt: &[u8], paint: &[u8]) {
+    let (mnx, mny) = world.chunk_origin();
+    let cx = wx.div_euclid(16) + mnx;
+    let cy = wy.div_euclid(16) + mny;
+    if !world.has_chunk(cx, cy) { return; }
+    let col = wx.rem_euclid(16) as usize * 256 + wy.rem_euclid(16) as usize * 16;
     let depth = depth as usize;
     let mut z = z0 as usize;
     let mut i = 0usize;
@@ -8354,22 +9047,26 @@ fn write_column_bulk(world: &mut LoadedWorld, wx: i32, wy: i32, z0: i32, depth: 
         let band = z / 16;
         let lz0 = z % 16;
         let run = (16 - lz0).min(depth - i);
-        let bt_start = addr + band * 8192 + lx * 256 + ly * 16 + lz0;
-        let pt_start = bt_start + 4096;
-        if pt_start + run <= cend {
-            world.bytes[bt_start..bt_start + run].copy_from_slice(&bt[i..i + run]);
-            world.bytes[pt_start..pt_start + run].copy_from_slice(&paint[i..i + run]);
+        let (b0, p0) = (col + lz0, col + lz0 + 4096);
+        let (src_bt, src_pt) = (&bt[i..i + run], &paint[i..i + run]);
+        z += run;
+        i += run;
+        // Compare first (18.12): an unchanged run asks for no writable band.
+        let Some(cur) = world.band_bytes(cx, cy, band) else { continue };
+        if p0 + run <= cur.len() && cur[b0..b0 + run] == *src_bt && cur[p0..p0 + run] == *src_pt { continue; }
+        let Some(dst) = world.band_bytes_mut(cx, cy, band) else { continue };
+        if p0 + run <= dst.len() {
+            dst[b0..b0 + run].copy_from_slice(src_bt);
+            dst[p0..p0 + run].copy_from_slice(src_pt);
         } else {
+            // A short-span chunk's tail: write only the cells the band actually owns.
             for k in 0..run {
-                let (bi, pi) = (bt_start + k, pt_start + k);
-                if pi < cend {
-                    world.bytes[bi] = bt[i + k];
-                    world.bytes[pi] = paint[i + k];
+                if p0 + k < dst.len() {
+                    dst[b0 + k] = src_bt[k];
+                    dst[p0 + k] = src_pt[k];
                 }
             }
         }
-        z += run;
-        i += run;
     }
 }
 
@@ -8576,8 +9273,8 @@ fn retexture_top(world: &mut impl VoxelViewMut, wx: i32, wy: i32, cap: Option<i3
 
 /// The XY margin `field_stamp` writes *outside* its nominal `radius` — the wider of the noise
 /// blur kernel and the terrain fillet radius, plus one. Derived here rather than inline so the
-/// undo snapshot rect and the sculpt scratch (which must own every chunk the stamp writes to)
-/// are sized from the same arithmetic the stamp itself uses (audit H1).
+/// patch rect and the sculpt scratch (which must own every chunk the stamp writes to) are sized
+/// from the same arithmetic the stamp itself uses (audit H1).
 fn rock_stamp_pad(p: &RockParams, radius: i32) -> i32 {
     let r_xy = (radius.max(1)) as f64;
     let flatten = p.flatten.clamp(0.1, 1.5);
@@ -8651,9 +9348,9 @@ fn field_stamp(
     let meld_k = p.meld.clamp(0.0, 3.0);
     // Fillet radius in blocks — the smin/smax blend width (§6 of the design doc).
     let k = (meld_k * 0.3 * r_min).clamp(1.0, 14.0);
-    // ⚠️ Shared with `sculpt_write_rect`, which sizes both the undo snapshot and the sculpt
-    // scratch off it. If the two ever disagree this stamp writes outside the region that was
-    // captured/owned — silently un-undoable at best, silently dropped at worst.
+    // ⚠️ Shared with `sculpt_write_rect`, which sizes both the returned patch and the sculpt
+    // scratch off it. If the two ever disagree this stamp writes outside the region the scratch
+    // owns — those writes are silently dropped (and, on the in-guard path, left off the patch).
     let pad = rock_stamp_pad(p, radius);
 
     // XY bbox depends only on cx/cy/radius/pad — never on any live-sampled height — so it (and
@@ -9243,9 +9940,9 @@ fn sculpt_split(
         scratch.into_chunks().commit(&mut world)
     };
     // Same ordering rule as `with_edit_inner`: the commit changed bytes, so the scan ceilings over
-    // those chunks must go before the patch is rendered (see `invalidate_top_bands`).
+    // those chunks must go before the patch is rendered (see `invalidate_derived`).
     let committed: Vec<(i32, i32)> = pre_snap.iter().map(|s| (s.cx, s.cy)).collect();
-    world.invalidate_top_bands(&committed);
+    world.invalidate_derived(&committed);
     let (patch, invalidate) = edit_patch(&world, rect, ws.map_style(), ws.view_lod);
     ws.world = Some(world);
     if sculpt_persists_session(&args.mode, group) {
@@ -9956,7 +10653,7 @@ fn run_sculpt_in_guard(
     // stamps instead of being rounded away every call. Taken out of `ws` here so the edit closure
     // can borrow it mutably alongside `world` (which `with_edit_inner` takes out of `ws`).
     let mut session = take_sculpt_session(ws, group_id);
-    let result = with_edit_grouped(ws, label, rect, rect, group_id, None, |world| {
+    let result = with_edit_grouped(ws, label, rect, group_id, |world| {
         run_sculpt_flush(world, &mut session, &args, &stamps)
     });
     // Persist the float workspace only for a real (grouped) live stroke — a one-shot call (group
@@ -10031,8 +10728,7 @@ fn fill_surface(
             (i32::MAX, i32::MAX, i32::MIN, i32::MIN),
             |(x0,y0,x1,y1), &(x,y,_)| (x0.min(x), y0.min(y), x1.max(x), y1.max(y))
         );
-        let (chunks, z_range) = cells_snapshot_scope(world, &fill_cells);
-        Ok(FloodPlan { cells: fill_cells, rect: (x0, y0, x1, y1), chunks, z_range })
+        Ok(FloodPlan { cells: fill_cells, rect: (x0, y0, x1, y1) })
     };
     let (seq_seen, first) = {
         let ws = read_ws(&state);
@@ -10040,7 +10736,7 @@ fn fill_surface(
         (ws.dirty.seq, plan(world)?)
     };
     let mut ws = write_ws(&state);
-    let FloodPlan { cells: fill_cells, rect, chunks, z_range } = if ws.dirty.seq == seq_seen {
+    let FloodPlan { cells: fill_cells, rect } = if ws.dirty.seq == seq_seen {
         first
     } else {
         timing_log!("[FLOOD] world changed during BFS (seq {} -> {}) — redoing under the write guard", seq_seen, ws.dirty.seq);
@@ -10048,7 +10744,7 @@ fn fill_surface(
         plan(ws.world.as_ref().ok_or("No world loaded")?)?
     };
     let label = format!("Fill {} blocks", fill_cells.len());
-    with_edit_chunks(&mut ws, &label, chunks, rect, z_range, |world| {
+    with_edit(&mut ws, &label, rect, |world| {
         for &(x, y, z) in &fill_cells {
             set_block_abs(world, x, y, z, new_type, new_paint);
         }
@@ -10198,7 +10894,7 @@ fn get_selection_mask(state: tauri::State<'_, AppState>) -> Result<SelectionMask
 
 /// Helper: paste clipboard at a single world position. Assumes world is already taken.
 fn paste_clipboard_at(
-    world: &mut LoadedWorld,
+    world: &mut impl VoxelViewMut,
     px: i32, py: i32,
     block_types: &[u8], paints: &[u8],
     width: i32, height: i32, depth: i32, z_anchor: i32,
@@ -10206,6 +10902,7 @@ fn paste_clipboard_at(
     max_z: i32,
     mask: Option<&[u8]>,
 ) {
+    let (mnx, mny) = world.chunk_origin();
     for dz in 0..depth {
         let tz = z_anchor + elevation_offset + dz;
         if tz < 0 || tz > max_z { continue; }
@@ -10213,32 +10910,25 @@ fn paste_clipboard_at(
         let lz   = tz as usize % 16;
         for dy in 0..height {
             let ty = py + dy; if ty < 0 { continue; }
-            let chunk_cy = ty / 16 + world.min_y;
+            let chunk_cy = ty / 16 + mny;
             let ly = (ty % 16) as usize;
             for dx in 0..width {
                 let tx = px + dx; if tx < 0 { continue; }
                 // Shaped clipboard: unmasked columns don't stamp (scatter/array honour the shape too).
                 if let Some(m) = mask { if !bit_set(m, (dy * width + dx) as usize) { continue; } }
-                let chunk_cx = tx / 16 + world.min_x;
+                let chunk_cx = tx / 16 + mnx;
                 let lx = (tx % 16) as usize;
                 let idx = (dz * height * width + dy * width + dx) as usize;
                 let bt = block_types[idx];
                 if ignore_air && bt == 0 { continue; }
-                let Some((addr, cend)) = world.chunk_range(chunk_cx, chunk_cy) else { continue };
-                let bi = addr + band * 8192 + lx * 256 + ly * 16 + lz;
-                let pi = bi + 4096;
-                if pi < cend {
-                    world.bytes[bi] = bt;
-                    world.bytes[pi] = paints[idx];
-                }
+                set_block_in_band(world, chunk_cx, chunk_cy, band, lx * 256 + ly * 16 + lz, bt, paints[idx]);
             }
         }
     }
 }
 
 /// The seeded placement sequence `scatter_paste` uses: `count` top-left positions drawn from
-/// `x1..x1+range_x` × `y1..y1+range_y`. Split out so the pre-image scope can be computed before the
-/// edit from the *same* draws the edit makes.
+/// `x1..x1+range_x` × `y1..y1+range_y`.
 fn scatter_placements(x1: i32, y1: i32, range_x: i32, range_y: i32, count: i32, seed: u64) -> Vec<(i32, i32)> {
     let (range_x, range_y) = (range_x.max(1) as u64, range_y.max(1) as u64);
     let mut rng = Rng64::new(if seed == 0 { 0xdeadbeef_cafebabe } else { seed });
@@ -10247,18 +10937,6 @@ fn scatter_placements(x1: i32, y1: i32, range_x: i32, range_y: i32, count: i32, 
         let py = y1 + (rng.next() % range_y) as i32;
         (px, py)
     }).collect()
-}
-
-/// Undo pre-image scope for a multi-placement paste (scatter/array): the chunks under the union of
-/// the `width × height` footprints at `placements`, and the clipboard's z interval (row 18.2).
-fn paste_snapshot_scope(
-    world: &LoadedWorld,
-    placements: &[(i32, i32)],
-    width: i32, height: i32, depth: i32, z_anchor: i32, elevation_offset: i32,
-) -> (Vec<(i32, i32)>, (i32, i32)) {
-    let chunks = chunks_for_rects(world, placements.iter().map(|&(px, py)| (px, py, px + width - 1, py + height - 1)));
-    let z0 = z_anchor + elevation_offset;
-    (chunks, (z0, z0 + depth - 1))
 }
 
 /// Paste clipboard at `count` random positions within the bounding box.
@@ -10289,14 +10967,8 @@ fn scatter_paste(
     let max_py = y1 + range_y - 1;
     let rect = (x1, y1, x2.max(max_px + width - 1), y2.max(max_py + height - 1));
     let label = format!("Scatter paste ×{count}");
-    // Seeded, so the placements are known before the edit: snapshot only the chunks their footprints
-    // touch, and only the clipboard's z bands (row 18.2) — not the whole scatter box.
     let placements = scatter_placements(x1, y1, range_x, range_y, count, seed);
-    let scope = ws.world.as_ref().map(|w| paste_snapshot_scope(
-        w, &placements, width, height, depth, z_anchor, elevation_offset,
-    ));
-    let Some((chunks, z_range)) = scope else { ws.clipboard = Some(cb); return Err("No world loaded".into()); };
-    let result = with_edit_chunks(&mut ws, &label, chunks, rect, Some(z_range), |world| {
+    let result = with_edit(&mut ws, &label, rect, |world| {
         let max_z = world_max_z(world);
         for &(px, py) in &placements {
             paste_clipboard_at(world, px, py, block_types, paints,
@@ -10338,11 +11010,7 @@ fn array_paste(
     let placements: Vec<(i32, i32)> = (0..rows).flat_map(|row| (0..cols).map(move |col| (col, row)))
         .map(|(col, row)| (origin_x + col * step_x, origin_y + row * step_y))
         .collect();
-    let scope = ws.world.as_ref().map(|w| paste_snapshot_scope(
-        w, &placements, width, height, depth, z_anchor, elevation_offset,
-    ));
-    let Some((chunks, z_range)) = scope else { ws.clipboard = Some(cb); return Err("No world loaded".into()); };
-    let result = with_edit_chunks(&mut ws, &label, chunks, rect, Some(z_range), |world| {
+    let result = with_edit(&mut ws, &label, rect, |world| {
         let max_z = world_max_z(world);
         for &(px, py) in &placements {
             paste_clipboard_at(world, px, py, block_types, paints,
@@ -10389,6 +11057,13 @@ struct MemStats {
     /// Live clipboard / selection-mask sizes (18.0). Read straight off `WorldState` — no counter.
     clipboard_bytes: u64,
     selection_mask_bytes: u64,
+    /// Overview raster (18.15): heap bytes / granularity (0 = none built), lifetime
+    /// served/scanned sample counts, and the configured budget.
+    overview_bytes: u64,
+    overview_granularity: u64,
+    overview_served: u64,
+    overview_scanned: u64,
+    overview_budget: u64,
     /// The 18.0 peak counters (`mem::PEAKS`).
     peaks: mem::PeakSnapshot,
 }
@@ -10409,6 +11084,7 @@ fn mem_stats(state: tauri::State<'_, AppState>) -> MemStats {
             ),
             None => (false, 0, 0, 0, 0, 0, 0),
         };
+    let ov = ws.world.as_ref().and_then(|w| w.overview());
     MemStats {
         os: std::env::consts::OS,
         arch: std::env::consts::ARCH,
@@ -10430,6 +11106,11 @@ fn mem_stats(state: tauri::State<'_, AppState>) -> MemStats {
         clipboard_bytes: ws.clipboard.as_ref().map_or(0, |c|
             (c.block_types.len() + c.paints.len() + c.mask.as_ref().map_or(0, |m| m.len())) as u64),
         selection_mask_bytes: ws.selection_mask.as_ref().map_or(0, |m| m.bits.len() as u64),
+        overview_bytes: ov.map_or(0, |r| r.heap_bytes() as u64),
+        overview_granularity: ov.map_or(0, |r| r.granularity() as u64),
+        overview_served: ov.map_or(0, |r| r.counters().0),
+        overview_scanned: ov.map_or(0, |r| r.counters().1),
+        overview_budget: ws.overview_budget as u64,
         peaks: mem::PEAKS.snapshot(),
     }
 }
@@ -10456,17 +11137,24 @@ pub fn run() {
         .setup(|app| {
             // Windows-only, and only when `VUENCEDIT_TRIM=1` — see `working_set`.
             working_set::spawn_idle_trimmer(app.handle().clone());
+            // The persisted overview rasters (18.15), swept in the background.
+            {
+                use tauri::Manager;
+                if let Ok(dir) = app.path().app_data_dir() { overview::init_store(dir.join("overview")); }
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             load_world,
             get_world_info,
+            backup_status,
             fetch_tile,
             chunk_occupancy,
             set_view_cap,
             set_view_relief,
             set_view_lod,
             set_undo_budget,
+            set_overview_budget,
             export_png,
             describe_selection,
             delete_blocks,
@@ -10817,7 +11505,7 @@ mod tests {
         let mut ws = WorldState::new();
         ws.world = Some(world);
 
-        let result = with_edit(&mut ws, "delete", (0, 0, 15, 15), (0, 0, 15, 15), |world| {
+        let result = with_edit(&mut ws, "delete", (0, 0, 15, 15), |world| {
             delete_blocks_inner(world, 0, 0, 15, 15, 0, 63, None);
             Ok(())
         });
@@ -11573,13 +12261,23 @@ mod tests {
     fn test_oversized_undo_entry_drops_history() {
         let mut ws = ws_with(make_test_world());
         let rect = (0, 0, 15, 15);
-        // A first, small edit establishes some history to lose.
-        with_edit(&mut ws, "first", rect, rect, |w| { w.bytes[blk(1, 1, 0)] = 7; Ok(()) }).expect("first edit");
+        // A first edit establishes some history to lose — and fills the chunk with noise, so the next
+        // edit's pre-image is incompressible (a zero pre-image would deflate to almost nothing).
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        with_edit(&mut ws, "first", rect, |w| {
+            for i in HEADER..HEADER + 32768 {
+                seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
+                w.set_byte(i, (seed >> 24) as u8 | 1);
+            }
+            Ok(())
+        }).expect("first edit");
         assert_eq!(ws.undo_stack.len(), 1);
 
-        ws.undo_budget = 64; // smaller than any real delta, so the next edit can't fit
-        let r = with_edit(&mut ws, "huge", rect, rect, |w| {
-            for b in w.bytes[HEADER..HEADER + 32768].iter_mut() { *b = 0x2A; }
+        // Budget 8 KiB: the pre-image limit (4×) is exactly the chunk's 32 KiB, so the edit runs,
+        // but its ~32 KiB incompressible delta can't fit the budget.
+        ws.undo_budget = 8192;
+        let r = with_edit(&mut ws, "huge", rect, |w| {
+            for i in HEADER..HEADER + 32768 { w.set_byte(i, 0x2A); }
             Ok(())
         }).expect("edit itself still applies");
         assert!(r.undo_dropped, "an over-budget edit must report that its undo was dropped");
@@ -11613,106 +12311,435 @@ mod tests {
         b
     }
 
+    /// 18.12 (B.6 test 3) — the copy-on-write pre-image trips at `PREIMAGE_GUARD_FACTOR × budget`
+    /// of *changed bands*: the edit is refused with a sized message and rolled back exactly, with no
+    /// undo entry and no dirty mark.
     #[test]
-    fn test_preimage_guard_names_the_size_and_scales_with_budget() {
-        let mb = 1024 * 1024;
-        assert!(check_preimage_budget(4 * 96 * mb, 96 * mb).is_ok(), "exactly k x budget is allowed");
-        let e = check_preimage_budget(4 * 96 * mb + 1, 96 * mb).unwrap_err();
-        assert!(e.contains("384 MB"), "message names the limit: {e}");
-        assert!(check_preimage_budget(2000 * mb, 512 * mb).is_ok(), "a bigger budget raises the ceiling");
-        assert!(check_preimage_budget(usize::MAX, usize::MAX).is_ok(), "no overflow on saturating math");
-    }
-
-    #[test]
-    fn test_guarded_edit_refuses_oversized_preimage_and_keeps_the_world() {
+    fn test_preimage_trip_rolls_back_and_refuses() {
         let mut ws = ws_with(make_grid_world(2));
-        ws.undo_budget = 1024; // limit = 4 KiB; the 2x2 rect is 128 KiB
+        ws.undo_budget = 3 * 8192 / PREIMAGE_GUARD_FACTOR; // limit = exactly 3 bands
         let before = world_bytes(&ws);
+        let seq = ws.dirty.seq;
         let rect = (0, 0, 31, 31);
-        let mut ran = false;
-        let err = match with_edit_guarded(&mut ws, "trees", rect, rect, |_| { ran = true; Ok(()) }) {
+        // Five bands: all 4 of chunk (0,0) plus band 0 of chunk (1,0).
+        let err = match with_edit(&mut ws, "trees", rect, |w| {
+            for z in [1, 17, 33, 49] { set_block_abs(w, 3, 3, z, 9, 0); }
+            set_block_abs(w, 20, 3, 1, 9, 0);
+            Ok(())
+        }) {
             Err(e) => e,
-            Ok(_) => panic!("over-budget pre-image must be refused"),
+            Ok(_) => panic!("an over-limit pre-image must be refused"),
         };
-        assert!(!ran, "the edit closure must not run");
-        assert!(err.contains("MB"), "{err}");
+        assert_eq!(err, preimage_trip_message(3 * 8192));
+        assert!(err.contains("MB") && err.contains("undo limit"), "{err}");
         assert!(ws.world.is_some(), "the world is reinstalled on refusal");
-        assert_eq!(world_bytes(&ws), before);
-        // Plain with_edit is unchanged (no guard), so existing callers behave as before.
-        with_edit(&mut ws, "delete", rect, rect, |_| Ok(())).expect("unguarded path unaffected");
-        // And a guarded edit under budget still applies + undoes.
-        ws.undo_budget = DEFAULT_UNDO_BYTE_BUDGET;
-        with_edit_guarded(&mut ws, "trees", rect, rect, |w| { w.bytes[blk(1, 1, 5)] = 9; Ok(()) }).expect("in budget");
+        assert_eq!(world_bytes(&ws), before, "exact rollback");
+        assert!(ws.undo_stack.is_empty());
+        assert_eq!(ws.dirty.seq, seq, "a refused edit marks nothing dirty");
+        assert!(ws.dirty.since_disk.is_empty());
+
+        // Three bands is exactly the limit: applies and undoes.
+        with_edit(&mut ws, "trees", rect, |w| {
+            for z in [1, 17, 33] { set_block_abs(w, 3, 3, z, 9, 0); }
+            Ok(())
+        }).expect("at the limit");
         assert_eq!(ws.undo_stack.len(), 1);
+        undo_edit_inner(&mut ws).expect("undo");
+        assert_eq!(world_bytes(&ws), before);
+    }
+
+    /// 18.12 — the RAM-1 win: a whole-world rect that changes one block needs one band of
+    /// pre-image, so it passes a limit the old rect-sized snapshot (every band of every chunk)
+    /// would have been refused at.
+    #[test]
+    fn test_huge_rect_small_change_fits_a_small_limit() {
+        let mut ws = ws_with(make_grid_world(3));
+        ws.undo_budget = 8192 / PREIMAGE_GUARD_FACTOR; // limit = one band; the rect is 9 × 4 bands
+        let before = world_bytes(&ws);
+        with_edit(&mut ws, "trees", (0, 0, 47, 47), |w| { set_block_abs(w, 40, 40, 20, 9, 0); Ok(()) })
+            .expect("one changed band fits");
+        undo_edit_inner(&mut ws).expect("undo");
+        assert_eq!(world_bytes(&ws), before);
     }
 
     #[test]
-    fn test_explicit_chunk_set_snapshots_only_those_chunks_and_undoes() {
+    fn test_cow_snapshots_only_the_written_chunks_and_undoes() {
         let mut ws = ws_with(make_grid_world(3));
         let before = world_bytes(&ws);
-        // Bbox of these two corner chunks is the whole 3x3 grid; only the corners are listed.
-        let chunks = vec![(0, 0), (2, 2)];
         let world = ws.world.as_ref().unwrap();
-        assert_eq!(preimage_bytes(world, &chunks, Some((0, 15))), 2 * 8192, "one band per listed chunk");
-        assert_eq!(preimage_bytes(world, &chunks, None), 2 * 32768);
         let (a0, _) = world.chunk_range(0, 0).unwrap();
         let (a2, _) = world.chunk_range(2, 2).unwrap();
-        with_edit_chunks(&mut ws, "cells", chunks, (0, 0, 47, 47), Some((0, 15)), |w| {
-            w.bytes[a0 + 8192 * 0 + 3] = 7;
-            w.bytes[a2 + 5] = 7;
+        // The rect is the whole 3x3 grid; only the two corners are written.
+        with_edit(&mut ws, "cells", (0, 0, 47, 47), |w| {
+            w.set_byte(a0 + 3, 7);
+            w.set_byte(a2 + 5, 7);
             Ok(())
         }).expect("edit");
         let snapped: Vec<(i32, i32)> = ws.undo_stack.back().unwrap().chunks.iter().map(|s| (s.cx, s.cy)).collect();
-        assert_eq!(snapped.len(), 2);
-        assert!(snapped.contains(&(0, 0)) && snapped.contains(&(2, 2)) && !snapped.contains(&(1, 1)));
+        assert_eq!(snapped, vec![(0, 0), (2, 2)]);
         undo_edit_inner(&mut ws).expect("undo");
         assert_eq!(world_bytes(&ws), before, "undo restores the exact pre-edit bytes");
     }
 
-    #[test]
-    fn test_cells_snapshot_scope_is_footprint_not_bbox() {
-        let ws = ws_with(make_grid_world(4));
-        let world = ws.world.as_ref().unwrap();
-        // A diagonal tunnel: bbox spans all 16 chunks, cells touch only the diagonal 4.
-        let cells: Vec<(i32, i32, i32)> = (0..64).map(|i| (i, i, 20 + i / 16)).collect();
-        let (chunks, z) = cells_snapshot_scope(world, &cells);
-        assert_eq!(chunks, vec![(0, 0), (1, 1), (2, 2), (3, 3)]);
-        assert_eq!(z, Some((20, 23)));
-        assert_eq!(cells_snapshot_scope(world, &[]), (vec![], None));
+    // ── Row 18.12: copy-on-write edit pre-image — differential oracle + contract tests ──────────
+
+    /// A `side × side`-chunk world of `bands` bands (4 = 64z, 16 = 256z), terrain to `height(x, y)`
+    /// (clamped to the world), stone under a painted grass top, a lamp on every 11th column.
+    fn cow_world(side: i32, bands: usize, height: impl Fn(i32, i32) -> i32) -> Vec<u8> {
+        const HEADER: usize = 4096;
+        let chunk = bands * 8192;
+        let n = (side * side) as usize;
+        let dir_off = HEADER + n * chunk;
+        let mut b = vec![0u8; dir_off + n * 16];
+        b[32..40].copy_from_slice(&(dir_off as u64).to_le_bytes());
+        b[40..48].copy_from_slice(b"CowTest\0");
+        // version 5 + a 131072 stride = 256z; a legacy version + 32768 = 64z.
+        b[92..96].copy_from_slice(&(if bands == 16 { 5i32 } else { 0 }).to_le_bytes());
+        let top = (bands * 16 - 2) as i32;
+        let mut i = 0usize;
+        for cy in 0..side {
+            for cx in 0..side {
+                let base = HEADER + i * chunk;
+                for lx in 0..16usize {
+                    for ly in 0..16usize {
+                        let (wx, wy) = (cx * 16 + lx as i32, cy * 16 + ly as i32);
+                        let h = height(wx, wy).clamp(1, top);
+                        let at = |z: i32| base + (z / 16) as usize * 8192 + lx * 256 + ly * 16 + (z % 16) as usize;
+                        for z in 1..h { b[at(z)] = 1; }
+                        b[at(h)] = 2;
+                        b[at(h) + 4096] = ((wx + wy) % 9) as u8;
+                        if (wx * 7 + wy) % 11 == 0 { b[at(h + 1)] = LAMP_BLOCK_TYPE; }
+                    }
+                }
+                let e = dir_off + i * 16;
+                b[e..e + 4].copy_from_slice(&cx.to_le_bytes());
+                b[e + 4..e + 8].copy_from_slice(&cy.to_le_bytes());
+                b[e + 8..e + 16].copy_from_slice(&(base as u64).to_le_bytes());
+                i += 1;
+            }
+        }
+        b
+    }
+
+    fn cow_ws(bands: usize) -> WorldState {
+        // 256z: heights 30..69, terrain across bands 1..4. 64z: 8..37, leaving room for canopies.
+        let ws = if bands == 16 {
+            ws_with(cow_world(3, bands, |x, y| 30 + (x * 7 + y * 3) % 40))
+        } else {
+            ws_with(cow_world(3, bands, |x, y| 8 + (x * 7 + y * 3) % 30))
+        };
+        assert_eq!(ws.world.as_ref().unwrap().num_bands, bands, "fixture parsed at the wrong height");
+        let all: Vec<(i32, i32)> = ws.world.as_ref().unwrap().chunk_map.keys().copied().collect();
+        ws.lamp_index.build_now(ws.world.as_ref().unwrap(), &all);
+        ws
+    }
+
+    fn dirty_chunks(ws: &WorldState) -> Vec<(i32, i32)> {
+        let mut v: Vec<_> = ws.dirty.since_disk.keys().copied().collect();
+        v.sort_unstable();
+        v
+    }
+
+    fn lamps_match_a_rebuild(ws: &WorldState) -> bool {
+        let mut got = ws.lamp_index.snapshot();
+        got.retain(|_, v| !v.is_empty());
+        got == build_lamp_index(ws.world.as_ref().unwrap())
+    }
+
+    /// B.6 test 1: run `edit` through the pre-18.12 snapshot path (the oracle, snapshotting the whole
+    /// world) and through the copy-on-write path, from identical worlds, and require identical
+    /// post-edit bytes, patch, dirty chunk set and lamp index; exact undo; exact redo. Deltas are
+    /// compared semantically (apply → same bytes) — CoW may pick `Sparse` where the oracle chose a
+    /// whole-span `Full`.
+    fn differential(label: &str, bands: usize, patch_rect: (i32, i32, i32, i32),
+                    edit: &dyn Fn(&mut EditView) -> Result<(), String>) {
+        let mut old = cow_ws(bands);
+        let mut new = cow_ws(bands);
+        let before = world_bytes(&old);
+        let ro = with_edit_inner_oracle(&mut old, label, (0, 0, 47, 47), patch_rect, None, edit);
+        let rn = with_edit(&mut new, label, patch_rect, edit);
+        let (ro, rn) = match (ro, rn) {
+            (Ok(a), Ok(b)) => (a, b),
+            (Err(a), Err(b)) => {
+                assert_eq!(a, b, "{label}/{bands}: same error on both paths");
+                assert_eq!(world_bytes(&new), before, "{label}/{bands}: a failed CoW edit rolls back exactly");
+                assert!(new.undo_stack.is_empty() && dirty_chunks(&new).is_empty());
+                return;
+            }
+            (a, b) => panic!("{label}/{bands}: paths disagree on success: oracle {:?} vs cow {:?}",
+                             a.map(|_| ()), b.map(|_| ())),
+        };
+        let post = world_bytes(&old);
+        assert!(post != before, "{label}/{bands}: the fixture must actually change something");
+        assert!(world_bytes(&new) == post, "{label}/{bands}: post-edit worlds differ");
+        assert_eq!(ro.patch.pixels, rn.patch.pixels, "{label}/{bands}: patch differs");
+        assert_eq!(ro.invalidate, rn.invalidate);
+        assert_eq!(dirty_chunks(&old), dirty_chunks(&new), "{label}/{bands}: dirty chunk sets differ");
+        assert!(lamps_match_a_rebuild(&new), "{label}/{bands}: lamp index drifted after the edit");
+        assert_eq!(old.undo_stack.len(), 1);
+        assert_eq!(new.undo_stack.len(), 1);
+
+        undo_edit_inner(&mut old).expect("oracle undo");
+        undo_edit_inner(&mut new).expect("cow undo");
+        assert!(world_bytes(&old) == before, "{label}/{bands}: oracle undo inexact");
+        assert!(world_bytes(&new) == before, "{label}/{bands}: cow undo inexact");
+        assert!(lamps_match_a_rebuild(&new), "{label}/{bands}: lamp index drifted after undo");
+        redo_edit_inner(&mut new).expect("cow redo");
+        assert!(world_bytes(&new) == post, "{label}/{bands}: cow redo inexact");
+        assert!(lamps_match_a_rebuild(&new), "{label}/{bands}: lamp index drifted after redo");
+    }
+
+    fn cow_clipboard(w: i32, h: i32, d: i32) -> (Vec<u8>, Vec<u8>) {
+        let n = (w * h * d) as usize;
+        let bt: Vec<u8> = (0..n).map(|i| if i % 5 == 0 { 0 } else { [3u8, 7, 13, LAMP_BLOCK_TYPE][i % 4] }).collect();
+        let pt: Vec<u8> = (0..n).map(|i| (i % 11) as u8).collect();
+        (bt, pt)
+    }
+
+    fn cow_sculpt_args(mode: &str) -> SculptArgs {
+        SculptArgs {
+            mode: mode.into(), strength: 4, strength_eff: 4.0, seed: 3,
+            block_type: None, paint: None, freq: None, noise_mode: None,
+            softness: 0.6, profile: "smooth".into(), grab_delta: None,
+            anchor_x: None, anchor_y: None, slope_dx: None, slope_dy: None,
+            smear_dx: None, smear_dy: None, clip_rect: None, rock: None, cap: None,
+        }
     }
 
     #[test]
-    fn test_scatter_scope_matches_the_edit_draws_and_is_small() {
+    fn test_cow_edits_match_the_snapshot_oracle() {
+        for bands in [4usize, 16] {
+            let max_z = (bands * 16 - 1) as i32;
+            let all = (0, 0, 47, 47);
+            differential("delete", bands, (2, 3, 40, 37), &|w| {
+                delete_blocks_inner(w, 2, 3, 40, 37, 20, 50, None); Ok(())
+            });
+            differential("delete over air", bands, (0, 0, 20, 20), &|w| {
+                delete_blocks_inner(w, 0, 0, 20, 20, 0, max_z, None); Ok(())
+            });
+            differential("replace", bands, all, &|w| {
+                replace_blocks_inner(w, 0, 0, 47, 47, 0, max_z, 7, 3, Some(2), None, false, None); Ok(())
+            });
+            differential("replace inverted", bands, (5, 5, 25, 25), &|w| {
+                replace_blocks_inner(w, 5, 5, 25, 25, 25, 45, 13, 0, Some(0), None, true, None); Ok(())
+            });
+            differential("gradient", bands, (4, 4, 30, 30), &|w| {
+                gradient_fill_inner(w, 4, 4, 30, 30, 20, 60, 1, 0, 7, 5, "x", false, None); Ok(())
+            });
+            differential("paint + doors", bands, all, &|w| {
+                for (x, y, z) in [(3, 5, 31), (6, 2, 4), (20, 20, 47), (40, 9, 63.min(max_z - 1))] {
+                    set_block_abs(w, x, y, z, 66, 0);
+                    set_block_abs(w, x, y, z + 1, 70, 0);
+                }
+                set_block_abs(w, 12, 12, 40, LAMP_BLOCK_TYPE, 0);
+                Ok(())
+            });
+            let (cbt, cpt) = cow_clipboard(9, 7, 20);
+            differential("paste", bands, (10, 12, 18, 18), &|w| {
+                paste_clipboard_at(w, 10, 12, &cbt, &cpt, 9, 7, 20, 25, 3, false, max_z, None); Ok(())
+            });
+            differential("paste ignore-air", bands, (10, 12, 18, 18), &|w| {
+                paste_clipboard_at(w, 10, 12, &cbt, &cpt, 9, 7, 20, 25, 3, true, max_z, None); Ok(())
+            });
+            differential("scatter", bands, all, &|w| {
+                for (px, py) in [(1, 1), (14, 30), (35, 36), (40, 2)] {
+                    paste_clipboard_at(w, px, py, &cbt, &cpt, 9, 7, 20, 18, 0, true, max_z, None);
+                }
+                Ok(())
+            });
+            let (sbt, spt) = cow_clipboard(6, 5, 8);
+            differential("extrude x+", bands, all, &|w| {
+                extrude_write(w, 3, 3, &sbt, &spt, 6, 5, 8, 28, max_z, "x+", 3, false, None); Ok(())
+            });
+            differential("extrude z+", bands, all, &|w| {
+                extrude_write(w, 3, 3, &sbt, &spt, 6, 5, 8, 28, max_z, "z+", 2, true, None); Ok(())
+            });
+            differential("move", bands, all, &|w| {
+                // `move_selection`'s closure shape: read, clear source, write shifted by (+9, +4, +5).
+                let (x1, y1, wd, ht, z0, d) = (4, 4, 10, 8, 26, 20);
+                let mut bt = vec![0u8; (wd * ht * d) as usize];
+                let mut pt = bt.clone();
+                for lx in 0..wd { for ly in 0..ht {
+                    let o = ((lx * ht + ly) * d) as usize;
+                    read_column_bulk(w, x1 + lx, y1 + ly, z0, d, &mut bt[o..o + d as usize], &mut pt[o..o + d as usize]);
+                }}
+                let zeros = vec![0u8; d as usize];
+                for lx in 0..wd { for ly in 0..ht { write_column_bulk(w, x1 + lx, y1 + ly, z0, d, &zeros, &zeros); } }
+                for lx in 0..wd { for ly in 0..ht {
+                    let o = ((lx * ht + ly) * d) as usize;
+                    write_column_bulk(w, x1 + lx + 9, y1 + ly + 4, z0 + 5, d, &bt[o..o + d as usize], &pt[o..o + d as usize]);
+                }}
+                Ok(())
+            });
+            differential("trees", bands, all, &|w| {
+                generate_trees_inner(w, 0, 0, 47, 47, &["normal".to_string(), "pine".to_string(), "tall_pine".to_string()],
+                    0.04, &[], 11, false, None);
+                Ok(())
+            });
+            differential("wavy", bands, all, &|w| {
+                generate_wavy_surface_inner(w, 0, 0, 47, 47, max_z, 20, 0, 12.0, 0.5, 5, "fill", None); Ok(())
+            });
+            differential("flow", bands, all, &|w| {
+                let z = surface_z(w, 20, 20).unwrap() + 1;
+                set_block_abs(w, 20, 20, z, fluid_type_for(20, 4), 0);
+                simulate_flow_inner(w, 15, 15, 25, 25, 12, 12, 28, 28, 0, max_z, false, 20, None);
+                Ok(())
+            });
+            differential("pool (unenclosed → Err, rolled back)", bands, (5, 5, 30, 30), &|w| {
+                let z = surface_z(w, 17, 17).unwrap() + 1;
+                set_block_abs(w, 17, 17, z + 3, 7, 0); // a write before the Err: must roll back
+                pool_fill_inner(w, 5, 5, 30, 30, 17, 17, z, max_z.min(z + 30), 20, 0, None)
+            });
+            differential("flood fill", bands, all, &|w| {
+                let z = surface_z(w, 24, 24).unwrap() + 1;
+                let cells = flood_fill_bfs(w, 24, 24, z, 3000)?;
+                for (x, y, z) in cells { set_block_abs(w, x, y, z, 20, 0); }
+                Ok(())
+            });
+            differential("fill surface", bands, all, &|w| {
+                let cells = surface_region_bfs(w, 9, 9, false, 5000)?;
+                for (x, y, z) in cells { set_block_abs(w, x, y, z, 13, 2); }
+                Ok(())
+            });
+            for mode in ["raise", "lower", "smooth", "noise", "flatten"] {
+                differential(&format!("sculpt {mode}"), bands, all, &|w| {
+                    let mut s = SculptSession { group_id: 0, fheight: HashMap::new() };
+                    let stamps = vec![
+                        SculptStamp { points: disc_points(14, 14, 6), dial: Some((14, 14, 6)) },
+                        SculptStamp { points: disc_points(22, 17, 6), dial: Some((22, 17, 6)) },
+                    ];
+                    run_sculpt_flush(w, &mut s, &cow_sculpt_args(mode), &stamps)
+                });
+            }
+        }
+    }
+
+    /// B.6 test 2 — an edit that writes several bands and then fails leaves the world byte-identical,
+    /// its scan ceilings invalidated, no undo entry and no dirty mark. (Before 18.12 the partial
+    /// writes stayed — un-undoable, invisible to the incremental save and the autosave journal.
+    /// Real closures that can do this: a multi-stamp sculpt flush where a later Flatten/Slope stamp
+    /// finds no surface, after earlier stamps wrote.)
+    #[test]
+    fn test_cow_edit_error_rolls_back_exactly() {
+        let mut ws = cow_ws(16);
+        let before = world_bytes(&ws);
+        let seq = ws.dirty.seq;
+        let hint_before = ws.world.as_ref().unwrap().top_band_hint(0, 0);
+        let err = with_edit(&mut ws, "partial", (0, 0, 47, 47), |w| {
+            for z in [5, 40, 90, 200] { set_block_abs(w, 3, 3, z, 9, 1); }
+            set_block_abs(w, 40, 40, 33, 9, 1);
+            Err("stamp 3 found no surface".into())
+        }).err().expect("the closure's error propagates");
+        assert_eq!(err, "stamp 3 found no surface");
+        assert!(world_bytes(&ws) == before, "exact rollback");
+        assert!(ws.undo_stack.is_empty() && ws.redo_stack.is_empty());
+        assert_eq!(ws.dirty.seq, seq);
+        assert!(dirty_chunks(&ws).is_empty());
+        let w = ws.world.as_ref().unwrap();
+        assert_eq!(w.top_bands.peek(0, 0), None, "the rolled-back chunk's ceiling was invalidated");
+        assert_eq!(w.top_band_hint(0, 0), hint_before, "…and recomputes to the restored bytes");
+        assert!(lamps_match_a_rebuild(&ws));
+    }
+
+    /// B.6 test 4 — the `top_band_hint` trap. Warm a chunk's ceiling, raise a column far above it
+    /// inside one edit, and read the new top back *within the same edit* both through the view and
+    /// through `Deref` to the world. A stale ceiling would report the new blocks as air.
+    #[test]
+    fn test_cow_hint_covers_writes_inside_the_edit() {
+        let mut ws = cow_ws(16);
+        let warmed = ws.world.as_ref().unwrap().top_band_hint(1, 1);
+        assert!(warmed < 10, "fixture terrain must sit well below band 12 (got {warmed})");
+        with_edit(&mut ws, "tower", (16, 16, 31, 31), |w| {
+            set_block_abs(w, 20, 20, 200, 1, 0); // band 12
+            assert_eq!(surface_z(w, 20, 20), Some(200), "through the view");
+            let world: &LoadedWorld = w;
+            assert_eq!(surface_z(world, 20, 20), Some(200), "through Deref to the world");
+            assert_eq!(read_block_abs(world, 20, 20, 200), 1);
+            Ok(())
+        }).expect("edit");
+        let w = ws.world.as_ref().unwrap();
+        assert_eq!(surface_z(w, 20, 20), Some(200), "and after the edit");
+        assert!(w.top_band_hint(1, 1) >= 12);
+    }
+
+    /// B.6 test 5 — compare-before-write: an edit that rewrites every cell to its current value
+    /// captures nothing, keeps no undo entry and marks nothing dirty.
+    #[test]
+    fn test_cow_no_op_edits_capture_nothing() {
+        let mut ws = cow_ws(16);
+        let before = world_bytes(&ws);
+        // Delete over pure air (everything above the terrain).
+        let r = with_edit(&mut ws, "delete air", (0, 0, 47, 47), |w| {
+            delete_blocks_inner(w, 0, 0, 47, 47, 100, 255, None); Ok(())
+        }).expect("air delete");
+        assert!(!r.undo_dropped);
+        // Replace grass with itself, and re-paint a block with its own paint.
+        with_edit(&mut ws, "replace same", (0, 0, 47, 47), |w| {
+            replace_blocks_inner(w, 0, 0, 47, 47, 0, 255, 2, 0, Some(2), Some(0), false, None);
+            let z = surface_z(w, 5, 5).unwrap();
+            let (bt, pt) = get_block_at(w, 5, 5, z);
+            set_block_abs(w, 5, 5, z, bt, pt);
+            Ok(())
+        }).expect("replace same");
+        assert!(world_bytes(&ws) == before);
+        assert!(ws.undo_stack.is_empty(), "no-op edits keep no undo entry");
+        assert!(dirty_chunks(&ws).is_empty(), "…and mark nothing dirty");
+
+        // And the capture itself is empty (not merely diffed away afterwards).
+        let mut world = ws.world.take().unwrap();
+        let mut view = EditView::unbounded(&mut world);
+        delete_blocks_inner(&mut view, 0, 0, 47, 47, 100, 255, None);
+        replace_blocks_inner(&mut view, 0, 0, 47, 47, 0, 255, 2, 0, Some(2), Some(0), false, None);
+        write_column_bulk(&mut view, 7, 7, 120, 16, &[0; 16], &[0; 16]);
+        assert_eq!(view.into_capture().captured, 0, "no band may be captured by a no-op write");
+    }
+
+    /// 18.12 hot-path budget (plan B.7): ⌘A replace on a 64z world, snapshot oracle vs copy-on-write.
+    /// Reports only — `cargo test -p eden-world-editor bench_cow -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn bench_cow_select_all_replace() {
+        let bytes = make_bumpy_world_grid(32, 3, |x, y| 10 + (x + y) % 30);
+        let run = |oracle: bool| {
+            let mut best = f64::MAX;
+            for _ in 0..5 {
+                let mut ws = ws_with(bytes.clone());
+                let edit = |w: &mut EditView| {
+                    replace_blocks_inner(w, 0, 0, 511, 511, 0, 63, 7, 0, Some(3), None, false, None); Ok(())
+                };
+                let t = std::time::Instant::now();
+                if oracle {
+                    with_edit_inner_oracle(&mut ws, "r", (0, 0, 511, 511), (0, 0, 511, 511), None, edit).unwrap();
+                } else {
+                    with_edit(&mut ws, "r", (0, 0, 511, 511), edit).unwrap();
+                }
+                best = best.min(t.elapsed().as_secs_f64() * 1000.0);
+            }
+            best
+        };
+        let (o, c) = (run(true), run(false));
+        eprintln!("[bench] ⌘A replace 64z 32×32 chunks: oracle {o:.1} ms, cow {c:.1} ms ({:+.0} %)", (c / o - 1.0) * 100.0);
+    }
+
+    #[test]
+    fn test_scatter_placements_are_seeded() {
         let placements = scatter_placements(0, 0, 200, 200, 5, 42);
         assert_eq!(placements, scatter_placements(0, 0, 200, 200, 5, 42), "seeded and repeatable");
         assert_eq!(placements.len(), 5);
         assert!(placements.iter().all(|&(x, y)| (0..200).contains(&x) && (0..200).contains(&y)));
         // seed 0 maps to the fixed fallback stream, same as the edit used
         assert_eq!(scatter_placements(0, 0, 9, 9, 3, 0).len(), 3);
-
-        // A 4x4 chunk world, 3x3 clipboard, 4 placements: scope is far below the 16-chunk box.
-        let ws = ws_with(make_grid_world(4));
-        let world = ws.world.as_ref().unwrap();
-        let spots = [(1, 1), (17, 1), (60, 60), (33, 20)];
-        let (chunks, z) = paste_snapshot_scope(world, &spots, 3, 3, 5, 10, 2);
-        assert_eq!(z, (12, 16));
-        assert!(chunks.len() <= 4, "footprint chunks only, got {chunks:?}");
-        assert!(chunks.contains(&(0, 0)) && chunks.contains(&(1, 0)) && chunks.contains(&(3, 3)) && chunks.contains(&(2, 1)));
-        // A footprint straddling a chunk seam pulls in both chunks.
-        let (seam, _) = paste_snapshot_scope(world, &[(14, 0)], 4, 1, 1, 0, 0);
-        assert_eq!(seam, vec![(0, 0), (1, 0)]);
     }
 
     #[test]
-    fn test_scatter_and_array_edits_undo_exactly_under_chunk_scope() {
+    fn test_scatter_and_array_edits_undo_exactly() {
         let mut ws = ws_with(make_grid_world(4));
         let before = world_bytes(&ws);
         let (w, h, d, za) = (3, 3, 2, 1);
         let bt = vec![13u8; (w * h * d) as usize];
         let pt = vec![4u8; (w * h * d) as usize];
         let spots = vec![(5, 5), (30, 14), (50, 50)]; // (30,14): footprint spans chunk seam x 30..32
-        let (chunks, z) = paste_snapshot_scope(ws.world.as_ref().unwrap(), &spots, w, h, d, za, 0);
-        with_edit_chunks(&mut ws, "scatter", chunks, (0, 0, 63, 63), Some(z), |world| {
+        with_edit(&mut ws, "scatter", (0, 0, 63, 63), |world| {
             let mz = world_max_z(world);
             for &(px, py) in &spots {
                 paste_clipboard_at(world, px, py, &bt, &pt, w, h, d, za, 0, false, mz, None);
@@ -11729,7 +12756,7 @@ mod tests {
     }
 
     #[test]
-    fn test_terrain_paste_scope_tracks_surface_range_and_undoes() {
+    fn test_terrain_paste_across_surface_heights_undoes() {
         // Two 16x16 chunks side by side; chunk (1,0) terrain sits at z=20, chunk (0,0) at z=1.
         let mut bytes = make_grid_world(2);
         for lx in 0..16usize { for ly in 0..16usize {
@@ -11739,15 +12766,7 @@ mod tests {
         }}
         let mut ws = ws_with(bytes);
         let before = world_bytes(&ws);
-        let world = ws.world.as_ref().unwrap();
-        let (chunks, z) = terrain_paste_snapshot_scope(world, 10, 2, 12, 2, 3, 0, true, None, None);
-        assert_eq!(chunks, vec![(0, 0), (1, 0)]);
-        let lo = surface_z(world, 10, 2).unwrap() + 1;
-        let hi = surface_z(world, 25, 2).unwrap() + 1;
-        assert_eq!(z, (lo.min(hi), lo.max(hi) + 2), "surface range plus clipboard depth");
-        // Footprint entirely outside the world: empty scope.
-        let (none, _) = terrain_paste_snapshot_scope(world, 500, 500, 4, 4, 2, 0, true, None, None);
-        assert!(none.is_empty());
+        let lo = surface_z(ws.world.as_ref().unwrap(), 10, 2).unwrap() + 1;
 
         let cb = Clipboard { width: 12, height: 2, depth: 3, z_anchor: 0,
             block_types: vec![13u8; 72], paints: vec![0u8; 72], mask: None };
@@ -11770,20 +12789,20 @@ mod tests {
         let door_threshold = RISKY_BLOCK_GROUPS.iter().find(|g| g.name == "doors").unwrap().threshold;
         let over = (door_threshold + 1) as i32;
 
-        let r = with_edit(&mut ws, "dense doors", rect, rect, |w| {
+        let r = with_edit(&mut ws, "dense doors", rect, |w| {
             for i in 0..over { set_block_abs(w, i % 16, i / 16, 0, 66, 0); }
             Ok(())
         }).expect("edit applies");
         assert!(r.warnings.iter().any(|w| w.contains("doors")),
                 "placing {over} doors in one footprint must warn");
 
-        let r = with_edit(&mut ws, "sparse doors", rect, rect, |w| {
+        let r = with_edit(&mut ws, "sparse doors", rect, |w| {
             set_block_abs(w, 0, 0, 1, 66, 0);
             Ok(())
         }).expect("edit applies");
         assert!(r.warnings.is_empty(), "a single door must not warn");
 
-        let r = with_edit(&mut ws, "dense non-risky", rect, rect, |w| {
+        let r = with_edit(&mut ws, "dense non-risky", rect, |w| {
             for i in 0..over { set_block_abs(w, i % 16, i / 16, 2, 2, 0); } // plain Stone
             Ok(())
         }).expect("edit applies");
@@ -11801,7 +12820,7 @@ mod tests {
         let rect = (0, 0, 15, 15);
 
         let mut ws = ws_with(make_test_world());
-        let r = with_edit(&mut ws, "doors at threshold", rect, rect, |w| {
+        let r = with_edit(&mut ws, "doors at threshold", rect, |w| {
             for i in 0..door_threshold as i32 {
                 set_block_abs(w, i % 16, i / 16, 0, 66, 0); // base
                 set_block_abs(w, i % 16, i / 16, 1, 70, 0); // paired DoorTop
@@ -11812,7 +12831,7 @@ mod tests {
 
         let mut ws = ws_with(make_test_world());
         let over = door_threshold as i32 + 1;
-        let r = with_edit(&mut ws, "doors over threshold", rect, rect, |w| {
+        let r = with_edit(&mut ws, "doors over threshold", rect, |w| {
             for i in 0..over {
                 set_block_abs(w, i % 16, i / 16, 0, 66, 0);
                 set_block_abs(w, i % 16, i / 16, 1, 70, 0);
@@ -12088,7 +13107,7 @@ mod tests {
         let group = Some(42u64);
         for i in 0..5 {
             let (x, y) = (i, 0);
-            with_edit_grouped(&mut ws, "Paint 1 block", (x, y, x, y), (x, y, x, y), group, None, |world| {
+            with_edit_grouped(&mut ws, "Paint 1 block", (x, y, x, y), group, |world| {
                 set_block_abs(world, x, y, 21, 2, 0);
                 Ok(())
             }).expect("grouped stamp");
@@ -12111,7 +13130,7 @@ mod tests {
         let mut ws = ws_with(make_bumpy_world_grid(1, 8, |_, _| 20));
         for i in 0..5 {
             let (x, y) = (i, 0);
-            with_edit_grouped(&mut ws, "Paint 1 block", (x, y, x, y), (x, y, x, y), None, None, |world| {
+            with_edit_grouped(&mut ws, "Paint 1 block", (x, y, x, y), None, |world| {
                 set_block_abs(world, x, y, 21, 2, 0);
                 Ok(())
             }).expect("ungrouped stamp");
@@ -12132,14 +13151,14 @@ mod tests {
     #[test]
     fn test_redo_bytes_reset_on_new_edit() {
         let mut ws = ws_with(make_bumpy_world_grid(1, 8, |_, _| 20));
-        with_edit(&mut ws, "delete", (0, 0, 5, 5), (0, 0, 5, 5), |world| {
+        with_edit(&mut ws, "delete", (0, 0, 5, 5), |world| {
             delete_blocks_inner(world, 0, 0, 5, 5, 0, 63, None);
             Ok(())
         }).expect("edit 1");
         undo_edit_inner(&mut ws).expect("undo");
         assert!(ws.redo_bytes > 0, "undo must have populated the redo stack's byte total");
 
-        with_edit(&mut ws, "delete", (0, 0, 3, 3), (0, 0, 3, 3), |world| {
+        with_edit(&mut ws, "delete", (0, 0, 3, 3), |world| {
             delete_blocks_inner(world, 0, 0, 3, 3, 0, 63, None);
             Ok(())
         }).expect("edit 2");
@@ -12155,7 +13174,7 @@ mod tests {
         // Many small, distinct edits so the stack has several evictable entries.
         for i in 0..40 {
             let z = (i % 20) as i32;
-            with_edit(&mut ws, "raise", (0, 0, 15, 15), (0, 0, 15, 15), |world| {
+            with_edit(&mut ws, "raise", (0, 0, 15, 15), |world| {
                 set_block_abs(world, i % 16, (i / 16) % 16, z, 2, 0);
                 Ok(())
             }).expect("edit");
@@ -12187,7 +13206,7 @@ mod tests {
         let mut edit = |ws: &mut WorldState, group: Option<u64>, n: &mut i32| {
             let (x, y, z) = (*n % 16, (*n / 16) % 16, 21 + *n % 8);
             *n += 1;
-            with_edit_grouped(ws, "stamp", (x, y, x, y), (x, y, x, y), group, None, |world| {
+            with_edit_grouped(ws, "stamp", (x, y, x, y), group, |world| {
                 set_block_abs(world, x, y, z, 2, 0);
                 Ok(())
             }).expect("edit");
@@ -12240,30 +13259,11 @@ mod tests {
         assert_eq!((ws.undo_groups, ws.redo_groups), (0, 0));
     }
 
-    /// Phase 4.1 — the z-range `paint_blocks` hands to `with_edit_grouped`. `z_offset` must stay out
-    /// of it (it only applies on the surface-relative branch), a door/portal's auto-placed top block
-    /// must extend it, and one `None` anywhere must collapse the whole batch to a whole-chunk
-    /// snapshot.
-    #[test]
-    fn test_paint_z_range_covers_every_written_block() {
-        let at = |z: Option<i32>| PaintBlock { x: 0, y: 0, z };
-
-        assert_eq!(paint_z_range(&[at(Some(20)), at(Some(4)), at(Some(50))], 0), Some((4, 50)),
-                   "an all-explicit batch spans min..max of its own coordinates");
-        assert_eq!(paint_z_range(&[at(Some(31))], 70), Some((31, 32)),
-                   "a door's paired top block sits one above the base and must be inside the range");
-        assert_eq!(paint_z_range(&[at(Some(31))], 79), Some((31, 32)), "…and the same for portals");
-        assert_eq!(paint_z_range(&[at(Some(5)), at(None), at(Some(9))], 0), None,
-                   "one surface-relative block makes the whole batch's extent unknowable");
-        assert_eq!(paint_z_range(&[], 0), None);
-    }
-
-    /// Phase 4.1 — the band-scoped snapshot must be exactly invertible for every block the edit
-    /// writes. `snapshot_chunks_full` rounds the range out to whole 16-block bands, so a range that
-    /// is too *narrow* fails silently: the writes outside it never reach the undo delta and survive
-    /// the undo. `test_delta_undo_round_trip` can't catch that (it snapshots with `None`), so this
-    /// test deliberately writes at both ends of the range *and across a band boundary* — a door base
-    /// at z=31 (band 1, top lz) whose auto-placed top lands at z=32 (band 2).
+    /// Phase 4.1, kept through 18.12 — a paint batch's undo must be exactly invertible for every
+    /// block it writes, including across a band boundary: a door base at z=31 (band 1, top lz) whose
+    /// auto-placed top lands at z=32 (band 2), plus a write in band 0 in the same edit. (Before
+    /// 18.12 a hand-derived z range scoped the snapshot and a too-narrow one failed silently; the
+    /// copy-on-write capture has no range to get wrong, and this pins that.)
     #[test]
     fn test_paint_z_scoped_undo_restores_writes_outside_the_base_band() {
         let mut ws = ws_with(make_bumpy_world_grid(1, 8, |_, _| 20));
@@ -12275,10 +13275,7 @@ mod tests {
             PaintBlock { x: 3, y: 5, z: Some(31) },
             PaintBlock { x: 6, y: 2, z: Some(4) },
         ];
-        let z_range = paint_z_range(&blocks, 70).expect("an all-explicit batch has a known range");
-        assert_eq!(z_range, (4, 32), "the door top at z=32 must widen the range past its base band");
-
-        with_edit_grouped(&mut ws, "Paint 2 blocks", (3, 2, 6, 5), (3, 2, 6, 5), Some(7), Some(z_range), |world| {
+        with_edit_grouped(&mut ws, "Paint 2 blocks", (3, 2, 6, 5), Some(7), |world| {
             for b in &blocks {
                 let z = b.z.unwrap();
                 set_block_abs(world, b.x, b.y, z, 66, 0);
@@ -12297,8 +13294,8 @@ mod tests {
 
         undo_edit_inner(&mut ws).expect("undo");
         assert_eq!(world_bytes(&ws), before,
-                   "a band-scoped snapshot must restore the world byte-for-byte — including the \
-                    door top one band above the highest block the batch was asked to place");
+                   "undo must restore the world byte-for-byte — including the door top one band \
+                    above the highest block the batch was asked to place");
     }
 
     /// §1b — `chunk_snapshot_bytes` must report real heap capacity (post `shrink_to_fit`), not an
@@ -12346,13 +13343,13 @@ mod tests {
         let mut ws = ws_with(original.clone());
 
         // Edit 1: delete a rect that only touches chunk (0,0) — grouped None (immediate undo entry).
-        with_edit(&mut ws, "delete", (0, 0, 5, 5), (0, 0, 5, 5), |world| {
+        with_edit(&mut ws, "delete", (0, 0, 5, 5), |world| {
             delete_blocks_inner(world, 0, 0, 5, 5, 0, 63, None);
             Ok(())
         }).expect("delete chunk (0,0)");
 
         // Edit 2: delete a rect spanning all four chunks.
-        with_edit(&mut ws, "delete", (0, 0, 31, 31), (0, 0, 31, 31), |world| {
+        with_edit(&mut ws, "delete", (0, 0, 31, 31), |world| {
             delete_blocks_inner(world, 0, 0, 31, 31, 0, 63, None);
             Ok(())
         }).expect("delete all chunks");
@@ -12384,22 +13381,32 @@ mod tests {
         let expected_header = world.bytes[0..192] != original[0..192];
 
         let actual_chunks: std::collections::HashSet<(i32, i32)> =
-            ws.dirty.since_disk.iter().copied().collect();
+            ws.dirty.since_disk.keys().copied().collect();
         assert_eq!(actual_chunks, expected_chunks,
             "since_disk must equal the ground-truth changed-chunk set");
         assert_eq!(ws.dirty.header_disk, expected_header,
             "header_disk must equal the ground-truth header diff");
+        // Band level (18.13): every band whose bytes actually changed must be in the mask, in every
+        // set. (The mask may over-mark — a `Full` delta covers its lowest..highest band — but never
+        // under-mark: that is data loss.)
+        for set in [&ws.dirty.since_disk, &ws.dirty.since_journal, &ws.dirty.since_base, &ws.dirty.since_load] {
+            assert_bands_cover_diff(world, &original, set);
+        }
 
         // since_journal and since_base track the same events in Stage 1 (nothing yet clears them
         // independently), so they must agree with since_disk too.
         let journal_chunks: std::collections::HashSet<(i32, i32)> =
-            ws.dirty.since_journal.iter().copied().collect();
+            ws.dirty.since_journal.keys().copied().collect();
         let base_chunks: std::collections::HashSet<(i32, i32)> =
-            ws.dirty.since_base.iter().copied().collect();
+            ws.dirty.since_base.keys().copied().collect();
         assert_eq!(journal_chunks, expected_chunks);
         assert_eq!(base_chunks, expected_chunks);
+        let load_chunks: std::collections::HashSet<(i32, i32)> =
+            ws.dirty.since_load.keys().copied().collect();
+        assert_eq!(load_chunks, expected_chunks);
         assert_eq!(ws.dirty.header_journal, expected_header);
         assert_eq!(ws.dirty.header_base, expected_header);
+        assert_eq!(ws.dirty.header_load, expected_header);
     }
 
     /// A `WorldState` wired up like a freshly-`load_world`'d one, with a real on-disk staged temp
@@ -12430,9 +13437,10 @@ mod tests {
     /// §3 ground truth — with the world mapped MAP_SHARED over the staged temp, the autosave base is
     /// a clone of a file that edits are actively mutating, so it can be captured torn. What keeps
     /// recovery correct is `autosave_world_inner`'s step-0 ordering: the clone happens *before* the
-    /// tick's spans are captured, and `since_base` is monotone, so every chunk where the temp has
-    /// diverged from the as-loaded image is guaranteed to be in `since_base` (hence in the journal,
-    /// hence fully overwritten on replay).
+    /// tick's spans are captured, and `since_load` is monotone, so every chunk where the temp has
+    /// diverged from the as-loaded image is guaranteed to be in `since_load` (hence in a Clone
+    /// lineage's journal, hence fully overwritten on replay). These fixtures have no `DiskImage`,
+    /// so every tick here takes the Clone lineage.
     ///
     /// Asserts both halves: the containment property directly, and that recovery is still
     /// byte-identical. Reversing step 0 back below the read guard leaves this test's containment
@@ -12457,7 +13465,7 @@ mod tests {
         for round in 0..2 {
             if round == 1 {
                 // Edits (incl. a header write) land in the shared mapping only.
-                with_edit(&mut ws, "delete", (0, 0, 5, 5), (0, 0, 5, 5), |world| {
+                with_edit(&mut ws, "delete", (0, 0, 5, 5), |world| {
                     delete_blocks_inner(world, 0, 0, 5, 5, 0, 63, None);
                     Ok(())
                 }).expect("edit");
@@ -12480,7 +13488,7 @@ mod tests {
         }
         // Editing after a save must not disturb the already-saved (possibly cloned) destination.
         let saved_before = fs::read(dir.join("new_1.eden")).unwrap();
-        with_edit(&mut ws, "delete", (16, 0, 20, 5), (16, 0, 20, 5), |world| {
+        with_edit(&mut ws, "delete", (16, 0, 20, 5), |world| {
             delete_blocks_inner(world, 16, 0, 20, 5, 0, 63, None);
             Ok(())
         }).expect("edit after save");
@@ -12493,6 +13501,184 @@ mod tests {
         save_world_progress(world, fb.to_str().unwrap(), false, None, Some(&stale)).expect("fallback save");
         assert!(fs::read(&fb).unwrap() == world.bytes[..], "fallback must write the mapping");
         drop(ws);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Every band of `world` that differs from `original` is in `set`'s mask for that chunk, and no
+    /// chunk is marked that didn't change (masks may over-mark bands, never chunks).
+    fn assert_bands_cover_diff(world: &LoadedWorld, original: &[u8], set: &DirtyMap) {
+        for &(cx, cy) in world.chunk_map.keys() {
+            let (addr, end) = world.chunk_range(cx, cy).unwrap();
+            let mask = set.get(&(cx, cy)).copied().unwrap_or_default();
+            let changed = world.bytes[addr..end] != original[addr..end];
+            assert_eq!(mask != BandMask::default(), changed, "chunk ({cx},{cy}) marked iff it changed");
+            for b in 0..(end - addr).div_ceil(BAND_SPAN) {
+                let (lo, hi) = (addr + b * BAND_SPAN, (addr + (b + 1) * BAND_SPAN).min(end));
+                if world.bytes[lo..hi] != original[lo..hi] {
+                    assert!(mask.contains(b), "chunk ({cx},{cy}) band {b} changed but is not in its mask");
+                }
+            }
+        }
+    }
+
+    /// Replay a journal file and return its `(file_off, cx, cy, payload_len)` records.
+    fn journal_records(path: &std::path::Path, base_len: u64) -> Vec<(u64, i32, i32, usize)> {
+        let bytes = fs::read(path).expect("read journal");
+        journal::replay(&bytes, base_len).expect("replay").spans.iter()
+            .map(|s| (s.file_off, s.cx, s.cy, s.payload.len())).collect()
+    }
+
+    #[test]
+    fn test_band_mask_runs_and_range() {
+        assert_eq!(BandMask::default().runs().count(), 0);
+        let m = BandMask::band(2) | BandMask::band(3) | BandMask::band(5) | BandMask::band(15);
+        assert_eq!(m.runs().collect::<Vec<_>>(), vec![(2, 3), (5, 5), (15, 15)]);
+        assert_eq!(BandMask::ALL.runs().collect::<Vec<_>>(), vec![(0, 15)]);
+        assert_eq!(BandMask::range(0, 15), BandMask::ALL);
+        assert_eq!(BandMask::range(3, 5).runs().collect::<Vec<_>>(), vec![(3, 5)]);
+        assert!(BandMask::range(3, 5).contains(4) && !BandMask::range(3, 5).contains(6));
+    }
+
+    #[test]
+    fn test_chunk_delta_band_mask() {
+        let b = BAND_SPAN as u32;
+        let sparse = ChunkDelta::Sparse(vec![(3, 1), (b * 2 + 7, 1), (b * 2 + 9, 1), (b * 5, 1)]);
+        assert_eq!(sparse.band_mask().runs().collect::<Vec<_>>(), vec![(0, 0), (2, 2), (5, 5)]);
+        // A dense delta covers every band its bytes touch, inclusive of the last byte's band.
+        let full = ChunkDelta::Full(b * 3, vec![0; (b * 2) as usize]);
+        assert_eq!(full.band_mask().runs().collect::<Vec<_>>(), vec![(3, 4)]);
+        let full = ChunkDelta::Full(b * 3 + 5, vec![0; b as usize]);
+        assert_eq!(full.band_mask().runs().collect::<Vec<_>>(), vec![(3, 4)]);
+        assert_eq!(ChunkDelta::FullZ(b, vec![], b * 2).band_mask().runs().collect::<Vec<_>>(), vec![(1, 2)]);
+    }
+
+    /// `BandMask::ALL` on a 64z world (4 bands) must clamp to the chunk's real span — no spans past
+    /// `chunk_range`, and `dirty_bytes` counts 4 bands, not 16.
+    #[test]
+    fn test_dirty_spans_clamp_to_the_chunk_span() {
+        let ws = ws_with(make_bumpy_world_grid(2, 8, |_, _| 20));
+        let world = ws.world.as_ref().unwrap();
+        let mut dirty = DirtyMap::default();
+        dirty.insert((1, 0), BandMask::ALL);
+        let (addr, end) = world.chunk_range(1, 0).unwrap();
+        let spans = dirty_spans(world, &dirty);
+        assert_eq!(spans.len(), 1);
+        assert_eq!((spans[0].0 as usize, spans[0].3.len()), (addr, end - addr));
+        assert_eq!(dirty_bytes(world, &dirty), (end - addr) as u64);
+        // A run that starts past the end is skipped rather than slicing out of range.
+        dirty.insert((1, 0), BandMask::band(9));
+        assert!(dirty_spans(world, &dirty).is_empty());
+    }
+
+    /// One block in band 3 of a 256z chunk → one 8 KB journal record, and the incremental save and
+    /// the WAL carry that one band; the saved file still equals a full save.
+    #[test]
+    fn test_band_dirty_one_block_edit_256z() {
+        let dir = stage4_dir("band_one_block");
+        let original = cow_world(2, 16, |x, y| 30 + (x * 7 + y * 3) % 40);
+        let dest = dir.join("world.eden");
+        let mut ws = ws_with_disk_image(original.clone(), &dest);
+        let staged = dir.join("staged.eden");
+        fs::write(&staged, &original).unwrap();
+        ws.temp_path = Some(staged);
+        let state: AppState = RwLock::new(ws);
+        let paths = autosave_paths_at(&dir);
+
+        {
+            let mut ws = write_ws(&state);
+            with_edit(&mut ws, "paint", (3, 3, 3, 3), |world| {
+                set_block_abs(world, 3, 3, 50, 7, 3); // z=50 → band 3
+                Ok(())
+            }).expect("edit");
+            let m = ws.dirty.since_disk[&(0, 0)];
+            assert_eq!(m.runs().collect::<Vec<_>>(), vec![(3, 3)], "a one-block edit dirties exactly band 3");
+            assert_eq!(ws.dirty.since_disk.len(), 1);
+        }
+
+        autosave_world_inner(&state, &paths, None, None).expect("autosave tick");
+        let base_len = read_ws(&state).world.as_ref().unwrap().bytes.len() as u64;
+        let recs = journal_records(&paths.journal, base_len);
+        assert_eq!(recs.len(), 1, "one journal record");
+        assert_eq!((recs[0].1, recs[0].2, recs[0].3), (0, 0, BAND_SPAN), "…covering one 8 KB band of chunk (0,0)");
+
+        // The in-place save: same span, byte-identical result to a full save.
+        assert!(try_incremental_save(&state, dest.to_str().unwrap(), false).expect("incremental save"));
+        let expected = world_bytes(&read_ws(&state));
+        assert_eq!(fs::read(&dest).unwrap(), expected);
+        let full = dir.join("full.eden");
+        save_world_inner(read_ws(&state).world.as_ref().unwrap(), full.to_str().unwrap(), false).expect("full save");
+        assert_eq!(fs::read(&dest).unwrap(), fs::read(&full).unwrap());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// An edit touching bands 2 and 5 only → two runs, two records, and nothing in between.
+    #[test]
+    fn test_band_dirty_two_separate_bands_make_two_records() {
+        let dir = stage4_dir("band_two_runs");
+        let original = cow_world(2, 16, |x, y| 30 + (x * 7 + y * 3) % 40);
+        let staged = dir.join("staged.eden");
+        let paths = autosave_paths_at(&dir);
+        let state: AppState = RwLock::new(ws_with_temp_path(original.clone(), &staged));
+
+        {
+            let mut ws = write_ws(&state);
+            with_edit(&mut ws, "paint", (3, 3, 4, 3), |world| {
+                set_block_abs(world, 3, 3, 40, 7, 3); // band 2
+                set_block_abs(world, 4, 3, 85, 7, 3); // band 5
+                Ok(())
+            }).expect("edit");
+            let m = ws.dirty.since_journal[&(0, 0)];
+            assert_eq!(m.runs().collect::<Vec<_>>(), vec![(2, 2), (5, 5)]);
+        }
+        autosave_world_inner(&state, &paths, None, None).expect("autosave tick");
+        let base_len = read_ws(&state).world.as_ref().unwrap().bytes.len() as u64;
+        let recs = journal_records(&paths.journal, base_len);
+        assert_eq!(recs.len(), 2);
+        let (addr, _) = read_ws(&state).world.as_ref().unwrap().chunk_range(0, 0).unwrap();
+        assert_eq!(recs[0], ((addr + 2 * BAND_SPAN) as u64, 0, 0, BAND_SPAN));
+        assert_eq!(recs[1], ((addr + 5 * BAND_SPAN) as u64, 0, 0, BAND_SPAN));
+
+        // Recovery from those two records reproduces the world.
+        let expected = world_bytes(&read_ws(&state));
+        let fresh: AppState = RwLock::new(WorldState::new());
+        load_autosave_inner(&fresh, &paths).expect("recover");
+        assert!(world_bytes(&read_ws(&fresh)) == expected);
+        if let Some(t) = read_ws(&fresh).temp_path.clone() { let _ = fs::remove_file(t); }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Undo marks the *inverse's* bands: edit band 3, save, undo → the next incremental save owes
+    /// band 3 of that chunk and nothing else.
+    #[test]
+    fn test_band_dirty_undo_marks_the_inverse_bands() {
+        let dir = stage4_dir("band_undo");
+        let original = cow_world(2, 16, |x, y| 30 + (x * 7 + y * 3) % 40);
+        let dest = dir.join("world.eden");
+        let state: AppState = RwLock::new(ws_with_disk_image(original.clone(), &dest));
+        {
+            let mut ws = write_ws(&state);
+            with_edit(&mut ws, "paint", (3, 3, 3, 3), |world| {
+                set_block_abs(world, 3, 3, 50, 7, 3);
+                Ok(())
+            }).expect("edit");
+        }
+        assert!(try_incremental_save(&state, dest.to_str().unwrap(), false).expect("save"));
+        assert!(read_ws(&state).dirty.since_disk.is_empty());
+
+        undo_edit_inner(&mut write_ws(&state)).expect("undo");
+        {
+            let ws = read_ws(&state);
+            assert_eq!(ws.dirty.since_disk.len(), 1);
+            assert_eq!(ws.dirty.since_disk[&(0, 0)].runs().collect::<Vec<_>>(), vec![(3, 3)],
+                "undo re-dirties exactly the band it rewrote");
+        }
+        assert!(try_incremental_save(&state, dest.to_str().unwrap(), false).expect("save after undo"));
+        assert!(fs::read(&dest).unwrap() == original, "the reverted bytes reach the file");
+        // And redo marks it again.
+        redo_edit_inner(&mut write_ws(&state)).expect("redo");
+        assert_eq!(read_ws(&state).dirty.since_disk[&(0, 0)].runs().collect::<Vec<_>>(), vec![(3, 3)]);
+
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -12511,11 +13697,11 @@ mod tests {
         // again while the temp in between did not) — plus a header write.
         {
             let mut ws = write_ws(&state);
-            with_edit(&mut ws, "delete", (0, 0, 5, 5), (0, 0, 5, 5), |world| {
+            with_edit(&mut ws, "delete", (0, 0, 5, 5), |world| {
                 delete_blocks_inner(world, 0, 0, 5, 5, 0, 63, None);
                 Ok(())
             }).expect("edit 1");
-            with_edit(&mut ws, "delete", (16, 0, 20, 5), (16, 0, 20, 5), |world| {
+            with_edit(&mut ws, "delete", (16, 0, 20, 5), |world| {
                 delete_blocks_inner(world, 16, 0, 20, 5, 0, 63, None);
                 Ok(())
             }).expect("edit 2");
@@ -12543,13 +13729,22 @@ mod tests {
             for &(cx, cy) in world.chunk_map.keys() {
                 let (addr, end) = world.chunk_range(cx, cy).unwrap();
                 if temp_on_disk[addr..end] != original[addr..end] {
-                    assert!(ws.dirty.since_base.contains(&(cx, cy)),
-                        "chunk ({cx},{cy}) diverged in the shared temp but is missing from since_base — \
+                    assert!(ws.dirty.since_load.contains_key(&(cx, cy)),
+                        "chunk ({cx},{cy}) diverged in the shared temp but is missing from since_load — \
                          the autosave base can be torn there with nothing in the journal to repair it");
+                    // Band level (18.13): every diverged band, not just the chunk.
+                    let mask = ws.dirty.since_load[&(cx, cy)];
+                    for b in 0..(end - addr).div_ceil(BAND_SPAN) {
+                        let (lo, hi) = (addr + b * BAND_SPAN, (addr + (b + 1) * BAND_SPAN).min(end));
+                        if temp_on_disk[lo..hi] != original[lo..hi] {
+                            assert!(mask.contains(b), "chunk ({cx},{cy}) band {b} diverged in the shared temp \
+                                but is missing from since_load");
+                        }
+                    }
                 }
             }
             if temp_on_disk[0..192] != original[0..192] {
-                assert!(ws.dirty.header_base, "header diverged in the shared temp but header_base is false");
+                assert!(ws.dirty.header_load, "header diverged in the shared temp but header_load is false");
             }
         }
 
@@ -12584,7 +13779,7 @@ mod tests {
         // Tick 1: a single chunk edit, then autosave — establishes the base image + journal.
         {
             let mut ws = write_ws(&state);
-            with_edit(&mut ws, "delete", (0, 0, 5, 5), (0, 0, 5, 5), |world| {
+            with_edit(&mut ws, "delete", (0, 0, 5, 5), |world| {
                 delete_blocks_inner(world, 0, 0, 5, 5, 0, 63, None);
                 Ok(())
             }).expect("edit 1");
@@ -12603,7 +13798,7 @@ mod tests {
         // but its final bytes are back to the pristine original for that chunk.
         {
             let mut ws = write_ws(&state);
-            with_edit(&mut ws, "delete", (16, 0, 20, 5), (16, 0, 20, 5), |world| {
+            with_edit(&mut ws, "delete", (16, 0, 20, 5), |world| {
                 delete_blocks_inner(world, 16, 0, 20, 5, 0, 63, None);
                 Ok(())
             }).expect("edit 2");
@@ -12649,7 +13844,7 @@ mod tests {
         // Tick 1: touch chunk (0,0) only, establish base + journal.
         {
             let mut ws = write_ws(&state);
-            with_edit(&mut ws, "delete", (0, 0, 5, 5), (0, 0, 5, 5), |world| {
+            with_edit(&mut ws, "delete", (0, 0, 5, 5), |world| {
                 delete_blocks_inner(world, 0, 0, 5, 5, 0, 63, None);
                 Ok(())
             }).expect("edit 1");
@@ -12657,18 +13852,24 @@ mod tests {
         autosave_world_inner(&state, &paths, None, None).expect("autosave tick 1");
         let base_len = fs::metadata(&paths.base).unwrap().len();
 
-        // Before tick 2: re-touch chunk (0,0) and touch chunk (1,0) — 2 chunks * 32768B chunk_size
-        // comfortably exceeds base_len/4 for this small fixture, forcing the compact branch.
+        // Before tick 2: re-touch chunk (0,0) and touch chunks (1,0) and (0,1). The terrain tops out
+        // at z=20, so each chunk dirties bands 0..=1 (16 KB): 3 chunks × 16 KB exceeds base_len/4
+        // for this small fixture, forcing the compact branch (band-granular since 18.13 — two
+        // chunks' worth no longer does).
         {
             let mut ws = write_ws(&state);
-            with_edit(&mut ws, "delete", (0, 0, 8, 8), (0, 0, 8, 8), |world| {
+            with_edit(&mut ws, "delete", (0, 0, 8, 8), |world| {
                 delete_blocks_inner(world, 0, 0, 8, 8, 0, 63, None);
                 Ok(())
             }).expect("edit 2");
-            with_edit(&mut ws, "delete", (16, 0, 20, 5), (16, 0, 20, 5), |world| {
+            with_edit(&mut ws, "delete", (16, 0, 20, 5), |world| {
                 delete_blocks_inner(world, 16, 0, 20, 5, 0, 63, None);
                 Ok(())
             }).expect("edit 3");
+            with_edit(&mut ws, "delete", (0, 16, 5, 20), |world| {
+                delete_blocks_inner(world, 0, 16, 5, 20, 0, 63, None);
+                Ok(())
+            }).expect("edit 4");
         }
         autosave_world_inner(&state, &paths, None, None).expect("autosave tick 2 (compaction)");
 
@@ -12678,8 +13879,8 @@ mod tests {
         let distinct: std::collections::HashSet<(i32, i32)> =
             replay.spans.iter().map(|s| (s.cx, s.cy)).collect();
         assert_eq!(replay.spans.len(), distinct.len(),
-            "a compacted journal must carry exactly one span per dirty chunk, not one per edit");
-        assert_eq!(distinct, std::collections::HashSet::from([(0, 0), (1, 0)]));
+            "a compacted journal must carry exactly one span per dirty chunk (here one band run each), not one per edit");
+        assert_eq!(distinct, std::collections::HashSet::from([(0, 0), (1, 0), (0, 1)]));
 
         let expected = world_bytes(&read_ws(&state));
         let fresh: AppState = RwLock::new(WorldState::new());
@@ -12706,7 +13907,7 @@ mod tests {
 
         let edit = |x0: i32, x1: i32| {
             let mut ws = write_ws(&state);
-            with_edit(&mut ws, "delete", (x0, 0, x1, 5), (x0, 0, x1, 5), |world| {
+            with_edit(&mut ws, "delete", (x0, 0, x1, 5), |world| {
                 delete_blocks_inner(world, x0, 0, x1, 5, 0, 63, None);
                 Ok(())
             }).expect("edit");
@@ -12725,7 +13926,11 @@ mod tests {
 
         edit(16, 20);
         autosave_world_inner(&state, &paths, None, None).expect("tick after discard must succeed");
-        assert!(paths.base.exists() && paths.journal.exists(), "the tick must re-establish its lineage");
+        assert!(paths.journal.exists(), "the tick must re-establish its lineage");
+        // 18.9: the saved file is a known-good image of the world, so the new lineage builds on it
+        // (Source) instead of re-copying the world into `autosave.base.eden`.
+        assert!(!paths.base.exists(), "a Source lineage needs no base clone");
+        assert!(matches!(read_ws(&state).autosave.as_ref().map(|l| &l.base), Some(AutosaveBase::Source(_))));
 
         let expected = world_bytes(&read_ws(&state));
         let fresh: AppState = RwLock::new(WorldState::new());
@@ -12753,7 +13958,7 @@ mod tests {
 
         {
             let mut ws = write_ws(&state);
-            with_edit(&mut ws, "delete", (0, 0, 5, 5), (0, 0, 5, 5), |world| {
+            with_edit(&mut ws, "delete", (0, 0, 5, 5), |world| {
                 delete_blocks_inner(world, 0, 0, 5, 5, 0, 63, None);
                 Ok(())
             }).expect("edit");
@@ -12766,13 +13971,15 @@ mod tests {
             let ws = read_ws(&state);
             let world = ws.world.as_ref().unwrap();
             let (addr, end) = world.chunk_range(0, 0).expect("chunk (0,0) must exist");
-            let base_id = ws.autosave_base_id.expect("the tick records its base lineage");
+            let base_id = ws.autosave.as_ref().expect("the tick records its base lineage").base_id;
             let mut buf = journal::JournalHeader::new(true, world.bytes.len() as u64, base_id)
                 .encode().to_vec();
             buf.extend(journal::encode_span_record(
                 0, journal::HEADER_SPAN.0, journal::HEADER_SPAN.1, &world.bytes[0..192], true).unwrap());
+            // Bands 0..=1 only (terrain tops out at z=20): one record per dirty band run, 18.13.
+            let run_end = (addr + 2 * BAND_SPAN).min(end);
             buf.extend(journal::encode_span_record(
-                addr as u64, 0, 0, &world.bytes[addr..end], true).unwrap());
+                addr as u64, 0, 0, &world.bytes[addr..run_end], true).unwrap());
             buf
         };
 
@@ -12794,6 +14001,8 @@ mod tests {
     fn test_autosave_discharge_ignores_a_stale_capture() {
         let state: AppState = RwLock::new(ws_with(make_bumpy_world_grid(2, 8, |_, _| 20)));
         let base_id = random_base_id();
+        let lineage = AutosaveLineage { base_id, base: AutosaveBase::Clone, journal_written: false };
+        let gen = read_ws(&state).lineage_gen;
 
         // Stand in for a tick that captured the world at `stale`, having flushed chunk (0,0).
         {
@@ -12807,7 +14016,7 @@ mod tests {
         // retain got wrong.
         {
             let mut ws = write_ws(&state);
-            with_edit(&mut ws, "delete", (0, 0, 5, 5), (0, 0, 5, 5), |world| {
+            with_edit(&mut ws, "delete", (0, 0, 5, 5), |world| {
                 delete_blocks_inner(world, 0, 0, 5, 5, 0, 63, None);
                 Ok(())
             }).expect("edit landing 'during' the autosave");
@@ -12815,14 +14024,14 @@ mod tests {
             ws.dirty.mark_header();
         }
 
-        discharge_autosave_journal(&state, base_id, stale);
+        discharge_autosave_journal(&state, gen, lineage, stale);
 
         let ws = read_ws(&state);
-        assert!(ws.dirty.since_journal.contains(&(0, 0)),
+        assert!(ws.dirty.since_journal.contains_key(&(0, 0)),
             "a chunk re-dirtied after the capture must stay owed to the journal — clearing it would \
              drop that edit from crash recovery");
         assert!(ws.dirty.header_journal, "a header re-written after the capture is still owed too");
-        assert_eq!(ws.autosave_base_id, Some(base_id),
+        assert_eq!(ws.autosave.as_ref().map(|l| l.base_id), Some(base_id),
             "the base lineage is recorded regardless: gating it would make the next tick re-clone a \
              multi-GB base image for nothing");
     }
@@ -12834,6 +14043,8 @@ mod tests {
     fn test_autosave_discharge_clears_on_a_matching_capture() {
         let state: AppState = RwLock::new(ws_with(make_bumpy_world_grid(2, 8, |_, _| 20)));
         let base_id = random_base_id();
+        let lineage = AutosaveLineage { base_id, base: AutosaveBase::Clone, journal_written: false };
+        let gen = read_ws(&state).lineage_gen;
         {
             let mut ws = write_ws(&state);
             ws.dirty.mark_chunks([(0, 0), (1, 0)]);
@@ -12841,17 +14052,336 @@ mod tests {
         }
         let seq = read_ws(&state).dirty.seq;
 
-        discharge_autosave_journal(&state, base_id, seq);
+        discharge_autosave_journal(&state, gen, lineage, seq);
 
         let ws = read_ws(&state);
         assert!(ws.dirty.since_journal.is_empty(), "a clean capture discharges every journalled chunk");
         assert!(!ws.dirty.header_journal);
-        assert_eq!(ws.autosave_base_id, Some(base_id));
-        // `since_disk`/`since_base` advance on their own cadence and must be untouched by a journal
-        // flush — the whole reason `DirtyState` carries three independent sets.
+        let recorded = ws.autosave.as_ref().expect("lineage recorded");
+        assert_eq!(recorded.base_id, base_id);
+        assert!(recorded.journal_written, "a discharged lineage has a journal on disk");
+        // `since_disk`/`since_base`/`since_load` advance on their own cadence and must be untouched
+        // by a journal flush — the whole reason `DirtyState` carries independent sets.
         assert_eq!(ws.dirty.since_disk.len(), 2, "a journal flush must not discharge the save path");
         assert_eq!(ws.dirty.since_base.len(), 2, "nor the base-image compaction accounting");
-        assert!(ws.dirty.header_disk && ws.dirty.header_base);
+        assert_eq!(ws.dirty.since_load.len(), 2);
+        assert!(ws.dirty.header_disk && ws.dirty.header_base && ws.dirty.header_load);
+    }
+
+    // ── 18.9: autosave re-based on the saved file ────────────────────────────────────────────────
+
+    /// A session wired like a non-zip `load_world`: the world file on disk at `<dir>/world.eden`,
+    /// recorded as the `DiskImage`, plus a staged temp for the Clone fallback. The temp is written
+    /// once and never follows edits (the world is an anonymous mapping), i.e. the MAP_PRIVATE shape —
+    /// so any Clone fallback in these tests only recovers correctly if it journals `since_load`.
+    fn rebase_session(name: &str, chunks_side: i32) -> (AppState, std::path::PathBuf, AutosavePaths, std::path::PathBuf) {
+        let dir = stage4_dir(&format!("rebase_{name}"));
+        let bytes = make_bumpy_world_grid(chunks_side, 8, |_, _| 20);
+        let source = dir.join("world.eden");
+        let staged = dir.join("staged.eden");
+        let mut ws = ws_with_disk_image(bytes.clone(), &source);
+        fs::write(&staged, &bytes).expect("stage temp");
+        ws.temp_path = Some(staged);
+        let paths = autosave_paths_at(&dir.join("appdata"));
+        fs::create_dir_all(dir.join("appdata")).unwrap();
+        (RwLock::new(ws), source, paths, dir)
+    }
+
+    /// Delete a 5×5 column stack inside chunk `(cx, 0)`.
+    fn rebase_edit(state: &AppState, cx: i32) {
+        let x0 = cx * 16;
+        let mut ws = write_ws(state);
+        with_edit(&mut ws, "delete", (x0, 0, x0 + 4, 4), |world| {
+            delete_blocks_inner(world, x0, 0, x0 + 4, 4, 0, 63, None);
+            Ok(())
+        }).expect("edit");
+    }
+
+    /// What `save_world` does for a full save, minus the `AppHandle`: write, record, re-base.
+    fn rebase_full_save(state: &AppState, paths: &AutosavePaths, dest: &std::path::Path, compressed: bool) {
+        let seq = read_ws(state).dirty.seq;
+        {
+            let ws = read_ws(state);
+            let world = ws.world.as_ref().unwrap();
+            if compressed {
+                save_world_compressed(world, dest.to_str().unwrap(), false, None).expect("compressed save");
+            } else {
+                save_world_progress(world, dest.to_str().unwrap(), false, None, None).expect("full save");
+            }
+        }
+        record_full_write(state, dest, compressed, seq).expect("record_full_write");
+        rebase_after_save_inner(state, paths, dest, compressed, seq);
+    }
+
+    /// Recover into a fresh state, assert it equals `expected`, and return that state.
+    fn rebase_recover(paths: &AutosavePaths, expected: &[u8]) -> AppState {
+        let fresh: AppState = RwLock::new(WorldState::new());
+        load_autosave_inner(&fresh, paths).expect("recovery");
+        assert!(world_bytes(&read_ws(&fresh)) == expected, "recovered world must equal the last-ticked world");
+        fresh
+    }
+
+    fn rebase_cleanup(fresh: Option<AppState>, dir: &std::path::Path) {
+        if let Some(f) = fresh {
+            if let Some(t) = read_ws(&f).temp_path.clone() { let _ = fs::remove_file(t); }
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    fn journal_coords(paths: &AutosavePaths, base_len: u64) -> std::collections::HashSet<(i32, i32)> {
+        let bytes = fs::read(&paths.journal).expect("read journal");
+        journal::replay(&bytes, base_len).expect("replay").spans.iter().map(|s| (s.cx, s.cy)).collect()
+    }
+
+    fn meta_base(paths: &AutosavePaths) -> AutosaveBase {
+        let info: AutosaveInfo = serde_json::from_str(&fs::read_to_string(&paths.meta).unwrap()).unwrap();
+        assert_eq!(info.format, 2);
+        info.base.expect("format 2 names its base")
+    }
+
+    /// 18.9 phase 0 — a tick whose I/O straddles a discard must not resurrect the deleted lineage.
+    #[test]
+    fn test_discharge_ignores_a_stale_lineage_generation() {
+        let (state, _src, paths, dir) = rebase_session("stale_gen", 2);
+        rebase_edit(&state, 0);
+        let gen = read_ws(&state).lineage_gen;
+        let seq = read_ws(&state).dirty.seq;
+        discard_autosave_inner(&state, &paths); // lands while the tick is between capture and discharge
+        let lineage = AutosaveLineage { base_id: random_base_id(), base: AutosaveBase::Clone, journal_written: false };
+        discharge_autosave_journal(&state, gen, lineage, seq);
+        let ws = read_ws(&state);
+        assert!(ws.autosave.is_none(), "a discharge from before the discard must not restore its lineage");
+        assert!(ws.dirty.since_journal.contains_key(&(0, 0)), "nor clear what it journalled into deleted files");
+        drop(ws);
+        rebase_cleanup(None, &dir);
+    }
+
+    /// Tests 1 + phase 3: the first tick after a raw load writes no base copy; recovery keeps the
+    /// Source lineage and makes ⌘S an incremental patch of the user's file.
+    #[test]
+    fn test_autosave_source_lineage_needs_no_clone() {
+        let (state, source, paths, dir) = rebase_session("no_clone", 2);
+        rebase_edit(&state, 1);
+        autosave_world_inner(&state, &paths, None, None).expect("tick");
+        assert!(!paths.base.exists(), "a Source lineage must not copy the world");
+        assert!(matches!(meta_base(&paths), AutosaveBase::Source(ref id) if id.path == source));
+        let info = autosave_info_at(&paths).unwrap().expect("offered for recovery");
+        assert_eq!(info.base_status, Some(BaseStatus::Ok));
+
+        let expected = world_bytes(&read_ws(&state));
+        let fresh = rebase_recover(&paths, &expected);
+        {
+            let ws = read_ws(&fresh);
+            assert!(matches!(ws.autosave.as_ref().map(|l| &l.base), Some(AutosaveBase::Source(_))));
+            let disk: std::collections::HashSet<_> = ws.dirty.since_disk.keys().copied().collect();
+            assert_eq!(disk, std::collections::HashSet::from([(1, 0)]), "since_disk = exactly the replayed chunks");
+        }
+        assert!(try_incremental_save(&fresh, source.to_str().unwrap(), false).expect("save after recovery"),
+            "a recovered Source session saves incrementally");
+        assert!(fs::read(&source).unwrap() == expected);
+        rebase_cleanup(Some(fresh), &dir);
+    }
+
+    /// Tests 2 + 4: every save re-bases, so the journal (and any compaction) only ever holds edits
+    /// since the last save — the P-1b regression guard.
+    #[test]
+    fn test_autosave_rebases_on_full_save_and_compaction_is_bounded() {
+        let (state, source, paths, dir) = rebase_session("full", 3); // 9 chunks
+        let base_len = world_bytes(&read_ws(&state)).len() as u64;
+        rebase_edit(&state, 0);
+        autosave_world_inner(&state, &paths, None, None).expect("tick 1");
+        rebase_full_save(&state, &paths, &source, false);
+        assert!(!paths.meta.exists() && !paths.journal.exists(), "the re-base removes the old sidecars");
+        assert!(read_ws(&state).dirty.since_base.is_empty(), "a seq-clean save resets since_base");
+        assert!(read_ws(&state).dirty.since_load.contains_key(&(0, 0)), "since_load is never reset by a save");
+
+        rebase_edit(&state, 1);
+        autosave_world_inner(&state, &paths, None, None).expect("tick after save");
+        assert_eq!(journal_coords(&paths, base_len), std::collections::HashSet::from([(1, 0)]));
+
+        // Three more chunks in one tick push past base_len/4 and force a compaction.
+        { let mut ws = write_ws(&state); ws.dirty.mark_chunks([(0, 1), (1, 1), (2, 1)]); }
+        autosave_world_inner(&state, &paths, None, None).expect("compacting tick");
+        let coords = journal_coords(&paths, base_len);
+        assert!(!coords.contains(&(0, 0)), "compaction must not re-journal a chunk the save already holds");
+        assert_eq!(coords.len(), 4);
+        assert!(!paths.base.exists(), "no base copy at any point");
+
+        let fresh = rebase_recover(&paths, &world_bytes(&read_ws(&state)));
+        rebase_cleanup(Some(fresh), &dir);
+    }
+
+    /// Test 3: the same through an incremental save.
+    #[test]
+    fn test_autosave_rebases_on_incremental_save() {
+        let (state, source, paths, dir) = rebase_session("incr", 2);
+        let base_len = world_bytes(&read_ws(&state)).len() as u64;
+        rebase_edit(&state, 0);
+        autosave_world_inner(&state, &paths, None, None).expect("tick 1");
+        let seq = try_incremental_save_seq(&state, source.to_str().unwrap(), false).unwrap().expect("incremental");
+        rebase_after_save_inner(&state, &paths, &source, false, seq);
+        rebase_edit(&state, 1);
+        autosave_world_inner(&state, &paths, None, None).expect("tick 2");
+        assert_eq!(journal_coords(&paths, base_len), std::collections::HashSet::from([(1, 0)]));
+        let fresh = rebase_recover(&paths, &world_bytes(&read_ws(&state)));
+        rebase_cleanup(Some(fresh), &dir);
+    }
+
+    /// Test 5: an edit landing between the save's capture and its re-base keeps `since_base`.
+    #[test]
+    fn test_rebase_keeps_since_base_when_seq_moved() {
+        let (state, source, paths, dir) = rebase_session("seq_moved", 2);
+        rebase_edit(&state, 0);
+        let seq = read_ws(&state).dirty.seq;
+        {
+            let ws = read_ws(&state);
+            save_world_progress(ws.world.as_ref().unwrap(), source.to_str().unwrap(), false, None, None).unwrap();
+        }
+        rebase_edit(&state, 1); // lands after the capture
+        record_full_write(&state, &source, false, seq).unwrap();
+        rebase_after_save_inner(&state, &paths, &source, false, seq);
+        {
+            let ws = read_ws(&state);
+            assert!(ws.dirty.since_base.contains_key(&(0, 0)) && ws.dirty.since_base.contains_key(&(1, 0)),
+                "a moved seq leaves since_base over-approximate");
+            assert!(matches!(ws.autosave.as_ref().map(|l| &l.base), Some(AutosaveBase::Source(_))),
+                "the lineage is re-based regardless");
+        }
+        autosave_world_inner(&state, &paths, None, None).expect("tick");
+        let fresh = rebase_recover(&paths, &world_bytes(&read_ws(&state)));
+        rebase_cleanup(Some(fresh), &dir);
+    }
+
+    /// Test 6: an external write *during* the session falls back to a Clone; one *after* the last
+    /// tick makes recovery refuse and keep the sidecars.
+    #[test]
+    fn test_autosave_external_modification() {
+        let (state, source, paths, dir) = rebase_session("external", 2);
+        let touch = |p: &std::path::Path| {
+            let mut b = fs::read(p).unwrap();
+            b[200] ^= 0xFF;
+            fs::write(p, &b).unwrap();
+            let f = fs::OpenOptions::new().write(true).open(p).unwrap();
+            f.set_modified(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000)).unwrap();
+        };
+        rebase_edit(&state, 0);
+        autosave_world_inner(&state, &paths, None, None).expect("tick 1");
+        touch(&source);
+        rebase_edit(&state, 1);
+        autosave_world_inner(&state, &paths, None, None).expect("tick after external write");
+        assert_eq!(meta_base(&paths), AutosaveBase::Clone, "a changed source falls back to a clone");
+        assert!(paths.base.exists());
+        let fresh = rebase_recover(&paths, &world_bytes(&read_ws(&state)));
+        rebase_cleanup(Some(fresh), &dir);
+
+        let (state, source, paths, dir) = rebase_session("external_after", 2);
+        rebase_edit(&state, 0);
+        autosave_world_inner(&state, &paths, None, None).expect("tick");
+        touch(&source);
+        assert_eq!(autosave_info_at(&paths).unwrap().unwrap().base_status, Some(BaseStatus::Changed));
+        let fresh: AppState = RwLock::new(WorldState::new());
+        let err = load_autosave_inner(&fresh, &paths).err().expect("must refuse a changed base");
+        assert!(err.contains("changed after this autosave"), "{err}");
+        assert!(paths.meta.exists() && paths.journal.exists(), "sidecars are kept");
+        rebase_cleanup(None, &dir);
+    }
+
+    /// Test 7: a missing source is reported, the sidecars survive, and putting it back recovers.
+    #[test]
+    fn test_autosave_missing_source_then_restored() {
+        let (state, source, paths, dir) = rebase_session("missing", 2);
+        rebase_edit(&state, 0);
+        autosave_world_inner(&state, &paths, None, None).expect("tick");
+        let aside = dir.join("moved.eden");
+        fs::rename(&source, &aside).unwrap();
+        assert_eq!(autosave_info_at(&paths).unwrap().unwrap().base_status, Some(BaseStatus::Missing));
+        let err = load_autosave_inner(&RwLock::new(WorldState::new()), &paths).err().expect("missing base");
+        assert!(err.contains("Can't find"), "{err}");
+        assert!(paths.meta.exists() && paths.journal.exists());
+        fs::rename(&aside, &source).unwrap(); // same inode, len and mtime
+        let fresh = rebase_recover(&paths, &world_bytes(&read_ws(&state)));
+        rebase_cleanup(Some(fresh), &dir);
+    }
+
+    /// Tests 8 + 9: a committed save WAL beside the source means a later save — roll it forward and
+    /// report "changed"; an uncommitted one is discarded and recovery proceeds.
+    #[test]
+    fn test_autosave_source_with_wal() {
+        let (state, source, paths, dir) = rebase_session("wal_commit", 2);
+        rebase_edit(&state, 0);
+        autosave_world_inner(&state, &paths, None, None).expect("tick");
+        let len = fs::metadata(&source).unwrap().len();
+        write_test_wal(&source, len, &[(300, 0, 0, vec![7u8; 16])], true);
+        assert_eq!(autosave_info_at(&paths).unwrap().unwrap().base_status, Some(BaseStatus::Changed));
+        let err = load_autosave_inner(&RwLock::new(WorldState::new()), &paths).err().expect("superseded");
+        assert!(err.contains("changed after this autosave"), "{err}");
+        assert_eq!(&fs::read(&source).unwrap()[300..316], &[7u8; 16], "the WAL was rolled forward");
+        rebase_cleanup(None, &dir);
+
+        let (state, source, paths, dir) = rebase_session("wal_torn", 2);
+        rebase_edit(&state, 0);
+        autosave_world_inner(&state, &paths, None, None).expect("tick");
+        let len = fs::metadata(&source).unwrap().len();
+        write_test_wal(&source, len, &[(300, 0, 0, vec![7u8; 16])], false);
+        assert_eq!(autosave_info_at(&paths).unwrap().unwrap().base_status, Some(BaseStatus::Ok));
+        let fresh = rebase_recover(&paths, &world_bytes(&read_ws(&state)));
+        assert!(!wal_path(&source).exists(), "an uncommitted WAL is discarded");
+        rebase_cleanup(Some(fresh), &dir);
+    }
+
+    /// Tests 10 + 11 (+ 12): no disk image (zip load) → Clone; an uncompressed Save As → Source; a
+    /// compressed save → no lineage → the next tick clones again, from a stale (MAP_PRIVATE-shaped)
+    /// temp, which only recovers because a Clone journals `since_load`.
+    #[test]
+    fn test_autosave_clone_and_source_transitions() {
+        let (state, _source, paths, dir) = rebase_session("transitions", 2);
+        write_ws(&state).disk_image = None; // as after a zip load
+        rebase_edit(&state, 0);
+        autosave_world_inner(&state, &paths, None, None).expect("zip-load tick");
+        assert_eq!(meta_base(&paths), AutosaveBase::Clone);
+        assert!(paths.base.exists());
+
+        let save_as = dir.join("saved_as.eden");
+        rebase_full_save(&state, &paths, &save_as, false);
+        rebase_edit(&state, 1);
+        autosave_world_inner(&state, &paths, None, None).expect("tick after Save As");
+        assert!(matches!(meta_base(&paths), AutosaveBase::Source(ref id) if id.path == save_as));
+        assert!(!paths.base.exists(), "the clone is gone once the lineage is Source");
+        let fresh = rebase_recover(&paths, &world_bytes(&read_ws(&state)));
+        rebase_cleanup(Some(fresh), &dir.join("never")); // keep dir for the rest
+
+        let zip = dir.join("saved.zip");
+        rebase_full_save(&state, &paths, &zip, true);
+        assert!(read_ws(&state).autosave.is_none(), "a compressed save leaves no lineage");
+        rebase_edit(&state, 1);
+        autosave_world_inner(&state, &paths, None, None).expect("tick after compressed save");
+        assert_eq!(meta_base(&paths), AutosaveBase::Clone);
+        let fresh = rebase_recover(&paths, &world_bytes(&read_ws(&state)));
+        rebase_cleanup(Some(fresh), &dir);
+    }
+
+    /// Test 14: a format-1 sidecar from an older build still recovers.
+    #[test]
+    fn test_format_1_autosave_still_recovers() {
+        let (state, _source, paths, dir) = rebase_session("format1", 2);
+        let original = world_bytes(&read_ws(&state));
+        rebase_edit(&state, 0);
+        let expected = world_bytes(&read_ws(&state));
+        fs::write(&paths.base, &original).unwrap();
+        let base_id = [3u8; 16];
+        {
+            let ws = read_ws(&state);
+            let world = ws.world.as_ref().unwrap();
+            let (addr, end) = world.chunk_range(0, 0).unwrap();
+            let spans = [(addr as u64, 0, 0, &world.bytes[addr..end])];
+            write_fresh_journal(&paths.journal, original.len() as u64, base_id, None, &spans, None).unwrap();
+        }
+        let json = format!(r#"{{"world_name":"GridTest","source_path":null,"timestamp":0,"format":1,"base_id":{:?}}}"#, base_id);
+        fs::write(&paths.meta, json).unwrap();
+        let info = autosave_info_at(&paths).unwrap().expect("format 1 offered");
+        assert!(info.base.is_none() && info.base_status.is_none());
+        let fresh = rebase_recover(&paths, &expected);
+        rebase_cleanup(Some(fresh), &dir);
     }
 
     // ── Audit C2 Stage 4: incremental in-place save ──────────────────────────────────────────────
@@ -12872,12 +14402,7 @@ mod tests {
         fs::write(dest, &bytes).expect("write test destination");
         let md = fs::metadata(dest).expect("stat test destination");
         let mut ws = ws_with(bytes);
-        ws.disk_image = Some(DiskImage {
-            path: dest.to_path_buf(),
-            len: md.len(),
-            mtime: md.modified().expect("mtime"),
-            compressed: false,
-        });
+        ws.disk_image = Some(DiskImage::from_metadata(dest, &md, false));
         ws
     }
 
@@ -12908,7 +14433,7 @@ mod tests {
 
         {
             let mut ws = write_ws(&state);
-            with_edit(&mut ws, "delete", (0, 0, 5, 5), (0, 0, 5, 5), |world| {
+            with_edit(&mut ws, "delete", (0, 0, 5, 5), |world| {
                 delete_blocks_inner(world, 0, 0, 5, 5, 0, 63, None);
                 Ok(())
             }).expect("edit");
@@ -12948,7 +14473,7 @@ mod tests {
         // And a second edit + save still works against the freshly recorded image.
         {
             let mut ws = write_ws(&state);
-            with_edit(&mut ws, "delete", (16, 0, 20, 5), (16, 0, 20, 5), |world| {
+            with_edit(&mut ws, "delete", (16, 0, 20, 5), |world| {
                 delete_blocks_inner(world, 16, 0, 20, 5, 0, 63, None);
                 Ok(())
             }).expect("edit 2");
@@ -12973,7 +14498,7 @@ mod tests {
 
         {
             let mut ws = write_ws(&state);
-            with_edit(&mut ws, "delete", (0, 0, 5, 5), (0, 0, 5, 5), |world| {
+            with_edit(&mut ws, "delete", (0, 0, 5, 5), |world| {
                 delete_blocks_inner(world, 0, 0, 5, 5, 0, 63, None);
                 Ok(())
             }).expect("edit");
@@ -13008,9 +14533,7 @@ mod tests {
         {
             let md = fs::metadata(&dest).unwrap();
             let mut ws = write_ws(&state);
-            ws.disk_image = Some(DiskImage {
-                path: dest.clone(), len: md.len(), mtime: md.modified().unwrap(), compressed: true,
-            });
+            ws.disk_image = Some(DiskImage::from_metadata(&dest, &md, true));
         }
         assert!(!try_incremental_save(&state, dest.to_str().unwrap(), false).expect("decline, not error"),
             "a zip on disk is not a patchable image of world.bytes");
@@ -13059,13 +14582,15 @@ mod tests {
     #[test]
     fn test_incremental_save_declines_when_dirty_set_too_large() {
         let dir = stage4_dir("too_large");
-        let original = make_bumpy_world_grid(2, 8, |_, _| 20);
+        // Terrain to z=60 so the delete dirties all four bands of every chunk; at z=20 only two
+        // bands per chunk are dirty (18.13) — half the world, under the threshold.
+        let original = make_bumpy_world_grid(2, 8, |_, _| 60);
         let dest = dir.join("world.eden");
         let state: AppState = RwLock::new(ws_with_disk_image(original.clone(), &dest));
 
         {
             let mut ws = write_ws(&state);
-            with_edit(&mut ws, "delete", (0, 0, 31, 31), (0, 0, 31, 31), |world| {
+            with_edit(&mut ws, "delete", (0, 0, 31, 31), |world| {
                 delete_blocks_inner(world, 0, 0, 31, 31, 0, 63, None);
                 Ok(())
             }).expect("delete everything");
@@ -13073,7 +14598,7 @@ mod tests {
         assert_eq!(read_ws(&state).dirty.since_disk.len(), 4, "all four chunks must be dirty");
 
         assert!(!try_incremental_save(&state, dest.to_str().unwrap(), false).expect("decline, not error"),
-            "4 × 32 KB of a ~132 KB world is past the half-world threshold");
+            "4 chunks × 4 bands of a ~132 KB world is past the half-world threshold");
         assert_eq!(fs::read(&dest).unwrap(), original, "a declined save must not touch the destination");
 
         let _ = fs::remove_dir_all(&dir);
@@ -13091,7 +14616,7 @@ mod tests {
 
         {
             let mut ws = write_ws(&state);
-            with_edit(&mut ws, "delete", (0, 0, 5, 5), (0, 0, 5, 5), |world| {
+            with_edit(&mut ws, "delete", (0, 0, 5, 5), |world| {
                 delete_blocks_inner(world, 0, 0, 5, 5, 0, 63, None);
                 Ok(())
             }).expect("edit");
@@ -13262,7 +14787,7 @@ mod tests {
 
         {
             let mut ws = write_ws(&state);
-            with_edit(&mut ws, "delete", (0, 0, 5, 5), (0, 0, 5, 5), |world| {
+            with_edit(&mut ws, "delete", (0, 0, 5, 5), |world| {
                 delete_blocks_inner(world, 0, 0, 5, 5, 0, 63, None);
                 Ok(())
             }).expect("edit 1");
@@ -13287,7 +14812,7 @@ mod tests {
 
         {
             let mut ws = write_ws(&state);
-            with_edit(&mut ws, "delete", (16, 0, 20, 5), (16, 0, 20, 5), |world| {
+            with_edit(&mut ws, "delete", (16, 0, 20, 5), |world| {
                 delete_blocks_inner(world, 16, 0, 20, 5, 0, 63, None);
                 Ok(())
             }).expect("edit 2");
@@ -13334,7 +14859,7 @@ mod tests {
         let stale = read_ws(&state).dirty.seq;
         {
             let mut ws = write_ws(&state);
-            with_edit(&mut ws, "delete", (0, 0, 5, 5), (0, 0, 5, 5), |world| {
+            with_edit(&mut ws, "delete", (0, 0, 5, 5), |world| {
                 delete_blocks_inner(world, 0, 0, 5, 5, 0, 63, None);
                 Ok(())
             }).expect("edit landing 'during' the save");
@@ -13617,6 +15142,38 @@ mod tests {
 
         let _ = fs::remove_file(&tmp);
         let _ = fs::remove_file(&tmp_bak_zip);
+    }
+
+    /// 18.8 — `backup_status` reports exactly what `make_backup_if_absent` will do: the source size
+    /// before a first save, the existing backup afterwards, and the asymmetric "which format counts"
+    /// rule (a `.bak.zip` doesn't satisfy a plain-`.bak` save; a plain `.bak` satisfies both).
+    #[test]
+    fn test_backup_status_matches_backup_rule() {
+        let dir = std::env::temp_dir().join(format!("eden_test_bakstatus_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("w.eden");
+        let path = src.to_str().unwrap().to_string();
+
+        let none = backup_status(path.clone(), false);
+        assert_eq!((none.existing_name, none.source_bytes), (None, 0), "no file ⇒ no backup, nothing to copy");
+
+        fs::write(&src, vec![7u8; 1000]).unwrap();
+        let before = backup_status(path.clone(), true);
+        assert_eq!((before.existing_name, before.source_bytes), (None, 1000));
+
+        make_backup_if_absent(&src, true).unwrap();
+        let zipped = backup_status(path.clone(), true);
+        assert_eq!(zipped.existing_name.as_deref(), Some("w.eden.bak.zip"));
+        assert!(zipped.existing_bytes > 0 && zipped.existing_bytes < 1000, "deflated backup is reported at its own size");
+        assert_eq!(backup_status(path.clone(), false).existing_name, None,
+            "with backupCompressed off a .bak.zip doesn't count — the next save writes a plain .bak");
+
+        make_backup_if_absent(&src, false).unwrap();
+        let plain = backup_status(path.clone(), false);
+        assert_eq!((plain.existing_name.as_deref(), plain.existing_bytes), (Some("w.eden.bak"), 1000));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// Exercise the whole-world procedural generator: it must run without
@@ -14761,7 +16318,7 @@ mod tests {
             assert_eq!(from_index, rescan, "{label}: index must match a from-scratch rescan");
         };
 
-        with_edit(&mut ws, "place lamp", (0, 0, 15, 15), (0, 0, 15, 15), |world| {
+        with_edit(&mut ws, "place lamp", (0, 0, 15, 15), |world| {
             set_block_abs(world, 4, 6, 5, LAMP_BLOCK_TYPE, 0);
             Ok(())
         }).expect("place lamp");
@@ -15026,7 +16583,7 @@ mod tests {
             "reading the surface computes and caches the ceiling");
 
         // Raise a single column two bands higher than the cached ceiling.
-        with_edit(&mut ws, "paint", (3, 3, 3, 3), (3, 3, 3, 3), |world| {
+        with_edit(&mut ws, "paint", (3, 3, 3, 3), |world| {
             set_block_abs(world, 3, 3, 50, 8, 0);
             Ok(())
         }).expect("edit");
@@ -15053,7 +16610,7 @@ mod tests {
         let mut ws = ws_with(make_bumpy_world(8, |_, _| 20));
         assert_eq!(surf(&ws, 3, 3), 20, "warm the ceiling cache at the pre-edit height");
 
-        let result = with_edit(&mut ws, "paint", (0, 0, 15, 15), (0, 0, 15, 15), |world| {
+        let result = with_edit(&mut ws, "paint", (0, 0, 15, 15), |world| {
             set_block_abs(world, 3, 3, 50, 13, 0); // Brick, well above the cached ceiling
             Ok(())
         }).expect("edit");
@@ -15080,7 +16637,7 @@ mod tests {
         let warm = render(&ws); // every hint is now memoised
         assert_eq!(cold, warm, "warming the hint cache must not change a single pixel");
 
-        with_edit(&mut ws, "paint", (5, 5, 5, 5), (5, 5, 5, 5), |world| {
+        with_edit(&mut ws, "paint", (5, 5, 5, 5), |world| {
             set_block_abs(world, 5, 5, 60, 13, 0);
             Ok(())
         }).expect("edit");
@@ -15228,7 +16785,7 @@ mod tests {
         assert_eq!(ws.sculpt_session.as_ref().unwrap().group_id, 555);
 
         // Foreign edit (group None) through the shared choke point → session must clear.
-        with_edit(&mut ws, "delete", (0, 0, 15, 15), (0, 0, 15, 15), |world| {
+        with_edit(&mut ws, "delete", (0, 0, 15, 15), |world| {
             delete_blocks_inner(world, 0, 0, 15, 15, 0, 255, None);
             Ok(())
         }).expect("delete");
@@ -15607,7 +17164,7 @@ mod tests {
         // build buf, clear masked source, write masked dest.
         let (x1, y1) = (4, 4);
         let (width, height, depth) = (2i32, 2i32, 11i32); // z 0..=10
-        with_edit(&mut ws, "move", (4, 4, 8, 5), (4, 4, 8, 5), |world| {
+        with_edit(&mut ws, "move", (4, 4, 8, 5), |world| {
             let n = (width * height * depth) as usize;
             let mut buf_bt = vec![0u8; n];
             let mut buf_paint = vec![0u8; n];
@@ -15648,7 +17205,7 @@ mod tests {
 
         let mut ws = ws_with(make_bumpy_world(8, |_, _| 20));
         let mask = cb.mask.clone();
-        with_edit(&mut ws, "paste", (10, 10, 11, 11), (10, 10, 11, 11), |world| {
+        with_edit(&mut ws, "paste", (10, 10, 11, 11), |world| {
             paste_clipboard_at(world, 10, 10, &cb.block_types, &cb.paints,
                 cb.width, cb.height, cb.depth, cb.z_anchor, 0, false, world_max_z(world), mask.as_deref());
             Ok(())
@@ -16005,7 +17562,7 @@ mod tests {
             }}}
         }
         let mask = mask_from(4, 4, 5, 5, |x, y| x == 4 && y == 4);
-        with_edit(&mut ws, "extrude", (4, 4, 7, 5), (4, 4, 7, 5), |world| {
+        with_edit(&mut ws, "extrude", (4, 4, 7, 5), |world| {
             extrude_write(world, 4, 4, &src_types, &src_paints, width, height, depth, 0, 63, "x+", 1, false, Some(&mask));
             Ok(())
         }).expect("masked extrude");
@@ -16020,7 +17577,7 @@ mod tests {
     fn test_generate_trees_respects_mask() {
         let mut ws = ws_with(make_bumpy_world(8, |_, _| 20)); // grass surface z=20 everywhere
         let mask = mask_from(4, 4, 7, 7, |x, y| x == 4 && y == 4);
-        generate_trees_inner(ws.world.as_mut().unwrap(), 4, 4, 7, 7,
+        generate_trees_inner(&mut EditView::unbounded(ws.world.as_mut().unwrap()), 4, 4, 7, 7,
             &["normal".to_string()], 1.0, &[], 42, true, Some(&mask));
         let w = ws.world.as_ref().unwrap();
         // A normal tree places a trunk (bt 6) above the surface at the planted column.
@@ -16413,7 +17970,7 @@ mod tests {
         for x in 0..16 { for y in 0..16 { set_block_abs(&mut world, x, y, 0, 2, 0); } }
         // Place a single source; the "selection" is the 1×1 cell around it, the flood rect is padded ±3.
         set_block_abs(&mut world, 8, 8, 1, 20, 0);
-        simulate_flow_inner(&mut world, 8, 8, 8, 8, 5, 5, 11, 11, 0, 5, false, 20, None);
+        simulate_flow_inner(&mut EditView::unbounded(&mut world), 8, 8, 8, 8, 5, 5, 11, 11, 0, 5, false, 20, None);
 
         assert_eq!(get_block_at(&world, 8, 8, 1), (20, 0), "source stays full");
         assert_eq!(get_block_at(&world, 9, 8, 1), (59, 0), "radius 1 = ¾ (inside the 1×1 selection's spill)");
@@ -16441,7 +17998,7 @@ mod tests {
             }
         }
 
-        let result = pool_fill_inner(&mut world, 0, 0, 15, 15, 7, 7, 1, 3, 20, 0, None);
+        let result = pool_fill_inner(&mut EditView::unbounded(&mut world), 0, 0, 15, 15, 7, 7, 1, 3, 20, 0, None);
         assert!(result.is_ok(), "enclosed basin should fill cleanly: {result:?}");
 
         assert_eq!(get_block_at(&world, 7, 7, 1), (20, 0), "lower layer fills flat full-level water");
@@ -16772,7 +18329,7 @@ mod tests {
         let ex = (target.0 - world.min_x) * 16;
         let ey = (target.1 - world.min_y) * 16;
         ws.world = Some(world);
-        let result = with_edit(&mut ws, "test-edit-locality", (ex, ey, ex, ey), (ex, ey, ex, ey), |w| {
+        let result = with_edit(&mut ws, "test-edit-locality", (ex, ey, ex, ey), |w| {
             set_block_abs(w, ex, ey, 1, 7 /* wood */, 5 /* paint */);
             Ok(())
         });
@@ -16812,7 +18369,7 @@ mod tests {
         let ex = (target.0 - world.min_x) * 16;
         let ey = (target.1 - world.min_y) * 16;
         ws.world = Some(world);
-        let result = with_edit(&mut ws, "test-undo-roundtrip", (ex, ey, ex, ey), (ex, ey, ex, ey), |w| {
+        let result = with_edit(&mut ws, "test-undo-roundtrip", (ex, ey, ex, ey), |w| {
             set_block_abs(w, ex, ey, 1, 7, 5);
             Ok(())
         });

@@ -13,14 +13,13 @@
  * one-time status toast) — this component only ever renders once something is actually pasteable.
  * The Z arrows are the Quick Actions bar's own `IconButton`, so both surfaces match.
  *
- * **Attach/follow.** `FloatingWindow` positions every window from its stored anchor+offset
- * (`windowGeometry.ts` `rectOf`) — there is no imperative "just move this frame" escape hatch in
- * the shared framework (deliberately not added here; see the task handoff for why). So "following
- * the ghost" is implemented as `useWindowLayout.ts`'s `followLensPosition`, a store update that
- * *skips persistence* (§ its own doc comment) rather than a DOM write, throttled to ≤15 Hz — the
- * same throttle this file already needs for the lens's own render requests, so one throttle serves
- * both. Dragging the title bar (`onMoved` with `kind === "move"`) detaches; a resize doesn't;
- * 🔗 re-attaches.
+ * **Attach/follow.** While following, the window's `left`/`top` are written straight to its element
+ * on rAF (like `FloatingWindow`'s own drag path), never through React state at pointer rate (19.2;
+ * it used to go through a 66 ms-throttled store update per tick). When the ghost pauses (150 ms),
+ * goes away, or the lens unmounts, the final position is committed with `useWindowLayout.ts`'s
+ * `followLensPosition` (a store update that *skips persistence*), so `rectOf` and stacking agree
+ * with what's on screen. The render origin keeps its own ≤15 Hz throttle. Dragging the title bar
+ * (`onMoved` with `kind === "move"`) detaches; a resize doesn't; 🔗 re-attaches.
  */
 import { sfx } from "../sound/sfx";
 import { useEffect, useRef, useState, type RefObject } from "react";
@@ -37,10 +36,13 @@ import { ACCENT, FONT, SHIFT, SPACE, TEXT_META } from "../ribbon/tokens";
 import { IconButton } from "../ribbon/primitives";
 import { MAP, RAMP } from "../theme/theme";
 
-/** Throttle shared by (a) the render-input origin state this component feeds `useLensRender`, and
- *  (b) attach-follow repositioning — both are driven by the same ghost subscription, and both are
- *  "≤15 Hz while hovering" per the sub-plan. */
+/** Throttle for the render-input origin state this component feeds `useLensRender` (≤15 Hz while
+ *  hovering, per the sub-plan). Attach-follow *position* is not throttled: it is a direct style write
+ *  on rAF (19.2). */
 const GHOST_THROTTLE_MS = 66;
+/** Following "stops" after this long without a ghost event; the final position is then committed to
+ *  the layout store. */
+const FOLLOW_IDLE_MS = 150;
 /** Terrain-only context columns either side of the footprint (sub-plan §2.1 default). */
 const LENS_CONTEXT = 2;
 /** Below this rendered body width the legend/hint hide (mock `@container (max-width: 330px)`). */
@@ -81,24 +83,62 @@ export default function PasteLensWindow(p: PasteLensWindowProps) {
   const openRef = useRef(ws.open);
   useEffect(() => { attachedRef.current = attached; openRef.current = ws.open; }, [attached, ws.open]);
 
-  function applyGhost(g: GhostInfo | null) {
-    setOrigin(g ? { x: g.x, y: g.y } : null);
-    if (!g || !attachedRef.current || !openRef.current) return;
+  // Attach-follow runs at pointer rate and writes the window's style directly (rAF-coalesced), per the
+  // floating-window rule: never touch React state on pointer-rate work. The store only learns the
+  // final position once following pauses (`commitFollow`), so `rectOf`, snapping and stacking stay
+  // correct for whatever reads the store next. `offY` is the context-panel stack offset FloatingWindow
+  // adds on top of the stored y; it's measured from the live element at the start of each follow run.
+  const followRef = useRef<{
+    raf: number | null; idle: ReturnType<typeof setTimeout> | null;
+    pos: { x: number; y: number } | null; dirty: boolean; offY: number;
+  }>({ raf: null, idle: null, pos: null, dirty: false, offY: 0 });
+
+  function commitFollow() {
+    const f = followRef.current;
+    if (f.idle) { clearTimeout(f.idle); f.idle = null; }
+    if (f.raf != null) { cancelAnimationFrame(f.raf); f.raf = null; }
+    if (!f.dirty) return;
+    f.dirty = false;
+    if (f.pos) followLensPosition(f.pos);
+  }
+
+  function followGhost(g: GhostInfo | null) {
+    if (!g || !attachedRef.current || !openRef.current) { commitFollow(); return; }
     // Work-area-local = ghost's screen rect minus the window layer's own screen origin — the layer
     // fills the same box `rectOf` positions every window inside (`WindowLayer.tsx`'s `.vx-winlayer`).
     const layer = document.querySelector<HTMLElement>(".vx-winlayer");
-    if (!layer) return;
+    const el = document.querySelector<HTMLElement>('[data-win="lens"]');
+    if (!layer || !el) return;
     const layerRect = layer.getBoundingClientRect();
     const s = getWindowState();
     const rendered = rectOf(s.wins.lens, s.work, winLimits("lens", s.work));
+    const f = followRef.current;
+    if (!f.dirty) f.offY = (parseFloat(el.style.top) || rendered.y) - rendered.y;
     const localGhost = {
       x: g.screen.left - layerRect.left, y: g.screen.top - layerRect.top,
       w: g.screen.width, h: g.screen.height,
     };
-    followLensPosition(attachPosition(localGhost, { w: rendered.w, h: rendered.h }, s.work));
+    f.pos = attachPosition(localGhost, { w: rendered.w, h: rendered.h }, s.work);
+    f.dirty = true;
+    if (f.raf == null) {
+      f.raf = requestAnimationFrame(() => {
+        f.raf = null;
+        if (!f.pos) return;
+        el.style.left = `${f.pos.x}px`;
+        el.style.top = `${f.pos.y + f.offY}px`;
+      });
+    }
+    if (f.idle) clearTimeout(f.idle);
+    f.idle = setTimeout(commitFollow, FOLLOW_IDLE_MS);
+  }
+
+  // The render origin only needs the throttled rate (it drives backend renders).
+  function applyGhost(g: GhostInfo | null) {
+    setOrigin(g ? { x: g.x, y: g.y } : null);
   }
 
   function scheduleGhost(g: GhostInfo | null) {
+    followGhost(g); // every event: the position write is cheap and coalesced to rAF
     pendingGhostRef.current = g;
     const st = throttleRef.current;
     const elapsed = Date.now() - st.lastAt;
@@ -119,6 +159,7 @@ export default function PasteLensWindow(p: PasteLensWindowProps) {
     return () => {
       unsub();
       if (st.timer) { clearTimeout(st.timer); st.timer = null; }
+      commitFollow();
     };
     // `mc.subscribeGhost` is an imperative ref API stable for the map's whole lifetime; `scheduleGhost`
     // closes over refs only, never a stale value.
@@ -184,6 +225,7 @@ export default function PasteLensWindow(p: PasteLensWindowProps) {
             : attached ? "Following the ghost — drag the title bar to detach" : "Re-attach to the paste ghost"}
           active={attached}
           disabled={!p.mapVisible}
+          cue="tab"
           onClick={() => setLensAttached(!attached)}
         />
       }
@@ -247,7 +289,7 @@ function LensBody({ pasteElevationOffset, onNudge, note, front, side }: LensBody
         {!compact && (
           <span style={{ display: "flex", alignItems: "center", gap: SPACE.xs, fontSize: FONT.micro, color: TEXT_META }}>
             <Swatch hex={MAP.air} /> air
-            <Swatch hex={MAP.buried} /> buried
+            <Swatch hex={MAP.buried} hatch /> buried
           </span>
         )}
       </div>
@@ -282,8 +324,10 @@ function LensBody({ pasteElevationOffset, onNudge, note, front, side }: LensBody
   );
 }
 
-function Swatch({ hex }: { hex: string }) {
-  return <span style={{ width: 8, height: 8, borderRadius: 2, background: hex, display: "inline-block" }} />;
+/** `hatch`: the diagonal-stripe-over-wash look clash cells have in the lens image (19.3). */
+function Swatch({ hex, hatch }: { hex: string; hatch?: boolean }) {
+  const background = hatch ? `repeating-linear-gradient(135deg, ${hex} 0 2px, ${hex}59 2px 4px)` : hex;
+  return <span style={{ width: 8, height: 8, borderRadius: 2, background, display: "inline-block" }} />;
 }
 
 function LensPanel({ label, data }: { label: string; data: PasteLensResult | null }) {

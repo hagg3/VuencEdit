@@ -1,5 +1,5 @@
-import { decodeGeometry, type VoxelGeometry } from "./types";
-import { SKY_3D } from "./theme/theme";
+import { decodeGeometry, type GeometryStream, type VoxelGeometry } from "./types";
+import { SKY_3D, rgba } from "./theme/theme";
 import { useEffect, useRef, useState, useCallback, forwardRef, useImperativeHandle, type CSSProperties } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import * as THREE from "three";
@@ -7,8 +7,8 @@ import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import type { AtlasData } from "./texturePack";
 import { isTypingTarget, chunkToWorld, worldToChunk, gridDivisions } from "./viewportUtils";
 import type { WorldMeta } from "./types";
-import { BORDER, IS_MAC, RADIUS, SURFACE, btnBase } from "./ribbon/tokens";
-import { SliderRow } from "./ribbon/primitives";
+import { BORDER, FONT, IS_MAC, RADIUS, SMALL_H, SPACE, SURFACE, TEXT_DANGER, TEXT_DIM } from "./ribbon/tokens";
+import { Check, IconButton, SliderRow, SmallButton } from "./ribbon/primitives";
 import { skyFogColor, rampFamilyBase, wedgeFamilyBase, rampDirIndex, orientBlockToFacing } from "./blockDefs";
 import { maskPrismPositions, type OutlinePt, type MaskRect } from "./maskUtils";
 import { perfCounters, recordGeometryFetchMs, recordFrameMs, recordRenderMs, recordRenderStats, recordReload, bumpPerf, type ReloadReason } from "./perfCounters";
@@ -24,13 +24,13 @@ const fogDistances = (radiusChunks: number) => {
   return { near, far };
 };
 
-// Local replacement for the retired `chromeButton` (UI redesign r3, Stage 14.17 D5b) — this
-// pane's small HUD toggle buttons (render distance / fog / AA / grid / reset row), now built on
-// the shared `ribbon/tokens` `btnBase` recipe instead of the warm modal-ramp `chromeButton`. Every
-// call site already overrides `color` explicitly, so only the raised-face recipe moves.
-function hudBtn(extra?: CSSProperties): CSSProperties {
-  return btnBase(extra);
-}
+/** The view-options strip's container (19.13): one recessed bar, not a raised button per cell. */
+const hudBar: CSSProperties = {
+  display: "flex", alignItems: "center", gap: SPACE.lg, padding: `2px ${SPACE.md}px`,
+  background: SURFACE.popover, borderRadius: RADIUS.lg,
+  boxShadow: `inset 0 0 0 1px ${BORDER.outline}, inset 0 1px 0 ${BORDER.bevel}`,
+};
+const colorInput: CSSProperties = { width: 22, height: 18, padding: 0, border: "none", background: "none", cursor: "pointer" };
 
 // Local replacement for the retired `glassMenuPanel` — the same slate popover chrome
 // `ribbon/primitives.tsx`'s `Popover` uses (SURFACE.popover material; see its comment at the
@@ -169,11 +169,12 @@ const Z_BAND_STEP = 64;
 // geometry crosses this, the streaming queue stops pulling new chunks until eviction (moving the
 // camera) frees headroom.
 //
-// Counted in bytes, not vertices (3D-pane crash fix, Stage 1): a vertex is 24–36 B depending on
-// which stream it lands in and whether a texture pack is loaded, so a vertex cap is a 1.5× fuzzy
-// byte cap — and it says nothing about world height, where the 256z crashes actually came from.
-// Bytes are what the GPU and the JS heap both charge for, and the number comes straight off the
-// envelope header (`VoxelGeometry.bytes*`) rather than being re-derived.
+// Counted in bytes, not vertices (3D-pane crash fix, Stage 1): a vertex's cost depends on which
+// stream it lands in and whether a texture pack is loaded (and, since the compact format, on how
+// many indices share it), so a vertex cap is a fuzzy byte cap — and it says nothing about world
+// height, where the 256z crashes actually came from. Bytes are what the GPU and the JS heap both
+// charge for, and the number comes straight off the envelope header (`GeometryStream.bytes`) rather
+// than being re-derived.
 const GEOMETRY_BUDGET_BYTES = 512 << 20;
 
 /** Below this pane size the HUD compacts (see `compactHud`). */
@@ -757,8 +758,12 @@ const FlyView3D = forwardRef<FlyView3DRef, {
   /** Sky gradient + fog colour/model (15.8). Controlled by App so it persists; defaults to `DEFAULT_SKY3D`. */
   sky3d?: Sky3dPrefs;
   onSky3dChange?: (patch: Partial<Sky3dPrefs>) => void;
-  /** HUD visibility (15.8): hides the camera pill + key legend, compass/coords and the perf readout.
-   *  Never the build crosshair, and never the options row (that's how you turn it back on). Default true. */
+  /** HUD visibility (15.8, widened by 19.12 to "render only"): false hides EVERY DOM overlay in the pane
+   *  — camera pill, key legend and its popover, stream badges, the options row (render distance,
+   *  Fog/AA/Grid, `…`) and its popovers, compass/coords, the perf/geometry readout, the in-pane hotbar,
+   *  the VIEW/SELECT/BUILD pill + armed-block hint, and the build crosshair. What stays is the WebGL
+   *  canvas (and the floor grid, which is part of the scene) plus the context-lost cover, which is an
+   *  error state rather than HUD. The way back is the ribbon View ▸ 3D HUD toggle / ⌘K. Default true. */
   showHud?: boolean;
   /** Floor grid visibility (15.8). Default true. */
   showGrid?: boolean;
@@ -1276,6 +1281,11 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       // V is left clamped on purpose — it *selects* the row, which is why the Rust side refuses to
       // merge along V whenever a pack is loaded.
       tex.wrapS = THREE.RepeatWrapping;
+      // Compact (v2) chunk meshes ship integer UVs — U in half-tiles (a triangle apex sits at ½), V
+      // the atlas row — and this transform maps them (`uvTransform`, which every material sampling
+      // `map` applies, the fence's MeshDepthMaterial included). Exact, where a normalised Uint16 V
+      // couldn't represent `row / rows` and would seam at tile edges (ROADMAP-EDIT 18.14).
+      tex.repeat.set(0.5, 1 / rows);
       tex.flipY = false;
       tex.needsUpdate = true;
       atlasTexRef.current = tex;
@@ -1815,7 +1825,10 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     // fraction of `gpu` on the GeomMemHud, forcing the upload at install is the lever to reach for,
     // not the accounting change.
     const releaseOnUpload = (mesh: THREE.Mesh) => {
-      for (const attr of Object.values(mesh.geometry.attributes)) {
+      // The index buffer too (compact meshes are indexed) — it isn't in `attributes`, but three
+      // fires its `onUpload` the same way when it builds the ELEMENT_ARRAY_BUFFER.
+      const attrs = [...Object.values(mesh.geometry.attributes), mesh.geometry.index];
+      for (const attr of attrs) {
         if (!(attr instanceof THREE.BufferAttribute)) continue;
         const bytes = attr.array.byteLength;
         attr.onUpload(function (this: THREE.BufferAttribute) {
@@ -1834,8 +1847,8 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       residentBytes += bytes;
       jsBytes += bytes;
       releaseOnUpload(mesh);
-      // Chunk meshes never move (positions are baked in world space): compose the identity matrix
-      // once and skip the per-frame matrix recompose for the whole resident set.
+      // Chunk meshes never move: compose their matrix (the chunk-origin translate + fixed-point
+      // scale the caller set) once and skip the per-frame recompose for the whole resident set.
       mesh.matrixAutoUpdate = false;
       mesh.updateMatrix();
       scene.add(mesh);
@@ -1994,14 +2007,14 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       const fetchT0 = performance.now();
       // zMax = the camera band's ceiling (Stage 3); zMin stays 0 — see Z_BAND_ABOVE on why the band
       // is one-sided. `undefined` means "no clip" and is what a 64z world always sends.
-      invoke<ArrayBuffer>("get_chunk_geometry", { cx: cxk, cy: cyk, night: nightLightingRef.current, shadows: shadows3dRef.current, sunT: sunTRef.current, gpu: gpuShadowsRef.current, lampRadius: lampRadiusRef.current, lightingProfile: lightingProfileRef.current, zMax: zBand ?? undefined })
+      invoke<ArrayBuffer>("get_chunk_geometry", { cx: cxk, cy: cyk, night: nightLightingRef.current, shadows: shadows3dRef.current, sunT: sunTRef.current, gpu: gpuShadowsRef.current, lampRadius: lampRadiusRef.current, lightingProfile: lightingProfileRef.current, zMax: zBand ?? undefined, format: 2 })
         .then((buf) => {
           recordGeometryFetchMs(performance.now() - fetchT0);
           if (disposed) return;
           const g: VoxelGeometry = decodeGeometry(buf);
           // Feed the in-flight estimator from every landed payload, including the stale ones below —
           // a dropped result still measured a real chunk of this world.
-          const payload = g.bytes + g.bytes_t + g.bytes_e;
+          const payload = g.streams[0].bytes + g.streams[1].bytes + g.streams[2].bytes;
           if (payload > maxChunkBytes) maxChunkBytes = payload;
           chunkEstimateBytes = Math.round(chunkEstimateBytes * 0.8 + payload * 0.2);
           if (gen !== fetchGen || staleKeys.has(k)) {
@@ -2009,38 +2022,42 @@ const FlyView3D = forwardRef<FlyView3DRef, {
             return; // stale — dropped; finally{} requeues if needed
           }
           disposeMesh(k); // replace any existing mesh (reload path)
-          if (g.vertex_count > 0) {
+          const [op, tr, em] = g.streams;
+          // Compact (v2) mesh: chunk-local fixed-point positions (Int16×4 — the 4th is padding a
+          // `vec3` attribute ignores), normalised Uint8×4 colours, integer Uint16 UVs (mapped by the
+          // atlas texture's `repeat`), and an index. No CPU normals: baked mode is unlit (shading is
+          // in the vertex colours), and GPU mode's Lambert materials use `flatShading` (normals
+          // derived in-shader). Voxel faces are exactly the flat-shading case.
+          const buildGeom = (st: GeometryStream) => {
             const geom = new THREE.BufferGeometry();
-            geom.setAttribute("position", new THREE.BufferAttribute(g.positions, 3));
-            geom.setAttribute("color", new THREE.BufferAttribute(g.colors, 3));
-            // Add UV attribute when the pack is loaded (uvs is a non-empty float stream).
-            const hasUVs = g.uvs && g.uvs.length > 0;
-            if (hasUVs) {
-              geom.setAttribute("uv", new THREE.BufferAttribute(g.uvs, 2));
-            }
-            // No CPU normals: baked mode is unlit (shading is in the vertex colours), and GPU mode's
-            // Lambert materials use `flatShading` (normals derived in-shader). Voxel faces are exactly
-            // the flat-shading case, so this is visually identical to per-vertex normals here.
-            geom.computeBoundingSphere(); // cheap frustum-cull test per frame
-            const mesh = new THREE.Mesh(geom, pickMat(false, !!hasUVs));
+            geom.setAttribute("position", new THREE.BufferAttribute(st.positions, 4));
+            // RGBA (itemSize 4) — three reads a 4-component colour as vertex alpha too; 255 on the
+            // opaque/emissive streams, whose materials aren't `transparent`.
+            geom.setAttribute("color", new THREE.BufferAttribute(st.colors, 4, true));
+            if (st.uvs.length > 0) geom.setAttribute("uv", new THREE.BufferAttribute(st.uvs, 2));
+            geom.setIndex(new THREE.BufferAttribute(st.indices, 1));
+            geom.computeBoundingSphere(); // cheap frustum-cull test per frame (local space; the matrix scales it)
+            return geom;
+          };
+          const place = (mesh: THREE.Mesh) => {
+            mesh.position.set(g.origin[0], g.origin[1], g.origin[2]);
+            mesh.scale.setScalar(g.posScale);
+          };
+          if (op.vertexCount > 0) {
+            const hasUVs = op.uvs.length > 0;
+            const mesh = new THREE.Mesh(buildGeom(op), pickMat(false, hasUVs));
+            place(mesh);
             mesh.castShadow = mesh.receiveShadow = gpuShadowsRef.current;
-            addChunkMesh(meshes, k, mesh, g.bytes);
+            addChunkMesh(meshes, k, mesh, op.bytes);
           } else {
             // Marks the chunk "fetched" even when it's air (or all-transparent, e.g. an all-water
             // chunk went entirely into meshesT) — `isResident(k)` is what stops it from being refetched.
             emptyChunks.add(k);
           }
-          if (g.vertex_count_t > 0) {
-            const geomT = new THREE.BufferGeometry();
-            geomT.setAttribute("position", new THREE.BufferAttribute(g.positions_t, 3));
-            // RGBA (itemSize 4) — Three.js reads a 4-component color attribute as vertex alpha too.
-            geomT.setAttribute("color", new THREE.BufferAttribute(g.colors_t, 4));
-            const hasUVsT = g.uvs_t && g.uvs_t.length > 0;
-            if (hasUVsT) {
-              geomT.setAttribute("uv", new THREE.BufferAttribute(g.uvs_t, 2));
-            }
-            geomT.computeBoundingSphere();
-            const meshT = new THREE.Mesh(geomT, pickMat(true, !!hasUVsT));
+          if (tr.vertexCount > 0) {
+            const hasUVsT = tr.uvs.length > 0;
+            const meshT = new THREE.Mesh(buildGeom(tr), pickMat(true, hasUVsT));
+            place(meshT);
             // Transparent blocks receive shadows, and in GPU mode also cast *patterned* ones via a
             // customDepthMaterial (patchDepthAlpha): water/glass/flower discard in the shadow pass so
             // light passes straight through (no shadow, as before), while fence casts — its weave tile
@@ -2049,26 +2066,19 @@ const FlyView3D = forwardRef<FlyView3DRef, {
             meshT.receiveShadow = gpuShadowsRef.current;
             meshT.castShadow = gpuShadowsRef.current;
             meshT.customDepthMaterial = (hasUVsT && depthMatTexRef.current) ? depthMatTexRef.current : depthMatT;
-            addChunkMesh(meshesT, k, meshT, g.bytes_t);
+            addChunkMesh(meshesT, k, meshT, tr.bytes);
           }
           // Emissive stream (lamp faces, GPU mode only). Drawn with the UNLIT Basic material so lamps
           // stay fullbright under the scene's dim night ambient — matching the baked path and the game.
-          // castShadow (lamps are solid); receiveShadow off (fullbright anyway). No normals needed
-          // (Basic is unlit; the shadow depth pass doesn't consume them meaningfully here).
-          if (g.vertex_count_e > 0) {
-            const geomE = new THREE.BufferGeometry();
-            geomE.setAttribute("position", new THREE.BufferAttribute(g.positions_e, 3));
-            geomE.setAttribute("color", new THREE.BufferAttribute(g.colors_e, 3));
-            const hasUVsE = g.uvs_e && g.uvs_e.length > 0;
-            if (hasUVsE) {
-              geomE.setAttribute("uv", new THREE.BufferAttribute(g.uvs_e, 2));
-            }
-            geomE.computeBoundingSphere();
+          // castShadow (lamps are solid); receiveShadow off (fullbright anyway).
+          if (em.vertexCount > 0) {
+            const hasUVsE = em.uvs.length > 0;
             const emissiveMat = (hasUVsE && texMatRef.current) ? texMatRef.current : mat;
-            const meshE = new THREE.Mesh(geomE, emissiveMat);
+            const meshE = new THREE.Mesh(buildGeom(em), emissiveMat);
+            place(meshE);
             meshE.castShadow = true;
             meshE.receiveShadow = false;
-            addChunkMesh(meshesE, k, meshE, g.bytes_e);
+            addChunkMesh(meshesE, k, meshE, em.bytes);
           }
           invalidate();
         })
@@ -2824,6 +2834,9 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     /** `"nx,ny,nz@offset"` for a stamp: the face normal plus the acted cell's coordinate along it. */
     const planeKey = (nx: number, ny: number, nz: number, cx: number, cy: number, cz: number) =>
       `${nx},${ny},${nz}@${nx !== 0 ? cx : ny !== 0 ? cy : cz}`;
+    // Set when a button-2 pointerup already placed/consumed this click, so the `contextmenu` that
+    // follows (Chromium: at release; absent under Pointer Lock) doesn't place a second block.
+    let rightHandled = false;
     let buildRepeatFired = false; // guards onPickUp/onPickContext from double-editing after a stamp
     // Re-entrancy: the tick is async and awaits a pick round-trip that can exceed BUILD_REPEAT_MS on
     // a large world, so bare setInterval ticks would stack and fire together. Same discipline as the
@@ -2987,6 +3000,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       // whichever handler this gesture's button reaches, so a per-gesture reset is still what clears
       // the other one's leftover.)
       buildRepeatFired = false;
+      rightHandled = false;
       downX = e.clientX; downY = e.clientY; downT = performance.now(); downBtn = e.button;
       // Suppress the browser's middle-click autoscroll icon; only relevant in build mode (eyedropper).
       if (e.button === 1 && buildActive()) e.preventDefault();
@@ -3025,6 +3039,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       if (e.button !== 2 || buildRepeatButton === 2) return; // already armed by pointerdown — no-op
       endBuildGesture();
       buildRepeatFired = false;
+      rightHandled = false;
       downX = e.clientX; downY = e.clientY; downT = performance.now(); downBtn = e.button;
       if (e.altKey || !buildActive() || buildShapeRef.current !== "single") return;
       // No `setPointerCapture` here — MouseEvent carries no `pointerId`. A release off-canvas is
@@ -3082,6 +3097,16 @@ const FlyView3D = forwardRef<FlyView3DRef, {
         if (hit) onPickEyedropRef.current?.(hit.block_type, hit.paint);
         return;
       }
+      if (e.button === 2) {
+        // Right-click place straight from pointerup (see `placeAt`). macOS WKWebView may drop this
+        // event, which is why `contextmenu` still places too; `rightHandled` dedupes the two.
+        if (!buildActive() || e.altKey) return;
+        if (rightHandled) return;
+        rightHandled = true;
+        if (buildRepeatFired) { buildRepeatFired = false; return; }
+        await placeAt(e.clientX, e.clientY);
+        return;
+      }
       if (e.button !== 0) return;
       if (interact3dRef.current === "select") {
         const hit = await pickOrHover(e.clientX, e.clientY, PICK_DIST);
@@ -3116,6 +3141,32 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       onBuildGestureEndRef.current?.("break", 1);
     };
 
+    // The place action itself, shared by `contextmenu` (macOS / non-locked) and the button-2
+    // `pointerup` path (Windows look mode). Chromium never dispatches `contextmenu` while Pointer
+    // Lock is held, so a right-click in look mode reached neither handler and placed nothing.
+    const placeAt = async (cx: number, cy: number) => {
+      // M2: see the matching comment in onPickUp.
+      const hit = await pickOrHover(cx, cy, buildReachDist());
+      if (!hit) return;
+      // Fill re-skins the clicked wall in place (the seed IS the solid hit cell) — no offset-into-
+      // empty-neighbour math and no camera-occupancy guard (the seed being solid already rules out
+      // the camera standing inside it).
+      if (buildShapeRef.current === "fill") {
+        onPickFillFaceRef.current?.(hit.x, hit.y, hit.z, hit.nx, hit.ny, hit.nz, "place", placeYaw(cx, cy));
+        return;
+      }
+      const t = clickTarget(hit); // build → placement cell
+      const c = threeToEden(camera.position);
+      if (Math.floor(c.x) === t.x && Math.floor(c.y) === t.y && Math.floor(c.z) === t.z) return;
+      const yaw = placeYaw(cx, cy);
+      if (buildShapeRef.current !== "single") {
+        handleBuildShapeClick(t.x, t.y, t.z, "place", yaw);
+        return;
+      }
+      // Plain click, never reached buildRepeatTick — one block, summarized directly (see onPickUp).
+      onPickPlaceRef.current?.(t.x, t.y, t.z, yaw, buildGestureGroup);
+      onBuildGestureEndRef.current?.("place", 1);
+    };
     // Right-click → PLACE at the highlighted cell (the previewed hit+normal), so what a click does
     // matches what the highlight showed. Refuses to place inside the camera's own voxel (you'd entomb
     // yourself with no obvious way out). Bound to `contextmenu`, NOT button-2 pointer events: button 2
@@ -3146,7 +3197,8 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       if (!buildActive()) return;
       // Alt+right-drag is the camera's pan gesture in build mode (see setOrbitBuildMode) — never a place.
       if (e.altKey) return;
-      if (buildRepeatFired) { buildRepeatFired = false; return; }
+      if (rightHandled) return; // this press already placed via pointerup
+      if (buildRepeatFired) { buildRepeatFired = false; rightHandled = true; return; }
       // C2: OrbitControls used to bind RIGHT to PAN, so a right-drag to slide the camera ended in a
       // `contextmenu` — with no slop test this placed a block wherever the drag happened to end. H4
       // takes RIGHT away from OrbitControls in build mode, which makes that specific path impossible;
@@ -3156,27 +3208,8 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       // from it): if the webview dropped that event we have no evidence of a drag, and refusing
       // would break placing outright on exactly the platform this fallback path exists for.
       if ((downBtn === 2 || wasRepeating) && stale) return;
-      // M2: see the matching comment in onPickUp.
-      const hit = await pickOrHover(e.clientX, e.clientY, buildReachDist());
-      if (!hit) return;
-      // Fill re-skins the clicked wall in place (the seed IS the solid hit cell) — no offset-into-
-      // empty-neighbour math and no camera-occupancy guard (the seed being solid already rules out
-      // the camera standing inside it).
-      if (buildShapeRef.current === "fill") {
-        onPickFillFaceRef.current?.(hit.x, hit.y, hit.z, hit.nx, hit.ny, hit.nz, "place", placeYaw(e.clientX, e.clientY));
-        return;
-      }
-      const t = clickTarget(hit); // build → placement cell
-      const c = threeToEden(camera.position);
-      if (Math.floor(c.x) === t.x && Math.floor(c.y) === t.y && Math.floor(c.z) === t.z) return;
-      const yaw = placeYaw(e.clientX, e.clientY);
-      if (buildShapeRef.current !== "single") {
-        handleBuildShapeClick(t.x, t.y, t.z, "place", yaw);
-        return;
-      }
-      // Plain click, never reached buildRepeatTick — one block, summarized directly (see onPickUp).
-      onPickPlaceRef.current?.(t.x, t.y, t.z, yaw, buildGestureGroup);
-      onBuildGestureEndRef.current?.("place", 1);
+      rightHandled = true; // if contextmenu fires at press time, the pointerup must not place again
+      await placeAt(e.clientX, e.clientY);
     };
 
     const onPickMove = (e: PointerEvent) => {
@@ -4615,6 +4648,17 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     return () => window.removeEventListener("keydown", onEsc);
   }, [legendOpen]);
 
+  // HUD off (19.12) hides the whole overlay layer, so close every disclosure with it: otherwise a
+  // hidden popover would still swallow Escape (the handlers above) and reappear, open, when the HUD
+  // comes back.
+  useEffect(() => {
+    if (showHud) return;
+    setLegendOpen(false);
+    setDistanceWarnOpen(false);
+    setAutoOrientOpen(false);
+    setHudMore(false);
+  }, [showHud]);
+
   // Texture pack sync: rebuild the DataTexture + material when the pack changes.
   useEffect(() => {
     rebuildTextureMaterials(texturePack);
@@ -4810,38 +4854,35 @@ const FlyView3D = forwardRef<FlyView3DRef, {
           )}
         </div>
       </div>
-      {/* Camera reset button (A4) — faded to stay out of the way of the viewport, full opacity on hover
-          so the render-distance number and fog swatch are still legible when you look at this row. */}
+      {/* View options row (19.13): one dense strip on the ribbon's primitives and tokens (`SliderRow`,
+          `Check`, `IconButton`) instead of a raised button per cell with hard-coded warm-palette hexes.
+          Faded to stay out of the viewport's way, full opacity on hover. HUD off (19.12): hidden, not
+          unmounted — the row keeps its state (fog override, AA, slider). */}
       <div
         style={{
-          position: "absolute", top: compactHud ? 34 : 6, right: 6, zIndex: 1, display: "flex", alignItems: "center", gap: 6,
+          position: "absolute", top: compactHud ? 34 : 6, right: 6, zIndex: 1,
+          display: showHud ? "flex" : "none", alignItems: "center", gap: SPACE.md,
           flexWrap: compactHud ? "wrap" : undefined, justifyContent: "flex-end", maxWidth: "calc(100% - 12px)",
-          opacity: 0.5, transition: "opacity .12s",
+          opacity: 0.6, transition: "opacity .12s",
         }}
         onMouseEnter={e => { e.currentTarget.style.opacity = "1"; }}
-        onMouseLeave={e => { e.currentTarget.style.opacity = "0.5"; }}
+        onMouseLeave={e => { e.currentTarget.style.opacity = "0.6"; }}
       >
-        {compactHud && (
-          <button
-            onClick={() => setHudMore(m => !m)}
-            title={hudMore ? "Hide view options" : "View options: render distance, fog, AA, grid"}
-            aria-label={hudMore ? "Hide view options" : "Show view options"}
-            aria-expanded={hudMore}
-            style={hudBtn({ padding: "2px 7px", fontSize: 10, color: "#afa69d" })}
-          >⋯</button>
-        )}
-        {(!compactHud || hudMore) && (<>
-        {/* Render distance slider */}
-        <div style={hudBtn({
-          display: "flex", alignItems: "center", gap: 4,
-          padding: "2px 6px", cursor: "default",
-        })}>
+        <div style={hudBar}>
+          {compactHud && (
+            <IconButton
+              icon="more" onClick={() => setHudMore(m => !m)} active={hudMore}
+              label={hudMore ? "Hide view options" : "Show view options"}
+              title={hudMore ? "Hide view options" : "View options: render distance, fog, AA, grid"}
+            />
+          )}
+          {(!compactHud || hudMore) && (<>
           {/* `value`/`min`/`max` are all in the non-linear "pos" domain (`radiusToPos`/`posToRadius`)
               — the displayed chunk count only matches 1:1 with slider position below pos 15, so the
               label stays a formatted, non-editable span rather than becoming a click-to-type field
               that would show the wrong number while typing. */}
           <SliderRow
-            label="R" min={0} max={radiusToPos(MAX_RENDER_DISTANCE)} step={1}
+            label="Dist" min={0} max={radiusToPos(MAX_RENDER_DISTANCE)} step={1}
             value={radiusToPos(renderDistanceDisplay)}
             onChange={v => {
               // Phase 3.2: drag only moves the local display value — no App re-render, no scene
@@ -4850,7 +4891,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
             }}
             onCommit={v => commitRenderDistance(posToRadius(v))}
             format={v => String(posToRadius(v))}
-            accent="#83786c" width={150} labelWidth={10}
+            width={110} labelWidth={26}
             title={`Render distance: ${renderDistanceDisplay} chunks`}
           />
           {renderDistanceDisplay > RENDER_DISTANCE_WARN_THRESHOLD && (
@@ -4863,8 +4904,8 @@ const FlyView3D = forwardRef<FlyView3DRef, {
                 aria-controls="fly3d-distance-warning"
                 style={{
                   display: "flex", alignItems: "center", justifyContent: "center",
-                  width: 13, height: 13, borderRadius: "50%", border: "none", padding: 0,
-                  background: "rgba(239,68,68,0.18)", color: "#ef4444", fontSize: 10, fontWeight: 700,
+                  width: 14, height: 14, borderRadius: "50%", border: "none", padding: 0,
+                  background: rgba(TEXT_DANGER, 0.18), color: TEXT_DANGER, fontSize: FONT.micro, fontWeight: 700,
                   cursor: "pointer", lineHeight: 1,
                 }}
               >!</button>
@@ -4874,141 +4915,113 @@ const FlyView3D = forwardRef<FlyView3DRef, {
                   role="tooltip"
                   style={{
                     ...hudPopover,
-                    position: "absolute", top: 18, right: 0, zIndex: 10,
-                    width: 200, padding: 8, fontSize: 10, lineHeight: 1.4,
-                    color: "#dad6d2", fontWeight: 400,
+                    position: "absolute", top: 20, right: 0, zIndex: 10,
+                    width: 200, padding: SPACE.lg, fontSize: FONT.micro, lineHeight: 1.4,
+                    color: TEXT_DIM, fontWeight: 400,
                   }}>
                   High render distance ({loadRadius} chunks) streams and keeps far more chunk geometry
-                  in memory and on the GPU, which can drop frame rate — especially while flying. Lower
+                  in memory and on the GPU, which can drop frame rate, especially while flying. Lower
                   it if you notice stutter.
                 </div>
               )}
             </div>
           )}
-        </div>
-        {/* Fog/sky color override — editor viewer preference only, never written to world.sky */}
-        <div style={hudBtn({
-          display: "flex", alignItems: "center", gap: 4,
-          padding: "2px 6px", cursor: "default",
-        })}>
           {/* Fog on/off — local override of the Settings default, doesn't touch world.sky */}
-          <button
-            onClick={() => setFogOverride(!effectiveFogEnabled)}
-            title={effectiveFogEnabled ? "Fog on — click to disable" : "Fog off — click to enable"}
-            aria-label={effectiveFogEnabled ? "Fog on — click to disable" : "Fog off — click to enable"}
-            style={hudBtn({
-              padding: "1px 5px", fontSize: 10,
-              color: effectiveFogEnabled ? "#afa69d" : "#61584f",
-            })}
-          >Fog {effectiveFogEnabled ? "✓" : "✗"}</button>
-          {/* Fog model — soft (exponential haze) vs hard (linear cut) */}
-          {effectiveFogEnabled && (
-            <button
-              onClick={() => onSky3dChange?.({ fogSoft: !fogSoft })}
-              title={fogSoft ? "Soft fog (exponential) — click for hard/linear" : "Hard fog (linear) — click for soft/exponential"}
-              aria-label={fogSoft ? "Soft exponential fog — click to switch to hard linear fog" : "Hard linear fog — click to switch to soft exponential fog"}
-              style={hudBtn({ padding: "1px 5px", fontSize: 10, color: "#afa69d" })}
-            >{fogSoft ? "∿" : "│"}</button>
-          )}
-          <input
-            type="color"
-            value={rgbToHex(effectiveFogColor())}
-            onChange={e => onSky3dChange?.({ fogColor: e.target.value })}
-            title="Fog / sky color (editor view only — not saved to the world file)"
-            aria-label="Fog and sky color (editor view only — not saved to the world file)"
-            style={{ width: 20, height: 16, padding: 0, border: "none", background: "none", cursor: "pointer" }}
+          <Check
+            checked={effectiveFogEnabled} onChange={setFogOverride} label="Fog"
+            title={effectiveFogEnabled ? "Fog on. Click to disable" : "Fog off. Click to enable"}
           />
-          {fogColorOverride && (
-            <button
-              onClick={() => onSky3dChange?.({ fogColor: null })}
-              title="Reset to world sky color"
-              aria-label="Reset fog color to the world's own sky color"
-              style={hudBtn({ padding: "1px 5px", fontSize: 10, color: "#afa69d" })}
-            >↺</button>
-          )}
-        </div>
-        <button
-          onClick={() => setAntialias(a => !a)}
-          title={antialias ? "Antialiasing on — click to disable" : "Antialiasing off — click to enable (higher GPU cost)"}
-          aria-label={antialias ? "Antialiasing on — click to disable" : "Antialiasing off — click to enable (higher GPU cost)"}
-          style={hudBtn({ padding: "2px 7px", fontSize: 10, color: antialias ? "#afa69d" : "#61584f" })}
-        >AA {antialias ? "✓" : "✗"}</button>
-        <button
-          onClick={() => onSetShowGrid?.(!gridVisible)}
-          title={gridVisible ? "Floor grid on — click to hide" : "Floor grid off — click to show"}
-          aria-label={gridVisible ? "Floor grid on — click to hide" : "Floor grid off — click to show"}
-          style={hudBtn({ padding: "2px 7px", fontSize: 10, color: gridVisible ? "#afa69d" : "#61584f" })}
-        >Grid {gridVisible ? "✓" : "✗"}</button>
-        {/* Auto-orient disclosure (15.3) — moved out of the Ribbon's Mode group, which had no room
-            for a second row once it lost the old fixed-width mode slot's neighbour. Collapsed by
-            default; the command itself still lives in meta.ts/bind.ts for ⌘K. */}
-        <div style={{ position: "relative", display: "flex" }}>
-          <button
-            onClick={() => setAutoOrientOpen(o => !o)}
-            title={autoOrientOpen ? "Hide more options" : "More options — sky colours, Auto-orient"}
-            aria-label={autoOrientOpen ? "Hide more view options" : "Show more view options"}
-            aria-expanded={autoOrientOpen}
-            style={hudBtn({ padding: "2px 7px", fontSize: 10, color: "#afa69d" })}
-          >…</button>
-          {autoOrientOpen && (
-            <div
-              role="menu"
-              style={{
-                ...hudPopover,
-                position: "absolute", top: 18, right: 0, zIndex: 10, padding: 6, display: "flex",
-                flexDirection: "column", gap: 6, alignItems: "stretch", whiteSpace: "nowrap",
-              }}
-            >
-              {/* Sky gradient (15.8) — editor view only, like the fog colour: never written to world.sky */}
-              <div style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 10, color: "#afa69d" }}>
-                <span>Sky</span>
-                <input
-                  type="color"
-                  value={sky3d.zenith}
-                  onChange={e => onSky3dChange?.({ zenith: e.target.value })}
-                  title="Sky colour overhead (zenith) — editor view only, not saved to the world file"
-                  aria-label="Sky zenith colour (editor view only — not saved to the world file)"
-                  style={{ width: 20, height: 16, padding: 0, border: "none", background: "none", cursor: "pointer" }}
+          {effectiveFogEnabled && (<>
+            {/* Fog model — soft (exponential haze) vs hard (linear cut) */}
+            <Check
+              checked={fogSoft} onChange={v => onSky3dChange?.({ fogSoft: v })} label="Soft"
+              title={fogSoft ? "Soft fog (exponential). Click for hard/linear" : "Hard fog (linear). Click for soft/exponential"}
+            />
+            {/* Fog/sky colour override — editor viewer preference only, never written to world.sky */}
+            <input
+              type="color"
+              value={rgbToHex(effectiveFogColor())}
+              onChange={e => onSky3dChange?.({ fogColor: e.target.value })}
+              title="Fog colour (editor view only, not saved to the world file)"
+              aria-label="Fog colour (editor view only, not saved to the world file)"
+              style={colorInput}
+            />
+            {fogColorOverride && (
+              <IconButton
+                icon="undo" onClick={() => onSky3dChange?.({ fogColor: null })}
+                label="Reset fog colour" title="Reset to the world's sky colour"
+              />
+            )}
+          </>)}
+          <Check
+            checked={antialias} onChange={setAntialias} label="AA"
+            title={antialias ? "Antialiasing on. Click to disable" : "Antialiasing off. Click to enable (higher GPU cost)"}
+          />
+          <Check
+            checked={gridVisible} onChange={v => onSetShowGrid?.(v)} label="Grid"
+            title={gridVisible ? "Floor grid on. Click to hide" : "Floor grid off. Click to show"}
+          />
+          {/* Sky colours + Auto-orient disclosure (15.3/15.8). The command itself still lives in
+              meta.ts/bind.ts for ⌘K. */}
+          <div style={{ position: "relative", display: "flex" }}>
+            <IconButton
+              icon="more" onClick={() => setAutoOrientOpen(o => !o)} active={autoOrientOpen}
+              label={autoOrientOpen ? "Hide more view options" : "Show more view options"}
+              title={autoOrientOpen ? "Hide more options" : "More options: sky colours, Auto-orient"}
+            />
+            {autoOrientOpen && (
+              <div
+                role="menu"
+                style={{
+                  ...hudPopover,
+                  position: "absolute", top: SMALL_H + 4, right: 0, zIndex: 10, padding: SPACE.md, display: "flex",
+                  flexDirection: "column", gap: SPACE.md, alignItems: "stretch", whiteSpace: "nowrap",
+                }}
+              >
+                {/* Sky gradient (15.8) — editor view only, like the fog colour: never written to world.sky */}
+                <div style={{ display: "flex", alignItems: "center", gap: SPACE.md, fontSize: FONT.label, color: TEXT_DIM }}>
+                  <span>Sky</span>
+                  <input
+                    type="color"
+                    value={sky3d.zenith}
+                    onChange={e => onSky3dChange?.({ zenith: e.target.value })}
+                    title="Sky colour overhead (zenith), editor view only, not saved to the world file"
+                    aria-label="Sky zenith colour (editor view only, not saved to the world file)"
+                    style={colorInput}
+                  />
+                  <input
+                    type="color"
+                    value={sky3d.horizon}
+                    onChange={e => onSky3dChange?.({ horizon: e.target.value })}
+                    title="Sky colour at the horizon, editor view only, not saved to the world file"
+                    aria-label="Sky horizon colour (editor view only, not saved to the world file)"
+                    style={colorInput}
+                  />
+                  <SmallButton
+                    label="Match fog"
+                    onClick={() => onSky3dChange?.({ horizon: rgbToHex(effectiveFogColor()) })}
+                    title="Set the horizon colour to the current fog colour, so distant terrain fades into the sky seamlessly"
+                  />
+                  <IconButton
+                    icon="undo" onClick={() => onSky3dChange?.({ zenith: DEFAULT_SKY3D.zenith, horizon: DEFAULT_SKY3D.horizon })}
+                    label="Reset sky" title="Reset the sky gradient to the default"
+                  />
+                </div>
+                <Check
+                  checked={autoOrient3d} onChange={v => onSetAutoOrient3d?.(v)} label="Auto-orient"
+                  title="Auto-orient ramps, wedges and doors to your facing when placing. Off = they keep the orientation picked in the Block picker."
                 />
-                <input
-                  type="color"
-                  value={sky3d.horizon}
-                  onChange={e => onSky3dChange?.({ horizon: e.target.value })}
-                  title="Sky colour at the horizon — editor view only, not saved to the world file"
-                  aria-label="Sky horizon colour (editor view only — not saved to the world file)"
-                  style={{ width: 20, height: 16, padding: 0, border: "none", background: "none", cursor: "pointer" }}
-                />
-                <button
-                  onClick={() => onSky3dChange?.({ horizon: rgbToHex(effectiveFogColor()) })}
-                  title="Set the horizon colour to the current fog colour, so distant terrain fades into the sky seamlessly"
-                  aria-label="Match the sky horizon colour to the fog colour"
-                  style={hudBtn({ padding: "1px 5px", fontSize: 10, color: "#afa69d" })}
-                >match fog</button>
-                <button
-                  onClick={() => onSky3dChange?.({ zenith: DEFAULT_SKY3D.zenith, horizon: DEFAULT_SKY3D.horizon })}
-                  title="Reset the sky gradient to the default"
-                  aria-label="Reset the sky gradient to the default colours"
-                  style={hudBtn({ padding: "1px 5px", fontSize: 10, color: "#afa69d" })}
-                >↺</button>
               </div>
-              <button
-                onClick={() => onSetAutoOrient3d?.(!autoOrient3d)}
-                title="Auto-orient ramps, wedges and doors to your facing when placing. Off = they keep the orientation picked in the Block picker."
-                aria-label={autoOrient3d ? "Auto-orient on — click to disable" : "Auto-orient off — click to enable"}
-                style={hudBtn({ padding: "2px 7px", fontSize: 10, color: autoOrient3d ? "#afa69d" : "#61584f" })}
-              >Auto-orient {autoOrient3d ? "✓" : "✗"}</button>
-            </div>
-          )}
+            )}
+          </div>
+          </>)}
+          <IconButton
+            icon="home" onClick={() => sceneApi.current?.resetCamera()}
+            label="Reset camera" title="Reset camera to world overview"
+          />
         </div>
-        </>)}
-        <button
-          onClick={() => sceneApi.current?.resetCamera()}
-          title="Reset camera to world overview"
-          aria-label="Reset camera to world overview"
-          style={hudBtn({ padding: "2px 7px", fontSize: 10, color: "#afa69d" })}
-        >⌂ Reset</button>
       </div>
-      {camMode !== "orbit" && (
+      {showHud && camMode !== "orbit" && (
         // Centre crosshair — the aim point for movement and for 3D picking in both walking modes.
         <div style={{
           position: "absolute", top: "50%", left: "50%", transform: "translate(-50%,-50%)",
@@ -5023,7 +5036,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       {showPerfHud && <div style={{ display: showHud ? "contents" : "none" }}><GeomMemHud ref={memHudRef} /></div>}
       {/* In-pane hotbar (bottom-centre, build mode only) — 5 pinned + 5 recent, mirrors the Ribbon
           hotbar and the 1-5/6-0 digit keys so the active slot never needs a glance back at the Ribbon. */}
-      {interact3d === "build" && showHotbarOverlay && hotbarSlots && hotbarSlots.length > 0 && (
+      {showHud && interact3d === "build" && showHotbarOverlay && hotbarSlots && hotbarSlots.length > 0 && (
         <div style={{
           position: "absolute", bottom: 6, left: "50%", transform: "translateX(-50%)", zIndex: 1,
           display: "flex", gap: 3, pointerEvents: "auto",
@@ -5056,7 +5069,8 @@ const FlyView3D = forwardRef<FlyView3DRef, {
           so only the pill buttons capture clicks — the canvas stays interactive around them. */}
       <div style={{
         position: "absolute", bottom: 6, right: 6, zIndex: 1, pointerEvents: "none",
-        display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4,
+        // HUD off (19.12): hidden with the rest of the overlay layer.
+        display: showHud ? "flex" : "none", flexDirection: "column", alignItems: "flex-end", gap: 4,
       }}>
         <div style={{
           display: "flex", gap: 2, pointerEvents: "auto",

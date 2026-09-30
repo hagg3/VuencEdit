@@ -39,7 +39,7 @@ describe("settings v18 migration", () => {
     const s = await load({ settingsVersion: 17, defaultQuadView: true, default3dPane: false, leftToolbarOpen: true, memoryBudget: "high" });
     expect(s).not.toHaveProperty("workLayout");
     expect(s.pendingQuadRetiredNotice).toBe(false);
-    expect(s.settingsVersion).toBe(23); // now-current version — this test only cares about v18's own effects
+    expect(s.settingsVersion).toBe(24); // now-current version — this test only cares about v18's own effects
     const stored = JSON.parse(mem.getItem("eden_settings")!);
     expect(stored).not.toHaveProperty("defaultQuadView");
     expect(stored).not.toHaveProperty("default3dPane");
@@ -94,7 +94,7 @@ describe("settings v19 migration (UI sounds)", () => {
     expect(s.uiSounds).toBe(true);
     expect(s.uiSoundPack).toBe("classic");
     expect(s.uiSoundVolume).toBe(0.8);
-    expect(s.settingsVersion).toBe(23); // now-current version — this test only cares about v19's own effects
+    expect(s.settingsVersion).toBe(24); // now-current version — this test only cares about v19's own effects
   });
 
   it("a user who already turned sound off before this version keeps that choice", async () => {
@@ -113,7 +113,7 @@ describe("settings v19 migration (UI sounds)", () => {
   it("is a no-op once already at v19 (still bumps to the now-current version)", async () => {
     const s = await load({ settingsVersion: 19, uiSounds: false });
     expect(s.uiSounds).toBe(false);
-    expect(s.settingsVersion).toBe(23); // v19 < v23, so migrate() still runs — just none of *this* block's fields
+    expect(s.settingsVersion).toBe(24); // v19 < v23, so migrate() still runs — just none of *this* block's fields
   });
 });
 
@@ -127,7 +127,7 @@ describe("settings v20 migration (compact ribbon)", () => {
   it("an existing install gets ribbonCompact: false, with no explicit migrate() write", async () => {
     const s = await load({ settingsVersion: 19 });
     expect(s.ribbonCompact).toBe(false);
-    expect(s.settingsVersion).toBe(23); // now-current version — this test only cares about v20's own effects
+    expect(s.settingsVersion).toBe(24); // now-current version — this test only cares about v20's own effects
   });
 
   it("a user who already turned it on before this version keeps that choice", async () => {
@@ -143,7 +143,7 @@ describe("settings v20 migration (compact ribbon)", () => {
   it("is a no-op once already at v20 (still bumps to the now-current version)", async () => {
     const s = await load({ settingsVersion: 20, ribbonCompact: true });
     expect(s.ribbonCompact).toBe(true);
-    expect(s.settingsVersion).toBe(23); // v20 < v23, so migrate() still runs — just none of *this* block's fields
+    expect(s.settingsVersion).toBe(24); // v20 < v23, so migrate() still runs — just none of *this* block's fields
   });
 });
 
@@ -157,7 +157,7 @@ describe("settings v21 migration (motion)", () => {
   it("an existing install gets motion: \"system\", with no explicit migrate() write", async () => {
     const s = await load({ settingsVersion: 20 });
     expect(s.motion).toBe("system");
-    expect(s.settingsVersion).toBe(23); // now-current version — this test only cares about v21's own effects
+    expect(s.settingsVersion).toBe(24); // now-current version — this test only cares about v21's own effects
   });
 
   it("a user who already forced full or reduced motion before this version keeps that choice", async () => {
@@ -173,7 +173,7 @@ describe("settings v21 migration (motion)", () => {
   it("is a no-op once already at v21 (still bumps to the now-current version)", async () => {
     const s = await load({ settingsVersion: 21, motion: "full" });
     expect(s.motion).toBe("full");
-    expect(s.settingsVersion).toBe(23); // v21 < v23, so migrate() still runs — just none of *this* block's fields
+    expect(s.settingsVersion).toBe(24); // v21 < v23, so migrate() still runs — just none of *this* block's fields
   });
 });
 
@@ -186,7 +186,7 @@ describe("settings v22 migration (quick actions bar removed)", () => {
   it("strips a stored showQuickActions key from an existing install", async () => {
     const s = await load({ settingsVersion: 21, showQuickActions: false });
     expect(s).not.toHaveProperty("showQuickActions");
-    expect(s.settingsVersion).toBe(23);
+    expect(s.settingsVersion).toBe(24);
     const stored = JSON.parse(mem.getItem("eden_settings")!);
     expect(stored).not.toHaveProperty("showQuickActions");
   });
@@ -199,7 +199,7 @@ describe("settings v22 migration (quick actions bar removed)", () => {
   it("is a no-op once already at v22", async () => {
     const s = await load({ settingsVersion: 23 });
     expect(s).not.toHaveProperty("showQuickActions");
-    expect(s.settingsVersion).toBe(23);
+    expect(s.settingsVersion).toBe(24);
   });
 });
 
@@ -215,7 +215,7 @@ describe("settings v23 migration (Quad retired)", () => {
     expect(s).not.toHaveProperty("quad3dEnabled");
     expect(s).not.toHaveProperty("pendingLayoutNotice");
     expect(s.pendingQuadRetiredNotice).toBe(true);
-    expect(s.settingsVersion).toBe(23);
+    expect(s.settingsVersion).toBe(24);
     const stored = JSON.parse(mem.getItem("eden_settings")!);
     expect(stored).not.toHaveProperty("workLayout");
     expect(stored.pendingQuadRetiredNotice).toBe(true);
@@ -281,5 +281,21 @@ describe("3D look prefs (Stage 15.8, additive)", () => {
     expect(s.sky3dZenith).toBe("#112233");
     expect(s.fog3dColor).toBeNull();
     expect(s.show3dHud).toBe(false);
+  });
+});
+
+/** Settings v24 (Stage 19.1): relief shading defaults off; installs that stored the old default are forced off once. */
+describe("settings v24 migration (relief off by default)", () => {
+  it("forces a stored reliefShading:true off when migrating from v23", async () => {
+    const s = await load({ settingsVersion: 23, reliefShading: true });
+    expect(s.reliefShading).toBe(false);
+  });
+  it("a fresh install starts with relief off", async () => {
+    const s = await load(null);
+    expect(s.reliefShading).toBe(false);
+  });
+  it("keeps an explicit opt-in made after v24", async () => {
+    const s = await load({ settingsVersion: 24, reliefShading: true });
+    expect(s.reliefShading).toBe(true);
   });
 });

@@ -1294,17 +1294,34 @@ export function NumField({
  * fixed `SMALL_H` height; without one nothing changes.
  */
 export function Check({
-  checked, onChange, label, title, disabled, hint,
-}: { checked: boolean; onChange: (v: boolean) => void; label: ReactNode; title?: string; disabled?: boolean; hint?: ReactNode }) {
+  checked, onChange, label, title, disabled, hint, indeterminate,
+}: {
+  checked: boolean; onChange: (v: boolean) => void; label: ReactNode; title?: string; disabled?: boolean;
+  hint?: ReactNode;
+  /** The mixed state (some-but-not-all): drawn as a dash, and a click still reports `!checked`. */
+  indeterminate?: boolean;
+}) {
+  const inputRef = useRef<HTMLInputElement>(null);
+  useEffect(() => { if (inputRef.current) inputRef.current.indeterminate = !!indeterminate; }, [indeterminate]);
   return (
-    <label title={title} style={{
+    <label title={title} className="vx-chk" style={{
       display: "flex", alignItems: hint ? "flex-start" : "center", gap: 5, height: hint ? undefined : SMALL_H,
       userSelect: "none",
       cursor: disabled ? "default" : "pointer", ...(disabled ? btnDisabled : null),
     }}>
-      <input type="checkbox" checked={checked} disabled={disabled}
-        onChange={e => onChange(e.target.checked)}
-        style={{ accentColor: ACCENT.primary, margin: hint ? "2px 0 0" : 0 }} />
+      {/* The native input stays (visually hidden, `.vx-chk-in`) for keyboard, focus and screen
+          readers; the box next to it is what's drawn. Styles: theme/cssVars.ts. */}
+      <span className="vx-chk-wrap" style={{ marginTop: hint ? 2 : 0 }}>
+        <input ref={inputRef} type="checkbox" className="vx-chk-in" data-no-focus-ring
+          checked={checked} disabled={disabled}
+          onChange={e => onChange(e.target.checked)} />
+        <span className="vx-chk-box" aria-hidden>
+          <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <path className="vx-chk-tick" d="M3.4 7.4l2.4 2.4 4.8-5.2" />
+            <path className="vx-chk-dash" d="M3.8 7h6.4" />
+          </svg>
+        </span>
+      </span>
       {hint ? (
         <span>
           <span style={{ color: TEXT_DIM, fontSize: FONT.label }}>{label}</span>

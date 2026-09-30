@@ -114,6 +114,16 @@ describe("paste lens enabled flag is session-only (16.1)", () => {
 });
 
 describe("stored sizes are clamped to the window limits on load (16.2)", () => {
+  it("pulls an oversize lens down to its ~2x cap (19.8) and an oversize hotbar to the 44 px slot cap", () => {
+    const raw = {
+      swapped: false, workAtSave: { w: 1, h: 1 },
+      wins: { lens: { ...DEF.lens, w: 1800, h: 1100 }, hotbar: { ...DEF.hotbar, w: 2000, h: 300 } },
+    };
+    const got = sanitizeLayout(raw, DEF)!;
+    expect(got.wins.lens.w).toBe(640);
+    expect(got.wins.lens.h).toBe(420);
+    expect(got.wins.hotbar.w).toBe(winLimits("hotbar", { w: 0, h: 0 }).max.w);
+  });
   it("pulls a wild Tools/Hotbar size into [min, max] but keeps position", () => {
     const raw = {
       swapped: false, workAtSave: { w: 1, h: 1 },

@@ -100,7 +100,7 @@ export interface RibbonProps {
   mode3d: "off" | "select" | "build" | "sculpt" | "floodfill"; setMode3d: (v: "off" | "select" | "build" | "sculpt" | "floodfill") => void;
   /** Auto-orient directional blocks (ramps/wedges/doors) to the player's facing when placing in 3D build. */
   autoOrient3d: boolean; setAutoOrient3d: (v: boolean) => void;
-  /** 3D pane HUD / floor-grid visibility (Stage 15.8) — persisted, the same flags the pane's own `…` row drives. */
+  /** 3D pane HUD / floor-grid visibility (Stage 15.8) — persisted. HUD off hides every pane overlay (19.12). */
   show3dHud: boolean; setShow3dHud: (v: boolean) => void;
   show3dGrid: boolean; setShow3dGrid: (v: boolean) => void;
   floodFillLimit: number; setFloodFillLimit: (v: number) => void;

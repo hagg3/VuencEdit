@@ -1,12 +1,11 @@
 import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { decodePixelPatch, decodePreviewData, type SelectionInfo, type ClipboardInfo, type PreviewData, type SignInfo, type ExtrudeAxis } from "./types";
+import { decodePixelPatch, decodePreviewData, type SelectionInfo, type ClipboardInfo, type PreviewData, type SignInfo } from "./types";
 import { previewCanvas } from "./previewCanvas";
-import { Icon } from "./ribbon/icons";
-import { Segmented, NumField, Check, SliderRow } from "./ribbon/primitives";
+import { SliderRow } from "./ribbon/primitives";
 import {
-  ACCENT, TEXT, TEXT_ARMED, TEXT_DIM, TEXT_META, TEXT_LABEL, TEXT_DISABLED,
-  BORDER, RADIUS, SPACE, SMALL_H, btnBase, hexToRgbTriplet,
+  ACCENT, TEXT, TEXT_ARMED, TEXT_DIM, TEXT_META, TEXT_LABEL,
+  RADIUS, SPACE, hexToRgbTriplet,
 } from "./ribbon/tokens";
 import { Section, PropGrid, PROP_MONO } from "./ui/PropertyGrid";
 import ElevationPreviewPanel from "./ElevationPreviewPanel";
@@ -34,16 +33,6 @@ interface Props {
   onDrawElevation: (x: number, y: number, z: number) => void;
   onZRangeChange?: (zMin: number, zMax: number) => void;
 
-  // Extrude section (mirrors the ribbon Selection tab's Extrude group — same lifted App state,
-  // so the two stay in sync; "skip air" is local to whichever control last ran it, same as the
-  // ribbon's own Extrude group keeps its checkbox state ribbon-local). `extrudeCount` above is
-  // gated for the elevation ghost's benefit; `extrudeCountRaw`, when given, is the real value the
-  // editable field should show/edit.
-  extrudeCountRaw?: number;
-  setExtrudeCount?: (n: number) => void;
-  setExtrudeAxis?: (a: ExtrudeAxis) => void;
-  onExtrude?: (ignoreAir: boolean) => void;
-
   // Signs (256z-format plan, Phase 4) — read-only list, collapsible, only shown when non-empty.
   signs: SignInfo[];
   onSignClick?: (s: SignInfo) => void;
@@ -55,17 +44,6 @@ const LABEL_H = 16;
 const CLIP_PREV_W = 140;
 const CLIP_PREV_H = 140;
 const SIGNS_COLLAPSED_COUNT = 3;
-
-const POS_AXES: { id: ExtrudeAxis; label: string; title: string }[] = [
-  { id: "z+", label: "↑Z+", title: "Repeat upward" },
-  { id: "x+", label: "→X+", title: "Repeat east" },
-  { id: "y+", label: "↓Y+", title: "Repeat south" },
-];
-const NEG_AXES: { id: ExtrudeAxis; label: string; title: string }[] = [
-  { id: "z-", label: "↓Z−", title: "Repeat downward" },
-  { id: "x-", label: "←X−", title: "Repeat west" },
-  { id: "y-", label: "↑Y−", title: "Repeat north" },
-];
 
 const panelStyle: React.CSSProperties = {
   display: "flex",
@@ -165,58 +143,10 @@ function SignsBody({ signs, onSignClick }: { signs: SignInfo[]; onSignClick?: (s
   );
 }
 
-/** Extrude section body — mirrors the ribbon Selection tab's Extrude group so both surfaces drive
- *  the same App-level `extrudeCount`/`extrudeAxis` state; "ignore air" is local (same as the
- *  ribbon's own copy is Ribbon-local), since `onExtrude` already takes it as a parameter. */
-function ExtrudeBody({
-  extrudeCount, extrudeAxis, setExtrudeCount, setExtrudeAxis, onExtrude, hasSelection,
-}: {
-  extrudeCount: number; extrudeAxis: string;
-  setExtrudeCount?: (n: number) => void; setExtrudeAxis?: (a: ExtrudeAxis) => void;
-  onExtrude?: (ignoreAir: boolean) => void; hasSelection: boolean;
-}) {
-  const [ignoreAir, setIgnoreAir] = useState(false);
-  const axis = extrudeAxis as ExtrudeAxis;
-  const canRun = hasSelection && extrudeCount > 0 && !!onExtrude;
-  return (
-    <div style={{ display: "flex", flexDirection: "column", gap: SPACE.sm }}>
-      <Segmented ariaLabel="Extrude axis, positive" accent={ACCENT.selection} value={axis}
-        onChange={a => setExtrudeAxis?.(a)} options={POS_AXES} />
-      <Segmented ariaLabel="Extrude axis, negative" accent={ACCENT.selection} value={axis}
-        onChange={a => setExtrudeAxis?.(a)} options={NEG_AXES} />
-      <div style={{ display: "flex", alignItems: "center", gap: SPACE.md, height: SMALL_H }}>
-        <span style={{ color: TEXT_LABEL, fontSize: 11 }}>Copies</span>
-        <NumField min={0} max={20} value={extrudeCount} title="0 = preview off"
-          onChange={n => setExtrudeCount?.(n)} ariaLabel="Extrude copies" width={40} />
-        <Check checked={ignoreAir} onChange={setIgnoreAir} label="Ignore air"
-          title="Leave existing blocks where the source cell is air" />
-      </div>
-      <button
-        onClick={() => onExtrude?.(ignoreAir)}
-        disabled={!canRun}
-        title={!hasSelection ? "Make a selection first" : extrudeCount === 0 ? "Set the number of copies above 0" : `Repeat the selection ${extrudeCount}× along ${extrudeAxis}`}
-        style={btnBase({
-          padding: "5px 10px", fontSize: 11, borderRadius: RADIUS.md, width: "100%",
-          display: "flex", alignItems: "center", justifyContent: "center", gap: SPACE.sm,
-          color: canRun ? ACCENT.selection : TEXT_DISABLED,
-          boxShadow: canRun
-            ? `inset 0 0 0 1px rgba(${hexToRgbTriplet(ACCENT.selection)},.55), inset 0 1px 0 ${BORDER.bevel}`
-            : `inset 0 0 0 1px ${BORDER.outline}`,
-          opacity: canRun ? 1 : 0.5, cursor: canRun ? "pointer" : "default",
-        })}
-      >
-        <Icon name="extrude" size={13} tone="inherit" />
-        Extrude {extrudeCount > 0 ? `${extrudeCount}×` : ""}
-      </button>
-    </div>
-  );
-}
-
 export default function SelectionInspector({
   selection: sel, clipboard, clipboardPreview,
   elevationSelection, elevationWidth, maxZ, extrudeCount, extrudeAxis, isPastePreview,
   editEpoch, drawActive, onDrawElevation, onZRangeChange,
-  extrudeCountRaw, setExtrudeCount, setExtrudeAxis, onExtrude,
   signs, onSignClick,
 }: Props) {
   const [view, setView] = useState<PreviewView>("top");
@@ -370,16 +300,6 @@ export default function SelectionInspector({
             height={CH}
             style={{ display: "block", width: CW, height: CH, borderRadius: 4, border: "none", boxShadow: "inset 0 0 0 1px rgba(0,0,0,.4)" }}
             title={`${view} view — actual block colors`}
-          />
-        </Section>
-      )}
-
-      {sel && (
-        <Section id="extrude" title="Extrude" icon="extrude">
-          <ExtrudeBody
-            extrudeCount={extrudeCountRaw ?? extrudeCount} extrudeAxis={extrudeAxis}
-            setExtrudeCount={setExtrudeCount} setExtrudeAxis={setExtrudeAxis} onExtrude={onExtrude}
-            hasSelection={!!sel}
           />
         </Section>
       )}

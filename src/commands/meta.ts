@@ -244,7 +244,7 @@ export const COMMAND_META = {
   "3d.mode.autoOrient": { short: "Auto-orient", label: "3D: Auto-orient Blocks", icon: "autoOrient", family: "primary", title: "Auto-orient ramps, wedges and doors to your facing when placing. Off = they keep the orientation picked in the picker.", path: d3("mode"), kind: "toggle" },
   // Renamed from `3d.slot.block` in 16.6 (the contextual `slot` group became the Build slot panel).
   "3d.block.pick": { short: "Block", label: "3D Build Block…", icon: "block", title: "The block Build and Flood Fill place — opens the block/paint picker", path: d3("block"), kind: "picker" },
-  "3d.camera.hud": { short: "HUD", label: "3D: HUD (Compass, Legend, Readouts)", icon: "fps", family: "violet", title: "Show the 3D pane's HUD: camera pill and key legend, compass and coordinates, and the perf readout. The build crosshair always stays.", path: d3("camera"), kind: "toggle", keywords: ["overlay", "compass", "legend", "hide ui"] },
+  "3d.camera.hud": { short: "HUD", label: "3D: HUD (All Overlays)", icon: "fps", family: "violet", title: "Show the 3D pane's overlays, including the build crosshair. Off shows only the scene and, if on, the floor grid.", path: d3("camera"), kind: "toggle", keywords: ["overlay", "compass", "legend", "hide ui"] },
   "3d.camera.grid": { short: "Grid", label: "3D: Floor Grid", icon: "tiled", family: "violet", title: "Show the 3D pane's floor grid", path: d3("camera"), kind: "toggle", keywords: ["floor", "guides"] },
   "3d.camera.flySpeed": { label: "Fly Speed", icon: "flySpeed", family: "violet", path: d3("camera"), kind: "setting" },
   "3d.camera.distance": { label: "Render Distance", icon: "renderDistance", family: "violet", path: d3("camera"), kind: "setting", keywords: ["view distance", "chunks"] },

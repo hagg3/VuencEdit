@@ -26,7 +26,9 @@
 //!
 //! Replay applies span records in stream order — a later record for the same file offset simply
 //! overwrites what an earlier one wrote, so re-dirtying a chunk across ticks needs no special
-//! casing. Replay stops at the first record that is short, fails its CRC, or whose
+//! casing. A record covers whatever run of bytes its writer chose — the app emits one per maximal
+//! run of dirty 8 KB bands (18.13), so a chunk may have several records, or one covering only part
+//! of it; replay is by `file_off` and never assumes a record is a whole chunk. Replay stops at the first record that is short, fails its CRC, or whose
 //! `file_off + raw_len` would run past `base_len`; everything decoded before that point is still
 //! applied. That is what makes an append-only journal crash-safe without an fsync per record: a
 //! torn trailing write just gets ignored.
