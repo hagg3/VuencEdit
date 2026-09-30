@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { decodePasteLens } from "./types";
+import { decodeGeometry, decodePasteLens } from "./types";
 
 // Mirrors `ipc_envelope`'s framing (lib.rs) — same idiom as `codec.test.ts`'s `buildEnvelope`.
 function buildEnvelope(header: unknown, body: Uint8Array): ArrayBuffer {
@@ -60,5 +60,62 @@ describe("decodePasteLens", () => {
     expect(r.ghostZMin).toBeNull();
     expect(r.ghostZMax).toBeNull();
     expect(r.approx).toBe(true);
+  });
+});
+
+describe("decodeGeometry (format 2, ROADMAP-EDIT 18.14)", () => {
+  // One opaque quad (4 vertices, 6 Uint16 indices padded to 12 bytes) with UVs; an empty transparent
+  // stream; an emissive triangle with Uint32 indices. Section order per stream: pos, col, uv, idx.
+  const le16 = (xs: number[]) => { const b = new Uint8Array(xs.length * 2); const d = new DataView(b.buffer); xs.forEach((x, i) => d.setInt16(i * 2, x, true)); return b; };
+  const le32 = (xs: number[]) => { const b = new Uint8Array(xs.length * 4); const d = new DataView(b.buffer); xs.forEach((x, i) => d.setUint32(i * 4, x, true)); return b; };
+  const pad4 = (b: Uint8Array) => { const out = new Uint8Array(Math.ceil(b.length / 4) * 4); out.set(b); return out; };
+  const opPos = le16([0, 0, 0, 0, 16, 0, 0, 0, 16, 0, 16, 0, 0, 0, 16, 0]);
+  const opCol = new Uint8Array([255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 9, 9, 9, 255]);
+  const opUv = le16([0, 4, 2, 4, 2, 3, 0, 3]);
+  const opIdx = pad4(le16([0, 1, 3, 1, 2, 3]));
+  const emPos = le16([32, 64, 0, 0, 48, 64, 0, 0, 40, 72, 0, 0]);
+  const emCol = new Uint8Array(12).fill(200);
+  const emIdx = le32([0, 1, 2]);
+  const parts = [opPos, opCol, opUv, opIdx, emPos, emCol, emIdx];
+  const body = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+  let off = 0; for (const p of parts) { body.set(p, off); off += p.length; }
+  const header = {
+    format: 2, origin: [32, 0, 48], pos_scale: 1 / 16, atlas_rows: 9,
+    streams: [
+      { vertex_count: 4, index_count: 6, index_u32: false, lens: [opPos.length, opCol.length, opUv.length, opIdx.length] },
+      { vertex_count: 0, index_count: 0, index_u32: false, lens: [0, 0, 0, 0] },
+      { vertex_count: 3, index_count: 3, index_u32: true, lens: [emPos.length, emCol.length, 0, emIdx.length] },
+    ],
+  };
+
+  it("slices every section into typed views and cuts the index padding", () => {
+    const g = decodeGeometry(buildEnvelope(header, body));
+    expect(g.origin).toEqual([32, 0, 48]);
+    expect(g.posScale).toBe(1 / 16);
+    expect(g.atlasRows).toBe(9);
+    const [op, tr, em] = g.streams;
+    expect(op.positions).toBeInstanceOf(Int16Array);
+    expect(Array.from(op.positions)).toEqual([0, 0, 0, 0, 16, 0, 0, 0, 16, 0, 16, 0, 0, 0, 16, 0]);
+    expect(Array.from(op.colors.subarray(0, 4))).toEqual([255, 0, 0, 255]);
+    expect(Array.from(op.uvs)).toEqual([0, 4, 2, 4, 2, 3, 0, 3]);
+    expect(op.indices).toBeInstanceOf(Uint16Array);
+    expect(Array.from(op.indices)).toEqual([0, 1, 3, 1, 2, 3]); // not the 7th, padding, index
+    expect(op.bytes).toBe(opPos.length + opCol.length + opUv.length + opIdx.length);
+    expect(tr.vertexCount).toBe(0);
+    expect(tr.bytes).toBe(0);
+    expect(em.indices).toBeInstanceOf(Uint32Array);
+    expect(Array.from(em.indices)).toEqual([0, 1, 2]);
+    expect(em.uvs.length).toBe(0);
+  });
+
+  it("views in place (no copy) when the body is aligned", () => {
+    const buf = buildEnvelope(header, body);
+    const g = decodeGeometry(buf);
+    expect(g.streams[0].positions.buffer).toBe(buf);
+    expect(g.streams[2].indices.buffer).toBe(buf);
+  });
+
+  it("rejects a v1 (format-less) header", () => {
+    expect(() => decodeGeometry(buildEnvelope({ vertex_count: 0, lens: [] }, new Uint8Array(0)))).toThrow(/format/);
   });
 });

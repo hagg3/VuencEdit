@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { save } from "@tauri-apps/plugin-dialog";
 import { MODAL_TEXT } from "./designTokens";
+import { fmtBytes } from "./formatBytes";
 import { formatHistogram, approxPercentile, perfCounters, resetPerfCounters, RELOAD_REASONS } from "./perfCounters";
 import type { GpuInfo, PerfSnapshot } from "./FlyView3D";
 import type { WorldMeta } from "./types";
@@ -46,6 +47,11 @@ interface MemStatsJson {
   undoBudget: number;
   clipboardBytes: number;
   selectionMaskBytes: number;
+  overviewBytes: number;
+  overviewGranularity: number;
+  overviewServed: number;
+  overviewScanned: number;
+  overviewBudget: number;
   peaks: {
     editPreimageBytes: PeakPair;
     editDeltaBytes: PeakPair;
@@ -82,13 +88,6 @@ interface Props {
    *  pane has never mounted (e.g. the 3D window never opened this whole session). */
   getGpuInfo: () => GpuInfo | null;
   getPerfSnapshot: () => PerfSnapshot | null;
-}
-
-function fmtBytes(n: number): string {
-  if (n >= 1 << 30) return `${(n / (1 << 30)).toFixed(2)} GB`;
-  if (n >= 1 << 20) return `${(n / (1 << 20)).toFixed(1)} MB`;
-  if (n >= 1 << 10) return `${(n / (1 << 10)).toFixed(1)} KB`;
-  return `${n} B`;
 }
 
 /** basename only, by design — see the module doc's privacy note. Handles both path separators
@@ -186,6 +185,9 @@ function buildReport(a: {
     out.push(line("Undo bytes / groups", `${fmtBytes(mem.undoBytes)} / ${mem.undoGroups}`));
     out.push(line("Redo bytes / groups", `${fmtBytes(mem.redoBytes)} / ${mem.redoGroups}`));
     out.push(line("Undo budget", fmtBytes(mem.undoBudget)));
+    out.push(line("Overview raster", mem.overviewGranularity > 0
+      ? `${fmtBytes(mem.overviewBytes)} at g=${mem.overviewGranularity} (budget ${fmtBytes(mem.overviewBudget)}), ${mem.overviewServed.toLocaleString("en-US")} samples served / ${mem.overviewScanned.toLocaleString("en-US")} scanned`
+      : `not built (budget ${fmtBytes(mem.overviewBudget)})`));
     // Stage 18.0 peak counters — `last / max` since launch. They attribute a working-set spike to
     // an operation, which the process peak above cannot.
     const pk = mem.peaks;

@@ -502,6 +502,8 @@ interface Props {
   onMapContextMenu?: (wx: number, wy: number, screenX: number, screenY: number) => void;
   /** Called on every pointer-move during a select-tool drag with the live (unnormalized) rect; null when the drag ends/cancels. Used for a live W×H status bar readout. */
   onSelectDragUpdate?: (rect: { x1: number; y1: number; x2: number; y2: number } | null) => void;
+  /** A marquee drag just committed a real (non-click) selection rect, for the commit flash (19.6). */
+  onSelectionCommitted?: (rect: { x1: number; y1: number; x2: number; y2: number }) => void;
   /** Called when the user drags inside the committed selection (not on a resize edge) and releases with a nonzero offset — moves the selection and its contents as one gesture (E2). */
   onMoveSelection?: (dx: number, dy: number) => void;
   /** When true, a drag-move captures a snapshot of the selection's current pixels and shows it as a semi-transparent ghost following the drag (content will actually move on drop). When false, only the outline is dragged (E2 "Move: Box Only" default). */
@@ -527,7 +529,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     spawnPos = null, playerPos = null, creatures = [], signs = [],
     pasteElevationOffset = 0, onEyedropper, onPoolFillPick,
     cameraPos3d = null, onSetCamera3d,
-    showTemplateOverlay = false, onMapContextMenu, onSelectDragUpdate, onMoveSelection, moveWithContents = false,
+    showTemplateOverlay = false, onMapContextMenu, onSelectDragUpdate, onSelectionCommitted, onMoveSelection, moveWithContents = false,
     committedMaterializeSelection = null, onMaterializeSelectionChange,
     tileBudgetBytes = DEFAULT_TILE_BUDGET_BYTES }: Props,
   ref,
@@ -662,6 +664,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   const cameraPos3dRef      = useRef<{ x: number; y: number; yaw?: number; hfov?: number } | null>(cameraPos3d ?? null);
   const onSetCamera3dRef    = useRef(onSetCamera3d);
   const onSelectDragUpdateRef = useRef(onSelectDragUpdate);
+  const onSelectionCommittedRef = useRef(onSelectionCommitted);
   const onMoveSelectionRef = useRef(onMoveSelection);
   const moveWithContentsRef = useRef(moveWithContents);
   const committedMaterializeSelRef = useRef<MaterializeSelectionBounds | null>(committedMaterializeSelection);
@@ -750,6 +753,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   useEffect(() => { cameraPos3dRef.current     = cameraPos3d ?? null; }, [cameraPos3d]);
   useEffect(() => { onSetCamera3dRef.current   = onSetCamera3d;       }, [onSetCamera3d]);
   useEffect(() => { onSelectDragUpdateRef.current = onSelectDragUpdate; }, [onSelectDragUpdate]);
+  useEffect(() => { onSelectionCommittedRef.current = onSelectionCommitted; }, [onSelectionCommitted]);
   useEffect(() => { onMoveSelectionRef.current = onMoveSelection; }, [onMoveSelection]);
   useEffect(() => { moveWithContentsRef.current = moveWithContents; }, [moveWithContents]);
   useEffect(() => { committedMaterializeSelRef.current = committedMaterializeSelection; }, [committedMaterializeSelection]);
@@ -2611,12 +2615,14 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
       if (drag.start.x === end.x && drag.start.y === end.y) {
         onSelChangeRef.current(null);
       } else {
-        onSelChangeRef.current({
+        const committed = {
           x1: Math.min(drag.start.x, end.x),
           y1: Math.min(drag.start.y, end.y),
           x2: Math.max(drag.start.x, end.x),
           y2: Math.max(drag.start.y, end.y),
-        });
+        };
+        onSelChangeRef.current(committed);
+        onSelectionCommittedRef.current?.(committed);
       }
       draw();
       return;

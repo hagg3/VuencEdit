@@ -137,8 +137,10 @@ export interface AppSettings {
 }
 
 /** Memory-budget preset table — the single source of truth for what each preset actually bounds.
- *  `undoBudgetBytes` reaches Rust via `set_undo_budget`; `tileBudgetBytes`/`geometryBudgetBytes` stay
- *  frontend-side as props into `MapCanvas`/`FlyView3D`. See CLAUDE.md's memory-efficiency pass notes.
+ *  `undoBudgetBytes` reaches Rust via `set_undo_budget` and `overviewBudgetBytes` via
+ *  `set_overview_budget` (the zoomed-out map's per-chunk raster, 18.15 — it picks the raster's
+ *  granularity); `tileBudgetBytes`/`geometryBudgetBytes` stay frontend-side as props into
+ *  `MapCanvas`/`FlyView3D`. See CLAUDE.md's memory-efficiency pass notes.
  *
  *  `geometryBudgetBytes` replaced the old `vertexBudget` (3D-pane crash fix, Stage 1): a vertex costs
  *  24–36 B depending on stream and texture pack, and a 256z world reaches any vertex count 4× faster
@@ -150,14 +152,15 @@ export const MEMORY_PRESETS: Record<AppSettings["memoryBudget"], {
   undoBudgetBytes: number;
   tileBudgetBytes: number;
   geometryBudgetBytes: number;
+  overviewBudgetBytes: number;
 }> = {
-  low:      { label: "Low",      undoBudgetBytes:  48 << 20, tileBudgetBytes: 128 << 20, geometryBudgetBytes:  192 << 20 },
-  balanced: { label: "Balanced", undoBudgetBytes:  96 << 20, tileBudgetBytes: 256 << 20, geometryBudgetBytes:  512 << 20 },
-  high:     { label: "High",     undoBudgetBytes: 256 << 20, tileBudgetBytes: 512 << 20, geometryBudgetBytes: 1024 << 20 },
+  low:      { label: "Low",      undoBudgetBytes:  48 << 20, tileBudgetBytes: 128 << 20, geometryBudgetBytes:  192 << 20, overviewBudgetBytes: 16 << 20 },
+  balanced: { label: "Balanced", undoBudgetBytes:  96 << 20, tileBudgetBytes: 256 << 20, geometryBudgetBytes:  512 << 20, overviewBudgetBytes: 32 << 20 },
+  high:     { label: "High",     undoBudgetBytes: 256 << 20, tileBudgetBytes: 512 << 20, geometryBudgetBytes: 1024 << 20, overviewBudgetBytes: 64 << 20 },
 };
 
 /** Current settings schema version. Bump + add a case to `migrate()` when a stored default must change. */
-const SETTINGS_VERSION = 23;
+const SETTINGS_VERSION = 24;
 
 /** Exported so Stage 10.3's potato-profile check can test "still at the stock default" without
  *  duplicating the magic numbers — the same heuristic `migrate()` itself uses per-field above. */
@@ -179,7 +182,7 @@ export const DEFAULTS: AppSettings = {
   dragSensitivity: 1,
   invertY: false,
   autosaveIntervalMin: 3,
-  reliefShading: true,
+  reliefShading: false,
   autoOrient3d: true,
   sky3dZenith: SKY_3D.zenith,
   sky3dHorizon: SKY_3D.horizon,
@@ -345,6 +348,9 @@ function migrate(s: Record<string, unknown>): boolean {
     delete s.quad3dEnabled;
     delete s.pendingLayoutNotice;
   }
+  // v23 → v24: relief shading now defaults off (Stage 19.1). Installs since 2026-09-28 stored
+  // `true` without ever choosing it, so force it off once; a later explicit opt-in sticks.
+  if (from < 24) s.reliefShading = false;
   // (Stage 15.8 added sky3dZenith/sky3dHorizon/fog3dColor/fog3dSoft/show3dHud/show3dGrid with no
   // version bump: purely additive, so the `{...DEFAULTS, ...parsed}` merge below supplies every
   // existing install the same look the pane always had.)
@@ -739,7 +745,7 @@ export default function SettingsModal({
             <Check checked={local.defaultSaveCompressed} onChange={v => set("defaultSaveCompressed", v)} label="" title="Save compressed by default" />
           </SettingRow>
 
-          <SettingRow last label="Compress backups" description="The one-time pre-save snapshot is written as .bak.zip instead of a plain .bak copy">
+          <SettingRow last label="Compress backups" description="The first save over a file keeps its old bytes as a backup. A plain .bak is a full-size copy kept until you delete it; .bak.zip is far smaller but makes that first save slower.">
             <Check checked={local.backupCompressed} onChange={v => set("backupCompressed", v)} label="" title="Compress backups" />
           </SettingRow>
 
@@ -769,6 +775,10 @@ export default function SettingsModal({
               ariaLabel="Sound pack"
               width={170}
             />
+          </SettingRow>
+
+          <SettingRow label="Hold sound" description="The tick while you drag or resize">
+            <DialogButton onClick={() => sfx.previewHold(local.uiSoundPack, local.uiSoundVolume)}>Preview</DialogButton>
           </SettingRow>
 
           <SettingRow last label="Volume">

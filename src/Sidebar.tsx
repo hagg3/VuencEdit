@@ -16,7 +16,7 @@ import {
 } from "./ribbon/tokens";
 import SelectionInspector from "./SelectionInspector";
 import PrefabLibraryPanel from "./PrefabLibraryPanel";
-import type { SelectionInfo, ClipboardInfo, SignInfo, ExtrudeAxis } from "./types";
+import type { SelectionInfo, ClipboardInfo, SignInfo } from "./types";
 
 export type SidebarTab = "inspector" | "prefabs" | "history";
 
@@ -141,16 +141,6 @@ export interface SidebarProps {
   drawActive: boolean;
   onDrawElevation: (x: number, y: number, z: number) => void;
   onZRangeChange?: (zMin: number, zMax: number) => void;
-
-  // Extrude section (Inspector tab) — mirrors the ribbon Selection tab's Extrude group, same
-  // lifted App state. `extrudeCount` above is *gated* (zeroed unless the Selection ribbon tab is
-  // active and not mid-paste-preview) for the elevation ghost's benefit — the section's own
-  // editable field needs the real, ungated value or it would show 0 while the user's actual
-  // extrude count sits unseen. Omitted = the field falls back to the gated value.
-  extrudeCountRaw?: number;
-  setExtrudeCount?: (n: number) => void;
-  setExtrudeAxis?: (a: ExtrudeAxis) => void;
-  onExtrude?: (ignoreAir: boolean) => void;
 
   // History tab
   worldEpoch: number;
@@ -282,10 +272,6 @@ export default function Sidebar(p: SidebarProps) {
             drawActive={p.drawActive}
             onDrawElevation={p.onDrawElevation}
             onZRangeChange={p.onZRangeChange}
-            extrudeCountRaw={p.extrudeCountRaw}
-            setExtrudeCount={p.setExtrudeCount}
-            setExtrudeAxis={p.setExtrudeAxis}
-            onExtrude={p.onExtrude}
             signs={p.signs}
             onSignClick={p.onSignClick}
           />

@@ -46,12 +46,21 @@ export function splitBody(body: Uint8Array, lens: number[]): Uint8Array[] {
   return out;
 }
 
-/** Reinterpret an envelope byte range as LE f32s (vertex/colour/UV streams).
- *  Copies only when the view isn't 4-byte aligned, which `Float32Array` requires. */
-export function asF32(bytes: Uint8Array): Float32Array {
-  const count = bytes.byteLength >> 2;
-  if (bytes.byteOffset % 4 === 0) return new Float32Array(bytes.buffer, bytes.byteOffset, count);
-  return new Float32Array(bytes.slice(0, count * 4).buffer);
+/** Reinterpret an envelope byte range as LE `Int16`/`Uint16`/`Uint32`s (the compact geometry
+ *  streams, ROADMAP-EDIT 18.14) — a view, copying only when the range is misaligned for the element
+ *  size (typed arrays require it). `count` caps the element count: an index section is zero-padded
+ *  to 4 bytes past its last index. */
+export function asI16(bytes: Uint8Array, count = bytes.byteLength >> 1): Int16Array {
+  if (bytes.byteOffset % 2 === 0) return new Int16Array(bytes.buffer, bytes.byteOffset, count);
+  return new Int16Array(bytes.slice(0, count * 2).buffer);
+}
+export function asU16(bytes: Uint8Array, count = bytes.byteLength >> 1): Uint16Array {
+  if (bytes.byteOffset % 2 === 0) return new Uint16Array(bytes.buffer, bytes.byteOffset, count);
+  return new Uint16Array(bytes.slice(0, count * 2).buffer);
+}
+export function asU32(bytes: Uint8Array, count = bytes.byteLength >> 2): Uint32Array {
+  if (bytes.byteOffset % 4 === 0) return new Uint32Array(bytes.buffer, bytes.byteOffset, count);
+  return new Uint32Array(bytes.slice(0, count * 4).buffer);
 }
 
 /** Encode a byte array to base64 for IPC payloads flowing JS → Rust (e.g. a lasso selection

@@ -128,6 +128,15 @@ setWindowSnap(loadSettings().snapWindows);
  *  5 hotbar.collapsed (the last two feed `hotbarWindowOpen`/`showHotbarOverlay`, Stage 14.5),
  *  6 lens.open (feeds `lensWindowOpen`'s ribbon-armed state, Stage 14.9 — the lens's own mount
  *  gate also reads `tool`/`clipboard`, which already re-render App on every change). */
+/** Send a memory preset's backend-side budgets to Rust: the undo stacks' byte ceiling and the
+ *  overview raster's (18.15). Fire-and-forget — both commands clamp, and a failure only means the
+ *  backend keeps its Balanced defaults. */
+function pushBackendBudgets(preset: AppSettings["memoryBudget"]): void {
+  const p = MEMORY_PRESETS[preset];
+  invoke("set_undo_budget", { bytes: p.undoBudgetBytes }).catch(() => {});
+  invoke("set_overview_budget", { bytes: p.overviewBudgetBytes }).catch(() => {});
+}
+
 function windowLayoutKey(): string {
   const s = getWindowState();
   return `${+s.swapped}${+s.wins.view3d.open}${+s.wins.view3d.collapsed}${+s.wins.tools.open}` +
@@ -920,16 +929,18 @@ function App() {
   const [show3dGrid, setShow3dGrid] = useState(() => loadSettings().show3dGrid);
   const [floodFillLimit, setFloodFillLimit] = useState(() => loadSettings().floodFillLimit);
   const [buildReach, setBuildReach] = useState(() => loadSettings().buildReach);
-  // Memory-budget preset (§6 of the 2026-08 memory-efficiency pass) — only the undo budget reaches
-  // Rust (via set_undo_budget below); tile/vertex budgets stay frontend-side as MapCanvas/FlyView3D props.
+  // Memory-budget preset (§6 of the 2026-08 memory-efficiency pass) — the undo and overview-raster
+  // budgets reach Rust (`pushBackendBudgets` below); tile/vertex budgets stay frontend-side as
+  // MapCanvas/FlyView3D props.
   const [memoryBudget, setMemoryBudget] = useState<AppSettings["memoryBudget"]>(() => loadSettings().memoryBudget);
   // 3D perf HUD toggle (ROADMAP-EDIT Stage 9.3/9.4). Only the overlay follows it: since 17.1 the
   // histogram/counter recorders sample always (see perfCounters.ts).
   const [showPerfHud, setShowPerfHud] = useState(() => loadSettings().showPerfHud);
-  // Push the undo budget once at startup (Rust's WorldState default is already "balanced", but a
-  // saved Low/High preset must apply before the user's first edit, not just after their next Save).
+  // Push the backend budgets once at startup (Rust's WorldState default is already "balanced", but a
+  // saved Low/High preset must apply before the user's first edit or zoom-out, not just after their
+  // next Save).
   useEffect(() => {
-    invoke("set_undo_budget", { bytes: MEMORY_PRESETS[memoryBudget].undoBudgetBytes }).catch(() => {});
+    pushBackendBudgets(memoryBudget);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
   // Debounces the localStorage write only (state stays live so the slider/HUD track immediately) —
@@ -1006,7 +1017,7 @@ function App() {
     setBuildReach(s.buildReach);
     setMemoryBudget(s.memoryBudget);
     setShowPerfHud(s.showPerfHud);
-    invoke("set_undo_budget", { bytes: MEMORY_PRESETS[s.memoryBudget].undoBudgetBytes }).catch(() => {});
+    pushBackendBudgets(s.memoryBudget);
     if (s.templatePath !== templatePath) setTemplatePath(s.templatePath);
     if (s.texturePackPath !== texturePackPath) {
       if (s.texturePackPath) loadTexturePackFile(s.texturePackPath);
@@ -1095,6 +1106,12 @@ function App() {
   // edit, so `DoneOutline`'s effect restarts even when back-to-back edits touch the same rect.
   const doneOutlineKeyRef = useRef(0);
   const [doneRect, setDoneRect] = useState<DoneRect | null>(null);
+  // Selection-commit flash (Stage 19.6): accent-toned, for marquee and magic-wand commits only
+  // (not ⌘A, which would flash the whole world's edge).
+  const flashSelection = useCallback((r: { x1: number; y1: number; x2: number; y2: number }) => {
+    doneOutlineKeyRef.current += 1;
+    setDoneRect({ key: doneOutlineKeyRef.current, tone: "select", x: r.x1, y: r.y1, w: r.x2 - r.x1 + 1, h: r.y2 - r.y1 + 1 });
+  }, []);
 
   const [extrudeCount, setExtrudeCount] = useState(0);
   const [extrudeAxis, setExtrudeAxis]   = useState<ExtrudeAxis>("z+");
@@ -2103,6 +2120,7 @@ function App() {
         selectionMaskRectRef.current = rect;
         setHasSelectionMask(true);
         setRawBounds(rect);
+        flashSelection(rect);
       }
     } catch (e) { reportError(e); }
   }
@@ -2384,12 +2402,12 @@ function App() {
           showToast(`Saved ${saveCompressed ? "compressed" : "uncompressed"} data into a “.${ext}” file — other tools may not recognize it`);
         }
       }
+      // save_world also re-bases the autosave onto the file it just wrote (18.9), which replaces the
+      // old sidecars — no discard_autosave here any more.
       await invoke("save_world", { path, compressed: saveCompressed, backupCompressed });
-      // A real save makes any pending autosave sidecar redundant — nothing left to recover.
       lastAutosavedEpochRef.current = editEpochRef.current;
       savedEpochRef.current = editEpochRef.current;
       setLastSavedAt(Date.now()); // status-bar "Saved" timestamp (Stage 15.6)
-      invoke("discard_autosave").catch(() => {});
       sfx.play("save"); // the one place saveWorld resolves true — every caller inherits this cue
       return true;
     } catch (e) {
@@ -2462,8 +2480,9 @@ function App() {
     const id = setInterval(() => {
       if (editEpochRef.current === lastAutosavedEpochRef.current) return;
       const epoch = editEpochRef.current;
-      invoke("autosave_world", { sourcePath: sourcePathRef.current })
-        .then(() => {
+      invoke<boolean>("autosave_world", { sourcePath: sourcePathRef.current })
+        .then((ran) => {
+          if (!ran) return; // skipped: a save was running (18.9). The next interval retries.
           lastAutosavedEpochRef.current = epoch;
           autosaveFailureCountRef.current = 0;
           setLastSavedAt(Date.now()); // status-bar "Saved" timestamp (Stage 15.6)
@@ -2500,8 +2519,8 @@ function App() {
       if (editEpochRef.current !== lastAutosavedEpochRef.current) {
         const epoch = editEpochRef.current;
         try {
-          await invoke("autosave_world", { sourcePath: sourcePathRef.current });
-          lastAutosavedEpochRef.current = epoch;
+          const ran = await invoke<boolean>("autosave_world", { sourcePath: sourcePathRef.current });
+          if (ran) lastAutosavedEpochRef.current = epoch;
           autosaveFailureCountRef.current = 0;
         } catch (e) {
           autosaveFailureCountRef.current += 1;
@@ -2521,7 +2540,7 @@ function App() {
     if (!recoveryInfo) return;
     setRecovering(true);
     try {
-      if (recoveryInfo.format === 1) {
+      if (recoveryInfo.format >= 1) {
         // Base+journal recovery doesn't go through load_world at all — the sidecars aren't a
         // loadable file on their own, so this resolves and replays them directly.
         const data = await invoke<WorldMeta>("load_autosave");
@@ -2547,6 +2566,15 @@ function App() {
     } finally {
       setRecovering(false);
     }
+  }
+
+  // The autosave builds on a world file that was saved or changed after it (18.9 `base_status`
+  // "changed"): it can never be applied, so drop it and open the file itself.
+  async function openRecoveryBase() {
+    const path = recoveryInfo?.base?.kind === "source" ? recoveryInfo.base.path : recoveryInfo?.source_path;
+    try { await invoke("discard_autosave"); } catch { /* best effort */ }
+    setRecoveryInfo(null);
+    if (path) await openFileAt(path);
   }
 
   // Destroys the autosave sidecar. Only reachable from RecoveryModal's explicit
@@ -3307,6 +3335,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
       showTemplateOverlay={showTemplateOverlay && templateLoaded && viewMode === "topdown"}
       onMapContextMenu={(wx, wy, x, y) => { sfx.play("menu"); setCtxMenu({ wx, wy, x, y }); }}
       onSelectDragUpdate={handleSelectDragUpdate}
+      onSelectionCommitted={flashSelection}
       onMoveSelection={nudgeSelection}
       moveWithContents={moveWithContents}
       committedMaterializeSelection={materializeSelection}
@@ -4024,10 +4053,6 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           worldEpoch={worldEpoch}
           signs={signs}
           onSignClick={focusOnSign}
-          extrudeCountRaw={extrudeCount}
-          setExtrudeCount={setExtrudeCount}
-          setExtrudeAxis={setExtrudeAxis}
-          onExtrude={handleExtrude}
         />
 
         {prefabNameModal && (
@@ -4111,7 +4136,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
         )}
         {showWorldInfo && <WorldInfoModal onClose={() => setShowWorldInfo(false)} />}
         {recoveryInfo && (
-          <RecoveryModal info={recoveryInfo} recovering={recovering} onRecover={recoverAutosave} onDiscard={discardRecovery} onDismiss={dismissRecovery} />
+          <RecoveryModal info={recoveryInfo} recovering={recovering} onRecover={recoverAutosave} onDiscard={discardRecovery} onDismiss={dismissRecovery} onOpenBase={openRecoveryBase} />
         )}
         {showSettings && (
           <SettingsModal
@@ -4546,7 +4571,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
 
       {showAbout && <AboutModal version={appVersion} onClose={() => setShowAbout(false)} />}
       {recoveryInfo && (
-        <RecoveryModal info={recoveryInfo} recovering={recovering} onRecover={recoverAutosave} onDiscard={discardRecovery} onDismiss={dismissRecovery} />
+        <RecoveryModal info={recoveryInfo} recovering={recovering} onRecover={recoverAutosave} onDiscard={discardRecovery} onDismiss={dismissRecovery} onOpenBase={openRecoveryBase} />
       )}
       {showSettings && (
         <SettingsModal

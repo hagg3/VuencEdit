@@ -43,6 +43,10 @@ import {
   TOPBAR_BG, TOP_BAR_HEIGHT,
 } from "./ribbon/tokens";
 import type { RibbonProps, RibbonTab } from "./ribbon/props";
+import { MOTION } from "./theme/theme";
+
+/** Left-to-right tab order, for the tab-change animation's direction of travel. */
+const TAB_ORDER: RibbonTab[] = ["home", "draw", "sculpt", "insert", "view", "3d", "selection", "paste"];
 
 export { EDEN_TEAL } from "./designTokens";
 export { RIBBON_HEIGHT_COLLAPSED, RIBBON_BODY_HEIGHT, COMPACT_BODY_HEIGHT, TOP_BAR_HEIGHT } from "./ribbon/tokens";
@@ -55,6 +59,27 @@ export default function Ribbon(p: RibbonProps) {
   const [activeTab, setActiveTab] = useState<RibbonTab>("home");
   const activeTabRef = useRef<RibbonTab>("home");
   useEffect(() => { activeTabRef.current = activeTab; }, [activeTab]);
+
+  // Tab-change animation (Stage 19.5): the new tab's groups fade in and slide a few px in the
+  // direction of travel, staggered. Fires only when `activeTab` actually changes, so a first mount,
+  // a responsive-tier change or an overflow re-solve (none of which change the tab) never animates.
+  // Transform/opacity only, so it cannot affect `__harvestRibbonWidths()`, which measures layout.
+  // The CSS that reads these attributes is gated on `:root[data-motion="full"]` (theme/cssVars.ts).
+  const prevTabRef = useRef<RibbonTab>(activeTab);
+  useLayoutEffect(() => {
+    const prev = prevTabRef.current;
+    prevTabRef.current = activeTab;
+    const body = bodyRef.current;
+    if (prev === activeTab || !body || p.compact) return;
+    const dir = TAB_ORDER.indexOf(activeTab) >= TAB_ORDER.indexOf(prev) ? 1 : -1;
+    body.style.setProperty("--vx-tab-dx", `${dir * 10}px`);
+    body.querySelectorAll<HTMLElement>("[data-group]").forEach((el, i) => el.style.setProperty("--vx-i", String(Math.min(i, 8))));
+    body.dataset.tabanim = "";
+    const t = window.setTimeout(() => { delete body.dataset.tabanim; }, MOTION.chromeMs + 8 * 20 + 40);
+    return () => window.clearTimeout(t);
+    // `p.compact` only gates the effect; a compact toggle must not itself replay it.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab]);
 
   const registerTabSetter = p.registerTabSetter;
   useEffect(() => { registerTabSetter?.(setActiveTab); }, [registerTabSetter]);

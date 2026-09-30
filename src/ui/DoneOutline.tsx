@@ -19,6 +19,8 @@ import { ACCENTS, MOTION } from "../theme/theme";
  *  at the same location still restart the effect (object identity, not just field equality). */
 export interface DoneRect {
   key: number;
+  /** `done` (default): an edit landed, teal. `select`: a selection was committed, blue, shorter. */
+  tone?: "done" | "select";
   x: number;
   y: number;
   w: number;
@@ -54,7 +56,7 @@ export default function DoneOutline({
     hideTimerRef.current = window.setTimeout(() => {
       if (rafRef.current !== null) { cancelAnimationFrame(rafRef.current); rafRef.current = null; }
       setScreen(null);
-    }, MOTION.doneMs);
+    }, rect.tone === "select" ? MOTION.selectMs : MOTION.doneMs);
 
     return () => {
       if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
@@ -68,13 +70,14 @@ export default function DoneOutline({
     <div
       aria-hidden
       className="vx-done-outline"
+      data-tone={rect?.tone === "select" ? "select" : undefined}
       style={{
         position: "fixed",
         left: screen.left, top: screen.top, width: screen.width, height: screen.height,
         pointerEvents: "none",
         zIndex: 90, // Above the map (20), below the ribbon (100) and QuickActionsBar chrome.
         boxSizing: "border-box",
-        border: `2px solid ${ACCENTS.primary}`,
+        border: `2px solid ${rect?.tone === "select" ? ACCENTS.selection : ACCENTS.primary}`,
         borderRadius: 2,
       }}
     />

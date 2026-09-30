@@ -22,8 +22,10 @@ class FakeNode {
   start = vi.fn();
   connect() { return this; }
 }
+/** The fake audio clock, shared so a test can advance it. */
+const clock = { t: 0 };
 class FakeAudioContext {
-  currentTime = 0;
+  get currentTime() { return clock.t; }
   sampleRate = 8000;
   state = "running";
   destination = {};
@@ -51,9 +53,11 @@ let win: FakeWindow;
 beforeEach(() => {
   win = new FakeWindow();
   vi.stubGlobal("window", win);
+  vi.useFakeTimers();
   sources.length = 0;
+  clock.t = 0;
 });
-afterEach(() => { vi.unstubAllGlobals(); vi.resetModules(); });
+afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); vi.resetModules(); });
 
 /** The window-level guard installs once per module load, on whichever `window` exists at the first
  *  hold — so every test gets a freshly imported `sfx` bound to its own `FakeWindow`. */
@@ -80,9 +84,9 @@ describe("sfx.hold end paths", () => {
       expect(m._activeHoldCount()).toBe(1);
       fire();
       expect(m._activeHoldCount()).toBe(0);
-      expect(sources[0].stop).toHaveBeenCalledTimes(1);
+      const n = sources.length;
       h.stop(); // idempotent
-      expect(sources[0].stop).toHaveBeenCalledTimes(1);
+      expect(sources.length).toBe(n);
     });
   }
 
@@ -117,12 +121,48 @@ describe("sfx.hold end paths", () => {
   });
 });
 
+describe("sfx.hold tick loop", () => {
+  it("keeps scheduling ticks while held, then schedules nothing and cancels the queued ones on stop()", async () => {
+    const m = await fresh();
+    const h = m.hold();
+    const first = sources.length;
+    expect(first).toBeGreaterThan(0);
+    // Advance the audio clock and the refill timer: more ticks get queued ahead of it.
+    for (let i = 0; i < 12; i++) { clock.t += 0.025; vi.advanceTimersByTime(25); }
+    const held = sources.length;
+    expect(held).toBeGreaterThan(first);
+    // Every voice calls stop() once for its own end; one still queued ahead of the clock also gets a
+    // cancelling stop() on release, so some source has two.
+    expect(sources.every(s => s.stop.mock.calls.length === 1)).toBe(true);
+    h.stop();
+    expect(sources.some(s => s.stop.mock.calls.length >= 2)).toBe(true);
+    // No more scheduling afterwards, however long the clock runs.
+    for (let i = 0; i < 12; i++) { clock.t += 0.025; vi.advanceTimersByTime(25); }
+    expect(sources.length).toBe(held);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("previewHold ticks for its duration even with sounds off, then stops by itself", async () => {
+    const m = await fresh();
+    m.configure({ enabled: false, pack: "classic", volume: 0.8 });
+    m.previewHold("mech", 0.8, 500);
+    expect(m._activeHoldCount()).toBe(1);
+    vi.advanceTimersByTime(600);
+    expect(m._activeHoldCount()).toBe(0);
+  });
+});
+
 describe("hold + nudge data", () => {
-  it("every audible pack defines a hold voice at or under −12 dB of the loudest one-shot", () => {
+  it("every audible pack defines a tick voice at or under −12 dB of the loudest one-shot", () => {
     for (const pack of Object.values(SOUND_PACKS)) {
       if (pack.id === "none") { expect(pack.hold).toBeUndefined(); continue; }
       expect(pack.hold, `${pack.id} has no hold voice`).toBeTruthy();
-      expect(pack.hold!.g, pack.id).toBeLessThanOrEqual(HOLD_MAX_GAIN);
+      expect(pack.hold!.period, pack.id).toBeGreaterThanOrEqual(90);
+      expect(pack.hold!.period, pack.id).toBeLessThanOrEqual(140);
+      for (const vc of pack.hold!.voices) {
+        expect(vc.g, pack.id).toBeLessThanOrEqual(HOLD_MAX_GAIN);
+        expect(vc.t + vc.d, `${pack.id} tick must be short`).toBeLessThanOrEqual(0.04);
+      }
     }
     const loudest = Math.max(...Object.values(SOUND_PACKS).flatMap(p =>
       CUE_IDS.flatMap(c => (p.cues[c] ?? []).map(v => v.g))));

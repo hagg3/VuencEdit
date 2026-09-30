@@ -70,9 +70,18 @@ pub fn pixels_patch_lod(
     world: &(impl VoxelView + Sync), meta: ViewMeta,
     px1: i32, py1: i32, px2: i32, py2: i32, cap: Option<i32>, lod: u32,
 ) -> Raster {
+    pixels_patch_lod_from(&WorldSource::new(world, cap), meta, px1, py1, px2, py2, lod)
+}
+
+/// [`pixels_patch_lod`] over any [`SampleSource`] — the one plain top-down render loop. The
+/// world path is `WorldSource`; an app can hand in a cache (VuencEdit's overview raster, 18.15)
+/// and get byte-identical output as long as it returns what `WorldSource` would.
+#[allow(clippy::too_many_arguments)]
+pub fn pixels_patch_lod_from(
+    src: &impl SampleSource, meta: ViewMeta,
+    px1: i32, py1: i32, px2: i32, py2: i32, lod: u32,
+) -> Raster {
     let lod = lod.clamp(1, MAX_LOD);
-    let (min_x, min_y) = world.chunk_origin();
-    let num_bands = world.num_bands();
     let world_w = meta.width();
     let world_h = meta.height();
     let x1 = px1.clamp(0, world_w - 1) as u32;
@@ -86,31 +95,9 @@ pub fn pixels_patch_lod(
     // One row per rayon task — rows are disjoint slices of `pixels`, and each pixel is an
     // independent O(1) lookup into `world`, so this is embarrassingly parallel.
     pixels.par_chunks_mut((width * 4) as usize).enumerate().for_each(|(row, row_pixels)| {
-        let py = y1 + row as u32 * lod;
-        let cy = (py / 16) as i32 + min_y;
-        let ly = (py % 16) as usize;
-        // The chunk lookup is a hash probe; at lod 1 `cx` only changes every 16 pixels, so memoize
-        // it across the run instead of calling it for every sample (audit M3 (1)) — ~16× fewer
-        // lookups on a wide patch. At lod ≥ 16 every sample lands in a new chunk and the memo
-        // simply never hits, which costs one integer compare.
-        let mut last_cx = i32::MIN;
-        let mut chunk: Option<&[u8]> = None;
-        // The chunk's top-occupied-band ceiling (`VoxelView::top_band_hint`), fetched alongside the
-        // chunk and memoized with it — this loop is *the* reason the hint exists (it is the highest
-        // page-touch-rate scan in the program), and probing it per sample rather than per chunk
-        // would give back much of what it saves.
-        let mut hi_band = num_bands;
+        let mut cursor = src.row(y1 + row as u32 * lod);
         for ox in 0..width {
-            let px = x1 + ox * lod;
-            let cx = (px / 16) as i32 + min_x;
-            if cx != last_cx {
-                last_cx = cx;
-                chunk = world.chunk_bytes(cx, cy);
-                hi_band = scan_band_ceiling(world, cx, cy);
-            }
-            let Some(chunk) = chunk else { continue };
-            let lx = (px % 16) as usize;
-            let (top_bt, top_paint, under_bt, under_paint, _) = scan_column(chunk, lx, ly, hi_band, cap);
+            let (top_bt, top_paint, under_bt, under_paint, _) = cursor.sample(x1 + ox * lod);
             if top_bt == 0 { continue; }
             let [r, g, b] = blend_top_over_under(top_bt, top_paint, under_bt, under_paint, meta.sky);
             let off = (ox * 4) as usize;
@@ -120,12 +107,106 @@ pub fn pixels_patch_lod(
     Raster { x: x1, y: y1, width, height, lod, pixels }
 }
 
+/// One top-down sample, the result of [`scan_column`]: `(top_bt, top_paint, under_bt, under_paint,
+/// top_z)`. `top_bt == 0` is an empty column (or no chunk), and `top_z` is then `-1`.
+pub type Sample = (u8, u8, u8, u8, i32);
+
+/// The sample of an empty column or a missing chunk.
+pub const EMPTY_SAMPLE: Sample = (0, 0, 0, 0, -1);
+
+/// Where the top-down map's per-column scan results come from. The renders ([`pixels_patch_lod_from`],
+/// [`pixels_patch_styled_from`]) own the rect, the LOD grid, the blend, relief shading and the output
+/// layout; a source only answers "what does the column at world pixel `(px, py)` hold".
+///
+/// [`WorldSource`] is the ground truth. Any other source must return **exactly** what it would for
+/// the same world, or the map drifts from the world it claims to show.
+pub trait SampleSource: Sync {
+    type Row<'a>: SampleRow where Self: 'a;
+    /// A cursor over world-pixel row `py` (0-based, inside the world). Creating one must not touch
+    /// the world — a render builds one per output row.
+    fn row(&self, py: u32) -> Self::Row<'_>;
+}
+
+/// A cursor along one row of a [`SampleSource`]. Renders call `sample` with non-decreasing `px`,
+/// which lets a source memoise per-chunk lookups across a run of samples.
+pub trait SampleRow {
+    /// The sample at world pixel `(px, py)`, `px` inside the world.
+    fn sample(&mut self, px: u32) -> Sample;
+}
+
+/// The world itself as a [`SampleSource`]: chunk lookup, band ceiling, column scan — what every
+/// top-down render did inline before 18.15. `cap` is the cutaway ceiling (see [`pixels_patch`]).
+pub struct WorldSource<'w, V> {
+    world: &'w V,
+    cap: Option<i32>,
+}
+
+impl<'w, V: VoxelView> WorldSource<'w, V> {
+    pub fn new(world: &'w V, cap: Option<i32>) -> Self { WorldSource { world, cap } }
+}
+
+impl<V: VoxelView + Sync> SampleSource for WorldSource<'_, V> {
+    type Row<'a> = WorldRow<'a, V> where Self: 'a;
+    #[inline]
+    fn row(&self, py: u32) -> WorldRow<'_, V> { WorldRow::new(self.world, py, self.cap) }
+}
+
+/// A [`WorldSource`] row cursor. Public so an app-side cache can fall back to — and fill itself
+/// from — exactly the scan the world path runs.
+pub struct WorldRow<'w, V> {
+    world: &'w V,
+    cap: Option<i32>,
+    min_x: i32,
+    cy: i32,
+    ly: usize,
+    // The chunk lookup is a hash probe; at lod 1 `cx` only changes every 16 pixels, so memoize
+    // it across the run instead of calling it for every sample (audit M3 (1)) — ~16× fewer
+    // lookups on a wide patch. At lod ≥ 16 every sample lands in a new chunk and the memo
+    // simply never hits, which costs one integer compare.
+    last_cx: i32,
+    chunk: Option<&'w [u8]>,
+    // The chunk's top-occupied-band ceiling (`VoxelView::top_band_hint`), fetched alongside the
+    // chunk and memoized with it — this loop is *the* reason the hint exists (it is the highest
+    // page-touch-rate scan in the program), and probing it per sample rather than per chunk
+    // would give back much of what it saves.
+    hi_band: usize,
+}
+
+impl<'w, V: VoxelView> WorldRow<'w, V> {
+    #[inline]
+    pub fn new(world: &'w V, py: u32, cap: Option<i32>) -> Self {
+        let (min_x, min_y) = world.chunk_origin();
+        WorldRow {
+            world, cap, min_x,
+            cy: (py / 16) as i32 + min_y,
+            ly: (py % 16) as usize,
+            last_cx: i32::MIN,
+            chunk: None,
+            hi_band: world.num_bands(),
+        }
+    }
+}
+
+impl<V: VoxelView> SampleRow for WorldRow<'_, V> {
+    #[inline(always)]
+    fn sample(&mut self, px: u32) -> Sample {
+        let cx = (px / 16) as i32 + self.min_x;
+        if cx != self.last_cx {
+            self.last_cx = cx;
+            self.chunk = self.world.chunk_bytes(cx, self.cy);
+            self.hi_band = scan_band_ceiling(self.world, cx, self.cy);
+        }
+        let Some(chunk) = self.chunk else { return EMPTY_SAMPLE };
+        scan_column(chunk, (px % 16) as usize, self.ly, self.hi_band, self.cap)
+    }
+}
+
 /// The column scan every top-down sample runs: walk down from the chunk's band ceiling to the topmost
 /// block at or under `cap`, and — only when that top is transparent — one block further for the
 /// composite. Returns `(top_bt, top_paint, under_bt, under_paint, top_z)`; `top_bt == 0` is an empty
 /// column (`top_z` is then -1). Shared by the plain and relief renders so both see the same surface.
 #[inline(always)]
-fn scan_column(chunk: &[u8], lx: usize, ly: usize, hi_band: usize, cap: Option<i32>) -> (u8, u8, u8, u8, i32) {
+fn scan_column(chunk: &[u8], lx: usize, ly: usize, hi_band: usize, cap: Option<i32>) -> Sample {
     let mut top_bt = 0u8; let mut top_paint = 0u8;
     let mut under_bt = 0u8; let mut under_paint = 0u8;
     let mut top_z = -1i32;
@@ -184,9 +265,19 @@ pub fn pixels_patch_styled(
     world: &(impl VoxelView + Sync), meta: ViewMeta,
     px1: i32, py1: i32, px2: i32, py2: i32, style: MapStyle, lod: u32,
 ) -> Raster {
-    match style.relief_on() {
-        None => pixels_patch_lod(world, meta, px1, py1, px2, py2, style.cap, lod),
-        Some(strength) => pixels_patch_relief(world, meta, px1, py1, px2, py2, style.cap, lod, strength),
+    pixels_patch_styled_from(&WorldSource::new(world, style.cap), meta, px1, py1, px2, py2, style.relief, lod)
+}
+
+/// [`pixels_patch_styled`] over any [`SampleSource`]. The source already carries the cutaway cap
+/// (it decides what a column scan sees), so only the relief strength is passed here.
+#[allow(clippy::too_many_arguments)]
+pub fn pixels_patch_styled_from(
+    src: &impl SampleSource, meta: ViewMeta,
+    px1: i32, py1: i32, px2: i32, py2: i32, relief: Option<u8>, lod: u32,
+) -> Raster {
+    match relief.filter(|&r| r > 0) {
+        None => pixels_patch_lod_from(src, meta, px1, py1, px2, py2, lod),
+        Some(strength) => pixels_patch_relief(src, meta, px1, py1, px2, py2, lod, strength),
     }
 }
 
@@ -206,11 +297,10 @@ pub fn pixels_patch_styled(
 /// aligned to the same `lod` grid, which the tiler and the edit patch both guarantee.
 #[allow(clippy::too_many_arguments)]
 fn pixels_patch_relief(
-    world: &(impl VoxelView + Sync), meta: ViewMeta,
-    px1: i32, py1: i32, px2: i32, py2: i32, cap: Option<i32>, lod: u32, strength: u8,
+    src: &impl SampleSource, meta: ViewMeta,
+    px1: i32, py1: i32, px2: i32, py2: i32, lod: u32, strength: u8,
 ) -> Raster {
     let lod = lod.clamp(1, MAX_LOD);
-    let (min_x, min_y) = world.chunk_origin();
     let world_w = meta.width();
     let world_h = meta.height();
     let x1 = px1.clamp(0, world_w - 1) as u32;
@@ -230,25 +320,11 @@ fn pixels_patch_relief(
         .for_each(|(r, (row_rgba, row_h))| {
             let py = y1 as i64 + (r as i64 - 1) * lod as i64;
             if py < 0 { return; } // apron row above the world's top edge
-            let py = py as u32;
-            let cy = (py / 16) as i32 + min_y;
-            let ly = (py % 16) as usize;
-            let mut last_cx = i32::MIN;
-            let mut chunk: Option<&[u8]> = None;
-            let mut hi_band = 0usize;
+            let mut cursor = src.row(py as u32);
             for c in 0..gw {
                 let px = x1 as i64 + (c as i64 - 1) * lod as i64;
                 if px < 0 { continue; } // apron column left of the world's west edge
-                let px = px as u32;
-                let cx = (px / 16) as i32 + min_x;
-                if cx != last_cx {
-                    last_cx = cx;
-                    chunk = world.chunk_bytes(cx, cy);
-                    hi_band = scan_band_ceiling(world, cx, cy);
-                }
-                let Some(chunk) = chunk else { continue };
-                let (top_bt, top_paint, under_bt, under_paint, top_z) =
-                    scan_column(chunk, (px % 16) as usize, ly, hi_band, cap);
+                let (top_bt, top_paint, under_bt, under_paint, top_z) = cursor.sample(px as u32);
                 if top_bt == 0 { continue; }
                 row_h[c as usize] = top_z as i16;
                 let [cr, cg, cb] = blend_top_over_under(top_bt, top_paint, under_bt, under_paint, meta.sky);
@@ -920,9 +996,36 @@ fn dim_context_columns(pixels: &mut [u8], pw: u32, ph: u32, left_ctx: usize, rig
 /// Overlay colours. They mirror the frontend theme's `MAP.clipboard`/`MAP.buried`/`MAP.cleared`
 /// (`apps/vuencedit/src/theme/theme.ts`) — the crate can't import the theme, and the lens image is
 /// drawn straight onto a canvas, so the values are duplicated here on purpose. Keep them in step.
+/// `BURIED`/`CLEARED` are *tints* laid over the block's own colour (see [`lens_clash_px`]), no longer
+/// flat fills; the legend swatches in `PasteLensWindow.tsx` draw the same hatch.
 pub const LENS_CLIPBOARD_RGB: [u8; 3] = [0x22, 0xc5, 0x5e];
 pub const LENS_BURIED_RGB: [u8; 3] = [0xef, 0x44, 0x44];
 pub const LENS_CLEARED_RGB: [u8; 3] = [0xf5, 0x9e, 0x0b];
+
+/// Clash pixels keep the block's own colour underneath and lay the state tint over it: a **diagonal
+/// hatch** (tint at [`LENS_HATCH_PCT`] on every [`LENS_HATCH_PERIOD`]th diagonal) over a light wash
+/// (tint at [`LENS_WASH_PCT`]), so what's being pasted stays readable through the warning.
+pub const LENS_HATCH_PERIOD: i64 = 4;
+pub const LENS_HATCH_PCT: u32 = 70;
+pub const LENS_WASH_PCT: u32 = 25;
+
+/// Is `phase` (an anti-diagonal coordinate, `col + z` or `col + row`) on a hatch stripe?
+#[inline]
+pub fn lens_hatch(phase: i64) -> bool { phase.rem_euclid(LENS_HATCH_PERIOD) == 0 }
+
+/// A clash pixel: `base` (the block underneath) with `tint` laid over it, at hatch or wash strength.
+pub fn lens_clash_px(base: [u8; 3], tint: [u8; 3], hatch: bool) -> [u8; 4] {
+    let t = if hatch { LENS_HATCH_PCT } else { LENS_WASH_PCT };
+    let mix = |b: u8, c: u8| ((b as u32 * (100 - t) + c as u32 * t + 50) / 100) as u8;
+    [mix(base[0], tint[0]), mix(base[1], tint[1]), mix(base[2], tint[2]), 255]
+}
+
+/// A ghost-solid block's lens colour: its own colour mixed 35 % toward clipboard green.
+fn lens_ghost_rgb(bt: u8, paint: u8, sky: u8) -> [u8; 3] {
+    let [r, g, b] = block_color(bt, paint, sky);
+    let mix = |c: u8, t: u8| ((c as u32 * 65 + t as u32 * 35 + 50) / 100) as u8;
+    [mix(r, LENS_CLIPBOARD_RGB[0]), mix(g, LENS_CLIPBOARD_RGB[1]), mix(b, LENS_CLIPBOARD_RGB[2])]
+}
 
 /// Tallest Z window the lens will render. A 256z world is exactly this tall, so today it only
 /// matters for a hypothetical taller format; the window is re-centred on the ghost if it's exceeded.
@@ -990,9 +1093,10 @@ pub struct LensStats {
 ///   always 1:1 (at most [`LENS_MAX_ROWS`]), and the depth ray is always walked in full, because
 ///   a sampled ray would miss collisions.
 ///
-/// Pixel classes, highest priority first: **buried** (red) — some cell along the ray is both
-/// ghost-solid and world-occupied; **cleared** (amber hatch on an even `(ox + row)` parity, only
-/// with `ignore_air` off) — some cell is box-air over world-occupied; **ghost** — the first
+/// Pixel classes, highest priority first: **buried** (red hatch + wash over the ghost block's colour)
+/// — some cell along the ray is both ghost-solid and world-occupied; **cleared** (amber hatch + wash
+/// over the ghost block, or the terrain being deleted where there is none; only with `ignore_air`
+/// off) — some cell is box-air over world-occupied; **ghost** — the first
 /// ghost-solid block's colour mixed 35 % toward clipboard green; **terrain** — the first
 /// world-occupied block's colour (50 % alpha in context columns); else transparent. "Occupied" is
 /// any non-air block, fluids included: the paste overwrites water just as it overwrites stone.
@@ -1097,16 +1201,21 @@ pub fn paste_lens(
         let mut out = vec![0u8; rows * 4];
         for row in 0..rows {
             let px = &mut out[row * 4..row * 4 + 4];
-            if buried[row] {
-                px.copy_from_slice(&[LENS_BURIED_RGB[0], LENS_BURIED_RGB[1], LENS_BURIED_RGB[2], 255]);
-            } else if cleared[row] && (ox + row) % 2 == 0 {
-                px.copy_from_slice(&[LENS_CLEARED_RGB[0], LENS_CLEARED_RGB[1], LENS_CLEARED_RGB[2], 255]);
+            if buried[row] || cleared[row] {
+                // Hatch phase is anchored to the world (column + z), so the stripes sit still on the
+                // terrain as the ghost moves, and LOD-n stays a point sample of LOD 1 (at a coarse
+                // LOD the stripes just coarsen; that only happens for very wide pastes).
+                let phase = cw as i64 + (z_hi - row as i32) as i64;
+                let base = if ghost[row].0 != 0 {
+                    lens_ghost_rgb(ghost[row].0, ghost[row].1, meta.sky)
+                } else {
+                    block_color(terr[row].0, terr[row].1, meta.sky) // cleared: the terrain being deleted
+                };
+                let tint = if buried[row] { LENS_BURIED_RGB } else { LENS_CLEARED_RGB };
+                px.copy_from_slice(&lens_clash_px(base, tint, lens_hatch(phase)));
             } else if ghost[row].0 != 0 {
-                let [r, g, b] = block_color(ghost[row].0, ghost[row].1, meta.sky);
-                let mix = |c: u8, t: u8| ((c as u32 * 65 + t as u32 * 35 + 50) / 100) as u8;
-                px.copy_from_slice(&[
-                    mix(r, LENS_CLIPBOARD_RGB[0]), mix(g, LENS_CLIPBOARD_RGB[1]), mix(b, LENS_CLIPBOARD_RGB[2]), 255,
-                ]);
+                let [r, g, b] = lens_ghost_rgb(ghost[row].0, ghost[row].1, meta.sky);
+                px.copy_from_slice(&[r, g, b, 255]);
             } else if terr[row].0 != 0 {
                 let [r, g, b] = block_color(terr[row].0, terr[row].1, meta.sky);
                 px.copy_from_slice(&[r, g, b, if in_fp { 255 } else { 128 }]);
@@ -1543,7 +1652,8 @@ mod tests {
                     assert!(!st.approx);
                     assert_eq!(st.buried, ob, "seed {seed} {view:?} ignore_air={ignore_air}: buried");
                     assert_eq!(st.cleared, oc, "seed {seed} {view:?} ignore_air={ignore_air}: cleared");
-                    // Every image pixel is red iff the oracle has a buried cell on that pixel's ray.
+                    // Every image pixel is a buried-tint pixel iff the oracle has a buried cell on that
+                    // pixel's ray, and then it is exactly the hatch/wash over the first ghost block.
                     for ox in 0..r.width {
                         let cw = st.col_lo + ox as i32;
                         for row in 0..r.height {
@@ -1553,14 +1663,48 @@ mod tests {
                                 LensView::Side => wy == cw,
                             });
                             let p = px(&r, ox, row);
-                            assert_eq!(p[..3] == LENS_BURIED_RGB[..] && p[3] == 255, expect,
-                                "seed {seed} {view:?} pixel ({ox},{row}) z={z}");
+                            if !expect { continue; }
+                            // First ghost-solid block along the ray at this z, nearest first.
+                            let (fp_lo, ray_len) = match view {
+                                LensView::Front => (x, clip.h),
+                                LensView::Side => (y, clip.w),
+                            };
+                            let fc = (cw - fp_lo) as usize;
+                            let first = (0..ray_len).find_map(|k| {
+                                let (dx, dy) = match view { LensView::Front => (fc, k), LensView::Side => (k, fc) };
+                                let b = clip.base[dy * clip.w + dx];
+                                let dz = z as i64 - b as i64;
+                                if b == LENS_SKIP || dz < 0 || dz >= clip.d as i64 { return None; }
+                                let i = dz as usize * clip.h * clip.w + dy * clip.w + dx;
+                                (clip.types[i] != 0).then_some((clip.types[i], clip.paints[i]))
+                            });
+                            let (bt, paint) = first.expect("a buried pixel has a ghost block");
+                            let want = lens_clash_px(lens_ghost_rgb(bt, paint, world.meta().sky), LENS_BURIED_RGB, lens_hatch(cw as i64 + z as i64));
+                            assert_eq!(p, want, "seed {seed} {view:?} pixel ({ox},{row}) z={z}");
                         }
                     }
                 }
             }
         }
         assert!(total_buried > 50 && total_cleared > 50, "fixture must actually collide ({total_buried}, {total_cleared})");
+    }
+
+    #[test]
+    fn lens_clash_px_keeps_block_and_tint() {
+        let base = [100, 120, 140];
+        let hatch = lens_clash_px(base, LENS_BURIED_RGB, true);
+        let wash = lens_clash_px(base, LENS_BURIED_RGB, false);
+        assert_eq!((hatch[3], wash[3]), (255, 255));
+        // Both carry the tint (red up) and the block (blue still well above the tint's 0x44)...
+        for p in [hatch, wash] {
+            assert!(p[0] > base[0] && p[2] > LENS_BURIED_RGB[2]);
+        }
+        // ...the stripe leans further to the tint than the wash does, and neither is flat red.
+        assert!(hatch[0] > wash[0]);
+        assert_ne!(hatch[..3], LENS_BURIED_RGB[..]);
+        // Stripes repeat on a fixed diagonal period, including for negative phases.
+        assert!(lens_hatch(0) && lens_hatch(LENS_HATCH_PERIOD) && lens_hatch(-LENS_HATCH_PERIOD));
+        assert!(!lens_hatch(1) && !lens_hatch(-1));
     }
 
     /// On a world mirrored across x = y, with a clipboard and bases mirrored the same way and the

@@ -69,3 +69,28 @@ describe("no OS-native message boxes", () => {
     });
   }
 });
+
+/** Stage 19.9: dialogs close only from their own controls (✕, Cancel, Esc), never a stray backdrop
+ *  click. `Dialog` is the one place that decides, so guard it there. */
+describe("dialogs ignore backdrop clicks", () => {
+  const files = import.meta.glob<string>(["./Dialog.tsx"], { query: "?raw", import: "default", eager: true });
+  it("Dialog passes closeOnBackdrop={false} to Modal", () => {
+    const text = Object.values(files)[0];
+    expect(text).toMatch(/closeOnBackdrop=\{false\}/);
+  });
+});
+
+/** Stage 19.7: one checkbox everywhere. `Check` (ribbon/primitives.tsx) is the only place a native
+ *  `type="checkbox"` may appear, because it restyles it; a raw one would look like the OS's. */
+describe("no raw checkboxes", () => {
+  const files = import.meta.glob<string>(["../**/*.tsx", "!../**/*.test.tsx"], { query: "?raw", import: "default", eager: true });
+  it("only ribbon/primitives.tsx renders type=\"checkbox\"", () => {
+    const offenders = Object.entries(files)
+      .filter(([f, text]) => !f.endsWith("/ribbon/primitives.tsx") && /type=["']checkbox["']/.test(text))
+      .map(([f]) => f);
+    expect(offenders, `use <Check> instead in: ${offenders.join(", ")}`).toEqual([]);
+  });
+  it("found source files to scan (glob sanity check)", () => {
+    expect(Object.keys(files).length).toBeGreaterThan(50);
+  });
+});

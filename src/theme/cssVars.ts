@@ -113,6 +113,26 @@ body { background: var(--vx-surface-bg0); color: var(--vx-text-primary); }
 }
 .vx-row[data-cur] { background: var(--vx-cur-bg) !important; box-shadow: var(--vx-cur-shadow) !important; }
 .vx-row[data-cur] .vx-ico { color: var(--vx-cur-icon); }
+/* The one checkbox (Stage 19.7, ribbon/primitives.tsx \`Check\`): a visually-hidden native input plus a
+   14px token-coloured box. Every on/off control goes through Check; a test bans raw checkboxes. */
+.vx-chk-wrap { position: relative; display: inline-flex; flex: none; width: 14px; height: 14px; }
+.vx-chk-in { position: absolute; inset: 0; margin: 0; opacity: 0; cursor: inherit; }
+.vx-chk-box {
+  box-sizing: border-box; width: 14px; height: 14px; border-radius: 3px; pointer-events: none;
+  display: inline-flex; align-items: center; justify-content: center;
+  border: 1px solid var(--vx-text-meta); background: var(--vx-surface-well);
+  color: var(--vx-surface-bg0); transition: background .09s, border-color .09s;
+}
+.vx-chk-box svg { display: block; }
+.vx-chk-tick, .vx-chk-dash { opacity: 0; }
+.vx-chk:hover .vx-chk-box { border-color: var(--vx-text-primary); }
+.vx-chk-in:checked + .vx-chk-box, .vx-chk-in:indeterminate + .vx-chk-box {
+  background: var(--vx-accent-primary); border-color: var(--vx-accent-primary);
+}
+.vx-chk-in:checked + .vx-chk-box .vx-chk-tick { opacity: 1; }
+.vx-chk-in:indeterminate + .vx-chk-box .vx-chk-tick { opacity: 0; }
+.vx-chk-in:indeterminate + .vx-chk-box .vx-chk-dash { opacity: 1; }
+.vx-chk-in:focus-visible + .vx-chk-box { outline: 2px solid var(--vx-focus); outline-offset: 1px; }
 /* Completion outline (Stage 14.13, src/ui/DoneOutline.tsx): a 400ms-max flash around a just-edited
    world-rect. Transform/opacity only, gated on data-motion="full" (src/theme/motion.ts) — under
    "reduced" the div still appears and disappears (its own JS timeout unmounts it either way), it
@@ -120,6 +140,19 @@ body { background: var(--vx-surface-bg0); color: var(--vx-text-primary); }
    header for why one is never added here. */
 :root[data-motion="full"] .vx-done-outline {
   animation: vxDoneOutline ${MOTION.doneMs}ms ${MOTION.easeExit} both;
+}
+:root[data-motion="full"] .vx-done-outline[data-tone="select"] {
+  animation-duration: ${MOTION.selectMs}ms;
+}
+/* Ribbon tab change (Stage 19.5, Ribbon.tsx): while the body carries data-tabanim, each group fades in
+   and slides --vx-tab-dx, staggered by --vx-i. Transform/opacity only; motion-gated like the rest. */
+:root[data-motion="full"] .rbn-body[data-tabanim] [data-group] {
+  animation: vxTabIn ${MOTION.chromeMs}ms ${MOTION.easeEnter} both;
+  animation-delay: calc(var(--vx-i, 0) * 20ms);
+}
+@keyframes vxTabIn {
+  from { opacity: 0; transform: translateX(var(--vx-tab-dx, 0)); }
+  to   { opacity: 1; transform: translateX(0); }
 }
 @keyframes vxDoneOutline {
   0%   { opacity: 0; transform: scale(0.97); }

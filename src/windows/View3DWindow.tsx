@@ -29,7 +29,7 @@ export default function View3DWindow({ swapped, node, onSwap, onMoved }: {
       onMoved={onMoved}
       bodyStyle={{ background: RAMP.mapBg }}
       buttons={<>
-        <WinButton icon="swap" label="Swap map ⇄ 3D (Tab)" onClick={onSwap} />
+        <WinButton icon="swap" label="Swap map ⇄ 3D (Tab)" cue="rotate" onClick={onSwap} />
         <WinButton icon={enlarged ? "restore" : "enlarge"} label={enlarged ? "Restore size" : "Enlarge"}
           active={enlarged} onClick={() => { enlargeWin("view3d"); onMoved(); }} />
       </>}

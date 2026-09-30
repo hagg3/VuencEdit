@@ -89,7 +89,7 @@ export default function Dialog({
   return (
     <Modal
       onClose={onClose} zIndex={zIndex} labelledBy={titleId} label={label}
-      closeOnBackdrop={!busy} closeOnEsc={!busy}
+      closeOnBackdrop={false} closeOnEsc={!busy}
     >
       <style>{DIALOG_CSS}</style>
       <div

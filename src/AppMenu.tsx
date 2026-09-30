@@ -16,7 +16,9 @@
  * has, and none of that chrome carried information the text doesn't.
  */
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { spinnerStyle } from "./designTokens";
+import { fmtBytes } from "./formatBytes";
 import AboutPanel from "./panels/AboutPanel";
 import WorldInfoPanel from "./panels/WorldInfoPanel";
 import { Icon, type IconName } from "./ribbon/icons";
@@ -242,6 +244,32 @@ function CheckRow({ checked, onChange, label, hint }: { checked: boolean; onChan
   );
 }
 
+interface BackupStatus { existing_name: string | null; existing_bytes: number; source_bytes: number }
+
+/** 18.8 (audit S-1): a plain `.bak` is a world-sized copy kept beside the file forever, so the Save
+ *  pane says how big the backup is (or will be) instead of the default changing under the user. */
+function BackupNote({ path, compressed }: { path: string; compressed: boolean }) {
+  const [st, setSt] = useState<BackupStatus | null>(null);
+  useEffect(() => {
+    let live = true;
+    invoke<BackupStatus>("backup_status", { path, backupCompressed: compressed })
+      .then(s => { if (live) setSt(s); }, () => { if (live) setSt(null); });
+    return () => { live = false; };
+  }, [path, compressed]);
+  if (!st) return null;
+  let text: ReactNode = null;
+  if (st.existing_name) {
+    text = <>Backup already kept: <code style={{ color: TEXT }}>{st.existing_name}</code> ({fmtBytes(st.existing_bytes)}).
+      Later saves leave it alone. If you delete it, the next save makes a fresh one.</>;
+  } else if (st.source_bytes > 0) {
+    text = compressed
+      ? <>This save first zips the current file ({fmtBytes(st.source_bytes)}) to <code style={{ color: TEXT }}>.bak.zip</code>, kept until you delete it.</>
+      : <>This save first copies the current file to <code style={{ color: TEXT }}>.bak</code>: {fmtBytes(st.source_bytes)} more on disk, kept until you delete it.</>;
+  }
+  if (!text) return null;
+  return <div style={{ fontSize: 11.5, color: TEXT_LABEL, padding: "2px 0 0 18px", lineHeight: 1.5, maxWidth: 620 }}>{text}</div>;
+}
+
 // ── The panes ─────────────────────────────────────────────────────────────────
 
 function Pane({ row, onClose, infoKey, bumpInfo }: { row: AppMenuRow; onClose: () => void; infoKey: number; bumpInfo: () => void }) {
@@ -329,7 +357,8 @@ function Pane({ row, onClose, infoKey, bumpInfo }: { row: AppMenuRow; onClose: (
             hint="Deflates the world inside a zip. Much smaller on disk and what the game expects for uploads; the editor detects either form on open, whatever the file is named." />
           <CheckRow checked={p.backupCompressed} onChange={p.setBackupCompressed}
             label="Compress the one-time backup"
-            hint="The first save over an existing file keeps its previous bytes as a .bak. With this on, that backup is deflated to .bak.zip instead of a plain copy." />
+            hint="The first save over an existing file keeps its previous bytes as a .bak: a full-size copy that stays until you delete it. With this on, that backup is deflated to .bak.zip instead, which is far smaller but slower to write." />
+          {p.sourcePath && <BackupNote path={p.sourcePath} compressed={p.backupCompressed} />}
         </div>
         <div style={{ fontSize: 11.5, color: TEXT_LABEL, marginBottom: 16, lineHeight: 1.5, maxWidth: 620 }}>
           Saving tries an incremental in-place write first. Only the chunks you actually edited are
@@ -354,7 +383,7 @@ function Pane({ row, onClose, infoKey, bumpInfo }: { row: AppMenuRow; onClose: (
             hint="Save As corrects a mismatched .eden/.zip extension for you, so the name always matches the container you picked." />
           <CheckRow checked={p.backupCompressed} onChange={p.setBackupCompressed}
             label="Compress the one-time backup"
-            hint="Only applies if you save over a file that already exists." />
+            hint="Only applies if you save over a file that already exists. A plain .bak is the full size of that file." />
         </div>
         <div style={{ fontSize: 11.5, color: TEXT_LABEL, marginBottom: 16, lineHeight: 1.5, maxWidth: 620 }}>
           Overwriting an existing file asks for confirmation first. The new path becomes this

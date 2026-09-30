@@ -3,7 +3,7 @@
 // which is exactly the kind of drift that bit the color tables before C6 — declare
 // once here and import everywhere instead.
 
-import { asF32, decodeEnvelope, splitBody, type IpcBinary } from "./codec";
+import { asI16, asU16, asU32, decodeEnvelope, splitBody, type IpcBinary } from "./codec";
 
 // ---- World metadata (Rust `WorldMeta`, returned by load_world) ----
 
@@ -107,38 +107,69 @@ export function decodePreviewData(buf: IpcBinary): PreviewData {
   return { width: header.width, height: header.height, pixels: body };
 }
 
-// ---- Voxel geometry (get_chunk_geometry) ----
+// ---- Voxel geometry (get_chunk_geometry, format 2) ----
 
-/** Decoded geometry: three vertex streams (opaque / transparent / emissive), each already a
- *  `Float32Array` view over the IPC response — ready to hand straight to `THREE.BufferAttribute`. */
-export interface VoxelGeometry {
-  positions: Float32Array; colors: Float32Array; uvs: Float32Array; vertex_count: number;
-  /** Transparent stream (water/glass/fence/new-flower) — colors are RGBA (itemSize 4), not RGB. */
-  positions_t: Float32Array; colors_t: Float32Array; uvs_t: Float32Array; vertex_count_t: number;
-  /** Emissive stream — lamp-block faces, RGB. Populated only in GPU (flat) mode. */
-  positions_e: Float32Array; colors_e: Float32Array; uvs_e: Float32Array; vertex_count_e: number;
-  /** Wire bytes behind each stream (position + color + uv), straight from the envelope's own `lens`
-   *  header. FlyView3D's geometry budget counts these rather than vertices: a GPU VBO is exactly the
-   *  size of the buffer it was uploaded from, whereas a vertex costs 24–36 B depending on which
-   *  stream it lands in and whether a texture pack is loaded. */
-  bytes: number; bytes_t: number; bytes_e: number;
+/** One stream of a compact (v2, ROADMAP-EDIT 18.14) chunk mesh: typed views over the IPC response,
+ *  ready to hand straight to `THREE.BufferAttribute`. */
+export interface GeometryStream {
+  /** `Int16 × 4` per vertex — fixed-point x, y, z (three-space) plus a 0 pad (D3D/ANGLE has no
+   *  3×16-bit vertex format). Place the mesh at `origin`, scaled by `posScale`. */
+  positions: Int16Array;
+  /** `Uint8 × 4` per vertex, normalised RGBA (alpha 255 outside the transparent stream). */
+  colors: Uint8Array;
+  /** `Uint16 × 2` per vertex, integer: U in half-tiles, V = atlas row. Empty without a texture pack;
+   *  with one, the atlas texture's `repeat = (0.5, 1 / atlasRows)` maps them exactly. */
+  uvs: Uint16Array;
+  /** Triangle indices (`Uint32` once a stream reaches 65 535 vertices), already cut to `indexCount`. */
+  indices: Uint16Array | Uint32Array;
+  vertexCount: number;
+  /** Wire bytes behind this stream (all four sections) — FlyView3D's geometry budget counts these:
+   *  a GPU buffer is exactly the size of the array it was uploaded from. */
+  bytes: number;
 }
 
+/** Decoded `get_chunk_geometry` (format 2) result. */
+export interface VoxelGeometry {
+  /** Three-space position of the mesh (the chunk's corner). */
+  origin: [number, number, number];
+  /** Scale that turns the fixed-point positions into blocks (1/16). */
+  posScale: number;
+  /** Atlas height in tiles; 0 = no texture pack. */
+  atlasRows: number;
+  /** Opaque, transparent (water/glass/fence/new-flower), emissive (lamp faces, GPU mode only). */
+  streams: [GeometryStream, GeometryStream, GeometryStream];
+}
+
+type GeometryStreamHeader = {
+  vertex_count: number; index_count: number; index_u32: boolean;
+  /** Byte lengths of positions, colours, uvs, indices (each a multiple of 4). */
+  lens: [number, number, number, number];
+};
 type VoxelGeometryHeader = {
-  vertex_count: number; vertex_count_t: number; vertex_count_e: number;
-  /** Byte length of each of the nine buffers, in body order (see `ObjGeometryResult` in export.rs). */
-  lens: number[];
+  format: number;
+  origin: [number, number, number]; pos_scale: number; atlas_rows: number;
+  streams: [GeometryStreamHeader, GeometryStreamHeader, GeometryStreamHeader];
 };
 
 export function decodeGeometry(buf: IpcBinary): VoxelGeometry {
   const { header, body } = decodeEnvelope<VoxelGeometryHeader>(buf);
-  const [p, c, u, pt, ct, ut, pe, ce, ue] = splitBody(body, header.lens).map(asF32);
-  const L = header.lens;
+  if (header.format !== 2) throw new Error(`Unexpected geometry format ${header.format}`);
+  const sections = splitBody(body, header.streams.flatMap((s) => s.lens));
+  const stream = (i: number): GeometryStream => {
+    const h = header.streams[i];
+    const [p, c, u, x] = sections.slice(i * 4, i * 4 + 4);
+    return {
+      positions: asI16(p),
+      colors: c,
+      uvs: asU16(u),
+      indices: h.index_u32 ? asU32(x, h.index_count) : asU16(x, h.index_count),
+      vertexCount: h.vertex_count,
+      bytes: h.lens[0] + h.lens[1] + h.lens[2] + h.lens[3],
+    };
+  };
   return {
-    positions: p, colors: c, uvs: u, vertex_count: header.vertex_count,
-    positions_t: pt, colors_t: ct, uvs_t: ut, vertex_count_t: header.vertex_count_t,
-    positions_e: pe, colors_e: ce, uvs_e: ue, vertex_count_e: header.vertex_count_e,
-    bytes: L[0] + L[1] + L[2], bytes_t: L[3] + L[4] + L[5], bytes_e: L[6] + L[7] + L[8],
+    origin: header.origin, posScale: header.pos_scale, atlasRows: header.atlas_rows,
+    streams: [stream(0), stream(1), stream(2)],
   };
 }
 
@@ -243,8 +274,15 @@ export interface AutosaveInfo {
   source_path: string | null;
   timestamp: number; // unix seconds
   /** 0 = legacy single-file autosave (open via `get_autosave_path` + `load_world`); 1 = journaled
-   *  base+journal sidecars, recovered via `load_autosave` instead. */
+   *  base+journal sidecars; 2 = journal + `base` naming its base image (18.9). 1–2 recover via
+   *  `load_autosave`. */
   format: number;
-  /** Journal's own base id, 16 bytes — only meaningful when `format === 1`. */
+  /** Journal's own base id, 16 bytes — only meaningful when `format >= 1`. */
   base_id: number[];
+  /** Format 2: the image the journal replays onto — the user's world file (`source`) or a private
+   *  copy in the app data dir (`clone`). Absent for formats 0–1. */
+  base?: { kind: "clone" } | { kind: "source"; path: string; len: number; mtime_ns: number; file_id: [number, number] } | null;
+  /** Format 2: whether that base can still be used. `changed`/`missing` only happen for a `source`
+   *  base (the file was saved/edited since, or moved/deleted/offline). */
+  base_status?: "ok" | "changed" | "missing" | null;
 }
