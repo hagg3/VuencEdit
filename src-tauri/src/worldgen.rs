@@ -612,6 +612,12 @@ impl VoxelSink for LoadedWorld {
         set_block_abs(self, wx, wy, wz, bt, paint);
     }
 }
+impl VoxelSink for crate::EditView<'_> {
+    #[inline]
+    fn put(&mut self, wx: i32, wy: i32, wz: i32, bt: u8, paint: u8) {
+        set_block_abs(self, wx, wy, wz, bt, paint);
+    }
+}
 impl<'a> VoxelSink for WorldGen<'a> {
     #[inline]
     fn put(&mut self, wx: i32, wy: i32, wz: i32, bt: u8, paint: u8) {

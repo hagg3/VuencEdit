@@ -448,6 +448,27 @@ mod tests {
         assert_eq!(sparse_idx.snapshot()[&(0, 0)], dense_idx.snapshot()[&(0, 0)]);
     }
 
+    /// A band-offset dense delta — `start_off` = a band boundary, `pre` covering only bands 2..=3 of
+    /// a 16-band chunk — is what copy-on-write edits and the sculpt scratch produce (ROADMAP-EDIT
+    /// 18.10/18.12). Its offsets must decode relative to the chunk, not to `pre`.
+    #[test]
+    fn band_offset_dense_delta_moves_the_index() {
+        let mut world = TestWorld::new(1, 1, 16);
+        world.bytes[blk(4, 6, 40)] = LAMP_BLOCK_TYPE; // band 2
+        let index = LampIndex::default();
+        index.build_now(&world, &[(0, 0)]);
+        assert_eq!(sorted(&index.snapshot()[&(0, 0)]), vec![[4, 6, 40]]);
+
+        let (lo, hi) = (2 * 8192, 4 * 8192);
+        let pre: Vec<u8> = world.bytes[lo..hi].to_vec();
+        world.bytes[blk(4, 6, 40)] = 0;
+        world.bytes[blk(9, 1, 55)] = LAMP_BLOCK_TYPE; // band 3
+        index.delta_batch().dense(&world, 0, 0, lo as u32, &pre);
+
+        assert_eq!(sorted(&index.snapshot()[&(0, 0)]), vec![[9, 1, 55]]);
+        assert_eq!(index.snapshot()[&(0, 0)], build_lamp_index(&world, &[(0, 0)])[&(0, 0)]);
+    }
+
     /// §4's corruption guard: a delta into a chunk the index has never scanned must be dropped, not
     /// fabricated into a bucket claiming the chunk is fully known.
     #[test]

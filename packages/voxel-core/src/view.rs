@@ -198,9 +198,26 @@ pub fn set_block_abs(world: &mut impl VoxelViewMut, wx: i32, wy: i32, wz: i32, b
     let ly   = wy.rem_euclid(16) as usize;
     let band = wz as usize / 16;
     let lz   = wz as usize % 16;
+    set_block_in_band(world, cx, cy, band, lx * 256 + ly * 16 + lz, bt, paint);
+}
+
+/// Write `(bt, paint)` at band-local block index `bi` (`lx*256 + ly*16 + lz`, `< 4096`) of band
+/// `band` of chunk `(cx, cy)` — the addressing-free core of [`set_block_abs`], for writers that
+/// already resolved the chunk. Dropped for a missing chunk or past a short span's tail.
+///
+/// **Compares before writing** (ROADMAP-EDIT 18.12): a write that wouldn't change either byte never
+/// asks for `band_bytes_mut`. That matters twice over — a lazy/copy-on-write view (`ChunkScratch`,
+/// VuencEdit's `EditView`) materialises a band on its first `band_bytes_mut`, so a no-op write (a
+/// delete over air, a fill with the block already there) would otherwise copy the band for nothing;
+/// and on a `MAP_SHARED` mapping a no-op store still dirties the page.
+#[inline]
+pub fn set_block_in_band(world: &mut impl VoxelViewMut, cx: i32, cy: i32, band: usize, bi: usize, bt: u8, paint: u8) {
+    let pi = bi + 4096;
+    match world.band_bytes(cx, cy, band) {
+        Some(b) if pi < b.len() => { if b[bi] == bt && b[pi] == paint { return; } }
+        _ => return,
+    }
     if let Some(chunk) = world.band_bytes_mut(cx, cy, band) {
-        let bi = lx * 256 + ly * 16 + lz;
-        let pi = bi + 4096;
         if pi < chunk.len() {
             chunk[bi] = bt;
             chunk[pi] = paint;
@@ -379,5 +396,47 @@ mod hint_tests {
             "a too-low hint must be observable — the contract is an UPPER bound, not an exact value");
         assert_eq!(surface_z(&w, 3, 3), None, "the slab is now invisible to surface_z");
         assert!(scan_chunk_lamps(&w, 0, 0).is_empty(), "and the lamp above it is gone too");
+    }
+}
+
+#[cfg(test)]
+mod write_tests {
+    use super::*;
+    use crate::testworld::TestWorld;
+
+    /// Counts `band_bytes_mut` calls — the hook a copy-on-write view captures a band on.
+    struct Counting(TestWorld, usize);
+    impl VoxelView for Counting {
+        fn num_bands(&self) -> usize { self.0.num_bands() }
+        fn chunk_origin(&self) -> (i32, i32) { self.0.chunk_origin() }
+        fn chunk_bytes(&self, cx: i32, cy: i32) -> Option<&[u8]> { self.0.chunk_bytes(cx, cy) }
+    }
+    impl VoxelViewMut for Counting {
+        fn chunk_bytes_mut(&mut self, cx: i32, cy: i32) -> Option<&mut [u8]> { self.0.chunk_bytes_mut(cx, cy) }
+        fn band_bytes_mut(&mut self, cx: i32, cy: i32, band: usize) -> Option<&mut [u8]> {
+            self.1 += 1;
+            let c = self.0.chunk_bytes_mut(cx, cy)?;
+            let lo = band * 8192;
+            let hi = (lo + 8192).min(c.len());
+            Some(&mut c[lo..hi])
+        }
+    }
+
+    /// ROADMAP-EDIT 18.12: a write that changes nothing must never ask for a writable band.
+    #[test]
+    fn set_block_abs_skips_no_op_writes() {
+        let mut w = Counting(TestWorld::new(1, 1, 4), 0);
+        set_block_abs(&mut w, 3, 4, 20, 0, 0); // air over air
+        assert_eq!(w.1, 0, "a no-op write must not touch band_bytes_mut");
+        set_block_abs(&mut w, 3, 4, 20, 5, 2);
+        assert_eq!(w.1, 1);
+        assert_eq!(get_block_at(&w, 3, 4, 20), (5, 2));
+        set_block_abs(&mut w, 3, 4, 20, 5, 2); // same again
+        assert_eq!(w.1, 1);
+        set_block_abs(&mut w, 3, 4, 20, 5, 3); // paint-only change still writes
+        assert_eq!(w.1, 2);
+        assert_eq!(get_block_at(&w, 3, 4, 20), (5, 3));
+        set_block_abs(&mut w, 99, 4, 20, 5, 3); // missing chunk: dropped, no probe
+        assert_eq!(w.1, 2);
     }
 }

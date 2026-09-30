@@ -204,10 +204,10 @@ describe("hotbarGrid", () => {
     expect(hotbarGrid(1000, 100)).toEqual({ cols: 11, size: HOTBAR_MAX_SLOT });
   });
   it("wraps to two rows when roughly square", () => {
-    expect(hotbarGrid(300, 150)).toEqual({ cols: 6, size: 45 });
+    expect(hotbarGrid(300, 150)).toEqual({ cols: 6, size: 44 });
   });
   it("is a single column when tall and thin", () => {
-    expect(hotbarGrid(80, 600)).toEqual({ cols: 1, size: 50 });
+    expect(hotbarGrid(80, 600)).toEqual({ cols: 1, size: 44 });
   });
   it("clamps to the minimum slot size when the body is tiny", () => {
     const g = hotbarGrid(20, 20);
@@ -258,16 +258,16 @@ describe("winLimits", () => {
     expect(max.h).toBe(TITLE_H + TOOL_COUNT * TOOL_CELL + (TOOL_COUNT - 1) * TOOL_GAP + 2 * TOOL_PAD);
   });
 
-  it("Hotbar: min fits the smallest slots (24 px), max is the natural size at the 72 px slot cap", () => {
+  it("Hotbar: min fits the smallest slots (24 px), max is the natural size at the 44 px slot cap", () => {
     const { min, max } = winLimits("hotbar", WORK);
     expect(min.h).toBe(TITLE_H + HOTBAR_MIN_SLOT + 2 * HOTBAR_PAD);
     expect(max.w).toBe(HOTBAR_SLOTS * HOTBAR_MAX_SLOT + (HOTBAR_SLOTS - 1) * HOTBAR_GAP + 2 * HOTBAR_PAD);
   });
 
-  it("3D view and lens may grow to the work area", () => {
+  it("3D view may grow to the work area; the lens is capped at ~2x its default (19.8)", () => {
     for (const work of WORKS) {
       expect(winLimits("view3d", work).max).toEqual(work);
-      expect(winLimits("lens", work).max).toEqual(work);
+      expect(winLimits("lens", work).max).toEqual({ w: 640, h: 420 });
     }
   });
 

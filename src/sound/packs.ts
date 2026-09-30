@@ -52,20 +52,18 @@ export const CUE_LABELS: Record<CueId, string> = {
   drop: "Drag release", error: "Error", nudge: "Paste Z-offset step",
 };
 
-/** A quiet looped voice that plays for as long as a gesture is held (window move/resize, selection
- *  drag, paste-ghost drag). Not a one-shot, so exempt from the 250 ms cue ceiling — but its gain is
- *  capped 12 dB under the loudest one-shot peak (`HOLD_MAX_GAIN`; `sfx.test.ts` enforces it). */
+/** A quiet **tick loop** that plays for as long as a gesture is held (window move/resize, selection
+ *  drag, paste-ghost drag) — a dry, low, skeuomorphic click repeating like a classic desktop window
+ *  drag, not a drone. Each tick is the `voices` burst (offsets `t` relative to the tick). Ticks are
+ *  scheduled ahead on the AudioContext clock. Every voice's gain is capped 12 dB under the loudest
+ *  one-shot peak (`HOLD_MAX_GAIN`; `sfx.hold.test.ts` enforces it) and each tick is short. */
 export interface HoldVoice {
-  w: Waveform;
-  /** Oscillator frequency (Hz); ignored for `"noise"`. */
-  f: number;
-  /** Bandpass centre (Hz) / Q for `"noise"` loops. */
-  bp?: number;
-  q?: number;
-  /** Steady-state peak gain (0–1, pre-volume). */
-  g: number;
+  /** Mean time between ticks (ms); jittered ±3 % at play time so the loop doesn't sound mechanical. */
+  period: number;
+  /** The burst making up one tick. Keep each `t + d` well under `period`. */
+  voices: Voice[];
 }
-/** −12 dB relative to the loudest one-shot peak (0.12) — the ceiling for any `HoldVoice.g`. */
+/** −12 dB relative to the loudest one-shot peak (0.12) — the ceiling for any hold voice's `g`. */
 export const HOLD_MAX_GAIN = 0.12 * 0.25;
 
 export type PackId = "tick" | "soft" | "mech" | "glass" | "chip" | "classic" | "none";
@@ -76,7 +74,7 @@ export interface SoundPack {
   label: string;
   /** Empty for `"none"`; every other pack defines the full `CUE_IDS` set. */
   cues: Partial<Record<CueId, Voice[]>>;
-  /** The looped hold voice; `"none"` (and any pack that omits it) plays no hold. */
+  /** The tick-loop hold voice; `"none"` (and any pack that omits it) plays no hold. */
   hold?: HoldVoice;
 }
 
@@ -97,7 +95,7 @@ export const SOUND_PACKS: Record<PackId, SoundPack> = {
       error: [v("triangle", 220, 0, .09, .07)],
       nudge: [v("sine", 1500, 0, .012, .04)],
     },
-    hold: { w: "noise", f: 0, bp: 3000, q: 4, g: .012 },
+    hold: { period: 100, voices: [v("noise", 0, 0, .009, .022, { bp: 3400, q: 4 }), v("sine", 1800, 0, .008, .008)] },
   },
   soft: {
     id: "soft", label: "Soft",
@@ -115,7 +113,7 @@ export const SOUND_PACKS: Record<PackId, SoundPack> = {
       error: [v("sine", 311, 0, .12, .06), v("sine", 293, .08, .14, .05)],
       nudge: [v("sine", 700, 0, .03, .035)],
     },
-    hold: { w: "sine", f: 220, g: .012 },
+    hold: { period: 130, voices: [v("sine", 520, 0, .022, .016, { f2: 400 })] },
   },
   mech: {
     id: "mech", label: "Mechanical",
@@ -137,7 +135,7 @@ export const SOUND_PACKS: Record<PackId, SoundPack> = {
       error: [v("square", 110, 0, .06, .04)],
       nudge: [v("noise", 0, 0, .01, .09, { bp: 2000, q: 3 })],
     },
-    hold: { w: "noise", f: 0, bp: 700, q: 1.2, g: .025 },
+    hold: { period: 110, voices: [v("noise", 0, 0, .014, .028, { bp: 1400, q: 2 }), v("sine", 220, 0, .02, .012, { f2: 150 })] },
   },
   glass: {
     id: "glass", label: "Glass",
@@ -157,7 +155,7 @@ export const SOUND_PACKS: Record<PackId, SoundPack> = {
       error: [v("sine", 392, 0, .2, .04), v("sine", 370, .09, .16, .035)],
       nudge: [v("sine", 1568, 0, .05, .02)],
     },
-    hold: { w: "sine", f: 1320, g: .008 },
+    hold: { period: 140, voices: [v("sine", 2093, 0, .03, .01), v("sine", 4186, 0, .015, .004)] },
   },
   chip: {
     id: "chip", label: "Chiptune",
@@ -182,7 +180,7 @@ export const SOUND_PACKS: Record<PackId, SoundPack> = {
       error: [v("square", 196, 0, .08, .03), v("square", 147, .08, .1, .03)],
       nudge: [v("square", 1175, 0, .02, .018)],
     },
-    hold: { w: "triangle", f: 165, g: .02 },
+    hold: { period: 120, voices: [v("square", 880, 0, .012, .014)] },
   },
   classic: {
     id: "classic", label: "Classic",
@@ -209,7 +207,7 @@ export const SOUND_PACKS: Record<PackId, SoundPack> = {
       error: [v("square", 147, 0, .09, .03), v("square", 139, .1, .12, .03)],
       nudge: [v("noise", 0, 0, .012, .08, { bp: 1700, q: 2.5 })],
     },
-    hold: { w: "noise", f: 0, bp: 550, q: .8, g: .028 },
+    hold: { period: 100, voices: [v("noise", 0, 0, .012, .028, { bp: 900, q: 1.5 }), v("sine", 140, 0, .022, .02, { f2: 90 })] },
   },
   none: { id: "none", label: "Off", cues: {} },
 };

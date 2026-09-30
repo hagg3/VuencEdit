@@ -62,12 +62,12 @@ export const TOOL_GAP = 2;
 export const TOOL_PAD = 4;
 export const TOOL_COUNT = 6;
 
-/** Hotbar grid metrics (mock `layoutHotbar`): ▣ + 10 slots, clamp 24–72px, 4px gap, 5px body inset. */
+/** Hotbar grid metrics (mock `layoutHotbar`): ▣ + 10 slots, clamp 24–44px, 4px gap, 5px body inset. */
 export const HOTBAR_SLOTS = 11;
 export const HOTBAR_GAP = 4;
 export const HOTBAR_PAD = 5;
 export const HOTBAR_MIN_SLOT = 24;
-export const HOTBAR_MAX_SLOT = 72;
+export const HOTBAR_MAX_SLOT = 44;
 
 /** Narrowest a Tools/Hotbar window gets: the title icon + collapse + ✕ still fit. */
 const TOOLS_MIN_W = 64;
@@ -168,7 +168,8 @@ export function winLimits(id: WinId, work: Size): WinLimits {
       return { min: minOf(lo), max: maxOf(hotbarOptions(HOTBAR_MAX_SLOT)), fit: (w, h) => growToOption(lo, w, h) };
     }
     case "view3d": return { min: { w: 240, h: 150 }, max: work };
-    case "lens": return { min: { w: 220, h: 150 }, max: work };
+    // A preview, not a viewport: capped at ~2x its 300x196 default (19.8).
+    case "lens": return { min: { w: 220, h: 150 }, max: { w: 640, h: 420 } };
   }
 }
 

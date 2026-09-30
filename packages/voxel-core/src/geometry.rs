@@ -137,6 +137,232 @@ impl ObjGeometryResult {
     }
 }
 
+// ── Mesh sinks: one mesher, two wire formats (ROADMAP-EDIT 18.14) ─────────────────────────────
+
+/// Which of the three streams a face lands in (`ObjGeometryResult`'s field groups, in order).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Stream {
+    /// Everything not below.
+    Opaque = 0,
+    /// `transparent_alpha` blocks (water/glass/fence/new-flower) — RGBA colour.
+    Transparent = 1,
+    /// Lamp faces in flat (GPU-shadow) mode, drawn unlit by the frontend.
+    Emissive = 2,
+}
+
+/// Where [`obj_geometry_region_into`] sends each finished face. The mesher computes everything —
+/// stream, lit colour, texture row — and a sink only encodes it, so the two formats can't disagree
+/// about *what* is drawn, only about how it's packed.
+///
+/// Positions are **three-space** (`(eden x, eden z, eden y)`), in the mesher's winding. With a
+/// texture pack loaded `row` is `Some` (the atlas row; `None` from `face_color_and_row` is row 0).
+pub trait MeshSink {
+    /// A quad `a, b, c, d`, drawn as triangles `(a, b, d)` and `(b, c, d)`. U runs `0..nu` along
+    /// `a→b` (`nu` = the greedy-merged width in blocks, 1 for a per-block face); V is `row + 1` at
+    /// `a`/`b` and `row` at `c`/`d` (a tile reads top→bottom).
+    fn quad(&mut self, s: Stream, v: [[f32; 3]; 4], rgba: [f32; 4], uv: Option<(u32, u16)>);
+    /// A triangle `v0, v1, v2`; U = 0, 1, ½ and V = `row + 1`, `row + 1`, `row`.
+    fn tri(&mut self, s: Stream, v: [[f32; 3]; 3], rgba: [f32; 4], row: Option<u32>);
+    /// Capacity hint: at most `n` more quads are coming for `s`.
+    fn reserve_quads(&mut self, _s: Stream, _n: usize) {}
+}
+
+/// The v1 encoder: non-indexed LE `f32` streams — exactly the nine buffers of [`ObjGeometryResult`],
+/// byte for byte what the mesher emitted before sinks existed (every mesher test runs on it).
+pub struct F32Sink {
+    /// `atlas_rows` as the mesher always divided by it; unused without a pack.
+    ar: f32,
+    pos: [Vec<u8>; 3],
+    col: [Vec<u8>; 3],
+    uv: [Vec<u8>; 3],
+}
+
+impl F32Sink {
+    pub fn new(pack: Option<&TexturePack>) -> Self {
+        F32Sink { ar: pack.map_or(1.0, |p| p.atlas_rows as f32), pos: Default::default(), col: Default::default(), uv: Default::default() }
+    }
+
+    #[inline]
+    fn vert(&mut self, s: Stream, p: [f32; 3], rgba: [f32; 4]) {
+        let i = s as usize;
+        for c in p { self.pos[i].extend_from_slice(&c.to_le_bytes()); }
+        let n = if s == Stream::Transparent { 4 } else { 3 };
+        for c in &rgba[..n] { self.col[i].extend_from_slice(&c.to_le_bytes()); }
+    }
+
+    pub fn finish(self) -> ObjGeometryResult {
+        let [positions, positions_t, positions_e] = self.pos;
+        let [colors, colors_t, colors_e] = self.col;
+        let [uvs, uvs_t, uvs_e] = self.uv;
+        // One vertex is 3 floats = 12 bytes.
+        ObjGeometryResult {
+            vertex_count: (positions.len() / 12) as u32,
+            vertex_count_t: (positions_t.len() / 12) as u32,
+            vertex_count_e: (positions_e.len() / 12) as u32,
+            positions, colors, uvs, positions_t, colors_t, uvs_t, positions_e, colors_e, uvs_e,
+        }
+    }
+}
+
+impl MeshSink for F32Sink {
+    fn quad(&mut self, s: Stream, v: [[f32; 3]; 4], rgba: [f32; 4], uv: Option<(u32, u16)>) {
+        for k in [0, 1, 3, 1, 2, 3] { self.vert(s, v[k], rgba); }
+        if let Some((row, nu)) = uv {
+            let (v0, v1, nu) = ((row + 1) as f32 / self.ar, row as f32 / self.ar, nu as f32);
+            for f in [0.0, v0, nu, v0, 0.0, v1, nu, v0, nu, v1, 0.0, v1] {
+                self.uv[s as usize].extend_from_slice(&f.to_le_bytes());
+            }
+        }
+    }
+    fn tri(&mut self, s: Stream, v: [[f32; 3]; 3], rgba: [f32; 4], row: Option<u32>) {
+        for p in v { self.vert(s, p, rgba); }
+        if let Some(row) = row {
+            let (v0, v1) = ((row + 1) as f32 / self.ar, row as f32 / self.ar);
+            for f in [0.0, v0, 1.0, v0, 0.5, v1] { self.uv[s as usize].extend_from_slice(&f.to_le_bytes()); }
+        }
+    }
+    fn reserve_quads(&mut self, s: Stream, n: usize) {
+        let i = s as usize;
+        self.pos[i].reserve(n * 6 * 12);
+        self.col[i].reserve(n * 6 * 12);
+    }
+}
+
+/// Fixed-point steps per block in [`CompactGeometry`] positions. Every coordinate the mesher emits
+/// is a multiple of ¼ (fluid surfaces at `level/4`); 16 leaves headroom and still fits a 256-tall
+/// column in `Int16` (256 × 16 = 4096).
+pub const COMPACT_POS_SUBDIV: f32 = 16.0;
+
+/// One stream of a [`CompactGeometry`], as LE bytes ready for the wire. Every section's length is
+/// a multiple of 4, so each can be viewed in place from a 4-aligned body.
+pub struct CompactStream {
+    pub vertex_count: u32,
+    pub index_count: u32,
+    /// `Uint32` indices from 65 535 vertices up (a tall 256z cliff chunk), else `Uint16`.
+    pub index_u32: bool,
+    /// `Int16 × 4` per vertex: fixed-point (`COMPACT_POS_SUBDIV`) offset from `origin`, then a 0 pad
+    /// (D3D11/ANGLE has no 3×16-bit vertex format — it would convert a 3-component one on the CPU).
+    pub positions: Vec<u8>,
+    /// `Uint8 × 4` per vertex, normalised: lit RGB + alpha (255 outside the transparent stream).
+    pub colors: Vec<u8>,
+    /// `Uint16 × 2` per vertex, integer, empty without a pack: U in **half**-tiles (so a triangle's
+    /// apex at ½ is exact), V = atlas row. The frontend maps them with the atlas texture's
+    /// `repeat = (½, 1/atlas_rows)` — exact, where a normalised V couldn't hit `k/atlas_rows`.
+    pub uvs: Vec<u8>,
+    /// `Uint16` or `Uint32` (see `index_u32`), zero-padded to 4 bytes.
+    pub indices: Vec<u8>,
+}
+
+/// The v2 ("compact indexed") mesh — ~2.5× smaller than [`ObjGeometryResult`] with a pack, ~3×
+/// without (76 vs 192 B per opaque quad). Deliberately **not** `Serialize` (same rule as
+/// `ObjGeometryResult`).
+pub struct CompactGeometry {
+    /// Three-space position of the mesh origin; vertices are `origin + p / COMPACT_POS_SUBDIV`.
+    pub origin: [f32; 3],
+    /// 0 = no texture pack (every `uvs` is empty).
+    pub atlas_rows: u32,
+    /// Opaque, transparent, emissive.
+    pub streams: [CompactStream; 3],
+}
+
+impl CompactGeometry {
+    /// The twelve sections in wire order: per stream, positions / colours / uvs / indices.
+    pub fn buffers(&self) -> [&[u8]; 12] {
+        let [a, b, c] = &self.streams;
+        [&a.positions, &a.colors, &a.uvs, &a.indices,
+         &b.positions, &b.colors, &b.uvs, &b.indices,
+         &c.positions, &c.colors, &c.uvs, &c.indices]
+    }
+    /// Total wire bytes (the frontend budget's unit — see [`ObjGeometryResult::wire_bytes`]).
+    pub fn wire_bytes(&self) -> usize { self.buffers().iter().map(|b| b.len()).sum() }
+}
+
+#[derive(Default)]
+struct CompactAcc {
+    pos: Vec<u8>,
+    col: Vec<u8>,
+    uv: Vec<u8>,
+    idx: Vec<u32>,
+    n: u32,
+}
+
+/// The v2 encoder — see [`CompactGeometry`].
+pub struct CompactSink {
+    origin: [f32; 3],
+    atlas_rows: u32,
+    acc: [CompactAcc; 3],
+}
+
+impl CompactSink {
+    /// `origin` is the three-space corner vertices are stored relative to — for a chunk,
+    /// `(sx1, 0, sy1)`.
+    pub fn new(origin: [f32; 3], pack: Option<&TexturePack>) -> Self {
+        CompactSink { origin, atlas_rows: pack.map_or(0, |p| p.atlas_rows), acc: Default::default() }
+    }
+
+    #[inline]
+    fn vert(&mut self, s: Stream, p: [f32; 3], rgba: [f32; 4], uv: Option<(u16, u16)>) {
+        let a = &mut self.acc[s as usize];
+        for k in 0..3 {
+            let f = (p[k] - self.origin[k]) * COMPACT_POS_SUBDIV;
+            let q = f.round();
+            debug_assert!(q == f, "vertex coordinate {} is off the 1/{} grid", p[k], COMPACT_POS_SUBDIV);
+            debug_assert!((i16::MIN as f32..=i16::MAX as f32).contains(&q), "vertex {} out of Int16 range", p[k]);
+            a.pos.extend_from_slice(&(q as i16).to_le_bytes());
+        }
+        a.pos.extend_from_slice(&0i16.to_le_bytes());
+        for c in rgba { a.col.push((c * 255.0).round().clamp(0.0, 255.0) as u8); }
+        if let Some((u, v)) = uv {
+            a.uv.extend_from_slice(&u.to_le_bytes());
+            a.uv.extend_from_slice(&v.to_le_bytes());
+        }
+        a.n += 1;
+    }
+
+    pub fn finish(self) -> CompactGeometry {
+        let streams = self.acc.map(|a| {
+            // ⚠️ Not `n > 65 536`: WebGL2 always has PRIMITIVE_RESTART_FIXED_INDEX on, so index
+            // 0xFFFF in a `Uint16` buffer restarts the primitive instead of drawing vertex 65 535.
+            let index_u32 = a.n > u16::MAX as u32;
+            let mut indices = Vec::with_capacity(a.idx.len() * if index_u32 { 4 } else { 2 } + 2);
+            for &i in &a.idx {
+                if index_u32 { indices.extend_from_slice(&i.to_le_bytes()); }
+                else { indices.extend_from_slice(&(i as u16).to_le_bytes()); }
+            }
+            while indices.len() % 4 != 0 { indices.push(0); }
+            CompactStream {
+                vertex_count: a.n, index_count: a.idx.len() as u32, index_u32,
+                positions: a.pos, colors: a.col, uvs: a.uv, indices,
+            }
+        });
+        CompactGeometry { origin: self.origin, atlas_rows: self.atlas_rows, streams }
+    }
+}
+
+impl MeshSink for CompactSink {
+    fn quad(&mut self, s: Stream, v: [[f32; 3]; 4], rgba: [f32; 4], uv: Option<(u32, u16)>) {
+        let base = self.acc[s as usize].n;
+        let uvs = uv.map(|(row, nu)| {
+            let (r0, r1, u1) = (row as u16, (row + 1) as u16, nu * 2);
+            [(0, r1), (u1, r1), (u1, r0), (0, r0)]
+        });
+        for k in 0..4 { self.vert(s, v[k], rgba, uvs.map(|u| u[k])); }
+        self.acc[s as usize].idx.extend_from_slice(&[base, base + 1, base + 3, base + 1, base + 2, base + 3]);
+    }
+    fn tri(&mut self, s: Stream, v: [[f32; 3]; 3], rgba: [f32; 4], row: Option<u32>) {
+        let base = self.acc[s as usize].n;
+        let uvs = row.map(|row| [(0, (row + 1) as u16), (2, (row + 1) as u16), (1, row as u16)]);
+        for k in 0..3 { self.vert(s, v[k], rgba, uvs.map(|u| u[k])); }
+        self.acc[s as usize].idx.extend_from_slice(&[base, base + 1, base + 2]);
+    }
+    fn reserve_quads(&mut self, s: Stream, n: usize) {
+        let a = &mut self.acc[s as usize];
+        a.pos.reserve(n * 4 * 8);
+        a.col.reserve(n * 4 * 4);
+        a.idx.reserve(n * 6);
+    }
+}
+
 /// Which of the game's two shipped lighting behaviours a lamp's falloff follows. The original
 /// (64z-era) client used a tight, steep-falloff pool (~4 tile effective radius); "New Dawn"
 /// (256z) widened it to a much broader, gradual pool (~14 tiles). Both are real, previously-shipped
@@ -459,8 +685,8 @@ struct FaceRec {
     u: i32,
 }
 
-/// Face-culled cube/ramp/wedge geometry for an arbitrary world box, encoded as LE f32 position +
-/// colour triplets (Three.js Y-up coords). The core of `get_chunk_geometry` (world-scale fly-through
+/// Face-culled cube/ramp/wedge geometry for an arbitrary world box, encoded as the v1 LE f32
+/// streams (Three.js Y-up coords) — [`obj_geometry_region_into`] with an [`F32Sink`]. The core of `get_chunk_geometry` (world-scale fly-through
 /// chunk streaming) — the shaped-selection `mask` param below is now exercised only by tests (it was
 /// also used by the removed `get_obj_geometry` 64³ selection-preview command; kept, unused by any
 /// live caller, because the mask-aware behaviour it gates is still covered by
@@ -473,6 +699,15 @@ struct FaceRec {
 /// are not unit squares, so there is nothing to tile. See `FaceRec`.
 #[allow(clippy::too_many_arguments)]
 pub fn obj_geometry_region(world: &impl VoxelView, meta: ViewMeta, pack: Option<&TexturePack>, sx1: i32, sy1: i32, sx2: i32, sy2: i32, sz1: i32, sz2: i32, lamps: &[([i32; 3], [f32; 3])], mode: LightMode, mask: Option<&SelectionMask>) -> ObjGeometryResult {
+    let mut sink = F32Sink::new(pack);
+    obj_geometry_region_into(&mut sink, world, meta, pack, sx1, sy1, sx2, sy2, sz1, sz2, lamps, mode, mask);
+    sink.finish()
+}
+
+/// [`obj_geometry_region`] into any [`MeshSink`] — the one mesher behind both wire formats
+/// (ROADMAP-EDIT 18.14): [`F32Sink`] (v1, `ObjGeometryResult`) and [`CompactSink`] (v2).
+#[allow(clippy::too_many_arguments)]
+pub fn obj_geometry_region_into<S: MeshSink>(sink: &mut S, world: &impl VoxelView, meta: ViewMeta, pack: Option<&TexturePack>, sx1: i32, sy1: i32, sx2: i32, sy2: i32, sz1: i32, sz2: i32, lamps: &[([i32; 3], [f32; 3])], mode: LightMode, mask: Option<&SelectionMask>) {
     // Every block read below goes through the chunk-address memo. Single-threaded by construction
     // (see ChunkCache) — this function is not parallelised.
     let cache = ChunkCache::new(world);
@@ -503,28 +738,8 @@ pub fn obj_geometry_region(world: &impl VoxelView, meta: ViewMeta, pack: Option<
         gb(wx, wy, wz)
     };
 
-    // Emitted directly as LE bytes (audit I-1) rather than as `Vec<f32>` converted afterwards —
-    // that used to cost a doubling-realloc `Vec<f32>` *and* a `flat_map().collect()` pass per
-    // stream, ~3× the wire payload in transient allocator traffic per chunk. `push_f32!` is the one
-    // place a float becomes bytes.
-    let mut pos_f: Vec<u8> = Vec::new();
-    let mut col_f: Vec<u8> = Vec::new();
-    let mut uv_f:  Vec<u8> = Vec::new();
-    // Transparent stream (water/glass/fence/new-flower) — same layout except colors are RGBA.
-    let mut pos_ft: Vec<u8> = Vec::new();
-    let mut col_ft: Vec<u8> = Vec::new();
-    let mut uv_ft:  Vec<u8> = Vec::new();
-    // Emissive stream (lamp blocks in flat/GPU mode) — RGB, drawn unlit by the frontend so lamps
-    // stay fullbright. Only populated when `mode.flat`.
-    let mut pos_ef: Vec<u8> = Vec::new();
-    let mut col_ef: Vec<u8> = Vec::new();
-    let mut uv_ef:  Vec<u8> = Vec::new();
-
-    // Push one f32 as LE bytes — the sole float→byte conversion site the macros below funnel
-    // through, so the wire format (`to_le_bytes`, explicit and endianness-correct) can't drift.
-    macro_rules! push_f32 {
-        ($buf:expr, $v:expr) => { $buf.extend_from_slice(&($v as f32).to_le_bytes()); };
-    }
+    // Three-space tuple → the `[f32; 3]` a `MeshSink` takes.
+    let v3 = |t: (f32, f32, f32)| [t.0, t.1, t.2];
 
     // Deferred plain-cube faces, merged and emitted after the voxel pass (see `FaceRec`). A record is
     // ~28 B where the six vertices it stands for cost ≥ 144 B, so collecting first is cheaper in peak
@@ -607,29 +822,13 @@ pub fn obj_geometry_region(world: &impl VoxelView, meta: ViewMeta, pack: Option<
         }};
     }
 
-    // Push UV coords for a quad (6 verts: ABD, BCD) covering atlas row with v in [v0,v1], into a
-    // caller-chosen buffer (opaque `uv_f` or transparent `uv_ft`).
-    //
-    // `$nu` is how many block-sized tiles the quad spans along its U axis — 1 for every per-block
-    // quad, and the merged width for a greedy-meshed face (see `FaceRec` below). U therefore runs
-    // 0..$nu instead of 0..1, which needs `wrapS = RepeatWrapping` on the atlas texture; the atlas is
-    // exactly one tile wide (`texturepack.rs`: `atlas_w = TILE`), so repeating in U re-tiles the same
-    // column and never bleeds into a neighbouring row. **V has no such freedom** — the atlas is a
-    // vertical strip and V selects the row, so tiling it would walk into the next block's texture.
-    // That is why greedy merging only grows along V when no pack is loaded.
-    macro_rules! push_quad_uv {
-        ($buf:expr, $v0:expr, $v1:expr, $nu:expr) => {{
-            let nu: f32 = $nu;
-            for f in [0.0, $v0,  nu, $v0,  0.0, $v1,
-                      nu, $v0,   nu, $v1,  0.0, $v1] { push_f32!($buf, f); }
-        }};
-    }
-    // Push UV coords for a triangle covering the same atlas row.
-    macro_rules! push_tri_uv {
-        ($buf:expr, $v0:expr, $v1:expr) => {
-            for f in [0.0, $v0,  1.0, $v0,  0.5, $v1] { push_f32!($buf, f); }
-        };
-    }
+    // UVs are the sink's business (`MeshSink::quad`): U runs 0..nu, where nu is how many block-sized
+    // tiles the quad spans along its U axis — 1 for every per-block quad, and the merged width for a
+    // greedy-meshed face (see `FaceRec` below). That needs `wrapS = RepeatWrapping` on the atlas
+    // texture; the atlas is exactly one tile wide (`texturepack.rs`: `atlas_w = TILE`), so repeating
+    // in U re-tiles the same column and never bleeds into a neighbouring row. **V has no such
+    // freedom** — the atlas is a vertical strip and V selects the row, so tiling it would walk into
+    // the next block's texture. That is why greedy merging only grows along V when no pack is loaded.
 
     // Per-channel colour after light + face shading, capped so light can brighten a shaded face back
     // up to its flat paint colour but never past it — mirrors TerrainChunk.mm's
@@ -652,35 +851,28 @@ pub fn obj_geometry_region(world: &impl VoxelView, meta: ViewMeta, pack: Option<
         }};
     }
 
-    macro_rules! push_tri {
-        ($verts:expr, $rgb:expr, $sh:expr, $lm:expr, $btype:expr, $bpaint:expr) => {{
+    // Everything a face needs besides its vertices: its stream (lamps → emissive in flat/GPU mode,
+    // `transparent_alpha` blocks → transparent, else opaque), its lit RGBA, and — with a pack — its
+    // atlas row (`None` from `face_color_and_row` is row 0, the blank sentinel).
+    macro_rules! face_paint {
+        ($rgb:expr, $sh:expr, $lm:expr, $btype:expr, $bpaint:expr) => {{
             let fk = face_kind!($sh);
             let (rgb2, row_opt) = if let Some(p) = pack {
                 texture::face_color_and_row(p, $btype, $bpaint, fk, $rgb)
             } else { ($rgb, None) };
-            let [r,g,b] = lit_rgb!(rgb2, $sh, $lm);
-            if flat && $btype == LAMP_BLOCK_TYPE {
-                for (x,y,z) in $verts { push_f32!(pos_ef, x); push_f32!(pos_ef, y); push_f32!(pos_ef, z); push_f32!(col_ef, r); push_f32!(col_ef, g); push_f32!(col_ef, b); }
-                if let Some(p) = pack {
-                    let ar = p.atlas_rows as f32;
-                    let (v0, v1) = match row_opt { Some(row) => (row as f32/ar, (row+1) as f32/ar), None => (0.0, 1.0/ar) };
-                    push_tri_uv!(uv_ef, v1, v0);
-                }
-            } else if let Some(alpha) = transparent_alpha($btype) {
-                for (x,y,z) in $verts { push_f32!(pos_ft, x); push_f32!(pos_ft, y); push_f32!(pos_ft, z); push_f32!(col_ft, r); push_f32!(col_ft, g); push_f32!(col_ft, b); push_f32!(col_ft, alpha); }
-                if let Some(p) = pack {
-                    let ar = p.atlas_rows as f32;
-                    let (v0, v1) = match row_opt { Some(row) => (row as f32/ar, (row+1) as f32/ar), None => (0.0, 1.0/ar) };
-                    push_tri_uv!(uv_ft, v1, v0);
-                }
-            } else {
-                for (x,y,z) in $verts { push_f32!(pos_f, x); push_f32!(pos_f, y); push_f32!(pos_f, z); push_f32!(col_f, r); push_f32!(col_f, g); push_f32!(col_f, b); }
-                if let Some(p) = pack {
-                    let ar = p.atlas_rows as f32;
-                    let (v0, v1) = match row_opt { Some(row) => (row as f32/ar, (row+1) as f32/ar), None => (0.0, 1.0/ar) };
-                    push_tri_uv!(uv_f, v1, v0); // swap: $v0 arg → floor vertex, $v1 arg → apex; tile reads top→bottom
-                }
-            }
+            let [r, g, b] = lit_rgb!(rgb2, $sh, $lm);
+            let bt: u8 = $btype;
+            let (stream, a) = if flat && bt == LAMP_BLOCK_TYPE { (Stream::Emissive, 1.0f32) }
+                else if let Some(a) = transparent_alpha(bt) { (Stream::Transparent, a) }
+                else { (Stream::Opaque, 1.0f32) };
+            (stream, [r, g, b, a], pack.map(|_| row_opt.unwrap_or(0)))
+        }};
+    }
+    macro_rules! push_tri {
+        ($verts:expr, $rgb:expr, $sh:expr, $lm:expr, $btype:expr, $bpaint:expr) => {{
+            let (stream, rgba, row) = face_paint!($rgb, $sh, $lm, $btype, $bpaint);
+            let [p0, p1, p2] = $verts;
+            sink.tri(stream, [v3(p0), v3(p1), v3(p2)], rgba, row);
         }};
     }
     // Tiled quad: `$nu` block-tiles along U (1 for a per-block face, the merged width for a
@@ -688,38 +880,14 @@ pub fn obj_geometry_region(world: &impl VoxelView, meta: ViewMeta, pack: Option<
     // call site uses.
     macro_rules! push_quad_t {
         ($a:expr,$b:expr,$c:expr,$d:expr,$rgb:expr,$sh:expr,$lm:expr,$btype:expr,$bpaint:expr,$nu:expr) => {{
-            let fk = face_kind!($sh);
-            let (rgb2, row_opt) = if let Some(p) = pack {
-                texture::face_color_and_row(p, $btype, $bpaint, fk, $rgb)
-            } else { ($rgb, None) };
-            let [r,g,b_] = lit_rgb!(rgb2, $sh, $lm);
-            if flat && $btype == LAMP_BLOCK_TYPE {
-                for (x,y,z) in [$a,$b,$d, $b,$c,$d] { push_f32!(pos_ef, x); push_f32!(pos_ef, y); push_f32!(pos_ef, z); push_f32!(col_ef, r); push_f32!(col_ef, g); push_f32!(col_ef, b_); }
-                if let Some(p) = pack {
-                    let ar = p.atlas_rows as f32;
-                    let (v0, v1) = match row_opt { Some(row) => (row as f32/ar, (row+1) as f32/ar), None => (0.0, 1.0/ar) };
-                    push_quad_uv!(uv_ef, v1, v0, $nu);
-                }
-            } else if let Some(alpha) = transparent_alpha($btype) {
-                for (x,y,z) in [$a,$b,$d, $b,$c,$d] { push_f32!(pos_ft, x); push_f32!(pos_ft, y); push_f32!(pos_ft, z); push_f32!(col_ft, r); push_f32!(col_ft, g); push_f32!(col_ft, b_); push_f32!(col_ft, alpha); }
-                if let Some(p) = pack {
-                    let ar = p.atlas_rows as f32;
-                    let (v0, v1) = match row_opt { Some(row) => (row as f32/ar, (row+1) as f32/ar), None => (0.0, 1.0/ar) };
-                    push_quad_uv!(uv_ft, v1, v0, $nu);
-                }
-            } else {
-                for (x,y,z) in [$a,$b,$d, $b,$c,$d] { push_f32!(pos_f, x); push_f32!(pos_f, y); push_f32!(pos_f, z); push_f32!(col_f, r); push_f32!(col_f, g); push_f32!(col_f, b_); }
-                if let Some(p) = pack {
-                    let ar = p.atlas_rows as f32;
-                    let (v0, v1) = match row_opt { Some(row) => (row as f32/ar, (row+1) as f32/ar), None => (0.0, 1.0/ar) };
-                    push_quad_uv!(uv_f, v1, v0, $nu); // swap: $v0 arg → A/B vertices, $v1 arg → C/D vertices; tile reads top→bottom
-                }
-            }
+            let (stream, rgba, row) = face_paint!($rgb, $sh, $lm, $btype, $bpaint);
+            let nu: u16 = $nu;
+            sink.quad(stream, [v3($a), v3($b), v3($c), v3($d)], rgba, row.map(|r| (r, nu)));
         }};
     }
     macro_rules! push_quad {
         ($a:expr,$b:expr,$c:expr,$d:expr,$rgb:expr,$sh:expr,$lm:expr,$btype:expr,$bpaint:expr) => {
-            push_quad_t!($a,$b,$c,$d,$rgb,$sh,$lm,$btype,$bpaint, 1.0)
+            push_quad_t!($a,$b,$c,$d,$rgb,$sh,$lm,$btype,$bpaint, 1)
         };
     }
 
@@ -995,10 +1163,7 @@ pub fn obj_geometry_region(world: &impl VoxelView, meta: ViewMeta, pack: Option<
     // ever reduces that count), so reserving for the fully-unmerged case up front avoids the opaque
     // stream's doubling reallocs on any chunk with real terrain — the common case merging shrinks.
     if !faces.is_empty() {
-        let max_verts = faces.len() * 6;
-        pos_f.reserve(max_verts * 12);
-        col_f.reserve(max_verts * 12);
-        if pack.is_some() { uv_f.reserve(max_verts * 8); }
+        sink.reserve_quads(Stream::Opaque, faces.len());
     }
     // The second in-plane axis may only grow when no texture pack is loaded: U tiles by repeating a
     // one-tile-wide atlas, but V *selects the row*, so growing it would run into the next block's
@@ -1060,7 +1225,7 @@ pub fn obj_geometry_region(world: &impl VoxelView, meta: ViewMeta, pack: Option<
             let s0 = head.slice as f32;
             let s1 = s0 + 1.0;
             let (bt, paint) = (head.bt, head.paint);
-            let nu = w as f32;
+            let nu = w as u16;
             match head.dir {
                 0 => push_quad_t!(o(f0,g0,s1),o(f1,g0,s1),o(f1,g1,s1),o(f0,g1,s1),rgb,SH_TOP,lm,bt,paint,nu),
                 1 => push_quad_t!(o(f0,g1,s0),o(f1,g1,s0),o(f1,g0,s0),o(f0,g0,s0),rgb,SH_BOT,lm,bt,paint,nu),
@@ -1072,21 +1237,6 @@ pub fn obj_geometry_region(world: &impl VoxelView, meta: ViewMeta, pack: Option<
         }
     }
 
-    // Already LE-byte buffers (audit I-1) — one vertex is 3 floats = 12 bytes, no conversion pass.
-    let vertex_count = (pos_f.len() / 12) as u32;
-    let (positions, colors, uvs) = (pos_f, col_f, uv_f);
-
-    let vertex_count_t = (pos_ft.len() / 12) as u32;
-    let (positions_t, colors_t, uvs_t) = (pos_ft, col_ft, uv_ft);
-
-    let vertex_count_e = (pos_ef.len() / 12) as u32;
-    let (positions_e, colors_e, uvs_e) = (pos_ef, col_ef, uv_ef);
-
-    ObjGeometryResult {
-        positions, colors, uvs, vertex_count,
-        positions_t, colors_t, uvs_t, vertex_count_t,
-        positions_e, colors_e, uvs_e, vertex_count_e,
-    }
 }
 
 /// Face-culled geometry for a single chunk (16×16 XY × a z band). For the 3D fly-through pane, which
@@ -1114,11 +1264,46 @@ pub fn chunk_geometry(
     z_min: Option<i32>, z_max: Option<i32>,
     cap: Option<i32>,
 ) -> ObjGeometryResult {
+    let mut sink = F32Sink::new(pack);
+    chunk_geometry_into(&mut sink, world, meta, pack, lamps, cx, cy, mode, z_min, z_max, cap);
+    sink.finish()
+}
+
+/// [`chunk_geometry`] in the v2 compact indexed format (ROADMAP-EDIT 18.14), stored relative to the
+/// chunk's own corner `(cx*16, 0, cy*16)` (three-space) — the frontend places the mesh there.
+#[allow(clippy::too_many_arguments)]
+pub fn chunk_geometry_compact(
+    world: &impl VoxelView,
+    meta: ViewMeta,
+    pack: Option<&TexturePack>,
+    lamps: &[([i32; 3], [f32; 3])],
+    cx: i32, cy: i32,
+    mode: LightMode,
+    z_min: Option<i32>, z_max: Option<i32>,
+    cap: Option<i32>,
+) -> CompactGeometry {
+    let mut sink = CompactSink::new([(cx * 16) as f32, 0.0, (cy * 16) as f32], pack);
+    chunk_geometry_into(&mut sink, world, meta, pack, lamps, cx, cy, mode, z_min, z_max, cap);
+    sink.finish()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn chunk_geometry_into<S: MeshSink>(
+    sink: &mut S,
+    world: &impl VoxelView,
+    meta: ViewMeta,
+    pack: Option<&TexturePack>,
+    lamps: &[([i32; 3], [f32; 3])],
+    cx: i32, cy: i32,
+    mode: LightMode,
+    z_min: Option<i32>, z_max: Option<i32>,
+    cap: Option<i32>,
+) {
     // Defensive: only serve chunks inside the world's chunk grid. Out-of-range indices already scan
     // to all-air (empty geometry), but bailing early avoids the wasted 16×16×Z probe and documents
     // the frontend contract (local 0-based chunk indices).
     if cx < 0 || cy < 0 || cx as u32 >= meta.w_chunks || cy as u32 >= meta.h_chunks {
-        return ObjGeometryResult::empty();
+        return;
     }
     // Early-out on an unpopulated chunk. Eden only saves edited chunks, so on sparse worlds most
     // chunks streamed by the fly-through pane's radius sweep are entirely unwritten — without this
@@ -1127,13 +1312,13 @@ pub fn chunk_geometry(
     // worlds; it does not affect worlds with contiguous chunk coverage (a hit on the first try).
     let (min_x, min_y) = world.chunk_origin();
     if world.chunk_bytes(cx + min_x, cy + min_y).is_none() {
-        return ObjGeometryResult::empty();
+        return;
     }
     let sx1 = cx * 16;
     let sy1 = cy * 16;
     let (sz1, sz2) = emitted_band(world, z_min, z_max, cap);
     // Fly-through streaming stays unmasked.
-    obj_geometry_region(world, meta, pack, sx1, sy1, sx1 + 15, sy1 + 15, sz1, sz2, lamps, mode, None)
+    obj_geometry_region_into(sink, world, meta, pack, sx1, sy1, sx1 + 15, sy1 + 15, sz1, sz2, lamps, mode, None);
 }
 
 /// The z band [`chunk_geometry`] will emit: the caller's camera band ∩ the cutaway `cap` ∩ the
@@ -1803,4 +1988,210 @@ mod tests {
         assert_eq!(hit.block_type, 20);
     }
 
+
+    // ── 18.14: the compact (v2) encoder ─────────────────────────────────────────────────────────
+
+    /// Every block family the mesher branches on — cubes, ramps, wedges, full and partial fluids,
+    /// glass/fence/flower (transparent), lamps (emissive in flat mode), painted and not — scattered
+    /// over a 2×2-chunk world with bumpy terrain and a few floating blocks.
+    pub(super) fn mixed_world(bands: usize) -> TestWorld {
+        let mut w = TestWorld::new(2, 2, bands);
+        let top = (bands * 16 - 2) as u64;
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut rnd = move || { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; seed };
+        const TOPS: [u8; 20] = [1, 2, 3, 7, 24, 29, 34, 39, 40, 45, 50, 55, 20, 59, 60, 61, 58, 21, 73, LAMP_BLOCK_TYPE];
+        for cx in 0..2 { for cy in 0..2 {
+            let base = w.chunks[&(cx, cy)];
+            for lx in 0..16usize { for ly in 0..16usize {
+                let h = (3 + rnd() % 20).min(top) as usize;
+                let at = |z: usize| base + (z / 16) * 8192 + lx * 256 + ly * 16 + z % 16;
+                for z in 0..h { w.bytes[at(z)] = 1; }
+                let r = rnd();
+                w.bytes[at(h)] = TOPS[(r % TOPS.len() as u64) as usize];
+                if r % 3 == 0 { w.bytes[at(h) + 4096] = (r % 54) as u8 + 1; }
+                if r % 7 == 0 && h + 4 <= top as usize { w.bytes[at(h + 3)] = TOPS[((r >> 8) % TOPS.len() as u64) as usize]; }
+                if r % 11 == 0 && h + 1 <= top as usize { w.bytes[at(h + 1)] = 20; } // water on top
+            }}
+        }}
+        w
+    }
+
+    /// A pack naming every texture `BLOCK_FACE_TEX` uses, so real rows (colour and grayscale) come out.
+    pub(super) fn full_pack() -> TexturePack {
+        let mut names: Vec<&str> = texture::BLOCK_FACE_TEX.iter().flatten().copied().filter(|n| !n.is_empty()).collect();
+        names.sort_unstable();
+        names.dedup();
+        let n = names.len() as u32;
+        TexturePack {
+            tile: 1,
+            atlas_rgba: vec![255u8; (2 * n as usize + 1) * 4],
+            atlas_rows: 2 * n + 1,
+            gray_row_offset: n,
+            name_to_row: names.iter().enumerate().map(|(i, s)| (s.to_string(), i as u32 + 1)).collect(),
+        }
+    }
+
+    fn lamps_of(w: &TestWorld) -> Vec<([i32; 3], [f32; 3])> {
+        let mut out = Vec::new();
+        for (&(cx, cy), &base) in &w.chunks {
+            for off in 0..w.chunk_size {
+                if off % 8192 < 4096 && w.bytes[base + off] == LAMP_BLOCK_TYPE {
+                    let (band, r) = (off / 8192, off % 8192);
+                    let (lx, ly, lz) = (r / 256, (r / 16) % 16, r % 16);
+                    out.push(([cx * 16 + lx as i32, cy * 16 + ly as i32, (band * 16 + lz) as i32], [1.0, 0.7, 0.4]));
+                }
+            }
+        }
+        out.sort_by_key(|l| l.0);
+        out
+    }
+
+    /// Every (mode, lamps, pack, z band) combination the equivalence tests sweep.
+    pub(super) fn geometry_cases(w: &TestWorld) -> Vec<(String, LightMode, Vec<([i32; 3], [f32; 3])>, bool, i32, i32)> {
+        let top = world_max_z(w);
+        let modes = [
+            ("day", LightMode::default(), false),
+            ("night", LightMode::resolve(true, false, 0.5, false, Some(6.0), LightingProfile::Legacy), true),
+            ("shadows", LightMode::resolve(false, true, 0.3, false, None, LightingProfile::Legacy), false),
+            ("night+shadows", LightMode::resolve(true, true, 0.8, false, None, LightingProfile::Modern), true),
+            ("gpu", LightMode::resolve(false, false, 0.5, true, None, LightingProfile::Legacy), false),
+        ];
+        let mut out = Vec::new();
+        for (name, mode, night) in modes {
+            for textured in [false, true] {
+                for (z1, z2) in [(0, top), (4, 12)] {
+                    let lamps = if night { lamps_of(w) } else { Vec::new() };
+                    out.push((format!("{name}/tex={textured}/z{z1}..{z2}"), mode, lamps, textured, z1, z2));
+                }
+            }
+        }
+        out
+    }
+
+    /// Expand one compact stream back into a non-indexed triangle list: (positions, rgba, uv).
+    fn expand(g: &CompactGeometry, s: usize) -> (Vec<[f32; 3]>, Vec<[u8; 4]>, Vec<[f32; 2]>) {
+        let st = &g.streams[s];
+        let i16s = |b: &[u8]| -> Vec<i16> { b.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect() };
+        let u16s = |b: &[u8]| -> Vec<u16> { b.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect() };
+        let pos = i16s(&st.positions);
+        let uv = u16s(&st.uvs);
+        let idx: Vec<u32> = if st.index_u32 {
+            st.indices.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+        } else {
+            u16s(&st.indices).into_iter().map(u32::from).collect()
+        };
+        assert_eq!(pos.len(), st.vertex_count as usize * 4);
+        assert_eq!(st.colors.len(), st.vertex_count as usize * 4);
+        let idx = &idx[..st.index_count as usize];
+        let ar = g.atlas_rows as f32;
+        let (mut p, mut c, mut t) = (Vec::new(), Vec::new(), Vec::new());
+        for &i in idx {
+            let i = i as usize;
+            assert_eq!(pos[i * 4 + 3], 0, "position pad");
+            p.push([0, 1, 2].map(|k| g.origin[k] + pos[i * 4 + k] as f32 / COMPACT_POS_SUBDIV));
+            c.push([0, 1, 2, 3].map(|k| st.colors[i * 4 + k]));
+            if !uv.is_empty() { t.push([uv[i * 2] as f32 * 0.5, uv[i * 2 + 1] as f32 / ar]); }
+        }
+        (p, c, t)
+    }
+
+    fn f32s(b: &[u8]) -> Vec<f32> { b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect() }
+
+    /// Phase 1 equivalence: the compact mesh, expanded, is the f32 mesh — positions and UVs exactly,
+    /// colour within 1/255, same triangles in the same order and winding — over every mixed-world
+    /// fixture and mode, on 64z and 256z, whole-region and per chunk.
+    #[test]
+    fn compact_sink_expands_to_the_f32_mesh() {
+        let pack = full_pack();
+        for bands in [4usize, 16] {
+            let w = mixed_world(bands);
+            for (name, mode, lamps, textured, z1, z2) in geometry_cases(&w) {
+                let pk = textured.then_some(&pack);
+                let f = obj_geometry_region(&w, w.meta(), pk, 0, 0, 31, 31, z1, z2, &lamps, mode, None);
+                let mut cs = CompactSink::new([0.0, 0.0, 0.0], pk);
+                obj_geometry_region_into(&mut cs, &w, w.meta(), pk, 0, 0, 31, 31, z1, z2, &lamps, mode, None);
+                let g = cs.finish();
+                let f_streams = [
+                    (&f.positions, &f.colors, &f.uvs, f.vertex_count, 3usize),
+                    (&f.positions_t, &f.colors_t, &f.uvs_t, f.vertex_count_t, 4),
+                    (&f.positions_e, &f.colors_e, &f.uvs_e, f.vertex_count_e, 3),
+                ];
+                assert!(f.vertex_count > 0, "{bands}/{name}: fixture must mesh something");
+                for (s, (fp, fc, fu, fvc, ncol)) in f_streams.into_iter().enumerate() {
+                    let (p, c, t) = expand(&g, s);
+                    assert_eq!(p.len(), fvc as usize, "{bands}/{name} stream {s}: triangle-vertex count");
+                    let fp = f32s(fp);
+                    let fc = f32s(fc);
+                    for (i, v) in p.iter().enumerate() {
+                        assert_eq!(v[..], fp[i * 3..i * 3 + 3], "{bands}/{name} stream {s} vertex {i}: position");
+                        for k in 0..ncol {
+                            let d = (c[i][k] as f32 / 255.0 - fc[i * ncol + k]).abs();
+                            assert!(d <= 0.5 / 255.0 + 1e-6, "{bands}/{name} stream {s} vertex {i}: colour {k} off by {d}");
+                        }
+                        if ncol == 3 { assert_eq!(c[i][3], 255, "opaque/emissive alpha is 255"); }
+                    }
+                    let fu = f32s(fu);
+                    assert_eq!(t.len() * 2, fu.len(), "{bands}/{name} stream {s}: uv count");
+                    for (i, uv) in t.iter().enumerate() {
+                        assert_eq!(uv[..], fu[i * 2..i * 2 + 2], "{bands}/{name} stream {s} vertex {i}: uv");
+                    }
+                }
+                // Smaller on every stream that has anything in it.
+                if f.wire_bytes() > 0 {
+                    assert!(g.wire_bytes() * 2 < f.wire_bytes(), "{bands}/{name}: {} B compact vs {} B f32", g.wire_bytes(), f.wire_bytes());
+                }
+            }
+            // Per chunk, with the chunk's own origin — the shape `get_chunk_geometry` ships.
+            for (cx, cy) in [(0, 0), (1, 1)] {
+                let f = chunk_geometry(&w, w.meta(), Some(&pack), &[], cx, cy, LightMode::default(), None, None, None);
+                let g = chunk_geometry_compact(&w, w.meta(), Some(&pack), &[], cx, cy, LightMode::default(), None, None, None);
+                assert_eq!(g.origin, [cx as f32 * 16.0, 0.0, cy as f32 * 16.0]);
+                let (p, _, t) = expand(&g, 0);
+                assert_eq!(p.iter().flatten().copied().collect::<Vec<f32>>(), f32s(&f.positions));
+                assert_eq!(t.iter().flatten().copied().collect::<Vec<f32>>(), f32s(&f.uvs));
+            }
+        }
+    }
+
+    /// Fractional coordinates — partial fluid tops at ¼/½/¾ and the lateral slivers they leave — land
+    /// exactly on the fixed-point grid (the `debug_assert!` in `CompactSink::vert` would fire otherwise,
+    /// and the expanded positions must equal the f32 ones).
+    #[test]
+    fn compact_positions_cover_every_fractional_case() {
+        let mut w = TestWorld::new(1, 1, 4);
+        let at = |lx: usize, ly: usize, z: usize| (z / 16) * 8192 + lx * 256 + ly * 16 + z % 16;
+        // Partial water of each level next to a full one and a shallower one.
+        for (lx, bt) in [(2usize, 61u8), (3, 60), (4, 59), (5, 20), (6, 61)] { w.bytes[at(lx, 4, 5)] = bt; }
+        let f = obj_geometry_region(&w, w.meta(), None, 0, 0, 15, 15, 0, 63, &[], LightMode::default(), None);
+        let fp = f32s(&f.positions_t);
+        assert!(fp.iter().any(|v| v.fract() == 0.25) && fp.iter().any(|v| v.fract() == 0.5) && fp.iter().any(|v| v.fract() == 0.75));
+        let mut cs = CompactSink::new([0.0; 3], None);
+        obj_geometry_region_into(&mut cs, &w, w.meta(), None, 0, 0, 15, 15, 0, 63, &[], LightMode::default(), None);
+        let (p, _, _) = expand(&cs.finish(), 1);
+        assert_eq!(p.iter().flatten().copied().collect::<Vec<f32>>(), fp);
+    }
+
+    /// Index width: a stream switches to `Uint32` indices at 65 535 vertices — not 65 536, because
+    /// WebGL2's always-on primitive restart makes index 0xFFFF in a `Uint16` buffer a restart.
+    #[test]
+    fn compact_index_width_switches_below_the_restart_index() {
+        let quads = |n: usize| {
+            let mut cs = CompactSink::new([0.0; 3], None);
+            for i in 0..n {
+                let x = (i % 256) as f32;
+                let z = (i / 256) as f32;
+                cs.quad(Stream::Opaque, [[x, 0.0, z], [x + 1.0, 0.0, z], [x + 1.0, 0.0, z + 1.0], [x, 0.0, z + 1.0]], [1.0; 4], None);
+            }
+            cs.finish()
+        };
+        // 4 vertices per quad: 16 383 quads = 65 532 vertices (max index 65 531) stays 16-bit…
+        let g = quads(16_383);
+        assert!(!g.streams[0].index_u32);
+        assert_eq!(g.streams[0].indices.len() % 4, 0, "padded to 4 bytes");
+        // …16 384 quads = 65 536 vertices needs index 65 535 = the restart index → 32-bit.
+        let g = quads(16_384);
+        assert!(g.streams[0].index_u32);
+        let last = &g.streams[0].indices[g.streams[0].indices.len() - 4..];
+        assert_eq!(u32::from_le_bytes(last.try_into().unwrap()), 65_535);
+    }
 }

@@ -25,6 +25,7 @@ import {
 } from "./useWindowLayout";
 import { isContextPanel } from "./contextPanels";
 import { sfx, type HoldHandle } from "../sound/sfx";
+import type { CueId } from "../sound/packs";
 
 /** Pointer travel before a press on the title bar becomes a move — so clicks and double-clicks
  *  never drag. */
@@ -193,7 +194,7 @@ export default function FloatingWindow({
     if (el) delete el.dataset.moving;
     setDragging(false);
     if (!g.started) return;
-    if (g.kind === "move") sfx.play("drop"); // window "set down" — the drag cue's counterpart
+    sfx.play("drop"); // window "set down" (move or resize) — the drag cue's counterpart
     commitRect(g.cur);
     onMovedRef.current?.(g.kind === "move" ? "move" : "resize");
   }
@@ -255,7 +256,7 @@ export default function FloatingWindow({
         onPointerMove={onGestureMove}
         onPointerUp={endGesture}
         onLostPointerCapture={() => { if (gestureRef.current?.kind === "move") endGesture(); }}
-        onDoubleClick={e => { if (!(e.target as HTMLElement).closest("button")) collapseWin(id); }}
+        onDoubleClick={e => { if (!(e.target as HTMLElement).closest("button")) { sfx.play("tab"); collapseWin(id); } }}
         onKeyDown={onTitleKey}
       >
         {rect.w >= ICON_MIN_W && <span style={{ display: "flex", flexShrink: 0 }}><Icon name={icon} size={ICON.xs} tone="default" /></span>}
@@ -264,8 +265,8 @@ export default function FloatingWindow({
         <span style={{ flex: 1, minWidth: 0 }} />
         {!ws.collapsed && buttons}
         <WinButton icon={ws.collapsed ? "expandBar" : "collapse"} label={ws.collapsed ? `Expand ${title}` : `Collapse ${title}`}
-          onClick={() => collapseWin(id)} />
-        {closable && <WinButton icon="close" label={isContextPanel(id) ? `Close ${title}` : `Hide ${title}`} onClick={onClose ?? (() => closeWin(id))} />}
+          cue="tab" onClick={() => collapseWin(id)} />
+        {closable && <WinButton icon="close" label={isContextPanel(id) ? `Close ${title}` : `Hide ${title}`} cue="menu" onClick={onClose ?? (() => closeWin(id))} />}
       </div>
       {!ws.collapsed && (
         <>
@@ -286,15 +287,17 @@ export default function FloatingWindow({
 }
 
 /** A title-bar button: 18 px, icon-only, stops the press from starting a drag. */
-export function WinButton({ icon, label, onClick, active, disabled }: {
+export function WinButton({ icon, label, onClick, active, disabled, cue }: {
   icon: IconName; label: string; onClick: () => void; active?: boolean; disabled?: boolean;
+  /** UI sound played on click. */
+  cue?: CueId;
 }) {
   return (
     <button
       type="button" className="vx-winbtn" title={label} aria-label={label} aria-pressed={active}
       disabled={disabled}
       onPointerDown={e => e.stopPropagation()}
-      onClick={e => { e.stopPropagation(); onClick(); }}
+      onClick={e => { e.stopPropagation(); if (cue) sfx.play(cue); onClick(); }}
       style={{ borderRadius: RADIUS.sm }}
     >
       <Icon name={icon} size={ICON.xs} tone="inherit" />
