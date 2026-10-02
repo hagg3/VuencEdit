@@ -1,16 +1,11 @@
 import { useState, useEffect, useRef } from "react";
-import { invoke } from "@tauri-apps/api/core";
-import { decodePixelPatch, decodePreviewData, type SelectionInfo, type ClipboardInfo, type PreviewData, type SignInfo } from "./types";
+import type { SelectionInfo, ClipboardInfo, SignInfo } from "./types";
 import { previewCanvas } from "./previewCanvas";
-import { SliderRow } from "./ribbon/primitives";
 import {
-  ACCENT, TEXT, TEXT_ARMED, TEXT_DIM, TEXT_META, TEXT_LABEL,
+  ACCENT, TEXT, TEXT_DIM, TEXT_META, TEXT_LABEL,
   RADIUS, SPACE, hexToRgbTriplet,
 } from "./ribbon/tokens";
 import { Section, PropGrid, PROP_MONO } from "./ui/PropertyGrid";
-import ElevationPreviewPanel from "./ElevationPreviewPanel";
-
-type PreviewView = "front" | "side" | "top" | "axo";
 
 interface Props {
   /** Sidebar tab is always mounted, unlike the old floating panel which only mounted while a
@@ -19,28 +14,11 @@ interface Props {
   clipboard: ClipboardInfo | null;
   clipboardPreview: { width: number; height: number; pixels: Uint8Array } | null;
 
-  // Elevation view — folded in from the old standalone Elevation tab. Independent of `selection`:
-  // during a paste preview `elevationSelection` is the ghost's footprint while `selection` (the
-  // real marquee) stays null, so the Elevation section is gated on this prop, not on `selection`.
-  elevationSelection: SelectionInfo | null;
-  elevationWidth: number;
-  maxZ: number;
-  extrudeCount: number;
-  extrudeAxis: string;
-  isPastePreview: boolean;
-  editEpoch: number;
-  drawActive: boolean;
-  onDrawElevation: (x: number, y: number, z: number) => void;
-  onZRangeChange?: (zMin: number, zMax: number) => void;
-
   // Signs (256z-format plan, Phase 4) — read-only list, collapsible, only shown when non-empty.
   signs: SignInfo[];
   onSignClick?: (s: SignInfo) => void;
 }
 
-const CW = 190;
-const CH = 120;
-const LABEL_H = 16;
 const CLIP_PREV_W = 140;
 const CLIP_PREV_H = 140;
 const SIGNS_COLLAPSED_COUNT = 3;
@@ -145,111 +123,18 @@ function SignsBody({ signs, onSignClick }: { signs: SignInfo[]; onSignClick?: (s
 
 export default function SelectionInspector({
   selection: sel, clipboard, clipboardPreview,
-  elevationSelection, elevationWidth, maxZ, extrudeCount, extrudeAxis, isPastePreview,
-  editEpoch, drawActive, onDrawElevation, onZRangeChange,
   signs, onSignClick,
 }: Props) {
-  const [view, setView] = useState<PreviewView>("top");
-  const [previewData, setPreviewData] = useState<PreviewData | null>(null);
-  const [axoSki, setAxoSki] = useState(0.2);
-  const [axoDir, setAxoDir] = useState(0);
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-
-  // Fetch orthographic preview (front/side/top).
-  useEffect(() => {
-    if (!sel || view === "axo") return;
-    let cancelled = false;
-    const timer = setTimeout(() => {
-      invoke<ArrayBuffer>("render_selection_view", {
-        x1: sel.x1, y1: sel.y1, x2: sel.x2, y2: sel.y2,
-        zMin: sel.z_min, zMax: sel.z_max,
-        view,
-      })
-        .then((buf) => { if (!cancelled) setPreviewData(decodePreviewData(buf)); })
-        .catch(() => { if (!cancelled) setPreviewData(null); });
-    }, 150);
-    // Guards against out-of-order resolution: the debounce timer is cleared here, but an
-    // `invoke` already in flight when the selection changes again is not cancellable — without
-    // `cancelled`, a slow older response could land after a newer one and show stale data (audit M7).
-    return () => { cancelled = true; clearTimeout(timer); };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sel?.x1, sel?.y1, sel?.x2, sel?.y2, sel?.z_min, sel?.z_max, view, editEpoch]);
-
-  // Fetch axo preview — clipboard contents if available, else selection footprint.
-  useEffect(() => {
-    if (!sel || view !== "axo") return;
-    let cancelled = false;
-    const timer = setTimeout(() => {
-      const p = clipboard
-        ? invoke<ArrayBuffer>("render_axo_clipboard", { ski: axoSki, dir: axoDir }).then(decodePreviewData)
-        : invoke<ArrayBuffer>("render_axo_region", { x1: sel.x1, y1: sel.y1, x2: sel.x2, y2: sel.y2, ski: axoSki, dir: axoDir, zMax: sel.z_max }).then(decodePixelPatch);
-      p.then((data) => { if (!cancelled) setPreviewData({ width: data.width, height: data.height, pixels: data.pixels }); })
-       .catch(() => { if (!cancelled) setPreviewData(null); });
-    }, 150);
-    return () => { cancelled = true; clearTimeout(timer); };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sel?.x1, sel?.y1, sel?.x2, sel?.y2, clipboard?.width, clipboard?.height, clipboard?.depth, sel?.z_max, view, axoSki, axoDir, editEpoch]);
-
-  // Render preview onto canvas.
-  useEffect(() => {
-    if (!sel) return;
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-
-    ctx.fillStyle = "#14181c";
-    ctx.fillRect(0, 0, CW, CH);
-
-    if (previewData && previewData.width > 0 && previewData.height > 0) {
-      const off = previewCanvas(previewData);
-      const availH = CH - LABEL_H;
-      const scale = Math.min(CW / previewData.width, availH / previewData.height);
-      const dw = Math.round(previewData.width * scale);
-      const dh = Math.round(previewData.height * scale);
-      const ox = Math.round((CW - dw) / 2);
-      const oy = Math.round((availH - dh) / 2);
-      ctx.imageSmoothingEnabled = false;
-      ctx.drawImage(off, ox, oy, dw, dh);
-    }
-
-    const axoDirLabel = ["SE", "SW", "NE", "NW"][axoDir] ?? "SE";
-    const viewLabel = view === "front" ? "Front X-Z" : view === "side" ? "Side Y-Z" : view === "axo" ? `Axo ${axoDirLabel} d=${axoSki.toFixed(2)}` : "Top X-Y";
-    ctx.fillStyle = "rgba(0,0,0,0.65)";
-    ctx.fillRect(0, CH - LABEL_H, CW, LABEL_H);
-    ctx.fillStyle = TEXT_ARMED;
-    ctx.font = "7px monospace";
-    ctx.textAlign = "left";
-    ctx.textBaseline = "middle";
-    ctx.fillText(
-      `${viewLabel}  z${sel.z_min}–${sel.z_max}  x${sel.x1}–${sel.x2}  y${sel.y1}–${sel.y2}`,
-      3, CH - LABEL_H / 2,
-    );
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [previewData, view, sel?.x1, sel?.y1, sel?.x2, sel?.y2, sel?.z_min, sel?.z_max, axoDir, axoSki]);
-
-  const tabBtn = (v: PreviewView): React.CSSProperties => ({
-    flex: 1, padding: "2px 0", fontSize: 11, cursor: "pointer", border: "none",
-    background: view === v
-      ? "linear-gradient(180deg, rgba(0,164,173,0.35) 0%, rgba(0,164,173,0.10) 100%)"
-      : "linear-gradient(180deg, rgba(255,255,255,0.05) 0%, rgba(255,255,255,0.02) 100%)",
-    boxShadow: view === v
-      ? `inset 0 0 0 1px ${TEXT_ARMED}, 0 .5px .5px rgba(255,255,255,.15)`
-      : "inset 0 0 0 1px rgba(0,0,0,.5)",
-    color: view === v ? TEXT_ARMED : TEXT_LABEL,
-    borderRadius: 3,
-  });
-
   return (
     <div style={panelStyle}>
       {!sel && (
         <div style={{ color: TEXT_META, fontSize: 11, textAlign: "center", padding: "16px 4px" }}>
-          No selection. Drag on the map (Select tool) or use the Wand/Lasso to inspect a region here.
+          No selection. Select a region on the map to inspect it.
         </div>
       )}
 
       {sel && (
-        <Section id="selection" title="Selection" meta={`${sel.width}×${sel.height}`} icon="select">
+        <Section id="selection" title="Selection" meta={`${sel.width}×${sel.height}`}>
           <PropGrid rows={[
             { label: "Size", value: `${sel.width} × ${sel.height} × ${sel.depth}` },
             { label: "Z range", value: `${sel.z_min} – ${sel.z_max}` },
@@ -265,71 +150,11 @@ export default function SelectionInspector({
         </Section>
       )}
 
-      {sel && (
-        <Section id="view" title="Front view" meta="ortho">
-          <div style={{ display: "flex", gap: 3 }}>
-            {(["front", "side", "top", "axo"] as PreviewView[]).map((v) => (
-              <button key={v} style={tabBtn(v)} onClick={() => setView(v)}>
-                {v.charAt(0).toUpperCase() + v.slice(1)}
-              </button>
-            ))}
-          </div>
-          {view === "axo" && (
-            <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-              <div style={{ display: "flex", gap: 3 }}>
-                {([["SE", 0], ["SW", 1], ["NE", 2], ["NW", 3]] as [string, number][]).map(([label, d]) => (
-                  <button key={d} onClick={() => setAxoDir(d)}
-                    style={{
-                      flex: 1, padding: "2px 0", fontSize: 10, cursor: "pointer", border: "none",
-                      background: axoDir === d
-                        ? "linear-gradient(180deg, rgba(168,85,247,0.35) 0%, rgba(168,85,247,0.10) 100%)"
-                        : "linear-gradient(180deg, rgba(255,255,255,0.05) 0%, rgba(255,255,255,0.02) 100%)",
-                      boxShadow: axoDir === d ? `inset 0 0 0 1px ${ACCENT.violet}, 0 .5px .5px rgba(255,255,255,.15)` : "inset 0 0 0 1px rgba(0,0,0,.5)",
-                      color: axoDir === d ? ACCENT.violet : TEXT_LABEL, borderRadius: 3,
-                    }}
-                  >{label}</button>
-                ))}
-              </div>
-              <SliderRow label="Depth" min={0.05} max={0.5} step={0.01} value={axoSki}
-                onChange={setAxoSki} accent={ACCENT.violet} width={118} labelWidth={38} />
-            </div>
-          )}
-          <canvas
-            ref={canvasRef}
-            width={CW}
-            height={CH}
-            style={{ display: "block", width: CW, height: CH, borderRadius: 4, border: "none", boxShadow: "inset 0 0 0 1px rgba(0,0,0,.4)" }}
-            title={`${view} view — actual block colors`}
-          />
-        </Section>
-      )}
-
       {signs.length > 0 && (
-        <Section id="signs" title="Signs" meta={String(signs.length)} icon="signs">
+        <Section id="signs" title="Signs" meta={String(signs.length)}>
           <SignsBody signs={signs} onSignClick={onSignClick} />
         </Section>
       )}
-
-      <Section id="elevation" title="Elevation" defaultOpen={false} meta={isPastePreview ? "paste ghost" : undefined}>
-        {elevationSelection ? (
-          <ElevationPreviewPanel
-            selection={elevationSelection}
-            maxZ={maxZ}
-            width={elevationWidth}
-            extrudeCount={extrudeCount}
-            extrudeAxis={extrudeAxis}
-            isPastePreview={isPastePreview}
-            editEpoch={editEpoch}
-            drawActive={drawActive}
-            onDrawElevation={onDrawElevation}
-            onZRangeChange={onZRangeChange}
-          />
-        ) : (
-          <div style={{ color: TEXT_META, fontSize: 11, textAlign: "center", padding: "8px 4px" }}>
-            No selection. Make a selection to see its front/side elevation.
-          </div>
-        )}
-      </Section>
 
       {clipboard && <div style={{ padding: "8px 2px 2px" }}><ClipboardInfoBlock clipboard={clipboard} pixels={clipboardPreview} /></div>}
     </div>

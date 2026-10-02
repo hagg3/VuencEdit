@@ -477,7 +477,7 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
                 {searching ? "Searching…" :
                  browsing || featuredLoading ? "Loading worlds…" :
                  results.length > 0 ? "No results match your filters" :
-                 searched ? (viewMode === "search" ? "No worlds found — try a different search term" : "No worlds found") :
+                 searched ? (viewMode === "search" ? "No worlds found. Try a different search." : "No worlds found") :
                  "Loading worlds…"}
               </div>
             )}

@@ -250,7 +250,7 @@ export function Group({
         <span data-group-chevron style={{ display: "contents" }}>
           <button
             className="rbn-btn" type="button" aria-label={text}
-            title={dim ? `${text}${why}` : `${text} — show this group's commands`}
+            title={dim ? `${text}${why}` : `${text}: show this group's commands`}
             aria-haspopup="dialog" aria-expanded={popupOpen}
             {...a11y(popupOpen, dim)}
             onClick={dim ? undefined : () => setPopupOpen(v => !v)}
@@ -407,7 +407,7 @@ export function LargeButton({
 /** A small `kbd` chip for a formatted chord (`formatChord`, `commands/keys.ts`). Shared by
  *  `LargeButton`'s corner chip, ⌘K's result rows and the top bar's search-shortcut hint — one
  *  implementation so the three never render a shortcut differently. */
-export function Keycap({ text, small }: { text: string; small?: boolean }) {
+export function Keycap({ text, small }: { text: ReactNode; small?: boolean }) {
   return (
     <kbd style={{
       fontFamily: "ui-monospace, 'SF Mono', Menlo, monospace", fontSize: small ? FONT.micro : FONT.label,
@@ -1283,6 +1283,52 @@ export function NumField({
         textAlign: "center", outline: "none", height: 20, width, ...style,
       }}
     />
+  );
+}
+
+/** Text twin of `NumField`: the same recessed well, left-aligned, for names and other free text. */
+export function TextField({
+  value, onChange, ariaLabel, title, placeholder, maxLength, disabled, width, style, onKeyDown,
+}: {
+  value: string; onChange: (v: string) => void; ariaLabel: string; title?: string;
+  placeholder?: string; maxLength?: number; disabled?: boolean; width?: number | string;
+  style?: CSSProperties; onKeyDown?: (e: React.KeyboardEvent<HTMLInputElement>) => void;
+}) {
+  return (
+    <input
+      type="text" value={value} aria-label={ariaLabel} title={title} placeholder={placeholder}
+      maxLength={maxLength} disabled={disabled} onKeyDown={onKeyDown}
+      onChange={e => onChange(e.target.value)}
+      style={{
+        background: SURFACE.well, border: "none",
+        boxShadow: `inset 0 0 0 1px ${BORDER.outline}, inset 0 2px 3px rgba(0,0,0,.35)`,
+        color: TEXT, borderRadius: RADIUS.md, padding: "1px 6px", fontSize: FONT.body,
+        outline: "none", height: 22, width: width ?? "100%", boxSizing: "border-box",
+        ...(disabled ? btnDisabled : null), ...style,
+      }}
+    />
+  );
+}
+
+export type CalloutTone = "info" | "warn" | "danger";
+
+const CALLOUT_COLOR: Record<CalloutTone, string> = {
+  info: RAMP.azure, warn: RAMP.amber, danger: DANGER,
+};
+
+/** A tinted, bordered notice block: an intro, a size warning, an error line. One shape instead of
+ *  a hand-built `rgba(accent, .06)` box per call site. */
+export function Callout({ tone = "info", children, style }: {
+  tone?: CalloutTone; children: ReactNode; style?: CSSProperties;
+}) {
+  const c = CALLOUT_COLOR[tone];
+  return (
+    <div role={tone === "info" ? undefined : "alert"} style={{
+      padding: "8px 10px", borderRadius: RADIUS.lg, fontSize: FONT.label, lineHeight: 1.5, color: TEXT_DIM,
+      background: rgba(c, 0.08), boxShadow: `inset 0 0 0 1px ${rgba(c, 0.35)}`, ...style,
+    }}>
+      {children}
+    </div>
   );
 }
 

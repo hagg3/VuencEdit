@@ -168,7 +168,7 @@ export function winLimits(id: WinId, work: Size): WinLimits {
       return { min: minOf(lo), max: maxOf(hotbarOptions(HOTBAR_MAX_SLOT)), fit: (w, h) => growToOption(lo, w, h) };
     }
     case "view3d": return { min: { w: 240, h: 150 }, max: work };
-    // A preview, not a viewport: capped at ~2x its 300x196 default (19.8).
+    // A preview, not a viewport: capped at ~2x its old 300x196 default (19.8; the default is 340x240 since 20.4).
     case "lens": return { min: { w: 220, h: 150 }, max: { w: 640, h: 420 } };
   }
 }
@@ -367,7 +367,7 @@ export function defaultWins(work: Size, o: DefaultOpts): Record<WinId, WinState>
     // `windowStorage.sessionizeContext`). It only ever *renders* while a paste is armed, so being on
     // costs nothing until then. `attached: true` so it snaps straight to the ghost instead of
     // sitting at this placeholder corner.
-    lens: { open: true, collapsed: false, w: 300, h: 196, anchor: { h: "l", v: "b" }, dx: WM, dy: WM, attached: true },
+    lens: { open: true, collapsed: false, w: 340, h: 240, anchor: { h: "l", v: "b" }, dx: WM, dy: WM, attached: true },
     // Mode-driven context panels (16.6): top-left under the ribbon like every context panel, but
     // shifted right of the Tools window's default column so a fresh layout doesn't stack them on it.
     cutaway: panelDefault(PANEL_SIZES.cutaway.level),

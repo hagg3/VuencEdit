@@ -75,7 +75,7 @@ export default function SculptTab() {
           <CmdSetting id="sculpt.brush.softness"><SliderRow label="Softness" min={0} max={100} step={5} accent={AMBER}
             value={Math.round(p.sculptSoftness * 100)} onChange={v => p.setSculptSoftness(v / 100)}
             format={v => `${v}%`}
-            title="Radial falloff — 0 = hard edges, 100 = full dome (soft rim)" /></CmdSetting>
+            title="Edge softness: 0 is a hard edge, 100 a soft dome" /></CmdSetting>
         </Col>
       </Group>
       <GroupDivider />
@@ -86,9 +86,9 @@ export default function SculptTab() {
           <CmdSetting id="sculpt.falloff.profile"><Segmented ariaLabel="Falloff profile" label="Profile" value={p.sculptProfile} accent={AMBER}
             onChange={p.setSculptProfile}
             options={[
-              { id: "smooth", label: "Smooth", title: "Cosine dome — the default" },
+              { id: "smooth", label: "Smooth", title: "Cosine dome (default)" },
               { id: "linear", label: "Linear", title: "Straight cone" },
-              { id: "sphere", label: "Sphere", title: "Spherical cap — fat centre" },
+              { id: "sphere", label: "Sphere", title: "Spherical cap, wide centre" },
               { id: "sharp", label: "Sharp", title: "Nearly flat-topped, hard rim" },
             ]} /></CmdSetting>
           <Row>

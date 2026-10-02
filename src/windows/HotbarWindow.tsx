@@ -75,7 +75,7 @@ export default function HotbarWindow({
           <button
             type="button"
             onClick={e => togglePicker(e, "block-draw")}
-            title={`Active block: ${name} — click to browse all blocks & paints`}
+            title={`Active block: ${name}. Click to choose a block and paint.`}
             aria-label="Open block & paint picker"
             style={{
               width: grid.size, height: grid.size, flexShrink: 0, cursor: "pointer",

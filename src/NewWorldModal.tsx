@@ -1,17 +1,18 @@
 import { decodePreviewData } from "./types";
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { save } from "@tauri-apps/plugin-dialog";
-import { MODAL_TEXT, recessedWell, accentRing, expBadge } from "./designTokens";
-import { ACCENTS, DANGER_HEX, RAMP, armedRecipe, hexToRgb, mix, rgba } from "./theme/theme";
+import { spinnerStyle } from "./designTokens";
 import { v } from "./theme/cssVars";
 import { resolveColor } from "./blockDefs";
 import { putPatchPixels } from "./viewportUtils";
-import NumberField from "./NumberField";
-import { Check, Select, SliderRow } from "./ribbon/primitives";
+import { Icon, type IconName } from "./ribbon/icons";
+import { ACCENT, FONT, SURFACE, TEXT_DANGER, TEXT_DIM } from "./ribbon/tokens";
+import { Badge, Callout, Check, IconButton, NumField, Segmented, Select, SliderRow, TextField } from "./ribbon/primitives";
 import Dialog, { DialogButton } from "./ui/Dialog";
 import { DialogNav, type DialogNavItem } from "./ui/DialogNav";
+import { SectionHeading, SettingBlock } from "./ui/SettingRow";
 
 interface GenProgress { phase: string; pct: number; }
 interface Preview { width: number; height: number; pixels: Uint8Array; }
@@ -38,29 +39,56 @@ function PreviewCanvas({ preview }: { preview: Preview }) {
     <canvas ref={ref} style={{
       width: Math.round(preview.width * scale), height: Math.round(preview.height * scale),
       imageRendering: "pixelated", display: "block", margin: "0 auto",
-      border: `1px solid ${RAMP.mbtn1}`, borderRadius: 4,
+      border: `1px solid ${v("border-modalHairline")}`, borderRadius: 4,
     }} />
   );
 }
 
-// Accent-family text tints for buttons/labels on the warm modal surface (mechanical hex-literal
-// migration, Stage 14.15) — armedRecipe's lightened label colour clears AA against both an
-// accent-tinted button face *and* the plain modal background used for standalone captions.
-const TEAL_TEXT = armedRecipe(ACCENTS.primary).text;
-const WARM_TEXT = armedRecipe(ACCENTS.warm).text;
-const VIOLET_TEXT = armedRecipe(ACCENTS.violet).text;
-const AZURE_TEXT = armedRecipe(ACCENTS.selection).text;
-const RED_LIGHT = mix(RAMP.white, DANGER_HEX, 0.5);
-/** Neutral (non-accented) toggle group — the Classic tab's cave options are deliberately grey. */
-const NEUTRAL_ACCENT = RAMP.mlabel;
-/** Real block colours for the Flat-tab layer-depth preview bar — data, not decoration. */
-/** A `Check` whose label carries the modal's own type scale (13px, per-site colour/weight). */
-function Opt({ checked, onChange, color, bold, children }: {
-  checked: boolean; onChange: (v: boolean) => void; color: string; bold?: boolean; children: ReactNode;
+/** A level picker over an index (0 … n-1): `Segmented` wants string ids, the state is a number. */
+function Levels({ ariaLabel, value, labels, onChange }: {
+  ariaLabel: string; value: number; labels: string[]; onChange: (i: number) => void;
 }) {
   return (
-    <Check checked={checked} onChange={onChange}
-      label={<span style={{ color, fontSize: 13, fontWeight: bold ? 600 : undefined }}>{children}</span>} />
+    <Segmented ariaLabel={ariaLabel} value={String(value)}
+      options={labels.map((label, i) => ({ id: String(i), label }))}
+      onChange={id => onChange(+id)} />
+  );
+}
+
+/** Slider geometry shared by every row, so the tracks line up down the column. */
+const SLIDER = { width: 190, labelWidth: 80 } as const;
+
+/** Seed field + dice button, one copy for all three tabs. */
+function SeedRow({ value, onChange, onRandomise }: {
+  value: number; onChange: (n: number) => void; onRandomise: () => void;
+}) {
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+      <NumField min={1} value={value} onChange={onChange} ariaLabel="Seed" width={170} style={{ textAlign: "left" }} />
+      <IconButton icon="dice" label="Random seed" title="Random seed" onClick={onRandomise} />
+    </div>
+  );
+}
+
+/** The Preview / Refresh button and, once rendered, the canvas + caption. One copy for Natural and Tg2. */
+function PreviewBlock({ busy, preview, onPreview, caption }: {
+  busy: boolean; preview: Preview | null; onPreview: () => void; caption: string;
+}) {
+  const icon: IconName = preview ? "refresh" : "eye";
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+      <DialogButton onClick={onPreview} disabled={busy}
+        style={{ width: "100%", display: "flex", alignItems: "center", justifyContent: "center", gap: 6, cursor: busy ? "wait" : undefined }}>
+        {busy ? <div style={spinnerStyle(14)} /> : <Icon name={icon} size={14} tone="inherit" />}
+        {busy ? "Rendering preview…" : preview ? "Refresh preview" : "Preview terrain"}
+      </DialogButton>
+      {preview && (
+        <div>
+          <PreviewCanvas preview={preview} />
+          <div style={{ color: TEXT_DIM, fontSize: FONT.label, textAlign: "center", marginTop: 4 }}>{caption}</div>
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -79,10 +107,10 @@ type WaterMode   = "none" | "ponds" | "lakes" | "ocean";
 type Biome       = "grassland" | "desert" | "snow" | "lava" | "classic";
 
 const NAV_ITEMS: DialogNavItem[] = [
-  { id: "flat", icon: "block", label: "Flat", description: "Solid stone & dirt slab, no generation" },
-  { id: "natural", icon: "trees", label: "Natural", description: "Procedural biomes, rivers, caves & structures (experimental)" },
-  { id: "classic", icon: "history", label: "Classic", description: "Original Eden Perlin-hill terrain generator" },
-  { id: "tg2", icon: "world", label: "Tg2", description: "Eden 2.0 biome terrain — pyramids, sky islands, volcanoes (experimental)" },
+  { id: "flat", icon: "block", label: "Flat", description: "A flat stone and dirt slab" },
+  { id: "natural", icon: "trees", label: "Natural", description: "Biomes, rivers, caves and structures (experimental)" },
+  { id: "classic", icon: "history", label: "Classic", description: "The original Eden terrain" },
+  { id: "tg2", icon: "world", label: "TG2", description: "Eden 2.0 terrain (experimental)" },
 ];
 
 export default function NewWorldModal({ onClose, onCreated }: Props) {
@@ -327,39 +355,6 @@ export default function NewWorldModal({ onClose, onCreated }: Props) {
     }
   }
 
-  // ── styles ──────────────────────────────────────────────────────────────────
-  const label: React.CSSProperties   = { color: MODAL_TEXT.label, fontSize: 11, fontWeight: 700, letterSpacing: "0.06em", marginBottom: 5 };
-  const inp: React.CSSProperties     = { ...recessedWell, background: v("surface-modalRaised"), borderRadius: 6, color: MODAL_TEXT.primary, padding: "7px 10px", fontSize: 14, width: "100%", boxSizing: "border-box" };
-  // Local replacement for the retired `chromeButton`/`chromeButtonAccent` (UI redesign r3, Stage
-  // 14.17 D3) — same visual recipe as `designTokens.ts` used to provide, inlined here so this file
-  // can drop those two imports (the modal-migration drift guard, `ui/dialogs.test.ts`, bans them).
-  const btnBase: React.CSSProperties = {
-    background: v("surface-modalRaised"), border: "none",
-    boxShadow: "inset 0 0 0 1px rgba(0,0,0,.5), inset 0 1px 0 rgba(255,255,255,.10)",
-    color: MODAL_TEXT.primary, borderRadius: 6, cursor: "pointer", outline: "none",
-    padding: "6px 14px", fontSize: 13,
-  };
-  function accentBtn(accent: string, extra?: React.CSSProperties): React.CSSProperties {
-    const rgb = hexToRgb(accent).join(",");
-    return {
-      background: `linear-gradient(180deg, rgba(${rgb},0.32) 0%, rgba(${rgb},0.10) 100%)`,
-      border: "none",
-      boxShadow: `inset 0 0 0 1px ${accent}, 0 .5px .5px rgba(255,255,255,.2)`,
-      borderRadius: 6, cursor: "pointer", outline: "none",
-      ...extra,
-    };
-  }
-  function fmtBtn(active: boolean): React.CSSProperties {
-    return active
-      ? accentBtn(ACCENTS.primary, { flex: 1, color: TEAL_TEXT, fontSize: 13 })
-      : { ...btnBase, flex: 1, background: "transparent", boxShadow: "none", color: MODAL_TEXT.label };
-  }
-  function optBtn(active: boolean, accent: string = ACCENTS.violet): React.CSSProperties {
-    return active
-      ? accentBtn(accent, { flex: 1, color: MODAL_TEXT.primary, fontSize: 12 })
-      : { ...btnBase, flex: 1, background: "transparent", boxShadow: "none", color: MODAL_TEXT.label, fontSize: 12 };
-  }
-
   // Layer preview bar
   const total  = surfaceZ + 1 + Math.max(1, buildLayers);
   const pBed   = (1          / total * 100).toFixed(1);
@@ -368,15 +363,19 @@ export default function NewWorldModal({ onClose, onCreated }: Props) {
   const pGrass = (1          / total * 100).toFixed(1);
   const pBuild = (Math.max(1, buildLayers) / total * 100).toFixed(1);
 
-  const roughnessLabels = ["Plains", "Rolling", "Hilly", "Rugged", "Jagged"];
-  const erosionLabels   = ["None", "Light", "Medium", "Strong"];
-  const scaleLabels     = ["Small", "Medium", "Large", "Huge"];
-  const biomeColors: Record<Biome, string> = {
-    grassland: ACCENTS.clipboard, desert: ACCENTS.warm, snow: ACCENTS.selection, lava: DANGER_HEX, classic: NEUTRAL_ACCENT,
-  };
   const biomeLabels: Record<Biome, string> = {
     grassland: "Grassland", desert: "Desert", snow: "Snow", lava: "Lava", classic: "Classic+",
   };
+  const tg2Types = ["Plains", "Mars", "River+Forest", "Mtn+River", "Desert", "Ponies", "Beach", "Mix", "Flat", "Custom Mix"];
+
+  // One readout + one warning for whichever tab is showing (Tg2 has its own square size).
+  const isTg2 = terrainType === "tg2";
+  const readoutChunks = isTg2 ? tg2NChunks : nChunks;
+  const readout = `${readoutChunks} chunk${readoutChunks !== 1 ? "s" : ""} · ${
+    isTg2 ? `${tg2SizeChunks * 16}×${tg2SizeChunks * 16}` : `${widthChunks * 16}×${heightChunks * 16}`
+  } blocks · ~${isTg2 ? tg2FileSizeMB : fileSizeMB} MB`;
+  const warning = isTg2 ? tg2SizeWarning : sizeWarning;
+  const warnMB = isTg2 ? tg2FileSizeMB : fileSizeMB;
 
   return (
     <Dialog
@@ -384,6 +383,7 @@ export default function NewWorldModal({ onClose, onCreated }: Props) {
       nav={<DialogNav items={NAV_ITEMS} value={terrainType} onChange={id => setTerrainType(id as TerrainType)} />}
       footer={
         <>
+          <span style={{ marginRight: "auto", fontSize: FONT.label, color: TEXT_DIM }}>{readout}</span>
           <DialogButton
             onClick={onClose} disabled={creating}
             title={creating ? "World generation is running and can't be cancelled" : undefined}
@@ -405,623 +405,307 @@ export default function NewWorldModal({ onClose, onCreated }: Props) {
       <div style={{ display: "flex", gap: 20, height: "100%", minHeight: 0 }}>
 
         {/* Parameters column — scrolls on its own; the preview column stays put beside it. */}
-        <div style={{
-          flex: 1, minWidth: 0, height: "100%", overflowY: "auto",
-          display: "flex", flexDirection: "column", gap: 18, paddingRight: 4,
-        }}>
+        <div style={{ flex: 1, minWidth: 0, height: "100%", overflowY: "auto", paddingRight: 4 }}>
 
-          {/* Name */}
-          <div>
-            <div style={label}>WORLD NAME</div>
-            <input style={inp} value={name} onChange={e => setName(e.target.value)} maxLength={35} placeholder="My World" />
-          </div>
+          <SettingBlock label="World name">
+            <TextField value={name} onChange={setName} maxLength={32} placeholder="My World" ariaLabel="World name" />
+          </SettingBlock>
 
           {/* Dimensions (Tg2 has its own square size slider, so hide these) */}
-          {terrainType !== "tg2" && <div>
-            <div style={label}>SIZE (CHUNKS · 1 CHUNK = 16 BLOCKS)</div>
-            <div style={{ display: "flex", gap: 10, alignItems: "flex-end" }}>
-              <div style={{ flex: 1 }}>
-                <div style={{ color: MODAL_TEXT.secondary, fontSize: 11, marginBottom: 3 }}>Width</div>
-                <NumberField min={1} max={128} value={widthChunks} style={inp}
-                  onChange={setWidthChunks} aria-label="World width in chunks" />
+          {!isTg2 && (
+            <SettingBlock label="Size" description="In chunks. 1 chunk = 16 blocks.">
+              <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: FONT.label, color: TEXT_DIM }}>
+                <NumField min={1} max={128} value={widthChunks} onChange={setWidthChunks} ariaLabel="World width in chunks" width={56} />
+                <span>×</span>
+                <NumField min={1} max={128} value={heightChunks} onChange={setHeightChunks} ariaLabel="World height in chunks" width={56} />
+                <span>= {widthChunks * 16}×{heightChunks * 16} blocks</span>
               </div>
-              <div style={{ color: MODAL_TEXT.secondary, paddingBottom: 8 }}>×</div>
-              <div style={{ flex: 1 }}>
-                <div style={{ color: MODAL_TEXT.secondary, fontSize: 11, marginBottom: 3 }}>Height</div>
-                <NumberField min={1} max={128} value={heightChunks} style={inp}
-                  onChange={setHeightChunks} aria-label="World height in chunks" />
-              </div>
-              <div style={{ color: MODAL_TEXT.secondary, fontSize: 12, paddingBottom: 10, whiteSpace: "nowrap" }}>
-                = {widthChunks * 16}×{heightChunks * 16}
-              </div>
-            </div>
-          </div>}
+            </SettingBlock>
+          )}
 
-          {/* Format */}
-          <div>
-            <div style={label}>HEIGHT FORMAT</div>
-            <div style={{ display: "flex", gap: 6 }}>
-              <button title="Original Eden format — worlds up to 64 blocks tall" style={fmtBtn(!extendedZ)} onClick={() => handleFormatChange(false)}>Legacy 64z</button>
-              <button title="Newer Eden format — worlds up to 256 blocks tall" style={fmtBtn(extendedZ)}  onClick={() => handleFormatChange(true)}>New Dawn 256z</button>
-            </div>
-          </div>
+          <SettingBlock label="Height format">
+            <Segmented ariaLabel="Height format" value={extendedZ ? "256" : "64"}
+              options={[
+                { id: "64", label: "Legacy 64z", title: "Original Eden format: worlds up to 64 blocks tall" },
+                { id: "256", label: "New Dawn 256z", title: "Newer Eden format: worlds up to 256 blocks tall" },
+              ]}
+              onChange={id => handleFormatChange(id === "256")} />
+          </SettingBlock>
 
           {/* 64z compatibility notice */}
           {!extendedZ && (
-            <div style={{
-              background: rgba(ACCENTS.selection, 0.07), border: `1px solid ${rgba(ACCENTS.selection, 0.25)}`,
-              borderRadius: 6, padding: "8px 12px", fontSize: 11.5, color: AZURE_TEXT, lineHeight: 1.5,
-            }}>
-              64z worlds are compatible with the latest version of Eden. They will be converted on first launch to support the new height limit.
+            <div style={{ marginTop: 9 }}>
+              <Callout tone="info">
+                Current Eden opens 64z worlds and converts them to 256z.
+              </Callout>
             </div>
           )}
 
           {/* ── FLAT params ── */}
-          {terrainType === "flat" && (
-            <div>
-              <div style={label}>LAYER DEPTHS (BLOCKS)</div>
-              <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-                <SliderRow label="Stone" min={0} max={extendedZ ? 100 : 40} value={stoneDepth}
-                  onChange={setStoneDepth} accent={NEUTRAL_ACCENT} width={280} labelWidth={50} />
-                <SliderRow label="Dirt" min={0} max={extendedZ ? 60 : 20} value={dirtDepth}
-                  onChange={setDirtDepth} accent={ACCENTS.warm} width={280} labelWidth={50} />
-              </div>
-            </div>
-          )}
+          {terrainType === "flat" && (<>
+            <SectionHeading>Layer depths (blocks)</SectionHeading>
+            <SettingBlock>
+              <SliderRow label="Stone" min={0} max={extendedZ ? 100 : 40} value={stoneDepth}
+                onChange={setStoneDepth} {...SLIDER} />
+            </SettingBlock>
+            <SettingBlock last>
+              <SliderRow label="Dirt" min={0} max={extendedZ ? 60 : 20} value={dirtDepth}
+                onChange={setDirtDepth} {...SLIDER} />
+            </SettingBlock>
+          </>)}
 
           {/* ── NATURAL params ── */}
           {terrainType === "natural" && (<>
-
-            {/* Base height */}
-            <div>
+            <SectionHeading>Terrain</SectionHeading>
+            <SettingBlock>
               <SliderRow label="Base height" min={5} max={extendedZ ? 200 : 55} value={baseHeight}
-                onChange={setBaseHeight} format={v => `z=${v}`}
-                accent={ACCENTS.clipboard} width={280} labelWidth={76} />
-              <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, color: MODAL_TEXT.secondary, marginTop: 2 }}>
-                <span>Low</span><span>High</span>
-              </div>
-            </div>
-
-            {/* Roughness */}
-            <div>
-              <div style={label}>TERRAIN ROUGHNESS</div>
-              <div style={{ display: "flex", gap: 4 }}>
-                {roughnessLabels.map((lbl, i) => (
-                  <button key={i} style={optBtn(roughnessLevel === i, ACCENTS.violet)}
-                    onClick={() => setRoughnessLevel(i)}>{lbl}</button>
-                ))}
-              </div>
-            </div>
-
-            {/* Erosion (flatness) */}
-            <div>
-              <div style={label}>EROSION</div>
-              <div style={{ display: "flex", gap: 4 }}>
-                {erosionLabels.map((lbl, i) => (
-                  <button key={i} style={optBtn(erosionLevel === i, ACCENTS.violet)}
-                    onClick={() => setErosionLevel(i)}>{lbl}</button>
-                ))}
-              </div>
-              <div style={{ color: MODAL_TEXT.secondary, fontSize: 11, marginTop: 4 }}>
-                Higher = broad flat plains carved between rugged highlands (relief varies by region).
-              </div>
-            </div>
-
-            {/* Terrain scale (feature size) */}
-            <div>
-              <div style={label}>FEATURE SCALE</div>
-              <div style={{ display: "flex", gap: 4 }}>
-                {scaleLabels.map((lbl, i) => (
-                  <button key={i} style={optBtn(terrainScale === i, ACCENTS.violet)}
-                    onClick={() => setTerrainScale(i)}>{lbl}</button>
-                ))}
-              </div>
-              <div style={{ color: MODAL_TEXT.secondary, fontSize: 11, marginTop: 4 }}>
-                Larger = broader continents &amp; mountain ranges.
-              </div>
-            </div>
+                onChange={setBaseHeight} format={v => `z=${v}`} {...SLIDER} />
+            </SettingBlock>
+            <SettingBlock label="Roughness">
+              <Levels ariaLabel="Terrain roughness" value={roughnessLevel} onChange={setRoughnessLevel}
+                labels={["Plains", "Rolling", "Hilly", "Rugged", "Jagged"]} />
+            </SettingBlock>
+            <SettingBlock label="Erosion" description="Higher gives flat plains between rugged highlands.">
+              <Levels ariaLabel="Erosion" value={erosionLevel} onChange={setErosionLevel}
+                labels={["None", "Light", "Medium", "Strong"]} />
+            </SettingBlock>
+            <SettingBlock label="Feature scale" description="Larger gives broader continents and ranges.">
+              <Levels ariaLabel="Feature scale" value={terrainScale} onChange={setTerrainScale}
+                labels={["Small", "Medium", "Large", "Huge"]} />
+            </SettingBlock>
 
             {/* Extreme mountains — 256z only */}
             {extendedZ && (
-              <div style={{
-                border: `1px solid ${rgba(ACCENTS.violet, 0.4)}`, borderRadius: 6, padding: "10px 12px",
-                background: rgba(ACCENTS.violet, 0.06),
-              }}>
-                <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                  <Opt checked={extreme} onChange={setExtreme} color={VIOLET_TEXT} bold>Extreme mountains</Opt>
-                  <span style={{ marginLeft: "auto", fontSize: 10, color: VIOLET_TEXT, fontWeight: 700, letterSpacing: "0.05em" }}>
-                    256z ONLY
-                  </span>
-                </div>
-                <div style={{ color: MODAL_TEXT.label, fontSize: 11, marginTop: 6 }}>
-                  Towering peaks &amp; deep valleys that use the full 256-block height — pairs
-                  best with high roughness and a higher base height.
-                </div>
-              </div>
+              <SettingBlock>
+                <Check checked={extreme} onChange={setExtreme}
+                  label={<>Extreme mountains<Badge title="256z worlds only">256z only</Badge></>}
+                  hint="Uses the full 256-block height. Best with high roughness." />
+              </SettingBlock>
             )}
 
-            {/* Water */}
-            <div>
-              <div style={label}>WATER</div>
-              <div style={{ display: "flex", gap: 4 }}>
-                {(["none", "ponds", "lakes", "ocean"] as WaterMode[]).map(m => (
-                  <button key={m} style={optBtn(waterMode === m, ACCENTS.selection)}
-                    onClick={() => setWaterMode(m)}>{m.charAt(0).toUpperCase() + m.slice(1)}</button>
-                ))}
-              </div>
-              <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 8 }}>
-                <Opt checked={rivers} onChange={setRivers} color={MODAL_TEXT.secondary}>Carve winding rivers</Opt>
-              </div>
-            </div>
+            <SectionHeading>Water</SectionHeading>
+            <SettingBlock last>
+              <Segmented<WaterMode> ariaLabel="Water" value={waterMode} onChange={setWaterMode}
+                options={[
+                  { id: "none", label: "None" }, { id: "ponds", label: "Ponds" },
+                  { id: "lakes", label: "Lakes" }, { id: "ocean", label: "Ocean" },
+                ]} />
+              <Check checked={rivers} onChange={setRivers} label="Carve winding rivers" />
+            </SettingBlock>
 
-            {/* Biome */}
-            <div>
-              <div style={label}>BIOME</div>
-              <div style={{ display: "flex", gap: 4, marginBottom: 8 }}>
-                {["Single", "Mixed"].map((lbl, i) => (
-                  <button key={i} style={optBtn(biomeMode === i, ACCENTS.clipboard)}
-                    onClick={() => setBiomeMode(i)}>{lbl}</button>
-                ))}
-              </div>
-
+            <SectionHeading>Biome</SectionHeading>
+            <SettingBlock last>
+              <Levels ariaLabel="Biome mode" value={biomeMode} onChange={setBiomeMode} labels={["Single", "Mixed"]} />
               {biomeMode === 0 ? (<>
-                <div style={{ display: "flex", gap: 4 }}>
-                  {(["grassland", "desert", "snow", "lava", "classic"] as Biome[]).map(b => (
-                    <button key={b} style={optBtn(biome === b, biomeColors[b])}
-                      onClick={() => setBiome(b)}>
-                      {biomeLabels[b]}
-                    </button>
-                  ))}
-                </div>
+                <Segmented<Biome> ariaLabel="Biome" value={biome} onChange={setBiome}
+                  options={(Object.keys(biomeLabels) as Biome[]).map(b => ({ id: b, label: biomeLabels[b] }))} />
                 {biome === "classic" && (
-                  <div style={{ color: MODAL_TEXT.secondary, fontSize: 11, marginTop: 6, lineHeight: 1.5 }}>
-                    Legacy Eden rolling-hill terrain &amp; caves (with bare-stone outcrops),
+                  <span style={{ fontSize: FONT.label, color: TEXT_DIM, lineHeight: 1.5 }}>
+                    Legacy Eden rolling-hill terrain & caves (with bare-stone outcrops),
                     but enhanced with the modern pipeline — rivers, lakes/ocean, structures
                     and natural trees. For the pure legacy generator use the Classic tab.
-                  </div>
+                  </span>
                 )}
-                {biome === "grassland" && (
-                  <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 8 }}>
-                    <Opt checked={snowCaps} onChange={setSnowCaps} color={MODAL_TEXT.secondary}>Snow-capped peaks</Opt>
-                  </div>
-                )}
+                {biome === "grassland" && <Check checked={snowCaps} onChange={setSnowCaps} label="Snow-capped peaks" />}
               </>) : (<>
-                <div style={{ color: MODAL_TEXT.secondary, fontSize: 11, marginBottom: 6 }}>BIOME SIZE</div>
-                <div style={{ display: "flex", gap: 4 }}>
-                  {["Small", "Medium", "Large"].map((lbl, i) => (
-                    <button key={i} style={optBtn(biomeScale === i, ACCENTS.clipboard)}
-                      onClick={() => setBiomeScale(i)}>{lbl}</button>
-                  ))}
-                </div>
-                <div style={{ color: MODAL_TEXT.secondary, fontSize: 11, marginTop: 6, lineHeight: 1.5 }}>
-                  Grassland, desert &amp; snow blend by temperature &amp; moisture; high
-                  ground turns snowy. (Lava &amp; Classic+ are single-biome only.)
-                </div>
+                <span style={{ fontSize: FONT.label, color: TEXT_DIM }}>Biome size</span>
+                <Levels ariaLabel="Biome size" value={biomeScale} onChange={setBiomeScale} labels={["Small", "Medium", "Large"]} />
+                <span style={{ fontSize: FONT.label, color: TEXT_DIM, lineHeight: 1.5 }}>
+                  Grassland, desert & snow blend by temperature & moisture; high
+                  ground turns snowy. (Lava & Classic+ are single-biome only.)
+                </span>
               </>)}
-            </div>
+            </SettingBlock>
 
-            {/* Trees */}
-            <div>
-              <div style={label}>TREE DENSITY</div>
-              <div style={{ display: "flex", gap: 4 }}>
-                {["None", "Sparse", "Normal", "Dense"].map((lbl, i) => (
-                  <button key={i} style={optBtn(treeDensity === i, ACCENTS.clipboard)}
-                    onClick={() => setTreeDensity(i)}>{lbl}</button>
-                ))}
-              </div>
-            </div>
-
-            {/* Caves */}
-            <div>
-              <div style={label}>CAVES</div>
-              <div style={{ display: "flex", gap: 4 }}>
-                {["None", "Rare", "Common"].map((lbl, i) => (
-                  <button key={i} style={optBtn(caveDensity === i, NEUTRAL_ACCENT)}
-                    onClick={() => setCaveDensity(i)}>{lbl}</button>
-                ))}
-              </div>
+            <SectionHeading>Features</SectionHeading>
+            <SettingBlock label="Tree density">
+              <Levels ariaLabel="Tree density" value={treeDensity} onChange={setTreeDensity}
+                labels={["None", "Sparse", "Normal", "Dense"]} />
+            </SettingBlock>
+            <SettingBlock label="Caves"
+              description={caveDensity > 0 ? (caveStyle === 0 ? "Winding spaghetti tunnels." : "Legacy Eden 3D-noise caverns with dark-stone veins.") : undefined}>
+              <Levels ariaLabel="Cave density" value={caveDensity} onChange={setCaveDensity} labels={["None", "Rare", "Common"]} />
               {caveDensity > 0 && (<>
-                <div style={{ display: "flex", gap: 4, marginTop: 8 }}>
-                  {["Tunnels", "Classic"].map((lbl, i) => (
-                    <button key={i} style={optBtn(caveStyle === i, NEUTRAL_ACCENT)}
-                      onClick={() => setCaveStyle(i)}>{lbl}</button>
-                  ))}
-                </div>
-                <div style={{ color: MODAL_TEXT.secondary, fontSize: 11, marginTop: 4 }}>
-                  {caveStyle === 0
-                    ? "Winding spaghetti tunnels."
-                    : "Legacy Eden 3D-noise caverns with dark-stone veins."}
-                </div>
-                <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 8 }}>
-                  <Opt checked={caverns} onChange={setCaverns} color={MODAL_TEXT.secondary}>Large caverns &amp; deep lava pools</Opt>
-                </div>
-                {waterMode !== "none" && (
-                  <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 8 }}>
-                    <Opt checked={floodCaves} onChange={setFloodCaves} color={MODAL_TEXT.secondary}>Flood caves with water</Opt>
-                  </div>
-                )}
+                <Levels ariaLabel="Cave style" value={caveStyle} onChange={setCaveStyle} labels={["Tunnels", "Classic"]} />
+                <Check checked={caverns} onChange={setCaverns} label="Large caverns & deep lava pools" />
+                {waterMode !== "none" && <Check checked={floodCaves} onChange={setFloodCaves} label="Flood caves with water" />}
               </>)}
-            </div>
-
-            {/* Minerals / ore */}
-            <div>
-              <div style={label}>MINERALS</div>
-              <div style={{ display: "flex", gap: 4 }}>
-                {["None", "Sparse", "Rich"].map((lbl, i) => (
-                  <button key={i} style={optBtn(oreDensity === i, ACCENTS.primary)}
-                    onClick={() => setOreDensity(i)}>{lbl}</button>
-                ))}
-              </div>
-              <div style={{ color: MODAL_TEXT.secondary, fontSize: 11, marginTop: 4 }}>
-                Underground veins of dark stone, slate &amp; glowing crystal.
-              </div>
-            </div>
-
-            {/* Vegetation */}
-            <div>
-              <div style={label}>VEGETATION</div>
-              <div style={{ display: "flex", gap: 4 }}>
-                {["None", "Light", "Lush"].map((lbl, i) => (
-                  <button key={i} style={optBtn(vegetation === i, ACCENTS.clipboard)}
-                    onClick={() => setVegetation(i)}>{lbl}</button>
-                ))}
-              </div>
-              <div style={{ color: MODAL_TEXT.secondary, fontSize: 11, marginTop: 4 }}>
-                Flowers, tall grass, boulders &amp; lily pads.
-              </div>
-            </div>
-
-            {/* Structures */}
-            <div>
-              <div style={label}>STRUCTURES</div>
-              <div style={{ display: "flex", gap: 4 }}>
-                {["None", "Sparse", "Common"].map((lbl, i) => (
-                  <button key={i} style={optBtn(structures === i, ACCENTS.warm)}
-                    onClick={() => setStructures(i)}>{lbl}</button>
-                ))}
-              </div>
-              <div style={{ color: MODAL_TEXT.secondary, fontSize: 11, marginTop: 4 }}>
-                Cabins, wells, watchtowers, ruins &amp; desert pyramids.
-              </div>
-            </div>
-
-            {/* Clouds */}
-            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-              <Opt checked={cloudsEnabled} onChange={setCloudsEnabled} color={MODAL_TEXT.secondary}>Generate cloud layer</Opt>
-            </div>
-
+            </SettingBlock>
+            <SettingBlock label="Minerals" description="Underground veins of dark stone, slate and glowing crystal.">
+              <Levels ariaLabel="Minerals" value={oreDensity} onChange={setOreDensity} labels={["None", "Sparse", "Rich"]} />
+            </SettingBlock>
+            <SettingBlock label="Vegetation" description="Flowers, tall grass, boulders and lily pads.">
+              <Levels ariaLabel="Vegetation" value={vegetation} onChange={setVegetation} labels={["None", "Light", "Lush"]} />
+            </SettingBlock>
+            <SettingBlock label="Structures" description="Cabins, wells, watchtowers, ruins and desert pyramids.">
+              <Levels ariaLabel="Structures" value={structures} onChange={setStructures} labels={["None", "Sparse", "Common"]} />
+            </SettingBlock>
+            <SettingBlock last>
+              <Check checked={cloudsEnabled} onChange={setCloudsEnabled} label="Generate cloud layer" />
+            </SettingBlock>
           </>)}
 
           {/* ── CLASSIC params ── */}
           {terrainType === "classic" && (<>
-
-            <div style={{
-              border: `1px solid ${rgba(ACCENTS.violet, 0.4)}`, borderRadius: 6, padding: "8px 12px",
-              background: rgba(ACCENTS.violet, 0.06), color: VIOLET_TEXT, fontSize: 11.5, lineHeight: 1.5,
-            }}>
-              Reproduces the original randomly-generated Eden terrain from the early
-              game: rolling Perlin hills, dirt &amp; grass surface, trees and clouds.
+            <div style={{ marginTop: 9 }}>
+              <Callout tone="info">
+                Recreates the early Eden terrain: hills, trees and clouds.
+              </Callout>
             </div>
 
-            {/* Variance */}
-            <div>
-              <div style={label}>TERRAIN VARIANCE</div>
-              <div style={{ display: "flex", gap: 4 }}>
-                {["Plains", "Rolling", "Classic", "Rugged", "Wild"].map((lbl, i) => (
-                  <button key={i} style={optBtn(classicVariance === i, ACCENTS.violet)}
-                    onClick={() => setClassicVariance(i)}>{lbl}</button>
-                ))}
-              </div>
-              <div style={{ color: MODAL_TEXT.secondary, fontSize: 11, marginTop: 4 }}>
-                How dramatic the heightmap relief is (legacy default = Classic).
-              </div>
-            </div>
-
-            {/* Base height */}
-            <div>
+            <SectionHeading>Terrain</SectionHeading>
+            <SettingBlock label="Variance" description="How hilly the terrain is (game default: Classic).">
+              <Levels ariaLabel="Terrain variance" value={classicVariance} onChange={setClassicVariance}
+                labels={["Plains", "Rolling", "Classic", "Rugged", "Wild"]} />
+            </SettingBlock>
+            <SettingBlock last>
               <SliderRow label="Base height" min={5} max={extendedZ ? 200 : 55} value={classicBaseHeight}
-                onChange={setClassicBaseHeight} format={v => `z=${v}`}
-                accent={ACCENTS.violet} width={280} labelWidth={76} />
-              <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, color: MODAL_TEXT.secondary, marginTop: 2 }}>
-                <span>Low</span><span>High</span>
-              </div>
-            </div>
+                onChange={setClassicBaseHeight} format={v => `z=${v}`} {...SLIDER} />
+            </SettingBlock>
 
-            {/* Caves */}
-            <div style={{
-              border: `1px solid ${v("border-modalHairline")}`, borderRadius: 6, padding: "10px 12px",
-              background: rgba(NEUTRAL_ACCENT, 0.06),
-            }}>
-              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                <Opt checked={classicCaves} onChange={setClassicCaves} color={MODAL_TEXT.primary} bold>Underground caves</Opt>
-              </div>
-              <div style={{ color: MODAL_TEXT.label, fontSize: 11, marginTop: 6 }}>
-                Carves the original 3D-noise cave tunnels (with dark-stone veins) deep
-                underground — a feature from the very earliest Eden builds.
-              </div>
+            <SectionHeading>Features</SectionHeading>
+            <SettingBlock>
+              <Check checked={classicCaves} onChange={setClassicCaves} label="Underground caves"
+                hint="The original deep cave tunnels." />
               {classicCaves && (
-                <div style={{ marginTop: 10, paddingTop: 8, borderTop: `1px solid ${v("border-modalHairline")}` }}>
-                  <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                    <Opt checked={classicTallCaves} onChange={setClassicTallCaves} color={MODAL_TEXT.primary}>Tall caves</Opt>
-                  </div>
-                  <div style={{ color: MODAL_TEXT.label, fontSize: 11, marginTop: 6 }}>
-                    Taller, vertically-stretched versions of the normal stone &amp;
-                    dark-stone caves — an even older Eden cave style.
-                  </div>
-                </div>
+                <Check checked={classicTallCaves} onChange={setClassicTallCaves} label="Tall caves"
+                  hint="Taller caves from an older Eden version." />
               )}
-            </div>
-
-            {/* Trees */}
-            <div>
-              <div style={label}>TREE DENSITY</div>
-              <div style={{ display: "flex", gap: 4 }}>
-                {["None", "Sparse", "Normal", "Dense"].map((lbl, i) => (
-                  <button key={i} style={optBtn(classicTrees === i, ACCENTS.clipboard)}
-                    onClick={() => setClassicTrees(i)}>{lbl}</button>
-                ))}
-              </div>
-            </div>
-
-            {/* Flowers (sparse) */}
-            <div>
-              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                <Opt checked={classicFlowers} onChange={setClassicFlowers} color={MODAL_TEXT.secondary}>Scatter flowers (sparse)</Opt>
-              </div>
-              <div style={{ color: MODAL_TEXT.secondary, fontSize: 11, marginTop: 6 }}>
-                Sprinkles a few flowers across the grass. Kept sparse on purpose — the
-                game can&apos;t load a world packed with flower sprites.
-              </div>
-            </div>
-
-            {/* Clouds */}
-            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-              <Opt checked={classicClouds} onChange={setClassicClouds} color={MODAL_TEXT.secondary}>Generate cloud layer</Opt>
-            </div>
-
+            </SettingBlock>
+            <SettingBlock label="Tree density">
+              <Levels ariaLabel="Tree density" value={classicTrees} onChange={setClassicTrees}
+                labels={["None", "Sparse", "Normal", "Dense"]} />
+            </SettingBlock>
+            <SettingBlock>
+              <Check checked={classicFlowers} onChange={setClassicFlowers} label="Scatter flowers (sparse)"
+                hint="Kept sparse because the game can't load worlds with many flowers." />
+            </SettingBlock>
+            <SettingBlock last>
+              <Check checked={classicClouds} onChange={setClassicClouds} label="Generate cloud layer" />
+            </SettingBlock>
           </>)}
 
           {/* ── TG2 params ── */}
           {terrainType === "tg2" && (<>
-
-            <div style={{
-              background: rgba(ACCENTS.warm, 0.06), border: `1px solid ${rgba(ACCENTS.warm, 0.25)}`,
-              borderRadius: 6, padding: "8px 12px", fontSize: 11.5, color: WARM_TEXT, lineHeight: 1.5,
-            }}>
-              Eden 2.0 pre-generated terrain — nine distinct biome styles with height-based
-              paint gradients, pyramids, sky islands, and volcanoes.
+            <div style={{ marginTop: 9 }}>
+              <Callout tone="info">
+                Eden 2.0 terrain: nine biome styles plus pyramids, sky islands and volcanoes.
+              </Callout>
             </div>
 
-            {/* Terrain type grid */}
-            <div>
-              <div style={label}>TERRAIN TYPE</div>
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 4 }}>
-                {(["Plains","Mars","River+Forest","Mtn+River","Desert","Ponies","Beach","Mix","Flat","Custom Mix"] as const).map((lbl, i) => (
-                  <button key={i} style={optBtn(tg2TerrainType === i, ACCENTS.warm)}
-                    onClick={() => setTg2TerrainType(i)}>{lbl}</button>
-                ))}
-              </div>
-            </div>
-
-            {/* Size */}
-            <div>
-              <div style={label}>WORLD SIZE (SQUARE)</div>
-              {/* `label=""`/`labelWidth={0}`: the header above already names the field, and the tick
-                  row below is positioned in px against this same 280px track width — an explicit
-                  `label` would shift the track right and desync the ticks from it. */}
-              <SliderRow label="" labelWidth={0} min={5} max={180} value={tg2SizeChunks}
-                onChange={setTg2SizeChunks}
-                format={v => `${v}×${v} chunks · ${v * 16}×${v * 16} blocks`}
-                accent={ACCENTS.warm} width={280} />
-              {/* Ticks positioned at their real value on the 5–180 chunk track. Spacing these evenly
-                  (as a flex row) put "256" at the 25% mark when 256 blocks = 16 chunks actually lives
-                  at ~6% — every intermediate label pointed at the wrong place on the slider.
-                  `width: 280` matches the `SliderRow` above's `width` so the percentages below still
-                  line up with the track (off by a few px for the track's own left inset — close
-                  enough for a decorative tick row). */}
-              <div style={{ position: "relative", width: 280, height: 14, fontSize: 11, color: MODAL_TEXT.secondary, marginTop: 2 }}>
-                {[80, 256, 640, 1280, 2880].map((blocks) => {
-                  const chunks = blocks / 16;
-                  const pct = ((chunks - 5) / (180 - 5)) * 100;
-                  return (
-                    <span
-                      key={blocks}
-                      style={{
-                        position: "absolute", left: `${pct}%`,
-                        // Clamp the end labels inside the track instead of overhanging it.
-                        transform: pct <= 1 ? "none" : pct >= 99 ? "translateX(-100%)" : "translateX(-50%)",
-                        whiteSpace: "nowrap",
-                      }}
-                    >
-                      {blocks}
-                    </span>
-                  );
-                })}
-              </div>
-              <button
-                onClick={() => setTg2SizeChunks(180)}
-                style={{ ...btnBase, marginTop: 5, fontSize: 11.5, padding: "3px 10px",
-                  background: tg2SizeChunks === 180 ? rgba(ACCENTS.warm, 0.25) : rgba(ACCENTS.warm, 0.08),
-                  ...accentRing(tg2SizeChunks === 180 ? ACCENTS.warm : rgba(ACCENTS.warm, 0.3)),
-                  color: tg2SizeChunks === 180 ? WARM_TEXT : MODAL_TEXT.label }}>
-                Default (2880×2880 — canonical Eden template size)
-              </button>
-            </div>
+            <SectionHeading>Terrain</SectionHeading>
+            <SettingBlock label="Terrain type">
+              <Select<string> ariaLabel="Terrain type" width={200} value={String(tg2TerrainType)}
+                options={tg2Types.map((label, i) => ({ id: String(i), label }))}
+                onChange={id => setTg2TerrainType(+id)} />
+            </SettingBlock>
 
             {/* Custom Mix quadrant selector */}
-            {tg2TerrainType === 9 && (() => {
-              const biomeNames = ["Plains","Mars","River+Forest","Mtn+River","Desert","Ponies","Beach"];
-              const quadLabels = ["NW","NE","SW","SE"];
-              return (
-                <div style={{ border: `1px solid ${rgba(ACCENTS.warm, 0.3)}`, borderRadius: 6, padding: "10px 12px", background: rgba(ACCENTS.warm, 0.06) }}>
-                  <div style={{ ...label, marginBottom: 8 }}>QUADRANT BIOMES</div>
-                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6 }}>
-                    {quadLabels.map((ql, qi) => (
-                      <div key={qi} style={{ display: "flex", flexDirection: "column", gap: 3 }}>
-                        <span style={{ fontSize: 10, color: MODAL_TEXT.label, fontWeight: 600 }}>{ql}</span>
-                        <Select<string> ariaLabel={`${ql} quadrant biome`} width={140}
-                          value={String(tg2CustomBiomes[qi])}
-                          options={biomeNames.map((bn, bi) => ({ id: String(bi), label: bn }))}
-                          onChange={id => {
-                            const next = [...tg2CustomBiomes] as [number,number,number,number];
-                            next[qi] = +id;
-                            setTg2CustomBiomes(next);
-                          }} />
-                      </div>
-                    ))}
-                  </div>
+            {tg2TerrainType === 9 && (
+              <SettingBlock label="Quadrant biomes">
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                  {["NW", "NE", "SW", "SE"].map((ql, qi) => (
+                    <div key={ql} style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+                      <span style={{ fontSize: FONT.label, color: TEXT_DIM }}>{ql}</span>
+                      <Select<string> ariaLabel={`${ql} quadrant biome`} width={140}
+                        value={String(tg2CustomBiomes[qi])}
+                        options={tg2Types.slice(0, 7).map((label, bi) => ({ id: String(bi), label }))}
+                        onChange={id => {
+                          const next = [...tg2CustomBiomes] as [number, number, number, number];
+                          next[qi] = +id;
+                          setTg2CustomBiomes(next);
+                        }} />
+                    </div>
+                  ))}
                 </div>
-              );
-            })()}
+              </SettingBlock>
+            )}
 
-            {/* Options */}
-            <div>
-              <div style={label}>OPTIONS</div>
-              <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
-                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                  <Opt checked={tg2SkyIslands} onChange={setTg2SkyIslands} color={MODAL_TEXT.secondary}>Sky islands</Opt>
-                </div>
-                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                  <Opt checked={tg2Clouds} onChange={setTg2Clouds} color={MODAL_TEXT.secondary}>Clouds</Opt>
-                </div>
-                {tg2TerrainType !== 8 && (
-                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                    <Opt checked={tg2Caves} onChange={v => { setTg2Caves(v); if (!v) setTg2TallCaves(false); }} color={MODAL_TEXT.secondary}>Caves</Opt>
-                  </div>
-                )}
-                {tg2Caves && tg2TerrainType !== 8 && (
-                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                    <Opt checked={tg2TallCaves} onChange={setTg2TallCaves} color={MODAL_TEXT.secondary}>Tall caves</Opt>
-                  </div>
-                )}
+            <SettingBlock>
+              <SliderRow label="World size" min={5} max={180} value={tg2SizeChunks}
+                onChange={setTg2SizeChunks} format={v => `${v * 16}×${v * 16}`} {...SLIDER} />
+              <div>
+                <DialogButton onClick={() => setTg2SizeChunks(180)} disabled={tg2SizeChunks === 180}
+                  title="Eden's standard size (2880×2880 blocks)"
+                  style={{ height: 24 }}>
+                  Use default size
+                </DialogButton>
               </div>
-            </div>
+            </SettingBlock>
 
             {/* Terrain amplitude (all but Flat) */}
             {tg2TerrainType !== 8 && (
-              <div>
-                <div style={{ ...label, display: "flex", alignItems: "center", gap: 6, marginBottom: 4 }}>
-                  TERRAIN AMPLITUDE
-                  <span style={expBadge({ fontSize: 9 })}>Exp</span>
-                </div>
+              <SettingBlock badge={<Badge>exp</Badge>}
+                description={<>Exaggerates hills and mountains. {extendedZ
+                  ? "256z worlds also scale to the full height."
+                  : "Switch to 256z to use the full height."}</>}>
                 <SliderRow label="Amplitude" min={0.5} max={3} step={0.1} value={tg2Amplitude}
-                  onChange={setTg2Amplitude} format={v => `${v.toFixed(1)}×`}
-                  accent={ACCENTS.warm} width={280} labelWidth={70} />
-                <div style={{ color: MODAL_TEXT.secondary, fontSize: 11, marginTop: 4 }}>
-                  Exaggerates hills &amp; mountains. {extendedZ
-                    ? "New Dawn 256z worlds also scale up to fill the taller space automatically."
-                    : "Switch to New Dawn 256z to let terrain fill the full height."}
-                </div>
-              </div>
+                  onChange={setTg2Amplitude} format={v => `${v.toFixed(1)}×`} {...SLIDER} />
+              </SettingBlock>
             )}
 
             {/* Sea level (water biomes) */}
-            {(tg2TerrainType === 2 || tg2TerrainType === 3 || tg2TerrainType === 4 || tg2TerrainType === 6 || tg2TerrainType === 7 || tg2TerrainType === 9) && (
-              <div>
-                <div style={label}>SEA LEVEL</div>
+            {[2, 3, 4, 6, 7, 9].includes(tg2TerrainType) && (
+              <SettingBlock description="Raises or lowers oceans, rivers and lakes.">
                 <SliderRow label="Sea level" min={-12} max={24} value={tg2SeaLevel}
-                  onChange={setTg2SeaLevel} format={v => (v > 0 ? `+${v}` : String(v))}
-                  accent={ACCENTS.selection} width={280} labelWidth={70} />
-                <div style={{ color: MODAL_TEXT.secondary, fontSize: 11, marginTop: 4 }}>
-                  Raises or lowers oceans, rivers &amp; lakes (more or less flooding).
-                </div>
-              </div>
-            )}
-
-            {/* Biome blend (multi-zone types) */}
-            {(tg2TerrainType === 3 || tg2TerrainType === 7 || tg2TerrainType === 9) && (
-              <div style={{
-                border: `1px solid ${rgba(ACCENTS.warm, 0.3)}`, borderRadius: 6, padding: "10px 12px",
-                background: rgba(ACCENTS.warm, 0.06),
-              }}>
-                <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                  <Opt checked={tg2Blend} onChange={setTg2Blend} color={WARM_TEXT} bold>Blend biome seams</Opt>
-                  <span style={expBadge({ marginLeft: "auto", fontSize: 9 })}>exp</span>
-                </div>
-                <div style={{ color: MODAL_TEXT.label, fontSize: 11, marginTop: 6 }}>
-                  Builds gentle talus slopes between zones so they meet naturally
-                  instead of with hard cliffs at the borders.
-                </div>
-              </div>
+                  onChange={setTg2SeaLevel} format={v => (v > 0 ? `+${v}` : String(v))} {...SLIDER} />
+              </SettingBlock>
             )}
 
             {/* Structure frequency (Desert/Mix/Custom Mix) */}
-            {(tg2TerrainType === 4 || tg2TerrainType === 7 || tg2TerrainType === 9) && (
-              <div>
-                <div style={label}>STRUCTURE DENSITY</div>
-                <div style={{ display: "flex", gap: 4 }}>
-                  {["Sparse", "Normal", "Dense"].map((lbl, i) => (
-                    <button key={i} style={optBtn(tg2StructFreq === i, ACCENTS.warm)}
-                      onClick={() => setTg2StructFreq(i)}>{lbl}</button>
-                  ))}
-                </div>
-                <div style={{ color: MODAL_TEXT.secondary, fontSize: 11, marginTop: 4 }}>
-                  Controls pyramid and volcano frequency.
-                </div>
-              </div>
+            {[4, 7, 9].includes(tg2TerrainType) && (
+              <SettingBlock label="Structure density" description="Controls pyramid and volcano frequency.">
+                <Levels ariaLabel="Structure density" value={tg2StructFreq} onChange={setTg2StructFreq}
+                  labels={["Sparse", "Normal", "Dense"]} />
+              </SettingBlock>
             )}
 
-            {/* File size */}
-            <div style={{
-              background: "rgba(255,255,255,0.03)", border: `1px solid ${RAMP.mbtn1}`,
-              borderRadius: 6, padding: "7px 12px", fontSize: 12, color: MODAL_TEXT.label,
-              display: "flex", justifyContent: "space-between",
-            }}>
-              <span>{tg2NChunks} chunks · {tg2SizeChunks * 16}×{tg2SizeChunks * 16} blocks</span>
-              <span>~{tg2FileSizeMB} MB</span>
-            </div>
-
-            {tg2SizeWarning !== "none" && (
-              <div style={{
-                background: tg2SizeWarning === "heavy" ? rgba(DANGER_HEX, 0.08) : rgba(ACCENTS.warm, 0.08),
-                border: `1px solid ${tg2SizeWarning === "heavy" ? rgba(DANGER_HEX, 0.35) : rgba(ACCENTS.warm, 0.3)}`,
-                borderRadius: 6, padding: "8px 12px", fontSize: 11.5,
-                color: tg2SizeWarning === "heavy" ? RED_LIGHT : WARM_TEXT, lineHeight: 1.5,
-              }}>
-                {tg2SizeWarning === "heavy"
-                  ? `Very large world (~${tg2FileSizeMB} MB). Consider a smaller size.`
-                  : `Large world (~${tg2FileSizeMB} MB) — generation may take several seconds.`}
-              </div>
-            )}
-
+            <SectionHeading>Options</SectionHeading>
+            <SettingBlock last>
+              <Check checked={tg2SkyIslands} onChange={setTg2SkyIslands} label="Sky islands" />
+              <Check checked={tg2Clouds} onChange={setTg2Clouds} label="Clouds" />
+              {tg2TerrainType !== 8 && (
+                <Check checked={tg2Caves} onChange={v => { setTg2Caves(v); if (!v) setTg2TallCaves(false); }} label="Caves" />
+              )}
+              {tg2Caves && tg2TerrainType !== 8 && (
+                <Check checked={tg2TallCaves} onChange={setTg2TallCaves} label="Tall caves" />
+              )}
+              {/* Biome blend (multi-zone types) */}
+              {[3, 7, 9].includes(tg2TerrainType) && (
+                <Check checked={tg2Blend} onChange={setTg2Blend}
+                  label={<>Blend biome seams<Badge>exp</Badge></>}
+                  hint="Smooth slopes between zones instead of cliffs." />
+              )}
+            </SettingBlock>
           </>)}
 
-          {/* Info row (hidden for Tg2 — it shows its own, above) */}
-          {terrainType !== "tg2" && <div style={{
-            background: "rgba(255,255,255,0.03)", border: `1px solid ${RAMP.mbtn1}`,
-            borderRadius: 6, padding: "7px 12px", fontSize: 12, color: MODAL_TEXT.label,
-            display: "flex", justifyContent: "space-between",
-          }}>
-            <span>{nChunks} chunk{nChunks !== 1 ? "s" : ""} · {widthChunks * 16}×{heightChunks * 16} blocks</span>
-            <span>~{fileSizeMB} MB</span>
-          </div>}
-
-          {terrainType !== "tg2" && sizeWarning !== "none" && (
-            <div style={{
-              background: sizeWarning === "heavy" ? rgba(DANGER_HEX, 0.08) : rgba(ACCENTS.warm, 0.08),
-              border: `1px solid ${sizeWarning === "heavy" ? rgba(DANGER_HEX, 0.35) : rgba(ACCENTS.warm, 0.3)}`,
-              borderRadius: 6, padding: "8px 12px", fontSize: 11.5,
-              color: sizeWarning === "heavy" ? RED_LIGHT : WARM_TEXT, lineHeight: 1.5,
-            }}>
-              {sizeWarning === "heavy"
-                ? `Very large world (~${fileSizeMB} MB). Generation needs that much RAM at once and may take a while; the editor can also be slow to open it. Consider a smaller size or the 64z format.`
-                : `Large world (~${fileSizeMB} MB) — generation may take several seconds and use significant memory.`}
+          {warning !== "none" && (
+            <div style={{ marginTop: 12 }}>
+              <Callout tone={warning === "heavy" ? "danger" : "warn"}>
+                {isTg2
+                  ? (warning === "heavy"
+                    ? `Very large world (~${warnMB} MB). Consider a smaller size.`
+                    : `Large world (~${warnMB} MB). Generation may take several seconds.`)
+                  : (warning === "heavy"
+                    ? `Very large world (~${warnMB} MB). It needs that much RAM and can be slow to create and open. Try a smaller size or 64z.`
+                    : `Large world (~${warnMB} MB). Generation may take several seconds and use significant memory.`)}
+              </Callout>
             </div>
           )}
 
-          {error && <div style={{ color: RED_LIGHT, fontSize: 13 }}>{error}</div>}
+          {error && <div style={{ marginTop: 12 }}><Callout tone="danger">{error}</Callout></div>}
 
           {/* Generation progress */}
           {creating && progress && (
-            <div>
-              <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 5 }}>
-                <span style={{ color: AZURE_TEXT, fontSize: 12, fontWeight: 600 }}>{progress.phase}…</span>
-                <span style={{ color: MODAL_TEXT.label, fontSize: 12 }}>{Math.round(progress.pct)}%</span>
+            <div style={{ marginTop: 12 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 5, fontSize: FONT.label }}>
+                <span style={{ color: TEXT_DIM, fontWeight: 600 }}>{progress.phase}…</span>
+                <span style={{ color: TEXT_DIM }}>{Math.round(progress.pct)}%</span>
               </div>
-              <div style={{ height: 8, borderRadius: 4, background: RAMP.mbtn1, overflow: "hidden" }}>
+              <div style={{ height: 8, borderRadius: 4, background: SURFACE.well, overflow: "hidden" }}>
                 <div style={{
                   width: `${Math.max(2, Math.min(100, progress.pct))}%`, height: "100%",
-                  background: `linear-gradient(90deg, ${ACCENTS.warm}, ${WARM_TEXT})`, transition: "width 0.15s linear",
+                  background: ACCENT.primary, transition: "width 0.15s linear",
                 }} />
               </div>
             </div>
@@ -1029,7 +713,7 @@ export default function NewWorldModal({ onClose, onCreated }: Props) {
 
         </div>
 
-        {/* Preview column — fixed 300px: seed + 🎲 + Preview button + canvas, or (Flat, which has
+        {/* Preview column — fixed 300px: seed + dice + Preview button + canvas, or (Flat, which has
             neither seed nor a generated preview) its own layer-depth bar. */}
         <div style={{
           width: 300, flexShrink: 0, height: "100%", overflowY: "auto",
@@ -1038,103 +722,55 @@ export default function NewWorldModal({ onClose, onCreated }: Props) {
 
           {terrainType === "flat" && (
             <div>
-              <div style={label}>PREVIEW</div>
+              <SectionHeading first>Preview</SectionHeading>
               <div style={{ display: "flex", height: 14, borderRadius: 4, overflow: "hidden", gap: 1 }}>
                 <div style={{ width: `${pBed}%`,   background: blockSwatch(1) }} title="Bedrock" />
                 {stoneDepth > 0 && <div style={{ width: `${pStone}%`, background: blockSwatch(2) }} title="Stone" />}
                 {dirtDepth  > 0 && <div style={{ width: `${pDirt}%`,  background: blockSwatch(3) }} title="Dirt" />}
                 <div style={{ width: `${pGrass}%`, background: blockSwatch(8) }} title="Grass" />
-                <div style={{ width: `${pBuild}%`, background: "rgba(255,255,255,0.06)" }} title="Build space" />
+                <div style={{ width: `${pBuild}%`, background: SURFACE.well }} title="Build space" />
               </div>
-              <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, marginTop: 6 }}>
-                <span style={{ color: MODAL_TEXT.secondary }}>z=0 Bedrock</span>
-                <span style={{ color: flatValid ? ACCENTS.clipboard : RED_LIGHT }}>
-                  {flatValid
-                    ? `Surface z=${surfaceZ}`
-                    : `Exceeds max ${maxZ}`}
+              <div style={{ display: "flex", justifyContent: "space-between", fontSize: FONT.label, marginTop: 6 }}>
+                <span style={{ color: TEXT_DIM }}>z=0 Bedrock</span>
+                <span style={{ color: flatValid ? ACCENT.clipboard : TEXT_DANGER }}>
+                  {flatValid ? `Surface z=${surfaceZ}` : `Exceeds max ${maxZ}`}
                 </span>
               </div>
-              <div style={{ color: MODAL_TEXT.secondary, fontSize: 11, marginTop: 4 }}>
+              <div style={{ color: TEXT_DIM, fontSize: FONT.label, marginTop: 4 }}>
                 {flatValid
                   ? `${buildLayers} build layer${buildLayers !== 1 ? "s" : ""} above the surface.`
-                  : `Too deep — surface z=${surfaceZ} exceeds max ${maxZ}.`}
+                  : `Too deep: surface z=${surfaceZ} is above the max of ${maxZ}.`}
               </div>
             </div>
           )}
 
           {terrainType === "natural" && (<>
             <div>
-              <div style={label}>SEED</div>
-              <div style={{ display: "flex", gap: 6 }}>
-                <NumberField min={1} value={seed} style={{ ...inp, flex: 1 }}
-                  onChange={setSeed} aria-label="Seed" />
-                <button onClick={randomiseSeed} style={{ ...btnBase, background: rgba(ACCENTS.violet, 0.2), ...accentRing(ACCENTS.violet), color: VIOLET_TEXT, whiteSpace: "nowrap" }}>
-                  🎲
-                </button>
-              </div>
+              <SectionHeading first>Seed</SectionHeading>
+              <SeedRow value={seed} onChange={setSeed} onRandomise={randomiseSeed} />
             </div>
-            <div>
-              <button onClick={previewNatural} disabled={previewing} style={{
-                ...btnBase, width: "100%", fontWeight: 600,
-                background: previewing ? rgba(ACCENTS.violet, 0.25) : rgba(ACCENTS.violet, 0.2),
-                ...accentRing(ACCENTS.violet), color: VIOLET_TEXT,
-                cursor: previewing ? "wait" : "pointer",
-              }}>
-                {previewing ? "Rendering preview…" : preview ? "↻ Refresh preview" : "👁 Preview terrain"}
-              </button>
-              {preview && (
-                <div style={{ marginTop: 8 }}>
-                  <PreviewCanvas preview={preview} />
-                  <div style={{ color: MODAL_TEXT.secondary, fontSize: 10.5, textAlign: "center", marginTop: 4 }}>
-                    Top-down surface preview (heightmap &amp; biomes; trees/structures not shown).
-                  </div>
-                </div>
-              )}
-            </div>
+            <PreviewBlock busy={previewing} preview={preview} onPreview={previewNatural}
+              caption="Top-down preview (no trees or structures)." />
           </>)}
 
           {terrainType === "classic" && (
             <div>
-              <div style={label}>SEED</div>
-              <div style={{ display: "flex", gap: 6 }}>
-                <NumberField min={1} value={seed} style={{ ...inp, flex: 1 }}
-                  onChange={setSeed} aria-label="Seed" />
-                <button onClick={randomiseSeed} style={{ ...btnBase, background: rgba(ACCENTS.violet, 0.2), ...accentRing(ACCENTS.violet), color: VIOLET_TEXT, whiteSpace: "nowrap" }}>
-                  🎲
-                </button>
-              </div>
-              <div style={{ color: MODAL_TEXT.secondary, fontSize: 11, marginTop: 6, lineHeight: 1.5 }}>
-                Classic has no live preview — generate the world to see the result.
+              <SectionHeading first>Seed</SectionHeading>
+              <SeedRow value={seed} onChange={setSeed} onRandomise={randomiseSeed} />
+              <div style={{ color: TEXT_DIM, fontSize: FONT.label, marginTop: 6, lineHeight: 1.5 }}>
+                Classic has no preview.
               </div>
             </div>
           )}
 
           {terrainType === "tg2" && (<>
             <div>
-              <div style={label}>SEED</div>
-              <div style={{ display: "flex", gap: 6 }}>
-                <NumberField min={1} value={tg2Seed} style={{ ...inp, flex: 1 }}
-                  onChange={setTg2Seed} aria-label="Seed" />
-                <button onClick={() => setTg2Seed(Math.floor(Math.random() * 999_999) + 1)}
-                  style={{ ...btnBase, background: rgba(ACCENTS.warm, 0.2), ...accentRing(ACCENTS.warm), color: WARM_TEXT, whiteSpace: "nowrap" }}>
-                  🎲
-                </button>
-              </div>
+              <SectionHeading first>Seed</SectionHeading>
+              <SeedRow value={tg2Seed} onChange={setTg2Seed}
+                onRandomise={() => setTg2Seed(Math.floor(Math.random() * 999_999) + 1)} />
             </div>
-            <div>
-              <button onClick={previewTg2} disabled={tg2Previewing}
-                style={{ ...btnBase, background: rgba(ACCENTS.warm, 0.15), ...accentRing(ACCENTS.warm), color: WARM_TEXT, width: "100%" }}>
-                {tg2Previewing ? "Generating preview…" : "Preview Terrain"}
-              </button>
-              {tg2Preview && (
-                <div style={{ marginTop: 8 }}>
-                  <PreviewCanvas preview={tg2Preview} />
-                  <div style={{ color: MODAL_TEXT.secondary, fontSize: 11, marginTop: 4 }}>
-                    Top-down heightmap (reflects amplitude, sea level &amp; height format; structures, trees &amp; blend not shown).
-                  </div>
-                </div>
-              )}
-            </div>
+            <PreviewBlock busy={tg2Previewing} preview={tg2Preview} onPreview={previewTg2}
+              caption="Top-down heightmap (no structures, trees or blending)." />
           </>)}
 
         </div>

@@ -358,7 +358,7 @@ export default function PrefabLibraryPanel({
                   onMouseEnter={() => setHovered(entry.path)}
                   onMouseLeave={() => setHovered((h) => (h === entry.path ? null : h))}
                   onClick={() => { if (!isRenaming) handleClick(entry); }}
-                  title={isRenaming ? undefined : `${entry.width}×${entry.height}×${entry.depth} — click to paste`}
+                  title={isRenaming ? undefined : `${entry.width}×${entry.height}×${entry.depth}, click to paste`}
                   role="button"
                   style={{
                     display: "flex", alignItems: "center", gap: 4, borderRadius: 3, padding: "3px 6px",
@@ -389,7 +389,7 @@ export default function PrefabLibraryPanel({
                 key={entry.path}
                 onMouseEnter={() => setHovered(entry.path)}
                 onMouseLeave={() => setHovered((h) => (h === entry.path ? null : h))}
-                title={`${entry.name} — ${entry.width}×${entry.height}×${entry.depth}`}
+                title={`${entry.name}: ${entry.width}×${entry.height}×${entry.depth}`}
                 style={{ position: "relative", display: "flex", flexDirection: "column", gap: 3, cursor: "pointer" }}
                 onClick={() => { if (renaming !== entry.path) handleClick(entry); }}
               >

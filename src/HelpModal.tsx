@@ -105,44 +105,37 @@ function GettingStartedHelp() {
 
       <div style={sectionHead}>Ribbon tabs</div>
       <p style={{ margin: "4px 0 10px" }}>
-        Five permanent tabs run across the top — <b style={strong}>Home</b>, <b style={strong}>Draw</b>,{" "}
-        <b style={strong}>Sculpt</b>, <b style={strong}>Insert</b> and <b style={strong}>View</b> —
-        grouping every tool and setting by what you're doing. Three more appear only when they're
-        relevant: <b style={strong}>3D</b> while the 3D pane is open, <b style={strong}>Selection</b>{" "}
-        once you have one, and <b style={strong}>Clipboard</b> once you've copied something. Picking
-        up a tool switches to its tab for you.
+        Five tabs hold every tool: <b style={strong}>Home</b>, <b style={strong}>Draw</b>,{" "}
+        <b style={strong}>Sculpt</b>, <b style={strong}>Insert</b> and <b style={strong}>View</b>.{" "}
+        <b style={strong}>3D</b> appears while the 3D view is open, <b style={strong}>Selection</b>{" "}
+        when you have a selection, and <b style={strong}>Clipboard</b> once you've copied something.
+        Arming a tool switches to its tab.
       </p>
 
       <div style={sectionHead}>Floating windows</div>
       <p style={{ margin: "4px 0 10px" }}>
-        The map isn't the only pane — <b style={strong}>Tools</b> (<Key>{ALT}T</Key>),{" "}
-        <b style={strong}>3D view</b> (<Key>{ALT}3</Key>), <b style={strong}>Hotbar</b>{" "}
-        (<Key>{ALT}H</Key>) and the paste <b style={strong}>Lens</b> (<Key>{ALT}P</Key>) are all
-        floating windows you can drag by their title bar, resize from the corner, dock to an edge, or
-        hide entirely. Each world remembers its own layout. <Key>Tab</Key> swaps focus between the
-        map and the 3D view whenever one of them has it.
+        <b style={strong}>Tools</b> (<Key>{ALT}T</Key>), <b style={strong}>3D view</b> (<Key>{ALT}3</Key>),{" "}
+        <b style={strong}>Hotbar</b> (<Key>{ALT}H</Key>) and the paste <b style={strong}>Lens</b>{" "}
+        (<Key>{ALT}P</Key>) are floating windows. Drag a title bar to move one, or a corner to resize
+        it. Each world keeps its own layout. <Key>Tab</Key> swaps the map and the 3D view.
       </p>
 
       <div style={sectionHead}>Mode panels</div>
       <p style={{ margin: "4px 0 10px" }}>
-        A few modes open a small panel of their own while they're active: the{" "}
-        <b style={strong}>brush shape</b> while a sculpt tool is armed, the level slider for{" "}
-        <b style={strong}>Z-slice</b> and <b style={strong}>Cutaway</b>, and the build slot in the 3D
-        view. They can't be toggled from View ▸ Windows — closing one with its ✕ leaves the mode.
+        Some modes open a small panel: the <b style={strong}>brush shape</b> for sculpt tools, the
+        level for <b style={strong}>Z-slice</b> and <b style={strong}>Cutaway</b>, and the build slot
+        in 3D. Close the panel to leave the mode.
       </p>
 
       <div style={sectionHead}>Relief shading</div>
       <p style={{ margin: "4px 0 10px" }}>
-        View ▸ Render ▸ <b style={strong}>Relief</b> shades the top-down map's slopes as if lit from
-        the north-west, so hills, cliffs and valleys read at a glance. It's a display effect only —
-        PNG export, Z-slice and the paste lens stay unshaded.
+        View ▸ Render ▸ <b style={strong}>Relief</b> shades slopes so hills and cliffs stand out. It
+        only changes the map display, not PNG export.
       </p>
 
       <div style={sectionHead}>Command search</div>
       <p style={{ margin: "4px 0 10px" }}>
-        <Key>{MOD}K</Key> opens a search box over every command in the app — type a few letters of
-        what you're after (a tool, a setting, a menu item), arrow keys or the mouse to pick a result,
-        Enter to run it, or <Key>Tab</Key> to jump to it in the ribbon instead of running it.
+        <Key>{MOD}K</Key> searches every command. Enter runs it, <Key>Tab</Key> shows it in the ribbon.
       </p>
     </div>
   );
@@ -163,33 +156,27 @@ function TexturePackHelp() {
           names below (may also bundle <code>atlas.png</code> / <code>atlas2.png</code>).
         </li>
         <li>
-          A game-style <b style={strong}>atlas image</b> (<code>atlas.png</code>) —
+          A game-style <b style={strong}>atlas image</b> (<code>atlas.png</code>):
           a vertical strip of square tiles in the original block-texture order. Load it directly.
         </li>
       </ul>
       <p style={{ margin: "4px 0 10px" }}>
-        Any size is accepted — tiles are resized to <b style={strong}>32×32</b>{" "}
-        internally (nearest-neighbour). Partial packs are fine: any missing tile falls back to the
+        Tiles can be any size and are scaled to <b style={strong}>32×32</b>. Missing tiles use the
         flat block colour.
       </p>
 
       {/* Loading */}
       <div style={sectionHead}>Loading</div>
       <p style={{ margin: "4px 0 10px" }}>
-        <b style={strong}>View tab → Load Texture Pack…</b> — or set a default path
-        in <b style={strong}>Settings</b> so it loads automatically on startup.
-        Textures appear in the 3D fly-through, 3D selection preview, and block-picker swatches.
+        Load a pack from <b style={strong}>View ▸ Load Texture Pack…</b>, or set a default in{" "}
+        <b style={strong}>Settings ▸ Files</b>. Textures show in the 3D view and the block picker.
       </p>
 
       {/* Tinting */}
       <div style={sectionHead}>Colour tinting</div>
       <p style={{ margin: "4px 0 10px" }}>
-        <b style={strong}>Unpainted</b> blocks show your tile in full colour, as
-        authored. <b style={strong}>Painted</b> blocks are modulated against a
-        brightness-normalized greyscale of the tile, so the paint colour reads cleanly instead of
-        double-tinting the tile's own colour — matching how the original game pairs each block's
-        full-colour and greyscale textures. Author tiles in full colour and both cases are handled
-        automatically.
+        <b style={strong}>Unpainted</b> blocks show the tile as drawn. <b style={strong}>Painted</b>{" "}
+        blocks tint a greyscale copy of the tile, as the game does. Draw tiles in full colour.
       </p>
 
       {/* Tile names */}
@@ -235,28 +222,26 @@ function ToolsHelp() {
       {/* Sculpt */}
       <div style={sectionHead}>Terrain sculpt</div>
       <p style={{ margin: "4px 0 10px" }}>
-        Axiom-style heightmap sculpting, armed from the Sculpt tools group. Click-drag over terrain
-        to apply the active mode within a brush radius. <b style={strong}>Live brush</b>{" "}
-        (on by default) deforms the terrain live as you drag and builds up on dwell like an airbrush;
-        press <Key>Esc</Key> mid-stroke to revert the whole stroke. Turn Live brush off for the legacy
-        one-shot behaviour — the swept stroke commits as a single uniform shape when you release.
+        Arm a tool from Sculpt ▸ Tools and drag over terrain. With <b style={strong}>Live brush</b> on
+        (the default), terrain changes as you drag, and <Key>Esc</Key> mid-stroke reverts it. With it
+        off, the stroke applies on release.
       </p>
       <table style={{ borderCollapse: "collapse", fontSize: 12, marginTop: 4, marginBottom: 10 }}>
         <tbody>
           {[
-            ["Raise / Lower", "Push or pull terrain up/down by Strength"],
-            ["Grab", "Drag vertically to pull a whole dome of terrain up or down"],
-            ["Smooth", "Averages each column against its neighbours — flattens bumps"],
-            ["Flatten", "Levels everything in the brush to the height where you clicked"],
-            ["Slope", "Flatten tilted to a plane through the clicked anchor (Slope X/Y % grade, in the Falloff group)"],
-            ["Terrace", "Quantizes height into Strength-block steps — plateaus and stairs"],
-            ["Smear", "Drag to pull terrain along with the brush, like wet paint"],
-            ["Sharpen", "Unsharp mask — crisps terrain away from its local average, the inverse of Smooth"],
-            ["Noise", "Adds coherent hills or ridged mountains (Hills/Mtns + feature size)"],
-            ["Erode / Thermal / Hydro", "Progressively rougher erosion — talus slides, then simulated water flow"],
-            ["Stamp / Retexture", "Repaints the surface by steepness (flat→grass, mid→dirt, steep→stone) without changing height"],
-            ["Rock", "Stamps a volumetric rock mass fused into the terrain with a smooth fillet (not a heightmap offset) — ignores Strength/Softness, has its own Rock options group"],
-            ["Carve", "Rock's inverse — cuts a filleted depression, deleting only sky-connected material so it can't open a floating roof or a sealed cave — ignores Strength/Softness"],
+            ["Raise / Lower", "Push terrain up or down by Strength"],
+            ["Grab", "Drag up or down to pull a dome of terrain"],
+            ["Smooth", "Evens out bumps"],
+            ["Flatten", "Levels terrain to the height you click"],
+            ["Slope", "Flatten tilted to a plane through the clicked anchor (Slope X/Y in the Brush shape panel)"],
+            ["Terrace", "Steps terrain into Strength-high terraces"],
+            ["Smear", "Pulls terrain along with the brush"],
+            ["Sharpen", "Crisps terrain (opposite of Smooth)"],
+            ["Noise", "Adds hills or ridged mountains"],
+            ["Erode / Thermal / Hydro", "Erosion from gentle to strong: slides, then water flow"],
+            ["Retexture", "Repaints by slope (flat: grass, mid: dirt, steep: stone) without changing height"],
+            ["Rock", "Places a rock mass fused into the terrain. Tune it in the Rock shape panel."],
+            ["Carve", "Cuts a rounded hollow. It only removes exposed terrain, so it never opens a cave roof. Tune it in the Carve shape panel."],
           ].map(([mode, desc]) => (
             <tr key={mode}>
               <td style={{ padding: "3px 16px 3px 0", color: MODAL_TEXT.primary, whiteSpace: "nowrap", verticalAlign: "top" }}>{mode}</td>
@@ -266,36 +251,31 @@ function ToolsHelp() {
         </tbody>
       </table>
       <p style={{ margin: "4px 0 10px" }}>
-        <b style={strong}>Softness</b> blends the effect out toward the edge of the
-        brush instead of a hard cutoff — 0 is a flat hard edge, higher values dome the falloff
-        (Profile picks the dome shape). <b style={strong}>In-selection</b> clips the
-        stroke to the current selection, if any.
+        <b style={strong}>Softness</b> fades the effect toward the brush edge: 0 is a hard edge, higher
+        is a softer dome (Profile sets its shape). <b style={strong}>In selection</b> keeps strokes
+        inside the selection.
       </p>
 
       {/* Gradient fill */}
       <div style={sectionHead}>Gradient fill</div>
       <p style={{ margin: "4px 0 10px" }}>
-        In the Selection tab: blends the Fill block into a second block across the selection,
-        dithered so the transition doesn't band. Pick the second block via the swatch next to
-        "Gradient to…". <b style={strong}>Axis</b> chooses which direction the blend
-        runs — X/Y for a horizontal gradient across the map, Z for a vertical one (e.g. cliff
-        striations, floor-to-ceiling shading). Only re-skins blocks that already exist unless
-        "include air" is on.
+        In the Selection tab, Gradient blends the Write block into the Fade block across the
+        selection, dithered to avoid bands. <b style={strong}>Axis</b> sets the direction: X or Y
+        across the map, Z by height. Only existing blocks change unless <b style={strong}>+Air</b> is on.
       </p>
 
       {/* 3D pane */}
-      <div style={sectionHead}>3D pane — camera & build</div>
+      <div style={sectionHead}>3D view: camera and build</div>
       <p style={{ margin: "4px 0 10px" }}>
-        A floating window over the map — View ▸ Windows ▸ 3D view (<Key>{ALT}3</Key>). Swap it with
-        the map using ⇄ in its title bar or <Key>Tab</Key> (with focus on the map). The camera pill (top-left of the pane, or press{" "}
-        <Key>Z</Key>) cycles three modes:
+        Open it from View ▸ Windows ▸ 3D View (<Key>{ALT}3</Key>), and swap it with the map using ⇄ or{" "}
+        <Key>Tab</Key>. Click the camera pill (top left) or press <Key>Z</Key> to change mode:
       </p>
       <table style={{ borderCollapse: "collapse", fontSize: 12, marginTop: 4, marginBottom: 10 }}>
         <tbody>
           {[
-            ["Orbit", "Drag to rotate around a point, scroll to zoom — inspection mode"],
-            ["Mouselook", "WASD to walk, mouse freely aims (cursor hidden/locked); Esc or Z to exit"],
-            ["Fly", "WASD to walk, left-drag to look around; cursor stays visible"],
+            ["Orbit", "Drag to rotate, scroll to zoom"],
+            ["Look", "WASD to move, the mouse to look. Esc or Z exits."],
+            ["Fly", "WASD to move, left-drag to look"],
           ].map(([mode, desc]) => (
             <tr key={mode}>
               <td style={{ padding: "3px 16px 3px 0", color: MODAL_TEXT.primary, whiteSpace: "nowrap", verticalAlign: "top" }}>{mode}</td>
@@ -305,32 +285,21 @@ function ToolsHelp() {
         </tbody>
       </table>
       <p style={{ margin: "4px 0 10px" }}>
-        <b style={strong}>Build mode</b> (3D tab → Camera/Select/Build) arms the same
-        block as the map's fill block/hotbar — set it from either place and it stays in sync,
-        including the <Key>1</Key>–<Key>0</Key> digit keys and an in-pane hotbar strip while
-        building. While in Build, <b style={strong}>left-click breaks</b> the block
-        you're aiming at and <b style={strong}>right-click places</b> the armed block
-        against that face — the same convention as most block-building games. Holding either button
-        down repeats break/place at the crosshair every ~220ms instead of single clicks (release, or
-        drag past a few pixels, to stop). <b style={strong}>Middle-click</b> picks the
-        block under the cursor as the new armed block, mirroring the map's eyedropper. Ramps, wedges,
-        and doors auto-orient to face you as you place them (the pane's own <Key>…</Key> options
-        disclosure has an Auto-orient toggle that turns this off, to use the picker's manual
-        Dir/Apex buttons instead). Two highlight
-        boxes show which block each click acts on. <b style={strong}>Select mode</b>{" "}
-        lets you click two corners to make a 3D box selection, same as dragging one on the map.
+        <b style={strong}>Build mode</b> (3D tab): left-click breaks the block you aim at, right-click
+        places the active block on that face. Drag to break or place a row. Middle-click picks a
+        block. Ramps, wedges and doors face you when placed (turn this off with Auto-orient in the
+        pane's <Key>…</Key> menu). <b style={strong}>Select mode</b>: click two corners to make a 3D
+        selection.
       </p>
       <p style={{ margin: "4px 0 10px" }}>
-        <b style={strong}>Sculpt mode</b> (3D tab → Camera/Select/Build/Sculpt) sculpts
-        terrain right in the 3D view with the same brush and tool settings as the 2D map's Sculpt
-        group — press and hold left to stroke; an amber disc shows the brush radius at the picked
-        surface. In Orbit, left-drag rotate is disabled while armed so it doesn't fight the stroke;
-        in Fly mode drag-to-look is unavailable for the same reason — use Mouselook or WASD instead.
-        Grab (drag vertically to raise/lower) has no hold-timer: it commits once on release.
+        <b style={strong}>Sculpt mode</b>: hold left to sculpt with the current Sculpt tool and brush.
+        An amber disc shows the brush. Drag-to-look is off while sculpting, so use Look mode or WASD.
+        Grab applies on release.
       </p>
       <p style={{ margin: "4px 0 10px" }}>
-        <b style={strong}>Night Lighting / Shadows / GPU Shadows</b> (3D tab → Lighting)
-        are experimental and perf-heavy (⚡-badged) — they reset off every time you load a world.
+        <b style={strong}>Night Lighting</b>, <b style={strong}>Shadows</b> and{" "}
+        <b style={strong}>GPU Shadows</b> (3D tab ▸ Lighting) are slow and experimental. They turn off
+        whenever you load a world.
       </p>
     </div>
   );
@@ -363,10 +332,10 @@ export default function HelpModal({ onClose, onStartTour }: { onClose: () => voi
           footer={onStartTour && (
             <DialogButton
               onClick={() => { onStartTour(); onClose(); }}
-              title="Replay the guided tour of the app's main surfaces"
+              title="Replay the guided tour"
               style={{ width: "100%", height: "auto", whiteSpace: "normal", lineHeight: 1.3, padding: "6px 8px" }}
             >
-              Take the guided tour
+              Guided tour
             </DialogButton>
           )}
         />

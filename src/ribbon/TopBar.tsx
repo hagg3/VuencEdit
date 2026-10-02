@@ -97,7 +97,7 @@ export default function TopBar({
           while the menu is open. Not `.rbn-btn`; see `.rbn-brand` in RIBBON_CSS. */}
       <button
         className="rbn-brand" type="button" onClick={onToggleMenu}
-        title="VuencEdit — application menu: New, Open, Save, Export, Settings…"
+        title="Application menu"
         aria-haspopup="menu" aria-expanded={menuOpen} aria-label="VuencEdit application menu"
         style={{
           display: "flex", alignItems: "center", gap: 7, padding: "0 12px 0 9px",
@@ -297,7 +297,7 @@ function Tab({
       // because React only replays the CSS animation on mount, not on every re-render.
       className={`rbn-tab${flash ? " rbn-flash" : ""}${contextual ? " vx-ctx-tab-enter" : ""}`}
       aria-controls="ribbon-tabpanel" tabIndex={selected ? 0 : -1}
-      title={contextual ? `${label} — contextual tab` : `${label} (double-click to collapse/expand the ribbon)`}
+      title={contextual ? `${label} (contextual tab)` : `${label} (double-click to collapse/expand the ribbon)`}
       onClick={() => {
         if (!selected) sfx.play("tab");
         setActiveTab(id);

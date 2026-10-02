@@ -116,18 +116,15 @@ export default function MaterializeModal({ world, bounds, onClose, onMaterialize
       {!running && result === null && (
         <>
           <div style={{ fontSize: 12, color: MODAL_TEXT.secondary, marginBottom: 14, lineHeight: 1.5 }}>
-            Writes {nChunks.toLocaleString()} ungenerated chunk{nChunks === 1 ? "" : "s"} as real flat
-            terrain{beyond ? " (this selection extends beyond the current map edge)" : ""}, to a
-            <strong style={{ color: MODAL_TEXT.primary }}> new output file</strong>. This is non-undoable and
-            cannot edit the currently open world in place.
+            Writes {nChunks.toLocaleString()} empty chunk{nChunks === 1 ? "" : "s"} as flat terrain to a
+            <strong style={{ color: MODAL_TEXT.primary }}> new file</strong>{beyond ? ", growing the map" : ""}. This can't be undone.
           </div>
           <div style={{
             fontSize: 12, color: RED_LIGHT, background: "rgba(220,38,38,0.12)",
             border: "1px solid rgba(220,38,38,0.35)", borderRadius: 6, padding: "8px 10px", marginBottom: 16, lineHeight: 1.5,
           }}>
-            Completing this will <strong>replace the currently open world</strong> with the new file —
-            save any unsaved work first. Write time scales with the world size and the number of
-            chunks selected, so this may take a while on a large selection.
+            This <strong>replaces the open world</strong> with the new file, so save your work first.
+            Large selections take a while.
           </div>
 
           <div style={{ display: "flex", flexDirection: "column", gap: 10, marginBottom: 16 }}>
@@ -146,16 +143,14 @@ export default function MaterializeModal({ world, bounds, onClose, onMaterialize
                 {dirtDepth > 0 && ` · dirt z${1 + stoneDepth}–${surfaceZ - 1}`}
                 {" · grass surface at "}
                 <span style={{ color: MODAL_TEXT.secondary }}>z{surfaceZ}</span>
-                {stoneDepth === 15 && dirtDepth === 16 && " — matches the game's own flat terrain"}
+                {stoneDepth === 15 && dirtDepth === 16 && " (matches the game's flat terrain)"}
               </div>
             )}
           </div>
 
           {tooLarge && (
             <div style={{ fontSize: 12, color: RED_LIGHT, marginBottom: 12 }}>
-              Selection too large: {nChunks.toLocaleString()} chunks exceeds the{" "}
-              {MAX_MATERIALIZE_CHUNKS.toLocaleString()}-chunk limit for one materialize operation.
-              Narrow the selection and try again.
+              Selection too large: {nChunks.toLocaleString()} chunks (limit {MAX_MATERIALIZE_CHUNKS.toLocaleString()}).
             </div>
           )}
           {depthTooLarge && (
@@ -174,8 +169,8 @@ export default function MaterializeModal({ world, bounds, onClose, onMaterialize
             }}>
               Map grows from {world.width_chunks}×{world.height_chunks} to {newWChunks}×{newHChunks} chunks
               ({(newWChunks * 16).toLocaleString()}×{(newHChunks * 16).toLocaleString()} blocks).
-              {bboxBlowup && " That's mostly empty space — the 2D map will zoom right out and tiles" +
-                " will load slowly. Consider a selection closer to the existing map."}
+              {bboxBlowup && " That's mostly empty space, so the map will zoom far out and load slowly." +
+                " Try a selection closer to the map."}
             </div>
           )}
         </>
@@ -198,7 +193,7 @@ export default function MaterializeModal({ world, bounds, onClose, onMaterialize
 
       {result !== null && !running && (
         <div style={{ fontSize: 13, color: GREEN_TEXT, marginTop: 12 }}>
-          Done — {result.chunksAdded.toLocaleString()} chunks added ({result.totalChunks.toLocaleString()} total).
+          Done: {result.chunksAdded.toLocaleString()} chunks added ({result.totalChunks.toLocaleString()} total).
           Reloading…
         </div>
       )}

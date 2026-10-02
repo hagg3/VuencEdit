@@ -127,7 +127,7 @@ export default function Dialog({
           <span style={{ flex: 1, minWidth: 0 }} />
           <button
             type="button" className="vx-dlg-x" onClick={onClose} disabled={busy}
-            aria-label={`Close ${title}`} title={busy ? "Busy — please wait" : `Close ${title}`}
+            aria-label={`Close ${title}`} title={busy ? "Working…" : `Close ${title}`}
           >
             <Icon name="close" size={ICON.xs} tone="inherit" />
           </button>

@@ -11,8 +11,8 @@
  *
  * What it doesn't:
  * - **Not in View ▸ Windows, no ⌥ shortcut** — there's nothing to toggle; the mode is the toggle.
- *   The one exception is the paste lens (`userToggle`), whose session-only "enabled" flag predates
- *   the framework (16.1) and stays user-owned: shown = `when && enabled`.
+ *   The one exception is the Lens (`userToggle`), whose session-only "enabled" flags predate the
+ *   framework (16.1) and stay user-owned: one per mode (20.4), shown = `when && enabled`.
  * - **Never shown without a world.** Every predicate is ANDed with `worldLoaded` here, so a panel
  *   can't pop over the splash even if its mode state outlives the world (e.g. a sticky view mode).
  * - **Stacking.** Panels start top-left under the ribbon; several active at once stack downward
@@ -28,8 +28,8 @@ import {
 export type ResizeAxes = "both" | "x" | "y" | "none";
 
 export interface ContextPanelDef {
-  /** A user-owned "enabled" toggle, listed in View ▸ Windows with its ⌥ shortcut. The paste lens
-   *  only — the documented exception. Every other context panel simply follows its mode. */
+  /** A user-owned "enabled" toggle, listed in View ▸ Windows with its ⌥ shortcut. The Lens only —
+   *  the documented exception. Every other context panel simply follows its mode. */
   userToggle: boolean;
   resize: ResizeAxes;
   /** Play the `menu` cue when the panel appears/disappears (16.6: "don't invent a new one"). The lens
@@ -61,11 +61,13 @@ export function contextIds(): WinId[] {
   return (Object.keys(CONTEXT_PANELS) as WinId[]).filter(id => WIN_IDS.includes(id));
 }
 
-/** The render gate. `open` is the stored `wins[id].open` — only consulted for a `userToggle` panel. */
-export function contextPanelShown(id: WinId, s: { when: boolean; worldLoaded: boolean; open: boolean }): boolean {
+/** The render gate. `open` is the stored `wins[id].open` — only consulted for a `userToggle` panel,
+ *  and `enabled` overrides it when given (20.4: the Lens has one flag per mode, and only the paste
+ *  one is `wins.lens.open`). */
+export function contextPanelShown(id: WinId, s: { when: boolean; worldLoaded: boolean; open: boolean; enabled?: boolean }): boolean {
   const def = CONTEXT_PANELS[id];
   if (!def || !s.worldLoaded || !s.when) return false;
-  return def.userToggle ? s.open : true;
+  return def.userToggle ? (s.enabled ?? s.open) : true;
 }
 
 export function resizeDirsFor(axes: ResizeAxes): readonly ResizeDir[] {

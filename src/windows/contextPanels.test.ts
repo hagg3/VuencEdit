@@ -62,6 +62,14 @@ describe("contextPanelShown (the when-predicate gate)", () => {
     expect(contextPanelShown("lens", { when: true, worldLoaded: true, open: false })).toBe(false);
     expect(contextPanelShown("lens", { when: false, worldLoaded: true, open: true })).toBe(false);
   });
+  it("`enabled` overrides the stored open bit for a userToggle panel only (20.4)", () => {
+    registerFakes();
+    expect(contextPanelShown("lens", { when: true, worldLoaded: true, open: false, enabled: true })).toBe(true);
+    expect(contextPanelShown("lens", { when: true, worldLoaded: true, open: true, enabled: false })).toBe(false);
+    expect(contextPanelShown("lens", { when: false, worldLoaded: true, open: true, enabled: true })).toBe(false);
+    expect(contextPanelShown("lens", { when: true, worldLoaded: false, open: true, enabled: true })).toBe(false);
+    expect(contextPanelShown("tools", { when: true, worldLoaded: true, open: true, enabled: false })).toBe(true);
+  });
   it("never shows with no world loaded, whatever the mode says", () => {
     registerFakes();
     for (const id of contextIds())

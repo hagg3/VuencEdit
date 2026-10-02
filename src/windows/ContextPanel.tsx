@@ -18,16 +18,19 @@ export interface ContextPanelProps extends Omit<FloatingWindowProps, "onClose" |
   worldLoaded: boolean;
   /** ✕ = leave the mode. Omit for a panel that has no ✕ and just follows its mode. */
   onExit?: () => void;
+  /** `userToggle` panels: overrides the stored `wins[id].open` as the user's on/off (the Lens's
+   *  per-mode flags, 20.4). */
+  enabled?: boolean;
   /** The panel's live content size (16.6, `PANEL_SIZES`): pins its rendered size for as long as it's
    *  shown, so a panel whose content changes with the mode (Noise vs Rock) grows/shrinks with it. */
   contentSize?: Size;
 }
 
-export default function ContextPanel({ when, worldLoaded, onExit, contentSize, ...win }: ContextPanelProps) {
+export default function ContextPanel({ when, worldLoaded, onExit, enabled, contentSize, ...win }: ContextPanelProps) {
   const { id } = win;
   const def = CONTEXT_PANELS[id];
   const layout = useWindowLayout();
-  const shown = def != null && contextPanelShown(id, { when, worldLoaded, open: layout.wins[id].open });
+  const shown = def != null && contextPanelShown(id, { when, worldLoaded, open: layout.wins[id].open, enabled });
   // Registered *during render*, not in an effect: `FloatingWindow` (a child) reads `winLimits` in the
   // same pass, and an effect would let it paint one frame at the previous variant's size. The write
   // is to module state and idempotent, so StrictMode's double render is harmless.
@@ -56,6 +59,7 @@ export default function ContextPanel({ when, worldLoaded, onExit, contentSize, .
       resizeDirs={resizeDirsFor(def.resize)}
       closable={onExit != null}
       onClose={onExit}
+      open
     />
   );
 }

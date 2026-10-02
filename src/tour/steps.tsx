@@ -9,7 +9,7 @@ import type { SidebarTab } from "../Sidebar";
 import { MOD, SHIFT, TEXT } from "../ribbon/tokens";
 
 // ⚠ written by bump-version.sh — keep this on one line
-export const TOUR_VERSION = 3;
+export const TOUR_VERSION = 4;
 
 export interface TourCtx {
   setRibbonTab: (t: RibbonTab) => void;
@@ -85,8 +85,7 @@ export const TOUR_STEPS: TourStep[] = [
     target: null,
     body: (
       <>
-        A quick tour of the main surfaces — about a minute. Press <Kbd>Esc</Kbd> to skip
-        at any point; you can replay this any time from the Help window.
+        A one-minute tour of the app. Press <Kbd>Esc</Kbd> to skip. You can replay it from Help.
       </>
     ),
   },
@@ -108,8 +107,8 @@ export const TOUR_STEPS: TourStep[] = [
     before: (c) => c.setRibbonCollapsed(false),
     body: (
       <>
-        Five permanent tabs — Home, Draw, Sculpt, Insert, View. 3D, Selection and Clipboard appear
-        only when they apply.
+        Five main tabs: Home, Draw, Sculpt, Insert and View. The 3D, Selection and Clipboard tabs
+        appear when needed.
       </>
     ),
   },
@@ -124,7 +123,7 @@ export const TOUR_STEPS: TourStep[] = [
     title: "The Tools window",
     target: TOUR_ANCHORS.toolsWindow,
     before: (c) => c.openToolsWindow(),
-    body: "Everyday draw and select tools, one click away — each with its own one-key shortcut. Drag its title bar to move it; hold a button for its variants.",
+    body: "Common draw and select tools, each with a one-key shortcut. Hold a button for its variants.",
   },
   {
     id: "block",
@@ -132,7 +131,7 @@ export const TOUR_STEPS: TourStep[] = [
     target: TOUR_ANCHORS.blockGroup,
     secondaryTargets: [RIBBON_TABLIST],
     before: (c) => c.setRibbonTab("home"),
-    body: "The block and paint you're currently placing. Click it to browse every block & paint.",
+    body: "The block and paint you're placing. Click it to choose another.",
   },
   {
     id: "hotbar",
@@ -141,9 +140,8 @@ export const TOUR_STEPS: TourStep[] = [
     before: (c) => c.openHotbarWindow(),
     body: (
       <>
-        Pinned blocks and recently used ones, always one keystroke away: <Kbd>1</Kbd>–<Kbd>5</Kbd> arm
-        pinned slots, <Kbd>6</Kbd>–<Kbd>0</Kbd> jump to recent ones. Hover a slot to pin or unpin it,
-        or click ▣ to open the full picker from here.
+        Pinned and recent blocks. <Kbd>1</Kbd>–<Kbd>5</Kbd> pick pinned slots, <Kbd>6</Kbd>–<Kbd>0</Kbd>{" "}
+        recent ones. Hover a slot to pin it, or click ▣ for the full picker.
       </>
     ),
   },
@@ -155,8 +153,7 @@ export const TOUR_STEPS: TourStep[] = [
     before: (c) => c.setRibbonTab("draw"),
     body: (
       <>
-        Pen, brush, line, rectangle, ellipse, polygon — with brush size and a block mask for
-        selective replacement.
+        Pen, brush, line and shape tools. The mask limits drawing to matching blocks.
       </>
     ),
   },
@@ -182,9 +179,8 @@ export const TOUR_STEPS: TourStep[] = [
     before: (c) => c.setRibbonTab("home"),
     body: (
       <>
-        Rectangle <Kbd>S</Kbd>, magic wand <Kbd>W</Kbd> and lasso <Kbd>K</Kbd> make real shapes,
-        not just bounding boxes. Once you have a selection, a Selection tab, a Clipboard tab and a
-        floating Quick Actions bar all appear.
+        Rectangle <Kbd>S</Kbd>, magic wand <Kbd>W</Kbd> and lasso <Kbd>K</Kbd> select areas.
+        A selection opens the Selection tab and the Quick Actions bar.
       </>
     ),
   },
@@ -194,7 +190,7 @@ export const TOUR_STEPS: TourStep[] = [
     target: TOUR_ANCHORS.layoutGroup,
     secondaryTargets: [RIBBON_TABLIST, TOUR_ANCHORS.map],
     before: (c) => c.setRibbonTab("view"),
-    body: "The 3D view floats over the map as a window — swap them with Tab or ⇄ — plus which floating windows are shown. The Render group's Relief shades the map's slopes so hills and cliffs read at a glance.",
+    body: "Swap the map and the 3D view (Tab or ⇄) and choose which windows show. Render ▸ Relief shades slopes.",
   },
   {
     id: "context-panels",
@@ -202,9 +198,8 @@ export const TOUR_STEPS: TourStep[] = [
     target: null,
     body: (
       <>
-        Some modes bring a small panel of their own — the brush shape while sculpting, the level
-        while in Z-slice or Cutaway, the build slot in the 3D view. It appears with the mode and
-        its ✕ leaves the mode, so there's nothing to hunt for in the ribbon.
+        Some modes open their own small panel, like the brush shape while sculpting. Its ✕ leaves
+        the mode.
       </>
     ),
   },
@@ -221,8 +216,8 @@ export const TOUR_STEPS: TourStep[] = [
     target: TOUR_ANCHORS.undo,
     body: (
       <>
-        <Kbd>{MOD}Z</Kbd> / <Kbd>{MOD}{SHIFT}Z</Kbd> undo and redo — also listed in the sidebar's
-        History tab. <Kbd>{MOD}S</Kbd> saves, and an autosave runs quietly in the background.
+        <Kbd>{MOD}Z</Kbd> / <Kbd>{MOD}{SHIFT}Z</Kbd> undo and redo, also listed in the sidebar's
+        History tab. <Kbd>{MOD}S</Kbd> saves, and autosave runs in the background.
       </>
     ),
   },
@@ -230,6 +225,6 @@ export const TOUR_STEPS: TourStep[] = [
     id: "help",
     title: "Help",
     target: TOUR_ANCHORS.help,
-    body: "The full keyboard map and tool reference live here — and you can replay this tour any time from this button.",
+    body: "Shortcuts and tool guides. You can replay this tour from here.",
   },
 ];

@@ -49,7 +49,7 @@ export default function WorldNamePill() {
     <div ref={wrapRef} data-tour="world-pill" style={{ position: "relative", display: "flex", alignItems: "center", marginRight: 4 }}>
       <button
         className="rbn-btn" type="button" onClick={() => setOpen(v => !v)}
-        title={`${w.name} — ${formatLabel}, ${w.width_chunks}×${w.height_chunks} chunks. Click for world details and rename.`}
+        title={`${w.name}: ${formatLabel}, ${w.width_chunks}×${w.height_chunks} chunks. Click for world details and rename.`}
         aria-haspopup="dialog" aria-expanded={open} data-active={open ? "true" : undefined}
         style={btnBase({
           display: "flex", alignItems: "center", gap: 6, height: TOPBAR_BTN_H, padding: "0 8px",
@@ -93,7 +93,7 @@ export default function WorldNamePill() {
                 ref={renameInputRef}
                 value={renameInput}
                 aria-label="World name"
-                title="Letters, numbers, spaces and apostrophes — max 32 characters"
+                title="Letters, numbers, spaces and apostrophes (max 32)"
                 onChange={e => {
                   const raw = e.target.value;
                   const clean = raw.split("").filter(c => RENAME_ALLOWED.test(c)).join("").slice(0, 32);
@@ -154,7 +154,7 @@ export default function WorldNamePill() {
 
           <div style={{ display: "flex", gap: 5, marginTop: 9 }}>
             <button className="rbn-btn" type="button" onClick={() => { setOpen(false); openAppMenu("properties"); }}
-              title="Full world header readout — seed, sky bands, golden cubes"
+              title="Full world header readout: seed, sky bands, golden cubes"
               style={btnBase({ flex: 1, height: TOPBAR_BTN_H, display: "flex", alignItems: "center", justifyContent: "center", gap: 5, fontSize: FONT.body, color: TEXT })}>
               <Icon name="properties" size={ICON.xs} /> Properties…
             </button>

@@ -278,11 +278,11 @@ export type Interact3D = "none" | "select" | "build" | "sculpt" | "floodfill";
 /// terrain-editing BUILD/SCULPT modes. VIEW = "none" (camera only); BUILD amber and SCULPT amber
 /// to flag the armed edit modes; neither has a bare-key binding (click-only power features).
 const INTERACT_SEGMENTS: { mode: Interact3D; label: string; accent: string; title: string }[] = [
-  { mode: "none", label: "VIEW", accent: "#afa69d", title: "View only — clicks don't edit" },
-  { mode: "select", label: "SELECT", accent: "#3b82f6", title: "Select mode — click two voxels to make a 3D selection" },
-  { mode: "floodfill", label: "FILL", accent: "#38bdf8", title: "Flood Fill — click a block face to fill connected air across and down with the armed block" },
-  { mode: "build", label: "BUILD", accent: "#f59e0b", title: "Build mode — left-click breaks, right-click places the armed block" },
-  { mode: "sculpt", label: "SCULPT", accent: "#fb923c", title: "Sculpt mode — press and hold left to sculpt terrain under the cursor" },
+  { mode: "none", label: "VIEW", accent: "#afa69d", title: "View only" },
+  { mode: "select", label: "SELECT", accent: "#3b82f6", title: "Click two blocks to make a 3D selection" },
+  { mode: "floodfill", label: "FILL", accent: "#38bdf8", title: "Click a block face to fill connected air" },
+  { mode: "build", label: "BUILD", accent: "#f59e0b", title: "Left-click breaks, right-click places" },
+  { mode: "sculpt", label: "SCULPT", accent: "#fb923c", title: "Hold left to sculpt" },
 ];
 
 /// Display names for the ten sculpt tools, for the in-pane armed-hint readout. (The ribbon owns the
@@ -594,7 +594,7 @@ const StreamBadges = forwardRef<StreamBadgesRef, { budgetBytes: number }>(functi
         )}
         {budgetLimited && (
           <span
-            title={`Resident chunk geometry hit the ${(budgetBytes / (1 << 20)).toFixed(0)} MB budget — the farthest chunks are being dropped to stay inside it, so the pane is showing less than the render distance asks for. Raise it in Settings → Memory budget, or lower the render distance.`}
+            title={`Hit the ${(budgetBytes / (1 << 20)).toFixed(0)} MB 3D memory limit, so the farthest chunks are hidden. Raise Settings ▸ General ▸ Memory budget or lower the render distance.`}
             style={{
               padding: "1px 5px", borderRadius: 4, fontSize: 10,
               background: "rgba(239,68,68,0.12)", border: "1px solid rgba(239,68,68,0.3)",
@@ -3487,7 +3487,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
         // resume branch is already guarded on `contextLost` (now permanently, via contextGivenUp).
         setSuspended(true);
         setContextDisabledRef.current(true);
-        onNoticeRef.current?.(`3D view disabled for this session: the graphics context was lost ${MAX_CONTEXT_LOSSES} times. Restoring it again would most likely just lose it again, and repeated losses can make the system disable hardware acceleration entirely. The rest of the editor is unaffected — restart VuencEdit to try the 3D pane again.`);
+        onNoticeRef.current?.(`3D view disabled for this session: the graphics context was lost ${MAX_CONTEXT_LOSSES} times, and repeated losses can make the system turn off hardware acceleration. The rest of the editor still works. Restart VuencEdit to try 3D again.`);
         return;
       }
       // Shrink the disc for the coming restore. The budget halving is implicit (`effectiveBudget()`
@@ -3505,7 +3505,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
         setLoadRadiusStateRef.current(nextR);
       }
       const budgetMb = (effectiveBudget() / (1 << 20)).toFixed(0);
-      onNoticeRef.current?.(`3D view: the graphics context was lost (usually memory pressure). Recovering with render distance ${nextR} and a ${budgetMb} MB geometry budget — reduced on purpose so it is less likely to happen again.`);
+      onNoticeRef.current?.(`3D view: the graphics context was lost (usually low GPU memory). Recovering with render distance ${nextR} and a ${budgetMb} MB geometry budget, both lowered to help prevent a repeat.`);
     };
     const onContextRestored = () => {
       // The back-off gave up: stay parked (and leave `contextLost` set, so frame() and the resume
@@ -3526,7 +3526,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       sweepInterval = setInterval(streamSweep, STREAM_MS);
       reloadAllChunks("restore");
       invalidate();
-      onNoticeRef.current?.("3D view: graphics context restored — reloading terrain.");
+      onNoticeRef.current?.("3D view: graphics context restored. Reloading terrain.");
     };
     canvas.addEventListener("webglcontextlost", onContextLost);
     canvas.addEventListener("webglcontextrestored", onContextRestored);
@@ -4735,7 +4735,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
             into mouselook, and a way back when Z is being swallowed by whatever holds focus. */}
         <button
           type="button"
-          title={`Camera: ${camMode === "look" ? "mouselook" : camMode === "fly" ? "fly" : "orbit"} — click or press Z to cycle`}
+          title={`Camera: ${camMode === "look" ? "mouselook" : camMode === "fly" ? "fly" : "orbit"}. Click or press Z to change.`}
           onClick={(e) => { e.currentTarget.blur(); cycleModeRef.current?.(); }}
           style={{
             padding: "2px 7px", borderRadius: 10, fontSize: 10, fontWeight: 600, letterSpacing: "0.05em",
@@ -4823,33 +4823,33 @@ const FlyView3D = forwardRef<FlyView3DRef, {
                 }}
               >×</button>
               <div style={{ fontWeight: 700, color: "#fff", marginBottom: 4, paddingRight: 20 }}>Camera</div>
-              <div>Z / click pill — cycle Orbit → Look → Fly → Orbit</div>
-              <div>Orbit — drag to rotate, scroll to zoom</div>
-              <div>Look / Fly — WASD move · Space/E up · Ctrl/Q down</div>
-              <div>Shift — sprint (3.5×) · Alt — crawl / precision (0.25×)</div>
-              <div>Look — free mouselook · Fly — drag to look</div>
-              <div>Scroll — adjust fly speed · Esc — exit to Orbit</div>
+              <div>Z / click pill: switch Orbit, Look, Fly</div>
+              <div>Orbit: drag to rotate, scroll to zoom</div>
+              <div>Look / Fly: WASD move · Space/E up · Ctrl/Q down</div>
+              <div>Shift: sprint (3.5×) · Alt: crawl / precision (0.25×)</div>
+              <div>Look: free mouselook · Fly: drag to look</div>
+              <div>Scroll: adjust fly speed · Esc: exit to Orbit</div>
               <div style={{ fontWeight: 700, color: "#fff", margin: "6px 0 4px" }}>Select mode</div>
-              <div>Click 2 corners (no gizmo hit) — make/replace a 3D selection</div>
-              <div>Drag the gray center cube — slide the whole box on the ground</div>
-              <div>Drag a colored arrow — move the box along that axis</div>
-              <div>Drag a colored plane square — move the box on that plane (2 axes)</div>
-              <div>Drag a small face box — resize that one side (region only)</div>
-              <div>⇄ Region/Blocks toggle — a MOVE edits the region only, or relocates its
-                blocks (undoable) — resize is always region-only</div>
-              <div>Esc mid-drag — cancel the gizmo drag, no change committed</div>
+              <div>Click 2 corners (no gizmo hit): make/replace a 3D selection</div>
+              <div>Drag the grey centre cube: slide the whole box on the ground</div>
+              <div>Drag a coloured arrow: move the box along that axis</div>
+              <div>Drag a coloured plane square: move the box on that plane (2 axes)</div>
+              <div>Drag a small face box: resize that one side (region only)</div>
+              <div>⇄ Region/Blocks: move the region only, or its blocks too (undoable).
+                Resizing only changes the region</div>
+              <div>Esc mid-drag: cancel the gizmo drag, no change committed</div>
               <div style={{ fontWeight: 700, color: "#fff", margin: "6px 0 4px" }}>Build mode</div>
-              <div>Left drag — sweep break · Right drag — sweep place</div>
+              <div>Left drag: sweep break · Right drag: sweep place</div>
               <div>A sweep sticks to the face you started on and never revisits a cell</div>
-              <div>Click without dragging — exactly one block</div>
+              <div>Click without dragging: exactly one block</div>
               <div>Camera: middle drag orbits · Alt+left orbits · Alt+right pans · scroll zooms</div>
-              <div>Middle click (no drag) — eyedropper (pick block+paint)</div>
-              <div>Reach {Math.round(buildReach)} blocks — no outline means out of range (Settings ▸ 3D)</div>
-              <div>1–5 / 6–0 — hotbar pinned/recent slots (works while flying)</div>
+              <div>Middle click (no drag): eyedropper (pick block+paint)</div>
+              <div>Reach {Math.round(buildReach)} blocks. No outline means out of range (Settings ▸ 3D)</div>
+              <div>1–5 / 6–0: hotbar pinned/recent slots (works while flying)</div>
               <div style={{ fontWeight: 700, color: "#fff", margin: "6px 0 4px" }}>Sculpt mode</div>
-              <div>Left press+hold — sculpt under the cursor (Grab: vertical drag)</div>
-              <div>[ / ] — brush radius · Shift+[ / Shift+] — strength</div>
-              <div>Esc — cancel the in-progress stroke</div>
+              <div>Left press+hold: sculpt under the cursor (Grab: vertical drag)</div>
+              <div>[ / ]: brush radius · Shift+[ / Shift+]: strength</div>
+              <div>Esc: cancel the in-progress stroke</div>
             </div>
           )}
         </div>
@@ -4898,8 +4898,8 @@ const FlyView3D = forwardRef<FlyView3DRef, {
             <div style={{ position: "relative", display: "flex" }}>
               <button
                 onClick={() => setDistanceWarnOpen(o => !o)}
-                title={`High render distance (${loadRadius} chunks) can hurt performance — click for details`}
-                aria-label={`High render distance warning: ${loadRadius} chunks — click for details`}
+                title={`High render distance (${loadRadius} chunks) can be slow. Click for details.`}
+                aria-label={`High render distance warning: ${loadRadius} chunks. Click for details.`}
                 aria-expanded={distanceWarnOpen}
                 aria-controls="fly3d-distance-warning"
                 style={{
@@ -4919,9 +4919,8 @@ const FlyView3D = forwardRef<FlyView3DRef, {
                     width: 200, padding: SPACE.lg, fontSize: FONT.micro, lineHeight: 1.4,
                     color: TEXT_DIM, fontWeight: 400,
                   }}>
-                  High render distance ({loadRadius} chunks) streams and keeps far more chunk geometry
-                  in memory and on the GPU, which can drop frame rate, especially while flying. Lower
-                  it if you notice stutter.
+                  More chunks in memory and on the GPU can lower frame rate. Lower it if you see
+                  stutter.
                 </div>
               )}
             </div>
@@ -4942,8 +4941,8 @@ const FlyView3D = forwardRef<FlyView3DRef, {
               type="color"
               value={rgbToHex(effectiveFogColor())}
               onChange={e => onSky3dChange?.({ fogColor: e.target.value })}
-              title="Fog colour (editor view only, not saved to the world file)"
-              aria-label="Fog colour (editor view only, not saved to the world file)"
+              title="Fog colour (not saved to the world)"
+              aria-label="Fog colour (not saved to the world)"
               style={colorInput}
             />
             {fogColorOverride && (
@@ -4985,22 +4984,22 @@ const FlyView3D = forwardRef<FlyView3DRef, {
                     type="color"
                     value={sky3d.zenith}
                     onChange={e => onSky3dChange?.({ zenith: e.target.value })}
-                    title="Sky colour overhead (zenith), editor view only, not saved to the world file"
-                    aria-label="Sky zenith colour (editor view only, not saved to the world file)"
+                    title="Sky colour overhead (not saved to the world)"
+                    aria-label="Sky zenith colour (not saved to the world)"
                     style={colorInput}
                   />
                   <input
                     type="color"
                     value={sky3d.horizon}
                     onChange={e => onSky3dChange?.({ horizon: e.target.value })}
-                    title="Sky colour at the horizon, editor view only, not saved to the world file"
-                    aria-label="Sky horizon colour (editor view only, not saved to the world file)"
+                    title="Sky colour at the horizon (not saved to the world)"
+                    aria-label="Sky horizon colour (not saved to the world)"
                     style={colorInput}
                   />
                   <SmallButton
                     label="Match fog"
                     onClick={() => onSky3dChange?.({ horizon: rgbToHex(effectiveFogColor()) })}
-                    title="Set the horizon colour to the current fog colour, so distant terrain fades into the sky seamlessly"
+                    title="Set the horizon colour to the fog colour"
                   />
                   <IconButton
                     icon="undo" onClick={() => onSky3dChange?.({ zenith: DEFAULT_SKY3D.zenith, horizon: DEFAULT_SKY3D.horizon })}
@@ -5009,7 +5008,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
                 </div>
                 <Check
                   checked={autoOrient3d} onChange={v => onSetAutoOrient3d?.(v)} label="Auto-orient"
-                  title="Auto-orient ramps, wedges and doors to your facing when placing. Off = they keep the orientation picked in the Block picker."
+                  title="Turn ramps, wedges and doors to face you when placed"
                 />
               </div>
             )}
@@ -5105,9 +5104,9 @@ const FlyView3D = forwardRef<FlyView3DRef, {
           }}>
             {(["single", "line", "box", "fill"] as BuildShape[]).map((s) => {
               const active = buildShape === s;
-              const title = s === "single" ? "Single voxel — plain click to break/place"
-                : s === "fill" ? "Fill bucket — click a wall face to flood-fill the connected same-type run (L clears it, R re-skins it)"
-                : `${s === "line" ? "Line" : "Box"} — click a start cell, then click the end cell to commit the whole run`;
+              const title = s === "single" ? "Single voxel: plain click to break/place"
+                : s === "fill" ? "Fill bucket: click a wall face to flood-fill the connected same-type run (L clears it, R re-skins it)"
+                : `${s === "line" ? "Line" : "Box"}: click a start cell, then click the end cell to commit the whole run`;
               const label = s === "single" ? "◽" : s === "line" ? "Line" : s === "box" ? "Box" : "Fill";
               return (
                 <button
@@ -5166,7 +5165,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
                         ? ` · Δ${grabReadout > 0 ? "+" : ""}${grabReadout}`
                         : ` · str${sculptStrength}`}`
                   : buildShape === "fill"
-                    ? `click a wall — L clear · R fill${armedLabel ? ` ${armedLabel}` : ""}`
+                    ? `click a wall: L clear · R fill${armedLabel ? ` ${armedLabel}` : ""}`
                     : buildShape !== "single"
                       ? `${buildShapeArmed ? "click end cell to commit" : `click start cell (${buildShape})`}${armedLabel ? ` · ${armedLabel}` : ""}`
                       : `L drag break · R drag place${armedLabel ? ` ${armedLabel}` : ""}`}
@@ -5193,14 +5192,14 @@ const FlyView3D = forwardRef<FlyView3DRef, {
             3D view disabled for this session
           </div>
           <div style={{ fontSize: 11, color: "#afa69d", lineHeight: 1.7, maxWidth: 380 }}>
-            The graphics context was lost {MAX_CONTEXT_LOSSES} times — usually GPU memory pressure.
-            Each recovery already retried with a smaller render distance and geometry budget, so the
-            pane has stopped trying rather than risk the system disabling hardware acceleration
-            altogether.
+            The graphics context was lost {MAX_CONTEXT_LOSSES} times, usually from low GPU memory.
+            Repeated losses can make the system turn off hardware acceleration, so 3D has stopped
+            retrying.
           </div>
           <div style={{ fontSize: 10, color: "#83786c", lineHeight: 1.7, maxWidth: 380 }}>
-            The rest of the editor is unaffected. Restart VuencEdit to use the 3D pane again — and
-            before you do, lower <strong>Settings → Memory budget</strong> and the render distance.
+            The rest of the editor still works. To use 3D again, lower{" "}
+            <strong>Settings ▸ General ▸ Memory budget</strong> and the render distance, then restart
+            VuencEdit.
           </div>
         </div>
       )}

@@ -1,7 +1,7 @@
 /**
  * Fetches the paste lens's front + side elevations from `render_paste_lens` (UI redesign r3, Stage
- * 14.9). Policy (one request in flight / latest wins / a failed key stays parked) lives in the pure,
- * separately-tested `lensScheduler.ts` — this hook is just the I/O and the throttle around it.
+ * 14.9). The paste wrapper over `useLensFetch` (20.4), which owns the throttle and the pure
+ * `lensScheduler.ts` policy (one request in flight / latest wins / a failed key stays parked).
  *
  * **Hover-driven origin churn is coalesced to ≤15 Hz** before it ever reaches the scheduler:
  * `MapCanvas`'s ghost subscription can fire far faster than that while the mouse moves over the map
@@ -9,10 +9,9 @@
  * offset, mode flags, clipboard identity, `editEpoch`) — none of those change anywhere near 15 Hz in
  * practice, so a single throttle keeps this simple rather than special-casing origin changes.
  */
-import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { decodePasteLens, type PasteLensResult } from "../types";
-import { reduceLensScheduler, type LensSchedulerState } from "./lensScheduler";
+import { decodePasteLensPair, type PasteLensResult } from "../types";
+import { useLensFetch } from "./useLensFetch";
 
 export type LensPasteMode = "normal" | "terrain";
 
@@ -36,13 +35,10 @@ export interface LensRenderState {
   side: PasteLensResult | null;
   loading: boolean;
   /** Set on the most recent failure; cleared on the next successful render. Shown as an inline
-   *  message in the lens body instead of the elevations (the last-good images are dropped, not kept
-   *  stale behind the message — nothing here promises they still match the current inputs). */
+   *  message in the lens body instead of the elevations. */
   error: string | null;
 }
 
-const IDLE: LensRenderState = { front: null, side: null, loading: false, error: null };
-const IDLE_SCHEDULER: LensSchedulerState = { inFlight: null, pending: null, failedKey: null };
 /** Hover-driven origin churn (and everything else) coalesces to this period — see the file header. */
 const THROTTLE_MS = 66;
 
@@ -59,86 +55,16 @@ function keyOf(i: LensRenderInputs): string {
  * result resets to idle, matching "no render requests while the lens isn't showing anything".
  */
 export function useLensRender(inputs: LensRenderInputs, enabled: boolean): LensRenderState {
-  const [state, setState] = useState<LensRenderState>(IDLE);
-  const schedulerRef = useRef<LensSchedulerState>(IDLE_SCHEDULER);
-  const pendingRef = useRef<LensRenderInputs | null>(null);
-  const lastFireAtRef = useRef(0);
-  const throttleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const seqRef = useRef(0); // discards a resolved fetch superseded by a later reset/disable
-
-  async function startFetch(key: string, snap: LensRenderInputs) {
-    const seq = ++seqRef.current;
-    setState(s => ({ ...s, loading: true }));
-    const params = {
-      x: snap.origin.x, y: snap.origin.y,
-      elevationOffset: snap.elevationOffset, mode: snap.mode,
-      aboveSurface: snap.aboveSurface, ignoreAir: snap.ignoreAir,
-      context: snap.context ?? 2, maxPx: snap.maxPx ?? 512,
-    };
-    try {
-      const [frontBuf, sideBuf] = await Promise.all([
-        invoke<ArrayBuffer>("render_paste_lens", { ...params, view: "front" }),
-        invoke<ArrayBuffer>("render_paste_lens", { ...params, view: "side" }),
-      ]);
-      if (seqRef.current !== seq) return; // superseded by a disable/reset while in flight
-      setState({ front: decodePasteLens(frontBuf), side: decodePasteLens(sideBuf), loading: false, error: null });
-      applyEvent({ type: "success", key });
-    } catch (e) {
-      if (seqRef.current !== seq) return;
-      const message = e instanceof Error ? e.message : String(e);
-      setState({ front: null, side: null, loading: false, error: message });
-      applyEvent({ type: "failure", key });
-    }
-  }
-
-  function applyEvent(event: { type: "request" | "success" | "failure"; key: string }) {
-    const { state: next, fire } = reduceLensScheduler(schedulerRef.current, event);
-    schedulerRef.current = next;
-    if (fire == null) return;
-    const snap = pendingRef.current;
-    if (snap && keyOf(snap) === fire) void startFetch(fire, snap);
-  }
-
-  const key = enabled ? keyOf(inputs) : null;
-
-  useEffect(() => {
-    if (key == null) {
-      // No setState here — `key == null` is handled entirely by the render-time fallback below,
-      // so disabling never itself triggers a render; this effect only tears down bookkeeping so a
-      // later re-enable starts clean.
-      seqRef.current++; // orphan any in-flight fetch
-      schedulerRef.current = IDLE_SCHEDULER;
-      pendingRef.current = null;
-      if (throttleTimerRef.current) { clearTimeout(throttleTimerRef.current); throttleTimerRef.current = null; }
-      return;
-    }
-    pendingRef.current = inputs;
-    const request = () => {
-      lastFireAtRef.current = Date.now();
-      const snap = pendingRef.current;
-      if (!snap) return;
-      applyEvent({ type: "request", key: keyOf(snap) });
-    };
-    const elapsed = Date.now() - lastFireAtRef.current;
-    if (elapsed >= THROTTLE_MS) {
-      if (throttleTimerRef.current) { clearTimeout(throttleTimerRef.current); throttleTimerRef.current = null; }
-      request();
-    } else if (!throttleTimerRef.current) {
-      throttleTimerRef.current = setTimeout(() => { throttleTimerRef.current = null; request(); }, THROTTLE_MS - elapsed);
-    }
-    // `key` is derived from every field `keyOf` reads (plus `enabled`); `inputs` itself is read
-    // through `pendingRef` so the throttled call always sees the latest snapshot, not a stale one
-    // captured when the timer was scheduled.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [key]);
-
-  // Unmount: stop a straggling throttle timer and orphan any in-flight fetch's result.
-  useEffect(() => () => {
-    seqRef.current++;
-    if (throttleTimerRef.current) clearTimeout(throttleTimerRef.current);
-  }, []);
-
-  // `key == null` (disabled / nothing to render) always reports idle, regardless of whatever
-  // `state` was left holding from before — see the effect above.
-  return key == null ? IDLE : state;
+  const fetch = async () => {
+    // One call returns both views (20.3): the backend computes the paste bases once.
+    const buf = await invoke<ArrayBuffer>("render_paste_lens", {
+      x: inputs.origin.x, y: inputs.origin.y,
+      elevationOffset: inputs.elevationOffset, mode: inputs.mode,
+      aboveSurface: inputs.aboveSurface, ignoreAir: inputs.ignoreAir,
+      context: inputs.context ?? 2, maxPx: inputs.maxPx ?? 512,
+    });
+    return decodePasteLensPair(buf);
+  };
+  const r = useLensFetch(enabled ? keyOf(inputs) : null, fetch, THROTTLE_MS);
+  return { front: r.data?.front ?? null, side: r.data?.side ?? null, loading: r.loading, error: r.error };
 }

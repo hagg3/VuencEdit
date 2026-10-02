@@ -59,7 +59,7 @@ export default function BlockPaintPicker({
 
         {/* Air (fill) / Any (filter) */}
         <div
-          title={isFill ? "Air — erase blocks in the selection" : "Any block (no type filter)"}
+          title={isFill ? "Air (erase)" : "Any block (no type filter)"}
           onClick={() => onBlockTypeChange(isFill ? 0 : null)}
           style={{
             fontSize: 10, textAlign: "center", cursor: "pointer",
@@ -300,7 +300,7 @@ export default function BlockPaintPicker({
           onClick={allowNewFormat ? () => setNewFormatOpen(v => !v) : undefined}
           title={allowNewFormat
             ? "16 new block types added by a 2026 game update"
-            : "New-format blocks only exist in 256z worlds — unavailable for this (64z) world"}
+            : "New-format blocks need a 256z world"}
           style={{
             display: "flex", alignItems: "center", gap: 4, marginTop: 2,
             cursor: allowNewFormat ? "pointer" : "not-allowed", userSelect: "none",
@@ -356,7 +356,7 @@ export default function BlockPaintPicker({
           )}
           {/* No-paint swatch */}
           <div
-            title={isFill ? "No paint (use block default color)" : "No paint (unpainted blocks only)"}
+            title={isFill ? "No paint (use block default colour)" : "No paint (unpainted blocks only)"}
             onClick={() => onPaintChange(0)}
             style={{
               width: 18, height: 18, flexShrink: 0,
@@ -374,7 +374,7 @@ export default function BlockPaintPicker({
               const paintTexUrl = texturePack && bt !== null ? tintedSwatch(bt, pIdx, texturePack) : null;
               return (
                 <div
-                  key={i} title={`Paint color ${i + 1}`}
+                  key={i} title={`Paint colour ${i + 1}`}
                   onClick={() => onPaintChange(pIdx)}
                   style={{
                     width: 18, height: 18,

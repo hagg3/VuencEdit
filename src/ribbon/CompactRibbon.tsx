@@ -282,15 +282,15 @@ function SettingWidget({ id }: { id: CommandId }): ReactNode {
       return (
         <SliderRow label="Softness" min={0} max={100} step={5} accent={ACCENT.warm}
           value={Math.round(p.sculptSoftness * 100)} onChange={v => p.setSculptSoftness(v / 100)}
-          format={v => `${v}%`} title="Radial falloff — 0 = hard edges, 100 = full dome (soft rim)" />
+          format={v => `${v}%`} title="Edge softness: 0 is a hard edge, 100 a soft dome" />
       );
     case "sculpt.falloff.profile":
       return (
         <Select ariaLabel="Falloff profile" value={p.sculptProfile} onChange={p.setSculptProfile} width={104}
           options={[
-            { id: "smooth", label: "Smooth", title: "Cosine dome — the default" },
+            { id: "smooth", label: "Smooth", title: "Cosine dome (default)" },
             { id: "linear", label: "Linear", title: "Straight cone" },
-            { id: "sphere", label: "Sphere", title: "Spherical cap — fat centre" },
+            { id: "sphere", label: "Sphere", title: "Spherical cap, wide centre" },
             { id: "sharp", label: "Sharp", title: "Nearly flat-topped, hard rim" },
           ]} />
       );
@@ -325,9 +325,9 @@ function SettingWidget({ id }: { id: CommandId }): ReactNode {
       return (
         <Segmented ariaLabel="Gradient axis" accent={ACCENT.primary} value={p.gradientAxis} onChange={p.setGradientAxis}
           options={[
-            { id: "x", label: "X", title: "Blend across (E–W) — visible top-down" },
-            { id: "y", label: "Y", title: "Blend across (N–S) — visible top-down" },
-            { id: "z", label: "Z", title: "Blend by height — visible in side/3D views" },
+            { id: "x", label: "X", title: "East–west (seen from above)" },
+            { id: "y", label: "Y", title: "North–south (seen from above)" },
+            { id: "z", label: "Z", title: "By height (seen from the side and in 3D)" },
           ]} />
       );
     case "selection.extrude.axis":
@@ -394,7 +394,7 @@ function RenderDistanceSetting() {
   return (
     <SliderRow label="Distance" min={RD_MIN} max={MAX_RENDER_DISTANCE} accent={ACCENT.violet} labelWidth={54}
       value={display} onChange={setDisplay} onCommit={p.commitRenderDistance}
-      title="Chunk render distance. Cost rises quadratically — this is the main 3D performance dial." />
+      title="Render distance in chunks. The biggest 3D performance cost." />
   );
 }
 
