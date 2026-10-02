@@ -1092,8 +1092,8 @@ fn check_worldgen_budget(total_bytes: u64) -> Result<(), String> {
     if total_bytes > MAX_WORLDGEN_BYTES {
         let gb = |b: u64| b as f64 / (1u64 << 30) as f64;
         return Err(format!(
-            "This world would need approximately {:.1} GB of memory to generate — the limit is \
-             {:.0} GB. Reduce the world size or turn off extended (256z) height.",
+            "This world would need approximately {:.1} GB of memory to generate (limit \
+             {:.0} GB). Reduce the world size or turn off extended (256z) height.",
             gb(total_bytes), gb(MAX_WORLDGEN_BYTES)
         ));
     }

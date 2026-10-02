@@ -71,7 +71,7 @@ export default function RecoveryModal({
       footer={footer}
     >
       <p style={{ margin: "0 0 8px", color: MODAL_TEXT.secondary, lineHeight: 1.5 }}>
-        Eden World Editor found autosaved changes from a previous session that wasn't saved before closing.
+        VuencEdit found autosaved changes from a previous session that wasn't saved before closing.
       </p>
       <div style={{ background: "rgba(0,0,0,0.25)", borderRadius: 6, padding: "8px 12px", margin: "0 0 16px", fontFamily: "monospace", fontSize: 12 }}>
         <div><span style={{ color: MODAL_TEXT.label }}>World: </span>{info.world_name || "(unnamed)"}</div>

@@ -112,7 +112,7 @@ export default function AboutPanel({ version, compact, onOpenDiagnostics }: {
             )}
             {checkState.kind === "available" && (
               <span style={{ fontSize: 11, color: MODAL_TEXT.label }}>
-                v{checkState.latestVersion} available — <Link href={checkState.releaseUrl}>download</Link>
+                v{checkState.latestVersion} available: <Link href={checkState.releaseUrl}>download</Link>
               </span>
             )}
           </div>

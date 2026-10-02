@@ -100,8 +100,7 @@ export default function UploadModal({ sourcePath, onClose }: Props) {
             options={[{ id: "current", label: "Current" }, { id: "legacy", label: "Legacy" }]}
           />
           <span style={{ fontSize: 10, color: MODAL_TEXT.label, lineHeight: 1.5 }}>
-            Uploads use plain HTTP — the world file, its name, and the preview travel unencrypted.
-            Don't upload anything private.
+            Uploads use plain HTTP and aren't encrypted. Don't upload anything private.
           </span>
         </div>
 
@@ -114,7 +113,7 @@ export default function UploadModal({ sourcePath, onClose }: Props) {
             </span>
           ) : (
             <span style={{ color: RED_LIGHT, fontSize: 13 }}>
-              No world saved — use File → Save As… first.
+              Save the world first (Save As…).
             </span>
           )}
         </div>

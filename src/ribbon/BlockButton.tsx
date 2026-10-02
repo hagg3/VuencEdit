@@ -51,7 +51,7 @@ export default function BlockButton({
       <div data-cmd={cmd} style={{ display: "flex", flexDirection: "column", justifyContent: "center", height: GROUP_CONTENT_H, gap: 0 }}>
         <button
           className="rbn-btn" type="button" onClick={binding.run}
-          title={`Active block: ${name} — click to browse all blocks & paints`}
+          title={`Active block: ${name}. Click to choose a block and paint.`}
           aria-label="Active block" data-active={open ? "true" : undefined}
           style={btnBase(narrow ? {
             height: GROUP_CONTENT_H - 2 * SPACE.md, width: BLOCK_NARROW_W,

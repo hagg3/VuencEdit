@@ -34,6 +34,9 @@ export interface WindowLayoutState {
   /** Context panels currently rendered (Stage 16.5), for `contextPanels.stackOffsets`. Not persisted —
    *  it's derived from mode state every session. Registered by `ContextPanel`. */
   activeContext: WinId[];
+  /** The Lens's selection-mode flag (20.4, plan D1): session-only like the paste flag
+   *  (`wins.lens.open`), never stored. */
+  lensSelOn: boolean;
 }
 
 const FALLBACK_WORK: Size = { w: 1200, h: 700 };
@@ -48,6 +51,7 @@ let state: WindowLayoutState = {
   snap: true,
   passThrough: false,
   activeContext: [],
+  lensSelOn: true,
 };
 /** Has `loadWorld` run with a real work-area size? Defaults sized before that are provisional. */
 let worldKey: { path: string | null; identity: string } | null = null;
@@ -216,6 +220,14 @@ export function resetWindows() {
   const wins = {} as Record<WinId, WinState>;
   for (const id of WIN_IDS) wins[id] = { ...d[id], open: state.wins[id].open, collapsed: false };
   commit({ wins, swapped: false });
+}
+
+/** The Lens's two session flags at once (⌥P / ✕ / Settings, `lensMode.lensToggle`). The paste flag
+ *  is `wins.lens.open` (a commit, for the geometry's sake; `open` itself is never stored), the
+ *  selection flag is `lensSelOn` (store-only). */
+export function setLensFlags(f: { pasteOn?: boolean; selOn?: boolean }) {
+  if (f.pasteOn != null) { if (f.pasteOn) openWin("lens"); else closeWin("lens"); }
+  if (f.selOn != null && f.selOn !== state.lensSelOn) set({ lensSelOn: f.selOn });
 }
 
 // ── Paste lens attach/follow (Stage 14.9) ────────────────────────────────────────────────────

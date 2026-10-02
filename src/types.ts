@@ -97,7 +97,7 @@ export function decodeEditResult(buf: IpcBinary): EditResult {
   };
 }
 
-// ---- Preview images (elevation panel, selection ortho/axo, clipboard preview) ----
+// ---- Preview images (clipboard, prefab and new-world previews) ----
 
 export interface PreviewData { width: number; height: number; pixels: Uint8Array; }
 
@@ -230,9 +230,7 @@ type PasteLensHeader = {
   approx: boolean;
 };
 
-/** Decode a `render_paste_lens` binary response (audit H2 framing — see codec.ts). */
-export function decodePasteLens(buf: IpcBinary): PasteLensResult {
-  const { header: h, body } = decodeEnvelope<PasteLensHeader>(buf);
+function pasteLensView(h: PasteLensHeader, pixels: Uint8Array): PasteLensResult {
   return {
     width: h.width, height: h.height, lod: h.lod,
     colLo: h.col_lo, zLo: h.z_lo, zHi: h.z_hi,
@@ -240,8 +238,64 @@ export function decodePasteLens(buf: IpcBinary): PasteLensResult {
     ghostZMin: h.ghost_z_min, ghostZMax: h.ghost_z_max,
     buried: h.buried, cleared: h.cleared, floatingCols: h.floating_cols,
     approx: h.approx,
-    pixels: body,
+    pixels,
   };
+}
+
+/** Decode a `render_paste_lens` binary response (audit H2 framing — see codec.ts): both views from
+ *  one call (20.3). They share the Z window and the cell counts. */
+export function decodePasteLensPair(buf: IpcBinary): { front: PasteLensResult; side: PasteLensResult } {
+  const { header: h, body } = decodeEnvelope<{ front: PasteLensHeader; side: PasteLensHeader; lens: [number, number] }>(buf);
+  const [front, side] = splitBody(body, h.lens);
+  return { front: pasteLensView(h.front, front), side: pasteLensView(h.side, side) };
+}
+
+// ---- Selection lens (Stage 20.3/20.5 — `render_selection_lens`) ----
+
+/** One image from `render_selection_lens`. RGBA, row-major. Elevations (`front`/`side`) are full
+ *  world height with rows 1:1 and `lod` world columns per image column; `top` is point-sampled
+ *  every `lod` blocks on both axes and also has `rowLo` (world Y of image row 0). `colLo` is the
+ *  world X (front/top) or Y (side) of image column 0; `footprintLo/Hi` is the selection along that
+ *  axis. A selected block is drawn at alpha 255, context / masked-out terrain at 128. */
+export interface SelectionLensImage {
+  width: number; height: number; lod: number;
+  colLo: number; rowLo: number | null;
+  footprintLo: number; footprintHi: number;
+  pixels: Uint8Array;
+}
+
+/** `render_selection_lens`'s reply: front + side (`top: false`) or top only (`top: true`).
+ *  `zLo`/`zHi` are the elevations' bottom/top rows (the selection's own z range for top);
+ *  `terrainZHi` is the highest block on either elevation, for the initial framing. */
+export interface SelectionLensResult {
+  front: SelectionLensImage | null;
+  side: SelectionLensImage | null;
+  top: SelectionLensImage | null;
+  zLo: number; zHi: number; terrainZHi: number | null;
+}
+
+type SelectionLensHeader = {
+  views: {
+    kind: "front" | "side" | "top"; width: number; height: number; lod: number;
+    col_lo: number; row_lo: number | null; footprint_lo: number; footprint_hi: number;
+  }[];
+  lens: number[];
+  z_lo: number; z_hi: number; terrain_z_hi: number | null;
+};
+
+export function decodeSelectionLens(buf: IpcBinary): SelectionLensResult {
+  const { header: h, body } = decodeEnvelope<SelectionLensHeader>(buf);
+  const parts = splitBody(body, h.lens);
+  const out: SelectionLensResult = { front: null, side: null, top: null, zLo: h.z_lo, zHi: h.z_hi, terrainZHi: h.terrain_z_hi };
+  h.views.forEach((v, i) => {
+    out[v.kind] = {
+      width: v.width, height: v.height, lod: v.lod,
+      colLo: v.col_lo, rowLo: v.row_lo,
+      footprintLo: v.footprint_lo, footprintHi: v.footprint_hi,
+      pixels: parts[i],
+    };
+  });
+  return out;
 }
 
 export interface ClipboardInfo {

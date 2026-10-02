@@ -42,13 +42,13 @@ function fmt1(n: number) { return n.toFixed(1); }
 function formatLabel(info: WorldInfo): { label: string; title: string } {
   switch (classifyWorldFormat(info)) {
     case "legacy64z":
-      return { label: "Legacy 64z", title: "Legacy (64z) format — worlds up to 64 blocks tall" };
+      return { label: "Legacy 64z", title: "Legacy (64z) format: worlds up to 64 blocks tall" };
     case "newDawn256z":
-      return { label: "New Dawn 256z", title: "New Dawn (256z) format — worlds up to 256 blocks tall" };
+      return { label: "New Dawn 256z", title: "New Dawn (256z) format: worlds up to 256 blocks tall" };
     case "newFormat256z":
       return {
         label: "NewFormat256z",
-        title: `A 2026 game update's 256z variant (version ${info.version}, not the New Dawn 5/6 you'd expect) — adds 16 new block types (112–127) and stores signs differently from earlier New Dawn worlds`,
+        title: `256z format from a 2026 game update. Adds blocks 112–127.`,
       };
   }
 }
@@ -118,7 +118,7 @@ export default function WorldInfoPanel({ refreshKey = 0 }: { refreshKey?: number
           <Row k="Home height (Z)" v={fmt1(info.home_height)} />
           <Row k="Start / last pos (XY)" v={`(${fmt1(info.pos_local_x)}, ${fmt1(info.pos_local_y)})`} />
           <Row k="Start height (Z)" v={fmt1(info.pos_height)} />
-          <Row k="Heading (@28)" v={<span title="Unknown — possibly player yaw">{fmt1(info.heading)}°?</span>} />
+          <Row k="Heading (@28)" v={<span title="Unknown, possibly player yaw">{fmt1(info.heading)}°?</span>} />
         </div>
 
         <div style={section}>
@@ -129,7 +129,7 @@ export default function WorldInfoPanel({ refreshKey = 0 }: { refreshKey?: number
         </div>
 
         <div style={section}>
-          <div style={sectionLabel}>Sky colors (16 altitude bands)</div>
+          <div style={sectionLabel}>Sky colours (16 altitude bands)</div>
           <div style={{ display: "flex", gap: 3, flexWrap: "wrap", marginTop: 4 }}>
             {info.sky_colors.map((idx, i) => {
               const color = paintColor(idx);

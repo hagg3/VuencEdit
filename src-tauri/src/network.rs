@@ -619,7 +619,7 @@ pub(crate) async fn upload_world(
     const MAX_IMAGE_BYTES: usize = 2 * 1024 * 1024;
     if image_bytes.len() > MAX_IMAGE_BYTES {
         return Err(format!(
-            "Preview image is {:.1} MB — maximum allowed size is 2 MB",
+            "Preview image is {:.1} MB. The limit is 2 MB.",
             image_bytes.len() as f64 / 1_048_576.0
         ));
     }

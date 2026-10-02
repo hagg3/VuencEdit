@@ -85,7 +85,7 @@ export default function QuickActionsBar(p: QuickActionsBarProps) {
     }}>
       <span style={groupLabel}>Sel</span>
       <SmallButton icon="copy" label="Copy" title={`Copy selection (${MOD}C)`} disabled={!hasSel} onClick={p.onCopy} />
-      <SmallButton icon="cut" label="Cut" title="Cut selection — copy, then clear" disabled={!hasSel} onClick={p.onCut} />
+      <SmallButton icon="cut" label="Cut" title="Cut selection (copy, then clear)" disabled={!hasSel} onClick={p.onCut} />
       <SmallButton icon="fill" label="Fill" title="Fill selection with the active block" disabled={!hasSel} onClick={p.onFill} />
       <SmallButton icon="delete" label="Delete" title={`Delete selection (${DEL})`} disabled={!hasSel} tone="danger" onClick={p.onDelete} />
       <SmallButton icon="clear" label="Clear" title={`Clear selection (${MOD}D)`} disabled={!hasSel} onClick={p.onDeselect} />
@@ -97,7 +97,7 @@ export default function QuickActionsBar(p: QuickActionsBarProps) {
         ? <SmallButton icon="paste" label="Confirm paste" title="Paste at the locked-in position (second click)" disabled={!hasClip} active accent={ACCENT.warm} onClick={p.onConfirmPaste} />
         : <SmallButton icon="paste" label="Paste" title={`Arm the paste tool (${MOD}V)`} disabled={!hasClip} active={hasClip} accent={ACCENT.clipboard} onClick={p.onPaste} />}
       <FieldLabel>Z offset</FieldLabel>
-      <IconButton icon="down" label="Lower paste" title={`Lower the paste (PgDn — ${SHIFT} for ±5)`} disabled={!hasClip} onClick={() => nudge(-1)} />
+      <IconButton icon="down" label="Lower paste" title={`Lower the paste (PgDn, ${SHIFT} for 5)`} disabled={!hasClip} onClick={() => nudge(-1)} />
       <NumberField
         value={p.pasteElevationOffset}
         onChange={p.setPasteElevationOffset}
@@ -113,7 +113,7 @@ export default function QuickActionsBar(p: QuickActionsBarProps) {
           opacity: hasClip ? 1 : 0.4,
         }}
       />
-      <IconButton icon="up" label="Raise paste" title={`Raise the paste (PgUp — ${SHIFT} for ±5)`} disabled={!hasClip} onClick={() => nudge(1)} />
+      <IconButton icon="up" label="Raise paste" title={`Raise the paste (PgUp, ${SHIFT} for 5)`} disabled={!hasClip} onClick={() => nudge(1)} />
       <IconButton icon="rotate" label="Rotate" title="Rotate clipboard 90° CW" disabled={!hasClip} onClick={p.onRotate} />
       <IconButton icon="flipX" label="Mirror X" title="Mirror clipboard along X" disabled={!hasClip} onClick={p.onMirrorX} />
       <IconButton icon="flipY" label="Mirror Y" title="Mirror clipboard along Y" disabled={!hasClip} onClick={p.onMirrorY} />

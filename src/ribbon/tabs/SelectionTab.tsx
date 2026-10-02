@@ -101,19 +101,19 @@ export default function SelectionTab() {
           <CmdSetting id="selection.fill.write">
             <BlockChip label="Write" blockType={p.fillBlockType} paint={p.fillPaint}
               open={!!write.armed} onClick={write.run}
-              title="The block Fill writes — and Gradient's starting colour. To replace only certain blocks, set the filter in Replace →" />
+              title="Block for Fill, and the start of Gradient" />
           </CmdSetting>
           <CmdSetting id="selection.fill.fade">
             <BlockChip label="Fade" blockType={p.gradientToBlock} paint={p.gradientToPaint}
               open={!!fade.armed} onClick={fade.run}
-              title="Gradient's ending colour — ignored by Fill" />
+              title="End block for Gradient" />
           </CmdSetting>
           <Row style={{ height: SMALL_H }}>
             <CmdSetting id="selection.fill.axis"><Segmented ariaLabel="Gradient axis" label="Axis" accent={ACCENT.primary} value={p.gradientAxis} onChange={p.setGradientAxis}
               options={[
-                { id: "x", label: "X", title: "Blend across (E–W) — visible top-down" },
-                { id: "y", label: "Y", title: "Blend across (N–S) — visible top-down" },
-                { id: "z", label: "Z", title: "Blend by height — visible in side/3D views" },
+                { id: "x", label: "X", title: "East–west (seen from above)" },
+                { id: "y", label: "Y", title: "North–south (seen from above)" },
+                { id: "z", label: "Z", title: "By height (seen from the side and in 3D)" },
               ]} /></CmdSetting>
             <CmdSmall id="selection.fill.includeAir" />
           </Row>
@@ -127,7 +127,7 @@ export default function SelectionTab() {
       <Group id="replace" label="Replace" tier={tier.replace} declaredWidth={W("replace")} icon="replace">
         <Col style={{ justifyContent: "center", height: GROUP_CONTENT_H }}>
           <CmdSetting id="selection.replace.filter"><button className="rbn-btn" type="button" onClick={filter.run}
-            title="Filter — only these existing blocks get touched by Fill (← Write) and Delete. Leave as 'any block' to affect everything"
+            title="Fill and Delete only touch these blocks"
             aria-label="Filter: which blocks Fill and Delete touch" data-active={filter.armed ? "true" : undefined}
             style={btnBase({
               height: SMALL_H, display: "flex", alignItems: "center", gap: 5, padding: "0 7px", width: "100%",
@@ -167,7 +167,7 @@ export default function SelectionTab() {
             <NumField min={0} max={20} value={p.extrudeCount} title="0 = preview off"
               onChange={p.setExtrudeCount} ariaLabel="Extrude copies" width={40} />
             <CmdSetting id="selection.extrude.skipAir">
-              <Check checked={!!skipAir.armed} onChange={skipAir.run} label="skip air"
+              <Check checked={!!skipAir.armed} onChange={skipAir.run} label="Skip air"
                 title="Leave existing blocks where the source cell is air" />
             </CmdSetting>
           </Row>

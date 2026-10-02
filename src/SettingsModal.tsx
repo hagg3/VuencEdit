@@ -1,4 +1,4 @@
-import { useState, type CSSProperties, type ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { MODAL_TEXT, expBadge, recessedWell } from "./designTokens";
 // M1: shared floor/ceiling with FlyView3D's own in-pane slider and the ribbon 3D tab, so a value set
@@ -6,14 +6,14 @@ import { MODAL_TEXT, expBadge, recessedWell } from "./designTokens";
 import { MAX_RENDER_DISTANCE, RD_MIN } from "./FlyView3D";
 import { openView3dEverywhere, seedLastLayout } from "./windows/windowSeed";
 import { Check, Segmented, Select, SliderRow } from "./ribbon/primitives";
-import { ACCENT, FONT, ICON, RADIUS, TEXT_LABEL } from "./ribbon/tokens";
+import { ACCENT, FONT, ICON, RADIUS } from "./ribbon/tokens";
 import { Icon } from "./ribbon/icons";
-import { v } from "./theme/cssVars";
 import { SKY_3D } from "./theme/theme";
 import { SOUND_PACK_OPTIONS, type PackId } from "./sound/packs";
 import { sfx } from "./sound/sfx";
 import Dialog, { DialogButton } from "./ui/Dialog";
 import { DialogNav, type DialogNavItem } from "./ui/DialogNav";
+import { SectionHeading, SettingRow, rowDivider } from "./ui/SettingRow";
 
 export const SETTINGS_KEY = "eden_settings";
 /** The retired left tool rail's raw collapse key — read once by the v18 migration, then deleted. */
@@ -392,48 +392,6 @@ export function saveSettings(patch: Partial<AppSettings>) {
 
 // ── Layout primitives (UI redesign r3, Stage 14.17 — Dialog/DialogNav chrome) ────────────────────
 
-const rowDivider = `1px solid ${v("border-modalHairline")}`;
-
-/** Two-column settings row (plan §3.3): label + one-line description on the left, one control
- *  right-aligned. Replaces the old "checkbox + stacked label" rows. */
-function SettingRow({
-  label, badge, description, children, last, align = "center",
-}: {
-  label: string; badge?: ReactNode; description?: ReactNode; children: ReactNode;
-  last?: boolean; align?: CSSProperties["alignItems"];
-}) {
-  return (
-    <div style={{
-      display: "flex", alignItems: align, justifyContent: "space-between", gap: 16,
-      padding: "9px 0", borderBottom: last ? "none" : rowDivider,
-    }}>
-      <div style={{ display: "flex", flexDirection: "column", gap: 2, minWidth: 0, flex: 1 }}>
-        <span style={{ fontSize: FONT.body, color: MODAL_TEXT.primary, display: "flex", alignItems: "center" }}>
-          {label}{badge}
-        </span>
-        {description && (
-          <span style={{ fontSize: FONT.label, color: MODAL_TEXT.secondary, lineHeight: 1.4 }}>
-            {description}
-          </span>
-        )}
-      </div>
-      <div style={{ flexShrink: 0, display: "flex", alignItems: "center" }}>{children}</div>
-    </div>
-  );
-}
-
-/** Small-caps section heading (`FONT.label`/`TEXT_LABEL`), the plan's `md-sec`/`md-cap`. */
-function SectionHeading({ children, first }: { children: ReactNode; first?: boolean }) {
-  return (
-    <div style={{
-      fontSize: FONT.label, fontWeight: 700, letterSpacing: "0.08em", textTransform: "uppercase",
-      color: TEXT_LABEL, margin: first ? "0 0 6px" : "16px 0 6px",
-    }}>
-      {children}
-    </div>
-  );
-}
-
 /** A file/directory path setting: label + description on top, a recessed path well + Browse +
  *  optional Clear below. Kept as its own row shape (not the plain two-column `SettingRow`) since a
  *  full path needs more width than a right-aligned control column leaves it. */
@@ -483,16 +441,15 @@ interface Props {
   /** Settings ▸ Layout ▸ Reset window positions — applies immediately (not staged until Save);
    *  omitted on the splash screen, where there are no windows to reset. */
   onResetWindows?: () => void;
-  /** Paste lens (14.9): live `wins.lens.open` state + toggle, mirroring the View ▸ Windows ▸ Paste
-   *  Lens command — the *window*, not visibility (it only actually shows while a paste is armed).
-   *  Applies immediately, like `onResetWindows`; omitted on the splash screen for the same reason. */
-  lensWindowOpen?: boolean;
-  onToggleLensWindow?: () => void;
+  /** The Lens's two session flags (20.4): show it while pasting / for selections. Applies
+   *  immediately, like `onResetWindows`; omitted on the splash screen for the same reason. */
+  lensFlags?: { pasteOn: boolean; selOn: boolean };
+  onLensFlags?: (f: { pasteOn?: boolean; selOn?: boolean }) => void;
   /** Which tab to open on (⌘K "Sound Settings…" opens straight on Sounds). */
   initialTab?: SettingsTab;
 }
 
-export type SettingsTab = "general" | "layout" | "3d" | "editor" | "sounds" | "files";
+export type SettingsTab = "general" | "layout" | "3d" | "editor" | "sounds" | "files" | "experiments";
 
 const NAV_ITEMS: DialogNavItem[] = [
   { id: "general", icon: "settings", label: "General" },
@@ -501,10 +458,11 @@ const NAV_ITEMS: DialogNavItem[] = [
   { id: "editor", icon: "pen", label: "Editor" },
   { id: "sounds", icon: "wavy", label: "Sounds" },
   { id: "files", icon: "open", label: "Files" },
+  { id: "experiments", icon: "sparkle", label: "Experiments" },
 ];
 
 export default function SettingsModal({
-  onClose, onSave, onResetWindows, lensWindowOpen, onToggleLensWindow, initialTab = "general",
+  onClose, onSave, onResetWindows, lensFlags, onLensFlags, initialTab = "general",
 }: Props) {
   const [local, setLocal] = useState<AppSettings>(() => loadSettings());
   const [resetHint, setResetHint] = useState(false);
@@ -558,7 +516,7 @@ export default function SettingsModal({
             </DialogButton>
             {resetHint && (
               <span style={{ color: ACCENT.warm, fontSize: FONT.label }}>
-                Defaults restored — Save to apply.
+                Defaults restored. Save to apply.
               </span>
             )}
           </div>
@@ -570,12 +528,12 @@ export default function SettingsModal({
       {tab === "general" && (
         <>
           <SettingRow label="Check for updates on launch"
-            description="Checks github.com/hagg3/VuencEdit/releases and shows a banner on the splash screen if a newer version is out">
+            description="Show a banner on the start screen when an update is out">
             <Check checked={local.checkForUpdatesOnLaunch} onChange={v => set("checkForUpdatesOnLaunch", v)} label="" title="Check for updates on launch" />
           </SettingRow>
 
           <SettingRow label="Motion"
-            description={<>Chrome animations — popover open, contextual tabs appearing, the edit-completion outline. "System" follows the OS's Reduce Motion setting.</>}>
+            description={<>Interface animations. System follows your OS setting.</>}>
             <Segmented
               ariaLabel="Motion"
               value={local.motion}
@@ -591,7 +549,7 @@ export default function SettingsModal({
           <SettingRow last label="Memory budget"
             description={
               <>
-                Trades resident RAM against undo depth, tile-cache hit rate, and 3D streaming range.
+                Higher keeps more undo, map tiles and 3D chunks in memory.
                 {" "}{MEMORY_PRESETS[local.memoryBudget].label} ≈ {MEMORY_PRESETS[local.memoryBudget].undoBudgetBytes / (1 << 20)} MB undo
                 + {MEMORY_PRESETS[local.memoryBudget].tileBudgetBytes / (1 << 20)} MB tiles
                 + {MEMORY_PRESETS[local.memoryBudget].geometryBudgetBytes / (1 << 20)} MB 3D geometry.
@@ -611,29 +569,28 @@ export default function SettingsModal({
 
       {tab === "layout" && (
         <>
-          <SectionHeading first>Ribbon</SectionHeading>
-          <SettingRow
-            label="Compact ribbon (command bar)" badge={<Badge>exp</Badge>}
-            description="An icon-only command row over a settings row, instead of the labelled ribbon. Experimental and disabled for now (2026-09-28) — the ribbon's own corner toggle was removed.">
-            <Check checked={local.ribbonCompact} onChange={v => set("ribbonCompact", v)} label="" title="Compact ribbon (command bar) — experimental, disabled" disabled />
-          </SettingRow>
-
-          <SectionHeading>Work area</SectionHeading>
-          <SettingRow last={!onToggleLensWindow && !onResetWindows} label="Snap windows"
-            description="Floating windows snap to the work-area edges and centre line while you drag them">
+          <SectionHeading first>Work area</SectionHeading>
+          <SettingRow last={!onLensFlags && !onResetWindows} label="Snap windows"
+            description="Windows snap to edges and the centre line while dragged">
             <Check checked={local.snapWindows} onChange={v => set("snapWindows", v)} label="" title="Snap windows" />
           </SettingRow>
 
-          {onToggleLensWindow && (
-            <SettingRow last={!onResetWindows} label="Paste lens: show while pasting"
-              description="Front/side elevations with Z controls, appearing at the paste ghost — same as View ▸ Windows ▸ Paste Lens (⌥P)">
-              <Check checked={lensWindowOpen ?? false} onChange={() => onToggleLensWindow()} label="" title="Paste lens: show while pasting" />
-            </SettingRow>
+          {onLensFlags && (
+            <>
+              <SettingRow label="Lens while pasting"
+                description="Front and side views of the paste, with Z controls (⌥P)">
+                <Check checked={lensFlags?.pasteOn ?? false} onChange={v => onLensFlags({ pasteOn: v })} label="" title="Lens while pasting" />
+              </SettingRow>
+              <SettingRow last={!onResetWindows} label="Lens for selections"
+                description="Front, side and top views of the selection, with z handles (⌥P)">
+                <Check checked={lensFlags?.selOn ?? false} onChange={v => onLensFlags({ selOn: v })} label="" title="Lens for selections" />
+              </SettingRow>
+            </>
           )}
 
           {onResetWindows && (
             <SettingRow last label="Reset window positions"
-              description="Puts every window back where it starts on a fresh install (this world only; takes effect now).">
+              description="Move every window back to its default place (this world only)">
               <DialogButton onClick={onResetWindows}>Reset window positions</DialogButton>
             </SettingRow>
           )}
@@ -642,7 +599,7 @@ export default function SettingsModal({
 
       {tab === "3d" && (
         <>
-          <SettingRow label="Look sensitivity" description="Mouselook speed in grabbed-cursor LOOK mode (Z from orbit)">
+          <SettingRow label="Look sensitivity" description="Mouse speed in Look mode">
             <SliderRow label="" labelWidth={0} width={130}
               value={local.lookSensitivity} min={0.25} max={4} step={0.05}
               format={v => `${v.toFixed(2)}×`}
@@ -650,7 +607,7 @@ export default function SettingsModal({
             />
           </SettingRow>
 
-          <SettingRow label="Fly-drag sensitivity" description="Look speed while drag-looking (left-drag) in FLY mode">
+          <SettingRow label="Fly-drag sensitivity" description="Drag-to-look speed in Fly mode">
             <SliderRow label="" labelWidth={0} width={130}
               value={local.dragSensitivity} min={0.25} max={4} step={0.05}
               format={v => `${v.toFixed(2)}×`}
@@ -662,7 +619,7 @@ export default function SettingsModal({
             <Check checked={local.invertY} onChange={v => set("invertY", v)} label="" title="Invert Y axis" />
           </SettingRow>
 
-          <SettingRow label="Fog in 3D views" description="Fades distant terrain like the game does; turn off to inspect far terrain">
+          <SettingRow label="Fog in 3D views" description="Fade distant terrain, as in the game">
             <Check checked={local.enableFog} onChange={v => set("enableFog", v)} label="" title="Fog in 3D views" />
           </SettingRow>
 
@@ -670,7 +627,7 @@ export default function SettingsModal({
               they live in the Ribbon's 3D/View Lighting group (⚡ badged) and always start off,
               so they're deliberately not persisted defaults here. */}
 
-          <SettingRow last label="3D performance HUD" description="Resident-geometry readout in the 3D pane; also feeds Help ▸ Diagnostics">
+          <SettingRow last label="3D performance HUD" description="Show 3D memory use in the 3D view">
             <Check checked={local.showPerfHud} onChange={v => set("showPerfHud", v)} label="" title="3D performance HUD" />
           </SettingRow>
 
@@ -709,7 +666,7 @@ export default function SettingsModal({
           </SettingRow>
 
           <SettingRow label="Build reach"
-            description="How far a 3D build-mode break/place can reach. Past it the placement outline doesn't appear and a click does nothing. Select, eyedropper and flood fill still reach 256.">
+            description="How far Build mode can break and place blocks">
             <SliderRow label="" labelWidth={0} width={130}
               value={local.buildReach} min={8} max={256} step={8}
               format={v => `${Math.round(v)} blocks`}
@@ -718,7 +675,7 @@ export default function SettingsModal({
           </SettingRow>
 
           <SettingRow last label="Lighting profile"
-            description="Legacy (~4-tile, steep falloff) vs Modern/New Dawn (~14-tile, gradual falloff). Switching snaps Lamp radius to that profile's default.">
+            description="Legacy is short and steep, New Dawn long and gradual. Switching resets Lamp radius.">
             <Segmented
               ariaLabel="Lighting profile"
               value={local.lightingProfile}
@@ -734,23 +691,23 @@ export default function SettingsModal({
           </SettingRow>
 
           <div style={{ fontSize: FONT.label, color: MODAL_TEXT.secondary, marginTop: 8 }}>
-            These are also editable from the 3D pane / Ribbon directly — surfaced here so Reset to defaults has somewhere visible to reset them to.
+            These sliders also appear in the 3D view and the ribbon.
           </div>
         </>
       )}
 
       {tab === "editor" && (
         <>
-          <SettingRow label="Save compressed by default" description="New worlds save as .zip; overridden by the loaded world's format">
+          <SettingRow label="Save compressed by default" description="Save new worlds as .zip. Opened worlds keep their format.">
             <Check checked={local.defaultSaveCompressed} onChange={v => set("defaultSaveCompressed", v)} label="" title="Save compressed by default" />
           </SettingRow>
 
-          <SettingRow last label="Compress backups" description="The first save over a file keeps its old bytes as a backup. A plain .bak is a full-size copy kept until you delete it; .bak.zip is far smaller but makes that first save slower.">
+          <SettingRow last label="Compress backups" description="The first save over a file keeps a backup until you delete it. Compressed backups are much smaller but slower to make.">
             <Check checked={local.backupCompressed} onChange={v => set("backupCompressed", v)} label="" title="Compress backups" />
           </SettingRow>
 
           <SectionHeading>Autosave</SectionHeading>
-          <SettingRow last label="Autosave interval" description="How often an in-progress world is snapshotted to a recovery sidecar. 0 disables autosave.">
+          <SettingRow last label="Autosave interval" description="How often unsaved work is kept for recovery. 0 turns it off.">
             <SliderRow label="" labelWidth={0} width={130}
               value={local.autosaveIntervalMin} min={0} max={15} step={1}
               format={v => (v === 0 ? "Off" : `${Math.round(v)} min`)}
@@ -763,7 +720,7 @@ export default function SettingsModal({
       {tab === "sounds" && (
         <>
           <SettingRow label="UI sounds"
-            description="Synthesised completion cues (tab/menu switches, copy/paste, save, rotate/mirror, undo/redo, drag start and drop, errors). Never on hover, never at pointer or stamp rate.">
+            description="Short sounds when actions finish">
             <Check checked={local.uiSounds} onChange={v => set("uiSounds", v)} label="" title="UI sounds" />
           </SettingRow>
 
@@ -795,14 +752,14 @@ export default function SettingsModal({
         <>
           <PathRow
             label="Eden.eden template path" badge={<Badge>exp</Badge>}
-            description="Eden.eden is the pre-generated template bundled with the game. Point this at your copy to show its terrain faded behind the gaps in a sparse/normal world's map (View ▾ → Template Overlay), or to &quot;Expand from Template&quot; and bake it into a full world file."
+            description="Your copy of the game's Eden.eden, for the template overlay and Expand from Template"
             value={local.templatePath} placeholder="Not set"
             onBrowse={browsePath} onClear={() => set("templatePath", null)}
           />
 
           <PathRow
             label="Texture pack path"
-            description="ZIP of PNGs — adds textures to 3D views and block picker icons"
+            description="A ZIP of PNGs for the 3D view and block picker"
             value={local.texturePackPath} placeholder="Not set"
             onBrowse={browseTexturePack} onClear={() => set("texturePackPath", null)}
           />
@@ -813,6 +770,17 @@ export default function SettingsModal({
             value={local.prefabDirectory} placeholder="App default"
             onBrowse={browsePrefabDir} onClear={() => set("prefabDirectory", null)}
           />
+        </>
+      )}
+
+      {tab === "experiments" && (
+        <>
+          <SectionHeading first>Ribbon</SectionHeading>
+          <SettingRow
+            last label="Compact ribbon (command bar)" badge={<Badge>exp</Badge>}
+            description="An icon-only ribbon.">
+            <Check checked={local.ribbonCompact} onChange={v => set("ribbonCompact", v)} label="" title="Compact ribbon" />
+          </SettingRow>
         </>
       )}
     </Dialog>

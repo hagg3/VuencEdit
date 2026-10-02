@@ -16,26 +16,26 @@ export interface SculptToolDef {
 
 /** Raise / Lower / Rock / Carve — the four big prominent commands. */
 export const SCULPT_PRIMARY: SculptToolDef[] = [
-  { id: "raise", icon: "raise", label: "Raise", title: "Raise — drag to pull terrain up" },
-  { id: "lower", icon: "lower", label: "Lower", title: "Lower — drag to dig down" },
-  { id: "rock", icon: "rock", label: "Rock", title: "Rock — volumetric mass fused into the terrain (ignores Strength/Softness; Radius sets its size)" },
-  { id: "carve", icon: "carve", label: "Carve", title: "Carve — cuts a filleted depression, sky-connected material only (ignores Strength/Softness)" },
+  { id: "raise", icon: "raise", label: "Raise", title: "Drag to raise terrain" },
+  { id: "lower", icon: "lower", label: "Lower", title: "Drag to dig down" },
+  { id: "rock", icon: "rock", label: "Rock", title: "Place a rock mass fused into the terrain (Radius sets size)" },
+  { id: "carve", icon: "carve", label: "Carve", title: "Cut a rounded hollow into exposed terrain (Radius sets size)" },
 ];
 
 /** Everything else, reached through the "More tools" menu. */
 export const SCULPT_MORE: SculptToolDef[] = [
-  { id: "smooth", icon: "smooth", label: "Smooth", title: "Smooth — average neighbouring heights" },
-  { id: "flatten", icon: "flatten", label: "Flatten", title: "Flatten — level terrain to the height you clicked" },
-  { id: "slope", icon: "slope", label: "Slope", title: "Slope — flatten to a tilted plane (set Slope X/Y in the Brush shape panel)" },
-  { id: "noise", icon: "noise", label: "Noise", title: "Noise — coherent hills or mountains" },
-  { id: "erode", icon: "erode", label: "Erode", title: "Erode — drop each column toward its lowest neighbour" },
-  { id: "thermal", icon: "thermal", label: "Thermal", title: "Thermal — talus-angle erosion, scree slopes" },
-  { id: "hydro", icon: "hydro", label: "Hydro", title: "Hydro — droplet hydraulic erosion, carves channels" },
-  { id: "terrace", icon: "terrace", label: "Terrace", title: "Terrace — quantize height into Strength-block steps" },
-  { id: "sharpen", icon: "sharpen", label: "Sharpen", title: "Sharpen — crisps terrain, the inverse of Smooth" },
-  { id: "smear", icon: "smear", label: "Smear", title: "Smear — drag to pull height along with the brush" },
-  { id: "grab", icon: "grab", label: "Grab", title: "Grab — press and drag up/down to pull terrain" },
-  { id: "stamp", icon: "stamp", label: "Retexture", title: "Retexture — repaint the surface by slope" },
+  { id: "smooth", icon: "smooth", label: "Smooth", title: "Average neighbouring heights" },
+  { id: "flatten", icon: "flatten", label: "Flatten", title: "Level terrain to the height you click" },
+  { id: "slope", icon: "slope", label: "Slope", title: "Flatten to a tilted plane (Slope X/Y in the Brush shape panel)" },
+  { id: "noise", icon: "noise", label: "Noise", title: "Add hills or mountains" },
+  { id: "erode", icon: "erode", label: "Erode", title: "Lower each column toward its lowest neighbour" },
+  { id: "thermal", icon: "thermal", label: "Thermal", title: "Slide steep slopes into scree" },
+  { id: "hydro", icon: "hydro", label: "Hydro", title: "Water erosion that carves channels" },
+  { id: "terrace", icon: "terrace", label: "Terrace", title: "Cut terrain into steps of Strength blocks" },
+  { id: "sharpen", icon: "sharpen", label: "Sharpen", title: "Crisp up terrain (opposite of Smooth)" },
+  { id: "smear", icon: "smear", label: "Smear", title: "Drag to pull terrain along with the brush" },
+  { id: "grab", icon: "grab", label: "Grab", title: "Press and drag up or down to pull terrain" },
+  { id: "stamp", icon: "stamp", label: "Retexture", title: "Repaint the surface by slope" },
 ];
 
 export const SCULPT_ALL: SculptToolDef[] = [...SCULPT_PRIMARY, ...SCULPT_MORE];

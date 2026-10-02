@@ -50,6 +50,34 @@ describe("paste lens session flag (Stage 16.1)", () => {
     expect(m.getWindowState().wins.lens.open).toBe(true);
   });
 
+  it("the selection flag (20.4) is session-only too: on at launch, kept across worlds, never stored", async () => {
+    const m = await load();
+    m.loadWorld("/w/a.eden", "id-a");
+    expect(m.getWindowState().lensSelOn).toBe(true);
+    m.setLensFlags({ selOn: false });
+    expect(m.getWindowState().lensSelOn).toBe(false);
+    expect(m.getWindowState().wins.lens.open).toBe(true); // the paste flag is separate
+    m.loadWorld("/w/b.eden", "id-b");
+    expect(m.getWindowState().lensSelOn).toBe(false);
+    m.closeWorld();
+    expect(mem.get("vuencedit_window_layouts") ?? "").not.toContain("lensSel");
+
+    vi.resetModules();
+    const m2 = await load();
+    m2.loadWorld("/w/a.eden", "id-a");
+    expect(m2.getWindowState().lensSelOn).toBe(true);
+  });
+
+  it("setLensFlags drives the paste flag through wins.lens.open", async () => {
+    const m = await load();
+    m.loadWorld("/w/a.eden", "id-a");
+    m.setLensFlags({ pasteOn: false, selOn: false });
+    expect(m.getWindowState().wins.lens.open).toBe(false);
+    m.setLensFlags({ pasteOn: true });
+    expect(m.getWindowState().wins.lens.open).toBe(true);
+    expect(m.getWindowState().lensSelOn).toBe(false);
+  });
+
   it("keeps the lens geometry persisted per world", async () => {
     const m = await load();
     m.loadWorld("/w/a.eden", "id-a");

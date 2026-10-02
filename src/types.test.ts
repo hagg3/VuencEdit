@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { decodeGeometry, decodePasteLens } from "./types";
+import { decodeGeometry, decodePasteLensPair, decodeSelectionLens } from "./types";
 
 // Mirrors `ipc_envelope`'s framing (lib.rs) — same idiom as `codec.test.ts`'s `buildEnvelope`.
 function buildEnvelope(header: unknown, body: Uint8Array): ArrayBuffer {
@@ -13,12 +13,13 @@ function buildEnvelope(header: unknown, body: Uint8Array): ArrayBuffer {
   return out.buffer;
 }
 
-describe("decodePasteLens", () => {
+describe("decodePasteLensPair", () => {
   it("round-trips a hand-built render_paste_lens envelope", () => {
     const width = 6, height = 4;
     const pixels = new Uint8Array(4 * width * height);
     for (let i = 0; i < pixels.length; i++) pixels[i] = i % 256;
-    const header = {
+    const sidePixels = new Uint8Array(4 * 3 * height).fill(77);
+    const front = {
       width, height, lod: 2,
       col_lo: 10, z_lo: 40, z_hi: 43,
       footprint_lo: 12, footprint_hi: 20,
@@ -26,8 +27,12 @@ describe("decodePasteLens", () => {
       buried: 5, cleared: 0, floating_cols: 1,
       approx: false,
     };
-    const buf = buildEnvelope(header, pixels);
-    const r = decodePasteLens(buf);
+    const side = { ...front, width: 3, lod: 1, col_lo: 7, footprint_lo: 8, footprint_hi: 9 };
+    const header = { front, side, lens: [pixels.length, sidePixels.length] };
+    const buf = buildEnvelope(header, new Uint8Array([...pixels, ...sidePixels]));
+    const { front: r, side: s } = decodePasteLensPair(buf);
+    expect(s).toMatchObject({ width: 3, height, lod: 1, colLo: 7, footprintLo: 8, footprintHi: 9, zLo: 40, zHi: 43, buried: 5 });
+    expect(s.pixels).toEqual(sidePixels);
 
     expect(r.width).toBe(width);
     expect(r.height).toBe(height);
@@ -47,7 +52,7 @@ describe("decodePasteLens", () => {
   });
 
   it("carries null ghostZMin/ghostZMax through when every column is skipped", () => {
-    const header = {
+    const view = {
       width: 1, height: 1, lod: 1,
       col_lo: 0, z_lo: 0, z_hi: 0,
       footprint_lo: 0, footprint_hi: 0,
@@ -55,11 +60,49 @@ describe("decodePasteLens", () => {
       buried: 0, cleared: 0, floating_cols: 0,
       approx: true,
     };
-    const buf = buildEnvelope(header, new Uint8Array(4));
-    const r = decodePasteLens(buf);
+    const buf = buildEnvelope({ front: view, side: view, lens: [4, 4] }, new Uint8Array(8));
+    const r = decodePasteLensPair(buf).side;
     expect(r.ghostZMin).toBeNull();
     expect(r.ghostZMax).toBeNull();
     expect(r.approx).toBe(true);
+  });
+});
+
+describe("decodeSelectionLens", () => {
+  const img = (w: number, h: number, seed: number) => new Uint8Array(4 * w * h).map((_, i) => (i * seed) % 256);
+
+  it("splits a front + side envelope by `lens` and maps each view by kind", () => {
+    const front = img(5, 64, 3), side = img(7, 64, 5);
+    const header = {
+      views: [
+        { kind: "front", width: 5, height: 64, lod: 2, col_lo: -3, row_lo: null, footprint_lo: 1, footprint_hi: 6 },
+        { kind: "side", width: 7, height: 64, lod: 1, col_lo: 4, row_lo: null, footprint_lo: 7, footprint_hi: 10 },
+      ],
+      lens: [front.length, side.length],
+      z_lo: 0, z_hi: 63, terrain_z_hi: 41,
+    };
+    const body = new Uint8Array([...front, ...side]);
+    const r = decodeSelectionLens(buildEnvelope(header, body));
+    expect(r.top).toBeNull();
+    expect([r.zLo, r.zHi, r.terrainZHi]).toEqual([0, 63, 41]);
+    expect(r.front).toMatchObject({ width: 5, height: 64, lod: 2, colLo: -3, rowLo: null, footprintLo: 1, footprintHi: 6 });
+    expect(r.side).toMatchObject({ width: 7, lod: 1, colLo: 4, footprintLo: 7, footprintHi: 10 });
+    expect(r.front!.pixels).toEqual(front);
+    expect(r.side!.pixels).toEqual(side);
+  });
+
+  it("decodes the top-only flavour", () => {
+    const top = img(3, 2, 7);
+    const header = {
+      views: [{ kind: "top", width: 3, height: 2, lod: 4, col_lo: 8, row_lo: 12, footprint_lo: 10, footprint_hi: 17 }],
+      lens: [top.length], z_lo: 20, z_hi: 30, terrain_z_hi: null,
+    };
+    const r = decodeSelectionLens(buildEnvelope(header, top));
+    expect(r.front).toBeNull();
+    expect(r.side).toBeNull();
+    expect(r.terrainZHi).toBeNull();
+    expect(r.top).toMatchObject({ width: 3, height: 2, lod: 4, colLo: 8, rowLo: 12 });
+    expect(r.top!.pixels).toEqual(top);
   });
 });
 

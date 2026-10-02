@@ -184,6 +184,8 @@ describe("defaultWins", () => {
     expect(WORK.h - (v.y + v.h)).toBe(WM);
     expect(d.hotbar.open).toBe(true);
     expect(d.lens.open).toBe(true); // session-only "enabled" flag, on by default (16.1)
+    // 20.4: two elevations side by side need the room for z handles.
+    expect([d.lens.w, d.lens.h]).toEqual([340, 240]);
   });
 });
 

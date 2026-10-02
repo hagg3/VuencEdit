@@ -5,7 +5,7 @@
  * `placeLens`.
  *
  * Coordinates are **work-area-local** px, the same space `windowGeometry.ts`'s `WinState`/`rectOf`
- * use — the caller (`PasteLensWindow.tsx`) is responsible for converting the ghost's screen
+ * use — the caller (`LensWindow.tsx`) is responsible for converting the ghost's screen
  * (viewport) rect into this space by subtracting the work area's own `getBoundingClientRect()`
  * origin before calling `attachPosition`.
  */
