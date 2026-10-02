@@ -11,14 +11,14 @@
 import {
   Anvil, AppWindow, ArrowDown, ArrowLeft, ArrowLeftRight, ArrowRight, ArrowUp, Blend, Blocks, Box, Brush, Camera,
   Check, ChevronDown, ChevronUp, ChevronsUpDown, Circle, CircleHelp, ClipboardPaste,
-  Copy, CopyPlus, Crosshair, Cuboid, Download, Droplet, Droplets, Expand, Feather, FileInput,
+  Copy, CopyPlus, Crosshair, Cuboid, Dices, Download, Droplet, Droplets, Expand, Eye, Feather, FileInput,
   FileOutput, FilePlus, Filter, Flag, Flame, FlipHorizontal2, FlipVertical2, FolderOpen, Frame, Gauge,
   Globe2, Grid2x2, Grid3x3, Hammer, Hand, History, House, Image, Info, Lasso, LayoutGrid, Layers,
   Layers2, LibraryBig, Link2, Link2Off, Map, Maximize, Maximize2, Minimize2, Minus, Moon, Mountain, Move,
   MoveHorizontal, Package, PaintBucket, PanelLeft, PanelRight, Pencil, Pentagon, Pickaxe, Pipette, Repeat,
   Replace, RotateCcw, RotateCw, Rows3, Save, SaveAll, Scissors, Search, Settings, Shuffle, Slash, Snowflake,
   Signpost, Sparkles, SprayCan, Square, SquareDashed, SquareSplitVertical, Stamp, Sun, Target, TriangleAlert,
-  TrendingUp, Trash2, TreePine, Triangle, Undo2, Redo2, Upload, Wand2, Waves, Wind, X, ZoomIn,
+  TrendingUp, Trash2, TreePine, Triangle, Undo2, Redo2, RefreshCw, Upload, Wand2, Waves, Wind, X, ZoomIn,
   ZoomOut, Zap,
 } from "lucide-react";
 import type { CSSProperties } from "react";
@@ -72,6 +72,8 @@ const MAP = {
   // Floating windows (Stage 14.3/14.4) + Select
   check: Check, swap: ArrowLeftRight, enlarge: Maximize2, restore: Minimize2, windows: AppWindow,
   resetWindows: RotateCcw, link: Link2, linkOff: Link2Off,
+  // New World seed / preview (19.10)
+  dice: Dices, eye: Eye, refresh: RefreshCw,
   // Command search (⌘K, Stage 14.6)
   search: Search,
   // Status bar segments (Stage 14.11)

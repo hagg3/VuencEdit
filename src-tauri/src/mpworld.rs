@@ -146,7 +146,7 @@ pub(crate) fn parse_mpworld(path: &str) -> Result<MpParse, String> {
 
     if recs.is_empty() {
         return Err(
-            "No world records found — this does not look like an Eden server world model \
+            "No world records found. This does not look like an Eden server world model \
              (.mpworld / eden_world.model)."
                 .into(),
         );

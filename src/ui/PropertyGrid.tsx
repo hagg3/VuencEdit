@@ -2,7 +2,7 @@
  * Property-grid primitives for the docked sidebar's Inspector tab (UI redesign r3, Stage 14.11).
  *
  * `Section` is a collapsible header + body — the sidebar's replacement for the old bespoke
- * ▶/▼ disclosures each panel (`ElevationPreviewPanel`, `SignsList`) hand-rolled its own copy of.
+ * ▶/▼ disclosures each panel (`SignsList`, the old elevation panel) hand-rolled its own copy of.
  * `PropRow`/`PropGrid` are label/value rows in the Visual Studio / Xcode "inspector" idiom: a
  * left-aligned label in `TEXT_LABEL` and a right-aligned, tabular-nums monospace value — every
  * numeric readout in the Inspector tab (Selection's Size/Z range/Volume/Shape) goes through these
@@ -12,7 +12,7 @@
  * `ribbon_collapsed` — a plain per-install UI preference, not an `AppSettings` field.
  */
 import { useCallback, useState, type CSSProperties, type ReactNode } from "react";
-import { Icon, type IconName } from "../ribbon/icons";
+import { Icon } from "../ribbon/icons";
 import { FONT, HAIRLINE, ICON, SPACE, TEXT, TEXT_LABEL, TEXT_META } from "../ribbon/tokens";
 
 /** Monospace stack for property values — matches the canvas HUD labels elsewhere in the Inspector
@@ -49,7 +49,6 @@ export interface SectionProps {
   title: string;
   /** Right-aligned mono meta text in the header (e.g. a count, "ortho", a dimension string). */
   meta?: string;
-  icon?: IconName;
   /** Falls back to this the first time a section is seen — a returning user's explicit choice
    *  (recorded in `sidebar_sections`) always wins over a later default change. */
   defaultOpen?: boolean;
@@ -57,7 +56,7 @@ export interface SectionProps {
   style?: CSSProperties;
 }
 
-export function Section({ id, title, meta, icon, defaultOpen = true, children, style }: SectionProps) {
+export function Section({ id, title, meta, defaultOpen = true, children, style }: SectionProps) {
   const [open, setOpen] = useState(() => {
     const s = sectionState();
     return id in s ? s[id] : defaultOpen;
@@ -78,8 +77,10 @@ export function Section({ id, title, meta, icon, defaultOpen = true, children, s
           letterSpacing: "0.06em", textTransform: "uppercase", color: TEXT_LABEL,
         }}
       >
-        <Icon name={open ? "expandBar" : "right"} size={ICON.xs} tone="default" />
-        {icon && <Icon name={icon} size={ICON.xs} tone="default" />}
+        {/* One chevron for both states, rotated when closed, so open/closed never differ in glyph. */}
+        <span style={{ display: "inline-flex", transform: open ? undefined : "rotate(-90deg)" }}>
+          <Icon name="expandBar" size={ICON.xs} tone="default" />
+        </span>
         <span style={{ flex: 1 }}>{title}</span>
         {meta && (
           <span style={{

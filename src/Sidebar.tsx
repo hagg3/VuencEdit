@@ -131,18 +131,8 @@ export interface SidebarProps {
   onSavePrefabAs: () => void;
   prefabRefreshToken: number;
 
-  // Elevation view — folded into the Inspector tab. Null when there's nothing to show it for.
-  elevationSelection: SelectionInfo | null;
-  maxZ: number;
-  extrudeCount: number;
-  extrudeAxis: string;
-  isPastePreview: boolean;
-  editEpoch: number;
-  drawActive: boolean;
-  onDrawElevation: (x: number, y: number, z: number) => void;
-  onZRangeChange?: (zMin: number, zMax: number) => void;
-
   // History tab
+  editEpoch: number;
   worldEpoch: number;
 
   // Inspector tab — signs (256z-format plan, Phase 4)
@@ -192,8 +182,6 @@ export default function Sidebar(p: SidebarProps) {
       </div>
     );
   }
-
-  const contentWidth = p.width - PAD * 2;
 
   return (
     <div data-tour="sidebar" style={{
@@ -262,16 +250,6 @@ export default function Sidebar(p: SidebarProps) {
             selection={p.selection}
             clipboard={p.clipboard}
             clipboardPreview={p.clipboardPreview}
-            elevationSelection={p.elevationSelection}
-            elevationWidth={contentWidth}
-            maxZ={p.maxZ}
-            extrudeCount={p.extrudeCount}
-            extrudeAxis={p.extrudeAxis}
-            isPastePreview={p.isPastePreview}
-            editEpoch={p.editEpoch}
-            drawActive={p.drawActive}
-            onDrawElevation={p.onDrawElevation}
-            onZRangeChange={p.onZRangeChange}
             signs={p.signs}
             onSignClick={p.onSignClick}
           />

@@ -76,7 +76,7 @@ export default function ThreeDTab() {
             title="Movement speed in fly/look mode, in blocks per second" /></CmdSetting>
           <CmdSetting id="3d.camera.distance"><SliderRow label="Distance" min={RD_MIN} max={MAX_RENDER_DISTANCE} accent={SPATIAL} labelWidth={54}
             value={distDisplay} onChange={setDistDisplay} onCommit={p.commitRenderDistance}
-            title="Chunk render distance. Cost rises quadratically — this is the main 3D performance dial." /></CmdSetting>
+            title="Render distance in chunks. The biggest 3D performance cost." /></CmdSetting>
         </Col>
         <Col style={{ justifyContent: "center", height: GROUP_CONTENT_H }}>
           <CmdSmall id="3d.camera.hud" full />
@@ -97,11 +97,11 @@ export default function ThreeDTab() {
             labelWidth={32} width={68} disabled={!sunActive}
             value={sunDisplay} onChange={setSunDisplay} onCommit={p.commitSunT}
             format={v => `${Math.round(v * 100)}%`}
-            title={sunActive ? "Sun angle: 0 = sunrise, 0.5 = noon, 1 = sunset" : "Turn on Shadows or GPU Shadows — the sun angle only affects shadowed lighting"} />
+            title={sunActive ? "Sun angle: 0 = sunrise, 0.5 = noon, 1 = sunset" : "Turn on Shadows or GPU Shadows to use the sun angle"} />
           <SliderRow label="Lamp R" min={2} max={32} accent={AMBER} labelWidth={44} width={68}
             disabled={!p.nightLighting}
             value={lampDisplay} onChange={setLampDisplay} onCommit={p.commitLampRadius}
-            title={p.nightLighting ? "Lamp light radius, in blocks" : "Turn on Night Lighting — lamps only cast light at night"} />
+            title={p.nightLighting ? "Lamp light radius, in blocks" : "Turn on Night Lighting to use the lamp radius"} />
           <Row style={{ height: SMALL_H, opacity: p.nightLighting ? 1 : 0.35, pointerEvents: p.nightLighting ? "auto" : "none" }}>
             <CmdSmall id="3d.lighting.legacy" />
             <CmdSmall id="3d.lighting.modern" />

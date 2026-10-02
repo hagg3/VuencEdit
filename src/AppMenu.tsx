@@ -24,10 +24,13 @@ import WorldInfoPanel from "./panels/WorldInfoPanel";
 import { Icon, type IconName } from "./ribbon/icons";
 import { useRibbon } from "./ribbon/context";
 import {
-  BORDER, CUR_ICON, MOD, RADIUS, SHIFT, SURFACE, TEXT, TEXT_ARMED, TEXT_DANGER, TEXT_DIM, TEXT_LABEL,
-  btnBase, currentRow,
+  ACCENT, BORDER, CUR_ICON, FONT, MOD, RADIUS, SHIFT, SURFACE, TEXT, TEXT_ARMED, TEXT_DANGER, TEXT_DIM, TEXT_LABEL,
+  currentRow,
 } from "./ribbon/tokens";
-import { Check } from "./ribbon/primitives";
+import { Check, Keycap, TextField } from "./ribbon/primitives";
+import { v } from "./theme/cssVars";
+import { DialogButton } from "./ui/Dialog";
+import { SectionHeading } from "./ui/SettingRow";
 import { timeAgo } from "./useRecentWorlds";
 
 export type AppMenuRow =
@@ -120,7 +123,7 @@ export default function AppMenu({
       style={{
         background: SURFACE.popover,
         position: "fixed", top: anchorTop, left: 6, zIndex: 500,
-        boxShadow: `inset 0 0 0 1px ${BORDER.outline}, inset 0 1px 0 ${BORDER.bevel}, 0 20px 50px rgba(0,0,0,.55)`,
+        boxShadow: `inset 0 0 0 1px ${BORDER.outline}, inset 0 1px 0 ${BORDER.bevel}, ${v("pop-shadow")}`,
         borderRadius: RADIUS.lg,
         // Fixed, not elastic: the panel must not resize as the selected row changes.
         width: MENU_W, height: MENU_H,
@@ -132,11 +135,11 @@ export default function AppMenu({
       <div ref={listRef} onKeyDown={onListKeyDown}
         style={{
           width: LIST_W, flexShrink: 0, padding: "8px 6px", display: "flex", flexDirection: "column", gap: 1,
-          background: "rgba(0,0,0,.10)",
+          background: SURFACE.body,
           borderRight: `1px solid ${BORDER.hairline}`, overflowY: "auto",
         }}>
         {rows.map((r, i) => r.kind === "sep" ? (
-          <div key={`sep-${i}`} aria-hidden="true" style={{ height: 1, background: "rgba(255,255,255,.09)", margin: "5px 8px" }} />
+          <div key={`sep-${i}`} aria-hidden="true" style={{ height: 1, background: BORDER.hairline, margin: "5px 8px" }} />
         ) : (
           <button
             key={r.id} data-row={r.id} role="menuitem" type="button"
@@ -148,7 +151,7 @@ export default function AppMenu({
             style={{
               display: "flex", alignItems: "center", gap: 9, textAlign: "left",
               padding: "0 10px", height: 34, borderRadius: 5, border: "none", outline: "none",
-              cursor: r.disabled ? "default" : "pointer", fontSize: 14,
+              cursor: r.disabled ? "default" : "pointer", fontSize: FONT.tab,
               opacity: r.disabled ? 0.4 : 1,
               color: r.danger ? TEXT_DANGER : TEXT,
               // Current row = pushed in (Stage 14.2) — no accent fill or ring.
@@ -160,9 +163,7 @@ export default function AppMenu({
               style={!r.danger && row === r.id ? { color: CUR_ICON } : undefined} />
             <span style={{ flex: 1 }}>{r.label}</span>
             {r.accel && (
-              <span style={{ fontSize: 11.5, color: TEXT_DIM, fontFamily: "ui-monospace, 'SF Mono', monospace" }}>
-                {r.accel}
-              </span>
+              <Keycap text={r.accel} small />
             )}
           </button>
         ))}
@@ -181,8 +182,8 @@ export default function AppMenu({
 function PaneHead({ title, sub }: { title: string; sub?: ReactNode }) {
   return (
     <div style={{ marginBottom: 14 }}>
-      <h2 style={{ margin: 0, fontSize: 17, fontWeight: 700, color: TEXT_ARMED }}>{title}</h2>
-      {sub && <div style={{ marginTop: 4, fontSize: 12.5, color: TEXT_DIM, lineHeight: 1.5, maxWidth: 620 }}>{sub}</div>}
+      <h2 style={{ margin: 0, fontSize: FONT.tab, fontWeight: 600, color: TEXT_ARMED }}>{title}</h2>
+      {sub && <div style={{ marginTop: 4, fontSize: FONT.body, color: TEXT_DIM, lineHeight: 1.5, maxWidth: 620 }}>{sub}</div>}
     </div>
   );
 }
@@ -198,7 +199,7 @@ function TextList({ items }: { items: [string, ReactNode][] }) {
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 9, marginBottom: 14 }}>
       {items.map(([term, def]) => (
-        <div key={term} style={{ fontSize: 12, lineHeight: 1.55, color: TEXT_DIM }}>
+        <div key={term} style={{ fontSize: FONT.body, lineHeight: 1.55, color: TEXT_DIM }}>
           <span style={{ color: TEXT, fontWeight: 600 }}>{term}</span>
           <span style={{ color: TEXT_LABEL }}> — </span>
           {def}
@@ -210,36 +211,27 @@ function TextList({ items }: { items: [string, ReactNode][] }) {
 
 /** Closing note under a pane's text list — the caveat, not the content. */
 function PaneNote({ children }: { children: ReactNode }) {
-  return <div style={{ fontSize: 11.5, color: TEXT_LABEL, marginBottom: 14, lineHeight: 1.5 }}>{children}</div>;
+  return <div style={{ fontSize: FONT.label, color: TEXT_LABEL, marginBottom: 14, lineHeight: 1.5 }}>{children}</div>;
 }
 
-function Primary({ label, icon, onClick, disabled, busy, tone = "teal", title }: {
+function Primary({ label, icon, onClick, disabled, busy, tone = "teal", title, neutral }: {
   label: string; icon: IconName; onClick: () => void; disabled?: boolean; busy?: boolean;
-  tone?: "teal" | "danger"; title?: string;
+  tone?: "teal" | "danger"; title?: string; neutral?: boolean;
 }) {
-  const accent = tone === "danger" ? "#ef4444" : TEXT_ARMED;
   return (
-    <button type="button" onClick={onClick} disabled={disabled} title={title}
-      style={btnBase({
-        display: "inline-flex", alignItems: "center", gap: 8, padding: "0 16px", height: 32,
-        fontSize: 13, fontWeight: 600, borderRadius: 6, color: disabled ? "#7a8488" : TEXT,
-        background: disabled
-          ? "rgba(255,255,255,.04)"
-          : `linear-gradient(180deg, rgba(${tone === "danger" ? "239,68,68" : "0,164,173"},.42), rgba(${tone === "danger" ? "239,68,68" : "0,164,173"},.16))`,
-        boxShadow: `inset 0 0 0 1px ${disabled ? "rgba(255,255,255,.10)" : accent}`,
-        cursor: disabled ? "not-allowed" : "pointer",
-      })}>
+    <DialogButton variant={neutral ? "neutral" : tone === "danger" ? "danger" : "primary"}
+      onClick={onClick} disabled={disabled} title={title}
+      style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
       {busy ? <div style={spinnerStyle(14)} /> : <Icon name={icon} size={15} tone="inherit" />}
       {label}
-    </button>
+    </DialogButton>
   );
 }
 
 function CheckRow({ checked, onChange, label, hint }: { checked: boolean; onChange: (v: boolean) => void; label: string; hint: string }) {
   return (
     <div style={{ padding: "5px 0" }}>
-      <Check checked={checked} onChange={onChange} hint={hint}
-        label={<span style={{ fontSize: 12.5, color: TEXT }}>{label}</span>} />
+      <Check checked={checked} onChange={onChange} hint={hint} label={label} />
     </div>
   );
 }
@@ -267,7 +259,7 @@ function BackupNote({ path, compressed }: { path: string; compressed: boolean })
       : <>This save first copies the current file to <code style={{ color: TEXT }}>.bak</code>: {fmtBytes(st.source_bytes)} more on disk, kept until you delete it.</>;
   }
   if (!text) return null;
-  return <div style={{ fontSize: 11.5, color: TEXT_LABEL, padding: "2px 0 0 18px", lineHeight: 1.5, maxWidth: 620 }}>{text}</div>;
+  return <div style={{ fontSize: FONT.label, color: TEXT_LABEL, padding: "2px 0 0 18px", lineHeight: 1.5, maxWidth: 620 }}>{text}</div>;
 }
 
 // ── The panes ─────────────────────────────────────────────────────────────────
@@ -280,16 +272,15 @@ function Pane({ row, onClose, infoKey, bumpInfo }: { row: AppMenuRow; onClose: (
     case "new":
       return (<>
         <PaneHead title="New World"
-          sub="Generate a fresh world. Pick a size and a generator in the dialog. Every generator writes a complete, playable world you can edit immediately." />
+          sub="Create a new world." />
         <TextList items={[
-          ["Flat", "Uniform slab at a chosen height. The blank canvas: fastest to make, and the right starting point when you intend to build everything yourself."],
-          ["Natural", "Customizable terrain generation, such as rolling terrain with coasts and mountain ranges. Six octaves of fBm plus ridged noise for the heightmap, then per-column biomes."],
-          ["Classic", <>The older v1.7 era <code>TerrainGenerator</code>: seeded Ken-Perlin noise, ten height octaves and 3D-noise caves.</>],
-          ["Terrain Gen 2", <>The 2.0+ era <code>TerrainGen2</code> — nine terrain types with bidirectional biome-seam blending, plus pyramid, volcano and sky-island structures.</>],
+          ["Flat", "A flat slab. Best if you'll build everything yourself."],
+          ["Natural", "Rolling terrain with biomes, coasts and mountains."],
+          ["Classic", "The original Eden terrain generator (v1.7)."],
+          ["TG2", "The Eden 2.0 generator, with nine terrain types."],
         ]} />
         <PaneNote>
-          Worlds are created in the <strong>New Dawn 256z</strong> format (256 blocks tall) unless you
-          choose the legacy 64z size. Creating a world does not touch the one you have open until you confirm.
+          New worlds are 256z unless you pick 64z. Your open world isn't touched until you confirm.
         </PaneNote>
         <Primary icon="new" label="New World…" onClick={() => { onClose(); p.setShowNewWorld(true); }} />
       </>);
@@ -298,28 +289,25 @@ function Pane({ row, onClose, infoKey, bumpInfo }: { row: AppMenuRow; onClose: (
     case "open":
       return (<>
         <PaneHead title="Open World"
-          sub="Open a .eden file, compressed and/or zipped, or otherwise. Format is detected from the file's magic bytes, not its extension." />
-        <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: ".08em", color: TEXT_LABEL, textTransform: "uppercase", marginBottom: 7 }}>
-          Recent worlds
-        </div>
+          sub="Open a .eden or .zip world." />
+        <SectionHeading first>Recent worlds</SectionHeading>
         {p.recentWorlds.length === 0 ? (
-          <div style={{ color: TEXT_DIM, fontSize: 12.5, padding: "10px 0" }}>
-            No recent worlds yet — anything you open or save shows up here.
+          <div style={{ color: TEXT_DIM, fontSize: FONT.body, padding: "10px 0" }}>
+            No recent worlds yet.
           </div>
         ) : (
           <div style={{ display: "flex", flexDirection: "column", gap: 2, marginBottom: 16 }}>
             {p.recentWorlds.map(r => (
-              <button key={r.path} type="button" title={r.path}
+              <button key={r.path} type="button" title={r.path} className="vx-row"
                 onClick={() => { onClose(); p.openFileAt(r.path); }}
-                style={btnBase({
+                style={{
                   display: "flex", alignItems: "center", gap: 10, padding: "0 10px", height: 34,
-                  background: "none", boxShadow: "none", textAlign: "left", color: TEXT,
-                })}
-                onMouseEnter={e => (e.currentTarget.style.background = "rgba(255,255,255,.07)")}
-                onMouseLeave={e => (e.currentTarget.style.background = "none")}>
+                  background: "none", border: "none", outline: "none", cursor: "pointer",
+                  textAlign: "left", color: TEXT, fontSize: FONT.tab,
+                }}>
                 <Icon name="open" size={15} />
-                <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 13 }}>{r.name}</span>
-                <span style={{ fontSize: 11, color: TEXT_LABEL }}>{timeAgo(r.timestamp)}</span>
+                <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{r.name}</span>
+                <span style={{ fontSize: FONT.label, color: TEXT_LABEL }}>{timeAgo(r.timestamp)}</span>
               </button>
             ))}
           </div>
@@ -331,15 +319,14 @@ function Pane({ row, onClose, infoKey, bumpInfo }: { row: AppMenuRow; onClose: (
     case "download":
       return (<>
         <PaneHead title="Download a World"
-          sub="Browse worlds published to the Eden community servers and pull one straight into the editor. Both the current (2.2+) and the legacy (2.0-2.1) servers are supported." />
+          sub="Download worlds from the Eden servers (current 2.2+ and legacy 2.0–2.1)." />
         <TextList items={[
-          ["Quality sort", "Experimental feature which ranks results by a heuristic over size, chunk count and name, so hand-built worlds surface ahead of the generated test uploads that dominate the raw listing."],
-          ["Date filters", "Useful for finding a world you saw recently, or for archaeology on the early days of the server."],
-          ["Hide junk", "Experimental feature which filters out empty, tiny and obviously-placeholder uploads in one click."],
+          ["Quality sort", "Ranks hand-built worlds above test uploads (experimental)."],
+          ["Date filters", "Find worlds from a given time."],
+          ["Hide junk", "Hides empty and placeholder uploads (experimental)."],
         ]} />
         <PaneNote>
-          Connections use plain HTTP: the server's TLS endpoint is not usable. Nothing is uploaded
-          while browsing.
+          Connections use plain HTTP. Browsing doesn't upload anything.
         </PaneNote>
         <Primary icon="download" label="Browse Online Worlds…" onClick={() => { onClose(); p.setShowWorldBrowser(true); }} />
       </>);
@@ -354,21 +341,18 @@ function Pane({ row, onClose, infoKey, bumpInfo }: { row: AppMenuRow; onClose: (
         <div style={{ marginBottom: 12 }}>
           <CheckRow checked={p.saveCompressed} onChange={p.setSaveCompressed}
             label="Compressed (.zip container)"
-            hint="Deflates the world inside a zip. Much smaller on disk and what the game expects for uploads; the editor detects either form on open, whatever the file is named." />
+            hint="Deflates the world inside a zip. Much smaller on disk. Either form opens fine, whatever the file is named." />
           <CheckRow checked={p.backupCompressed} onChange={p.setBackupCompressed}
             label="Compress the one-time backup"
-            hint="The first save over an existing file keeps its previous bytes as a .bak: a full-size copy that stays until you delete it. With this on, that backup is deflated to .bak.zip instead, which is far smaller but slower to write." />
+            hint="The first save over a file keeps a full-size .bak until you delete it. This makes it a smaller .bak.zip, but slower." />
           {p.sourcePath && <BackupNote path={p.sourcePath} compressed={p.backupCompressed} />}
         </div>
-        <div style={{ fontSize: 11.5, color: TEXT_LABEL, marginBottom: 16, lineHeight: 1.5, maxWidth: 620 }}>
-          Saving tries an incremental in-place write first. Only the chunks you actually edited are
-          rewritten, through a committed write-ahead log that is rolled forward if the app is killed
-          mid-save. If that isn't safe (the file changed underneath you, or too much is dirty) it
-          falls back to a full atomic temp-then-rename write.
+        <div style={{ fontSize: FONT.label, color: TEXT_LABEL, marginBottom: 16, lineHeight: 1.5, maxWidth: 620 }}>
+          Only edited chunks are rewritten, and saves are crash-safe.
         </div>
         <Primary icon="save" label={p.saving ? "Saving…" : "Save Now"} busy={p.saving}
           disabled={!p.sourcePath || p.saving}
-          title={p.sourcePath ? `Save to ${p.sourcePath}` : "Use Save As — this world has no file yet"}
+          title={p.sourcePath ? `Save to ${p.sourcePath}` : "This world has no file yet. Use Save As."}
           onClick={() => { if (p.sourcePath) { onClose(); p.saveWorld(p.sourcePath); } }} />
       </>);
 
@@ -380,14 +364,13 @@ function Pane({ row, onClose, infoKey, bumpInfo }: { row: AppMenuRow; onClose: (
         <div style={{ marginBottom: 12 }}>
           <CheckRow checked={p.saveCompressed} onChange={p.setSaveCompressed}
             label="Compressed (.zip container)"
-            hint="Save As corrects a mismatched .eden/.zip extension for you, so the name always matches the container you picked." />
+            hint="The file extension is set to match." />
           <CheckRow checked={p.backupCompressed} onChange={p.setBackupCompressed}
             label="Compress the one-time backup"
             hint="Only applies if you save over a file that already exists. A plain .bak is the full size of that file." />
         </div>
-        <div style={{ fontSize: 11.5, color: TEXT_LABEL, marginBottom: 16, lineHeight: 1.5, maxWidth: 620 }}>
-          Overwriting an existing file asks for confirmation first. The new path becomes this
-          session's save target, and the autosave journal follows it.
+        <div style={{ fontSize: FONT.label, color: TEXT_LABEL, marginBottom: 16, lineHeight: 1.5, maxWidth: 620 }}>
+          You'll be asked before a file is overwritten. Later saves go to the new file.
         </div>
         <Primary icon="saveAs" label="Choose Location & Save…" disabled={p.saving}
           onClick={() => { onClose(); p.saveWorldAs(); }} />
@@ -397,10 +380,10 @@ function Pane({ row, onClose, infoKey, bumpInfo }: { row: AppMenuRow; onClose: (
     case "export":
       return (<>
         <PaneHead title="Export"
-          sub="Write the world out in another format. Exports never modify your world." />
+          sub="Exports never change your world." />
         <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 8 }}>
           <ExportRow icon="fullmap" title="PNG image" busy={p.longOpKind === "png"}
-            desc="A top-down render of the whole map at one pixel per block, using the same colours the 2D view draws."
+            desc="A top-down image of the whole map, one pixel per block."
             onExport={() => { onClose(); p.exportPng(); }} />
         </div>
       </>);
@@ -409,12 +392,12 @@ function Pane({ row, onClose, infoKey, bumpInfo }: { row: AppMenuRow; onClose: (
     case "upload":
       return (<>
         <PaneHead title="Upload"
-          sub="Publish this world to the Eden community server so others can download it in-game or from the world browser." />
+          sub="Publish this world on the Eden server for others to download." />
         <TextList items={[
-          ["What gets sent", "The world is uploaded exactly as it is in memory, compressed. Your local file is not modified and nothing else about your machine is transmitted."],
-          ["Name and description", "The upload dialog takes the listing name and blurb. The world's internal name (the button in the top bar) is separate. You can rename it there first if you want them to match."],
-          ["Save first", `Uploading does not save. If you want the same bytes on disk, press ${MOD}S before uploading.`],
-          ["Finding it again", "Fresh uploads appear at the top of the browser's date sort. As in the game itself, there is no way to delete, so treat a publish as permanent."],
+          ["What gets sent", "The saved world file, compressed, plus your preview image. Unsaved edits aren't included. Your local file is not modified and nothing else about your machine is transmitted."],
+          ["Name and description", "The listing name is separate from the world's own name (top bar)."],
+          ["Save first", `Uploading sends the last saved version. Save first (${MOD}S) to include recent edits.`],
+          ["Finding it again", "Uploads can't be deleted, so treat them as permanent."],
         ]} />
         <Primary icon="upload" label="Upload This World…" disabled={!p.world}
           onClick={() => { onClose(); p.setShowUploadModal(true); }} />
@@ -423,12 +406,12 @@ function Pane({ row, onClose, infoKey, bumpInfo }: { row: AppMenuRow; onClose: (
     // ── Properties ───────────────────────────────────────────────────────
     case "properties":
       return (<>
-        <PaneHead title="World Properties" sub="Everything in the world's 192-byte header, read live." />
+        <PaneHead title="World Properties" sub="Details from the world file." />
         {p.world ? (<>
           <RenameField onRenamed={bumpInfo} />
           <WorldInfoPanel refreshKey={infoKey} />
         </>) : (
-          <div style={{ color: TEXT_DIM, fontSize: 12.5 }}>No world is open.</div>
+          <div style={{ color: TEXT_DIM, fontSize: FONT.body }}>No world is open.</div>
         )}
       </>);
 
@@ -436,12 +419,12 @@ function Pane({ row, onClose, infoKey, bumpInfo }: { row: AppMenuRow; onClose: (
     case "settings":
       return (<>
         <PaneHead title="Settings"
-          sub="The full preferences dialog covers appearance, memory budget, autosave, experimental features and the prefab folder. A few view toggles are repeated here because they change what you see immediately." />
+          sub="Quick view toggles. Open Settings for the rest." />
         <div style={{ display: "flex", flexDirection: "column", gap: 2, marginBottom: 16, maxWidth: 620 }}>
-          <QuickToggle label="3D view" on={p.view3dWindowOpen} onToggle={p.onToggle3dWindow}
-            hint="A floating window over the map — swap them with Tab or ⇄." />
-          <QuickToggle label="Docked sidebar" on={p.sidebarOpen} onToggle={p.onToggleSidebar}
-            hint="Inspector, prefab library, elevation preview and undo history." />
+          <CheckRow label="3D view" checked={p.view3dWindowOpen} onChange={() => p.onToggle3dWindow()}
+            hint="Floating 3D view. Tab swaps it with the map." />
+          <CheckRow label="Docked sidebar" checked={p.sidebarOpen} onChange={() => p.onToggleSidebar()}
+            hint="Inspector, prefab library and undo history." />
         </div>
         <Primary icon="settings" label="Open Settings…" onClick={() => { onClose(); p.setShowSettings(true); }} />
       </>);
@@ -450,18 +433,20 @@ function Pane({ row, onClose, infoKey, bumpInfo }: { row: AppMenuRow; onClose: (
     case "help":
       return (<>
         <PaneHead title="Help"
-          sub="The help window collects the keyboard map and a tour of each tool family. A few things worth knowing right now:" />
+          sub="Shortcuts and tool guides. The basics:" />
         <TextList items={[
           ["Getting around", <>Middle-drag pans from any tool; <Kbd>Space</Kbd> holds pan temporarily. <Kbd>Home</Kbd> fits the whole map, <Kbd>{MOD}±</Kbd> zooms, <Kbd>{MOD}{SHIFT}0</Kbd> zooms to the selection.</>],
-          ["Selecting", <><Kbd>S</Kbd> rectangle, <Kbd>W</Kbd> magic wand, <Kbd>K</Kbd> lasso, <Kbd>J</Kbd> polygon. Wand and lasso make real shaped selections, not just bounding boxes.</>],
+          ["Selecting", <><Kbd>S</Kbd> rectangle, <Kbd>W</Kbd> magic wand, <Kbd>K</Kbd> lasso, <Kbd>J</Kbd> polygon.</>],
           ["Drawing", <><Kbd>P</Kbd> pen, <Kbd>B</Kbd> brush, <Kbd>L</Kbd> line, <Kbd>R</Kbd> rectangle, <Kbd>E</Kbd> ellipse, <Kbd>G</Kbd> polygon, <Kbd>I</Kbd> eyedropper. Digits <Kbd>1</Kbd>–<Kbd>5</Kbd> arm pinned blocks, <Kbd>6</Kbd>–<Kbd>0</Kbd> recent ones.</>],
           ["Sculpting", <><Kbd>[</Kbd> / <Kbd>]</Kbd> change radius, with <Kbd>{SHIFT}</Kbd> for strength. Escape mid-stroke reverts the whole stroke as one undo step.</>],
-          ["Undo", <><Kbd>{MOD}Z</Kbd> / <Kbd>{MOD}{SHIFT}Z</Kbd>. Undo is chunk-scoped and byte-budgeted; the sidebar's History tab lists what is on each stack.</>],
-          ["Escape", "Steps back through whatever is in progress — paste, a shape, the selection, a sculpt grab, a lasso — one level per press."],
+          ["Undo", <><Kbd>{MOD}Z</Kbd> / <Kbd>{MOD}{SHIFT}Z</Kbd>. The sidebar's History tab lists every step.</>],
+          ["Escape", "Steps back one level per press (paste, shape, selection…)."],
         ]} />
-        <Primary icon="help" label="Open Help" onClick={() => { onClose(); p.setShowHelp(true); }} />
-        <Primary icon="help" label="Replay the guided tour" onClick={() => { onClose(); p.startTour(); }} />
-        <Primary icon="help" label="Open Diagnostics…" onClick={() => { onClose(); p.setShowDiagnostics(true); }} />
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+          <Primary icon="help" label="Open Help" onClick={() => { onClose(); p.setShowHelp(true); }} />
+          <Primary neutral icon="sparkle" label="Guided tour" onClick={() => { onClose(); p.startTour(); }} />
+          <Primary neutral icon="about" label="Open Diagnostics…" onClick={() => { onClose(); p.setShowDiagnostics(true); }} />
+        </div>
       </>);
 
     // ── About ────────────────────────────────────────────────────────────
@@ -474,10 +459,9 @@ function Pane({ row, onClose, infoKey, bumpInfo }: { row: AppMenuRow; onClose: (
     case "close":
       return (<>
         <PaneHead title="Close World"
-          sub="Return to the splash screen and release this world's memory — its undo history, clipboard and staged temp file." />
-        <div style={{ fontSize: 12.5, color: TEXT_DIM, lineHeight: 1.6, maxWidth: 620, marginBottom: 16 }}>
-          If there are unsaved changes you will be asked to confirm first. Autosave state is kept, so
-          a world closed by accident can still be recovered on the next launch.
+          sub="Close this world and free its memory." />
+        <div style={{ fontSize: FONT.body, color: TEXT_DIM, lineHeight: 1.6, maxWidth: 620, marginBottom: 16 }}>
+          You'll be asked first if there are unsaved changes. Autosave is kept, so an accidental close can be recovered.
         </div>
         <Primary icon="close" tone="danger" label="Close World" disabled={!p.world}
           onClick={() => { onClose(); p.closeWorld(); }} />
@@ -486,13 +470,7 @@ function Pane({ row, onClose, infoKey, bumpInfo }: { row: AppMenuRow; onClose: (
 }
 
 function Kbd({ children }: { children: ReactNode }) {
-  return (
-    <kbd style={{
-      fontSize: 10.5, fontFamily: "ui-monospace,'SF Mono',monospace", color: TEXT,
-      background: "rgba(255,255,255,.08)", boxShadow: "inset 0 0 0 1px rgba(255,255,255,.14)",
-      borderRadius: 3, padding: "0 4px", margin: "0 1px",
-    }}>{children}</kbd>
-  );
+  return <Keycap text={children} small />;
 }
 
 function ExportRow({
@@ -511,43 +489,14 @@ function ExportRow({
     }}>
       <div style={{ display: "flex", alignItems: "center", gap: 9 }}>
         <Icon name={icon} size={16} />
-        <div style={{ fontSize: 12.5, fontWeight: 600, color: TEXT, display: "flex", alignItems: "center", gap: 6, flex: 1 }}>
+        <div style={{ fontSize: FONT.body, fontWeight: 600, color: TEXT, display: "flex", alignItems: "center", gap: 6, flex: 1 }}>
           {title}{badge}
         </div>
         <Primary icon="export" label={busy ? "Exporting…" : "Export"} busy={busy}
           disabled={disabled || busy} onClick={onExport} title={`Export ${title}`} />
       </div>
-      <div style={{ fontSize: 11.5, color: TEXT_DIM, lineHeight: 1.45 }}>{desc}</div>
+      <div style={{ fontSize: FONT.label, color: TEXT_DIM, lineHeight: 1.45 }}>{desc}</div>
     </div>
-  );
-}
-
-function QuickToggle({ label, hint, on, onToggle, readOnly }: {
-  label: string; hint: string; on: boolean; onToggle: () => void; readOnly?: boolean;
-}) {
-  return (
-    <button type="button" onClick={onToggle} aria-pressed={on}
-      style={btnBase({
-        display: "flex", alignItems: "flex-start", gap: 10, padding: "7px 10px", textAlign: "left",
-        background: "none", boxShadow: "none", color: TEXT, width: "100%",
-      })}
-      onMouseEnter={e => (e.currentTarget.style.background = "rgba(255,255,255,.06)")}
-      onMouseLeave={e => (e.currentTarget.style.background = "none")}>
-      <span style={{
-        width: 28, height: 16, borderRadius: 8, flexShrink: 0, marginTop: 1, position: "relative",
-        background: on ? "rgba(0,164,173,.55)" : "rgba(255,255,255,.09)",
-        boxShadow: `inset 0 0 0 1px ${on ? TEXT_ARMED : "rgba(255,255,255,.16)"}`,
-      }}>
-        <span style={{
-          position: "absolute", top: 2, left: on ? 14 : 2, width: 12, height: 12, borderRadius: "50%",
-          background: on ? "#e8fbfd" : "#7a8488", transition: "left .12s",
-        }} />
-      </span>
-      <span>
-        <span style={{ fontSize: 12.5 }}>{label}{readOnly && <span style={{ color: TEXT_LABEL, fontSize: 11 }}> · read-only here</span>}</span>
-        <span style={{ display: "block", fontSize: 11.5, color: TEXT_DIM, lineHeight: 1.45 }}>{hint}</span>
-      </span>
-    </button>
   );
 }
 
@@ -561,25 +510,20 @@ function RenameField({ onRenamed }: { onRenamed: () => void }) {
 
   return (
     <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 16 }}>
-      <span style={{ fontSize: 12, color: TEXT_DIM, width: 52 }}>Name</span>
-      <input
-        value={value} aria-label="World name"
-        title="Letters, numbers, spaces and apostrophes — max 32 characters"
-        onChange={e => {
-          const clean = e.target.value.split("").filter(c => allowed.test(c)).join("").slice(0, 32);
-          setHint(clean !== e.target.value);
+      <span style={{ fontSize: FONT.body, color: TEXT_DIM, width: 52 }}>Name</span>
+      <TextField
+        value={value} ariaLabel="World name" width={300}
+        title="Letters, numbers, spaces and apostrophes (max 32)"
+        onChange={raw => {
+          const clean = raw.split("").filter(c => allowed.test(c)).join("").slice(0, 32);
+          setHint(clean !== raw);
           setValue(clean);
         }}
         onKeyDown={e => { if (e.key === "Enter" && dirty) { p.onRenameBlur(value.trim()); onRenamed(); } }}
-        style={{
-          flex: 1, maxWidth: 300, background: "rgba(0,0,0,.35)", border: "none", borderRadius: 4,
-          boxShadow: "inset 0 0 0 1px rgba(255,255,255,.14)", color: TEXT, fontSize: 13,
-          padding: "5px 8px", outline: "none",
-        }}
       />
-      <Primary icon="save" label="Rename" disabled={!dirty}
+      <Primary neutral icon="save" label="Rename" disabled={!dirty}
         onClick={() => { p.onRenameBlur(value.trim()); onRenamed(); }} />
-      {hint && <span style={{ color: "#f59e0b", fontSize: 11 }}>letters, numbers, spaces and ’ only</span>}
+      {hint && <span style={{ color: ACCENT.warm, fontSize: FONT.label }}>letters, numbers, spaces and ’ only</span>}
     </div>
   );
 }

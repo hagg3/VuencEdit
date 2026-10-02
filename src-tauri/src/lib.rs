@@ -6,7 +6,7 @@ pub(crate) use voxel_core::colors;
 // `impl VoxelView for LoadedWorld` / `for ChunkScratch` below, which stay here because those
 // types are app-specific — read exactly as they did before the extraction.
 pub(crate) use voxel_core::view::{
-    get_block_at, read_block_abs, read_paint_abs, scan_band_ceiling, set_block_abs, set_block_in_band, surface_z,
+    get_block_at, read_block_abs, read_paint_abs, set_block_abs, set_block_in_band, surface_z,
     surface_z_capped, world_max_z, ViewMeta, VoxelView, VoxelViewMut,
 };
 // The rest of PR-C: the fluid block family, the shaped-selection footprint, the lamp spatial index
@@ -3136,7 +3136,7 @@ fn validate_volume(width: i32, height: i32, depth: i32) -> Result<i64, String> {
     let vol = width as i64 * height as i64 * depth as i64;
     if vol > MAX_CLIPBOARD_VOLUME {
         return Err(format!(
-            "Selection is {vol} blocks — the limit for this operation is {MAX_CLIPBOARD_VOLUME}. Select a smaller region."
+            "Selection is {vol} blocks (limit {MAX_CLIPBOARD_VOLUME}). Select a smaller region."
         ));
     }
     Ok(vol)
@@ -3720,7 +3720,7 @@ fn materialize_flat_chunks(
     if let Some(&(bad_x, bad_y)) = coords.iter().find(|&&(cx, cy)| !is_chunk_coord(cx) || !is_chunk_coord(cy)) {
         return Err(format!(
             "Chunk coordinate ({bad_x}, {bad_y}) is outside the addressable range \
-             0..{CHUNK_COORD_LIMIT} — the game cannot index it"
+             0..{CHUNK_COORD_LIMIT}, so the game cannot index it"
         ));
     }
 
@@ -3975,152 +3975,6 @@ fn render_zslice_patch(
         return Err(format!("Z must be 0–{max_z}, got {z}"));
     }
     Ok(render_zslice_patch_lod(world, z, x1 as i32, y1 as i32, x2 as i32, y2 as i32, lod.unwrap_or(1)))
-}
-
-/// Cap on the selection area `render_selection_view`/`render_full_height_view` will render under
-/// the read guard. Since the 2026-09 preview-hygiene pass (RAM-6 / 11.5) neither command clones
-/// the world into a scan buffer any more — they render straight off the real world — so this no
-/// longer bounds an allocation, only how long one preview may hold the read guard (which blocks
-/// edits, not other readers). The unit is unchanged (chunks × the bytes a scan would have
-/// copied) so the error thresholds users already see stay the same.
-const MAX_PREVIEW_BYTES: usize = 128 * 1024 * 1024; // 128 MB
-
-/// Read-only `VoxelView` over the real world for the preview renderers: `chunk_bytes` is truncated
-/// at each chunk's `top_band_hint` ceiling, so the renderers' `pi < chunk.len()` guard reads every
-/// band above it as air *without touching those pages*. That is what the old scan-buffer clone
-/// achieved with `fill(0)` (audit R2-3), minus the copy — same one-directional hint contract, so a
-/// too-low hint is still observable (see the hint test) and a too-high one is merely slower.
-struct HintClamped<'a>(&'a LoadedWorld);
-
-impl VoxelView for HintClamped<'_> {
-    #[inline]
-    fn num_bands(&self) -> usize { self.0.num_bands() }
-    #[inline]
-    fn chunk_origin(&self) -> (i32, i32) { self.0.chunk_origin() }
-    #[inline]
-    fn chunk_bytes(&self, cx: i32, cy: i32) -> Option<&[u8]> {
-        let chunk = self.0.chunk_bytes(cx, cy)?;
-        let ceil = scan_band_ceiling(self.0, cx, cy) * 8192;
-        Some(&chunk[..chunk.len().min(ceil)])
-    }
-    #[inline]
-    fn top_band_hint(&self, cx: i32, cy: i32) -> usize { self.0.top_band_hint(cx, cy) }
-}
-
-#[tauri::command(async)]
-fn render_selection_view(
-    x1: i32, y1: i32, x2: i32, y2: i32,
-    z_min: i32, z_max: i32,
-    view: String,
-    state: tauri::State<'_, AppState>,
-) -> Result<PreviewData, String> {
-    let t0 = Instant::now();
-    let us = || t0.elapsed().as_micros();
-
-    timing_log!("[PREVIEW] start  cmd=render_selection_view  view={view}  sel={}×{}×{}  z={z_min}–{z_max}",
-        x2-x1+1, y2-y1+1, z_max-z_min+1);
-
-    // Rendered under the read guard directly off the real world (RAM-6 / 11.5): no band-scoped
-    // scan-buffer clone, so an edit burst no longer allocates and page-touches up to 128 MB per
-    // refresh. Only writers wait, and only for one preview render (bounded by the size cap below).
-    let b_lo = (z_min as usize) / 16;
-    let b_hi = (z_max as usize) / 16;
-    let local_band_bytes = (b_hi - b_lo + 1) * 8192;
-
-    timing_log!("[LOCK] acquire_start  cmd=render_selection_view  t=+{}µs", us());
-    let t_lock = Instant::now();
-    let ws = read_ws(&state);
-    timing_log!("[LOCK] acquired  cmd=render_selection_view  wait={}µs", t_lock.elapsed().as_micros());
-    let world = ws.world.as_ref().ok_or("No world loaded")?;
-    validate_selection(x1, y1, x2, y2, z_min, z_max, world_max_z(world))?;
-    // Resolve the shaped-selection mask while we still hold the lock (fail-safe: exact bbox).
-    let sel_mask = active_mask(&ws, x1, y1, x2, y2);
-
-    let n_sel = (((x2 / 16 - x1 / 16 + 1) as i64) * ((y2 / 16 - y1 / 16 + 1) as i64)).max(0) as usize;
-    let total_bytes = n_sel.saturating_mul(local_band_bytes);
-    if total_bytes > MAX_PREVIEW_BYTES {
-        return Err(format!(
-            "Selection too large to preview ({} chunks, {} MB) — the preview limit is {} MB. Select a smaller region.",
-            n_sel, total_bytes / (1024 * 1024), MAX_PREVIEW_BYTES / (1024 * 1024)
-        ));
-    }
-
-    timing_log!("[SCAN] start  cmd=render_selection_view  t=+{}µs", us());
-    let t_scan = Instant::now();
-    let mask = sel_mask.as_ref();
-    // `b_lo = 0`: the real chunk slice starts at band 0 (the old clone was band-scoped, so it
-    // passed the real `b_lo`).
-    let clamped = HintClamped(world);
-    let meta = world.meta();
-    let (width, height, pixels) = match view.as_str() {
-        "front" => render::view_front(&clamped, meta, x1, x2, y1, y2, z_min, z_max, 0, mask),
-        "side"  => render::view_side(&clamped, meta, x1, x2, y1, y2, z_min, z_max, 0, mask),
-        _       => render::view_top(&clamped, meta, x1, x2, y1, y2, z_min, z_max, 0, mask),
-    };
-    drop(ws);
-    timing_log!("[SCAN] end  cmd=render_selection_view  elapsed={}ms  result={}×{}", t_scan.elapsed().as_millis(), width, height);
-    timing_log!("[PREVIEW] end  cmd=render_selection_view  pixels={}B  total={}ms", pixels.len(), t0.elapsed().as_millis());
-    Ok(PreviewData { width, height, pixels })
-}
-
-
-/// Full-height contextual front/side view. `context_blocks` columns outside the
-/// selection are rendered at 50% opacity to show surrounding terrain.
-#[tauri::command(async)]
-fn render_full_height_view(
-    x1: i32, y1: i32, x2: i32, y2: i32,
-    view: String,
-    context_blocks: i32,
-    state: tauri::State<'_, AppState>,
-) -> Result<PreviewData, String> {
-    render_full_height_view_inner(&state, x1, y1, x2, y2, view, context_blocks)
-}
-
-/// Core of `render_full_height_view`, factored out so it's callable from tests with a bare
-/// `AppState` (mirrors the `_inner` convention used elsewhere in this file, e.g. `autosave_world_inner`).
-///
-/// Renders under the read guard straight off the real world (RAM-6): the front and side panels each
-/// used to clone the same chunks into their own anonymous scan buffer (up to 128 MB apiece); now
-/// neither copies anything, and `HintClamped` keeps the air pages above each chunk's terrain cold.
-fn render_full_height_view_inner(
-    state: &AppState,
-    x1: i32, y1: i32, x2: i32, y2: i32,
-    view: String,
-    context_blocks: i32,
-) -> Result<PreviewData, String> {
-    if x2 < x1 || y2 < y1 {
-        return Err("Invalid XY bounds".into());
-    }
-
-    let ctx = context_blocks.max(0);
-    let ws = read_ws(state);
-    let world = ws.world.as_ref().ok_or("No world loaded")?;
-
-    let z_max = world_max_z(world);
-    // Same size guard as before (one chunk of margin each side for the context columns) — now a
-    // read-guard hold bound rather than an allocation bound; see `MAX_PREVIEW_BYTES`.
-    let ctx_chunks = ctx / 16 + 1;
-    let cx_lo = x1.div_euclid(16) - ctx_chunks;
-    let cx_hi = x2.div_euclid(16) + ctx_chunks;
-    let cy_lo = y1.div_euclid(16) - ctx_chunks;
-    let cy_hi = y2.div_euclid(16) + ctx_chunks;
-    let n_sel = ((cx_hi - cx_lo + 1) as i64 * (cy_hi - cy_lo + 1) as i64).max(0) as usize;
-    let total_bytes = n_sel.saturating_mul(world.chunk_size);
-    if total_bytes > MAX_PREVIEW_BYTES {
-        return Err(format!(
-            "Selection too large to preview ({} chunks, {} MB) — the preview limit is {} MB. Select a smaller region.",
-            n_sel, total_bytes / (1024 * 1024), MAX_PREVIEW_BYTES / (1024 * 1024)
-        ));
-    }
-
-    let clamped = HintClamped(world);
-    let meta = world.meta();
-    let (width, height, pixels) = match view.as_str() {
-        "front" => render::view_front_ctx(&clamped, meta, x1, x2, y1, y2, z_max, ctx),
-        _       => render::view_side_ctx(&clamped, meta, x1, x2, y1, y2, z_max, ctx),
-    };
-    drop(ws);
-    Ok(PreviewData { width, height, pixels })
 }
 
 // ── Editing — pure inner functions (also called by tests) ─────────────────────
@@ -5221,7 +5075,7 @@ fn risky_block_warnings(counts: &[u32; 128]) -> Vec<String> {
     RISKY_BLOCK_GROUPS.iter().filter_map(|g| {
         let total: u32 = g.types.iter().map(|&t| counts[t as usize]).sum();
         (total > g.threshold).then(|| format!(
-            "This placed {total} {} in one area — Eden has been known to crash with dense placements like this. Consider thinning them out.",
+            "This placed {total} {} in one area. Dense placements like this can crash Eden, so consider thinning them out.",
             g.name
         ))
     }).collect()
@@ -6464,7 +6318,7 @@ fn load_autosave_inner(state: &AppState, paths: &AutosavePaths) -> Result<WorldM
         if let Some(hdr) = hdr {
             if hdr.base_id != info.base_id {
                 let _ = fs::remove_file(&temp_path);
-                return Err("Autosave journal does not match its base image — recovery aborted for safety".into());
+                return Err("The autosave doesn't match its world file, so recovery stopped to keep the world safe.".into());
             }
         }
         // `replay_each` reads the header itself; rewind so it sees the stream from the top.
@@ -6987,7 +6841,7 @@ fn rename_world(state: tauri::State<'_, AppState>, name: String) -> Result<(), S
     }
     for ch in name.chars() {
         if !ch.is_ascii_alphabetic() && !ch.is_ascii_digit() && ch != '\'' {
-            return Err(format!("Invalid character '{}' — only A–Z, a–z, 0–9 and ' are allowed", ch));
+            return Err(format!("Invalid character '{}'. Use only A–Z, a–z, 0–9 and '.", ch));
         }
     }
     let mut ws = write_ws(&state);
@@ -7860,98 +7714,6 @@ fn generate_trees_inner(
     }
 }
 
-/// Long-side pixel cap of the Inspector's axo preview (Stage 13.3) — ~2.5× its 200 px panel.
-const AXO_PREVIEW_MAX_SIDE: u32 = 512;
-
-/// Axonometric top-down render for the visible region — see `voxel_core::render::axo_region` for
-/// the parallax math. `ski = 0` is a flat top-down render; `dir` picks the viewing corner.
-///
-/// Only the Inspector's axo preview calls this (13.3), so it is bounded: the output long side is
-/// capped at `AXO_PREVIEW_MAX_SIDE` px (the patch's `lod` says how far to upscale it) and rays start
-/// at `z_max` — the selection's top — instead of the world's.
-#[tauri::command(async)]
-fn render_axo_region(
-    x1: i32, y1: i32, x2: i32, y2: i32,
-    ski: f32,
-    dir: u8, // 0=SE 1=SW 2=NE 3=NW
-    z_max: Option<i32>,
-    state: tauri::State<'_, AppState>,
-) -> Result<PixelPatch, String> {
-    let ws = read_ws(&state);
-    let world = ws.world.as_ref().ok_or("No world loaded")?;
-    let lod = render::axo_lod_for((x2 - x1 + 1).max(1) as u32, (y2 - y1 + 1).max(1) as u32, AXO_PREVIEW_MAX_SIDE);
-    Ok(render::axo_region_bounded(world, world.meta(), x1, y1, x2, y2, ski, dir, lod, z_max).into())
-}
-
-
-/// Axonometric preview of the clipboard contents for the 3D tab in SelectionInspector.
-/// Same projection math as render_axo_region but iterates in-memory clipboard voxels.
-#[tauri::command(async)]
-fn render_axo_clipboard(ski: f32, dir: u8, state: tauri::State<'_, AppState>) -> Result<PreviewData, String> {
-    let ws = read_ws(&state);
-    let sky = ws.world.as_ref().map(|w| w.sky).unwrap_or(0);
-    let cb  = ws.clipboard.as_ref().ok_or("Clipboard is empty")?;
-    Ok(render_axo_clipboard_inner(cb, sky, ski, dir))
-}
-
-fn render_axo_clipboard_inner(cb: &Clipboard, sky: u8, ski: f32, dir: u8) -> PreviewData {
-    let (cw, ch, cd) = (cb.width, cb.height, cb.depth);
-
-    let mut pixels = vec![30u8; (cw * ch * 4) as usize];
-    for p in pixels.chunks_exact_mut(4) { p[3] = 255; }
-    let (sx_sgn, sy_sgn): (f32, f32) = match dir {
-        1 => (-1.0, -1.0), // SW
-        2 => ( 1.0,  1.0), // NE
-        3 => (-1.0,  1.0), // NW
-        _ => ( 1.0, -1.0), // SE (default)
-    };
-
-    for py in 0..ch {
-        for px in 0..cw {
-            let mut top_bt = 0u8; let mut top_paint = 0u8;
-            let mut under_bt = 0u8; let mut under_paint = 0u8;
-
-            'zray: for dz in 0..cd {
-                let cb_layer = cd - 1 - dz; // top clipboard layer first
-                let sx = (px as f32 + sx_sgn * ski * 0.5 * dz as f32).round() as i32;
-                let sy = (py as f32 + sy_sgn * ski * dz as f32).round() as i32;
-                if sx < 0 || sx >= cw || sy < 0 || sy >= ch { continue; }
-                // Shaped clipboard: unmasked columns are see-through so the axo ghost matches paste.
-                if cb.mask.as_ref().is_some_and(|m| !bit_set(m, (sy * cw + sx) as usize)) { continue; }
-                let idx = (cb_layer * ch * cw + sy * cw + sx) as usize;
-                if idx >= cb.block_types.len() { continue; }
-                let bt = cb.block_types[idx];
-                if bt == 0 { continue; }
-                if top_bt == 0 {
-                    top_bt = bt; top_paint = cb.paints[idx];
-                    if transparent_alpha(bt).is_none() { break 'zray; }
-                } else {
-                    under_bt = bt; under_paint = cb.paints[idx];
-                    break 'zray;
-                }
-            }
-
-            if top_bt == 0 { continue; }
-            let c1 = block_color(top_bt, top_paint, sky);
-            let [r, g, b] = if under_bt != 0 {
-                if let Some(alpha) = transparent_alpha(top_bt) {
-                    let c2 = block_color(under_bt, under_paint, sky);
-                    [
-                        (c1[0] as f32 * alpha + c2[0] as f32 * (1.0 - alpha)) as u8,
-                        (c1[1] as f32 * alpha + c2[1] as f32 * (1.0 - alpha)) as u8,
-                        (c1[2] as f32 * alpha + c2[2] as f32 * (1.0 - alpha)) as u8,
-                    ]
-                } else { c1 }
-            } else { c1 };
-
-            let off = ((py * cw + px) * 4) as usize;
-            pixels[off] = r; pixels[off + 1] = g; pixels[off + 2] = b; pixels[off + 3] = 255;
-        }
-    }
-
-    PreviewData { width: cw as u32, height: ch as u32, pixels }
-}
-
 /// Used to show a block preview inside the paste ghost box.
 /// Reads only from clipboard + sky — no world mutation.
 #[tauri::command(async)]
@@ -8010,66 +7772,31 @@ fn render_clipboard_preview_inner(cb: &Clipboard, sky: u8, max_side: Option<u32>
     PreviewData { width: ow as u32, height: oh as u32, pixels }
 }
 
-// Renders the front (X-Z) or side (Y-Z) face of the clipboard for use as a
-// ghost overlay in the elevation preview panel. Transparent pixels = air.
-#[tauri::command(async)]
-fn render_clipboard_elevation_preview(
-    view: String,
-    state: tauri::State<'_, AppState>,
-) -> Result<PreviewData, String> {
-    let ws = read_ws(&state);
-    let sky = ws.world.as_ref().map(|w| w.sky).unwrap_or(0);
-    let cb  = ws.clipboard.as_ref().ok_or("Clipboard is empty")?;
-    Ok(render_clipboard_elevation_preview_inner(cb, sky, &view))
-}
-
-fn render_clipboard_elevation_preview_inner(cb: &Clipboard, sky: u8, view: &str) -> PreviewData {
-    let (w, h, d) = (cb.width as usize, cb.height as usize, cb.depth as usize);
-    let is_front = view != "side";
-    let img_w = if is_front { w } else { h };
-    let img_h = d;
-    let mut pixels = vec![0u8; img_w * img_h * 4]; // alpha 0 = transparent air
-    for dz in 0..d {
-        let row = d - 1 - dz; // row 0 = top = highest z
-        for col in 0..img_w {
-            // Shaped clipboard: an unmasked column is treated as air so the ghost's silhouette
-            // matches the paste footprint (front idx dy*w+col, side idx col*w+dx). None ⇒ no gate.
-            let result = if is_front {
-                // col = dx, scan dy front-to-back
-                (0..h).find_map(|dy| {
-                    if cb.mask.as_ref().is_some_and(|m| !bit_set(m, dy * w + col)) { return None; }
-                    let bt = cb.block_types[dz * h * w + dy * w + col];
-                    if bt != 0 { Some((bt, cb.paints[dz * h * w + dy * w + col])) } else { None }
-                })
-            } else {
-                // col = dy, scan dx left-to-right
-                (0..w).find_map(|dx| {
-                    if cb.mask.as_ref().is_some_and(|m| !bit_set(m, col * w + dx)) { return None; }
-                    let bt = cb.block_types[dz * h * w + col * w + dx];
-                    if bt != 0 { Some((bt, cb.paints[dz * h * w + col * w + dx])) } else { None }
-                })
-            };
-            if let Some((bt, paint)) = result {
-                let [r, g, b] = block_color(bt, paint, sky);
-                let i = (row * img_w + col) * 4;
-                pixels[i] = r; pixels[i+1] = g; pixels[i+2] = b; pixels[i+3] = 255;
-            }
-        }
-    }
-    PreviewData { width: img_w as u32, height: img_h as u32, pixels }
-}
-
 // ── Paste lens (UI redesign r3, 14.8) ────────────────────────────────────────────────────────
 //
 // The render is `voxel_core::render::paste_lens`; what lives here is the part that knows what a
 // paste *is* — the per-column base Z, computed with the same code the paste commands write with —
 // and the IPC skin. Sub-plan: `TEST WORLDS/ui-redesign-r3-paste-lens-plan-2026-09-26.md` §2.
 
+/// Both elevations of the armed paste, from one call (20.3 §4): the bases are computed once.
 /// ⚠️ Deliberately **not** `Serialize` — see "Binary payloads" in CLAUDE.md (a derive would let
-/// tauri's blanket impl silently turn this back into base64-in-JSON). Only the header serialises.
+/// tauri's blanket impl silently turn this back into base64-in-JSON). Only the headers serialise.
 struct PasteLensPatch {
+    front: PasteLensView,
+    side: PasteLensView,
+}
+
+struct PasteLensView {
     header: PasteLensHeader,
     pixels: Vec<u8>,
+}
+
+#[derive(Serialize)]
+struct PasteLensPatchHeader<'a> {
+    front: &'a PasteLensHeader,
+    side: &'a PasteLensHeader,
+    /// Byte lengths of the front and side images, in that order.
+    lens: [usize; 2],
 }
 
 #[derive(Serialize)]
@@ -8093,7 +7820,11 @@ struct PasteLensHeader {
 
 impl tauri::ipc::IpcResponse for PasteLensPatch {
     fn body(self) -> tauri::Result<tauri::ipc::InvokeResponseBody> {
-        ipc_envelope_one(&self.header, self.pixels)
+        let h = PasteLensPatchHeader {
+            front: &self.front.header, side: &self.side.header,
+            lens: [self.front.pixels.len(), self.side.pixels.len()],
+        };
+        ipc_envelope(&h, &[&self.front.pixels, &self.side.pixels])
     }
 }
 
@@ -8128,16 +7859,11 @@ fn paste_lens_bases(
 
 #[allow(clippy::too_many_arguments)]
 fn render_paste_lens_inner(
-    ws: &WorldState, x: i32, y: i32, view: &str, elevation_offset: i32, mode: &str,
+    ws: &WorldState, x: i32, y: i32, elevation_offset: i32, mode: &str,
     above_surface: bool, ignore_air: bool, context: i32, max_px: Option<u32>,
 ) -> Result<PasteLensPatch, String> {
     let world = ws.world.as_ref().ok_or("No world loaded")?;
     let cb = ws.clipboard.as_ref().ok_or("Clipboard is empty")?;
-    let view = match view {
-        "front" => render::LensView::Front,
-        "side" => render::LensView::Side,
-        other => return Err(format!("Unknown lens view: {other}")),
-    };
     let terrain = match mode {
         "normal" => false,
         "terrain" => true,
@@ -8148,24 +7874,27 @@ fn render_paste_lens_inner(
         w: cb.width as usize, h: cb.height as usize, d: cb.depth as usize,
         types: &cb.block_types, paints: &cb.paints, base: &base,
     };
-    let (r, st) = render::paste_lens(
-        world, world.meta(), x, y, &clip, view,
-        context.clamp(0, 16), ignore_air, max_px.unwrap_or(512).clamp(16, 4096),
-    );
-    Ok(PasteLensPatch {
-        header: PasteLensHeader {
-            width: r.width, height: r.height, lod: r.lod,
-            col_lo: st.col_lo, z_lo: st.z_lo, z_hi: st.z_hi,
-            footprint_lo: st.footprint_lo, footprint_hi: st.footprint_hi,
-            ghost_z_min: st.ghost_z_min, ghost_z_max: st.ghost_z_max,
-            buried: st.buried, cleared: st.cleared, floating_cols: st.floating_cols, approx: st.approx,
-        },
-        pixels: r.pixels,
-    })
+    let (meta, context, max_px) = (world.meta(), context.clamp(0, 16), max_px.unwrap_or(512).clamp(16, 4096));
+    let one = |view| {
+        let (r, st) = render::paste_lens(world, meta, x, y, &clip, view, context, ignore_air, max_px);
+        PasteLensView {
+            header: PasteLensHeader {
+                width: r.width, height: r.height, lod: r.lod,
+                col_lo: st.col_lo, z_lo: st.z_lo, z_hi: st.z_hi,
+                footprint_lo: st.footprint_lo, footprint_hi: st.footprint_hi,
+                ghost_z_min: st.ghost_z_min, ghost_z_max: st.ghost_z_max,
+                buried: st.buried, cleared: st.cleared, floating_cols: st.floating_cols, approx: st.approx,
+            },
+            pixels: r.pixels,
+        }
+    };
+    // Both are pure renders over the same guard and the same bases.
+    let (front, side) = rayon::join(|| one(render::LensView::Front), || one(render::LensView::Side));
+    Ok(PasteLensPatch { front, side })
 }
 
-/// Front (`view = "front"`, looking north) or side (`"side"`, looking east) elevation of the armed
-/// paste at origin `(x, y)`: terrain, the ghost at its paste Z, and the cells where they collide.
+/// Front (looking north) and side (looking east) elevations of the armed paste at origin `(x, y)`,
+/// in one envelope: terrain, the ghost at its paste Z, and the cells where they collide.
 /// `mode` is `"normal"` (`paste_at`) or `"terrain"` (`paste_terrain`, which also takes
 /// `above_surface`); `ignore_air` mirrors "Skip air". One read guard for the whole render — the
 /// volume is footprint-bounded, so there's no scan-buffer clone to release it early for.
@@ -8173,7 +7902,6 @@ fn render_paste_lens_inner(
 #[tauri::command(async)]
 fn render_paste_lens(
     x: i32, y: i32,
-    view: String,
     elevation_offset: i32,
     mode: String,
     above_surface: bool,
@@ -8183,7 +7911,129 @@ fn render_paste_lens(
     state: tauri::State<'_, AppState>,
 ) -> Result<PasteLensPatch, String> {
     let ws = read_ws(&state);
-    render_paste_lens_inner(&ws, x, y, &view, elevation_offset, &mode, above_surface, ignore_air, context, max_px)
+    render_paste_lens_inner(&ws, x, y, elevation_offset, &mode, above_surface, ignore_air, context, max_px)
+}
+
+// ── Selection lens (Stage 20.3/20.5) ─────────────────────────────────────────────────────────
+//
+// The no-clipboard mode of the lens: `voxel_core::render::selection_lens` (front + side) and
+// `selection_top`. Plan: `TEST WORLDS/lens-selection-mode-plan-2026-10-01.md` §4.
+
+/// ⚠️ Deliberately **not** `Serialize` (base64 trap — see `ipc_envelope`). Only the header serialises.
+struct SelectionLensPatch {
+    header: SelectionLensHeader,
+    images: Vec<Vec<u8>>,
+}
+
+#[derive(Serialize)]
+struct SelectionLensHeader {
+    views: Vec<LensImageHeader>,
+    /// Byte length of each image, in `views` order.
+    lens: Vec<usize>,
+    /// World Z of the elevations' bottom/top rows; the selection's own z range for `top`.
+    z_lo: i32,
+    z_hi: i32,
+    terrain_z_hi: Option<i32>,
+}
+
+#[derive(Serialize)]
+struct LensImageHeader {
+    /// `"front"`, `"side"` or `"top"`.
+    kind: &'static str,
+    width: u32,
+    height: u32,
+    /// World columns per image column (elevations: column axis only; top: both axes).
+    lod: u32,
+    /// World coordinate of image column 0 (X for front/top, Y for side).
+    col_lo: i32,
+    /// Top only: world Y of image row 0.
+    row_lo: Option<i32>,
+    /// The selection's extent along the image's column axis.
+    footprint_lo: i32,
+    footprint_hi: i32,
+}
+
+impl tauri::ipc::IpcResponse for SelectionLensPatch {
+    fn body(self) -> tauri::Result<tauri::ipc::InvokeResponseBody> {
+        let bodies: Vec<&[u8]> = self.images.iter().map(|v| v.as_slice()).collect();
+        ipc_envelope(&self.header, &bodies)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_selection_lens_inner(
+    ws: &WorldState, x1: i32, y1: i32, x2: i32, y2: i32, z_min: i32, z_max: i32,
+    context: i32, max_px: Option<u32>, top: bool,
+) -> Result<SelectionLensPatch, String> {
+    let world = ws.world.as_ref().ok_or("No world loaded")?;
+    validate_selection(x1, y1, x2, y2, z_min, z_max, world_max_z(world))?;
+    let mask = active_mask(ws, x1, y1, x2, y2);
+    let sel = render::SelRef { x1, y1, x2, y2, z_min, z_max, mask: mask.as_ref() };
+    let context = context.clamp(0, 16);
+    let max_px = max_px.unwrap_or(512).clamp(16, 4096);
+    let meta = world.meta();
+
+    if top {
+        let (r, col_lo, row_lo) = render::selection_top(world, meta, &sel, context, max_px);
+        let len = r.pixels.len();
+        return Ok(SelectionLensPatch {
+            header: SelectionLensHeader {
+                views: vec![LensImageHeader {
+                    kind: "top", width: r.width, height: r.height, lod: r.lod,
+                    col_lo, row_lo: Some(row_lo), footprint_lo: x1, footprint_hi: x2,
+                }],
+                lens: vec![len],
+                z_lo: z_min, z_hi: z_max, terrain_z_hi: None,
+            },
+            images: vec![r.pixels],
+        });
+    }
+
+    // Both elevations are pure renders over the same read guard; run them side by side.
+    let ((f, fs), (s, ss)) = rayon::join(
+        || render::selection_lens(world, meta, &sel, render::LensView::Front, context, max_px),
+        || render::selection_lens(world, meta, &sel, render::LensView::Side, context, max_px),
+    );
+    let image = |kind, r: &Raster, st: &render::SelLensStats| LensImageHeader {
+        kind, width: r.width, height: r.height, lod: r.lod,
+        col_lo: st.col_lo, row_lo: None, footprint_lo: st.footprint_lo, footprint_hi: st.footprint_hi,
+    };
+    Ok(SelectionLensPatch {
+        header: SelectionLensHeader {
+            views: vec![image("front", &f, &fs), image("side", &s, &ss)],
+            lens: vec![f.pixels.len(), s.pixels.len()],
+            z_lo: fs.z_lo, z_hi: fs.z_hi,
+            terrain_z_hi: fs.terrain_z_hi.max(ss.terrain_z_hi),
+        },
+        images: vec![f.pixels, s.pixels],
+    })
+}
+
+/// The selection lens (20.3): front + side full-height elevations of the selection plus `context`
+/// columns, in one envelope; with `top`, only the top-down view of the selection's z range (20.5),
+/// so the default fetch never pays for it. Shaped mask resolved fail-safe (exact bbox), as in
+/// the old `render_selection_view`. Rows are 1:1 over the whole world height; columns LOD past `max_px`.
+#[allow(clippy::too_many_arguments)]
+#[tauri::command(async)]
+fn render_selection_lens(
+    x1: i32, y1: i32, x2: i32, y2: i32,
+    z_min: i32, z_max: i32,
+    context: i32,
+    max_px: Option<u32>,
+    top: bool,
+    state: tauri::State<'_, AppState>,
+) -> Result<SelectionLensPatch, String> {
+    let t0 = Instant::now();
+    timing_log!("[PREVIEW] start  cmd=render_selection_lens  top={top}  sel={}×{}  z={z_min}–{z_max}",
+        x2 - x1 + 1, y2 - y1 + 1);
+    let ws = read_ws(&state);
+    let out = render_selection_lens_inner(&ws, x1, y1, x2, y2, z_min, z_max, context, max_px, top);
+    drop(ws);
+    if let Ok(p) = &out {
+        timing_log!("[PREVIEW] end  cmd=render_selection_lens  top={top}  pixels={}B  total={}ms",
+            p.header.lens.iter().sum::<usize>(), t0.elapsed().as_millis());
+    }
+    out
 }
 
 // ── Fluid Flow Toolkit ───────────────────────────────────────────────────────────
@@ -8419,7 +8269,7 @@ fn pool_fill_inner(
     while let Some((cx, cy, cz)) = queue.pop_front() {
         if visited.len() > POOL_FILL_MAX_CELLS {
             return Err(format!(
-                "Basin isn't enclosed — the flood exceeded {POOL_FILL_MAX_CELLS} cells. Check for gaps in the walls."
+                "The basin isn't enclosed (the fill passed {POOL_FILL_MAX_CELLS} cells). Check the walls for gaps."
             ));
         }
         for (dx, dy, dz) in [(-1, 0, 0), (1, 0, 0), (0, -1, 0), (0, 1, 0), (0, 0, -1), (0, 0, 1)] {
@@ -8515,7 +8365,7 @@ fn flood_fill_3d(
     state: tauri::State<'_, AppState>,
 ) -> Result<EditResult, String> {
     if block_type == 0 {
-        return Err("Flood Fill can't place air — arm a block first".into());
+        return Err("Flood Fill can't place air. Arm a block first.".into());
     }
     if (block_type as usize) >= BLOCK_RGB.len() {
         return Err(format!("Invalid block type {block_type}"));
@@ -8556,7 +8406,7 @@ fn flood_fill_3d(
     // BFS frontier simply running out first) means the fill was capped, not finished — surface that
     // in the toast label so a small Limit reads as "it stopped" rather than "that's everything".
     let label = if n >= limit {
-        format!("Flood fill ({n} blocks — hit the Limit)")
+        format!("Flood fill ({n} blocks, hit the limit)")
     } else {
         format!("Flood fill ({n} blocks)")
     };
@@ -11179,13 +11029,11 @@ pub fn run() {
             paste_at,
             paste_terrain,
             render_zslice_patch,
-            render_selection_view,
-            render_full_height_view,
             extrude_selection,
             move_selection,
             render_clipboard_preview,
-            render_clipboard_elevation_preview,
             render_paste_lens,
+            render_selection_lens,
             save_prefab,
             load_prefab,
             get_default_prefab_dir,
@@ -11199,8 +11047,6 @@ pub fn run() {
             pool_fill,
             flood_fill_3d,
             generate_wavy_surface,
-            render_axo_region,
-            render_axo_clipboard,
             search_worlds,
             list_worlds,
             fetch_featured_worlds,
@@ -16649,43 +16495,6 @@ mod tests {
         assert_eq!(render(&fresh), after, "post-edit render must match a cold-cache render");
     }
 
-    /// Audit R2-3 — `render_full_height_view`'s scan-buffer clone now `fill(0)`s bands above
-    /// `top_band_hint` instead of copying them, consuming the same one-directional contract
-    /// `voxel-core`'s `hint_tests` establish. A loose (too-high) hint must be output-identical to
-    /// no hint at all; a deliberately too-low one must observably hide real terrain — proving the
-    /// test would actually catch a wrong-direction bug, not just that the code runs.
-    #[test]
-    fn test_full_height_view_hint_is_loose_safe_and_a_too_low_hint_is_observable() {
-        // A single-chunk 64z (4-band) world, terrain solid at z=1..=20 — real top band is 1
-        // (z 16..20). Deliberately one chunk, not a grid: `view_front_ctx` scans the full y range
-        // per column and takes the *first* non-air hit, so a grid fixture would let a neighbouring,
-        // un-poked chunk paper over the poked one at the same z — a single chunk has nothing else
-        // to fall back on, which is what makes the too-low case actually observable here.
-        let ws = ws_with(make_bumpy_world(8, |_, _| 20));
-        let state: AppState = RwLock::new(ws);
-
-        let render = |state: &AppState| {
-            render_full_height_view_inner(state, 0, 0, 15, 15, "front".into(), 0)
-                .expect("render").pixels
-        };
-        let truth = render(&state); // natural (correct) hint, freshly computed
-
-        let poke = |band: u8| {
-            let ws = read_ws(&state);
-            let world = ws.world.as_ref().unwrap();
-            let idx = world.top_bands.index(0, 0).expect("(0,0) must be in the hint grid");
-            world.top_bands.cells()[idx].store(band, std::sync::atomic::Ordering::Relaxed);
-        };
-
-        poke(3); // too high: num_bands - 1, i.e. "no hint" — must change nothing
-        assert_eq!(render(&state), truth, "a loose hint must not change a single pixel");
-
-        poke(0); // too low: excludes band 1, which is where the real terrain (z 16..20) lives
-        assert_ne!(render(&state), truth,
-            "a too-low hint must be observable, not silently absorbed — otherwise this test \
-             would pass even if the fill(0) optimization were reading past the wrong bound");
-    }
-
     /// Filled disc footprint matching the backend's/frontend's `(dx² + dy²) <= (r + 0.5)²`.
     fn disc_points(cx: i32, cy: i32, r: i32) -> Vec<SculptPoint> {
         let rr = (r as f64 + 0.5).powi(2);
@@ -17243,7 +17052,7 @@ mod tests {
             ws.clipboard = Some(lens_test_clipboard(0));
             let (px, py) = (6, 7);
 
-            let lens = render_paste_lens_inner(&ws, px, py, "front", offset, "terrain", above_surface, ignore_air, 2, None)
+            let lens = render_paste_lens_inner(&ws, px, py, offset, "terrain", above_surface, ignore_air, 2, None)
                 .expect("lens");
             let cb = ws.clipboard.as_ref().unwrap();
             let bases = paste_lens_bases(&pre, cb, px, py, true, offset, above_surface, None);
@@ -17274,24 +17083,54 @@ mod tests {
                     "({x},{y},{z}) outside the predicted cells must be untouched");
             }}}
             assert!(solid_over_solid > 0, "fixture must actually bury something");
-            assert_eq!(lens.header.buried, solid_over_solid, "lens buried count = cells the paste overwrote");
+            assert_eq!(lens.front.header.buried, solid_over_solid, "lens buried count = cells the paste overwrote");
             // The masked-out column (dx 1, dy 1) is skipped by both.
             assert_eq!(bases[w + 1], render::LENS_SKIP);
         }
     }
 
-    /// On an empty world the lens's ghost is the Inspector's clipboard silhouette, shifted to the
+    /// Front (X-Z) or side (Y-Z) silhouette of the clipboard as RGBA (alpha 0 = air), the oracle for
+    /// `test_paste_lens_no_terrain_ghost_equals_clipboard_silhouette`. It was the retired
+    /// `render_clipboard_elevation_preview` command's core (20.4). An unmasked column of a shaped
+    /// clipboard reads as air, so the silhouette matches the paste footprint.
+    fn clipboard_silhouette(cb: &Clipboard, sky: u8, view: &str) -> PreviewData {
+        let (w, h, d) = (cb.width as usize, cb.height as usize, cb.depth as usize);
+        let is_front = view != "side";
+        let img_w = if is_front { w } else { h };
+        let mut pixels = vec![0u8; img_w * d * 4];
+        for dz in 0..d {
+            let row = d - 1 - dz; // row 0 = top = highest z
+            for col in 0..img_w {
+                // front: col = dx, scan dy front-to-back; side: col = dy, scan dx left-to-right.
+                let n = if is_front { h } else { w };
+                let hit = (0..n).find_map(|k| {
+                    let i = if is_front { k * w + col } else { col * w + k };
+                    if cb.mask.as_ref().is_some_and(|m| !bit_set(m, i)) { return None; }
+                    let bt = cb.block_types[dz * h * w + i];
+                    if bt != 0 { Some((bt, cb.paints[dz * h * w + i])) } else { None }
+                });
+                if let Some((bt, paint)) = hit {
+                    let [r, g, b] = block_color(bt, paint, sky);
+                    let o = (row * img_w + col) * 4;
+                    pixels[o] = r; pixels[o + 1] = g; pixels[o + 2] = b; pixels[o + 3] = 255;
+                }
+            }
+        }
+        PreviewData { width: img_w as u32, height: d as u32, pixels }
+    }
+
+    /// On an empty world the lens's ghost is the clipboard silhouette, shifted to the
     /// paste Z — the two renders share axes, handedness and the mask gate.
     #[test]
     fn test_paste_lens_no_terrain_ghost_equals_clipboard_silhouette() {
         let mut ws = ws_with(make_bumpy_world(0, |_, _| 1)); // surf_bt 0 = all air
         let cb = lens_test_clipboard(20);
         let (w, h, d) = (cb.width as u32, cb.height as u32, cb.depth as u32);
-        let sil_front = render_clipboard_elevation_preview_inner(&cb, 0, "front");
-        let sil_side = render_clipboard_elevation_preview_inner(&cb, 0, "side");
+        let sil_front = clipboard_silhouette(&cb, 0, "front");
+        let sil_side = clipboard_silhouette(&cb, 0, "side");
         ws.clipboard = Some(cb);
-        for (view, sil, cols) in [("front", sil_front, w), ("side", sil_side, h)] {
-            let lens = render_paste_lens_inner(&ws, 3, 4, view, 5, "normal", false, true, 0, None).expect("lens");
+        let pair = render_paste_lens_inner(&ws, 3, 4, 5, "normal", false, true, 0, None).expect("lens");
+        for (view, lens, sil, cols) in [("front", &pair.front, sil_front, w), ("side", &pair.side, sil_side, h)] {
             let hd = &lens.header;
             assert_eq!((hd.width, sil.width), (cols, cols));
             assert_eq!((hd.buried, hd.cleared), (0, 0));
@@ -17307,14 +17146,19 @@ mod tests {
         }
     }
 
-    /// `PasteLensPatch` frames as the binary envelope (header JSON + raw RGBA), never base64.
+    /// `PasteLensPatch` frames both views as one binary envelope (header JSON + two raw RGBA
+    /// bodies), never base64, and the two views agree on the Z window and the cell counts.
     #[test]
     fn test_render_paste_lens_envelope() {
         use tauri::ipc::InvokeResponseBody;
         let mut ws = ws_with(make_bumpy_world(2, |_, _| 10));
         ws.clipboard = Some(lens_test_clipboard(8));
-        let lens = render_paste_lens_inner(&ws, 2, 2, "side", 0, "normal", false, false, 3, Some(64)).expect("lens");
-        let (w, h) = (lens.header.width, lens.header.height);
+        let lens = render_paste_lens_inner(&ws, 2, 2, 0, "normal", false, false, 3, Some(64)).expect("lens");
+        let (f, s) = (&lens.front.header, &lens.side.header);
+        assert_eq!((f.z_lo, f.z_hi), (s.z_lo, s.z_hi), "one Z window for both views");
+        assert_eq!((f.ghost_z_min, f.ghost_z_max), (s.ghost_z_min, s.ghost_z_max));
+        assert_eq!((f.buried, f.cleared, f.floating_cols, f.approx), (s.buried, s.cleared, s.floating_cols, s.approx));
+        let (fl, sl) = (lens.front.pixels.len(), lens.side.pixels.len());
         let bytes = match tauri::ipc::IpcResponse::body(lens).expect("frame") {
             InvokeResponseBody::Raw(v) => v,
             InvokeResponseBody::Json(_) => panic!("lens must be a raw envelope"),
@@ -17322,15 +17166,121 @@ mod tests {
         let hlen = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
         assert_eq!((4 + hlen) % 4, 0);
         let hdr: serde_json::Value = serde_json::from_slice(&bytes[4..4 + hlen]).unwrap();
-        assert_eq!(hdr["width"], w);
-        assert_eq!(hdr["height"], h);
-        assert_eq!(hdr["col_lo"], -1, "side view: y 2 − 3 context columns");
-        assert_eq!(hdr["footprint_lo"], 2);
-        assert_eq!(hdr["footprint_hi"], 5);
-        assert!(hdr["buried"].as_u64().unwrap() > 0 && hdr["cleared"].as_u64().unwrap() > 0);
-        assert_eq!(bytes.len() - 4 - hlen, (w * h * 4) as usize);
-        assert!(render_paste_lens_inner(&ws, 0, 0, "top", 0, "normal", false, false, 0, None).is_err());
-        assert!(render_paste_lens_inner(&ws, 0, 0, "front", 0, "scatter", false, false, 0, None).is_err());
+        assert_eq!(hdr["lens"], serde_json::json!([fl, sl]));
+        assert_eq!(bytes.len() - 4 - hlen, fl + sl);
+        for (k, n) in [("front", fl), ("side", sl)] {
+            let v = &hdr[k];
+            assert_eq!((v["width"].as_u64().unwrap() * v["height"].as_u64().unwrap() * 4) as usize, n, "{k}");
+        }
+        let side = &hdr["side"];
+        assert_eq!(side["col_lo"], -1, "side view: y 2 − 3 context columns");
+        assert_eq!(side["footprint_lo"], 2);
+        assert_eq!(side["footprint_hi"], 5);
+        assert_eq!(hdr["front"]["footprint_hi"], 6, "front: x 2 + width 5 − 1");
+        assert!(side["buried"].as_u64().unwrap() > 0 && side["cleared"].as_u64().unwrap() > 0);
+        assert!(render_paste_lens_inner(&ws, 0, 0, 0, "scatter", false, false, 0, None).is_err());
+    }
+
+    /// Frame a `SelectionLensPatch` and split it back into (header JSON, body bytes).
+    fn frame_selection_lens(p: SelectionLensPatch) -> (serde_json::Value, Vec<u8>) {
+        use tauri::ipc::InvokeResponseBody;
+        let bytes = match tauri::ipc::IpcResponse::body(p).expect("frame") {
+            InvokeResponseBody::Raw(v) => v,
+            InvokeResponseBody::Json(_) => panic!("selection lens must be a raw envelope"),
+        };
+        let hlen = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
+        assert_eq!((4 + hlen) % 4, 0);
+        (serde_json::from_slice(&bytes[4..4 + hlen]).unwrap(), bytes[4 + hlen..].to_vec())
+    }
+
+    /// `render_selection_lens` (20.3): front + side in one raw envelope whose `lens` sum is the
+    /// body, full world height, and the stored shaped mask honoured only on an exact bbox match.
+    #[test]
+    fn test_render_selection_lens_envelope() {
+        let mut ws = ws_with(make_bumpy_world(2, |lx, _| 6 + lx as i32));
+        let (hdr, body) = frame_selection_lens(
+            render_selection_lens_inner(&ws, 2, 3, 9, 6, 4, 20, 3, None, false).expect("lens"));
+        let views = hdr["views"].as_array().unwrap();
+        assert_eq!(views.iter().map(|v| v["kind"].as_str().unwrap()).collect::<Vec<_>>(), ["front", "side"]);
+        let lens: Vec<usize> = hdr["lens"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as usize).collect();
+        assert_eq!(lens.iter().sum::<usize>(), body.len());
+        for (v, &n) in views.iter().zip(&lens) {
+            assert_eq!((v["width"].as_u64().unwrap() * v["height"].as_u64().unwrap() * 4) as usize, n);
+            assert_eq!(v["height"], 64, "full height on a 64z world");
+            assert!(v["row_lo"].is_null());
+        }
+        assert_eq!((&views[0]["col_lo"], &views[0]["footprint_lo"], &views[0]["footprint_hi"]), (&(-1).into(), &2.into(), &9.into()));
+        assert_eq!((&views[1]["col_lo"], &views[1]["footprint_lo"], &views[1]["footprint_hi"]), (&0.into(), &3.into(), &6.into()));
+        assert_eq!((&hdr["z_lo"], &hdr["z_hi"]), (&0.into(), &63.into()));
+        // Highest terrain in view: lx up to 9 + 3 context columns → 6 + 12.
+        assert_eq!(hdr["terrain_z_hi"], 18);
+
+        // A stored mask that matches the rect makes masked-out columns see-through; one that
+        // doesn't is ignored (fail-safe), so the render is the plain bbox one.
+        let plain = body;
+        ws.selection_mask = Some(SelectionMask { x1: 2, y1: 3, x2: 9, y2: 6, bits: vec![0; 4] });
+        let (_, masked) = frame_selection_lens(
+            render_selection_lens_inner(&ws, 2, 3, 9, 6, 4, 20, 3, None, false).expect("lens"));
+        assert_ne!(masked, plain, "an all-clear mask leaves no sel hits");
+        ws.selection_mask = Some(SelectionMask { x1: 2, y1: 3, x2: 9, y2: 7, bits: vec![0; 5] });
+        let (_, stale) = frame_selection_lens(
+            render_selection_lens_inner(&ws, 2, 3, 9, 6, 4, 20, 3, None, false).expect("lens"));
+        assert_eq!(stale, plain, "a mismatched mask is ignored");
+
+        assert!(render_selection_lens_inner(&ws, 2, 3, 9, 6, 4, 64, 3, None, false).is_err(), "z past max_z");
+        assert!(render_selection_lens_inner(&ws, 9, 3, 2, 6, 4, 20, 3, None, false).is_err(), "inverted rect");
+    }
+
+    /// `render_selection_lens` with `top: true` (20.5): exactly one "top" view, origin in `row_lo`,
+    /// z range echoed from the selection.
+    #[test]
+    fn test_render_selection_lens_top() {
+        let ws = ws_with(make_bumpy_world(2, |lx, _| 6 + lx as i32));
+        let (hdr, body) = frame_selection_lens(
+            render_selection_lens_inner(&ws, 2, 3, 9, 6, 4, 20, 3, None, true).expect("lens"));
+        let views = hdr["views"].as_array().unwrap();
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0]["kind"], "top");
+        assert!(views[0]["row_lo"].is_number());
+        let lens: Vec<usize> = hdr["lens"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as usize).collect();
+        assert_eq!(lens.len(), 1);
+        assert_eq!(lens.iter().sum::<usize>(), body.len());
+        assert_eq!((views[0]["width"].as_u64().unwrap() * views[0]["height"].as_u64().unwrap() * 4) as usize, lens[0]);
+        assert_eq!((&hdr["z_lo"], &hdr["z_hi"]), (&4.into(), &20.into()));
+    }
+
+    /// 20.3 §6 measurement: `render_selection_lens` (both flavours) on the largest world in
+    /// `TEST WORLDS/` for a 512², 2048² and whole-world selection. Reports only —
+    /// `cargo test -p eden-world-editor bench_selection_lens -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn bench_selection_lens() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../TEST WORLDS");
+        let mut worlds: Vec<_> = fs::read_dir(&dir).expect("TEST WORLDS").filter_map(|e| e.ok())
+            .map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "eden")).collect();
+        worlds.sort_by_key(|p| std::cmp::Reverse(fs::metadata(p).map(|m| m.len()).unwrap_or(0)));
+        for path in worlds.iter().take(2) {
+            let mut ws = WorldState::new();
+            ws.world = Some(parse_world_inner(map_fixture(path)).expect("parse"));
+            let w = ws.world.as_ref().unwrap();
+            let (ww, wh, max_z) = (w.meta().width(), w.meta().height(), world_max_z(w));
+            eprintln!("[bench] {:?}: {ww}×{wh} blocks, max_z {max_z}", path.file_name().unwrap());
+            for side in [512, 2048, i32::MAX] {
+                let (sw, sh) = (side.min(ww), side.min(wh));
+                let (x1, y1) = ((ww - sw) / 2, (wh - sh) / 2);
+                for top in [false, true] {
+                    let mut times = Vec::new();
+                    for _ in 0..4 {
+                        let t = Instant::now();
+                        render_selection_lens_inner(&ws, x1, y1, x1 + sw - 1, y1 + sh - 1, 0, max_z, 2, None, top).expect("lens");
+                        times.push(t.elapsed().as_secs_f64() * 1000.0);
+                    }
+                    let best = times[1..].iter().cloned().fold(f64::MAX, f64::min);
+                    eprintln!("[bench]   {sw}×{sh} {}: first {:.1} ms, warm best {best:.1} ms",
+                        if top { "top" } else { "front+side" }, times[0]);
+                }
+            }
+        }
     }
 
     /// Rotating a shaped clipboard 90° CW transforms the footprint with the SAME map as the data, so
@@ -17441,40 +17391,6 @@ mod tests {
             block_types: vec![13u8; 4], paints: vec![0u8; 4], mask: None };
         let ps = render_clipboard_preview_inner(&small, 0, Some(512));
         assert_eq!((ps.width, ps.height), (2, 2));
-    }
-
-    /// The front/side clipboard elevation ghost treats an unmasked column as air, so its silhouette
-    /// matches the shaped paste instead of the full box.
-    #[test]
-    fn test_clipboard_elevation_preview_respects_mask() {
-        // 2(w)×1(h)×1(d): only column dx0 masked. Front view is 2 wide, 1 tall.
-        let mut bits = vec![0u8; 1];
-        bits[0] |= 1 << 0; // (dy0,dx0)
-        let cb = Clipboard { width: 2, height: 1, depth: 1, z_anchor: 0,
-            block_types: vec![13u8, 13], paints: vec![0u8; 2], mask: Some(bits) };
-        let pd = render_clipboard_elevation_preview_inner(&cb, 0, "front");
-        assert_eq!(pd.width, 2);
-        assert_eq!(pd.pixels[3], 255, "masked column (dx0) shows the block");
-        assert_eq!(pd.pixels[4 + 3], 0, "unmasked column (dx1) reads as air");
-    }
-
-    /// The axo clipboard ghost (SelectionInspector 3D tab) skips unmasked columns.
-    #[test]
-    fn test_axo_clipboard_respects_mask() {
-        // 2×2×1 all brick, only (0,0) masked. ski=0 ⇒ no parallax, straight top-down sample.
-        let mut bits = vec![0u8; 1];
-        bits[0] |= 1 << 0;
-        let cb = Clipboard { width: 2, height: 2, depth: 1, z_anchor: 0,
-            block_types: vec![13u8; 4], paints: vec![0u8; 4], mask: Some(bits) };
-        let pd = render_axo_clipboard_inner(&cb, 0, 0.0, 0);
-        // Background is [30,30,30,255]; a rendered brick column differs from that.
-        let is_bg = |dx: usize, dy: usize| {
-            let o = (dy * 2 + dx) * 4;
-            pd.pixels[o] == 30 && pd.pixels[o + 1] == 30 && pd.pixels[o + 2] == 30
-        };
-        assert!(!is_bg(0, 0), "masked column renders a block");
-        assert!(is_bg(1, 0), "unmasked column stays background");
-        assert!(is_bg(0, 1), "unmasked column stays background");
     }
 
     /// The ortho front/side selection view (SliceViewport + SelectionInspector) skips unmasked

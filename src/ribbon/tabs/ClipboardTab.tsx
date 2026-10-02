@@ -99,7 +99,7 @@ export default function ClipboardTab() {
       <Group id="options" label="Options" tier={tier.options} declaredWidth={W("options")} icon="settings">
         <Col style={{ justifyContent: "center", height: GROUP_CONTENT_H }}>
           <Row style={{ height: SMALL_H }}>
-            <CmdSmall id="home.clipboard.skipAir" label="No Air" />
+            <CmdSmall id="home.clipboard.skipAir" label="Skip air" />
             <CmdSmall id="home.clipboard.repeat" label="Repeat" />
           </Row>
           <Row style={{ height: SMALL_H }}>

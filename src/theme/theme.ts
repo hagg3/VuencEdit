@@ -215,6 +215,11 @@ export const MAP = {
   cleared: RAMP.mapCleared,
   air: RAMP.mapAir,
   camera: RAMP.mapCamera,
+  /** Lens window overlays (20.4): the z band's outline (its fill is `selection`), the z± extrude
+   *  bands' outline (fill `clipboard`), and the map-cursor column. */
+  lensBand: mix(RAMP.mapSelection, RAMP.white, 0.55),
+  lensExtrude: mix(RAMP.mapClipboard, RAMP.white, 0.8),
+  lensHover: RAMP.mapCleared,
 } as const;
 
 /**

@@ -65,8 +65,8 @@ export function bindCommands(c: CommandCtx): Record<CommandId, CommandBinding> {
   });
   const picker = (kind: PickerKind, id: CommandId, enabled: true | string = true): CommandBinding =>
     ({ run: () => c.togglePickerFor(kind, id), armed: c.pickerKind === kind, enabled });
-  const setPoint = (label: string, pos: { px: number; py: number } | null, field: string) =>
-    `Move the ${label} (header "${field}"${pos ? `, now ${Math.round(pos.px)}, ${Math.round(pos.py)}` : ", unset"}) to the centre of the selection`;
+  const setPoint = (label: string, pos: { px: number; py: number } | null) =>
+    `Move the ${label} (${pos ? `now ${Math.round(pos.px)}, ${Math.round(pos.py)}` : "unset"}) to the centre of the selection`;
 
   return {
     // ── Application menu + top bar ───────────────────────────────────────────────────────────
@@ -127,8 +127,8 @@ export function bindCommands(c: CommandCtx): Record<CommandId, CommandBinding> {
 
     "home.block.pick": picker("block-draw", "home.block.pick"),
 
-    "home.setpoint.home": { ...act(() => p.onSetSpawnAtSelection(), p.selection ? true : NO_SEL), titleOverride: setPoint("respawn point", p.spawnPos, "home") },
-    "home.setpoint.start": { ...act(() => p.onSetPlayerPosAtSelection(), p.selection ? true : NO_SEL), titleOverride: setPoint("last-walked player position", p.playerPos, "pos") },
+    "home.setpoint.home": { ...act(() => p.onSetSpawnAtSelection(), p.selection ? true : NO_SEL), titleOverride: setPoint("respawn point", p.spawnPos) },
+    "home.setpoint.start": { ...act(() => p.onSetPlayerPosAtSelection(), p.selection ? true : NO_SEL), titleOverride: setPoint("player start position", p.playerPos) },
 
     // ── Draw ─────────────────────────────────────────────────────────────────────────────────
     "draw.tools.pen": tool("pen"),
@@ -177,8 +177,8 @@ export function bindCommands(c: CommandCtx): Record<CommandId, CommandBinding> {
     "sculpt.falloff.live": {
       ...flip(p.sculptAccumulate, p.setSculptAccumulate),
       titleOverride: p.sculptAccumulate
-        ? "Live brush ON — terrain deforms as you drag, stamps build up on dwell (airbrush). Escape reverts the whole stroke."
-        : "Live brush OFF — legacy one-shot: the swept stroke commits as a single uniform shape on release.",
+        ? "Live brush on: terrain changes as you drag. Esc reverts the stroke."
+        : "Live brush off: the stroke applies on release.",
     },
     "sculpt.falloff.clip": flip(p.sculptClipToSelection, p.setSculptClipToSelection),
     "sculpt.block.pick": picker("block-draw", "sculpt.block.pick"),
@@ -254,7 +254,7 @@ export function bindCommands(c: CommandCtx): Record<CommandId, CommandBinding> {
     "view.windows.sidebar": { run: () => p.onToggleSidebar(), armed: p.sidebarOpen, enabled: true },
     "view.windows.signs": {
       run: () => p.setShowSigns(!p.showSigns), armed: p.showSigns && p.hasSigns,
-      enabled: p.hasSigns ? true : "This world has no signs. Signs are written by the game; VuencEdit reads and shows them but can't place them.",
+      enabled: p.hasSigns ? true : "This world has no signs. Signs can only be placed in the game.",
     },
     "view.template.load": { ...act(() => p.openTemplateFile()), labelOverride: p.templateLoaded ? "Change Template…" : undefined, shortOverride: p.templateLoaded ? "Change…" : undefined },
     "view.template.overlay": {

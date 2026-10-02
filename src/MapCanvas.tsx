@@ -85,13 +85,13 @@ export const TOOL_HINTS: Partial<Record<Tool, string>> = {
   line: "Drag from one point to another",
   rect: "Drag to size the rectangle",
   ellipse: "Drag to size the ellipse",
-  flatten: "The first block you press on sets the height everything else is levelled to",
-  slope: "The first block you press on anchors the tilted plane (set Slope X/Y in the Falloff group)",
+  flatten: "Press on a block to level to its height",
+  slope: "The first block you press on anchors the tilted plane (Slope X/Y in the Brush shape panel)",
   smear: "Drag across terrain to pull height along with the brush, like wet paint",
   poolfill: "Click an empty (air) floor cell inside the selection to bucket-fill the basin",
-  materialize: "Drag to select ungenerated chunk space — holes inside the map or growth beyond its edge — then Materialize to write it as real terrain",
-  rock: "Click to place a rock mass fused into the terrain — ignores Strength/Softness, tune it in the Rock group",
-  carve: "Click to cut a filleted depression into the terrain — ignores Strength/Softness, tune it in the Rock group",
+  materialize: "Drag over empty chunk space, then Materialize it into terrain",
+  rock: "Click to place a rock mass. Tune it in the Rock shape panel.",
+  carve: "Click to cut a hollow. Tune it in the Carve shape panel.",
 };
 
 /**
@@ -323,6 +323,10 @@ export interface MapCanvasRef {
    *  change (deduped) from resetView/zoomBy/zoomToBox/focusOn/the initial fit/the wheel handler.
    *  Same ref-fan-out contract as `subscribeGhost` — no React state, no App re-render. */
   subscribeZoom: (cb: (scale: number) => void) => () => void;
+  /** Lens (Stage 20.4): subscribe to the world cell under the map cursor, `null` when the pointer
+   *  leaves the map. Deduped per cell; replays the current value on subscribe. Same ref-fan-out
+   *  contract as `subscribeGhost` — no React state, no App re-render. */
+  subscribeCursor: (cb: (p: WorldPoint | null) => void) => () => void;
   /** World-rect → viewport client-rect, the same `rect.left + wx*scale + vx` transform the paste
    *  ghost's `screen` field above is computed with (Stage 14.9) — reused here rather than a second
    *  conversion. Backs the completion outline (`src/ui/DoneOutline.tsx`, Stage 14.13), a DOM overlay
@@ -632,6 +636,15 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   // trigger a synchronous draw()), so every one of those sites calls `notifyZoom` itself rather than
   // relying on a single choke point the way `notifyGhost` can (it only ever fires from inside draw()).
   const zoomSubscribersRef = useRef<Set<(scale: number) => void>>(new Set());
+  // Cursor subscription (Stage 20.4 — the Lens's hover column): notified from the pointer handlers.
+  const cursorSubscribersRef = useRef<Set<(p: WorldPoint | null) => void>>(new Set());
+  const lastCursorNotifyRef  = useRef<WorldPoint | null>(null);
+  const notifyCursor = useCallback((p: WorldPoint | null) => {
+    const last = lastCursorNotifyRef.current;
+    if (last === p || (last && p && last.x === p.x && last.y === p.y)) return;
+    lastCursorNotifyRef.current = p;
+    for (const cb of cursorSubscribersRef.current) cb(p);
+  }, []);
   const lastZoomNotifyRef  = useRef<number | null>(null);
   const notifyZoom = useCallback((scale: number) => {
     if (lastZoomNotifyRef.current === scale) return;
@@ -1936,6 +1949,11 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
       cb(viewRef.current.scale);
       return () => { zoomSubscribersRef.current.delete(cb); };
     },
+    subscribeCursor(cb: (p: WorldPoint | null) => void) {
+      cursorSubscribersRef.current.add(cb);
+      cb(lastCursorNotifyRef.current);
+      return () => { cursorSubscribersRef.current.delete(cb); };
+    },
     worldRectToScreen(x1: number, y1: number, x2: number, y2: number) {
       const rect = rectRef.current;
       if (!rect) return null;
@@ -2399,6 +2417,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     const wp = screenToWorld(e.clientX, e.clientY);
     cursorPosRef.current = wp;
     onCursorMoveRef.current?.(wp.x, wp.y);
+    notifyCursor(wp);
     const drag = dragRef.current;
     if (!holdSpentRef.current && pointerDownOnCanvasRef.current
         && (e.buttons & 1) !== 0
@@ -2555,7 +2574,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
       }
       scheduleDraw();
     }
-  }, [scheduleDraw, scheduleEnsureTiles, screenToWorld, screenToWorldLoose, scheduleMaterializeOccupancyFetch]);
+  }, [scheduleDraw, scheduleEnsureTiles, screenToWorld, screenToWorldLoose, scheduleMaterializeOccupancyFetch, notifyCursor]);
 
   const onPointerUp = useCallback((e: React.PointerEvent) => {
     stopHold();
@@ -2728,10 +2747,11 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
 
   const onPointerLeave = useCallback(() => {
     cursorPosRef.current = null;
+    notifyCursor(null);
     const canvas = canvasRef.current;
     if (canvas) canvas.style.cursor = TOOL_CURSOR[toolRef.current];
     draw();
-  }, [draw]);
+  }, [draw, notifyCursor]);
 
   // Native (non-passive) wheel listener so preventDefault actually suppresses the WKWebView's
   // page-scroll / pinch-zoom. React's synthetic onWheel is registered passively (React 17+), so

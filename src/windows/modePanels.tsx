@@ -101,16 +101,16 @@ export function BrushShapePanel(p: BrushShapePanelProps) {
           ]} />
         <SliderRow label="Feature size" min={6} max={80} step={2} accent={AMBER} labelWidth={64} width={TRACK}
           value={p.noiseFeatureSize} onChange={p.setNoiseFeatureSize}
-          title="Wavelength of the noise, in blocks — larger = broader landforms" />
+          title="Noise size in blocks. Larger gives broader landforms." />
       </>)}
 
       {t === "slope" && (<>
         <SliderRow label="Slope X" min={-100} max={100} step={5} accent={AMBER} labelWidth={48} width={TRACK}
           value={p.slopeGradeX} onChange={p.setSlopeGradeX} format={v => `${v}%`}
-          title="Tilt along X — rise in blocks per 100 blocks of run" />
+          title="Tilt along X, in blocks per 100 blocks" />
         <SliderRow label="Slope Y" min={-100} max={100} step={5} accent={AMBER} labelWidth={48} width={TRACK}
           value={p.slopeGradeY} onChange={p.setSlopeGradeY} format={v => `${v}%`}
-          title="Tilt along Y — rise in blocks per 100 blocks of run" />
+          title="Tilt along Y, in blocks per 100 blocks" />
         <Caption>Anchor is the block you press on</Caption>
       </>)}
 
@@ -118,21 +118,21 @@ export function BrushShapePanel(p: BrushShapePanelProps) {
         <div style={{ display: "flex", flexDirection: "column", gap: ROW_GAP }}>
           <SliderRow label="Noisiness" min={0} max={1} step={0.05} accent={AMBER} labelWidth={56} width={110}
             value={p.rockNoisiness} onChange={p.setRockNoisiness} format={v => v.toFixed(2)}
-            title="Displacement amplitude of the surface noise, as a fraction of the fillet radius — 0 = clean squashed ellipsoid, 1 = chaotic but still connected" />
+            title="Surface roughness. 0 is smooth, 1 is chaotic." />
           <SliderRow label="Noise size" min={2} max={40} accent={AMBER} labelWidth={56} width={110}
             value={p.rockNoiseRadius} onChange={p.setRockNoiseRadius}
-            title="Feature scale of the surface noise, in world blocks — larger = blobbier, smaller = jagged" />
+            title="Size of the surface bumps in blocks" />
           <SliderRow label="Smoothing" min={0} max={5} step={0.25} accent={AMBER} labelWidth={56} width={110}
             value={p.rockSmoothing} onChange={p.setRockSmoothing} format={v => v.toFixed(2)}
-            title="Cohesion blur — turns granular noise into fewer, larger forms" />
+            title="Cohesion blur: turns granular noise into fewer, larger forms" />
           <SliderRow label="Blend" min={0} max={3} step={0.1} accent={AMBER} labelWidth={56} width={110}
             value={p.rockMeld} onChange={p.setRockMeld} format={v => v.toFixed(1)}
             title={t === "carve"
-              ? "Fillet radius where the cut rolls over into the surrounding terrain — no sharp rim"
-              : "Fillet radius where the rock flares into the surrounding terrain — no hard seam"} />
+              ? "Rounding where the cut meets the terrain"
+              : "Rounding where the rock meets the terrain"} />
           <SliderRow label="Flatten" min={0.2} max={1.2} step={0.05} accent={AMBER} labelWidth={56} width={110}
             value={p.rockFlatten} onChange={p.setRockFlatten} format={v => v.toFixed(2)}
-            title="Vertical/horizontal ratio of the base shape — lower = squashed, never a sphere" />
+            title="Height-to-width ratio. Lower is flatter." />
         </div>
         <div style={{ display: "flex", flexDirection: "column", gap: ROW_GAP }}>
           <SliderRow label="Sink" min={0} max={1} step={0.05} accent={AMBER} labelWidth={56} width={110}
@@ -140,10 +140,10 @@ export function BrushShapePanel(p: BrushShapePanelProps) {
             title="Fraction of the shape's vertical half-extent buried below the anchor surface" />
           <SliderRow label="Drape" min={0} max={1} step={0.05} accent={AMBER} labelWidth={56} width={110}
             value={p.rockDrape} onChange={p.setRockDrape} format={v => v.toFixed(2)}
-            title="How strongly the base follows local terrain height — 0 = one flat anchor height, 1 = fully terrain-conformal" />
+            title="How closely the base follows the terrain. 0 is flat, 1 follows it fully." />
           <SliderRow label="Strata" min={0} max={2} step={0.1} accent={AMBER} labelWidth={56} width={110}
             value={p.rockStrata} onChange={p.setRockStrata} format={v => v.toFixed(1)}
-            title="Horizontal sedimentary-bedding ledges — 0 = none" />
+            title="Horizontal ledges. 0 is none." />
           <Caption>Radius sets the mass size</Caption>
         </div>
       </>)}

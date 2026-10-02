@@ -57,6 +57,9 @@ export interface FloatingWindowProps {
   resizeDirs?: readonly ResizeDir[];
   /** False = no ✕ (a context panel that just follows its mode — plan Q3). */
   closable?: boolean;
+  /** Overrides the stored `wins[id].open`. `ContextPanel` passes `true`: it has already decided
+   *  the panel is shown (the Lens can show with `wins.lens.open` off, 20.4). */
+  open?: boolean;
 }
 
 interface Gesture {
@@ -72,10 +75,11 @@ interface Gesture {
 
 export default function FloatingWindow({
   id, title, icon, meta, buttons, children, bodyStyle, dataTour, hideTitleBelow = 90, onClose, onMoved,
-  offsetY = 0, resizeDirs = RESIZE_DIRS, closable = true,
+  offsetY = 0, resizeDirs = RESIZE_DIRS, closable = true, open,
 }: FloatingWindowProps) {
   const layout = useWindowLayout();
   const ws = layout.wins[id];
+  const isOpen = open ?? ws.open;
   const frameRef = useRef<HTMLDivElement>(null);
   const gestureRef = useRef<Gesture | null>(null);
   const rafRef = useRef<number | null>(null);
@@ -94,7 +98,7 @@ export default function FloatingWindow({
     const down = () => toFront(id);
     el.addEventListener("pointerdown", down, true);
     return () => el.removeEventListener("pointerdown", down, true);
-  }, [id, ws.open]);
+  }, [id, isOpen]);
 
   // A window blur (alt-tab mid-drag) ends the gesture, committing what's there.
   useEffect(() => {
@@ -105,7 +109,7 @@ export default function FloatingWindow({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  if (!ws.open) return null;
+  if (!isOpen) return null;
   const rect = shown(rectOf(ws, layout.work, winLimits(id, layout.work)));
   const eh = effectiveHeight({ collapsed: ws.collapsed, h: rect.h });
   const z = layout.order.indexOf(id) + 1;
@@ -251,7 +255,7 @@ export default function FloatingWindow({
         data-win-title=""
         tabIndex={0}
         aria-expanded={!ws.collapsed}
-        title={`${title} — drag to move · double-click to ${ws.collapsed ? "expand" : "collapse"} · arrows move, ⌥arrows resize`}
+        title={`${title}: drag to move · double-click to ${ws.collapsed ? "expand" : "collapse"} · arrows move, ⌥arrows resize`}
         onPointerDown={e => beginGesture(e, "move", null)}
         onPointerMove={onGestureMove}
         onPointerUp={endGesture}

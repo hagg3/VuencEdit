@@ -399,7 +399,7 @@ export default function Ribbon(p: RibbonProps) {
           </div>
         )}
         {/* The ribbon's own Compact/Labels corner toggle was removed (2026-09-28 UI feedback) —
-            `ribbonCompact` is experimental-only now, set (disabled) from Settings ▸ Layout. */}
+            `ribbonCompact` is experimental-only now, set from Settings ▸ Experiments. */}
 
         {menuOpen && (
           <AppMenu initialRow={menuRow} anchorTop={TOP_BAR_HEIGHT + 2} onClose={() => setMenuRow(null)} />

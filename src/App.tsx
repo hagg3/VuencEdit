@@ -21,7 +21,8 @@ import Sidebar, { type SidebarTab } from "./Sidebar";
 import ToolsWindow from "./windows/ToolsWindow";
 import HotbarWindow from "./windows/HotbarWindow";
 import { BrushShapePanel, BuildSlotPanel, CutawayPanel } from "./windows/modePanels";
-import PasteLensWindow from "./windows/PasteLensWindow";
+import LensWindow from "./windows/LensWindow";
+import { lensArmed, lensToggle } from "./lens/lensMode";
 import WindowLayer from "./windows/WindowLayer";
 import View3DWindow from "./windows/View3DWindow";
 import { createHostNode, InPortal, OutPortal } from "./windows/Reparentable";
@@ -31,8 +32,8 @@ import { PickerProvider, usePickerHost } from "./picker/PickerHost";
 import {
   closeWorld as closeWindowWorld, collapseWin, getWindowState, loadWorld as loadWindowLayout,
   openWin, resetWindows, saveAs as saveWindowLayoutAs, setDefaultOpts as setWindowDefaultOpts,
-  setPassThrough as setWindowPassThrough, setSnap as setWindowSnap, setSwapped, subscribe as subscribeWindows,
-  toggleWin,
+  setLensFlags, setPassThrough as setWindowPassThrough, setSnap as setWindowSnap, setSwapped,
+  subscribe as subscribeWindows, toggleWin,
 } from "./windows/useWindowLayout";
 import { normalizePath, worldIdentity } from "./windows/windowStorage";
 import FlyView3D, { type Sky3dPrefs, type FlyView3DRef, type Overlay3D, type Interact3D, type GpuInfo, RD_MIN } from "./FlyView3D";
@@ -126,8 +127,8 @@ setWindowSnap(loadSettings().snapWindows);
  *  measurement, drag start/end or click-to-front (those only re-render the windows themselves).
  *  Indices: 0 swapped, 1 view3d.open, 2 view3d.collapsed, 3 tools.open, 4 hotbar.open,
  *  5 hotbar.collapsed (the last two feed `hotbarWindowOpen`/`showHotbarOverlay`, Stage 14.5),
- *  6 lens.open (feeds `lensWindowOpen`'s ribbon-armed state, Stage 14.9 — the lens's own mount
- *  gate also reads `tool`/`clipboard`, which already re-render App on every change). */
+ *  6 lens.open, 7 lensSelOn (the Lens's two session flags, 20.4: they feed `lensWindowOpen`'s
+ *  armed state, with `tool`/`clipboard`/`selection`, which already re-render App on every change). */
 /** Send a memory preset's backend-side budgets to Rust: the undo stacks' byte ceiling and the
  *  overview raster's (18.15). Fire-and-forget — both commands clamp, and a failure only means the
  *  backend keeps its Balanced defaults. */
@@ -140,7 +141,7 @@ function pushBackendBudgets(preset: AppSettings["memoryBudget"]): void {
 function windowLayoutKey(): string {
   const s = getWindowState();
   return `${+s.swapped}${+s.wins.view3d.open}${+s.wins.view3d.collapsed}${+s.wins.tools.open}` +
-    `${+s.wins.hotbar.open}${+s.wins.hotbar.collapsed}${+s.wins.lens.open}`;
+    `${+s.wins.hotbar.open}${+s.wins.hotbar.collapsed}${+s.wins.lens.open}${+s.lensSelOn}`;
 }
 
 /** `fresh`: the world was just created by New World — its window layout inherits `last`, never a
@@ -151,6 +152,8 @@ type Toast = { id: number; text: string; kind: ToastKind };
 const INFO_TOAST_MS = 2500;
 const ERROR_TOAST_MS = 8000;
 const MAX_TOASTS = 4;
+/** Default top of the selection z range (64 layers). Keeps 256z worlds from selecting 4× the voxels by default. */
+const DEFAULT_SEL_Z_MAX = 63;
 /** Stable empty array for the sign-marker prop — a fresh `[]` each render would churn MapCanvas's
  *  prop-mirroring effects on every App re-render (cursor ticks, FPS, …). */
 const NO_SIGNS: SignInfo[] = [];
@@ -301,7 +304,7 @@ function LongOpOverlay({ op, onCancel }: { op: LongOpState | null; onCancel: () 
         boxShadow: "0 8px 28px rgba(0,0,0,.45)",
       }}>
         <div style={{ color: TEXT, fontSize: FONT.tab, marginBottom: SPACE.md }}>
-          {label}{pct !== null ? ` — ${pct}%` : "…"}
+          {label}{pct !== null ? ` ${pct}%` : "…"}
         </div>
         {op?.phase && (
           <div style={{ color: TEXT_DIM, fontSize: FONT.body, marginBottom: SPACE.md }}>{op.phase}</div>
@@ -442,7 +445,7 @@ const CursorZHud = forwardRef<CursorZHudHandle>((_props, ref) => {
 
 // Zoom badge (Stage 15.6): `MapCanvas`'s zoom is purely imperative (`viewRef.current.scale`, no
 // React state), so this leaf subscribes to it via `MapCanvasRef.subscribeZoom` — same ref-fan-out
-// pattern as the paste lens's ghost subscription, and the same "own state, no App re-render" leaf
+// pattern as the Lens's ghost subscription, and the same "own state, no App re-render" leaf
 // contract as CursorHud/SelStatusHud. Click = Fit (mirrors ⌘0 / `view.zoom.fit`'s `resetView()`).
 function ZoomStatusSeg({ mapCanvasRef }: { mapCanvasRef: React.RefObject<MapCanvasRef | null> }) {
   const [scalePct, setScalePct] = useState<number | null>(null);
@@ -452,11 +455,11 @@ function ZoomStatusSeg({ mapCanvasRef }: { mapCanvasRef: React.RefObject<MapCanv
     const unsub = mc.subscribeZoom(scale => setScalePct(Math.round(scale * 100)));
     return unsub;
     // `mapCanvasRef.current.subscribeZoom` is an imperative ref API stable for the map's whole
-    // lifetime, same as PasteLensWindow's subscribeGhost effect.
+    // lifetime, same as LensWindow's subscribeGhost effect.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mapCanvasRef.current]);
   return (
-    <StatusSeg icon="fit" style={{ flexShrink: 0 }} title="Zoom — click to fit the map (⌘0)"
+    <StatusSeg icon="fit" style={{ flexShrink: 0 }} title="Zoom. Click to fit the map (⌘0)"
       onClick={() => mapCanvasRef.current?.resetView()}>
       {scalePct !== null ? `${scalePct}%` : "—"}
     </StatusSeg>
@@ -478,7 +481,7 @@ function ActiveBlockStatusSeg({
   const name = `${blockDisplayName(fillBlockType)}${fillPaint > 0 ? ` #${fillPaint}` : ""}`;
   return (
     <StatusSeg divider={false} style={{ flexShrink: 0 }}
-      title={`Active block: ${name} — click to browse all blocks & paints`}
+      title={`Active block: ${name}. Click to choose a block and paint.`}
       onClick={e => togglePicker(e, "block-draw")}>
       <Swatch color={`rgb(${r},${g},${b})`} url={swatchUrl} size={12} />
       <span style={{ maxWidth: 90, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{name}</span>
@@ -512,7 +515,7 @@ const SelStatusHud = forwardRef<SelStatusHudHandle, { selection: SelectionInfo |
         <StatusSeg icon="select" color={TEXT_LABEL}>
           Sel <span style={{ color: TEXT_DIM }}>{selection.width}×{selection.height}</span>
           {selection.masked && selection.cell_count != null && (
-            <span style={{ color: ACCENT.violet, marginLeft: 5 }} title="Shaped selection — edits affect only the wand/lasso footprint, not the whole box">
+            <span style={{ color: ACCENT.violet, marginLeft: 5 }} title="Shaped selection: edits only affect the selected shape">
               ◆ shaped ({selection.cell_count.toLocaleString()} cells)
             </span>
           )}
@@ -580,7 +583,7 @@ function App() {
   // `<html data-motion>`, which is the one thing every motion-gated CSS rule in the app reads.
   const [motion, setMotion] = useState<AppSettings["motion"]>(() => loadSettings().motion);
   useMotionPref(motion);
-  // Docked right sidebar (Inspector/Prefabs/Elevation/History) — see Sidebar.tsx. Width persists via
+  // Docked right sidebar (Inspector/Prefabs/History) — see Sidebar.tsx. Width persists via
   // the same debounced-localStorage pattern as other drag-driven values (see saveSettingsDebounced).
   const [sidebarOpen, setSidebarOpen] = useState(() => loadSettings().sidebarOpen);
   const [sidebarWidth, setSidebarWidth] = useState(() => loadSettings().sidebarWidth);
@@ -807,16 +810,18 @@ function App() {
     setSwapped(!getWindowState().swapped);
     requestAnimationFrame(() => mapCanvasRef.current?.invalidateRect());
   }, []);
-  // View ▸ Windows ▸ Paste Lens / ⌥P: toggles `wins.lens.open` (the *window*, not visibility —
-  // PasteLensWindow only actually renders while a paste is also armed). Turning it on with nothing
-  // armed gets a one-time explanatory toast (mock `w-lens`'s `flashStatus`) instead of silently
-  // doing nothing visible.
+  // View ▸ Windows ▸ Lens / ⌥P / the Lens's ✕ (20.4, `lens/lensMode.ts`): flips the flag of the
+  // mode that's showing; with nothing showing, turns both flags on (or both off). Turning it on with
+  // nothing to show gets an explanatory toast instead of silently doing nothing visible.
   const onToggleLensWindow = useCallback(() => {
-    const wasOpen = getWindowState().wins.lens.open;
-    toggleWin("lens");
-    if (!wasOpen && !(toolRef.current === "paste" && clipboardRef.current)) {
-      pushToast("Paste lens on — it appears at the ghost when you paste (⌘V)", "info");
-    }
+    const s = getWindowState();
+    const r = lensToggle({
+      pasteArmed: toolRef.current === "paste" && !!clipboardRef.current,
+      hasSelection: rawBoundsRef.current != null,
+      pasteOn: s.wins.lens.open, selOn: s.lensSelOn,
+    });
+    setLensFlags(r);
+    if (r.announce) pushToast("Lens on. It appears when you select or paste.", "info");
   }, [pushToast]);
   // Key → action for the ⌥ window shortcuts, read by the keydown handler. Every action goes through
   // refs / stable callbacks, so the table itself never needs re-pointing.
@@ -884,7 +889,7 @@ function App() {
   // say so, and only when one was actually on.
   function resetHeavyLighting() {
     if (nightLightingRef.current || shadows3dRef.current || gpuShadowsRef.current) {
-      showToast("3D lighting (Night / Shadows / GPU Shadows) turned off for the new world — re-enable it in the 3D tab");
+      showToast("3D lighting was turned off for the new world. Turn it on in the 3D tab.");
     }
     setNightLighting(false);
     setShadows3d(false);
@@ -980,10 +985,10 @@ function App() {
       const next: AppSettings = { ...s, renderDistance: RD_MIN, memoryBudget: "low", potatoProfileApplied: true };
       applySettings(next);
       saveSettings(next);
-      showToast(`This machine's graphics driver is using software rendering (${info.renderer}) — 3D render distance and memory usage have been lowered to keep it usable. Raise them again in Settings ▸ 3D if you like, but performance will suffer.`);
+      showToast(`Software rendering detected (${info.renderer}). 3D render distance and memory use were lowered. You can raise them in Settings ▸ 3D View, but 3D will be slow.`);
     } else {
       saveSettings({ potatoProfileApplied: true });
-      showToast(`This machine's graphics driver is using software rendering (${info.renderer}) — 3D performance will be poor. Consider lowering render distance / memory preset in Settings ▸ 3D.`);
+      showToast(`Software rendering detected (${info.renderer}), so 3D will be slow. Lower the render distance or memory budget in Settings.`);
     }
   }, [showToast]);
 
@@ -1032,7 +1037,7 @@ function App() {
   // prop bag, MapCanvas, Sidebar, FlyView3D's own overlay JSX — on every tick, precisely while the
   // user is trying to move the camera. It's now a plain ref: MapCanvas.setCameraDot() updates the
   // on-map dot imperatively (see MapCanvas.tsx), and `hasCam3dPos` is a rarely-changing boolean
-  // (flips false→true once) purely to gate the "Center Map on 3D Camera" context-menu item.
+  // (flips false→true once) purely to gate the "Centre Map on 3D Camera" context-menu item.
   const cam3dPosRef = useRef<{ x: number; y: number } | null>(null);
   const [hasCam3dPos, setHasCam3dPos] = useState(false);
   const [showWorldBrowser, setShowWorldBrowser] = useState(false);
@@ -1212,7 +1217,6 @@ function App() {
   useEffect(() => { appToolRef.current = tool; }, [tool]);
   useEffect(() => { lockedPastePosRef.current = lockedPastePos; }, [lockedPastePos]);
   useEffect(() => { if (tool !== "paste") setLockedPastePos(null); }, [tool]);
-  useEffect(() => { /* elevation panel always visible in normal mode */ }, [lockedPastePos]);
 
   // Clear paste trail when clipboard changes or we leave paste mode.
   useEffect(() => {
@@ -1348,6 +1352,18 @@ function App() {
   const zMaxRef = useRef(63);
   useEffect(() => { zMinRef.current = zMin; }, [zMin]);
   useEffect(() => { zMaxRef.current = zMax; }, [zMax]);
+  // The Lens's z-edge drags (20.4): already throttled to ≤ 15 Hz by `LensView`.
+  const onLensZRange = useCallback((lo: number, hi: number) => { setZMin(lo); setZMax(hi); }, []);
+  // On 256z worlds a tall selection makes every preview/mask/render pass ~4× heavier, so the
+  // default z range is 0–63 and a range taller than that doesn't outlive its selection: once the
+  // selection is cleared, snap back. (Non-null selections are never touched, so editing a tall one
+  // is unaffected.)
+  useEffect(() => {
+    if (rawBounds === null && zMax > DEFAULT_SEL_Z_MAX) {
+      setZMin(0);
+      setZMax(DEFAULT_SEL_Z_MAX);
+    }
+  }, [rawBounds, zMax]);
 
   const [selection, setSelection] = useState<SelectionInfo | null>(null);
 
@@ -1592,8 +1608,8 @@ function App() {
     // history was dropped rather than parked in RAM for the session. Never silent — this is the
     // one case where ⌘Z won't get the user's work back.
     if (raw.undo_dropped) {
-      pushToast("This edit was too large to undo — undo history has been cleared. " +
-                "Raise the memory budget in Settings ▸ General to keep undo for edits this size.", "error");
+      pushToast("This edit was too large to undo, so undo history was cleared. " +
+                "Raise the memory budget in Settings ▸ General to keep it.", "error");
     }
     // Risky-block density warnings (dense doors/flowers packed into one footprint — see
     // RISKY_BLOCK_GROUPS in lib.rs). Advisory only, shown regardless of `silent` since it's a safety
@@ -1625,7 +1641,7 @@ function App() {
     // One-shot notice for a user migrated off the retired Quad layout (settings v23, Stage 16.4).
     if (loadSettings().pendingQuadRetiredNotice) {
       saveSettings({ pendingQuadRetiredNotice: false });
-      showToast("Quad view was retired — your 3D view is now a window");
+      showToast("The 3D view is now a window.");
     }
     setWorld(data);
     setWorldEpoch((e) => e + 1);
@@ -1633,7 +1649,7 @@ function App() {
     setRawBounds(null);
     setMaterializeSelection(null);
     setZMin(0);
-    setZMax(data.max_z);
+    setZMax(Math.min(data.max_z, DEFAULT_SEL_Z_MAX));
     setTool("pan");
     setUndoDepth(0);
     setRedoDepth(0);
@@ -1655,9 +1671,9 @@ function App() {
     // rather than at save time — by then the user has already chosen a destination.
     if (data.signs_from_sidecar) {
       pushToast(
-        "This world's signs live in a separate signs_….eden.dat file beside it. They're shown here, "
-        + "but VuencEdit can't write that file — Save As, Upload and compressed saves will drop them. "
-        + "Keep the sidecar next to the world, or re-upload from the game to fold the signs in.",
+        "This world's signs are in a separate signs_….eden.dat file. "
+        + "VuencEdit can't write it, so Save As, Upload and compressed saves drop the signs. "
+        + "Keep that file next to the world.",
         "error",
       );
     }
@@ -2195,10 +2211,12 @@ function App() {
     } catch (e) { reportError(e); }
   }
 
-  async function handleDrawElevation(x: number, y: number, z: number) {
+  /** A Lens draw stroke (20.4): every cell in one `paint_blocks` call, so one undo step. */
+  async function handleDrawElevation(blocks: { x: number; y: number; z: number }[]) {
+    if (blocks.length === 0) return;
     try {
       const result = await invoke<ArrayBuffer>("paint_blocks", {
-        blocks: [{ x, y, z }], blockType: fillBlockType, paint: fillPaint, zOffset: 0,
+        blocks, blockType: fillBlockType, paint: fillPaint, zOffset: 0,
       });
       await applyEditResult(result);
     } catch (e) {
@@ -2399,7 +2417,7 @@ function App() {
         const warnKey = `${path}|${saveCompressed}`;
         if (lastExtWarnRef.current !== warnKey) {
           lastExtWarnRef.current = warnKey;
-          showToast(`Saved ${saveCompressed ? "compressed" : "uncompressed"} data into a “.${ext}” file — other tools may not recognize it`);
+          showToast(`Saved ${saveCompressed ? "compressed" : "uncompressed"} data in a “.${ext}” file. Other tools may not open it.`);
         }
       }
       // save_world also re-bases the autosave onto the file it just wrote (18.9), which replaces the
@@ -2650,7 +2668,7 @@ function App() {
         }
       }
       // Floating-window toggles (UI redesign r3, Stages 14.4/14.5): ⌥3 3D view, ⌥T Tools, ⌥H
-      // Hotbar, ⌥P Paste lens. Matched on `e.code` — ⌥3 on macOS types "£" in `e.key`. `!ctrlKey` keeps Windows
+      // Hotbar, ⌥P Lens. Matched on `e.code` — ⌥3 on macOS types "£" in `e.key`. `!ctrlKey` keeps Windows
       // **AltGr** (= Ctrl+Alt) from ever firing them on EU layouts (AltGr+3 types "³"). Checked
       // ahead of the hotbar digits (Alt+3 is not "slot 3") and of the fly-camera gate below: the
       // fly controller doesn't use ⌥+key, and a bare Alt press still reaches FlyView3D's own
@@ -3263,22 +3281,11 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
     setRenamingWorld(false);
   }
 
-  const pastePreviewSelection: SelectionInfo | null =
-    lockedPastePos && clipboard
-      ? {
-          x1: lockedPastePos.x,
-          y1: lockedPastePos.y,
-          x2: lockedPastePos.x + clipboard.width - 1,
-          y2: lockedPastePos.y + clipboard.height - 1,
-          z_min: clipboard.z_anchor + pasteElevationOffset,
-          z_max: clipboard.z_anchor + pasteElevationOffset + clipboard.depth - 1,
-          width: clipboard.width,
-          height: clipboard.height,
-          depth: clipboard.depth,
-          cell_count: null,
-          masked: false,
-        }
-      : null;
+  // View ▸ Windows ▸ Lens's armed state (20.4): the showing mode's flag, or both flags.
+  const lensWindowArmed = lensArmed({
+    pasteArmed: tool === "paste" && !!clipboard, hasSelection: selection != null,
+    pasteOn: winKey[6] === "1", selOn: winKey[7] === "1",
+  });
 
   const isSculptTool = tool === "smooth" || tool === "noise" || tool === "flatten" || tool === "erode" || tool === "thermal" || tool === "hydro" || tool === "stamp" || tool === "grab" || tool === "raise" || tool === "lower" || tool === "terrace" || tool === "sharpen" || tool === "slope" || tool === "smear" || tool === "rock" || tool === "carve";
   const isDrawTool = tool === "pen" || tool === "brush" || tool === "spray" || tool === "line" || tool === "rect" || tool === "ellipse" || tool === "polygon" || isSculptTool || tool === "fill";
@@ -3388,9 +3395,9 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
         {chunkToWorld(world.width_chunks)}×{chunkToWorld(world.height_chunks)}
         <span
           title={
-            classifyWorldFormat(world) === "legacy64z" ? "Legacy (64z) format — worlds up to 64 blocks tall"
-            : classifyWorldFormat(world) === "newDawn256z" ? "New Dawn (256z) format — worlds up to 256 blocks tall"
-            : "NewFormat256z — a 2026 game update's 256z variant, not the original New Dawn format"
+            classifyWorldFormat(world) === "legacy64z" ? "Legacy (64z) format: worlds up to 64 blocks tall"
+            : classifyWorldFormat(world) === "newDawn256z" ? "New Dawn (256z) format: worlds up to 256 blocks tall"
+            : "NewFormat256z: a 256z format from a 2026 game update"
           }
           style={{ color: world.max_z === 255 ? ACCENT.violet : TEXT_META, marginLeft: 6 }}
         >
@@ -3404,7 +3411,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           on disk already, Save As otherwise). */}
       <StatusSeg
         color={dirty ? ACCENT.warm : TEXT_META}
-        title={dirty ? "Unsaved changes — click to save" : "All changes saved"}
+        title={dirty ? "Unsaved changes. Click to save." : "All changes saved"}
         onClick={() => { if (sourcePath) saveWorld(sourcePath); else saveWorldAs(); }}
       >
         <span style={{
@@ -3486,7 +3493,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           background: `rgba(${hexToRgbTriplet(lockedPastePos ? ACCENT.warm : ACCENT.clipboard)},0.10)` }}>
           <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0 }}>
             {lockedPastePos
-              ? "Position locked — click again to stamp, Esc to unlock"
+              ? "Position locked. Click again to place, Esc to unlock."
               : "Click the map to lock the paste position"}
           </span>
         </StatusSeg>
@@ -3562,7 +3569,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
               setFillPaint={setFillPaint}
               texturePack={texturePackInfo}
             />
-            <PasteLensWindow
+            <LensWindow
               tool={tool}
               clipboard={clipboard}
               pasteMode={pasteMode}
@@ -3575,6 +3582,16 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
               mapCanvasRef={mapCanvasRef}
               mapVisible={placement.main !== "fly"}
               worldLoaded={world != null}
+              onExit={onToggleLensWindow}
+              selection={selection}
+              zMin={zMin}
+              zMax={zMax}
+              onZRangeChange={onLensZRange}
+              selectionMask={selectionMaskOverlay}
+              extrude={extrudeOpen && extrudeCount > 0 ? { axis: extrudeAxis, count: extrudeCount } : null}
+              drawActive={["pen", "brush", "rect", "ellipse"].includes(tool)}
+              onDrawElevation={handleDrawElevation}
+              maxZ={world.max_z}
             />
             {/* Mode-driven context panels (16.6) — in registry (= stacking) order. Each exists only while
                 its mode holds; see windows/panelModes.ts and modePanels.tsx. */}
@@ -3836,7 +3853,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           onToggleToolsWindow={() => toggleWin("tools")}
           hotbarWindowOpen={winKey[4] === "1"}
           onToggleHotbarWindow={() => toggleWin("hotbar")}
-          lensWindowOpen={winKey[6] === "1"}
+          lensWindowOpen={lensWindowArmed}
           onToggleLensWindow={onToggleLensWindow}
           onResetWindows={resetWindows}
           mode3d={mode3d}
@@ -4025,7 +4042,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
         </ErrorBoundary>
 
 
-        {/* Docked right sidebar: Inspector / Prefabs / Elevation / History tabs — see Sidebar.tsx. */}
+        {/* Docked right sidebar: Inspector / Prefabs / History tabs — see Sidebar.tsx. */}
         <Sidebar
           open={sidebarOpen}
           onOpenChange={(v) => { setSidebarOpen(v); saveSettings({ sidebarOpen: v }); }}
@@ -4041,15 +4058,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           onArmPaste={(info) => { setClipboard(info); setTool("paste"); }}
           onSavePrefabAs={savePrefabAs}
           prefabRefreshToken={prefabRefreshToken}
-          elevationSelection={pastePreviewSelection ?? selection}
-          maxZ={world.max_z}
-          extrudeCount={pastePreviewSelection ? 0 : (extrudeOpen && extrudeCount > 0 ? extrudeCount : 0)}
-          extrudeAxis={extrudeAxis}
-          isPastePreview={pastePreviewSelection !== null}
           editEpoch={editEpoch}
-          drawActive={["pen","brush","rect","ellipse"].includes(tool)}
-          onDrawElevation={handleDrawElevation}
-          onZRangeChange={pastePreviewSelection ? undefined : (zMin, zMax) => { setZMin(zMin); setZMax(zMax); }}
           worldEpoch={worldEpoch}
           signs={signs}
           onSignClick={focusOnSign}
@@ -4143,8 +4152,8 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
             onClose={() => { setShowSettings(false); setSettingsTab("general"); }}
             onSave={applySettings}
             onResetWindows={resetWindows}
-            lensWindowOpen={winKey[6] === "1"}
-            onToggleLensWindow={onToggleLensWindow}
+            lensFlags={{ pasteOn: winKey[6] === "1", selOn: winKey[7] === "1" }}
+            onLensFlags={setLensFlags}
             initialTab={settingsTab}
           />
         )}
@@ -4203,8 +4212,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
             {!expandInProgress && expandResult === null && (
               <>
                 <div style={{ fontSize: 12, color: MODAL_TEXT.secondary, marginBottom: 16, lineHeight: 1.5 }}>
-                  Fills missing chunks from Eden.eden into a new world file. Your edits are preserved.
-                  Output can be ~1 GB for the full template.
+                  Fills missing chunks from Eden.eden into a new file (up to ~1 GB). Your edits are kept.
                 </div>
                 <Segmented
                   ariaLabel="Expand extent"
@@ -4232,7 +4240,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
             )}
             {expandResult !== null && !expandInProgress && (
               <div style={{ fontSize: 13, color: armedRecipe(ACCENTS.clipboard).text }}>
-                Done — {expandResult.chunksAdded.toLocaleString()} chunks added
+                Done. {expandResult.chunksAdded.toLocaleString()} chunks added
                 ({expandResult.totalChunks.toLocaleString()} total).
               </div>
             )}
@@ -4247,7 +4255,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
         {ctxMenu && (() => {
           const items: ContextMenuItem[] = [];
           items.push({
-            id: "spawn", label: "Set Spawn Here", icon: "home",
+            id: "spawn", label: "Set Home Point Here", icon: "home",
             onClick: () => { invoke<[number,number]>("set_spawn_pos", { px: Math.round(ctxMenu.wx), py: Math.round(ctxMenu.wy) }).then(([px, py]) => { setSpawnPos({ px, py }); setEditEpoch(e => e + 1); }).catch(e => reportError(e)); },
           });
           if (rawBounds) items.push({
@@ -4279,7 +4287,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
               onClick: () => flyView3dRef.current?.teleport(ctxMenu.wx, ctxMenu.wy),
             });
             if (hasCam3dPos) items.push({
-              id: "centerOn3d", label: "Center Map on 3D Camera",
+              id: "centerOn3d", label: "Centre Map on 3D Camera",
               onClick: () => { const cp = cam3dPosRef.current; if (cp) mapCanvasRef.current?.centerOn(cp.x, cp.y); },
             });
           }

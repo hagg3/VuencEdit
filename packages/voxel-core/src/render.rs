@@ -857,134 +857,6 @@ pub fn view_top(
     (pw, ph, pixels)
 }
 
-/// Front view with `ctx` context columns on each side at 50% alpha. `b_lo` is always 0 here — the
-/// caller clones whole chunks rather than a band range, because the view spans the full height.
-#[allow(clippy::too_many_arguments)]
-pub fn view_front_ctx(
-    world: &(impl VoxelView + Sync), meta: ViewMeta,
-    sel_x1: i32, sel_x2: i32, y1: i32, y2: i32,
-    z_max: i32, ctx: i32,
-) -> (u32, u32, Vec<u8>) {
-    let (min_x, min_y) = world.chunk_origin();
-    let rx1 = sel_x1 - ctx;
-    let rx2 = sel_x2 + ctx;
-    let pw = (rx2 - rx1 + 1) as u32;
-    let ph = (z_max + 1) as u32;
-    let mut pixels = vec![0u8; (pw * ph * 4) as usize];
-    for p in pixels.chunks_exact_mut(4) { p.copy_from_slice(&VOID); }
-
-    // Row-parallel (audit R2-4) — same transposition as `view_front`.
-    pixels.par_chunks_mut((pw * 4) as usize).enumerate().for_each(|(row, row_pixels)| {
-        let z     = z_max - row as i32;
-        let band  = (z as usize) / 16;
-        let lz    = (z as usize) & 15;
-        let z_off = band * 8192 + lz; // b_lo=0 always
-        for x in rx1..=rx2 {
-            // div_euclid handles negative x (context left of world origin).
-            // x & 15 == x.rem_euclid(16) for all i32 (two's-complement property).
-            let cx     = x.div_euclid(16) + min_x;
-            let lx_256 = (x & 15) as usize * 256;
-            let out    = (x - rx1) as usize * 4;
-            let mut y = y1;
-            'y_scan: while y <= y2 {
-                let cy          = y / 16 + min_y;
-                let chunk_y_end = (y | 15).min(y2);
-                match world.chunk_bytes(cx, cy) {
-                    None => { y = chunk_y_end + 1; }
-                    Some(chunk) => {
-                        let base = z_off + lx_256;
-                        while y <= chunk_y_end {
-                            let bi = base + (y & 15) as usize * 16;
-                            let pi = bi + 4096;
-                            if pi < chunk.len() {
-                                let bt = chunk[bi];
-                                if bt != 0 {
-                                    let [r, g, b] = block_color(bt, chunk[pi], meta.sky);
-                                    row_pixels[out]     = r;
-                                    row_pixels[out + 1] = g;
-                                    row_pixels[out + 2] = b;
-                                    break 'y_scan;
-                                }
-                            }
-                            y += 1;
-                        }
-                    }
-                }
-            }
-        }
-    });
-    dim_context_columns(&mut pixels, pw, ph, (sel_x1 - rx1) as usize, (sel_x2 + 1 - rx1) as usize);
-    (pw, ph, pixels)
-}
-
-/// Side view with `ctx` context columns on each side at 50% alpha. `b_lo` is always 0 — see
-/// [`view_front_ctx`].
-#[allow(clippy::too_many_arguments)]
-pub fn view_side_ctx(
-    world: &(impl VoxelView + Sync), meta: ViewMeta,
-    x1: i32, x2: i32, sel_y1: i32, sel_y2: i32,
-    z_max: i32, ctx: i32,
-) -> (u32, u32, Vec<u8>) {
-    let (min_x, min_y) = world.chunk_origin();
-    let ry1 = sel_y1 - ctx;
-    let ry2 = sel_y2 + ctx;
-    let pw = (ry2 - ry1 + 1) as u32;
-    let ph = (z_max + 1) as u32;
-    let mut pixels = vec![0u8; (pw * ph * 4) as usize];
-    for p in pixels.chunks_exact_mut(4) { p.copy_from_slice(&VOID); }
-
-    // Row-parallel (audit R2-4) — same transposition as `view_front`.
-    pixels.par_chunks_mut((pw * 4) as usize).enumerate().for_each(|(row, row_pixels)| {
-        let z     = z_max - row as i32;
-        let band  = (z as usize) / 16;
-        let lz    = (z as usize) & 15;
-        let z_off = band * 8192 + lz;
-        for y in ry1..=ry2 {
-            let cy    = y.div_euclid(16) + min_y;
-            let ly_16 = (y & 15) as usize * 16;
-            let out   = (y - ry1) as usize * 4;
-            let mut x = x1;
-            'x_scan: while x <= x2 {
-                let cx          = x / 16 + min_x;
-                let chunk_x_end = (x | 15).min(x2);
-                match world.chunk_bytes(cx, cy) {
-                    None => { x = chunk_x_end + 1; }
-                    Some(chunk) => {
-                        let base = z_off + ly_16;
-                        while x <= chunk_x_end {
-                            let bi = base + (x & 15) as usize * 256;
-                            let pi = bi + 4096;
-                            if pi < chunk.len() {
-                                let bt = chunk[bi];
-                                if bt != 0 {
-                                    let [r, g, b] = block_color(bt, chunk[pi], meta.sky);
-                                    row_pixels[out]     = r;
-                                    row_pixels[out + 1] = g;
-                                    row_pixels[out + 2] = b;
-                                    break 'x_scan;
-                                }
-                            }
-                            x += 1;
-                        }
-                    }
-                }
-            }
-        }
-    });
-    dim_context_columns(&mut pixels, pw, ph, (sel_y1 - ry1) as usize, (sel_y2 + 1 - ry1) as usize);
-    (pw, ph, pixels)
-}
-
-/// Post-process: drop the columns outside `[left_ctx, right_ctx)` to 50% opacity, so the selection
-/// reads against its surroundings without the surroundings competing with it.
-fn dim_context_columns(pixels: &mut [u8], pw: u32, ph: u32, left_ctx: usize, right_ctx: usize) {
-    for col in (0..left_ctx).chain(right_ctx..(pw as usize)) {
-        for row in 0..(ph as usize) {
-            pixels[(row * pw as usize + col) * 4 + 3] = 128;
-        }
-    }
-}
-
 // ── Paste lens (UI redesign r3, stage 14.8) ─────────────────────────────────────────────────────
 //
 // A front or side elevation of an *armed* paste: the clipboard ghost drawn at the Z it would land
@@ -1053,8 +925,8 @@ pub struct ClipRef<'a> {
 pub const LENS_SKIP: i32 = i32::MIN;
 
 /// Which elevation. **Front** looks north: image columns are world X, the ray runs +Y. **Side**
-/// looks east: image columns are world Y, the ray runs +X. Same axes as the app's
-/// `render_clipboard_elevation_preview`, so the lens and the Inspector never disagree on handedness.
+/// looks east: image columns are world Y, the ray runs +X. Same axes as the selection lens and the
+/// clipboard silhouette the app tests it against, so they never disagree on handedness.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LensView { Front, Side }
 
@@ -1155,11 +1027,7 @@ pub fn paste_lens(
         LensView::Front => (x, w, y, h),
         LensView::Side => (y, h, x, w),
     };
-    let col_lo = fp_lo - context;
-    let ncols = fp_len + 2 * context as usize;
-    let max_px = max_px.max(1) as usize;
-    let lod = (ncols.div_ceil(max_px)).clamp(1, MAX_LOD as usize);
-    let out_w = (ncols - 1) / lod + 1;
+    let LensFrame { col_lo, lod, out_w } = lens_frame(fp_lo, fp_len, context, max_px);
 
     let (world_w, world_h) = (meta.width(), meta.height());
     let column = |wx: i32, wy: i32| lens_column(world, world_w, world_h, wx, wy);
@@ -1218,19 +1086,12 @@ pub fn paste_lens(
                 px.copy_from_slice(&[r, g, b, 255]);
             } else if terr[row].0 != 0 {
                 let [r, g, b] = block_color(terr[row].0, terr[row].1, meta.sky);
-                px.copy_from_slice(&[r, g, b, if in_fp { 255 } else { 128 }]);
+                px.copy_from_slice(&[r, g, b, if in_fp { 255 } else { LENS_CONTEXT_ALPHA }]);
             }
         }
         out
     }).collect();
-
-    let mut pixels = vec![0u8; out_w * rows * 4];
-    for (ox, col) in columns.iter().enumerate() {
-        for row in 0..rows {
-            let o = (row * out_w + ox) * 4;
-            pixels[o..o + 4].copy_from_slice(&col[row * 4..row * 4 + 4]);
-        }
-    }
+    let pixels = lens_assemble(&columns, rows);
 
     // ── Stats: exact cell counts over the whole volume (strided for huge clipboards) ─────────
     let cells = (w * h) as u64 * d as u64;
@@ -1287,6 +1148,222 @@ pub fn paste_lens(
     (raster, stats)
 }
 
+// ── Selection lens (Stage 20.3) ─────────────────────────────────────────────────────────────────
+//
+// The no-clipboard sibling of `paste_lens`: front/side elevations of a selection footprint plus
+// context columns, full height. Its own function rather than an empty `ClipRef` because the Z
+// window, the meaning of the mask, and the stats all differ (plan: `TEST WORLDS/
+// lens-selection-mode-plan-2026-10-01.md` §1). The column frame and assembly are shared.
+
+/// A selection as the lens reads it: the bbox, its Z range, and the shaped mask if one applies
+/// (the caller resolves it fail-safe, as every mask-aware command does).
+pub struct SelRef<'a> {
+    pub x1: i32,
+    pub y1: i32,
+    pub x2: i32,
+    pub y2: i32,
+    pub z_min: i32,
+    pub z_max: i32,
+    pub mask: Option<&'a SelectionMask>,
+}
+
+impl SelRef<'_> {
+    #[inline]
+    fn contains(&self, x: i32, y: i32) -> bool {
+        match self.mask {
+            Some(m) => m.contains(x, y),
+            None => x >= self.x1 && x <= self.x2 && y >= self.y1 && y <= self.y2,
+        }
+    }
+}
+
+/// Everything the selection lens header reports beyond the raster's own dimensions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SelLensStats {
+    /// World coordinate (X for front, Y for side) of image column 0.
+    pub col_lo: i32,
+    /// The selection's first/last column along the image axis.
+    pub footprint_lo: i32,
+    pub footprint_hi: i32,
+    /// World Z of the bottom (last) and top (first) image rows.
+    pub z_lo: i32,
+    pub z_hi: i32,
+    /// Highest Z with any block on the raster, context included — lets the window open framed on
+    /// the terrain instead of on 256 rows of sky. `None` when the raster is empty.
+    pub terrain_z_hi: Option<i32>,
+}
+
+/// The selection lens's Z window: the whole world height when it fits in [`LENS_MAX_ROWS`] (every
+/// format today), so a z-handle drag never runs off the image. A taller format centres the window
+/// on the selection, or on `z_max` (the handle people drag most) when the selection is taller still.
+fn sel_lens_z_window(max_z: i32, z_min: i32, z_max: i32) -> (i32, i32) {
+    if max_z < LENS_MAX_ROWS { return (0, max_z); }
+    let mid = if z_max - z_min < LENS_MAX_ROWS { z_min / 2 + z_max / 2 } else { z_max };
+    let z_lo = (mid - LENS_MAX_ROWS / 2).clamp(0, max_z - LENS_MAX_ROWS + 1);
+    (z_lo, z_lo + LENS_MAX_ROWS - 1)
+}
+
+/// Render the selection lens: a front (looking north: columns = X, ray +Y over `y1..=y2`) or side
+/// (looking east: columns = Y, ray +X over `x1..=x2`) elevation of `sel`, with `context` columns
+/// either side. Same axes and column LOD as [`paste_lens`]; rows are 1:1 and the ray is never
+/// strided (a strided ray would miss the first hit).
+///
+/// Per pixel: the first block along the ray whose `(x, y)` is in the selection (the mask if any,
+/// else the bbox), at full alpha; failing that, the first block at all, at 50 % (context columns,
+/// and in-bbox rays that only cross unmasked cells: the mask is see-through). Else transparent.
+/// Full height, not clipped to `z_min..z_max` (the z band is the caller's overlay), and uncapped
+/// in cutaway, for the same reason as the paste lens.
+///
+/// Cost: the ray is walked one chunk segment (16 cells) at a time. Rows above every remaining
+/// segment's `scan_z_ceiling` can't gain a hit, so the walk stops once each row under that
+/// ceiling has its answer; on ordinary terrain that's a few segments in.
+pub fn selection_lens(
+    world: &(impl VoxelView + Sync), meta: ViewMeta,
+    sel: &SelRef, view: LensView, context: i32, max_px: u32,
+) -> (Raster, SelLensStats) {
+    let max_z = world_max_z(world);
+    let (z_lo, z_hi) = sel_lens_z_window(max_z, sel.z_min, sel.z_max);
+    let rows = (z_hi - z_lo + 1) as usize;
+
+    let (fp_lo, fp_hi, ray_lo, ray_hi) = match view {
+        LensView::Front => (sel.x1, sel.x2, sel.y1, sel.y2),
+        LensView::Side => (sel.y1, sel.y2, sel.x1, sel.x2),
+    };
+    let fp_len = (fp_hi - fp_lo + 1).max(1) as usize;
+    let LensFrame { col_lo, lod, out_w } = lens_frame(fp_lo, fp_len, context, max_px);
+    let (world_w, world_h) = (meta.width(), meta.height());
+    let (min_x, min_y) = world.chunk_origin();
+
+    // Ray segments: [start, end] runs that share one chunk along the ray.
+    let mut segs: Vec<(i32, i32)> = Vec::new();
+    let mut s = ray_lo;
+    while s <= ray_hi {
+        let e = (s.div_euclid(16) * 16 + 15).min(ray_hi);
+        segs.push((s, e));
+        s = e + 1;
+    }
+
+    let columns: Vec<(Vec<u8>, Option<i32>)> = (0..out_w).into_par_iter().map(|ox| {
+        let cw = col_lo + (ox * lod) as i32;
+        let in_bbox = cw >= fp_lo && cw <= fp_hi;
+        let cell = |r: i32| match view { LensView::Front => (cw, r), LensView::Side => (r, cw) };
+        let in_world = |(wx, wy): (i32, i32)| wx >= 0 && wy >= 0 && wx < world_w && wy < world_h;
+
+        // Suffix max of the segments' ceilings: rows above `reach[i]` can't gain a hit from
+        // segment `i` on. Only `top_band_hint` is consulted here, never a page.
+        let mut reach = vec![-1i32; segs.len() + 1];
+        for (i, &(a, _)) in segs.iter().enumerate().rev() {
+            let (wx, wy) = cell(a);
+            let ceil = if in_world((wx, wy)) {
+                scan_z_ceiling(world, wx / 16 + min_x, wy / 16 + min_y).min(z_hi)
+            } else { -1 };
+            reach[i] = reach[i + 1].max(ceil);
+        }
+
+        let mut sel_hit: Vec<(u8, u8)> = vec![(0, 0); rows];
+        let mut any_hit: Vec<(u8, u8)> = vec![(0, 0); rows];
+        // The rows still waiting for the hit that decides their pixel (a sel hit in a bbox column,
+        // any hit in a context column, where no cell can be in the selection), highest Z first.
+        // Each cell only visits these, so a row costs nothing once answered.
+        let mut open: Vec<i32> = (z_lo..=reach[0]).rev().collect();
+
+        for (i, &(a, b)) in segs.iter().enumerate() {
+            // Rows above every remaining segment's ceiling can never be answered: drop them.
+            let r = reach[i];
+            let above = open.iter().take_while(|&&z| z > r).count();
+            open.drain(..above);
+            if open.is_empty() { break; }
+            let (wx, wy) = cell(a);
+            if !in_world((wx, wy)) { continue; }
+            let (cx, cy) = (wx / 16 + min_x, wy / 16 + min_y);
+            let Some(chunk) = world.chunk_bytes(cx, cy) else { continue };
+            let ceil = scan_z_ceiling(world, cx, cy);
+            for k in a..=b {
+                let (wx, wy) = cell(k);
+                let in_sel = in_bbox && sel.contains(wx, wy);
+                let col: LensCol = Some((chunk, (wx % 16) as usize * 256 + (wy % 16) as usize * 16, ceil));
+                open.retain(|&z| {
+                    if z > ceil { return true; }
+                    let hit = lens_read(col, z);
+                    if hit.0 == 0 { return true; }
+                    let row = (z_hi - z) as usize;
+                    if any_hit[row].0 == 0 { any_hit[row] = hit; }
+                    if in_sel { sel_hit[row] = hit; }
+                    !(in_sel || !in_bbox)
+                });
+                if open.is_empty() { break; }
+            }
+        }
+
+        let mut out = vec![0u8; rows * 4];
+        let mut top = None;
+        for row in 0..rows {
+            let (hit, a) = if sel_hit[row].0 != 0 { (sel_hit[row], 255) }
+                else if any_hit[row].0 != 0 { (any_hit[row], LENS_CONTEXT_ALPHA) }
+                else { continue };
+            top.get_or_insert(z_hi - row as i32);
+            let [r, g, b] = block_color(hit.0, hit.1, meta.sky);
+            out[row * 4..row * 4 + 4].copy_from_slice(&[r, g, b, a]);
+        }
+        (out, top)
+    }).collect();
+
+    let terrain_z_hi = columns.iter().filter_map(|c| c.1).max();
+    let strips: Vec<Vec<u8>> = columns.into_iter().map(|c| c.0).collect();
+    let pixels = lens_assemble(&strips, rows);
+    let raster = Raster { x: 0, y: z_lo as u32, width: out_w as u32, height: rows as u32, lod: lod as u32, pixels };
+    let stats = SelLensStats { col_lo, footprint_lo: fp_lo, footprint_hi: fp_hi, z_lo, z_hi, terrain_z_hi };
+    (raster, stats)
+}
+
+/// Top-down view of the selection's z range (20.5): what you'd see looking straight down at
+/// `sel.z_min..=sel.z_max`, over the bbox plus `context` columns on every side. Returns
+/// `(raster, col_lo, row_lo)`: image pixel `(ox, oy)` is world column
+/// `(col_lo + ox·lod, row_lo + oy·lod)` — point sampling, the same H6 contract as
+/// [`pixels_patch_lod`]. One LOD serves both axes (`ceil(max(ncols, nrows) / max_px)`, clamped to
+/// `1..=MAX_LOD`), so pixels stay square. `Raster.x`/`y` are 0; the origin is the returned pair.
+///
+/// Per pixel: the first non-air block scanning down from `min(z_max, scan ceiling)` to `z_min`,
+/// at full alpha when `(x, y)` is in the selection (the mask if any, else the bbox), at 50 %
+/// otherwise (context columns and masked-out in-bbox columns: the mask is see-through, as in
+/// [`selection_lens`]). No hit, off-world, or no chunk: transparent (not `VOID`).
+///
+/// Cost: at most `max_px²` sampled columns, each one chunk resolution plus ≤ `z_max − z_min + 1`
+/// (≤ 256) reads with early exit; a column whose chunk top is under `z_min` is free (the ceiling
+/// skip never touches a page). Selection-mode only and on demand (the caller's `top` flag), so
+/// it's never in the idle path.
+pub fn selection_top(
+    world: &(impl VoxelView + Sync), meta: ViewMeta,
+    sel: &SelRef, context: i32, max_px: u32,
+) -> (Raster, i32, i32) {
+    let ctx = context.max(0);
+    let (col_lo, row_lo) = (sel.x1 - ctx, sel.y1 - ctx);
+    let ncols = ((sel.x2 - sel.x1 + 1).max(1) + 2 * ctx) as usize;
+    let nrows = ((sel.y2 - sel.y1 + 1).max(1) + 2 * ctx) as usize;
+    let lod = ncols.max(nrows).div_ceil(max_px.max(1) as usize).clamp(1, MAX_LOD as usize);
+    let (w, h) = ((ncols - 1) / lod + 1, (nrows - 1) / lod + 1);
+    let (world_w, world_h) = (meta.width(), meta.height());
+
+    let mut pixels = vec![0u8; w * h * 4];
+    pixels.par_chunks_mut(w * 4).enumerate().for_each(|(oy, row)| {
+        let wy = row_lo + (oy * lod) as i32;
+        for (ox, px) in row.chunks_exact_mut(4).enumerate() {
+            let wx = col_lo + (ox * lod) as i32;
+            let col = lens_column(world, world_w, world_h, wx, wy);
+            let Some((_, _, ceil)) = col else { continue };
+            for z in (sel.z_min..=sel.z_max.min(ceil)).rev() {
+                let (bt, paint) = lens_read(col, z);
+                if bt == 0 { continue; }
+                let [r, g, b] = block_color(bt, paint, meta.sky);
+                let a = if sel.contains(wx, wy) { 255 } else { LENS_CONTEXT_ALPHA };
+                px.copy_from_slice(&[r, g, b, a]);
+                break;
+            }
+        }
+    });
+    (Raster { x: 0, y: 0, width: w as u32, height: h as u32, lod: lod as u32, pixels }, col_lo, row_lo)
+}
+
 /// One world column as the lens reads it: the chunk's bytes, the column's intra-chunk offset, and
 /// the chunk's scan ceiling (`top_band_hint`, so reads above it are air without touching the page).
 type LensCol<'a> = Option<(&'a [u8], usize, i32)>;
@@ -1306,6 +1383,32 @@ fn lens_read(c: LensCol<'_>, z: i32) -> (u8, u8) {
     if z < 0 || z > ceil { return (0, 0); }
     let bi = (z as usize / 16) * 8192 + col_off + (z as usize % 16);
     if bi + 4096 < chunk.len() { (chunk[bi], chunk[bi + 4096]) } else { (0, 0) }
+}
+
+/// Alpha of a context (outside-the-footprint) pixel in both lenses.
+const LENS_CONTEXT_ALPHA: u8 = 128;
+
+/// The image-column frame both lenses share: image column `ox` is world column `col_lo + ox·lod`
+/// (point sampling, phase `col_lo`), `out_w = ceil(ncols / lod) ≤ max_px`.
+struct LensFrame { col_lo: i32, lod: usize, out_w: usize }
+
+fn lens_frame(fp_lo: i32, fp_len: usize, context: i32, max_px: u32) -> LensFrame {
+    let ncols = fp_len + 2 * context.max(0) as usize;
+    let lod = ncols.div_ceil(max_px.max(1) as usize).clamp(1, MAX_LOD as usize);
+    LensFrame { col_lo: fp_lo - context.max(0), lod, out_w: (ncols - 1) / lod + 1 }
+}
+
+/// Transpose per-column RGBA strips (each `rows × 4` bytes, top row first) into a row-major raster.
+fn lens_assemble(columns: &[Vec<u8>], rows: usize) -> Vec<u8> {
+    let out_w = columns.len();
+    let mut pixels = vec![0u8; out_w * rows * 4];
+    for (ox, col) in columns.iter().enumerate() {
+        for row in 0..rows {
+            let o = (row * out_w + ox) * 4;
+            pixels[o..o + 4].copy_from_slice(&col[row * 4..row * 4 + 4]);
+        }
+    }
+    pixels
 }
 
 #[cfg(test)]
@@ -1796,5 +1899,293 @@ mod tests {
         let none = Clip { base: vec![LENS_SKIP; 3], ..clip };
         let (_, st) = paste_lens(&world, world.meta(), 2, 2, &none.r(), LensView::Side, 0, false, 512);
         assert_eq!((st.ghost_z_min, st.ghost_z_max), (None, None));
+    }
+
+    // ── selection lens ────────────────────────────────────────────────────────────────────────
+
+    fn random_mask(rng: &mut Lcg, x1: i32, y1: i32, x2: i32, y2: i32) -> SelectionMask {
+        let n = ((x2 - x1 + 1) * (y2 - y1 + 1)) as usize;
+        SelectionMask { x1, y1, x2, y2, bits: (0..n.div_ceil(8)).map(|_| rng.next() as u8).collect() }
+    }
+
+    /// §2.1 literally: per pixel, walk the ray cell by cell; the first block in the selection wins
+    /// at 255, else the first block at all at 128, else transparent.
+    fn sel_lens_oracle(world: &TestWorld, sel: &SelRef, view: LensView, cw: i32, z: i32) -> [u8; 4] {
+        let (fp_lo, fp_hi, ray) = match view {
+            LensView::Front => (sel.x1, sel.x2, sel.y1..=sel.y2),
+            LensView::Side => (sel.y1, sel.y2, sel.x1..=sel.x2),
+        };
+        let mut any = None;
+        for k in ray {
+            let (wx, wy) = match view { LensView::Front => (cw, k), LensView::Side => (k, cw) };
+            let (bt, paint) = crate::view::get_block_at(world, wx, wy, z);
+            if wx < 0 || wy < 0 || wx >= world.meta().width() || wy >= world.meta().height() || bt == 0 { continue; }
+            let in_sel = (fp_lo..=fp_hi).contains(&cw) && sel.contains(wx, wy);
+            if in_sel {
+                let [r, g, b] = block_color(bt, paint, world.meta().sky);
+                return [r, g, b, 255];
+            }
+            any.get_or_insert((bt, paint));
+        }
+        match any {
+            Some((bt, paint)) => { let [r, g, b] = block_color(bt, paint, world.meta().sky); [r, g, b, 128] }
+            None => [0; 4],
+        }
+    }
+
+    #[test]
+    fn selection_lens_matches_brute_force() {
+        for seed in 0..6u64 {
+            let mut rng = Lcg(seed * 104729 + 3);
+            let world = random_terrain(&mut rng);
+            let (x1, y1) = (rng.below(12) as i32, rng.below(12) as i32);
+            let (x2, y2) = (x1 + 3 + rng.below(14) as i32, y1 + 3 + rng.below(14) as i32);
+            let mask = random_mask(&mut rng, x1, y1, x2, y2);
+            for m in [None, Some(&mask)] {
+                let sel = SelRef { x1, y1, x2, y2, z_min: 6, z_max: 14, mask: m };
+                for view in [LensView::Front, LensView::Side] {
+                    let (r, st) = selection_lens(&world, world.meta(), &sel, view, 5, 512);
+                    assert_eq!((r.lod, st.z_lo, st.z_hi, r.height), (1, 0, 63, 64));
+                    let mut top = None;
+                    for ox in 0..r.width {
+                        let cw = st.col_lo + ox as i32;
+                        for row in 0..r.height {
+                            let z = st.z_hi - row as i32;
+                            let want = sel_lens_oracle(&world, &sel, view, cw, z);
+                            if want[3] != 0 { top = top.max(Some(z)); }
+                            assert_eq!(px(&r, ox, row), want, "seed {seed} mask={} {view:?} ({ox},{row}) z={z}", m.is_some());
+                        }
+                    }
+                    assert_eq!(st.terrain_z_hi, top);
+                }
+            }
+        }
+    }
+
+    /// Mirrored world, square selection on the diagonal, symmetric mask: side == front exactly.
+    #[test]
+    fn selection_lens_side_is_transpose_of_front() {
+        let mut rng = Lcg(43);
+        let mut world = TestWorld::new(2, 2, 4);
+        for x in 0..32 { for y in 0..=x {
+            let top = 4 + rng.below(20) as i32;
+            for z in 0..=top { set(&mut world, x, y, z, 2 + (z % 3) as u8); set(&mut world, y, x, z, 2 + (z % 3) as u8); }
+        }}
+        let n = 12;
+        let mut mask = random_mask(&mut rng, 8, 8, 8 + n - 1, 8 + n - 1);
+        for a in 0..n { for b in 0..a {
+            let on = mask.contains(8 + a, 8 + b);
+            let i = (a * n + b) as usize; // bit of (x = 8+b, y = 8+a)
+            mask.bits[i >> 3] = (mask.bits[i >> 3] & !(1 << (i & 7))) | ((on as u8) << (i & 7));
+        }}
+        for m in [None, Some(&mask)] {
+            let sel = SelRef { x1: 8, y1: 8, x2: 8 + n - 1, y2: 8 + n - 1, z_min: 0, z_max: 10, mask: m };
+            let (f, fs) = selection_lens(&world, world.meta(), &sel, LensView::Front, 3, 512);
+            let (s, ss) = selection_lens(&world, world.meta(), &sel, LensView::Side, 3, 512);
+            assert_eq!(fs, ss);
+            assert_eq!(f.pixels, s.pixels, "mask={}", m.is_some());
+        }
+    }
+
+    /// Column LOD is point sampling with phase `col_lo`: LOD-n column `ox` is LOD-1 column `ox*n`.
+    #[test]
+    fn selection_lens_lod_point_samples() {
+        let mut rng = Lcg(8);
+        let world = random_terrain(&mut rng);
+        let mask = random_mask(&mut rng, 4, 3, 23, 20);
+        let sel = SelRef { x1: 4, y1: 3, x2: 23, y2: 20, z_min: 0, z_max: 63, mask: Some(&mask) };
+        let (full, _) = selection_lens(&world, world.meta(), &sel, LensView::Front, 4, 512);
+        assert_eq!((full.width, full.lod), (28, 1));
+        let (coarse, st) = selection_lens(&world, world.meta(), &sel, LensView::Front, 4, 10);
+        assert_eq!((coarse.width, coarse.lod, st.col_lo), (10, 3, 0));
+        for ox in 0..coarse.width { for row in 0..coarse.height {
+            assert_eq!(px(&coarse, ox, row), px(&full, ox * 3, row), "({ox},{row})");
+        }}
+    }
+
+    /// An unmasked tall column in front of a masked short one: the short one is the sel hit where it
+    /// exists, and the tall one only shows (at 128) above it, where nothing masked is behind.
+    #[test]
+    fn selection_lens_mask_is_see_through() {
+        let mut world = TestWorld::new(1, 1, 4);
+        for z in 0..=10 { set(&mut world, 3, 5, z, 13); } // front, unmasked
+        for z in 0..=3 { set(&mut world, 3, 6, z, 2); }   // behind, masked
+        let mask = SelectionMask { x1: 3, y1: 5, x2: 3, y2: 6, bits: vec![0b10] };
+        let sel = SelRef { x1: 3, y1: 5, x2: 3, y2: 6, z_min: 0, z_max: 63, mask: Some(&mask) };
+        let (r, st) = selection_lens(&world, world.meta(), &sel, LensView::Front, 0, 512);
+        let [sr, sg, sb] = block_color(2, 0, 0);
+        let [tr, tg, tb] = block_color(13, 0, 0);
+        for z in 0..=12 {
+            let want = match z { 0..=3 => [sr, sg, sb, 255], 4..=10 => [tr, tg, tb, 128], _ => [0; 4] };
+            assert_eq!(px(&r, 0, (st.z_hi - z) as u32), want, "z={z}");
+        }
+        assert_eq!(st.terrain_z_hi, Some(10));
+        // Without the mask the tall front column is in the selection and wins outright.
+        let bbox = SelRef { mask: None, ..sel };
+        let (r, _) = selection_lens(&world, world.meta(), &bbox, LensView::Front, 0, 512);
+        assert_eq!(px(&r, 0, (st.z_hi - 2) as u32), [tr, tg, tb, 255]);
+    }
+
+    /// At LOD 1, context 0 the in-selection pixels are exactly `view_top`'s (RGB, alpha 255); where
+    /// `view_top` leaves VOID (a masked-out column, or no hit) the lens is the 128-alpha hit or
+    /// transparent. With context, every pixel outside the footprint is 128 or transparent.
+    #[test]
+    fn selection_top_matches_view_top() {
+        for seed in 0..6u64 {
+            let mut rng = Lcg(seed * 7919 + 11);
+            let world = random_terrain(&mut rng);
+            let (x1, y1) = (rng.below(12) as i32, rng.below(12) as i32);
+            let (x2, y2) = (x1 + 3 + rng.below(14) as i32, y1 + 3 + rng.below(14) as i32);
+            let mask = random_mask(&mut rng, x1, y1, x2, y2);
+            let (z_min, z_max) = (6, 14);
+            for m in [None, Some(&mask)] {
+                let sel = SelRef { x1, y1, x2, y2, z_min, z_max, mask: m };
+                let (r, col_lo, row_lo) = selection_top(&world, world.meta(), &sel, 0, 512);
+                assert_eq!((r.lod, col_lo, row_lo), (1, x1, y1));
+                assert_eq!((r.width as i32, r.height as i32), (x2 - x1 + 1, y2 - y1 + 1));
+                let (_, _, vt) = view_top(&world, world.meta(), x1, x2, y1, y2, z_min, z_max, 0, m);
+                // The unmasked-bbox view_top is the oracle for the 128-alpha see-through hits too.
+                let (_, _, full) = view_top(&world, world.meta(), x1, x2, y1, y2, z_min, z_max, 0, None);
+                for oy in 0..r.height { for ox in 0..r.width {
+                    let (wx, wy) = (x1 + ox as i32, y1 + oy as i32);
+                    let i = ((oy * r.width + ox) * 4) as usize;
+                    let want_full = &full[i..i + 4];
+                    let got = px(&r, ox, oy);
+                    let in_sel = m.is_none_or(|mk| mk.contains(wx, wy));
+                    if in_sel {
+                        assert_eq!(&vt[i..i + 4], want_full);
+                        let want = if want_full == VOID { [0; 4] } else { want_full.to_vec().try_into().unwrap() };
+                        assert_eq!(got, want, "seed {seed} in-sel ({wx},{wy})");
+                    } else if want_full == VOID {
+                        assert_eq!(got, [0; 4], "seed {seed} masked-out miss ({wx},{wy})");
+                    } else {
+                        assert_eq!(got, [want_full[0], want_full[1], want_full[2], LENS_CONTEXT_ALPHA], "seed {seed} masked-out ({wx},{wy})");
+                    }
+                }}
+
+                // Context ring: same colours, half alpha outside the footprint.
+                let (c, clo, rlo) = selection_top(&world, world.meta(), &sel, 3, 512);
+                assert_eq!((c.width as i32, c.height as i32, clo, rlo), (x2 - x1 + 7, y2 - y1 + 7, x1 - 3, y1 - 3));
+                for oy in 0..c.height { for ox in 0..c.width {
+                    let (wx, wy) = (clo + ox as i32, rlo + oy as i32);
+                    let p = px(&c, ox, oy);
+                    let inside = m.is_none_or(|mk| mk.contains(wx, wy)) && wx >= x1 && wx <= x2 && wy >= y1 && wy <= y2;
+                    if inside { assert!(p[3] == 255 || p[3] == 0, "({wx},{wy})"); }
+                    else { assert!(p[3] == LENS_CONTEXT_ALPHA || p[3] == 0, "context ({wx},{wy}) alpha {}", p[3]); }
+                }}
+            }
+        }
+    }
+
+    /// LOD is point sampling with phase `(col_lo, row_lo)` on both axes, one LOD for both.
+    #[test]
+    fn selection_top_lod_point_samples() {
+        let mut rng = Lcg(21);
+        let world = random_terrain(&mut rng);
+        let mask = random_mask(&mut rng, 4, 3, 23, 20);
+        let sel = SelRef { x1: 4, y1: 3, x2: 23, y2: 20, z_min: 0, z_max: 63, mask: Some(&mask) };
+        let (full, _, _) = selection_top(&world, world.meta(), &sel, 4, 512);
+        assert_eq!((full.width, full.height, full.lod), (28, 26, 1));
+        let (coarse, clo, rlo) = selection_top(&world, world.meta(), &sel, 4, 10);
+        // 28 columns / 10 px → LOD 3; (28-1)/3+1 = 10 wide, (26-1)/3+1 = 9 tall.
+        assert_eq!((coarse.width, coarse.height, coarse.lod, clo, rlo), (10, 9, 3, 0, -1));
+        for oy in 0..coarse.height { for ox in 0..coarse.width {
+            assert_eq!(px(&coarse, ox, oy), px(&full, ox * 3, oy * 3), "({ox},{oy})");
+        }}
+    }
+
+    /// The scan is clipped to `z_min..=z_max`: a block above `z_max` is not seen, the one under it is;
+    /// nothing in range is transparent (not VOID).
+    #[test]
+    fn selection_top_clips_to_z_range() {
+        let mut world = TestWorld::new(1, 1, 4);
+        set(&mut world, 3, 3, 5, 2);
+        set(&mut world, 3, 3, 12, 13); // above z_max
+        set(&mut world, 4, 3, 2, 2);   // below z_min
+        let sel = SelRef { x1: 3, y1: 3, x2: 4, y2: 3, z_min: 4, z_max: 10, mask: None };
+        let (r, _, _) = selection_top(&world, world.meta(), &sel, 0, 512);
+        let [sr, sg, sb] = block_color(2, 0, 0);
+        assert_eq!(px(&r, 0, 0), [sr, sg, sb, 255], "z=5 under z_max wins over z=12");
+        assert_eq!(px(&r, 1, 0), [0; 4], "z=2 is below z_min");
+    }
+
+    /// 256z: the raster is the whole world height, so a selection near the top is on it.
+    #[test]
+    fn selection_lens_256z_full_height() {
+        let mut world = TestWorld::new(1, 1, 16);
+        for x in 0..16 { for y in 0..16 { set(&mut world, x, y, 0, 1); } }
+        set(&mut world, 5, 5, 240, 13);
+        let sel = SelRef { x1: 2, y1: 2, x2: 9, y2: 9, z_min: 200, z_max: 255, mask: None };
+        let (r, st) = selection_lens(&world, world.meta(), &sel, LensView::Front, 2, 512);
+        assert_eq!((st.z_lo, st.z_hi, r.height), (0, 255, 256));
+        assert_eq!(px(&r, 5 - st.col_lo as u32, (255 - 240) as u32)[3], 255);
+        assert_eq!(st.terrain_z_hi, Some(240));
+        // A format taller than LENS_MAX_ROWS centres on the selection, or on z_max if it's taller.
+        assert_eq!(sel_lens_z_window(255, 200, 255), (0, 255));
+        assert_eq!(sel_lens_z_window(511, 300, 340), (192, 447));
+        assert_eq!(sel_lens_z_window(511, 0, 300), (172, 427), "taller than the window: centre on z_max");
+        assert_eq!(sel_lens_z_window(511, 0, 511), (256, 511));
+    }
+
+    /// 20.3 §6 CPU measurement on a synthetic 4096² 256z world: 16 shared chunk templates (terrain
+    /// at z 60–120, every third with an overhang at z 180 so rays stay live past the first chunk).
+    /// Shared templates keep it cache-warm, so this is the CPU cost, not the page-fault cost.
+    /// `cargo test -p voxel-core bench_selection_lens -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn bench_selection_lens_256z() {
+        struct Tiled { templates: Vec<Vec<u8>>, top: Vec<usize> }
+        impl VoxelView for Tiled {
+            fn num_bands(&self) -> usize { 16 }
+            fn chunk_origin(&self) -> (i32, i32) { (0, 0) }
+            fn chunk_bytes(&self, cx: i32, cy: i32) -> Option<&[u8]> {
+                Some(&self.templates[((cx * 7 + cy * 13) & 15) as usize])
+            }
+            fn top_band_hint(&self, cx: i32, cy: i32) -> usize { self.top[((cx * 7 + cy * 13) & 15) as usize] }
+        }
+        let mut rng = Lcg(5);
+        let (mut templates, mut top) = (Vec::new(), Vec::new());
+        for t in 0..16 {
+            let mut c = vec![0u8; 16 * 8192];
+            let mut hi = 0;
+            for lx in 0..16 { for ly in 0..16 {
+                let h = 60 + rng.below(61) as i32;
+                for z in 0..=h { c[blk(lx, ly, z)] = if z == h { 8 } else { 2 }; }
+                hi = hi.max(h);
+                if t % 3 == 0 && lx > 4 && lx < 11 { c[blk(lx, ly, 180)] = 13; hi = hi.max(180); }
+            }}
+            templates.push(c);
+            top.push(hi as usize / 16);
+        }
+        let world = Tiled { templates, top };
+        let meta = ViewMeta { w_chunks: 256, h_chunks: 256, sky: 0 };
+        for side in [512, 2048, 4096] {
+            let x1 = (4096 - side) / 2;
+            let sel = SelRef { x1, y1: x1, x2: x1 + side - 1, y2: x1 + side - 1, z_min: 0, z_max: 255, mask: None };
+            let time = |f: &dyn Fn()| (0..3).map(|_| { let t = std::time::Instant::now(); f(); t.elapsed().as_secs_f64() * 1000.0 })
+                .fold(f64::MAX, f64::min);
+            let fs = time(&|| { rayon::join(
+                || selection_lens(&world, meta, &sel, LensView::Front, 2, 512),
+                || selection_lens(&world, meta, &sel, LensView::Side, 2, 512)); });
+            let tp = time(&|| { selection_top(&world, meta, &sel, 2, 512); });
+            eprintln!("[bench] 256z {side}²: front+side {fs:.1} ms, top {tp:.1} ms");
+        }
+    }
+
+    /// The one-directional hint contract: too high is invisible, too low shows air above it.
+    #[test]
+    fn selection_lens_respects_top_band_hint() {
+        let mut world = TestWorld::new(1, 1, 4);
+        for z in 0..=20 { set(&mut world, 4, 4, z, 2); }
+        let sel = SelRef { x1: 4, y1: 4, x2: 4, y2: 4, z_min: 0, z_max: 63, mask: None };
+        let (exact, _) = selection_lens(&world, world.meta(), &sel, LensView::Side, 0, 512);
+        world.top_band_hint = Some(9);
+        let (high, _) = selection_lens(&world, world.meta(), &sel, LensView::Side, 0, 512);
+        assert_eq!(high.pixels, exact.pixels, "a too-high hint is merely slower");
+        world.top_band_hint = Some(0);
+        let (low, st) = selection_lens(&world, world.meta(), &sel, LensView::Side, 0, 512);
+        assert_eq!(px(&low, 0, (63 - 20) as u32)[3], 0, "z=20 is above a band-0 hint: air");
+        assert_eq!(px(&low, 0, (63 - 15) as u32)[3], 255, "z=15 is under it");
+        assert_eq!(st.terrain_z_hi, Some(15));
     }
 }

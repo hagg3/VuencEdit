@@ -24,6 +24,7 @@ export const RAW_HEX_CLEAN_FILES = [
   "src/designTokens.ts",
   "src/HelpModal.tsx",
   "src/SettingsModal.tsx",
+  "src/AppMenu.tsx",
   "src/NewWorldModal.tsx",
   "src/WorldBrowserModal.tsx",
   "src/MaterializeModal.tsx",

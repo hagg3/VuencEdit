@@ -339,7 +339,7 @@ export default function DiagnosticsModal(props: Props) {
       footer={
         <>
           <DialogButton onClick={doCopy}>
-            {copyState === "copied" ? "Copied!" : copyState === "failed" ? "Select below (Ctrl/⌘+C)" : "Copy to clipboard"}
+            {copyState === "copied" ? "Copied" : copyState === "failed" ? "Select below (Ctrl/⌘+C)" : "Copy to clipboard"}
           </DialogButton>
           <DialogButton variant="primary" onClick={onClose}>Close</DialogButton>
         </>
@@ -347,15 +347,13 @@ export default function DiagnosticsModal(props: Props) {
     >
       <div style={{ display: "flex", flexDirection: "column", height: "100%", gap: 8 }}>
         <div style={{ fontSize: 12, color: MODAL_TEXT.secondary, lineHeight: 1.5 }}>
-          A plain-text snapshot of this session's memory/GPU/latency numbers — paste it into a bug
-          report. Nothing here is sent anywhere automatically. World paths are reported as
-          filenames only, never full paths; no world contents are included.
+          Paste this into a bug report. Nothing is sent automatically, and it has file names only, not paths or world contents.
         </div>
         <div style={{ display: "flex", gap: 8 }}>
           <DialogButton onClick={refresh}>Refresh</DialogButton>
           <DialogButton onClick={doReset}>Reset counters</DialogButton>
           <DialogButton onClick={doSaveAs}>
-            {saveState === "saved" ? "Saved!" : saveState === "failed" ? "Save failed" : "Save as .txt…"}
+            {saveState === "saved" ? "Saved" : saveState === "failed" ? "Save failed" : "Save as .txt…"}
           </DialogButton>
         </div>
         <textarea
