@@ -3,13 +3,13 @@
   text: "Open a world, move around the map, and make your first edit."
 - title: "Editing"
   url: /docs/editing/
-  text: "Draw tools, selections, fill and replace, and terrain sculpting."
-- title: "3D & Quad View"
-  url: /docs/3d-and-quad-view/
-  text: "The four-pane editor, the fly-through pane, and building in 3D."
+  text: "Draw tools, selections, the Lens, the Insert tab and terrain sculpting."
+- title: "Layout & 3D View"
+  url: /docs/layout-and-3d/
+  text: "The floating windows, the 3D view, cutaway, and building in 3D."
 - title: "Prefabs & Clipboard"
   url: /docs/prefabs-and-clipboard/
-  text: "Copy/paste and the prefab library."
+  text: "Copy and paste, paste modes, and the prefab library."
 - title: "World Compatibility"
   url: /docs/world-compatibility/
-  text: "Legacy64z, New Dawn 256z, and NewFormat256z — what each means for you."
+  text: "Legacy64z, New Dawn 256z and NewFormat256z, and what each means."

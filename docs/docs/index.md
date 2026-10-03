@@ -1,7 +1,7 @@
 ---
 layout: page
 title: Docs
-subtitle: Everything you need to get started, and a few things worth knowing before you dig deep.
+subtitle: A short manual for the parts of VuencEdit that aren't obvious.
 ---
 
 <div class="doc-grid">
@@ -17,12 +17,7 @@ subtitle: Everything you need to get started, and a few things worth knowing bef
 
 ## For developers
 
-VuencEdit's own architecture, IPC, and subsystem documentation lives alongside the source and is
-kept up to date as the app changes — it's the real reference, not this manual.
+How VuencEdit works inside, plus a reference for the Eden file format, block tables and 3D
+rendering, is in the [Developer Reference]({{ '/docs/dev/' | relative_url }}).
 
-- [Architecture overview](https://github.com/{{ site.repository }}/blob/main/DOCUMENTATION/01-architecture.md)
-- [File format](https://github.com/{{ site.repository }}/tree/main/DOCUMENTATION)
-- [Full documentation index](https://github.com/{{ site.repository }}/tree/main/DOCUMENTATION)
-
-Questions or bug reports are welcome on the [Discord server](https://discord.com/invite/rjYXwBC)
-or as a [GitHub issue](https://github.com/{{ site.repository }}/issues).
+Questions and bug reports are welcome on the [Discord server](https://discord.com/invite/rjYXwBC) or as a [GitHub issue](https://github.com/{{ site.repository }}/issues).

@@ -305,6 +305,10 @@ export interface ClipboardInfo {
   z_anchor: number;
   /** True when the clipboard carries a non-rectangular footprint (paste skips unmasked columns). */
   masked: boolean;
+  /** `.epfab` ORGN provenance (ROADMAP-LINK 21.6) — absolute/server coordinates of the copied box;
+   *  `null`/absent when unknown. `source`: 0 a VuencEdit world · 1 inside a round-trip placement ·
+   *  2 exported by VuencLink. Not surfaced in the UI yet. */
+  origin?: { ax: number; ay: number; az: number; source: number; rtid: number } | null;
 }
 
 export type ExtrudeAxis = "z+" | "z-" | "x+" | "x-" | "y+" | "y-";

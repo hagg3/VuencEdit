@@ -1,15 +1,14 @@
 ---
 layout: page
 title: Downloads
-subtitle: Pre-built installers for macOS, Windows, and Linux.
+subtitle: Installers for macOS, Windows and Linux.
 ---
 
 <p id="release-meta" style="color:#a3adb6; font-size:13px; margin-top:-8px;">v{{ site.latest_version }}</p>
 
 <div class="callout callout-warm">
-  <strong>Beta software.</strong> VuencEdit writes binary world files directly. Back up your
-  worlds before editing them — use the app's built-in backup-on-save option, or copy the file
-  yourself first.
+  <strong>Beta software.</strong> VuencEdit writes the game's binary world files directly. The
+  first save over a file keeps a backup next to it, but copy anything you care about yourself first.
 </div>
 
 <div class="download-grid">
@@ -18,7 +17,7 @@ subtitle: Pre-built installers for macOS, Windows, and Linux.
     <div class="platform-name">macOS</div>
     <a class="btn btn-primary" data-suffix="_universal.dmg" href="https://github.com/{{ site.repository }}/releases/latest">Download for macOS</a>
     <div class="file-meta">VuencEdit_{{ site.latest_version }}_universal.dmg</div>
-    <p style="font-size:12px; color:#a3adb6; margin:0;">Universal binary — Apple Silicon and Intel. Requires macOS 11+.</p>
+    <p style="font-size:12px; color:#a3adb6; margin:0;">Universal build for Apple Silicon and Intel.</p>
   </div>
 
   <div class="card download-card" data-platform="win">
@@ -43,29 +42,29 @@ subtitle: Pre-built installers for macOS, Windows, and Linux.
 </div>
 
 <p style="text-align:center; font-size:13px;">
-  All installers, checksums, and older versions are on the
+  Other installers and older versions are on the
   <a href="https://github.com/{{ site.repository }}/releases">Releases page</a>.
 </p>
 
 ## Before you install
 
-Builds are not code-signed — that costs money the project doesn't spend — so both operating
-systems will warn you the first time you open VuencEdit. This is expected, not a sign of malware:
+The builds aren't code-signed, since certificates cost money the project doesn't spend. Both
+operating systems will warn you the first time you open VuencEdit:
 
 - **macOS** shows *"VuencEdit can't be opened because it is from an unidentified developer."*
   Right-click (or Control-click) the app and choose **Open**, then confirm in the dialog that
-  appears. You only need to do this once. **If that fails**,  open System Settings, go to Privacy & Security, scroll to the bottom and look for the 'Open anyway' button.
+  appears. You only need to do this once. If that doesn't work, open System Settings, go to Privacy & Security, scroll to the bottom and click **Open Anyway**.
 - **Windows** shows a SmartScreen warning ("Windows protected your PC"). Click **More info**,
   then **Run anyway**.
 
 ## System requirements
 
-VuencEdit is a Tauri app — a small native shell around a WebView, not a bundled Electron/Chromium
-runtime — so it's lightweight on memory and disk compared to most editors in this space. Any
-Mac from the last several years, or a Windows 10/11 or modern Linux desktop, is enough.
+VuencEdit is a Tauri app: a native shell around the system WebView, with no bundled Chromium. It
+runs on a Mac from the last several years, Windows 10 or 11, or a recent Linux desktop. Big 256-high
+worlds use more memory. If the app is struggling, Settings has a Low, Balanced or High memory preset.
 
 <div class="btn-row">
-  <a class="btn btn-secondary" href="{{ '/docs/getting-started/' | relative_url }}">Read the Getting Started guide &rarr;</a>
+  <a class="btn btn-secondary" href="{{ '/docs/getting-started/' | relative_url }}">Getting Started &rarr;</a>
 </div>
 
 <script src="{{ '/assets/js/downloads.js' | relative_url }}"></script>
