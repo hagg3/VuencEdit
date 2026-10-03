@@ -1,0 +1,33 @@
+- title: "Architecture"
+  url: /docs/dev/architecture/
+  text: "Tauri shell, process and threading model, IPC design."
+- title: "File Format"
+  url: /docs/dev/file-format/
+  text: "The .eden binary layout, block addressing, saving, and the Eden.eden template."
+- title: "Blocks & Colors"
+  url: /docs/dev/blocks-and-colors/
+  text: "Block types, the paint palette, and colour tables."
+- title: "IPC Reference"
+  url: /docs/dev/ipc-reference/
+  text: "Every backend command, grouped by subsystem."
+- title: "2D Rendering"
+  url: /docs/dev/rendering-2d/
+  text: "The tiled map, Relief shading, the Lens renderers, and HiDPI canvases."
+- title: "3D Rendering"
+  url: /docs/dev/rendering-3d/
+  text: "Geometry generation, culling, lighting, shadows and picking."
+- title: "Editing, Undo & Clipboard"
+  url: /docs/dev/editing-undo-clipboard/
+  text: "The edit pipeline, delta undo, copy and paste, prefabs and sculpting."
+- title: "World Generation"
+  url: /docs/dev/world-generation/
+  text: "The Flat, Natural, Classic and Tg2 generators."
+- title: "Frontend"
+  url: /docs/dev/frontend/
+  text: "The React component map, the ribbon, windows and UI conventions."
+- title: "Subsystems"
+  url: /docs/dev/subsystems/
+  text: "Texture packs, the template overlay, networking and PNG export."
+- title: "Building & Testing"
+  url: /docs/dev/building/
+  text: "Building, tests, CI and conventions."

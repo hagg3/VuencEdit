@@ -1,6 +1,6 @@
 // Upgrades the Downloads page's static release links with live data from the GitHub API.
 // Every button already has a working href to .../releases/latest, so a fetch failure or a
-// rate-limited response (60 req/hr unauthenticated) just leaves the static fallbacks standing —
+// rate-limited response (60 req/hr unauthenticated) just leaves the static fallbacks standing.
 // nothing here is load-bearing for the page to function.
 (function () {
   var API = "https://api.github.com/repos/hagg3/VuencEdit/releases/latest";
@@ -49,6 +49,6 @@
     if (!r.ok) throw new Error("release fetch failed");
     return r.json();
   }).then(applyRelease).catch(function () {
-    // Static fallback hrefs already point at /releases/latest — nothing to do.
+    // Static fallback hrefs already point at /releases/latest, so nothing to do.
   });
 })();
