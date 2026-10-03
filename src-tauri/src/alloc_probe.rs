@@ -79,7 +79,7 @@ mod tests {
             width: w as i32, height: h as i32, depth: d as i32, z_anchor: 0,
             block_types: (0..vol).map(|i| (i % 7) as u8).collect(),
             paints: vec![3u8; vol],
-            mask: None,
+            mask: None, origin: None
         }
     }
 

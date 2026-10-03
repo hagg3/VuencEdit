@@ -1377,6 +1377,27 @@ pub(crate) struct Clipboard {
     /// prefab save (a shaped clipboard writes `EPFAB\x02` with a footprint section; rectangular
     /// clipboards stay on `EPFAB\x01`).
     pub(crate) mask: Option<Vec<u8>>,
+    /// Where this clipboard came from in absolute/server coordinates (`.epfab` `ORGN` section,
+    /// ROADMAP-LINK 21.6). Set by `copy_selection` / `load_prefab`; every rotate/mirror drops it
+    /// (a transformed clipboard no longer corresponds to the box). Every other producer leaves it
+    /// `None`.
+    pub(crate) origin: Option<PrefabOrigin>,
+}
+
+/// `.epfab` provenance (`ORGN` section) — identical layout to VuencLink's `PrefabOrigin`
+/// (`apps/vuenclink/src-tauri/src/world/prefab_interchange.rs`); the two codecs are pinned by the
+/// same golden hex fixture. `dx → +ax`, `dy → +ay` (server z), `dz → +az` (height).
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PrefabOrigin {
+    pub(crate) ax: i32,
+    pub(crate) ay: i32,
+    pub(crate) az: i32,
+    /// 0 copied from a VuencEdit world · 1 copied inside a placement of a round-trip prefab ·
+    /// 2 exported by VuencLink.
+    pub(crate) source: u8,
+    /// Round-trip id (VuencLink's base-store key); 0 = none.
+    pub(crate) rtid: u64,
 }
 
 impl Clipboard {
@@ -1384,6 +1405,7 @@ impl Clipboard {
         ClipboardInfo {
             width: self.width, height: self.height, depth: self.depth,
             z_anchor: self.z_anchor, masked: self.mask.is_some(),
+            origin: self.origin,
         }
     }
 }
@@ -1396,6 +1418,52 @@ pub(crate) struct ClipboardInfo {
     pub(crate) z_anchor: i32,
     /// True when the clipboard carries a non-rectangular footprint (paste skips unmasked columns).
     pub(crate) masked: bool,
+    /// Provenance, `null` when the clipboard has none (serialises camelCase).
+    pub(crate) origin: Option<PrefabOrigin>,
+}
+
+/// A paste that is known to equal a round-trip prefab cell for cell (ROADMAP-LINK 21.6 §3.2):
+/// `(x, y, z)` is where the clipboard's `(0,0,0)` landed in world coordinates and `(ax, ay, az)`
+/// the server coordinates that cell stands for. `copy_selection` uses it to derive an origin for a
+/// sub-box copied out of the pasted area. Cleared on world load/close and on every undo/redo.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Placement {
+    pub(crate) x: i32, pub(crate) y: i32, pub(crate) z: i32,
+    pub(crate) w: i32, pub(crate) h: i32, pub(crate) d: i32,
+    pub(crate) ax: i32, pub(crate) ay: i32, pub(crate) az: i32,
+    pub(crate) rtid: u64,
+}
+
+/// Newest-last cap for `WorldState.paste_placements`.
+pub(crate) const MAX_PLACEMENTS: usize = 8;
+
+/// The origin a copy of box `(x1,y1)..(x2,y2)`, `z_min..=z_max` should carry, given the recorded
+/// placements and the world's absolute chunk offset (`abs_min_*16`). See §3.1.
+pub(crate) fn derive_copy_origin(
+    placements: &[Placement],
+    abs_min_x: i32, abs_min_y: i32,
+    x1: i32, y1: i32, x2: i32, y2: i32, z_min: i32, z_max: i32,
+) -> Option<PrefabOrigin> {
+    // Newest first: a later paste that merely overlaps the box makes the claim ambiguous even if
+    // an older placement contains it (the newer paste overwrote part of it).
+    for p in placements.iter().rev() {
+        let inside = x1 >= p.x && x2 < p.x + p.w
+            && y1 >= p.y && y2 < p.y + p.h
+            && z_min >= p.z && z_max < p.z + p.d;
+        if inside {
+            return Some(PrefabOrigin {
+                ax: p.ax + (x1 - p.x), ay: p.ay + (y1 - p.y), az: p.az + (z_min - p.z),
+                source: 1, rtid: p.rtid,
+            });
+        }
+        let disjoint = x2 < p.x || x1 >= p.x + p.w
+            || y2 < p.y || y1 >= p.y + p.h
+            || z_max < p.z || z_min >= p.z + p.d;
+        if !disjoint { return None; }
+    }
+    Some(PrefabOrigin {
+        ax: abs_min_x * 16 + x1, ay: abs_min_y * 16 + y1, az: z_min, source: 0, rtid: 0,
+    })
 }
 
 /// Test a linear bit in a row-major bitset (used for clipboard footprints and selection masks).
@@ -1821,6 +1889,11 @@ pub(crate) struct AutosaveLineage {
 pub(crate) struct WorldState {
     pub(crate) world: Option<LoadedWorld>,
     pub(crate) clipboard: Option<Clipboard>,
+    /// Round-trip paste placements (21.6 §3.2), newest last, capped at `MAX_PLACEMENTS`. Recorded
+    /// only by `paste_at` when the pasted area equals the prefab cell for cell; **cleared on world
+    /// load/close and on every undo/redo** (an undone paste must not leave a placement claiming
+    /// unrelated content).
+    pub(crate) paste_placements: Vec<Placement>,
     pub(crate) undo_stack: VecDeque<UndoEntry>,
     pub(crate) redo_stack: VecDeque<UndoEntry>,
     /// Running byte totals for `undo_stack`/`redo_stack`, kept in sync by `push_undo`/`pop_undo`
@@ -1932,6 +2005,7 @@ impl WorldState {
         WorldState {
             world: None,
             clipboard: None,
+            paste_placements: Vec::new(),
             undo_stack: VecDeque::new(),
             redo_stack: VecDeque::new(),
             undo_bytes: 0,
@@ -2876,6 +2950,7 @@ fn load_world(path: String, state: tauri::State<'_, AppState>) -> Result<WorldMe
         let old_persist = overview_persist_candidate(&ws); // before the dirty/disk state is reset
         let old_world = ws.world.replace(loaded);  // pointer swap only — dealloc happens outside the lock
         ws.clipboard = None;
+        ws.paste_placements.clear();
         ws.clear_undo();
         ws.clear_redo();
         ws.lamp_index.clear(); // rebuilt lazily for the new world on first night-lit request
@@ -5690,6 +5765,7 @@ fn close_world(state: tauri::State<'_, AppState>) {
         let mut ws = write_ws(&state);
         let old_persist = overview_persist_candidate(&ws);
         ws.clipboard = None;
+        ws.paste_placements.clear();
         ws.clear_undo();
         ws.clear_redo();
         ws.lamp_index.clear();
@@ -6404,6 +6480,7 @@ fn load_autosave_inner(state: &AppState, paths: &AutosavePaths) -> Result<WorldM
         let mut ws = write_ws(state);
         let old_world = ws.world.replace(loaded);
         ws.clipboard = None;
+        ws.paste_placements.clear();
         ws.clear_undo();
         ws.clear_redo();
         ws.lamp_index.clear();
@@ -6598,6 +6675,7 @@ fn undo_edit_inner(ws: &mut WorldState) -> Result<EditResult, String> {
     // the very stroke that owns the session is the dangerous case (its `fheight` would now describe
     // heights the world no longer has). See `SculptSession`.
     ws.sculpt_session = None;
+    ws.paste_placements.clear(); // 21.6: an undone paste must not leave a placement behind
     // Take the world first: if none is loaded, error out before popping the undo stack, so a
     // stray call with no world can't silently discard an entry (harmless today since the stacks
     // are cleared with the world, but fragile ordering otherwise).
@@ -6649,6 +6727,7 @@ fn undo_edit_inner(ws: &mut WorldState) -> Result<EditResult, String> {
 /// pushing inverses onto `undo_stack`.
 fn redo_edit_inner(ws: &mut WorldState) -> Result<EditResult, String> {
     ws.sculpt_session = None; // bypasses with_edit_inner — clear the live-sculpt workspace (see SculptSession)
+    ws.paste_placements.clear(); // 21.6: same rule as undo — placements die on every undo/redo
     let mut world = ws.world.take().ok_or("No world loaded")?;
     let entry = match pop_undo(&mut ws.redo_stack, &mut ws.redo_bytes, &mut ws.redo_groups) {
         Some(e) => e,
@@ -6699,6 +6778,15 @@ fn copy_selection(
     z_min: i32, z_max: i32,
     state: tauri::State<'_, AppState>,
 ) -> Result<ClipboardInfo, String> {
+    copy_selection_inner(&state, x1, y1, x2, y2, z_min, z_max)
+}
+
+/// `copy_selection` minus the tauri `State` (callable from tests, per the `_inner` convention).
+fn copy_selection_inner(
+    state: &AppState,
+    x1: i32, y1: i32, x2: i32, y2: i32,
+    z_min: i32, z_max: i32,
+) -> Result<ClipboardInfo, String> {
     // The volume copy (audit H3) only needs a shared read guard — up to 512 MB of scanning that
     // used to hold the exclusive write guard for its entire duration, starving every edit/render.
     // Only the clipboard drop/install below need the write guard.
@@ -6716,11 +6804,11 @@ fn copy_selection(
     // selection, over the volume cap, no world) returns above this line and keeps the old one.
     // std's RwLock can't upgrade, so validate under a read guard, release, drop under a write
     // guard, then re-take the read guard and re-validate (the world may have changed in the gap).
-    check(&read_ws(&state))?;
-    let old = write_ws(&state).clipboard.take();
+    check(&read_ws(state))?;
+    let old = write_ws(state).clipboard.take();
     drop(old);
     let cb = {
-        let ws = read_ws(&state);
+        let ws = read_ws(state);
         let vol = check(&ws)?;
         let world = ws.world.as_ref().ok_or("No world loaded")?;
 
@@ -6753,10 +6841,15 @@ fn copy_selection(
         // exactly the clipboard's per-column layout (dy*width+dx), so the bits transfer verbatim.
         // `active_mask` applies the rect-equality fail-safe; a mismatched/absent mask → full-box copy.
         let mask = active_mask(&ws, x1, y1, x2, y2).map(|m| m.bits);
-        Clipboard { width, height, depth, z_anchor: z_min, block_types, paints, mask }
+        // 21.6 §3.1: a copy carries where it came from — derived from a covering paste placement
+        // when there is one, else this world's absolute coordinates.
+        let origin = derive_copy_origin(
+            &ws.paste_placements, world.min_x, world.min_y, x1, y1, x2, y2, z_min, z_max,
+        );
+        Clipboard { width, height, depth, z_anchor: z_min, block_types, paints, mask, origin }
     };
     let info = cb.info();
-    write_ws(&state).clipboard = Some(cb);
+    write_ws(state).clipboard = Some(cb);
     Ok(info)
 }
 
@@ -6897,6 +6990,7 @@ fn pick_block_surface(state: tauri::State<'_, AppState>, wx: i32, wy: i32) -> Re
 /// Directional block IDs (ramps 24–39, wedges 40–55, doors 66–69, portals 75–78) are remapped.
 /// Does not touch world data; no undo entry required.
 fn rotate_clipboard_inner(cb: &mut Clipboard) {
+    cb.origin = None; // a transformed clipboard no longer corresponds to the copied box (21.6 §2)
     let old_w = cb.width as usize;
     let old_h = cb.height as usize;
     let depth = cb.depth as usize;
@@ -6953,6 +7047,7 @@ fn rotate_clipboard(state: tauri::State<'_, AppState>) -> Result<ClipboardInfo, 
 }
 
 fn mirror_clipboard_x_inner(cb: &mut Clipboard) {
+    cb.origin = None; // a transformed clipboard no longer corresponds to the copied box (21.6 §2)
     let w = cb.width as usize;
     let h = cb.height as usize;
     let depth = cb.depth as usize;
@@ -6998,6 +7093,7 @@ fn mirror_clipboard_x(state: tauri::State<'_, AppState>) -> Result<ClipboardInfo
 }
 
 fn mirror_clipboard_y_inner(cb: &mut Clipboard) {
+    cb.origin = None; // a transformed clipboard no longer corresponds to the copied box (21.6 §2)
     let w = cb.width as usize;
     let h = cb.height as usize;
     let depth = cb.depth as usize;
@@ -7059,7 +7155,16 @@ fn paste_at(
     state: tauri::State<'_, AppState>,
 ) -> Result<EditResult, String> {
     let mut ws = write_ws(&state);
+    paste_at_inner(&mut ws, paste_x, paste_y, elevation_offset, ignore_air)
+}
 
+/// `paste_at` minus the tauri `State` (callable from tests, per the `_inner` convention).
+fn paste_at_inner(
+    ws: &mut WorldState,
+    paste_x: i32, paste_y: i32,
+    elevation_offset: i32,
+    ignore_air: bool,
+) -> Result<EditResult, String> {
     // Take the clipboard out instead of cloning its two (up to 256 MB each) arrays purely to
     // satisfy the borrow checker (audit H4) — the edit closure only ever needs `&Clipboard`, and
     // it's restored right after, so `ws.clipboard` is never observably absent to any other code
@@ -7074,7 +7179,7 @@ fn paste_at(
     let patch_rect = (paste_x, paste_y, x2_paste, y2_paste);
 
     let label = format!("Paste {width}×{height}×{depth}");
-    let result = with_edit(&mut ws, &label, patch_rect, |world| {
+    let result = with_edit(ws, &label, patch_rect, |world| {
         for dz in 0..depth {
             let z = z_anchor + elevation_offset + dz;
             if z < 0 || z > world_max_z(world) { continue; }
@@ -7102,6 +7207,28 @@ fn paste_at(
         }
         Ok(())
     });
+    // 21.6 §3.2: remember what this paste put where — only when the pasted area equals the prefab
+    // cell for cell (round-trip origin, unmasked, ignore-air off, the whole footprint inside the
+    // world, committed Ok). Anything else — masked / ignore-air / clipped / terrain / scatter /
+    // array pastes — never records.
+    if result.is_ok() && !ignore_air && cb.mask.is_none() {
+        if let (Some(o), Some(world)) = (cb.origin, ws.world.as_ref()) {
+            let pz = z_anchor + elevation_offset;
+            let fits = o.rtid != 0
+                && paste_x >= 0 && paste_y >= 0
+                && (paste_x as i64 + width as i64) <= world.w_chunks as i64 * 16
+                && (paste_y as i64 + height as i64) <= world.h_chunks as i64 * 16
+                && pz >= 0 && pz + depth - 1 <= world_max_z(world);
+            if fits {
+                ws.paste_placements.push(Placement {
+                    x: paste_x, y: paste_y, z: pz, w: width, h: height, d: depth,
+                    ax: o.ax, ay: o.ay, az: o.az, rtid: o.rtid,
+                });
+                let extra = ws.paste_placements.len().saturating_sub(MAX_PLACEMENTS);
+                if extra > 0 { ws.paste_placements.drain(..extra); }
+            }
+        }
+    }
     ws.clipboard = Some(cb);
     result
 }
@@ -8521,6 +8648,45 @@ fn generate_wavy_surface_inner(
 fn serialize_prefab(cb: &Clipboard) -> Vec<u8> {
     use flate2::{write::GzEncoder, Compression};
     use std::io::Write;
+    let raw = serialize_prefab_raw(cb);
+    let mut enc = GzEncoder::new(Vec::new(), Compression::best());
+    enc.write_all(&raw).unwrap();
+    enc.finish().unwrap()
+}
+
+/// `.epfab` provenance section tag (ROADMAP-LINK 21.6 §2): `tag[4] len:u32 payload`, appended after
+/// the body. Readers skip unknown tags and treat a truncated section as the end of the walk.
+const EPFAB_TAG_ORGN: &[u8; 4] = b"ORGN";
+const EPFAB_ORGN_LEN: usize = 21;
+
+/// Walk tagged sections in `tail` and return the first valid `ORGN`. Unknown tags are skipped; a
+/// truncated section ends the walk silently (the prefab is still valid, just without provenance).
+fn parse_epfab_sections(tail: &[u8]) -> Option<PrefabOrigin> {
+    let mut i = 0usize;
+    while tail.len().saturating_sub(i) >= 8 {
+        let tag = &tail[i..i + 4];
+        let len = u32::from_le_bytes(tail[i + 4..i + 8].try_into().unwrap()) as usize;
+        let start = i + 8;
+        let end = start.checked_add(len)?;
+        if end > tail.len() { return None; }
+        if tag == EPFAB_TAG_ORGN && len >= EPFAB_ORGN_LEN {
+            let p = &tail[start..end];
+            return Some(PrefabOrigin {
+                ax: i32::from_le_bytes(p[0..4].try_into().unwrap()),
+                ay: i32::from_le_bytes(p[4..8].try_into().unwrap()),
+                az: i32::from_le_bytes(p[8..12].try_into().unwrap()),
+                source: p[12],
+                rtid: u64::from_le_bytes(p[13..21].try_into().unwrap()),
+            });
+        }
+        i = end;
+    }
+    None
+}
+
+/// The pre-gzip bytes of a prefab — split out so the golden fixture test can pin the exact layout
+/// (gzip output isn't byte-stable across flate2 versions; the raw container is the contract).
+fn serialize_prefab_raw(cb: &Clipboard) -> Vec<u8> {
     let n = (cb.width * cb.height * cb.depth) as usize;
     // A shaped prefab uses EPFAB\x02, appending a per-column footprint after the dense arrays.
     // Rectangular prefabs stay on EPFAB\x01 byte-for-byte, so existing files and older builds are
@@ -8540,9 +8706,14 @@ fn serialize_prefab(cb: &Clipboard) -> Vec<u8> {
         raw.push(1u8);
         raw.extend_from_slice(m);
     }
-    let mut enc = GzEncoder::new(Vec::new(), Compression::best());
-    enc.write_all(&raw).unwrap();
-    enc.finish().unwrap()
+    if let Some(o) = cb.origin {
+        raw.extend_from_slice(EPFAB_TAG_ORGN);
+        raw.extend_from_slice(&(EPFAB_ORGN_LEN as u32).to_le_bytes());
+        for v in [o.ax, o.ay, o.az] { raw.extend_from_slice(&v.to_le_bytes()); }
+        raw.push(o.source);
+        raw.extend_from_slice(&o.rtid.to_le_bytes());
+    }
+    raw
 }
 
 fn deserialize_prefab(data: &[u8]) -> Result<Clipboard, String> {
@@ -8594,22 +8765,27 @@ fn deserialize_prefab(data: &[u8]) -> Result<Clipboard, String> {
     // EPFAB\x02 appends a per-column footprint: a 1-byte presence flag + a row-major width*height
     // bitset. v1 has no such section and stays rectangular (mask None). A malformed/short mask is
     // treated as "no shape" rather than an error — the prefab is still a valid full-box paste.
-    let mask = if version == 2 {
+    // `body_end` is where tagged sections begin (§2); `None` = a malformed v2 tail, so no walk.
+    let (mask, body_end) = if version == 2 {
         let mask_len = (width as usize * height as usize).div_ceil(8);
         let flag_off = 22 + 2 * n;
         if data.len() >= flag_off + 1 + mask_len && data[flag_off] == 1 {
-            Some(data[flag_off + 1..flag_off + 1 + mask_len].to_vec())
+            (Some(data[flag_off + 1..flag_off + 1 + mask_len].to_vec()), Some(flag_off + 1 + mask_len))
+        } else if data.len() > flag_off && data[flag_off] == 0 {
+            (None, Some(flag_off + 1))
         } else {
-            None
+            (None, None)
         }
     } else {
-        None // .epfab v1 is rectangular — prefabs drop any shape (see Clipboard::mask)
+        (None, Some(22 + 2 * n)) // .epfab v1 is rectangular — prefabs drop any shape (see Clipboard::mask)
     };
+    let origin = body_end.and_then(|e| parse_epfab_sections(&data[e..]));
     Ok(Clipboard {
         width, height, depth, z_anchor,
         block_types: data[22..22 + n].to_vec(),
         paints:      data[22 + n..22 + 2 * n].to_vec(),
         mask,
+        origin,
     })
 }
 
@@ -12615,7 +12791,7 @@ mod tests {
         let lo = surface_z(ws.world.as_ref().unwrap(), 10, 2).unwrap() + 1;
 
         let cb = Clipboard { width: 12, height: 2, depth: 3, z_anchor: 0,
-            block_types: vec![13u8; 72], paints: vec![0u8; 72], mask: None };
+            block_types: vec![13u8; 72], paints: vec![0u8; 72], mask: None, origin: None };
         ws.clipboard = Some(cb);
         paste_terrain_inner(&mut ws, 10, 2, 0, false, true).expect("terrain paste");
         assert_eq!(ws.undo_stack.len(), 1);
@@ -15825,7 +16001,7 @@ mod tests {
             0, 0,
             3, 4,
         ];
-        Clipboard { width: 2, height: 3, depth: 1, z_anchor: 10, block_types, paints, mask: None }
+        Clipboard { width: 2, height: 3, depth: 1, z_anchor: 10, block_types, paints, mask: None, origin: None }
     }
 
     /// rotate_clipboard_inner: dimensions swap (w,h)->(h,w), content transform
@@ -15902,7 +16078,7 @@ mod tests {
                 // Cycle through ramps/wedges/doors/portals/plain so every remap arm is exercised.
                 block_types: (0..vol).map(|i| ((i * 5) % 80) as u8).collect(),
                 paints: (0..vol).map(|i| (i % 251) as u8).collect(),
-                mask: Some((0..(w * h).div_ceil(8)).map(|i| (i as u8).wrapping_mul(37) | 1).collect()),
+                mask: Some((0..(w * h).div_ceil(8)).map(|i| (i as u8).wrapping_mul(37) | 1).collect()), origin: None
             };
             let mask_bit = |m: &Option<Vec<u8>>, i: usize| bit_set(m.as_ref().unwrap(), i);
             let src = mk();
@@ -17009,7 +17185,7 @@ mod tests {
         let mut bits = vec![0u8; 1];
         bits[0] |= 1 << 0; // (dy0,dx0) idx 0
         bits[0] |= 1 << 3; // (dy1,dx1) idx 3
-        let cb = Clipboard { width: 2, height: 2, depth: 1, z_anchor: 30, block_types, paints, mask: Some(bits) };
+        let cb = Clipboard { width: 2, height: 2, depth: 1, z_anchor: 30, block_types, paints, mask: Some(bits), origin: None };
         assert!(cb.info().masked, "info reflects the footprint");
 
         let mut ws = ws_with(make_bumpy_world(8, |_, _| 20));
@@ -17036,7 +17212,7 @@ mod tests {
         let paints = (0..n).map(|i| (i % 7) as u8).collect();
         let mut bits = vec![0xffu8; 3];
         bits[0] &= !(1 << 6); // (dx 1, dy 1) outside the footprint
-        Clipboard { width: w, height: h, depth: d, z_anchor, block_types, paints, mask: Some(bits) }
+        Clipboard { width: w, height: h, depth: d, z_anchor, block_types, paints, mask: Some(bits), origin: None }
     }
 
     /// The lens's terrain-mode bases are the paste's: after a real `paste_terrain`, exactly the
@@ -17292,7 +17468,7 @@ mod tests {
         bits[0] |= 1 << 0;
         let mut cb = Clipboard {
             width: 2, height: 3, depth: 1, z_anchor: 0,
-            block_types: vec![0u8; 6], paints: vec![0u8; 6], mask: Some(bits),
+            block_types: vec![0u8; 6], paints: vec![0u8; 6], mask: Some(bits), origin: None
         };
         rotate_clipboard_inner(&mut cb);
         // After CW: new dims 3(w)×2(h). Old (dx0,dy0) → (ndx=dy=0, ndy=old_w-1-dx=1). New idx = ndy*new_w+ndx = 1*3+0 = 3.
@@ -17315,7 +17491,7 @@ mod tests {
             width: 3, height: 2, depth: 1, z_anchor: 42,
             block_types: (0..n).map(|i| 13 + i as u8).collect(),
             paints: (0..n).map(|i| i as u8).collect(),
-            mask: Some(bits.clone()),
+            mask: Some(bits.clone()), origin: None
         };
         let round = deserialize_prefab(&serialize_prefab(&cb)).expect("round-trips");
         assert_eq!(round.width, 3);
@@ -17333,7 +17509,7 @@ mod tests {
     fn test_prefab_rectangular_stays_v1() {
         let cb = Clipboard {
             width: 2, height: 2, depth: 1, z_anchor: 0,
-            block_types: vec![13u8; 4], paints: vec![0u8; 4], mask: None,
+            block_types: vec![13u8; 4], paints: vec![0u8; 4], mask: None, origin: None
         };
         let bytes = serialize_prefab(&cb);
         // Decompress to inspect the version byte.
@@ -17355,7 +17531,7 @@ mod tests {
         let mut bits = vec![0u8; 1];
         bits[0] |= 1 << 0; bits[0] |= 1 << 3;
         let cb = Clipboard { width: 2, height: 2, depth: 1, z_anchor: 0,
-            block_types: vec![13u8; 4], paints: vec![0u8; 4], mask: Some(bits) };
+            block_types: vec![13u8; 4], paints: vec![0u8; 4], mask: Some(bits), origin: None };
         let pd = render_clipboard_preview_inner(&cb, 0, None);
         let a = |dx: usize, dy: usize| pd.pixels[(dy * 2 + dx) * 4 + 3];
         assert_eq!(a(0, 0), 255, "masked block column is opaque");
@@ -17377,7 +17553,7 @@ mod tests {
         let mut bt = vec![0u8; w * h];
         bt[0] = 13; bt[512] = 13;
         let cb = Clipboard { width: w as _, height: h as _, depth: 1, z_anchor: 0,
-            block_types: bt, paints: vec![0u8; w * h], mask: None };
+            block_types: bt, paints: vec![0u8; w * h], mask: None, origin: None };
         let full = render_clipboard_preview_inner(&cb, 0, None);
         assert_eq!((full.width, full.height), (1024, 2));
         let pd = render_clipboard_preview_inner(&cb, 0, Some(512));
@@ -17388,7 +17564,7 @@ mod tests {
         assert_eq!(&pd.pixels[4..7], &[20, 20, 35], "air column stays VOID");
         // Small clipboard is unaffected by the cap.
         let small = Clipboard { width: 2, height: 2, depth: 1, z_anchor: 0,
-            block_types: vec![13u8; 4], paints: vec![0u8; 4], mask: None };
+            block_types: vec![13u8; 4], paints: vec![0u8; 4], mask: None, origin: None };
         let ps = render_clipboard_preview_inner(&small, 0, Some(512));
         assert_eq!((ps.width, ps.height), (2, 2));
     }
@@ -18761,6 +18937,203 @@ mod tests {
         for wy in 34..=62 { for wx in 34..=62 {
             assert_eq!(read_block_abs(&w, wx, wy, 1), 1, "bedrock at ({wx},{wy},1) must survive any carve");
         }}
+    }
+
+
+    // ── ROADMAP-LINK 21.6: .epfab ORGN provenance + paste placements ───────────────────────
+
+    fn hex_bytes(h: &str) -> Vec<u8> {
+        (0..h.len() / 2).map(|i| u8::from_str_radix(&h[2 * i..2 * i + 2], 16).unwrap()).collect()
+    }
+
+    /// The golden fixture shared byte-for-byte with VuencLink's `prefab_interchange` tests: a 2×1×1
+    /// prefab (types [74,0], paints [5,0], z_anchor 40) + an `ORGN` section.
+    const GOLDEN_V1: &str = "455046414201020000000100000001000000280000004a0005004f52474e150000000a000100f9ffffff2800000002efcdab8967452301";
+    const GOLDEN_V2: &str = "455046414202020000000100000001000000280000004a00050001014f52474e150000000a000100f9ffffff2800000002efcdab8967452301";
+    const GOLDEN_ORGN: &str = "4f52474e150000000a000100f9ffffff2800000002efcdab8967452301";
+
+    fn golden_origin() -> PrefabOrigin {
+        PrefabOrigin { ax: 65546, ay: -7, az: 40, source: 2, rtid: 0x0123_4567_89AB_CDEF }
+    }
+    fn golden_clip(mask: Option<Vec<u8>>, origin: Option<PrefabOrigin>) -> Clipboard {
+        Clipboard {
+            width: 2, height: 1, depth: 1, z_anchor: 40,
+            block_types: vec![74, 0], paints: vec![5, 0], mask, origin,
+        }
+    }
+
+    #[test]
+    fn test_epfab_orgn_golden_fixture() {
+        for (hex, mask) in [(GOLDEN_V1, None), (GOLDEN_V2, Some(vec![0b01u8]))] {
+            let bytes = hex_bytes(hex);
+            let cb = golden_clip(mask.clone(), Some(golden_origin()));
+            assert_eq!(serialize_prefab_raw(&cb), bytes, "serialize == golden bytes");
+            let back = deserialize_prefab(&bytes).expect("golden parses");
+            assert_eq!(back.origin, Some(golden_origin()));
+            assert_eq!((back.width, back.height, back.depth, back.z_anchor), (2, 1, 1, 40));
+            assert_eq!(back.block_types, cb.block_types);
+            assert_eq!(back.paints, cb.paints);
+            assert_eq!(back.mask, mask);
+            // gzip wrapper round-trips too
+            assert_eq!(deserialize_prefab(&serialize_prefab(&cb)).unwrap().origin, Some(golden_origin()));
+            // old-reader shape: strip the section and the prefab is the same with no origin
+            let stripped = &bytes[..bytes.len() - hex_bytes(GOLDEN_ORGN).len()];
+            let old = deserialize_prefab(stripped).expect("stripped parses");
+            assert_eq!(old.origin, None);
+            assert_eq!(old.block_types, cb.block_types);
+            assert_eq!(old.mask, mask);
+            assert_eq!(serialize_prefab_raw(&golden_clip(mask, None)), stripped,
+                "no origin → byte-identical to today's output");
+        }
+    }
+
+    #[test]
+    fn test_epfab_sections_skip_unknown_and_tolerate_truncation() {
+        let mut bytes = hex_bytes(GOLDEN_V1);
+        let orgn = bytes.split_off(bytes.len() - hex_bytes(GOLDEN_ORGN).len());
+        // unknown tag first, then ORGN → still found
+        let mut b = bytes.clone();
+        b.extend_from_slice(b"XXXX");
+        b.extend_from_slice(&3u32.to_le_bytes());
+        b.extend_from_slice(&[1, 2, 3]);
+        b.extend_from_slice(&orgn);
+        assert_eq!(deserialize_prefab(&b).unwrap().origin, Some(golden_origin()));
+        // truncated section → valid prefab, no origin
+        let mut t = bytes.clone();
+        t.extend_from_slice(&orgn[..orgn.len() - 1]);
+        assert_eq!(deserialize_prefab(&t).unwrap().origin, None);
+        // ORGN longer than 21: extra bytes ignored
+        let mut l = bytes.clone();
+        l.extend_from_slice(b"ORGN");
+        l.extend_from_slice(&23u32.to_le_bytes());
+        l.extend_from_slice(&orgn[8..]);
+        l.extend_from_slice(&[9, 9]);
+        assert_eq!(deserialize_prefab(&l).unwrap().origin, Some(golden_origin()));
+    }
+
+    #[test]
+    fn test_clipboard_transforms_drop_origin() {
+        let mut cb = golden_clip(None, Some(golden_origin()));
+        rotate_clipboard_inner(&mut cb);
+        assert_eq!(cb.origin, None);
+        let mut cb = golden_clip(None, Some(golden_origin()));
+        mirror_clipboard_x_inner(&mut cb);
+        assert_eq!(cb.origin, None);
+        let mut cb = golden_clip(None, Some(golden_origin()));
+        mirror_clipboard_y_inner(&mut cb);
+        assert_eq!(cb.origin, None);
+    }
+
+    /// A one-chunk 64z world whose chunk sits at (cx=5, cy=7), so `abs_min_* * 16` is non-zero.
+    fn offset_world_state() -> WorldState {
+        let mut b = make_test_world();
+        let pe = 4096 + 32768;
+        b[pe..pe + 2].copy_from_slice(&5i16.to_le_bytes());
+        b[pe + 4..pe + 6].copy_from_slice(&7i16.to_le_bytes());
+        let ws = ws_with(b);
+        let w = ws.world.as_ref().unwrap();
+        assert_eq!((w.min_x, w.min_y), (5, 7));
+        ws
+    }
+
+    fn rt_clip(rtid: u64, mask: Option<Vec<u8>>) -> Clipboard {
+        Clipboard {
+            width: 4, height: 4, depth: 3, z_anchor: 10,
+            block_types: vec![13; 48], paints: vec![0; 48], mask,
+            origin: Some(PrefabOrigin { ax: 1000, ay: 2000, az: 10, source: 2, rtid }),
+        }
+    }
+
+    #[test]
+    fn test_placement_copy_origin_offsets_exactly() {
+        let mut ws = offset_world_state();
+        ws.clipboard = Some(rt_clip(99, None));
+        paste_at_inner(&mut ws, 2, 3, 0, false).expect("paste");
+        assert_eq!(ws.paste_placements, vec![Placement {
+            x: 2, y: 3, z: 10, w: 4, h: 4, d: 3, ax: 1000, ay: 2000, az: 10, rtid: 99,
+        }]);
+        // edit inside the pasted area, then copy a sub-box of it
+        with_edit(&mut ws, "tweak", (3, 4, 3, 4), |w| { set_block_abs(w, 3, 4, 11, 2, 0); Ok(()) }).unwrap();
+        // with_edit is not undo/redo, so the placement survives
+        assert_eq!(ws.paste_placements.len(), 1);
+        let state = RwLock::new(ws);
+        let info = copy_selection_inner(&state, 3, 4, 4, 5, 11, 12).expect("copy");
+        assert_eq!(info.origin, Some(PrefabOrigin { ax: 1001, ay: 2001, az: 11, source: 1, rtid: 99 }));
+        // …and it round-trips through the file codec
+        let cb = state.read().unwrap().clipboard.as_ref().map(serialize_prefab).unwrap();
+        assert_eq!(deserialize_prefab(&cb).unwrap().origin, info.origin);
+
+        // straddling the placement edge → ambiguous → None
+        let info = copy_selection_inner(&state, 1, 3, 3, 4, 10, 10).expect("copy");
+        assert_eq!(info.origin, None);
+        // exceeding the placement in z → None
+        let info = copy_selection_inner(&state, 3, 4, 4, 5, 11, 13).expect("copy");
+        assert_eq!(info.origin, None);
+        // outside every placement → this world's absolute coordinates, source 0
+        let info = copy_selection_inner(&state, 10, 11, 12, 12, 0, 1).expect("copy");
+        assert_eq!(info.origin, Some(PrefabOrigin { ax: 5 * 16 + 10, ay: 7 * 16 + 11, az: 0, source: 0, rtid: 0 }));
+    }
+
+    #[test]
+    fn test_placement_not_recorded_unless_cell_for_cell() {
+        // ignore-air on
+        let mut ws = offset_world_state();
+        ws.clipboard = Some(rt_clip(7, None));
+        paste_at_inner(&mut ws, 2, 3, 0, true).unwrap();
+        assert!(ws.paste_placements.is_empty(), "ignore-air paste must not record");
+        // masked
+        ws.clipboard = Some(rt_clip(7, Some(vec![0xff, 0xff])));
+        paste_at_inner(&mut ws, 2, 3, 0, false).unwrap();
+        assert!(ws.paste_placements.is_empty(), "masked paste must not record");
+        // no rtid
+        ws.clipboard = Some(rt_clip(0, None));
+        paste_at_inner(&mut ws, 2, 3, 0, false).unwrap();
+        assert!(ws.paste_placements.is_empty(), "rtid 0 must not record");
+        // no origin at all
+        let mut cb = rt_clip(7, None);
+        cb.origin = None;
+        ws.clipboard = Some(cb);
+        paste_at_inner(&mut ws, 2, 3, 0, false).unwrap();
+        assert!(ws.paste_placements.is_empty());
+        // clipped by the world edge (paste at x=14, 4 wide, world is 16 wide)
+        ws.clipboard = Some(rt_clip(7, None));
+        paste_at_inner(&mut ws, 14, 3, 0, false).unwrap();
+        assert!(ws.paste_placements.is_empty(), "a clipped paste must not record");
+        // a good one records, and the cap holds at MAX_PLACEMENTS newest-last
+        for i in 0..(MAX_PLACEMENTS as i32 + 3) {
+            let mut cb = rt_clip(100 + i as u64, None);
+            cb.width = 1; cb.height = 1; cb.depth = 1;
+            cb.block_types.truncate(1); cb.paints.truncate(1);
+            ws.clipboard = Some(cb);
+            paste_at_inner(&mut ws, i, 0, 0, false).unwrap();
+        }
+        assert_eq!(ws.paste_placements.len(), MAX_PLACEMENTS);
+        assert_eq!(ws.paste_placements.last().unwrap().rtid, 100 + MAX_PLACEMENTS as u64 + 2);
+    }
+
+    #[test]
+    fn test_undo_and_redo_clear_placements() {
+        let mut ws = offset_world_state();
+        ws.clipboard = Some(rt_clip(5, None));
+        paste_at_inner(&mut ws, 2, 3, 0, false).unwrap();
+        assert_eq!(ws.paste_placements.len(), 1);
+        undo_edit_inner(&mut ws).expect("undo");
+        assert!(ws.paste_placements.is_empty(), "undo clears placements");
+        // redo clears whatever was recorded since too
+        ws.paste_placements.push(Placement { x: 0, y: 0, z: 0, w: 1, h: 1, d: 1, ax: 0, ay: 0, az: 0, rtid: 1 });
+        redo_edit_inner(&mut ws).expect("redo");
+        assert!(ws.paste_placements.is_empty(), "redo clears placements");
+    }
+
+    #[test]
+    fn test_derive_copy_origin_newer_overlap_beats_older_cover() {
+        let older = Placement { x: 0, y: 0, z: 0, w: 10, h: 10, d: 10, ax: 100, ay: 200, az: 5, rtid: 1 };
+        let newer = Placement { x: 4, y: 4, z: 0, w: 3, h: 3, d: 10, ax: 900, ay: 900, az: 5, rtid: 2 };
+        // box inside older, overlapping newer's edge → ambiguous
+        assert_eq!(derive_copy_origin(&[older, newer], 0, 0, 2, 2, 4, 4, 0, 1), None);
+        // box inside older, clear of newer → older's origin
+        let o = derive_copy_origin(&[older, newer], 0, 0, 0, 0, 1, 1, 2, 3).unwrap();
+        assert_eq!((o.ax, o.ay, o.az, o.source, o.rtid), (100, 200, 7, 1, 1));
     }
 
 }

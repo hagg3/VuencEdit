@@ -1,46 +1,40 @@
 ---
 layout: doc
 title: Prefabs & Clipboard
-subtitle: Copy/paste and the prefab library.
+subtitle: Copy, paste, and the prefab library.
 ---
 
-## Copy & paste
+## Copy and paste
 
-With a selection active, **Copy** captures the volume (block types and paints); **Cut** copies
-then deletes in one undo step. When you paste, you can combine any of:
+With a selection, <kbd>⌘C</kbd> copies the volume (block types and paints). Cut copies it and then clears it, as a single undo step. <kbd>⌘V</kbd> arms a paste, and the Clipboard tab shows up in the ribbon.
 
-- **No Air** — skip air cells so you only overwrite what the structure actually occupies.
-- **Terrain-align** — instead of pasting at a fixed height, each column lands relative to the
-  ground's own surface height, so a structure follows uneven terrain.
-- **Rotate 90°** — including correct remapping for ramps and wedges.
-- **Flip X / Flip Y** — mirrors, also remapping ramp/wedge orientation correctly.
-- **Repeat** — keep the same clipboard armed for placing multiple copies in a row.
+Paste options:
 
-**Two-click placement**: the first click locks the XY position (shown as an amber ghost with a
-live elevation preview), and the second click commits it. <kbd>Esc</kbd> cancels without pasting.
-<kbd>Page Up</kbd>/<kbd>Page Down</kbd> nudge the paste's Z offset while it's armed.
+- **Skip air** leaves existing blocks alone wherever the clipboard has air, so you only overwrite what the structure fills.
+- **Follow terrain** places each column on the local surface instead of at one fixed height, so a structure can follow uneven ground.
+- **Rotate** turns the clipboard 90°, and **Flip X** and **Flip Y** mirror it. Ramps, wedges and doors are remapped so they still face the right way.
+- **Repeat on each click** keeps the paste armed after you place it.
 
-### Advanced paste
+Placement takes two clicks. The first locks the position and turns the ghost amber. The second stamps it. <kbd>Esc</kbd> backs out. <kbd>Page Up</kbd> and <kbd>Page Down</kbd> change the height offset by one block, and <kbd>Shift</kbd> makes it five. <kbd>.</kbd> repeats the last paste step in the same direction.
 
-Two extra placement modes, available once something is on the clipboard:
+The paste Lens is a window next to the ghost with front and side views, so you can see how deep a paste will sit in the terrain before you commit. It's on by default. Settings ▸ Layout & windows has a switch for it.
 
-- **Scatter** — places N copies at random positions within a chosen area.
-- **Array** — places a rows × columns grid of copies with configurable spacing.
+{% include placeholder.html caption="The Lens next to an armed paste, showing front and side views" ratio="16/9" %}
+
+### Scatter and Array
+
+Paste Mode switches between Single (one copy per click), Scatter and Array. Scatter places N copies at random positions inside the selection. Array places a grid of copies with fixed spacing.
 
 ## Prefabs
 
-Save any selection straight into your prefab library, or use *Save As…* to write it anywhere on
-disk. The library lives in the sidebar's **Prefabs** tab: a searchable, sortable gallery with
-thumbnails, list/grid views, and inline rename/delete. Clicking a prefab arms it for pasting, the
-same two-click flow as a regular clipboard paste.
+Copy something, then save the clipboard as a prefab. Save goes into your prefab library, and Save As writes the `.epfab` file wherever you want. Load Prefab reads one back into the clipboard.
 
-Prefab files (`.epfab`) are gzip-compressed and store the exact shape you selected — including a
-non-rectangular Wand or Lasso selection, not just its bounding box.
+The library is the sidebar's Prefabs tab, also reachable from Insert ▸ Prefab. It has search, sorting, thumbnails, and list or grid views, with rename and delete in place. Clicking a prefab arms it for pasting, and from there it works like any other paste.
+
+Prefab files are gzip-compressed and keep the exact shape you selected. A Lasso or Wand selection stays non-rectangular. You can change the library's folder in Settings ▸ Files.
 
 {% include placeholder.html caption="The Prefabs tab, showing a gallery of saved structures" ratio="4/3" %}
 
 ## Export
 
-PNG image export — a top-down render of the map — lives on the **File → Export** menu.
-Minecraft schematic import and OBJ/Source Engine VMF export moved to the sibling
-[EdenToMC](https://github.com/hagg3/EdenToMC) project.
+Export PNG, in the application menu, saves a top-down render of the map at one pixel per block. There's no OBJ, VOX or VMF export and no Minecraft schematic import. Those were removed from this project and live on in [EdenToMC](https://github.com/hagg3/EdenToMC).
