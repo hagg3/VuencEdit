@@ -9,7 +9,7 @@
  * The grid reflows 2×3 / 3×2 / 6×1 / 1×6 to the window's shape (`toolsGridCols`); the buttons are
  * the ribbon's `IconButton`s and never scale.
  */
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useRef, useState, type KeyboardEvent } from "react";
 import type { Tool } from "../MapCanvas";
 import { IconButton, MenuItem, Popover } from "../ribbon/primitives";
 import { SPACE, SURFACE } from "../ribbon/tokens";
@@ -44,6 +44,7 @@ const FAMILIES: Family[] = [
       { tool: "select", icon: "select", label: "Select" },
       { tool: "wand", icon: "wand", label: "Magic Wand" },
       { tool: "lasso", icon: "lasso", label: "Lasso" },
+      { tool: "polyselect", icon: "polyselect", label: "Polygon Select" },
     ],
   },
   {
@@ -121,8 +122,23 @@ function FamilyButton({
     held.current = false;
   };
 
+  // Keyboard path (22.19): Enter/Space arms the current variant, ↓/↑ (or the context-menu key) opens
+  // the variants flyout. Handled here and preventDefault-ed so the button's synthetic click
+  // doesn't arm twice.
+  const onKeyDown = (e: KeyboardEvent) => {
+    if (e.target !== e.currentTarget.querySelector("button")) return; // not from inside the flyout
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      setTool(armed.tool);
+      setLastVariant(armed.tool);
+    } else if (hasVariants && (e.key === "ArrowDown" || e.key === "ArrowUp" || e.key === "ContextMenu")) {
+      e.preventDefault();
+      setOpen(true);
+    }
+  };
+
   const title = hasVariants
-    ? `${armed.label} (hold for ${family.variants.filter(v => v !== armed).map(v => v.label).join(", ")})`
+    ? `${armed.label} (hold or ↓ for ${family.variants.filter(v => v !== armed).map(v => v.label).join(", ")})`
     : armed.label;
 
   return (
@@ -132,6 +148,7 @@ function FamilyButton({
       onPointerDown={onPointerDown}
       onPointerUp={onPointerUp}
       onPointerLeave={onPointerLeave}
+      onKeyDown={onKeyDown}
     >
       <IconButton
         icon={armed.icon} label={armed.label} title={title} active={active}

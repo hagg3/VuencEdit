@@ -1,11 +1,12 @@
 import { encodeU8 } from "./codec";
-import { polygonPixels } from "./drawTools";
+import { polygonMask } from "./drawTools";
 import {
   type WorldMeta,
   decodeEditResult, decodePreviewData, decodeSelectionMask,
   type SelectionInfo, type ClipboardInfo, type ExtrudeAxis, type AutosaveInfo, type SignInfo,
   classifyWorldFormat,
 } from "./types";
+import ExportPngModal, { type ExportPngOpts } from "./ExportPngModal";
 import { useRecentWorlds, timeAgo } from "./useRecentWorlds";
 import { useState, useCallback, useEffect, useRef, useMemo, useImperativeHandle, forwardRef, useSyncExternalStore } from "react";
 import { invoke } from "@tauri-apps/api/core";
@@ -17,6 +18,7 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import MapCanvas, { KEY_ZOOM_STEP, TOOL_LABELS, TOOL_HINTS, TOOL_ICON, TOOL_FAMILY, type Tool, type ToolFamily, type SelectionBounds, type MapCanvasRef, type MaterializeSelectionBounds } from "./MapCanvas";
 import MaterializeModal from "./MaterializeModal";
+import GoToModal from "./GoToModal";
 import Sidebar, { type SidebarTab } from "./Sidebar";
 import ToolsWindow from "./windows/ToolsWindow";
 import HotbarWindow from "./windows/HotbarWindow";
@@ -39,6 +41,8 @@ import { normalizePath, worldIdentity } from "./windows/windowStorage";
 import FlyView3D, { type Sky3dPrefs, type FlyView3DRef, type Overlay3D, type Interact3D, type GpuInfo, RD_MIN } from "./FlyView3D";
 import { bumpPerf, recordRafMs, recordLagMs } from "./perfCounters";
 import ErrorBoundary from "./ErrorBoundary";
+import PanelBoundary from "./PanelBoundary";
+import { registerRootSave } from "./rootSave";
 import HelpModal from "./HelpModal";
 import DiagnosticsModal from "./DiagnosticsModal";
 import TourOverlay from "./tour/TourOverlay";
@@ -71,7 +75,8 @@ import Dialog, { DialogButton } from "./ui/Dialog";
 import { decodeAtlas, tintedSwatch, type AtlasData, clearSwatchCache } from "./texturePack";
 import { blockDisplayName, applyBlockTables, orientBlockToFacing, resolveColor, type BlockTables } from "./blockDefs";
 import { Segmented, Swatch } from "./ribbon/primitives";
-import { isTypingTarget, chunkToWorld } from "./viewportUtils";
+import { SCULPT_USES_PALETTE } from "./ribbon/sculptTools";
+import { isTypingTarget, shouldBlurAfterClick, chunkToWorld } from "./viewportUtils";
 import { decomposeMask, maskOutline } from "./maskUtils";
 import { sfx } from "./sound/sfx";
 import appIcon from "./assets/app-icon.png";
@@ -153,7 +158,11 @@ const INFO_TOAST_MS = 2500;
 const ERROR_TOAST_MS = 8000;
 const MAX_TOASTS = 4;
 /** Default top of the selection z range (64 layers). Keeps 256z worlds from selecting 4× the voxels by default. */
+/** Tools whose result is a selection — Delete/arrow-nudge act on it from any of them (22.1). */
+const SELECTION_TOOLS: ReadonlySet<string> = new Set(["select", "wand", "lasso", "polyselect"]);
 const DEFAULT_SEL_Z_MAX = 63;
+/** Quiet time that ends a live sculpt gesture for toast/outline purposes (22.4) — a few flush ticks. */
+const SCULPT_GESTURE_IDLE_MS = 400;
 /** Stable empty array for the sign-marker prop — a fresh `[]` each render would churn MapCanvas's
  *  prop-mirroring effects on every App re-render (cursor ticks, FPS, …). */
 const NO_SIGNS: SignInfo[] = [];
@@ -197,6 +206,16 @@ const SPLASH_CSS = `
 .spl-row:focus-visible { box-shadow: inset 0 0 0 2px ${FOCUS_RING}; }
 .spl-row[aria-disabled="true"] { opacity: .4; cursor: default; }
 
+.spl-recent-wrap { position: relative; }
+.spl-recent-wrap .spl-recent { padding-right: ${SPACE.lg + 52}px; }
+.spl-recent-x {
+  position: absolute; top: 50%; right: ${SPACE.md}px; transform: translateY(-50%);
+  background: none; border: none; color: ${TEXT_META}; cursor: pointer; font-size: 12px;
+  width: 24px; height: 24px; border-radius: ${RADIUS.md}px; opacity: 0; outline: none;
+}
+.spl-recent-wrap:hover .spl-recent-x, .spl-recent-x:focus-visible { opacity: 1; }
+.spl-recent-x:hover { color: ${TEXT}; }
+.spl-recent-x:focus-visible { box-shadow: inset 0 0 0 2px ${FOCUS_RING}; }
 .spl-recent {
   display: flex; align-items: center; gap: ${SPACE.lg}px;
   width: 100%; padding: ${SPACE.md}px ${SPACE.lg}px;
@@ -287,16 +306,19 @@ function SplashLink({ href, children }: { href: string; children: React.ReactNod
  * Styled from `ribbon/tokens` rather than the warm-brown glass it used to use, per H10's
  * "finish the migration" direction.
  */
-function LongOpOverlay({ op, onCancel }: { op: LongOpState | null; onCancel: () => void }) {
+function LongOpOverlay({ op, blocking, onCancel }: {
+  op: LongOpState | null; blocking: boolean; onCancel: () => void;
+}) {
   const pct = op?.pct ?? null;
   const label = op?.label ?? "Loading world…";
   return (
     <div style={{
       position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center",
       background: "rgba(0,0,0,0.45)", zIndex: 200,
-      // Only a cancellable operation needs to receive clicks; everything else stays click-through
-      // inert exactly as the old overlay was.
-      pointerEvents: op?.cancellable ? "auto" : "none",
+      // A load or save is modal (21.3 / audit L1): clicks during one could start a second load or
+      // edit a world that's about to be swapped out. A cancellable op needs clicks for its button.
+      // Everything else (autosave ticks, PNG export) stays click-through so the map stays live.
+      pointerEvents: blocking || op?.cancellable ? "auto" : "none",
     }}>
       <div style={{
         background: SURFACE.popover, border: `1px solid ${BORDER.outline}`,
@@ -549,9 +571,15 @@ function App() {
   /// overlays that read them.
   const [longOp, setLongOp] = useState<LongOpState | null>(null);
   const [saving, setSaving] = useState(false);
+  // Synchronous mirrors of `loading`/`saving` (21.3 / audit L1): the re-entry guards must see a
+  // load or save started earlier in the same frame, which the state values can't. Two overlapping
+  // loads could leave the backend on world A while the UI showed B, and ⌘S then wrote A over B.
+  const loadingRef = useRef(false);
+  const savingRef = useRef(false);
+  const fileOpBusy = () => loadingRef.current || savingRef.current;
   const [saveCompressed, setSaveCompressed] = useState(() => loadSettings().defaultSaveCompressed);
   const [backupCompressed, setBackupCompressed] = useState(() => loadSettings().backupCompressed);
-  const { recentWorlds, addRecentWorld } = useRecentWorlds();
+  const { recentWorlds, addRecentWorld, removeRecentWorld } = useRecentWorlds();
   /** Splash "More…" disclosure — collapsed shows SPLASH_RECENT_COLLAPSED of the MAX_RECENT entries. */
   const [showAllRecent, setShowAllRecent] = useState(false);
   const [ribbonCollapsed, setRibbonCollapsed] = useState(() => {
@@ -627,6 +655,8 @@ function App() {
   const prevToolRef = useRef<Tool>("pan");
   const [materializeSelection, setMaterializeSelection] = useState<MaterializeSelectionBounds | null>(null);
   const [showMaterializeModal, setShowMaterializeModal] = useState(false);
+  const [goToFrom, setGoToFrom] = useState<{ x: number; y: number } | null>(null); // Go to X, Y dialog (pre-fill = map centre)
+  const openGoTo = useCallback(() => { setGoToFrom(mapCanvasRef.current?.viewCenter() ?? { x: 0, y: 0 }); }, []);
   // Tool to re-arm when the Space hold-to-pan key is released (null = not holding).
   const spaceReturnToolRef = useRef<Tool | null>(null);
   const [wandMatchPaint, setWandMatchPaint] = useState(true);
@@ -953,9 +983,16 @@ function App() {
   // loadSettings() (JSON.parse) + JSON.stringify round-trip; without this a drag gesture does dozens
   // of synchronous localStorage round-trips for a value that only needs to persist once released.
   const saveSettingsDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Patches accumulate until the timer fires, so two different keys changed inside the window both persist.
+  const pendingSettingsPatchRef = useRef<Partial<AppSettings>>({});
   function saveSettingsDebounced(patch: Partial<AppSettings>) {
+    pendingSettingsPatchRef.current = { ...pendingSettingsPatchRef.current, ...patch };
     if (saveSettingsDebounceRef.current) clearTimeout(saveSettingsDebounceRef.current);
-    saveSettingsDebounceRef.current = setTimeout(() => saveSettings(patch), 250);
+    saveSettingsDebounceRef.current = setTimeout(() => {
+      const merged = pendingSettingsPatchRef.current;
+      pendingSettingsPatchRef.current = {};
+      saveSettings(merged);
+    }, 250);
   }
   // Stage 15.8 — 3D look prefs. `changeSky3d` takes a partial patch (a colour swatch drag fires
   // per-frame, so persistence rides the same 250 ms debounce as the other drag-driven settings; a
@@ -1106,7 +1143,9 @@ function App() {
   // check above (which stays keyed off editEpoch vs. savedEpochRef, autosave included or not).
   const [lastSavedAt, setLastSavedAt] = useState<number | null>(null);
   // World bounds of the most recent edit (top-down X/Y) — FlyView3D's edit-sync reads it.
-  const [lastEditBounds, setLastEditBounds] = useState<{ x: number; y: number; w: number; h: number } | null>(null);
+  const [lastEditBounds, setLastEditBounds] = useState<{ x: number; y: number; w: number; h: number }[] | null>(null);
+  // 23.1: edits landing in the same tick accumulate into one list so FlyView3D sees every rect, not just the last.
+  const editBatchRef = useRef<{ list: { x: number; y: number; w: number; h: number }[]; open: boolean }>({ list: [], open: false });
   // Completion outline (Stage 14.13) — a fresh object (and incrementing `key`) per user-initiated
   // edit, so `DoneOutline`'s effect restarts even when back-to-back edits touch the same rect.
   const doneOutlineKeyRef = useRef(0);
@@ -1250,6 +1289,10 @@ function App() {
   // before ours and refetch tiles under the old cap. Setting this only after the invoke resolves
   // makes it a safe refetch trigger — the backend is guaranteed to already be capped.
   const [viewCapZ, setViewCapZ] = useState<number | null>(null);
+  // Synchronous mirror of `viewCapZ`, so the effect below can tell the backend is already uncapped
+  // and skip a no-op `set_view_cap(null)` (which takes the write guard on every z-slice tick).
+  const viewCapZRef = useRef<number | null>(null);
+  viewCapZRef.current = viewCapZ;
 
   // Relief shading (Stage 13.2). `reliefShading` is the user's preference (persisted); `viewRelief`
   // is what the backend currently has (`set_view_relief`), advanced only once the invoke resolves —
@@ -1273,6 +1316,8 @@ function App() {
   useEffect(() => {
     if (!world) { setViewCapZ(null); return; }
     const want = viewMode === "cutaway" ? zSliceZ : null;
+    // Already uncapped on the backend (it resets the cap on load/close): nothing to send.
+    if (want === null && viewCapZRef.current === null) return;
     let cancelled = false;
     invoke("set_view_cap", { cap: want })
       .then(() => {
@@ -1366,6 +1411,7 @@ function App() {
   }, [rawBounds, zMax]);
 
   const [selection, setSelection] = useState<SelectionInfo | null>(null);
+  const [showExportPng, setShowExportPng] = useState(false);
 
   // First corner of a two-click 3D selection, or null. Mirrors MapCanvas's two-click paste flow:
   // the first click arms an amber ghost, the second commits, Escape cancels.
@@ -1387,6 +1433,15 @@ function App() {
     () => (rawBounds ? { x1: rawBounds.x1, y1: rawBounds.y1, x2: rawBounds.x2, y2: rawBounds.y2, zMin, zMax } : null),
     [rawBounds, zMin, zMax],
   );
+
+  // The shaped-selection prism's geometry depends only on the mask, not on Z or the drag — compute it
+  // once per mask instead of on every overlays3d rebuild (every Z tick; audit M12).
+  const maskPrismShape = useMemo(() => {
+    const mo = selectionMaskOverlay;
+    if (!mo) return null;
+    const caps = decomposeMask(mo);
+    return caps ? { caps, loops: maskOutline(mo) } : null;
+  }, [selectionMaskOverlay]);
 
   // 3D wireframe overlays for the fly-through pane: selection (blue), extrude copies (amber), paste (green).
   const overlays3d = useMemo<Overlay3D[] | null>(() => {
@@ -1410,11 +1465,11 @@ function App() {
       // plain full bbox overlay.
       const mo = selectionMaskOverlay;
       const maskMatches = !dragSelectRect && mo && mo.x1 === x1 && mo.y1 === y1 && mo.x2 === x2 && mo.y2 === y2;
-      const caps = maskMatches && mo ? decomposeMask(mo) : null;
-      if (caps && mo) {
+      const prism = maskMatches ? maskPrismShape : null;
+      if (prism) {
         ovs.push({
           min: [x1, zMin, y1], max: [x2 + 1, zMax + 1, y2 + 1], color: 0x3b82f6, style: "full",
-          shape: { loops: maskOutline(mo), caps, zBottom: zMin, zTop: zMax + 1 },
+          shape: { loops: prism.loops, caps: prism.caps, zBottom: zMin, zTop: zMax + 1 },
         });
       } else {
         ovs.push({ min: [x1, zMin, y1], max: [x2 + 1, zMax + 1, y2 + 1], color: 0x3b82f6 });
@@ -1447,7 +1502,7 @@ function App() {
       });
     }
     return ovs.length > 0 ? ovs : null;
-  }, [pane3dLive, rawBounds, dragSelectRect, zMin, zMax, extrudeOpen, extrudeAxis, extrudeCount, lockedPastePos, clipboard, pasteElevationOffset, pick3dFirst, selectionMaskOverlay]);
+  }, [pane3dLive, rawBounds, dragSelectRect, zMin, zMax, extrudeOpen, extrudeAxis, extrudeCount, lockedPastePos, clipboard, pasteElevationOffset, pick3dFirst, selectionMaskOverlay, maskPrismShape]);
 
   useEffect(() => {
     if (!rawBounds) {
@@ -1570,7 +1625,7 @@ function App() {
   }
 
   const applyEditResult = useCallback(async (
-    buf: ArrayBuffer, kind: "edit" | "undo" | "redo" = "edit", opts?: { silent?: boolean },
+    buf: ArrayBuffer, kind: "edit" | "undo" | "redo" = "edit", opts?: { silent?: boolean; noOutline?: boolean },
   ) => {
     const raw = decodeEditResult(buf);
     // The patch is sampled at `patch.lod` (audit M3), so its *world* footprint is its pixel
@@ -1587,10 +1642,13 @@ function App() {
       mapCanvasRef.current?.applyPatch(raw.patch);
     }
     // Broadcast the edit's world bounds (top-down X/Y extent) for FlyView3D's edit-sync.
-    setLastEditBounds({ x: raw.patch.x, y: raw.patch.y, w: editW, h: editH });
+    const eb = editBatchRef.current;
+    if (!eb.open) { eb.list = []; eb.open = true; queueMicrotask(() => { eb.open = false; }); }
+    eb.list = [...eb.list, { x: raw.patch.x, y: raw.patch.y, w: editW, h: editH }];
+    setLastEditBounds(eb.list);
     // Completion outline (Stage 14.13) — user-initiated edits only, never undo/redo (a flood of
     // undo/redo flashes would be noise, not feedback on something the user just did).
-    if (kind === "edit") {
+    if (kind === "edit" && !opts?.noOutline) {
       doneOutlineKeyRef.current += 1;
       setDoneRect({ key: doneOutlineKeyRef.current, x: raw.patch.x, y: raw.patch.y, w: editW, h: editH });
     }
@@ -1615,7 +1673,39 @@ function App() {
     // RISKY_BLOCK_GROUPS in lib.rs). Advisory only, shown regardless of `silent` since it's a safety
     // signal rather than a routine operation label.
     for (const w of raw.warnings) pushToast(w, "error");
+    return { x: raw.patch.x, y: raw.patch.y, w: editW, h: editH };
   }, [showToast, pushToast]);
+
+  // 22.4: a live sculpt stroke flushes every ~140 ms; each flush used to toast and restart the
+  // completion outline. Flushes now apply silently and fold into this record; one toast + one
+  // outline fire once the gesture has been quiet for SCULPT_GESTURE_IDLE_MS.
+  const sculptGestureRef = useRef<{
+    label: string; stamps: number; x1: number; y1: number; x2: number; y2: number;
+    timer: ReturnType<typeof setTimeout> | null;
+  } | null>(null);
+  const noteSculptFlush = useCallback((label: string, stamps: number, r: { x: number; y: number; w: number; h: number } | undefined) => {
+    let g = sculptGestureRef.current;
+    if (!g) {
+      g = { label, stamps: 0, x1: Infinity, y1: Infinity, x2: -Infinity, y2: -Infinity, timer: null };
+      sculptGestureRef.current = g;
+    }
+    g.stamps += stamps;
+    if (r) {
+      g.x1 = Math.min(g.x1, r.x); g.y1 = Math.min(g.y1, r.y);
+      g.x2 = Math.max(g.x2, r.x + r.w); g.y2 = Math.max(g.y2, r.y + r.h);
+    }
+    if (g.timer !== null) clearTimeout(g.timer);
+    g.timer = setTimeout(() => {
+      const done = sculptGestureRef.current;
+      sculptGestureRef.current = null;
+      if (!done) return;
+      showToast(`${done.label} (${done.stamps} stamp${done.stamps === 1 ? "" : "s"})`);
+      if (done.x2 > done.x1) {
+        doneOutlineKeyRef.current += 1;
+        setDoneRect({ key: doneOutlineKeyRef.current, x: done.x1, y: done.y1, w: done.x2 - done.x1, h: done.y2 - done.y1 });
+      }
+    }, SCULPT_GESTURE_IDLE_MS);
+  }, [showToast]);
 
   async function openFile() {
     const selected = await open({
@@ -1683,6 +1773,8 @@ function App() {
   }
 
   async function swapToWorldFile(path: string, opts?: WorldOpenOpts) {
+    if (fileOpBusy()) return; // one load or save at a time (21.3); the overlay says what's running
+    loadingRef.current = true;
     const myEpoch = ++loadEpochRef.current;
     setLoading(true);
     setError(null);
@@ -1693,11 +1785,13 @@ function App() {
     } catch (e) {
       reportError(e);
     } finally {
+      loadingRef.current = false;
       setLoading(false);
     }
   }
 
   async function openFileAt(path: string, opts?: WorldOpenOpts) {
+    if (fileOpBusy()) return; // before the discard prompt, not just inside swapToWorldFile
     if (world && isDirty()) {
       const ok = await confirmDialog("You have unsaved changes. Open a new world and discard them?", {
         title: "Unsaved changes", kind: "danger", okLabel: "Discard changes",
@@ -1707,7 +1801,28 @@ function App() {
     await swapToWorldFile(path, opts);
   }
 
-  async function exportPng() {
+  /** Splash recent-list click: a moved/deleted file offers removal instead of a misleading load error. */
+  async function openRecent(path: string) {
+    if (fileOpBusy()) return;
+    let exists = true;
+    try { exists = await invoke<boolean>("prefab_exists", { path }); } catch { /* let the load report it */ }
+    if (!exists) {
+      const remove = await confirmDialog(
+        `${path} no longer exists (moved, renamed or deleted). Remove it from Recent Worlds?`,
+        { title: "World not found", okLabel: "Remove", cancelLabel: "Keep" },
+      );
+      if (remove) removeRecentWorld(path);
+      return;
+    }
+    await openFileAt(path);
+  }
+
+  function exportPng() {
+    if (world) setShowExportPng(true);
+  }
+
+  async function doExportPng(opts: ExportPngOpts) {
+    setShowExportPng(false);
     if (!world) return;
     const suffix = viewMode === "zslice" ? `_z${zSliceZ}` : viewMode === "cutaway" ? `_cut${zSliceZ}` : "";
     const savePath = await save({
@@ -1725,6 +1840,8 @@ function App() {
         view: viewMode === "zslice" ? "zslice" : "topdown",
         z: zSliceZ,
         useTemplate: showTemplateOverlay && templateLoaded && viewMode === "topdown",
+        rect: opts.selectionOnly && selection ? [selection.x1, selection.y1, selection.x2, selection.y2] : null,
+        scale: opts.scale,
       });
     } catch (e) {
       reportExportError(e);
@@ -1808,14 +1925,21 @@ function App() {
       const mapMaxX = chunkToWorld(w.width_chunks) - 1, mapMaxY = chunkToWorld(w.height_chunks) - 1;
       const clampDx = Math.max(-bounds.x1, Math.min(mapMaxX - bounds.x2, dx));
       const clampDy = Math.max(-bounds.y1, Math.min(mapMaxY - bounds.y2, dy));
-      setRawBounds({
+      const moved = {
         x1: bounds.x1 + clampDx, y1: bounds.y1 + clampDy,
         x2: bounds.x2 + clampDx, y2: bounds.y2 + clampDy,
-      });
+      };
+      // A wand/lasso shape travels with the box (22.1): shift the backend mask's bbox and record the
+      // new rect before setRawBounds so the clear-on-reshape effect sees a match.
+      if (selectionMaskRectRef.current && (clampDx || clampDy)) {
+        selectionMaskRectRef.current = moved;
+        invoke("shift_selection_mask", { dx: clampDx, dy: clampDy }).catch((e) => reportError(e));
+      }
+      setRawBounds(moved);
       return;
     }
     nudgeSelectionContents(dx, dy);
-  }, [nudgeSelectionContents]);
+  }, [nudgeSelectionContents, reportError]);
 
   /** 3D gizmo face-resize, or an arrow-move while its Region⇄Blocks toggle is set to Region: the
    *  selection box itself changed, no backend edit — same as any other region-only bounds commit. */
@@ -1932,7 +2056,8 @@ function App() {
 
   // trackRecentBlock now comes from useHotbar() (destructured above).
 
-  async function handleEyedropper(wx: number, wy: number) {
+  /** Make the surface block under a map point the active block (eyedropper and the map menu's Pick Block). */
+  async function pickBlockAt(wx: number, wy: number) {
     try {
       const result = await invoke<{ block_type: number; paint: number }>("pick_block_surface", { wx, wy });
       if (result.block_type !== 0) {
@@ -1943,6 +2068,10 @@ function App() {
     } catch (e) {
       reportError(e);
     }
+  }
+
+  async function handleEyedropper(wx: number, wy: number) {
+    await pickBlockAt(wx, wy);
     // One-shot: return to previous draw tool
     const prev = prevToolRef.current;
     setTool(prev === "eyedropper" ? "pen" : prev);
@@ -2001,8 +2130,10 @@ function App() {
         stampCy: opts.stampCy ?? null,
         stampRadius: opts.stampRadius ?? null,
         mode: t, strength: sculptStrength, seed,
-        blockType: fillBlockType || null,
-        paint: fillPaint || null,
+        // Only palette tools (Rock) take the armed block; for the rest a non-null value would make
+        // Raise & co. build with Stone instead of the surface block (21.10).
+        blockType: SCULPT_USES_PALETTE(t) ? (fillBlockType || null) : null,
+        paint: SCULPT_USES_PALETTE(t) ? (fillPaint || null) : null,
         freq: 1 / Math.max(4, noiseFeatureSize),
         noiseMode,
         softness: sculptSoftness,
@@ -2031,7 +2162,13 @@ function App() {
           meld: rockMeld, flatten: rockFlatten, sink: rockSink, drape: rockDrape, strata: rockStrata,
         } : null,
       });
-      await applyEditResult(result);
+      // Grouped (live) flushes report once per gesture, not once per flush (22.4).
+      if (opts.groupId != null && (opts.stampCenters || opts.stampCx != null)) {
+        const r = await applyEditResult(result, "edit", { silent: true, noOutline: true });
+        noteSculptFlush(t.charAt(0).toUpperCase() + t.slice(1), opts.stampCenters?.length ?? 1, r);
+      } else {
+        await applyEditResult(result);
+      }
     } catch (e) { reportError(e); }
   }
 
@@ -2057,7 +2194,7 @@ function App() {
   async function handleDrawStroke(pts: [number, number][], zOverride: number | null, anchor?: [number, number], grabDelta?: number, groupId?: number, smear?: [number, number]) {
     const t = appToolRef.current;
     try {
-      if (t === "smooth" || t === "noise" || t === "flatten" || t === "erode" || t === "thermal" || t === "hydro" || t === "stamp" || t === "grab" || t === "raise" || t === "lower"
+      if (t === "smooth" || t === "noise" || t === "flatten" || t === "thermal" || t === "hydro" || t === "stamp" || t === "grab" || t === "raise" || t === "lower"
           || t === "terrace" || t === "sharpen" || t === "slope" || t === "smear" || t === "rock" || t === "carve") {
         await applySculpt({
           points: pts.map(([x, y]) => ({ x, y })),
@@ -2126,7 +2263,7 @@ function App() {
 
   async function handleMagicWand(wx: number, wy: number) {
     try {
-      const rect = await invoke<{ x1: number; y1: number; x2: number; y2: number } | null>("magic_wand_select", {
+      const rect = await invoke<{ x1: number; y1: number; x2: number; y2: number; truncated: boolean } | null>("magic_wand_select", {
         wx, wy, matchPaint: wandMatchPaint,
       });
       if (rect) {
@@ -2137,6 +2274,7 @@ function App() {
         setHasSelectionMask(true);
         setRawBounds(rect);
         flashSelection(rect);
+        if (rect.truncated) pushToast("Wand stopped at 50,000 cells — the matching region is larger than the selection.", "error");
       }
     } catch (e) { reportError(e); }
   }
@@ -2146,23 +2284,12 @@ function App() {
   async function applyPolygonSelection(pathPts: [number, number][]) {
     try {
       const verts = pathPts.map(([x, y]) => ({ x, y }));
-      const filled = polygonPixels(verts, "fill");
-      if (filled.length === 0) return;
-      let x1 = Infinity, y1 = Infinity, x2 = -Infinity, y2 = -Infinity;
-      for (const p of filled) {
-        if (p.x < x1) x1 = p.x; if (p.x > x2) x2 = p.x;
-        if (p.y < y1) y1 = p.y; if (p.y > y2) y2 = p.y;
-      }
-      x1 = Math.max(0, x1); y1 = Math.max(0, y1);
-      const width = x2 - x1 + 1, height = y2 - y1 + 1;
-      // Row-major bitset over the bbox, bit (y-y1)*width + (x-x1) — must match set_selection_mask's
-      // expected layout on the Rust side exactly (it validates byte length against width*height).
-      const bits = new Uint8Array(Math.ceil((width * height) / 8));
-      for (const p of filled) {
-        if (p.x < x1 || p.x > x2 || p.y < y1 || p.y > y2) continue;
-        const bitIdx = (p.y - y1) * width + (p.x - x1);
-        bits[bitIdx >> 3] |= 1 << (bitIdx & 7);
-      }
+      // Scanline straight into the bitset (audit M7) — no per-cell objects. Row-major over the
+      // bbox, bit (y-y1)*width + (x-x1): must match set_selection_mask's layout on the Rust side
+      // (it validates byte length against width*height).
+      const m = polygonMask(verts);
+      if (!m) return;
+      const { x1, y1, x2, y2, bits } = m;
       await invoke("set_selection_mask", { x1, y1, x2, y2, bitsB64: encodeU8(bits) });
       const rect = { x1, y1, x2, y2 };
       selectionMaskRectRef.current = rect;
@@ -2191,6 +2318,7 @@ function App() {
         x1: rawBounds.x1, y1: rawBounds.y1, x2: rawBounds.x2, y2: rawBounds.y2,
         count: scatterCount, seed: Math.floor(Math.random() * 0xFFFFFFFF),
         elevationOffset: pasteElevationOffset, ignoreAir: pasteIgnoreAir,
+        terrainAbove: pasteTerrain ? pasteTerrainAbove : null,
       });
       await applyEditResult(result);
       sfx.play("paste");
@@ -2204,6 +2332,7 @@ function App() {
         cols: arrayCols, rows: arrayRows,
         spacingX: arraySpacingX, spacingY: arraySpacingY,
         elevationOffset: pasteElevationOffset, ignoreAir: pasteIgnoreAir,
+        terrainAbove: pasteTerrain ? pasteTerrainAbove : null,
       });
       await applyEditResult(result);
       sfx.play("paste");
@@ -2240,7 +2369,7 @@ function App() {
   useEffect(() => {
     if (mode3d !== "sculpt") return;
     const t = appToolRef.current;
-    const isSculpt = t === "smooth" || t === "noise" || t === "flatten" || t === "erode" ||
+    const isSculpt = t === "smooth" || t === "noise" || t === "flatten" ||
       t === "thermal" || t === "hydro" || t === "stamp" || t === "grab" || t === "raise" || t === "lower" ||
       t === "terrace" || t === "sharpen" || t === "slope" || t === "smear" || t === "rock" || t === "carve";
     if (!isSculpt) setTool("raise");
@@ -2383,6 +2512,19 @@ function App() {
     }
   }, [applyEditResult, reportError]);
 
+  // Esc on a live sculpt stroke (2D or 3D): revert that stroke only. `onlyGroup` makes the backend
+  // refuse when the stroke pushed no undo entry (every flush changed nothing), instead of popping
+  // the unrelated edit underneath (21.9, audit S2).
+  const handleCancelStroke = useCallback(async (groupId: number) => {
+    try {
+      const result = await invoke<ArrayBuffer>("undo_edit", { onlyGroup: groupId });
+      await applyEditResult(result, "undo");
+      sfx.play("undo");
+    } catch (e) {
+      if (e !== "Nothing to undo") reportError(e);
+    }
+  }, [applyEditResult, reportError]);
+
   const handleRedo = useCallback(async () => {
     try {
       const result = await invoke<ArrayBuffer>("redo_edit");
@@ -2401,6 +2543,8 @@ function App() {
   // never written, which made a later Upload fail with "Cannot read world: No such file or
   // directory" — the state believed a save had happened when it hadn't.
   const saveWorld = useCallback(async (path: string): Promise<boolean> => {
+    if (loadingRef.current || savingRef.current) return false; // 21.3: never overlap a load or save
+    savingRef.current = true;
     setSaving(true);
     setError(null);
     try {
@@ -2422,9 +2566,12 @@ function App() {
       }
       // save_world also re-bases the autosave onto the file it just wrote (18.9), which replaces the
       // old sidecars — no discard_autosave here any more.
+      // The epoch is captured *before* the invoke (21.3 / audit L2), like the autosave timer: an
+      // edit that lands while the save runs its post-steps must stay dirty, not be marked saved.
+      const epoch = editEpochRef.current;
       await invoke("save_world", { path, compressed: saveCompressed, backupCompressed });
-      lastAutosavedEpochRef.current = editEpochRef.current;
-      savedEpochRef.current = editEpochRef.current;
+      lastAutosavedEpochRef.current = epoch;
+      savedEpochRef.current = epoch;
       setLastSavedAt(Date.now()); // status-bar "Saved" timestamp (Stage 15.6)
       sfx.play("save"); // the one place saveWorld resolves true — every caller inherits this cue
       return true;
@@ -2432,6 +2579,7 @@ function App() {
       reportError(e);
       return false;
     } finally {
+      savingRef.current = false;
       setSaving(false);
     }
   }, [saveCompressed, showToast, reportError]);
@@ -2462,9 +2610,19 @@ function App() {
     const ok = await saveWorld(finalPath);
     if (ok) {
       setSourcePath(finalPath);
+      addRecentWorld(finalPath, finalPath.split(/[\\/]/).pop()!.replace(/\.(eden|zip)$/i, ""));
       saveWindowLayoutAs(normalizePath(finalPath, IS_WINDOWS)!); // the copy inherits the window layout
     }
-  }, [sourcePath, saveWorld, saveCompressed]);
+  }, [sourcePath, saveWorld, saveCompressed, addRecentWorld]);
+
+  // 21.15: the root error boundary's Save (RootErrorBoundary.tsx) reaches this after App unmounts.
+  // Registered, never cleared: surviving the unmount is the point.
+  useEffect(() => {
+    registerRootSave(async () => {
+      const p = sourcePathRef.current;
+      return p ? saveWorld(p) : (await saveWorldAs(), true);
+    });
+  }, [saveWorld, saveWorldAs]);
 
   // Upload sends `sourcePath` — the file on disk, not the in-memory world — so unsaved edits
   // would silently upload a stale version. Gate opening the modal on the same `isDirty()` check
@@ -2500,7 +2658,9 @@ function App() {
       const epoch = editEpochRef.current;
       invoke<boolean>("autosave_world", { sourcePath: sourcePathRef.current })
         .then((ran) => {
-          if (!ran) return; // skipped: a save was running (18.9). The next interval retries.
+          // Skipped: a save was running (18.9; the next interval retries), or a crash autosave is
+          // still awaiting a recovery decision (21.5; paused for the session).
+          if (!ran) return;
           lastAutosavedEpochRef.current = epoch;
           autosaveFailureCountRef.current = 0;
           setLastSavedAt(Date.now()); // status-bar "Saved" timestamp (Stage 15.6)
@@ -2567,6 +2727,7 @@ function App() {
         const autosavePath = await invoke<string>("get_autosave_path");
         await openFileAt(autosavePath, { skipRecent: true });
         setSourcePath(recoveryInfo.source_path ?? null);
+        await invoke("release_autosave_hold"); // load_world doesn't know about the 21.5 hold
       }
       // The recovery path above marks the freshly-loaded autosave "clean" (savedEpochRef = current
       // edit epoch), but the in-memory world differs from the file at sourcePath — nothing has
@@ -2590,7 +2751,7 @@ function App() {
   // "changed"): it can never be applied, so drop it and open the file itself.
   async function openRecoveryBase() {
     const path = recoveryInfo?.base?.kind === "source" ? recoveryInfo.base.path : recoveryInfo?.source_path;
-    try { await invoke("discard_autosave"); } catch { /* best effort */ }
+    try { await invoke("discard_autosave", { decided: true }); } catch { /* best effort */ }
     setRecoveryInfo(null);
     if (path) await openFileAt(path);
   }
@@ -2598,13 +2759,16 @@ function App() {
   // Destroys the autosave sidecar. Only reachable from RecoveryModal's explicit
   // Discard → confirm; Esc/backdrop go to dismissRecovery instead (C1).
   async function discardRecovery() {
-    try { await invoke("discard_autosave"); } catch { /* best effort */ }
+    try { await invoke("discard_autosave", { decided: true }); } catch { /* best effort */ }
     setRecoveryInfo(null);
   }
 
-  // Closes the prompt without touching the sidecar — it's re-offered on next launch.
+  // Closes the prompt without touching the sidecar — it's re-offered on next launch. The backend
+  // keeps a hold on the sidecars until then (21.5): autosave ticks, a save's re-base and a close's
+  // discard all leave them alone, so autosave is paused for the rest of this session.
   function dismissRecovery() {
     setRecoveryInfo(null);
+    showToast("Autosave paused: the earlier autosave is kept for next launch");
   }
 
   // Any dialog-style modal open? (HelpModal is excluded — it has its own key handling below.)
@@ -2613,9 +2777,11 @@ function App() {
   const anyModalOpen =
     showAbout || showSettings || showWorldInfo || showWorldBrowser || showUploadModal ||
     showNewWorld || showExpandModal || !!recoveryInfo || prefabNameModal ||
-    tourOpen || confirmOpen;
+    tourOpen || confirmOpen || showDiagnostics || showMaterializeModal || !!goToFrom || !!longOp;
   const anyModalOpenRef = useRef(false);
   useEffect(() => { anyModalOpenRef.current = anyModalOpen; }, [anyModalOpen]);
+  const longOpRef = useRef<LongOpState | null>(null);
+  useEffect(() => { longOpRef.current = longOp; }, [longOp]);
 
   // Auto-trigger the onboarding tour the first time a world becomes loaded (new/open/download/
   // recent/recovery — this effect runs after the editor branch has mounted regardless of which
@@ -2704,6 +2870,12 @@ function App() {
       // the camera downward for the length of the keypress. Bare Control (no other key yet) must
       // still fall through to the fly controller.
       if (flyActiveRef.current && !e.metaKey && !(e.ctrlKey && e.key !== "Control")) return;
+      // Esc cancels a cancellable long operation (its overlay is click-blocking and counts as a modal).
+      if (e.key === "Escape" && longOpRef.current?.cancellable) {
+        e.preventDefault();
+        void invoke("cancel_long_op", { id: longOpRef.current.id });
+        return;
+      }
       // A modal dialog is open — let it own the keyboard (its own Escape/Enter handling applies).
       if (anyModalOpenRef.current) return;
       const typing = isTypingTarget(e.target);
@@ -2752,7 +2924,7 @@ function App() {
         }
         const t = appToolRef.current;
         if (t === "paste" || t === "wand" || t === "lasso" || t === "polyselect" || t === "pen" || t === "brush" || t === "spray" || t === "line" || t === "rect" || t === "ellipse" || t === "polygon" ||
-            t === "smooth" || t === "noise" || t === "flatten" || t === "erode" || t === "thermal" ||
+            t === "smooth" || t === "noise" || t === "flatten" || t === "thermal" ||
             t === "hydro" || t === "stamp" || t === "grab" || t === "raise" || t === "lower" ||
             t === "terrace" || t === "sharpen" || t === "slope" || t === "smear" || t === "rock" || t === "carve" || t === "fill" || t === "eyedropper" || t === "poolfill") {
           e.preventDefault();
@@ -2797,13 +2969,13 @@ function App() {
         if (e.key === "r" || e.key === "R") { e.preventDefault(); setTool("rect"); return; }
         if (e.key === "e" || e.key === "E") { e.preventDefault(); setTool("ellipse"); return; }
         if (e.key === "g" || e.key === "G") { e.preventDefault(); setTool("polygon"); return; }
-        if (e.key === "f" || e.key === "F") { e.preventDefault(); setTool("fill"); return; }
+        if ((e.key === "f" || e.key === "F") && !e.shiftKey) { e.preventDefault(); setTool("fill"); return; } // ⇧F = 3D "frame selection"
         if (e.key === "w" || e.key === "W") { e.preventDefault(); setTool("wand"); return; }
         if (e.key === "k" || e.key === "K") { e.preventDefault(); setTool("lasso"); return; }
         if (e.key === "j" || e.key === "J") { e.preventDefault(); setTool("polyselect"); return; }
         // Delete/Backspace clears the current selection (audit H9) — advertised in tooltips
         // (Home's Delete button, the Quick Actions bar) since before there was ever a binding.
-        if ((e.key === "Delete" || e.key === "Backspace") && appToolRef.current === "select" && rawBoundsRef.current) {
+        if ((e.key === "Delete" || e.key === "Backspace") && SELECTION_TOOLS.has(appToolRef.current) && rawBoundsRef.current) {
           e.preventDefault();
           void deleteBlocksRef.current();
           return;
@@ -2837,7 +3009,7 @@ function App() {
         }
         // Arrow keys nudge the selection (and its contents) by 1 block; Shift = 10.
         if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(e.key)
-            && appToolRef.current === "select" && rawBoundsRef.current) {
+            && SELECTION_TOOLS.has(appToolRef.current) && rawBoundsRef.current) {
           e.preventDefault();
           const step = e.shiftKey ? 10 : 1;
           const dx = e.key === "ArrowLeft" ? -step : e.key === "ArrowRight" ? step : 0;
@@ -2848,7 +3020,7 @@ function App() {
         // Sculpt radius/strength: `[`/`]` resize the brush, Shift+`[`/`]` adjusts strength instead.
         // Brackets avoid every wheel conflict (wheel is zoom on the map, fly-speed in the 3D pane).
         const st = appToolRef.current;
-        const isSculptToolKey = st === "smooth" || st === "noise" || st === "flatten" || st === "erode" ||
+        const isSculptToolKey = st === "smooth" || st === "noise" || st === "flatten" ||
           st === "thermal" || st === "hydro" || st === "stamp" || st === "grab" || st === "raise" || st === "lower" ||
           st === "terrace" || st === "sharpen" || st === "slope" || st === "smear" || st === "rock" || st === "carve";
         // Shift+[ / Shift+] arrive as "{" / "}" on US-style layouts — matching only "[" / "]" meant
@@ -2866,9 +3038,13 @@ function App() {
       // Normalize case: with Shift (⌘⇧Z) or Caps Lock, e.key is uppercase ("Z"), so a bare
       // === "z" comparison silently misses. This was why ⌘⇧Z redo never fired.
       const k = e.key.toLowerCase();
+      // In a text field the editing chords belong to the field (native undo/copy/paste/select-all),
+      // not the map (21.6).
+      if (typing && ["z", "y", "c", "x", "v", "a", "d"].includes(k)) return;
       if (k === "z" && !e.shiftKey) { e.preventDefault(); handleUndo(); }
       if ((k === "z" && e.shiftKey) || k === "y") { e.preventDefault(); handleRedo(); }
       if (k === "c") { e.preventDefault(); copySelection(); }
+      if (k === "x") { e.preventDefault(); void cutSelectionRef.current(); }
       if (k === "v") {
         e.preventDefault();
         if (clipboardRef.current) setTool("paste");
@@ -2888,6 +3064,7 @@ function App() {
         setRawBounds({ x1: 0, y1: 0, x2: chunkToWorld(world.width_chunks) - 1, y2: chunkToWorld(world.height_chunks) - 1 });
       }
       if (k === "d") { e.preventDefault(); setRawBounds(null); }
+      if (k === "g" && !e.shiftKey) { e.preventDefault(); openGoTo(); }
       // Zoom: ⌘0 fit map, ⌘+/⌘− step, ⌘⇧0 zoom to selection. (⌘= is the unshifted "+" key.)
       if (k === "0" && e.shiftKey) {
         e.preventDefault();
@@ -2912,6 +3089,16 @@ function App() {
       setTool(back);
     };
     const onKeyUp = (e: KeyboardEvent) => { if (e.key === " ") releaseSpacePan(); };
+    // U9: a mouse-clicked button keeps focus on Windows, so Space (pan) would re-fire it. Drop focus
+    // after pointer clicks only; keyboard activation (detail 0) and dialogs keep theirs.
+    const onClickBlur = (e: MouseEvent) => {
+      const t = e.target as Element | null;
+      if (shouldBlurAfterClick(e.detail, t)) {
+        const btn = t!.closest("button") as HTMLButtonElement;
+        if (document.activeElement === btn) btn.blur();
+      }
+    };
+    window.addEventListener("click", onClickBlur);
     window.addEventListener("keydown", onKeyDown);
     window.addEventListener("keyup", onKeyUp);
     window.addEventListener("blur", releaseSpacePan);
@@ -2919,6 +3106,7 @@ function App() {
       window.removeEventListener("keydown", onKeyDown);
       window.removeEventListener("keyup", onKeyUp);
       window.removeEventListener("blur", releaseSpacePan);
+      window.removeEventListener("click", onClickBlur);
     };
     // clipboard/sourcePath/rawBounds deliberately excluded — read via clipboardRef/sourcePathRef/
     // rawBoundsRef so this handler doesn't re-register on every selection or clipboard change (L2).
@@ -3045,9 +3233,22 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
   // Default "Save Prefab" opens an in-app name modal that writes into the prefab library folder —
   // deliberately avoiding the native NSSavePanel, which hangs ~30s on macOS Sonoma (ViewBridge
   // XPC stall). "Save As…" (below) still offers the native picker for saving to any folder.
-  function openPrefabNameModal() {
+  async function openPrefabNameModal() {
     if (!clipboard) { reportError("Copy a selection first, then save it as a prefab."); return; }
-    setPrefabNameInput(world?.name?.trim() || "prefab");
+    // 22.8: suffix the default name ("name 2", "name 3"…) until it's free, so a second save doesn't
+    // always hit the overwrite guard. Best-effort — if the library folder can't be resolved the
+    // plain name stands and the guard still catches a collision.
+    const base = world?.name?.trim() || "prefab";
+    let name = base;
+    try {
+      const dir = await resolvePrefabDir();
+      if (dir) {
+        for (let n = 2; n < 1000 && await invoke<boolean>("prefab_exists", { path: `${dir}/${name.replace(/[/\\]/g, "_")}.epfab` }); n++) {
+          name = `${base} ${n}`;
+        }
+      }
+    } catch { /* fall back to the plain name */ }
+    setPrefabNameInput(name);
     setPrefabOverwrite(false);
     setPrefabNameModal(true);
   }
@@ -3101,6 +3302,10 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
       multiple: false,
     });
     if (!path || typeof path !== "string") return;
+    await loadPrefabAt(path);
+  }
+
+  async function loadPrefabAt(path: string) {
     const info = await invoke<ClipboardInfo>("load_prefab", { path })
       .catch((e: unknown) => { reportError(e); return null; });
     if (!info) return;
@@ -3128,6 +3333,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
   // always call the latest deleteBlocks closure without re-registering on every selection change.
   const deleteBlocksRef = useRef(deleteBlocks);
   useEffect(() => { deleteBlocksRef.current = deleteBlocks; });
+  const cutSelectionRef = useRef<() => Promise<void>>(async () => {});
 
   /**
    * Cut = copy, then clear. Composed here rather than added as a Rust command because
@@ -3139,6 +3345,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
     await copySelection();
     await deleteBlocks();
   }
+  cutSelectionRef.current = cutSelection;
 
   async function fillSelection() {
     if (!rawBounds) return;
@@ -3189,6 +3396,10 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
 
   const openFileAtRef = useRef(openFileAt);
   openFileAtRef.current = openFileAt;
+  const loadPrefabAtRef = useRef(loadPrefabAt);
+  loadPrefabAtRef.current = loadPrefabAt;
+  const hasWorldRef = useRef(false);
+  hasWorldRef.current = !!world;
 
   // Drag-and-drop a .eden/.zip world file onto the window — many users try this first. Tauri's
   // native drag-drop (dragDropEnabled, on by default) replaces the browser's own HTML5 drag events,
@@ -3200,7 +3411,14 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
       if (event.payload.type !== "drop") return;
       const path = event.payload.paths.find((p) => /\.(eden|zip)$/i.test(p));
       if (!path) {
-        showToast("Drop a .eden or .zip world file to open it.");
+        // 22.8: a dropped prefab goes straight onto the clipboard in paste mode (needs a world to paste into).
+        const prefab = event.payload.paths.find((p) => /\.epfab$/i.test(p));
+        if (prefab) {
+          if (!hasWorldRef.current) showToast("Open a world first, then drop the prefab to paste it.");
+          else void loadPrefabAtRef.current(prefab);
+          return;
+        }
+        showToast("Drop a .eden or .zip world file to open it (or a .epfab prefab to paste).");
         return;
       }
       void openFileAtRef.current(path);
@@ -3212,6 +3430,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
   openFileRef.current = openFile;
 
   async function closeWorld() {
+    if (fileOpBusy()) return; // 21.3: a close mid-load would leave the backend on the loaded world
     if (isDirty()) {
       const ok = await confirmDialog("You have unsaved changes. Close this world and discard them?", {
         title: "Unsaved changes", kind: "danger", okLabel: "Discard changes",
@@ -3287,7 +3506,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
     pasteOn: winKey[6] === "1", selOn: winKey[7] === "1",
   });
 
-  const isSculptTool = tool === "smooth" || tool === "noise" || tool === "flatten" || tool === "erode" || tool === "thermal" || tool === "hydro" || tool === "stamp" || tool === "grab" || tool === "raise" || tool === "lower" || tool === "terrace" || tool === "sharpen" || tool === "slope" || tool === "smear" || tool === "rock" || tool === "carve";
+  const isSculptTool = tool === "smooth" || tool === "noise" || tool === "flatten" || tool === "thermal" || tool === "hydro" || tool === "stamp" || tool === "grab" || tool === "raise" || tool === "lower" || tool === "terrace" || tool === "sharpen" || tool === "slope" || tool === "smear" || tool === "rock" || tool === "carve";
   const isDrawTool = tool === "pen" || tool === "brush" || tool === "spray" || tool === "line" || tool === "rect" || tool === "ellipse" || tool === "polygon" || isSculptTool || tool === "fill";
 
   const mapPaneEl = world ? (
@@ -3301,6 +3520,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
       viewMode={viewMode === "cutaway" ? "topdown" : viewMode}
       zSliceZ={zSliceZ}
       viewCapZ={viewCapZ}
+      capPending={viewMode === "cutaway" ? viewCapZ !== zSliceZ : viewCapZ !== null}
       viewRelief={viewRelief}
       committedSelection={rawBounds}
       onSelectionChange={handleSelectionChange}
@@ -3314,7 +3534,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
       drawConfig={{ brushSize, brushShape, fillMode: drawFilled ? "fill" : "outline", sculptRadius, sculptSoftness, sculptProfile, sculptAccumulate, sprayDensity, strokeStabilizer }}
       onDrawStroke={handleDrawStroke}
       onSculptStroke={handleSculptStroke}
-      onCancelStroke={handleUndo}
+      onCancelStroke={handleCancelStroke}
       drawZOverride={viewMode === "zslice" ? zSliceZ : null}
       extrudePreview={
         extrudeOpen && extrudeCount > 0 && rawBounds && (extrudeAxis.startsWith("x") || extrudeAxis.startsWith("y"))
@@ -3560,7 +3780,8 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
             <OutPortal node={placement.main === "fly" ? flyHost : mapHost} />
           </div>
           <WindowLayer>
-            <ToolsWindow tool={tool} setTool={setTool} />
+            <PanelBoundary label="Tools" slot={6}><ToolsWindow tool={tool} setTool={setTool} /></PanelBoundary>
+            <PanelBoundary label="Hotbar" slot={0}>
             <HotbarWindow
               hotbar={hotbar}
               fillBlockType={fillBlockType}
@@ -3569,6 +3790,8 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
               setFillPaint={setFillPaint}
               texturePack={texturePackInfo}
             />
+            </PanelBoundary>
+            <PanelBoundary label="Lens" slot={1} onClose={onToggleLensWindow}>
             <LensWindow
               tool={tool}
               clipboard={clipboard}
@@ -3593,14 +3816,18 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
               onDrawElevation={handleDrawElevation}
               maxZ={world.max_z}
             />
+            </PanelBoundary>
             {/* Mode-driven context panels (16.6) — in registry (= stacking) order. Each exists only while
                 its mode holds; see windows/panelModes.ts and modePanels.tsx. */}
+            <PanelBoundary label="Z-slice panel" slot={2}>
             <CutawayPanel
               worldLoaded={world != null} maxZ={world.max_z}
               viewMode={viewMode} setViewMode={setViewMode}
               zSliceZ={zSliceZ} commitZSlice={commitZSlice}
               followSurface={followSurface} setFollowSurface={setFollowSurface}
             />
+            </PanelBoundary>
+            <PanelBoundary label="Brush panel" slot={3}>
             <BrushShapePanel
               worldLoaded={world != null} tool={tool}
               noiseMode={noiseMode} setNoiseMode={setNoiseMode}
@@ -3616,6 +3843,8 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
               rockDrape={rockDrape} setRockDrape={setRockDrape}
               rockStrata={rockStrata} setRockStrata={setRockStrata}
             />
+            </PanelBoundary>
+            <PanelBoundary label="Build panel" slot={4}>
             <BuildSlotPanel
               worldLoaded={world != null} pane3dLive={pane3dLive}
               mode3d={mode3d} setMode3d={setMode3d}
@@ -3626,12 +3855,15 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
               sculptRadius={sculptRadius} setSculptRadius={setSculptRadius}
               sculptSoftness={sculptSoftness} setSculptSoftness={setSculptSoftness}
             />
+            </PanelBoundary>
+            <PanelBoundary label="3D window" slot={5}>
             <View3DWindow
               swapped={swapped}
               node={placement.window === "fly" ? flyHost : placement.window === "map" ? mapHost : null}
               onSwap={swapViews}
               onMoved={() => mapCanvasRef.current?.invalidateRect()}
             />
+            </PanelBoundary>
           </WindowLayer>
         </div>
         {/* The two viewports, rendered exactly once each into their detached host nodes. */}
@@ -3712,6 +3944,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
               sculptRadius={sculptRadius}
               sculptStrength={sculptStrength}
               onSculptStamp3d={handleSculptStamp3d}
+              onCancelSculptStroke3d={handleCancelStroke}
               armedSwatch={texturePackInfo ? tintedSwatch(fillBlockType, fillPaint, texturePackInfo) : null}
               armedLabel={blockDisplayName(fillBlockType)}
               armedBlockType={fillBlockType}
@@ -3907,6 +4140,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           onSetSpawnAtSelection={setSpawnAtSelection}
           onSetPlayerPosAtSelection={setPlayerPosAtSelection}
           onShowWorldInfo={() => setShowWorldInfo(true)}
+          onGoTo={openGoTo}
           selection={selection}
           rawBounds={rawBounds}
           setRawBounds={setRawBounds}
@@ -4043,6 +4277,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
 
 
         {/* Docked right sidebar: Inspector / Prefabs / History tabs — see Sidebar.tsx. */}
+        <PanelBoundary label="Sidebar" kind="dock" topPx={effectiveRibbonHeight}>
         <Sidebar
           open={sidebarOpen}
           onOpenChange={(v) => { setSidebarOpen(v); saveSettings({ sidebarOpen: v }); }}
@@ -4063,6 +4298,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           signs={signs}
           onSignClick={focusOnSign}
         />
+        </PanelBoundary>
 
         {prefabNameModal && (
           <Dialog
@@ -4116,12 +4352,12 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
         )}
 
         {(longOp || loading) && (
-          <LongOpOverlay op={longOp} onCancel={cancelLongOp} />
+          <LongOpOverlay op={longOp} blocking={loading || saving} onCancel={cancelLongOp} />
         )}
 
-        {showHelp && <HelpModal onClose={() => setShowHelp(false)} onStartTour={startTour} />}
+        {showHelp && <PanelBoundary kind="dialog" label="Help" onClose={() => setShowHelp(false)}><HelpModal onClose={() => setShowHelp(false)} onStartTour={startTour} /></PanelBoundary>}
         {showDiagnostics && (
-          <DiagnosticsModal
+          <PanelBoundary kind="dialog" label="Diagnostics" onClose={() => setShowDiagnostics(false)}><DiagnosticsModal
             onClose={() => setShowDiagnostics(false)}
             appVersion={appVersion}
             sourcePath={sourcePath}
@@ -4134,55 +4370,73 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
             viewHost={swapped ? "main" : "window"}
             getGpuInfo={() => flyView3dRef.current?.getGpuInfo() ?? null}
             getPerfSnapshot={() => flyView3dRef.current?.getPerfSnapshot() ?? null}
-          />
+          /></PanelBoundary>
         )}
         {tourOpen && (
           <TourOverlay steps={TOUR_STEPS} ctx={tourCtx} onClose={() => setTourOpen(false)} />
         )}
-        {showAbout && (
-          <AboutModal version={appVersion} onClose={() => setShowAbout(false)}
-            onOpenDiagnostics={() => { setShowAbout(false); setShowDiagnostics(true); }} />
+        {showExportPng && world && (
+          <PanelBoundary kind="dialog" label="Export PNG" onClose={() => setShowExportPng(false)}>
+            <ExportPngModal
+              selectionSize={selection ? { w: selection.width, h: selection.height } : null}
+              worldSize={{ w: world.width_chunks * 16, h: world.height_chunks * 16 }}
+              onExport={doExportPng} onClose={() => setShowExportPng(false)}
+            />
+          </PanelBoundary>
         )}
-        {showWorldInfo && <WorldInfoModal onClose={() => setShowWorldInfo(false)} />}
+        {showAbout && (
+          <PanelBoundary kind="dialog" label="About" onClose={() => setShowAbout(false)}><AboutModal version={appVersion} onClose={() => setShowAbout(false)}
+            onOpenDiagnostics={() => { setShowAbout(false); setShowDiagnostics(true); }} /></PanelBoundary>
+        )}
+        {showWorldInfo && <PanelBoundary kind="dialog" label="World info" onClose={() => setShowWorldInfo(false)}><WorldInfoModal onClose={() => setShowWorldInfo(false)} /></PanelBoundary>}
         {recoveryInfo && (
-          <RecoveryModal info={recoveryInfo} recovering={recovering} onRecover={recoverAutosave} onDiscard={discardRecovery} onDismiss={dismissRecovery} onOpenBase={openRecoveryBase} />
+          <PanelBoundary kind="dialog" label="Recovery" onClose={() => dismissRecovery()}><RecoveryModal info={recoveryInfo} recovering={recovering} onRecover={recoverAutosave} onDiscard={discardRecovery} onDismiss={dismissRecovery} onOpenBase={openRecoveryBase} /></PanelBoundary>
         )}
         {showSettings && (
-          <SettingsModal
+          <PanelBoundary kind="dialog" label="Settings" onClose={() => setShowSettings(false)}><SettingsModal
             onClose={() => { setShowSettings(false); setSettingsTab("general"); }}
             onSave={applySettings}
             onResetWindows={resetWindows}
             lensFlags={{ pasteOn: winKey[6] === "1", selOn: winKey[7] === "1" }}
             onLensFlags={setLensFlags}
             initialTab={settingsTab}
-          />
+          /></PanelBoundary>
         )}
 
         {showWorldBrowser && (
-          <WorldBrowserModal
+          <PanelBoundary kind="dialog" label="World browser" onClose={() => setShowWorldBrowser(false)}><WorldBrowserModal
             onClose={() => setShowWorldBrowser(false)}
             onOpenWorld={(path) => { setShowWorldBrowser(false); openFileAt(path); }}
-          />
+          /></PanelBoundary>
         )}
         {showUploadModal && (
-          <UploadModal
+          <PanelBoundary kind="dialog" label="Upload" onClose={() => setShowUploadModal(false)}><UploadModal
             sourcePath={sourcePath}
             onClose={() => setShowUploadModal(false)}
-          />
+          /></PanelBoundary>
         )}
         {showNewWorld && (
-          <NewWorldModal
+          <PanelBoundary kind="dialog" label="New world" onClose={() => setShowNewWorld(false)}><NewWorldModal
             onClose={() => setShowNewWorld(false)}
             onCreated={(path) => { setShowNewWorld(false); openFileAt(path, { fresh: true }); }}
-          />
+          /></PanelBoundary>
         )}
         <ConfirmHost />
 
         {/* Sky Editor and Creature Viewer panels — implemented, hidden pending testing */}
 
+        {goToFrom && world && (
+          <PanelBoundary kind="dialog" label="Go to X, Y" onClose={() => setGoToFrom(null)}><GoToModal
+            width={chunkToWorld(world.width_chunks)} height={chunkToWorld(world.height_chunks)}
+            initial={goToFrom}
+            onGo={(x, y) => mapCanvasRef.current?.centerOn(x, y)}
+            onClose={() => setGoToFrom(null)}
+          /></PanelBoundary>
+        )}
+
         {/* Materialize ungenerated chunk space modal */}
         {showMaterializeModal && world && materializeSelection && (
-          <MaterializeModal
+          <PanelBoundary kind="dialog" label="Materialize" onClose={() => setShowMaterializeModal(false)}><MaterializeModal
             world={world}
             bounds={materializeSelection}
             onClose={() => setShowMaterializeModal(false)}
@@ -4191,7 +4445,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
               setMaterializeSelection(null);
               setShowMaterializeModal(false);
             }}
-          />
+          /></PanelBoundary>
         )}
 
         {/* Expand from Template — on the shared Dialog chrome (it was the last hand-rolled
@@ -4257,6 +4511,24 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           items.push({
             id: "spawn", label: "Set Home Point Here", icon: "home",
             onClick: () => { invoke<[number,number]>("set_spawn_pos", { px: Math.round(ctxMenu.wx), py: Math.round(ctxMenu.wy) }).then(([px, py]) => { setSpawnPos({ px, py }); setEditEpoch(e => e + 1); }).catch(e => reportError(e)); },
+          });
+          items.push({
+            id: "playerStart", label: "Set Player Start Here", icon: "start",
+            onClick: () => {
+              const px = Math.round(ctxMenu.wx), py = Math.round(ctxMenu.wy);
+              invoke("set_player_pos", { px, py })
+                .then(() => { setPlayerPos({ px, py }); setEditEpoch(e => e + 1); })
+                .catch(e => reportError(e));
+            },
+          });
+          items.push({
+            id: "pickBlock", label: "Pick Block", icon: "eyedropper",
+            onClick: () => { void pickBlockAt(ctxMenu.wx, ctxMenu.wy); },
+          });
+          if (rawBounds) items.push({
+            id: "zoomSel", label: "Zoom to Selection", icon: "zoomSel",
+            shortcut: formatChord(COMMAND_META["view.zoom.selection"].keys[0]),
+            onClick: () => mapCanvasRef.current?.zoomToBox(rawBounds.x1, rawBounds.y1, rawBounds.x2, rawBounds.y2),
           });
           if (rawBounds) items.push({
             id: "copy", label: "Copy", icon: "copy", separatorBefore: true,
@@ -4347,16 +4619,20 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
         {statusBarEl}
 
         {/* Toast stack — sits clear of the status bar (STATUS_BAR_HEIGHT), newest at the bottom. */}
-        {toasts.length > 0 && (
-          <div style={{
+        {/* Always mounted: a screen reader only announces additions to a live region that already
+            exists (22.19). `pointer-events:none` keeps the empty wrapper click-through. */}
+        {(
+          <div role="status" aria-live="polite" style={{
             position: "fixed", bottom: STATUS_BAR_HEIGHT + 10, left: "50%", transform: "translateX(-50%)",
             zIndex: 200, display: "flex", flexDirection: "column", alignItems: "center", gap: 6,
+            maxWidth: "calc(100vw - 24px)", pointerEvents: "none",
           }}>
             {toasts.map((t) => {
               const isErr = t.kind === "error";
               return (
                 <div
                   key={t.id}
+                  role={isErr ? "alert" : undefined}
                   // Errors are dismissable and hold open while hovered so a long message can be
                   // read; info toasts are pure status blips and stay click-through.
                   onMouseEnter={isErr ? () => {
@@ -4372,7 +4648,8 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
                     boxShadow: `inset 0 1px 0 rgba(255,255,255,.06), 0 8px 20px rgba(0,0,0,.4), 0 0 0 1px ${isErr ? "rgba(248,113,113,.45)" : `rgba(${EDEN_TEAL},.25)`}`,
                     color: isErr ? RAMP.textDanger : RAMP.text,
                     fontSize: 12, maxWidth: 460,
-                    whiteSpace: isErr ? "normal" : "nowrap",
+                    // Info toasts wrap too (22.19): a long one used to run off both screen edges.
+                    whiteSpace: "normal", overflowWrap: "anywhere",
                     pointerEvents: isErr ? "auto" : "none",
                     display: "flex", alignItems: "flex-start", gap: 8,
                     animation: "eden-toast-in .15s ease-out",
@@ -4539,12 +4816,12 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           ) : (
             <div style={{ flex: 1, overflowY: "auto", display: "flex", flexDirection: "column", gap: SPACE.xs }}>
               {visibleRecent.map((r) => (
+                <div key={r.path} className="spl-recent-wrap">
                 <button
-                  key={r.path}
                   className="spl-recent"
                   aria-disabled={loading || undefined}
                   tabIndex={loading ? -1 : 0}
-                  onClick={() => { if (!loading) openFileAt(r.path); }}
+                  onClick={() => { if (!loading) openRecent(r.path); }}
                   title={r.path}
                 >
                   <Icon name="world" size={ICON.lg} strokeWidth={1.5} />
@@ -4559,6 +4836,14 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
                   </div>
                   <span style={{ fontSize: FONT.label, color: TEXT_META, flexShrink: 0 }}>{timeAgo(r.timestamp)}</span>
                 </button>
+                <button
+                  className="spl-recent-x"
+                  aria-label={`Remove ${r.name} from recent worlds`}
+                  title="Remove from recent"
+                  tabIndex={loading ? -1 : 0}
+                  onClick={() => removeRecentWorld(r.path)}
+                >✕</button>
+                </div>
               ))}
 
               {recentWorlds.length > SPLASH_RECENT_COLLAPSED && (
@@ -4577,28 +4862,28 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
       </div>
       </div>
 
-      {showAbout && <AboutModal version={appVersion} onClose={() => setShowAbout(false)} />}
+      {showAbout && <PanelBoundary kind="dialog" label="About" onClose={() => setShowAbout(false)}><AboutModal version={appVersion} onClose={() => setShowAbout(false)} /></PanelBoundary>}
       {recoveryInfo && (
-        <RecoveryModal info={recoveryInfo} recovering={recovering} onRecover={recoverAutosave} onDiscard={discardRecovery} onDismiss={dismissRecovery} onOpenBase={openRecoveryBase} />
+        <PanelBoundary kind="dialog" label="Recovery" onClose={() => dismissRecovery()}><RecoveryModal info={recoveryInfo} recovering={recovering} onRecover={recoverAutosave} onDiscard={discardRecovery} onDismiss={dismissRecovery} onOpenBase={openRecoveryBase} /></PanelBoundary>
       )}
       {showSettings && (
-        <SettingsModal
+        <PanelBoundary kind="dialog" label="Settings" onClose={() => setShowSettings(false)}><SettingsModal
           onClose={() => setShowSettings(false)}
           onSave={applySettings}
-        />
+        /></PanelBoundary>
       )}
 
       {showWorldBrowser && (
-        <WorldBrowserModal
+        <PanelBoundary kind="dialog" label="World browser" onClose={() => setShowWorldBrowser(false)}><WorldBrowserModal
           onClose={() => setShowWorldBrowser(false)}
           onOpenWorld={(path) => { setShowWorldBrowser(false); openFileAt(path); }}
-        />
+        /></PanelBoundary>
       )}
       {showNewWorld && (
-        <NewWorldModal
+        <PanelBoundary kind="dialog" label="New world" onClose={() => setShowNewWorld(false)}><NewWorldModal
           onClose={() => setShowNewWorld(false)}
           onCreated={(path) => { setShowNewWorld(false); openFileAt(path, { fresh: true }); }}
-        />
+        /></PanelBoundary>
       )}
       <ConfirmHost />
     </div>

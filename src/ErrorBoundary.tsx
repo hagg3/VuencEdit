@@ -10,11 +10,11 @@ import { btnBase } from "./ribbon/tokens";
 interface Props {
   children: ReactNode;
   /** Inline fallback shown in place of the failed subtree. Receives a retry callback. */
-  fallback?: (error: Error, retry: () => void) => ReactNode;
+  fallback?: (error: Error, retry: () => void, dismiss: () => void) => ReactNode;
   /** Label used in the default fallback (e.g. "3D view"). */
   label?: string;
 }
-interface State { error: Error | null }
+interface State { error: Error | null; dismissed?: boolean }
 
 export default class ErrorBoundary extends Component<Props, State> {
   state: State = { error: null };
@@ -28,12 +28,15 @@ export default class ErrorBoundary extends Component<Props, State> {
     console.error(`[ErrorBoundary${this.props.label ? ` ${this.props.label}` : ""}]`, error, info);
   }
 
-  retry = () => this.setState({ error: null });
+  retry = () => this.setState({ error: null, dismissed: false });
+  /** Hides the fallback too (a floating piece's "close"); Retry on a remount brings it back. */
+  dismiss = () => this.setState({ dismissed: true });
 
   render() {
     const { error } = this.state;
     if (!error) return this.props.children;
-    if (this.props.fallback) return this.props.fallback(error, this.retry);
+    if (this.state.dismissed) return null;
+    if (this.props.fallback) return this.props.fallback(error, this.retry, this.dismiss);
     return (
       <div style={{
         display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center",

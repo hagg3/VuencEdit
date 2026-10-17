@@ -1,5 +1,5 @@
 /**
- * The sixteen sculpt tools, in frequency order: the four primaries get large buttons, the rest live
+ * The fifteen sculpt tools, in frequency order: the four primaries get large buttons, the rest live
  * in a "More tools" dropdown menu (mirrors the Draw tab's Shape split/dropdown button). Module scope
  * so the Sculpt tab and the 3D tab's Sculpt mode share one source of truth (they are one brush —
  * same state, same backend command).
@@ -28,7 +28,6 @@ export const SCULPT_MORE: SculptToolDef[] = [
   { id: "flatten", icon: "flatten", label: "Flatten", title: "Level terrain to the height you click" },
   { id: "slope", icon: "slope", label: "Slope", title: "Flatten to a tilted plane (Slope X/Y in the Brush shape panel)" },
   { id: "noise", icon: "noise", label: "Noise", title: "Add hills or mountains" },
-  { id: "erode", icon: "erode", label: "Erode", title: "Lower each column toward its lowest neighbour" },
   { id: "thermal", icon: "thermal", label: "Thermal", title: "Slide steep slopes into scree" },
   { id: "hydro", icon: "hydro", label: "Hydro", title: "Water erosion that carves channels" },
   { id: "terrace", icon: "terrace", label: "Terrace", title: "Cut terrain into steps of Strength blocks" },
@@ -42,14 +41,23 @@ export const SCULPT_ALL: SculptToolDef[] = [...SCULPT_PRIMARY, ...SCULPT_MORE];
 
 export const SCULPT_TOOL_IDS: Tool[] = SCULPT_ALL.map(t => t.id);
 
-/** Rock and Carve are volumetric and share one parameter block; Retexture consumes the palette. */
-export const SCULPT_USES_PALETTE = (t: Tool) => t === "rock" || t === "stamp";
+/** Rock and Carve are volumetric and share one parameter block. Only Rock consumes the palette
+ *  (Retexture classifies by slope and ignores it; every other tool keeps the surface block). */
+export const SCULPT_USES_PALETTE = (t: Tool) => t === "rock";
 export const SCULPT_IS_VOLUMETRIC = (t: Tool) => t === "rock" || t === "carve";
 
 /** The newer/less-battle-tested tools, each flagged individually in the "More tools" menu rather
  *  than the whole module carrying one blanket EXP badge — Raise/Lower/Rock/Carve/Smooth/Flatten
  *  are considered stable. */
 const EXPERIMENTAL: ReadonlySet<Tool> = new Set([
-  "slope", "noise", "erode", "thermal", "hydro", "terrace", "sharpen", "smear", "grab", "stamp",
+  "slope", "noise", "thermal", "hydro", "terrace", "sharpen", "smear", "grab", "stamp",
 ]);
 export const SCULPT_IS_EXPERIMENTAL = (t: Tool) => EXPERIMENTAL.has(t);
+
+/** Tools that never read the Strength slider (22.10): Flatten/Slope level to a target, Grab follows
+ *  the drag, Smear follows the stroke, Retexture only repaints. The slider is disabled for them
+ *  rather than left live and silently inert. */
+export const SCULPT_IGNORES_STRENGTH = (t: Tool) =>
+  t === "flatten" || t === "slope" || t === "grab" || t === "smear" || t === "stamp";
+/** Retexture never changes heights, so the edge-softness blend has nothing to act on. */
+export const SCULPT_IGNORES_SOFTNESS = (t: Tool) => t === "stamp";

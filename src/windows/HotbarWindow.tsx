@@ -153,10 +153,21 @@ function HotbarCell({
       role="button" tabIndex={block ? 0 : -1}
       aria-label={block ? `${blockDisplayName(block.type)}${block.paint > 0 ? ` paint ${block.paint}` : ""}` : `Empty ${kind} slot ${index + 1}`}
       title={block
-        ? `${blockDisplayName(block.type)}${block.paint > 0 ? ` p${block.paint}` : ""} · key ${digit}`
+        ? `${blockDisplayName(block.type)}${block.paint > 0 ? ` p${block.paint}` : ""} · key ${digit} · P to ${kind === "pinned" ? "unpin" : "pin"}`
         : `Empty ${kind} slot ${index + 1}`}
       onClick={onSelect}
-      onKeyDown={e => { if (block && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); onSelect(); } }}
+      // Keyboard pinning (22.19): P pins a recent / unpins a pinned slot (Delete also unpins) — the
+      // badge below is hover-only for the pointer, and focus reveals it the same way.
+      onKeyDown={e => {
+        if (!block) return;
+        if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onSelect(); }
+        else if ((e.key === "p" || e.key === "P") && !e.metaKey && !e.ctrlKey && !e.altKey) {
+          e.preventDefault(); onPinToggle();
+        } else if (e.key === "Delete" && kind === "pinned") { e.preventDefault(); onPinToggle(); }
+      }}
+      onFocus={() => onHover(key)}
+      onBlur={() => onHover(null)}
+      aria-keyshortcuts={block ? "P" : undefined}
       onMouseEnter={() => onHover(key)}
       onMouseLeave={() => onHover(null)}
       style={{

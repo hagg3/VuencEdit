@@ -108,6 +108,23 @@ export const BLOCK_TOP_TEX: Record<number, string> = {
   109: "firework",
   110: "lightbox",
   111: "steel",
+  // 112–127: tiles 32–47 of the Emod 64-tile atlas.png (absent from a stock atlas → flat colour)
+  112: "ore_sand",
+  113: "space_stone",
+  114: "carpet",
+  115: "snakeskin",
+  116: "obsidian",
+  117: "cheese",
+  118: "space_dirt",
+  119: "space_grass",
+  120: "moss",
+  121: "dark_matter",
+  122: "space_sand",
+  123: "snow",
+  124: "moonrock",
+  125: "basalt",
+  126: "dark_tile",
+  127: "algae",
 };
 
 // Cache: "(blockType,paint)" → data URL (or null when no tile available). Bounded (§2 of the
@@ -167,8 +184,11 @@ export function tintedSwatch(
     }
   }
 
-  // Multiply full-color tile by block tint (same GL_MODULATE as the 3D views)
-  const [tr, tg, tb] = resolveColor(blockType, paint);
+  // Multiply full-color tile by block tint (same GL_MODULATE as the 3D views). Unpainted 112–127
+  // tiles are the finished colour art and draw white (face_color_and_row in texture.rs).
+  const [tr, tg, tb] = paint === 0 && blockType >= 112 && blockType <= 127
+    ? [255, 255, 255]
+    : resolveColor(blockType, paint);
   for (let i = 0; i < imgData.data.length; i += 4) {
     imgData.data[i]     = Math.round(imgData.data[i]     * tr / 255);
     imgData.data[i + 1] = Math.round(imgData.data[i + 1] * tg / 255);

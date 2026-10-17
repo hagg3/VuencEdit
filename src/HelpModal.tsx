@@ -78,6 +78,10 @@ const TILE_GROUPS: { label: string; tiles: string[] }[] = [
     label: "Expansion blocks (side + bottom)",
     tiles: ["blocktnt"],
   },
+  {
+    label: "New-format blocks (112–127)",
+    tiles: ["ore_sand", "space_stone", "carpet", "snakeskin", "obsidian", "cheese", "space_dirt", "space_grass", "moss", "dark_matter", "space_sand", "snow", "moonrock", "basalt", "dark_tile", "algae"],
+  },
 ];
 
 function TileName({ name }: { name: string }) {
@@ -203,6 +207,7 @@ function TexturePackHelp() {
             ["Brick", "All faces: brick(_color)"],
             ["Ramps / Wedges", "Use the same tile as their material (e.g. stone, wood)"],
             ["Expansion blocks 82–111", "Side + bottom: blocktnt · Top: base material"],
+            ["New-format blocks 112–127", "All faces: their own tile (Emod atlas.png tiles 32–47)"],
           ].map(([block, faces]) => (
             <tr key={block}>
               <td style={{ padding: "3px 16px 3px 0", color: MODAL_TEXT.primary, whiteSpace: "nowrap", verticalAlign: "top" }}>{block}</td>
@@ -238,7 +243,7 @@ function ToolsHelp() {
             ["Smear", "Pulls terrain along with the brush"],
             ["Sharpen", "Crisps terrain (opposite of Smooth)"],
             ["Noise", "Adds hills or ridged mountains"],
-            ["Erode / Thermal / Hydro", "Erosion from gentle to strong: slides, then water flow"],
+            ["Thermal / Hydro", "Erosion: slides, then water flow"],
             ["Retexture", "Repaints by slope (flat: grass, mid: dirt, steep: stone) without changing height"],
             ["Rock", "Places a rock mass fused into the terrain. Tune it in the Rock shape panel."],
             ["Carve", "Cuts a rounded hollow. It only removes exposed terrain, so it never opens a cave roof. Tune it in the Carve shape panel."],

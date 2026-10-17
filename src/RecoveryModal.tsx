@@ -21,7 +21,8 @@ function timeAgoShort(unixSeconds: number): string {
 
 /**
  * ⚠️ Escape / backdrop-click must NOT destroy the autosave (they call `onDismiss`, which only
- * closes the dialog and leaves the sidecar on disk to be re-offered next launch). Deleting the
+ * closes the dialog and leaves the sidecar on disk to be re-offered next launch; the backend pauses
+ * autosave until then so it survives, 21.5). Deleting the
  * only copy of the user's unsaved work is reserved for the explicit Discard button, behind a
  * confirm step — this is the one dialog whose entire job is protecting that work.
  */
@@ -53,7 +54,10 @@ export default function RecoveryModal({
     </>
   ) : (
     <>
-      <DialogButton onClick={onDismiss} disabled={recovering}>Not now</DialogButton>
+      <DialogButton
+        onClick={onDismiss} disabled={recovering}
+        title="Keep the autosave for next launch. Autosave is paused until then so it isn't overwritten."
+      >Not now</DialogButton>
       <DialogButton onClick={() => setConfirmDiscard(true)} disabled={recovering}>Discard</DialogButton>
       {status === "changed" ? (
         <DialogButton variant="primary" onClick={onOpenBase} disabled={recovering}>Open file</DialogButton>

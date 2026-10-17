@@ -2,6 +2,14 @@ export interface WP { x: number; y: number }
 export type BrushShape = "sq" | "circ";
 export type FillMode = "fill" | "outline";
 
+// Numeric cell keys (audit M8): `x * 2^32 + y` is unique for |y| < 2^31 and exact in a double for
+// |x| < 2^20, far beyond any world coordinate. Replaces `"x,y"` string keys (and their per-cell
+// `parseInt` on the way back out). `Set` insertion order is unchanged, so iteration order is too.
+const KEY_STRIDE = 4294967296;
+export function cellKey(x: number, y: number): number { return x * KEY_STRIDE + y; }
+export function cellKeyX(k: number): number { return Math.floor((k + 2147483648) / KEY_STRIDE); }
+export function cellKeyY(k: number): number { return k - cellKeyX(k) * KEY_STRIDE; }
+
 export function penFootprint(p: WP): WP[] {
   return [{ x: p.x, y: p.y }];
 }
@@ -40,32 +48,30 @@ export function bresenhamLine(a: WP, b: WP): WP[] {
 export function linePixels(a: WP, b: WP, size: number, shape: BrushShape): WP[] {
   const centre = bresenhamLine(a, b);
   if (size <= 1) return centre;
-  const seen = new Set<string>();
+  const seen = new Set<number>();
   const pts: WP[] = [];
   for (const c of centre) {
     for (const p of brushFootprint(c, size, shape)) {
-      const k = `${p.x},${p.y}`;
+      const k = cellKey(p.x, p.y);
       if (!seen.has(k)) { seen.add(k); pts.push(p); }
     }
   }
   return pts;
 }
 
-/** Filled or outlined polygon from an ordered vertex list (auto-closed). */
-export function polygonPixels(verts: WP[], mode: FillMode): WP[] {
-  if (verts.length === 0) return [];
-  if (verts.length === 1) return [{ x: verts[0].x, y: verts[0].y }];
-  // Edge pixels (closed loop) via bresenham between consecutive vertices.
+/** Edge pixels of the closed vertex loop, plus (fill, >= 3 verts) one `[xa, xb]` run per scanline
+ *  span. Runs are inclusive and may overlap the edge pixels — callers dedupe or OR into a bitset. */
+function polygonEdgeAndRuns(verts: WP[], fill: boolean): { edge: WP[]; runs: { y: number; xa: number; xb: number }[] } {
   const edge: WP[] = [];
   for (let i = 0; i < verts.length; i++) {
     const a = verts[i], b = verts[(i + 1) % verts.length];
     for (const p of bresenhamLine(a, b)) edge.push(p);
   }
-  if (mode === "outline" || verts.length < 3) return dedup(edge);
+  const runs: { y: number; xa: number; xb: number }[] = [];
+  if (!fill || verts.length < 3) return { edge, runs };
   // Scanline fill: for each row, find polygon-edge crossings and fill between pairs.
   let minY = Infinity, maxY = -Infinity;
   for (const v of verts) { minY = Math.min(minY, v.y); maxY = Math.max(maxY, v.y); }
-  const pts: WP[] = [...edge];
   for (let y = Math.ceil(minY); y <= Math.floor(maxY); y++) {
     const xs: number[] = [];
     for (let i = 0; i < verts.length; i++) {
@@ -78,10 +84,67 @@ export function polygonPixels(verts: WP[], mode: FillMode): WP[] {
     }
     xs.sort((m, n) => m - n);
     for (let i = 0; i + 1 < xs.length; i += 2) {
-      for (let x = Math.ceil(xs[i]); x <= Math.floor(xs[i + 1]); x++) pts.push({ x, y });
+      const xa = Math.ceil(xs[i]), xb = Math.floor(xs[i + 1]);
+      if (xa <= xb) runs.push({ y, xa, xb });
     }
   }
-  return dedup(pts);
+  return { edge, runs };
+}
+
+/** Filled or outlined polygon from an ordered vertex list (auto-closed). */
+export function polygonPixels(verts: WP[], mode: FillMode): WP[] {
+  if (verts.length === 0) return [];
+  if (verts.length === 1) return [{ x: verts[0].x, y: verts[0].y }];
+  const { edge, runs } = polygonEdgeAndRuns(verts, mode !== "outline");
+  if (runs.length === 0) return dedup(edge);
+  const seen = new Set<number>();
+  const pts: WP[] = [];
+  for (const p of edge) {
+    const k = cellKey(p.x, p.y);
+    if (!seen.has(k)) { seen.add(k); pts.push(p); }
+  }
+  for (const r of runs) {
+    for (let x = r.xa; x <= r.xb; x++) {
+      const k = cellKey(x, r.y);
+      if (!seen.has(k)) { seen.add(k); pts.push({ x, y: r.y }); }
+    }
+  }
+  return pts;
+}
+
+/**
+ * The filled polygon straight into a row-major selection bitset — no per-cell objects (audit M7).
+ * Same cells as `polygonPixels(verts, "fill")`, with the bbox's min corner clamped to 0 (negative
+ * world coords don't exist) exactly as the old caller did. Bit `(y-y1)*width + (x-x1)`. Returns
+ * null when the polygon has no cells.
+ */
+export function polygonMask(verts: WP[]): { x1: number; y1: number; x2: number; y2: number; bits: Uint8Array } | null {
+  if (verts.length === 0) return null;
+  let edge: WP[], runs: { y: number; xa: number; xb: number }[];
+  if (verts.length === 1) { edge = [{ x: verts[0].x, y: verts[0].y }]; runs = []; }
+  else ({ edge, runs } = polygonEdgeAndRuns(verts, true));
+  let x1 = Infinity, y1 = Infinity, x2 = -Infinity, y2 = -Infinity;
+  for (const p of edge) {
+    if (p.x < x1) x1 = p.x; if (p.x > x2) x2 = p.x;
+    if (p.y < y1) y1 = p.y; if (p.y > y2) y2 = p.y;
+  }
+  for (const r of runs) {
+    if (r.xa < x1) x1 = r.xa; if (r.xb > x2) x2 = r.xb;
+    if (r.y < y1) y1 = r.y; if (r.y > y2) y2 = r.y;
+  }
+  x1 = Math.max(0, x1); y1 = Math.max(0, y1);
+  const width = x2 - x1 + 1, height = y2 - y1 + 1;
+  const bits = new Uint8Array(Math.ceil((width * height) / 8));
+  const set = (x: number, y: number) => {
+    if (x < x1 || x > x2 || y < y1 || y > y2) return;
+    const i = (y - y1) * width + (x - x1);
+    bits[i >> 3] |= 1 << (i & 7);
+  };
+  for (const p of edge) set(p.x, p.y);
+  for (const r of runs) {
+    for (let x = Math.max(r.xa, x1); x <= r.xb; x++) set(x, r.y);
+  }
+  return { x1, y1, x2, y2, bits };
 }
 
 export function rectPixels(a: WP, b: WP, mode: FillMode): WP[] {
@@ -98,6 +161,38 @@ export function rectPixels(a: WP, b: WP, mode: FillMode): WP[] {
   return pts;
 }
 
+/** Rect as inclusive cell rectangles `[x, y, w, h]` — a ghost paints these with `fillRect` instead
+ *  of one call per cell. Union equals `rectPixels(a, b, mode)`; outline strips never overlap. */
+export function rectRects(a: WP, b: WP, mode: FillMode): [number, number, number, number][] {
+  const x1 = Math.min(a.x, b.x), x2 = Math.max(a.x, b.x);
+  const y1 = Math.min(a.y, b.y), y2 = Math.max(a.y, b.y);
+  const w = x2 - x1 + 1, h = y2 - y1 + 1;
+  if (mode === "fill" || w <= 2 || h <= 2) return [[x1, y1, w, h]];
+  return [
+    [x1, y1, w, 1],          // top row
+    [x1, y2, w, 1],          // bottom row
+    [x1, y1 + 1, 1, h - 2],  // left column, between the rows
+    [x2, y1 + 1, 1, h - 2],  // right column
+  ];
+}
+
+/** Filled ellipse as per-row runs `[y, xa, xb]` (inclusive) with no per-cell objects. Same cells as
+ *  `ellipsePixels(a, b, "fill")` as a set. */
+export function ellipseFillRuns(a: WP, b: WP): [number, number, number][] {
+  const cx = (a.x + b.x) / 2, cy = (a.y + b.y) / 2;
+  const rx = Math.abs(b.x - a.x) / 2, ry = Math.abs(b.y - a.y) / 2;
+  if (rx === 0 && ry === 0) return [[Math.round(cy), Math.round(cx), Math.round(cx)]];
+  const rows = new Map<number, { minX: number; maxX: number }>();
+  for (const p of midpointEllipse(cx, cy, rx, ry)) {
+    const r = rows.get(p.y);
+    if (!r) rows.set(p.y, { minX: p.x, maxX: p.x });
+    else { if (p.x < r.minX) r.minX = p.x; if (p.x > r.maxX) r.maxX = p.x; }
+  }
+  const out: [number, number, number][] = [];
+  for (const [y, { minX, maxX }] of rows) out.push([y, minX, maxX]);
+  return out;
+}
+
 export function ellipsePixels(a: WP, b: WP, mode: FillMode): WP[] {
   const cx = (a.x + b.x) / 2, cy = (a.y + b.y) / 2;
   const rx = Math.abs(b.x - a.x) / 2, ry = Math.abs(b.y - a.y) / 2;
@@ -111,11 +206,12 @@ export function ellipsePixels(a: WP, b: WP, mode: FillMode): WP[] {
     if (!r) rows.set(p.y, { minX: p.x, maxX: p.x });
     else { r.minX = Math.min(r.minX, p.x); r.maxX = Math.max(r.maxX, p.x); }
   }
+  // Rows are unique per y and runs don't overlap, so no dedup pass is needed.
   const pts: WP[] = [];
   for (const [y, { minX, maxX }] of rows) {
     for (let x = minX; x <= maxX; x++) pts.push({ x, y });
   }
-  return dedup(pts);
+  return pts;
 }
 
 function midpointEllipse(cx: number, cy: number, rx: number, ry: number): WP[] {
@@ -156,9 +252,9 @@ function midpointEllipse(cx: number, cy: number, rx: number, ry: number): WP[] {
 }
 
 function dedup(pts: WP[]): WP[] {
-  const seen = new Set<string>();
+  const seen = new Set<number>();
   return pts.filter(p => {
-    const k = `${p.x},${p.y}`;
+    const k = cellKey(p.x, p.y);
     if (seen.has(k)) return false;
     seen.add(k);
     return true;

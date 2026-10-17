@@ -7,12 +7,15 @@ import { spinnerStyle } from "./designTokens";
 import { v } from "./theme/cssVars";
 import { resolveColor } from "./blockDefs";
 import { putPatchPixels } from "./viewportUtils";
-import { Icon, type IconName } from "./ribbon/icons";
+import { Icon } from "./ribbon/icons";
 import { ACCENT, FONT, SURFACE, TEXT_DANGER, TEXT_DIM } from "./ribbon/tokens";
 import { Badge, Callout, Check, IconButton, NumField, Segmented, Select, SliderRow, TextField } from "./ribbon/primitives";
 import Dialog, { DialogButton } from "./ui/Dialog";
 import { DialogNav, type DialogNavItem } from "./ui/DialogNav";
 import { SectionHeading, SettingBlock } from "./ui/SettingRow";
+
+/** `worldgen::GEN_CANCELLED` — the error a cancelled create rejects with. */
+const CANCELLED = "Cancelled";
 
 interface GenProgress { phase: string; pct: number; }
 interface Preview { width: number; height: number; pixels: Uint8Array; }
@@ -70,20 +73,54 @@ function SeedRow({ value, onChange, onRandomise }: {
   );
 }
 
-/** The Preview / Refresh button and, once rendered, the canvas + caption. One copy for Natural and Tg2. */
-function PreviewBlock({ busy, preview, onPreview, caption }: {
-  busy: boolean; preview: Preview | null; onPreview: () => void; caption: string;
+/**
+ * Live preview: re-renders `PREVIEW_DEBOUNCE_MS` after the last change to `deps` (and on first
+ * showing), keeping the previous image on screen meanwhile. A request that a newer change has
+ * overtaken is dropped when it lands, so seed hunting is one click per roll.
+ */
+const PREVIEW_DEBOUNCE_MS = 250;
+function useLivePreview(
+  active: boolean, deps: readonly unknown[], fetcher: () => Promise<ArrayBuffer>, onError: (msg: string) => void,
+) {
+  const [preview, setPreview] = useState<Preview | null>(null);
+  const [busy, setBusy] = useState(false);
+  const seq = useRef(0);
+  const latest = useRef({ fetcher, onError });
+  useEffect(() => { latest.current = { fetcher, onError }; });
+  const [nonce, setNonce] = useState(0);
+  useEffect(() => {
+    if (!active) { setBusy(false); return; }
+    const mine = ++seq.current;
+    const timer = setTimeout(async () => {
+      setBusy(true);
+      try {
+        const buf = await latest.current.fetcher();
+        if (seq.current === mine) setPreview(decodePreviewData(buf));
+      } catch (e) {
+        if (seq.current === mine) latest.current.onError(String(e));
+      } finally {
+        if (seq.current === mine) setBusy(false);
+      }
+    }, PREVIEW_DEBOUNCE_MS);
+    return () => { clearTimeout(timer); seq.current++; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [active, nonce, ...deps]);
+  return { preview, busy, refresh: () => setNonce(n => n + 1) };
+}
+
+/** The live preview canvas with a manual refresh; dims while a newer render is in flight. */
+function PreviewBlock({ busy, preview, onRefresh, caption }: {
+  busy: boolean; preview: Preview | null; onRefresh: () => void; caption: string;
 }) {
-  const icon: IconName = preview ? "refresh" : "eye";
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-      <DialogButton onClick={onPreview} disabled={busy}
+      <DialogButton onClick={onRefresh} disabled={busy}
         style={{ width: "100%", display: "flex", alignItems: "center", justifyContent: "center", gap: 6, cursor: busy ? "wait" : undefined }}>
-        {busy ? <div style={spinnerStyle(14)} /> : <Icon name={icon} size={14} tone="inherit" />}
-        {busy ? "Rendering preview…" : preview ? "Refresh preview" : "Preview terrain"}
+        {busy ? <div style={spinnerStyle(14)} /> : <Icon name="refresh" size={14} tone="inherit" />}
+        {busy ? "Rendering preview…" : "Refresh preview"}
       </DialogButton>
       {preview && (
-        <div>
+        <div style={{ opacity: busy ? 0.6 : 1, transition: "opacity 0.12s" }}>
           <PreviewCanvas preview={preview} />
           <div style={{ color: TEXT_DIM, fontSize: FONT.label, textAlign: "center", marginTop: 4 }}>{caption}</div>
         </div>
@@ -123,8 +160,6 @@ export default function NewWorldModal({ onClose, onCreated }: Props) {
   const [creating,     setCreating]     = useState(false);
   const [progress,     setProgress]     = useState<GenProgress | null>(null);
   const [error,        setError]        = useState<string | null>(null);
-  const [preview,      setPreview]      = useState<Preview | null>(null);
-  const [previewing,   setPreviewing]   = useState(false);
   const unlistenRef = useRef<(() => void) | null>(null);
   const mountedRef = useRef(true);
 
@@ -184,20 +219,48 @@ export default function NewWorldModal({ onClose, onCreated }: Props) {
   const [tg2Caves,       setTg2Caves]       = useState(false);
   const [tg2TallCaves,   setTg2TallCaves]   = useState(false);
   const [tg2CustomBiomes, setTg2CustomBiomes] = useState<[number,number,number,number]>([0,6,4,2]); // NW/NE/SW/SE
-  const [tg2Preview,     setTg2Preview]     = useState<Preview | null>(null);
-  const [tg2Previewing,  setTg2Previewing]  = useState(false);
 
-  // Drop a stale preview whenever a surface-affecting parameter changes.
-  useEffect(() => { setPreview(null); }, [
-    seed, baseHeight, roughnessLevel, erosionLevel, terrainScale, extreme,
-    waterMode, rivers, biome, biomeMode, biomeScale, snowCaps,
-    widthChunks, heightChunks, extendedZ,
-  ]);
-
-  useEffect(() => { setTg2Preview(null); }, [
-    tg2Seed, tg2TerrainType, tg2SizeChunks, tg2CustomBiomes,
-    tg2Amplitude, tg2SeaLevel, extendedZ,
-  ]);
+  // Live previews: one per generator tab, re-rendered (debounced) whenever a surface-affecting
+  // parameter changes and only while its tab is showing and no create is running.
+  const showPreview = !creating;
+  const natural = useLivePreview(
+    showPreview && terrainType === "natural",
+    [seed, baseHeight, roughnessLevel, erosionLevel, terrainScale, extreme,
+      waterMode, rivers, biome, biomeMode, biomeScale, snowCaps, widthChunks, heightChunks, extendedZ],
+    () => invoke<ArrayBuffer>("preview_natural_world", {
+      widthChunks, heightChunks, extendedZ,
+      seed, baseHeight, roughnessLevel, erosionLevel,
+      terrainScaleLevel: terrainScale,
+      extreme: extendedZ && extreme,
+      waterMode, rivers,
+      biome, biomeMode, biomeScaleLevel: biomeScale, snowCaps,
+      treeDensity, caveDensity, caveStyle, caverns, floodCaves,
+      oreDensity, vegetation, structures,
+      clouds: cloudsEnabled,
+      maxPx: 220,
+    }),
+    msg => setError(msg),
+  );
+  const classic = useLivePreview(
+    showPreview && terrainType === "classic",
+    [seed, classicVariance, classicBaseHeight, widthChunks, heightChunks, extendedZ],
+    () => invoke<ArrayBuffer>("preview_classic_world", {
+      widthChunks, heightChunks, extendedZ,
+      seed, varianceLevel: classicVariance, baseHeight: classicBaseHeight,
+      maxPx: 220,
+    }),
+    msg => setError(msg),
+  );
+  const tg2 = useLivePreview(
+    showPreview && terrainType === "tg2",
+    [tg2Seed, tg2TerrainType, tg2SizeChunks, tg2CustomBiomes, tg2Amplitude, tg2SeaLevel, extendedZ],
+    () => invoke<ArrayBuffer>("preview_tg2_world", {
+      sizeChunks: tg2SizeChunks, seed: tg2Seed, terrainType: tg2TerrainType, maxPx: 220,
+      customBiomes: tg2TerrainType === 9 ? [...tg2CustomBiomes] : null,
+      extendedZ, amplitude: tg2Amplitude, seaLevelOff: tg2SeaLevel,
+    }),
+    msg => setError(msg),
+  );
 
   const maxZ     = extendedZ ? 255 : 63;
   const surfaceZ = 1 + stoneDepth + dirtDepth;
@@ -303,55 +366,13 @@ export default function NewWorldModal({ onClose, onCreated }: Props) {
       }
       if (mountedRef.current) onCreated(savePath); // don't open a world into an unmounted modal
     } catch (e) {
-      setError(String(e));
+      // A user cancel comes back as the backend's "Cancelled" error: back to the form, no banner.
+      if (String(e) !== CANCELLED) setError(String(e));
       setCreating(false);
       setProgress(null);
     } finally {
       unlistenRef.current?.();
       unlistenRef.current = null;
-    }
-  }
-
-  async function previewNatural() {
-    if (previewing) return;
-    setPreviewing(true);
-    setError(null);
-    try {
-      const buf = await invoke<ArrayBuffer>("preview_natural_world", {
-        widthChunks, heightChunks, extendedZ,
-        seed, baseHeight, roughnessLevel, erosionLevel,
-        terrainScaleLevel: terrainScale,
-        extreme: extendedZ && extreme,
-        waterMode, rivers,
-        biome, biomeMode, biomeScaleLevel: biomeScale, snowCaps,
-        treeDensity, caveDensity, caveStyle, caverns, floodCaves,
-        oreDensity, vegetation, structures,
-        clouds: cloudsEnabled,
-        maxPx: 220,
-      });
-      setPreview(decodePreviewData(buf));
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setPreviewing(false);
-    }
-  }
-
-  async function previewTg2() {
-    if (tg2Previewing) return;
-    setTg2Previewing(true);
-    setError(null);
-    try {
-      const buf = await invoke<ArrayBuffer>("preview_tg2_world", {
-        sizeChunks: tg2SizeChunks, seed: tg2Seed, terrainType: tg2TerrainType, maxPx: 220,
-        customBiomes: tg2TerrainType === 9 ? [...tg2CustomBiomes] : null,
-        extendedZ, amplitude: tg2Amplitude, seaLevelOff: tg2SeaLevel,
-      });
-      setTg2Preview(decodePreviewData(buf));
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setTg2Previewing(false);
     }
   }
 
@@ -385,10 +406,10 @@ export default function NewWorldModal({ onClose, onCreated }: Props) {
         <>
           <span style={{ marginRight: "auto", fontSize: FONT.label, color: TEXT_DIM }}>{readout}</span>
           <DialogButton
-            onClick={onClose} disabled={creating}
-            title={creating ? "World generation is running and can't be cancelled" : undefined}
+            onClick={creating ? () => { void invoke("cancel_world_gen"); } : onClose}
+            title={creating ? "Stop generating and discard the partial world" : undefined}
           >
-            Cancel
+            {creating ? "Cancel generation" : "Cancel"}
           </DialogButton>
           <DialogButton
             variant="primary" onClick={handleCreate} disabled={!valid || creating}
@@ -749,7 +770,7 @@ export default function NewWorldModal({ onClose, onCreated }: Props) {
               <SectionHeading first>Seed</SectionHeading>
               <SeedRow value={seed} onChange={setSeed} onRandomise={randomiseSeed} />
             </div>
-            <PreviewBlock busy={previewing} preview={preview} onPreview={previewNatural}
+            <PreviewBlock busy={natural.busy} preview={natural.preview} onRefresh={natural.refresh}
               caption="Top-down preview (no trees or structures)." />
           </>)}
 
@@ -757,10 +778,11 @@ export default function NewWorldModal({ onClose, onCreated }: Props) {
             <div>
               <SectionHeading first>Seed</SectionHeading>
               <SeedRow value={seed} onChange={setSeed} onRandomise={randomiseSeed} />
-              <div style={{ color: TEXT_DIM, fontSize: FONT.label, marginTop: 6, lineHeight: 1.5 }}>
-                Classic has no preview.
-              </div>
             </div>
+          )}
+          {terrainType === "classic" && (
+            <PreviewBlock busy={classic.busy} preview={classic.preview} onRefresh={classic.refresh}
+              caption="Top-down preview (no trees or caves)." />
           )}
 
           {terrainType === "tg2" && (<>
@@ -769,7 +791,7 @@ export default function NewWorldModal({ onClose, onCreated }: Props) {
               <SeedRow value={tg2Seed} onChange={setTg2Seed}
                 onRandomise={() => setTg2Seed(Math.floor(Math.random() * 999_999) + 1)} />
             </div>
-            <PreviewBlock busy={tg2Previewing} preview={tg2Preview} onPreview={previewTg2}
+            <PreviewBlock busy={tg2.busy} preview={tg2.preview} onRefresh={tg2.refresh}
               caption="Top-down heightmap (no structures, trees or blending)." />
           </>)}
 

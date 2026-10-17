@@ -15,7 +15,7 @@ import AppMenu, { type AppMenuRow } from "./AppMenu";
 import type { SelectionBounds, Tool } from "./MapCanvas";
 import type { ClipboardInfo } from "./types";
 import { RibbonProvider, type PickerKind } from "./ribbon/context";
-import { CommandBindingsProvider } from "./ribbon/Cmd";
+import { CommandBindingsProvider, CommandNoticeProvider } from "./ribbon/Cmd";
 import { bindCommands } from "./commands/bind";
 import { meta, type CommandId, type CommandPath } from "./commands/meta";
 import { matchChord } from "./commands/keys";
@@ -342,6 +342,7 @@ export default function Ribbon(p: RibbonProps) {
   return (
     <RibbonProvider value={{ p, activeTab, setActiveTab, bodyWidth: bodyWidth - fixPx, pickerKind, togglePicker, openAppMenu, armTransientTool, peeking, requestPeek }}>
       <CommandBindingsProvider value={bindings}>
+      <CommandNoticeProvider value={p.onNotice}>
       <div ref={rootRef} className="eden-ribbon" style={{
         position: "fixed", top: 0, left: 0, right: 0, zIndex: 100,
         background: TOPBAR_BG,
@@ -410,6 +411,7 @@ export default function Ribbon(p: RibbonProps) {
         )}
         {import.meta.env.DEV && <UnmarkedButtonCheck tab={activeTab} />}
       </div>
+      </CommandNoticeProvider>
       </CommandBindingsProvider>
     </RibbonProvider>
   );

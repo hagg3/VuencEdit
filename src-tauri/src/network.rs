@@ -311,12 +311,85 @@ fn copy_capped<R: Read, W: Write>(reader: &mut R, writer: &mut W, max_bytes: u64
     }
 }
 
+/// Estimate a gzip file's decompressed size from its ISIZE trailer (last 4 bytes, little-endian,
+/// size mod 2^32). Worlds can exceed 4 GiB, so lift the value by whole 4 GiB steps until it is at
+/// least the compressed length. Capped at `MAX_DOWNLOADED_WORLD_BYTES`; a lying trailer only
+/// weakens the pre-flight — `copy_capped` and the write error path still bound the damage.
+fn gzip_isize_estimate(path: &std::path::Path) -> std::io::Result<u64> {
+    use std::io::{Seek, SeekFrom};
+    let mut f = fs::File::open(path)?;
+    let len = f.metadata()?.len();
+    if len < 4 { return Ok(MAX_DOWNLOADED_WORLD_BYTES); }
+    f.seek(SeekFrom::End(-4))?;
+    let mut b = [0u8; 4];
+    f.read_exact(&mut b)?;
+    Ok(isize_to_estimate(u32::from_le_bytes(b), len))
+}
+
+fn isize_to_estimate(isize_mod: u32, compressed_len: u64) -> u64 {
+    const STEP: u64 = 1 << 32;
+    let mut est = isize_mod as u64;
+    if est < compressed_len { est += (compressed_len - est).div_ceil(STEP) * STEP; }
+    est.min(MAX_DOWNLOADED_WORLD_BYTES)
+}
+
 fn size_limit_error(stage: &str) -> String {
     format!("Downloaded world {stage} exceeds the {MAX_DOWNLOADED_WORLD_GIB} GiB safety limit")
 }
 
 fn write_error(stage: &str, error: std::io::Error) -> String {
     format!("Failed to {stage}: {error}. Check available disk space and file permissions")
+}
+
+/// Cooperative cancel flag shared by `download_world` and `upload_world` (22.15) — the same shape
+/// as `ExpandCancel`: its own managed state so polling it never touches the world lock. The two
+/// transfers can't overlap (both dialogs lock the UI), so one flag is enough; each command clears
+/// it on entry.
+#[derive(Default, Clone)]
+pub(crate) struct NetCancel(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl NetCancel {
+    fn cancelled(&self) -> bool { self.0.load(std::sync::atomic::Ordering::Relaxed) }
+    fn reset(&self) { self.0.store(false, std::sync::atomic::Ordering::Relaxed) }
+}
+
+/// The error a cancelled transfer returns; the frontend closes quietly on it instead of toasting.
+pub(crate) const NET_CANCELLED: &str = "Cancelled";
+
+#[tauri::command]
+pub(crate) fn cancel_net_transfer(flag: tauri::State<'_, NetCancel>) {
+    flag.0.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Resolves once the cancel flag is set (polled — the flag is a plain atomic).
+async fn wait_cancelled(flag: &NetCancel) {
+    while !flag.cancelled() {
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    }
+}
+
+/// Runs `fut` to completion unless the cancel flag trips first (`None`).
+async fn unless_cancelled<T>(fut: impl std::future::Future<Output = T>, flag: &NetCancel) -> Option<T> {
+    use futures_util::future::{select, Either};
+    futures_util::pin_mut!(fut);
+    let cancelled = wait_cancelled(flag);
+    futures_util::pin_mut!(cancelled);
+    match select(fut, cancelled).await {
+        Either::Left((v, _)) => Some(v),
+        Either::Right(_) => None,
+    }
+}
+
+/// `Read` adapter that fails with `Interrupted` once the flag is set, so the blocking gzip/gunzip
+/// copies stop promptly.
+struct CancelReader<'a, R> { inner: R, flag: &'a NetCancel }
+impl<R: Read> Read for CancelReader<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.flag.cancelled() {
+            return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, NET_CANCELLED));
+        }
+        self.inner.read(buf)
+    }
 }
 
 /// Download a world from the Eden server, streaming to disk with progress events.
@@ -330,7 +403,9 @@ pub(crate) async fn download_world(
     id: String,
     server: String,
     dest_path: String,
+    cancel: tauri::State<'_, NetCancel>,
 ) -> Result<(), String> {
+    cancel.reset();
     let srv = get_server(&server)?;
     let url = format!("{}/{}.eden", srv.download_base_url, id);
     let client = reqwest::Client::builder()
@@ -339,7 +414,8 @@ pub(crate) async fn download_world(
         .build()
         .map_err(|e| e.to_string())?;
 
-    let mut response = client.get(&url).send().await
+    let mut response = unless_cancelled(client.get(&url).send(), &cancel).await
+        .ok_or_else(|| NET_CANCELLED.to_string())?
         .map_err(|e| format!("Download failed: {e}"))?;
 
     if !response.status().is_success() {
@@ -353,18 +429,24 @@ pub(crate) async fn download_world(
     let mut downloaded: u64 = 0;
     let mut last_emit: u64 = 0;
     let raw_tmp_path = format!("{}.download.tmp", dest_path);
-    // audit P-4: the 12 GiB cap above had no space check backing it. `total` is a server-declared
-    // upper bound when present; unknown falls back to the cap itself (the safe over-estimate).
-    crate::ensure_room_for(std::path::Path::new(&raw_tmp_path), total.unwrap_or(MAX_DOWNLOADED_WORLD_BYTES))
+    // audit P-4: `total` is the server-declared compressed size when present. Unknown: pre-flight a
+    // token amount and let a full disk surface as the clean `write_error` message mid-stream
+    // (reserving the 12 GiB cap here failed every download to a drive with less free than that).
+    crate::ensure_room_for(std::path::Path::new(&raw_tmp_path), total.unwrap_or(64 * 1024 * 1024))
         .map_err(|e| e.to_string())?;
     let mut raw_file = fs::File::create(&raw_tmp_path)
         .map_err(|e| write_error("create temporary download file", e))?;
     // First bytes only, to sniff gzip magic after the stream completes.
     let mut head: Vec<u8> = Vec::new();
 
-    while let Some(chunk) = match response.chunk().await {
-        Ok(chunk) => chunk,
-        Err(e) => {
+    while let Some(chunk) = match unless_cancelled(response.chunk(), &cancel).await {
+        None => {
+            drop(raw_file);
+            let _ = fs::remove_file(&raw_tmp_path);
+            return Err(NET_CANCELLED.into());
+        }
+        Some(Ok(chunk)) => chunk,
+        Some(Err(e)) => {
             drop(raw_file);
             let _ = fs::remove_file(&raw_tmp_path);
             return Err(format!("Download failed: {e}"));
@@ -407,10 +489,11 @@ pub(crate) async fn download_world(
     if head.starts_with(&[0x1f, 0x8b]) {
         use flate2::read::GzDecoder;
         let src = fs::File::open(&raw_tmp_path).map_err(|e| format!("Failed to read temporary download file: {e}"))?;
-        let mut dec = GzDecoder::new(std::io::BufReader::new(src));
-        // audit P-4: decompressed size isn't known ahead of time, but `copy_capped` below never lets
-        // it exceed the cap — the safe over-estimate to pre-flight against.
-        if let Err(e) = crate::ensure_room_for(std::path::Path::new(&tmp_path), MAX_DOWNLOADED_WORLD_BYTES) {
+        let mut dec = GzDecoder::new(CancelReader { inner: std::io::BufReader::new(src), flag: &cancel });
+        // audit P-4: estimate the decompressed size from the gzip ISIZE trailer (21.7); `copy_capped`
+        // still bounds it if the trailer lies.
+        let est = gzip_isize_estimate(std::path::Path::new(&raw_tmp_path)).unwrap_or(MAX_DOWNLOADED_WORLD_BYTES);
+        if let Err(e) = crate::ensure_room_for(std::path::Path::new(&tmp_path), est) {
             cleanup(&[&raw_tmp_path]);
             return Err(e.to_string());
         }
@@ -425,6 +508,7 @@ pub(crate) async fn download_world(
             }
             Err(e) => {
                 cleanup(&[&raw_tmp_path, &tmp_path]);
+                if cancel.cancelled() { return Err(NET_CANCELLED.into()); }
                 return Err(write_error("decompress downloaded world", e));
             }
         }
@@ -487,6 +571,15 @@ mod tests {
     }
 
     #[test]
+    fn isize_estimate_lifts_wrapped_trailer_past_compressed_len() {
+        use super::isize_to_estimate;
+        assert_eq!(isize_to_estimate(1000, 10), 1000);
+        // 6 GiB world stored as 6 GiB mod 2^32 = 2 GiB, compressed to 5 GiB → lifts to 6 GiB.
+        assert_eq!(isize_to_estimate(2 << 30, 5 << 30), 6 << 30);
+        assert_eq!(isize_to_estimate(0, 100 << 30), 12 << 30);
+    }
+
+    #[test]
     fn copy_capped_accepts_input_at_the_limit() {
         let mut input = Cursor::new(vec![1, 2, 3, 4]);
         let mut output = Vec::new();
@@ -533,7 +626,7 @@ impl Drop for TempFile {
 /// Returns `None` when the source is already gzip — that file is streamed directly, no temp.
 /// `Compression::new(6)` rather than `best()`: about 1 % larger on voxel data and several times
 /// faster (audit C4).
-fn gzip_world_to_temp(src: &std::path::Path) -> Result<Option<(TempFile, u64)>, String> {
+fn gzip_world_to_temp(src: &std::path::Path, cancel: &NetCancel) -> Result<Option<(TempFile, u64)>, String> {
     use flate2::{write::GzEncoder, Compression};
 
     let mut probe = [0u8; 4];
@@ -554,7 +647,7 @@ fn gzip_world_to_temp(src: &std::path::Path) -> Result<Option<(TempFile, u64)>, 
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let temp = TempFile(std::env::temp_dir().join(format!("vuencedit_upload_{ts}.gz")));
+    let temp = TempFile(std::env::temp_dir().join(format!("vuencedit_upload_{}_{ts}.gz", std::process::id())));
     let out = fs::File::create(&temp.0).map_err(|e| format!("Cannot stage upload: {e}"))?;
     let mut enc = GzEncoder::new(std::io::BufWriter::new(out), Compression::new(6));
 
@@ -564,11 +657,13 @@ fn gzip_world_to_temp(src: &std::path::Path) -> Result<Option<(TempFile, u64)>, 
         let mut archive = zip::ZipArchive::new(std::io::BufReader::new(f))
             .map_err(|e| format!("Invalid zip: {e}"))?;
         let mut entry = archive.by_index(0).map_err(|e| format!("Zip entry: {e}"))?;
-        std::io::copy(&mut entry, &mut enc).map_err(|e| format!("Decompress zip: {e}"))?;
+        std::io::copy(&mut CancelReader { inner: &mut entry, flag: cancel }, &mut enc)
+            .map_err(|e| if cancel.cancelled() { NET_CANCELLED.to_string() } else { format!("Decompress zip: {e}") })?;
     } else {
         let f = fs::File::open(src).map_err(|e| format!("Cannot read world: {e}"))?;
-        let mut r = std::io::BufReader::with_capacity(256 * 1024, f);
-        std::io::copy(&mut r, &mut enc).map_err(|e| format!("Gzip write: {e}"))?;
+        let mut r = CancelReader { inner: std::io::BufReader::with_capacity(256 * 1024, f), flag: cancel };
+        std::io::copy(&mut r, &mut enc)
+            .map_err(|e| if cancel.cancelled() { NET_CANCELLED.to_string() } else { format!("Gzip write: {e}") })?;
     }
     let mut w = enc.finish().map_err(|e| format!("Gzip finish: {e}"))?;
     w.flush().map_err(|e| format!("Gzip flush: {e}"))?;
@@ -613,7 +708,9 @@ pub(crate) async fn upload_world(
     world_path: String,
     image_path: String,
     server: String,
+    cancel: tauri::State<'_, NetCancel>,
 ) -> Result<String, String> {
+    cancel.reset();
     let srv = get_server(&server)?;
     let image_bytes = fs::read(&image_path).map_err(|e| format!("Cannot read image: {e}"))?;
     const MAX_IMAGE_BYTES: usize = 2 * 1024 * 1024;
@@ -626,7 +723,8 @@ pub(crate) async fn upload_world(
 
     // Compress off the async runtime — this is minutes of CPU on a large world.
     let src = std::path::PathBuf::from(&world_path);
-    let staged = tokio::task::spawn_blocking(move || gzip_world_to_temp(&src))
+    let flag = NetCancel::clone(&cancel);
+    let staged = tokio::task::spawn_blocking(move || gzip_world_to_temp(&src, &flag))
         .await
         .map_err(|e| format!("Compression task failed: {e}"))??;
 
@@ -686,7 +784,8 @@ pub(crate) async fn upload_world(
             .file_name("image.bin")
             .mime_str("image/png").unwrap());
 
-    let response = client.post(&post_url).multipart(form).send().await
+    let response = unless_cancelled(client.post(&post_url).multipart(form).send(), &cancel).await
+        .ok_or_else(|| NET_CANCELLED.to_string())?
         .map_err(|e| format!("Upload failed: {e}"))?;
 
     let status = response.status();

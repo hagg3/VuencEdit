@@ -11,7 +11,7 @@ import { useRibbon } from "../context";
 import BlockButton from "../BlockButton";
 import { Cmd, CmdDropdown, CmdMenuItem, CmdSetting, CmdSplit } from "../Cmd";
 import type { CommandId } from "../../commands/meta";
-import { SCULPT_MORE, SCULPT_PRIMARY, SCULPT_IS_VOLUMETRIC, SCULPT_USES_PALETTE, SCULPT_IS_EXPERIMENTAL } from "../sculptTools";
+import { SCULPT_MORE, SCULPT_PRIMARY, SCULPT_IS_VOLUMETRIC, SCULPT_USES_PALETTE, SCULPT_IS_EXPERIMENTAL, SCULPT_IGNORES_STRENGTH, SCULPT_IGNORES_SOFTNESS } from "../sculptTools";
 import {
   Badge, Col, Group, GroupDivider, Row, Segmented, SliderRow,
 } from "../primitives";
@@ -67,13 +67,14 @@ export default function SculptTab() {
         dim={volumetric} dimNote={volumetric ? "(radius only)" : undefined}>
         <Col style={{ justifyContent: "center", height: GROUP_CONTENT_H }}>
           <CmdSetting id="sculpt.brush.strength"><SliderRow label={p.tool === "terrace" ? "Step" : "Strength"} min={1} max={8} accent={AMBER}
-            value={p.sculptStrength} onChange={p.setSculptStrength}
+            value={p.sculptStrength} onChange={p.setSculptStrength} disabled={SCULPT_IGNORES_STRENGTH(p.tool)}
             title={p.tool === "terrace" ? "Terrace step height, in blocks" : "How far each stamp moves the terrain"} /></CmdSetting>
           <CmdSetting id="sculpt.brush.radius"><SliderRow label="Radius" min={1} max={32} accent={AMBER}
             value={p.sculptRadius} onChange={p.setSculptRadius}
             title="Brush radius in blocks ([ and ])" /></CmdSetting>
           <CmdSetting id="sculpt.brush.softness"><SliderRow label="Softness" min={0} max={100} step={5} accent={AMBER}
             value={Math.round(p.sculptSoftness * 100)} onChange={v => p.setSculptSoftness(v / 100)}
+            disabled={SCULPT_IGNORES_SOFTNESS(p.tool)}
             format={v => `${v}%`}
             title="Edge softness: 0 is a hard edge, 100 a soft dome" /></CmdSetting>
         </Col>
@@ -99,9 +100,9 @@ export default function SculptTab() {
       </Group>
       <GroupDivider />
 
-      {/* ── Block — only Rock and Retexture consume the fill block ────────── */}
+      {/* ── Block — only Rock consumes the fill block ────────── */}
       <BlockButton cmd="sculpt.block.pick" tier={tier.block} declaredWidth={W("block")}
-        dim={!SCULPT_USES_PALETTE(p.tool)} dimNote="(Rock/Retexture only)" />
+        dim={!SCULPT_USES_PALETTE(p.tool)} dimNote="(Rock only)" />
     </>
   );
 }

@@ -1,12 +1,10 @@
 ---
 layout: doc
 title: World Compatibility
-subtitle: Legacy64z, New Dawn 256z, and NewFormat256z — what each means for you.
+subtitle: Legacy64z, New Dawn 256z, and NewFormat256z, and what each means for you.
 ---
 
-Eden World Builder's file format has changed twice since launch. VuencEdit detects which version
-a world file uses automatically when you open it — you don't need to tell it anything — and shows
-the detected format in the status bar and the World Info panel.
+Eden World Builder's file format has changed twice since launch. VuencEdit works out which one a file uses when you open it. You don't have to tell it anything.
 
 <table>
   <thead>
@@ -15,42 +13,31 @@ the detected format in the status bar and the World Info panel.
   <tbody>
     <tr>
       <td><strong>Legacy64z</strong></td>
-      <td>0–63</td>
-      <td>The original format, from before the New Dawn update. Worlds are shallower — 64
-      vertical levels instead of 256.</td>
+      <td>0 to 63</td>
+      <td>The original format, from before the New Dawn update. Worlds are 64 levels tall.</td>
     </tr>
     <tr>
       <td><strong>NewDawn256z</strong></td>
-      <td>0–255</td>
-      <td>The New Dawn update's format. Same 256-level depth as NewFormat256z below, but without
-      the newer block types or sign data.</td>
+      <td>0 to 255</td>
+      <td>The New Dawn update's format. Same 256 levels as NewFormat256z, without the newer block types or sign data.</td>
     </tr>
     <tr>
       <td><strong>NewFormat256z</strong></td>
-      <td>0–255</td>
-      <td>A 2026 game update. Also 256 levels, plus 16 additional block types and in-game sign
-      text, which VuencEdit reads and displays.</td>
+      <td>0 to 255</td>
+      <td>A 2026 game update. 256 levels, 16 more block types, and in-game sign text, which VuencEdit reads and shows.</td>
     </tr>
   </tbody>
 </table>
 
-## What this means in practice
+## In practice
 
-- **Opening a world** works the same regardless of format — VuencEdit reads the header and picks
-  the right layout before showing you anything.
-- **New worlds**: every generator (Flat, Natural, Classic, Tg2) lets you choose 64z or 256z when
-  you create a world, so you can target whichever format matches where you'll play it.
-- **Saving** always writes back in the same format the world was loaded in — VuencEdit won't
-  silently upgrade or downgrade a world's height format.
-- **The new block types (112–127)** introduced by NewFormat256z are only placeable on a
-  NewFormat256z world; they show up behind a small disclosure in the block picker rather than
-  cluttering the default palette, since most worlds never use them.
-- **Signs** — text signs placed in-game are read-only in VuencEdit right now: they show up as
-  markers on the map and are listed in the sidebar, but nothing in the app currently writes new
-  sign text.
+- **Opening** works the same for all three. The header tells VuencEdit the layout before anything is drawn.
+- **New worlds**: every generator (Flat, Natural, Classic, Tg2) lets you pick 64 or 256 levels, so you can match the version you'll play on.
+- **Saving** writes the world back in the format it was loaded in. It never upgrades or downgrades the height format.
+- **The new block types (112 to 127)** can only be placed on a NewFormat256z world. They sit behind a small disclosure in the block picker so they don't clutter the palette, since most worlds don't use them.
+- **Signs** are read-only. They show as markers on the map (View ▸ Sign Markers) and in the Inspector's Signs section, but VuencEdit can't create or edit sign text.
+- **Zipped worlds**: `.eden.zip` opens and saves like a plain `.eden`. Settings has an option to save new worlds compressed by default.
 
-## If you're not sure which format a world is
+## Which format is my world?
 
-Open **World Info** from the application menu — it shows the detected format alongside the seed,
-dimensions, and spawn position. If a world caps out at Z=63, it's Legacy64z; if it reaches Z=255,
-it's one of the two 256z variants, and World Info tells you which.
+Open World Properties from the application menu. It shows the detected format next to the seed, dimensions and spawn position. A world that tops out at Z=63 is Legacy64z. One that reaches Z=255 is one of the two 256z formats, and World Properties says which.

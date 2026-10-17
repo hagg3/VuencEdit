@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { gridDivisions, tileWindowFits } from "./viewportUtils";
+import { gridDivisions, tileWindowFits, shouldPasteOnPointerUp, shouldBlurAfterClick } from "./viewportUtils";
 
 // Phase 6 (256z-format plan): defense-in-depth caps so a corrupt world (quarry.eden's pre-fix
 // billions-scale chunk dimensions) degrades to "warn and stop" instead of OOM/RangeError, even
@@ -49,5 +49,27 @@ describe("tileWindowFits", () => {
   it("non-finite input does not fit", () => {
     expect(tileWindowFits(0, 0, NaN, 10)).toBe(false);
     expect(tileWindowFits(0, 0, Infinity, 10)).toBe(false);
+  });
+});
+
+describe("shouldPasteOnPointerUp (21.12)", () => {
+  it("pastes only on primary release that started on canvas", () => {
+    expect(shouldPasteOnPointerUp("paste", true, 0)).toBe(true);
+    expect(shouldPasteOnPointerUp("paste", true, 2)).toBe(false);
+    expect(shouldPasteOnPointerUp("paste", true, 1)).toBe(false);
+    expect(shouldPasteOnPointerUp("paste", false, 0)).toBe(false);
+    expect(shouldPasteOnPointerUp("select", true, 0)).toBe(false);
+  });
+});
+
+describe("shouldBlurAfterClick (U9)", () => {
+  const fake = (btn: unknown) => ({ closest: (sel: string) => (sel === "button" ? btn : null) }) as unknown as Element;
+  const plain = { closest: () => null };
+  it("blurs pointer clicks on plain buttons only", () => {
+    expect(shouldBlurAfterClick(1, fake(plain))).toBe(true);
+    expect(shouldBlurAfterClick(0, fake(plain))).toBe(false);
+    expect(shouldBlurAfterClick(1, fake(null))).toBe(false);
+    expect(shouldBlurAfterClick(1, fake({ closest: () => ({}) }))).toBe(false);
+    expect(shouldBlurAfterClick(1, null)).toBe(false);
   });
 });
