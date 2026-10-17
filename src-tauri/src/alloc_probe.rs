@@ -79,7 +79,7 @@ mod tests {
             width: w as i32, height: h as i32, depth: d as i32, z_anchor: 0,
             block_types: (0..vol).map(|i| (i % 7) as u8).collect(),
             paints: vec![3u8; vol],
-            mask: None,
+            mask: None, origin: None
         }
     }
 
@@ -187,7 +187,7 @@ mod tests {
     #[test]
     fn alloc_probe_whole_world_trees() {
         let (extra, changed, kept, world) = whole_world_edit("trees(2%)", |w| {
-            generate_trees_inner(w, 0, 0, 511, 511, &["normal".to_string()], 0.02, &[], 7, true, None);
+            generate_trees_inner(w, 0, 0, 511, 511, &["normal".to_string()], 0.02, &[], 7, true, None, None);
         });
         assert!(kept > 0, "the edit must have changed something");
         assert!(extra <= cow_cap(changed, world), "trees transient {extra} B exceeds 3x changed bands {changed} B + slack ({world} B world)");

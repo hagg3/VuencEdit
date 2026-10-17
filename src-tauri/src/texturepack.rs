@@ -21,10 +21,15 @@ pub const KNOWN_TEX_NAMES: &[&str] = &[
     "brick", "cobblestone", "crystal", "lightbox",
     "ladder", "cloud", "vine", "shingle", "gradient", "ice",
     "glass", "weave", "water", "lava", "trampoline", "firework",
+    // 112–127 (new-format blocks): tiles 32–47 of the Emod 64-tile atlas.png.
+    "ore_sand", "space_stone", "carpet", "snakeskin", "obsidian", "cheese", "space_dirt",
+    "space_grass", "moss", "dark_matter", "space_sand", "snow", "moonrock", "basalt",
+    "dark_tile", "algae",
 ];
 
 /// Map from canonical (app) tile name → tile index in the game's `atlas.png` — a 32-wide vertical
-/// strip of 32×32 tiles. This is the **verified order of the shipped atlas.png** (top→bottom, 0-based):
+/// strip of 32×32 tiles (32 tiles stock, 64 in the Emod atlas, whose 32–47 are blocks 112–127).
+/// This is the **verified order of the shipped atlas.png** (top→bottom, 0-based):
 ///
 ///   0 grass_top, 1 grass_side(color), 2 grass_side, 3 dirt, 4 sand, 5 stone, 6 dark_stone,
 ///   7 trunk_side, 8 trunk_top, 9 wood, 10 tnt_side(color), 11 tnt_side, 12 tnt_top(color),
@@ -66,6 +71,25 @@ pub const ATLAS1_MAP: &[(&str, u32)] = &[
     ("ice", 29),
     ("trampoline", 30),
     ("firework", 31),    // color variant
+    // 112–127: the Emod atlas (D.2t) grew the strip to 64 tiles with the 2026 game's art — 32–47
+    // the full-colour tiles in id order, 48–63 the game's own greyscale copies (unused here: the
+    // grayscale rows are derived, as for every tile). A stock 32-tile atlas simply lacks them.
+    ("ore_sand", 32),      // 112 Ore Sand
+    ("space_stone", 33),   // 113 Space Stone
+    ("carpet", 34),        // 114 Carpet
+    ("snakeskin", 35),     // 115 Snakeskin
+    ("obsidian", 36),      // 116 Obsidian
+    ("cheese", 37),        // 117 Cheese
+    ("space_dirt", 38),    // 118 Space Dirt
+    ("space_grass", 39),   // 119 Space Grass
+    ("moss", 40),          // 120 Moss
+    ("dark_matter", 41),   // 121 Dark Matter
+    ("space_sand", 42),    // 122 Space Sand
+    ("snow", 43),          // 123 Snow
+    ("moonrock", 44),      // 124 Moonrock
+    ("basalt", 45),        // 125 Basalt
+    ("dark_tile", 46),     // 126 Dark Tile
+    ("algae", 47),         // 127 Algae
 ];
 
 /// Map from canonical tile name → tile index in the game's `atlas2.png` (IS_ATLAS2 blocks). The
@@ -392,17 +416,26 @@ mod tests {
 
     #[test]
     fn real_shipped_atlases_load_with_sibling_pickup() {
-        // The shipped atlas.png + atlas2.png live in the repo's TEST WORLDS/atlas folder.
-        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../TEST WORLDS/atlas");
+        // The shipped atlas.png + atlas2.png live in the repo-root TEST WORLDS/ATLAS folder (the
+        // path predated the monorepo move and had been skipping this test silently).
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../TEST WORLDS/ATLAS");
         let atlas1 = format!("{dir}/atlas.png");
         if !std::path::Path::new(&atlas1).exists() {
             return; // repo asset not present (e.g. slimmed checkout) — skip.
         }
         let pack = load_pack(&atlas1).expect("load shipped atlas.png");
 
-        // All 28 atlas1 names + 4 atlas2 names (sibling auto-pickup) = 32 tiles → 65 rows.
-        assert_eq!(pack.gray_row_offset, 32, "28 atlas1 + 4 atlas2 sibling tiles");
-        assert_eq!(pack.atlas_rows, 2 * 32 + 1);
+        // 28 atlas1 names + 4 atlas2 names (sibling auto-pickup) = 32 tiles from a stock atlas;
+        // the Emod 64-tile atlas adds the 16 new-format tiles (112–127) → 48.
+        let n = pack.gray_row_offset;
+        assert!(n == 32 || n == 48, "28 atlas1 (+16 new-format) + 4 atlas2 sibling tiles, got {n}");
+        assert_eq!(pack.atlas_rows, 2 * n + 1);
+        if n == 48 {
+            // An unpainted new-format face draws its colour tile untinted (white vertex colour).
+            let (rgb, row) = face_color_and_row(&pack, 117, 0, 2, [232, 194, 54]);
+            assert_eq!(row, Some(pack.name_to_row["cheese"]));
+            assert_eq!(rgb, [255, 255, 255]);
+        }
 
         // Sanity: names present for both atlases.
         for name in ["brick", "dark_stone", "bedrock", "glass", "water", "lava", "weave"] {

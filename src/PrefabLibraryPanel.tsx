@@ -39,6 +39,11 @@ const VIEW_LS = "eden_prefab_view";
 /** Resolve the active prefab library folder: user-set `prefabDirectory` in Settings, else the
  * app-default `<app_data_dir>/prefabs`. Shared by this panel and App.tsx's "Save Prefab" flow so
  * both write/read the same place. Returns null only if the default dir can't be resolved. */
+// Persistent decoded-thumbnail cache keyed by `${path}::${mtime}`, so re-listing (Refresh, save,
+// reopen) doesn't re-render unchanged files. Module scope (22.8) so it also survives the panel
+// unmounting on a tab switch; invalidated per-file whenever a file's mtime changes.
+const thumbCacheRef: { current: Map<string, string | null> } = { current: new Map() };
+
 export async function resolvePrefabDir(): Promise<string | null> {
   let settingsDir: string | null = null;
   try {
@@ -89,10 +94,6 @@ export default function PrefabLibraryPanel({
   // simultaneous full-file gzip decodes and freezing the app on folders with many/large prefabs.
   const [thumbs, setThumbs] = useState<Record<string, string | null>>({});
   const thumbEpochRef = useRef(0);
-  // Persistent decoded-thumbnail cache keyed by `${path}::${mtime}`, so re-listing (Refresh, save,
-  // reopen) doesn't re-render unchanged files. Survives across list resets; invalidated per-file
-  // whenever a file's mtime changes.
-  const thumbCacheRef = useRef<Map<string, string | null>>(new Map());
   const [query, setQuery] = useState("");
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
   const [renaming, setRenaming] = useState<string | null>(null);

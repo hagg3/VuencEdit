@@ -13,7 +13,7 @@ describe("specs: block group parity", () => {
   // Home/Draw/3D's Block button is the bare `<BlockButton cmd=… tier={tier.block}
   // declaredWidth={W("block")} />` call with no `dim`/`dimNote`/label override, so their spec
   // entries must be pixel-identical. Sculpt's Block button *does* pass `dim`/`dimNote`
-  // ("Rock/Retexture only") — an extra caption row that genuinely widens it (160 vs 134) — so it
+  // ("Rock only") — an extra caption row that genuinely widens it (160 vs 134) — so it
   // isn't part of the strict width match, only the invariants that hold regardless of that extra
   // row (id, label, minTier).
   const UNDIMMED_TABS = ["home", "draw", "3d"] as const;

@@ -147,7 +147,113 @@ fn temp_world_path() -> std::path::PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    std::env::temp_dir().join(format!("vuencedit_{ts}.eden"))
+    // pid-scoped (21.14): `sweep_stale_temps` in another instance must be able to tell this file is
+    // owned by a live process.
+    std::env::temp_dir().join(format!("vuencedit_{}_{ts}.eden", std::process::id()))
+}
+
+// ── Multi-instance ownership (21.14) ─────────────────────────────────────────
+//
+// Design (chosen over `tauri-plugin-single-instance`, which would forbid the dev + release
+// side-by-side the owner actually does): ownership by pid, with dead-owner takeover.
+//  * Staging temps are named `vuencedit_<pid>_<ts>.eden` / `vuencedit_upload_<pid>_<ts>.gz`; the
+//    startup sweep only deletes temps whose pid is dead (or that carry no pid: the pre-21.14 names).
+//  * The shared autosave slot in `app_data_dir` is claimed through an `autosave.owner` file holding
+//    the owner pid. A live owner keeps it; a second live instance autosaves into its own
+//    `instance-<pid>/` subdir instead, so it can neither overwrite nor discard (nor be offered) the
+//    first one's sidecars. A dead owner's slot is taken over, so crash recovery works as before.
+//  * Caveat: a *secondary* instance's crash leaves `instance-<pid>/` unrecovered (never offered);
+//    dirs with no pending meta are swept, ones with a meta are kept for manual rescue.
+
+/// Is a process with this pid currently running? Pid reuse can make a dead owner look alive; the
+/// cost is only a leaked temp / a second slot, never data loss.
+fn pid_alive(pid: u32) -> bool {
+    if pid == std::process::id() { return true; }
+    #[cfg(unix)]
+    {
+        // SAFETY: signal 0 only performs the existence/permission check.
+        let r = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        r == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+    #[cfg(windows)]
+    {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut core::ffi::c_void;
+            fn GetExitCodeProcess(h: *mut core::ffi::c_void, code: *mut u32) -> i32;
+            fn CloseHandle(h: *mut core::ffi::c_void) -> i32;
+        }
+        const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+        const STILL_ACTIVE: u32 = 259;
+        // SAFETY: plain handle open/query/close; the handle is closed on every path.
+        unsafe {
+            let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if h.is_null() {
+                // Access denied means it exists; anything else (invalid parameter) means gone.
+                return std::io::Error::last_os_error().raw_os_error() == Some(5);
+            }
+            let mut code = 0u32;
+            let ok = GetExitCodeProcess(h, &mut code);
+            CloseHandle(h);
+            ok == 0 || code == STILL_ACTIVE
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    { true }
+}
+
+/// The pid embedded in a staging-temp file name (`vuencedit_<pid>_…` or `vuencedit_upload_<pid>_…`),
+/// or `None` for the pre-21.14 names (`vuencedit_<nanos>.eden`: no `_` after the number).
+fn temp_owner_pid(name: &str) -> Option<u32> {
+    let rest = name.strip_prefix("vuencedit_")?;
+    let rest = rest.strip_prefix("upload_").unwrap_or(rest);
+    let (num, _) = rest.split_once('_')?;
+    num.parse::<u32>().ok()
+}
+
+fn read_owner_pid(file: &std::path::Path) -> Option<u32> {
+    fs::read_to_string(file).ok()?.trim().parse().ok()
+}
+
+/// Decide which autosave directory this process uses. `base` is `app_data_dir`. Returns `base`
+/// itself when we own (or just took over) the shared slot, else `base/instance-<pid>`.
+fn claim_autosave_dir(base: &std::path::Path, me: u32, alive: &dyn Fn(u32) -> bool) -> std::path::PathBuf {
+    use std::io::Write as _;
+    let owner = base.join("autosave.owner");
+    let _ = fs::create_dir_all(base);
+    for _ in 0..2 {
+        match fs::OpenOptions::new().write(true).create_new(true).open(&owner) {
+            Ok(mut f) => { let _ = write!(f, "{me}"); return base.to_path_buf(); }
+            Err(_) => match read_owner_pid(&owner) {
+                Some(p) if p == me => return base.to_path_buf(),
+                Some(p) if alive(p) => break,
+                // Dead owner, or an unreadable/empty file (a claimant mid-write is vanishingly
+                // brief; a corrupt one must not wedge the slot): take over and retry atomically.
+                _ => { let _ = fs::remove_file(&owner); }
+            },
+        }
+    }
+    let dir = base.join(format!("instance-{me}"));
+    let _ = fs::create_dir_all(&dir);
+    // Housekeeping: drop dead instances' empty slots; keep any holding a pending meta.
+    if let Ok(rd) = fs::read_dir(base) {
+        for e in rd.flatten() {
+            let n = e.file_name().to_string_lossy().into_owned();
+            let Some(pid) = n.strip_prefix("instance-").and_then(|s| s.parse::<u32>().ok()) else { continue };
+            if pid != me && !alive(pid) && !e.path().join("autosave.meta.json").exists() {
+                let _ = fs::remove_dir_all(e.path());
+            }
+        }
+    }
+    dir
+}
+
+static AUTOSAVE_DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+/// Remove our ownership claim on a clean exit so the next launch needn't rely on pid-liveness.
+fn release_autosave_owner(base: &std::path::Path) {
+    let owner = base.join("autosave.owner");
+    if read_owner_pid(&owner) == Some(std::process::id()) { let _ = fs::remove_file(owner); }
 }
 
 /// Copies `src` to `dst` for the load-time private-temp-copy staging and `.bak` creation (audit
@@ -375,7 +481,9 @@ fn sweep_stale_temps() {
         let ext = p.extension().and_then(|x| x.to_str());
         let is_stale = matches!(ext, Some("eden") | Some("gz"))
             && p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("vuencedit_"));
-        if is_stale { let _ = fs::remove_file(&p); }
+        // 21.14: never touch a live sibling instance's temp (pid-scoped names; pid-less = legacy).
+        let live_owner = p.file_name().and_then(|n| n.to_str()).and_then(temp_owner_pid).is_some_and(pid_alive);
+        if is_stale && !live_owner { let _ = fs::remove_file(&p); }
     }
 }
 
@@ -1377,6 +1485,27 @@ pub(crate) struct Clipboard {
     /// prefab save (a shaped clipboard writes `EPFAB\x02` with a footprint section; rectangular
     /// clipboards stay on `EPFAB\x01`).
     pub(crate) mask: Option<Vec<u8>>,
+    /// Where this clipboard came from in absolute/server coordinates (`.epfab` `ORGN` section,
+    /// ROADMAP-LINK 21.6). Set by `copy_selection` / `load_prefab`; every rotate/mirror drops it
+    /// (a transformed clipboard no longer corresponds to the box). Every other producer leaves it
+    /// `None`.
+    pub(crate) origin: Option<PrefabOrigin>,
+}
+
+/// `.epfab` provenance (`ORGN` section) — identical layout to VuencLink's `PrefabOrigin`
+/// (`apps/vuenclink/src-tauri/src/world/prefab_interchange.rs`); the two codecs are pinned by the
+/// same golden hex fixture. `dx → +ax`, `dy → +ay` (server z), `dz → +az` (height).
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PrefabOrigin {
+    pub(crate) ax: i32,
+    pub(crate) ay: i32,
+    pub(crate) az: i32,
+    /// 0 copied from a VuencEdit world · 1 copied inside a placement of a round-trip prefab ·
+    /// 2 exported by VuencLink.
+    pub(crate) source: u8,
+    /// Round-trip id (VuencLink's base-store key); 0 = none.
+    pub(crate) rtid: u64,
 }
 
 impl Clipboard {
@@ -1384,6 +1513,7 @@ impl Clipboard {
         ClipboardInfo {
             width: self.width, height: self.height, depth: self.depth,
             z_anchor: self.z_anchor, masked: self.mask.is_some(),
+            origin: self.origin,
         }
     }
 }
@@ -1396,6 +1526,52 @@ pub(crate) struct ClipboardInfo {
     pub(crate) z_anchor: i32,
     /// True when the clipboard carries a non-rectangular footprint (paste skips unmasked columns).
     pub(crate) masked: bool,
+    /// Provenance, `null` when the clipboard has none (serialises camelCase).
+    pub(crate) origin: Option<PrefabOrigin>,
+}
+
+/// A paste that is known to equal a round-trip prefab cell for cell (ROADMAP-LINK 21.6 §3.2):
+/// `(x, y, z)` is where the clipboard's `(0,0,0)` landed in world coordinates and `(ax, ay, az)`
+/// the server coordinates that cell stands for. `copy_selection` uses it to derive an origin for a
+/// sub-box copied out of the pasted area. Cleared on world load/close and on every undo/redo.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Placement {
+    pub(crate) x: i32, pub(crate) y: i32, pub(crate) z: i32,
+    pub(crate) w: i32, pub(crate) h: i32, pub(crate) d: i32,
+    pub(crate) ax: i32, pub(crate) ay: i32, pub(crate) az: i32,
+    pub(crate) rtid: u64,
+}
+
+/// Newest-last cap for `WorldState.paste_placements`.
+pub(crate) const MAX_PLACEMENTS: usize = 8;
+
+/// The origin a copy of box `(x1,y1)..(x2,y2)`, `z_min..=z_max` should carry, given the recorded
+/// placements and the world's absolute chunk offset (`abs_min_*16`). See §3.1.
+pub(crate) fn derive_copy_origin(
+    placements: &[Placement],
+    abs_min_x: i32, abs_min_y: i32,
+    x1: i32, y1: i32, x2: i32, y2: i32, z_min: i32, z_max: i32,
+) -> Option<PrefabOrigin> {
+    // Newest first: a later paste that merely overlaps the box makes the claim ambiguous even if
+    // an older placement contains it (the newer paste overwrote part of it).
+    for p in placements.iter().rev() {
+        let inside = x1 >= p.x && x2 < p.x + p.w
+            && y1 >= p.y && y2 < p.y + p.h
+            && z_min >= p.z && z_max < p.z + p.d;
+        if inside {
+            return Some(PrefabOrigin {
+                ax: p.ax + (x1 - p.x), ay: p.ay + (y1 - p.y), az: p.az + (z_min - p.z),
+                source: 1, rtid: p.rtid,
+            });
+        }
+        let disjoint = x2 < p.x || x1 >= p.x + p.w
+            || y2 < p.y || y1 >= p.y + p.h
+            || z_max < p.z || z_min >= p.z + p.d;
+        if !disjoint { return None; }
+    }
+    Some(PrefabOrigin {
+        ax: abs_min_x * 16 + x1, ay: abs_min_y * 16 + y1, az: z_min, source: 0, rtid: 0,
+    })
 }
 
 /// Test a linear bit in a row-major bitset (used for clipboard footprints and selection masks).
@@ -1821,6 +1997,11 @@ pub(crate) struct AutosaveLineage {
 pub(crate) struct WorldState {
     pub(crate) world: Option<LoadedWorld>,
     pub(crate) clipboard: Option<Clipboard>,
+    /// Round-trip paste placements (21.6 §3.2), newest last, capped at `MAX_PLACEMENTS`. Recorded
+    /// only by `paste_at` when the pasted area equals the prefab cell for cell; **cleared on world
+    /// load/close and on every undo/redo** (an undone paste must not leave a placement claiming
+    /// unrelated content).
+    pub(crate) paste_placements: Vec<Placement>,
     pub(crate) undo_stack: VecDeque<UndoEntry>,
     pub(crate) redo_stack: VecDeque<UndoEntry>,
     /// Running byte totals for `undo_stack`/`redo_stack`, kept in sync by `push_undo`/`pop_undo`
@@ -1932,6 +2113,7 @@ impl WorldState {
         WorldState {
             world: None,
             clipboard: None,
+            paste_placements: Vec::new(),
             undo_stack: VecDeque::new(),
             redo_stack: VecDeque::new(),
             undo_bytes: 0,
@@ -2301,8 +2483,8 @@ fn parse_world_inner(bytes: MmapMut) -> Result<LoadedWorld, String> {
         }
     };
 
-    // World name: bytes 40–75, null-terminated ASCII
-    let name_bytes = &bytes[40..76.min(bytes.len())];
+    // World name: `name[50]`, bytes 40–89, null-terminated ASCII
+    let name_bytes = &bytes[40..90.min(bytes.len())];
     let name_end = name_bytes.iter().position(|&b| b == 0).unwrap_or(name_bytes.len());
     let name = String::from_utf8_lossy(&name_bytes[..name_end]).into_owned();
 
@@ -2716,6 +2898,11 @@ fn load_world(path: String, state: tauri::State<'_, AppState>) -> Result<WorldMe
 
     timing_log!("[LOAD] start");
 
+    // A swap must not interleave with a save's re-base (21.3 / audit L5): a re-base landing after
+    // this swap would point the new world's autosave lineage at the old world's file. Held for the
+    // whole load, so an autosave tick meanwhile skips (`try_lock`) instead of journaling mid-swap.
+    let _durable = durability_lock();
+
     // Step 1: File I/O + parse — no lock held, and critically, the previous world is left
     // untouched until parsing succeeds. A corrupt/wrong-type file must not destroy the current
     // session (it used to: the old world was cleared here before the file was even read).
@@ -2731,6 +2918,7 @@ fn load_world(path: String, state: tauri::State<'_, AppState>) -> Result<WorldMe
         // log beside this file. Roll it forward *before* staging, so the copy we map — and therefore
         // everything downstream, including this session's autosave base — is the repaired file.
         recover_wal(std::path::Path::new(&path));
+        sweep_orphan_save_temps(std::path::Path::new(&path));
     }
 
     let mut temp_shared = false;
@@ -2745,7 +2933,8 @@ fn load_world(path: String, state: tauri::State<'_, AppState>) -> Result<WorldMe
         let mut archive = ZipArchive::new(std::io::BufReader::new(file))
             .map_err(|e| format!("Invalid zip archive: {e}"))?;
         if archive.is_empty() { return Err("Zip archive contains no files".into()); }
-        let mut entry = archive.by_index(0)
+        let idx = pick_world_zip_entry(&mut archive);
+        let mut entry = archive.by_index(idx)
             .map_err(|e| format!("Failed to read zip entry: {e}"))?;
         let temp_path = temp_world_path();
         // A compressed world decompresses to many times its own size — check against the entry's
@@ -2876,6 +3065,7 @@ fn load_world(path: String, state: tauri::State<'_, AppState>) -> Result<WorldMe
         let old_persist = overview_persist_candidate(&ws); // before the dirty/disk state is reset
         let old_world = ws.world.replace(loaded);  // pointer swap only — dealloc happens outside the lock
         ws.clipboard = None;
+        ws.paste_placements.clear();
         ws.clear_undo();
         ws.clear_redo();
         ws.lamp_index.clear(); // rebuilt lazily for the new world on first night-lit request
@@ -3037,6 +3227,42 @@ fn composite_template_full(ws: &WorldState, w: i32, h: i32, buf: &mut [u8]) {
     }
 }
 
+/// Clamps an export rect to a `w`×`h` world; errors when it lies fully outside.
+fn export_rect(r: [i32; 4], w: i32, h: i32) -> Result<(i32, i32, i32, i32), String> {
+    let (x1, y1, x2, y2) = (r[0].max(0), r[1].max(0), r[2].min(w - 1), r[3].min(h - 1));
+    if x2 < x1 || y2 < y1 { return Err("Selection is outside the world".into()); }
+    Ok((x1, y1, x2, y2))
+}
+
+/// Copies the inclusive rect out of a `w`-wide RGBA buffer.
+fn crop_rgba(buf: &[u8], w: i32, x1: i32, y1: i32, x2: i32, y2: i32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(((x2 - x1 + 1) * (y2 - y1 + 1) * 4) as usize);
+    for y in y1..=y2 {
+        let a = ((y * w + x1) * 4) as usize;
+        out.extend_from_slice(&buf[a..a + ((x2 - x1 + 1) * 4) as usize]);
+    }
+    out
+}
+
+/// Nearest-neighbour integer upscale; refuses outputs past 256 Mpx (~1 GB RGBA).
+fn scale_rgba(w: i32, h: i32, buf: Vec<u8>, k: u32) -> Result<(i32, i32, Vec<u8>), String> {
+    if k <= 1 { return Ok((w, h, buf)); }
+    let k = k as usize;
+    let (ow, oh) = (w as usize * k, h as usize * k);
+    if ow * oh > 256 * 1024 * 1024 {
+        return Err(format!("{ow}×{oh} px is too large; pick a smaller scale or a selection"));
+    }
+    let mut out = vec![0u8; ow * oh * 4];
+    for y in 0..oh {
+        let src_row = &buf[(y / k) * w as usize * 4..][..w as usize * 4];
+        let dst_row = &mut out[y * ow * 4..][..ow * 4];
+        for x in 0..ow {
+            dst_row[x * 4..x * 4 + 4].copy_from_slice(&src_row[(x / k) * 4..(x / k) * 4 + 4]);
+        }
+    }
+    Ok((ow as i32, oh as i32, out))
+}
+
 /// Render the whole map to a PNG on disk, entirely in Rust. Replaces the old path that built the
 /// full RGBA buffer in JS, then a binary string, then a base64 string (≈4× the map size in JS heap)
 /// before shipping it back over IPC. Renders under the lock, then releases it before encoding+writing.
@@ -3048,6 +3274,10 @@ fn export_png(
     view: String,
     z: i32,
     use_template: bool,
+    // Selection-only export (22.20): inclusive block rect `[x1, y1, x2, y2]`, clamped to the world.
+    rect: Option<[i32; 4]>,
+    // Integer nearest-neighbour upscale, 1–8 (None = 1).
+    scale: Option<u32>,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
     // Three coarse phases (render → composite → encode) rather than the old indeterminate shimmer.
@@ -3063,16 +3293,22 @@ fn export_png(
         let cap = ws.view_cap_z;
         let world = ws.world.as_ref().ok_or("No world loaded")?;
         let (w, h) = ((world.w_chunks * 16) as i32, (world.h_chunks * 16) as i32);
+        // With a template composite the full world is rendered and cropped afterwards (the
+        // composite works on whole-world buffers); otherwise only the rect is rendered.
+        let (rx1, ry1, rx2, ry2) = match (rect, use_template && view != "zslice") {
+            (Some(r), false) => export_rect(r, w, h)?,
+            _ => (0, 0, w - 1, h - 1),
+        };
         let buf = if view == "zslice" {
             let max_z = world_max_z(world);
             if z < 0 || z > max_z { return Err(format!("Z must be 0–{max_z}, got {z}")); }
-            render_zslice_patch_inner(world, z, 0, 0, w - 1, h - 1).pixels
+            render_zslice_patch_inner(world, z, rx1, ry1, rx2, ry2).pixels
         } else {
             // Cutaway is a top-down render with the cap applied, so the exported PNG matches
             // what's on screen without the frontend passing a separate view name.
-            render_pixels_patch(world, 0, 0, w - 1, h - 1, cap).pixels
+            render_pixels_patch(world, rx1, ry1, rx2, ry2, cap).pixels
         };
-        Ok((w, h, buf))
+        Ok((rx2 - rx1 + 1, ry2 - ry1 + 1, buf))
     };
     let (w, h, buf) = if use_template && view != "zslice" {
         let ws = read_ws(&state);
@@ -3080,10 +3316,17 @@ fn export_png(
         if ws.template_bytes.is_some() {
             composite_template_full(&ws, w, h, &mut buf);
         }
-        (w, h, buf)
+        match rect {
+            Some(r) => {
+                let (x1, y1, x2, y2) = export_rect(r, w, h)?;
+                (x2 - x1 + 1, y2 - y1 + 1, crop_rgba(&buf, w, x1, y1, x2, y2))
+            }
+            None => (w, h, buf),
+        }
     } else {
         render(&read_ws(&state))?
     };
+    let (w, h, buf) = scale_rgba(w, h, buf, scale.unwrap_or(1).clamp(1, 8))?;
     op.step(1, "Encoding PNG")?;
     let png = encode_rgba_png(&buf, w as u32, h as u32)?;
     op.step(2, "Writing file")?;
@@ -3092,6 +3335,37 @@ fn export_png(
     Ok(())
 }
 
+
+/// Renders the top-down map to a temp PNG that fits the server's 2 MB preview limit (22.15):
+/// halves the resolution (nearest-neighbour) until the encoded file is small enough. Returns the path.
+#[tauri::command(async)]
+fn render_upload_thumbnail(state: tauri::State<'_, AppState>) -> Result<String, String> {
+    const LIMIT: usize = 2 * 1024 * 1024 - 64 * 1024;
+    let (mut w, mut h, mut buf) = {
+        let ws = read_ws(&state);
+        let world = ws.world.as_ref().ok_or("No world loaded")?;
+        let (w, h) = ((world.w_chunks * 16) as i32, (world.h_chunks * 16) as i32);
+        (w, h, render_pixels_patch(world, 0, 0, w - 1, h - 1, ws.view_cap_z).pixels)
+    };
+    let mut png = encode_rgba_png(&buf, w as u32, h as u32)?;
+    for _ in 0..4 {
+        if png.len() <= LIMIT || w < 2 || h < 2 { break; }
+        let (nw, nh) = (w / 2, h / 2);
+        let mut out = Vec::with_capacity((nw * nh * 4) as usize);
+        for y in 0..nh {
+            for x in 0..nw {
+                let i = (((y * 2) * w + x * 2) * 4) as usize;
+                out.extend_from_slice(&buf[i..i + 4]);
+            }
+        }
+        (w, h, buf) = (nw, nh, out);
+        png = encode_rgba_png(&buf, w as u32, h as u32)?;
+    }
+    if png.len() > LIMIT { return Err("Map snapshot is still over 2 MB; choose a PNG by hand".into()); }
+    let path = std::env::temp_dir().join(format!("vuencedit_thumb_{}.png", std::process::id()));
+    fs::write(&path, &png).map_err(|e| format!("Failed to write snapshot: {e}"))?;
+    Ok(path.to_string_lossy().into_owned())
+}
 
 // ── Selection ──────────────────────────────────────────────────────────────────
 
@@ -4314,12 +4588,12 @@ fn fsync_dir(dir: &std::path::Path) {
 #[cfg(not(unix))]
 fn fsync_dir(_dir: &std::path::Path) {}
 
-/// Write `spans` into an already-existing file at their absolute offsets and fsync it. Shared by the
-/// incremental save's step 3 and `recover_wal`'s roll-forward so both can't drift apart. Opened
-/// `write(true)` with no truncate/append — every write is positioned, and the file's length never
-/// changes (a world's layout is fixed, see the module note above).
-fn apply_spans_in_place(dest: &std::path::Path, spans: &[(u64, &[u8])]) -> std::io::Result<()> {
-    let mut f = fs::OpenOptions::new().write(true).open(dest)?;
+/// Write `spans` into an already-existing file at their absolute offsets and fsync it — the
+/// incremental save's step 3. `f` must have been opened `write(true)` with no truncate/append (every
+/// write is positioned, and the file's length never changes — a world's layout is fixed, see the
+/// module note above). The caller opens it *before* committing the WAL (21.4), so a destination that
+/// can't be opened at all never leaves a log behind.
+fn apply_spans_in_place(f: &mut fs::File, spans: &[(u64, &[u8])]) -> std::io::Result<()> {
     for (off, payload) in spans {
         f.seek(SeekFrom::Start(*off))?;
         f.write_all(payload)?;
@@ -4482,7 +4756,16 @@ fn try_incremental_save_seq(state: &AppState, path: &str, backup_compressed: boo
             return Ok(None);
         }
 
-        // ── Step 2: the redo log, committed and fsynced before the destination is touched at all.
+        // ── Step 2a (21.4 / audit L3): open the destination for writing *before* the log exists. A
+        // read-only file, a Windows sharing violation (the game, OneDrive) or a permissions error
+        // fails here, with nothing written and no WAL — so it declines and the full atomic path
+        // owns the error message. Opening it after the commit used to leave a log that replayed on
+        // the next open (possibly over edits the user had since discarded) and claimed "partway".
+        let Ok(mut dest_file) = fs::OpenOptions::new().write(true).open(dest) else {
+            return Ok(None);
+        };
+
+        // ── Step 2b: the redo log, committed and fsynced before the destination is touched at all.
         let wal_written = (|| -> Result<(), String> {
             let file = fs::File::create(&wal).map_err(|e| format!("Failed to create save log: {e}"))?;
             let mut w = journal::JournalWriter::create(file, world.bytes.len() as u64, random_base_id(), false)
@@ -4506,13 +4789,14 @@ fn try_incremental_save_seq(state: &AppState, path: &str, backup_compressed: boo
         // ── Step 3: apply in place. From here the destination is mid-mutation, which is exactly what
         // the committed log above covers — so a failure keeps the log (the next `load_world` rolls it
         // forward) and reports rather than pretending the save didn't happen.
-        if let Err(e) = apply_spans_in_place(dest, &spans) {
+        if let Err(e) = apply_spans_in_place(&mut dest_file, &spans) {
             return Err(format!(
                 "Save failed partway through writing {} changed regions. The file's change log was kept \
                  and will be applied automatically the next time it's opened. Underlying error: {e}",
                 spans.len()
             ));
         }
+        drop(dest_file); // closed before the stat in `record_full_write` (Windows reports mtime on close)
         // ── Step 4: the log has served its purpose.
         let _ = fs::remove_file(&wal);
 
@@ -5598,7 +5882,10 @@ fn save_world(
     // The file just written becomes the autosave journal's new base (or, compressed, no lineage) —
     // replaces the frontend's old post-save `discard_autosave`. Best effort: the save itself already
     // succeeded, and without a re-base the old lineage stays valid or falls back on its own.
+    // Skipped while a crash autosave is undecided (21.5): the re-base deletes the sidecars, and
+    // autosave is paused for the session anyway, so the lineage it would set is never used.
     let rebase = |seq: u64| match autosave_paths(&app) {
+        Ok(_) if recovery_held() => timing_log!("[AUTOSAVE] re-base skipped: recovery undecided"),
         Ok(paths) => rebase_after_save_inner(&state, &paths, &dest, compressed, seq),
         Err(e) => timing_log!("[AUTOSAVE] re-base skipped: {}", e),
     };
@@ -5686,10 +5973,12 @@ fn overview_job_after_save(state: &AppState, dest: &std::path::Path, seq: u64) -
 /// World-independent state (texture pack, Eden.eden template) is intentionally left loaded.
 #[tauri::command(async)]
 fn close_world(state: tauri::State<'_, AppState>) {
+    let _durable = durability_lock(); // same reason as `load_world` (21.3 / audit L5)
     let (old_world, old_temp, old_persist) = {
         let mut ws = write_ws(&state);
         let old_persist = overview_persist_candidate(&ws);
         ws.clipboard = None;
+        ws.paste_placements.clear();
         ws.clear_undo();
         ws.clear_redo();
         ws.lamp_index.clear();
@@ -5746,7 +6035,8 @@ fn close_world(state: tauri::State<'_, AppState>) {
 // under read guards or none, so without it a tick could interleave with a save's re-base and
 // resurrect a lineage whose files were just deleted (plan §1.1). Lock order is always durability →
 // world guard, never the reverse; readers and edits never take it. `lineage_gen` is the second
-// line of defence, for the paths that don't take it (load/close) and for tests.
+// line of defence, for tests (which call the `_inner` functions without it). Load and close take it
+// too (21.3), so a world swap can't land between a save's guard drop and its re-base.
 
 /// Serialises the autosave/save file lifecycle — see the module comment above. A plain static
 /// rather than managed state so the `_inner` functions stay callable from tests without it (they
@@ -5755,6 +6045,23 @@ static DURABILITY: Mutex<()> = Mutex::new(());
 
 fn durability_lock() -> std::sync::MutexGuard<'static, ()> {
     DURABILITY.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Set while a crash autosave found at startup is undecided (21.5, audit L4). The prompt's "Not
+/// now" promises the autosave is re-offered next launch, but every path that writes or clears the
+/// sidecars would destroy it: an autosave tick's fresh lineage, a save's re-base, a close's discard.
+/// While this is set those paths leave the sidecar files alone, so autosave is paused for the
+/// session. Set by `get_autosave_info` when it offers one; cleared only by a decision: a successful
+/// `load_autosave`, `discard_autosave(decided: true)`, or `release_autosave_hold` (legacy format-0
+/// recovery, which loads through `load_world`). The commands check it; the `_inner` functions don't.
+static RECOVERY_HOLD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn recovery_held() -> bool {
+    RECOVERY_HOLD.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+fn set_recovery_hold(held: bool) {
+    RECOVERY_HOLD.store(held, std::sync::atomic::Ordering::SeqCst);
 }
 
 #[derive(Serialize, serde::Deserialize, Clone)]
@@ -5803,9 +6110,11 @@ fn autosave_paths_at(dir: &std::path::Path) -> AutosavePaths {
 
 fn autosave_paths(app: &tauri::AppHandle) -> Result<AutosavePaths, String> {
     use tauri::Manager;
-    let dir = app.path().app_data_dir().map_err(|e| format!("Failed to resolve app data dir: {e}"))?;
-    fs::create_dir_all(&dir).map_err(|e| format!("Failed to create app data dir: {e}"))?;
-    Ok(autosave_paths_at(&dir))
+    let base = app.path().app_data_dir().map_err(|e| format!("Failed to resolve app data dir: {e}"))?;
+    fs::create_dir_all(&base).map_err(|e| format!("Failed to create app data dir: {e}"))?;
+    // 21.14: claimed once per process (shared slot if free/stale, else our own instance-<pid> dir).
+    let dir = AUTOSAVE_DIR.get_or_init(|| claim_autosave_dir(&base, std::process::id(), &pid_alive));
+    Ok(autosave_paths_at(dir))
 }
 
 /// Below this many bytes' worth of journal already on disk, an autosave tick just appends. Above
@@ -6161,6 +6470,10 @@ fn autosave_world(
             return Ok(false);
         }
     };
+    if recovery_held() {
+        timing_log!("[AUTOSAVE] tick skipped: a crash autosave is awaiting a recovery decision");
+        return Ok(false);
+    }
     let paths = autosave_paths(&app)?;
     autosave_world_inner(&state, &paths, source_path, Some((&app, &ops)))?;
     Ok(true)
@@ -6404,6 +6717,7 @@ fn load_autosave_inner(state: &AppState, paths: &AutosavePaths) -> Result<WorldM
         let mut ws = write_ws(state);
         let old_world = ws.world.replace(loaded);
         ws.clipboard = None;
+        ws.paste_placements.clear();
         ws.clear_undo();
         ws.clear_redo();
         ws.lamp_index.clear();
@@ -6457,7 +6771,9 @@ fn load_autosave_inner(state: &AppState, paths: &AutosavePaths) -> Result<WorldM
 fn load_autosave(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<WorldMeta, String> {
     let _durable = durability_lock();
     let paths = autosave_paths(&app)?;
-    load_autosave_inner(&state, &paths)
+    let meta = load_autosave_inner(&state, &paths)?;
+    set_recovery_hold(false); // recovered: the lineage is live again (21.5)
+    Ok(meta)
 }
 
 /// Core of `get_autosave_info`: `None` if no autosave is pending recovery. Side-effect free (the
@@ -6491,7 +6807,18 @@ fn autosave_info_at(paths: &AutosavePaths) -> Result<Option<AutosaveInfo>, Strin
 #[tauri::command(async)]
 fn get_autosave_info(app: tauri::AppHandle) -> Result<Option<AutosaveInfo>, String> {
     let paths = autosave_paths(&app)?;
-    autosave_info_at(&paths)
+    let info = autosave_info_at(&paths)?;
+    if info.is_some() {
+        set_recovery_hold(true); // 21.5: hands off the sidecars until the user decides
+    }
+    Ok(info)
+}
+
+/// Lifts the recovery hold after a legacy (format 0) autosave was recovered through `load_world`,
+/// which knows nothing about the hold (21.5). Formats 1–2 lift it in `load_autosave`.
+#[tauri::command]
+fn release_autosave_hold() {
+    set_recovery_hold(false);
 }
 
 /// The path to load a *legacy* (format 0) pending autosave from — the caller feeds this into the
@@ -6530,12 +6857,23 @@ fn discard_autosave_inner(state: &AppState, paths: &AutosavePaths) {
 }
 
 /// Clears the pending autosave — every sidecar format might have left behind — and resets the
-/// in-memory lineage with it. Called when the user declines the recovery prompt and on world close
-/// (a save re-bases in the backend instead, 18.9). The single entry point so the files and
-/// `WorldState::autosave` can never diverge.
+/// in-memory lineage with it. Called when the user declines the recovery prompt (`decided: true`)
+/// and on world close (a save re-bases in the backend instead, 18.9). The single entry point so the
+/// files and `WorldState::autosave` can never diverge. While a crash autosave is undecided (21.5),
+/// only `decided: true` touches anything — a close must not delete the sidecar "Not now" kept.
 #[tauri::command(async)]
-fn discard_autosave(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> {
+fn discard_autosave(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    decided: Option<bool>,
+) -> Result<(), String> {
     let _durable = durability_lock();
+    if decided == Some(true) {
+        set_recovery_hold(false);
+    } else if recovery_held() {
+        timing_log!("[AUTOSAVE] discard skipped: recovery undecided");
+        return Ok(());
+    }
     let paths = autosave_paths(&app)?;
     discard_autosave_inner(&state, &paths);
     timing_log!("[AUTOSAVE] discarded sidecar files, lineage reset");
@@ -6575,10 +6913,22 @@ fn list_undo_stack(state: tauri::State<'_, AppState>) -> Result<UndoStackInfo, S
     })
 }
 
+/// `only_group` (21.9, audit S2): undo only if the top entry belongs to that group, else "Nothing to
+/// undo" without touching anything. A cancelled live sculpt stroke passes its id: a stroke whose
+/// flushes changed nothing pushed no entry, and a plain undo would pop the unrelated edit below it.
 #[tauri::command(async)]
-fn undo_edit(state: tauri::State<'_, AppState>) -> Result<EditResult, String> {
+fn undo_edit(state: tauri::State<'_, AppState>, only_group: Option<u64>) -> Result<EditResult, String> {
     let mut ws = write_ws(&state);
-    undo_edit_inner(&mut ws)
+    undo_edit_only(&mut ws, only_group)
+}
+
+fn undo_edit_only(ws: &mut WorldState, only_group: Option<u64>) -> Result<EditResult, String> {
+    if let Some(g) = only_group {
+        if ws.undo_stack.back().map(|e| e.group) != Some(Some(g)) {
+            return Err("Nothing to undo".into());
+        }
+    }
+    undo_edit_inner(ws)
 }
 
 #[tauri::command(async)]
@@ -6598,6 +6948,7 @@ fn undo_edit_inner(ws: &mut WorldState) -> Result<EditResult, String> {
     // the very stroke that owns the session is the dangerous case (its `fheight` would now describe
     // heights the world no longer has). See `SculptSession`.
     ws.sculpt_session = None;
+    ws.paste_placements.clear(); // 21.6: an undone paste must not leave a placement behind
     // Take the world first: if none is loaded, error out before popping the undo stack, so a
     // stray call with no world can't silently discard an entry (harmless today since the stacks
     // are cleared with the world, but fragile ordering otherwise).
@@ -6649,6 +7000,7 @@ fn undo_edit_inner(ws: &mut WorldState) -> Result<EditResult, String> {
 /// pushing inverses onto `undo_stack`.
 fn redo_edit_inner(ws: &mut WorldState) -> Result<EditResult, String> {
     ws.sculpt_session = None; // bypasses with_edit_inner — clear the live-sculpt workspace (see SculptSession)
+    ws.paste_placements.clear(); // 21.6: same rule as undo — placements die on every undo/redo
     let mut world = ws.world.take().ok_or("No world loaded")?;
     let entry = match pop_undo(&mut ws.redo_stack, &mut ws.redo_bytes, &mut ws.redo_groups) {
         Some(e) => e,
@@ -6699,6 +7051,15 @@ fn copy_selection(
     z_min: i32, z_max: i32,
     state: tauri::State<'_, AppState>,
 ) -> Result<ClipboardInfo, String> {
+    copy_selection_inner(&state, x1, y1, x2, y2, z_min, z_max)
+}
+
+/// `copy_selection` minus the tauri `State` (callable from tests, per the `_inner` convention).
+fn copy_selection_inner(
+    state: &AppState,
+    x1: i32, y1: i32, x2: i32, y2: i32,
+    z_min: i32, z_max: i32,
+) -> Result<ClipboardInfo, String> {
     // The volume copy (audit H3) only needs a shared read guard — up to 512 MB of scanning that
     // used to hold the exclusive write guard for its entire duration, starving every edit/render.
     // Only the clipboard drop/install below need the write guard.
@@ -6716,11 +7077,11 @@ fn copy_selection(
     // selection, over the volume cap, no world) returns above this line and keeps the old one.
     // std's RwLock can't upgrade, so validate under a read guard, release, drop under a write
     // guard, then re-take the read guard and re-validate (the world may have changed in the gap).
-    check(&read_ws(&state))?;
-    let old = write_ws(&state).clipboard.take();
+    check(&read_ws(state))?;
+    let old = write_ws(state).clipboard.take();
     drop(old);
     let cb = {
-        let ws = read_ws(&state);
+        let ws = read_ws(state);
         let vol = check(&ws)?;
         let world = ws.world.as_ref().ok_or("No world loaded")?;
 
@@ -6753,10 +7114,15 @@ fn copy_selection(
         // exactly the clipboard's per-column layout (dy*width+dx), so the bits transfer verbatim.
         // `active_mask` applies the rect-equality fail-safe; a mismatched/absent mask → full-box copy.
         let mask = active_mask(&ws, x1, y1, x2, y2).map(|m| m.bits);
-        Clipboard { width, height, depth, z_anchor: z_min, block_types, paints, mask }
+        // 21.6 §3.1: a copy carries where it came from — derived from a covering paste placement
+        // when there is one, else this world's absolute coordinates.
+        let origin = derive_copy_origin(
+            &ws.paste_placements, world.min_x, world.min_y, x1, y1, x2, y2, z_min, z_max,
+        );
+        Clipboard { width, height, depth, z_anchor: z_min, block_types, paints, mask, origin }
     };
     let info = cb.info();
-    write_ws(&state).clipboard = Some(cb);
+    write_ws(state).clipboard = Some(cb);
     Ok(info)
 }
 
@@ -6840,17 +7206,18 @@ fn rename_world(state: tauri::State<'_, AppState>, name: String) -> Result<(), S
         return Err("Name must be 32 characters or fewer".into());
     }
     for ch in name.chars() {
-        if !ch.is_ascii_alphabetic() && !ch.is_ascii_digit() && ch != '\'' {
-            return Err(format!("Invalid character '{}'. Use only A–Z, a–z, 0–9 and '.", ch));
+        if !ch.is_ascii_alphabetic() && !ch.is_ascii_digit() && ch != '\'' && ch != ' ' {
+            return Err(format!("Invalid character '{}'. Use only A–Z, a–z, 0–9, spaces and '.", ch));
         }
     }
     let mut ws = write_ws(&state);
     let world = ws.world.as_mut().ok_or("No world loaded")?;
-    if world.bytes.len() < 76 {
+    if world.bytes.len() < 90 {
         return Err("World file too small to contain name field".into());
     }
     let name_bytes = name.as_bytes();
-    for i in 0..36usize {
+    // The header's `name[50]` field (40..90); zero all of it so no tail of an older name survives.
+    for i in 0..50usize {
         world.bytes[40 + i] = if i < name_bytes.len() { name_bytes[i] } else { 0 };
     }
     world.name = name;
@@ -6897,6 +7264,7 @@ fn pick_block_surface(state: tauri::State<'_, AppState>, wx: i32, wy: i32) -> Re
 /// Directional block IDs (ramps 24–39, wedges 40–55, doors 66–69, portals 75–78) are remapped.
 /// Does not touch world data; no undo entry required.
 fn rotate_clipboard_inner(cb: &mut Clipboard) {
+    cb.origin = None; // a transformed clipboard no longer corresponds to the copied box (21.6 §2)
     let old_w = cb.width as usize;
     let old_h = cb.height as usize;
     let depth = cb.depth as usize;
@@ -6953,6 +7321,7 @@ fn rotate_clipboard(state: tauri::State<'_, AppState>) -> Result<ClipboardInfo, 
 }
 
 fn mirror_clipboard_x_inner(cb: &mut Clipboard) {
+    cb.origin = None; // a transformed clipboard no longer corresponds to the copied box (21.6 §2)
     let w = cb.width as usize;
     let h = cb.height as usize;
     let depth = cb.depth as usize;
@@ -6998,6 +7367,7 @@ fn mirror_clipboard_x(state: tauri::State<'_, AppState>) -> Result<ClipboardInfo
 }
 
 fn mirror_clipboard_y_inner(cb: &mut Clipboard) {
+    cb.origin = None; // a transformed clipboard no longer corresponds to the copied box (21.6 §2)
     let w = cb.width as usize;
     let h = cb.height as usize;
     let depth = cb.depth as usize;
@@ -7059,7 +7429,16 @@ fn paste_at(
     state: tauri::State<'_, AppState>,
 ) -> Result<EditResult, String> {
     let mut ws = write_ws(&state);
+    paste_at_inner(&mut ws, paste_x, paste_y, elevation_offset, ignore_air)
+}
 
+/// `paste_at` minus the tauri `State` (callable from tests, per the `_inner` convention).
+fn paste_at_inner(
+    ws: &mut WorldState,
+    paste_x: i32, paste_y: i32,
+    elevation_offset: i32,
+    ignore_air: bool,
+) -> Result<EditResult, String> {
     // Take the clipboard out instead of cloning its two (up to 256 MB each) arrays purely to
     // satisfy the borrow checker (audit H4) — the edit closure only ever needs `&Clipboard`, and
     // it's restored right after, so `ws.clipboard` is never observably absent to any other code
@@ -7074,34 +7453,59 @@ fn paste_at(
     let patch_rect = (paste_x, paste_y, x2_paste, y2_paste);
 
     let label = format!("Paste {width}×{height}×{depth}");
-    let result = with_edit(&mut ws, &label, patch_rect, |world| {
+    let mut clipped = 0u32;
+    let mut result = with_edit(ws, &label, patch_rect, |world| {
+        let max_z = world_max_z(world);
         for dz in 0..depth {
             let z = z_anchor + elevation_offset + dz;
-            if z < 0 || z > world_max_z(world) { continue; }
-            let band = (z as usize) / 16;
-            let lz   = (z as usize) % 16;
+            let z_ok = z >= 0 && z <= max_z;
+            let band = (z.max(0) as usize) / 16;
+            let lz   = (z.max(0) as usize) % 16;
             for dy in 0..height {
                 let py = paste_y + dy;
-                if py < 0 { continue; }
-                let chunk_cy = py / 16 + world.min_y;
-                let ly       = (py % 16) as usize;
+                let chunk_cy = py.div_euclid(16) + world.min_y;
+                let ly       = py.rem_euclid(16) as usize;
                 for dx in 0..width {
                     let px = paste_x + dx;
-                    if px < 0 { continue; }
                     // Non-rectangular clipboard: skip columns outside the footprint before anything
                     // else, so a shaped copy stamps its shape, not the box. Distinct from ignore_air.
                     if let Some(m) = mask { if !bit_set(m, (dy * width + dx) as usize) { continue; } }
-                    let chunk_cx = px / 16 + world.min_x;
-                    let lx       = (px % 16) as usize;
                     let idx = (dz * height * width + dy * width + dx) as usize;
                     if ignore_air && block_types[idx] == 0 { continue; }
-                    // Outside the world boundary (no chunk) the write is clipped silently.
+                    // Outside the world (off an edge, no chunk, above max_z) the write is dropped;
+                    // 22.9 counts it so the user is told.
+                    let chunk_cx = px.div_euclid(16) + world.min_x;
+                    if px < 0 || py < 0 || !z_ok || !world.has_chunk(chunk_cx, chunk_cy) { clipped += 1; continue; }
+                    let lx = (px % 16) as usize;
                     set_block_in_band(world, chunk_cx, chunk_cy, band, lx * 256 + ly * 16 + lz, block_types[idx], paints[idx]);
                 }
             }
         }
         Ok(())
     });
+    if let Ok(r) = result.as_mut() { push_clip_warning(&mut r.warnings, clipped); }
+    // 21.6 §3.2: remember what this paste put where — only when the pasted area equals the prefab
+    // cell for cell (round-trip origin, unmasked, ignore-air off, the whole footprint inside the
+    // world, committed Ok). Anything else — masked / ignore-air / clipped / terrain / scatter /
+    // array pastes — never records.
+    if result.is_ok() && !ignore_air && cb.mask.is_none() {
+        if let (Some(o), Some(world)) = (cb.origin, ws.world.as_ref()) {
+            let pz = z_anchor + elevation_offset;
+            let fits = o.rtid != 0
+                && paste_x >= 0 && paste_y >= 0
+                && (paste_x as i64 + width as i64) <= world.w_chunks as i64 * 16
+                && (paste_y as i64 + height as i64) <= world.h_chunks as i64 * 16
+                && pz >= 0 && pz + depth - 1 <= world_max_z(world);
+            if fits {
+                ws.paste_placements.push(Placement {
+                    x: paste_x, y: paste_y, z: pz, w: width, h: height, d: depth,
+                    ax: o.ax, ay: o.ay, az: o.az, rtid: o.rtid,
+                });
+                let extra = ws.paste_placements.len().saturating_sub(MAX_PLACEMENTS);
+                if extra > 0 { ws.paste_placements.drain(..extra); }
+            }
+        }
+    }
     ws.clipboard = Some(cb);
     result
 }
@@ -7141,44 +7545,80 @@ fn paste_terrain_inner(
     let cap = ws.view_cap_z; // cutaway: follow the sub-cap surface (cave floor), not the true surface
 
     let label = format!("Paste (terrain) {width}×{height}×{depth}");
-    let result = with_edit(ws, &label, patch_rect, |world| {
+    let mut clipped = 0u32;
+    let mut result = with_edit(ws, &label, patch_rect, |world| {
         let max_z = world_max_z(world);
-        for dy in 0..height {
-            let py = paste_y + dy;
-            if py < 0 { continue; }
-            let chunk_cy = py / 16 + world.min_y;
-            let ly       = (py % 16) as usize;
-            for dx in 0..width {
-                let px = paste_x + dx;
-                if px < 0 { continue; }
-                // Shaped clipboard: skip whole columns outside the footprint.
-                if let Some(m) = mask { if !bit_set(m, (dy * width + dx) as usize) { continue; } }
-                let chunk_cx = px / 16 + world.min_x;
-                let lx       = (px % 16) as usize;
-                if !world.has_chunk(chunk_cx, chunk_cy) { continue; }
-                // Read surface before writing this column — other columns' writes never
-                // affect (px, py) since each (dx, dy) maps to a unique world position.
-                // `terrain_paste_base` is shared with `render_paste_lens`, so the lens can't drift.
-                let Some(surf_base) = terrain_paste_base(world, px, py, cap, above_surface) else {
-                    continue; // all-air column — skip
-                };
-                let z_base = surf_base + elevation_offset;
-
-                for dz in 0..depth {
-                    let z = z_base + dz;
-                    if z < 0 || z > max_z { continue; }
-                    let band = (z as usize) / 16;
-                    let lz   = (z as usize) % 16;
-                    let idx  = (dz * height * width + dy * width + dx) as usize;
-                    if ignore_air && block_types[idx] == 0 { continue; }
-                    set_block_in_band(world, chunk_cx, chunk_cy, band, lx * 256 + ly * 16 + lz, block_types[idx], paints[idx]);
-                }
-            }
-        }
+        clipped = paste_terrain_at(world, paste_x, paste_y, block_types, paints,
+            width, height, depth, elevation_offset, ignore_air, max_z, mask.as_deref(), cap, above_surface);
         Ok(())
     });
+    if let Ok(r) = result.as_mut() { push_clip_warning(&mut r.warnings, clipped); }
     ws.clipboard = Some(cb);
     result
+}
+
+/// One terrain-following stamp of the clipboard at `(paste_x, paste_y)`: per column, `dz = 0` lands
+/// on `terrain_paste_base` + `elevation_offset`. Shared by `paste_terrain` (once) and
+/// `scatter_paste`/`array_paste` (per placement, 22.6) — so all three follow terrain identically.
+/// Columns outside the shape, the world, or with no surface are skipped.
+fn paste_terrain_at(
+    world: &mut (impl VoxelViewMut + VoxelView),
+    paste_x: i32, paste_y: i32,
+    block_types: &[u8], paints: &[u8],
+    width: i32, height: i32, depth: i32,
+    elevation_offset: i32, ignore_air: bool,
+    max_z: i32,
+    mask: Option<&[u8]>,
+    cap: Option<i32>,
+    above_surface: bool,
+) -> u32 {
+    let (mnx, mny) = world.chunk_origin();
+    let mut clipped = 0u32;
+    for dy in 0..height {
+        let py = paste_y + dy;
+        if py < 0 { continue; }
+        let chunk_cy = py / 16 + mny;
+        let ly       = (py % 16) as usize;
+        for dx in 0..width {
+            let px = paste_x + dx;
+            if px < 0 { continue; }
+            // Shaped clipboard: skip whole columns outside the footprint.
+            if let Some(m) = mask { if !bit_set(m, (dy * width + dx) as usize) { continue; } }
+            let chunk_cx = px / 16 + mnx;
+            let lx       = (px % 16) as usize;
+            if !world.has_chunk(chunk_cx, chunk_cy) {
+                // 22.9: a shaped-in column off the world's edge — count its non-skipped cells.
+                clipped += (0..depth).filter(|&dz| !(ignore_air && block_types[(dz * height * width + dy * width + dx) as usize] == 0)).count() as u32;
+                continue;
+            }
+            // Read surface before writing this column — other columns' writes never
+            // affect (px, py) since each (dx, dy) maps to a unique world position.
+            // `terrain_paste_base` is shared with `render_paste_lens`, so the lens can't drift.
+            let Some(surf_base) = terrain_paste_base(&*world, px, py, cap, above_surface) else {
+                continue; // all-air column — skip
+            };
+            let z_base = surf_base + elevation_offset;
+            for dz in 0..depth {
+                let z = z_base + dz;
+                let idx  = (dz * height * width + dy * width + dx) as usize;
+                if ignore_air && block_types[idx] == 0 { continue; }
+                if z < 0 || z > max_z { clipped += 1; continue; }
+                let band = (z as usize) / 16;
+                let lz   = (z as usize) % 16;
+                set_block_in_band(world, chunk_cx, chunk_cy, band, lx * 256 + ly * 16 + lz, block_types[idx], paints[idx]);
+            }
+        }
+    }
+    clipped
+}
+
+/// 22.9: the toast for a paste whose cells fell outside the world. `clipped` = cells that were
+/// meant to be written (inside the shape, not skipped by ignore-air) but had nowhere to go.
+fn push_clip_warning(warnings: &mut Vec<String>, clipped: u32) {
+    if clipped > 0 {
+        warnings.push(format!(
+            "{clipped} blocks of the paste fell outside the world (past an edge, a missing chunk, or the height limit) and were not placed."));
+    }
 }
 
 /// Where a terrain paste puts column `(px, py)`'s `dz = 0` cell, before `elevation_offset`: the
@@ -7205,8 +7645,10 @@ fn extrude_selection(
     ignore_air: bool,
     state: tauri::State<'_, AppState>,
 ) -> Result<EditResult, String> {
-    let mut ws = write_ws(&state);
+    // Guard before taking the write lock: `count` is documented 1–20 but was never clamped backend-side.
     if count <= 0 { return Err("count must be at least 1".into()); }
+    if count > 20 { return Err("count must be at most 20".into()); }
+    let mut ws = write_ws(&state);
 
     // Non-rectangular selection: gate on the *source* footprint (mask only exists over the source
     // bbox). z± stacks the shape in place; x±/y± repeats the translated shape — each copy leaves
@@ -7222,7 +7664,8 @@ fn extrude_selection(
         let width  = x2 - x1 + 1;
         let height = y2 - y1 + 1;
         let depth  = z_max - z_min + 1;
-        let n = (width * height * depth) as usize;
+        // Same cap as copy/cut: the two source buffers below are n bytes each (21.11).
+        let n = validate_volume(width, height, depth)? as usize;
         let mut src_types  = vec![0u8; n];
         let mut src_paints = vec![0u8; n];
 
@@ -7641,8 +8084,10 @@ fn generate_trees(
     let patch_rect = ((x1 - 3).max(0), (y1 - 3).max(0), x2 + 3, y2 + 3);
 
     let label = format!("Generate trees ({}×{})", x2 - x1 + 1, y2 - y1 + 1);
+    // Cutaway: plant on the visible (sub-cap) surface, not the true one above it (22.2).
+    let cap = ws.view_cap_z;
     with_edit(&mut ws, &label, patch_rect, |world| {
-        generate_trees_inner(world, x1, y1, x2, y2, &tree_types, density, &leaf_paints, seed, smart_placement, mask.as_ref());
+        generate_trees_inner(world, x1, y1, x2, y2, &tree_types, density, &leaf_paints, seed, smart_placement, mask.as_ref(), cap);
         Ok(())
     })
 }
@@ -7655,7 +8100,7 @@ fn generate_trees_inner(
     world: &mut EditView,
     x1: i32, y1: i32, x2: i32, y2: i32,
     tree_types: &[String], density: f32, leaf_paints: &[u8], seed: u64,
-    smart_placement: bool, mask: Option<&SelectionMask>,
+    smart_placement: bool, mask: Option<&SelectionMask>, cap: Option<i32>,
 ) {
     let max_z = world_max_z(world);
     let mut rng = Rng64::new(seed);
@@ -7666,7 +8111,7 @@ fn generate_trees_inner(
             if mask.is_some_and(|m| !m.contains(wx, wy)) { continue; }
             if !rng.prob(density_num, 1_000_000) { continue; }
 
-            let sz = match surface_z(world, wx, wy) { Some(z) => z, None => continue };
+            let sz = match surface_z_capped(world, wx, wy, cap) { Some(z) => z, None => continue };
 
             // Read surface block type to check plantability.
             let surf_bt = {
@@ -8155,6 +8600,8 @@ fn simulate_flow(
     const FLOW_SPILL: i32 = 3;
     let (fx1, fy1) = ((x1 - FLOW_SPILL).max(0), (y1 - FLOW_SPILL).max(0));
     let (fx2, fy2) = (x2 + FLOW_SPILL, y2 + FLOW_SPILL);
+    // The flood grid covers the padded rect over the full z range — cap it like any other volume op.
+    validate_volume(fx2 - fx1 + 1, fy2 - fy1 + 1, z_max - z_min + 1)?;
     let rect = (fx1, fy1, fx2, fy2);
     let label = format!(
         "Simulate {} flow ({}×{})",
@@ -8350,6 +8797,8 @@ fn flood_fill_bfs(
 struct FloodPlan {
     cells: Vec<(i32, i32, i32)>,
     rect: (i32, i32, i32, i32),
+    /// Surface BFS stopped at its cap with matching cells left (22.2); always false for the 3D fill.
+    truncated: bool,
 }
 
 /// Axiom-style flood fill for the 3D pane: spreads the armed block through air connected to
@@ -8386,7 +8835,7 @@ fn flood_fill_3d(
             x_min = x_min.min(x); y_min = y_min.min(y);
             x_max = x_max.max(x); y_max = y_max.max(y);
         }
-        Ok(FloodPlan { cells, rect: (x_min, y_min, x_max, y_max) })
+        Ok(FloodPlan { cells, rect: (x_min, y_min, x_max, y_max), truncated: false })
     };
     let (seq_seen, first) = {
         let ws = read_ws(&state);
@@ -8394,7 +8843,7 @@ fn flood_fill_3d(
         (ws.dirty.seq, plan(world)?)
     };
     let mut ws = write_ws(&state);
-    let FloodPlan { cells, rect } = if ws.dirty.seq == seq_seen {
+    let FloodPlan { cells, rect, .. } = if ws.dirty.seq == seq_seen {
         first
     } else {
         timing_log!("[FLOOD] world changed during BFS (seq {} -> {}) — redoing under the write guard", seq_seen, ws.dirty.seq);
@@ -8521,6 +8970,45 @@ fn generate_wavy_surface_inner(
 fn serialize_prefab(cb: &Clipboard) -> Vec<u8> {
     use flate2::{write::GzEncoder, Compression};
     use std::io::Write;
+    let raw = serialize_prefab_raw(cb);
+    let mut enc = GzEncoder::new(Vec::new(), Compression::new(6)); // 22.8: ~best's size for a fraction of the time (18.8's level)
+    enc.write_all(&raw).unwrap();
+    enc.finish().unwrap()
+}
+
+/// `.epfab` provenance section tag (ROADMAP-LINK 21.6 §2): `tag[4] len:u32 payload`, appended after
+/// the body. Readers skip unknown tags and treat a truncated section as the end of the walk.
+const EPFAB_TAG_ORGN: &[u8; 4] = b"ORGN";
+const EPFAB_ORGN_LEN: usize = 21;
+
+/// Walk tagged sections in `tail` and return the first valid `ORGN`. Unknown tags are skipped; a
+/// truncated section ends the walk silently (the prefab is still valid, just without provenance).
+fn parse_epfab_sections(tail: &[u8]) -> Option<PrefabOrigin> {
+    let mut i = 0usize;
+    while tail.len().saturating_sub(i) >= 8 {
+        let tag = &tail[i..i + 4];
+        let len = u32::from_le_bytes(tail[i + 4..i + 8].try_into().unwrap()) as usize;
+        let start = i + 8;
+        let end = start.checked_add(len)?;
+        if end > tail.len() { return None; }
+        if tag == EPFAB_TAG_ORGN && len >= EPFAB_ORGN_LEN {
+            let p = &tail[start..end];
+            return Some(PrefabOrigin {
+                ax: i32::from_le_bytes(p[0..4].try_into().unwrap()),
+                ay: i32::from_le_bytes(p[4..8].try_into().unwrap()),
+                az: i32::from_le_bytes(p[8..12].try_into().unwrap()),
+                source: p[12],
+                rtid: u64::from_le_bytes(p[13..21].try_into().unwrap()),
+            });
+        }
+        i = end;
+    }
+    None
+}
+
+/// The pre-gzip bytes of a prefab — split out so the golden fixture test can pin the exact layout
+/// (gzip output isn't byte-stable across flate2 versions; the raw container is the contract).
+fn serialize_prefab_raw(cb: &Clipboard) -> Vec<u8> {
     let n = (cb.width * cb.height * cb.depth) as usize;
     // A shaped prefab uses EPFAB\x02, appending a per-column footprint after the dense arrays.
     // Rectangular prefabs stay on EPFAB\x01 byte-for-byte, so existing files and older builds are
@@ -8540,9 +9028,59 @@ fn serialize_prefab(cb: &Clipboard) -> Vec<u8> {
         raw.push(1u8);
         raw.extend_from_slice(m);
     }
-    let mut enc = GzEncoder::new(Vec::new(), Compression::best());
-    enc.write_all(&raw).unwrap();
-    enc.finish().unwrap()
+    if let Some(o) = cb.origin {
+        raw.extend_from_slice(EPFAB_TAG_ORGN);
+        raw.extend_from_slice(&(EPFAB_ORGN_LEN as u32).to_le_bytes());
+        for v in [o.ax, o.ay, o.az] { raw.extend_from_slice(&v.to_le_bytes()); }
+        raw.push(o.source);
+        raw.extend_from_slice(&o.rtid.to_le_bytes());
+    }
+    raw
+}
+
+/// Largest prefab `deserialize_prefab` accepts (voxels). `save_prefab` refuses anything above it,
+/// since the clipboard limit (`MAX_CLIPBOARD_VOLUME`) is 4x larger and such a file could never reload.
+const MAX_PREFAB_VOXELS: i64 = 64 * 1024 * 1024;
+
+fn check_prefab_savable(cb: &Clipboard) -> Result<(), String> {
+    let vol = (cb.width as i64).saturating_mul(cb.height as i64).saturating_mul(cb.depth as i64);
+    if vol > MAX_PREFAB_VOXELS {
+        return Err(format!(
+            "Prefab is {vol} blocks; prefabs are limited to {MAX_PREFAB_VOXELS} blocks (a larger file could not be loaded again). Copy a smaller region."
+        ));
+    }
+    Ok(())
+}
+
+/// Remove `<dest>.savetmp` and `<dest>.bak.zip.tmp` left by a save/backup that crashed mid-write.
+/// Run at open time (after `recover_wal`), when nothing of ours is mid-save on this path.
+///
+/// 21.14: another running instance may be mid-save of the same world, so a temp touched within
+/// `ORPHAN_TEMP_MIN_AGE` is left alone (a live save keeps modifying it; a crashed one goes stale and
+/// is swept on the next open).
+fn sweep_orphan_save_temps(dest: &std::path::Path) {
+    sweep_orphan_save_temps_aged(dest, std::time::Duration::from_secs(120));
+}
+
+fn sweep_orphan_save_temps_aged(dest: &std::path::Path, min_age: std::time::Duration) {
+    for ext in [".savetmp", ".bak.zip.tmp"] {
+        let mut p = dest.as_os_str().to_owned();
+        p.push(ext);
+        let p = std::path::PathBuf::from(p);
+        let age = fs::metadata(&p).and_then(|m| m.modified()).ok()
+            .and_then(|t| t.elapsed().ok()).unwrap_or(std::time::Duration::MAX);
+        if age >= min_age { let _ = fs::remove_file(&p); }
+    }
+}
+
+/// Index of the first `.eden` entry (by name, case-insensitive) in a world zip, else entry 0.
+fn pick_world_zip_entry<R: std::io::Read + std::io::Seek>(archive: &mut zip::ZipArchive<R>) -> usize {
+    for i in 0..archive.len() {
+        if let Ok(e) = archive.by_index_raw(i) {
+            if !e.is_dir() && e.name().to_ascii_lowercase().ends_with(".eden") { return i; }
+        }
+    }
+    0
 }
 
 fn deserialize_prefab(data: &[u8]) -> Result<Clipboard, String> {
@@ -8551,7 +9089,7 @@ fn deserialize_prefab(data: &[u8]) -> Result<Clipboard, String> {
     // Cap the decompressed size so a tiny "gzip bomb" .epfab can't expand to gigabytes. The largest
     // legitimate prefab is 22-byte header + 2 bytes per voxel + an optional 1-byte flag and a
     // width*height footprint bitset (≤ voxels/8, and ≤ MAX_CELLS/8 in the worst case).
-    const MAX_CELLS: i64 = 64 * 1024 * 1024; // 64M voxels
+    const MAX_CELLS: i64 = MAX_PREFAB_VOXELS;
     const MAX_DECOMPRESSED: u64 = 22 + 2 * MAX_CELLS as u64 + 1 + MAX_CELLS as u64 / 8;
     let raw: Cow<[u8]> = if data.starts_with(&[0x1f, 0x8b]) {
         use flate2::read::GzDecoder;
@@ -8594,22 +9132,27 @@ fn deserialize_prefab(data: &[u8]) -> Result<Clipboard, String> {
     // EPFAB\x02 appends a per-column footprint: a 1-byte presence flag + a row-major width*height
     // bitset. v1 has no such section and stays rectangular (mask None). A malformed/short mask is
     // treated as "no shape" rather than an error — the prefab is still a valid full-box paste.
-    let mask = if version == 2 {
+    // `body_end` is where tagged sections begin (§2); `None` = a malformed v2 tail, so no walk.
+    let (mask, body_end) = if version == 2 {
         let mask_len = (width as usize * height as usize).div_ceil(8);
         let flag_off = 22 + 2 * n;
         if data.len() >= flag_off + 1 + mask_len && data[flag_off] == 1 {
-            Some(data[flag_off + 1..flag_off + 1 + mask_len].to_vec())
+            (Some(data[flag_off + 1..flag_off + 1 + mask_len].to_vec()), Some(flag_off + 1 + mask_len))
+        } else if data.len() > flag_off && data[flag_off] == 0 {
+            (None, Some(flag_off + 1))
         } else {
-            None
+            (None, None)
         }
     } else {
-        None // .epfab v1 is rectangular — prefabs drop any shape (see Clipboard::mask)
+        (None, Some(22 + 2 * n)) // .epfab v1 is rectangular — prefabs drop any shape (see Clipboard::mask)
     };
+    let origin = body_end.and_then(|e| parse_epfab_sections(&data[e..]));
     Ok(Clipboard {
         width, height, depth, z_anchor,
         block_types: data[22..22 + n].to_vec(),
         paints:      data[22 + n..22 + 2 * n].to_vec(),
         mask,
+        origin,
     })
 }
 
@@ -8617,6 +9160,7 @@ fn deserialize_prefab(data: &[u8]) -> Result<Clipboard, String> {
 fn save_prefab(path: String, state: tauri::State<'_, AppState>) -> Result<Vec<String>, String> {
     let ws = read_ws(&state);
     let cb = ws.clipboard.as_ref().ok_or("Clipboard is empty")?;
+    check_prefab_savable(cb)?;
     let bytes = serialize_prefab(cb);
     atomic_write(std::path::Path::new(&path), &bytes)?;
     let mut counts = [0u32; 128];
@@ -8702,7 +9246,7 @@ fn read_prefab_header(path: &std::path::Path) -> Option<(i32, i32, i32)> {
 
 /// Scans `dir` (non-recursive) for `.epfab` files and reports their dimensions.
 /// Skips anything that fails to parse rather than erroring the whole listing.
-#[tauri::command]
+#[tauri::command(async)]
 fn list_prefabs(dir: String) -> Result<Vec<PrefabEntry>, String> {
     let entries = fs::read_dir(&dir).map_err(|e| format!("Failed to read prefab directory: {e}"))?;
     let mut out = Vec::new();
@@ -8720,7 +9264,7 @@ fn list_prefabs(dir: String) -> Result<Vec<PrefabEntry>, String> {
 
 /// Delete a `.epfab` file from disk. Guards on the extension so a bad `path` can't be used to
 /// remove arbitrary files. Does not touch WorldState.
-#[tauri::command]
+#[tauri::command(async)]
 fn delete_prefab(path: String) -> Result<(), String> {
     let p = std::path::Path::new(&path);
     if p.extension().and_then(|e| e.to_str()) != Some("epfab") {
@@ -8732,7 +9276,7 @@ fn delete_prefab(path: String) -> Result<(), String> {
 /// Rename a `.epfab` file to `new_name` (a bare stem, no path/extension) within its own folder.
 /// Sanitizes the new name and returns the new full path. Errors if the target already exists so
 /// the caller can decide whether to overwrite via a fresh save.
-#[tauri::command]
+#[tauri::command(async)]
 fn rename_prefab(path: String, new_name: String) -> Result<String, String> {
     let src = std::path::Path::new(&path);
     if src.extension().and_then(|e| e.to_str()) != Some("epfab") {
@@ -9467,7 +10011,7 @@ fn rock_stamp(
 }
 
 /// Sculpt terrain at brush positions.
-/// mode: "smooth" | "noise" | "flatten" | "erode" | "thermal" | "raise" | "lower"
+/// mode: "smooth" | "noise" | "flatten" | "thermal" | "raise" | "lower"
 ///      | "grab" (drag-controlled displacement, `grab_delta`)
 ///      | "hydro" (droplet hydraulic erosion) | "stamp" (retexture surface by slope/height)
 ///      | "terrace" (quantize height to `strength`-block steps)
@@ -10039,21 +10583,6 @@ fn sculpt_stamp_body(
                 sculpt_column(world, p.x, p.y, cur_z, target, max_z, surf_bt, surf_paint, block_type, paint);
             }
         }
-        "erode" => {
-            for p in points {
-                let Some(&(cur_z, surf_bt, surf_paint)) = height_map.get(&(p.x, p.y)) else { continue };
-                let min_n = SCULPT_KERNEL.iter()
-                    .filter_map(|((dx,dy),_)| height_map.get(&(p.x+dx, p.y+dy)).map(|v| v.0))
-                    .min();
-                if let Some(mn) = min_n {
-                    if cur_z > mn {
-                        let eroded = (cur_z - strength).max(mn);
-                        let target = blend(cur_z, eroded as f64, weight(p.x, p.y), p.x, p.y);
-                        sculpt_column(world, p.x, p.y, cur_z, target, max_z, surf_bt, surf_paint, block_type, paint);
-                    }
-                }
-            }
-        }
         "thermal" => {
             // Talus-angle erosion: any column whose drop to its lowest neighbour exceeds
             // the max stable slope (talus) sheds the excess, proportional to how far over
@@ -10253,9 +10782,9 @@ fn sculpt_stamp_body(
             // Commit final workspace heights back — footprint columns only (see arm comment).
             for p in points {
                 let Some(&(cur_z, surf_bt, surf_paint)) = height_map.get(&(p.x, p.y)) else { continue };
-                let new_h = node_at(&hmap, p.x - ws_x0, p.y - ws_y0)
-                    .unwrap_or(cur_z as f64).round() as i32;
-                let target = blend(cur_z, new_h as f64, weight(p.x, p.y), p.x, p.y);
+                // Float into `blend` (22.10) — rounding first dropped sub-half-block erosion.
+                let new_h = node_at(&hmap, p.x - ws_x0, p.y - ws_y0).unwrap_or(cur_z as f64);
+                let target = blend(cur_z, new_h, weight(p.x, p.y), p.x, p.y);
                 sculpt_column(world, p.x, p.y, cur_z, target, max_z, surf_bt, surf_paint, block_type, paint);
             }
         }
@@ -10298,8 +10827,10 @@ fn sculpt_stamp_body(
                 }
                 if wsum <= 1.0 { continue; }
                 let avg = hsum / wsum;
-                let sharpened = (cur_z as f64 + (cur_z as f64 - avg) * amount).round() as i32;
-                let target = blend(cur_z, sharpened as f64, weight(p.x, p.y), p.x, p.y);
+                // Float into `blend` (22.10): rounding here first swallowed any deviation under ~half a
+                // block at the default strength, so sharpen did nothing on gentle terrain.
+                let sharpened = cur_z as f64 + (cur_z as f64 - avg) * amount;
+                let target = blend(cur_z, sharpened, weight(p.x, p.y), p.x, p.y);
                 sculpt_column(world, p.x, p.y, cur_z, target, max_z, surf_bt, surf_paint, block_type, paint);
             }
         }
@@ -10521,14 +11052,17 @@ fn run_sculpt_in_guard(
 /// Read-only BFS over the 4-connected surface region matching the seed column's top block (and its
 /// paint when `match_paint`), capped at `max` cells. Cells are `(x, y, surface_z)`. Errors only when
 /// the seed has no surface / is air; an empty `Ok` can't happen for a valid seed but callers handle it.
+/// `cap` is the cutaway ceiling (`view_cap_z`): surfaces are read below it, as the map shows them.
+/// The `bool` is `true` when the cap stopped the walk with matching cells still unvisited (22.2).
 /// Split out so `fill_surface` and `magic_wand_select` share it and it runs on a bare `LoadedWorld`.
 fn surface_region_bfs(
     world: &LoadedWorld,
     wx: i32, wy: i32,
     match_paint: bool,
     max: u32,
-) -> Result<Vec<(i32, i32, i32)>, &'static str> {
-    let seed_z     = surface_z(world, wx, wy).ok_or("No surface at position")?;
+    cap: Option<i32>,
+) -> Result<(Vec<(i32, i32, i32)>, bool), &'static str> {
+    let seed_z     = surface_z_capped(world, wx, wy, cap).ok_or("No surface at position")?;
     let seed_bt    = read_block_abs(world, wx, wy, seed_z);
     let seed_paint = read_paint_abs(world, wx, wy, seed_z);
     if seed_bt == 0 { return Err("No block at surface"); }
@@ -10541,9 +11075,19 @@ fn surface_region_bfs(
     queue.push_back((wx, wy));
     visited.insert((wx, wy));
 
+    let matches = |x: i32, y: i32| -> Option<i32> {
+        let sz = surface_z_capped(world, x, y, cap)?;
+        if read_block_abs(world, x, y, sz) != seed_bt { return None; }
+        if match_paint && read_paint_abs(world, x, y, sz) != seed_paint { return None; }
+        Some(sz)
+    };
+    let mut truncated = false;
     while let Some((x, y)) = queue.pop_front() {
-        if cells.len() as u32 >= max { break; }
-        let Some(sz) = surface_z(world, x, y) else { continue };
+        if cells.len() as u32 >= max {
+            truncated = matches(x, y).is_some() || queue.iter().any(|&(qx, qy)| matches(qx, qy).is_some());
+            break;
+        }
+        let Some(sz) = surface_z_capped(world, x, y, cap) else { continue };
         if read_block_abs(world, x, y, sz) != seed_bt { continue; }
         if match_paint && read_paint_abs(world, x, y, sz) != seed_paint { continue; }
         cells.push((x, y, sz));
@@ -10553,7 +11097,7 @@ fn surface_region_bfs(
             if visited.insert((nx, ny)) { queue.push_back((nx, ny)); }
         }
     }
-    Ok(cells)
+    Ok((cells, truncated))
 }
 
 /// Flood-fill connected surface blocks of the same type as the seed position.
@@ -10569,8 +11113,9 @@ fn fill_surface(
 
     // Row 18.7: discovery under the read guard, then the write guard re-validates via `dirty.seq`
     // (redoing the discovery if a writer landed in the gap) — see `flood_fill_3d`.
+    let cap = read_ws(&state).view_cap_z;
     let plan = |world: &LoadedWorld| -> Result<FloodPlan, String> {
-        let fill_cells = surface_region_bfs(world, wx, wy, true, max_fill)?;
+        let (fill_cells, truncated) = surface_region_bfs(world, wx, wy, true, max_fill, cap)?;
         if fill_cells.is_empty() {
             return Err("No fillable surface found".into());
         }
@@ -10578,7 +11123,7 @@ fn fill_surface(
             (i32::MAX, i32::MAX, i32::MIN, i32::MIN),
             |(x0,y0,x1,y1), &(x,y,_)| (x0.min(x), y0.min(y), x1.max(x), y1.max(y))
         );
-        Ok(FloodPlan { cells: fill_cells, rect: (x0, y0, x1, y1) })
+        Ok(FloodPlan { cells: fill_cells, rect: (x0, y0, x1, y1), truncated })
     };
     let (seq_seen, first) = {
         let ws = read_ws(&state);
@@ -10586,7 +11131,7 @@ fn fill_surface(
         (ws.dirty.seq, plan(world)?)
     };
     let mut ws = write_ws(&state);
-    let FloodPlan { cells: fill_cells, rect } = if ws.dirty.seq == seq_seen {
+    let FloodPlan { cells: fill_cells, rect, truncated } = if ws.dirty.seq == seq_seen {
         first
     } else {
         timing_log!("[FLOOD] world changed during BFS (seq {} -> {}) — redoing under the write guard", seq_seen, ws.dirty.seq);
@@ -10594,18 +11139,22 @@ fn fill_surface(
         plan(ws.world.as_ref().ok_or("No world loaded")?)?
     };
     let label = format!("Fill {} blocks", fill_cells.len());
-    with_edit(&mut ws, &label, rect, |world| {
+    let mut result = with_edit(&mut ws, &label, rect, |world| {
         for &(x, y, z) in &fill_cells {
             set_block_abs(world, x, y, z, new_type, new_paint);
         }
         Ok(())
-    })
+    })?;
+    if truncated {
+        result.warnings.push(format!("Fill stopped at the {max_fill}-block limit — the region is larger; fill again to continue."));
+    }
+    Ok(result)
 }
 
 // ── Selection helpers ─────────────────────────────────────────────────────────
 
 #[derive(Serialize)]
-struct SelectRect { x1: i32, y1: i32, x2: i32, y2: i32 }
+struct SelectRect { x1: i32, y1: i32, x2: i32, y2: i32, truncated: bool }
 
 /// Flood-fill select connected surface region matching (wx,wy).
 /// When match_paint is false, only block type is compared (ignores paint colour).
@@ -10623,9 +11172,10 @@ fn magic_wand_select(
     // the write guard, which re-checks `dirty.seq` and redoes the discovery if a writer landed in the
     // gap (see `flood_fill_3d`). Result: `Ok(None)` = nothing matched (existing mask left alone).
     const MAX_CELLS: u32 = 50_000;
+    let cap = read_ws(&state).view_cap_z;
     let plan = |world: &LoadedWorld| -> Result<Option<(SelectRect, Vec<u8>)>, String> {
         // Seed with no surface / air → no selection, same as an empty match.
-        let matched = match surface_region_bfs(world, wx, wy, match_paint, MAX_CELLS) {
+        let (matched, truncated) = match surface_region_bfs(world, wx, wy, match_paint, MAX_CELLS, cap) {
             Ok(m) => m,
             Err(_) => return Ok(None),
         };
@@ -10635,7 +11185,7 @@ fn magic_wand_select(
             x_min = x_min.min(x); y_min = y_min.min(y);
             x_max = x_max.max(x); y_max = y_max.max(y);
         }
-        let rect = SelectRect { x1: x_min, y1: y_min, x2: x_max, y2: y_max };
+        let rect = SelectRect { x1: x_min, y1: y_min, x2: x_max, y2: y_max, truncated };
         // Rasterise the matched cells into a bitset over the bbox. `w`/`h` come from the BFS bbox,
         // which (unlike the BFS cell count) is not itself capped — a diagonal or ring-shaped run can
         // span the whole world, so the area must be computed in `usize`/`saturating_mul` (audit H8),
@@ -10708,6 +11258,18 @@ fn clear_selection_mask(state: tauri::State<'_, AppState>) -> Result<(), String>
     Ok(())
 }
 
+/// Slide the active selection mask's bbox by (dx, dy) without touching its bits — the box-only
+/// nudge path (22.1), so a wand/lasso shape survives a move of just the selection outline.
+/// No mask → no-op.
+#[tauri::command(async)]
+fn shift_selection_mask(dx: i32, dy: i32, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let mut ws = write_ws(&state);
+    if let Some(m) = ws.selection_mask.as_mut() {
+        m.x1 += dx; m.x2 += dx; m.y1 += dy; m.y2 += dy;
+    }
+    Ok(())
+}
+
 /// The active mask, or "no mask" — a single `IpcResponse` type rather than `Option<…>`, since the
 /// binary envelope (audit H2) is framed by the payload type itself and `Option` has no framing of
 /// its own. Absence is a `null` JSON header with an empty body; JS reads `header === null`.
@@ -10744,37 +11306,40 @@ fn get_selection_mask(state: tauri::State<'_, AppState>) -> Result<SelectionMask
 
 /// Helper: paste clipboard at a single world position. Assumes world is already taken.
 fn paste_clipboard_at(
-    world: &mut impl VoxelViewMut,
+    world: &mut (impl VoxelViewMut + VoxelView),
     px: i32, py: i32,
     block_types: &[u8], paints: &[u8],
     width: i32, height: i32, depth: i32, z_anchor: i32,
     elevation_offset: i32, ignore_air: bool,
     max_z: i32,
     mask: Option<&[u8]>,
-) {
+) -> u32 {
     let (mnx, mny) = world.chunk_origin();
+    let mut clipped = 0u32;
     for dz in 0..depth {
         let tz = z_anchor + elevation_offset + dz;
-        if tz < 0 || tz > max_z { continue; }
-        let band = tz as usize / 16;
-        let lz   = tz as usize % 16;
+        let z_ok = tz >= 0 && tz <= max_z;
+        let band = tz.max(0) as usize / 16;
+        let lz   = tz.max(0) as usize % 16;
         for dy in 0..height {
-            let ty = py + dy; if ty < 0 { continue; }
-            let chunk_cy = ty / 16 + mny;
-            let ly = (ty % 16) as usize;
+            let ty = py + dy;
+            let chunk_cy = ty.div_euclid(16) + mny;
+            let ly = ty.rem_euclid(16) as usize;
             for dx in 0..width {
-                let tx = px + dx; if tx < 0 { continue; }
+                let tx = px + dx;
                 // Shaped clipboard: unmasked columns don't stamp (scatter/array honour the shape too).
                 if let Some(m) = mask { if !bit_set(m, (dy * width + dx) as usize) { continue; } }
-                let chunk_cx = tx / 16 + mnx;
-                let lx = (tx % 16) as usize;
                 let idx = (dz * height * width + dy * width + dx) as usize;
                 let bt = block_types[idx];
                 if ignore_air && bt == 0 { continue; }
+                let chunk_cx = tx.div_euclid(16) + mnx;
+                if tx < 0 || ty < 0 || !z_ok || !world.has_chunk(chunk_cx, chunk_cy) { clipped += 1; continue; }
+                let lx = (tx % 16) as usize;
                 set_block_in_band(world, chunk_cx, chunk_cy, band, lx * 256 + ly * 16 + lz, bt, paints[idx]);
             }
         }
     }
+    clipped
 }
 
 /// The seeded placement sequence `scatter_paste` uses: `count` top-left positions drawn from
@@ -10797,6 +11362,7 @@ fn scatter_paste(
     seed: u64,
     elevation_offset: i32,
     ignore_air: bool,
+    terrain_above: Option<bool>,
     state: tauri::State<'_, AppState>,
 ) -> Result<EditResult, String> {
     let count = count.clamp(1, 100);
@@ -10816,16 +11382,23 @@ fn scatter_paste(
     let max_px = x1 + range_x - 1;
     let max_py = y1 + range_y - 1;
     let rect = (x1, y1, x2.max(max_px + width - 1), y2.max(max_py + height - 1));
+    let cap = ws.view_cap_z; // cutaway: follow the sub-cap surface, as paste_terrain does
     let label = format!("Scatter paste ×{count}");
     let placements = scatter_placements(x1, y1, range_x, range_y, count, seed);
-    let result = with_edit(&mut ws, &label, rect, |world| {
+    let mut clipped = 0u32;
+    let mut result = with_edit(&mut ws, &label, rect, |world| {
         let max_z = world_max_z(world);
         for &(px, py) in &placements {
-            paste_clipboard_at(world, px, py, block_types, paints,
-                width, height, depth, z_anchor, elevation_offset, ignore_air, max_z, mask.as_deref());
+            clipped += match terrain_above {
+                Some(above) => paste_terrain_at(world, px, py, block_types, paints,
+                    width, height, depth, elevation_offset, ignore_air, max_z, mask.as_deref(), cap, above),
+                None => paste_clipboard_at(world, px, py, block_types, paints,
+                    width, height, depth, z_anchor, elevation_offset, ignore_air, max_z, mask.as_deref()),
+            };
         }
         Ok(())
     });
+    if let Ok(r) = result.as_mut() { push_clip_warning(&mut r.warnings, clipped); }
     ws.clipboard = Some(cb);
     result
 }
@@ -10838,6 +11411,7 @@ fn array_paste(
     spacing_x: i32, spacing_y: i32,
     elevation_offset: i32,
     ignore_air: bool,
+    terrain_above: Option<bool>,
     state: tauri::State<'_, AppState>,
 ) -> Result<EditResult, String> {
     let cols = cols.clamp(1, 20);
@@ -10855,19 +11429,26 @@ fn array_paste(
     let y2 = origin_y + (rows - 1) * step_y + height - 1;
 
     let rect = (origin_x, origin_y, x2, y2);
+    let cap = ws.view_cap_z;
     let label = format!("Array paste {cols}×{rows}");
     // Grid cells only (not the gaps between them), and only the clipboard's z bands (row 18.2).
     let placements: Vec<(i32, i32)> = (0..rows).flat_map(|row| (0..cols).map(move |col| (col, row)))
         .map(|(col, row)| (origin_x + col * step_x, origin_y + row * step_y))
         .collect();
-    let result = with_edit(&mut ws, &label, rect, |world| {
+    let mut clipped = 0u32;
+    let mut result = with_edit(&mut ws, &label, rect, |world| {
         let max_z = world_max_z(world);
         for &(px, py) in &placements {
-            paste_clipboard_at(world, px, py, block_types, paints,
-                width, height, depth, z_anchor, elevation_offset, ignore_air, max_z, mask.as_deref());
+            clipped += match terrain_above {
+                Some(above) => paste_terrain_at(world, px, py, block_types, paints,
+                    width, height, depth, elevation_offset, ignore_air, max_z, mask.as_deref(), cap, above),
+                None => paste_clipboard_at(world, px, py, block_types, paints,
+                    width, height, depth, z_anchor, elevation_offset, ignore_air, max_z, mask.as_deref()),
+            };
         }
         Ok(())
     });
+    if let Ok(r) = result.as_mut() { push_clip_warning(&mut r.warnings, clipped); }
     ws.clipboard = Some(cb);
     result
 }
@@ -10981,6 +11562,7 @@ pub fn run() {
         .manage(AppState::new(WorldState::new()))
         .manage(LongOps::default())
         .manage(ExpandCancel::default())
+        .manage(network::NetCancel::default())
         .manage(MaterializeCancel::default())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
@@ -11017,6 +11599,7 @@ pub fn run() {
             autosave_world,
             load_autosave,
             get_autosave_info,
+            release_autosave_hold,
             get_autosave_path,
             discard_autosave,
             undo_edit,
@@ -11054,6 +11637,8 @@ pub fn run() {
             list_legacy_featured_lists,
             load_legacy_featured_list,
             download_world,
+            cancel_net_transfer,
+            render_upload_thumbnail,
             upload_world,
             check_for_update,
             get_surface_z,
@@ -11064,6 +11649,7 @@ pub fn run() {
             set_selection_mask,
             clear_selection_mask,
             get_selection_mask,
+            shift_selection_mask,
             scatter_paste,
             array_paste,
             get_chunk_geometry,
@@ -11076,6 +11662,8 @@ pub fn run() {
             preview_natural_world,
             create_classic_world,
             create_tg2_world,
+            cancel_world_gen,
+            preview_classic_world,
             preview_tg2_world,
             scan_mpworld,
             set_spawn_pos,
@@ -11100,8 +11688,14 @@ pub fn run() {
             mem_stats,
             write_text_file,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            if let tauri::RunEvent::Exit = event {
+                use tauri::Manager;
+                if let Ok(base) = app.path().app_data_dir() { release_autosave_owner(&base); }
+            }
+        });
 }
 
 // ── Sky grid (Phase 5) ───────────────────────────────────────────────────────
@@ -12419,7 +13013,7 @@ mod tests {
             });
             differential("trees", bands, all, &|w| {
                 generate_trees_inner(w, 0, 0, 47, 47, &["normal".to_string(), "pine".to_string(), "tall_pine".to_string()],
-                    0.04, &[], 11, false, None);
+                    0.04, &[], 11, false, None, None);
                 Ok(())
             });
             differential("wavy", bands, all, &|w| {
@@ -12443,7 +13037,7 @@ mod tests {
                 Ok(())
             });
             differential("fill surface", bands, all, &|w| {
-                let cells = surface_region_bfs(w, 9, 9, false, 5000)?;
+                let (cells, _) = surface_region_bfs(w, 9, 9, false, 5000, None)?;
                 for (x, y, z) in cells { set_block_abs(w, x, y, z, 13, 2); }
                 Ok(())
             });
@@ -12615,7 +13209,7 @@ mod tests {
         let lo = surface_z(ws.world.as_ref().unwrap(), 10, 2).unwrap() + 1;
 
         let cb = Clipboard { width: 12, height: 2, depth: 3, z_anchor: 0,
-            block_types: vec![13u8; 72], paints: vec![0u8; 72], mask: None };
+            block_types: vec![13u8; 72], paints: vec![0u8; 72], mask: None, origin: None };
         ws.clipboard = Some(cb);
         paste_terrain_inner(&mut ws, 10, 2, 0, false, true).expect("terrain paste");
         assert_eq!(ws.undo_stack.len(), 1);
@@ -14392,6 +14986,40 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// 21.4 / audit L3: a destination that can't be opened for writing (read-only here; a Windows
+    /// sharing violation in the field) must decline with nothing written and **no WAL** — a committed
+    /// log left behind would replay on the next open, over edits the user may have discarded since.
+    #[test]
+    fn test_incremental_save_unwritable_destination_leaves_no_wal() {
+        let dir = stage4_dir("unwritable_dest");
+        let original = make_bumpy_world_grid(2, 8, |_, _| 20);
+        let dest = dir.join("world.eden");
+        let state: AppState = RwLock::new(ws_with_disk_image(original.clone(), &dest));
+        {
+            let mut ws = write_ws(&state);
+            with_edit(&mut ws, "delete", (0, 0, 5, 5), |world| {
+                delete_blocks_inner(world, 0, 0, 5, 5, 0, 63, None);
+                Ok(())
+            }).expect("edit");
+        }
+
+        let set_readonly = |ro: bool| {
+            let mut perms = fs::metadata(&dest).unwrap().permissions();
+            perms.set_readonly(ro);
+            fs::set_permissions(&dest, perms).unwrap();
+        };
+        set_readonly(true);
+        let result = try_incremental_save(&state, dest.to_str().unwrap(), false);
+        set_readonly(false); // before any assert, so a failure can't leave an undeletable file (Windows)
+
+        assert!(!result.expect("decline, not error"), "an unwritable destination must decline");
+        assert!(!wal_path(&dest).exists(), "a declined save must not leave a redo log");
+        assert_eq!(fs::read(&dest).unwrap(), original, "a declined save must not touch the destination");
+        assert_eq!(read_ws(&state).dirty.since_disk.len(), 1, "a declined save must not discharge dirty state");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// `set_spawn_pos` / `rename_world` / `set_sky_grid` write header bytes only and never dirty a
     /// chunk, so the header span is the one case where an incremental save has no chunk work at all.
     /// It must still be written — and must not disturb a single byte outside the 192-byte header.
@@ -15279,6 +15907,40 @@ mod tests {
         assert!(img.pixels.iter().any(|&c| c != 0), "preview should not be blank");
     }
 
+    /// Classic and Tg2 previews render non-blank, correctly-sized RGBA images; the Tg2 shade is
+    /// no longer a constant (a mountainous biome must vary in brightness).
+    #[test]
+    fn classic_and_tg2_previews_render() {
+        let img = preview_classic_world(16, 16, false, 7, 2, 32, 64).expect("classic preview");
+        assert!(img.width <= 64 && img.height <= 64);
+        assert_eq!(img.pixels.len(), (img.width * img.height * 4) as usize);
+        assert!(img.pixels.iter().any(|&c| c != 0));
+        let t = preview_tg2_world(16, 7, 3, 64, None, None, None, None).expect("tg2 preview");
+        assert_eq!(t.pixels.len(), (t.width * t.height * 4) as usize);
+        let lum: std::collections::HashSet<u8> = t.pixels.chunks(4).map(|p| p[0]).collect();
+        assert!(lum.len() > 8, "tg2 preview should be shaded, got {} distinct reds", lum.len());
+    }
+
+    /// A create is atomic: the file only appears complete (no `.tmp` left), and a cancel leaves
+    /// neither the destination nor a temp behind and surfaces as the `Cancelled` error.
+    #[test]
+    fn world_create_is_atomic_and_cancellable() {
+        let p = std::env::temp_dir().join("eden_atomic_create.eden");
+        let ps = p.to_str().unwrap().to_string();
+        let tmp = format!("{ps}.tmp");
+        let _ = fs::remove_file(&p); let _ = fs::remove_file(&tmp);
+        create_classic_world_inner(ps.clone(), "Atomic".into(), 2, 2, false, 7, 2, 0, true, false, 1, true, true, &mut |_, _| {})
+            .expect("create failed");
+        assert!(p.exists() && !std::path::Path::new(&tmp).exists(), "complete file, no temp");
+        let _ = fs::remove_file(&p);
+
+        // Cancel from the first progress callback: generation stops, nothing is written.
+        let r = create_classic_world_inner(ps.clone(), "Atomic".into(), 4, 4, false, 7, 2, 0, true, false, 1, true, true,
+            &mut |_, _| cancel_world_gen());
+        assert_eq!(r.unwrap_err(), GEN_CANCELLED);
+        assert!(!p.exists() && !std::path::Path::new(&tmp).exists(), "cancel leaves no file");
+    }
+
     /// Steep terrain must expose bare rock at the surface (cliff faces), while
     /// perfectly flat terrain keeps its soil surface.
     #[test]
@@ -15825,7 +16487,7 @@ mod tests {
             0, 0,
             3, 4,
         ];
-        Clipboard { width: 2, height: 3, depth: 1, z_anchor: 10, block_types, paints, mask: None }
+        Clipboard { width: 2, height: 3, depth: 1, z_anchor: 10, block_types, paints, mask: None, origin: None }
     }
 
     /// rotate_clipboard_inner: dimensions swap (w,h)->(h,w), content transform
@@ -15902,7 +16564,7 @@ mod tests {
                 // Cycle through ramps/wedges/doors/portals/plain so every remap arm is exercised.
                 block_types: (0..vol).map(|i| ((i * 5) % 80) as u8).collect(),
                 paints: (0..vol).map(|i| (i % 251) as u8).collect(),
-                mask: Some((0..(w * h).div_ceil(8)).map(|i| (i as u8).wrapping_mul(37) | 1).collect()),
+                mask: Some((0..(w * h).div_ceil(8)).map(|i| (i as u8).wrapping_mul(37) | 1).collect()), origin: None
             };
             let mask_bit = |m: &Option<Vec<u8>>, i: usize| bit_set(m.as_ref().unwrap(), i);
             let src = mk();
@@ -16698,7 +17360,7 @@ mod tests {
     #[test]
     fn test_lazy_scratch_matches_reference_across_modes_and_undoes() {
         let base = make_bumpy_world_grid(2, 8, |x, y| 18 + ((x * 3 + y) % 5));
-        for mode in ["raise", "lower", "smooth", "flatten", "erode", "noise", "thermal"] {
+        for mode in ["raise", "lower", "smooth", "flatten", "noise", "thermal"] {
             let args = || SculptArgs {
                 mode: mode.into(), strength: 4, strength_eff: 4.0, seed: 7,
                 block_type: None, paint: None, freq: None, noise_mode: None,
@@ -17009,7 +17671,7 @@ mod tests {
         let mut bits = vec![0u8; 1];
         bits[0] |= 1 << 0; // (dy0,dx0) idx 0
         bits[0] |= 1 << 3; // (dy1,dx1) idx 3
-        let cb = Clipboard { width: 2, height: 2, depth: 1, z_anchor: 30, block_types, paints, mask: Some(bits) };
+        let cb = Clipboard { width: 2, height: 2, depth: 1, z_anchor: 30, block_types, paints, mask: Some(bits), origin: None };
         assert!(cb.info().masked, "info reflects the footprint");
 
         let mut ws = ws_with(make_bumpy_world(8, |_, _| 20));
@@ -17036,7 +17698,7 @@ mod tests {
         let paints = (0..n).map(|i| (i % 7) as u8).collect();
         let mut bits = vec![0xffu8; 3];
         bits[0] &= !(1 << 6); // (dx 1, dy 1) outside the footprint
-        Clipboard { width: w, height: h, depth: d, z_anchor, block_types, paints, mask: Some(bits) }
+        Clipboard { width: w, height: h, depth: d, z_anchor, block_types, paints, mask: Some(bits), origin: None }
     }
 
     /// The lens's terrain-mode bases are the paste's: after a real `paste_terrain`, exactly the
@@ -17292,7 +17954,7 @@ mod tests {
         bits[0] |= 1 << 0;
         let mut cb = Clipboard {
             width: 2, height: 3, depth: 1, z_anchor: 0,
-            block_types: vec![0u8; 6], paints: vec![0u8; 6], mask: Some(bits),
+            block_types: vec![0u8; 6], paints: vec![0u8; 6], mask: Some(bits), origin: None
         };
         rotate_clipboard_inner(&mut cb);
         // After CW: new dims 3(w)×2(h). Old (dx0,dy0) → (ndx=dy=0, ndy=old_w-1-dx=1). New idx = ndy*new_w+ndx = 1*3+0 = 3.
@@ -17301,6 +17963,101 @@ mod tests {
         let m = cb.mask.unwrap();
         assert!(bit_set(&m, 3), "the one set column rotated to its new position");
         assert_eq!(m.iter().map(|b| b.count_ones()).sum::<u32>(), 1, "exactly one cell still set");
+    }
+
+    #[test]
+    fn test_prefab_save_refuses_over_load_cap() {
+        let mk = |w, h, d| Clipboard { width: w, height: h, depth: d, z_anchor: 0,
+            block_types: vec![], paints: vec![], mask: None, origin: None };
+        assert!(check_prefab_savable(&mk(256, 256, 1024)).is_ok(), "exactly 64M voxels is loadable");
+        let err = check_prefab_savable(&mk(256, 256, 1025)).unwrap_err();
+        assert!(err.contains("limited"), "{err}");
+        assert!(check_prefab_savable(&mk(i32::MAX, i32::MAX, i32::MAX)).is_err(), "no i32 overflow");
+    }
+
+    #[test]
+    fn test_sweep_orphan_save_temps_removes_only_temps() {
+        let dir = std::env::temp_dir().join(format!("eden_sweep_{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let w = dir.join("w.eden");
+        for n in ["w.eden", "w.eden.savetmp", "w.eden.bak.zip.tmp", "w.eden.bak", "other.eden.savetmp"] {
+            fs::write(dir.join(n), b"x").unwrap();
+        }
+        // 21.14: fresh temps (a live sibling's save) survive the production sweep.
+        sweep_orphan_save_temps(&w);
+        assert!(dir.join("w.eden.savetmp").exists() && dir.join("w.eden.bak.zip.tmp").exists());
+        let z = std::time::Duration::ZERO;
+        sweep_orphan_save_temps_aged(&w, z);
+        assert!(w.exists() && dir.join("w.eden.bak").exists() && dir.join("other.eden.savetmp").exists());
+        assert!(!dir.join("w.eden.savetmp").exists() && !dir.join("w.eden.bak.zip.tmp").exists());
+        sweep_orphan_save_temps_aged(&w, z); // idempotent when nothing is there
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_temp_owner_pid_parsing() {
+        assert_eq!(temp_owner_pid("vuencedit_1234_999.eden"), Some(1234));
+        assert_eq!(temp_owner_pid("vuencedit_upload_77_5.gz"), Some(77));
+        assert_eq!(temp_owner_pid("vuencedit_1789000000000000000.eden"), None, "legacy name");
+        assert_eq!(temp_owner_pid("vuencedit_upload_1789000000000000000.gz"), None);
+        assert_eq!(temp_owner_pid("vuencedit_stage4_12.eden"), None);
+        assert!(pid_alive(std::process::id()));
+    }
+
+    #[test]
+    fn test_claim_autosave_dir_ownership_and_takeover() {
+        let base = std::env::temp_dir().join(format!("eden_claim_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let live = |p: u32| p == 100 || p == 200;
+        // First instance owns the shared slot; re-claim by itself is stable.
+        assert_eq!(claim_autosave_dir(&base, 100, &live), base);
+        assert_eq!(claim_autosave_dir(&base, 100, &live), base);
+        // A second live instance gets its own dir and the owner file is untouched.
+        let d2 = claim_autosave_dir(&base, 200, &live);
+        assert_eq!(d2, base.join("instance-200"));
+        assert!(d2.is_dir());
+        assert_eq!(read_owner_pid(&base.join("autosave.owner")), Some(100));
+        // Sidecars in the shared slot are not disturbed.
+        fs::write(base.join("autosave.meta.json"), b"{}").unwrap();
+        // Owner dies: next instance takes over (crash recovery keeps working).
+        let live2 = |p: u32| p == 300;
+        assert_eq!(claim_autosave_dir(&base, 300, &live2), base);
+        assert_eq!(read_owner_pid(&base.join("autosave.owner")), Some(300));
+        assert!(base.join("autosave.meta.json").exists());
+        // Dead instance dirs: empty one swept, one with a pending meta kept.
+        fs::create_dir_all(base.join("instance-900")).unwrap();
+        fs::create_dir_all(base.join("instance-901")).unwrap();
+        fs::write(base.join("instance-901").join("autosave.meta.json"), b"{}").unwrap();
+        let _ = claim_autosave_dir(&base, 400, &|p| p == 300 || p == 400);
+        assert!(!base.join("instance-900").exists() && base.join("instance-901").exists());
+        // Corrupt owner file does not wedge the slot.
+        fs::write(base.join("autosave.owner"), b"junk").unwrap();
+        assert_eq!(claim_autosave_dir(&base, 500, &|_| false), base);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_pick_world_zip_entry_prefers_eden_by_name() {
+        use zip::write::{SimpleFileOptions, ZipWriter};
+        let mut buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut z = ZipWriter::new(&mut buf);
+            let o = SimpleFileOptions::default();
+            z.start_file("__MACOSX/", o).unwrap();
+            z.start_file("readme.txt", o).unwrap(); z.write_all(b"hi").unwrap();
+            z.start_file("My World.EDEN", o).unwrap(); z.write_all(b"w").unwrap();
+            z.finish().unwrap();
+        }
+        let mut a = zip::ZipArchive::new(std::io::Cursor::new(buf.into_inner())).unwrap();
+        assert_eq!(pick_world_zip_entry(&mut a), 2);
+        let mut buf2 = std::io::Cursor::new(Vec::new());
+        {
+            let mut z = ZipWriter::new(&mut buf2);
+            z.start_file("only.bin", SimpleFileOptions::default()).unwrap();
+            z.finish().unwrap();
+        }
+        let mut b = zip::ZipArchive::new(std::io::Cursor::new(buf2.into_inner())).unwrap();
+        assert_eq!(pick_world_zip_entry(&mut b), 0, "falls back to the first entry");
     }
 
     /// A shaped clipboard survives a prefab serialize→deserialize round trip: EPFAB\x02 carries the
@@ -17315,7 +18072,7 @@ mod tests {
             width: 3, height: 2, depth: 1, z_anchor: 42,
             block_types: (0..n).map(|i| 13 + i as u8).collect(),
             paints: (0..n).map(|i| i as u8).collect(),
-            mask: Some(bits.clone()),
+            mask: Some(bits.clone()), origin: None
         };
         let round = deserialize_prefab(&serialize_prefab(&cb)).expect("round-trips");
         assert_eq!(round.width, 3);
@@ -17333,7 +18090,7 @@ mod tests {
     fn test_prefab_rectangular_stays_v1() {
         let cb = Clipboard {
             width: 2, height: 2, depth: 1, z_anchor: 0,
-            block_types: vec![13u8; 4], paints: vec![0u8; 4], mask: None,
+            block_types: vec![13u8; 4], paints: vec![0u8; 4], mask: None, origin: None
         };
         let bytes = serialize_prefab(&cb);
         // Decompress to inspect the version byte.
@@ -17355,7 +18112,7 @@ mod tests {
         let mut bits = vec![0u8; 1];
         bits[0] |= 1 << 0; bits[0] |= 1 << 3;
         let cb = Clipboard { width: 2, height: 2, depth: 1, z_anchor: 0,
-            block_types: vec![13u8; 4], paints: vec![0u8; 4], mask: Some(bits) };
+            block_types: vec![13u8; 4], paints: vec![0u8; 4], mask: Some(bits), origin: None };
         let pd = render_clipboard_preview_inner(&cb, 0, None);
         let a = |dx: usize, dy: usize| pd.pixels[(dy * 2 + dx) * 4 + 3];
         assert_eq!(a(0, 0), 255, "masked block column is opaque");
@@ -17377,7 +18134,7 @@ mod tests {
         let mut bt = vec![0u8; w * h];
         bt[0] = 13; bt[512] = 13;
         let cb = Clipboard { width: w as _, height: h as _, depth: 1, z_anchor: 0,
-            block_types: bt, paints: vec![0u8; w * h], mask: None };
+            block_types: bt, paints: vec![0u8; w * h], mask: None, origin: None };
         let full = render_clipboard_preview_inner(&cb, 0, None);
         assert_eq!((full.width, full.height), (1024, 2));
         let pd = render_clipboard_preview_inner(&cb, 0, Some(512));
@@ -17388,7 +18145,7 @@ mod tests {
         assert_eq!(&pd.pixels[4..7], &[20, 20, 35], "air column stays VOID");
         // Small clipboard is unaffected by the cap.
         let small = Clipboard { width: 2, height: 2, depth: 1, z_anchor: 0,
-            block_types: vec![13u8; 4], paints: vec![0u8; 4], mask: None };
+            block_types: vec![13u8; 4], paints: vec![0u8; 4], mask: None, origin: None };
         let ps = render_clipboard_preview_inner(&small, 0, Some(512));
         assert_eq!((ps.width, ps.height), (2, 2));
     }
@@ -17494,7 +18251,7 @@ mod tests {
         let mut ws = ws_with(make_bumpy_world(8, |_, _| 20)); // grass surface z=20 everywhere
         let mask = mask_from(4, 4, 7, 7, |x, y| x == 4 && y == 4);
         generate_trees_inner(&mut EditView::unbounded(ws.world.as_mut().unwrap()), 4, 4, 7, 7,
-            &["normal".to_string()], 1.0, &[], 42, true, Some(&mask));
+            &["normal".to_string()], 1.0, &[], 42, true, Some(&mask), None);
         let w = ws.world.as_ref().unwrap();
         // A normal tree places a trunk (bt 6) above the surface at the planted column.
         assert_eq!(read_block_abs(w, 4, 4, 21), 6, "masked column grew a trunk");
@@ -17555,6 +18312,33 @@ mod tests {
         redo_edit_inner(&mut ws).expect("redo ungrouped");
         assert_eq!(world_bytes(&ws), post);
         assert_eq!(ws.undo_stack.len(), 1);
+    }
+
+    /// 21.9 (audit S2): cancelling a live stroke that pushed nothing must not pop the edit below.
+    #[test]
+    fn test_undo_only_group_refuses_a_foreign_top_entry() {
+        let mut ws = ws_with(make_bumpy_world(2, |lx, ly| 12 + ((lx + ly) % 5) as i32));
+        let base = world_bytes(&ws);
+        sculpt(&mut ws, Some(disc_points(6, 6, 2)), "raise", 3, 0.0, None, Some(5));
+        let after_first = world_bytes(&ws);
+
+        // Stroke 6 changed nothing (no entry); Esc asks to undo group 6 only.
+        let err = undo_edit_only(&mut ws, Some(6)).err().expect("refused");
+        assert_eq!(err, "Nothing to undo");
+        assert_eq!(world_bytes(&ws), after_first, "the previous stroke survives");
+        assert_eq!(ws.undo_stack.len(), 1);
+        assert!(ws.redo_stack.is_empty(), "a refused cancel leaves redo alone");
+
+        // Stroke 7 did change something: its own cancel reverts it, and only it.
+        sculpt(&mut ws, Some(disc_points(7, 7, 2)), "raise", 3, 0.0, None, Some(7));
+        sculpt(&mut ws, Some(disc_points(8, 7, 2)), "raise", 3, 0.0, None, Some(7));
+        undo_edit_only(&mut ws, Some(7)).expect("own group undoes");
+        assert_eq!(world_bytes(&ws), after_first);
+
+        // No group = the plain ⌘Z behaviour.
+        undo_edit_only(&mut ws, None).expect("plain undo");
+        assert_eq!(world_bytes(&ws), base);
+        assert_eq!(undo_edit_only(&mut ws, Some(5)).err().as_deref(), Some("Nothing to undo"));
     }
 
     #[test]
@@ -17982,14 +18766,16 @@ mod tests {
         // A 3x3 patch with a different paint.
         for x in 4..=6 { for y in 4..=6 { set_block_abs(&mut world, x, y, 0, 2, 5); } }
 
-        let all = surface_region_bfs(&world, 0, 0, false, 50_000).expect("seed ok");
+        let all = surface_region_bfs(&world, 0, 0, false, 50_000, None).expect("seed ok").0;
         assert!(all.len() >= 250, "paint-agnostic fill covers the whole same-type surface (got {})", all.len());
-        let painted = surface_region_bfs(&world, 5, 5, true, 50_000).expect("seed ok");
+        let painted = surface_region_bfs(&world, 5, 5, true, 50_000, None).expect("seed ok").0;
         assert_eq!(painted.len(), 9, "paint filter isolates the patch");
         assert!(painted.iter().all(|&(x, y, z)| (4..=6).contains(&x) && (4..=6).contains(&y) && z == 0));
-        let capped = surface_region_bfs(&world, 0, 0, false, 10).expect("seed ok");
+        let (capped, truncated) = surface_region_bfs(&world, 0, 0, false, 10, None).expect("seed ok");
         assert_eq!(capped.len(), 10);
-        assert!(surface_region_bfs(&world, -1, 0, false, 10).is_err(), "out-of-world seed has no surface");
+        assert!(truncated, "a 10-cell cap on a 256-cell region reports truncation");
+        assert!(!surface_region_bfs(&world, 0, 0, false, 50_000, None).unwrap().1, "uncapped run is not truncated");
+        assert!(surface_region_bfs(&world, -1, 0, false, 10, None).is_err(), "out-of-world seed has no surface");
     }
 
     /// The wavy-surface quantizer must span all four fluid levels (full/¾/½/¼) as its noise input
@@ -18761,6 +19547,219 @@ mod tests {
         for wy in 34..=62 { for wx in 34..=62 {
             assert_eq!(read_block_abs(&w, wx, wy, 1), 1, "bedrock at ({wx},{wy},1) must survive any carve");
         }}
+    }
+
+
+    // ── ROADMAP-LINK 21.6: .epfab ORGN provenance + paste placements ───────────────────────
+
+    fn hex_bytes(h: &str) -> Vec<u8> {
+        (0..h.len() / 2).map(|i| u8::from_str_radix(&h[2 * i..2 * i + 2], 16).unwrap()).collect()
+    }
+
+    /// The golden fixture shared byte-for-byte with VuencLink's `prefab_interchange` tests: a 2×1×1
+    /// prefab (types [74,0], paints [5,0], z_anchor 40) + an `ORGN` section.
+    const GOLDEN_V1: &str = "455046414201020000000100000001000000280000004a0005004f52474e150000000a000100f9ffffff2800000002efcdab8967452301";
+    const GOLDEN_V2: &str = "455046414202020000000100000001000000280000004a00050001014f52474e150000000a000100f9ffffff2800000002efcdab8967452301";
+    const GOLDEN_ORGN: &str = "4f52474e150000000a000100f9ffffff2800000002efcdab8967452301";
+
+    fn golden_origin() -> PrefabOrigin {
+        PrefabOrigin { ax: 65546, ay: -7, az: 40, source: 2, rtid: 0x0123_4567_89AB_CDEF }
+    }
+    fn golden_clip(mask: Option<Vec<u8>>, origin: Option<PrefabOrigin>) -> Clipboard {
+        Clipboard {
+            width: 2, height: 1, depth: 1, z_anchor: 40,
+            block_types: vec![74, 0], paints: vec![5, 0], mask, origin,
+        }
+    }
+
+    #[test]
+    fn test_epfab_orgn_golden_fixture() {
+        for (hex, mask) in [(GOLDEN_V1, None), (GOLDEN_V2, Some(vec![0b01u8]))] {
+            let bytes = hex_bytes(hex);
+            let cb = golden_clip(mask.clone(), Some(golden_origin()));
+            assert_eq!(serialize_prefab_raw(&cb), bytes, "serialize == golden bytes");
+            let back = deserialize_prefab(&bytes).expect("golden parses");
+            assert_eq!(back.origin, Some(golden_origin()));
+            assert_eq!((back.width, back.height, back.depth, back.z_anchor), (2, 1, 1, 40));
+            assert_eq!(back.block_types, cb.block_types);
+            assert_eq!(back.paints, cb.paints);
+            assert_eq!(back.mask, mask);
+            // gzip wrapper round-trips too
+            assert_eq!(deserialize_prefab(&serialize_prefab(&cb)).unwrap().origin, Some(golden_origin()));
+            // old-reader shape: strip the section and the prefab is the same with no origin
+            let stripped = &bytes[..bytes.len() - hex_bytes(GOLDEN_ORGN).len()];
+            let old = deserialize_prefab(stripped).expect("stripped parses");
+            assert_eq!(old.origin, None);
+            assert_eq!(old.block_types, cb.block_types);
+            assert_eq!(old.mask, mask);
+            assert_eq!(serialize_prefab_raw(&golden_clip(mask, None)), stripped,
+                "no origin → byte-identical to today's output");
+        }
+    }
+
+    #[test]
+    fn test_epfab_sections_skip_unknown_and_tolerate_truncation() {
+        let mut bytes = hex_bytes(GOLDEN_V1);
+        let orgn = bytes.split_off(bytes.len() - hex_bytes(GOLDEN_ORGN).len());
+        // unknown tag first, then ORGN → still found
+        let mut b = bytes.clone();
+        b.extend_from_slice(b"XXXX");
+        b.extend_from_slice(&3u32.to_le_bytes());
+        b.extend_from_slice(&[1, 2, 3]);
+        b.extend_from_slice(&orgn);
+        assert_eq!(deserialize_prefab(&b).unwrap().origin, Some(golden_origin()));
+        // truncated section → valid prefab, no origin
+        let mut t = bytes.clone();
+        t.extend_from_slice(&orgn[..orgn.len() - 1]);
+        assert_eq!(deserialize_prefab(&t).unwrap().origin, None);
+        // ORGN longer than 21: extra bytes ignored
+        let mut l = bytes.clone();
+        l.extend_from_slice(b"ORGN");
+        l.extend_from_slice(&23u32.to_le_bytes());
+        l.extend_from_slice(&orgn[8..]);
+        l.extend_from_slice(&[9, 9]);
+        assert_eq!(deserialize_prefab(&l).unwrap().origin, Some(golden_origin()));
+    }
+
+    #[test]
+    fn test_clipboard_transforms_drop_origin() {
+        let mut cb = golden_clip(None, Some(golden_origin()));
+        rotate_clipboard_inner(&mut cb);
+        assert_eq!(cb.origin, None);
+        let mut cb = golden_clip(None, Some(golden_origin()));
+        mirror_clipboard_x_inner(&mut cb);
+        assert_eq!(cb.origin, None);
+        let mut cb = golden_clip(None, Some(golden_origin()));
+        mirror_clipboard_y_inner(&mut cb);
+        assert_eq!(cb.origin, None);
+    }
+
+    /// A one-chunk 64z world whose chunk sits at (cx=5, cy=7), so `abs_min_* * 16` is non-zero.
+    fn offset_world_state() -> WorldState {
+        let mut b = make_test_world();
+        let pe = 4096 + 32768;
+        b[pe..pe + 2].copy_from_slice(&5i16.to_le_bytes());
+        b[pe + 4..pe + 6].copy_from_slice(&7i16.to_le_bytes());
+        let ws = ws_with(b);
+        let w = ws.world.as_ref().unwrap();
+        assert_eq!((w.min_x, w.min_y), (5, 7));
+        ws
+    }
+
+    fn rt_clip(rtid: u64, mask: Option<Vec<u8>>) -> Clipboard {
+        Clipboard {
+            width: 4, height: 4, depth: 3, z_anchor: 10,
+            block_types: vec![13; 48], paints: vec![0; 48], mask,
+            origin: Some(PrefabOrigin { ax: 1000, ay: 2000, az: 10, source: 2, rtid }),
+        }
+    }
+
+    /// 22.9: cells that fall off the world (negative origin, past max_z) are counted into one toast
+    /// warning; a fully-inside paste stays silent.
+    #[test]
+    fn test_paste_warns_when_clipped() {
+        let mut ws = offset_world_state();
+        ws.clipboard = Some(rt_clip(99, None));
+        let ok = paste_at_inner(&mut ws, 2, 3, 0, false).expect("paste");
+        assert!(ok.warnings.is_empty(), "an in-bounds paste must not warn: {:?}", ok.warnings);
+        // 2 columns off the west edge → 2 cols × 4 rows × 3 layers = 24 dropped cells.
+        let r = paste_at_inner(&mut ws, -2, 3, 0, false).expect("paste");
+        assert!(r.warnings.iter().any(|w| w.starts_with("24 blocks")), "{:?}", r.warnings);
+        // Entirely above the world: every cell is dropped.
+        let r = paste_at_inner(&mut ws, 2, 3, 100_000, false).expect("paste");
+        assert!(r.warnings.iter().any(|w| w.starts_with("48 blocks")), "{:?}", r.warnings);
+    }
+
+    #[test]
+    fn test_placement_copy_origin_offsets_exactly() {
+        let mut ws = offset_world_state();
+        ws.clipboard = Some(rt_clip(99, None));
+        paste_at_inner(&mut ws, 2, 3, 0, false).expect("paste");
+        assert_eq!(ws.paste_placements, vec![Placement {
+            x: 2, y: 3, z: 10, w: 4, h: 4, d: 3, ax: 1000, ay: 2000, az: 10, rtid: 99,
+        }]);
+        // edit inside the pasted area, then copy a sub-box of it
+        with_edit(&mut ws, "tweak", (3, 4, 3, 4), |w| { set_block_abs(w, 3, 4, 11, 2, 0); Ok(()) }).unwrap();
+        // with_edit is not undo/redo, so the placement survives
+        assert_eq!(ws.paste_placements.len(), 1);
+        let state = RwLock::new(ws);
+        let info = copy_selection_inner(&state, 3, 4, 4, 5, 11, 12).expect("copy");
+        assert_eq!(info.origin, Some(PrefabOrigin { ax: 1001, ay: 2001, az: 11, source: 1, rtid: 99 }));
+        // …and it round-trips through the file codec
+        let cb = state.read().unwrap().clipboard.as_ref().map(serialize_prefab).unwrap();
+        assert_eq!(deserialize_prefab(&cb).unwrap().origin, info.origin);
+
+        // straddling the placement edge → ambiguous → None
+        let info = copy_selection_inner(&state, 1, 3, 3, 4, 10, 10).expect("copy");
+        assert_eq!(info.origin, None);
+        // exceeding the placement in z → None
+        let info = copy_selection_inner(&state, 3, 4, 4, 5, 11, 13).expect("copy");
+        assert_eq!(info.origin, None);
+        // outside every placement → this world's absolute coordinates, source 0
+        let info = copy_selection_inner(&state, 10, 11, 12, 12, 0, 1).expect("copy");
+        assert_eq!(info.origin, Some(PrefabOrigin { ax: 5 * 16 + 10, ay: 7 * 16 + 11, az: 0, source: 0, rtid: 0 }));
+    }
+
+    #[test]
+    fn test_placement_not_recorded_unless_cell_for_cell() {
+        // ignore-air on
+        let mut ws = offset_world_state();
+        ws.clipboard = Some(rt_clip(7, None));
+        paste_at_inner(&mut ws, 2, 3, 0, true).unwrap();
+        assert!(ws.paste_placements.is_empty(), "ignore-air paste must not record");
+        // masked
+        ws.clipboard = Some(rt_clip(7, Some(vec![0xff, 0xff])));
+        paste_at_inner(&mut ws, 2, 3, 0, false).unwrap();
+        assert!(ws.paste_placements.is_empty(), "masked paste must not record");
+        // no rtid
+        ws.clipboard = Some(rt_clip(0, None));
+        paste_at_inner(&mut ws, 2, 3, 0, false).unwrap();
+        assert!(ws.paste_placements.is_empty(), "rtid 0 must not record");
+        // no origin at all
+        let mut cb = rt_clip(7, None);
+        cb.origin = None;
+        ws.clipboard = Some(cb);
+        paste_at_inner(&mut ws, 2, 3, 0, false).unwrap();
+        assert!(ws.paste_placements.is_empty());
+        // clipped by the world edge (paste at x=14, 4 wide, world is 16 wide)
+        ws.clipboard = Some(rt_clip(7, None));
+        paste_at_inner(&mut ws, 14, 3, 0, false).unwrap();
+        assert!(ws.paste_placements.is_empty(), "a clipped paste must not record");
+        // a good one records, and the cap holds at MAX_PLACEMENTS newest-last
+        for i in 0..(MAX_PLACEMENTS as i32 + 3) {
+            let mut cb = rt_clip(100 + i as u64, None);
+            cb.width = 1; cb.height = 1; cb.depth = 1;
+            cb.block_types.truncate(1); cb.paints.truncate(1);
+            ws.clipboard = Some(cb);
+            paste_at_inner(&mut ws, i, 0, 0, false).unwrap();
+        }
+        assert_eq!(ws.paste_placements.len(), MAX_PLACEMENTS);
+        assert_eq!(ws.paste_placements.last().unwrap().rtid, 100 + MAX_PLACEMENTS as u64 + 2);
+    }
+
+    #[test]
+    fn test_undo_and_redo_clear_placements() {
+        let mut ws = offset_world_state();
+        ws.clipboard = Some(rt_clip(5, None));
+        paste_at_inner(&mut ws, 2, 3, 0, false).unwrap();
+        assert_eq!(ws.paste_placements.len(), 1);
+        undo_edit_inner(&mut ws).expect("undo");
+        assert!(ws.paste_placements.is_empty(), "undo clears placements");
+        // redo clears whatever was recorded since too
+        ws.paste_placements.push(Placement { x: 0, y: 0, z: 0, w: 1, h: 1, d: 1, ax: 0, ay: 0, az: 0, rtid: 1 });
+        redo_edit_inner(&mut ws).expect("redo");
+        assert!(ws.paste_placements.is_empty(), "redo clears placements");
+    }
+
+    #[test]
+    fn test_derive_copy_origin_newer_overlap_beats_older_cover() {
+        let older = Placement { x: 0, y: 0, z: 0, w: 10, h: 10, d: 10, ax: 100, ay: 200, az: 5, rtid: 1 };
+        let newer = Placement { x: 4, y: 4, z: 0, w: 3, h: 3, d: 10, ax: 900, ay: 900, az: 5, rtid: 2 };
+        // box inside older, overlapping newer's edge → ambiguous
+        assert_eq!(derive_copy_origin(&[older, newer], 0, 0, 2, 2, 4, 4, 0, 1), None);
+        // box inside older, clear of newer → older's origin
+        let o = derive_copy_origin(&[older, newer], 0, 0, 0, 0, 1, 1, 2, 3).unwrap();
+        assert_eq!((o.ax, o.ay, o.az, o.source, o.rtid), (100, 200, 7, 1, 1));
     }
 
 }

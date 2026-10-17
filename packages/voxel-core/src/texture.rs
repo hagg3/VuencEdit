@@ -138,26 +138,25 @@ pub const BLOCK_FACE_TEX: [[&str; 3]; 128] = [
     ["blocktnt", "blocktnt", "firework"],           // 109 BTFIREWORK
     ["blocktnt", "blocktnt", "lightbox"],           // 110 BTLIGHTBOX
     ["blocktnt", "blocktnt", "steel"],              // 111 BTSTEEL
-    // 112–127: new-format blocks — no atlas row (shipped game atlas has no free slots; a texture
-    // pack would need a `KNOWN_TEX_NAMES` extension to carry these). Empty string ⇒ `face_tile`
-    // returns None ⇒ falls back to atlas row 0 (white sentinel), so the approximated BLOCK_RGB
-    // colour above shows through unmodulated.
-    ["", "", ""],                                   // 112 Ore Sand (no texture yet)
-    ["", "", ""],                                   // 113 Space Stone (no texture yet)
-    ["", "", ""],                                   // 114 Carpet (no texture yet)
-    ["", "", ""],                                   // 115 Snakeskin (no texture yet)
-    ["", "", ""],                                   // 116 Obsidian (no texture yet)
-    ["", "", ""],                                   // 117 Cheese (no texture yet)
-    ["", "", ""],                                   // 118 Space Dirt (no texture yet)
-    ["", "", ""],                                   // 119 Space Grass (no texture yet)
-    ["", "", ""],                                   // 120 Moss (no texture yet)
-    ["", "", ""],                                   // 121 Dark Matter (no texture yet)
-    ["", "", ""],                                   // 122 Space Sand (no texture yet)
-    ["", "", ""],                                   // 123 Snow (no texture yet)
-    ["", "", ""],                                   // 124 Moonrock (no texture yet)
-    ["", "", ""],                                   // 125 Basalt (no texture yet)
-    ["", "", ""],                                   // 126 Dark Tile (no texture yet)
-    ["", "", ""],                                   // 127 Algae (no texture yet)
+    // 112–127: new-format blocks — tiles 32–47 of the Emod 64-tile atlas.png (the 2026 game's art).
+    // A pack without them (a stock 32-tile atlas) ⇒ `face_tile` returns None ⇒ atlas row 0 (white
+    // sentinel), so the approximated BLOCK_RGB colour shows through unmodulated, as before.
+    ["ore_sand", "ore_sand", "ore_sand"],           // 112 Ore Sand
+    ["space_stone", "space_stone", "space_stone"],  // 113 Space Stone
+    ["carpet", "carpet", "carpet"],                 // 114 Carpet
+    ["snakeskin", "snakeskin", "snakeskin"],        // 115 Snakeskin
+    ["obsidian", "obsidian", "obsidian"],           // 116 Obsidian
+    ["cheese", "cheese", "cheese"],                 // 117 Cheese
+    ["space_dirt", "space_dirt", "space_dirt"],     // 118 Space Dirt
+    ["space_grass", "space_grass", "space_grass"],  // 119 Space Grass
+    ["moss", "moss", "moss"],                       // 120 Moss
+    ["dark_matter", "dark_matter", "dark_matter"],  // 121 Dark Matter
+    ["space_sand", "space_sand", "space_sand"],     // 122 Space Sand
+    ["snow", "snow", "snow"],                       // 123 Snow
+    ["moonrock", "moonrock", "moonrock"],           // 124 Moonrock
+    ["basalt", "basalt", "basalt"],                 // 125 Basalt
+    ["dark_tile", "dark_tile", "dark_tile"],        // 126 Dark Tile
+    ["algae", "algae", "algae"],                    // 127 Algae
 ];
 
 pub struct TexturePack {
@@ -191,7 +190,8 @@ pub fn face_tile(pack: &TexturePack, bt: u8, face_kind: u8) -> Option<u32> {
 /// colour otherwise.
 ///
 /// The texture row depends on paint state, mirroring the game's two-atlas scheme:
-///   - **unpainted** (`paint == 0`) → the full-color tile: `block_color × full_color ≈ natural`.
+///   - **unpainted** (`paint == 0`) → the full-color tile: `block_color × full_color ≈ natural`
+///     (blocks 112–127: white × full_color, since their tiles are the finished colour art).
 ///   - **painted** (`paint != 0`)  → the grayscale variant (`row + gray_row_offset`) so that
 ///     `paint_color × grayscale` produces a clean tint instead of double-tinting a full-color
 ///     tile (which reads washed-out / oversaturated). The game does exactly this — e.g.
@@ -208,6 +208,16 @@ pub fn face_color_and_row(
         Some(r) if paint != 0 => Some(r + pack.gray_row_offset),
         other => other,
     };
+    // 112–127's colour tiles are the game's finished art (its unpainted look), not a base the block
+    // colour modulates — the approximated BLOCK_RGB would double-tint them. Draw them white.
+    if paint == 0 && row.is_some() && is_new_format_tex_block(bt) {
+        return ([255, 255, 255], row);
+    }
     (fallback_rgb, row)
+}
+
+/// Blocks 112–127, whose atlas tiles already carry their colour (see `face_color_and_row`).
+pub fn is_new_format_tex_block(bt: u8) -> bool {
+    (112..=127).contains(&bt)
 }
 

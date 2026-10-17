@@ -255,6 +255,10 @@ export function btnActive(accent: string = ACCENT.primary, extra?: CSSProperties
 /** Disabled: dim + inert, never unmounted, so neighbouring groups don't shift. Always pair with
  *  `aria-disabled` + `tabIndex={-1}` (a `pointerEvents:none` button stays focusable otherwise). */
 export const btnDisabled: CSSProperties = { opacity: 0.4, pointerEvents: "none" };
+/** Disabled but still hoverable/clickable (22.5): the tooltip carries the reason and a click on a
+ *  `<Cmd>` button surfaces it as a notice. The primitive swaps `onClick` for `onDisabledClick`, so
+ *  the real handler can never fire. */
+export const btnDisabledExplains: CSSProperties = { opacity: 0.4, cursor: "not-allowed" };
 
 /**
  * "Current item" = **pushed in** (Stage 14.2): the one recipe for the current row of every list or

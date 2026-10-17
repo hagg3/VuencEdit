@@ -6,7 +6,7 @@
 import type { ReactNode } from "react";
 import type { RibbonTab } from "../ribbon/props";
 import type { SidebarTab } from "../Sidebar";
-import { MOD, SHIFT, TEXT } from "../ribbon/tokens";
+import { ALT, MOD, SHIFT, TEXT } from "../ribbon/tokens";
 
 // ⚠ written by bump-version.sh — keep this on one line
 export const TOUR_VERSION = 4;
@@ -165,7 +165,7 @@ export const TOUR_STEPS: TourStep[] = [
     before: (c) => c.setRibbonTab("sculpt"),
     body: (
       <>
-        Raise, lower, smooth, erode and more. <Kbd>[</Kbd> / <Kbd>]</Kbd> change radius,
+        Raise, lower, smooth, sharpen and more. <Kbd>[</Kbd> / <Kbd>]</Kbd> change radius,
         <Kbd>{SHIFT}[</Kbd> / <Kbd>{SHIFT}]</Kbd> change strength, and <Kbd>Esc</Kbd> mid-stroke
         reverts the whole stroke as one undo step.
       </>
@@ -204,6 +204,18 @@ export const TOUR_STEPS: TourStep[] = [
     ),
   },
   {
+    id: "lens",
+    title: "The Lens",
+    target: null,
+    body: (
+      <>
+        Select an area and the Lens window shows its front and side views, with handles to adjust
+        the height band. While a paste is armed it previews the paste instead. <Kbd>{ALT}P</Kbd>{" "}
+        toggles it.
+      </>
+    ),
+  },
+  {
     id: "sidebar",
     title: "The sidebar",
     target: TOUR_ANCHORS.sidebar,
@@ -218,6 +230,17 @@ export const TOUR_STEPS: TourStep[] = [
       <>
         <Kbd>{MOD}Z</Kbd> / <Kbd>{MOD}{SHIFT}Z</Kbd> undo and redo, also listed in the sidebar's
         History tab. <Kbd>{MOD}S</Kbd> saves, and autosave runs in the background.
+      </>
+    ),
+  },
+  {
+    id: "command-search",
+    title: "Search commands",
+    target: null,
+    body: (
+      <>
+        <Kbd>{MOD}K</Kbd> searches every command, including each Settings page. Enter runs it, Tab
+        shows where it lives in the ribbon.
       </>
     ),
   },

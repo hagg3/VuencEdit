@@ -6,10 +6,11 @@ import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import type { AtlasData } from "./texturePack";
 import { isTypingTarget, chunkToWorld, worldToChunk, gridDivisions } from "./viewportUtils";
+import { editReloadPlan, shouldReloadChunk, staleBandKeys, bandCovers } from "./flySync";
 import type { WorldMeta } from "./types";
 import { BORDER, FONT, IS_MAC, RADIUS, SMALL_H, SPACE, SURFACE, TEXT_DANGER, TEXT_DIM } from "./ribbon/tokens";
 import { Check, IconButton, SliderRow, SmallButton } from "./ribbon/primitives";
-import { skyFogColor, rampFamilyBase, wedgeFamilyBase, rampDirIndex, orientBlockToFacing } from "./blockDefs";
+import { blockDisplayName, skyFogColor, rampFamilyBase, wedgeFamilyBase, rampDirIndex, orientBlockToFacing } from "./blockDefs";
 import { maskPrismPositions, type OutlinePt, type MaskRect } from "./maskUtils";
 import { perfCounters, recordGeometryFetchMs, recordFrameMs, recordRenderMs, recordRenderStats, recordReload, bumpPerf, type ReloadReason } from "./perfCounters";
 import { backoffBudget, backoffRadius, MAX_CONTEXT_LOSSES } from "./gfxBackoff";
@@ -289,7 +290,7 @@ const INTERACT_SEGMENTS: { mode: Interact3D; label: string; accent: string; titl
 /// canonical picker; this is just a label so the pane doesn't show a bare tool id.)
 const SCULPT_TOOL_LABELS: Record<string, string> = {
   raise: "Raise", lower: "Lower", grab: "Grab", smooth: "Smooth", flatten: "Flatten",
-  noise: "Noise", erode: "Erode", thermal: "Thermal", hydro: "Hydro", stamp: "Retexture",
+  noise: "Noise", thermal: "Thermal", hydro: "Hydro", stamp: "Retexture",
   terrace: "Terrace", sharpen: "Sharpen", slope: "Slope", smear: "Smear", rock: "Rock", carve: "Carve",
 };
 /// Amber sculpt-brush colour (matches the Ribbon sculpt affordances / 2D sculpt ghost).
@@ -385,12 +386,15 @@ function bresenham3D(x0: number, y0: number, z0: number, x1: number, y1: number,
 /** Every cell in the inclusive 3D box between two Eden corners, or null if it would exceed the
  *  MAX_BUILD_SHAPE_CELLS safety cap (caller drops the gesture rather than truncating silently into a
  *  half-built box). */
+function boxCellCount(x0: number, y0: number, z0: number, x1: number, y1: number, z1: number): number {
+  return (Math.abs(x1 - x0) + 1) * (Math.abs(y1 - y0) + 1) * (Math.abs(z1 - z0) + 1);
+}
+
 function boxCells(x0: number, y0: number, z0: number, x1: number, y1: number, z1: number): [number, number, number][] | null {
   const xlo = Math.min(x0, x1), xhi = Math.max(x0, x1);
   const ylo = Math.min(y0, y1), yhi = Math.max(y0, y1);
   const zlo = Math.min(z0, z1), zhi = Math.max(z0, z1);
-  const count = (xhi - xlo + 1) * (yhi - ylo + 1) * (zhi - zlo + 1);
-  if (count > MAX_BUILD_SHAPE_CELLS) return null;
+  if (boxCellCount(x0, y0, z0, x1, y1, z1) > MAX_BUILD_SHAPE_CELLS) return null;
   const pts: [number, number, number][] = [];
   for (let x = xlo; x <= xhi; x++)
     for (let y = ylo; y <= yhi; y++)
@@ -642,7 +646,7 @@ const GeomMemHud = forwardRef<GeomMemHudRef>(function GeomMemHud(_props, ref) {
 });
 
 const FlyView3D = forwardRef<FlyView3DRef, {
-  world: WorldMeta; editEpoch?: number; lastEdit?: EditBounds | null;
+  world: WorldMeta; editEpoch?: number; lastEdit?: EditBounds[] | null;
   /** Initial camera target in Eden local block coords (x = east, y = south). Spawns the camera
    *  over real geometry; falls back to the world centre when null/undefined. */
   spawnAt?: { x: number; y: number } | null;
@@ -803,6 +807,9 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     stampCx: number; stampCy: number; stampRadius: number; groupId: number;
     anchor?: [number, number]; grabDelta?: number; smear?: [number, number];
   }) => void | Promise<void>;
+  /** Escape mid-stroke: revert that stroke's stamps (its group id). Called once, after any in-flight
+   *  stamp settles; App undoes that group only, so a stroke that changed nothing is a no-op (21.9). */
+  onCancelSculptStroke3d?: (groupId: number) => void | Promise<void>;
   /** Opt-in real GPU shadow map: switches chunk meshes to a lit material + a directional sun with a
    *  shadow map, and fetches flat (unshaded) geometry. Overrides the baked night/shadow preview.
    *  Makes sunT free (moving the sun just repositions the light — no chunk reload). Default false. */
@@ -851,7 +858,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
   moveWithContents = false, setMoveWithContents,
   hotbarSlots, activeBlock, onHotbarSelect, showHotbarOverlay = true,
   onSetInteract3d,
-  sculptTool = "raise", sculptRadius = 6, sculptStrength = 2, onSculptStamp3d,
+  sculptTool = "raise", sculptRadius = 6, sculptStrength = 2, onSculptStamp3d, onCancelSculptStroke3d,
   gpuShadows = false,
   geometryBudgetBytes = GEOMETRY_BUDGET_BYTES,
   onNotice,
@@ -987,6 +994,11 @@ const FlyView3D = forwardRef<FlyView3DRef, {
 
   // Camera position/heading HUD (Eden coords), refreshed at the ~10fps broadcast cadence.
   const hudRef = useRef<CoordHudRef | null>(null);
+  // VIEW-mode hover readout (block name + XYZ under the cursor). A plain DOM node written straight
+  // from the hover pick, so the ~20 Hz updates never re-render the pane.
+  const hoverReadoutRef = useRef<HTMLDivElement | null>(null);
+  const showHudRef = useRef(showHud);
+  showHudRef.current = showHud;
 
   // C3 steps 2–3: the deferred lighting-halo half of the edit-sync reload rect. Keys are `"cx,cy"`,
   // accumulated across every edit inside one HALO_FLUSH_MS window (i.e. one build sweep) and flushed
@@ -1077,6 +1089,10 @@ const FlyView3D = forwardRef<FlyView3DRef, {
   // Whether a line/box gesture's start cell is currently armed — read by the build-mode hint text.
   // Low-frequency (flips twice per gesture), so a plain setState re-render here is fine.
   const [buildShapeArmed, setBuildShapeArmed] = useState(false);
+  // Live extents of the armed line/box while the cursor chooses its far corner (D8): cell counts per
+  // axis, the total, and whether it breaks MAX_BUILD_SHAPE_CELLS (so the commit would be refused).
+  // Updates at hover-pick rate, so `updateShapeExtent` only sets state when the readout text changes.
+  const [buildShapeExtent, setBuildShapeExtent] = useState<{ dx: number; dy: number; dz: number; count: number; over: boolean } | null>(null);
 
   // Gizmo props/state read through refs by the scene closure (see "3D selection gizmo" below).
   const selectionBounds3dRef = useRef(selectionBounds3d);
@@ -1097,6 +1113,8 @@ const FlyView3D = forwardRef<FlyView3DRef, {
   sculptRadiusRef.current = sculptRadius;
   const onSculptStamp3dRef = useRef(onSculptStamp3d);
   onSculptStamp3dRef.current = onSculptStamp3d;
+  const onCancelSculptStroke3dRef = useRef(onCancelSculptStroke3d);
+  onCancelSculptStroke3dRef.current = onCancelSculptStroke3d;
 
   // Grab tool's live vertical-drag displacement, shown in the armed-hint readout. null when no grab
   // drag is active. Set imperatively from the scene closure's pointer handlers.
@@ -1497,6 +1515,9 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     const controls = new OrbitControls(camera, renderer.domElement);
     controls.enableDamping = true;
     controls.dampingFactor = 0.1;
+    // Wheel zoom homes in on the point under the cursor (not the orbit target), so a distant block
+    // can be reached without first re-centring the view on it.
+    controls.zoomToCursor = true;
     // Snapshot the controls' original button actions so a mode that owns a drag can disable the
     // camera's claim on it (setting an entry to null makes OrbitControls' onMouseDown fall through to
     // STATE.NONE — verified in three's source) and restore *exactly* these values on leaving, rather
@@ -1775,6 +1796,9 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     // doesn't keep refetching it. A plain key set — not a shared sentinel mesh, which would need
     // `.dispose()`d every time an empty chunk is evicted despite never being added to the scene.
     const emptyChunks = new Set<string>();
+    // 23.2: z band each resident chunk was fetched under (`null` = unclipped). Lets a band change keep
+    // every mesh that still covers the new band and refetch only those that don't.
+    const builtBand = new Map<string, number | null>();
     // L1: `meshesT` belongs here for symmetry with residentKeys() below. Not live today (a chunk
     // with zero opaque verts always also lands in `emptyChunks`), but that's a property of one
     // branch in startFetch, not an invariant — a transparent-only mesh installed without it would
@@ -1851,6 +1875,9 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       // scale the caller set) once and skip the per-frame recompose for the whole resident set.
       mesh.matrixAutoUpdate = false;
       mesh.updateMatrix();
+      // The manual frustum pass runs before render(), so a fresh mesh must already have its world
+      // matrix or it is tested at the origin, hidden, and (render-on-demand) never redrawn (21.1).
+      mesh.updateMatrixWorld(true);
       scene.add(mesh);
       map.set(k, mesh);
     };
@@ -1870,6 +1897,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       dropChunkMesh(meshesT, k);
       dropChunkMesh(meshesE, k);
       emptyChunks.delete(k);
+      builtBand.delete(k);
       invalidate();
     };
 
@@ -2003,11 +2031,12 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       inflightBytes += chunkEstimateBytes;
       badgesRef.current?.setLoading(inflight.size);
       const gen = fetchGen;
+      const fetchBand = zBand ?? null;
       if (perfCounters.enabled) perfCounters.chunkFetchesIssued++;
       const fetchT0 = performance.now();
       // zMax = the camera band's ceiling (Stage 3); zMin stays 0 — see Z_BAND_ABOVE on why the band
       // is one-sided. `undefined` means "no clip" and is what a 64z world always sends.
-      invoke<ArrayBuffer>("get_chunk_geometry", { cx: cxk, cy: cyk, night: nightLightingRef.current, shadows: shadows3dRef.current, sunT: sunTRef.current, gpu: gpuShadowsRef.current, lampRadius: lampRadiusRef.current, lightingProfile: lightingProfileRef.current, zMax: zBand ?? undefined, format: 2 })
+      invoke<ArrayBuffer>("get_chunk_geometry", { cx: cxk, cy: cyk, night: nightLightingRef.current, shadows: shadows3dRef.current, sunT: sunTRef.current, gpu: gpuShadowsRef.current, lampRadius: lampRadiusRef.current, lightingProfile: lightingProfileRef.current, zMax: fetchBand ?? undefined, format: 2 })
         .then((buf) => {
           recordGeometryFetchMs(performance.now() - fetchT0);
           if (disposed) return;
@@ -2022,6 +2051,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
             return; // stale — dropped; finally{} requeues if needed
           }
           disposeMesh(k); // replace any existing mesh (reload path)
+          builtBand.set(k, fetchBand);
           const [op, tr, em] = g.streams;
           // Compact (v2) mesh: chunk-local fixed-point positions (Int16×4 — the 4th is padding a
           // `vec3` attribute ignores), normalised Uint8×4 colours, integer Uint16 UVs (mapped by the
@@ -2147,12 +2177,27 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       const nextBand = zBandTop();
       const bandMoved = nextBand !== zBand;
       if (bandMoved) {
+        // 23.2: keep the meshes. Lowering the band leaves a superset of what's needed (a mesh built
+        // under a taller ceiling still covers it), so nothing is touched. Raising it only invalidates
+        // meshes built under a lower ceiling: those stay on screen and are force-refetched nearest-first,
+        // each swapped atomically when its replacement lands (the reloadChunk idiom) — no blank scene.
         recordReload("band");
         zBand = nextBand;
-        fetchGen++;
+        fetchGen++; // any in-flight fetch was issued under the old band
         queue = [];
         forceKeys.clear();
-        for (const k of residentKeys()) disposeMesh(k);
+        const stale = staleBandKeys(builtBand, nextBand, ccx, ccy);
+        if (committedBytes() < effectiveBudget() * 0.85) {
+          for (const k of stale) forceKeys.add(k);
+          queue = stale.map((k) => { const [qx, qy] = k.split(",").map(Number); return { cx: qx, cy: qy }; });
+        } else {
+          // Near the budget pump() refuses fetches while old meshes count against it; dispose instead.
+          for (const k of stale) disposeMesh(k);
+        }
+        // Resident markers with no recorded band (shouldn't happen) are treated as stale too.
+        for (const k of residentKeys()) {
+          if (!builtBand.has(k) && !forceKeys.has(k) && !bandCovers(undefined, nextBand)) disposeMesh(k);
+        }
       }
       // A stationary camera with nothing queued has nothing new to do — skip the O((2r+1)²) disc
       // scan and the Set-union + string-split dispose pass below, which otherwise runs unconditionally
@@ -2256,6 +2301,8 @@ const FlyView3D = forwardRef<FlyView3DRef, {
         const [fx, fy] = k.split(",").map(Number);
         pendingForced.push({ cx: fx, cy: fy });
       }
+      // Nearest-first (23.2: a band raise can force hundreds of resident keys at once).
+      pendingForced.sort((a, b) => ((a.cx - ccx) ** 2 + (a.cy - ccy) ** 2) - ((b.cx - ccx) ** 2 + (b.cy - ccy) ** 2));
       queue = pendingForced.length ? [...pendingForced, ...needed] : needed;
       pump();
       pushMemHud();
@@ -2269,6 +2316,10 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       // this, every 2D edit made with the 3D view closed fetched its chunk into the hidden pane.
       if (suspendedNow) return;
       const k = key(cxk, cyk);
+      // 23.1: only chunks that hold (or are fetching) geometry need a forced reload. A non-resident
+      // one — out of range, evicted by the budget — is fetched fresh by the sweep if/when it's wanted,
+      // so forcing it here would pull in a chunk nobody asked for, at the front of the queue.
+      if (!shouldReloadChunk(isResident(k), inflight.has(k))) return;
       // Set on both paths: the requeue in startFetch's finally{} runs while the *old* mesh is still
       // resident now that the dispose is no longer eager, so without the force flag the requeued
       // fetch would be skipped as "already resident" and the chunk would keep pre-edit geometry.
@@ -2649,6 +2700,8 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     let sculptStartT = 0;     // hold-timer stroke start, for the BUILD_GESTURE_MAX_MS-style watchdog
     let sculptActive = false; // a hold-timer stroke is live
     let sculptGroupId = 0;
+    let sculptStamped = false; // this stroke sent at least one stamp (Escape then reverts it, 21.9)
+    let sculptInflight: Promise<unknown> | null = null; // the tick stamp in flight, for Escape to await
     let sculptAnchor: [number, number] | null = null; // stroke-start column (flatten/stamp read it)
     // Smear: like the 2D timer, each tick needs the drag delta *since the previous tick* — the
     // hit column from the previous pick, not the stroke-start anchor.
@@ -2672,11 +2725,23 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       setGrabReadout(null);
     };
 
+    // Escape (only — blur, pointer loss and the watchdog keep what was stamped, like a release):
+    // stop the stroke, then once the in-flight stamp settles undo this stroke's group. Grab commits
+    // only on release, so a cancelled grab has nothing to revert.
+    const revertSculptStroke = () => {
+      const live = sculptActive, stamped = sculptStamped, gid = sculptGroupId, inflight = sculptInflight;
+      cancelSculptStroke();
+      if (!live || !stamped) return;
+      void Promise.resolve(inflight).finally(() => { void onCancelSculptStroke3dRef.current?.(gid); });
+    };
+
     // The Eden voxel a right-click (place) acts on, given the picked block. Build mode places
     // against the hit face, so the target is the empty neighbour `hit + normal` — that's what the
     // green box previews and what a right-click fills. Select mode acts on the hit voxel itself.
+    // Flood fill seeds from the air cell against the face too (`handlePick3dFloodFill` does
+    // `hit + normal`), so its outline is that cell, not the solid voxel that was hit.
     const clickTarget = (p: PickResult) =>
-      interact3dRef.current === "build"
+      interact3dRef.current === "build" || interact3dRef.current === "floodfill"
         ? { x: p.x + p.nx, y: p.y + p.ny, z: p.z + p.nz }
         : { x: p.x, y: p.y, z: p.z };
 
@@ -2687,6 +2752,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     const setHighlight = (p: PickResult | null, yaw: number = 0) => {
       const want = !!p && interact3dRef.current !== "none";
       if (!want) {
+        updateShapeExtent(null, null);
         if (highlight.visible || breakHighlight.visible || placeShapeHighlight.visible) {
           highlight.visible = false;
           breakHighlight.visible = false;
@@ -2697,9 +2763,11 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       }
       const build = interact3dRef.current === "build";
       const t = clickTarget(p!);
-      // Green = placement (build), blue = select — matches the overlay box colours. Shared by the
-      // cube and the ramp/wedge shape preview below (never shown at the same time).
-      hlMat.color.setHex(build ? 0x22c55e : 0x60a5fa);
+      updateShapeExtent(p, t);
+      // Green = placement (build), sky = flood fill (its start cell is the air against the face),
+      // blue = select — matches the overlay box colours. Shared by the cube and the ramp/wedge shape
+      // preview below (never shown at the same time).
+      hlMat.color.setHex(build ? 0x22c55e : interact3dRef.current === "floodfill" ? 0x38bdf8 : 0x60a5fa);
 
       // B3: preview the oriented ramp/wedge shape that would actually be placed here — auto-orient's
       // resolved variant when on, the armed block verbatim when off — instead of a plain cube.
@@ -2747,12 +2815,25 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       }
       return pick(cx, cy, maxDist);
     };
+    // Write the VIEW-mode readout straight into its DOM node (hidden when there is no target).
+    const setHoverReadout = (p: PickResult | null) => {
+      const el = hoverReadoutRef.current;
+      if (!el) return;
+      if (!p) { if (el.style.display !== "none") el.style.display = "none"; return; }
+      const text = `${blockDisplayName(p.block_type)} · X ${p.x} · Y ${p.y} · Z ${p.z}`;
+      if (el.textContent !== text) el.textContent = text;
+      if (el.style.display !== "block") el.style.display = "block";
+    };
     const refreshHighlight = async () => {
       if (suspendedNow) return; // 16.3 — no pick_block round-trips for a hidden pane
       const mode = interact3dRef.current;
       // In fly mode the crosshair is the cursor and the pointer may be locked (no pointerenter/leave,
       // no meaningful clientX/Y), so hover isn't a precondition there.
-      if (mode === "none" || !(flyModeRef.current || hoverRef.current)) { setHighlight(null); placeBrush(null); return; }
+      const hovering = flyModeRef.current || hoverRef.current;
+      // VIEW mode (`none`) has no outline, but still picks for the hover readout while the HUD is on.
+      if (mode === "none" ? !(hovering && showHudRef.current) : !hovering) {
+        setHighlight(null); placeBrush(null); setHoverReadout(null); return;
+      }
       // Freeze the brush disc at the grab column while a grab drag is in progress (the pointer is
       // moving vertically to set the displacement, not to re-aim).
       if (mode === "sculpt" && sculptGrab) return;
@@ -2769,8 +2850,12 @@ const FlyView3D = forwardRef<FlyView3DRef, {
         // only readers) and even on a miss (`p === null`), since a fresh pick would miss too.
         lastHoverPick = p; lastHoverCx = cursorX; lastHoverCy = cursorY; lastHoverT = now;
         // Sculpt shows the amber brush disc; select/build show the wireframe box. Never both.
-        if (mode === "sculpt") { placeBrush(p); setHighlight(null); }
-        else { setHighlight(p, placeYaw(cursorX, cursorY)); placeBrush(null); }
+        if (mode === "none") { setHoverReadout(p); setHighlight(null); placeBrush(null); }
+        else {
+          setHoverReadout(null);
+          if (mode === "sculpt") { placeBrush(p); setHighlight(null); }
+          else { setHighlight(p, placeYaw(cursorX, cursorY)); placeBrush(null); }
+        }
       } finally {
         pickInflight = false;
       }
@@ -2957,11 +3042,45 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     shapeAnchorBox.visible = false;
     scene.add(shapeAnchorBox);
 
+    // D8: the armed shape's bounding box, stretched from the anchor to the cell under the cursor,
+    // so the run's size is visible before the second click (red once a box would be refused).
+    const shapeExtentMat = new THREE.LineBasicMaterial({ color: 0xf59e0b, depthTest: false, transparent: true, opacity: 0.6 });
+    const shapeExtentBox = new THREE.LineSegments(hlGeom, shapeExtentMat);
+    shapeExtentBox.renderOrder = 998;
+    shapeExtentBox.visible = false;
+    scene.add(shapeExtentBox);
+    let lastExtentKey = "";
+
     let buildShapeAnchor: { x: number; y: number; z: number; kind: "break" | "place" } | null = null;
+    // Called from setHighlight on every hover pick: p = the hit voxel, t = the placement cell. The
+    // far corner is whichever the armed gesture acts on (break → hit, place → hit+normal).
+    const updateShapeExtent = (p: PickResult | null, t: { x: number; y: number; z: number } | null) => {
+      const a = buildShapeAnchor;
+      const shape = buildShapeRef.current;
+      if (!a || !p || !t || (shape !== "line" && shape !== "box")) {
+        if (shapeExtentBox.visible) { shapeExtentBox.visible = false; invalidate(); }
+        if (lastExtentKey !== "") { lastExtentKey = ""; setBuildShapeExtent(null); }
+        return;
+      }
+      const e = a.kind === "break" ? { x: p.x, y: p.y, z: p.z } : t;
+      const dx = Math.abs(e.x - a.x) + 1, dy = Math.abs(e.y - a.y) + 1, dz = Math.abs(e.z - a.z) + 1;
+      const count = shape === "line" ? Math.max(dx, dy, dz) : boxCellCount(a.x, a.y, a.z, e.x, e.y, e.z);
+      const over = shape === "box" && count > MAX_BUILD_SHAPE_CELLS;
+      // Bounding box centre/size in Three coords (x=Eden x, y=Eden z, z=Eden y).
+      shapeExtentBox.position.set((a.x + e.x) / 2 + 0.5, (a.z + e.z) / 2 + 0.5, (a.y + e.y) / 2 + 0.5);
+      shapeExtentBox.scale.set(dx, dz, dy);
+      shapeExtentMat.color.setHex(over ? 0xef4444 : 0xf59e0b);
+      shapeExtentBox.visible = true;
+      invalidate();
+      const key = `${dx}x${dy}x${dz}:${count}:${over}`;
+      if (key !== lastExtentKey) { lastExtentKey = key; setBuildShapeExtent({ dx, dy, dz, count, over }); }
+    };
     const clearBuildShapeAnchor = () => {
       const wasArmed = buildShapeAnchor !== null;
       buildShapeAnchor = null;
       shapeAnchorBox.visible = false;
+      shapeExtentBox.visible = false;
+      if (lastExtentKey !== "") { lastExtentKey = ""; setBuildShapeExtent(null); }
       if (wasArmed) setBuildShapeArmed(false);
       invalidate();
     };
@@ -2982,7 +3101,12 @@ const FlyView3D = forwardRef<FlyView3DRef, {
         ? bresenham3D(a.x, a.y, a.z, x, y, z)
         : boxCells(a.x, a.y, a.z, x, y, z);
       clearBuildShapeAnchor();
-      if (!cells) return; // over the safety cap — dropped, matching magic_wand_select's own cap behaviour
+      if (!cells) {
+        // Over the safety cap — dropped, matching magic_wand_select's own cap behaviour, but said out
+        // loud: the live extent readout already turned red, and this is the click that was refused.
+        onNoticeRef.current?.(`Box too large: ${boxCellCount(a.x, a.y, a.z, x, y, z).toLocaleString()} blocks (limit ${MAX_BUILD_SHAPE_CELLS.toLocaleString()}). Nothing was changed.`);
+        return;
+      }
       if (kind === "break") onPickBreakBatchRef.current?.(cells);
       else onPickPlaceBatchRef.current?.(cells, yaw);
     };
@@ -3221,7 +3345,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       void refreshHighlight();
     };
     // Pointer lock can synthesize a pointerleave; while flying the crosshair still has a target.
-    const onPickLeave = () => { if (!flyModeRef.current) { setHighlight(null); placeBrush(null); } };
+    const onPickLeave = () => { if (!flyModeRef.current) { setHighlight(null); placeBrush(null); setHoverReadout(null); } };
 
     // Fire one sculpt stamp at a picked column through App's dispatch (which reads the rest of the
     // brush params and applies use_cap:false). Radius is read fresh here so a mid-stroke [ / ] resize
@@ -3254,6 +3378,8 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       sculptBusy = false;
       sculptStartT = performance.now();
       sculptGroupId = groupId;
+      sculptStamped = false;
+      sculptInflight = null;
       // Anchor = stroke-start column, fixed for the whole stroke (flatten/stamp read it; harmless for
       // the others). Captured once here so it never drifts to the live cursor on later ticks.
       const first = await pick(e.clientX, e.clientY);
@@ -3268,7 +3394,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
         // stroke here instead of stamping forever.
         if (gestureTimedOut(sculptStartT, performance.now(), BUILD_GESTURE_MAX_MS)) { cancelSculptStroke(); return; }
         sculptBusy = true;
-        (async () => {
+        sculptInflight = (async () => {
           const hit = await pick(cursorX, cursorY); // crosshair while flying, pointer otherwise
           if (disposed || !sculptActive || !hit) return;
           let smear: [number, number] | undefined;
@@ -3280,8 +3406,9 @@ const FlyView3D = forwardRef<FlyView3DRef, {
             sculptSmearLastPos = [hit.x, hit.y];
             smear = [dx, dy];
           }
+          sculptStamped = true;
           await emitStamp(hit, sculptGroupId, sculptAnchor, undefined, smear);
-        })().finally(() => { sculptBusy = false; });
+        })().finally(() => { sculptBusy = false; sculptInflight = null; });
       }, SCULPT_TICK_MS);
     };
 
@@ -3382,12 +3509,18 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       // Escape cancels a live sculpt hold/grab stroke, or a live gizmo drag, in ANY camera mode (the
       // fly-mode Escape below only fires while walking). Doesn't return — App's own Escape handling
       // still runs, mirroring the sculpt-cancel precedence already established here.
-      if (e.key === "Escape") { cancelSculptStroke(); cancelGizmoDrag(); clearBuildShapeAnchor(); }
+      if (e.key === "Escape") { revertSculptStroke(); cancelGizmoDrag(); clearBuildShapeAnchor(); }
       if (e.key.toLowerCase() === "z" && !e.repeat && !e.metaKey && !e.ctrlKey) {
         // Z cycles camera mode (orbit → look → fly → orbit). Advancing *into* a walking mode from
         // orbit requires the pointer to be over this pane (so Z while working in another
         // window is ignored); once walking, Z keeps cycling regardless of hover.
         if (flyModeRef.current || hoverRef.current) { cycleMode(); e.preventDefault(); }
+        return;
+      }
+      // Shift+F frames the selection (plain F is the Fill tool, which has the same chord scope).
+      // Orbit only — a walking camera owns its own pose.
+      if (e.key.toLowerCase() === "f" && e.shiftKey && !e.repeat && !e.metaKey && !e.ctrlKey && !e.altKey) {
+        if (hoverRef.current && !flyModeRef.current) { frameSelection(); e.preventDefault(); }
         return;
       }
       // Esc leaves any walking mode back to orbit (releasing the OS cursor grab if look mode held it).
@@ -3813,6 +3946,25 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       const toTarget = controls.target.clone(); toTarget.x = wx; toTarget.z = wy;
       startCamTween(toPos, toTarget);
       streamSweep(true); // immediate sweep without waiting for the next interval tick (tween hasn't ticked yet)
+      invalidate();
+    };
+
+    // Shift+F — frame the 3D selection box: keep the current viewing direction, retarget its centre
+    // and back off until the whole box fits the narrower of the two fields of view.
+    const frameSelection = () => {
+      const b = selectionBounds3dRef.current;
+      if (!b) { onNoticeRef.current?.("Nothing to frame — select a region first."); return; }
+      const sx = b.x2 - b.x1 + 1, sy = b.y2 - b.y1 + 1, sz = b.zMax - b.zMin + 1;
+      const toTarget = new THREE.Vector3(b.x1 + sx / 2, b.zMin + sz / 2, b.y1 + sy / 2); // Eden (x,y,z) → Three (x,z,y)
+      const radius = Math.max(2, 0.5 * Math.hypot(sx, sy, sz));
+      const vfov = THREE.MathUtils.degToRad(camera.fov);
+      const hfov = 2 * Math.atan(Math.tan(vfov / 2) * camera.aspect);
+      const dist = (radius / Math.sin(Math.min(vfov, hfov) / 2)) * 1.1;
+      const dir = camera.position.clone().sub(controls.target);
+      if (dir.lengthSq() < 1e-6) dir.set(0, 0.6, 1);
+      const toPos = toTarget.clone().add(dir.normalize().multiplyScalar(dist));
+      startCamTween(toPos, toTarget);
+      streamSweep(true);
       invalidate();
     };
 
@@ -4418,6 +4570,8 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       scene.remove(placeShapeHighlight);
       scene.remove(brushGroup);
       scene.remove(shapeAnchorBox);
+      scene.remove(shapeExtentBox);
+      shapeExtentMat.dispose();
       scene.remove(gizmoGroup);
       scene.remove(gizmoPreviewGroup);
       for (const d of gizmoDisposables) d.dispose();
@@ -4547,6 +4701,9 @@ const FlyView3D = forwardRef<FlyView3DRef, {
   // above) still supplies the actual coordinates resetCamera() reads.
   useEffect(() => {
     sceneApi.current?.resetCamera();
+    // Same-size worlds keep the scene (init re-runs only on dimension change): drop the previous
+    // world's resident meshes and `emptyChunks` markers so nothing stale survives (21.8).
+    sceneApi.current?.reloadAllChunks("world");
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [worldLoadToken]);
 
@@ -4573,7 +4730,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
   // which since C3 step 1 keeps the old mesh up until the replacement lands — no blanking hole.
   useEffect(() => {
     const api = sceneApi.current;
-    if (!api || !lastEdit) return;
+    if (!api || !lastEdit || lastEdit.length === 0) return;
     // Lamp reach uses the live slider value (not the const) so a wider lamp radius reloads the wider
     // seam; shadow reach stays the raymarch constant.
     const reach = Math.max(
@@ -4587,21 +4744,13 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     // reloaded at all. That's the "removing blocks near others leaves a see-through/culled face
     // until the pane is toggled" bug: the halo below is what fixes it (still deferred by
     // HALO_FLUSH_MS, since it isn't the block you just placed — that part shows immediately).
-    const chunkPad = Math.max(1, Math.ceil(reach / 16));
-    const cx0 = worldToChunk(lastEdit.x);
-    const cy0 = worldToChunk(lastEdit.y);
-    const cx1 = worldToChunk(lastEdit.x + Math.max(0, lastEdit.w - 1));
-    const cy1 = worldToChunk(lastEdit.y + Math.max(0, lastEdit.h - 1));
-    for (let cy = cy0; cy <= cy1; cy++)
-      for (let cx = cx0; cx <= cx1; cx++)
-        api.reloadChunk(cx, cy);
-    if (chunkPad > 0) {
+    // 23.1: with no lighting/shadow reach only the edge-touching face neighbours need a rebuild (face
+    // culling is decided against the neighbour block); no diagonals, nothing for an interior edit.
+    const plans = lastEdit.map((r) => editReloadPlan(r, reach));
+    for (const p of plans) for (const [cx, cy] of p.core) api.reloadChunk(cx, cy);
+    if (plans.some((p) => p.halo.length)) {
       const halo = haloKeysRef.current;
-      for (let cy = cy0 - chunkPad; cy <= cy1 + chunkPad; cy++)
-        for (let cx = cx0 - chunkPad; cx <= cx1 + chunkPad; cx++) {
-          if (cx >= cx0 && cx <= cx1 && cy >= cy0 && cy <= cy1) continue; // core — already reloaded
-          halo.add(`${cx},${cy}`);
-        }
+      for (const p of plans) for (const [cx, cy] of p.halo) halo.add(`${cx},${cy}`);
       if (haloTimerRef.current) clearTimeout(haloTimerRef.current);
       haloTimerRef.current = setTimeout(() => {
         haloTimerRef.current = null;
@@ -5028,6 +5177,12 @@ const FlyView3D = forwardRef<FlyView3DRef, {
           fontSize: 16, fontWeight: 400, lineHeight: 1,
         }}>+</div>
       )}
+      {/* VIEW-mode hover readout: the block under the cursor and its coordinates (written imperatively). */}
+      <div ref={hoverReadoutRef} style={{
+        display: "none", position: "absolute", bottom: 30, left: 6, zIndex: 1, pointerEvents: "none",
+        padding: "2px 7px", borderRadius: 4, fontSize: 10, fontVariantNumeric: "tabular-nums",
+        background: "rgba(31,28,26,0.7)", border: "1px solid rgba(131,120,108,0.3)", color: "#afa69d",
+      }} />
       {/* Camera position / heading HUD (Eden coords) */}
       <div style={{ display: showHud ? "contents" : "none" }}><CoordHud ref={hudRef} /></div>
       {/* Resident-geometry readout — promoted out of dev-only behind `showPerfHud` (Stage 9.3), so a
@@ -5035,7 +5190,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       {showPerfHud && <div style={{ display: showHud ? "contents" : "none" }}><GeomMemHud ref={memHudRef} /></div>}
       {/* In-pane hotbar (bottom-centre, build mode only) — 5 pinned + 5 recent, mirrors the Ribbon
           hotbar and the 1-5/6-0 digit keys so the active slot never needs a glance back at the Ribbon. */}
-      {showHud && interact3d === "build" && showHotbarOverlay && hotbarSlots && hotbarSlots.length > 0 && (
+      {showHud && (interact3d === "build" || interact3d === "floodfill") && showHotbarOverlay && hotbarSlots && hotbarSlots.length > 0 && (
         <div style={{
           position: "absolute", bottom: 6, left: "50%", transform: "translateX(-50%)", zIndex: 1,
           display: "flex", gap: 3, pointerEvents: "auto",
@@ -5151,9 +5306,9 @@ const FlyView3D = forwardRef<FlyView3DRef, {
             display: "flex", alignItems: "center", gap: 6, pointerEvents: "none",
             padding: "3px 7px", borderRadius: 4, fontSize: 10,
             background: "rgba(31,28,26,0.7)", border: "1px solid rgba(131,120,108,0.3)",
-            color: interact3d === "sculpt" ? "#fdba74" : "#afa69d",
+            color: interact3d === "sculpt" ? "#fdba74" : buildShapeExtent?.over ? "#f87171" : "#afa69d",
           }}>
-            {interact3d === "build" && armedSwatch && (
+            {(interact3d === "build" || interact3d === "floodfill") && armedSwatch && (
               <img src={armedSwatch} alt="" width={14} height={14} style={{ imageRendering: "pixelated", borderRadius: 2 }} />
             )}
             <span>
@@ -5164,10 +5319,18 @@ const FlyView3D = forwardRef<FlyView3DRef, {
                       grabReadout != null
                         ? ` · Δ${grabReadout > 0 ? "+" : ""}${grabReadout}`
                         : ` · str${sculptStrength}`}`
+                  : interact3d === "floodfill"
+                    ? `click a face: fill connected air${armedLabel ? ` with ${armedLabel}` : ""}`
                   : buildShape === "fill"
                     ? `click a wall: L clear · R fill${armedLabel ? ` ${armedLabel}` : ""}`
                     : buildShape !== "single"
-                      ? `${buildShapeArmed ? "click end cell to commit" : `click start cell (${buildShape})`}${armedLabel ? ` · ${armedLabel}` : ""}`
+                      ? `${buildShapeArmed
+                          ? (buildShapeExtent
+                              ? (buildShapeExtent.over
+                                  ? `too large: ${buildShapeExtent.count.toLocaleString()} > ${MAX_BUILD_SHAPE_CELLS.toLocaleString()} blocks`
+                                  : `${buildShapeExtent.dx}×${buildShapeExtent.dy}×${buildShapeExtent.dz} · ${buildShapeExtent.count.toLocaleString()} block${buildShapeExtent.count === 1 ? "" : "s"} · click to commit`)
+                              : "click end cell to commit")
+                          : `click start cell (${buildShape})`}${armedLabel && !buildShapeExtent ? ` · ${armedLabel}` : ""}`
                       : `L drag break · R drag place${armedLabel ? ` ${armedLabel}` : ""}`}
             </span>
           </div>

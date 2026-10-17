@@ -10,6 +10,7 @@ use crate::{
 use rayon::prelude::*;
 use serde::Serialize;
 use std::fs;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::Emitter;
 
 // ── Perlin noise (ported from the Eden game's fixed permutation noiseFast) ──────
@@ -1006,22 +1007,21 @@ pub(crate) fn generate_natural_world(
     progress("Filling chunks", 0.12);
 
     // 2. Per-chunk column fill (cache-friendly, continuous noise across borders). Chunks are
-    // independent Vec<u8>s at disjoint indices, so fill each one in parallel; progress can only
-    // be reported after the whole pass (no way to observe partial completion across threads).
-    chunks.par_iter_mut().enumerate().for_each(|(ci, chunk)| {
-        let cx = ci % wc;
-        let cy = ci / wc;
-        fill_chunk_terrain(chunk, cx, cy, wc, &heights, cfg, &classic_noise, t_height);
-    });
-    progress("Filling chunks", 0.80);
+    // independent Vec<u8>s at disjoint indices, so fill each one in parallel, a batch of whole rows
+    // at a time so progress and cancel are observed between batches.
+    if !fill_chunks_batched(chunks, wc, progress, 0.12, 0.80, |ci, chunk| {
+        fill_chunk_terrain(chunk, ci % wc, ci / wc, wc, &heights, cfg, &classic_noise, t_height);
+    }) { return 0; }
 
     // 3. Cross-chunk features (trees, vegetation, structures, clouds).
     {
         let mut gen = WorldGen { chunks, wc, hc, t_height, water_mask: &water_mask };
         decorate(&mut gen, &heights, cfg);
         progress("Planting & decorating", 0.88);
+        if gen_cancelled() { return 0; }
         place_structures(&mut gen, &heights, cfg);
         progress("Building structures", 0.93);
+        if gen_cancelled() { return 0; }
         place_clouds(&mut gen, cfg);
     }
     progress("Finishing", 0.95);
@@ -1041,6 +1041,80 @@ pub(crate) fn gen_progress_reporter(app: tauri::AppHandle) -> impl FnMut(&str, f
             let _ = app.emit("world-gen-progress", serde_json::json!({ "phase": phase, "pct": pct }));
         }
     }
+}
+
+/// Set by `cancel_world_gen`, polled by every create path between row batches / phases / chunk
+/// writes. Only one world is generated at a time (the New World dialog is modal and locks while
+/// busy), so a process-wide flag is enough; `create_scaffold` clears it on entry.
+#[cfg(not(test))]
+static GEN_CANCEL: AtomicBool = AtomicBool::new(false);
+// Tests run in parallel and several generate worlds, so under `cfg(test)` the flag is per-thread
+// (every cancel check runs on the thread that called the generator, never on a rayon worker) —
+// otherwise one test's cancel would abort its neighbours.
+#[cfg(test)]
+thread_local! { static GEN_CANCEL: AtomicBool = const { AtomicBool::new(false) }; }
+
+/// The `Err` a cancelled create returns; the dialog treats it as "stopped", not as a failure.
+pub(crate) const GEN_CANCELLED: &str = "Cancelled";
+
+#[inline]
+fn set_gen_cancel(v: bool) {
+    #[cfg(not(test))] GEN_CANCEL.store(v, Ordering::Relaxed);
+    #[cfg(test)] GEN_CANCEL.with(|c| c.store(v, Ordering::Relaxed));
+}
+
+#[inline]
+pub(crate) fn gen_cancelled() -> bool {
+    #[cfg(not(test))] { GEN_CANCEL.load(Ordering::Relaxed) }
+    #[cfg(test)] { GEN_CANCEL.with(|c| c.load(Ordering::Relaxed)) }
+}
+
+/// Ask the running world generation (if any) to stop. Cheap and sync: it only flips the flag.
+#[tauri::command]
+pub(crate) fn cancel_world_gen() { set_gen_cancel(true); }
+
+/// Fill `chunks` (row-major, `wc` per row) in parallel one batch of whole rows at a time, so
+/// progress can be reported (`lo..hi`) and a cancel is noticed between batches. Returns `false`
+/// if cancelled part-way. `fill(ci, chunk)` gets the global chunk index.
+fn fill_chunks_batched(
+    chunks: &mut [Vec<u8>], wc: usize,
+    progress: &mut dyn FnMut(&str, f32), lo: f32, hi: f32,
+    fill: impl Fn(usize, &mut Vec<u8>) + Sync,
+) -> bool {
+    let rows = chunks.len().div_ceil(wc.max(1));
+    // Enough chunks per batch to keep every core busy even on a narrow world.
+    let batch_rows = (64 / wc.max(1)).max(1);
+    let mut done = 0usize;
+    for batch in chunks.chunks_mut(wc.max(1) * batch_rows) {
+        if gen_cancelled() { return false; }
+        let base = done * wc;
+        batch.par_iter_mut().enumerate().for_each(|(i, c)| fill(base + i, c));
+        done += batch.len().div_ceil(wc.max(1));
+        progress("Filling chunks", lo + (hi - lo) * done as f32 / rows as f32);
+    }
+    true
+}
+
+/// The one create scaffold all four generators share: memory-budget check, cancel reset, chunk
+/// allocation, the generator itself (returns the centre surface z), a cancel gate, then an atomic
+/// file write. `extra_bytes` is any generator workspace on top of the chunk output (Tg2's grid).
+#[allow(clippy::too_many_arguments)]
+fn create_scaffold(
+    path: &str, name: &str, width_chunks: u32, height_chunks: u32, chunk_size: usize,
+    extra_bytes: u64, report: &mut dyn FnMut(&str, f32),
+    generate: impl FnOnce(&mut Vec<Vec<u8>>, &mut dyn FnMut(&str, f32)) -> u32,
+) -> Result<(), String> {
+    const CENTER_CHUNK: i32 = 4096;
+    let n_chunks = (width_chunks * height_chunks) as usize;
+    check_worldgen_budget(n_chunks as u64 * chunk_size as u64 + extra_bytes)?;
+    set_gen_cancel(false);
+    let mut chunks: Vec<Vec<u8>> = (0..n_chunks).map(|_| vec![0u8; chunk_size]).collect();
+    let surface_z = generate(&mut chunks, report);
+    if gen_cancelled() { return Err(GEN_CANCELLED.into()); }
+    report("Writing file", 0.97);
+    write_world_file(path, name, width_chunks, height_chunks, chunk_size, CENTER_CHUNK, CENTER_CHUNK, surface_z, &chunks)?;
+    report("Done", 1.0);
+    Ok(())
 }
 
 /// Parameters shared by every flat-chunk fill, independent of world dimensions — used both by
@@ -1124,26 +1198,13 @@ pub(crate) fn create_world(
     }
 
     let chunk_size = if extended_z { 131_072usize } else { 32_768usize };
-    let n_chunks   = (width_chunks * height_chunks) as usize;
-    check_worldgen_budget(n_chunks as u64 * chunk_size as u64)?;
     let params = FlatChunkParams { chunk_size, stone_depth, dirt_depth, surface_z };
-
-    pub(crate) const CENTER_CHUNK: i32 = 4096;
-    let start_cx = CENTER_CHUNK;
-    let start_cy = CENTER_CHUNK;
-
-    let mut chunks: Vec<Vec<u8>> = Vec::with_capacity(n_chunks);
-    for cy in 0..height_chunks {
-        for cx in 0..width_chunks {
-            chunks.push(generate_flat_chunk(start_cx + cx as i32, start_cy + cy as i32, &params));
-        }
-        report("Filling chunks", 0.90 * ((cy + 1) as f32 / height_chunks as f32));
-    }
-
-    report("Writing file", 0.95);
-    let res = write_world_file(&path, &name, width_chunks, height_chunks, chunk_size, start_cx, start_cy, surface_z, &chunks);
-    report("Done", 1.0);
-    res
+    create_scaffold(&path, &name, width_chunks, height_chunks, chunk_size, 0, &mut report, |chunks, report| {
+        if !fill_chunks_batched(chunks, width_chunks as usize, report, 0.0, 0.90, |_, c| {
+            *c = generate_flat_chunk(0, 0, &params);
+        }) { return 0; }
+        surface_z
+    })
 }
 
 /// Build a `NaturalConfig` (and resolve `t_height`) from the raw GUI parameters.
@@ -1233,7 +1294,8 @@ pub(crate) fn preview_natural_world(
     let snowline = cfg.base_height as f64 + (t_height as f64) * relief_factor(&cfg) * 0.60;
     let sky = 14u8;
 
-    // First pass: surface heights for the sample grid (for water test + hillshade).
+    // Surface heights for the sample grid, computed once per sample (the cliff test and the water
+    // test both reuse them, rather than re-evaluating the noise for every neighbour).
     let surf_at = |wx: i32, wy: i32| -> i32 {
         if is_classic {
             let h = classic_height(&classic_noise, wx as f64, wy as f64, &ccfg, t_height) as f64;
@@ -1242,13 +1304,16 @@ pub(crate) fn preview_natural_world(
             terrain_height(wx as f64, wy as f64, &cfg, t_height)
         }
     };
+    let grid = preview_height_grid(bw, bh, step, pw, ph, surf_at);
+    let gw = (pw + 2) as usize;
 
     let mut pixels = vec![0u8; (pw * ph * 4) as usize];
-    for py in 0..ph {
-        for pxi in 0..pw {
-            let wx = (pxi * step).min(bw - 1);
-            let wy = (py * step).min(bh - 1);
-            let surf = surf_at(wx, wy);
+    pixels.par_chunks_mut((pw * 4) as usize).enumerate().for_each(|(py, row)| {
+        for pxi in 0..pw as usize {
+            let wx = pxi as i32 * step;
+            let wy = py as i32 * step;
+            let gi = (py + 1) * gw + pxi + 1;
+            let surf = grid[gi];
 
             // Standing water for this column.
             let mut wl = cfg.water_z;
@@ -1262,12 +1327,7 @@ pub(crate) fn preview_natural_world(
             } else {
                 let b = biome_at(wx, wy, surf as usize, &cfg, t_height);
                 // Cliff (steep) → bare rock, matching the generator.
-                let mut maxd = 0;
-                for (dx, dy) in [(-step, 0), (step, 0), (0, -step), (0, step)] {
-                    let (nx, ny) = (wx + dx, wy + dy);
-                    if nx < 0 || ny < 0 || nx >= bw || ny >= bh { continue; }
-                    maxd = maxd.max((surf - surf_at(nx, ny)).abs());
-                }
+                let maxd = preview_max_slope(&grid, gi, gw, surf);
                 // Slope is measured over `step` blocks here, so scale the threshold.
                 if maxd >= CLIFF_SLOPE * step.max(1) {
                     block_color(2, 0, sky)
@@ -1289,14 +1349,98 @@ pub(crate) fn preview_natural_world(
             let shade = 1.0 + t * 0.45;
             for c in rgb.iter_mut() { *c = (*c as f64 * shade).clamp(0.0, 255.0) as u8; }
 
-            let idx = ((py * pw + pxi) * 4) as usize;
-            pixels[idx] = rgb[0];
-            pixels[idx + 1] = rgb[1];
-            pixels[idx + 2] = rgb[2];
-            pixels[idx + 3] = 255;
+            row[pxi * 4..pxi * 4 + 3].copy_from_slice(&rgb);
+            row[pxi * 4 + 3] = 255;
         }
-    }
+    });
 
+    Ok(PreviewImage { width: pw as u32, height: ph as u32, pixels })
+}
+
+/// Sentinel for a preview height-grid cell that lies outside the world.
+const NO_SAMPLE: i32 = i32::MIN;
+
+/// `(pw+2)×(ph+2)` grid of surface heights for a preview: cell `(i+1, j+1)` is the height at world
+/// `(i·step, j·step)`; the one-cell margin holds the neighbours the slope tests read (`NO_SAMPLE`
+/// where that neighbour is outside the world). Rows are independent noise samples → rayon.
+fn preview_height_grid(
+    bw: i32, bh: i32, step: i32, pw: i32, ph: i32, surf: impl Fn(i32, i32) -> i32 + Sync,
+) -> Vec<i32> {
+    let gw = (pw + 2) as usize;
+    let mut grid = vec![NO_SAMPLE; gw * (ph + 2) as usize];
+    grid.par_chunks_mut(gw).enumerate().for_each(|(j, row)| {
+        let wy = (j as i32 - 1) * step;
+        if wy < 0 || wy >= bh { return; }
+        for (i, out) in row.iter_mut().enumerate() {
+            let wx = (i as i32 - 1) * step;
+            if wx >= 0 && wx < bw { *out = surf(wx, wy); }
+        }
+    });
+    grid
+}
+
+/// Largest height difference between `surf` and its four grid neighbours (the generator's cliff
+/// test, measured on the preview's `step`-spaced grid). Neighbours outside the world are skipped.
+fn preview_max_slope(grid: &[i32], gi: usize, gw: usize, surf: i32) -> i32 {
+    [gi - 1, gi + 1, gi - gw, gi + gw].into_iter()
+        .map(|n| grid[n])
+        .filter(|&h| h != NO_SAMPLE)
+        .map(|h| (surf - h).abs())
+        .max()
+        .unwrap_or(0)
+}
+
+/// Fast top-down preview of a Classic world: the legacy heightmap plus its stone-patch/grass skin
+/// and cliff rock, hillshaded. Classic has no water, trees or caves in the preview.
+#[tauri::command(async)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn preview_classic_world(
+    width_chunks: u32, height_chunks: u32, extended_z: bool,
+    seed: u32, variance_level: u32, base_height: u32,
+    max_px: u32,
+) -> Result<PreviewImage, String> {
+    if width_chunks == 0 || height_chunks == 0 { return Err("Dimensions must be at least 1×1 chunk".into()); }
+    let t_height: usize = if extended_z { 256 } else { 64 };
+    let variance = match variance_level { 0 => 1.0f64, 1 => 2.0, 2 => 3.0, 3 => 4.5, _ => 6.0 };
+    let base_h = if base_height == 0 { t_height / 2 } else { (base_height as usize).min(t_height - 4).max(5) };
+    let cfg = ClassicConfig {
+        seed, variance, base_height: base_h,
+        gen_caves: false, tall_caves: false, tree_spacing: 0, flowers: false, clouds: false,
+    };
+    let noise = ClassicNoise::new(seed);
+    let bw = (width_chunks * 16) as i32;
+    let bh = (height_chunks * 16) as i32;
+    let cap = max_px.clamp(32, 512) as i32;
+    let step = ((bw.max(bh) + cap - 1) / cap).max(1);
+    let pw = ((bw + step - 1) / step).max(1);
+    let ph = ((bh + step - 1) / step).max(1);
+    let sky = 14u8;
+
+    let grid = preview_height_grid(bw, bh, step, pw, ph, |wx, wy| {
+        classic_height(&noise, wx as f64, wy as f64, &cfg, t_height) as i32
+    });
+    let gw = (pw + 2) as usize;
+
+    let mut pixels = vec![0u8; (pw * ph * 4) as usize];
+    pixels.par_chunks_mut((pw * 4) as usize).enumerate().for_each(|(py, row)| {
+        for pxi in 0..pw as usize {
+            let wx = pxi as i32 * step;
+            let wy = py as i32 * step;
+            let gi = (py + 1) * gw + pxi + 1;
+            let surf = grid[gi];
+            let mut rgb = if preview_max_slope(&grid, gi, gw, surf) >= CLIFF_SLOPE * step
+                || classic_biome_rocky(&noise, wx, wy, surf, seed as f64) {
+                block_color(2, 0, sky)
+            } else {
+                grass_color(sky)
+            };
+            let t = ((surf as f64 - base_h as f64) / (t_height as f64 * 0.5)).clamp(-0.6, 0.6);
+            let shade = 1.0 + t * 0.45;
+            for c in rgb.iter_mut() { *c = (*c as f64 * shade).clamp(0.0, 255.0) as u8; }
+            row[pxi * 4..pxi * 4 + 3].copy_from_slice(&rgb);
+            row[pxi * 4 + 3] = 255;
+        }
+    });
     Ok(PreviewImage { width: pw as u32, height: ph as u32, pixels })
 }
 
@@ -1335,8 +1479,6 @@ pub(crate) fn create_natural_world(
     if width_chunks > 128 || height_chunks > 128 { return Err("Maximum world size is 128×128 chunks (2048×2048 blocks)".into()); }
 
     let chunk_size = if extended_z { 131_072usize } else { 32_768usize };
-    let n_chunks = (width_chunks * height_chunks) as usize;
-    check_worldgen_budget(n_chunks as u64 * chunk_size as u64)?;
 
     let (cfg, t_height) = natural_config_from_params(
         extended_z, seed, base_height, roughness_level, erosion_level, terrain_scale_level, extreme,
@@ -1344,21 +1486,10 @@ pub(crate) fn create_natural_world(
         tree_density, cave_density, cave_style, caverns, flood_caves, ore_density, vegetation, structures, clouds,
     );
 
-    pub(crate) const CENTER_CHUNK: i32 = 4096;
-    let start_cx = CENTER_CHUNK;
-    let start_cy = CENTER_CHUNK;
-
-    let mut chunks: Vec<Vec<u8>> = Vec::with_capacity(n_chunks);
-    for _ in 0..n_chunks { chunks.push(vec![0u8; chunk_size]); }
-
     let mut report = gen_progress_reporter(app);
-    let center_surface_z =
-        generate_natural_world(&mut chunks, width_chunks as usize, height_chunks as usize, &cfg, t_height, &mut report) as u32;
-
-    report("Writing file", 0.97);
-    let res = write_world_file(&path, &name, width_chunks, height_chunks, chunk_size, start_cx, start_cy, center_surface_z, &chunks);
-    report("Done", 1.0);
-    res
+    create_scaffold(&path, &name, width_chunks, height_chunks, chunk_size, 0, &mut report, |chunks, report| {
+        generate_natural_world(chunks, width_chunks as usize, height_chunks as usize, &cfg, t_height, report) as u32
+    })
 }
 
 // ── Classic terrain (legacy Eden procedural generator) ─────────────────────────
@@ -1730,19 +1861,18 @@ pub(crate) fn generate_classic_world(
     });
     progress("Shaping terrain", 0.10);
 
-    chunks.par_iter_mut().enumerate().for_each(|(ci, chunk)| {
-        let cx = ci % wc;
-        let cy = ci / wc;
-        fill_classic_chunk(chunk, cx, cy, wc, &heights, cfg, &noise, t_height);
-    });
-    progress("Filling chunks", 0.80);
+    if !fill_chunks_batched(chunks, wc, progress, 0.10, 0.80, |ci, chunk| {
+        fill_classic_chunk(chunk, ci % wc, ci / wc, wc, &heights, cfg, &noise, t_height);
+    }) { return 0; }
 
     let water_mask = vec![false; bw * bh]; // classic terrain has no standing water
     {
         let mut gen = WorldGen { chunks, wc, hc, t_height, water_mask: &water_mask };
         let mut rng = Rng64::new(cfg.seed as u64 ^ 0xC1A5_51C0_0DEF_ACED);
         classic_decorate(&mut gen, &heights, cfg, &mut rng);
+        if gen_cancelled() { return 0; }
         classic_place_trees(&mut gen, &heights, cfg, &mut rng);
+        if gen_cancelled() { return 0; }
         place_classic_clouds(&mut gen, cfg, &mut rng);
     }
     progress("Finishing", 0.95);
@@ -1800,8 +1930,6 @@ pub(crate) fn create_classic_world_inner(
     let max_z: u32 = if extended_z { 255 } else { 63 };
     let t_height = (max_z + 1) as usize;
     let chunk_size = if extended_z { 131_072usize } else { 32_768usize };
-    let n_chunks = (width_chunks * height_chunks) as usize;
-    check_worldgen_budget(n_chunks as u64 * chunk_size as u64)?;
 
     let variance = match variance_level { 0 => 1.0f64, 1 => 2.0, 2 => 3.0, 3 => 4.5, _ => 6.0 };
     let base_h = if base_height == 0 { t_height / 2 } else { (base_height as usize).min(t_height - 4).max(5) };
@@ -1813,22 +1941,14 @@ pub(crate) fn create_classic_world_inner(
         tree_spacing, flowers, clouds,
     };
 
-    pub(crate) const CENTER_CHUNK: i32 = 4096;
-    let start_cx = CENTER_CHUNK;
-    let start_cy = CENTER_CHUNK;
-
-    let mut chunks: Vec<Vec<u8>> = Vec::with_capacity(n_chunks);
-    for _ in 0..n_chunks { chunks.push(vec![0u8; chunk_size]); }
-
-    let center_surface_z =
-        generate_classic_world(&mut chunks, width_chunks as usize, height_chunks as usize, &cfg, t_height, report) as u32;
-
-    report("Writing file", 0.97);
-    let res = write_world_file(&path, &name, width_chunks, height_chunks, chunk_size, start_cx, start_cy, center_surface_z, &chunks);
-    report("Done", 1.0);
-    res
+    create_scaffold(&path, &name, width_chunks, height_chunks, chunk_size, 0, report, |chunks, report| {
+        generate_classic_world(chunks, width_chunks as usize, height_chunks as usize, &cfg, t_height, report) as u32
+    })
 }
 
+/// Write the world file atomically: stream to `<path>.tmp`, fsync, then rename over `path`, so a
+/// full disk, a cancel or a crash leaves either the old file or nothing — never a truncated
+/// `.eden` at the destination. The temp is removed on any failure.
 pub(crate) fn write_world_file(
     path: &str, name: &str,
     width_chunks: u32, height_chunks: u32,
@@ -1875,11 +1995,22 @@ pub(crate) fn write_world_file(
         }
     }
 
-    let mut file = fs::File::create(path).map_err(|e| format!("Failed to create file: {e}"))?;
-    file.write_all(&header).map_err(|e| format!("Write error: {e}"))?;
-    for chunk in chunks { file.write_all(chunk).map_err(|e| format!("Write error: {e}"))?; }
-    file.write_all(&ptr_table).map_err(|e| format!("Write error: {e}"))?;
-    Ok(())
+    let tmp = format!("{path}.tmp");
+    let write = || -> Result<(), String> {
+        let mut file = fs::File::create(&tmp).map_err(|e| format!("Failed to create file: {e}"))?;
+        file.write_all(&header).map_err(|e| format!("Write error: {e}"))?;
+        for chunk in chunks {
+            if gen_cancelled() { return Err(GEN_CANCELLED.into()); }
+            file.write_all(chunk).map_err(|e| format!("Write error: {e}"))?;
+        }
+        file.write_all(&ptr_table).map_err(|e| format!("Write error: {e}"))?;
+        file.sync_all().map_err(|e| format!("Write error: {e}"))?;
+        drop(file);
+        fs::rename(&tmp, path).map_err(|e| format!("Failed to save world: {e}"))
+    };
+    let res = write();
+    if res.is_err() { let _ = fs::remove_file(&tmp); }
+    res
 }
 
 // ── TG2 World Generator ───────────────────────────────────────────────────────
@@ -2527,6 +2658,7 @@ pub(crate) fn tg2_flush(g: &Tg2Grid, gen: &mut WorldGen, report: &mut dyn FnMut(
     let gs=g.gsize;
     for x in 0..gs {
         if x % 32 == 0 {
+            if gen_cancelled() { return; }
             report("Writing chunks", 0.84 + 0.12 * x as f32 / gs as f32);
         }
         for z in 0..gs { for y in 0..g.t_height {
@@ -2755,6 +2887,7 @@ pub(crate) fn generate_tg2_world(
         9 => tg2_make_custom_mix(&mut g,&noise,seed,&mut rng,&cfg.custom_biomes,pf,&mut report),
         _ => {} // Flat / unknown: bedrock only
     }
+    if gen_cancelled() { return 0; }
     if cfg.caves && cfg.terrain_type!=8 {
         report("Carving caves",0.70);
         tg2_carve_caves(&mut g,&noise,seed,cfg.tall_caves);
@@ -2765,6 +2898,7 @@ pub(crate) fn generate_tg2_world(
         // 24-iteration talus count is overkill; ~6·vs gives gentle seams.
         tg2_blend_seams(&mut g,&noise,seed,(6.0*vs).round() as i32);
     }
+    if gen_cancelled() { return 0; }
     report("Placing features",0.79);
     if cfg.sky_islands && cfg.terrain_type!=7 && cfg.terrain_type!=9 {
         let ni=((gsize as f64/300.0*6.0) as i32).max(1);
@@ -2811,7 +2945,6 @@ pub(crate) fn create_tg2_world(
     // total rather than the ~4.2 GB the chunk output alone suggests (audit E-2).
     let gsize = wc * 16;
     let tg2_workspace_bytes = 2u64 * (gsize as u64) * (gsize as u64) * (t_height as u64);
-    check_worldgen_budget((wc * hc) as u64 * chunk_size as u64 + tg2_workspace_bytes)?;
     let cb=custom_biomes.unwrap_or_default();
     let custom_biomes_arr=[
         cb.first().copied().unwrap_or(0),
@@ -2822,13 +2955,9 @@ pub(crate) fn create_tg2_world(
     let cfg=Tg2Config{seed,terrain_type,sky_islands,struct_freq,clouds,
         amplitude:amplitude.clamp(0.1,4.0),sea_level_off:sea_level_off.clamp(-16,32),blend,
         caves,tall_caves,custom_biomes:custom_biomes_arr};
-    let mut chunks:Vec<Vec<u8>>=(0..wc*hc).map(|_|vec![0u8;chunk_size]).collect();
-    let surf=generate_tg2_world(&cfg,wc,hc,t_height,&mut chunks,&mut report);
-    report("Writing file",0.97);
-    pub(crate) const CENTER_CHUNK:i32=4096;
-    let res=write_world_file(&path,&name,wc as u32,hc as u32,chunk_size,CENTER_CHUNK,CENTER_CHUNK,surf,&chunks);
-    report("Done",1.0);
-    res
+    create_scaffold(&path,&name,wc as u32,hc as u32,chunk_size,tg2_workspace_bytes,&mut report,|chunks,report|{
+        generate_tg2_world(&cfg,wc,hc,t_height,chunks,report)
+    })
 }
 
 #[tauri::command(async)]
@@ -2872,8 +3001,7 @@ pub(crate) fn preview_tg2_world(
     let cb=custom_biomes.unwrap_or_default();
     let cba=[cb.first().copied().unwrap_or(0),cb.get(1).copied().unwrap_or(6),
               cb.get(2).copied().unwrap_or(4),cb.get(3).copied().unwrap_or(2)];
-    for px in 0..pw { for py in 0..pw {
-        let wx=(px*step) as i32; let wz=(py*step) as i32;
+    let sample=|wx:i32,wz:i32|->(i32,u8,u8){
         let (h,bt,paint)=match terrain_type {
             9 => { // custom mix: 4 quadrants
                 let q=if wx<gs/2{if wz<gs/2{0}else{2}}else{if wz<gs/2{1}else{3}};
@@ -2887,15 +3015,33 @@ pub(crate) fn preview_tg2_world(
             }
             t => preview_biome(t,wx,wz,gs)
         };
-        let h=h.max(0).min(th-1);
-        let hr=(h+1).min(th-1);
-        let [r,gr,b]=block_color(bt,paint,14);
-        let shade=(1.0+(hr-h) as f64*0.04).clamp(0.6,1.4);
-        let ri=((r as f64*shade).round()as u32).min(255)as u8;
-        let gi=((gr as f64*shade).round()as u32).min(255)as u8;
-        let bi=((b as f64*shade).round()as u32).min(255)as u8;
-        let i=(py*pw+px)*4;
-        pixels[i]=ri;pixels[i+1]=gi;pixels[i+2]=bi;pixels[i+3]=255;
-    }}
+        (h.max(0).min(th-1),bt,paint)
+    };
+    // Height/block/paint grid with a one-cell margin (clamped into the world) so the shading
+    // below can read each pixel's NW and SE neighbours. Computed once per sample, rows in parallel.
+    let gw=pw+2;
+    let mut grid=vec![(0i32,0u8,0u8);gw*gw];
+    grid.par_chunks_mut(gw).enumerate().for_each(|(j,row)|{
+        let wz=((j as i64-1)*step as i64).clamp(0,gs as i64-1) as i32;
+        for (i,out) in row.iter_mut().enumerate(){
+            let wx=((i as i64-1)*step as i64).clamp(0,gs as i64-1) as i32;
+            *out=sample(wx,wz);
+        }
+    });
+    // Directional hillshade from the north-west (the 2D map's light): a rise toward the NW
+    // brightens, a drop darkens. Slope is per block (÷ step, ÷ vertical scale), so the look is
+    // the same at every world size and height format; water stays flat.
+    pixels.par_chunks_mut(pw*4).enumerate().for_each(|(py,row)|{
+        for px in 0..pw {
+            let (h,bt,paint)=grid[(py+1)*gw+px+1];
+            let nw=grid[py*gw+px].0; let se=grid[(py+2)*gw+px+2].0;
+            let slope=(nw-se) as f64/(2.0*step as f64*vs);
+            let k=if bt==20{0.5}else{1.0};
+            let shade=(1.0+slope*0.5*k+(h as f64/th as f64-0.4)*0.25).clamp(0.55,1.45);
+            let [r,gr,b]=block_color(bt,paint,14);
+            let c=|v:u8|((v as f64*shade).round() as u32).min(255) as u8;
+            row[px*4]=c(r);row[px*4+1]=c(gr);row[px*4+2]=c(b);row[px*4+3]=255;
+        }
+    });
     Ok(PreviewImage{width:pw as u32,height:pw as u32,pixels})
 }

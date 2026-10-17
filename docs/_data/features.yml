@@ -1,35 +1,40 @@
 - icon: "🗺️"
   title: "Map & navigation"
   text: >-
-    Zoomable, pannable top-down map with Z-slice, cutaway, axonometric, and full-map render
-    modes, plus a Hammer-style quad view with front/side slabs and a live 3D pane.
+    A top-down map you can zoom and pan, with Z-slice, cutaway and relief shading. The 3D view,
+    a tools rail and a hotbar float over it as windows.
   exp: false
 - icon: "✏️"
   title: "Drawing & selection"
   text: >-
-    Pen, brush, spray, line, rectangle, ellipse, and polygon tools; click-drag and magic-wand
-    selection with a non-rectangular cell mask so Wand and Lasso select real shapes.
+    Pen, brush, spray, shapes and a fill bucket. Select with a box, wand, lasso or polygon, and
+    every edit respects the shape you picked.
   exp: false
 - icon: "⛰️"
   title: "Terrain sculpting"
   text: >-
-    Sixteen brush-based sculpt tools — raise, lower, smooth, erode, hydraulic erosion, stamp,
-    volumetric rock and carve — with soft falloff and a live stroke preview.
+    Sixteen brush tools, from raise and smooth to hydraulic erosion, plus rock and carve, which
+    work on volume instead of a height map.
   exp: true
 - icon: "🧊"
-  title: "3D & quad view"
+  title: "3D view"
   text: >-
-    A streaming Three.js fly-through with orbit, fly, and mouselook cameras; build and select
-    directly in 3D, all going through the same undo/redo as the 2D map.
+    Fly, orbit or mouselook through the world. Break, place, select and sculpt in 3D, with the
+    same undo as the map.
+  exp: false
+- icon: "🔍"
+  title: "Lens"
+  text: >-
+    A floating window with front, side and top views of your selection or paste, so you can see
+    how deep it goes before you commit.
   exp: false
 - icon: "🌍"
   title: "World generation"
   text: >-
-    Four generators — Flat, Natural (biome pipeline with erosion and structures), Classic, and
-    Tg2 — for both the legacy 64z and New Dawn 256z height formats.
+    Flat, Natural, Classic and Tg2 generators, for both 64-high and 256-high worlds.
   exp: false
 - icon: "📦"
-  title: "Import & export"
+  title: "Clipboard & prefabs"
   text: >-
-    Copy/paste with rotate/mirror/scatter/array, a searchable prefab library, and PNG map export.
+    Copy and paste with rotate, mirror, scatter and array, plus a searchable prefab library.
   exp: false
