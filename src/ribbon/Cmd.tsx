@@ -25,6 +25,10 @@ import { ACCENT } from "./tokens";
 
 const BindingsCtx = createContext<Record<CommandId, CommandBinding> | null>(null);
 export const CommandBindingsProvider = BindingsCtx.Provider;
+/** Where a click on a disabled button sends its reason (22.5) — the Ribbon's `onNotice`, the same
+ *  sink ⌘K uses for a disabled command. */
+const NoticeCtx = createContext<((text: string) => void) | null>(null);
+export const CommandNoticeProvider = NoticeCtx.Provider;
 
 export function useBinding(id: CommandId): CommandBinding {
   const all = useContext(BindingsCtx);
@@ -39,7 +43,7 @@ export const FAMILY_ACCENT: Record<CommandFamily, string | undefined> = {
 
 /** Everything a button primitive needs, resolved from the registry. `close` is the enclosing
  *  `popup` group's (`usePopupGroupClose`): running a command from a group popup dismisses it. */
-function resolve(id: CommandId, b: CommandBinding, o: Placement, close: (() => void) | null) {
+function resolve(id: CommandId, b: CommandBinding, o: Placement, close: (() => void) | null, notify: ((text: string) => void) | null) {
   const m = meta(id);
   const base = o.label ?? b.shortOverride ?? b.labelOverride ?? m.short ?? m.label;
   const label = o.check && b.armed ? `${base} ✓` : base;
@@ -54,6 +58,7 @@ function resolve(id: CommandId, b: CommandBinding, o: Placement, close: (() => v
     accent: m.family ? FAMILY_ACCENT[m.family] : undefined,
     tone: m.family === "danger" ? ("danger" as const) : undefined,
     onClick: () => { b.run(); if (b.enabled === true) close?.(); },
+    onDisabledClick: () => { if (b.enabled !== true) notify?.(b.enabled); },
   };
 }
 
@@ -83,25 +88,25 @@ function Mark({ id, children }: { id: CommandId; children: ReactNode }) {
  * anyway — the `tier === "full"` check here just avoids formatting a chord nobody will render.
  */
 export function Cmd({ id, tier = "full", full, badge, ...o }: Placement & { id: CommandId; tier?: Tier; full?: boolean; badge?: ReactNode }) {
-  const r = resolve(id, useBinding(id), o, usePopupGroupClose());
+  const r = resolve(id, useBinding(id), o, usePopupGroupClose(), useContext(NoticeCtx));
   const chord = meta(id).keys?.[0];
   const keycap = tier === "full" && chord ? formatChord(chord) : undefined;
   return <Mark id={id}><CommandButton {...r} icon={r.icon ?? "more"} tier={tier} full={full} badge={badge} keycap={keycap} /></Mark>;
 }
 
 export function CmdSmall({ id, full, badge, ...o }: Placement & { id: CommandId; full?: boolean; badge?: ReactNode }) {
-  const r = resolve(id, useBinding(id), o, usePopupGroupClose());
+  const r = resolve(id, useBinding(id), o, usePopupGroupClose(), useContext(NoticeCtx));
   return <Mark id={id}><SmallButton {...r} full={full} badge={badge} iconOnly={o.iconOnly} /></Mark>;
 }
 
 export function CmdIcon({ id, ...o }: Placement & { id: CommandId }) {
-  const r = resolve(id, useBinding(id), o, usePopupGroupClose());
+  const r = resolve(id, useBinding(id), o, usePopupGroupClose(), useContext(NoticeCtx));
   return <Mark id={id}><IconButton {...r} icon={r.icon ?? "more"} /></Mark>;
 }
 
 /** A split button whose face is `id` and whose menu the tab supplies (usually `CmdMenuItem`s). */
 export function CmdSplit({ id, menuTitle, menu, ...o }: Placement & { id: CommandId; menuTitle: string; menu: () => ReactNode }) {
-  const r = resolve(id, useBinding(id), o, usePopupGroupClose());
+  const r = resolve(id, useBinding(id), o, usePopupGroupClose(), useContext(NoticeCtx));
   return <Mark id={id}><SplitButton {...r} icon={r.icon ?? "more"} menuTitle={menuTitle} menu={menu} /></Mark>;
 }
 
@@ -110,19 +115,19 @@ export function CmdSplit({ id, menuTitle, menu, ...o }: Placement & { id: Comman
  * Mode) or a real command whose face it shows (the Shape dropdown at medium tier).
  */
 export function CmdDropdown({ id, full, menu, ...o }: Placement & { id: CommandId; full?: boolean; menu: () => ReactNode }) {
-  const r = resolve(id, useBinding(id), o, usePopupGroupClose());
+  const r = resolve(id, useBinding(id), o, usePopupGroupClose(), useContext(NoticeCtx));
   return <Mark id={id}><DropdownButton {...r} full={full} menu={menu} /></Mark>;
 }
 
 export function CmdMenuItem({ id, after, ...o }: Placement & { id: CommandId; after?: ReactNode }) {
   const b = useBinding(id);
-  const r = resolve(id, b, o, usePopupGroupClose());
+  const r = resolve(id, b, o, usePopupGroupClose(), useContext(NoticeCtx));
   const chord = meta(id).keys?.[0];
   const text = o.label ?? b.shortOverride ?? b.labelOverride ?? meta(id).short ?? meta(id).label;
   return (
     <Mark id={id}>
       <MenuItem label={after ? <>{text} {after}</> : text} icon={r.icon} active={r.active}
-        disabled={r.disabled} title={r.title} onClick={r.onClick} danger={r.tone === "danger"}
+        disabled={r.disabled} title={r.title} onClick={r.onClick} onDisabledClick={r.onDisabledClick} danger={r.tone === "danger"}
         shortcut={chord ? formatChord(chord) : undefined} />
     </Mark>
   );

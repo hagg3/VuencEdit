@@ -133,6 +133,7 @@ export interface RibbonProps {
   onSetSpawnAtSelection: () => void;
   onSetPlayerPosAtSelection: () => void;
   onShowWorldInfo: () => void;
+  onGoTo: () => void;
   // Selection
   selection: SelectionInfo | null;
   rawBounds: SelectionBounds | null;

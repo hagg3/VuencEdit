@@ -1,7 +1,7 @@
 title: VuencEdit
 description: >-
-  A comprehensive world editor for Eden World Builder (.eden) files — top-down map editing,
-  terrain sculpting, 3D fly-through, world generation, and more.
+  A world editor for Eden World Builder (.eden) files: top-down map editing, terrain sculpting,
+  a 3D view, world generation and prefabs.
 url: "https://hagg3.github.io"
 baseurl: "/VuencEdit"
 
@@ -10,7 +10,7 @@ repository: hagg3/VuencEdit
 
 # Latest release, kept in sync by hand (downloads.js overrides this live via the GitHub API,
 # these are only the no-JS fallback values).
-latest_version: "1.0.15"
+latest_version: "1.0.18"
 
 permalink: pretty
 

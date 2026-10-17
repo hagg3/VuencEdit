@@ -18,7 +18,7 @@ import {
   MoveHorizontal, Package, PaintBucket, PanelLeft, PanelRight, Pencil, Pentagon, Pickaxe, Pipette, Repeat,
   Replace, RotateCcw, RotateCw, Rows3, Save, SaveAll, Scissors, Search, Settings, Shuffle, Slash, Snowflake,
   Signpost, Sparkles, SprayCan, Square, SquareDashed, SquareSplitVertical, Stamp, Sun, Target, TriangleAlert,
-  TrendingUp, Trash2, TreePine, Triangle, Undo2, Redo2, RefreshCw, Upload, Wand2, Waves, Wind, X, ZoomIn,
+  TrendingUp, Trash2, TreePine, Triangle, Undo2, Redo2, RefreshCw, Upload, Wand2, Waves, X, ZoomIn,
   ZoomOut, Zap,
 } from "lucide-react";
 import type { CSSProperties } from "react";
@@ -43,7 +43,7 @@ const MAP = {
   polygon: Pentagon, bucket: PaintBucket,
   // Sculpt tools
   raise: ArrowUp, lower: ArrowDown, smooth: Waves, flatten: Minus, slope: TrendingUp,
-  noise: Mountain, erode: Wind, thermal: Flame, hydro: Droplets, stamp: Stamp,
+  noise: Mountain, thermal: Flame, hydro: Droplets, stamp: Stamp,
   grab: Move, terrace: Rows3, sharpen: Triangle, smear: MoveHorizontal, rock: Anvil,
   carve: Pickaxe, sculpt: Mountain,
   // Insert

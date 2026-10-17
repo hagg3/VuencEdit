@@ -19,7 +19,7 @@ import {
   ACCENT, ARMED_RING, BORDER, BTN_RADIUS, COL_GAP, DANGER, FONT, GRAD_HOVER, GRAD_PRESSED,
   GROUP_CONTENT_H, GROUP_LABEL_H, GROUP_PAD_BOTTOM, GROUP_PAD_TOP, GROUP_PAD_X, HAIRLINE, ICON,
   LARGE_H, POPUP_BTN_W, RADIUS, RAIL_W, ROW_GAP, SHADOW_HOVER, SHADOW_PRESSED, SMALL_H, SPACE, SURFACE, TEXT,
-  TEXT_DANGER, TEXT_DIM, TEXT_LABEL, TEXT_META, CUR_ICON, btnActive, btnBase, btnDisabled, currentRow, hexToRgbTriplet,
+  TEXT_DANGER, TEXT_DIM, TEXT_LABEL, TEXT_META, CUR_ICON, btnActive, btnBase, btnDisabled, btnDisabledExplains, currentRow, hexToRgbTriplet,
 } from "./tokens";
 import { MOTION, RAMP, rgba } from "../theme/theme";
 import type { Tier } from "./layout";
@@ -346,6 +346,8 @@ interface CommonBtn {
   title: string;
   /** Receives the event so callers can anchor a portal/popover on the clicked element. */
   onClick?: (e: React.MouseEvent<HTMLButtonElement>) => void;
+  /** Runs instead of `onClick` while `disabled` (22.5) — `<Cmd>` uses it to show the reason. */
+  onDisabledClick?: () => void;
   active?: boolean;
   disabled?: boolean;
   tone?: Tone;
@@ -358,7 +360,7 @@ interface CommonBtn {
 function stateStyle(active?: boolean, disabled?: boolean, accent?: string): CSSProperties {
   return {
     ...(active ? btnActive(accent) : null),
-    ...(disabled ? btnDisabled : null),
+    ...(disabled ? btnDisabledExplains : null),
   };
 }
 
@@ -372,11 +374,11 @@ function a11y(active?: boolean, disabled?: boolean) {
 
 /** Large: 76px tall, icon over label. The mockup's primary commands (Paste, Pan, Delete, Fill…). */
 export function LargeButton({
-  icon, label, title, onClick, active, disabled, tone = "default", accent, badge, style, iconNode, keycap,
+  icon, label, title, onClick, onDisabledClick, active, disabled, tone = "default", accent, badge, style, iconNode, keycap,
 }: CommonBtn & { icon: IconName; iconNode?: ReactNode; keycap?: string }) {
   return (
     <button
-      className="rbn-btn" type="button" title={title} aria-label={label} onClick={onClick}
+      className="rbn-btn" type="button" title={title} aria-label={label} onClick={disabled ? onDisabledClick : onClick}
       {...a11y(active, disabled)}
       style={btnBase({
         height: LARGE_H, minWidth: 54, padding: `${SPACE.md}px ${SPACE.md}px 5px`,
@@ -421,11 +423,11 @@ export function Keycap({ text, small }: { text: ReactNode; small?: boolean }) {
  *  `iconOnly` suppresses the visible label span but keeps `aria-label`/`title` at the full
  *  registry label, so the tooltip, ⌘K and Help stay unaffected — placement-only compaction. */
 export function SmallButton({
-  icon, label, title, onClick, active, disabled, tone = "default", accent, badge, style, full, iconOnly,
+  icon, label, title, onClick, onDisabledClick, active, disabled, tone = "default", accent, badge, style, full, iconOnly,
 }: CommonBtn & { icon?: IconName; full?: boolean; iconOnly?: boolean }) {
   return (
     <button
-      className="rbn-btn" type="button" title={title} aria-label={label} onClick={onClick}
+      className="rbn-btn" type="button" title={title} aria-label={label} onClick={disabled ? onDisabledClick : onClick}
       {...a11y(active, disabled)}
       style={btnBase({
         height: SMALL_H, padding: "0 7px", display: "flex", alignItems: "center", gap: 5,
@@ -444,11 +446,11 @@ export function SmallButton({
 
 /** Square icon-only button (segmented sets, tool grids, nudge arrows). Needs both label + title. */
 export function IconButton({
-  icon, label, title, onClick, active, disabled, tone = "default", accent, style, size = ICON.sm, iconNode,
+  icon, label, title, onClick, onDisabledClick, active, disabled, tone = "default", accent, style, size = ICON.sm, iconNode,
 }: CommonBtn & { icon: IconName; size?: number; iconNode?: ReactNode }) {
   return (
     <button
-      className="rbn-btn" type="button" title={title} aria-label={label} onClick={onClick}
+      className="rbn-btn" type="button" title={title} aria-label={label} onClick={disabled ? onDisabledClick : onClick}
       {...a11y(active, disabled)}
       style={btnBase({
         height: SMALL_H, width: SMALL_H, display: "flex", alignItems: "center", justifyContent: "center",
@@ -1098,14 +1100,14 @@ export function Caption({ children, tone = TEXT_DIM }: { children: ReactNode; to
 
 /** Plain menu row for popovers and split menus. */
 export function MenuItem({
-  label, onClick, icon, active, danger, shortcut, disabled, title,
+  label, onClick, onDisabledClick, icon, active, danger, shortcut, disabled, title,
 }: {
-  label: ReactNode; onClick?: () => void; icon?: IconName; active?: boolean;
+  label: ReactNode; onClick?: () => void; onDisabledClick?: () => void; icon?: IconName; active?: boolean;
   danger?: boolean; shortcut?: string; disabled?: boolean; title?: string;
 }) {
   return (
     <button
-      type="button" role="menuitem" className="rbn-btn" title={title} onClick={onClick}
+      type="button" role="menuitem" className="rbn-btn" title={title} onClick={disabled ? onDisabledClick : onClick}
       {...a11y(active, disabled)}
       style={btnBase({
         display: "flex", alignItems: "center", gap: 7, width: "100%", textAlign: "left",
@@ -1114,7 +1116,7 @@ export function MenuItem({
         // The current option is pushed in (Stage 14.2), not armed-accent: a menu row is a list
         // item, and "current" has one look app-wide.
         ...(active ? currentRow() : null),
-        ...(disabled ? btnDisabled : null),
+        ...(disabled ? btnDisabledExplains : null),
       })}
     >
       {icon && <Icon name={icon} size={ICON.sm} tone={danger ? "danger" : active ? "inherit" : "default"}

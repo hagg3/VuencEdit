@@ -47,6 +47,15 @@ export default function UploadModal({ sourcePath, onClose }: Props) {
     }
   }
 
+  async function useSnapshot() {
+    try {
+      setImagePath(await invoke<string>("render_upload_thumbnail"));
+      setError(null);
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
   async function doUpload() {
     if (!sourcePath || !imagePath) return;
     setUploading(true);
@@ -67,13 +76,14 @@ export default function UploadModal({ sourcePath, onClose }: Props) {
         imagePath,
         server,
       });
-      unlisten();
-      unlistenRef.current = null;
       setUploadProgress(100);
       setResult(response || "Upload complete.");
     } catch (e) {
-      setError(String(e));
+      // A user-requested cancel isn't a failure (matches the backend's NET_CANCELLED).
+      if (String(e) !== "Cancelled") setError(String(e));
     } finally {
+      unlisten();
+      unlistenRef.current = null;
       setUploading(false);
     }
   }
@@ -82,13 +92,16 @@ export default function UploadModal({ sourcePath, onClose }: Props) {
   const imageFilename = imagePath ? imagePath.split(/[\\/]/).pop() ?? imagePath : null;
 
   return (
-    // Blocked mid-upload — dismissing wouldn't cancel the request, it would just hide it.
+    // Blocked mid-upload — Esc/✕ would only hide the request; "Cancel upload" actually stops it.
     <Dialog
       size="sm" icon="upload" title="Upload World" onClose={onClose} busy={uploading}
       footer={
-        <DialogButton variant="primary" onClick={doUpload} disabled={!canUpload}>
-          {uploading ? "Uploading…" : "Upload"}
-        </DialogButton>
+        <>
+          {uploading && <DialogButton onClick={() => { invoke("cancel_net_transfer"); }}>Cancel upload</DialogButton>}
+          <DialogButton variant="primary" onClick={doUpload} disabled={!canUpload}>
+            {uploading ? "Uploading…" : "Upload"}
+          </DialogButton>
+        </>
       }
     >
       <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
@@ -122,7 +135,8 @@ export default function UploadModal({ sourcePath, onClose }: Props) {
         <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
           <span style={{ fontSize: 11, color: MODAL_TEXT.secondary, textTransform: "uppercase", letterSpacing: "0.06em" }}>Preview Image (required)</span>
           <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-            <DialogButton onClick={choosePng}>Choose PNG…</DialogButton>
+            <DialogButton onClick={choosePng} disabled={uploading}>Choose PNG…</DialogButton>
+            <DialogButton onClick={useSnapshot} disabled={uploading} title="Render the current map as the preview image">Use map snapshot</DialogButton>
             {imageFilename && (
               <span style={{ color: GREEN_TEXT, fontSize: 12 }}>✓ {imageFilename}</span>
             )}

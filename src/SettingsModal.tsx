@@ -511,7 +511,18 @@ export default function SettingsModal({
               like any other edit: it doesn't persist until Save. D0's left-slot convention: a
               footer child with marginRight:"auto" — no dedicated slot component. */}
           <div style={{ display: "flex", alignItems: "center", gap: 10, marginRight: "auto" }}>
-            <DialogButton onClick={() => { setLocal({ ...DEFAULTS }); setResetHint(true); }}>
+            <DialogButton onClick={() => {
+              // Preferences only: tour/profile gates, both paths and the device-aware budget survive.
+              setLocal(cur => ({
+                ...DEFAULTS,
+                memoryBudget: deviceAwareDefaultMemoryBudget(),
+                tourVersion: cur.tourVersion,
+                potatoProfileApplied: cur.potatoProfileApplied,
+                texturePackPath: cur.texturePackPath,
+                prefabDirectory: cur.prefabDirectory,
+              }));
+              setResetHint(true);
+            }}>
               Reset to defaults
             </DialogButton>
             {resetHint && (

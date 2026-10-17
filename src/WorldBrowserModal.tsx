@@ -270,12 +270,13 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
 
     try {
       await invoke("download_world", { id: selectedId, server, destPath });
-      unlisten();
-      unlistenRef.current = null;
       if (openAfter && mountedRef.current) onOpenWorld(destPath);
     } catch (e) {
-      setError(String(e));
+      // A user-requested cancel isn't a failure (matches the backend's NET_CANCELLED).
+      if (String(e) !== "Cancelled") setError(String(e));
     } finally {
+      unlisten();
+      unlistenRef.current = null;
       setDownloading(false);
       setDownloadProgress(null);
     }
@@ -600,6 +601,12 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
               >
                 Save &amp; Open
               </button>
+
+              {downloading && (
+                <DialogButton onClick={() => { invoke("cancel_net_transfer"); }} style={{ width: "100%" }}>
+                  Cancel download
+                </DialogButton>
+              )}
 
               {/* Progress bar */}
               {downloading && downloadProgress && (

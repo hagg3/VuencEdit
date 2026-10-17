@@ -182,3 +182,19 @@ export function isTypingTarget(t: EventTarget | null): boolean {
   return tag === "TEXTAREA" || el?.isContentEditable === true ||
     (tag === "INPUT" && !NON_TEXT_INPUT_TYPES.has((el as HTMLInputElement).type));
 }
+
+/** Paste only commits on a primary-button release that began on the canvas (21.12: a right-click
+ *  with Paste armed must open the context menu, not paste). */
+export function shouldPasteOnPointerUp(tool: string, startedOnCanvas: boolean, button: number): boolean {
+  return tool === "paste" && startedOnCanvas && button === 0;
+}
+
+/** True for a pointer-initiated click (detail > 0) on a plain button outside any dialog. Such a
+ *  button should drop focus afterwards, else Space (hold-to-pan) re-activates it — Windows
+ *  WebView2 leaves it focused (U9). Keyboard-initiated clicks (detail 0) keep focus. */
+export function shouldBlurAfterClick(detail: number, el: Element | null): boolean {
+  if (detail <= 0 || !el) return false;
+  const btn = el.closest("button");
+  if (!btn) return false;
+  return !btn.closest('[role="dialog"],[aria-modal="true"]');
+}

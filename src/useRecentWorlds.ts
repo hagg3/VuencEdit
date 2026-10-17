@@ -33,5 +33,13 @@ export function useRecentWorlds() {
     });
   }
 
-  return { recentWorlds, addRecentWorld };
+  function removeRecentWorld(path: string) {
+    setRecentWorlds(prev => {
+      const next = prev.filter(r => r.path !== path);
+      try { localStorage.setItem(RECENT_WORLDS_KEY, JSON.stringify(next)); } catch {}
+      return next;
+    });
+  }
+
+  return { recentWorlds, addRecentWorld, removeRecentWorld };
 }

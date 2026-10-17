@@ -56,7 +56,7 @@ export function approxPercentile(hist: Uint32Array, p: number): number | null {
 }
 
 /** Why a whole-disc `reloadAllChunks` ran (17.1), so a restream storm can be attributed. */
-export const RELOAD_REASONS = ["tex", "light", "gpuShadows", "cap", "resume", "band", "restore"] as const;
+export const RELOAD_REASONS = ["tex", "light", "gpuShadows", "cap", "resume", "band", "restore", "world"] as const;
 export type ReloadReason = typeof RELOAD_REASONS[number];
 
 export interface PerfCounters {
@@ -106,7 +106,7 @@ function freshCounters(): PerfCounters {
     rafMs: newHistogram(),
     lagMs: newHistogram(),
     mapDrawMs: newHistogram(),
-    reloads: { tex: 0, light: 0, gpuShadows: 0, cap: 0, resume: 0, band: 0, restore: 0 },
+    reloads: { tex: 0, light: 0, gpuShadows: 0, cap: 0, resume: 0, band: 0, restore: 0, world: 0 },
     flyRenders: 0, appRenders: 0, editsApplied: 0, mapDraws: 0, sceneFrames: 0,
     drawCallsLast: 0, drawCallsMax: 0, visibleMeshesLast: 0, visibleMeshesMax: 0,
     tilesByLod: {},
