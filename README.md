@@ -4,24 +4,27 @@
 
 # VuencEdit
 
-**[hagg3.github.io/VuencEdit](https://hagg3.github.io/VuencEdit/)**
+**[Website & support (under construction)](https://hagg3.github.io/VuencEdit/)**
 
-VuencEdit is a desktop editor for **Eden World Builder** world files (`.eden`). Open a world and you
-get a top-down map of the whole thing, which you can pan around, select, paint, sculpt, copy from and
-paste into. You can also fly through the world in 3D, generate new worlds from scratch, and save
-everything back to a file the game will load. It runs on macOS, Windows and Linux, and never touches
-the game itself.
+VuencEdit is a full-scale world editor for **[Eden: World Builder](https://store.steampowered.com/app/5004190/Eden__World_Builder/)** and **[Eden: Community Edition](https://github.com/hagg3/edencom)** world files. It is written in Rust and is a small, lightweight, cross-platform Tauri program.
 
-It started as a successor to Eden World Manipulator, which was itself based on Vuenctools. The file
-format was originally documented by Robert Munafo. Eden World Builder was made by Ari Ronen and
-open-sourced in 2018.
-
-Questions, bug reports and screenshots of cool builds are all welcome on the game's
-[Discord server](http://discord.gg/rjYXwBC).
-
+Eden World Builder was created by Ari Ronen.
 <p align="center">
   <img src="assets/screen.png" alt="VuencEdit with a world open" width="900">
 </p>
+This community-developed project is the successor to Eden World Manipulator, which was itself based on Vuenctools, created after the game's file format was reverse engineered by Robert Munafo before the Eden 2.1 source code was released in 2018. 
+
+As well as adding support for the latest world formats (as of updates in 2026 adding signs, and new block types), this program offers near-parity with editors like Axiom for Minecraft and includes brand-new features such as:
+
+- Prefab importing/exporting across worlds.
+- 3D viewport allowing you to fly through, edit, and make selections within your world.
+- Instant pan-zoom across the default top-down 2D map view.
+- Axiom-style 3D sculpt tools for creating natural looking terrain.
+- All features from World Manipulator ported to rust (such as tree generation), and improved.
+- Full integration with the shared world service for both the latest and legacy versions of the game.
+
+Questions, bug reports and screenshots of cool builds are all welcome on the game's
+[Discord server](http://discord.gg/rjYXwBC).
 
 ## Download
 
