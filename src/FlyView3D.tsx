@@ -4,6 +4,7 @@ import { useEffect, useRef, useState, useCallback, forwardRef, useImperativeHand
 import { invoke } from "@tauri-apps/api/core";
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import { MAX_RENDER_DISTANCE, RD_MIN } from "./renderDistance";
 import type { AtlasData } from "./texturePack";
 import { isTypingTarget, chunkToWorld, worldToChunk, gridDivisions } from "./viewportUtils";
 import { editReloadPlan, shouldReloadChunk, staleBandKeys, bandCovers } from "./flySync";
@@ -15,6 +16,7 @@ import { maskPrismPositions, type OutlinePt, type MaskRect } from "./maskUtils";
 import { perfCounters, recordGeometryFetchMs, recordFrameMs, recordRenderMs, recordRenderStats, recordReload, bumpPerf, type ReloadReason } from "./perfCounters";
 import { backoffBudget, backoffRadius, MAX_CONTEXT_LOSSES } from "./gfxBackoff";
 import { GESTURE_MAX_MS, gestureTimedOut } from "./gestureWatchdog";
+import { isDwellIdempotent } from "./drawTools";
 
 // Fog distance scales with the render distance slider (chunk radius × 16 blocks/chunk) so terrain
 // fades out at the edge of what's actually streamed in, instead of a fixed distance that either
@@ -89,7 +91,7 @@ export const DEFAULT_SKY3D: Sky3dPrefs = { zenith: SKY_3D.zenith, horizon: SKY_3
 
 /** A lamp light for the experimental GPU night path — Eden local block coords (voxel centre) + colour 0..1. */
 interface LampLight { x: number; y: number; z: number; r: number; g: number; b: number }
-/** Which shipped lamp-lighting behaviour is active — mirrors Rust `LightingProfile` (export.rs). */
+/** Which shipped lamp-lighting behaviour is active — mirrors Rust `LightingProfile` (voxel-core `geometry.rs`). */
 export type LightingProfile = "legacy" | "modern";
 /** Cap on live GPU-night point lights. MeshLambertMaterial forward-lights each one in-shader, so this
  *  is the experimental perf ceiling; the nearest N lamps to the camera are assigned. */
@@ -114,15 +116,7 @@ const SHADOW_MAX_REACH = 320;
 interface EditBounds { x: number; y: number; w: number; h: number }
 
 const LOAD_RADIUS = 5;   // chunks loaded around the camera (in chunk units)
-// M1: exported so every render-distance slider (this pane's own, the ribbon 3D tab, Settings) shares
-// one floor/ceiling — they used to disagree (1–16 / 2–32 / 2–32), so the ribbon slider could push
-// `loadRadius` to 1 (below this pane's own floor, breaking `radiusToPos`) and couldn't reach 17–32,
-// silently clamping a value Settings had just set the next time it was touched.
-export const MAX_RENDER_DISTANCE = 32; // slider ceiling (chunk radius)
-export const RD_MIN = 2;               // slider floor (chunk radius)
-// The slider maps 1:1 to chunk radius (step = 1 chunk). The old quadratic remap gave the low range
-// more pixels but made the top half jump several chunks per pixel (e.g. 16→20 in one nudge), which
-// read as "dodgy". A plain linear integer domain is fully predictable — one notch = one chunk.
+// The render-distance slider is piecewise-linear in chunks — see `radiusToPos` below (1:1 up to 16, two notches per chunk past it).
 // rad/px at sensitivity multiplier 1. Raised from the old hardcoded 0.0025 (look mode) — that base
 // felt too slow by default; the Settings sliders scale from here (0.25x-4x range).
 const LOOK_SENS_BASE = 0.006;
@@ -184,9 +178,19 @@ const GEOMETRY_BUDGET_BYTES = 512 << 20;
 const COMPACT_HUD_W = 720;
 const COMPACT_HUD_H = 300;
 
+/** `teleport(wx, wy, z)` stand-off from the aimed-at block: the orbit distance is kept within this
+ *  range (closer is a wall of blocks, further loses the target), and fly mode, which has no
+ *  meaningful orbit distance, uses the fixed value. */
+const TELEPORT_MIN_DIST = 16;
+const TELEPORT_MAX_DIST = 96;
+const TELEPORT_FLY_STANDOFF = 20;
+
 export interface FlyView3DRef {
-  /** Move the camera to a world XY position (keeps current height). */
-  teleport: (wx: number, wy: number) => void;
+  /** Move the camera to a world XY position. Without `z` it keeps the current height (the map's
+   *  "Teleport 3D Camera Here"). With `z` (a block layer) it *aims at* that block instead: same
+   *  viewing direction, backed off a short distance from it, so a jump to a sign or a place on far
+   *  higher or lower terrain doesn't land the camera inside a hill or up in the sky (24.1). */
+  teleport: (wx: number, wy: number, z?: number) => void;
   /** Leave mouselook (releases the pointer lock / native cursor grab) if it is active. Called before
    *  the pane's canvas is *moved* in the DOM — a view swap or 3D-window toggle (UI redesign r3, Stage 14.4) —
    *  because moving a pointer-locked element silently drops the lock out from under look mode. */
@@ -286,7 +290,7 @@ const INTERACT_SEGMENTS: { mode: Interact3D; label: string; accent: string; titl
   { mode: "sculpt", label: "SCULPT", accent: "#fb923c", title: "Hold left to sculpt" },
 ];
 
-/// Display names for the ten sculpt tools, for the in-pane armed-hint readout. (The ribbon owns the
+/// Display names for the sculpt tools (every `isSculptTool` id), for the in-pane armed-hint readout. (The ribbon owns the
 /// canonical picker; this is just a label so the pane doesn't show a bare tool id.)
 const SCULPT_TOOL_LABELS: Record<string, string> = {
   raise: "Raise", lower: "Lower", grab: "Grab", smooth: "Smooth", flatten: "Flatten",
@@ -820,8 +824,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
    *  Note this only *pauses streaming* once crossed (see the `budgetLimited` gate below) — it never
    *  evicts, so a stationary camera at a lower preset simply plateaus at a smaller resident set. */
   geometryBudgetBytes?: number;
-  /** Non-fatal warning channel (WebGL context loss/restore). Same idiom as `SliceViewport.onNotice`:
-   *  the pane's only other escape hatch is *throwing*, which the ErrorBoundary turns into a full-pane
+  /** Non-fatal warning channel (WebGL context loss/restore). The pane's only other escape hatch is *throwing*, which the ErrorBoundary turns into a full-pane
    *  replacement — wrong for a condition the pane recovers from on its own. */
   onNotice?: (msg: string) => void;
   /** Fires once, the first time this pane's WebGL context is confirmed to be a software rasterizer
@@ -953,7 +956,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
   const geometryBudgetRef = useRef(geometryBudgetBytes);
   geometryBudgetRef.current = geometryBudgetBytes;
   // Non-fatal notice channel, mirrored into a ref so the big scene effect's dep array stays stable
-  // (SliceViewport's idiom). The context-loss handlers below are its only callers today.
+  // The context-loss handlers below are its only callers today.
   const onNoticeRef = useRef(onNotice);
   onNoticeRef.current = onNotice;
   const onSoftwareRenderingDetectedRef = useRef(onSoftwareRenderingDetected);
@@ -1008,7 +1011,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
   useEffect(() => () => { if (haloTimerRef.current) clearTimeout(haloTimerRef.current); }, []);
 
   // Lamp/shadow reach, fetched once from Rust so the edit-sync reload radius below can't drift out
-  // of sync with export.rs's LAMP_LIGHT_RADIUS/SHADOW_RAY_STEPS constants. Seeded with those same
+  // of sync with voxel-core's LAMP_LIGHT_RADIUS/SHADOW_RAY_STEPS constants. Seeded with those same
   // values as a fallback in case the fetch hasn't landed yet (a stale/undersized radius for one
   // frame is harmless — the next edit reloads correctly once the fetch resolves).
   const lightConstantsRef = useRef({ lampLightRadius: 4.0, shadowRayScan: 24 });
@@ -1209,7 +1212,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     reloadChunk: (cx: number, cy: number) => void;
     reloadAllChunks: (reason: ReloadReason, keepMeshes?: boolean) => void;
     resetCamera: () => void;
-    teleport: (wx: number, wy: number) => void;
+    teleport: (wx: number, wy: number, z?: number) => void;
     exitLook: () => void;
     exitWalk: () => void;
     setOverlays: (ovs: Overlay3D[] | null) => void;
@@ -1261,7 +1264,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
   });
 
   useImperativeHandle(ref, () => ({
-    teleport: (wx, wy) => sceneApi.current?.teleport(wx, wy),
+    teleport: (wx, wy, z) => sceneApi.current?.teleport(wx, wy, z),
     exitLook: () => sceneApi.current?.exitLook(),
     exitWalk: () => sceneApi.current?.exitWalk(),
     getGpuInfo: () => sceneApi.current?.getGpuInfo() ?? null,
@@ -1740,7 +1743,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
           // profile switch isn't stale.
           const lampR = lampRadiusRef.current;
           // `decay` picks which of the two shipped falloff shapes this matches (mirrors the CPU/baked
-          // `LightingProfile::falloff` in export.rs): legacy's small, steep-edged pool reads closest to
+          // `LightingProfile::falloff` in voxel-core): legacy's small, steep-edged pool reads closest to
           // Three's decay=2 (inverse-square); modern's much broader, gradual New Dawn pool reads closer
           // to decay=1. `distance` is the hard cutoff — set it well beyond the nominal lamp radius so
           // the falloff curve isn't clipped right at the edge (a distance==lampR cutoff with 2/d
@@ -2548,8 +2551,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     //
     // Three.js (x, y, z) ↔ Eden (x = east, y = south, z = up) is the sign-free permutation
     // (ex, ez, ey) that `obj_geometry_region` emits with. Direction transforms identically to
-    // position since the map is a pure axis swap. (Note: export.rs's `ov()` — the OBJ *file* writer —
-    // negates Y; that mapping does not apply here.)
+    // position since the map is a pure axis swap.
     const threeToEden = (v: THREE.Vector3) => ({ x: v.x, y: v.z, z: v.y });
 
     const rayFwd = new THREE.Vector3();
@@ -2706,6 +2708,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     // Smear: like the 2D timer, each tick needs the drag delta *since the previous tick* — the
     // hit column from the previous pick, not the stroke-start anchor.
     let sculptSmearLastPos: [number, number] | null = null;
+    let sculptLastStamp: [number, number] | null = null; // last column an idempotent tool stamped
     // Grab state (no timer).
     let sculptGrab = false;
     let sculptGrabPick: PickResult | null = null;
@@ -3385,6 +3388,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       const first = await pick(e.clientX, e.clientY);
       if (disposed || !sculptActive) return;
       sculptAnchor = first ? [first.x, first.y] : null;
+      sculptLastStamp = null;
       sculptSmearLastPos = sculptToolRef.current === "smear" && first ? [first.x, first.y] : null;
       // Hold-timer: re-pick + stamp each tick. Busy is set *before* the async pick so two ticks can't
       // both slip past the guard during the pick's await window.
@@ -3405,6 +3409,11 @@ const FlyView3D = forwardRef<FlyView3DRef, {
             if (dx === 0 && dy === 0) return; // no movement this tick — nothing to smear
             sculptSmearLastPos = [hit.x, hit.y];
             smear = [dx, dy];
+          }
+          // Idempotent tools (Rock/Carve/Stamp): a dwell on the same column re-stamps nothing new (23.6).
+          if (isDwellIdempotent(sculptToolRef.current)) {
+            if (sculptLastStamp && sculptLastStamp[0] === hit.x && sculptLastStamp[1] === hit.y) return;
+            sculptLastStamp = [hit.x, hit.y];
           }
           sculptStamped = true;
           await emitStamp(hit, sculptGroupId, sculptAnchor, undefined, smear);
@@ -3867,9 +3876,8 @@ const FlyView3D = forwardRef<FlyView3DRef, {
         lastEmitT = now;
       }
       // Throttled camera-position broadcast to the parent (~3fps) so the top-down map can draw the
-      // camera dot. Deliberately slower than the HUD above: this bubbles into App-level state
-      // (setCam3dPos), which re-renders MapCanvas/Ribbon/SelectionInspector/FlyView3D itself on every
-      // update — a coarse map-dot position doesn't need 10Hz for that cost.
+      // camera dot. Deliberately slower than the HUD above: a coarse map-dot position doesn't need 10Hz.
+      // App keeps it in a ref and moves the dot imperatively (no React state), so it costs no re-render.
       if (now - lastEmitExternalT >= 300) {
         const ex = camera.position.x, ey = camera.position.z;
         // Map-space heading for the view wedge: Eden X is three's X, Eden Y is three's Z.
@@ -3939,11 +3947,25 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       invalidate();
     };
 
-    // Teleport camera to an Eden world XY position, keeping the current height.
+    // Teleport camera to an Eden world XY position, keeping the current height — or, given a block
+    // layer `z`, aim at that block: keep the live viewing direction and back off along it (the
+    // orbit distance clamped to a readable range, or a fixed stand-off while flying, where
+    // `controls.target` is stale). Same "keep the direction, retarget" idea as frameSelection.
     // Force an immediate chunk sweep so old far-away chunks are cleared right away.
-    const teleport = (wx: number, wy: number) => {
-      const toPos = camera.position.clone(); toPos.x = wx; toPos.z = wy; // Three.js Z = Eden Y
-      const toTarget = controls.target.clone(); toTarget.x = wx; toTarget.z = wy;
+    const teleport = (wx: number, wy: number, z?: number) => {
+      let toPos: THREE.Vector3, toTarget: THREE.Vector3;
+      if (z === undefined) {
+        toPos = camera.position.clone(); toPos.x = wx; toPos.z = wy; // Three.js Z = Eden Y
+        toTarget = controls.target.clone(); toTarget.x = wx; toTarget.z = wy;
+      } else {
+        toTarget = new THREE.Vector3(wx, z + 0.5, wy); // Eden (x,y,z) → Three (x,z,y)
+        const dist = flyModeRef.current
+          ? TELEPORT_FLY_STANDOFF
+          : THREE.MathUtils.clamp(camera.position.distanceTo(controls.target), TELEPORT_MIN_DIST, TELEPORT_MAX_DIST);
+        const dir = new THREE.Vector3();
+        camera.getWorldDirection(dir);
+        toPos = toTarget.clone().addScaledVector(dir, -dist);
+      }
       startCamTween(toPos, toTarget);
       streamSweep(true); // immediate sweep without waiting for the next interval tick (tween hasn't ticked yet)
       invalidate();
@@ -5290,7 +5312,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
             type="button"
             onClick={(e) => { e.currentTarget.blur(); setMoveWithContents?.(v => !v); }}
             title={!moveWithContents
-              ? "Gizmo arrows move the selection region only (2D/slab views follow). Click to switch to moving its blocks (undoable). Same toggle as the Selection tab's Move: Box/Contents."
+              ? "Gizmo arrows move the selection region only (the 2D map follows). Click to switch to moving its blocks (undoable). Same toggle as the Selection tab's Move: Box/Contents."
               : "Gizmo arrows relocate the selection's blocks (undoable move_selection). Click to switch to moving the region only. Same toggle as the Selection tab's Move: Box/Contents."}
             style={{
               padding: "2px 8px", borderRadius: 4, fontSize: 10, fontWeight: 700, letterSpacing: "0.03em",

@@ -9,7 +9,7 @@
  * 2400 lines, and the same command had different glyphs on different tabs.
  */
 import {
-  Anvil, AppWindow, ArrowDown, ArrowLeft, ArrowLeftRight, ArrowRight, ArrowUp, Blend, Blocks, Box, Brush, Camera,
+  Anvil, AppWindow, ArrowDown, ArrowLeft, ArrowLeftRight, ArrowRight, ArrowUp, Blend, Blocks, Brush, Camera,
   Check, ChevronDown, ChevronUp, ChevronsUpDown, Circle, CircleHelp, ClipboardPaste,
   Copy, CopyPlus, Crosshair, Cuboid, Dices, Download, Droplet, Droplets, Expand, Eye, Feather, FileInput,
   FileOutput, FilePlus, Filter, Flag, Flame, FlipHorizontal2, FlipVertical2, FolderOpen, Frame, Gauge,
@@ -51,7 +51,7 @@ const MAP = {
   trees: TreePine, water: Droplet, lava: Flame, materialize: Grid3x3, expandWorld: Layers2,
   // View
   topdown: Map, zslice: Layers, cutaway: SquareSplitVertical, tiled: Grid3x3, fullmap: Image,
-  axo: Box, fit: Maximize, zoomIn: ZoomIn, zoomOut: ZoomOut, zoomSel: Crosshair,
+  relief: Mountain, fit: Maximize, zoomIn: ZoomIn, zoomOut: ZoomOut, zoomSel: Crosshair,
   quad: LayoutGrid, pane3d: Cuboid, sidebar: PanelRight, toolbar: PanelLeft, quickActions: Rows3, signs: Signpost,
   template: Map, textures: Image,
   // 3D

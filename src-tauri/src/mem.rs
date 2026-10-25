@@ -416,7 +416,7 @@ pub struct Peaks {
     pub autosave_bytes: Peak,
     pub autosave_ms: Peak,
     pub autosave_compactions: AtomicU64,
-    /// Full/incremental/compressed save: 0 = none yet, 1 = incremental, 2 = full, 3 = compressed.
+    /// Last save: 0 = none yet, 1 = incremental, 2 = full, 3 = compressed, 4 = `.emod` append.
     pub save_kind: AtomicU64,
     pub save_bytes: Peak,
     pub save_ms: Peak,
@@ -443,7 +443,7 @@ impl Peaks {
             autosave_ms: self.autosave_ms.snap(),
             autosave_compactions: self.autosave_compactions.load(Relaxed),
             save_kind: match self.save_kind.load(Relaxed) {
-                1 => "incremental", 2 => "full", 3 => "compressed", _ => "none",
+                1 => "incremental", 2 => "full", 3 => "compressed", 4 => "emod", _ => "none",
             },
             save_bytes: self.save_bytes.snap(),
             save_ms: self.save_ms.snap(),

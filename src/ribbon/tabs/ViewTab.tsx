@@ -36,7 +36,6 @@ export default function ViewTab() {
       {/* Relief (13.2) is a shading toggle layered on Tiled, not a render mode. */}
       <Group id="render" label="Render" tier={tier.render} declaredWidth={W("render")} icon="tiled">
         <Col style={{ justifyContent: "center", height: GROUP_CONTENT_H }}>
-          <CmdSmall id="view.render.tiled" full />
           <CmdSmall id="view.render.relief" full />
         </Col>
       </Group>

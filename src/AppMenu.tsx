@@ -424,7 +424,7 @@ function Pane({ row, onClose, infoKey, bumpInfo }: { row: AppMenuRow; onClose: (
           <CheckRow label="3D view" checked={p.view3dWindowOpen} onChange={() => p.onToggle3dWindow()}
             hint="Floating 3D view. Tab swaps it with the map." />
           <CheckRow label="Docked sidebar" checked={p.sidebarOpen} onChange={() => p.onToggleSidebar()}
-            hint="Inspector, prefab library and undo history." />
+            hint="World navigator, prefab library and undo history." />
         </div>
         <Primary icon="settings" label="Open Settings…" onClick={() => { onClose(); p.setShowSettings(true); }} />
       </>);

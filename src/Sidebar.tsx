@@ -1,5 +1,5 @@
 /**
- * The docked right-edge sidebar — Inspector / Prefabs / History.
+ * The docked right-edge sidebar — World / Prefabs / History.
  *
  * Restyled onto `ribbon/tokens` + `ribbon/icons` (audit H10 step 3). It used to be the app's third
  * competing visual system: warm-brown `glassPanel`/`glassTab`, text-only tabs, and its own eight
@@ -14,22 +14,22 @@ import {
   BORDER, FONT, HAIRLINE, RADIUS, SPACE, SURFACE, TEXT, TEXT_DIM, TEXT_META,
   CUR_ICON, currentRow, TEXT_LABEL, btnBase,
 } from "./ribbon/tokens";
-import SelectionInspector from "./SelectionInspector";
+import WorldTab, { type WorldTabProps } from "./WorldTab";
 import PrefabLibraryPanel from "./PrefabLibraryPanel";
-import type { SelectionInfo, ClipboardInfo, SignInfo } from "./types";
+import type { ClipboardInfo } from "./types";
 
-export type SidebarTab = "inspector" | "prefabs" | "history";
+export type SidebarTab = "world" | "prefabs" | "history";
 
 const TABS: { id: SidebarTab; label: string; icon: IconName }[] = [
-  // Inspector reads out the *selection*, so it carries the selection glyph rather than a generic
-  // "info" one — same command, same icon, wherever it appears.
-  { id: "inspector", label: "Inspector", icon: "select" },
+  // World (24.1, was Inspector): a navigator for the whole world, so the globe rather than the
+  // selection glyph the Inspector carried.
+  { id: "world", label: "World", icon: "world" },
   { id: "prefabs", label: "Prefabs", icon: "prefabLibrary" },
   { id: "history", label: "History", icon: "history" },
 ];
 
 /** Section heading for the History tab's undo/redo stacks — the ribbon's `FieldLabel` treatment.
- *  (The Inspector tab's own sections use `ui/PropertyGrid`'s `Section` instead, since those are
+ *  (The World tab's own sections use `ui/PropertyGrid`'s `Section` instead, since those are
  *  collapsible and persist their open/closed state — History's two stacks are always both shown.) */
 function SectionLabel({ children }: { children: React.ReactNode }) {
   return (
@@ -108,7 +108,7 @@ function HistoryTab({ editEpoch, worldEpoch }: { editEpoch: number; worldEpoch: 
   );
 }
 
-export interface SidebarProps {
+export interface SidebarProps extends Omit<WorldTabProps, "editEpoch"> {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   width: number;
@@ -121,24 +121,14 @@ export interface SidebarProps {
   /** Bottom inset (px) — mirrors `STATUS_BAR_HEIGHT`. */
   bottomPx: number;
 
-  // Inspector tab
-  selection: SelectionInfo | null;
-  clipboard: ClipboardInfo | null;
-  clipboardPreview: { width: number; height: number; pixels: Uint8Array } | null;
-
   // Prefabs tab
   onArmPaste: (info: ClipboardInfo) => void;
   onSavePrefabAs: () => void;
   prefabRefreshToken: number;
 
-  // History tab
+  // History tab (and the World tab's `useWorldInfo` keys)
   editEpoch: number;
   worldEpoch: number;
-
-  // Inspector tab — signs (256z-format plan, Phase 4)
-  signs: SignInfo[];
-  /** Clicking a sign row focuses the 2D map on it. Omitted = rows are inert. */
-  onSignClick?: (s: SignInfo) => void;
 }
 
 export default function Sidebar(p: SidebarProps) {
@@ -245,18 +235,26 @@ export default function Sidebar(p: SidebarProps) {
       </div>
 
       <div style={{ flex: 1, minHeight: 0, overflowY: "auto", padding: PAD, color: TEXT }}>
-        {p.tab === "inspector" && (
-          <SelectionInspector
+        {/* Keyed on the world so a newly opened world never shows the previous one's info while
+            its first (debounced) `get_world_info` is in flight. */}
+        {p.tab === "world" && (
+          <WorldTab
+            key={p.worldEpoch}
             selection={p.selection}
-            clipboard={p.clipboard}
-            clipboardPreview={p.clipboardPreview}
             signs={p.signs}
-            onSignClick={p.onSignClick}
+            spawnPos={p.spawnPos}
+            playerPos={p.playerPos}
+            onGoTo={p.onGoTo}
+            viewCenter={p.viewCenter}
+            cam3dAvailable={p.cam3dAvailable}
+            onCentreOnCam3d={p.onCentreOnCam3d}
+            editEpoch={p.editEpoch}
+            worldKey={p.worldKey}
           />
         )}
         {p.tab === "prefabs" && (
           <PrefabLibraryPanel
-            onClose={() => p.onTabChange("inspector")}
+            onClose={() => p.onTabChange("world")}
             onArmPaste={p.onArmPaste}
             onSaveAs={p.onSavePrefabAs}
             refreshToken={p.prefabRefreshToken}

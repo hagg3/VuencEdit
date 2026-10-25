@@ -3,7 +3,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { MODAL_TEXT, expBadge, recessedWell } from "./designTokens";
 // M1: shared floor/ceiling with FlyView3D's own in-pane slider and the ribbon 3D tab, so a value set
 // here can never be silently clamped by a stricter range on either of the other two.
-import { MAX_RENDER_DISTANCE, RD_MIN } from "./FlyView3D";
+import { MAX_RENDER_DISTANCE, RD_MIN } from "./renderDistance";
 import { openView3dEverywhere, seedLastLayout } from "./windows/windowSeed";
 import { Check, Segmented, Select, SliderRow } from "./ribbon/primitives";
 import { ACCENT, FONT, ICON, RADIUS } from "./ribbon/tokens";
@@ -86,12 +86,12 @@ export interface AppSettings {
    *  no visual confirmation of what changed. Past this cap the placement outline simply doesn't
    *  appear (build-mode hover picks at the same distance), so the refusal is legible. Default 64. */
   buildReach: number;
-  /** Docked right sidebar (Inspector/Prefabs/History tabs — Elevation folded into Inspector) open on load. Default true. */
+  /** Docked right sidebar (World/Prefabs/History tabs) open on load. Default true. */
   sidebarOpen: boolean;
   /** Docked sidebar width in px, drag-resizable ~200–420. Default 260. */
   sidebarWidth: number;
-  /** Docked sidebar's active tab on load. Default "inspector". */
-  sidebarTab: "inspector" | "prefabs" | "history";
+  /** Docked sidebar's active tab on load. Default "world" (was "inspector" before v25). */
+  sidebarTab: "world" | "prefabs" | "history";
   /** Memory-budget preset (§6 of the 2026-08 memory-efficiency pass) — trades resident RAM against
    *  undo depth / cache hit rate / 3D streaming range. See `MEMORY_PRESETS`. Default "balanced". */
   memoryBudget: "low" | "balanced" | "high";
@@ -160,7 +160,7 @@ export const MEMORY_PRESETS: Record<AppSettings["memoryBudget"], {
 };
 
 /** Current settings schema version. Bump + add a case to `migrate()` when a stored default must change. */
-const SETTINGS_VERSION = 24;
+const SETTINGS_VERSION = 25;
 
 /** Exported so Stage 10.3's potato-profile check can test "still at the stock default" without
  *  duplicating the magic numbers — the same heuristic `migrate()` itself uses per-field above. */
@@ -194,7 +194,7 @@ export const DEFAULTS: AppSettings = {
   buildReach: 64,
   sidebarOpen: true,
   sidebarWidth: 260,
-  sidebarTab: "inspector",
+  sidebarTab: "world",
   memoryBudget: "balanced",
   checkForUpdatesOnLaunch: true,
   settingsVersion: SETTINGS_VERSION,
@@ -351,6 +351,9 @@ function migrate(s: Record<string, unknown>): boolean {
   // v23 → v24: relief shading now defaults off (Stage 19.1). Installs since 2026-09-28 stored
   // `true` without ever choosing it, so force it off once; a later explicit opt-in sticks.
   if (from < 24) s.reliefShading = false;
+  // v24 → v25: the sidebar's Inspector tab became the World navigator (ROADMAP-EDIT 24.1). Remap
+  // installs parked on it; runs after v4's "elevation" → "inspector", so that chain lands here too.
+  if (from < 25 && s.sidebarTab === "inspector") s.sidebarTab = "world";
   // (Stage 15.8 added sky3dZenith/sky3dHorizon/fog3dColor/fog3dSoft/show3dHud/show3dGrid with no
   // version bump: purely additive, so the `{...DEFAULTS, ...parsed}` merge below supplies every
   // existing install the same look the pane always had.)

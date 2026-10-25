@@ -1,5 +1,9 @@
 export interface WP { x: number; y: number }
 export type BrushShape = "sq" | "circ";
+/** Sculpt tools whose stamp at a fixed centre is idempotent (same centre + stroke seed → same
+ *  result), so a held-still cursor's dwell re-stamp changes nothing and only burns a full
+ *  `field_stamp` per tick. Both viewports skip the dwell for them (23.6). */
+export const isDwellIdempotent = (tool: string): boolean => tool === "rock" || tool === "carve" || tool === "stamp";
 export type FillMode = "fill" | "outline";
 
 // Numeric cell keys (audit M8): `x * 2^32 + y` is unique for |y| < 2^31 and exact in a double for

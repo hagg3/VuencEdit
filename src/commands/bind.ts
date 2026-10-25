@@ -240,7 +240,6 @@ export function bindCommands(c: CommandCtx): Record<CommandId, CommandBinding> {
     "view.mapview.zslice": choose(p.viewMode, "zslice", p.setViewMode),
     "view.mapview.cutaway": choose(p.viewMode, "cutaway", p.setViewMode),
     // Tiled is the only render mode now — always armed, nothing to switch.
-    "view.render.tiled": { run: () => {}, armed: true, enabled: true },
     "view.render.relief": { run: () => p.setReliefShading(!p.reliefShading), armed: p.reliefShading, enabled: true },
     "view.zoom.fit": act(() => p.onFitMap()),
     "view.zoom.selection": act(() => p.onZoomToSelection(), sel),

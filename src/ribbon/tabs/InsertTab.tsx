@@ -87,7 +87,7 @@ export default function InsertTab() {
             <CmdSetting id="insert.nature.density">
               <SliderRow label="Density" min={1} max={100} accent={ACCENT.primary} labelWidth={44} width={70}
                 value={p.treeDensity} onChange={p.setTreeDensity} format={v => `${v}%`}
-                title="Chance a given column gets a tree" />
+                title="How many columns get a tree: 100% plants about one column in five (the curve is squared, so low values stay sparse)" />
             </CmdSetting>
             <CmdSmall id="insert.nature.grassOnly" check />
           </Row>

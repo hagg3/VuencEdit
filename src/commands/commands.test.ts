@@ -50,6 +50,17 @@ describe("command registry: paths", () => {
     }
   });
 
+  it("every tab-path command is rendered in a tab, or marked paletteOnly", () => {
+    const files = import.meta.glob(["../ribbon/tabs/*.tsx", "../ribbon/*.ts", "../ribbon/*.tsx"], { query: "?raw", import: "default", eager: true }) as Record<string, string>;
+    const src = Object.values(files).join("\n");
+    const missing = COMMAND_IDS.filter(id => {
+      if (meta(id).paletteOnly || !placements(id).some(isTabPath)) return false;
+      if (id.startsWith("sculpt.tools.")) return false; // rendered from SCULPT_ALL (`sculpt.tools.${tool}`), not by literal id
+      return !src.includes(`"${id}"`);
+    });
+    expect(missing, "declare a tab path but no tab renders them: render them or set paletteOnly").toEqual([]);
+  });
+
   it("labels are unique within a group", () => {
     const seen = new Map<string, CommandId>();
     for (const id of COMMAND_IDS) {
