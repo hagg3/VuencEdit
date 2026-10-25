@@ -1,2 +1,6 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# packages/eden-format's fixture pack is pinned by SHA-256 (expected.txt included): never
+# normalise line endings in it.
+packages/eden-format/tests/fixtures/* binary

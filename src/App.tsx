@@ -3,12 +3,12 @@ import { polygonMask } from "./drawTools";
 import {
   type WorldMeta,
   decodeEditResult, decodePreviewData, decodeSelectionMask,
-  type SelectionInfo, type ClipboardInfo, type ExtrudeAxis, type AutosaveInfo, type SignInfo,
-  classifyWorldFormat,
+  type SelectionInfo, type ClipboardInfo, type ExtrudeAxis, type AutosaveInfo, type SignInfo, type RecordsInfo,
+  type PreviewData, classifyWorldFormat,
 } from "./types";
 import ExportPngModal, { type ExportPngOpts } from "./ExportPngModal";
 import { useRecentWorlds, timeAgo } from "./useRecentWorlds";
-import { useState, useCallback, useEffect, useRef, useMemo, useImperativeHandle, forwardRef, useSyncExternalStore } from "react";
+import { useState, useCallback, useEffect, useRef, useMemo, useImperativeHandle, forwardRef, useSyncExternalStore, lazy, Suspense } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getVersion } from "@tauri-apps/api/app";
@@ -16,7 +16,7 @@ import { open, save } from "@tauri-apps/plugin-dialog";
 import ConfirmHost, { confirmDialog, useConfirmOpen } from "./ui/confirm";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import MapCanvas, { KEY_ZOOM_STEP, TOOL_LABELS, TOOL_HINTS, TOOL_ICON, TOOL_FAMILY, type Tool, type ToolFamily, type SelectionBounds, type MapCanvasRef, type MaterializeSelectionBounds } from "./MapCanvas";
+import MapCanvas, { KEY_ZOOM_STEP, TOOL_LABELS, TOOL_HINTS, TOOL_ICON, TOOL_FAMILY, isSculptTool, type Tool, type ToolFamily, type SelectionBounds, type MapCanvasRef, type MaterializeSelectionBounds } from "./MapCanvas";
 import MaterializeModal from "./MaterializeModal";
 import GoToModal from "./GoToModal";
 import Sidebar, { type SidebarTab } from "./Sidebar";
@@ -38,7 +38,8 @@ import {
   subscribe as subscribeWindows, toggleWin,
 } from "./windows/useWindowLayout";
 import { normalizePath, worldIdentity } from "./windows/windowStorage";
-import FlyView3D, { type Sky3dPrefs, type FlyView3DRef, type Overlay3D, type Interact3D, type GpuInfo, RD_MIN } from "./FlyView3D";
+import type { Sky3dPrefs, FlyView3DRef, Overlay3D, Interact3D, GpuInfo } from "./FlyView3D";
+import { RD_MIN } from "./renderDistance";
 import { bumpPerf, recordRafMs, recordLagMs } from "./perfCounters";
 import ErrorBoundary from "./ErrorBoundary";
 import PanelBoundary from "./PanelBoundary";
@@ -60,7 +61,7 @@ import Ribbon, { ribbonHeight, EDEN_TEAL, type RibbonTab, type MapViewMode } fro
 import QuickActionsBar, { QUICK_ACTIONS_BAR_H } from "./QuickActionsBar";
 import SettingsModal, { loadSettings, saveSettings, MEMORY_PRESETS, DEFAULTS as SETTINGS_DEFAULTS, deviceAwareDefaultMemoryBudget, type AppSettings, type SettingsTab } from "./SettingsModal";
 import WorldInfoModal from "./WorldInfoModal";
-import RecoveryModal from "./RecoveryModal";
+import RecoveryModal, { recoveryBasePath } from "./RecoveryModal";
 import { resolvePrefabDir } from "./PrefabLibraryPanel";
 import { MODAL_TEXT, recessedWell } from "./designTokens";
 import { Icon, type IconName } from "./ribbon/icons";
@@ -155,6 +156,9 @@ type WorldOpenOpts = { skipRecent?: boolean; fresh?: boolean };
 type ToastKind = "info" | "error";
 type Toast = { id: number; text: string; kind: ToastKind };
 const INFO_TOAST_MS = 2500;
+/** Paste-ghost pixel budget (18.3 follow-up): 1:1 up to ≈ 2896² px. Mirrors lib.rs's
+ *  `CLIPBOARD_GHOST_MAX_PX` — see there for why it's a budget (~3 resident copies of the image). */
+const CLIPBOARD_GHOST_MAX_PX = 8 * 1024 * 1024;
 const ERROR_TOAST_MS = 8000;
 const MAX_TOASTS = 4;
 /** Default top of the selection z range (64 layers). Keeps 256z worlds from selecting 4× the voxels by default. */
@@ -166,8 +170,8 @@ const SCULPT_GESTURE_IDLE_MS = 400;
 /** Stable empty array for the sign-marker prop — a fresh `[]` each render would churn MapCanvas's
  *  prop-mirroring effects on every App re-render (cursor ticks, FPS, …). */
 const NO_SIGNS: SignInfo[] = [];
-/** Zoom (px per world block) the map is taken to when focusing a sign from the Inspector — enough
- *  to read the sign's immediate surroundings, not so close that you lose the neighbourhood. */
+/** Zoom (px per world block) the map is taken to by the World tab's "Go to" (a sign or a place) —
+ *  enough to read the immediate surroundings, not so close that you lose the neighbourhood. */
 const SIGN_FOCUS_SCALE = 8;
 // Hotbar state/persistence moved to `useHotbar()` (Stage 14.5, `src/hotbar/useHotbar.ts`) —
 // verbatim, same localStorage keys, no fork.
@@ -295,8 +299,8 @@ function SplashLink({ href, children }: { href: string; children: React.ReactNod
 // Self-contained FPS meter: owns its rAF loop and 1 Hz state update so the
 // per-second re-render stays inside this leaf instead of cascading from App.
 /**
- * The single modal overlay every long-running operation shares (audit C6/M14) — PNG/OBJ/JSON/VOX
- * export, full save and compressed save, plus the world-load spinner when `op` is null.
+ * The single modal overlay every long-running operation shares (audit C6/M14) — PNG export,
+ * full save and compressed save, plus the world-load spinner when `op` is null.
  *
  * It replaced four hand-rolled overlays that between them offered six different levels of feedback
  * (a percentage bar, an indeterminate shimmer, two static "Exporting X…" labels) and no Cancel at
@@ -549,24 +553,31 @@ const SelStatusHud = forwardRef<SelStatusHudHandle, { selection: SelectionInfo |
   }
 );
 
+// 23.11: the 3D pane (FlyView3D is three.js's only importer) is its own chunk, so the welcome screen
+// doesn't parse three.js before first paint. Opening a world prefetches it (below), so the first
+// 3D toggle doesn't wait on it either. A failed load surfaces through the pane's ErrorBoundary.
+const loadFlyView3D = () => import("./FlyView3D");
+const FlyView3D = lazy(loadFlyView3D);
+
 function App() {
   bumpPerf("appRenders");
   const [world, setWorld] = useState<WorldMeta | null>(null);
+  const worldOpen = world != null;
+  useEffect(() => {
+    if (!worldOpen) return;
+    const t = setTimeout(() => { void loadFlyView3D(); }, 0);
+    return () => clearTimeout(t);
+  }, [worldOpen]);
   // Live mirror of `world` for []-memoized callbacks (undo/redo → applyEditResult).
   const worldRef = useRef<WorldMeta | null>(null);
   useEffect(() => { worldRef.current = world; }, [world]);
   // Monotonically increments only on full world load; triggers view+selection reset in MapCanvas.
   const [worldEpoch, setWorldEpoch] = useState(0);
   const mapCanvasRef = useRef<MapCanvasRef>(null);
-  // Inspector ▸ SIGNS row click: centre the 2D map on the sign and zoom in far enough to read its
-  // surroundings, without ever zooming back out from a closer view (see MapCanvasRef.focusOn).
-  const focusOnSign = useCallback((s: SignInfo) => {
-    mapCanvasRef.current?.focusOn(s.x, s.y, SIGN_FOCUS_SCALE);
-  }, []);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
-  /// Audit C6/M14 — one piece of state for every long-running backend operation (PNG/OBJ/JSON/VOX
-  /// export, full save, compressed save), fed by the shared `long-op` event. Replaces the six
+  /// Audit C6/M14 — one piece of state for every long-running backend operation (PNG export,
+  /// full save, compressed save), fed by the shared `long-op` event. Replaces the six
   /// booleans and two bespoke progress shapes these used to need, and the four hand-rolled
   /// overlays that read them.
   const [longOp, setLongOp] = useState<LongOpState | null>(null);
@@ -611,7 +622,7 @@ function App() {
   // `<html data-motion>`, which is the one thing every motion-gated CSS rule in the app reads.
   const [motion, setMotion] = useState<AppSettings["motion"]>(() => loadSettings().motion);
   useMotionPref(motion);
-  // Docked right sidebar (Inspector/Prefabs/History) — see Sidebar.tsx. Width persists via
+  // Docked right sidebar (World/Prefabs/History) — see Sidebar.tsx. Width persists via
   // the same debounced-localStorage pattern as other drag-driven values (see saveSettingsDebounced).
   const [sidebarOpen, setSidebarOpen] = useState(() => loadSettings().sidebarOpen);
   const [sidebarWidth, setSidebarWidth] = useState(() => loadSettings().sidebarWidth);
@@ -816,6 +827,9 @@ function App() {
   // The ONE definition of "the 3D view is on screen" (layoutState.ts): overlays, the mode reset, the
   // context menu's camera commands, … all read it.
   const pane3dLive = computePane3dLive(layoutInputs);
+  // Live mirror for `goTo` (below), which is []-memoized so the sidebar's props stay stable.
+  const pane3dLiveRef = useRef(pane3dLive);
+  useEffect(() => { pane3dLiveRef.current = pane3dLive; }, [pane3dLive]);
   const placement = computePlacement(layoutInputs);
   const swapped = layoutInputs.swapped;
   // Map and FlyView3D are each rendered ONCE into a detached host node and *moved* between the main
@@ -906,7 +920,7 @@ function App() {
   const [sunT, setSunT] = useState(() => loadSettings().sunT);
   // Lamp light radius (blocks) for night lighting. Same committed-only pattern as sunT.
   const [lampRadius, setLampRadius] = useState(() => loadSettings().lampRadius);
-  // Legacy vs Modern/New Dawn lamp falloff (see FlyView3D's LightingProfile / export.rs's
+  // Legacy vs Modern/New Dawn lamp falloff (see FlyView3D's LightingProfile / voxel-core's
   // LightingProfile). Independent of lampRadius — the profile picks the falloff curve *and* the
   // radius a switch snaps to; the slider can still override the radius afterward.
   const [lightingProfile, setLightingProfile] = useState<"legacy" | "modern">(() => loadSettings().lightingProfile);
@@ -1077,6 +1091,25 @@ function App() {
   // (flips false→true once) purely to gate the "Centre Map on 3D Camera" context-menu item.
   const cam3dPosRef = useRef<{ x: number; y: number } | null>(null);
   const [hasCam3dPos, setHasCam3dPos] = useState(false);
+  // Sidebar ▸ World "Go to" (24.1) — a sign, Home, Start. Centres the 2D map and zooms in far
+  // enough to read the surroundings, never back out from a closer view (MapCanvasRef.focusOn);
+  // when the 3D view is live, also aims its camera at the same block. A known block layer (`z`, a
+  // sign's) is used as-is; otherwise the column's surface is looked up live, since the header's
+  // stored heights go stale as soon as the terrain under them is edited. No surface (an empty
+  // column, or the lookup failed) falls back to a plain same-height teleport.
+  const goTo = useCallback((x: number, y: number, z?: number) => {
+    mapCanvasRef.current?.focusOn(x, y, SIGN_FOCUS_SCALE);
+    if (!pane3dLiveRef.current) return;
+    if (z !== undefined) { flyView3dRef.current?.teleport(x, y, z); return; }
+    invoke<number | null>("get_surface_z", { x: Math.floor(x), y: Math.floor(y) })
+      .then((sz) => flyView3dRef.current?.teleport(x, y, sz ?? undefined))
+      .catch(() => flyView3dRef.current?.teleport(x, y));
+  }, []);
+  const viewCenter = useCallback(() => mapCanvasRef.current?.viewCenter() ?? null, []);
+  const centreOnCam3d = useCallback(() => {
+    const cp = cam3dPosRef.current;
+    if (cp) mapCanvasRef.current?.centerOn(cp.x, cp.y);
+  }, []);
   const [showWorldBrowser, setShowWorldBrowser] = useState(false);
   const [showUploadModal, setShowUploadModal] = useState(false);
   const [showNewWorld, setShowNewWorld] = useState(false);
@@ -1223,9 +1256,9 @@ function App() {
   const [arraySpacingX, setArraySpacingX] = useState(0);
   const [arraySpacingY, setArraySpacingY] = useState(0);
 
-  const [clipboardPreviewPixels, setClipboardPreviewPixels] = useState<{ width: number; height: number; pixels: Uint8Array } | null>(null);
+  const [clipboardPreviewPixels, setClipboardPreviewPixels] = useState<PreviewData | null>(null);
 
-  // Tree generation state (lifted from SelectionInspector so Ribbon can render the tree UI)
+  // Tree generation state (lifted from the old SelectionInspector so Ribbon can render the tree UI)
   const [treeTypes, setTreeTypes] = useState<string[]>(["normal"]);
   const [treeDensity, setTreeDensity] = useState(20);
   const [leafPaints, setLeafPaints] = useState<number[]>([0, 22, 31, 40]);
@@ -1243,8 +1276,6 @@ function App() {
   const [lastPasteDelta, setLastPasteDelta] = useState<{ dx: number; dy: number } | null>(null);
   const lastPastePosRef   = useRef<{ x: number; y: number } | null>(null);
   const lastPasteDeltaRef = useRef<{ dx: number; dy: number } | null>(null);
-
-  // Creature viewer (Phase 6) — UI + state hidden pending testing; Rust get_creatures command is implemented
 
   // Z-slice follow-surface mode
   const [followSurface, setFollowSurface] = useState(false);
@@ -1545,12 +1576,14 @@ function App() {
   }, [hasSelectionMask, rawBounds]);
 
   // Fetch top-down clipboard preview whenever clipboard changes.
-  // Row 18.3: this is the ONE owner of the clipboard preview. It is LOD-bounded (≤512 px long
-  // side) and shared by the Clipboard ribbon tab, the Inspector and the map ghost.
+  // Row 18.3: this is the ONE owner of the clipboard preview, shared by the Clipboard ribbon tab
+  // (drawn scaled down) and the map ghost. It's bounded by a pixel budget, not a long-side cap:
+  // users line the ghost up block-for-block against terrain, so it stays 1:1 up to
+  // CLIPBOARD_GHOST_MAX_PX and only downsamples beyond it (the ghost then shows a "1:N" tag).
   useEffect(() => {
     if (!clipboard) { setClipboardPreviewPixels(null); return; }
     let stale = false;
-    invoke<ArrayBuffer>("render_clipboard_preview", { maxSide: 512 })
+    invoke<ArrayBuffer>("render_clipboard_preview", { maxPixels: CLIPBOARD_GHOST_MAX_PX })
       .then(buf => { if (!stale) setClipboardPreviewPixels(decodePreviewData(buf)); })
       .catch(() => { if (!stale) setClipboardPreviewPixels(null); });
     return () => { stale = true; };
@@ -1709,7 +1742,7 @@ function App() {
 
   async function openFile() {
     const selected = await open({
-      filters: [{ name: "Eden World", extensions: ["eden", "zip"] }],
+      filters: [{ name: "Eden World", extensions: ["eden", "zip", "emod"] }],
       multiple: false,
     });
     if (!selected || typeof selected !== "string") return;
@@ -1753,19 +1786,31 @@ function App() {
       .then(pos => setPlayerPos(pos ? { px: pos[0], py: pos[1] } : null))
       .catch(() => setPlayerPos(null));
     setShowSigns(true); // markers default back on for every newly opened world
-    invoke<SignInfo[]>("get_signs")
-      .then(setSigns)
+    invoke<RecordsInfo>("get_records")
+      .then(r => setSigns(r.signs))
       .catch(() => setSigns([]));
-    // Sidecar signs are read-only *and* untravelled: nothing in VuencEdit writes a sidecar, so a
-    // Save As / Upload / compressed save of this world silently drops them. Warn once, on load,
-    // rather than at save time — by then the user has already chosen a destination.
-    if (data.signs_from_sidecar) {
-      pushToast(
-        "This world's signs are in a separate signs_….eden.dat file. "
-        + "VuencEdit can't write it, so Save As, Upload and compressed saves drop the signs. "
-        + "Keep that file next to the world.",
-        "error",
-      );
+    // 27.0b: the game's sidecar files were adopted into the world (the world's own records win per
+    // kind). Nothing is unsaved yet; the next save writes them in and retires the side files.
+    const { signs: adoptedSigns, cmds: adoptedCmds } = data.records_adopted;
+    if (adoptedSigns + adoptedCmds > 0) {
+      const parts = [
+        adoptedSigns > 0 ? `${adoptedSigns} sign${adoptedSigns === 1 ? "" : "s"}` : "",
+        adoptedCmds > 0 ? `${adoptedCmds} command block${adoptedCmds === 1 ? "" : "s"}` : "",
+      ].filter(Boolean).join(" and ");
+      showToast(`Brought ${parts} in from the game's side files. They'll be saved into this world.`);
+    }
+    // Stage 26.4/26.5: an `.emod` opens through a private `.eden` copy and Save appends back to
+    // it; the game itself can't open `.emod`, so say where a playable copy comes from.
+    if (data.container === "emod") {
+      if (data.emod_damage.length > 0) {
+        pushToast(
+          `This .emod file has damaged records (${data.emod_damage.length}). What could be read is shown; `
+          + "unreadable chunks show as air. Saving keeps the damaged records; Save As makes a clean .eden copy.",
+          "error",
+        );
+      } else {
+        showToast("Opened an Emod world. Save writes back to the .emod; Save As makes a .eden copy for the game.");
+      }
     }
     if (path && !opts?.skipRecent) addRecentWorld(path, data.name);
     lastAutosavedEpochRef.current = editEpochRef.current;
@@ -1805,7 +1850,7 @@ function App() {
   async function openRecent(path: string) {
     if (fileOpBusy()) return;
     let exists = true;
-    try { exists = await invoke<boolean>("prefab_exists", { path }); } catch { /* let the load report it */ }
+    try { exists = await invoke<boolean>("path_exists", { path }); } catch { /* let the load report it */ }
     if (!exists) {
       const remove = await confirmDialog(
         `${path} no longer exists (moved, renamed or deleted). Remove it from Recent Worlds?`,
@@ -2194,8 +2239,7 @@ function App() {
   async function handleDrawStroke(pts: [number, number][], zOverride: number | null, anchor?: [number, number], grabDelta?: number, groupId?: number, smear?: [number, number]) {
     const t = appToolRef.current;
     try {
-      if (t === "smooth" || t === "noise" || t === "flatten" || t === "thermal" || t === "hydro" || t === "stamp" || t === "grab" || t === "raise" || t === "lower"
-          || t === "terrace" || t === "sharpen" || t === "slope" || t === "smear" || t === "rock" || t === "carve") {
+      if (isSculptTool(t)) {
         await applySculpt({
           points: pts.map(([x, y]) => ({ x, y })),
           anchor, grabDelta, groupId, smear, tool: t,
@@ -2369,9 +2413,7 @@ function App() {
   useEffect(() => {
     if (mode3d !== "sculpt") return;
     const t = appToolRef.current;
-    const isSculpt = t === "smooth" || t === "noise" || t === "flatten" ||
-      t === "thermal" || t === "hydro" || t === "stamp" || t === "grab" || t === "raise" || t === "lower" ||
-      t === "terrace" || t === "sharpen" || t === "slope" || t === "smear" || t === "rock" || t === "carve";
+    const isSculpt = isSculptTool(t);
     if (!isSculpt) setTool("raise");
   }, [mode3d]);
 
@@ -2587,7 +2629,8 @@ function App() {
   const saveWorldAs = useCallback(async () => {
     const chosen = await save({
       filters: [{ name: "Eden World", extensions: ["eden", "zip"] }],
-      defaultPath: sourcePath ?? undefined,
+      // An `.emod` source suggests the same name as a `.eden` (never write `.eden` bytes to `.emod`).
+      defaultPath: sourcePath?.replace(/\.emod$/i, ".eden") ?? undefined,
     });
     if (!chosen) return;
     // Save As is a fresh path choice — silently correct the extension to match the compressed
@@ -2595,12 +2638,12 @@ function App() {
     const dot = chosen.lastIndexOf(".");
     const ext = dot >= 0 ? chosen.slice(dot + 1).toLowerCase() : "";
     const expectedExt = saveCompressed ? "zip" : "eden";
-    const finalPath = (ext === "eden" || ext === "zip") && ext !== expectedExt
+    const finalPath = (ext === "eden" || ext === "zip" || ext === "emod") && ext !== expectedExt
       ? `${chosen.slice(0, dot)}.${expectedExt}`
       : chosen;
     // The native Save dialog only confirmed overwrite for `chosen` — if extension correction
     // above rewrote the path, `finalPath` names a different file the user never confirmed.
-    if (finalPath !== chosen && await invoke<boolean>("prefab_exists", { path: finalPath })) {
+    if (finalPath !== chosen && await invoke<boolean>("path_exists", { path: finalPath })) {
       const ok = await confirmDialog(
         `${finalPath.slice(finalPath.lastIndexOf("/") + 1)} already exists. Overwrite it?`,
         { title: "Confirm overwrite", kind: "danger", okLabel: "Overwrite" },
@@ -2610,6 +2653,8 @@ function App() {
     const ok = await saveWorld(finalPath);
     if (ok) {
       setSourcePath(finalPath);
+      // Save As `.eden` from an `.emod` session leaves `.emod` mode (the backend drops the session).
+      setWorld(w => w && w.container === "emod" ? { ...w, container: "eden", emod_damage: [] } : w);
       addRecentWorld(finalPath, finalPath.split(/[\\/]/).pop()!.replace(/\.(eden|zip)$/i, ""));
       saveWindowLayoutAs(normalizePath(finalPath, IS_WINDOWS)!); // the copy inherits the window layout
     }
@@ -2629,6 +2674,15 @@ function App() {
   // the close/quit/open-new-world guards use, offering a Save first.
   const requestShowUploadModal = useCallback(async (v: boolean) => {
     if (!v) { setShowUploadModal(false); return; }
+    // Stage 26.4: uploads send the file on disk, and the servers take `.eden` only.
+    if (sourcePath && /\.emod$/i.test(sourcePath)) {
+      const ok = await confirmDialog(
+        "The world servers only accept .eden files. Save a .eden copy of this Emod world first?",
+        { title: "Save as .eden", icon: "save", okLabel: "Save As…", cancelLabel: "Cancel" },
+      );
+      if (ok) await saveWorldAs();
+      return;
+    }
     if (isDirty()) {
       const ok = await confirmDialog(
         "You have unsaved changes. Uploading now would send the last saved version, not your current edits. Save first?",
@@ -2718,17 +2772,15 @@ function App() {
     if (!recoveryInfo) return;
     setRecovering(true);
     try {
-      if (recoveryInfo.format >= 1) {
-        // Base+journal recovery doesn't go through load_world at all — the sidecars aren't a
-        // loadable file on their own, so this resolves and replays them directly.
-        const data = await invoke<WorldMeta>("load_autosave");
-        applyLoadedWorld(data, recoveryInfo.source_path ?? null, { skipRecent: true });
-      } else {
-        const autosavePath = await invoke<string>("get_autosave_path");
-        await openFileAt(autosavePath, { skipRecent: true });
-        setSourcePath(recoveryInfo.source_path ?? null);
-        await invoke("release_autosave_hold"); // load_world doesn't know about the 21.5 hold
-      }
+      // Base+journal recovery doesn't go through load_world at all — the sidecars aren't a
+      // loadable file on their own, so this resolves and replays them directly.
+      const data = await invoke<WorldMeta>("load_autosave");
+      // Stage 26.6: an `.emod` autosave recovered as a copy (another program saved the file since)
+      // isn't that `.emod` session any more, so it opens unsaved and ⌘S asks for a `.eden` name.
+      const src = recoveryInfo.source_path ?? null;
+      const asCopy = data.container !== "emod" && !!src && /\.emod$/i.test(src);
+      applyLoadedWorld(data, asCopy ? null : src, { skipRecent: true });
+      if (asCopy) showToast("Recovered as an unsaved copy. Use Save As to keep it as a .eden file.");
       // The recovery path above marks the freshly-loaded autosave "clean" (savedEpochRef = current
       // edit epoch), but the in-memory world differs from the file at sourcePath — nothing has
       // actually been saved there yet. Force dirty so the close/quit prompt guards this until a
@@ -2750,7 +2802,7 @@ function App() {
   // The autosave builds on a world file that was saved or changed after it (18.9 `base_status`
   // "changed"): it can never be applied, so drop it and open the file itself.
   async function openRecoveryBase() {
-    const path = recoveryInfo?.base?.kind === "source" ? recoveryInfo.base.path : recoveryInfo?.source_path;
+    const path = (recoveryInfo && recoveryBasePath(recoveryInfo)) ?? recoveryInfo?.source_path;
     try { await invoke("discard_autosave", { decided: true }); } catch { /* best effort */ }
     setRecoveryInfo(null);
     if (path) await openFileAt(path);
@@ -2924,9 +2976,7 @@ function App() {
         }
         const t = appToolRef.current;
         if (t === "paste" || t === "wand" || t === "lasso" || t === "polyselect" || t === "pen" || t === "brush" || t === "spray" || t === "line" || t === "rect" || t === "ellipse" || t === "polygon" ||
-            t === "smooth" || t === "noise" || t === "flatten" || t === "thermal" ||
-            t === "hydro" || t === "stamp" || t === "grab" || t === "raise" || t === "lower" ||
-            t === "terrace" || t === "sharpen" || t === "slope" || t === "smear" || t === "rock" || t === "carve" || t === "fill" || t === "eyedropper" || t === "poolfill") {
+            isSculptTool(t) || t === "fill" || t === "eyedropper" || t === "poolfill") {
           e.preventDefault();
           setTool("pan");
         } else {
@@ -3020,9 +3070,7 @@ function App() {
         // Sculpt radius/strength: `[`/`]` resize the brush, Shift+`[`/`]` adjusts strength instead.
         // Brackets avoid every wheel conflict (wheel is zoom on the map, fly-speed in the 3D pane).
         const st = appToolRef.current;
-        const isSculptToolKey = st === "smooth" || st === "noise" || st === "flatten" ||
-          st === "thermal" || st === "hydro" || st === "stamp" || st === "grab" || st === "raise" || st === "lower" ||
-          st === "terrace" || st === "sharpen" || st === "slope" || st === "smear" || st === "rock" || st === "carve";
+        const isSculptToolKey = isSculptTool(st);
         // Shift+[ / Shift+] arrive as "{" / "}" on US-style layouts — matching only "[" / "]" meant
         // the strength half of this shortcut never fired there.
         const bracket = e.key === "[" || e.key === "{" ? -1 : e.key === "]" || e.key === "}" ? 1 : 0;
@@ -3243,7 +3291,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
     try {
       const dir = await resolvePrefabDir();
       if (dir) {
-        for (let n = 2; n < 1000 && await invoke<boolean>("prefab_exists", { path: `${dir}/${name.replace(/[/\\]/g, "_")}.epfab` }); n++) {
+        for (let n = 2; n < 1000 && await invoke<boolean>("path_exists", { path: `${dir}/${name.replace(/[/\\]/g, "_")}.epfab` }); n++) {
           name = `${base} ${n}`;
         }
       }
@@ -3264,7 +3312,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
       const path = `${dir}/${safe}.epfab`;
       // First attempt: warn (don't save) if a prefab with this name already exists. A second click
       // (prefabOverwrite armed) confirms the overwrite. Editing the name re-arms the guard.
-      if (!prefabOverwrite && await invoke<boolean>("prefab_exists", { path })) {
+      if (!prefabOverwrite && await invoke<boolean>("path_exists", { path })) {
         setPrefabOverwrite(true);
         return;
       }
@@ -3409,7 +3457,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
     const win = getCurrentWindow();
     const unlisten = win.onDragDropEvent((event) => {
       if (event.payload.type !== "drop") return;
-      const path = event.payload.paths.find((p) => /\.(eden|zip)$/i.test(p));
+      const path = event.payload.paths.find((p) => /\.(eden|zip|emod)$/i.test(p));
       if (!path) {
         // 22.8: a dropped prefab goes straight onto the clipboard in paste mode (needs a world to paste into).
         const prefab = event.payload.paths.find((p) => /\.epfab$/i.test(p));
@@ -3418,7 +3466,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           else void loadPrefabAtRef.current(prefab);
           return;
         }
-        showToast("Drop a .eden or .zip world file to open it (or a .epfab prefab to paste).");
+        showToast("Drop a .eden, .zip or .emod world file to open it (or a .epfab prefab to paste).");
         return;
       }
       void openFileAtRef.current(path);
@@ -3506,8 +3554,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
     pasteOn: winKey[6] === "1", selOn: winKey[7] === "1",
   });
 
-  const isSculptTool = tool === "smooth" || tool === "noise" || tool === "flatten" || tool === "thermal" || tool === "hydro" || tool === "stamp" || tool === "grab" || tool === "raise" || tool === "lower" || tool === "terrace" || tool === "sharpen" || tool === "slope" || tool === "smear" || tool === "rock" || tool === "carve";
-  const isDrawTool = tool === "pen" || tool === "brush" || tool === "spray" || tool === "line" || tool === "rect" || tool === "ellipse" || tool === "polygon" || isSculptTool || tool === "fill";
+  const isSculptToolArmed = isSculptTool(tool);
 
   const mapPaneEl = world ? (
     <MapCanvas
@@ -3549,7 +3596,6 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
       selectionMask={selectionMaskOverlay}
       spawnPos={spawnPos}
       playerPos={playerPos}
-      creatures={[]}
       signs={showSigns ? signs : NO_SIGNS}
       pasteElevationOffset={pasteElevationOffset}
       onEyedropper={handleEyedropper}
@@ -3875,6 +3921,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
         {mounted3d && (
           <InPortal node={flyHost}>
             <ErrorBoundary label="3D view">
+            <Suspense fallback={null}>
             <FlyView3D
               ref={flyView3dRef}
               world={world}
@@ -3962,6 +4009,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
               showPerfHud={showPerfHud}
               onHotbarSelect={(type, paint) => { setFillBlockType(type); setFillPaint(paint); }}
             />
+            </Suspense>
             </ErrorBoundary>
           </InPortal>
         )}
@@ -3996,8 +4044,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           onRenameBlur={onRenameBlur}
           tool={tool}
           setTool={setTool}
-          isDrawTool={isDrawTool}
-          isSculptTool={isSculptTool}
+          isSculptTool={isSculptToolArmed}
           wandMatchPaint={wandMatchPaint}
           setWandMatchPaint={setWandMatchPaint}
           materializeSelection={materializeSelection}
@@ -4241,7 +4288,6 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           setExtrudeCount={setExtrudeCount}
           extrudeAxis={extrudeAxis}
           setExtrudeAxis={setExtrudeAxis}
-          extrudeOpen={extrudeOpen}
           setExtrudeOpen={setExtrudeOpen}
           onExtrude={handleExtrude}
           treeTypes={treeTypes}
@@ -4276,7 +4322,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
         </ErrorBoundary>
 
 
-        {/* Docked right sidebar: Inspector / Prefabs / History tabs — see Sidebar.tsx. */}
+        {/* Docked right sidebar: World / Prefabs / History tabs — see Sidebar.tsx. */}
         <PanelBoundary label="Sidebar" kind="dock" topPx={effectiveRibbonHeight}>
         <Sidebar
           open={sidebarOpen}
@@ -4288,15 +4334,19 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           topPx={effectiveRibbonHeight}
           bottomPx={STATUS_BAR_HEIGHT}
           selection={selection}
-          clipboard={clipboard}
-          clipboardPreview={clipboardPreviewPixels}
           onArmPaste={(info) => { setClipboard(info); setTool("paste"); }}
           onSavePrefabAs={savePrefabAs}
           prefabRefreshToken={prefabRefreshToken}
           editEpoch={editEpoch}
           worldEpoch={worldEpoch}
           signs={signs}
-          onSignClick={focusOnSign}
+          spawnPos={spawnPos}
+          playerPos={playerPos}
+          onGoTo={goTo}
+          viewCenter={viewCenter}
+          cam3dAvailable={pane3dLive && hasCam3dPos}
+          onCentreOnCam3d={centreOnCam3d}
+          worldKey={normalizePath(sourcePath, IS_WINDOWS)}
         />
         </PanelBoundary>
 
@@ -4422,8 +4472,6 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           /></PanelBoundary>
         )}
         <ConfirmHost />
-
-        {/* Sky Editor and Creature Viewer panels — implemented, hidden pending testing */}
 
         {goToFrom && world && (
           <PanelBoundary kind="dialog" label="Go to X, Y" onClose={() => setGoToFrom(null)}><GoToModal

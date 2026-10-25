@@ -2656,18 +2656,25 @@ pub(crate) fn tg2_make_mix(g: &mut Tg2Grid, noise: &ClassicNoise, seed: f64, see
 // Flush TG2 flat grid → WorldGen chunk storage, emitting progress per x-slice.
 pub(crate) fn tg2_flush(g: &Tg2Grid, gen: &mut WorldGen, report: &mut dyn FnMut(&str, f32)) {
     let gs=g.gsize;
-    for x in 0..gs {
-        if x % 32 == 0 {
-            if gen_cancelled() { return; }
-            report("Writing chunks", 0.84 + 0.12 * x as f32 / gs as f32);
-        }
-        for z in 0..gs { for y in 0..g.t_height {
-            let i=g.idx(x,z,y);
-            let bt=g.blockz[i]; if bt==0 { continue; }
-            let paint=g.colorz[i];
-            gen.set(x as i32,z as i32,y as i32,bt);
-            if paint!=0 { gen.set_paint(x as i32,z as i32,y as i32,paint); }
-        }}
+    let (wc,hc)=(gen.wc,gen.hc);
+    let th=g.t_height.min(gen.t_height);
+    // Chunk rows (cy) are independent; each worker owns whole chunks, so the
+    // writes are disjoint. Cancel/progress stay on the calling thread between rows.
+    for (cy,row) in gen.chunks.chunks_mut(wc).enumerate().take(hc) {
+        if gen_cancelled() { return; }
+        report("Writing chunks", 0.84 + 0.12 * (cy * 16) as f32 / (hc * 16).max(1) as f32);
+        row.par_iter_mut().enumerate().for_each(|(cx,chunk)| {
+            for lx in 0..16usize { for ly in 0..16usize {
+                let (x,z)=(cx*16+lx, cy*16+ly);
+                if x>=gs || z>=gs { continue; }
+                for y in 0..th {
+                    let i=g.idx(x,z,y);
+                    let bt=g.blockz[i]; if bt==0 { continue; }
+                    chunk_set(chunk,lx,ly,y,bt);
+                    chunk_set_paint(chunk,lx,ly,y,g.colorz[i]);
+                }
+            }}
+        });
     }
 }
 
@@ -2773,37 +2780,69 @@ pub(crate) fn tg2_blend_seams(g: &mut Tg2Grid, noise: &ClassicNoise, seed: f64, 
     // smoothed band wanders organically instead of tracing the straight zone grid.
     let radius=((g.vs*2.0).round() as i32).clamp(2,5);
     let warp_amp=radius as f64*1.5;
+    // The warp depends only on (x,z) — not on the iteration — so sample it once
+    // (2 × 10-octave fbm per column) instead of once per iteration.
+    let warp: Vec<(i32,i32)> = (0..gs*gs).into_par_iter().map(|i| {
+        let (x,z)=(i/gs,i%gs);
+        let wx=x+(tg2_fbm2(noise,x,z,seed+700.0,1.0,warp_amp,1.0).round() as i32).clamp(-radius*2,radius*2);
+        let wz=z+(tg2_fbm2(noise,z,x,seed+811.0,1.0,warp_amp,1.0).round() as i32).clamp(-radius*2,radius*2);
+        (wx,wz)
+    }).collect();
+    // Summed-area tables (stride gs+1) of height and count over natural columns.
+    let stride=(gs+1) as usize;
+    let mut sat_h=vec![0i64; stride*stride];
+    let mut sat_c=vec![0i32; stride*stride];
     for _ in 0..iters.max(1) {
+        // Rebuild the SATs from the current snapshot.
+        for x in 0..gs as usize { for z in 0..gs as usize {
+            let (h,bt,_)=surf[x*gs as usize+z];
+            let (hv,cv)=if h>=1 && natural(bt) {(h as i64,1)} else {(0,0)};
+            let i=(x+1)*stride+z+1;
+            sat_h[i]=hv+sat_h[i-stride]+sat_h[i-1]-sat_h[i-stride-1];
+            sat_c[i]=cv+sat_c[i-stride]+sat_c[i-1]-sat_c[i-stride-1];
+        }}
         // Pass 1: compute the warped, box-blurred target height + a dithered
         // surface paint for every natural column from the current snapshot.
-        let mut plan: Vec<(i32,i32,i32,u8,u8)> = Vec::new(); // (x,z,target_h,bt,paint)
-        for x in 0..gs { for z in 0..gs {
-            let (h,bt,_)=surf[sidx(x,z)];
-            if h<1 || !natural(bt) { continue; }
-            // Warp the kernel centre with low-frequency noise → wavy seams.
-            let wx=x+(tg2_fbm2(noise,x,z,seed+700.0,1.0,warp_amp,1.0).round() as i32).clamp(-radius*2,radius*2);
-            let wz=z+(tg2_fbm2(noise,z,x,seed+811.0,1.0,warp_amp,1.0).round() as i32).clamp(-radius*2,radius*2);
-            let (mut hsum,mut hcnt)=(0i64,0i64);
-            let mut paints: Vec<u8> = Vec::new();
-            for dx in -radius..=radius { for dz in -radius..=radius {
-                let (nx,nz)=(wx+dx,wz+dz);
-                if nx<0||nz<0||nx>=gs||nz>=gs { continue; }
-                let (nh,nbt,npt)=surf[sidx(nx,nz)];
-                if nh<1 || !natural(nbt) { continue; }
-                hsum+=nh as i64; hcnt+=1;
-                paints.push(npt);
-            }}
-            if hcnt==0 { continue; }
-            let avg=(hsum as f64/hcnt as f64).round() as i32;
-            // Move halfway toward the blurred average (both up and down).
-            let target=h+(((avg-h) as f64*0.5).round() as i32);
-            // Dithered palette blend: pick one neighbour's paint by a stable hash,
-            // so a seam between two palettes resolves to a speckled gradient rather
-            // than averaging to a meaningless third hue.
-            let hsh=((x as u32).wrapping_mul(73856093)^(z as u32).wrapping_mul(19349663)) as usize;
-            let pt=if paints.is_empty(){0}else{paints[hsh%paints.len()]};
-            plan.push((x,z,target.clamp(1,th-1),bt,pt));
-        }}
+        // Reads only the snapshot/SATs → rows are independent (rayon).
+        let surf_r=&surf; let sat_h_r=&sat_h; let sat_c_r=&sat_c; let warp_r=&warp;
+        let plan: Vec<(i32,i32,i32,u8,u8)> = (0..gs).into_par_iter().flat_map_iter(|x| {
+            (0..gs).filter_map(move |z| {
+                let (h,bt,_)=surf_r[sidx(x,z)];
+                if h<1 || !natural(bt) { return None; }
+                let (wx,wz)=warp_r[sidx(x,z)];
+                // Clip the kernel box to the grid, then query the SATs.
+                let x0=(wx-radius).max(0); let x1=(wx+radius).min(gs-1);
+                let z0=(wz-radius).max(0); let z1=(wz+radius).min(gs-1);
+                if x0>x1 || z0>z1 { return None; }
+                let q=|x0:i32,x1:i32,z0:i32,z1:i32| {
+                    let (a,b,c,d)=((x1+1) as usize*stride+(z1+1) as usize,
+                                   x0 as usize*stride+(z1+1) as usize,
+                                   (x1+1) as usize*stride+z0 as usize,
+                                   x0 as usize*stride+z0 as usize);
+                    (sat_h_r[a]-sat_h_r[b]-sat_h_r[c]+sat_h_r[d],
+                     sat_c_r[a]-sat_c_r[b]-sat_c_r[c]+sat_c_r[d])
+                };
+                let (hsum,hcnt)=q(x0,x1,z0,z1);
+                if hcnt==0 { return None; }
+                let avg=(hsum as f64/hcnt as f64).round() as i32;
+                // Move halfway toward the blurred average (both up and down).
+                let target=h+(((avg-h) as f64*0.5).round() as i32);
+                // Dithered palette blend: pick one neighbour's paint by a stable hash,
+                // so a seam between two palettes resolves to a speckled gradient rather
+                // than averaging to a meaningless third hue. The pick is the k-th
+                // natural column in (dx,dz) scan order, found without allocating.
+                let hsh=((x as u32).wrapping_mul(73856093)^(z as u32).wrapping_mul(19349663)) as usize;
+                let mut k=hsh%(hcnt as usize);
+                let mut pt=0u8;
+                'scan: for nx in x0..=x1 { for nz in z0..=z1 {
+                    let (nh,nbt,npt)=surf_r[sidx(nx,nz)];
+                    if nh<1 || !natural(nbt) { continue; }
+                    if k==0 { pt=npt; break 'scan; }
+                    k-=1;
+                }}
+                Some((x,z,target.clamp(1,th-1),bt,pt))
+            })
+        }).collect();
         if plan.is_empty() { break; }
         // Pass 2: apply. Raise by stacking the column's own material; lower by
         // carving to air. Always retint the resulting surface cell.
@@ -3044,4 +3083,74 @@ pub(crate) fn preview_tg2_world(
         }
     });
     Ok(PreviewImage{width:pw as u32,height:pw as u32,pixels})
+}
+
+#[cfg(test)]
+mod tg2_blend_tests {
+    use super::*;
+
+    /// The pre-optimisation per-column kernel scan, kept as the reference for the SAT version.
+    fn reference_blend(g: &mut Tg2Grid, noise: &ClassicNoise, seed: f64, iters: i32) {
+        let gs=g.gsize as i32; let th=g.t_height as i32;
+        let natural=|bt:u8| matches!(bt,2|3|4|8);
+        let sidx=|x:i32,z:i32| (x*gs+z) as usize;
+        let mut surf=vec![(-1i32,0u8,0u8); (gs*gs) as usize];
+        for x in 0..gs { for z in 0..gs { for y in (1..th).rev() {
+            let bt=g.get(x,z,y);
+            if bt!=0 && bt!=19 && bt!=20 && bt!=23 && bt!=15 && bt!=14 {
+                surf[sidx(x,z)]=(y,bt,g.colorz[g.idx(x as usize,z as usize,y as usize)]); break;
+            }
+        }}}
+        let radius=((g.vs*2.0).round() as i32).clamp(2,5);
+        let warp_amp=radius as f64*1.5;
+        for _ in 0..iters.max(1) {
+            let mut plan=Vec::new();
+            for x in 0..gs { for z in 0..gs {
+                let (h,bt,_)=surf[sidx(x,z)];
+                if h<1 || !natural(bt) { continue; }
+                let wx=x+(tg2_fbm2(noise,x,z,seed+700.0,1.0,warp_amp,1.0).round() as i32).clamp(-radius*2,radius*2);
+                let wz=z+(tg2_fbm2(noise,z,x,seed+811.0,1.0,warp_amp,1.0).round() as i32).clamp(-radius*2,radius*2);
+                let (mut hsum,mut hcnt)=(0i64,0i64);
+                let mut paints=Vec::new();
+                for dx in -radius..=radius { for dz in -radius..=radius {
+                    let (nx,nz)=(wx+dx,wz+dz);
+                    if nx<0||nz<0||nx>=gs||nz>=gs { continue; }
+                    let (nh,nbt,npt)=surf[sidx(nx,nz)];
+                    if nh<1 || !natural(nbt) { continue; }
+                    hsum+=nh as i64; hcnt+=1; paints.push(npt);
+                }}
+                if hcnt==0 { continue; }
+                let avg=(hsum as f64/hcnt as f64).round() as i32;
+                let target=h+(((avg-h) as f64*0.5).round() as i32);
+                let hsh=((x as u32).wrapping_mul(73856093)^(z as u32).wrapping_mul(19349663)) as usize;
+                plan.push((x,z,target.clamp(1,th-1),bt,paints[hsh%paints.len()]));
+            }}
+            if plan.is_empty() { break; }
+            for (x,z,target,bt,pt) in &plan {
+                let (h,_,_)=surf[sidx(*x,*z)];
+                if *target>h { for y in h+1..=*target { g.put(*x,*z,y,*bt,*pt); } }
+                else if *target<h { for y in *target+1..=h { g.set_bt(*x,*z,y,0); } }
+                g.put(*x,*z,*target,*bt,*pt);
+                surf[sidx(*x,*z)]=(*target,*bt,*pt);
+            }
+        }
+    }
+
+    #[test]
+    fn sat_blend_matches_reference() {
+        let seed=1234.0;
+        let noise=ClassicNoise::new(1234);
+        let mut a=Tg2Grid::new(48,32,1.0,1.0,0);
+        let mut r=Rng64::new(99);
+        for x in 0..48i32 { for z in 0..48i32 {
+            let h=6+((x*3+z*5)%9)+(r.next()%4) as i32;
+            let bt=[2u8,3,4,8,19][(r.next()%5) as usize];
+            for y in 1..=h { a.put(x,z,y,bt,(r.next()%6) as u8); }
+        }}
+        let mut b=Tg2Grid::new(48,32,1.0,1.0,0);
+        b.blockz=a.blockz.clone(); b.colorz=a.colorz.clone();
+        tg2_blend_seams(&mut a,&noise,seed,6);
+        reference_blend(&mut b,&noise,seed,6);
+        assert!(a.blockz==b.blockz && a.colorz==b.colorz);
+    }
 }

@@ -38,7 +38,9 @@ function swatchColor(b: HotbarSlot, texturePack?: AtlasData | null): { color: st
 export default function HotbarWindow({
   hotbar, fillBlockType, fillPaint, setFillBlockType, setFillPaint, texturePack,
 }: HotbarWindowProps) {
-  const { pinnedBlocks, recentBlocks, hotbarHover, setHotbarHover, pinFromRecent, unpinSlot } = hotbar;
+  const { pinnedBlocks, recentBlocks, pinFromRecent, unpinSlot } = hotbar;
+  // Local, not in `useHotbar`: slot enter/leave is pointer-rate and must not re-render App + the Ribbon.
+  const [hotbarHover, setHotbarHover] = useState<string | null>(null);
   const { togglePicker } = usePickerHost();
   const name = `${blockDisplayName(fillBlockType)}${fillPaint > 0 ? ` #${fillPaint}` : ""}`;
 

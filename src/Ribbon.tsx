@@ -250,6 +250,7 @@ export default function Ribbon(p: RibbonProps) {
     // A control that lives in a context panel (16.6) that's on screen: flash it there, expanding the
     // panel first if it was collapsed, rather than hopping to another ribbon tab.
     const m = meta(id);
+    if (m.paletteOnly) return; // declares a path but renders no control
     const panel = panelToReveal([m.path, ...(m.also ?? [])], activeTabRef.current, getWindowState().activeContext);
     if (panel) {
       collapseWin(panel, false);

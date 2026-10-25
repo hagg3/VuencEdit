@@ -6,7 +6,8 @@
 import type { ReactNode } from "react";
 import type { RibbonTab } from "../ribbon/props";
 import type { SidebarTab } from "../Sidebar";
-import { ALT, MOD, SHIFT, TEXT } from "../ribbon/tokens";
+import { ALT, MOD, SHIFT } from "../ribbon/tokens";
+import { Keycap } from "../ribbon/primitives";
 
 // ⚠ written by bump-version.sh — keep this on one line
 export const TOUR_VERSION = 4;
@@ -69,13 +70,7 @@ export const TOUR_ANCHORS = {
 const RIBBON_TABLIST = TOUR_ANCHORS.ribbonTabs;
 
 function Kbd({ children }: { children: ReactNode }) {
-  return (
-    <kbd style={{
-      fontSize: 10.5, fontFamily: "ui-monospace,'SF Mono',monospace", color: TEXT,
-      background: "rgba(255,255,255,.08)", boxShadow: "inset 0 0 0 1px rgba(255,255,255,.14)",
-      borderRadius: 3, padding: "0 4px", margin: "0 1px",
-    }}>{children}</kbd>
-  );
+  return <span style={{ margin: "0 1px" }}><Keycap text={children} small /></span>;
 }
 
 export const TOUR_STEPS: TourStep[] = [
@@ -220,7 +215,7 @@ export const TOUR_STEPS: TourStep[] = [
     title: "The sidebar",
     target: TOUR_ANCHORS.sidebar,
     before: (c) => c.setSidebarOpen(true),
-    body: "Docked to the right edge: Inspector, Prefabs and undo History, all in one tabbed panel.",
+    body: "Docked to the right edge: the World tab (selection, places, signs), Prefabs and undo History.",
   },
   {
     id: "undo",

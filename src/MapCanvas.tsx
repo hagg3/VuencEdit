@@ -1,6 +1,6 @@
 import { useEffect, useRef, useCallback, forwardRef, useImperativeHandle } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { brushFootprint, bresenhamLine, linePixels, polygonPixels, rectPixels, ellipsePixels, rectRects, ellipseFillRuns, cellKey, cellKeyX, cellKeyY, type WP, type BrushShape, type FillMode } from "./drawTools";
+import { brushFootprint, bresenhamLine, linePixels, polygonPixels, rectPixels, ellipsePixels, rectRects, ellipseFillRuns, cellKey, cellKeyX, cellKeyY, isDwellIdempotent, type WP, type BrushShape, type FillMode } from "./drawTools";
 import { type WorldMeta, type PixelPatch, decodePixelPatch } from "./types";
 import { zoomAtPoint, resizeCanvasToContainer, makeSeqGuard, putPatchPixels, beginFrame, cssWidth, cssHeight, isTypingTarget, shouldPasteOnPointerUp, chunkToWorld, worldToChunk, CHUNK_SIZE_BLOCKS, tileWindowFits } from "./viewportUtils";
 import { maskOutline, type OutlinePt } from "./maskUtils";
@@ -8,6 +8,7 @@ import { recordTileFetchMs, recordMapDrawMs, bumpPerf, perfCounters } from "./pe
 import { MAP, rgba } from "./theme/theme";
 import { sfx, type HoldHandle } from "./sound/sfx";
 import type { IconName } from "./ribbon/icons";
+import { previewCanvas } from "./previewCanvas";
 
 export type { PixelPatch } from "./types";
 
@@ -60,7 +61,7 @@ export const TOOL_FAMILY: Record<Tool, ToolFamily> = {
   select: "selection", wand: "selection", lasso: "selection", polyselect: "selection",
   // Clipboard — green.
   paste: "clipboard",
-  // Sculpt (16 tools) — warm.
+  // Sculpt (15 tools) — warm.
   smooth: "warm", noise: "warm", flatten: "warm", thermal: "warm", hydro: "warm",
   stamp: "warm", grab: "warm", raise: "warm", lower: "warm", terrace: "warm", sharpen: "warm",
   slope: "warm", smear: "warm", rock: "warm", carve: "warm",
@@ -111,6 +112,9 @@ export const TOOL_CURSOR: Record<Tool, string> = {
   slope: "crosshair", smear: "crosshair", rock: "crosshair", carve: "crosshair", fill: "crosshair", poolfill: "cell",
   materialize: "crosshair",
 };
+
+/** Every sculpt tool (the "warm" family, incl. grab). Use this, not a hand-written `||` chain: a new tool then lands in the right branch by being added to TOOL_FAMILY. */
+export const isSculptTool = (t: Tool): boolean => TOOL_FAMILY[t] === "warm";
 
 /** Sculpt tools that paint a swept disc footprint (everything except the drag-controlled "grab"). */
 const SCULPT_STROKE_TOOLS: readonly Tool[] = ["smooth", "noise", "flatten", "thermal", "hydro", "stamp", "raise", "lower", "terrace", "sharpen", "slope", "smear", "rock", "carve"];
@@ -287,7 +291,7 @@ export const KEY_ZOOM_STEP = 1.25;
 
 /** Zoom (px per world block) at and above which sign markers get their text drawn beside them. */
 const SIGN_LABEL_MIN_SCALE = 4;
-/** Longest sign label drawn on the map — the full text is always in the sidebar's Inspector tab. */
+/** Longest sign label drawn on the map — the full text is always in the sidebar's World tab. */
 const SIGN_LABEL_MAX_CHARS = 24;
 
 /** The paste ghost's current world origin and screen (viewport, client-coordinate) rect — the
@@ -323,7 +327,7 @@ export interface MapCanvasRef {
    *  gesture. Also refreshed on every pointerenter. (UI redesign r3, Stage 14.4.) */
   invalidateRect: () => void;
   /** Recentre on a world-space point and zoom *in* to at least `minScale` px/block, never out —
-   *  so clicking the same target twice is idempotent (clicking a sign in the Inspector). */
+   *  so clicking the same target twice is idempotent (clicking a sign in the World tab). */
   focusOn: (wx: number, wy: number, minScale: number) => void;
   /** Paste lens (Stage 14.9): subscribe to the paste ghost's world origin + screen rect, called from
    *  draw()'s existing ghost-box section whenever either changes (pan/zoom move the screen rect even
@@ -464,7 +468,7 @@ interface Props {
   committedSelection: SelectionBounds | null;
   onSelectionChange: (bounds: SelectionBounds | null) => void;
   pastePreview: { width: number; height: number } | null;
-  clipboardPreviewPixels: { width: number; height: number; pixels: Uint8Array } | null;
+  clipboardPreviewPixels: { width: number; height: number; lod: number; pixels: Uint8Array } | null;
   onPasteAt: (pos: { x: number; y: number }) => void;
   /** When set, the paste ghost box is fixed here (amber) instead of following the cursor (green). */
   lockedPastePos?: { x: number; y: number } | null;
@@ -503,9 +507,7 @@ interface Props {
   /** Player start position in editor pixel coords — drawn as an orange marker, distinct from the
    *  teal home marker above (they're two independent header fields; see "Set Point" in CLAUDE.md). */
   playerPos?: { px: number; py: number } | null;
-  /** Creature list from get_creatures() — drawn as coloured dots when non-empty. */
-  creatures?: { type_id: number; color: number; x: number; y: number }[];
-  /** Sign list from get_signs() (256z-format plan, Phase 4) — drawn as small markers when
+  /** Sign list from get_records() (256z-format plan, Phase 4) — drawn as small markers when
    *  non-empty. `x`/`y` are already editor-local. */
   signs?: { x: number; y: number; z: number; text: string }[];
   /** Elevation offset applied to paste (shown as label above ghost rect). */
@@ -548,7 +550,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     lockedPastePos = null,
     drawConfig, onDrawStroke, onSculptStroke, onCancelStroke, drawZOverride = null,
     extrudePreview = null, lastPasteDelta = null, onCursorMove, onMagicWand, onLassoSelect, onPolySelect, selectionMask = null,
-    spawnPos = null, playerPos = null, creatures = [], signs = [],
+    spawnPos = null, playerPos = null, signs = [],
     pasteElevationOffset = 0, onEyedropper, onPoolFillPick,
     cameraPos3d = null, onSetCamera3d,
     showTemplateOverlay = false, onMapContextMenu, onSelectDragUpdate, onSelectionCommitted, onMoveSelection, moveWithContents = false,
@@ -559,6 +561,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   const canvasRef  = useRef<HTMLCanvasElement>(null);
   const viewRef    = useRef({ x: 0, y: 0, scale: 2 });
   const clipboardImgRef = useRef<HTMLCanvasElement | null>(null);
+  const clipboardLodRef = useRef(1);
 
   // Tile state (used in "tiled" mode)
   const tileCacheRef  = useRef<Map<string, HTMLCanvasElement>>(new Map());
@@ -687,7 +690,6 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   const onPolySelectRef     = useRef(onPolySelect);
   const spawnPosRef         = useRef(spawnPos);
   const playerPosRef        = useRef(playerPos);
-  const creaturesRef        = useRef(creatures);
   const signsRef            = useRef(signs);
   const pasteElevOffsetRef  = useRef(pasteElevationOffset);
   const onEyedropperRef     = useRef(onEyedropper);
@@ -776,7 +778,6 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   useEffect(() => { selectionMaskRef.current   = selectionMask;       }, [selectionMask]);
   useEffect(() => { spawnPosRef.current        = spawnPos;            }, [spawnPos]);
   useEffect(() => { playerPosRef.current       = playerPos;           }, [playerPos]);
-  useEffect(() => { creaturesRef.current       = creatures;           }, [creatures]);
   useEffect(() => { signsRef.current           = signs;               }, [signs]);
   useEffect(() => { pasteElevOffsetRef.current = pasteElevationOffset; }, [pasteElevationOffset]);
   useEffect(() => { onEyedropperRef.current    = onEyedropper;        }, [onEyedropper]);
@@ -1298,32 +1299,6 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
       }
     }
 
-    // Creature markers — coloured dots at each creature's world position
-    {
-      const clist = creaturesRef.current;
-      if (clist.length > 0) {
-        // Per-type colours from creatureColor[NUM_CREATURES+1][3] (Globals.mm)
-        const typeColors = ["#4646ff","#73ce4a","#ff46ff","#ff46ff","#ffa500","#eb1414","#eb1414"];
-        const r2 = Math.max(3, Math.min(8, scale * 1.2));
-        for (const c of clist) {
-          const cx2 = Math.round(c.x * scale + vx);
-          const cy2 = Math.round(c.y * scale + vy);
-          const baseCol = typeColors[c.type_id] ?? "#ffffff";
-          ctx.save();
-          ctx.beginPath();
-          ctx.arc(cx2, cy2, r2, 0, Math.PI * 2);
-          ctx.fillStyle = baseCol;
-          ctx.globalAlpha = 0.85;
-          ctx.fill();
-          ctx.globalAlpha = 1;
-          ctx.strokeStyle = "#000";
-          ctx.lineWidth = 1;
-          ctx.stroke();
-          ctx.restore();
-        }
-      }
-    }
-
     // Sign markers (256z-format plan, Phase 4) — small pin at each sign's editor-local position.
     // Not depth-sorted or z-filtered against the current view: signs are rare enough (max observed
     // so far: 6 on one world) that always showing all of them beats a fiddly z-slice-matching rule.
@@ -1350,7 +1325,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
           ctx.stroke();
           // Text label once zoomed in far enough to be reading one area rather than surveying the
           // map — a bare diamond doesn't say what the sign says, and jumping to one from the
-          // Inspector (MapCanvasRef.focusOn) lands well above this threshold.
+          // World tab (MapCanvasRef.focusOn) lands well above this threshold.
           if (scale >= SIGN_LABEL_MIN_SCALE && s.text) {
             const label = s.text.split("\n")[0].slice(0, SIGN_LABEL_MAX_CHARS);
             ctx.font = "11px ui-sans-serif, system-ui, sans-serif";
@@ -1411,8 +1386,12 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
           ctx.strokeRect(gx + 2.5, gy + 2.5, gw - 5, gh - 5);
         }
         // Z-offset label above the ghost rect
+        // Past the ghost's pixel budget the preview is downsampled — say so, since users rely on
+        // it lining up block-for-block (18.3 follow-up).
         const off = pasteElevOffsetRef.current;
-        const label = off === 0 ? "z+0" : off > 0 ? `z+${off}` : `z${off}`;
+        const ghostLod = clipboardLodRef.current;
+        const label = (off === 0 ? "z+0" : off > 0 ? `z+${off}` : `z${off}`)
+          + (ghostLod > 1 ? `  preview 1:${ghostLod}` : "");
         const labelColor = locked ? "rgba(251,191,36,1)" : MAP.clipboard;
         ctx.save();
         ctx.font = "bold 11px monospace";
@@ -2037,18 +2016,15 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     scheduleDraw();
   });
   useEffect(() => {
-    // Free the replaced ghost canvas's backing store right away rather than waiting for GC.
+    // Free the replaced ghost canvas's backing store right away rather than waiting for GC. It is
+    // `previewCanvas`'s memoised canvas, shared with the Clipboard ribbon thumbnail (one decoded
+    // copy, not two — the ghost is full-res up to its pixel budget); a zeroed entry just fails
+    // that cache's size check and is rebuilt if the thumbnail ever asks for it again.
     const old = clipboardImgRef.current;
     if (old) { old.width = 0; old.height = 0; }
+    clipboardLodRef.current = clipboardPreviewPixels?.lod ?? 1;
     if (!clipboardPreviewPixels) { clipboardImgRef.current = null; return; }
-    const c = document.createElement("canvas");
-    c.width  = clipboardPreviewPixels.width;
-    c.height = clipboardPreviewPixels.height;
-    const offCtx = c.getContext("2d")!;
-    const img = offCtx.createImageData(c.width, c.height);
-    img.data.set(clipboardPreviewPixels.pixels);
-    offCtx.putImageData(img, 0, 0);
-    clipboardImgRef.current = c;
+    clipboardImgRef.current = previewCanvas(clipboardPreviewPixels);
   }, [clipboardPreviewPixels]);
 
   useEffect(() => {
@@ -2414,7 +2390,8 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
         pendingStampsRef.current.push([wp.x, wp.y]);
         flushSculptRef.current(strokeId);
         // Dwell timer: while the cursor sits on the last stamped cell, keep re-stamping it (airbrush).
-        accumTimerRef.current = window.setInterval(() => {
+        // Rock/Carve/Stamp are idempotent at a fixed centre, so they get no dwell timer (23.6).
+        if (!isDwellIdempotent(toolRef.current)) accumTimerRef.current = window.setInterval(() => {
           if (strokeCancelledRef.current) return;
           const cur = cursorPosRef.current;
           const lastS = lastStampPosRef.current;

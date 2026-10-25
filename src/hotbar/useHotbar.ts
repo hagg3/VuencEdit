@@ -47,8 +47,6 @@ export interface UseHotbarResult {
    *  its listener on every hotbar change). */
   pinnedBlocksRef: React.RefObject<HotbarSlot[]>;
   recentBlocksRef: React.RefObject<HotbarBlock[]>;
-  hotbarHover: string | null;
-  setHotbarHover: (v: string | null) => void;
   /** 10-slot data for the 3D pane's in-build overlay and the Hotbar window (5 pinned + 5 recent,
    *  matching the digit-key ordering). */
   hotbar3dSlots: (Hotbar3DSlot | null)[];
@@ -71,7 +69,6 @@ export function useHotbar(texturePackInfo: AtlasData | null | undefined): UseHot
   useEffect(() => { pinnedBlocksRef.current = pinnedBlocks; }, [pinnedBlocks]);
   const recentBlocksRef = useRef(recentBlocks);
   useEffect(() => { recentBlocksRef.current = recentBlocks; }, [recentBlocks]);
-  const [hotbarHover, setHotbarHover] = useState<string | null>(null);
 
   const hotbar3dSlots = useMemo(() => {
     const swatchCss = (type: number, paint: number): string => {
@@ -108,6 +105,6 @@ export function useHotbar(texturePackInfo: AtlasData | null | undefined): UseHot
 
   return {
     pinnedBlocks, recentBlocks, setPinnedBlocks, pinnedBlocksRef, recentBlocksRef,
-    hotbarHover, setHotbarHover, hotbar3dSlots, trackRecentBlock, pinFromRecent, unpinSlot,
+    hotbar3dSlots, trackRecentBlock, pinFromRecent, unpinSlot,
   };
 }

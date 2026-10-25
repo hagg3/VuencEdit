@@ -3,27 +3,12 @@ import { MODAL_TEXT } from "./designTokens";
 import ShortcutTable from "./commands/ShortcutTable";
 import { ALT, MOD, ACCENT } from "./ribbon/tokens";
 import { rgba } from "./theme/theme";
+import { Keycap } from "./ribbon/primitives";
 import Dialog, { DialogButton } from "./ui/Dialog";
 import { DialogNav, type DialogNavItem } from "./ui/DialogNav";
 
 function Key({ children }: { children: React.ReactNode }) {
-  return (
-    <kbd style={{
-      display: "inline-block",
-      background: "rgba(255,255,255,0.06)",
-      border: "1px solid rgba(255,255,255,0.15)",
-      borderBottom: "2px solid rgba(0,0,0,0.35)",
-      borderRadius: 4,
-      padding: "1px 7px",
-      fontSize: 11,
-      fontFamily: "ui-monospace, 'SF Mono', monospace",
-      color: MODAL_TEXT.primary,
-      marginRight: 2,
-      whiteSpace: "nowrap",
-    }}>
-      {children}
-    </kbd>
-  );
+  return <span style={{ marginRight: 2 }}><Keycap text={children} /></span>;
 }
 
 function Row({ keys, action }: { keys: React.ReactNode; action: string }) {

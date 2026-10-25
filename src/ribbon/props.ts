@@ -26,7 +26,7 @@ export interface RibbonProps {
   onRenameBlur: (trimmed: string) => void;
   // Tool
   tool: Tool; setTool: (t: Tool) => void;
-  isDrawTool: boolean; isSculptTool: boolean;
+  isSculptTool: boolean;
   wandMatchPaint: boolean; setWandMatchPaint: (v: boolean) => void;
   // Materialize (ungenerated chunk space → real flat terrain)
   materializeSelection: MaterializeSelectionBounds | null;
@@ -177,7 +177,7 @@ export interface RibbonProps {
   // Extrude
   extrudeCount: number; setExtrudeCount: (n: number) => void;
   extrudeAxis: ExtrudeAxis; setExtrudeAxis: (a: ExtrudeAxis) => void;
-  extrudeOpen: boolean; setExtrudeOpen: (v: boolean) => void;
+  setExtrudeOpen: (v: boolean) => void;
   onExtrude: (ignoreAir: boolean) => void;
   // Trees
   treeTypes: string[]; setTreeTypes: (v: string[]) => void;

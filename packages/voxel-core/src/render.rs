@@ -584,6 +584,16 @@ pub fn axo_lod_for(w: u32, h: u32, max_side: u32) -> u32 {
     lod
 }
 
+/// Smallest power-of-two `lod` that keeps a `w × h` raster's *pixel count* within `max_px` —
+/// i.e. 1:1 whenever `w * h ≤ max_px`. Budgets memory rather than the long side, so a long thin
+/// region stays full resolution where a long-side cap would needlessly downsample it.
+pub fn lod_for_pixel_budget(w: u32, h: u32, max_px: u64) -> u32 {
+    let (w, h, max_px) = (w.max(1) as u64, h.max(1) as u64, max_px.max(1));
+    let mut lod = 1u64;
+    while w.div_ceil(lod) * h.div_ceil(lod) > max_px { lod *= 2; }
+    lod as u32
+}
+
 /// `axo_region` with its cost bounded (Stage 13.3): the Inspector previews a selection in a
 /// ~200 px panel, so a full-resolution raycast over a select-all world is wasted work.
 ///
@@ -1660,6 +1670,20 @@ mod tests {
         assert_ne!(axo_region_bounded(&world, meta, 0, 0, 15, 15, 0.0, 0, 1, Some(0)).pixels, flat.pixels);
         // …and with parallax the ceiling is the plane the picture is anchored to, so it shifts.
         assert_ne!(axo_region_bounded(&world, meta, 0, 0, 15, 15, 0.2, 0, 1, Some(20)).pixels, full.pixels);
+    }
+
+    #[test]
+    fn pixel_budget_lod_is_one_to_one_within_budget() {
+        assert_eq!(lod_for_pixel_budget(2048, 2048, 4 << 20), 1); // exactly at budget
+        assert_eq!(lod_for_pixel_budget(2049, 2048, 4 << 20), 2);
+        assert_eq!(lod_for_pixel_budget(16384, 1, 4 << 20), 1);   // long and thin stays 1:1
+        assert_eq!(lod_for_pixel_budget(1, 1, 1), 1);
+        assert_eq!(lod_for_pixel_budget(0, 0, 0), 1);             // degenerate input
+        assert_eq!(lod_for_pixel_budget(3, 3, 1), 4);             // 3→2→1: smallest pow2 fitting
+        assert_eq!(lod_for_pixel_budget(3, 3, 4), 2);
+        let lod = lod_for_pixel_budget(16384, 16384, 8 << 20) as u64;
+        assert!(16384u64.div_ceil(lod).pow(2) <= 8 << 20);
+        assert!(16384u64.div_ceil(lod / 2).pow(2) > 8 << 20);     // and it's the smallest
     }
 
     #[test]
