@@ -18,7 +18,7 @@ import type { ExtrudeAxis } from "../types";
 // M1: shared floor/ceiling with FlyView3D's own in-pane slider, the ribbon 3D tab and Settings —
 // see CLAUDE.md "Undo grouping, feedback, and discoverability" (M1). Importing straight from
 // FlyView3D (not re-declaring) is what keeps this control's range from silently drifting off theirs.
-import { MAX_RENDER_DISTANCE, RD_MIN } from "../FlyView3D";
+import { MAX_RENDER_DISTANCE, RD_MIN } from "../renderDistance";
 import { useRibbon, useRibbonProps } from "./context";
 import { CmdIcon, CmdSetting } from "./Cmd";
 import type { CommandId } from "../commands/meta";

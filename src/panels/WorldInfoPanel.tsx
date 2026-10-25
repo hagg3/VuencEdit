@@ -26,6 +26,8 @@ export interface WorldInfo {
   max_z: number; chunk_count: number;
   abs_min_x: number; abs_min_y: number;
   spawn_px: number | null; spawn_py: number | null;
+  /** `"emod"` while the session was opened from an `.emod` (Stage 26.4). */
+  container: "eden" | "emod";
 }
 
 function paintColor(idx: number): string {
@@ -39,7 +41,14 @@ function fmt1(n: number) { return n.toFixed(1); }
 
 /** Display text for the Properties pane's Format row — `classifyWorldFormat` (types.ts) owns the
  *  actual max_z/version logic; this just picks wording. */
-function formatLabel(info: WorldInfo): { label: string; title: string } {
+export function formatLabel(info: WorldInfo): { label: string; title: string } {
+  const f = heightFormatLabel(info);
+  return info.container === "emod"
+    ? { label: `${f.label} · .emod`, title: `${f.title}. Opened from an Emod .emod file: Save writes back to it, Save As makes a .eden copy for the game.` }
+    : f;
+}
+
+function heightFormatLabel(info: WorldInfo): { label: string; title: string } {
   switch (classifyWorldFormat(info)) {
     case "legacy64z":
       return { label: "Legacy 64z", title: "Legacy (64z) format: worlds up to 64 blocks tall" };
@@ -74,16 +83,31 @@ const sectionLabel: React.CSSProperties = {
   borderBottom: `1px solid ${RAMP.mbtn1}`, paddingBottom: 3,
 };
 
-/** `refreshKey` re-fetches — the menu bumps it after a rename so the pane doesn't go stale. */
-export default function WorldInfoPanel({ refreshKey = 0 }: { refreshKey?: number }) {
+/** `get_world_info`, re-fetched whenever `refreshKey` changes. `debounceMs` makes it trailing-edge
+ *  (the sidebar's World tab keys it on `editEpoch`, which bumps once per stamp during a 3D build
+ *  sweep — the HistoryTab idiom). Every header write (rename, Set Point Home/Start) bumps
+ *  `editEpoch` in App, so keying on it is what keeps Home/Start/name/chunks-saved current. The last
+ *  good `info` is kept while a re-fetch is in flight so the readout doesn't flash "Loading…". */
+export function useWorldInfo(refreshKey: unknown, debounceMs = 0): { info: WorldInfo | null; err: string | null } {
   const [info, setInfo] = useState<WorldInfo | null>(null);
   const [err, setErr] = useState<string | null>(null);
 
   useEffect(() => {
-    invoke<WorldInfo>("get_world_info")
-      .then(i => { setInfo(i); setErr(null); })
-      .catch(e => setErr(String(e)));
-  }, [refreshKey]);
+    let cancelled = false;
+    const fetchInfo = () => invoke<WorldInfo>("get_world_info")
+      .then(i => { if (!cancelled) { setInfo(i); setErr(null); } })
+      .catch(e => { if (!cancelled) setErr(String(e)); });
+    if (debounceMs <= 0) { fetchInfo(); return () => { cancelled = true; }; }
+    const t = setTimeout(fetchInfo, debounceMs);
+    return () => { cancelled = true; clearTimeout(t); };
+  }, [refreshKey, debounceMs]);
+
+  return { info, err };
+}
+
+/** `refreshKey` re-fetches — the menu bumps it after a rename so the pane doesn't go stale. */
+export default function WorldInfoPanel({ refreshKey = 0 }: { refreshKey?: number }) {
+  const { info, err } = useWorldInfo(refreshKey);
 
   return (
     <div style={{ color: MODAL_TEXT.primary, fontFamily: "monospace", fontSize: 12 }}>

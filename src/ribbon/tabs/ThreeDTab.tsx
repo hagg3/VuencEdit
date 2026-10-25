@@ -21,7 +21,7 @@ import { ACCENT, GROUP_CONTENT_H, SMALL_H } from "../tokens";
 // M1: shared with FlyView3D's own in-pane slider and SettingsModal — the ribbon slider used to allow
 // 1–16, below the pane's own 2–32 floor/ceiling, so a value set in Settings got silently clamped down
 // the next time this slider was touched.
-import { MAX_RENDER_DISTANCE, RD_MIN } from "../../FlyView3D";
+import { MAX_RENDER_DISTANCE, RD_MIN } from "../../renderDistance";
 
 const AMBER = ACCENT.warm;
 /** Everything spatial about the pane itself — camera, distance, the 3D-only modes. */

@@ -23,10 +23,14 @@ export interface WorldMeta {
   /** Header `version` field — distinguishes `NewFormat256z` (256z, not version 5/6 — the 2026
    *  game update) from `NewDawn256z` (256z, version 5 or 6) without a second IPC round trip. */
   version: number;
-  /** True when this world's signs came from a `signs_<file>.eden.dat` sidecar rather than from the
-   *  inline post-directory trailer. Nothing in VuencEdit writes a sidecar, so those signs do not
-   *  survive Save As / Upload / a compressed save — App warns once on load. */
-  signs_from_sidecar: boolean;
+  /** Records brought in from the game's `signs_…`/`cmd_….eden.dat` sidecars on this load (27.0b).
+   *  They're written into the world on the next save; App says so once. Zero when none. */
+  records_adopted: RecordCounts;
+  /** The container the world was opened from (Stage 26.4). An `.emod` is staged as a `.eden`
+   *  internally; Save appends the changes back to the `.emod` (26.5), Save As writes a `.eden`. */
+  container: "eden" | "emod";
+  /** An `.emod`'s damaged-record reports (empty when clean, and for a merely torn last save). */
+  emod_damage: string[];
 }
 
 export interface RecentWorld { path: string; name: string; timestamp: number; }
@@ -99,12 +103,14 @@ export function decodeEditResult(buf: IpcBinary): EditResult {
 
 // ---- Preview images (clipboard, prefab and new-world previews) ----
 
-export interface PreviewData { width: number; height: number; pixels: Uint8Array; }
+/** `lod` = world columns per pixel (1 = full resolution); only clipboard/prefab previews ever
+ *  downsample, and a header without it (e.g. `PreviewImage`) decodes as 1. */
+export interface PreviewData { width: number; height: number; lod: number; pixels: Uint8Array; }
 
 /** Decode a `PreviewData`/`PreviewImage`-returning command's binary response (audit H2). */
 export function decodePreviewData(buf: IpcBinary): PreviewData {
-  const { header, body } = decodeEnvelope<{ width: number; height: number }>(buf);
-  return { width: header.width, height: header.height, pixels: body };
+  const { header, body } = decodeEnvelope<{ width: number; height: number; lod?: number }>(buf);
+  return { width: header.width, height: header.height, lod: header.lod ?? 1, pixels: body };
 }
 
 // ---- Voxel geometry (get_chunk_geometry, format 2) ----
@@ -316,31 +322,68 @@ export type TreeType = "normal" | "terrain" | "pine" | "tall_pine";
 
 // ---- Signs (256z-format plan, Phase 4) ----
 
-/** Decoded `get_signs` result. `x`/`y` are already editor-local (min_x/min_y offset applied on
- *  the Rust side); `z` is an absolute height. `facing` is a strong-but-unproven hypothesis (a 0–3
- *  quadrant, see CLAUDE.md's "File Format" section) — shown as a raw number, not decoded further. */
+/** One sign from `get_records` (27.0b). `x`/`y` are editor-local (min_x/min_y offset applied on
+ *  the Rust side); `z` is an absolute height. `i` is the record's index in the world's trailer. */
 export interface SignInfo {
+  i: number;
   x: number;
   y: number;
   z: number;
-  facing: number;
+  /** Anchor face: 0 −x, 1 +x, 2 bottom, 3 top, 4 −y, 5 +y. */
+  a: number;
+  /** Board colour: a paint byte, 1..54. */
+  b: number;
+  /** The quarter turn the text faces: 0 −x, 1 −y, 2 +x, 3 +y. */
+  c: number;
   text: string;
+}
+
+/** One command block from `get_records` (same coordinates as `SignInfo`). */
+export interface CmdInfo {
+  i: number;
+  x: number;
+  y: number;
+  z: number;
+  flags: number;
+  script: string;
+}
+
+export interface RecordCounts { signs: number; cmds: number; }
+
+/** `get_records`: the world's signs + command blocks (its post-directory trailer, 27.0b). */
+export interface RecordsInfo {
+  /** "none" (no trailer), "parsed", or "opaque" (kept as is, can't be edited; `why` says why). */
+  status: "none" | "parsed" | "opaque";
+  why: string;
+  /** The trailer's size as the next save writes it, and the cap (1 MiB). */
+  bytes: number;
+  cap: number;
+  signs: SignInfo[];
+  cmds: CmdInfo[];
+  /** Records brought in from the game's sidecar files on load and not yet saved into the world. */
+  adopted: RecordCounts;
 }
 
 export interface AutosaveInfo {
   world_name: string;
   source_path: string | null;
   timestamp: number; // unix seconds
-  /** 0 = legacy single-file autosave (open via `get_autosave_path` + `load_world`); 1 = journaled
-   *  base+journal sidecars; 2 = journal + `base` naming its base image (18.9). 1–2 recover via
-   *  `load_autosave`. */
+  /** 1 = journaled base+journal sidecars; 2 = journal + `base` naming its base image (18.9). Both
+   *  recover via `load_autosave`. (Format 0, the legacy single file, is no longer offered.) */
   format: number;
   /** Journal's own base id, 16 bytes — only meaningful when `format >= 1`. */
   base_id: number[];
-  /** Format 2: the image the journal replays onto — the user's world file (`source`) or a private
-   *  copy in the app data dir (`clone`). Absent for formats 0–1. */
-  base?: { kind: "clone" } | { kind: "source"; path: string; len: number; mtime_ns: number; file_id: [number, number] } | null;
+  /** Format 2: the image the journal replays onto — the user's world file (`source`), an `.emod`
+   *  at a given commit (`emod`, Stage 26.6) or a private copy in the app data dir (`clone`). Absent
+   *  for format 1. */
+  base?:
+    | { kind: "clone" }
+    | { kind: "source"; path: string; len: number; mtime_ns: number; file_id: [number, number] }
+    | { kind: "emod"; file: { path: string }; committed_len: number; commit_offset: number; commit_crc: number; commit_seq: number }
+    | null;
   /** Format 2: whether that base can still be used. `changed`/`missing` only happen for a `source`
-   *  base (the file was saved/edited since, or moved/deleted/offline). */
-  base_status?: "ok" | "changed" | "missing" | null;
+   *  or `emod` base (the file was saved/edited since, or moved/deleted/offline). `copy` is `emod`
+   *  only: another program saved the `.emod` since, but the autosave can still be recovered as an
+   *  unsaved copy. */
+  base_status?: "ok" | "changed" | "missing" | "copy" | null;
 }

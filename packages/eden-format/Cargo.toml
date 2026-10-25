@@ -1,0 +1,22 @@
+[package]
+name = "eden-format"
+version = "0.1.0"
+description = "Eden world file formats (.emod container; later .eden layout, conversion, export) shared by the vuenc apps"
+edition = "2021"
+
+# Pure file-format code. Like voxel-core it must never gain a `tauri` dependency, and its payload
+# types never derive `Serialize`. It is a separate crate (not part of voxel-core) because zstd
+# brings a C dependency that voxel-core's pure voxel logic shouldn't carry.
+[dependencies]
+# zstd for codec 1. `zstd-sys` is pinned EXACTLY: the spec's byte-identical writers (conversion,
+# compaction, the cross-target gates) use zstd 1.5.7 at level 3, and `tests/zstd_version.rs`
+# asserts `ZSTD_versionNumber() == 10507`. Bump only together with the pinned hashes in the tests.
+# `default-features = false` on the pin: zstd-sys's defaults include `bindgen` (needs libclang).
+zstd-safe = { version = "7.2.4", default-features = false, features = ["std"] }
+zstd-sys = { version = "=2.0.16", default-features = false }
+# codec 2 (zlib streams) and the gzip'd fixtures in tests.
+flate2 = "1"
+# the spec's CRC-32 is zlib's crc32(): IEEE, reflected, init/final XOR 0xFFFFFFFF.
+crc32fast = "1"
+# the state digest (emod.py `digest`), later PROVENANCE's source hash.
+sha2 = "0.10"

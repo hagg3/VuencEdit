@@ -712,6 +712,11 @@ pub(crate) async fn upload_world(
 ) -> Result<String, String> {
     cancel.reset();
     let srv = get_server(&server)?;
+    // The servers take `.eden` only; `.emod` upload (through an exporter) is the deferred 26.9.
+    if crate::emod::is_emod_path(std::path::Path::new(&world_path)) {
+        return Err("The world servers only accept .eden files. Use Save As to save a .eden copy and upload that \
+                    (Emod can upload .emod worlds itself).".into());
+    }
     let image_bytes = fs::read(&image_path).map_err(|e| format!("Cannot read image: {e}"))?;
     const MAX_IMAGE_BYTES: usize = 2 * 1024 * 1024;
     if image_bytes.len() > MAX_IMAGE_BYTES {

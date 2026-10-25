@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["src-tauri", "packages/voxel-core"]
+members = ["src-tauri", "packages/eden-format", "packages/voxel-core"]
 
 [profile.release]
 opt-level = 3

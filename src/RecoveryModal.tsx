@@ -8,6 +8,15 @@ import Dialog, { DialogButton } from "./ui/Dialog";
 const RED_LIGHT = mix(RAMP.white, DANGER_HEX, 0.5);
 import type { AutosaveInfo } from "./types";
 
+/** The world file an autosave builds on (a `.eden` source or an `.emod`), or `null` for a private copy. */
+export function recoveryBasePath(info: AutosaveInfo): string | null {
+  switch (info.base?.kind) {
+    case "source": return info.base.path;
+    case "emod": return info.base.file.path;
+    default: return null;
+  }
+}
+
 function timeAgoShort(unixSeconds: number): string {
   const secs = Math.max(0, Date.now() / 1000 - unixSeconds);
   if (secs < 60) return "moments ago";
@@ -44,7 +53,7 @@ export default function RecoveryModal({
   // 18.9: a format-2 autosave can build on the user's world file. If that file moved or changed
   // since, recovery would refuse, so say why up front.
   const status = info.base_status ?? "ok";
-  const basePath = info.base?.kind === "source" ? info.base.path : null;
+  const basePath = recoveryBasePath(info);
   const baseName = basePath?.split(/[\\/]/).pop() ?? "The world file";
 
   const footer = confirmDiscard ? (
@@ -63,7 +72,7 @@ export default function RecoveryModal({
         <DialogButton variant="primary" onClick={onOpenBase} disabled={recovering}>Open file</DialogButton>
       ) : (
         <DialogButton variant="primary" onClick={onRecover} disabled={recovering}>
-          {recovering ? "Recovering…" : status === "missing" ? "Try again" : "Recover"}
+          {recovering ? "Recovering…" : status === "missing" ? "Try again" : status === "copy" ? "Recover copy" : "Recover"}
         </DialogButton>
       )}
     </>
@@ -85,6 +94,11 @@ export default function RecoveryModal({
       {status === "changed" && !confirmDiscard && (
         <p style={{ margin: "0 0 8px", color: MODAL_TEXT.secondary, lineHeight: 1.5 }}>
           {baseName} was saved or changed after this autosave, so the autosave no longer applies. Open the file instead.
+        </p>
+      )}
+      {status === "copy" && !confirmDiscard && (
+        <p style={{ margin: "0 0 8px", color: MODAL_TEXT.secondary, lineHeight: 1.5 }}>
+          {baseName} was saved by another program (Emod?) after this autosave. Your autosaved work can still be recovered, as an unsaved copy: use Save As to keep it as a .eden file. The .emod file isn't changed.
         </p>
       )}
       {status === "missing" && !confirmDiscard && (

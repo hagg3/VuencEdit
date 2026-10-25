@@ -43,7 +43,7 @@ export const RAMP = {
   // Icon + state tones (ribbon icons, danger labels, armed captions).
   iconTone: "#c3ccd2", iconDanger: "#d97570", iconAccent: "#e2a44c",
   textDanger: "#e39c99", textArmed: "#8cd6db",
-  // Badge text tones (exp/ok), and the modal-side badge hues (designTokens expBadge/perfBadge).
+  // Badge text tones (exp/ok), and the modal-side badge hues (designTokens expBadge).
   badgeExp: "#e0a95a", badgeOk: "#7fc994", badgeExpModal: "#f59e0b", badgePerfModal: "#f87171",
   /** Legacy readable teal (modal accents, spinners). Removed by Stage 14.15. */
   tealReadable: "#00dde9",

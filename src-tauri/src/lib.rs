@@ -6,7 +6,7 @@ pub(crate) use voxel_core::colors;
 // `impl VoxelView for LoadedWorld` / `for ChunkScratch` below, which stay here because those
 // types are app-specific — read exactly as they did before the extraction.
 pub(crate) use voxel_core::view::{
-    get_block_at, read_block_abs, read_paint_abs, set_block_abs, set_block_in_band, surface_z,
+    get_block_at, read_block_abs, read_paint_abs, set_block_abs, surface_z,
     surface_z_capped, world_max_z, ViewMeta, VoxelView, VoxelViewMut,
 };
 // The rest of PR-C: the fluid block family, the shaped-selection footprint, the lamp spatial index
@@ -50,6 +50,7 @@ mod journal;
 mod mem;
 #[cfg(test)]
 mod alloc_probe;
+mod emod;
 mod mpworld;
 mod network;
 mod overview;
@@ -68,7 +69,9 @@ use memmap2::{Mmap, MmapMut, MmapOptions};
 use serde::Serialize;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::borrow::Cow;
 use std::fs;
+use eden_format::eden::trailer::{self, Trailer};
 use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::sync::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Instant;
@@ -516,11 +519,16 @@ pub struct WorldMeta {
     /// (256z, `version` not 5/6 — the 2026 game update) from `NewDawn256z` (256z, `version` 5 or
     /// 6) without a second `get_world_info` round trip. See CLAUDE.md's "File Format" table.
     pub version: i32,
-    /// True when this world's signs came from a `signs_<file>.eden.dat` **sidecar** rather than
-    /// the inline post-directory trailer. The sidecar is a separate file that nothing in VuencEdit
-    /// writes, so it does not travel with Save As, Upload, or a compressed save — the frontend
-    /// warns once on load. False when there are no signs at all, or when they were inline.
-    pub signs_from_sidecar: bool,
+    /// Records brought in from the game's `signs_…`/`cmd_….eden.dat` sidecars on this load (27.0b,
+    /// plan §6.2): they'll be written into the world on the next save. Zero when nothing was
+    /// adopted (the usual case, and always for autosave recovery, which has no source path).
+    pub records_adopted: RecordCounts,
+    /// The container the world was opened from: `"eden"` (a `.eden` or a zip of one) or `"emod"`
+    /// (26.4: staged through an own-format export; saving back to it lands in 26.5).
+    pub container: &'static str,
+    /// An `.emod`'s damage list (empty otherwise, and for a merely torn last batch): drives the
+    /// non-blocking "damaged records" banner.
+    pub emod_damage: Vec<String>,
 }
 
 // ── In-memory world state ────────────────────────────────────────────────────
@@ -559,12 +567,15 @@ pub(crate) struct LoadedWorld {
     pub(crate) h_chunks: u32,
     pub(crate) name: String,
     pub(crate) sky: u8,
-    /// Raw bytes of a post-directory metadata section (currently only ever a `SGN1` signs
-    /// container — see `parse_signs`/Part A of the 256z-format plan), captured verbatim so the
-    /// rebuilding writers (`expand_world_from_template`, `materialize_flat_chunks_inner`) can
-    /// re-emit it instead of silently dropping the world's inline sign data. Empty for the
-    /// overwhelming majority of worlds, which have no trailer at all.
-    pub(crate) dir_trailer: Vec<u8>,
+    /// The post-directory trailer (signs `SGN1` + command blocks `CMB1`) as a model (27.0b). Loaded
+    /// from `bytes[trailer_start..]`; opaque (kept verbatim, every record edit refused) when it
+    /// doesn't parse or is over the 1 MiB cap. ⚠️ **Writers never read this directly**: they go
+    /// through `file_image()`, which knows when the temp's own tail is stale.
+    pub(crate) trailer: Trailer,
+    /// Where the trailer starts in `bytes` (and in the file): the directory offset + 16 × the real
+    /// directory rows. Everything from here to EOF is the trailer — a ragged last row included.
+    /// Equal to `bytes.len()` for the overwhelming majority of worlds, which have no trailer.
+    pub(crate) trailer_start: u64,
     /// Per-chunk "topmost band that holds anything" ceiling — see `TopBandHints` and
     /// `VoxelView::top_band_hint`. Lazily filled, interior-mutable, and invalidated per chunk by
     /// `mark_dirty_chunks`. Lives *in* `LoadedWorld` so a world load/close disposes of it with the
@@ -678,7 +689,49 @@ impl TopBandHints {
     }
 }
 
+/// What a writer puts in a file for a world (27.0b, plan §3.2): `head` (= `bytes[..trailer_start]`)
+/// then `tail` (the trailer). **Every file writer goes through this** — never `&world.bytes[..]` —
+/// because once the trailer model is touched, the temp's own tail is stale (T3: the temp's length
+/// never changes, so a trailer edit can't be applied to it).
+pub(crate) struct FileImage<'a> {
+    pub(crate) head: &'a [u8],
+    pub(crate) tail: Cow<'a, [u8]>,
+}
+
+impl FileImage<'_> {
+    pub(crate) fn len(&self) -> u64 {
+        (self.head.len() + self.tail.len()) as u64
+    }
+}
+
 impl LoadedWorld {
+    /// The file this world saves as — see `FileImage`. While the trailer model is untouched the
+    /// tail borrows the temp's own bytes (verbatim at any size, ragged rows and all); once touched
+    /// it is the model's encoding for the rest of the session (the model is never `mark_saved`, so
+    /// `is_touched` doubles as "the temp's tail is stale").
+    pub(crate) fn file_image(&self) -> FileImage<'_> {
+        let ts = (self.trailer_start as usize).min(self.bytes.len());
+        let tail = if self.tail_rewritten() { self.trailer.encode() } else { Cow::Borrowed(&self.bytes[ts..]) };
+        FileImage { head: &self.bytes[..ts], tail }
+    }
+
+    /// The trailer as the next save writes it, owned (tests).
+    #[cfg(test)]
+    pub(crate) fn trailer_bytes(&self) -> Vec<u8> {
+        self.file_image().tail.into_owned()
+    }
+
+    /// The saved tail differs from the temp's (see `file_image`).
+    pub(crate) fn tail_rewritten(&self) -> bool {
+        self.trailer.is_touched()
+    }
+
+    /// A record's anchor (absolute file order: x, y horizontal, z height) in editor-local block
+    /// coordinates. The one conversion helper (plan §8).
+    pub(crate) fn record_to_local(&self, p: trailer::Pos) -> (i32, i32, i32) {
+        (p.x - self.min_x * 16, p.y - self.min_y * 16, p.z)
+    }
+
     /// Bytes chunk `(cx, cy)` actually owns — `chunk_size` unless the directory says its data is
     /// cut short by whatever follows it (see `chunk_span`).
     #[inline]
@@ -1724,6 +1777,16 @@ pub(crate) struct DirtyState {
     header_disk: bool,
     header_base: bool,
     header_load: bool,
+    /// The trailer (signs + command blocks) changed since each horizon (27.0b). Set, cleared and
+    /// seq-gated exactly like the `header_*` flags; the trailer bytes themselves always come from
+    /// `LoadedWorld::file_image`, so a flag only says *whether* a writer owes the tail.
+    trailer_journal: bool,
+    trailer_disk: bool,
+    trailer_base: bool,
+    trailer_load: bool,
+    /// Sidecars were adopted into the trailer on load (plan §6.2) and no save to the world's own
+    /// path has written them in yet: that save renames them `*.adopted` (`WorldState::adopted`).
+    trailer_adopt_pending: bool,
     /// Monotonic counter bumped by every `mark_*` **and** by `clear_all`, i.e. by every event that
     /// can make a previously-captured view of this struct stale. A flush that captured its work
     /// under a *read* guard and released it before mutating this struct (the save path in
@@ -1787,6 +1850,26 @@ impl DirtyState {
         self.header_load = true;
     }
 
+    /// A record edit (or a replayed tail) changed the trailer: every horizon owes it. Called from
+    /// the `with_edit` funnel and undo/redo when their record op log is non-empty (27.8a).
+    pub(crate) fn mark_trailer(&mut self) {
+        self.seq = self.seq.wrapping_add(1);
+        self.trailer_journal = true;
+        self.trailer_disk = true;
+        self.trailer_base = true;
+        self.trailer_load = true;
+    }
+
+    /// Sidecars were adopted on load (plan §6.2): owed to the file, the journal and the autosave
+    /// base, but **not** `trailer_load` — the world isn't "unsaved" for that alone.
+    pub(crate) fn mark_adopted(&mut self) {
+        self.seq = self.seq.wrapping_add(1);
+        self.trailer_journal = true;
+        self.trailer_disk = true;
+        self.trailer_base = true;
+        self.trailer_adopt_pending = true;
+    }
+
     /// Called on world load/close — nothing prior to this instant is owed to anything, since
     /// there's either no world or a brand-new one with no journal/disk-image history yet.
     pub(crate) fn clear_all(&mut self) {
@@ -1799,6 +1882,11 @@ impl DirtyState {
         self.header_disk = false;
         self.header_base = false;
         self.header_load = false;
+        self.trailer_journal = false;
+        self.trailer_disk = false;
+        self.trailer_base = false;
+        self.trailer_load = false;
+        self.trailer_adopt_pending = false;
     }
 }
 
@@ -1821,6 +1909,21 @@ pub(crate) struct DiskImage {
     /// `file_id_of` at the same instant (18.9) — what lets this image seed an autosave *Source*
     /// lineage (`FileIdentity`) without a second, racier `metadata()` call.
     file_id: (u64, u64),
+}
+
+/// Sidecars adopted on load (plan §6.2): the world path they belong to, the sidecar files, and
+/// how many records each brought in (for `WorldMeta.records_adopted` / `get_records`).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct AdoptedSidecars {
+    pub(crate) world_path: std::path::PathBuf,
+    pub(crate) files: Vec<std::path::PathBuf>,
+    pub(crate) counts: RecordCounts,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, PartialEq, Eq)]
+pub struct RecordCounts {
+    pub signs: u32,
+    pub cmds: u32,
 }
 
 impl DiskImage {
@@ -1885,6 +1988,9 @@ pub(crate) enum BaseStatus {
     Changed,
     /// The file can't be stat'ed at all — moved, deleted, or on a drive that isn't mounted.
     Missing,
+    /// `.emod` bases only (26.6): another writer appended to the file since, but its prefix still
+    /// holds the base state, so recovery rebuilds it as an unsaved copy (never in place).
+    Copy,
 }
 
 impl FileIdentity {
@@ -1983,6 +2089,10 @@ pub(crate) enum AutosaveBase {
     /// `since_base`, which a save's re-base resets — that reset is what bounds compaction by the
     /// edits since the last save (Stage 8 P-1b).
     Source(FileIdentity),
+    /// An `.emod` session's file at a given COMMIT (26.6): the journal replays onto the own-format
+    /// export of that state, which reproduces the session's temp. No copy, like `Source` (compacts
+    /// from `since_base`); every in-place `.emod` save re-bases onto its own commit.
+    Emod(emod::EmodBase),
 }
 
 #[derive(Clone, Debug)]
@@ -2096,11 +2206,14 @@ pub(crate) struct WorldState {
     /// unchanged — otherwise a tick in flight across a save or discard would restore a lineage
     /// whose files were just deleted (18.9 phase 0, plan §1.1). Never reset.
     pub(crate) lineage_gen: u64,
-    /// Signs for the currently-loaded world (256z-format plan, Phase 4) — sidecar preferred if
-    /// present beside the world's source path, else decoded from `LoadedWorld::dir_trailer`.
-    /// Populated once by `load_world`, read by `get_signs`. Empty for the overwhelming majority
-    /// of worlds, which have no signs at all. Cleared on world load/close.
-    pub(crate) signs: Vec<signs::Sign>,
+    /// The game's sidecars (`signs_<stem>.eden.dat`, `cmd_<stem>.eden.dat`) adopted into the
+    /// trailer on load (27.0b, plan §6.2), until a save to the world's own path writes them in and
+    /// renames them `*.adopted`. `None` when nothing was adopted. Reset on world load/close.
+    pub(crate) adopted: Option<AdoptedSidecars>,
+    /// Set when the world was opened from an `.emod` (26.4) — see `emod::EmodSession`. Cleared on
+    /// load/close/recovery and by any successful save to a `.eden`/zip; an in-place `.emod` save
+    /// (26.5) re-bases it instead.
+    pub(crate) emod: Option<emod::EmodSession>,
 }
 
 impl WorldState {
@@ -2138,7 +2251,8 @@ impl WorldState {
             disk_image: None,
             autosave: None,
             lineage_gen: 0,
-            signs: Vec::new(),
+            adopted: None,
+            emod: None,
         }
     }
 
@@ -2230,6 +2344,39 @@ pub(crate) fn read_ws(state: &AppState) -> RwLockReadGuard<'_, WorldState> {
 pub(crate) fn write_ws(state: &AppState) -> RwLockWriteGuard<'_, WorldState> {
     working_set::note_world_access();
     state.write().unwrap_or_else(|p| p.into_inner())
+}
+
+// ── Clipboard transform lock (23.8, audit E9) ────────────────────────────────
+//
+// Rotate/mirror `take()` the clipboard under a short world write guard, transform it with no world
+// guard held, and put it back — so a seconds-long transform of a 256 MB clipboard no longer stalls
+// every edit, render and save. While it's out, `ws.clipboard` reads `None`, so everything else that
+// reads or replaces the clipboard takes this lock first: consumers (paste family, lens/preview,
+// save prefab) share it and so wait for an in-flight transform instead of seeing "Clipboard is
+// empty"; transforms and replacers (copy, load prefab, world load/close/recovery) take it
+// exclusively, so nothing lands in the slot a transform is about to restore into. Lock order is
+// always clipboard lock → world guard, never the reverse (taking it while holding a world guard
+// can deadlock against a transform). Like `DURABILITY`, only Tauri commands take it; the `_inner`
+// functions stay lock-free for tests. The memory-stats read doesn't take it (a transient 0 is fine).
+static CLIPBOARD_LOCK: RwLock<()> = RwLock::new(());
+
+fn clipboard_shared() -> std::sync::RwLockReadGuard<'static, ()> {
+    CLIPBOARD_LOCK.read().unwrap_or_else(|p| p.into_inner())
+}
+
+fn clipboard_exclusive() -> std::sync::RwLockWriteGuard<'static, ()> {
+    CLIPBOARD_LOCK.write().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Run one clipboard transform off the world guard (23.8): take → transform unlocked → restore.
+/// A panic inside `f` drops the clipboard rather than leaving a half-transformed one.
+fn transform_clipboard(state: &AppState, f: impl FnOnce(&mut Clipboard)) -> Result<ClipboardInfo, String> {
+    let _clip = clipboard_exclusive();
+    let mut cb = write_ws(state).clipboard.take().ok_or("Clipboard is empty")?;
+    f(&mut cb);
+    let info = cb.info();
+    write_ws(state).clipboard = Some(cb);
+    Ok(info)
 }
 
 // ── Long-operation contract (audit C6 + M14) ─────────────────────────────────
@@ -2540,43 +2687,52 @@ fn parse_world_inner(bytes: MmapMut) -> Result<LoadedWorld, String> {
     // existed those rows decoded as chunks at coordinates like `(-1, 1953719668)`, which corrupted
     // the world's reported bounding box (`w_chunks`/`h_chunks`) and everything downstream of it.
     //
-    // Only a contiguous *trailing* run is captured as `dir_trailer` and preserved verbatim; an
+    // Only a contiguous *trailing* run is the trailer and preserved verbatim; an
     // interior row that fails the gate is corruption, dropped outright and never appended to the
     // trailer (re-emitting garbage there could feed a real `SGN1` parser on the next load). This is
     // why the trailer is computed from `rposition` (last real entry) before any filtering — filtering
     // first would make the same row indices no longer line up with byte offsets.
-    const MAX_TRAILER_BYTES: usize = 64 * 1024; // multiple of 16 — never splits a slot
+    //
+    // The trailer is **everything from the first row after the last real entry to EOF** (27.0b):
+    // uncapped (27.1 — the adder's is 80,480 B), and including a ragged last row (< 16 bytes),
+    // which the row loop above never decodes and an earlier capture silently dropped. It becomes
+    // the `Trailer` model (≤ 1 MiB and well-formed ⇒ parsed, else opaque and kept verbatim), and
+    // the bytes stay in the mapping — `file_image` writes them from there while untouched.
     let last_valid_entry = entries.iter()
         .rposition(|&(cx, cy, _)| is_chunk_coord(cx) && is_chunk_coord(cy));
     let kept_entries = last_valid_entry.map(|i| i + 1).unwrap_or(0);
-    let dir_trailer: Vec<u8> = {
-        let start = (ptr_offset + kept_entries * 16).min(bytes.len());
-        let end = (ptr_offset + entries.len() * 16).min(bytes.len());
-        let raw = if start < end { &bytes[start..end] } else { &[][..] };
-        raw[..raw.len().min(MAX_TRAILER_BYTES)].to_vec()
+    let trailer_start = (ptr_offset + kept_entries * 16).min(bytes.len());
+    let trailer_bytes = &bytes[trailer_start..];
+    let trailer = if trailer_bytes.len() > trailer::MAX_BYTES {
+        Trailer::over_cap(trailer_bytes.len())
+    } else {
+        Trailer::load(trailer_bytes)
     };
     entries.truncate(kept_entries);
     let pre_interior_filter = entries.len();
     entries.retain(|&(cx, cy, _)| is_chunk_coord(cx) && is_chunk_coord(cy));
     let interior_dropped = pre_interior_filter - entries.len();
-    if !dir_trailer.is_empty() || interior_dropped > 0 {
-        eprintln!(
-            "[WORLD] chunk directory: {} B of post-directory metadata ({} interior entries dropped as corrupt)",
-            dir_trailer.len(), interior_dropped
+    if !trailer_bytes.is_empty() || interior_dropped > 0 {
+        timing_log!(
+            "[WORLD] chunk directory: {} B of post-directory trailer ({}; {} signs, {} command blocks{}) ({} interior entries dropped as corrupt)",
+            trailer_bytes.len(), if trailer.parsed() { "parsed" } else { "opaque" },
+            trailer.signs().len(), trailer.cmds().len(),
+            if trailer.why().is_empty() { String::new() } else { format!("; {}", trailer.why()) },
+            interior_dropped
         );
     }
 
     // Detect whether this is a 64-layer world (32768 bytes/chunk, 4 bands) or a
     // 256-layer world (131072 bytes/chunk, 16 bands).
     //
-    // Version field at bytes[92..96] selects the format:
-    //   version >= 5       → 256z New Dawn (versions 5 and 6 observed in the wild)
-    //   version <= 4       → 64z legacy (Eden 2.1 and older; version 2 is also legacy)
-    // This check is authoritative even for single-chunk worlds where the gap heuristic
-    // below would silently default to 64z.
-    //
-    // Fallback (unknown version): check the minimum gap between sorted chunk offsets.
-    // A valid 256z file never has two chunks closer than 131072 bytes apart.
+    // Version field at bytes[92..96]:
+    //   version >= 5       → 256z New Dawn, authoritative (versions 5 and 6 observed in the wild),
+    //                        even for single-chunk worlds where the gap heuristics have nothing to go on
+    //   version <= 4       → ambiguous: Eden 2.1-and-older 64z worlds, but the 2026-08 game update
+    //                        also writes `version = 2` on genuine 256z worlds. Decided by the
+    //                        creature-gap detector, then (if that's inconclusive) by the minimum gap
+    //                        between sorted chunk offsets — a valid 256z file never has two chunks
+    //                        closer than 131072 bytes apart.
     let version = if bytes.len() >= 96 {
         i32::from_le_bytes([bytes[92], bytes[93], bytes[94], bytes[95]])
     } else { 4 };
@@ -2698,7 +2854,8 @@ fn parse_world_inner(bytes: MmapMut) -> Result<LoadedWorld, String> {
         h_chunks,
         name,
         sky,
-        dir_trailer,
+        trailer,
+        trailer_start: trailer_start as u64,
         top_bands: TopBandHints::new(min_x, min_y, w_chunks, h_chunks),
         overview: std::sync::OnceLock::new(),
     })
@@ -2876,15 +3033,18 @@ fn edit_patch_capped(
 struct PreviewData {
     width: u32,
     height: u32,
+    /// World columns per pixel along each axis (1 = full resolution). Only the clipboard/prefab
+    /// previews ever downsample; the paste ghost uses it to flag an approximate preview.
+    lod: u32,
     pixels: Vec<u8>,
 }
 
 #[derive(Serialize)]
-struct PreviewDataHeader { width: u32, height: u32 }
+struct PreviewDataHeader { width: u32, height: u32, lod: u32 }
 
 impl tauri::ipc::IpcResponse for PreviewData {
     fn body(self) -> tauri::Result<tauri::ipc::InvokeResponseBody> {
-        ipc_envelope_one(&PreviewDataHeader { width: self.width, height: self.height }, self.pixels)
+        ipc_envelope_one(&PreviewDataHeader { width: self.width, height: self.height, lod: self.lod }, self.pixels)
     }
 }
 
@@ -2893,6 +3053,12 @@ impl tauri::ipc::IpcResponse for PreviewData {
 
 #[tauri::command(async)]
 fn load_world(path: String, state: tauri::State<'_, AppState>) -> Result<WorldMeta, String> {
+    load_world_inner(path, &state)
+}
+
+/// `load_world` without the `tauri::State` wrapper, so tests can drive a real load (sidecar
+/// adoption, the WAL roll-forward) against a bare `AppState`.
+fn load_world_inner(path: String, state: &AppState) -> Result<WorldMeta, String> {
     let t0 = Instant::now();
     let us = || t0.elapsed().as_micros();
 
@@ -2906,24 +3072,43 @@ fn load_world(path: String, state: tauri::State<'_, AppState>) -> Result<WorldMe
     // Step 1: File I/O + parse — no lock held, and critically, the previous world is left
     // untouched until parsing succeeds. A corrupt/wrong-type file must not destroy the current
     // session (it used to: the old world was cleared here before the file was even read).
-    // Peek at 4 magic bytes to detect zip without reading the whole file.
-    let mut magic = [0u8; 4];
+    // Peek at the first 8 bytes to detect a zip or an `.emod` without reading the whole file.
+    let mut magic = Vec::with_capacity(8);
     {
         use std::io::Read;
-        if let Ok(mut f) = fs::File::open(&path) { let _ = f.read_exact(&mut magic); }
+        if let Ok(f) = fs::File::open(&path) { let _ = f.take(8).read_to_end(&mut magic); }
     }
+    let is_emod = magic == eden_format::emod::MAGIC;
 
-    if !is_zip(&magic) {
+    if !is_zip(&magic) && !is_emod {
         // An incremental save (audit C2 Stage 4) that was interrupted mid-write left a committed redo
         // log beside this file. Roll it forward *before* staging, so the copy we map — and therefore
         // everything downstream, including this session's autosave base — is the repaired file.
         recover_wal(std::path::Path::new(&path));
         sweep_orphan_save_temps(std::path::Path::new(&path));
+    } else if is_emod {
+        // An `.emod` never has a WAL (26.5), but a crashed compaction or backup leaves temps.
+        sweep_orphan_save_temps(std::path::Path::new(&path));
     }
 
     let mut temp_shared = false;
     let mut staged_identity: Option<FileIdentity> = None;
-    let (mmap, maybe_temp, was_compressed): (MmapMut, Option<std::path::PathBuf>, bool) = if is_zip(&magic) {
+    let mut emod_session: Option<emod::EmodSession> = None;
+    let (mmap, maybe_temp, was_compressed): (MmapMut, Option<std::path::PathBuf>, bool) = if is_emod {
+        // 26.4: an own-format export of the store's live state into the private temp (sparse: only
+        // occupied bands are written), then the normal parse. The `.emod` itself is only read.
+        let temp_path = temp_world_path();
+        let session = emod::stage_emod(std::path::Path::new(&path), &temp_path)?;
+        timing_log!("[LOAD] emod staged  bytes={}B  damaged={}  torn={}  t=+{}µs",
+            fs::metadata(&temp_path).map_or(0, |m| m.len()), !session.damage.is_empty(), session.torn, us());
+        let (mmap, shared) = match map_staged_temp_ex(&temp_path) {
+            Ok(m) => m,
+            Err(e) => { let _ = fs::remove_file(&temp_path); return Err(format!("Failed to map staged file: {e}")); }
+        };
+        temp_shared = shared;
+        emod_session = Some(session);
+        (mmap, Some(temp_path), false)
+    } else if is_zip(&magic) {
         use zip::ZipArchive;
         timing_log!("[LOAD] detected zip archive, decompressing  t=+{}µs", us());
         // Stream from a `File`, not `fs::read` into a `Vec` first — the archive's compressed size
@@ -2993,31 +3178,21 @@ fn load_world(path: String, state: tauri::State<'_, AppState>) -> Result<WorldMe
     // The overview raster persisted for exactly this file (18.15 phase 2), so the first zoomed-out
     // view reads tens of MB of `.vxr` instead of every chunk's pages. Only with a proven identity
     // (a non-zip load that didn't change mid-copy); a stale or damaged entry is dropped, never an error.
-    if let (Some(id), Some(dir)) = (staged_identity.as_ref(), overview::store_dir()) {
-        let budget = read_ws(&state).overview_budget;
+    // An `.emod` keys it on the `.emod`'s own identity (it never has a `DiskImage`).
+    let overview_id = staged_identity.as_ref().or(emod_session.as_ref().map(|s| &s.file_identity));
+    if let (Some(id), Some(dir)) = (overview_id, overview::store_dir()) {
+        let budget = read_ws(state).overview_budget;
         if let Some(r) = overview::preload(&loaded, id, budget, dir) {
             loaded.overview = std::sync::OnceLock::from(Some(r));
         }
         timing_log!("[LOAD] overview preload  t=+{}µs", us());
     }
 
-    // Signs (256z-format plan, Phase 4): sidecar preferred if it exists beside the *source* path
-    // (never the staged temp — the sidecar travels with the user's file, not our private copy),
-    // else decoded from the inline post-directory trailer (Part A/C — what an upload actually
-    // sends). A missing/foreign/corrupt sidecar must never fail the load, just show no signs.
-    let (signs, signs_from_sidecar) = match fs::read(signs::sign_sidecar_path(std::path::Path::new(&path))) {
-        Ok(bytes) => {
-            let parsed = signs::parse_signs(&bytes);
-            // A sidecar that exists but decodes to nothing is not a sidecar world — fall back, so
-            // a stray/foreign file can't suppress signs sitting inline in the world itself.
-            if parsed.is_empty() {
-                (signs::parse_inline_signs(&loaded.dir_trailer), false)
-            } else {
-                (parsed, true)
-            }
-        }
-        Err(_) => (signs::parse_inline_signs(&loaded.dir_trailer), false),
-    };
+    // Sidecars (27.0b, plan §6.2): the game's `signs_…`/`cmd_….eden.dat` beside the *source* path
+    // (never the staged temp), for an `.eden`, a zip and an `.emod` alike. The trailer wins per
+    // section; what's adopted is owed to the next save (`mark_adopted` below), and a sidecar never
+    // fails the load.
+    let (adopted_files, records_adopted) = signs::adopt_sidecars(&mut loaded.trailer, std::path::Path::new(&path));
 
     // Capture metadata before moving loaded into state.
     // No render_pixels call — tiles are fetched on demand by the frontend.
@@ -3048,7 +3223,9 @@ fn load_world(path: String, state: tauri::State<'_, AppState>) -> Result<WorldMe
         abs_min_y: loaded.min_y,
         sky: loaded.sky,
         version: read_world_version(&loaded.bytes),
-        signs_from_sidecar,
+        records_adopted,
+        container: if is_emod { "emod" } else { "eden" },
+        emod_damage: emod_session.as_ref().map_or_else(Vec::new, |s| s.damage.clone()),
     };
 
     // Step 3: Swap in the new world and clear old session state (clipboard/undo/redo/lamp index/
@@ -3057,7 +3234,8 @@ fn load_world(path: String, state: tauri::State<'_, AppState>) -> Result<WorldMe
     timing_log!("[LOCK] acquire_start  cmd=load_world/step3  t=+{}µs", us());
     let t_s3 = Instant::now();
     let (old_world, old_temp, old_persist) = {
-        let mut ws = write_ws(&state);
+        let _clip = clipboard_exclusive(); // 23.8: not mid-transform
+        let mut ws = write_ws(state);
         let wait = t_s3.elapsed().as_micros();
         timing_log!("[LOCK] acquired  cmd=load_world/step3  wait={}µs  prev_undo={}B  prev_redo={}B",
             wait, ws.undo_bytes, ws.redo_bytes);
@@ -3080,7 +3258,16 @@ fn load_world(path: String, state: tauri::State<'_, AppState>) -> Result<WorldMe
         ws.dirty.clear_all();
         ws.autosave = None; // the new world's autosave lineage starts fresh, not the old one's
         ws.lineage_gen += 1;
-        ws.signs = signs;
+        ws.adopted = None;
+        if !adopted_files.is_empty() {
+            ws.dirty.mark_adopted();
+            ws.adopted = Some(AdoptedSidecars {
+                world_path: std::path::PathBuf::from(&path),
+                files: adopted_files,
+                counts: records_adopted,
+            });
+        }
+        ws.emod = emod_session;
         // Non-zip loads: the staged temp is an exact copy of the source file, which is exactly
         // world.bytes, so the source path is a known-good disk image the instant load succeeds.
         // Zip loads leave this None — there is no uncompressed on-disk image to write into.
@@ -3122,6 +3309,8 @@ struct WorldInfo {
     max_z: u32, chunk_count: usize,
     abs_min_x: i32, abs_min_y: i32,
     spawn_px: Option<f32>, spawn_py: Option<f32>,
+    /// `"emod"` while the session is an `.emod` (26.4), else `"eden"` — `WorldMeta::container`.
+    container: &'static str,
 }
 
 #[tauri::command(async)]
@@ -3166,6 +3355,7 @@ fn get_world_info(state: tauri::State<'_, AppState>) -> Result<WorldInfo, String
         max_z: world_max_z(world) as u32, chunk_count: world.chunk_map.len(),
         abs_min_x: world.min_x, abs_min_y: world.min_y,
         spawn_px: spawn.map(|(x,_)| x), spawn_py: spawn.map(|(_,y)| y),
+        container: if ws.emod.is_some() { "emod" } else { "eden" },
     })
 }
 
@@ -3729,6 +3919,10 @@ fn expand_world_from_template(
     cancel: tauri::State<'_, ExpandCancel>,
 ) -> Result<ExpandResult, String> {
     cancel.0.store(false, std::sync::atomic::Ordering::Relaxed);
+    // Both rebuilding writers produce `.eden` bytes, which never go under a `*.emod` name (26 §2.2).
+    if emod::is_emod_path(std::path::Path::new(&output_path)) {
+        return Err("Choose a .eden name for the new world file.".into());
+    }
     // The **read** guard is held for the whole write (audit C3). This used to copy every user
     // chunk into a `Vec<(i32,i32,Vec<u8>)>` first — a second full copy of the world in RAM, for a
     // write whose own UI warns the output can be ~1 GB — purely so the guard could be dropped
@@ -3743,16 +3937,36 @@ fn expand_world_from_template(
     let tmpl = ws.template_bytes.as_ref().ok_or("No template loaded")?;
     let tmpl: &[u8] = tmpl.as_ref();
     let tdir = &ws.template_dir;
+    expand_world_inner(
+        &output_path, world, tmpl, tdir, full_extent,
+        || expand_cancelled(&cancel),
+        |pct| { let _ = app_handle.emit("expand_progress", pct); },
+    )
+}
 
+/// Core expand write loop, factored out of the `#[tauri::command]` wrapper (like
+/// `materialize_flat_chunks_inner`) so tests can drive it without a `tauri::State`/`AppHandle`.
+/// `cancelled` is polled once per template chunk; `on_progress` gets a 0–100 percentage.
+fn expand_world_inner(
+    output_path: &str,
+    world: &LoadedWorld,
+    tmpl: &[u8],
+    tdir: &FxHashMap<(i32, i32), usize>,
+    full_extent: bool,
+    mut cancelled: impl FnMut() -> bool,
+    mut on_progress: impl FnMut(u32),
+) -> Result<ExpandResult, String> {
     let min_x = world.min_x;
     let min_y = world.min_y;
     let max_x = min_x + world.w_chunks as i32 - 1;
     let max_y = min_y + world.h_chunks as i32 - 1;
     let chunk_size = world.chunk_size;
     let header = &world.bytes[..192.min(world.bytes.len())];
-    let dir_trailer: &[u8] = &world.dir_trailer;
+    // The trailer as the world saves it (27.0b): the file's own bytes, or the model once touched.
+    let image = world.file_image();
+    let dir_trailer: &[u8] = &image.tail;
     // Preserve the source world's reserved creature block (see `creature_block_range`) rather
-    // than silently dropping it — same rationale as `dir_trailer`, one slot below it.
+    // than silently dropping it — same rationale as the trailer, one slot below it.
     let (cb_start, cb_end) = creature_block_range(world);
     let creature_block = &world.bytes[cb_start..cb_end];
 
@@ -3778,7 +3992,7 @@ fn expand_world_from_template(
     let add_count = to_add.len() as u32;
 
     // Write output file using BufWriter for performance
-    let out_file = fs::File::create(&output_path)
+    let out_file = fs::File::create(output_path)
         .map_err(|e| format!("Cannot create output file: {e}"))?;
     let mut writer = BufWriter::with_capacity(4 * 1024 * 1024, out_file);
 
@@ -3817,9 +4031,9 @@ fn expand_world_from_template(
     // upper 12 bands (z 64–255) as air is a correct, direct placement.
     let template_total = to_add.len();
     for (i, (tx, tz)) in to_add.iter().enumerate() {
-        if expand_cancelled(&cancel) {
+        if cancelled() {
             drop(writer);
-            let _ = fs::remove_file(&output_path); // don't leave a truncated/corrupt world file behind
+            let _ = fs::remove_file(output_path); // don't leave a truncated/corrupt world file behind
             return Err("Cancelled".into());
         }
         if let Some(&col_off) = tdir.get(&(*tx, *tz)) {
@@ -3836,13 +4050,12 @@ fn expand_world_from_template(
             }
         }
         if (i + 1) % 500 == 0 || i + 1 == template_total {
-            let pct = ((i + 1) as f64 / template_total as f64 * 100.0) as u32;
-            let _ = app_handle.emit("expand_progress", pct);
+            on_progress(((i + 1) as f64 / template_total as f64 * 100.0) as u32);
         }
     }
 
     // Re-emit the source world's reserved creature block (see `creature_block_range`) directly
-    // before the directory, exactly where the game itself reserves it — mirrors the dir_trailer
+    // before the directory, exactly where the game itself reserves it — mirrors the trailer
     // re-emission below, just on the other side of the directory.
     writer.write_all(creature_block).map_err(|e| format!("Write error: {e}"))?;
     cur_offset += creature_block.len() as u64;
@@ -3855,8 +4068,8 @@ fn expand_world_from_template(
     for &(cx, cy, off) in &dir_entries {
         writer.write_all(&encode_dir_entry(cx, cy, off)).map_err(|e| format!("Write error: {e}"))?;
     }
-    // Re-emit the source world's post-directory trailer (inline signs, see `LoadedWorld::dir_trailer`)
-    // verbatim, immediately after the real entries — the same layout the game itself writes, and what
+    // Re-emit the source world's post-directory trailer (signs + command blocks, see
+    // `LoadedWorld::file_image`) immediately after the real entries — the same layout the game itself writes, and what
     // `parse_world_inner`'s Pass A½ expects to find.
     writer.write_all(dir_trailer).map_err(|e| format!("Write error: {e}"))?;
 
@@ -3864,7 +4077,7 @@ fn expand_world_from_template(
     drop(writer);
 
     // Patch directory_offset in header (bytes 32–39)
-    let mut f = fs::OpenOptions::new().write(true).open(&output_path)
+    let mut f = fs::OpenOptions::new().write(true).open(output_path)
         .map_err(|e| format!("Cannot reopen output: {e}"))?;
     f.seek(SeekFrom::Start(32)).map_err(|e| format!("Seek error: {e}"))?;
     f.write_all(&dir_offset.to_le_bytes()).map_err(|e| format!("Patch error: {e}"))?;
@@ -3984,6 +4197,10 @@ fn materialize_flat_chunks(
     if coords.is_empty() {
         return Err("No chunks selected".into());
     }
+    // Like `expand_world_from_template`: `.eden` bytes never go under a `*.emod` name.
+    if emod::is_emod_path(std::path::Path::new(&output_path)) {
+        return Err("Choose a .eden name for the new world file.".into());
+    }
     if coords.len() > MAX_MATERIALIZE_CHUNKS {
         return Err(format!(
             "Selection too large: {} chunks exceeds the {} limit for a single materialize operation",
@@ -4004,7 +4221,8 @@ fn materialize_flat_chunks(
     let world = ws.world.as_ref().ok_or("No world loaded")?;
     let chunk_size = world.chunk_size;
     let header = &world.bytes[..192.min(world.bytes.len())];
-    let dir_trailer: &[u8] = &world.dir_trailer;
+    let image = world.file_image(); // 27.0b: the trailer as the world saves it
+    let dir_trailer: &[u8] = &image.tail;
     let (cb_start, cb_end) = creature_block_range(world);
     let creature_block = &world.bytes[cb_start..cb_end];
 
@@ -4192,7 +4410,7 @@ fn set_view_cap(cap: Option<i32>, state: tauri::State<'_, AppState>) -> Result<(
 
 /// Mirror the 2D map's current level-of-detail step into `WorldState` (audit M3). MapCanvas calls
 /// this whenever `lodForScale(scale)` changes — and reports 1 whenever it isn't drawing LOD tiles
-/// (Full Map / Axo render modes, whose canvases are 1:1), so an edit patch is never coarser than
+/// (any mode that isn't drawing LOD tiles — canvases are then 1:1), so an edit patch is never coarser than
 /// the surface it will be blitted onto. Same rationale as `set_view_cap` for living on the state
 /// rather than becoming an argument on all 11 editing commands.
 #[tauri::command(async)]
@@ -4338,7 +4556,7 @@ fn rewrite_column_runs(
 /// a file that's currently memory-mapped: the loaded world is mapped from a private temp copy (see
 /// load_world), never the destination, so on Windows the destination isn't locked and rename wins.
 fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
-    atomic_write_progress(path, bytes, None)
+    atomic_write_progress(path, &[bytes], None)
 }
 
 /// How much of a save is written between progress reports. Large enough that the chunking costs
@@ -4350,38 +4568,35 @@ const SAVE_PROGRESS_CHUNK: usize = 16 * 1024 * 1024;
 /// rolls forward, so "cancel" has no coherent meaning there, and stopping a full write halfway
 /// would only mean throwing away work the user asked for. They do now report progress, which is
 /// what makes a multi-minute save on a large world distinguishable from a hang.
+///
+/// `parts` are written back to back — a world is `[file_image.head, file_image.tail]` (27.0b).
 fn atomic_write_progress(
-    path: &std::path::Path, bytes: &[u8], op: Option<&LongOpHandle>,
+    path: &std::path::Path, parts: &[&[u8]], op: Option<&LongOpHandle>,
 ) -> Result<(), String> {
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".savetmp");
     let tmp = std::path::PathBuf::from(tmp);
+    let total: u64 = parts.iter().map(|p| p.len() as u64).sum();
     // audit P-4: not covered transitively by `make_backup_if_absent` past the first save to a path.
-    ensure_room_for(&tmp, bytes.len() as u64).map_err(|e| e.to_string())?;
+    ensure_room_for(&tmp, total).map_err(|e| e.to_string())?;
     let write_result = (|| -> Result<(), String> {
         let mut f = fs::File::create(&tmp).map_err(|e| format!("Failed to write temp file: {e}"))?;
-        match op {
-            None => f.write_all(bytes).map_err(|e| format!("Failed to write temp file: {e}"))?,
-            Some(op) => {
-                for (i, part) in bytes.chunks(SAVE_PROGRESS_CHUNK).enumerate() {
-                    f.write_all(part).map_err(|e| format!("Failed to write temp file: {e}"))?;
-                    op.step((i as u64 + 1) * SAVE_PROGRESS_CHUNK as u64, "Writing")?;
-                }
+        let mut done = 0u64;
+        for bytes in parts {
+            for part in bytes.chunks(SAVE_PROGRESS_CHUNK) {
+                f.write_all(part).map_err(|e| format!("Failed to write temp file: {e}"))?;
+                done += part.len() as u64;
+                if let Some(op) = op { op.step(done, "Writing")?; }
             }
         }
-        if op.is_some() { let _ = op.map(|o| o.step(bytes.len() as u64, "Flushing")); }
+        if let Some(op) = op { let _ = op.step(total, "Flushing"); }
         f.sync_all().map_err(|e| format!("Failed to sync temp file: {e}"))
     })();
     if let Err(e) = write_result {
         let _ = fs::remove_file(&tmp);
         return Err(e);
     }
-    fs::rename(&tmp, path).map_err(|e| {
-        let _ = fs::remove_file(&tmp);
-        format!("Failed to finalize save: {e}")
-    })?;
-    if let Some(parent) = path.parent() { fsync_dir(parent); }
-    Ok(())
+    publish(&tmp, path, "finalize save")
 }
 
 /// Full-save body for a `MAP_SHARED` world (18.11): `msync` the mapping so the temp file holds every
@@ -4390,8 +4605,13 @@ fn atomic_write_progress(
 /// `atomic_write_progress`. The mapping is only *flushed*, never read, so the save doesn't pull the
 /// whole world into the working set. Caller holds the world read guard, so no edit lands between
 /// the flush and the copy. Same on-disk bytes as writing `mmap` directly.
+///
+/// `tail` (27.0b): `Some((trailer_start, bytes))` when the trailer model is touched, so the temp's
+/// own tail is stale — the clone then gets `bytes` written at `trailer_start` and is cut to end
+/// right after them, before the fsync and rename. The temp itself is never changed.
 fn atomic_copy_from_temp(
     mmap: &MmapMut, temp: &std::path::Path, path: &std::path::Path, op: Option<&LongOpHandle>,
+    tail: Option<(u64, &[u8])>,
 ) -> Result<(), String> {
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".savetmp");
@@ -4403,20 +4623,20 @@ fn atomic_copy_from_temp(
         let _ = fs::remove_file(&tmp); // clonefile fails onto an existing destination
         // `stage_copy` does its own `ensure_room_for` (only when a clone isn't possible).
         stage_copy(temp, &tmp).map_err(|e| format!("Failed to write temp file: {e}"))?;
-        let f = fs::OpenOptions::new().write(true).open(&tmp)
+        let mut f = fs::OpenOptions::new().write(true).open(&tmp)
             .map_err(|e| format!("Failed to sync temp file: {e}"))?;
+        if let Some((at, bytes)) = tail {
+            f.set_len(at + bytes.len() as u64).map_err(|e| format!("Failed to write temp file: {e}"))?;
+            f.seek(SeekFrom::Start(at)).map_err(|e| format!("Failed to write temp file: {e}"))?;
+            f.write_all(bytes).map_err(|e| format!("Failed to write temp file: {e}"))?;
+        }
         f.sync_all().map_err(|e| format!("Failed to sync temp file: {e}"))
     })();
     if let Err(e) = copy_result {
         let _ = fs::remove_file(&tmp);
         return Err(e);
     }
-    fs::rename(&tmp, path).map_err(|e| {
-        let _ = fs::remove_file(&tmp);
-        format!("Failed to finalize save: {e}")
-    })?;
-    if let Some(parent) = path.parent() { fsync_dir(parent); }
-    Ok(())
+    publish(&tmp, path, "finalize save")
 }
 
 /// Write `world.bytes` to `path`.  Before overwriting an existing file, copies
@@ -4439,12 +4659,14 @@ fn save_world_progress(
 ) -> Result<(), String> {
     if let Some(op) = op { op.step(0, "Backing up")?; }
     make_backup_if_absent(std::path::Path::new(path), backup_compressed)?;
+    let image = world.file_image();
     if let Some(temp) = shared_temp {
         if fs::metadata(temp).map(|m| m.len()).ok() == Some(world.bytes.len() as u64) {
-            return atomic_copy_from_temp(&world.bytes, temp, std::path::Path::new(path), op);
+            let tail = world.tail_rewritten().then(|| (world.trailer_start, &*image.tail));
+            return atomic_copy_from_temp(&world.bytes, temp, std::path::Path::new(path), op, tail);
         }
     }
-    atomic_write_progress(std::path::Path::new(path), &world.bytes, op)
+    atomic_write_progress(std::path::Path::new(path), &[image.head, &image.tail], op)
 }
 
 /// Create a `.bak` (or `.bak.zip`) snapshot of `src` if neither already exists, and if `src` itself
@@ -4535,10 +4757,7 @@ fn zip_file_contents(src: &std::path::Path, dst: &std::path::Path) -> Result<(),
         let _ = fs::remove_file(&tmp);
         return Err(e);
     }
-    fs::rename(&tmp, dst).map_err(|e| {
-        let _ = fs::remove_file(&tmp);
-        format!("Failed to finalize backup: {e}")
-    })
+    publish(&tmp, dst, "finalize backup")
 }
 
 // ── Incremental in-place save (audit C2 Stage 4) ──────────────────────────────
@@ -4563,10 +4782,13 @@ fn zip_file_contents(src: &std::path::Path, dst: &std::path::Path) -> Result<(),
 // and the destination was never touched. Either way there is no state in which the file on disk is
 // both incomplete and unrepairable.
 //
-// This works only because a loaded world's byte layout is immutable: `save_world_inner` writes
-// `world.bytes` verbatim, so `chunk_map[(cx,cy)]` is a *file* offset as much as a memory offset, and
-// nothing mutates the layout for the life of one `LoadedWorld` (world generation and template
-// expansion write brand-new files and force a reload).
+// This works only because a loaded world's head layout is immutable: every writer emits
+// `file_image()` = `bytes[..trailer_start]` + the trailer, so `chunk_map[(cx,cy)]` is a *file* offset
+// as much as a memory offset, and nothing mutates the layout for the life of one `LoadedWorld` (world
+// generation and template expansion write brand-new files and force a reload). The one thing that
+// moves is the end of the file (27.0b): a touched trailer goes in as a tail record, applied first —
+// `set_len` to the final length, then the bytes — so `wal_validate` accepts the old or the final
+// length and nothing in between.
 
 /// `<path>.wal` — the redo log for an in-place incremental save. A sibling of the destination, like
 /// `.savetmp` and `.bak`, so it's guaranteed to be on the same filesystem.
@@ -4574,6 +4796,19 @@ fn wal_path(path: &std::path::Path) -> std::path::PathBuf {
     let mut p = path.as_os_str().to_owned();
     p.push(".wal");
     std::path::PathBuf::from(p)
+}
+
+/// Final step of every stage-then-rename write: rename `tmp` over `dest` (removing `tmp` if that
+/// fails, error `"Failed to {what}: …"`), then fsync the parent so the new name is durable. The one
+/// place a rename retry (P-6) belongs.
+fn publish(tmp: &std::path::Path, dest: impl AsRef<std::path::Path>, what: &str) -> Result<(), String> {
+    let dest = dest.as_ref();
+    fs::rename(tmp, dest).map_err(|e| {
+        let _ = fs::remove_file(tmp);
+        format!("Failed to {what}: {e}")
+    })?;
+    if let Some(parent) = dest.parent() { fsync_dir(parent); }
+    Ok(())
 }
 
 /// Fsync a *directory*, so a file just created inside it is durably named and not merely durably
@@ -4588,10 +4823,20 @@ fn fsync_dir(dir: &std::path::Path) {
 #[cfg(not(unix))]
 fn fsync_dir(_dir: &std::path::Path) {}
 
+/// The incremental save's tail (27.0b), before its spans: make the file end at `at + bytes.len()`
+/// (`set_len` first, so the file is only ever its old length or its final one), then write the
+/// trailer at `at`. No fsync — `apply_spans_in_place` does one for both.
+fn apply_tail_in_place(f: &mut fs::File, tail: Option<(u64, &[u8])>) -> std::io::Result<()> {
+    let Some((at, bytes)) = tail else { return Ok(()) };
+    f.set_len(at + bytes.len() as u64)?;
+    f.seek(SeekFrom::Start(at))?;
+    f.write_all(bytes)
+}
+
 /// Write `spans` into an already-existing file at their absolute offsets and fsync it — the
 /// incremental save's step 3. `f` must have been opened `write(true)` with no truncate/append (every
-/// write is positioned, and the file's length never changes — a world's layout is fixed, see the
-/// module note above). The caller opens it *before* committing the WAL (21.4), so a destination that
+/// write is positioned; the length only changes through `apply_tail_in_place`, before this — a
+/// world's head layout is fixed, see the module note above). The caller opens it *before* committing the WAL (21.4), so a destination that
 /// can't be opened at all never leaves a log behind.
 fn apply_spans_in_place(f: &mut fs::File, spans: &[(u64, &[u8])]) -> std::io::Result<()> {
     for (off, payload) in spans {
@@ -4639,24 +4884,20 @@ fn recover_wal(dest: &std::path::Path) {
 
     // ── Pass 1: validate. The sink does nothing, so the only question this pass answers is whether
     // the log is ours, intact, and committed.
-    let summary = match journal::replay_each(&mut reader, dest_len, |_| Ok::<(), std::convert::Infallible>(())) {
-        Ok(s) => s,
-        Err(journal::ReplayAbort::Journal(_)) => { let _ = fs::remove_file(&wal); return; }
-        // Total, not a panic: the sink above returns `Infallible`, so this arm is uninhabited.
-        Err(journal::ReplayAbort::Sink(never)) => match never {},
-    };
-    if !summary.ended_with_commit || summary.spans == 0 {
+    let Some((base_len, summary)) = wal_validate(&mut reader, dest_len) else {
         let _ = fs::remove_file(&wal);
         return;
-    }
+    };
 
     // ── Pass 2: apply. Same positioned-write discipline as `apply_spans_in_place` (which stays as
     // it is for `try_incremental_save`, whose spans are a genuine borrow of the mapping): open
-    // `write(true)` with no truncate/append, seek per span, and fsync once at the end.
+    // `write(true)` with no truncate/append, seek per span, and fsync once at the end. A tail
+    // record (27.0b) sets the length first, as `apply_tail_in_place` does.
     if reader.rewind().is_err() { return; }
     let Ok(mut f) = fs::OpenOptions::new().write(true).open(dest) else { return };
     timing_log!("[LOAD] recovering interrupted save  spans={}  dest={:?}", summary.spans, dest);
-    let applied = journal::replay_each(&mut reader, dest_len, |span| {
+    let applied = journal::replay_each(&mut reader, base_len, |span| {
+        if let Some(end) = span.tail_end() { f.set_len(end)?; }
         f.seek(SeekFrom::Start(span.file_off))?;
         f.write_all(span.payload)
     });
@@ -4715,16 +4956,25 @@ fn try_incremental_save_seq(state: &AppState, path: &str, backup_compressed: boo
         // The recorded image must still describe both the world in memory and the file on disk. A
         // length or mtime that has moved means something outside this editor wrote to the
         // destination since our last save, and its contents are no longer a base we can patch.
-        if di.len != world.bytes.len() as u64 { return Ok(None); }
+        //
+        // 27.0b: the file is `file_image()`, whose length moves with the trailer, so it is no longer
+        // `bytes.len()`. With no trailer owed it must be exactly the image's length; with one owed
+        // the file still holds the older tail, so it only has to hold the whole head.
+        let image = world.file_image();
+        let trailer_dirty = ws.dirty.trailer_disk;
+        if di.len < world.trailer_start || (!trailer_dirty && di.len != image.len()) { return Ok(None); }
         let Ok(md) = fs::metadata(dest) else { return Ok(None) };
         if md.len() != di.len || md.modified().ok() != Some(di.mtime) { return Ok(None); }
+        // A tail over the journal's cap (an opaque one is never owed, so this is belt and braces)
+        // takes the full write.
+        if trailer_dirty && image.tail.len() > journal::MAX_TAIL_LEN { return Ok(None); }
 
         let dirty = &ws.dirty.since_disk;
         let header_dirty = ws.dirty.header_disk;
         // Nothing tracked as dirty. The file *should* already be byte-identical, but taking the full
         // write here is the cheap insurance against the one bug class this whole feature can't
         // self-detect: a missed `mark_chunks` hook site would otherwise turn ⌘S into a silent no-op.
-        if dirty.is_empty() && !header_dirty { return Ok(None); }
+        if dirty.is_empty() && !header_dirty && !trailer_dirty { return Ok(None); }
         // Past roughly half the world, patching stops paying for itself against a single sequential
         // rewrite — and a ⌘A-scale fill lands here by design (see the plan's manual check 6).
         if dirty_bytes(world, dirty) >= world.bytes.len() as u64 / 2 {
@@ -4766,10 +5016,21 @@ fn try_incremental_save_seq(state: &AppState, path: &str, backup_compressed: boo
         };
 
         // ── Step 2b: the redo log, committed and fsynced before the destination is touched at all.
+        // The tail record goes first (27.0b), and is applied first: `set_len` to the final length,
+        // then the payload, then the spans — so a crash mid-apply leaves the file at either its
+        // old length or its final one, which is exactly what `wal_validate` accepts.
+        let tail: Option<(u64, &[u8])> = trailer_dirty.then(|| (world.trailer_start, &*image.tail));
         let wal_written = (|| -> Result<(), String> {
             let file = fs::File::create(&wal).map_err(|e| format!("Failed to create save log: {e}"))?;
-            let mut w = journal::JournalWriter::create(file, world.bytes.len() as u64, random_base_id(), false)
+            // `base_len` is the destination's length *before* this save (`di.len`, just checked
+            // against the file), not `bytes.len()` — they differ once a save has moved the tail.
+            let mut header = journal::JournalHeader::new(false, di.len, random_base_id());
+            if tail.is_some() { header = header.with_tail(); }
+            let mut w = journal::JournalWriter::create_with(file, header)
                 .map_err(|e| format!("Failed to write save log header: {e}"))?;
+            if let Some((off, payload)) = tail {
+                w.append_tail(off, payload).map_err(|e| format!("Failed to write save log: {e}"))?;
+            }
             for (i, (off, payload)) in spans.iter().enumerate() {
                 let (cx, cy) = coords[i];
                 w.append_span(*off, cx, cy, payload).map_err(|e| format!("Failed to write save log: {e}"))?;
@@ -4789,18 +5050,18 @@ fn try_incremental_save_seq(state: &AppState, path: &str, backup_compressed: boo
         // ── Step 3: apply in place. From here the destination is mid-mutation, which is exactly what
         // the committed log above covers — so a failure keeps the log (the next `load_world` rolls it
         // forward) and reports rather than pretending the save didn't happen.
-        if let Err(e) = apply_spans_in_place(&mut dest_file, &spans) {
+        if let Err(e) = apply_tail_in_place(&mut dest_file, tail).and_then(|()| apply_spans_in_place(&mut dest_file, &spans)) {
             return Err(format!(
                 "Save failed partway through writing {} changed regions. The file's change log was kept \
                  and will be applied automatically the next time it's opened. Underlying error: {e}",
-                spans.len()
+                spans.len() + tail.is_some() as usize
             ));
         }
         drop(dest_file); // closed before the stat in `record_full_write` (Windows reports mtime on close)
         // ── Step 4: the log has served its purpose.
         let _ = fs::remove_file(&wal);
 
-        (ws.dirty.seq, spans.len())
+        (ws.dirty.seq, spans.len() + tail.is_some() as usize)
     };
     // read guard dropped here.
 
@@ -4827,12 +5088,41 @@ fn record_full_write(
     seq_at_capture: u64,
 ) -> Result<(), String> {
     let md = fs::metadata(dest).map_err(|e| format!("Failed to stat saved file: {e}"))?;
-    let mut ws = write_ws(state);
-    if ws.dirty.seq != seq_at_capture { return Ok(()); }
-    ws.dirty.since_disk.clear();
-    ws.dirty.header_disk = false;
-    ws.disk_image = Some(DiskImage::from_metadata(dest, &md, compressed));
+    let adopted = {
+        let mut ws = write_ws(state);
+        if ws.dirty.seq != seq_at_capture { return Ok(()); }
+        ws.dirty.since_disk.clear();
+        ws.dirty.header_disk = false;
+        ws.dirty.trailer_disk = false;
+        ws.disk_image = Some(DiskImage::from_metadata(dest, &md, compressed));
+        take_adopted_for(&mut ws, dest)
+    };
+    rename_adopted(&adopted);
     Ok(())
+}
+
+/// After a seq-clean save to `dest` that wrote the trailer: if sidecars were adopted on load and
+/// `dest` is **their own world** (not a Save As elsewhere, plan §6.2), the save just wrote them in —
+/// return them for `rename_adopted` and end the adoption.
+pub(crate) fn take_adopted_for(ws: &mut WorldState, dest: &std::path::Path) -> Vec<std::path::PathBuf> {
+    if !ws.dirty.trailer_adopt_pending { return Vec::new(); }
+    if !ws.adopted.as_ref().is_some_and(|a| emod::same_file(&a.world_path, dest)) { return Vec::new(); }
+    ws.dirty.trailer_adopt_pending = false;
+    ws.adopted.take().map(|a| a.files).unwrap_or_default()
+}
+
+/// Rename each adopted sidecar `<name>.adopted` (Emod's `trailerSaved`), so deleting every sign
+/// later can't bring the sidecar's back on reload. Best-effort: a failed rename is logged, never an
+/// error — the save itself succeeded. Call with no world guard held.
+pub(crate) fn rename_adopted(files: &[std::path::PathBuf]) {
+    for f in files {
+        let mut to = f.as_os_str().to_owned();
+        to.push(".adopted");
+        match fs::rename(f, &to) {
+            Ok(()) => timing_log!("[SAVE] sidecar {:?} written into the world; renamed .adopted", f),
+            Err(e) => eprintln!("[SAVE] couldn't rename adopted sidecar {f:?}: {e}"),
+        }
+    }
 }
 
 // ── Undo / Redo helpers ────────────────────────────────────────────────────────
@@ -5811,6 +6101,38 @@ const SAVE_DEFLATE_LEVEL: i64 = 6;
 fn save_world_compressed(
     world: &LoadedWorld, path: &str, backup_compressed: bool, op: Option<&LongOpHandle>,
 ) -> Result<(), String> {
+    make_backup_if_absent(std::path::Path::new(path), backup_compressed)?;
+    let image = world.file_image();
+    write_zip_atomic(&mut std::io::Read::chain(image.head, &*image.tail), image.len(), path, op)
+}
+
+/// 23.9 (audit L7): an unguarded source for a compressed save. Under the caller's world read guard,
+/// `msync` the `MAP_SHARED` mapping and `stage_copy` its temp file to a fresh pid-scoped sibling (an
+/// O(1) APFS clone on macOS, a kernel copy elsewhere — either way far shorter than the deflate),
+/// so the multi-minute deflate can then read the snapshot with **no** guard held and edits stop
+/// queueing behind it. `None` (mapping not shared, stale temp length, flush/copy failure, no room)
+/// means "deflate from the mapping under the guard as before". The snapshot deletes itself on drop;
+/// a crash leaks it only until the next launch's `sweep_stale_temps` (same name shape as a staged
+/// world).
+fn snapshot_shared_temp(world: &LoadedWorld, temp: &std::path::Path) -> Option<SnapshotFile> {
+    if fs::metadata(temp).map(|m| m.len()).ok() != Some(world.bytes.len() as u64) { return None; }
+    world.bytes.flush().ok()?;
+    let snap = SnapshotFile(temp.with_file_name(temp_world_path().file_name()?));
+    stage_copy(temp, &snap.0).ok()?;
+    Some(snap)
+}
+
+/// A save snapshot (23.9), removed when dropped.
+struct SnapshotFile(std::path::PathBuf);
+impl Drop for SnapshotFile {
+    fn drop(&mut self) { let _ = fs::remove_file(&self.0); }
+}
+
+/// Deflate `total` bytes from `src` into `path` as a one-entry zip: stage into `<path>.savetmp`,
+/// fsync, rename over the destination. Makes no backup — callers do that first.
+fn write_zip_atomic(
+    src: &mut dyn std::io::Read, total: u64, path: &str, op: Option<&LongOpHandle>,
+) -> Result<(), String> {
     use zip::write::{SimpleFileOptions, ZipWriter};
     use std::io::Write;
     let inner_name = {
@@ -5820,7 +6142,6 @@ fn save_world_compressed(
         if fname.ends_with(".eden.zip") { fname[..fname.len() - 4].to_string() }
         else { fname.to_string() }
     };
-    make_backup_if_absent(std::path::Path::new(path), backup_compressed)?;
     // Stage the zip into a sibling temp file, then rename over the destination — same atomic-save
     // rationale as save_world_inner (never truncate the destination in place; never touch a file
     // that might be mapped).
@@ -5829,7 +6150,7 @@ fn save_world_compressed(
     let tmp = std::path::PathBuf::from(tmp);
     // audit P-4: not covered transitively by `make_backup_if_absent` past the first save to a path.
     // `needed` is the uncompressed size — the deflated output is never larger.
-    ensure_room_for(&tmp, world.bytes.len() as u64).map_err(|e| e.to_string())?;
+    ensure_room_for(&tmp, total).map_err(|e| e.to_string())?;
     let write_result = (|| -> Result<(), String> {
         let file = fs::File::create(&tmp).map_err(|e| format!("Failed to create file: {e}"))?;
         let mut zip = ZipWriter::new(file);
@@ -5837,14 +6158,27 @@ fn save_world_compressed(
             .compression_method(zip::CompressionMethod::Deflated)
             .compression_level(Some(SAVE_DEFLATE_LEVEL));
         zip.start_file(&inner_name, options).map_err(|e| format!("Zip error: {e}"))?;
-        match op {
-            None => zip.write_all(&world.bytes).map_err(|e| format!("Write error: {e}"))?,
-            Some(op) => {
-                for (i, part) in world.bytes.chunks(SAVE_PROGRESS_CHUNK).enumerate() {
-                    zip.write_all(part).map_err(|e| format!("Write error: {e}"))?;
-                    op.step((i as u64 + 1) * SAVE_PROGRESS_CHUNK as u64, "Compressing")?;
+        // Copy through a fixed buffer, stepping progress every `SAVE_PROGRESS_CHUNK` bytes.
+        let mut buf = vec![0u8; 1 << 20];
+        let (mut done, mut next_step) = (0u64, SAVE_PROGRESS_CHUNK as u64);
+        loop {
+            let n = match src.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(format!("Read error: {e}")),
+            };
+            zip.write_all(&buf[..n]).map_err(|e| format!("Write error: {e}"))?;
+            done += n as u64;
+            if let Some(op) = op {
+                if done >= next_step || done == total {
+                    op.step(done, "Compressing")?;
+                    next_step = done + SAVE_PROGRESS_CHUNK as u64;
                 }
             }
+        }
+        if done != total {
+            return Err(format!("Save source ended early ({done} of {total} bytes)"));
         }
         // finish() returns the inner File; drop it so its handle is closed before the rename
         // (Windows can't rename a file that still has an open handle).
@@ -5857,12 +6191,7 @@ fn save_world_compressed(
         let _ = fs::remove_file(&tmp);
         return Err(e);
     }
-    fs::rename(&tmp, path).map_err(|e| {
-        let _ = fs::remove_file(&tmp);
-        format!("Failed to finalize save: {e}")
-    })?;
-    if let Some(parent) = std::path::Path::new(path).parent() { fsync_dir(parent); }
-    Ok(())
+    publish(&tmp, path, "finalize save")
 }
 
 #[tauri::command(async)]
@@ -5878,17 +6207,54 @@ fn save_world(
     // it, and the re-base below can't race a tick's discharge.
     let _durable = durability_lock();
     let dest = std::path::PathBuf::from(&path);
+    // Two-sided container rule (Stage 26 plan §2.2): the writers below only produce `.eden`/zip
+    // bytes, which must never land under a `*.emod` name. The one `.emod` we write is the session's
+    // own, by appending (26.5, `save_emod` below); Save As `.emod` is deferred with conversion.
+    if emod::is_emod_path(&dest)
+        && !read_ws(&state).emod.as_ref().is_some_and(|s| emod::same_file(&s.path, &dest))
+    {
+        return Err("VuencEdit can only save an .emod back to the file it was opened from. \
+                    Use Save As and choose a .eden name; Emod can convert it to .emod.".into());
+    }
     let t0 = std::time::Instant::now(); // 18.0 `save_*` counters
     // The file just written becomes the autosave journal's new base (or, compressed, no lineage) —
     // replaces the frontend's old post-save `discard_autosave`. Best effort: the save itself already
     // succeeded, and without a re-base the old lineage stays valid or falls back on its own.
     // Skipped while a crash autosave is undecided (21.5): the re-base deletes the sidecars, and
     // autosave is paused for the session anyway, so the lineage it would set is never used.
-    let rebase = |seq: u64| match autosave_paths(&app) {
+    let rebase_as = |seq: u64, compressed: bool| match autosave_paths(&app) {
         Ok(_) if recovery_held() => timing_log!("[AUTOSAVE] re-base skipped: recovery undecided"),
         Ok(paths) => rebase_after_save_inner(&state, &paths, &dest, compressed, seq),
         Err(e) => timing_log!("[AUTOSAVE] re-base skipped: {}", e),
     };
+    let rebase = |seq: u64| rebase_as(seq, compressed);
+
+    // 23.9 (audit L7): the first `.bak`/`.bak.zip` reads only the file on disk, so make it before
+    // any world guard — a world-sized copy or zip no longer holds up edits. The durability mutex
+    // keeps every other writer of `dest` out; every path below then finds it present (a no-op).
+    if read_ws(&state).world.is_none() { return Err("No world loaded".into()); }
+    if dest.exists() && existing_backup(&dest, backup_compressed).is_none() {
+        let _op = ops.begin(&app, "save", "Backing up".into(),
+            fs::metadata(&dest).map_or(0, |m| m.len()), false);
+        make_backup_if_absent(&dest, backup_compressed)?;
+    }
+
+    // 26.5: the session's own `.emod` (the routing check above let nothing else through) is saved
+    // by appending a batch, never through the WAL / in-place / full-rewrite paths below. The
+    // `compressed` flag doesn't apply: the container is compressed per column already.
+    if emod::is_emod_path(&dest) {
+        let op = ops.begin(&app, "save", "Saving".into(), read_ws(&state).dirty.since_disk.len() as u64, false);
+        let saved = emod::save_in_place(&state, &dest, Some(&op))?;
+        drop(op);
+        timing_log!("[SAVE] emod append  columns={}  header={}  creatures={}  trailer={}  appended={}B  compacted={:?}  dest={:?}",
+            saved.columns, saved.header, saved.creatures, saved.trailer, saved.appended, saved.compacted, dest);
+        // 26.6: the commit just made becomes the autosave base (an Emod lineage).
+        rebase_as(saved.seq, false);
+        persist_overview_after_emod_save(&state, saved.seq);
+        mem::PEAKS.save_kind.store(4, std::sync::atomic::Ordering::Relaxed);
+        mem::PEAKS.save_ms.record(t0.elapsed().as_millis() as u64);
+        return Ok(());
+    }
 
     // Fast path: rewrite only what changed since this file was last written (audit C2 Stage 4). It
     // declines — falling through to the full write below — for a compressed target, an unknown or
@@ -5896,6 +6262,7 @@ fn save_world(
     // patching. Declining never touches the destination.
     if !compressed {
         if let Some(seq) = try_incremental_save_seq(&state, &path, backup_compressed)? {
+            write_ws(&state).emod = None; // the session now belongs to this `.eden`
             rebase(seq);
             persist_overview_after_save(&state, &dest, seq);
             mem::PEAKS.save_kind.store(1, std::sync::atomic::Ordering::Relaxed);
@@ -5904,7 +6271,7 @@ fn save_world(
         }
     }
 
-    let seq_at_capture = {
+    let (seq_at_capture, op, snapshot) = {
         let ws = read_ws(&state);
         let world = ws.world.as_ref().ok_or("No world loaded")?;
         let seq = ws.dirty.seq;
@@ -5914,20 +6281,43 @@ fn save_world(
             if compressed { "Saving (compressed)".into() } else { "Saving".into() },
             world.bytes.len() as u64, false,
         );
+        let shared = if ws.temp_shared { ws.temp_path.as_deref() } else { None };
+        let mut snapshot = None;
         if compressed {
-            save_world_compressed(world, &path, backup_compressed, Some(&op))?
+            // 23.9: snapshot under the guard, deflate after it (below); deflate under it only when
+            // there's nothing to snapshot from. The snapshot is the temp, so a rewritten trailer
+            // (27.0b) is captured here too and replaces the snapshot's tail in the deflate.
+            op.step(0, "Snapshotting")?;
+            snapshot = shared.and_then(|t| snapshot_shared_temp(world, t)).map(|snap| {
+                let tail = world.tail_rewritten().then(|| (world.trailer_start, world.file_image().tail.into_owned()));
+                (snap, tail)
+            });
+            if snapshot.is_none() { save_world_compressed(world, &path, backup_compressed, Some(&op))? }
         } else {
-            let shared = if ws.temp_shared { ws.temp_path.as_deref() } else { None };
             save_world_progress(world, &path, backup_compressed, Some(&op), shared)?
         }
-        seq
+        (seq, op, snapshot)
     };
+    if let Some((snap, tail)) = snapshot {
+        use std::io::Read as _;
+        let f = fs::File::open(&snap.0).map_err(|e| format!("Failed to read save snapshot: {e}"))?;
+        let len = f.metadata().map_err(|e| format!("Failed to read save snapshot: {e}"))?.len();
+        match tail {
+            None => write_zip_atomic(&mut &f, len, &path, Some(&op))?,
+            Some((at, tail)) => {
+                let total = at + tail.len() as u64;
+                write_zip_atomic(&mut (&f).take(at).chain(&tail[..]), total, &path, Some(&op))?
+            }
+        }
+    }
+    drop(op);
     // A completed full write supersedes any redo log for this destination: `atomic_write`'s rename
     // published a whole, self-consistent file, so an older log's spans could now only *revert* the
     // chunks they cover (they hold bytes captured before whatever went into this write).
     let _ = fs::remove_file(wal_path(&dest));
     let r = record_full_write(&state, &dest, compressed, seq_at_capture);
     if r.is_ok() {
+        write_ws(&state).emod = None; // Save As `.eden` from an `.emod` session leaves `.emod` mode
         rebase(seq_at_capture);
         if !compressed { persist_overview_after_save(&state, &dest, seq_at_capture); }
     }
@@ -5942,6 +6332,8 @@ fn save_world(
 fn overview_persist_candidate(ws: &WorldState) -> Option<FileIdentity> {
     if !ws.dirty.since_disk.is_empty() { return None; }
     ws.disk_image.as_ref().filter(|d| !d.compressed).map(DiskImage::identity)
+        // An unedited `.emod` session (26.4): its raster is keyed on the `.emod` itself.
+        .or_else(|| ws.emod.as_ref().map(|e| e.file_identity.clone()))
 }
 
 /// Persist the raster of a world being closed or switched away from, if `id` still names the file
@@ -5960,6 +6352,19 @@ fn persist_overview_after_save(state: &AppState, dest: &std::path::Path, seq: u6
     if let Some(job) = overview_job_after_save(state, dest, seq) { job.spawn_write(dir); }
 }
 
+/// `persist_overview_after_save` for an `.emod` session (26.5): the raster is keyed on the `.emod`'s
+/// identity as re-based by the save, under the same seq gate.
+fn persist_overview_after_emod_save(state: &AppState, seq: u64) {
+    let Some(dir) = overview::store_dir() else { return };
+    let job = {
+        let ws = read_ws(state);
+        if ws.dirty.seq != seq || !ws.dirty.since_disk.is_empty() { return; }
+        let (Some(w), Some(e)) = (ws.world.as_ref(), ws.emod.as_ref()) else { return };
+        overview::PersistJob::capture(w, &e.file_identity, true)
+    };
+    if let Some(job) = job { job.spawn_write(dir); }
+}
+
 fn overview_job_after_save(state: &AppState, dest: &std::path::Path, seq: u64) -> Option<overview::PersistJob> {
     let ws = read_ws(state);
     if ws.dirty.seq != seq || !ws.dirty.since_disk.is_empty() { return None; }
@@ -5975,6 +6380,7 @@ fn overview_job_after_save(state: &AppState, dest: &std::path::Path, seq: u64) -
 fn close_world(state: tauri::State<'_, AppState>) {
     let _durable = durability_lock(); // same reason as `load_world` (21.3 / audit L5)
     let (old_world, old_temp, old_persist) = {
+        let _clip = clipboard_exclusive(); // 23.8: not mid-transform
         let mut ws = write_ws(&state);
         let old_persist = overview_persist_candidate(&ws);
         ws.clipboard = None;
@@ -5991,13 +6397,52 @@ fn close_world(state: tauri::State<'_, AppState>) {
         ws.disk_image = None;
         ws.autosave = None;
         ws.lineage_gen += 1;
-        ws.signs.clear();
+        ws.adopted = None;
+        ws.emod = None;
         ws.temp_shared = false;
         (ws.world.take(), ws.temp_path.take(), old_persist)
     };
     persist_overview_on_close(old_world.as_ref(), old_persist);
     drop(old_world); // release the mmap before deleting its backing temp file
     if let Some(p) = old_temp { let _ = fs::remove_file(&p); }
+}
+
+/// Best-effort cleanup on quit (23.10, audit L8): persist the overview raster (synchronously — a
+/// spawned writer would die with the process), release the mapping, delete the staged temp (which is
+/// world-sized on Windows and otherwise leaked until the next launch's `sweep_stale_temps`). Never
+/// blocks the quit: a save/load holding the durability mutex, or any world guard still held, skips
+/// it entirely and the next launch's sweep reclaims the temp as before.
+fn exit_cleanup(state: &AppState, overview_dir: Option<&std::path::Path>) {
+    let _durable = match DURABILITY.try_lock() {
+        Ok(g) => g,
+        Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            timing_log!("[EXIT] cleanup skipped: a save or load is running");
+            return;
+        }
+    };
+    let (world, temp, persist) = {
+        let mut ws = match state.try_write() {
+            Ok(g) => g,
+            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                timing_log!("[EXIT] cleanup skipped: the world guard is held");
+                return;
+            }
+        };
+        let persist = overview_persist_candidate(&ws);
+        ws.temp_shared = false;
+        (ws.world.take(), ws.temp_path.take(), persist)
+    };
+    if let (Some(w), Some(id), Some(dir)) = (world.as_ref(), persist, overview_dir) {
+        if id.check() == BaseStatus::Ok {
+            if let Some(job) = overview::PersistJob::capture(w, &id, false) {
+                if let Err(e) = job.write(dir) { timing_log!("[EXIT] overview persist failed: {e}"); }
+            }
+        }
+    }
+    drop(world); // release the mmap before deleting its backing temp file (Windows refuses otherwise)
+    if let Some(p) = temp { let _ = fs::remove_file(&p); }
 }
 
 // ── Autosave / crash recovery (audit C2 Stage 3; re-based on the saved file in 18.9) ─────────
@@ -6012,6 +6457,11 @@ fn close_world(state: tauri::State<'_, AppState>) {
 //         `FileIdentity` (path, len, mtime, file id). No copy at all. Every uncompressed save
 //         re-bases onto the file it just wrote (`rebase_after_save_inner`), so the journal only
 //         ever holds edits since the last save. Recovery refuses if the file moved or changed.
+//       * **Emod** (26.6) — an `.emod` session's file at its last COMMIT (`emod::EmodBase`). The
+//         journal's offsets are into the own-format export of that state, which re-exporting
+//         reproduces. Re-based by every in-place `.emod` save. Recovery is in place while the
+//         file's last COMMIT is still the base, and an unsaved copy (rebuilt from the file's
+//         append-only prefix) when another writer appended since; anything else refuses.
 //       * **Clone** — `autosave.base.eden`, a clone of the staged temp (O(1) on APFS, a real copy
 //         elsewhere). The fallback when the world has no known on-disk twin: zip loads, recovered
 //         Clone sessions, compressed saves, a source file someone else wrote. ⚠️ The temp is **not**
@@ -6029,7 +6479,7 @@ fn close_world(state: tauri::State<'_, AppState>) {
 // lineage in the backend (the frontend no longer discards after a save); close and a declined
 // recovery prompt discard. If `autosave.meta.json` still exists at next launch, the previous session
 // ended without a clean save (crash, force-quit, or forgot to save) and the frontend offers to
-// recover it via `load_autosave` (formats 1–2) or the legacy `load_world` path (format 0).
+// recover it via `load_autosave` (formats 1–2; a format-0 meta offers nothing).
 //
 // **Durability mutex** (`DURABILITY`, 18.9 phase 0): save, autosave, discard and recovery all run
 // under read guards or none, so without it a tick could interleave with a save's re-base and
@@ -6052,8 +6502,7 @@ fn durability_lock() -> std::sync::MutexGuard<'static, ()> {
 /// sidecars would destroy it: an autosave tick's fresh lineage, a save's re-base, a close's discard.
 /// While this is set those paths leave the sidecar files alone, so autosave is paused for the
 /// session. Set by `get_autosave_info` when it offers one; cleared only by a decision: a successful
-/// `load_autosave`, `discard_autosave(decided: true)`, or `release_autosave_hold` (legacy format-0
-/// recovery, which loads through `load_world`). The commands check it; the `_inner` functions don't.
+/// `load_autosave` or `discard_autosave(decided: true)`. The commands check it; the `_inner` functions don't.
 static RECOVERY_HOLD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn recovery_held() -> bool {
@@ -6079,18 +6528,18 @@ struct AutosaveInfo {
     /// journal that doesn't actually belong to this lineage (formats 1–2).
     #[serde(default)]
     base_id: [u8; 16],
-    /// Format 2: which image the journal replays onto. `None` for formats 0–1.
+    /// Format 2: which image the journal replays onto. `None` for format 1.
     #[serde(default)]
     base: Option<AutosaveBase>,
     /// Computed by `get_autosave_info` for the Recovery modal, never meaningful on disk: whether a
-    /// Source base still matches (`Ok` for a Clone base). `None` for formats 0–1.
+    /// Source base still matches (`Ok` for a Clone base). `None` for format 1.
     #[serde(default)]
     base_status: Option<BaseStatus>,
 }
 
 struct AutosavePaths {
-    /// Legacy pre-Stage-3 single-file autosave. Never written anymore; still checked for and
-    /// cleaned up so an old-format sidecar from before this change doesn't linger forever.
+    /// Legacy pre-Stage-3 single-file autosave (format 0). Never written and no longer recoverable;
+    /// only deleted, so an old sidecar doesn't linger forever.
     legacy_data: std::path::PathBuf,
     meta: std::path::PathBuf,
     base: std::path::PathBuf,
@@ -6140,6 +6589,8 @@ fn random_base_id() -> [u8; 16] {
 /// P-1 (see `autosave_world_inner`), so every writer below must be callable while the read guard
 /// that produced them is still held.
 type JournalSpans<'a> = [(u64, i32, i32, &'a [u8])];
+/// A tick's tail record (27.0b): `(trailer_start, the trailer as the world saves it)`.
+type JournalTail<'a> = Option<(u64, &'a [u8])>;
 
 /// Shared record-emitting body of `write_fresh_journal`/`append_journal`. Reports progress against
 /// `op` as it goes: `LongOpHandle::step` also stamps the working-set access clock, which matters
@@ -6147,10 +6598,15 @@ type JournalSpans<'a> = [(u64, i32, i32, &'a [u8])];
 fn append_journal_records<W: std::io::Write>(
     writer: &mut journal::JournalWriter<W>,
     header: Option<&[u8]>,
+    tail: JournalTail<'_>,
     spans: &JournalSpans<'_>,
     op: Option<&LongOpHandle>,
 ) -> Result<(), String> {
     let mut done: u64 = 0;
+    if let Some((off, t)) = tail {
+        writer.append_tail(off, t).map_err(|e| format!("Failed to append autosave journal trailer: {e}"))?;
+        done += t.len() as u64;
+    }
     if let Some(h) = header {
         writer.append_span(0, journal::HEADER_SPAN.0, journal::HEADER_SPAN.1, h)
             .map_err(|e| format!("Failed to append autosave journal header span: {e}"))?;
@@ -6175,6 +6631,7 @@ fn write_fresh_journal(
     base_len: u64,
     base_id: [u8; 16],
     header: Option<&[u8]>,
+    tail: JournalTail<'_>,
     spans: &JournalSpans<'_>,
     op: Option<&LongOpHandle>,
 ) -> Result<(), String> {
@@ -6183,9 +6640,12 @@ fn write_fresh_journal(
     let tmp = std::path::PathBuf::from(tmp);
     let written = (|| -> Result<(), String> {
         let file = fs::File::create(&tmp).map_err(|e| format!("Failed to create autosave journal: {e}"))?;
-        let mut writer = journal::JournalWriter::create(file, base_len, base_id, true)
+        // `FLAG_TAIL` on every autosave journal: a later tick may append a tail record to it, and
+        // the flag only has to be a superset of what the journal holds (27.0b).
+        let hdr = journal::JournalHeader::new(true, base_len, base_id).with_tail();
+        let mut writer = journal::JournalWriter::create_with(file, hdr)
             .map_err(|e| format!("Failed to write autosave journal header: {e}"))?;
-        append_journal_records(&mut writer, header, spans, op)?;
+        append_journal_records(&mut writer, header, tail, spans, op)?;
         writer.flush().map_err(|e| format!("Failed to flush autosave journal: {e}"))?;
         writer.get_mut().sync_all().map_err(|e| format!("Failed to fsync autosave journal: {e}"))
     })();
@@ -6195,10 +6655,7 @@ fn write_fresh_journal(
         let _ = fs::remove_file(&tmp);
         return Err(e);
     }
-    fs::rename(&tmp, path).map_err(|e| {
-        let _ = fs::remove_file(&tmp);
-        format!("Failed to finalize autosave journal: {e}")
-    })
+    publish(&tmp, path, "finalize autosave journal")
 }
 
 /// Append to an existing journal in place. Safe to leave torn on a crash mid-write — that's the
@@ -6207,13 +6664,14 @@ fn write_fresh_journal(
 fn append_journal(
     path: &std::path::Path,
     header: Option<&[u8]>,
+    tail: JournalTail<'_>,
     spans: &JournalSpans<'_>,
     op: Option<&LongOpHandle>,
 ) -> Result<(), String> {
     let file = fs::OpenOptions::new().append(true).open(path)
         .map_err(|e| format!("Failed to open autosave journal: {e}"))?;
     let mut writer = journal::JournalWriter::resume(file, true);
-    append_journal_records(&mut writer, header, spans, op)?;
+    append_journal_records(&mut writer, header, tail, spans, op)?;
     writer.flush().map_err(|e| format!("Failed to flush autosave journal: {e}"))?;
     writer.get_mut().sync_all().map_err(|e| format!("Failed to fsync autosave journal: {e}"))
 }
@@ -6258,6 +6716,7 @@ fn discharge_autosave_journal(state: &AppState, gen_at_start: u64, lineage: Auto
     if ws.dirty.seq != seq_at_capture { return; }
     ws.dirty.since_journal.clear();
     ws.dirty.header_journal = false;
+    ws.dirty.trailer_journal = false;
 }
 
 /// Write `autosave.meta.json` via a temp + rename, so a crash mid-write can never leave a torn meta
@@ -6268,10 +6727,7 @@ fn write_autosave_meta(path: &std::path::Path, info: &AutosaveInfo) -> Result<()
     tmp.push(".tmp");
     let tmp = std::path::PathBuf::from(tmp);
     fs::write(&tmp, json).map_err(|e| format!("Failed to write autosave meta: {e}"))?;
-    fs::rename(&tmp, path).map_err(|e| {
-        let _ = fs::remove_file(&tmp);
-        format!("Failed to write autosave meta: {e}")
-    })
+    publish(&tmp, path, "write autosave meta")
 }
 
 /// Core of `autosave_world`, factored out so it's callable from tests with a bare `AppState` and a
@@ -6303,32 +6759,45 @@ fn autosave_world_inner(
     // captures spans, ends up in `spans`, and is fully overwritten on replay. Reversing this order
     // would let an edit slip between capture and clone, landing in the base while being absent from
     // that tick's journal: a silently torn chunk that still loads. No guard is held across the I/O.
-    let (gen_at_start, current, disk_ident, base_temp_path, world_len) = {
+    let (gen_at_start, current, disk_ident, emod_ident, base_temp_path, trailer_start) = {
         let ws = read_ws(state);
         let world = ws.world.as_ref().ok_or("No world loaded")?;
         (
             ws.lineage_gen,
             ws.autosave.clone(),
             ws.disk_image.as_ref().filter(|d| !d.compressed).map(DiskImage::identity),
+            // 26.6: an `.emod` session's base is its file at the last COMMIT (load or our save) —
+            // `since_base` is cleared only together with that state being established, exactly as
+            // for a `DiskImage`.
+            ws.emod.as_ref().and_then(emod::EmodSession::autosave_base),
             ws.temp_path.clone(),
-            world.bytes.len() as u64,
+            world.trailer_start,
         )
     };
-    // A Source base must be a UTF-8 path (the meta stores it as JSON) of exactly the world's length.
+    // A Source base must be a UTF-8 path (the meta stores it as JSON) holding the world's whole head.
+    // Its length is the head plus whatever trailer it was last saved with (27.0b), which needn't be
+    // the temp's: the journal records the base's own length, and a tail record replays the rest.
     let source_usable = |id: &FileIdentity| {
-        id.len == world_len && id.path.to_str().is_some() && id.check() == BaseStatus::Ok
+        id.len >= trailer_start && id.path.to_str().is_some() && id.check() == BaseStatus::Ok
     };
+    // An `.emod` base: the file untouched since that commit (one `metadata()`; anything else —
+    // Emod saving meanwhile — falls back to a clone, like a changed Source).
+    let emod_usable = |b: &emod::EmodBase| b.file.path.to_str().is_some() && b.file.check() == BaseStatus::Ok;
     let kept = match current {
         Some(l) => match &l.base {
             AutosaveBase::Source(id) if !source_usable(id) => {
                 timing_log!("[AUTOSAVE] source base {:?} changed or missing; falling back to a clone", id.path);
                 None
             }
+            AutosaveBase::Emod(b) if !emod_usable(b) => {
+                timing_log!("[AUTOSAVE] emod base {:?} changed or missing; falling back to a clone", b.file.path);
+                None
+            }
             _ => Some(l),
         },
-        None => disk_ident.filter(|id| source_usable(id)).map(|id| AutosaveLineage {
-            base_id: random_base_id(), base: AutosaveBase::Source(id), journal_written: false,
-        }),
+        None => disk_ident.filter(|id| source_usable(id)).map(AutosaveBase::Source)
+            .or_else(|| emod_ident.filter(|b| emod_usable(b)).map(AutosaveBase::Emod))
+            .map(|base| AutosaveLineage { base_id: random_base_id(), base, journal_written: false }),
     };
     let lineage = match kept {
         Some(l) => l,
@@ -6370,24 +6839,40 @@ fn autosave_world_inner(
         // A load/close/save/discard landed since step 0: this tick's lineage no longer exists.
         if ws.lineage_gen != gen_at_start { return Ok(()); }
         let world = ws.world.as_ref().ok_or("No world loaded")?;
-        let base_len = world.bytes.len() as u64;
+        // The base image's own length — what recovery stages and checks the journal against. A
+        // Clone is a copy of the temp (whose length never changes); a Source or Emod base is the
+        // file as last loaded or saved, whose trailer may differ in length from the temp's (27.0b).
+        let base_len = match &lineage.base {
+            AutosaveBase::Clone => world.bytes.len() as u64,
+            AutosaveBase::Source(id) => id.len,
+            AutosaveBase::Emod(_) => ws.emod.as_ref().map_or(world.bytes.len() as u64, |e| e.export_len),
+        };
         let seq_at_capture = ws.dirty.seq;
 
         let dirty_now = dirty_bytes(world, &ws.dirty.since_journal);
-        let compact_threshold = (base_len / 10).max(AUTOSAVE_COMPACT_MIN_JOURNAL_BYTES);
+        let compact_threshold = (world.bytes.len() as u64 / 10).max(AUTOSAVE_COMPACT_MIN_JOURNAL_BYTES);
         let compact = !lineage.journal_written
-            || dirty_now > base_len / 4
+            || dirty_now > world.bytes.len() as u64 / 4
             || journal_len_on_disk > compact_threshold;
 
         // Compaction rewrites the journal from everything that differs from the base: since the
-        // load for a Clone, since the last save for a Source (the P-1b fix).
-        let (set, header_dirty) = if !compact {
-            (&ws.dirty.since_journal, ws.dirty.header_journal)
+        // load for a Clone, since the last save for a Source or Emod base (the P-1b fix).
+        //
+        // The trailer (27.0b) follows the same horizons, except that a Clone compares against the
+        // temp's own tail, which is stale exactly when the model is touched (`tail_rewritten`) —
+        // `trailer_load` would miss sidecars adopted on load, which deliberately don't set it.
+        let (set, header_dirty, trailer_dirty) = if !compact {
+            (&ws.dirty.since_journal, ws.dirty.header_journal, ws.dirty.trailer_journal)
         } else if is_clone {
-            (&ws.dirty.since_load, ws.dirty.header_load)
+            (&ws.dirty.since_load, ws.dirty.header_load, world.tail_rewritten())
         } else {
-            (&ws.dirty.since_base, ws.dirty.header_base)
+            (&ws.dirty.since_base, ws.dirty.header_base, ws.dirty.trailer_base)
         };
+        let image = world.file_image();
+        // Never a tail the replay would refuse (only an opaque trailer can be that big, and an
+        // opaque one is never owed).
+        let tail: JournalTail<'_> = (trailer_dirty && image.tail.len() <= journal::MAX_TAIL_LEN)
+            .then(|| (world.trailer_start, &*image.tail));
 
         // One record per run of dirty bands (18.13), clamped to `chunk_range` — never
         // `bytes.len()`: a chunk's real span can be shorter than `chunk_size` (see "Per-chunk
@@ -6402,7 +6887,9 @@ fn autosave_world_inner(
             None
         };
 
-        if spans.is_empty() && header.is_none() && (lineage.journal_written || !is_clone) {
+        if let Some((_, t)) = tail { total_bytes += t.len() as u64; }
+
+        if spans.is_empty() && header.is_none() && tail.is_none() && (lineage.journal_written || !is_clone) {
             // Nothing pending — matches the frontend's own dirty-gating, but a defensive no-op here
             // means a stray call can never create an empty journal or an unnecessary meta rewrite.
             // The Clone term is load-bearing: a tick that just cloned a base in step 0 must always
@@ -6417,12 +6904,12 @@ fn autosave_world_inner(
                 .map(|(app, ops)| ops.begin(app, "autosave", "Autosaving".into(), total_bytes, false));
 
             if compact {
-                write_fresh_journal(&paths.journal, base_len, lineage.base_id, header, &spans, op.as_ref())?;
+                write_fresh_journal(&paths.journal, base_len, lineage.base_id, header, tail, &spans, op.as_ref())?;
             } else {
-                append_journal(&paths.journal, header, &spans, op.as_ref())?;
+                append_journal(&paths.journal, header, tail, &spans, op.as_ref())?;
             }
-            timing_log!("[SAVE] autosave  base={}  compact={}  spans={}  bytes={}",
-                if is_clone { "clone" } else { "source" }, compact, spans.len(), total_bytes);
+            let kind = match lineage.base { AutosaveBase::Clone => "clone", AutosaveBase::Source(_) => "source", AutosaveBase::Emod(_) => "emod" };
+            timing_log!("[SAVE] autosave  base={}  compact={}  spans={}  bytes={}", kind, compact, spans.len(), total_bytes);
             mem::PEAKS.autosave_bytes.record(total_bytes);
             if compact { mem::PEAKS.autosave_compactions.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
             Some((seq_at_capture, world.name.clone()))
@@ -6489,8 +6976,10 @@ fn autosave_world(
 ///    leaves nothing offered for recovery, never a meta pointing at a half-deleted lineage. The
 ///    file just saved holds everything they did.
 /// 2. Under the write guard: an uncompressed save becomes the new Source base (a fresh `base_id`,
-///    no journal yet); a compressed one leaves no lineage, so the next tick clones. `lineage_gen`
-///    bumps either way, so a tick in flight can't resurrect the old lineage.
+///    no journal yet), an in-place `.emod` save the new Emod base (the commit it just made, as
+///    `emod::save_in_place` re-based the session — 26.6); a compressed one leaves no lineage, so
+///    the next tick clones. `lineage_gen` bumps either way, so a tick in flight can't resurrect the
+///    old lineage.
 /// 3. `since_base` is cleared **only if `seq` is unchanged since the save captured the world**. If
 ///    it moved it stays over-approximate, which is safe: every chunk where the world now differs
 ///    from the saved file was edited after the capture, and every such edit marked it. The lineage
@@ -6504,19 +6993,25 @@ fn rebase_after_save_inner(
     seq_at_capture: u64,
 ) {
     remove_autosave_files(paths);
-    let identity = if compressed {
+    // `save_world`'s routing only lets the session's own `.emod` through to an `.emod` destination.
+    let is_emod = emod::is_emod_path(dest);
+    let identity = if compressed || is_emod {
         None
     } else {
         fs::metadata(dest).ok().map(|md| FileIdentity::of(dest, &md))
     };
     let mut ws = write_ws(state);
-    ws.autosave = identity.map(|id| AutosaveLineage {
-        base_id: random_base_id(), base: AutosaveBase::Source(id), journal_written: false,
-    });
+    let base = if is_emod {
+        ws.emod.as_ref().and_then(emod::EmodSession::autosave_base).map(AutosaveBase::Emod)
+    } else {
+        identity.map(AutosaveBase::Source)
+    };
+    ws.autosave = base.map(|base| AutosaveLineage { base_id: random_base_id(), base, journal_written: false });
     ws.lineage_gen += 1;
     if ws.dirty.seq == seq_at_capture {
         ws.dirty.since_base.clear();
         ws.dirty.header_base = false;
+        ws.dirty.trailer_base = false;
     }
 }
 
@@ -6526,11 +7021,26 @@ fn rebase_after_save_inner(
 fn has_committed_wal(dest: &std::path::Path) -> bool {
     let Ok(dest_len) = fs::metadata(dest).map(|m| m.len()) else { return false };
     let Ok(file) = fs::File::open(wal_path(dest)) else { return false };
-    let mut reader = std::io::BufReader::new(file);
-    matches!(
-        journal::replay_each(&mut reader, dest_len, |_| Ok::<(), std::convert::Infallible>(())),
-        Ok(s) if s.ended_with_commit && s.spans > 0
-    )
+    wal_validate(&mut std::io::BufReader::new(file), dest_len).is_some()
+}
+
+/// Pass 1 of `recover_wal` (and all of `has_committed_wal`): `Some((base_len, summary))` when the
+/// log is intact, committed, non-empty and belongs to a destination now `dest_len` long. Leaves the
+/// reader wherever pass 1 stopped.
+///
+/// The length rule (27.0b): a log without a tail record needs `dest_len == base_len` (the file's
+/// length never changed). One with a tail also accepts the final length, because the in-place
+/// apply sets it before anything else (`apply_tail_in_place`): a crash after that leaves the file
+/// at its final length with spans still owed, and replaying is what finishes it.
+fn wal_validate(reader: &mut std::io::BufReader<fs::File>, dest_len: u64) -> Option<(u64, journal::ReplaySummary)> {
+    use std::io::Read as _;
+    let mut hdr = [0u8; journal::HEADER_LEN];
+    reader.read_exact(&mut hdr).ok()?;
+    let base_len = journal::JournalHeader::decode(&hdr)?.base_len;
+    reader.rewind().ok()?;
+    let summary = journal::replay_each(&mut *reader, base_len, |_| Ok::<(), std::convert::Infallible>(())).ok()?;
+    let len_ok = dest_len == base_len || summary.tail_end == Some(dest_len);
+    (summary.ended_with_commit && summary.spans > 0 && len_ok).then_some((base_len, summary))
 }
 
 /// `BaseStatus` of a Source base as recovery would see it: a committed WAL beside the file means an
@@ -6566,7 +7076,7 @@ fn load_autosave_inner(state: &AppState, paths: &AutosavePaths) -> Result<WorldM
     // Which file the journal replays onto, and (Source only) the identity it must still have.
     let source: Option<FileIdentity> = match (info.format, &info.base) {
         (0, _) => return Err("This autosave is in the legacy single-file format; open it directly instead of recovering".into()),
-        (1, _) | (2, Some(AutosaveBase::Clone)) => None,
+        (1, _) | (2, Some(AutosaveBase::Clone)) | (2, Some(AutosaveBase::Emod(_))) => None,
         (2, Some(AutosaveBase::Source(id))) => {
             // A committed WAL means an incremental save got at least as far as committing after
             // this autosave's last tick. Rolling it forward changes the file's identity, so the
@@ -6580,26 +7090,46 @@ fn load_autosave_inner(state: &AppState, paths: &AutosavePaths) -> Result<WorldM
         }
         _ => return Err("This autosave was written by a newer version of VuencEdit and can't be recovered here".into()),
     };
-    let (base_file, base_len) = match &source {
-        Some(id) => (id.path.clone(), id.len),
-        None => {
-            let len = fs::metadata(&paths.base).map_err(|e| format!("Failed to stat autosave base: {e}"))?.len();
-            (paths.base.clone(), len)
-        }
-    };
 
     // Stage into a fresh temp file exactly like load_world does, then replay the journal into
     // THAT file — never into a live mmap, and never into the user's file.
     let temp_path = temp_world_path();
-    stage_copy(&base_file, &temp_path).map_err(|e| format!("Failed to stage autosave base: {e}"))?;
-    // TOCTOU: the user's file could have changed while it was being copied.
-    if let Some(id) = &source {
-        let status = id.check();
-        if status != BaseStatus::Ok {
+    // 26.6: an `.emod` base is re-exported from the file (`emod::stage_autosave_base`): its state
+    // at the recorded COMMIT, in place if that is still the file's last COMMIT, else as a copy
+    // from the append-only prefix. `in_place` decides whether the recovered world keeps the session.
+    let mut emod_base: Option<(emod::EmodSession, bool)> = None;
+    let base_len = if let Some(AutosaveBase::Emod(b)) = &info.base {
+        let (session, in_place) = emod::stage_autosave_base(b, &temp_path)?;
+        emod_base = Some((session, in_place));
+        fs::metadata(&temp_path).map_err(|e| {
             let _ = fs::remove_file(&temp_path);
-            return Err(source_base_error(id, status));
+            format!("Failed to stat autosave base: {e}")
+        })?.len()
+    } else {
+        let (base_file, base_len) = match &source {
+            Some(id) => (id.path.clone(), id.len),
+            None => {
+                let len = fs::metadata(&paths.base).map_err(|e| format!("Failed to stat autosave base: {e}"))?.len();
+                (paths.base.clone(), len)
+            }
+        };
+        stage_copy(&base_file, &temp_path).map_err(|e| format!("Failed to stage autosave base: {e}"))?;
+        // TOCTOU: the user's file could have changed while it was being copied.
+        if let Some(id) = &source {
+            let status = id.check();
+            if status != BaseStatus::Ok {
+                let _ = fs::remove_file(&temp_path);
+                return Err(source_base_error(id, status));
+            }
         }
-    }
+        base_len
+    };
+    let base_kind = match (&source, &emod_base) {
+        (Some(_), _) => "source",
+        (None, Some((_, true))) => "emod",
+        (None, Some((_, false))) => "emod-copy",
+        (None, None) => "clone",
+    };
 
     // ── Replay, streamed (audit P-2). The journal is decoded one record at a time and each span is
     // pwritten into the staged temp as it arrives, so peak RAM here is the largest single *record*
@@ -6649,8 +7179,18 @@ fn load_autosave_inner(state: &AppState, paths: &AutosavePaths) -> Result<WorldM
     // base, exactly where the recovered world differs from the user's file.
     let mut replayed: FxHashSet<(i32, i32)> = FxHashSet::default();
     let mut header_replayed = false;
+    let mut tail_replayed = false;
     let summary = journal::replay_each(&mut reader, base_len, |span| {
-        if span.is_header() { header_replayed = true; } else { replayed.insert((span.cx, span.cy)); }
+        if let Some(end) = span.tail_end() {
+            // 27.0b: the trailer as journaled, and the image ends right after it. Sets the length
+            // of a fresh staged copy — never of a mapped temp (T3 holds for the session's temp).
+            tail_replayed = true;
+            temp_file.set_len(end)?;
+        } else if span.is_header() {
+            header_replayed = true;
+        } else {
+            replayed.insert((span.cx, span.cy));
+        }
         temp_file.seek(SeekFrom::Start(span.file_off))?;
         temp_file.write_all(span.payload)
     })
@@ -6662,11 +7202,12 @@ fn load_autosave_inner(state: &AppState, paths: &AutosavePaths) -> Result<WorldM
             journal::ReplayAbort::Journal(journal::JournalError::BaseLenMismatch { expected, found }) => format!(
                 "Autosave journal doesn't match its base image (base is {expected}B, journal expects {found}B)"
             ),
+            journal::ReplayAbort::Journal(journal::JournalError::UnknownFlags(_)) =>
+                "This autosave was written by a newer version of VuencEdit and can't be recovered here".to_string(),
             journal::ReplayAbort::Sink(e) => format!("Failed to replay autosave journal: {e}"),
         }
     })?;
-    timing_log!("[LOAD] autosave replay  spans={}  truncated={}  base={}",
-        summary.spans, summary.truncated, if source.is_some() { "source" } else { "clone" });
+    timing_log!("[LOAD] autosave replay  spans={}  truncated={}  base={}", summary.spans, summary.truncated, base_kind);
 
     if summary.spans > 0 {
         temp_file.sync_all().map_err(|e| format!("Failed to fsync staged temp: {e}"))?;
@@ -6709,11 +7250,15 @@ fn load_autosave_inner(state: &AppState, paths: &AutosavePaths) -> Result<WorldM
         abs_min_y: loaded.min_y,
         sky: loaded.sky,
         version: read_world_version(&loaded.bytes),
-        signs_from_sidecar: false, // autosave recovery has no source path to hold a sidecar
+        records_adopted: RecordCounts::default(), // recovery has no source path, so adopts nothing (§6.2)
+        // An `.emod` recovered in place is that `.emod` session again; a copy is an unsaved `.eden`.
+        container: if matches!(emod_base, Some((_, true))) { "emod" } else { "eden" },
+        emod_damage: match &emod_base { Some((s, true)) => s.damage.clone(), _ => Vec::new() },
     };
 
     // ── Locked swap — mirrors load_world's step 3.
     let (old_world, old_temp) = {
+        let _clip = clipboard_exclusive(); // 23.8: not mid-transform
         let mut ws = write_ws(state);
         let old_world = ws.world.replace(loaded);
         ws.clipboard = None;
@@ -6729,35 +7274,51 @@ fn load_autosave_inner(state: &AppState, paths: &AutosavePaths) -> Result<WorldM
         let old_temp = ws.temp_path.take();
         ws.temp_path = Some(temp_path);
         ws.temp_shared = temp_shared;
+        ws.emod = None;
+        ws.adopted = None;
         ws.dirty.clear_all();
         ws.lineage_gen += 1;
-        match source {
+        // Marking the replayed chunks dirty makes every set exact for a kept lineage — `since_disk`
+        // (⌘S after recovery patches/appends to the file), `since_base` (the next tick's fresh
+        // journal reproduces this one) and `since_load` (a later Clone fallback). The same `base_id`
+        // is kept because the base is the same file, so a crash between that fresh journal's rename
+        // and its meta write still recovers. `journal_written: false` makes that next tick write
+        // fresh rather than append after a possibly torn tail.
+        let mut keep_lineage = |ws: &mut WorldState, base: AutosaveBase| {
+            let coords: Vec<(i32, i32)> = replayed.drain().collect();
+            if !coords.is_empty() { ws.dirty.mark_chunks(coords); }
+            if header_replayed { ws.dirty.mark_header(); }
+            ws.autosave = Some(AutosaveLineage { base_id: info.base_id, base, journal_written: false });
+        };
+        match (source, emod_base) {
             // Source base (18.9 phase 3): the recovered world is *exactly* the user's file plus the
-            // replayed spans, so keep that lineage. Marking the replayed chunks dirty makes every
-            // set exact — `since_disk` (⌘S after recovery is an incremental patch of the file),
-            // `since_base` (the next tick's fresh journal reproduces this one) and `since_load`
-            // (a later Clone fallback). The same `base_id` is kept because the base is the same
-            // file, so a crash between that fresh journal's rename and its meta write still
-            // recovers. `journal_written: false` makes that next tick write fresh rather than append
-            // after a possibly torn tail.
-            Some(id) => {
-                let coords: Vec<(i32, i32)> = replayed.into_iter().collect();
-                if !coords.is_empty() { ws.dirty.mark_chunks(coords); }
-                if header_replayed { ws.dirty.mark_header(); }
+            // replayed spans, so keep that lineage, and the file is the session's disk image again.
+            (Some(id), _) => {
                 ws.disk_image = Some(DiskImage::from_identity(id.clone(), false));
-                ws.autosave = Some(AutosaveLineage {
-                    base_id: info.base_id, base: AutosaveBase::Source(id), journal_written: false,
-                });
+                keep_lineage(&mut ws, AutosaveBase::Source(id));
+            }
+            // An `.emod` recovered in place (26.6) is the Source case's twin: the world is exactly
+            // that file's state at the base COMMIT plus the replayed spans, so the session comes
+            // back too. The base is re-taken from the fresh session (same commit; its `FileIdentity`
+            // is the file as it is now).
+            (None, Some((session, true))) => {
+                ws.disk_image = None;
+                if let Some(b) = session.autosave_base() { keep_lineage(&mut ws, AutosaveBase::Emod(b)); }
+                ws.emod = Some(session);
             }
             // Clone base: the recovered world isn't known to correspond byte-for-byte to any file on
             // disk yet — no DiskImage until a real Save succeeds, and the first tick starts a fresh
             // Clone lineage rather than resuming appends into a journal whose bookkeeping no longer
-            // matches this session's dirty sets.
-            None => {
+            // matches this session's dirty sets. An `.emod` recovered as a copy (another writer
+            // appended since) is the same: an unsaved world with no file of its own.
+            (None, _) => {
                 ws.disk_image = None;
                 ws.autosave = None;
             }
         }
+        // A replayed trailer (27.0b) is owed to every horizon, like the replayed chunks — and the
+        // recovered session starts with `trailer_load` set (plan §3.3).
+        if tail_replayed { ws.dirty.mark_trailer(); }
         drop(ws);
         (old_world, old_temp)
     };
@@ -6787,8 +7348,8 @@ fn autosave_info_at(paths: &AutosavePaths) -> Result<Option<AutosaveInfo>, Strin
     let json = fs::read_to_string(&paths.meta).map_err(|e| format!("Failed to read autosave meta: {e}"))?;
     let mut info: AutosaveInfo = serde_json::from_str(&json).map_err(|e| format!("Failed to parse autosave meta: {e}"))?;
     let sidecars_present = match (info.format, &info.base) {
-        (0, _) => paths.legacy_data.exists(),
-        (2, Some(AutosaveBase::Source(_))) => paths.journal.exists(),
+        (0, _) => false, // legacy single-file autosave: no longer recoverable (23.15)
+        (2, Some(AutosaveBase::Source(_) | AutosaveBase::Emod(_))) => paths.journal.exists(),
         _ => paths.base.exists() && paths.journal.exists(),
     };
     if !sidecars_present {
@@ -6796,6 +7357,7 @@ fn autosave_info_at(paths: &AutosavePaths) -> Result<Option<AutosaveInfo>, Strin
     }
     info.base_status = match &info.base {
         Some(AutosaveBase::Source(id)) => Some(source_base_status(id)),
+        Some(AutosaveBase::Emod(b)) => Some(emod::base_status(b)),
         Some(AutosaveBase::Clone) => Some(BaseStatus::Ok),
         None => None,
     };
@@ -6812,22 +7374,6 @@ fn get_autosave_info(app: tauri::AppHandle) -> Result<Option<AutosaveInfo>, Stri
         set_recovery_hold(true); // 21.5: hands off the sidecars until the user decides
     }
     Ok(info)
-}
-
-/// Lifts the recovery hold after a legacy (format 0) autosave was recovered through `load_world`,
-/// which knows nothing about the hold (21.5). Formats 1–2 lift it in `load_autosave`.
-#[tauri::command]
-fn release_autosave_hold() {
-    set_recovery_hold(false);
-}
-
-/// The path to load a *legacy* (format 0) pending autosave from — the caller feeds this into the
-/// existing `load_world` command to recover it, exactly like opening any other file. Formats 1–2
-/// recover via `load_autosave` instead, which needs no path (it resolves its own sidecars).
-#[tauri::command]
-fn get_autosave_path(app: tauri::AppHandle) -> Result<String, String> {
-    let paths = autosave_paths(&app)?;
-    Ok(paths.legacy_data.to_string_lossy().into_owned())
 }
 
 /// Removes every autosave sidecar file (meta, journal and its `.tmp`, base, legacy data). Best
@@ -7078,7 +7624,7 @@ fn copy_selection_inner(
     // std's RwLock can't upgrade, so validate under a read guard, release, drop under a write
     // guard, then re-take the read guard and re-validate (the world may have changed in the gap).
     check(&read_ws(state))?;
-    let old = write_ws(state).clipboard.take();
+    let old = { let _clip = clipboard_exclusive(); write_ws(state).clipboard.take() };
     drop(old);
     let cb = {
         let ws = read_ws(state);
@@ -7122,6 +7668,7 @@ fn copy_selection_inner(
         Clipboard { width, height, depth, z_anchor: z_min, block_types, paints, mask, origin }
     };
     let info = cb.info();
+    let _clip = clipboard_exclusive(); // 23.8: never install over a transform's taken clipboard
     write_ws(state).clipboard = Some(cb);
     Ok(info)
 }
@@ -7314,10 +7861,7 @@ fn rotate_clipboard_inner(cb: &mut Clipboard) {
 
 #[tauri::command(async)]
 fn rotate_clipboard(state: tauri::State<'_, AppState>) -> Result<ClipboardInfo, String> {
-    let mut ws = write_ws(&state);
-    let cb = ws.clipboard.as_mut().ok_or("Clipboard is empty")?;
-    rotate_clipboard_inner(cb);
-    Ok(cb.info())
+    transform_clipboard(&state, rotate_clipboard_inner)
 }
 
 fn mirror_clipboard_x_inner(cb: &mut Clipboard) {
@@ -7360,10 +7904,7 @@ fn mirror_clipboard_x_inner(cb: &mut Clipboard) {
 /// Ramp IDs are remapped so E-facing ramps become W-facing and vice versa.
 #[tauri::command(async)]
 fn mirror_clipboard_x(state: tauri::State<'_, AppState>) -> Result<ClipboardInfo, String> {
-    let mut ws = write_ws(&state);
-    let cb = ws.clipboard.as_mut().ok_or("Clipboard is empty")?;
-    mirror_clipboard_x_inner(cb);
-    Ok(cb.info())
+    transform_clipboard(&state, mirror_clipboard_x_inner)
 }
 
 fn mirror_clipboard_y_inner(cb: &mut Clipboard) {
@@ -7409,10 +7950,7 @@ fn mirror_clipboard_y_inner(cb: &mut Clipboard) {
 /// Ramp IDs are remapped so S-facing ramps become N-facing and vice versa.
 #[tauri::command(async)]
 fn mirror_clipboard_y(state: tauri::State<'_, AppState>) -> Result<ClipboardInfo, String> {
-    let mut ws = write_ws(&state);
-    let cb = ws.clipboard.as_mut().ok_or("Clipboard is empty")?;
-    mirror_clipboard_y_inner(cb);
-    Ok(cb.info())
+    transform_clipboard(&state, mirror_clipboard_y_inner)
 }
 
 /// Paste the clipboard at world pixel position (paste_x, paste_y).
@@ -7428,6 +7966,7 @@ fn paste_at(
     ignore_air: bool,
     state: tauri::State<'_, AppState>,
 ) -> Result<EditResult, String> {
+    let _clip = clipboard_shared();
     let mut ws = write_ws(&state);
     paste_at_inner(&mut ws, paste_x, paste_y, elevation_offset, ignore_air)
 }
@@ -7456,31 +7995,8 @@ fn paste_at_inner(
     let mut clipped = 0u32;
     let mut result = with_edit(ws, &label, patch_rect, |world| {
         let max_z = world_max_z(world);
-        for dz in 0..depth {
-            let z = z_anchor + elevation_offset + dz;
-            let z_ok = z >= 0 && z <= max_z;
-            let band = (z.max(0) as usize) / 16;
-            let lz   = (z.max(0) as usize) % 16;
-            for dy in 0..height {
-                let py = paste_y + dy;
-                let chunk_cy = py.div_euclid(16) + world.min_y;
-                let ly       = py.rem_euclid(16) as usize;
-                for dx in 0..width {
-                    let px = paste_x + dx;
-                    // Non-rectangular clipboard: skip columns outside the footprint before anything
-                    // else, so a shaped copy stamps its shape, not the box. Distinct from ignore_air.
-                    if let Some(m) = mask { if !bit_set(m, (dy * width + dx) as usize) { continue; } }
-                    let idx = (dz * height * width + dy * width + dx) as usize;
-                    if ignore_air && block_types[idx] == 0 { continue; }
-                    // Outside the world (off an edge, no chunk, above max_z) the write is dropped;
-                    // 22.9 counts it so the user is told.
-                    let chunk_cx = px.div_euclid(16) + world.min_x;
-                    if px < 0 || py < 0 || !z_ok || !world.has_chunk(chunk_cx, chunk_cy) { clipped += 1; continue; }
-                    let lx = (px % 16) as usize;
-                    set_block_in_band(world, chunk_cx, chunk_cy, band, lx * 256 + ly * 16 + lz, block_types[idx], paints[idx]);
-                }
-            }
-        }
+        clipped = paste_clipboard_at(world, paste_x, paste_y, block_types, paints,
+            width, height, depth, z_anchor, elevation_offset, ignore_air, max_z, mask.as_deref());
         Ok(())
     });
     if let Ok(r) = result.as_mut() { push_clip_warning(&mut r.warnings, clipped); }
@@ -7522,6 +8038,7 @@ fn paste_terrain(
     above_surface: bool,
     state: tauri::State<'_, AppState>,
 ) -> Result<EditResult, String> {
+    let _clip = clipboard_shared();
     let mut ws = write_ws(&state);
     paste_terrain_inner(&mut ws, paste_x, paste_y, elevation_offset, ignore_air, above_surface)
 }
@@ -7572,40 +8089,68 @@ fn paste_terrain_at(
     cap: Option<i32>,
     above_surface: bool,
 ) -> u32 {
+    stamp_columns(world, paste_x, paste_y, block_types, paints, width, height, depth, ignore_air, max_z,
+        |dx, dy| mask.is_none_or(|m| bit_set(m, (dy * width + dx) as usize)),
+        // `terrain_paste_base` is shared with `render_paste_lens`, so the lens can't drift. Each
+        // column is read before it's written, and no other column of this stamp writes (px, py).
+        |w, px, py| terrain_paste_base(w, px, py, cap, above_surface).map(|s| s + elevation_offset))
+}
+
+/// 23.12 (audit E12): **the** clipboard-stamp loop — paste, terrain paste, scatter, array and
+/// extrude all write through it. Walks the source volume (dz-major: `idx = (dz*height + dy)*width +
+/// dx`) one column at a time, gathers the column into a scratch run and writes it with
+/// `write_column_bulk`: one chunk lookup and per-band slice copies (compare-first, so undo capture
+/// is unchanged) instead of a `set_block_in_band` — two hash probes — per voxel.
+/// - `include(dx, dy)` gates a whole source column (shaped clipboard / selection mask).
+/// - `z_base(world, tx, ty)` is where the column's `dz = 0` cell lands; `None` skips the column
+///   (terrain paste over an all-air column). Only asked for columns that are on the world.
+/// - `ignore_air` skips source air cells, so such a column is written as its non-air runs.
+///
+/// Returns the 22.9 clipped count: cells meant to be written (included, not air-skipped) that had
+/// nowhere to go — off an edge, a missing chunk, or outside `0..=max_z`.
+#[allow(clippy::too_many_arguments)]
+fn stamp_columns<W: VoxelViewMut>(
+    world: &mut W,
+    ox: i32, oy: i32,
+    src_bt: &[u8], src_pt: &[u8],
+    width: i32, height: i32, depth: i32,
+    ignore_air: bool, max_z: i32,
+    include: impl Fn(i32, i32) -> bool,
+    mut z_base: impl FnMut(&W, i32, i32) -> Option<i32>,
+) -> u32 {
     let (mnx, mny) = world.chunk_origin();
+    let plane = (width * height) as usize;
+    let d = depth.max(0) as usize;
+    let mut col_bt = vec![0u8; d];
+    let mut col_pt = vec![0u8; d];
     let mut clipped = 0u32;
     for dy in 0..height {
-        let py = paste_y + dy;
-        if py < 0 { continue; }
-        let chunk_cy = py / 16 + mny;
-        let ly       = (py % 16) as usize;
+        let ty = oy + dy;
         for dx in 0..width {
-            let px = paste_x + dx;
-            if px < 0 { continue; }
-            // Shaped clipboard: skip whole columns outside the footprint.
-            if let Some(m) = mask { if !bit_set(m, (dy * width + dx) as usize) { continue; } }
-            let chunk_cx = px / 16 + mnx;
-            let lx       = (px % 16) as usize;
-            if !world.has_chunk(chunk_cx, chunk_cy) {
-                // 22.9: a shaped-in column off the world's edge — count its non-skipped cells.
-                clipped += (0..depth).filter(|&dz| !(ignore_air && block_types[(dz * height * width + dy * width + dx) as usize] == 0)).count() as u32;
+            if !include(dx, dy) { continue; }
+            let tx = ox + dx;
+            let first = (dy * width + dx) as usize;
+            let keep = |dz: usize| !(ignore_air && src_bt[first + dz * plane] == 0);
+            let on_world = tx >= 0 && ty >= 0 && world.has_chunk(tx / 16 + mnx, ty / 16 + mny);
+            if !on_world {
+                clipped += (0..d).filter(|&dz| keep(dz)).count() as u32;
                 continue;
             }
-            // Read surface before writing this column — other columns' writes never
-            // affect (px, py) since each (dx, dy) maps to a unique world position.
-            // `terrain_paste_base` is shared with `render_paste_lens`, so the lens can't drift.
-            let Some(surf_base) = terrain_paste_base(&*world, px, py, cap, above_surface) else {
-                continue; // all-air column — skip
-            };
-            let z_base = surf_base + elevation_offset;
-            for dz in 0..depth {
-                let z = z_base + dz;
-                let idx  = (dz * height * width + dy * width + dx) as usize;
-                if ignore_air && block_types[idx] == 0 { continue; }
-                if z < 0 || z > max_z { clipped += 1; continue; }
-                let band = (z as usize) / 16;
-                let lz   = (z as usize) % 16;
-                set_block_in_band(world, chunk_cx, chunk_cy, band, lx * 256 + ly * 16 + lz, block_types[idx], paints[idx]);
+            let Some(z0) = z_base(&*world, tx, ty) else { continue };
+            // Source rows a..b land inside 0..=max_z; the rest are clipped.
+            let a = (-z0).clamp(0, depth) as usize;
+            let b = (max_z - z0 + 1).clamp(a as i32, depth) as usize;
+            clipped += (0..a).chain(b..d).filter(|&dz| keep(dz)).count() as u32;
+            for dz in a..b {
+                col_bt[dz] = src_bt[first + dz * plane];
+                col_pt[dz] = src_pt[first + dz * plane];
+            }
+            let mut dz = a;
+            while dz < b {
+                if !keep(dz) { dz += 1; continue; }
+                let s = dz;
+                while dz < b && keep(dz) { dz += 1; }
+                write_column_bulk(world, tx, ty, z0 + s as i32, (dz - s) as i32, &col_bt[s..dz], &col_pt[s..dz]);
             }
         }
     }
@@ -7732,32 +8277,12 @@ fn extrude_write(
             "z-" => ( 0,  0,       -k * depth),
             _    => ( 0,  0,        k * depth), // "z+"
         };
-
-        let (mnx, mny) = world.chunk_origin();
-        for dz in 0..depth {
-            let tz = z_min + dz + dz_step;
-            if tz < 0 || tz > max_z { continue; }
-            let band = (tz as usize) / 16;
-            let lz   = (tz as usize) % 16;
-            for dy in 0..height {
-                let ty = y1 + dy + dy_step;
-                if ty < 0 { continue; }
-                let chunk_cy = ty / 16 + mny;
-                let ly       = (ty % 16) as usize;
-                for dx in 0..width {
-                    let tx = x1 + dx + dx_step;
-                    if tx < 0 { continue; }
-                    let chunk_cx = tx / 16 + mnx;
-                    let lx       = (tx % 16) as usize;
-                    // Gate on the source cell (x1+dx, y1+dy) — the shape is what repeats.
-                    if mask.is_some_and(|m| !m.contains(x1 + dx, y1 + dy)) { continue; }
-                    let idx      = (dz * height * width + dy * width + dx) as usize;
-                    let src_bt   = src_types[idx];
-                    if ignore_air && src_bt == 0 { continue; }
-                    set_block_in_band(world, chunk_cx, chunk_cy, band, lx * 256 + ly * 16 + lz, src_bt, src_paints[idx]);
-                }
-            }
-        }
+        // Gate on the source cell (x1+dx, y1+dy) — the shape is what repeats. Extrude has no clip
+        // warning, so the count is dropped.
+        stamp_columns(world, x1 + dx_step, y1 + dy_step, src_types, src_paints, width, height, depth,
+            ignore_air, max_z,
+            |dx, dy| mask.is_none_or(|m| m.contains(x1 + dx, y1 + dy)),
+            |_, _, _| Some(z_min + dz_step));
     }
 }
 
@@ -8161,28 +8686,58 @@ fn generate_trees_inner(
 
 /// Used to show a block preview inside the paste ghost box.
 /// Reads only from clipboard + sky — no world mutation.
+///
+/// `max_side` caps the long side (prefab-library-style thumbnails); `max_pixels` caps the pixel
+/// count and stays 1:1 within it (the paste ghost, which users align block-for-block against
+/// terrain). Both given → the coarser of the two; neither → 1:1.
 #[tauri::command(async)]
-fn render_clipboard_preview(max_side: Option<u32>, state: tauri::State<'_, AppState>) -> Result<PreviewData, String> {
+fn render_clipboard_preview(
+    max_side: Option<u32>,
+    max_pixels: Option<u64>,
+    state: tauri::State<'_, AppState>,
+) -> Result<PreviewData, String> {
+    let t0 = Instant::now();
+    let _clip = clipboard_shared();
     let ws = read_ws(&state);
     let sky = ws.world.as_ref().map(|w| w.sky).unwrap_or(0);
     let cb  = ws.clipboard.as_ref().ok_or("Clipboard is empty")?;
-    Ok(render_clipboard_preview_inner(cb, sky, max_side))
+    let lod = clipboard_preview_lod(cb, max_side, max_pixels);
+    let pd = render_clipboard_preview_inner(cb, sky, lod);
+    timing_log!("[PREVIEW] end  cmd=render_clipboard_preview  clip={}×{}×{}  lod={}  out={}×{}  pixels={}B  total={}ms",
+        cb.width, cb.height, cb.depth, pd.lod, pd.width, pd.height, pd.pixels.len(), t0.elapsed().as_millis());
+    Ok(pd)
 }
 
-/// Long-side cap (px) for thumbnails/ghost previews of a clipboard (row 18.3).
+/// Long-side cap (px) for prefab-library thumbnails (row 18.3).
 const CLIPBOARD_PREVIEW_MAX_SIDE: u32 = 512;
+
+/// Pixel budget for the paste ghost (the 18.3 follow-up): 1:1 up to this many pixels (≈ 2896²,
+/// 32 MB of RGBA), downsampled only beyond it. The image is resident roughly three times at peak
+/// — this `Vec` during the call, the JS envelope buffer in React state, and the ghost canvas's
+/// backing store — so the budget is what bounds a select-all clipboard's WebView heap. The
+/// frontend passes this value as `maxPixels`; keep `App.tsx`'s `CLIPBOARD_GHOST_MAX_PX` in step.
+#[cfg_attr(not(test), allow(dead_code))]
+const CLIPBOARD_GHOST_MAX_PX: u64 = 8 << 20;
+
+/// The `lod` a clipboard preview renders at for the given caps (see `render_clipboard_preview`).
+fn clipboard_preview_lod(cb: &Clipboard, max_side: Option<u32>, max_pixels: Option<u64>) -> u32 {
+    let (w, h) = (cb.width as u32, cb.height as u32);
+    let by_side = max_side.map_or(1, |m| render::axo_lod_for(w, h, m));
+    let by_px = max_pixels.map_or(1, |m| render::lod_for_pixel_budget(w, h, m));
+    by_side.max(by_px)
+}
 
 /// Top-down preview of a clipboard buffer (highest non-air block per column). Shared by
 /// `render_clipboard_preview` (current clipboard) and `render_prefab_thumbnail` (a prefab
 /// file on disk, deserialized without touching the clipboard/undo state).
 ///
-/// `max_side` (row 18.3) bounds the long side of the output: the smallest power-of-two `lod`
-/// (`render::axo_lod_for`) is chosen and each output pixel point-samples the column at the
-/// pixel's top-left, so a 61 M-column clipboard costs ≤ max_side² columns instead of a 244 MB
-/// image. `None` = 1:1.
-fn render_clipboard_preview_inner(cb: &Clipboard, sky: u8, max_side: Option<u32>) -> PreviewData {
+/// `lod` (from `clipboard_preview_lod`; row 18.3) is world columns per output pixel: each output
+/// pixel point-samples the column at the pixel's top-left, so a 61 M-column clipboard costs a
+/// bounded number of columns instead of a 244 MB image. `1` = 1:1.
+fn render_clipboard_preview_inner(cb: &Clipboard, sky: u8, lod: u32) -> PreviewData {
     let (w, h, d) = (cb.width, cb.height, cb.depth);
-    let lod = max_side.map_or(1, |m| render::axo_lod_for(w as u32, h as u32, m)) as usize;
+    let out_lod = lod.max(1);
+    let lod = out_lod as usize;
     let (w, h, d) = (w as usize, h as usize, d as usize);
     let (ow, oh) = (w.div_ceil(lod), h.div_ceil(lod));
     const VOID: [u8; 4] = [20, 20, 35, 255];
@@ -8214,7 +8769,7 @@ fn render_clipboard_preview_inner(cb: &Clipboard, sky: u8, max_side: Option<u32>
             }
         }
     }
-    PreviewData { width: ow as u32, height: oh as u32, pixels }
+    PreviewData { width: ow as u32, height: oh as u32, lod: out_lod, pixels }
 }
 
 // ── Paste lens (UI redesign r3, 14.8) ────────────────────────────────────────────────────────
@@ -8355,6 +8910,7 @@ fn render_paste_lens(
     max_px: Option<u32>,
     state: tauri::State<'_, AppState>,
 ) -> Result<PasteLensPatch, String> {
+    let _clip = clipboard_shared();
     let ws = read_ws(&state);
     render_paste_lens_inner(&ws, x, y, elevation_offset, &mode, above_surface, ignore_air, context, max_px)
 }
@@ -9052,7 +9608,8 @@ fn check_prefab_savable(cb: &Clipboard) -> Result<(), String> {
     Ok(())
 }
 
-/// Remove `<dest>.savetmp` and `<dest>.bak.zip.tmp` left by a save/backup that crashed mid-write.
+/// Remove `<dest>.savetmp` and `<dest>.bak.zip.tmp` left by a save/backup that crashed mid-write
+/// (and, for an `*.emod`, the container writers' `.compact`/`.creating`/`.converting`/`.spill`).
 /// Run at open time (after `recover_wal`), when nothing of ours is mid-save on this path.
 ///
 /// 21.14: another running instance may be mid-save of the same world, so a temp touched within
@@ -9063,7 +9620,8 @@ fn sweep_orphan_save_temps(dest: &std::path::Path) {
 }
 
 fn sweep_orphan_save_temps_aged(dest: &std::path::Path, min_age: std::time::Duration) {
-    for ext in [".savetmp", ".bak.zip.tmp"] {
+    let emod_exts = if emod::is_emod_path(dest) { &emod::ORPHAN_SUFFIXES[..] } else { &[] };
+    for ext in [".savetmp", ".bak.zip.tmp"].iter().chain(emod_exts) {
         let mut p = dest.as_os_str().to_owned();
         p.push(ext);
         let p = std::path::PathBuf::from(p);
@@ -9158,6 +9716,7 @@ fn deserialize_prefab(data: &[u8]) -> Result<Clipboard, String> {
 
 #[tauri::command(async)]
 fn save_prefab(path: String, state: tauri::State<'_, AppState>) -> Result<Vec<String>, String> {
+    let _clip = clipboard_shared();
     let ws = read_ws(&state);
     let cb = ws.clipboard.as_ref().ok_or("Clipboard is empty")?;
     check_prefab_savable(cb)?;
@@ -9173,6 +9732,7 @@ fn load_prefab(path: String, state: tauri::State<'_, AppState>) -> Result<Clipbo
     let data = fs::read(&path).map_err(|e| format!("Failed to read prefab: {e}"))?;
     let cb   = deserialize_prefab(&data)?;
     let info = cb.info();
+    let _clip = clipboard_exclusive();
     let mut ws = write_ws(&state);
     ws.clipboard = Some(cb);
     Ok(info)
@@ -9293,9 +9853,10 @@ fn rename_prefab(path: String, new_name: String) -> Result<String, String> {
     Ok(dst.to_string_lossy().into_owned())
 }
 
-/// Whether a file exists at `path` — used by the save-prefab flow to warn before overwriting.
+/// Whether a file exists at `path` — the save-prefab overwrite warning, the Save As extension
+/// check, and the recent-files "is it still there" probe.
 #[tauri::command]
-fn prefab_exists(path: String) -> bool {
+fn path_exists(path: String) -> bool {
     std::path::Path::new(&path).exists()
 }
 
@@ -9316,7 +9877,7 @@ fn render_prefab_thumbnail(path: String, state: tauri::State<'_, AppState>) -> R
     let cb = deserialize_prefab(&data)?;
     let ws = read_ws(&state);
     let sky = ws.world.as_ref().map(|w| w.sky).unwrap_or(0);
-    Ok(render_clipboard_preview_inner(&cb, sky, Some(CLIPBOARD_PREVIEW_MAX_SIDE)))
+    Ok(render_clipboard_preview_inner(&cb, sky, clipboard_preview_lod(&cb, Some(CLIPBOARD_PREVIEW_MAX_SIDE), None)))
 }
 
 // ── Texture pack commands ────────────────────────────────────────────────────
@@ -11304,7 +11865,8 @@ fn get_selection_mask(state: tauri::State<'_, AppState>) -> Result<SelectionMask
 
 // ── Scatter / Array paste ─────────────────────────────────────────────────────
 
-/// Helper: paste clipboard at a single world position. Assumes world is already taken.
+/// One flat stamp of the clipboard at `(px, py)`, `dz = 0` at `z_anchor + elevation_offset`. Shared by
+/// `paste_at` (once) and `scatter_paste`/`array_paste` (per placement); returns the clipped count.
 fn paste_clipboard_at(
     world: &mut (impl VoxelViewMut + VoxelView),
     px: i32, py: i32,
@@ -11314,32 +11876,10 @@ fn paste_clipboard_at(
     max_z: i32,
     mask: Option<&[u8]>,
 ) -> u32 {
-    let (mnx, mny) = world.chunk_origin();
-    let mut clipped = 0u32;
-    for dz in 0..depth {
-        let tz = z_anchor + elevation_offset + dz;
-        let z_ok = tz >= 0 && tz <= max_z;
-        let band = tz.max(0) as usize / 16;
-        let lz   = tz.max(0) as usize % 16;
-        for dy in 0..height {
-            let ty = py + dy;
-            let chunk_cy = ty.div_euclid(16) + mny;
-            let ly = ty.rem_euclid(16) as usize;
-            for dx in 0..width {
-                let tx = px + dx;
-                // Shaped clipboard: unmasked columns don't stamp (scatter/array honour the shape too).
-                if let Some(m) = mask { if !bit_set(m, (dy * width + dx) as usize) { continue; } }
-                let idx = (dz * height * width + dy * width + dx) as usize;
-                let bt = block_types[idx];
-                if ignore_air && bt == 0 { continue; }
-                let chunk_cx = tx.div_euclid(16) + mnx;
-                if tx < 0 || ty < 0 || !z_ok || !world.has_chunk(chunk_cx, chunk_cy) { clipped += 1; continue; }
-                let lx = (tx % 16) as usize;
-                set_block_in_band(world, chunk_cx, chunk_cy, band, lx * 256 + ly * 16 + lz, bt, paints[idx]);
-            }
-        }
-    }
-    clipped
+    // Shaped clipboard: unmasked columns don't stamp (scatter/array honour the shape too).
+    stamp_columns(world, px, py, block_types, paints, width, height, depth, ignore_air, max_z,
+        |dx, dy| mask.is_none_or(|m| bit_set(m, (dy * width + dx) as usize)),
+        |_, _, _| Some(z_anchor + elevation_offset))
 }
 
 /// The seeded placement sequence `scatter_paste` uses: `count` top-left positions drawn from
@@ -11366,6 +11906,7 @@ fn scatter_paste(
     state: tauri::State<'_, AppState>,
 ) -> Result<EditResult, String> {
     let count = count.clamp(1, 100);
+    let _clip = clipboard_shared();
     let mut ws = write_ws(&state);
 
     // See paste_at's comment (audit H4) — take instead of clone, restore after the edit.
@@ -11416,6 +11957,7 @@ fn array_paste(
 ) -> Result<EditResult, String> {
     let cols = cols.clamp(1, 20);
     let rows = rows.clamp(1, 20);
+    let _clip = clipboard_shared();
     let mut ws = write_ws(&state);
 
     // See paste_at's comment (audit H4) — take instead of clone, restore after the edit.
@@ -11599,8 +12141,6 @@ pub fn run() {
             autosave_world,
             load_autosave,
             get_autosave_info,
-            release_autosave_hold,
-            get_autosave_path,
             discard_autosave,
             undo_edit,
             redo_edit,
@@ -11623,7 +12163,7 @@ pub fn run() {
             list_prefabs,
             delete_prefab,
             rename_prefab,
-            prefab_exists,
+            path_exists,
             render_prefab_thumbnail,
             generate_trees,
             simulate_flow,
@@ -11671,8 +12211,7 @@ pub fn run() {
             get_player_pos,
             get_sky_grid,
             set_sky_grid,
-            get_signs,
-            get_creatures,
+            get_records,
             pick_block_surface,
             get_cursor_block,
             load_eden_template,
@@ -11693,6 +12232,7 @@ pub fn run() {
         .run(|app, event| {
             if let tauri::RunEvent::Exit = event {
                 use tauri::Manager;
+                exit_cleanup(&app.state::<AppState>(), overview::store_dir());
                 if let Ok(base) = app.path().app_data_dir() { release_autosave_owner(&base); }
             }
         });
@@ -11734,94 +12274,79 @@ fn set_sky_grid(grid: Vec<u8>, state: tauri::State<'_, AppState>) -> Result<(), 
     Ok(())
 }
 
-// ── Signs (256z-format plan, Phase 4) ───────────────────────────────────────────
+// ── Records: signs + command blocks (27.0b, plan §3.4) ─────────────────────────────
 
+/// One sign for the frontend. `x`/`y` editor-local, `z` absolute (`LoadedWorld::record_to_local`);
+/// `i` is its index in the trailer (what record edits will name, 27.8).
 #[derive(Serialize)]
-struct SignInfo {
-    /// Editor-local coordinates — `world block coord - min_{x,y}*16`, the same convention
-    /// `read_spawn`/`read_player_pos` use for the header's `pos`/`home` fields.
-    x: f32,
-    y: f32,
-    /// Absolute height — signs carry no z origin offset, unlike x/y.
+struct SignRecord {
+    i: u32,
+    x: i32,
+    y: i32,
     z: i32,
-    /// Strong-but-unproven hypothesis: a 0–3 facing quadrant (Part C3 of the 256z-format plan).
-    facing: i32,
+    /// Anchor face: 0 −x, 1 +x, 2 bottom, 3 top, 4 −y, 5 +y.
+    a: i32,
+    /// Board colour: a paint byte, 1..=54.
+    b: i32,
+    /// The quarter turn the text faces: 0 −x, 1 −y, 2 +x, 3 +y.
+    c: i32,
+    /// For display only (lossy UTF-8 of the bytes before the NUL).
     text: String,
 }
 
-/// Read-only sign list for the currently-loaded world (`ws.signs`, populated by `load_world` —
-/// see the comment there for sidecar-vs-inline-trailer precedence). Converts each sign's raw
-/// world x/y into editor-local coordinates on the way out.
-#[tauri::command(async)]
-fn get_signs(state: tauri::State<'_, AppState>) -> Result<Vec<SignInfo>, String> {
-    let ws = read_ws(&state);
-    let world = ws.world.as_ref().ok_or("No world loaded")?;
-    let origin_x = world.min_x as f32 * 16.0;
-    let origin_y = world.min_y as f32 * 16.0;
-    Ok(ws.signs.iter().map(|s| SignInfo {
-        x: s.x as f32 - origin_x,
-        y: s.y as f32 - origin_y,
-        z: s.z,
-        facing: s.c,
-        text: s.text.clone(),
-    }).collect())
-}
-
-// ── Creature viewer (Phase 6) ─────────────────────────────────────────────────
-
 #[derive(Serialize)]
-struct CreatureInfo {
-    type_id: i32,
-    color:   i32,
-    x:       f32,
-    y:       f32,
-    z:       f32,
-    angle:   f32,
+struct CmdRecord {
+    i: u32,
+    x: i32,
+    y: i32,
+    z: i32,
+    flags: i32,
+    script: String,
 }
 
-/// Read up to 400 entity slots from the reserved creature block that precedes the chunk
-/// directory (`creature_block_range` — sized to whatever gap the world actually has, not a
-/// hardcoded 200-slot/12,000-byte assumption, which used to read the wrong half of a 256z world's
-/// real 400-slot/24,000-byte block). Skips empty slots (type == −1) and out-of-range types.
-/// Returns an empty list for editor-created worlds that have no entity block.
-#[tauri::command(async)]
-fn get_creatures(state: tauri::State<'_, AppState>) -> Result<Vec<CreatureInfo>, String> {
-    const ENTITY_BYTES: usize = 60; // sizeof(EntityData)
-    const MAX_SLOTS: usize = 400;
+/// `get_records`' result. Small JSON (≤ 6.5k signs under the 1 MiB cap).
+#[derive(Serialize)]
+struct RecordsInfo {
+    /// `"none"` (no trailer), `"parsed"`, or `"opaque"` (kept verbatim, not editable — see `why`).
+    status: &'static str,
+    why: String,
+    /// The trailer's size as the next save writes it, and the cap.
+    bytes: u64,
+    cap: u64,
+    signs: Vec<SignRecord>,
+    cmds: Vec<CmdRecord>,
+    /// Records adopted from sidecars on load and not yet saved into the world (plan §6.2).
+    adopted: RecordCounts,
+}
 
+/// The open world's signs and command blocks (replaces `get_signs`). Refetch after any edit whose
+/// result reports a record change (27.8a).
+#[tauri::command(async)]
+fn get_records(state: tauri::State<'_, AppState>) -> Result<RecordsInfo, String> {
     let ws = read_ws(&state);
     let world = ws.world.as_ref().ok_or("No world loaded")?;
-    let bytes = &world.bytes[..];
+    Ok(records_info(world, ws.adopted.as_ref().filter(|_| ws.dirty.trailer_adopt_pending)))
+}
 
-    if bytes.len() < 192 { return Ok(vec![]); }
-
-    let (block_start, block_end) = creature_block_range(world);
-    if block_end <= block_start || block_end > bytes.len() { return Ok(vec![]); }
-    let slot_count = ((block_end - block_start) / ENTITY_BYTES).min(MAX_SLOTS);
-
-    let mut out = Vec::new();
-
-    // EntityData layout (Vector.h):
-    //   pos(3×f32 @0): x=Eden-X, y=Eden-Z(up), z=Eden-Y(south)
-    //   vel(3×f32 @12)
-    //   angle(f32 @24)  type(i32 @28)  color(i32 @32)  touched/extra2/extra3/extra4 @36
-    for i in 0..slot_count {
-        let base = block_start + i * ENTITY_BYTES;
-        if base + ENTITY_BYTES > bytes.len() { break; }
-        let s = &bytes[base..base + ENTITY_BYTES];
-
-        let type_id = i32::from_le_bytes(s[28..32].try_into().unwrap());
-        if !(0..=6).contains(&type_id) { continue; } // −1 = empty slot
-
-        let pos_x   = f32::from_le_bytes(s[ 0.. 4].try_into().unwrap()); // Eden X
-        let pos_z   = f32::from_le_bytes(s[ 8..12].try_into().unwrap()); // Eden Y (south)
-        let pos_y   = f32::from_le_bytes(s[ 4.. 8].try_into().unwrap()); // Eden Z (height)
-        let angle   = f32::from_le_bytes(s[24..28].try_into().unwrap());
-        let color   = i32::from_le_bytes(s[32..36].try_into().unwrap());
-
-        out.push(CreatureInfo { type_id, color, x: pos_x, y: pos_z, z: pos_y, angle });
+fn records_info(world: &LoadedWorld, adopted: Option<&AdoptedSidecars>) -> RecordsInfo {
+    let t = &world.trailer;
+    let bytes = world.file_image().tail.len() as u64;
+    let lossy = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
+    RecordsInfo {
+        status: if !t.parsed() { "opaque" } else if bytes == 0 { "none" } else { "parsed" },
+        why: t.why().to_string(),
+        bytes,
+        cap: trailer::MAX_BYTES as u64,
+        signs: t.signs().iter().enumerate().map(|(i, s)| {
+            let (x, y, z) = world.record_to_local(s.pos);
+            SignRecord { i: i as u32, x, y, z, a: s.a, b: s.b, c: s.c, text: lossy(s.text()) }
+        }).collect(),
+        cmds: t.cmds().iter().enumerate().map(|(i, c)| {
+            let (x, y, z) = world.record_to_local(c.pos);
+            CmdRecord { i: i as u32, x, y, z, flags: c.flags, script: lossy(c.script()) }
+        }).collect(),
+        adopted: adopted.map(|a| a.counts).unwrap_or_default(),
     }
-    Ok(out)
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
@@ -12188,7 +12713,7 @@ mod tests {
     fn test_parse_preserves_sign_trailer_bytes() {
         let b = make_world_with_sign_trailer(2, 32768, 0, &QUARRY_SIGN_TRAILER);
         let world = parse_world_inner(mmap_from_bytes(b)).expect("parse failed");
-        assert_eq!(world.dir_trailer, QUARRY_SIGN_TRAILER);
+        assert_eq!(world.trailer_bytes(), QUARRY_SIGN_TRAILER);
     }
 
     /// Ordering regression: the trailer's offset-0/offset-132 rows must be stripped *before*
@@ -12205,7 +12730,7 @@ mod tests {
     }
 
     /// An *interior* out-of-range entry (not part of a trailing run) is corruption, not a sign
-    /// trailer — it must be dropped and never folded into `dir_trailer`.
+    /// trailer — it must be dropped and never folded into the trailer.
     #[test]
     fn test_parse_drops_interior_out_of_range_entry() {
         let mut b = make_multi_chunk_world(3, 32768, 0);
@@ -12215,7 +12740,7 @@ mod tests {
         assert_eq!(world.chunk_map.len(), 2, "chunks 0 and 2 must still load");
         assert!(world.chunk_map.contains_key(&(0, 0)));
         assert!(world.chunk_map.contains_key(&(2, 0)));
-        assert!(world.dir_trailer.is_empty(),
+        assert!(world.trailer_bytes().is_empty(),
             "an interior corrupt row must be dropped outright, not captured as a trailer");
     }
 
@@ -12272,12 +12797,73 @@ mod tests {
             .join(format!("vuencedit_materialize_trailer_test_{}.eden", std::process::id()));
         materialize_flat_chunks_inner(
             out_path.to_str().unwrap(), chunk_size, &header, &coords, src, &[], &params,
-            &world.dir_trailer, &[], || false, |_, _| {},
+            &world.trailer_bytes(), &[], || false, |_, _| {},
         ).expect("materialize must succeed");
         let out_bytes = fs::read(&out_path).expect("read output");
         let _ = fs::remove_file(&out_path);
         let reloaded = parse_world_inner(mmap_from_bytes(out_bytes)).expect("output must parse");
-        assert_eq!(reloaded.dir_trailer, QUARRY_SIGN_TRAILER);
+        assert_eq!(reloaded.trailer_bytes(), QUARRY_SIGN_TRAILER);
+    }
+
+    /// 27.1: the adder specimen's post-directory trailer (80,480 B: `CMB1` then `SGN1`, to EOF)
+    /// must survive a normal save *and* both rebuilding writers. It used to be captured capped at
+    /// 64 KiB, so `expand_world_inner` and `materialize_flat_chunks_inner` wrote a truncated
+    /// trailer (data loss). The specimen is private; the test skips when it's absent.
+    #[test]
+    fn test_adder_trailer_survives_save_expand_and_materialize() {
+        const ADDER_TRAILER_LEN: usize = 80_480;
+        let Some(home) = std::env::var_os("HOME") else { return };
+        let path = std::path::Path::new(&home).join("emod/TESTERS/3 bit adder 1791611312.eden");
+        if !path.exists() {
+            eprintln!("skipping: {path:?} not present");
+            return;
+        }
+        let orig = fs::read(&path).expect("read adder");
+        let expected = &orig[orig.len() - ADDER_TRAILER_LEN..];
+        assert_eq!(&expected[..4], &[0xff; 4], "the trailer starts on a tagged row");
+        assert_eq!(&expected[4..8], b"CMB1", "the adder's first section is CMB1");
+
+        let world = parse_world_inner(map_fixture(&path)).expect("adder must parse");
+        let dir_off = u64::from_le_bytes(orig[32..40].try_into().unwrap()) as usize;
+        assert_eq!(dir_off + 16 * world.chunk_map.len(), orig.len() - ADDER_TRAILER_LEN,
+            "the trailer runs from the end of the real rows to EOF");
+        assert_eq!(world.trailer_bytes().len(), ADDER_TRAILER_LEN, "captured uncapped");
+        assert_eq!(world.trailer_bytes(), expected);
+
+        let tmp = |tag: &str| std::env::temp_dir()
+            .join(format!("vuencedit_adder_trailer_{tag}_{}.eden", std::process::id()));
+        let check = |out: &std::path::Path, what: &str| {
+            let bytes = fs::read(out).expect("read output");
+            let _ = fs::remove_file(out);
+            assert!(bytes.len() >= ADDER_TRAILER_LEN && &bytes[bytes.len() - ADDER_TRAILER_LEN..] == expected,
+                "{what}: the file must end with the full 80,480-byte trailer");
+            let reloaded = parse_world_inner(mmap_from_bytes(bytes)).expect("output must parse");
+            assert_eq!(reloaded.trailer_bytes(), expected, "{what}: trailer reloads intact");
+            assert_eq!(reloaded.chunk_map.len(), world.chunk_map.len(), "{what}: chunks kept");
+        };
+
+        // Normal save: writes the mapping verbatim.
+        let out = tmp("save");
+        save_world_inner(&world, out.to_str().unwrap(), false).expect("save");
+        check(&out, "save");
+
+        // Template expand with an empty template: only the rebuild path runs.
+        let out = tmp("expand");
+        expand_world_inner(out.to_str().unwrap(), &world, &[], &FxHashMap::default(), false,
+            || false, |_| {}).expect("expand");
+        check(&out, "expand");
+
+        // Materialize with nothing to add: same.
+        let out = tmp("materialize");
+        let header = world.bytes[..192].to_vec();
+        let (coords, src) = materialize_src(&world);
+        let params = FlatChunkParams { chunk_size: world.chunk_size, stone_depth: 1, dirt_depth: 2, surface_z: 4 };
+        let (cb_start, cb_end) = creature_block_range(&world);
+        materialize_flat_chunks_inner(
+            out.to_str().unwrap(), world.chunk_size, &header, &coords, src, &[], &params,
+            &world.trailer_bytes(), &world.bytes[cb_start..cb_end], || false, |_, _| {},
+        ).expect("materialize");
+        check(&out, "materialize");
     }
 
     // ── Phase 2a (256z-format plan): version-independent creature-gap chunk-size detector ─────
@@ -12929,6 +13515,55 @@ mod tests {
         assert!(lamps_match_a_rebuild(&new), "{label}/{bands}: lamp index drifted after redo");
     }
 
+    /// 23.12 — `stamp_columns` (column gather → `write_column_bulk` runs) must match the per-voxel
+    /// loop it replaced byte for byte, and count the same clipped cells: off the west/north edge,
+    /// past the world's east/south edge, below z 0 and above `max_z`, with and without ignore-air,
+    /// a shaped mask, and a per-column `z_base` that sometimes skips a column.
+    #[test]
+    fn test_stamp_columns_matches_per_voxel_reference() {
+        let (w, h, d) = (9, 7, 20);
+        let (cbt, cpt) = cow_clipboard(w, h, d);
+        let mask: Vec<u8> = (0..((w * h + 7) / 8)).map(|i| 0b1011_0111u8.rotate_left(i as u32)).collect();
+        let z_base = |tx: i32, ty: i32, k: i32| -> Option<i32> {
+            if (tx + ty) % 7 == 0 { None } else { Some(k + (tx * 3 + ty) % 9) }
+        };
+        for bands in [4usize, 16] {
+            let max_z = (bands * 16 - 1) as i32;
+            for &(ox, oy) in &[(-4, -3), (20, 20), (43, 44)] {
+                for &k in &[-12, 10, max_z - 8] {
+                    for ignore_air in [false, true] {
+                        for masked in [false, true] {
+                            let include = |dx: i32, dy: i32| !masked || bit_set(&mask, (dy * w + dx) as usize);
+                            let mut fast = cow_ws(bands).world.unwrap();
+                            let mut slow = cow_ws(bands).world.unwrap();
+                            let got = stamp_columns(&mut fast, ox, oy, &cbt, &cpt, w, h, d, ignore_air, max_z,
+                                include, |_, tx, ty| z_base(tx, ty, k));
+                            let (mnx, mny) = slow.chunk_origin();
+                            let mut want = 0u32;
+                            for dy in 0..h { for dx in 0..w {
+                                if !include(dx, dy) { continue; }
+                                let (tx, ty) = (ox + dx, oy + dy);
+                                let on = tx >= 0 && ty >= 0 && slow.has_chunk(tx / 16 + mnx, ty / 16 + mny);
+                                let zb = if on { z_base(tx, ty, k) } else { Some(0) };
+                                let Some(zb) = zb else { continue };
+                                for dz in 0..d {
+                                    let i = ((dz * h + dy) * w + dx) as usize;
+                                    if ignore_air && cbt[i] == 0 { continue; }
+                                    let z = zb + dz;
+                                    if !on || z < 0 || z > max_z { want += 1; continue; }
+                                    set_block_abs(&mut slow, tx, ty, z, cbt[i], cpt[i]);
+                                }
+                            }}
+                            let tag = format!("bands={bands} o=({ox},{oy}) k={k} air={ignore_air} mask={masked}");
+                            assert_eq!(got, want, "{tag}: clipped count");
+                            assert!(fast.bytes[..] == slow.bytes[..], "{tag}: bytes differ");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn cow_clipboard(w: i32, h: i32, d: i32) -> (Vec<u8>, Vec<u8>) {
         let n = (w * h * d) as usize;
         let bt: Vec<u8> = (0..n).map(|i| if i % 5 == 0 { 0 } else { [3u8, 7, 13, LAMP_BLOCK_TYPE][i % 4] }).collect();
@@ -12984,6 +13619,13 @@ mod tests {
             differential("scatter", bands, all, &|w| {
                 for (px, py) in [(1, 1), (14, 30), (35, 36), (40, 2)] {
                     paste_clipboard_at(w, px, py, &cbt, &cpt, 9, 7, 20, 18, 0, true, max_z, None);
+                }
+                Ok(())
+            });
+            differential("paste terrain", bands, all, &|w| {
+                // Off the west edge and over the world's top, so the clip path runs too.
+                for (px, py, above) in [(-3, 20, true), (30, 30, false), (5, 5, true)] {
+                    paste_terrain_at(w, px, py, &cbt, &cpt, 9, 7, 20, 2, true, max_z, None, None, above);
                 }
                 Ok(())
             });
@@ -14122,6 +14764,69 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// 23.10: the exit hook releases the world and deletes the staged temp, but never waits on a
+    /// held guard — a busy world is left alone for the next launch's sweep.
+    #[test]
+    fn test_exit_cleanup_removes_temp_unless_busy() {
+        let dir = std::env::temp_dir().join(format!("vuencedit_exit_cleanup_test_{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("create test dir");
+        let staged = dir.join("staged.eden");
+        let state: AppState = RwLock::new(ws_with_shared_temp(make_bumpy_world_grid(2, 2, |_, _| 20), &staged));
+        {
+            let _busy = read_ws(&state);
+            exit_cleanup(&state, None);
+        }
+        assert!(staged.exists(), "a held guard must skip the cleanup, not wait for it");
+        assert!(read_ws(&state).world.is_some());
+        exit_cleanup(&state, None);
+        assert!(!staged.exists(), "the staged temp is deleted on exit");
+        let ws = read_ws(&state);
+        assert!(ws.world.is_none() && ws.temp_path.is_none());
+        drop(ws);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 23.9: a compressed save deflates from a snapshot taken under the guard, so edits landing
+    /// during the (unguarded) deflate don't reach the file, and the snapshot is removed afterwards.
+    #[test]
+    fn test_compressed_save_deflates_a_snapshot_off_the_guard() {
+        let original = make_bumpy_world_grid(2, 8, |_, _| 20);
+        let dir = std::env::temp_dir().join(format!("vuencedit_save_snapshot_test_{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("create test dir");
+        let staged = dir.join("staged.eden");
+        let dest = dir.join("out.eden.zip");
+        let state: AppState = RwLock::new(ws_with_shared_temp(original, &staged));
+        if staged_map_mode(&staged) != MapMode::Shared { let _ = fs::remove_dir_all(&dir); return; }
+        let delete = |state: &AppState, x0: i32| {
+            with_edit(&mut write_ws(state), "delete", (x0, 0, x0 + 4, 4), |world| {
+                delete_blocks_inner(world, x0, 0, x0 + 4, 4, 0, 63, None);
+                Ok(())
+            }).expect("edit");
+        };
+        delete(&state, 0);
+        let (expected, snap) = {
+            let ws = read_ws(&state);
+            let world = ws.world.as_ref().unwrap();
+            (world_bytes(&ws).to_vec(), snapshot_shared_temp(world, &staged).expect("snapshot"))
+        };
+        let snap_path = snap.0.clone();
+        assert!(snap_path.starts_with(&dir), "the snapshot must sit beside the temp (same volume)");
+        delete(&state, 16); // lands mid-save: must not reach the file
+        let mut f = fs::File::open(&snap.0).unwrap();
+        let len = f.metadata().unwrap().len();
+        write_zip_atomic(&mut f, len, dest.to_str().unwrap(), None).expect("deflate");
+        drop(f);
+        drop(snap);
+        assert!(!snap_path.exists(), "the snapshot must delete itself");
+        let mut zip = zip::ZipArchive::new(fs::File::open(&dest).unwrap()).expect("open zip");
+        let mut got = Vec::new();
+        std::io::Read::read_to_end(&mut zip.by_index(0).unwrap(), &mut got).unwrap();
+        assert!(got == expected, "the zip must hold the world as of the snapshot");
+        assert!(got != world_bytes(&read_ws(&state)), "the later edit must not be in the zip");
+        drop(state);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn test_shared_temp_divergence_is_covered_by_since_base() {
         let original = make_bumpy_world_grid(2, 8, |_, _| 20); // 2×2 chunks
@@ -14412,8 +15117,9 @@ mod tests {
             let world = ws.world.as_ref().unwrap();
             let (addr, end) = world.chunk_range(0, 0).expect("chunk (0,0) must exist");
             let base_id = ws.autosave.as_ref().expect("the tick records its base lineage").base_id;
+            // Every autosave journal carries FLAG_TAIL (27.0b: a later tick may append a tail).
             let mut buf = journal::JournalHeader::new(true, world.bytes.len() as u64, base_id)
-                .encode().to_vec();
+                .with_tail().encode().to_vec();
             buf.extend(journal::encode_span_record(
                 0, journal::HEADER_SPAN.0, journal::HEADER_SPAN.1, &world.bytes[0..192], true).unwrap());
             // Bands 0..=1 only (terrain tops out at z=20): one record per dirty band run, 18.13.
@@ -14814,7 +15520,7 @@ mod tests {
             let world = ws.world.as_ref().unwrap();
             let (addr, end) = world.chunk_range(0, 0).unwrap();
             let spans = [(addr as u64, 0, 0, &world.bytes[addr..end])];
-            write_fresh_journal(&paths.journal, original.len() as u64, base_id, None, &spans, None).unwrap();
+            write_fresh_journal(&paths.journal, original.len() as u64, base_id, None, None, &spans, None).unwrap();
         }
         let json = format!(r#"{{"world_name":"GridTest","source_path":null,"timestamp":0,"format":1,"base_id":{:?}}}"#, base_id);
         fs::write(&paths.meta, json).unwrap();
@@ -17778,7 +18484,7 @@ mod tests {
                 }
             }
         }
-        PreviewData { width: img_w as u32, height: d as u32, pixels }
+        PreviewData { width: img_w as u32, height: d as u32, lod: 1, pixels }
     }
 
     /// On an empty world the lens's ghost is the clipboard silhouette, shifted to the
@@ -18113,7 +18819,7 @@ mod tests {
         bits[0] |= 1 << 0; bits[0] |= 1 << 3;
         let cb = Clipboard { width: 2, height: 2, depth: 1, z_anchor: 0,
             block_types: vec![13u8; 4], paints: vec![0u8; 4], mask: Some(bits), origin: None };
-        let pd = render_clipboard_preview_inner(&cb, 0, None);
+        let pd = render_clipboard_preview_inner(&cb, 0, 1);
         let a = |dx: usize, dy: usize| pd.pixels[(dy * 2 + dx) * 4 + 3];
         assert_eq!(a(0, 0), 255, "masked block column is opaque");
         assert_eq!(a(1, 1), 255, "far masked block column is opaque");
@@ -18122,7 +18828,7 @@ mod tests {
 
         // None mask ⇒ every column filled (VOID for the air columns), matching prefab thumbnails.
         let cb2 = Clipboard { mask: None, ..cb };
-        let pd2 = render_clipboard_preview_inner(&cb2, 0, None);
+        let pd2 = render_clipboard_preview_inner(&cb2, 0, 1);
         for i in 0..4 { assert_eq!(pd2.pixels[i * 4 + 3], 255, "None mask fills the whole box"); }
     }
 
@@ -18135,10 +18841,10 @@ mod tests {
         bt[0] = 13; bt[512] = 13;
         let cb = Clipboard { width: w as _, height: h as _, depth: 1, z_anchor: 0,
             block_types: bt, paints: vec![0u8; w * h], mask: None, origin: None };
-        let full = render_clipboard_preview_inner(&cb, 0, None);
+        let full = render_clipboard_preview_inner(&cb, 0, 1);
         assert_eq!((full.width, full.height), (1024, 2));
-        let pd = render_clipboard_preview_inner(&cb, 0, Some(512));
-        assert_eq!((pd.width, pd.height), (512, 1));
+        let pd = render_clipboard_preview_inner(&cb, 0, clipboard_preview_lod(&cb, Some(512), None));
+        assert_eq!((pd.width, pd.height, pd.lod), (512, 1, 2));
         assert_eq!(pd.pixels.len(), 512 * 4);
         assert_ne!(&pd.pixels[0..3], &[20, 20, 35], "column 0 is a block");
         assert_ne!(&pd.pixels[256 * 4..256 * 4 + 3], &[20, 20, 35], "column 512 samples at ox=256");
@@ -18146,11 +18852,32 @@ mod tests {
         // Small clipboard is unaffected by the cap.
         let small = Clipboard { width: 2, height: 2, depth: 1, z_anchor: 0,
             block_types: vec![13u8; 4], paints: vec![0u8; 4], mask: None, origin: None };
-        let ps = render_clipboard_preview_inner(&small, 0, Some(512));
-        assert_eq!((ps.width, ps.height), (2, 2));
+        let ps = render_clipboard_preview_inner(&small, 0, clipboard_preview_lod(&small, Some(512), None));
+        assert_eq!((ps.width, ps.height, ps.lod), (2, 2, 1));
     }
 
-    /// The ortho front/side selection view (SliceViewport + SelectionInspector) skips unmasked
+    /// 18.3 follow-up: the paste ghost's pixel budget keeps a city-sized clipboard 1:1 (the long-side
+    /// cap downsampled anything over 512, so the ghost no longer lined up block-for-block), and
+    /// only downsamples past the budget. Caps combine as the coarser of the two.
+    #[test]
+    fn test_clipboard_ghost_pixel_budget() {
+        let clip = |w: usize, h: usize| Clipboard { width: w as _, height: h as _, depth: 1, z_anchor: 0,
+            block_types: vec![13u8; w * h], paints: vec![0u8; w * h], mask: None, origin: None };
+        let city = clip(2000, 1500);
+        assert_eq!(clipboard_preview_lod(&city, None, Some(CLIPBOARD_GHOST_MAX_PX)), 1);
+        let pd = render_clipboard_preview_inner(&city, 0, 1);
+        assert_eq!((pd.width, pd.height, pd.lod), (2000, 1500, 1));
+        assert_eq!(clipboard_preview_lod(&city, Some(512), None), 4, "the old cap would have been 1:4");
+        assert_eq!(clipboard_preview_lod(&city, Some(512), Some(CLIPBOARD_GHOST_MAX_PX)), 4, "coarser cap wins");
+        assert_eq!(clipboard_preview_lod(&city, None, None), 1);
+        // Over budget → smallest pow2 that fits (lod math only — no 4 GB test allocation).
+        let huge = Clipboard { width: 8192, height: 8192, depth: 0, z_anchor: 0,
+            block_types: vec![], paints: vec![], mask: None, origin: None };
+        let lod = clipboard_preview_lod(&huge, None, Some(CLIPBOARD_GHOST_MAX_PX));
+        assert_eq!(lod, 4, "8192² = 64 M px → 2048² at lod 4 (lod 2 would be 16 M px)");
+    }
+
+    /// The ortho front/side selection view (the 2D selection inspector) skips unmasked
     /// columns, so a masked block *behind* an unmasked column shows through correctly.
     #[test]
     fn test_render_selection_view_masks_columns() {
@@ -18851,22 +19578,20 @@ mod tests {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../TEST WORLDS/quarry.eden");
         let world = parse_world_inner(map_fixture(&path)).expect("quarry.eden must parse");
         eprintln!(
-            "quarry.eden: {}x{} chunks, chunk_size={}, dir_trailer={}B, chunk_span short-spans={}",
-            world.w_chunks, world.h_chunks, world.chunk_size, world.dir_trailer.len(),
+            "quarry.eden: {}x{} chunks, chunk_size={}, trailer={}B, chunk_span short-spans={}",
+            world.w_chunks, world.h_chunks, world.chunk_size, world.trailer_bytes().len(),
             world.chunk_span.len()
         );
         assert!(world.w_chunks < 1000 && world.h_chunks < 1000,
             "bbox must be sane, not the old 4198 x 1,953,719,669 garbage");
         assert_eq!(world.chunk_size, 131072, "quarry.eden is a 256z world");
-        assert!(!world.dir_trailer.is_empty(), "quarry.eden's inline signs section must be captured");
+        assert!(!world.trailer_bytes().is_empty(), "quarry.eden's inline signs section must be captured");
 
         // Phase 4: the captured trailer must decode to exactly the one real sign record (Part A).
-        let quarry_signs = signs::parse_inline_signs(&world.dir_trailer);
+        let quarry_signs = world.trailer.signs();
         assert_eq!(quarry_signs.len(), 1);
-        assert_eq!(quarry_signs[0].x, 65412);
-        assert_eq!(quarry_signs[0].y, 65069);
-        assert_eq!(quarry_signs[0].z, 32);
-        assert_eq!(quarry_signs[0].text, "test");
+        assert_eq!(quarry_signs[0].pos, trailer::Pos::new(65412, 65069, 32));
+        assert_eq!(quarry_signs[0].text(), b"test");
     }
 
     /// Manual regression for the *other* Phase-1/2 specimen: the updated game's world, whose
@@ -19654,6 +20379,39 @@ mod tests {
         }
     }
 
+    /// 23.8: a clipboard transform runs with no world guard held (edits/renders/saves proceed), and
+    /// leaves the clipboard exactly as the old under-the-guard path did.
+    #[test]
+    fn test_clipboard_transform_runs_off_the_world_guard() {
+        let mut ws = offset_world_state();
+        let clip = || {
+            let mut cb = rt_clip(7, Some(vec![0b0000_0001, 0]));
+            cb.width = 3; cb.height = 2; cb.depth = 2; // odd width, non-square: a rotate changes shape
+            cb.block_types = (0..12).map(|i| 24 + i as u8).collect();
+            cb.paints = (0..12).collect();
+            cb
+        };
+        let mut expect = clip();
+        rotate_clipboard_inner(&mut expect);
+        ws.clipboard = Some(clip());
+        let state = RwLock::new(ws);
+        let info = transform_clipboard(&state, |cb| {
+            assert!(state.try_write().is_ok(), "the world guard must be free during the transform");
+            rotate_clipboard_inner(cb);
+        }).expect("rotate");
+        assert_eq!((info.width, info.height), (2, 3));
+        let ws = read_ws(&state);
+        let got = ws.clipboard.as_ref().expect("clipboard restored");
+        assert_eq!((got.width, got.height, got.depth), (expect.width, expect.height, expect.depth));
+        assert_eq!(got.block_types, expect.block_types);
+        assert_eq!(got.paints, expect.paints);
+        assert_eq!(got.mask, expect.mask);
+        assert!(got.origin.is_none());
+        drop(ws);
+        write_ws(&state).clipboard = None;
+        assert_eq!(transform_clipboard(&state, mirror_clipboard_x_inner).err().as_deref(), Some("Clipboard is empty"));
+    }
+
     /// 22.9: cells that fall off the world (negative origin, past max_z) are counted into one toast
     /// warning; a fully-inside paste stays silent.
     #[test]
@@ -19762,4 +20520,419 @@ mod tests {
         assert_eq!((o.ax, o.ay, o.az, o.source, o.rtid), (100, 200, 7, 1, 1));
     }
 
+
+    // ── 27.0b: the trailer in the world, the file-image seam, sidecars ─────────────────────────
+
+    /// A 2×2-chunk 64z world with the quarry sign trailer after its directory.
+    fn trailer_world() -> Vec<u8> {
+        let mut b = make_bumpy_world_grid(2, 8, |_, _| 20);
+        b.extend_from_slice(&QUARRY_SIGN_TRAILER);
+        b
+    }
+
+    /// Touch the open world's trailer the way a record edit will (27.8a): a model edit plus
+    /// `mark_trailer`. Returns the tail every writer must now produce.
+    fn touch_trailer(ws: &mut WorldState) -> Vec<u8> {
+        let w = ws.world.as_mut().unwrap();
+        let p = trailer::Pos::new(w.min_x * 16 + 3, w.min_y * 16 + 4, 21);
+        w.trailer.add_cmd(p, b"say hi").expect("add a command block");
+        ws.dirty.mark_trailer();
+        let tail = w.trailer_bytes();
+        assert_ne!(tail, QUARRY_SIGN_TRAILER.to_vec());
+        assert_eq!(&tail[4..8], b"CMB1", "a new CMB1 goes before SGN1");
+        tail
+    }
+
+    /// The file a world saves as: head + tail.
+    fn image_bytes(w: &LoadedWorld) -> Vec<u8> {
+        let i = w.file_image();
+        [i.head, &i.tail].concat()
+    }
+
+    fn reload(path: &std::path::Path) -> LoadedWorld {
+        parse_world_inner(mmap_from_bytes(fs::read(path).expect("read output"))).expect("output must parse")
+    }
+
+    /// The load capture keeps a ragged last row (< 16 bytes) instead of dropping it: the trailer is
+    /// everything from the end of the real rows to EOF, and a save writes the file back verbatim.
+    #[test]
+    fn test_trailer_capture_keeps_a_ragged_last_row() {
+        let mut b = trailer_world();
+        b.extend_from_slice(&[1, 2, 3, 4, 5]);
+        let world = parse_world_inner(mmap_from_bytes(b.clone())).expect("parse");
+        assert_eq!(world.chunk_map.len(), 4);
+        assert_eq!(world.trailer_start as usize, b.len() - 192 - 5);
+        assert_eq!(world.trailer_bytes(), b[b.len() - 197..].to_vec(), "the ragged row is part of the trailer");
+        assert!(!world.trailer.parsed(), "a partial row makes it opaque (kept verbatim)");
+        let dir = stage4_dir("ragged");
+        let out = dir.join("out.eden");
+        save_world_inner(&world, out.to_str().unwrap(), false).expect("save");
+        assert_eq!(fs::read(&out).unwrap(), b, "saved verbatim, ragged row included");
+
+        // No tagged rows at all, just a few stray bytes after the directory: still kept.
+        let mut b = make_bumpy_world_grid(2, 8, |_, _| 20);
+        b.extend_from_slice(&[9; 7]);
+        let world = parse_world_inner(mmap_from_bytes(b.clone())).expect("parse");
+        assert_eq!(world.chunk_map.len(), 4);
+        assert_eq!(world.trailer_bytes(), vec![9; 7]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The untouched trailer is the file's own bytes; the quarry trailer parses to its one sign.
+    #[test]
+    fn test_untouched_trailer_is_the_files_own_bytes() {
+        let world = parse_world_inner(mmap_from_bytes(trailer_world())).expect("parse");
+        assert!(world.trailer.parsed() && !world.tail_rewritten());
+        assert_eq!(world.trailer.signs().len(), 1);
+        assert!(matches!(world.file_image().tail, Cow::Borrowed(_)), "borrowed from the mapping while untouched");
+        assert_eq!(image_bytes(&world), trailer_world());
+        let r = records_info(&world, None);
+        assert_eq!((r.status, r.signs.len(), r.cmds.len(), r.bytes), ("parsed", 1, 0, 192));
+        let (x, y, z) = world.record_to_local(world.trailer.signs()[0].pos);
+        assert_eq!((r.signs[0].x, r.signs[0].y, r.signs[0].z, r.signs[0].text.as_str()), (x, y, z, "test"));
+    }
+
+    /// Plan §3.2's writer table: a world with a touched trailer, saved by every full writer,
+    /// reloads with the new trailer and the same head.
+    #[test]
+    fn test_touched_trailer_reaches_every_full_writer() {
+        let dir = stage4_dir("trailer_writers");
+        let mut ws = ws_with(trailer_world());
+        let tail = touch_trailer(&mut ws);
+        let world = ws.world.as_ref().unwrap();
+        let head = world.bytes[..world.trailer_start as usize].to_vec();
+        let check = |w: &LoadedWorld, what: &str| {
+            assert_eq!(w.trailer_bytes(), tail, "{what}: the new trailer");
+            assert_eq!(w.trailer.cmds().len(), 1, "{what}");
+            assert_eq!(w.trailer.signs().len(), 1, "{what}");
+            assert_eq!(w.chunk_map.len(), world.chunk_map.len(), "{what}: chunks kept");
+        };
+
+        // Full write from the mapping.
+        let out = dir.join("full.eden");
+        save_world_inner(world, out.to_str().unwrap(), false).expect("full save");
+        assert_eq!(fs::read(&out).unwrap(), [&head[..], &tail].concat(), "full: head ++ tail");
+        check(&reload(&out), "full");
+
+        // Compressed.
+        let out = dir.join("zipped.eden.zip");
+        save_world_compressed(world, out.to_str().unwrap(), false, None).expect("compressed save");
+        let mut zip = zip::ZipArchive::new(fs::File::open(&out).unwrap()).unwrap();
+        let mut inner = Vec::new();
+        std::io::Read::read_to_end(&mut zip.by_index(0).unwrap(), &mut inner).unwrap();
+        assert_eq!(inner, [&head[..], &tail].concat(), "compressed: head ++ tail");
+
+        // The rebuilding writers.
+        let out = dir.join("expand.eden");
+        expand_world_inner(out.to_str().unwrap(), world, &[], &FxHashMap::default(), false, || false, |_| {})
+            .expect("expand");
+        check(&reload(&out), "expand");
+        let out = dir.join("materialize.eden");
+        let (coords, src) = materialize_src(world);
+        let params = FlatChunkParams { chunk_size: world.chunk_size, stone_depth: 1, dirt_depth: 2, surface_z: 4 };
+        materialize_flat_chunks_inner(out.to_str().unwrap(), world.chunk_size, &world.bytes[..192], &coords, src,
+            &[], &params, &world.file_image().tail, &[], || false, |_, _| {}).expect("materialize");
+        check(&reload(&out), "materialize");
+
+        // The MAP_SHARED clone path (18.11): clone the temp, then patch its tail. The temp itself
+        // keeps its length (T3).
+        let temp = dir.join("staged.eden");
+        fs::write(&temp, trailer_world()).unwrap();
+        let (mmap, _) = map_staged_temp_ex(&temp).unwrap();
+        let mut ws2 = WorldState::new();
+        ws2.world = Some(parse_world_inner(mmap).unwrap());
+        assert_eq!(touch_trailer(&mut ws2), tail);
+        let out = dir.join("cloned.eden");
+        save_world_progress(ws2.world.as_ref().unwrap(), out.to_str().unwrap(), false, None, Some(&temp))
+            .expect("clone save");
+        assert_eq!(fs::read(&out).unwrap(), [&head[..], &tail].concat(), "clone: head ++ tail");
+        assert_eq!(fs::metadata(&temp).unwrap().len(), trailer_world().len() as u64, "the temp never changes length");
+        drop(ws2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The incremental save writes the tail through the WAL, and the file's length moves with it:
+    /// grows on an added record, stays eligible for the next save, and shrinks when the trailer
+    /// empties (no trailer at all).
+    #[test]
+    fn test_incremental_save_writes_the_tail() {
+        let dir = stage4_dir("trailer_incremental");
+        let dest = dir.join("world.eden");
+        let state: AppState = RwLock::new(ws_with_disk_image(trailer_world(), &dest));
+        let tail = touch_trailer(&mut write_ws(&state));
+        assert!(try_incremental_save(&state, dest.to_str().unwrap(), false).expect("save"), "a trailer-only save is eligible");
+        let expected = image_bytes(read_ws(&state).world.as_ref().unwrap());
+        assert_eq!(fs::read(&dest).unwrap(), expected);
+        assert!(expected.ends_with(&tail) && expected.len() > trailer_world().len(), "the file grew");
+        assert!(!wal_path(&dest).exists());
+        {
+            let ws = read_ws(&state);
+            assert!(!ws.dirty.trailer_disk, "the save discharged the trailer");
+            assert!(ws.dirty.trailer_load && ws.dirty.trailer_journal && ws.dirty.trailer_base);
+            assert_eq!(ws.disk_image.as_ref().unwrap().len, expected.len() as u64);
+        }
+
+        // A chunk edit next: the new file length is a valid image, so still incremental.
+        {
+            let mut ws = write_ws(&state);
+            with_edit(&mut ws, "delete", (0, 0, 5, 5), |w| { delete_blocks_inner(w, 0, 0, 5, 5, 0, 63, None); Ok(()) })
+                .expect("edit");
+        }
+        assert!(try_incremental_save(&state, dest.to_str().unwrap(), false).expect("save 2"), "eligible at the new length");
+        assert_eq!(fs::read(&dest).unwrap(), image_bytes(read_ws(&state).world.as_ref().unwrap()));
+
+        // Empty the trailer: the file ends at the directory.
+        {
+            let mut ws = write_ws(&state);
+            let w = ws.world.as_mut().unwrap();
+            w.trailer.remove_cmd(0).unwrap();
+            w.trailer.remove_sign(0).unwrap();
+            assert!(w.trailer_bytes().is_empty(), "nothing left: no trailer");
+            ws.dirty.mark_trailer();
+        }
+        assert!(try_incremental_save(&state, dest.to_str().unwrap(), false).expect("save 3"));
+        let ts = read_ws(&state).world.as_ref().unwrap().trailer_start;
+        assert_eq!(fs::metadata(&dest).unwrap().len(), ts, "the file shrank to the end of the directory");
+        assert_eq!(fs::read(&dest).unwrap(), image_bytes(read_ws(&state).world.as_ref().unwrap()));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A committed WAL with a tail record rolls forward whether the crash left the destination at
+    /// its old length or at its final one (the apply sets the length first), and is discarded at
+    /// any other length.
+    #[test]
+    fn test_wal_tail_recovers_at_either_length() {
+        let dir = stage4_dir("trailer_wal");
+        let base = trailer_world();
+        let ts = base.len() - QUARRY_SIGN_TRAILER.len();
+        let mut ws = ws_with(base.clone());
+        let tail = touch_trailer(&mut ws);
+        let span_off = 4096u64; // somewhere in chunk data
+        let span = vec![0x5a; 64];
+        let mut expected = [&base[..ts], &tail].concat();
+        expected[span_off as usize..span_off as usize + 64].copy_from_slice(&span);
+        let write_wal = |dest: &std::path::Path| {
+            let f = fs::File::create(wal_path(dest)).unwrap();
+            let hdr = journal::JournalHeader::new(false, base.len() as u64, [9; 16]).with_tail();
+            let mut w = journal::JournalWriter::create_with(f, hdr).unwrap();
+            w.append_tail(ts as u64, &tail).unwrap();
+            w.append_span(span_off, 0, 0, &span).unwrap();
+            w.append_commit().unwrap();
+            w.flush().unwrap();
+        };
+        let dest = dir.join("w.eden");
+        for (case, before) in [
+            ("crash before the apply", base.clone()),
+            ("crash after set_len + tail, spans owed", [&base[..ts], &tail].concat()),
+            ("crash after set_len only", { let mut v = base.clone(); v.resize(ts + tail.len(), 0); v }),
+        ] {
+            fs::write(&dest, &before).unwrap();
+            write_wal(&dest);
+            assert!(has_committed_wal(&dest), "{case}");
+            recover_wal(&dest);
+            assert_eq!(fs::read(&dest).unwrap(), expected, "{case}");
+            assert!(!wal_path(&dest).exists(), "{case}: the log is cleaned up");
+        }
+        // Any other length is not this log's destination: discarded, file untouched.
+        let other = [&base[..], &[0u8; 16]].concat();
+        fs::write(&dest, &other).unwrap();
+        write_wal(&dest);
+        assert!(!has_committed_wal(&dest));
+        recover_wal(&dest);
+        assert_eq!(fs::read(&dest).unwrap(), other);
+        assert!(!wal_path(&dest).exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The autosave journal carries the trailer as a tail record, for a Source lineage (the file's
+    /// own length as `base_len`) and a Clone (the temp's), and recovery restores it with
+    /// `trailer_load` set.
+    #[test]
+    fn test_autosave_tail_record_recovers_the_trailer() {
+        for clone in [false, true] {
+            let dir = stage4_dir(if clone { "trailer_autosave_clone" } else { "trailer_autosave_source" });
+            let src = dir.join("w.eden");
+            fs::write(&src, trailer_world()).unwrap();
+            let state: AppState = RwLock::new(WorldState::new());
+            load_world_inner(src.to_str().unwrap().into(), &state).expect("load");
+            if clone {
+                write_ws(&state).disk_image = None; // no Source base: the tick clones the temp
+            }
+            let paths = autosave_paths_at(&dir);
+            let tail = touch_trailer(&mut write_ws(&state));
+            {
+                let mut ws = write_ws(&state);
+                with_edit(&mut ws, "delete", (0, 0, 5, 5), |w| { delete_blocks_inner(w, 0, 0, 5, 5, 0, 63, None); Ok(()) })
+                    .expect("edit");
+            }
+            autosave_world_inner(&state, &paths, None, None).expect("tick");
+            assert!(!read_ws(&state).dirty.trailer_journal, "the tick discharged the trailer");
+            let expected = image_bytes(read_ws(&state).world.as_ref().unwrap());
+
+            let fresh: AppState = RwLock::new(WorldState::new());
+            load_autosave_inner(&fresh, &paths).expect("recovery");
+            {
+                let ws = read_ws(&fresh);
+                let w = ws.world.as_ref().unwrap();
+                assert_eq!(image_bytes(w), expected, "clone={clone}: the recovered world is the ticked one");
+                assert_eq!(w.trailer_bytes(), tail);
+                assert!(ws.dirty.trailer_load && ws.dirty.trailer_disk, "clone={clone}: the replayed trailer is owed");
+            }
+            for s in [&state, &fresh] {
+                let t = read_ws(s).temp_path.clone();
+                write_ws(s).world = None;
+                if let Some(t) = t { let _ = fs::remove_file(t); }
+            }
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// Sidecar adoption (plan §6.2): the trailer wins per section; adoption owes the trailer to the
+    /// file but doesn't make the world "unsaved"; Save As elsewhere doesn't rename; a save to the
+    /// world's own path writes the records in and renames the adopted sidecar `*.adopted`.
+    #[test]
+    fn test_sidecar_adoption_and_rename_on_save() {
+        let dir = stage4_dir("trailer_sidecars");
+        let src = dir.join("w.eden");
+        fs::write(&src, trailer_world()).unwrap();
+        let section = |magic: &[u8; 4], rec: usize, n: u32| {
+            let mut v = magic.to_vec();
+            v.extend(1u32.to_le_bytes());
+            v.extend(n.to_le_bytes());
+            v.resize(12 + rec * n as usize, 0);
+            v
+        };
+        fs::write(dir.join("signs_w.eden.dat"), section(b"SGN1", trailer::SIGN_LEN, 2)).unwrap();
+        fs::write(dir.join("cmd_w.eden.dat"), section(b"CMB1", trailer::CMD_LEN, 3)).unwrap();
+
+        let state: AppState = RwLock::new(WorldState::new());
+        let meta = load_world_inner(src.to_str().unwrap().into(), &state).expect("load");
+        assert_eq!(meta.records_adopted, RecordCounts { signs: 0, cmds: 3 }, "the world's own SGN1 wins");
+        {
+            let ws = read_ws(&state);
+            let d = &ws.dirty;
+            assert!(d.trailer_disk && d.trailer_journal && d.trailer_base && d.trailer_adopt_pending);
+            assert!(!d.trailer_load, "adoption alone isn't an unsaved change");
+            let r = records_info(ws.world.as_ref().unwrap(), ws.adopted.as_ref());
+            assert_eq!((r.signs.len(), r.cmds.len(), r.adopted.cmds), (1, 3, 3));
+        }
+
+        // Save As elsewhere: written in there, but the sidecar stays (the original still lacks it).
+        let other = dir.join("copy.eden");
+        let seq = read_ws(&state).dirty.seq;
+        save_world_progress(read_ws(&state).world.as_ref().unwrap(), other.to_str().unwrap(), false, None, None).unwrap();
+        record_full_write(&state, &other, false, seq).unwrap();
+        assert_eq!(reload(&other).trailer.cmds().len(), 3);
+        assert!(dir.join("cmd_w.eden.dat").exists(), "Save As elsewhere doesn't rename");
+        assert!(read_ws(&state).dirty.trailer_adopt_pending);
+
+        // Back to its own path (Save As back, a full write): written in, sidecar renamed.
+        let seq = read_ws(&state).dirty.seq;
+        save_world_progress(read_ws(&state).world.as_ref().unwrap(), src.to_str().unwrap(), false, None, None).unwrap();
+        record_full_write(&state, &src, false, seq).unwrap();
+        assert!(!dir.join("cmd_w.eden.dat").exists() && dir.join("cmd_w.eden.dat.adopted").exists());
+        assert!(dir.join("signs_w.eden.dat").exists(), "an ignored sidecar is left alone");
+        assert!(!read_ws(&state).dirty.trailer_adopt_pending);
+
+        // Reload: the records are the world's own now, nothing adopted.
+        let state2: AppState = RwLock::new(WorldState::new());
+        let meta = load_world_inner(src.to_str().unwrap().into(), &state2).expect("reload");
+        assert_eq!(meta.records_adopted, RecordCounts::default());
+        let ws = read_ws(&state2);
+        assert_eq!((ws.world.as_ref().unwrap().trailer.signs().len(), ws.world.as_ref().unwrap().trailer.cmds().len()), (1, 3));
+        drop(ws);
+        for s in [&state, &state2] {
+            let t = read_ws(s).temp_path.clone();
+            write_ws(s).world = None;
+            if let Some(t) = t { let _ = fs::remove_file(t); }
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The Command Block Academy specimen (`TEST WORLDS/academy`, private: skips when absent): the
+    /// `.eden` has no trailer and its records live in the game's sidecars (109 signs, 45 command
+    /// blocks); the `.emod` holds its own (one more sign). Both open with every record; saving the `.eden`
+    /// in place writes them in (`CMB1` first) and retires the sidecars.
+    #[test]
+    fn test_academy_specimen_adopts_and_saves() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../TEST WORLDS/academy");
+        let world = root.join("Command Block Academy.eden");
+        if !world.exists() {
+            eprintln!("skipping: {world:?} not present");
+            return;
+        }
+        let dir = stage4_dir("academy");
+        let src = dir.join("Command Block Academy.eden");
+        for f in ["Command Block Academy.eden", "signs_Command Block Academy.eden.dat", "cmd_Command Block Academy.eden.dat"] {
+            fs::copy(root.join(f), dir.join(f)).unwrap();
+        }
+        let state: AppState = RwLock::new(WorldState::new());
+        let meta = load_world_inner(src.to_str().unwrap().into(), &state).expect("load academy");
+        assert_eq!(meta.records_adopted, RecordCounts { signs: 109, cmds: 45 });
+        {
+            let ws = read_ws(&state);
+            let t = &ws.world.as_ref().unwrap().trailer;
+            assert_eq!(t.section_order(), vec![trailer::CMB1, trailer::SGN1]);
+        }
+        assert!(try_incremental_save(&state, src.to_str().unwrap(), false).expect("save"), "a trailer-only save is incremental");
+        assert!(dir.join("signs_Command Block Academy.eden.dat.adopted").exists());
+        assert!(dir.join("cmd_Command Block Academy.eden.dat.adopted").exists());
+        let state2: AppState = RwLock::new(WorldState::new());
+        let meta = load_world_inner(src.to_str().unwrap().into(), &state2).expect("reload");
+        assert_eq!(meta.records_adopted, RecordCounts::default());
+        {
+            let ws = read_ws(&state2);
+            let t = &ws.world.as_ref().unwrap().trailer;
+            assert!(t.parsed());
+            assert_eq!((t.signs().len(), t.cmds().len()), (109, 45));
+        }
+
+        // The `.emod`: its own SIGN_TRAILER (any sidecar beside it would lose to it).
+        let emod_path = root.join("command block academy.emod");
+        if emod_path.exists() {
+            let e = dir.join("academy.emod");
+            fs::copy(&emod_path, &e).unwrap();
+            let state3: AppState = RwLock::new(WorldState::new());
+            let meta = load_world_inner(e.to_str().unwrap().into(), &state3).expect("load the .emod");
+            assert_eq!(meta.container, "emod");
+            assert_eq!(meta.records_adopted, RecordCounts::default());
+            let ws = read_ws(&state3);
+            let t = &ws.world.as_ref().unwrap().trailer;
+            // Measured 2026-10-25: the .emod has one sign more than the .eden's sidecar (it was
+            // saved from a later session), the same 45 command blocks.
+            assert_eq!((t.signs().len(), t.cmds().len()), (110, 45), "the .emod carries its own records");
+            assert_eq!(t.section_order(), vec![trailer::CMB1, trailer::SGN1]);
+            drop(ws);
+            let t = read_ws(&state3).temp_path.clone();
+            write_ws(&state3).world = None;
+            if let Some(t) = t { let _ = fs::remove_file(t); }
+        }
+        for s in [&state, &state2] {
+            let t = read_ws(s).temp_path.clone();
+            write_ws(s).world = None;
+            if let Some(t) = t { let _ = fs::remove_file(t); }
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Plan §3.2's guard: no shipping code hands the mapping to a file writer — the file is
+    /// `file_image()` (head + the trailer as it saves). Comment lines and the test module are
+    /// exempt; a new writer that needs the raw temp (e.g. a snapshot) belongs in this allowlist
+    /// with a reason.
+    #[test]
+    fn test_no_file_writer_takes_the_raw_mapping() {
+        let forbidden = ["&world.bytes[..]", "&*world.bytes", "write_all(&world.bytes", "(&world.bytes)",
+            "&w.bytes[..]", ", &world.bytes,", "&mut &world.bytes"];
+        for (name, src) in [("lib.rs", include_str!("lib.rs")), ("emod.rs", include_str!("emod.rs")),
+            ("worldgen.rs", include_str!("worldgen.rs")), ("network.rs", include_str!("network.rs"))] {
+            let shipping = src.split("#[cfg(test)]\nmod tests").next().unwrap();
+            for (n, line) in shipping.lines().enumerate() {
+                let code = line.trim_start();
+                if code.starts_with("//") { continue; }
+                for f in forbidden {
+                    assert!(!code.contains(f), "{name}:{}: `{f}` — write through `LoadedWorld::file_image()`", n + 1);
+                }
+            }
+        }
+    }
 }

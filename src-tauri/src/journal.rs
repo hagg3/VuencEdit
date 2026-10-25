@@ -15,14 +15,25 @@
 //! followed by an append-only stream of records:
 //!
 //! ```text
-//! kind        u8     0 = span, 1 = commit
-//! file_off    u64    absolute offset into the base image   (kind 0 only)
+//! kind        u8     0 = span, 1 = commit, 2 = tail
+//! file_off    u64    absolute offset into the base image   (kinds 0, 2)
 //! cx, cy      i32,i32 chunk coords, or (i32::MIN, i32::MIN) for the header span (kind 0 only)
-//! raw_len     u32    uncompressed payload length            (kind 0 only)
-//! comp_len    u32    stored payload length                  (kind 0 only)
-//! crc32       u32    of the *uncompressed* payload           (kind 0 only)
-//! payload     comp_len bytes                                (kind 0 only)
+//! raw_len     u32    uncompressed payload length            (kinds 0, 2)
+//! comp_len    u32    stored payload length                  (kinds 0, 2)
+//! crc32       u32    of the *uncompressed* payload           (kinds 0, 2)
+//! payload     comp_len bytes                                (kinds 0, 2)
 //! ```
+//!
+//! A `kind = 2` **tail** record (ROADMAP-EDIT 27.0b) carries the world's post-directory trailer
+//! (signs + command blocks): replay writes `payload` at `file_off` (the trailer's start) and makes
+//! the image exactly `file_off + raw_len` long, so it is the one record that can change the image's
+//! length. The last tail record wins. Its bound is `file_off ≤ base_len` and `raw_len ≤ 1 MiB`
+//! (the trailer cap), not `file_off + raw_len ≤ base_len`. A journal that may hold one sets
+//! `FLAG_TAIL`; a reader from before 27.0b ignores that flag and stops at the first tail record
+//! (the clean-prefix rule below), keeping the spans before it.
+//!
+//! **Unknown header flag bits are rejected** (`JournalError::UnknownFlags`), so the next format
+//! change announces itself with a new flag instead of being silently cut short at an unknown kind.
 //!
 //! Replay applies span records in stream order — a later record for the same file offset simply
 //! overwrites what an earlier one wrote, so re-dirtying a chunk across ticks needs no special
@@ -54,14 +65,23 @@ use flate2::Compression;
 pub(crate) const MAGIC: [u8; 4] = *b"VEJ1";
 pub(crate) const HEADER_LEN: usize = 4 + 4 + 8 + 16 + 8; // 40
 pub(crate) const FLAG_COMPRESSED: u32 = 1 << 0;
+/// The journal may hold `kind = 2` tail records (27.0b).
+pub(crate) const FLAG_TAIL: u32 = 1 << 1;
+/// Every flag this build understands; any other bit rejects the journal.
+const KNOWN_FLAGS: u32 = FLAG_COMPRESSED | FLAG_TAIL;
+/// The largest tail record replay accepts: the trailer cap (`eden_format`'s `TRAILER_MAX`).
+pub(crate) const MAX_TAIL_LEN: usize = eden_format::emod::TRAILER_MAX;
 
 /// Chunk-coordinate sentinel for a span that carries header bytes (0..192) rather than a chunk.
 pub(crate) const HEADER_SPAN: (i32, i32) = (i32::MIN, i32::MIN);
 
 const RECORD_KIND_SPAN: u8 = 0;
 const RECORD_KIND_COMMIT: u8 = 1;
+const RECORD_KIND_TAIL: u8 = 2;
 /// file_off(8) + cx(4) + cy(4) + raw_len(4) + comp_len(4) + crc32(4)
 const SPAN_FIXED_LEN: usize = 8 + 4 + 4 + 4 + 4 + 4;
+/// file_off(8) + raw_len(4) + comp_len(4) + crc32(4)
+const TAIL_FIXED_LEN: usize = 8 + 4 + 4 + 4;
 
 // ── Header ────────────────────────────────────────────────────────────────
 
@@ -75,6 +95,11 @@ pub(crate) struct JournalHeader {
 impl JournalHeader {
     pub(crate) fn new(compressed: bool, base_len: u64, base_id: [u8; 16]) -> Self {
         Self { flags: if compressed { FLAG_COMPRESSED } else { 0 }, base_len, base_id }
+    }
+
+    /// The same header with `FLAG_TAIL` set: the journal may hold tail records.
+    pub(crate) fn with_tail(self) -> Self {
+        Self { flags: self.flags | FLAG_TAIL, ..self }
     }
 
     pub(crate) fn compressed(&self) -> bool {
@@ -111,6 +136,17 @@ impl JournalHeader {
 /// `JournalWriter` below, or Stage 3/4 directly) is responsible for keeping every record in one
 /// journal consistent with the flag it opened it with.
 pub(crate) fn encode_span_record(file_off: u64, cx: i32, cy: i32, payload: &[u8], compress: bool) -> io::Result<Vec<u8>> {
+    encode_payload_record(RECORD_KIND_SPAN, file_off, Some((cx, cy)), payload, compress)
+}
+
+/// Encode one tail record (see the module doc): the trailer bytes that belong at `file_off`, and
+/// the image ends right after them. `payload` must be at most `MAX_TAIL_LEN` bytes, or replay
+/// rejects the record.
+pub(crate) fn encode_tail_record(file_off: u64, payload: &[u8], compress: bool) -> io::Result<Vec<u8>> {
+    encode_payload_record(RECORD_KIND_TAIL, file_off, None, payload, compress)
+}
+
+fn encode_payload_record(kind: u8, file_off: u64, chunk: Option<(i32, i32)>, payload: &[u8], compress: bool) -> io::Result<Vec<u8>> {
     let raw_len = payload.len() as u32;
     let crc = crc32fast::hash(payload);
     let stored: Vec<u8> = if compress {
@@ -121,10 +157,12 @@ pub(crate) fn encode_span_record(file_off: u64, cx: i32, cy: i32, payload: &[u8]
         payload.to_vec()
     };
     let mut out = Vec::with_capacity(1 + SPAN_FIXED_LEN + stored.len());
-    out.push(RECORD_KIND_SPAN);
+    out.push(kind);
     out.extend_from_slice(&file_off.to_le_bytes());
-    out.extend_from_slice(&cx.to_le_bytes());
-    out.extend_from_slice(&cy.to_le_bytes());
+    if let Some((cx, cy)) = chunk {
+        out.extend_from_slice(&cx.to_le_bytes());
+        out.extend_from_slice(&cy.to_le_bytes());
+    }
     out.extend_from_slice(&raw_len.to_le_bytes());
     out.extend_from_slice(&(stored.len() as u32).to_le_bytes());
     out.extend_from_slice(&crc.to_le_bytes());
@@ -147,12 +185,14 @@ pub(crate) struct Span {
     pub(crate) cx: i32,
     pub(crate) cy: i32,
     pub(crate) payload: Vec<u8>,
+    /// A tail record (`cx`/`cy` are 0).
+    pub(crate) tail: bool,
 }
 
 #[cfg(test)]
 impl Span {
     pub(crate) fn is_header(&self) -> bool {
-        (self.cx, self.cy) == HEADER_SPAN
+        !self.tail && (self.cx, self.cy) == HEADER_SPAN
     }
 }
 
@@ -164,12 +204,20 @@ pub(crate) struct SpanRef<'a> {
     pub(crate) cx: i32,
     pub(crate) cy: i32,
     pub(crate) payload: &'a [u8],
+    /// A tail record (27.0b): write `payload` at `file_off` **and** make the image end right after
+    /// it. `cx`/`cy` are 0 and mean nothing.
+    pub(crate) tail: bool,
 }
 
 impl SpanRef<'_> {
     #[allow(dead_code)]
     pub(crate) fn is_header(&self) -> bool {
-        (self.cx, self.cy) == HEADER_SPAN
+        !self.tail && (self.cx, self.cy) == HEADER_SPAN
+    }
+
+    /// The image length after this record: `Some` only for a tail record.
+    pub(crate) fn tail_end(&self) -> Option<u64> {
+        self.tail.then(|| self.file_off + self.payload.len() as u64)
     }
 }
 
@@ -177,8 +225,11 @@ impl SpanRef<'_> {
 /// `ReplayResult`; the two carry the same two flags and mean the same thing by them.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ReplaySummary {
-    /// Number of span records handed to the sink.
+    /// Number of span **and tail** records handed to the sink.
     pub(crate) spans: u64,
+    /// `file_off + raw_len` of the last tail record handed to the sink: the image's length after
+    /// replay, when it differs from the base's. `None` = no tail record (the length is unchanged).
+    pub(crate) tail_end: Option<u64>,
     /// See `ReplayResult::ended_with_commit`.
     pub(crate) ended_with_commit: bool,
     /// See `ReplayResult::truncated`.
@@ -209,6 +260,9 @@ pub(crate) enum JournalError {
     /// Header's `base_len` doesn't match what the caller expected the base image to be — the
     /// journal belongs to a different base image entirely, not a partially-written one.
     BaseLenMismatch { expected: u64, found: u64 },
+    /// The header sets flag bits this build doesn't know: a journal from a newer VuencEdit, whose
+    /// records this build can't promise to read in full.
+    UnknownFlags(u32),
 }
 
 /// Why a streaming replay stopped without reaching the end of the stream. The two arms need
@@ -247,6 +301,9 @@ where
         return Err(ReplayAbort::Journal(JournalError::BadMagic));
     }
     let header = JournalHeader::decode(&header_buf).ok_or(ReplayAbort::Journal(JournalError::BadMagic))?;
+    if header.flags & !KNOWN_FLAGS != 0 {
+        return Err(ReplayAbort::Journal(JournalError::UnknownFlags(header.flags)));
+    }
     if header.base_len != expected_base_len {
         return Err(ReplayAbort::Journal(JournalError::BaseLenMismatch {
             expected: expected_base_len,
@@ -261,6 +318,7 @@ where
     let mut payload: Vec<u8> = Vec::new();
 
     let mut spans = 0u64;
+    let mut tail_end = None;
     let mut truncated = false;
     let mut hit_eof = false;
     let mut last_was_commit = false;
@@ -280,23 +338,34 @@ where
             last_was_commit = true;
             continue;
         }
-        if kind != RECORD_KIND_SPAN {
-            truncated = true;
-            break;
-        }
+        let tail = match kind {
+            RECORD_KIND_SPAN => false,
+            RECORD_KIND_TAIL => true,
+            _ => {
+                truncated = true;
+                break;
+            }
+        };
         last_was_commit = false;
 
+        // A tail record is a span record without the chunk coordinates.
         let mut fixed = [0u8; SPAN_FIXED_LEN];
-        if r.read_exact(&mut fixed).is_err() {
+        let fixed = &mut fixed[..if tail { TAIL_FIXED_LEN } else { SPAN_FIXED_LEN }];
+        if r.read_exact(fixed).is_err() {
             truncated = true;
             break;
         }
+        let (fixed, (cx, cy)) = if tail {
+            (&fixed[..], (0, 0))
+        } else {
+            let xy = (i32::from_le_bytes(fixed[8..12].try_into().unwrap()), i32::from_le_bytes(fixed[12..16].try_into().unwrap()));
+            fixed.copy_within(16.., 8);
+            (&fixed[..TAIL_FIXED_LEN], xy)
+        };
         let file_off = u64::from_le_bytes(fixed[0..8].try_into().unwrap());
-        let cx = i32::from_le_bytes(fixed[8..12].try_into().unwrap());
-        let cy = i32::from_le_bytes(fixed[12..16].try_into().unwrap());
-        let raw_len = u32::from_le_bytes(fixed[16..20].try_into().unwrap());
-        let comp_len = u32::from_le_bytes(fixed[20..24].try_into().unwrap());
-        let crc = u32::from_le_bytes(fixed[24..28].try_into().unwrap());
+        let raw_len = u32::from_le_bytes(fixed[8..12].try_into().unwrap());
+        let comp_len = u32::from_le_bytes(fixed[12..16].try_into().unwrap());
+        let crc = u32::from_le_bytes(fixed[16..20].try_into().unwrap());
 
         // ⚠️ `comp_len` is a u32 straight off disk, so a corrupt record can claim ~4 GB. `take` +
         // `read_to_end` allocates only what the stream actually holds and leaves a short read — the
@@ -312,11 +381,17 @@ where
         // file_off + raw_len must fit inside the base image — checked_add guards the overflow
         // case too (a corrupt file_off near u64::MAX must not wrap and pass the bounds check).
         // Deliberately *before* decompression, so a bogus length is rejected without doing work.
-        let end = match file_off.checked_add(raw_len as u64) {
-            Some(e) if e <= header.base_len => e,
-            _ => { truncated = true; break; }
+        // A tail record instead starts inside the base (or right at its end) and is at most the
+        // trailer cap — it is what may move the image's end.
+        let in_bounds = if tail {
+            file_off <= header.base_len && raw_len as usize <= MAX_TAIL_LEN
+        } else {
+            file_off.checked_add(raw_len as u64).is_some_and(|e| e <= header.base_len)
         };
-        let _ = end;
+        if !in_bounds {
+            truncated = true;
+            break;
+        }
 
         payload.clear();
         if compressed {
@@ -341,12 +416,15 @@ where
             break;
         }
 
-        sink(SpanRef { file_off, cx, cy, payload: &payload }).map_err(ReplayAbort::Sink)?;
+        sink(SpanRef { file_off, cx, cy, payload: &payload, tail }).map_err(ReplayAbort::Sink)?;
         spans += 1;
+        if tail {
+            tail_end = Some(file_off + raw_len as u64);
+        }
     }
 
     let ended_with_commit = !truncated && hit_eof && last_was_commit;
-    Ok(ReplaySummary { spans, ended_with_commit, truncated })
+    Ok(ReplaySummary { spans, tail_end, ended_with_commit, truncated })
 }
 
 /// Replay a journal buffer against a base image of `expected_base_len` bytes. A bad magic or a
@@ -367,7 +445,7 @@ where
 pub(crate) fn replay(bytes: &[u8], expected_base_len: u64) -> Result<ReplayResult, JournalError> {
     let mut spans = Vec::new();
     let summary = replay_each(bytes, expected_base_len, |s| {
-        spans.push(Span { file_off: s.file_off, cx: s.cx, cy: s.cy, payload: s.payload.to_vec() });
+        spans.push(Span { file_off: s.file_off, cx: s.cx, cy: s.cy, payload: s.payload.to_vec(), tail: s.tail });
         Ok::<(), std::convert::Infallible>(())
     })
     .map_err(|e| match e {
@@ -390,10 +468,13 @@ pub(crate) fn replay(bytes: &[u8], expected_base_len: u64) -> Result<ReplayResul
 /// was true of the base image and false of the spans, which is the bug P-2 fixed.) Kept as a
 /// small-buffer convenience for the tests that don't have that constraint.
 #[cfg(test)]
-pub(crate) fn apply_spans(base: &mut [u8], spans: &[Span]) {
+pub(crate) fn apply_spans(base: &mut Vec<u8>, spans: &[Span]) {
     for s in spans {
         let start = s.file_off as usize;
         let end = start + s.payload.len();
+        if s.tail {
+            base.resize(end, 0); // a tail record sets the image's length
+        }
         base[start..end].copy_from_slice(&s.payload);
     }
 }
@@ -412,10 +493,15 @@ pub(crate) struct JournalWriter<W> {
 
 impl<W: Write> JournalWriter<W> {
     /// Writes a fresh header and returns a writer for the record stream that follows it.
-    pub(crate) fn create(mut inner: W, base_len: u64, base_id: [u8; 16], compress: bool) -> io::Result<Self> {
-        let header = JournalHeader::new(compress, base_len, base_id);
+    #[cfg_attr(not(test), allow(dead_code))] // shipping writers build their header (`create_with`)
+    pub(crate) fn create(inner: W, base_len: u64, base_id: [u8; 16], compress: bool) -> io::Result<Self> {
+        Self::create_with(inner, JournalHeader::new(compress, base_len, base_id))
+    }
+
+    /// `create` with a header the caller built (e.g. `JournalHeader::with_tail`).
+    pub(crate) fn create_with(mut inner: W, header: JournalHeader) -> io::Result<Self> {
         inner.write_all(&header.encode())?;
-        Ok(Self { inner, compress })
+        Ok(Self { inner, compress: header.compressed() })
     }
 
     /// Resumes appending to an already-headered stream (e.g. a file reopened in append mode).
@@ -426,6 +512,12 @@ impl<W: Write> JournalWriter<W> {
 
     pub(crate) fn append_span(&mut self, file_off: u64, cx: i32, cy: i32, payload: &[u8]) -> io::Result<()> {
         let record = encode_span_record(file_off, cx, cy, payload, self.compress)?;
+        self.inner.write_all(&record)
+    }
+
+    /// A tail record (see the module doc). The journal's header must carry `FLAG_TAIL`.
+    pub(crate) fn append_tail(&mut self, file_off: u64, payload: &[u8]) -> io::Result<()> {
+        let record = encode_tail_record(file_off, payload, self.compress)?;
         self.inner.write_all(&record)
     }
 
@@ -634,7 +726,7 @@ mod tests {
     fn stream_collect(bytes: &[u8], base_len: u64) -> Result<(Vec<Span>, ReplaySummary), JournalError> {
         let mut spans = Vec::new();
         let summary = replay_each(bytes, base_len, |s| {
-            spans.push(Span { file_off: s.file_off, cx: s.cx, cy: s.cy, payload: s.payload.to_vec() });
+            spans.push(Span { file_off: s.file_off, cx: s.cx, cy: s.cy, payload: s.payload.to_vec(), tail: s.tail });
             Ok::<(), std::convert::Infallible>(())
         })
         .map_err(|e| match e {
@@ -887,5 +979,76 @@ mod tests {
         let result = replay(&buf, 16).unwrap();
         assert_eq!(result.spans.len(), 2);
         assert_eq!(result.spans[1].payload, b"BBBB");
+    }
+
+    // ── 27.0b: tail records + flags
+
+    fn with_tail(mut j: Vec<u8>, off: u64, payload: &[u8], compress: bool) -> Vec<u8> {
+        j.extend(encode_tail_record(off, payload, compress).unwrap());
+        j
+    }
+
+    #[test]
+    fn tail_record_sets_the_image_length_both_ways() {
+        for compress in [false, true] {
+            // Grow: a 16-byte base whose tail starts at 12 becomes 12 + 20 bytes.
+            let j = with_tail(build_journal(16, compress, &[(0, 1, 1, b"AB")], false), 12, &[9u8; 20], compress);
+            let r = replay(&j, 16).unwrap();
+            assert!(!r.truncated);
+            assert_eq!(r.spans.len(), 2);
+            assert!(r.spans[1].tail && !r.spans[1].is_header());
+            let mut base = vec![0u8; 16];
+            apply_spans(&mut base, &r.spans);
+            assert_eq!(base.len(), 32);
+            assert_eq!(&base[..2], b"AB");
+            assert_eq!(&base[12..], &[9u8; 20]);
+            // Shrink: the last tail wins, and an empty tail ends the image at `file_off`.
+            let j = with_tail(j, 12, &[], compress);
+            let (spans, summary) = stream_collect(&j, 16).unwrap();
+            assert_eq!(summary.tail_end, Some(12));
+            let mut base = vec![0u8; 16];
+            apply_spans(&mut base, &spans);
+            assert_eq!(base.len(), 12);
+        }
+    }
+
+    #[test]
+    fn tail_record_bounds() {
+        // file_off past base_len, and a payload over the cap, both stop replay (clean prefix kept).
+        let past = with_tail(build_journal(16, false, &[(0, 0, 0, b"OK")], false), 17, b"x", false);
+        let r = replay(&past, 16).unwrap();
+        assert!(r.truncated && r.spans.len() == 1);
+        let over = with_tail(build_journal(16, false, &[], false), 16, &vec![0u8; MAX_TAIL_LEN + 1], false);
+        assert!(replay(&over, 16).unwrap().truncated);
+        // Exactly at the cap and exactly at base_len is fine.
+        let at = with_tail(build_journal(16, false, &[], false), 16, &vec![0u8; MAX_TAIL_LEN], false);
+        let r = replay(&at, 16).unwrap();
+        assert!(!r.truncated && r.spans.len() == 1);
+    }
+
+    #[test]
+    fn tail_then_commit_is_committed() {
+        let mut buf = Vec::new();
+        {
+            let mut w = JournalWriter::create_with(&mut buf, JournalHeader::new(false, 16, base_id(3)).with_tail()).unwrap();
+            w.append_tail(16, b"TRAILER!").unwrap();
+            w.append_span(0, 0, 0, b"HEAD").unwrap();
+            w.append_commit().unwrap();
+        }
+        let (spans, s) = stream_collect(&buf, 16).unwrap();
+        assert!(s.ended_with_commit);
+        assert_eq!((s.spans, s.tail_end), (2, Some(24)));
+        assert!(spans[0].tail && !spans[1].tail);
+        assert_eq!(JournalHeader::decode(&buf).unwrap().flags, FLAG_TAIL);
+    }
+
+    #[test]
+    fn unknown_header_flags_reject_the_journal() {
+        let mut j = build_journal(16, false, &[(0, 0, 0, b"GOOD")], false);
+        j[4..8].copy_from_slice(&(FLAG_TAIL | 1 << 7).to_le_bytes());
+        assert!(matches!(replay(&j, 16), Err(JournalError::UnknownFlags(f)) if f == FLAG_TAIL | 1 << 7));
+        // Both known flags are fine.
+        j[4..8].copy_from_slice(&(FLAG_TAIL).to_le_bytes());
+        assert_eq!(replay(&j, 16).unwrap().spans.len(), 1);
     }
 }

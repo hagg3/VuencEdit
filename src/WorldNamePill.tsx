@@ -40,9 +40,9 @@ export default function WorldNamePill() {
   const w = world;
   const formatClass = classifyWorldFormat(w);
   const newDawn = formatClass !== "legacy64z"; // badge/accent only distinguish 64z vs 256z-of-either-kind
-  const formatLabel = formatClass === "legacy64z" ? "Legacy 64z"
+  const formatLabel = (formatClass === "legacy64z" ? "Legacy 64z"
     : formatClass === "newDawn256z" ? "New Dawn 256z"
-    : "NewFormat256z";
+    : "NewFormat256z") + (w.container === "emod" ? " · .emod" : "");
   const dawnRgb = hexToRgbTriplet(ACCENT.violet);
 
   return (

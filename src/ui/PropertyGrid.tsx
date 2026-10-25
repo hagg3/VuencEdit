@@ -1,12 +1,13 @@
 /**
- * Property-grid primitives for the docked sidebar's Inspector tab (UI redesign r3, Stage 14.11).
+ * Property-grid primitives for the docked sidebar's World tab (UI redesign r3, Stage 14.11; the
+ * Inspector tab until 24.1).
  *
  * `Section` is a collapsible header + body — the sidebar's replacement for the old bespoke
  * ▶/▼ disclosures each panel (`SignsList`, the old elevation panel) hand-rolled its own copy of.
  * `PropRow`/`PropGrid` are label/value rows in the Visual Studio / Xcode "inspector" idiom: a
  * left-aligned label in `TEXT_LABEL` and a right-aligned, tabular-nums monospace value — every
- * numeric readout in the Inspector tab (Selection's Size/Z range/Volume/Shape) goes through these
- * instead of a bespoke `<div>` layout per panel.
+ * numeric readout in the World tab (Selection's Bounds/Volume, the World section) goes through
+ * these instead of a bespoke `<div>` layout per panel.
  *
  * Open/closed state persists in one raw localStorage key (`sidebar_sections`), the same idiom as
  * `ribbon_collapsed` — a plain per-install UI preference, not an `AppSettings` field.
@@ -15,9 +16,8 @@ import { useCallback, useState, type CSSProperties, type ReactNode } from "react
 import { Icon } from "../ribbon/icons";
 import { FONT, HAIRLINE, ICON, SPACE, TEXT, TEXT_LABEL, TEXT_META } from "../ribbon/tokens";
 
-/** Monospace stack for property values — matches the canvas HUD labels elsewhere in the Inspector
- *  (`SelectionInspector`'s ortho-view caption uses the same "monospace" family). Not a CSS var:
- *  there's no themed mono token yet, and this is a font-family, not a colour. */
+/** Monospace stack for property values — the same "monospace" family as the canvas HUD labels.
+ *  Not a CSS var: there's no themed mono token yet, and this is a font-family, not a colour. */
 export const PROP_MONO = "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
 
 const SECTION_STORAGE_KEY = "sidebar_sections";

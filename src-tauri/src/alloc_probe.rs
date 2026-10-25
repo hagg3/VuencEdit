@@ -67,7 +67,7 @@ fn measure<R>(f: impl FnOnce() -> R) -> (R, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Clipboard, mirror_clipboard_x_inner, mirror_clipboard_y_inner,
+    use crate::{Clipboard, clipboard_preview_lod, mirror_clipboard_x_inner, mirror_clipboard_y_inner,
                 render_clipboard_preview_inner, rotate_clipboard_inner};
 
     /// 256 × 200 × 64 = 3.3 M voxels → a 6.5 MB clipboard (blocks + paints). Non-square so a
@@ -118,7 +118,7 @@ mod tests {
     fn alloc_probe_clipboard_preview_is_lod_bounded() {
         let cb = clipboard();
         let cb_bytes = (cb.block_types.len() + cb.paints.len()) as u64;
-        let (p, extra) = measure(|| render_clipboard_preview_inner(&cb, 0, Some(64)));
+        let (p, extra) = measure(|| render_clipboard_preview_inner(&cb, 0, clipboard_preview_lod(&cb, Some(64), None)));
         report("clipboard_preview(64)", cb_bytes, extra);
         assert!(p.width <= 64 && p.height <= 64);
         assert!(extra <= 64 * 64 * 4 + 64 * 1024, "a 64 px preview allocated {extra} B");

@@ -61,6 +61,10 @@ export interface CommandMeta {
   tool?: Tool;
   /** Search synonyms. */
   keywords?: readonly string[];
+  /** Declares a tab `path` (for ⌘K's breadcrumb) but no ribbon control: runs from ⌘K / its shortcut / a
+   *  menu only, and Tab-reveal does nothing. `commands.test.ts` fails a tab-path command that is
+   *  neither rendered in a tab nor marked this. */
+  paletteOnly?: true;
   /** Help row. Commands with `keys` but no `help` still show, under their tab's label. */
   help?: { section: HelpSection; text?: string };
 }
@@ -186,10 +190,10 @@ export const COMMAND_META = {
   "sculpt.brush.strength": { label: "Sculpt Strength", icon: "sculpt", family: "warm", path: sculpt("brush"), also: [panel("buildslot")], kind: "setting" },
   "sculpt.brush.radius": { label: "Sculpt Radius", icon: "sculpt", family: "warm", path: sculpt("brush"), also: [panel("buildslot")], kind: "setting", keywords: ["size"] },
   "sculpt.brush.softness": { label: "Sculpt Softness", icon: "sculpt", family: "warm", path: sculpt("brush"), also: [panel("buildslot")], kind: "setting", keywords: ["falloff"] },
-  "sculpt.brush.radiusDown": { label: "Sculpt Radius −1", icon: "shrink", family: "warm", path: sculpt("brush"), kind: "action", keys: [k("[", "sculpt")], handledBy: L, help: { section: "Sculpt", text: "Brush radius down (while a sculpt tool is armed)" } },
-  "sculpt.brush.radiusUp": { label: "Sculpt Radius +1", icon: "grow", family: "warm", path: sculpt("brush"), kind: "action", keys: [k("]", "sculpt")], handledBy: L, help: { section: "Sculpt", text: "Brush radius up" } },
-  "sculpt.brush.strengthDown": { label: "Sculpt Strength −1", icon: "lower", family: "warm", path: sculpt("brush"), kind: "action", keys: [k("[", "sculpt", { shift: true })], handledBy: L, help: { section: "Sculpt", text: "Strength down" } },
-  "sculpt.brush.strengthUp": { label: "Sculpt Strength +1", icon: "raise", family: "warm", path: sculpt("brush"), kind: "action", keys: [k("]", "sculpt", { shift: true })], handledBy: L, help: { section: "Sculpt", text: "Strength up" } },
+  "sculpt.brush.radiusDown": { label: "Sculpt Radius −1", icon: "shrink", family: "warm", path: sculpt("brush"), kind: "action", keys: [k("[", "sculpt")], handledBy: L, help: { section: "Sculpt", text: "Brush radius down (while a sculpt tool is armed)" }, paletteOnly: true },
+  "sculpt.brush.radiusUp": { label: "Sculpt Radius +1", icon: "grow", family: "warm", path: sculpt("brush"), kind: "action", keys: [k("]", "sculpt")], handledBy: L, help: { section: "Sculpt", text: "Brush radius up" }, paletteOnly: true },
+  "sculpt.brush.strengthDown": { label: "Sculpt Strength −1", icon: "lower", family: "warm", path: sculpt("brush"), kind: "action", keys: [k("[", "sculpt", { shift: true })], handledBy: L, help: { section: "Sculpt", text: "Strength down" }, paletteOnly: true },
+  "sculpt.brush.strengthUp": { label: "Sculpt Strength +1", icon: "raise", family: "warm", path: sculpt("brush"), kind: "action", keys: [k("]", "sculpt", { shift: true })], handledBy: L, help: { section: "Sculpt", text: "Strength up" }, paletteOnly: true },
   "sculpt.falloff.profile": { label: "Falloff Profile", icon: "smooth", family: "warm", path: sculpt("falloff"), kind: "setting" },
   "sculpt.falloff.live": { short: "Live brush", label: "Live Brush", icon: "sparkle", family: "warm", title: "Shape terrain as you drag. Off: apply the stroke on release.", path: sculpt("falloff"), kind: "toggle", keywords: ["airbrush", "accumulate"] },
   "sculpt.falloff.clip": { short: "In selection", label: "Sculpt in Selection", icon: "select", family: "warm", title: "Only sculpt inside the selection", path: sculpt("falloff"), kind: "toggle", keywords: ["clip", "constrain"] },
@@ -221,8 +225,7 @@ export const COMMAND_META = {
   "view.mapview.topdown": { short: "Top-down", label: "Top-down View", icon: "topdown", title: "Show the top block of every column", path: view("mapview"), kind: "toggle" },
   "view.mapview.zslice": { short: "Z-Slice", label: "Z-Slice View", icon: "zslice", title: "Show one horizontal layer at a time", path: view("mapview"), kind: "toggle", keywords: ["layer"] },
   "view.mapview.cutaway": { short: "Cutaway", label: "Cutaway View", icon: "cutaway", family: "primary", title: "Hide everything above the cap Z. Tools work on the exposed surface.", path: view("mapview"), kind: "toggle", keywords: ["cave", "interior", "cap"] },
-  "view.render.tiled": { short: "Tiled", label: "Render: Tiled", icon: "tiled", title: "Streamed map tiles (default)", path: view("render"), kind: "toggle" },
-  "view.render.relief": { short: "Relief", label: "Render: Relief", icon: "axo", family: "primary", title: "Shade slopes so hills and cliffs stand out", path: view("render"), kind: "toggle", keywords: ["axo", "isometric", "relief", "hillshade", "shading", "terrain"] },
+  "view.render.relief": { short: "Relief", label: "Render: Relief", icon: "relief", family: "primary", title: "Shade slopes so hills and cliffs stand out", path: view("render"), kind: "toggle", keywords: ["axo", "isometric", "relief", "hillshade", "shading", "terrain"] },
   "view.zoom.fit": { short: "Fit", label: "Fit Map", icon: "fit", title: "Fit the whole world in the viewport", path: view("zoom"), kind: "action", keys: [mod("0"), k("Home")], handledBy: L, help: { section: "Navigation", text: "Fit map to window" } },
   "view.zoom.selection": { short: "Selection", label: "Zoom to Selection", icon: "zoomSel", path: view("zoom"), kind: "action", keys: [mod("0", { shift: true })], handledBy: L, help: { section: "Navigation" } },
   "view.zoom.in": { short: "In", label: "Zoom In", icon: "zoomIn", path: view("zoom"), kind: "action", keys: [mod("=")], handledBy: L, help: { section: "Navigation", text: "Zoom in (viewport centre)" } },
@@ -233,7 +236,7 @@ export const COMMAND_META = {
   "view.windows.tools": { short: "Tools", label: "Tools Window", icon: "toolbar", title: "Quick access to the Pan, Select and Draw tools", path: view("windows"), kind: "toggle", keys: [alt("KeyT")], handledBy: L, help: { section: "Layout & windows", text: "Show / hide the Tools window" } },
   "view.windows.hotbar": { short: "Hotbar", label: "Hotbar Window", icon: "block", title: "Pinned (1–5) and recent (6–0) blocks", path: view("windows"), kind: "toggle", keys: [alt("KeyH")], handledBy: L, keywords: ["palette", "swatches", "recent blocks"], help: { section: "Layout & windows", text: "Show / hide the Hotbar window" } },
   "view.windows.lens": { short: "Lens", label: "Lens Window", icon: "paste", family: "clipboard", title: "Front, side and top views of the selection or paste", path: view("windows"), kind: "toggle", keys: [alt("KeyP")], handledBy: L, keywords: ["paste", "selection", "elevation", "z range", "buried", "z offset"], help: { section: "Layout & windows", text: "Show / hide the Lens (front, side and top views; appears when you select or paste)" } },
-  "view.windows.sidebar": { label: "Sidebar", icon: "sidebar", title: "Docked right sidebar: Inspector / Prefabs / History", path: view("windows"), kind: "toggle", keywords: ["inspector", "history", "panel"] },
+  "view.windows.sidebar": { label: "Sidebar", icon: "sidebar", title: "Docked right sidebar: World / Prefabs / History", path: view("windows"), kind: "toggle", keywords: ["world", "inspector", "signs", "places", "history", "panel"], paletteOnly: true },
   "view.windows.signs": { short: "Signs", label: "Sign Markers", icon: "signs", title: "Show a marker on the map at each sign's position", path: view("windows"), kind: "toggle" },
   "view.template.load": { short: "Load…", label: "Load Template…", icon: "template", title: "Load the game's Eden.eden for the overlay and Insert ▸ Expand", path: view("template"), kind: "action", keywords: ["eden.eden"] },
   "view.template.overlay": { short: "Overlay", label: "Template Overlay", icon: "fullmap", family: "primary", title: "Show the template's terrain under your world (top-down view only)", path: view("template"), kind: "toggle" },
@@ -246,7 +249,7 @@ export const COMMAND_META = {
   "3d.mode.build": { short: "Build", label: "3D: Build Mode", icon: "build", family: "primary", title: "Left-click breaks a block, right-click places one", path: d3("mode"), kind: "toggle", keywords: ["place", "break", "minecraft"] },
   "3d.mode.sculpt": { short: "Sculpt", label: "3D: Sculpt Mode", icon: "sculpt", family: "warm", title: "Hold left to sculpt under the crosshair", path: d3("mode"), kind: "toggle" },
   "3d.mode.floodfill": { short: "Flood Fill", label: "3D: Flood Fill Mode", icon: "floodfill", family: "primary", title: "Click a block face to fill the connected air", path: d3("mode"), kind: "toggle" },
-  "3d.mode.autoOrient": { short: "Auto-orient", label: "3D: Auto-orient Blocks", icon: "autoOrient", family: "primary", title: "Turn ramps, wedges and doors to face you when placed", path: d3("mode"), kind: "toggle" },
+  "3d.mode.autoOrient": { short: "Auto-orient", label: "3D: Auto-orient Blocks", icon: "autoOrient", family: "primary", title: "Turn ramps, wedges and doors to face you when placed", path: d3("mode"), kind: "toggle", paletteOnly: true },
   // Renamed from `3d.slot.block` in 16.6 (the contextual `slot` group became the Build slot panel).
   "3d.block.pick": { short: "Block", label: "3D Build Block…", icon: "block", title: "Block for Build and Flood Fill", path: d3("block"), kind: "picker" },
   "3d.camera.hud": { short: "HUD", label: "3D: HUD", icon: "fps", family: "violet", title: "Show the 3D view's overlays and crosshair", path: d3("camera"), kind: "toggle", keywords: ["overlay", "compass", "legend", "hide ui"] },
@@ -260,7 +263,7 @@ export const COMMAND_META = {
   "3d.lighting.modern": { short: "New Dawn", label: "Lamp Falloff: New Dawn", family: "warm", title: "Long, gradual lamp light (~14 blocks). Resets Lamp R.", path: d3("lighting"), kind: "toggle" },
 
   // ── Selection (contextual) ─────────────────────────────────────────────────────────────────
-  "selection.modify.selectAll": { label: "Select All", icon: "selectAll", family: "selection", title: "Select the whole world", path: sel("modify"), kind: "action", keys: [mod("a")], handledBy: L, help: { section: "Editing", text: "Select whole world" } },
+  "selection.modify.selectAll": { label: "Select All", icon: "selectAll", family: "selection", title: "Select the whole world", path: sel("modify"), kind: "action", keys: [mod("a")], handledBy: L, help: { section: "Editing", text: "Select whole world" }, paletteOnly: true },
   "selection.zrange.range": { label: "Selection Z Range", icon: "zslice", family: "selection", path: sel("zrange"), kind: "setting", keywords: ["height", "min", "max"] },
   "selection.move.mode": { label: "Selection Move Mode", icon: "move", family: "selection", path: sel("move"), kind: "setting", keywords: ["box", "blocks"] },
   "selection.move.left": { label: "Nudge Selection Left", icon: "left", family: "selection", path: sel("move"), kind: "action", keys: [k("ArrowLeft", "select")], handledBy: L, help: { section: "Editing", text: "Nudge the selection left one block (any selection tool)" } },
@@ -283,9 +286,9 @@ export const COMMAND_META = {
   "paste.place.confirm": { short: "Confirm", label: "Confirm Paste", icon: "paste", family: "clipboard", path: clip("place"), kind: "action", keywords: ["stamp", "place"] },
   "paste.place.unlock": { short: "Unlock", label: "Unlock Paste Position", icon: "clear", title: "Release the locked position and pick again", path: clip("place"), kind: "action" },
   "paste.place.offset": { label: "Paste Z Offset", icon: "zslice", family: "clipboard", path: clip("place"), kind: "setting", keywords: ["elevation", "height"] },
-  "paste.place.raise": { label: "Raise Paste 1", icon: "raise", family: "clipboard", path: clip("place"), kind: "action", keys: [k("PageUp", "paste")], handledBy: L, help: { section: "Paste mode", text: "Raise paste Z offset (⇧ = +5)" } },
-  "paste.place.lower": { label: "Lower Paste 1", icon: "lower", family: "clipboard", path: clip("place"), kind: "action", keys: [k("PageDown", "paste")], handledBy: L, help: { section: "Paste mode", text: "Lower paste Z offset (⇧ = −5)" } },
-  "paste.place.repeatStep": { label: "Repeat Last Paste Step", icon: "pasteMode", family: "clipboard", path: clip("place"), kind: "action", keys: [k(".", "paste")], handledBy: L, help: { section: "Paste mode", text: "Repeat paste one step in the same direction" } },
+  "paste.place.raise": { label: "Raise Paste 1", icon: "raise", family: "clipboard", path: clip("place"), kind: "action", keys: [k("PageUp", "paste")], handledBy: L, help: { section: "Paste mode", text: "Raise paste Z offset (⇧ = +5)" }, paletteOnly: true },
+  "paste.place.lower": { label: "Lower Paste 1", icon: "lower", family: "clipboard", path: clip("place"), kind: "action", keys: [k("PageDown", "paste")], handledBy: L, help: { section: "Paste mode", text: "Lower paste Z offset (⇧ = −5)" }, paletteOnly: true },
+  "paste.place.repeatStep": { label: "Repeat Last Paste Step", icon: "pasteMode", family: "clipboard", path: clip("place"), kind: "action", keys: [k(".", "paste")], handledBy: L, help: { section: "Paste mode", text: "Repeat paste one step in the same direction" }, paletteOnly: true },
   "paste.mode.pattern": { label: "Paste Pattern", icon: "pasteMode", family: "clipboard", path: clip("mode"), kind: "setting", keywords: ["scatter", "array", "grid", "repeat"] },
   "paste.options.above": { label: "Terrain Paste: Above Surface", family: "clipboard", path: clip("options"), kind: "toggle" },
 } as const satisfies Record<string, CommandMeta>;
