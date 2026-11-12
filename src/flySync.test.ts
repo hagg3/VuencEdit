@@ -25,6 +25,35 @@ describe("editReloadPlan", () => {
     expect(p.core).toHaveLength(1);
     expect(p.halo).toHaveLength(24); // 5x5 minus core
   });
+
+  // 27.4b: baked shadows reach 1 block sideways, diagonals included (a caster shades the 3×3 columns
+  // around it), so the ring is "edge or corner" instead of 23.1's "edge only".
+  describe("with baked shadows", () => {
+    it("interior edit has no halo", () => {
+      expect(editReloadPlan({ x: 21, y: 21, w: 1, h: 1 }, 0, true).halo).toEqual([]);
+    });
+    it("an edit one block in from the edge stays inside its chunk", () => {
+      expect(editReloadPlan({ x: 17, y: 20, w: 1, h: 1 }, 0, true).halo).toEqual([]);
+      expect(editReloadPlan({ x: 30, y: 20, w: 1, h: 1 }, 0, true).halo).toEqual([]);
+    });
+    it("edge edit adds the one neighbour", () => {
+      expect(s(editReloadPlan({ x: 16, y: 20, w: 1, h: 1 }, 0, true).halo)).toEqual(["0,1"]);
+    });
+    it("corner edit adds both edges and the diagonal", () => {
+      expect(s(editReloadPlan({ x: 31, y: 31, w: 1, h: 1 }, 0, true).halo)).toEqual(["1,2", "2,1", "2,2"]);
+      expect(s(editReloadPlan({ x: 16, y: 16, w: 1, h: 1 }, 0, true).halo)).toEqual(["0,0", "0,1", "1,0"]);
+    });
+    it("multi-chunk rect gets its four corners too", () => {
+      const p = editReloadPlan({ x: 16, y: 16, w: 32, h: 16 }, 0, true);
+      expect(s(p.halo)).toEqual(["0,0", "0,1", "0,2", "1,0", "1,2", "2,0", "2,2", "3,0", "3,1", "3,2"]);
+    });
+    it("the stale-shadow gate's canopy (chunk (1,0), touching the seam) reloads chunk (0,0)", () => {
+      // Mirrors `shadow_canopy_across_seam_remeshes_neighbour` in src-tauri lib.rs: leaves at x 16..18.
+      const p = editReloadPlan({ x: 16, y: 6, w: 3, h: 3 }, 0, true);
+      expect(s(p.core)).toEqual(["1,0"]);
+      expect(s(p.halo)).toContain("0,0");
+    });
+  });
 });
 
 describe("shouldReloadChunk", () => {

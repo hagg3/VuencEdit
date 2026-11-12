@@ -30,6 +30,8 @@ export interface Chord {
   alt?: boolean;
   /** Press-and-hold (Space pan, Ctrl invert) — display prefix only. */
   hold?: boolean;
+  /** Display-only: skip this chord in Help on a Mac (e.g. ⌘Y, which means nothing there). Matching ignores it. */
+  hideOnMac?: true;
   scope: ChordScope;
 }
 
@@ -64,7 +66,7 @@ export function isMacPlatform(): boolean {
 const KEY_GLYPH: Record<string, string> = {
   arrowup: "↑", arrowdown: "↓", arrowleft: "←", arrowright: "→",
   pageup: "PgUp", pagedown: "PgDn", escape: "Esc", " ": "Space", delete: "Del", backspace: "⌫",
-  home: "Home", tab: "Tab", control: "Ctrl", shift: "Shift", "=": "+",
+  home: "Home", tab: "Tab", shift: "Shift", "=": "+",
 };
 
 /** `code` → the character printed on a US keycap, for display of ⌥ combos. */
@@ -79,6 +81,8 @@ export function keyLabel(c: Chord, mac = isMacPlatform()): string {
   if (c.code) return codeLabel(c.code);
   const raw = c.key ?? "";
   const g = KEY_GLYPH[raw.toLowerCase()];
+  if (raw.toLowerCase() === "control") return mac ? "⌃" : "Ctrl";
+  if (raw.toLowerCase() === "meta") return mac ? "⌘" : "Win";
   if (g) return raw.toLowerCase() === "backspace" && !mac ? "Backspace" : g;
   if (raw === "-") return mac ? "−" : "Minus";
   return raw.length === 1 ? raw.toUpperCase() : raw;
@@ -103,6 +107,14 @@ export function formatChord(c: Chord, mac = isMacPlatform()): string {
   return c.hold ? `Hold ${s}` : s;
 }
 
+/**
+ * Is the platform's primary modifier down with the other one up? (⌘ and not Ctrl on a Mac; Ctrl and
+ * not ⌘ elsewhere.) The same rule `matchChord` uses, so Control chords never reach app shortcuts on a Mac.
+ */
+export function primaryModDown(e: Pick<KeyLike, "metaKey" | "ctrlKey">, mac = isMacPlatform()): boolean {
+  return mac ? e.metaKey && !e.ctrlKey : e.ctrlKey && !e.metaKey;
+}
+
 /** Just the event fields `matchChord` reads, so tests can pass plain objects. */
 export interface KeyLike {
   key: string; code: string;
@@ -123,4 +135,26 @@ export function matchChord(e: KeyLike, c: Chord, mac = isMacPlatform()): boolean
   if (!!c.shift !== e.shiftKey) return false;
   if (c.code) return e.code === c.code;
   return (c.key ?? "").toLowerCase() === e.key.toLowerCase();
+}
+
+/**
+ * The chord as a Tauri/muda menu accelerator string (34.1): `CmdOrCtrl[+Shift][+Alt]+<Key>`, or `null`
+ * when the chord must not become one. **Only `mod` chords qualify**: a menu key equivalent fires even
+ * with a text field focused, so a bare key (`S`, `?`, `Delete`, `Tab`) or a ⌥ chord (⌥T types "†")
+ * would steal typing. Those items keep no accelerator; Help and tooltips still show the chord.
+ * `=`, `-`, `,` and digits are the literal characters muda 0.19's parser accepts (pinned in a test).
+ */
+export function chordToAccelerator(c: Chord): string | null {
+  if (!c.mod || c.code || !c.key) return null;
+  const key = c.key.length === 1 ? c.key.toUpperCase() : c.key;
+  return ["CmdOrCtrl", c.shift ? "Shift" : "", c.alt ? "Alt" : "", key].filter(Boolean).join("+");
+}
+
+/** The accelerator a menu item shows: the first of the command's chords that qualifies. */
+export function firstAccelerator(keys: readonly Chord[] | undefined): string | null {
+  for (const c of keys ?? []) {
+    const a = chordToAccelerator(c);
+    if (a) return a;
+  }
+  return null;
 }

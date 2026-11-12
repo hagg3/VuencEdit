@@ -524,6 +524,41 @@ export function SplitButton({
   );
 }
 
+/** `SplitButton`'s small-row twin: a `SmallButton` face plus a `SMALL_H` rail that opens `menu`. The
+ *  popover is not click-to-close, so it can hold a slider (GPU Shadows' Sun, 27.4b). */
+export function SmallSplitButton({
+  icon, label, title, onClick, onDisabledClick, active, disabled, tone = "default", accent, badge, full, menu, menuTitle,
+}: CommonBtn & { icon?: IconName; full?: boolean; menu: () => ReactNode; menuTitle: string }) {
+  const wrapRef = useRef<HTMLDivElement>(null);
+  const [open, setOpen] = useState(false);
+  return (
+    <div ref={wrapRef} style={{ display: "flex", alignItems: "stretch", gap: 1, position: "relative", width: full ? "100%" : undefined }}>
+      <SmallButton
+        icon={icon} label={label} title={title} onClick={onClick} onDisabledClick={onDisabledClick}
+        active={active} disabled={disabled} tone={tone} accent={accent} badge={badge} full={full}
+        style={{ borderRadius: `${BTN_RADIUS}px 0 0 ${BTN_RADIUS}px`, minWidth: 0 }}
+      />
+      <button
+        className="rbn-btn" type="button" title={menuTitle} aria-label={menuTitle}
+        aria-haspopup="menu" aria-expanded={open}
+        onClick={() => setOpen(v => !v)} {...a11y(open, false)}
+        style={btnBase({
+          height: SMALL_H, width: RAIL_W, flex: "none", display: "flex", alignItems: "center", justifyContent: "center",
+          borderRadius: `0 ${BTN_RADIUS}px ${BTN_RADIUS}px 0`, padding: 0,
+          ...stateStyle(open, false, accent),
+        })}
+      >
+        <Icon name="split" size={ICON.xs} tone="inherit" />
+      </button>
+      {open && (
+        <Popover anchorRef={wrapRef} onClose={() => setOpen(false)}>
+          {menu()}
+        </Popover>
+      )}
+    </div>
+  );
+}
+
 /** A small labelled button that opens a menu — the mockup's "Mode ⌄". */
 export function DropdownButton({
   icon, label, title, disabled, full, menu, style, active, accent, minWidth = 170,

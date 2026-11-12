@@ -87,6 +87,12 @@ describe("parseStore / sanitize", () => {
     expect(l.wins.tools.open).toBe(false);
     expect(Object.keys(l.wins).sort()).toEqual([...WIN_IDS].sort());
   });
+  it("a layout stored with the retired cutaway / brushshape / buildslot windows (34.2) loads clean", () => {
+    const stale = { cutaway: { w: 290, h: 90 }, brushshape: { w: 480, h: 168 }, buildslot: { w: 290, h: 172 } };
+    const l = sanitizeLayout({ swapped: false, wins: { ...DEF, ...stale } }, DEF)!;
+    expect(Object.keys(l.wins).sort()).toEqual([...WIN_IDS].sort());
+    for (const id of Object.keys(stale)) expect(l.wins).not.toHaveProperty(id);
+  });
   it("discards a store from an unknown version (migration stub)", () => {
     expect(migrateStore({ v: 99 })).toBeNull();
     expect(parseStore(JSON.stringify({ v: 99, last: layout(), worlds: [] }), DEF)).toEqual(EMPTY_STORE);

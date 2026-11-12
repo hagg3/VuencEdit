@@ -75,7 +75,7 @@ export default function DoneOutline({
         position: "fixed",
         left: screen.left, top: screen.top, width: screen.width, height: screen.height,
         pointerEvents: "none",
-        zIndex: 90, // Above the map (20), below the ribbon (100) and QuickActionsBar chrome.
+        zIndex: 90, // Above the map (20), below the ribbon (100) and options-bar chrome.
         boxSizing: "border-box",
         border: `2px solid ${rect?.tone === "select" ? ACCENTS.selection : ACCENTS.primary}`,
         borderRadius: 2,

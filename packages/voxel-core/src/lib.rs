@@ -13,7 +13,10 @@ pub mod colors;
 pub mod geometry;
 pub mod lamps;
 pub mod mask;
+pub mod orient;
 pub mod render;
+pub mod shadow;
+pub mod signs;
 pub mod texture;
 pub mod view;
 

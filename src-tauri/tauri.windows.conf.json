@@ -1,0 +1,17 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "app": {
+    "windows": [
+      {
+        "title": "VuencEdit",
+        "width": 1440,
+        "height": 900,
+        "minWidth": 900,
+        "minHeight": 400,
+        "decorations": false,
+        "shadow": true,
+        "backgroundColor": "#16191d"
+      }
+    ]
+  }
+}

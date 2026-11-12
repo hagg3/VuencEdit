@@ -25,6 +25,10 @@ pub struct ProcessMemory {
     pub peak_working_set_bytes: u64,
     /// Total (soft + hard) page faults since process start. 0 where unavailable.
     pub page_fault_count: u64,
+    /// Memory only this process is holding: macOS `phys_footprint` (Activity Monitor's "Memory"),
+    /// Windows `PrivateUsage`. Unlike the working set / RSS it excludes clean file-backed pages
+    /// (the mmapped world), so it is the number that tracks real pressure. 0 where unavailable.
+    pub footprint_bytes: u64,
 }
 
 /// System-wide RAM, sampled on demand.
@@ -78,6 +82,8 @@ mod imp {
         quota_non_paged_pool_usage: usize,
         pagefile_usage: usize,
         peak_pagefile_usage: usize,
+        // PROCESS_MEMORY_COUNTERS_EX tail (Vista+): commit charge private to this process.
+        private_usage: usize,
     }
 
     #[link(name = "psapi")]
@@ -110,6 +116,7 @@ mod imp {
             working_set_bytes: counters.working_set_size as u64,
             peak_working_set_bytes: counters.peak_working_set_size as u64,
             page_fault_count: counters.page_fault_count as u64,
+            footprint_bytes: counters.private_usage as u64,
         }
     }
 
@@ -241,6 +248,23 @@ mod imp {
         ) -> i32;
     }
 
+    // TASK_VM_INFO = 22. Only `phys_footprint` is wanted, and it sits at byte offset 144 of
+    // `task_vm_info_data_t` (virtual_size, region_count+page_size, then 15 u64 counters before it),
+    // so read a generously sized zeroed buffer rather than vendoring the whole ~90-word struct.
+    const TASK_VM_INFO: i32 = 22;
+    const PHYS_FOOTPRINT_U64_INDEX: usize = 144 / 8;
+
+    fn phys_footprint() -> u64 {
+        let mut buf = [0u64; 64];
+        let mut count = (std::mem::size_of_val(&buf) / std::mem::size_of::<i32>()) as u32;
+        // SAFETY: `buf`/`count` describe each other's size; the kernel writes at most `count` words.
+        let kr = unsafe {
+            task_info(mach_task_self_, TASK_VM_INFO, buf.as_mut_ptr() as *mut i32, &mut count)
+        };
+        // A kernel too old to fill that far leaves the slot zero, which reads as "unavailable".
+        if kr == 0 { buf[PHYS_FOOTPRINT_U64_INDEX] } else { 0 }
+    }
+
     pub(super) fn process_memory() -> ProcessMemory {
         let mut basic = MachTaskBasicInfo::default();
         let mut count =
@@ -271,7 +295,12 @@ mod imp {
         };
         let page_fault_count = if ekr == 0 { events.faults as u64 } else { 0 };
 
-        ProcessMemory { working_set_bytes, peak_working_set_bytes, page_fault_count }
+        ProcessMemory {
+            working_set_bytes,
+            peak_working_set_bytes,
+            page_fault_count,
+            footprint_bytes: phys_footprint(),
+        }
     }
 
     extern "C" {
@@ -375,6 +404,27 @@ mod imp {
 
 pub fn process_memory() -> ProcessMemory { imp::process_memory() }
 pub fn system_memory() -> SystemMemory { imp::system_memory() }
+
+/// Hand freed heap pages back to the OS (31.3): macOS `malloc_zone_pressure_relief`, Windows
+/// `HeapCompact` on the process heap. Best-effort no-op elsewhere. Call after close/load/big transients.
+pub fn relieve_allocator() {
+    #[cfg(target_os = "macos")]
+    {
+        extern "C" { fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize; }
+        // SAFETY: a null zone means "all zones"; goal 0 means "as much as possible".
+        unsafe { malloc_zone_pressure_relief(std::ptr::null_mut(), 0); }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetProcessHeap() -> *mut std::ffi::c_void;
+            fn HeapCompact(h: *mut std::ffi::c_void, flags: u32) -> usize;
+        }
+        // SAFETY: the process heap handle is always valid.
+        unsafe { HeapCompact(GetProcessHeap(), 0); }
+    }
+}
 pub fn platform_state() -> PlatformState { imp::platform_state() }
 
 // ── Stage 18.0: peak/size counters ──────────────────────────────────────────

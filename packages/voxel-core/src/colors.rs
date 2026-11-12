@@ -119,26 +119,25 @@ pub const BLOCK_RGB: [[u8; 3]; 128] = [
     [148,  15,   2], // 109 bt-firework
     [148,  15,   2], // 110 bt-lightbox
     [148,  15,   2], // 111 bt-steel
-    // 112–127: new-format blocks (updated game, `TEST WORLDS/newblocks/`). Names are known (reported
-    // in-game); the game's own textures are not yet supported, so each colour below is an
-    // approximation of the block's texture, matched to the description of it. These are the single
-    // source of truth for 2D map, 3D render and picker swatch alike.
-    [176,  84,  56], // 112 Ore Sand
-    [ 86,  74,  88], // 113 Space Stone
-    [ 38, 176, 186], // 114 Carpet
-    [124,  72,  30], // 115 Snakeskin
-    [ 58,  32,  74], // 116 Obsidian
-    [232, 194,  54], // 117 Cheese
-    [104,  72,  44], // 118 Space Dirt
-    [ 44, 112,  48], // 119 Space Grass
-    [ 38,  82,  36], // 120 Moss
-    [ 96,  44, 150], // 121 Dark Matter
-    [224, 134,  46], // 122 Space Sand
-    [240, 246, 250], // 123 Snow
-    [214, 180, 178], // 124 Moonrock
-    [ 62,  62,  66], // 125 Basalt
-    [110, 110, 114], // 126 Dark Tile
-    [ 52, 118,  88], // 127 Algae
+    // 112–127: new-format blocks (updated game). Each colour is the mean opaque colour of the block's
+    // full-colour tile (32–47) in Emod's 128-tile `atlas.png`, so the zoomed-out map matches the 3D
+    // look. These are the single source of truth for 2D map, 3D render and picker swatch alike.
+    [133,  67,  58], // 112 Ore Sand
+    [ 61,  46,  59], // 113 Space Stone
+    [ 27, 179, 193], // 114 Carpet
+    [108,  62,  40], // 115 Snakeskin
+    [ 43,  26,  65], // 116 Obsidian
+    [220, 168,  45], // 117 Cheese
+    [ 80,  39,  19], // 118 Space Dirt
+    [ 21,  61,  24], // 119 Space Grass
+    [ 19,  44,  10], // 120 Moss
+    [ 66,  30, 105], // 121 Dark Matter
+    [225, 106,   0], // 122 Space Sand
+    [175, 189, 192], // 123 Snow
+    [137, 106, 129], // 124 Moonrock
+    [ 38,  35,  34], // 125 Basalt
+    [123, 123, 123], // 126 Dark Tile
+    [ 72, 102,  49], // 127 Algae
 ];
 
 // Paint colour table — colorTable[54] from Hud::genColorTable() (Hud.mm:150-196).
@@ -321,8 +320,8 @@ pub const BLOCK_INFO: [u32; 128] = [
     0,                           // 109 bt-firework
     0,                           // 110 bt-lightbox
     0,                           // 111 bt-steel
-    // 112–127: solid/occluding (0) — right for a plain decorative cube, wrong for whichever ID turns
-    // out to be a sign or another non-solid; flips with one entry once identified (see signs.rs).
+    // 112–127: plain solid, non-flammable cubes — Emod's `blockinfo` (Globals.cpp, D.2a) gives all
+    // sixteen `0|IS_HARD`, i.e. TYPE_STONE's flags (IS_HARD is not preserved in this table).
     0,                           // 112 Ore Sand
     0,                           // 113 Space Stone
     0,                           // 114 Carpet

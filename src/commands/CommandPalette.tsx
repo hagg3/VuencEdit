@@ -17,7 +17,7 @@ import {
   ACCENT, BORDER, FONT, RADIUS, SURFACE, TEXT, TEXT_DIM, TEXT_DISABLED, TEXT_META, fieldStyle, lighten,
 } from "../ribbon/tokens";
 import { COMMAND_IDS, meta, type CommandFamily, type CommandId } from "./meta";
-import { formatChord } from "./keys";
+import { formatChord, isMacPlatform } from "./keys";
 import { pushMru, rank, type SearchEntry } from "./search";
 import { commandPath } from "./paths";
 import type { CommandBinding } from "./types";
@@ -153,7 +153,7 @@ export default function CommandPalette({ bindings, top, onRun, onReveal, onClose
             const b = bindings[id];
             const disabled = b.enabled !== true;
             const label = b.labelOverride ?? m.label;
-            const chord = m.keys?.[0];
+            const chord = m.macOnly && !isMacPlatform() ? undefined : m.keys?.[0];
             const hue = m.family ? FAMILY_HEX[m.family] : undefined;
             return (
               <div

@@ -20,8 +20,8 @@ import { ACCENT, GROUP_CONTENT_H } from "../tokens";
 /** Sculpt is the `warm` tool family — one hue for all 16 tools and every parameter they own. */
 const AMBER = ACCENT.warm;
 
-// Noise/Slope/Rock/Carve's shape parameters are the Brush shape context panel now (Stage 16.6,
-// `windows/modePanels.tsx`), so this tab's solver input is static.
+// Noise/Slope/Rock/Carve's shape parameters live in the options bar now (Stage 34.2,
+// `ribbon/OptionsBarView.tsx`), so this tab's solver input is static.
 const SPECS = tabMetrics("sculpt");
 const W = (g: string) => specWidth("sculpt", g);
 

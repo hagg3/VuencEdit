@@ -1162,13 +1162,22 @@ pub(crate) fn generate_flat_chunk(_cx: i32, _cy: i32, params: &FlatChunkParams) 
 /// *plus* ~4.2 GB of `Tg2Grid` workspace (two full `gsize × gsize × t_height` arrays), ~8.5 GB total.
 const MAX_WORLDGEN_BYTES: u64 = 6 * 1024 * 1024 * 1024;
 
+/// D4 (31.5): `min(6 GiB, installed RAM / 2)`; 6 GiB when the probe reports nothing.
+fn worldgen_limit() -> u64 {
+    match crate::mem::system_memory().total_bytes {
+        0 => MAX_WORLDGEN_BYTES,
+        t => MAX_WORLDGEN_BYTES.min(t / 2),
+    }
+}
+
 fn check_worldgen_budget(total_bytes: u64) -> Result<(), String> {
-    if total_bytes > MAX_WORLDGEN_BYTES {
+    let limit = worldgen_limit();
+    if total_bytes > limit {
         let gb = |b: u64| b as f64 / (1u64 << 30) as f64;
         return Err(format!(
             "This world would need approximately {:.1} GB of memory to generate (limit \
-             {:.0} GB). Reduce the world size or turn off extended (256z) height.",
-            gb(total_bytes), gb(MAX_WORLDGEN_BYTES)
+             {:.1} GB). Reduce the world size or turn off extended (256z) height.",
+            gb(total_bytes), gb(limit)
         ));
     }
     Ok(())
@@ -2006,7 +2015,7 @@ pub(crate) fn write_world_file(
         file.write_all(&ptr_table).map_err(|e| format!("Write error: {e}"))?;
         file.sync_all().map_err(|e| format!("Write error: {e}"))?;
         drop(file);
-        fs::rename(&tmp, path).map_err(|e| format!("Failed to save world: {e}"))
+        crate::rename_logged(std::path::Path::new(&tmp), std::path::Path::new(path)).map_err(|e| format!("Failed to save world: {e}"))
     };
     let res = write();
     if res.is_err() { let _ = fs::remove_file(&tmp); }

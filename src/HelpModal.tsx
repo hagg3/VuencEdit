@@ -64,6 +64,10 @@ const TILE_GROUPS: { label: string; tiles: string[] }[] = [
     tiles: ["blocktnt"],
   },
   {
+    label: "Doors & portals (halves of door.png / portal.png)",
+    tiles: ["door_top", "door_bottom", "portal_top", "portal_bottom"],
+  },
+  {
     label: "New-format blocks (112–127)",
     tiles: ["ore_sand", "space_stone", "carpet", "snakeskin", "obsidian", "cheese", "space_dirt", "space_grass", "moss", "dark_matter", "space_sand", "snow", "moonrock", "basalt", "dark_tile", "algae"],
   },
@@ -109,11 +113,12 @@ function GettingStartedHelp() {
         it. Each world keeps its own layout. <Key>Tab</Key> swaps the map and the 3D view.
       </p>
 
-      <div style={sectionHead}>Mode panels</div>
+      <div style={sectionHead}>Options bar</div>
       <p style={{ margin: "4px 0 10px" }}>
-        Some modes open a small panel: the <b style={strong}>brush shape</b> for sculpt tools, the
-        level for <b style={strong}>Z-slice</b> and <b style={strong}>Cutaway</b>, and the build slot
-        in 3D. Close the panel to leave the mode.
+        The bar under the ribbon shows the armed tool's settings: the brush for sculpt tools (with a
+        <b style={strong}> Shape</b> menu for Rock and Carve), placement controls while pasting, and the
+        limit for 3D Flood Fill. The level for <b style={strong}>Z-slice</b> and <b style={strong}>Cutaway</b> sits
+        at its right end; its ✕ returns to Top-down. What doesn't fit folds into a <b style={strong}>⋯</b> menu.
       </p>
 
       <div style={sectionHead}>Relief shading</div>
@@ -150,6 +155,12 @@ function TexturePackHelp() {
         </li>
       </ul>
       <p style={{ margin: "4px 0 10px" }}>
+        <b style={strong}>Doors and portals</b> aren't in the game's atlas. Supply them as tall
+        images, twice as high as wide (<code>door.png</code> 32×64, <code>portal.png</code> 64×128) —
+        in the zip, or <b style={strong}>next to <code>atlas.png</code></b> in the same folder. Each is
+        split into a top and bottom half. Without them, doors use the wood tile and portals the stone tile.
+      </p>
+      <p style={{ margin: "4px 0 10px" }}>
         Tiles can be any size and are scaled to <b style={strong}>32×32</b>. Missing tiles use the
         flat block colour.
       </p>
@@ -157,8 +168,10 @@ function TexturePackHelp() {
       {/* Loading */}
       <div style={sectionHead}>Loading</div>
       <p style={{ margin: "4px 0 10px" }}>
-        Load a pack from <b style={strong}>View ▸ Load Texture Pack…</b>, or set a default in{" "}
-        <b style={strong}>Settings ▸ Files</b>. Textures show in the 3D view and the block picker.
+        VuencEdit ships with a built-in pack. To use your own, choose{" "}
+        <b style={strong}>View ▸ Load Texture Pack…</b>, or set a path in{" "}
+        <b style={strong}>Settings ▸ Files</b>. <b style={strong}>Default Texture Pack</b> (or clearing
+        the Settings path) switches back. Textures show in the 3D view and the block picker.
       </p>
 
       {/* Tinting */}
@@ -190,6 +203,8 @@ function TexturePackHelp() {
             ["Trunk", "Side: tree_side · Top + bottom: tree_vert"],
             ["TNT", "Side: tnt_side(_color) · Top: tnt_top(_color)"],
             ["Brick", "All faces: brick(_color)"],
+            ["Doors", "A thin slab on the facing edge: door_bottom (lower block) + door_top (upper block)"],
+            ["Portals", "Stone cube; its front face: portal_bottom (lower block) + portal_top (upper block)"],
             ["Ramps / Wedges", "Use the same tile as their material (e.g. stone, wood)"],
             ["Expansion blocks 82–111", "Side + bottom: blocktnt · Top: base material"],
             ["New-format blocks 112–127", "All faces: their own tile (Emod atlas.png tiles 32–47)"],
@@ -223,7 +238,7 @@ function ToolsHelp() {
             ["Grab", "Drag up or down to pull a dome of terrain"],
             ["Smooth", "Evens out bumps"],
             ["Flatten", "Levels terrain to the height you click"],
-            ["Slope", "Flatten tilted to a plane through the clicked anchor (Slope X/Y in the Brush shape panel)"],
+            ["Slope", "Flatten tilted to a plane through the clicked anchor (Slope X/Y in the options bar)"],
             ["Terrace", "Steps terrain into Strength-high terraces"],
             ["Smear", "Pulls terrain along with the brush"],
             ["Sharpen", "Crisps terrain (opposite of Smooth)"],

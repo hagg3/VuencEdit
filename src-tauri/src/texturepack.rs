@@ -25,7 +25,16 @@ pub const KNOWN_TEX_NAMES: &[&str] = &[
     "ore_sand", "space_stone", "carpet", "snakeskin", "obsidian", "cheese", "space_dirt",
     "space_grass", "moss", "dark_matter", "space_sand", "snow", "moonrock", "basalt",
     "dark_tile", "algae",
+    // Tile 64 of the 128-tile Emod atlas: the 1.x flower patch (block 12 "Grass3 / Old Flower" top).
+    "grass_flower",
+    // Door slabs (66–70) and the portal front face (75–79): not in the game's `atlas.png`. Supplied
+    // as a tall `door.png` / `portal.png` (height = 2 × width) that `split_tall` cuts into halves, or
+    // as the four halves by name.
+    "door_top", "door_bottom", "portal_top", "portal_bottom",
 ];
+
+/// Stems of the tall (2:1) images `split_tall` cuts into `<stem>_top` / `<stem>_bottom` tiles.
+const TALL_STEMS: &[&str] = &["door", "portal"];
 
 /// Map from canonical (app) tile name → tile index in the game's `atlas.png` — a 32-wide vertical
 /// strip of 32×32 tiles (32 tiles stock, 64 in the Emod atlas, whose 32–47 are blocks 112–127).
@@ -90,6 +99,8 @@ pub const ATLAS1_MAP: &[(&str, u32)] = &[
     ("basalt", 45),        // 125 Basalt
     ("dark_tile", 46),     // 126 Dark Tile
     ("algae", 47),         // 127 Algae
+    // Tile 64 (the strip is 128 tiles tall now): the 1.x flower patch, block 12's top.
+    ("grass_flower", 64),
 ];
 
 /// Map from canonical tile name → tile index in the game's `atlas2.png` (IS_ATLAS2 blocks). The
@@ -136,6 +147,24 @@ fn slice_atlas_image(
     Ok(())
 }
 
+/// Cut a tall image (height = 2 × width) into `<name>_top` (upper half) and `<name>_bottom` tiles,
+/// each resized to TILE×TILE. `Triangle` for the downscale: `Nearest` drops the 1-px rivets on
+/// `portal.png` (64×128). Existing entries win (`or_insert`), so a half supplied by name beats the
+/// split. Any other aspect ratio is ignored — a door's art is not a strip tile.
+fn split_tall(name: &str, bytes: &[u8], out: &mut HashMap<String, Tile>) {
+    let Ok(img) = image::load_from_memory(bytes) else { return };
+    let img = img.to_rgba8();
+    let w = img.width();
+    if w == 0 || img.height() != 2 * w {
+        return;
+    }
+    for (suffix, y) in [("top", 0), ("bottom", w)] {
+        let half = image::imageops::crop_imm(&img, 0, y, w, w).to_image();
+        let resized = image::imageops::resize(&half, TILE, TILE, image::imageops::FilterType::Triangle);
+        out.entry(format!("{name}_{suffix}")).or_insert(resized);
+    }
+}
+
 /// Derive a brightness-normalized grayscale variant of a full-color tile, for use as a paint
 /// modulation base. Luminance-flattens each pixel, then scales so the tile's mean opaque
 /// luminance maps to a bright neutral (`GRAY_TARGET`) — this keeps texture detail while letting
@@ -168,6 +197,19 @@ fn grayscale_tile(rgba: &[u8]) -> Vec<u8> {
     out
 }
 
+/// The grayscale base for `door_*` tiles: Emod's *value channel* (`max(r,g,b)`, not normalised), so a
+/// painted door has the brightness Emod's recolour (`max(r,g,b)/255 × paint`) gives it. Alpha kept.
+fn value_tile(rgba: &[u8]) -> Vec<u8> {
+    let mut out = rgba.to_vec();
+    for px in out.chunks_exact_mut(4) {
+        let v = px[0].max(px[1]).max(px[2]);
+        px[0] = v;
+        px[1] = v;
+        px[2] = v;
+    }
+    out
+}
+
 /// Collect TILE×TILE tiles from a zip texture pack: individually-named PNGs (`stone.png`, …) plus
 /// any bundled `atlas.png` / `atlas2.png` (sliced via the game index maps). Named files take
 /// precedence over atlas slices for the same block.
@@ -178,6 +220,7 @@ fn collect_tiles_from_zip(bytes: &[u8]) -> Result<HashMap<String, Tile>, String>
     let known_set: std::collections::HashSet<&str> = KNOWN_TEX_NAMES.iter().copied().collect();
     let mut tiles: HashMap<String, Tile> = HashMap::new();
     let mut atlas_bytes: HashMap<String, Vec<u8>> = HashMap::new(); // "atlas" / "atlas2"
+    let mut tall_bytes: HashMap<String, Vec<u8>> = HashMap::new(); // "door" / "portal"
 
     for i in 0..zip.len() {
         let mut entry = match zip.by_index(i) {
@@ -202,6 +245,13 @@ fn collect_tiles_from_zip(bytes: &[u8]) -> Result<HashMap<String, Tile>, String>
                     e.insert(buf);
                 }
             }
+        } else if TALL_STEMS.contains(&stem.as_str()) {
+            if let std::collections::hash_map::Entry::Vacant(e) = tall_bytes.entry(stem) {
+                let mut buf = Vec::new();
+                if entry.read_to_end(&mut buf).is_ok() {
+                    e.insert(buf);
+                }
+            }
         } else if known_set.contains(stem.as_str()) && !tiles.contains_key(&stem) {
             let mut buf = Vec::new();
             if entry.read_to_end(&mut buf).is_ok() {
@@ -218,7 +268,11 @@ fn collect_tiles_from_zip(bytes: &[u8]) -> Result<HashMap<String, Tile>, String>
         }
     }
 
-    // Slice bundled atlas images last, so individually-named tiles keep precedence.
+    // Split tall door/portal images and slice bundled atlas images last, so individually-named
+    // tiles keep precedence.
+    for (stem, b) in &tall_bytes {
+        split_tall(stem, b, &mut tiles);
+    }
     if let Some(b) = atlas_bytes.get("atlas") {
         slice_atlas_image(b, ATLAS1_MAP, &mut tiles)?;
     }
@@ -233,14 +287,14 @@ fn collect_tiles_from_zip(bytes: &[u8]) -> Result<HashMap<String, Tile>, String>
 /// modulation variants.
 fn assemble(tiles: &HashMap<String, Tile>) -> Result<TexturePack, String> {
     // (color_row, rgba) in KNOWN_TEX_NAMES order.
-    let mut row_tiles: Vec<(u32, Vec<u8>)> = Vec::new();
+    let mut row_tiles: Vec<(u32, bool, Vec<u8>)> = Vec::new();
     let mut name_to_row: HashMap<String, u32> = HashMap::new();
     let mut next_row: u32 = 1; // row 0 is blank white sentinel
 
     for &name in KNOWN_TEX_NAMES {
         if let Some(img) = tiles.get(name) {
             name_to_row.insert(name.to_string(), next_row);
-            row_tiles.push((next_row, img.as_raw().clone()));
+            row_tiles.push((next_row, name.starts_with("door_"), img.as_raw().clone()));
             next_row += 1;
         }
     }
@@ -267,9 +321,9 @@ fn assemble(tiles: &HashMap<String, Tile>) -> Result<TexturePack, String> {
         }
     };
 
-    for (row, tile_data) in &row_tiles {
+    for (row, is_door, tile_data) in &row_tiles {
         blit(*row, tile_data);
-        let gray = grayscale_tile(tile_data);
+        let gray = if *is_door { value_tile(tile_data) } else { grayscale_tile(tile_data) };
         blit(row + gray_row_offset, &gray);
     }
 
@@ -321,20 +375,23 @@ fn collect_tiles_from_atlas_image(path: &str, bytes: &[u8]) -> Result<HashMap<St
 
     slice_atlas_image(bytes, ATLAS1_MAP, &mut tiles)?;
 
-    // Auto-include a sibling atlas2 image (any case/extension) if one sits next to atlas.png.
+    // Auto-include siblings (any case/extension) next to atlas.png: `atlas2` (sliced via
+    // ATLAS2_MAP) and the tall `door` / `portal` images (split into halves).
     if let Some(dir) = p.parent() {
         if let Ok(rd) = std::fs::read_dir(dir) {
+            let mut seen_atlas2 = false;
             for entry in rd.flatten() {
                 let ep = entry.path();
-                let s = ep
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .map(|s| s.to_lowercase());
-                if s.as_deref() == Some("atlas2") {
+                let Some(s) = ep.file_stem().and_then(|s| s.to_str()).map(|s| s.to_lowercase()) else { continue };
+                if s == "atlas2" && !seen_atlas2 {
+                    seen_atlas2 = true;
                     if let Ok(b) = std::fs::read(&ep) {
                         let _ = slice_atlas_image(&b, ATLAS2_MAP, &mut tiles);
                     }
-                    break;
+                } else if TALL_STEMS.contains(&s.as_str()) {
+                    if let Ok(b) = std::fs::read(&ep) {
+                        split_tall(&s, &b, &mut tiles);
+                    }
                 }
             }
         }
@@ -426,11 +483,19 @@ mod tests {
         let pack = load_pack(&atlas1).expect("load shipped atlas.png");
 
         // 28 atlas1 names + 4 atlas2 names (sibling auto-pickup) = 32 tiles from a stock atlas;
-        // the Emod 64-tile atlas adds the 16 new-format tiles (112–127) → 48.
+        // the Emod 128-tile atlas adds the 16 new-format tiles (112–127) and the flower patch → 49.
+        // The Emod 128-tile atlas adds the 16 new-format tiles (112–127) and the flower patch; the
+        // sibling door.png / portal.png (when present) each add two halves.
         let n = pack.gray_row_offset;
-        assert!(n == 32 || n == 48, "28 atlas1 (+16 new-format) + 4 atlas2 sibling tiles, got {n}");
+        let siblings = ["door", "portal"].iter().filter(|s| std::path::Path::new(&format!("{dir}/{s}.png")).exists()).count() as u32 * 2;
+        let base = n - siblings;
+        assert!(base == 32 || base == 48 || base == 49, "28 atlas1 (+16 new-format, +flower) + 4 atlas2 sibling tiles + {siblings} door/portal halves, got {n}");
         assert_eq!(pack.atlas_rows, 2 * n + 1);
-        if n == 48 {
+        for (stem, halves) in [("door", ["door_top", "door_bottom"]), ("portal", ["portal_top", "portal_bottom"])] {
+            let present = std::path::Path::new(&format!("{dir}/{stem}.png")).exists();
+            for h in halves { assert_eq!(pack.name_to_row.contains_key(h), present, "{h} follows {stem}.png"); }
+        }
+        if base >= 48 {
             // An unpainted new-format face draws its colour tile untinted (white vertex colour).
             let (rgb, row) = face_color_and_row(&pack, 117, 0, 2, [232, 194, 54]);
             assert_eq!(row, Some(pack.name_to_row["cheese"]));
@@ -476,5 +541,122 @@ mod tests {
         assert_eq!(brick.get_pixel(0, 0).0[0], 19);
         // stone → index 5.
         assert_eq!(out.get("stone").unwrap().get_pixel(0, 0).0[0], 5);
+    }
+
+    #[test]
+    fn new_format_colours_match_blockdefs_ts() {
+        // BLOCK_RGB (authoritative) and the TS pre-fetch fallback in blockDefs.ts must not drift.
+        let ts = concat!(env!("CARGO_MANIFEST_DIR"), "/../src/blockDefs.ts");
+        let Ok(src) = std::fs::read_to_string(ts) else { return };
+        let mut seen = 0;
+        for line in src.lines() {
+            let Some(rest) = line.trim().strip_prefix("{ type: ") else { continue };
+            let Some((id, rest)) = rest.split_once(',') else { continue };
+            let Ok(id) = id.trim().parse::<usize>() else { continue };
+            if !(112..=127).contains(&id) { continue; }
+            let nums: Vec<u8> = rest[rest.find("color: [").expect("color") + 8..]
+                .split(']').next().unwrap().split(',').map(|n| n.trim().parse().unwrap()).collect();
+            assert_eq!(nums, voxel_core::colors::BLOCK_RGB[id].to_vec(), "block {id} drifted from colors.rs");
+            seen += 1;
+        }
+        assert_eq!(seen, 16, "expected all 16 new-format rows in blockDefs.ts");
+    }
+
+    fn png_bytes(img: &image::RgbaImage) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        img.write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png).unwrap();
+        bytes
+    }
+
+    /// A `w × 2w` image whose upper half is `top` and lower half is `bottom`.
+    fn tall(w: u32, top: [u8; 4], bottom: [u8; 4]) -> Vec<u8> {
+        png_bytes(&image::RgbaImage::from_fn(w, 2 * w, |_, y| image::Rgba(if y < w { top } else { bottom })))
+    }
+
+    #[test]
+    fn split_tall_cuts_a_two_to_one_image_into_named_halves() {
+        for w in [32u32, 64] {
+            let mut out: HashMap<String, Tile> = HashMap::new();
+            split_tall("portal", &tall(w, [200, 0, 0, 255], [0, 0, 200, 255]), &mut out);
+            assert_eq!(out.len(), 2);
+            let (t, b) = (&out["portal_top"], &out["portal_bottom"]);
+            assert_eq!((t.width(), t.height()), (TILE, TILE));
+            assert_eq!(t.get_pixel(5, 5).0, [200, 0, 0, 255], "upper half → _top");
+            assert_eq!(b.get_pixel(5, 5).0, [0, 0, 200, 255], "lower half → _bottom");
+        }
+        // Not 2:1 → ignored (a square door.png is not a strip tile); an existing half wins.
+        let mut out: HashMap<String, Tile> = HashMap::new();
+        split_tall("door", &png_bytes(&image::RgbaImage::new(32, 32)), &mut out);
+        assert!(out.is_empty());
+        out.insert("door_top".into(), solid_tile(1, 2, 3));
+        split_tall("door", &tall(32, [9, 9, 9, 255], [8, 8, 8, 255]), &mut out);
+        assert_eq!(out["door_top"].get_pixel(0, 0).0, [1, 2, 3, 255], "a named half keeps precedence");
+        assert_eq!(out["door_bottom"].get_pixel(0, 0).0, [8, 8, 8, 255]);
+    }
+
+    #[test]
+    fn zip_door_and_portal_images_split_but_named_halves_win() {
+        use std::io::Write;
+        let mut buf = Vec::new();
+        {
+            let mut z = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            let o = zip::write::SimpleFileOptions::default();
+            // Zip order puts the tall image *before* the named half: precedence must not depend on it.
+            z.start_file("Door.PNG", o).unwrap();
+            z.write_all(&tall(32, [10, 20, 30, 255], [40, 50, 60, 255])).unwrap();
+            z.start_file("door_top.png", o).unwrap();
+            z.write_all(&png_bytes(&solid_tile(7, 7, 7))).unwrap();
+            z.start_file("portal.png", o).unwrap();
+            z.write_all(&tall(64, [1, 1, 1, 255], [2, 2, 2, 255])).unwrap();
+            z.finish().unwrap();
+        }
+        let tiles = collect_tiles_from_zip(&buf).unwrap();
+        assert_eq!(tiles["door_top"].get_pixel(0, 0).0, [7, 7, 7, 255]);
+        assert_eq!(tiles["door_bottom"].get_pixel(0, 0).0, [40, 50, 60, 255]);
+        assert_eq!(tiles["portal_top"].get_pixel(0, 0).0, [1, 1, 1, 255]);
+        let pack = assemble(&tiles).unwrap();
+        for n in ["door_top", "door_bottom", "portal_top", "portal_bottom"] { assert!(pack.name_to_row.contains_key(n)); }
+    }
+
+    #[test]
+    fn door_gray_rows_are_the_value_channel_not_the_normalised_luminance() {
+        let mut tiles: HashMap<String, Tile> = HashMap::new();
+        tiles.insert("door_bottom".into(), solid_tile(96, 60, 17));
+        tiles.insert("stone".into(), solid_tile(96, 60, 17));
+        let pack = assemble(&tiles).unwrap();
+        let px = |name: &str| {
+            let off = ((pack.name_to_row[name] + pack.gray_row_offset) * TILE * TILE * 4) as usize;
+            [pack.atlas_rgba[off], pack.atlas_rgba[off + 1], pack.atlas_rgba[off + 2], pack.atlas_rgba[off + 3]]
+        };
+        assert_eq!(px("door_bottom"), [96, 96, 96, 255], "max(r,g,b), as Emod's recolour");
+        assert!((px("stone")[0] as i32 - 184).abs() <= 1, "every other tile keeps the brightness-normalised gray");
+    }
+
+    #[test]
+    fn sibling_door_and_portal_images_next_to_a_bare_atlas_are_picked_up() {
+        let dir = std::env::temp_dir().join(format!("vuencedit-sibling-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A uniform 128-tile strip: enough for every ATLAS1_MAP slot to slice.
+        let atlas = image::RgbaImage::from_pixel(32, 32 * 128, image::Rgba([90, 90, 90, 255]));
+        std::fs::write(dir.join("atlas.png"), png_bytes(&atlas)).unwrap();
+        std::fs::write(dir.join("Door.png"), tall(32, [10, 20, 30, 255], [40, 50, 60, 255])).unwrap();
+        std::fs::write(dir.join("portal.png"), tall(64, [1, 1, 1, 255], [2, 2, 2, 255])).unwrap();
+        let pack = load_pack(dir.join("atlas.png").to_str().unwrap()).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        for n in ["door_top", "door_bottom", "portal_top", "portal_bottom", "stone"] {
+            assert!(pack.name_to_row.contains_key(n), "missing {n}");
+        }
+    }
+
+    /// The pack bundled as a Tauri resource must stay loadable and complete: every known tile
+    /// (including the door/portal halves, which only the tall PNGs supply) resolves to a row.
+    #[test]
+    fn bundled_default_pack_loads_with_every_known_tile() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../default-textures/default.zip");
+        let pack = load_pack(path).expect("bundled default pack loads");
+        for name in KNOWN_TEX_NAMES {
+            assert!(pack.name_to_row.contains_key(*name), "default pack is missing tile {name}");
+        }
     }
 }

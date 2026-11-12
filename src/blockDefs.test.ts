@@ -23,7 +23,7 @@ describe("blockDisplayName", () => {
 describe("resolveColor", () => {
   it("returns the declared new-format colour, not the generic grey fallback", () => {
     expect(resolveColor(112, 0)).not.toEqual([128, 128, 128]);
-    expect(resolveColor(112, 0)).toEqual([176, 84, 56]); // Ore Sand
+    expect(resolveColor(112, 0)).toEqual([133, 67, 58]); // Ore Sand
   });
 
   it("every NEW_FORMAT_BLOCKS entry resolves to its declared colour unpainted", () => {

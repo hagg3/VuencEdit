@@ -44,6 +44,24 @@ fn create_appears_only_after_the_first_commit() {
 }
 
 #[test]
+fn a_failed_create_commit_rename_leaves_a_usable_store() {
+    let tmp = TempDir::new("create_rename_fail");
+    let p = tmp.path("w.emod");
+    // A non-empty directory at the final path makes the rename fail (not a transient error).
+    std::fs::create_dir(&p).unwrap();
+    std::fs::write(p.join("x"), b"x").unwrap();
+    let mut s = new_world(&p, 4);
+    s.put_column(10, 10, &make_column(&mut Rng(77), 4, 3)).unwrap();
+    assert!(s.commit().is_err());
+    assert!(tmp.path("w.emod.creating").exists(), "the staged file is the committed store: kept");
+    assert_eq!(s.path(), p.as_path(), "still `creating`, so the final path is remembered");
+    // not dead: the staged file reopens and holds the commit
+    drop(s);
+    let s = Store::open(tmp.path("w.emod.creating")).unwrap();
+    assert_eq!((s.last_seq(), s.column_count()), (1, 1));
+}
+
+#[test]
 fn ords_summary_rewrites_and_compaction() {
     let tmp = TempDir::new("writer");
     let p = tmp.path("w.emod");
@@ -260,9 +278,9 @@ fn a_length_limited_open_reads_the_earlier_state() {
 }
 
 /// A reserved type is a member of its batch (the batch check counts it) and otherwise ignored;
-/// `verify` reports it; compaction drops it.
+/// `verify` reports it; compaction refuses while it is present (29.11).
 #[test]
-fn reserved_types_are_counted_ignored_reported_and_dropped() {
+fn reserved_types_are_counted_ignored_reported_and_block_compaction() {
     let tmp = TempDir::new("reserved");
     let p = tmp.path("r.emod");
     let mut f = fixture("f256-trailer.2batch.emod");
@@ -276,9 +294,11 @@ fn reserved_types_are_counted_ignored_reported_and_dropped() {
     assert_eq!(s.state_digest().unwrap(), expected_for("f256-trailer.2batch.emod").digest, "ignored");
     let v = s.verify().unwrap();
     assert!(v.len() == 1 && v[0].contains("reserved type 12"), "verify reports it: {v:?}");
-    s.compact().unwrap();
-    assert!(s.verify().unwrap().is_empty(), "compaction dropped it");
-    assert!(walk(&std::fs::read(&p).unwrap()).iter().all(|q| q.rtype != 12));
+    // 29.11: compaction refuses (file unchanged) rather than dropping an unknown record.
+    let before = std::fs::read(&p).unwrap();
+    assert!(matches!(s.compact(), Err(Error::Invalid(m)) if m.contains("type 12")));
+    assert_eq!(std::fs::read(&p).unwrap(), before, "file unchanged");
+    assert!(!with_suffix_exists(&p), "no .compact temp left");
 }
 
 #[test]
@@ -385,4 +405,10 @@ fn compaction_policy() {
     let mut got = vec![0u8; 16 * BAND];
     s.read_column(40, 40, &mut got).unwrap();
     assert_eq!(got, c);
+}
+
+fn with_suffix_exists(p: &std::path::Path) -> bool {
+    let mut o = p.as_os_str().to_owned();
+    o.push(".compact");
+    std::path::Path::new(&o).exists()
 }

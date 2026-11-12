@@ -5,7 +5,7 @@
  * `defaultWins`, the resize arithmetic, `collapseWin`).
  *
  * Coordinates are **work-area-local** px: (0,0) is the work area's top-left, i.e. the box between
- * the ribbon (+ Quick Actions bar) and the status bar, left of the docked sidebar.
+ * the ribbon (+ options bar) and the status bar, left of the docked sidebar.
  *
  * The persistence and reflow model is **anchor + offsets**. A window records which horizontal edge
  * (`l`/`c`/`r`) and vertical edge (`t`/`b`) it belongs to, and its distance from them. The rendered
@@ -17,8 +17,8 @@
  * reflow idempotent by construction.
  */
 
-export type WinId = "tools" | "view3d" | "hotbar" | "lens" | "cutaway" | "brushshape" | "buildslot";
-export const WIN_IDS: readonly WinId[] = ["tools", "view3d", "hotbar", "lens", "cutaway", "brushshape", "buildslot"];
+export type WinId = "tools" | "view3d" | "hotbar" | "lens";
+export const WIN_IDS: readonly WinId[] = ["tools", "view3d", "hotbar", "lens"];
 
 export interface Rect { x: number; y: number; w: number; h: number }
 export interface Size { w: number; h: number }
@@ -125,40 +125,8 @@ export interface WinLimits {
 const minOf = (o: Size[]): Size => ({ w: Math.min(...o.map(s => s.w)), h: Math.min(...o.map(s => s.h)) });
 const maxOf = (o: Size[]): Size => ({ w: Math.max(...o.map(s => s.w)), h: Math.max(...o.map(s => s.h)) });
 
-/**
- * The three mode-driven context panels (Stage 16.6) are **content-sized**, and two of them have
- * content that changes with the mode (the brush-shape panel is one row taller for Rock than for
- * Noise; the build-slot panel is taller for Sculpt than Flood Fill). `PANEL_SIZES` lists each
- * variant's size (title bar + 8 px body padding + `SMALL_H` rows), the panel components pick one
- * and register it with `setContentSize`, and `winLimits` then pins min = max = that size. Until a
- * panel has registered (storage sanitising on load, tests) the limits are the range across its
- * variants, so a stored size can be clamped without knowing which variant will show.
- */
-export const PANEL_SIZES = {
-  cutaway: { level: { w: 290, h: 90 } },
-  brushshape: { noise: { w: 290, h: 90 }, slope: { w: 290, h: 106 }, volumetric: { w: 480, h: 168 } },
-  buildslot: { floodfill: { w: 290, h: 106 }, sculpt: { w: 290, h: 172 } },
-} as const;
-
-type ContextPanelId = "cutaway" | "brushshape" | "buildslot";
-const panelRange = (id: ContextPanelId): { min: Size; max: Size } => {
-  const v: Size[] = Object.values(PANEL_SIZES[id]);
-  return { min: minOf(v), max: maxOf(v) };
-};
-
-/** The live content size each mounted context panel registered (see `PANEL_SIZES`). Module state,
- *  written during the panel's render — idempotent, so StrictMode's double render is harmless. */
-const contentSizes: Partial<Record<WinId, Size>> = {};
-export function setContentSize(id: WinId, size: Size | null): void {
-  if (size) contentSizes[id] = size; else delete contentSizes[id];
-}
-
 export function winLimits(id: WinId, work: Size): WinLimits {
   switch (id) {
-    case "cutaway": case "brushshape": case "buildslot": {
-      const live = contentSizes[id];
-      return live ? { min: live, max: live } : panelRange(id);
-    }
     case "tools": {
       const o = toolsOptions();
       return { min: minOf(o), max: maxOf(o), fit: (w, h) => growToOption(o, w, h) };
@@ -179,9 +147,6 @@ export const MIN_SIZE: Record<WinId, Size> = {
   view3d: winLimits("view3d", { w: 0, h: 0 }).min,
   hotbar: winLimits("hotbar", { w: 0, h: 0 }).min,
   lens: winLimits("lens", { w: 0, h: 0 }).min,
-  cutaway: winLimits("cutaway", { w: 0, h: 0 }).min,
-  brushshape: winLimits("brushshape", { w: 0, h: 0 }).min,
-  buildslot: winLimits("buildslot", { w: 0, h: 0 }).min,
 };
 
 /** Where a caller has only a minimum (tests, pre-16.2 call sites), the max is unbounded. */
@@ -368,11 +333,6 @@ export function defaultWins(work: Size, o: DefaultOpts): Record<WinId, WinState>
     // costs nothing until then. `attached: true` so it snaps straight to the ghost instead of
     // sitting at this placeholder corner.
     lens: { open: true, collapsed: false, w: 340, h: 240, anchor: { h: "l", v: "b" }, dx: WM, dy: WM, attached: true },
-    // Mode-driven context panels (16.6): top-left under the ribbon like every context panel, but
-    // shifted right of the Tools window's default column so a fresh layout doesn't stack them on it.
-    cutaway: panelDefault(PANEL_SIZES.cutaway.level),
-    brushshape: panelDefault(PANEL_SIZES.brushshape.volumetric),
-    buildslot: panelDefault(PANEL_SIZES.buildslot.sculpt),
   };
 }
 
@@ -381,7 +341,6 @@ export function defaultWins(work: Size, o: DefaultOpts): Record<WinId, WinState>
 export function contextDefault(size: Size): WinState {
   return { open: true, collapsed: false, w: size.w, h: size.h, anchor: { h: "l", v: "t" }, dx: WM, dy: WM };
 }
-const panelDefault = (size: Size): WinState => ({ ...contextDefault(size), dx: WM + TOOLS_DEFAULT.w + WM });
 
 /**
  * Tools-window reflow (like the mock's `layoutHotbar`, but the buttons never scale — they are the

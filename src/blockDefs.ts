@@ -189,26 +189,26 @@ export function isExpansionBlock(blockType: number): boolean {
 }
 
 // New-format blocks (112–127): 16 types added by the updated game (see TEST WORLDS/newblocks).
-// Names are known; the game's textures are not supported yet, so each colour is an approximation of
-// the block's texture (mirrors BLOCK_RGB in colors.rs — keep the two in sync, the Rust table is
-// authoritative for rendering and is installed over these by applyBlockTables()).
+// Each colour is the mean of the block's tile in Emod's atlas (mirrors BLOCK_RGB in colors.rs — keep
+// the two in sync, the Rust table is authoritative for rendering and is installed over these by
+// applyBlockTables()).
 export const NEW_FORMAT_BLOCKS: readonly { type: number; name: string; color: [number, number, number] }[] = [
-  { type: 112, name: "Ore Sand", color: [176,  84,  56] },
-  { type: 113, name: "Space Stone", color: [ 86,  74,  88] },
-  { type: 114, name: "Carpet", color: [ 38, 176, 186] },
-  { type: 115, name: "Snakeskin", color: [124,  72,  30] },
-  { type: 116, name: "Obsidian", color: [ 58,  32,  74] },
-  { type: 117, name: "Cheese", color: [232, 194,  54] },
-  { type: 118, name: "Space Dirt", color: [104,  72,  44] },
-  { type: 119, name: "Space Grass", color: [ 44, 112,  48] },
-  { type: 120, name: "Moss", color: [ 38,  82,  36] },
-  { type: 121, name: "Dark Matter", color: [ 96,  44, 150] },
-  { type: 122, name: "Space Sand", color: [224, 134,  46] },
-  { type: 123, name: "Snow", color: [240, 246, 250] },
-  { type: 124, name: "Moonrock", color: [214, 180, 178] },
-  { type: 125, name: "Basalt", color: [ 62,  62,  66] },
-  { type: 126, name: "Dark Tile", color: [110, 110, 114] },
-  { type: 127, name: "Algae", color: [ 52, 118,  88] },
+  { type: 112, name: "Ore Sand", color: [133, 67, 58] },
+  { type: 113, name: "Space Stone", color: [61, 46, 59] },
+  { type: 114, name: "Carpet", color: [27, 179, 193] },
+  { type: 115, name: "Snakeskin", color: [108, 62, 40] },
+  { type: 116, name: "Obsidian", color: [43, 26, 65] },
+  { type: 117, name: "Cheese", color: [220, 168, 45] },
+  { type: 118, name: "Space Dirt", color: [80, 39, 19] },
+  { type: 119, name: "Space Grass", color: [21, 61, 24] },
+  { type: 120, name: "Moss", color: [19, 44, 10] },
+  { type: 121, name: "Dark Matter", color: [66, 30, 105] },
+  { type: 122, name: "Space Sand", color: [225, 106, 0] },
+  { type: 123, name: "Snow", color: [175, 189, 192] },
+  { type: 124, name: "Moonrock", color: [137, 106, 129] },
+  { type: 125, name: "Basalt", color: [38, 35, 34] },
+  { type: 126, name: "Dark Tile", color: [123, 123, 123] },
+  { type: 127, name: "Algae", color: [72, 102, 49] },
 ] as const;
 
 /** Returns true if blockType is any new-format block (112–127). */

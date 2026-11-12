@@ -63,3 +63,20 @@ describe("sortSigns", () => {
     expect(input).toEqual([far, near]);
   });
 });
+
+describe("filterSigns / sortSigns over command blocks (27.7)", () => {
+  const cmds = [
+    { x: 0, y: 0, z: 5, script: "say hello" },
+    { x: 9, y: 0, z: 5, script: "" },
+    { x: 3, y: 0, z: 5, script: "tp 1 2 3\nsay bye" },
+  ];
+  const textOf = (c: { script: string }) => c.script;
+  it("searches the script", () => {
+    expect(filterSigns(cmds, "say", textOf).map((c) => c.x)).toEqual([0, 3]);
+    expect(filterSigns(cmds, "tp bye", textOf).map((c) => c.x)).toEqual([3]);
+  });
+  it("sorts nearest and A-Z, empty scripts last", () => {
+    expect(sortSigns(cmds, "nearest", { x: 9, y: 0 }, textOf).map((c) => c.x)).toEqual([9, 3, 0]);
+    expect(sortSigns(cmds, "text", { x: 0, y: 0 }, textOf).map((c) => c.x)).toEqual([0, 3, 9]);
+  });
+});

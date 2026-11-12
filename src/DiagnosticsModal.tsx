@@ -21,7 +21,7 @@ import Dialog, { DialogButton } from "./ui/Dialog";
 interface MemStatsJson {
   os: string;
   arch: string;
-  process: { workingSetBytes: number; peakWorkingSetBytes: number; pageFaultCount: number };
+  process: { workingSetBytes: number; peakWorkingSetBytes: number; pageFaultCount: number; footprintBytes: number };
   system: { totalBytes: number; availableBytes: number };
   platform: {
     memoryPressureLevel: number;
@@ -165,7 +165,12 @@ function buildReport(a: {
 
   out.push("[Process memory]");
   if (mem) {
-    out.push(line("Working set / RSS", fmtBytes(mem.process.workingSetBytes)));
+    const { workingSetBytes, footprintBytes } = mem.process;
+    if (footprintBytes > 0) {
+      out.push(line("Memory footprint", fmtBytes(footprintBytes)));
+      out.push(line("World pages cached", fmtBytes(Math.max(0, workingSetBytes - footprintBytes))));
+    }
+    out.push(line("Working set / RSS", fmtBytes(workingSetBytes)));
     out.push(line("Peak working set", fmtBytes(mem.process.peakWorkingSetBytes)));
     out.push(line("Page faults (cumulative)", mem.process.pageFaultCount));
   } else {
@@ -230,6 +235,8 @@ function buildReport(a: {
     out.push(line("Camera Z band ceiling", perf.zBand ?? "none (whole world height)"));
     out.push(line("Context losses recovered", perf.contextLossCount));
     out.push(line("3D pane disabled by back-off", perf.contextDisabled));
+    out.push(line("Signs drawn / hidden (3D overlay)", `${perf.signsDrawn} / ${perf.signsHidden}`));
+    out.push(line("Sign text textures (live / bytes incl. mips)", `${perf.signTextures} / ${fmtBytes(perf.signTexBytes)}`));
     const st = perf.state;
     out.push(line("3D host", `${viewHost} (canvas ${st.canvasPx} px, suspended: ${st.suspended})`));
     out.push(line("Camera / interact mode", `${st.camMode} / ${st.interact3d}`));
@@ -255,6 +262,7 @@ function buildReport(a: {
   out.push(line("  approx p50 / p95", `${tp50 ?? "n/a"} ms / ${tp95 ?? "n/a"} ms`));
   out.push(`3D frame interval (continuous frames only): ${formatHistogram(perfCounters.frameMs, true)}`);
   out.push(`3D renderer.render() CPU cost: ${formatHistogram(perfCounters.renderMs)}`);
+  out.push("(rAF / event-loop samplers run only while the perf HUD is on or this panel is open — Reset counters, then reproduce, then Copy.)");
   out.push(`Page rAF interval: ${formatHistogram(perfCounters.rafMs, true)}`);
   out.push(`Event-loop lag (250 ms timer drift): ${formatHistogram(perfCounters.lagMs)}`);
   out.push(`MapCanvas.draw() tile blit: ${formatHistogram(perfCounters.mapDrawMs)}`);

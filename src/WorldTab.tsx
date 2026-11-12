@@ -8,7 +8,7 @@
  * view is live. The pure search/sort/volume logic lives in `worldNav.ts`.
  */
 import { useEffect, useMemo, useState } from "react";
-import type { SelectionInfo, SignInfo } from "./types";
+import type { CmdInfo, RecordsInfo, SelectionInfo, SignInfo } from "./types";
 import {
   ACCENT, TEXT, TEXT_META, TEXT_LABEL,
   RADIUS, SPACE, hexToRgbTriplet,
@@ -20,6 +20,7 @@ import {
   loadBookmarks, saveBookmarks, addBookmark, renameBookmark, deleteBookmark, MAX_BOOKMARKS, type Bookmark,
 } from "./bookmarks";
 import { selectionVolume, filterSigns, sortSigns, signDistance, type SignSort } from "./worldNav";
+import { MAP } from "./theme/theme";
 
 export interface WorldTabProps {
   /** Sidebar tab is always mounted, unlike the old floating panel which only mounted while a
@@ -27,6 +28,8 @@ export interface WorldTabProps {
   selection: SelectionInfo | null;
   /** `get_records().signs`, fetched once per world load by App. Empty for most worlds. */
   signs: SignInfo[];
+  /** `get_records()` in full (27.7): command blocks, trailer status, adopted counts. Null before it loads. */
+  records: RecordsInfo | null;
   /** Live Home (`home`, header 16–27) / Start (`pos`, 4–15) in editor XY, null = never set. App
    *  keeps these current through Set Point, so they're never stale the way a one-off fetch is. */
   spawnPos: { px: number; py: number } | null;
@@ -157,6 +160,113 @@ function SignsBody({ signs, viewCenter, worldCentre, onGoTo }: {
   );
 }
 
+/** One line of a command block's script for a list row: first non-empty line, cut with "…". */
+export function scriptPreview(script: string, max = 60): string {
+  const first = script.split("\n").find((l) => l.trim() !== "")?.trim() ?? "";
+  const multi = script.split("\n").filter((l) => l.trim() !== "").length > 1;
+  return first.length > max ? `${first.slice(0, max)}…` : multi ? `${first} …` : first;
+}
+
+/** Command-blocks body (27.7, read-only): search + Nearest / A–Z, every row a go-to. Also carries the
+ *  opaque-trailer reason and the adopted-sidecar notice, which concern signs too. */
+function CmdsBody({ records, viewCenter, worldCentre, onGoTo }: {
+  records: RecordsInfo;
+  viewCenter: () => { x: number; y: number } | null;
+  worldCentre: { x: number; y: number };
+  onGoTo: (x: number, y: number, z?: number) => void;
+}) {
+  const cmds = records.cmds;
+  const [query, setQuery] = useState("");
+  const [sort, setSort] = useState<SignSort>("nearest");
+  const [showAll, setShowAll] = useState(false);
+  const [resortTick, setResortTick] = useState(0);
+  const bump = () => setResortTick(t => t + 1);
+  const textOf = (c: CmdInfo) => c.script;
+
+  const centre = viewCenter() ?? worldCentre;
+  const filtered = useMemo(() => filterSigns(cmds, query, textOf), [cmds, query]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const sorted = useMemo(() => sortSigns(filtered, sort, centre, textOf), [filtered, sort, resortTick]);
+  const visible = showAll ? sorted : sorted.slice(0, SIGNS_COLLAPSED_COUNT);
+  const hiddenCount = sorted.length - visible.length;
+  const adopted = records.adopted;
+  const adoptedParts = [
+    adopted.signs > 0 ? `${adopted.signs} sign${adopted.signs === 1 ? "" : "s"}` : "",
+    adopted.cmds > 0 ? `${adopted.cmds} command block${adopted.cmds === 1 ? "" : "s"}` : "",
+  ].filter(Boolean).join(" and ");
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: SPACE.sm, fontSize: 11 }}>
+      {records.status === "opaque" && (
+        <div style={{ color: TEXT_META, fontSize: 10 }}>
+          This world's record data is kept as is and can't be read or edited{records.why ? `: ${records.why}` : "."}
+        </div>
+      )}
+      {adoptedParts && (
+        <div style={{ color: TEXT_META, fontSize: 10 }}>
+          {adoptedParts} came from the game's side files and will be saved into this world.
+        </div>
+      )}
+      {cmds.length === 0 && records.status !== "opaque" && (
+        <div style={{ color: TEXT_META, textAlign: "center", padding: "4px 0" }}>No command blocks in this world.</div>
+      )}
+      {cmds.length > 0 && (
+        <>
+          <TextField
+            value={query} onChange={setQuery} ariaLabel="Search command blocks" placeholder="Search scripts…"
+            onKeyDown={(e) => { if (e.key === "Escape") { setQuery(""); e.currentTarget.blur(); e.stopPropagation(); } }}
+            style={{ userSelect: "text" }}
+          />
+          <div style={{ display: "flex", gap: SPACE.sm, alignItems: "center" }}>
+            <SmallButton label="Nearest" title="Closest to the map's centre first"
+              active={sort === "nearest"} onClick={() => { setSort("nearest"); bump(); }} />
+            <SmallButton label="A–Z" title="Alphabetical by script"
+              active={sort === "text"} onClick={() => setSort("text")} />
+            <span style={{ flex: 1 }} />
+            {sort === "nearest" && (
+              <SmallButton label="Re-sort" title="Re-measure from the map's current centre" onClick={bump} />
+            )}
+          </div>
+          {query.trim() && (
+            <div style={{ color: TEXT_META, fontSize: 10 }}>{sorted.length} of {cmds.length} match</div>
+          )}
+          {visible.map((c) => (
+            <div key={`${c.i}`}
+              role="button" tabIndex={0}
+              onClick={() => onGoTo(c.x, c.y, c.z)}
+              onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onGoTo(c.x, c.y, c.z); } }}
+              title="Go to this command block (map, and the 3D view when it's open)"
+              style={{
+                padding: "4px 6px", borderRadius: RADIUS.md,
+                background: `rgba(${hexToRgbTriplet(MAP.command)},.10)`,
+                boxShadow: `inset 0 0 0 1px rgba(${hexToRgbTriplet(MAP.command)},.30)`,
+                cursor: "pointer",
+              }}>
+              <div style={{ color: TEXT, fontFamily: PROP_MONO, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                {scriptPreview(c.script) || <span style={{ color: TEXT_META, fontStyle: "italic" }}>(empty)</span>}
+              </div>
+              <div style={{ color: TEXT_LABEL, fontSize: 10, marginTop: 2, fontFamily: PROP_MONO }}>
+                ({Math.round(c.x)}, {Math.round(c.y)}, {c.z}) · {Math.round(signDistance(c, centre)).toLocaleString()} blocks
+              </div>
+            </div>
+          ))}
+          {sorted.length === 0 && <div style={{ color: TEXT_META, textAlign: "center", padding: "4px 0" }}>No command blocks match.</div>}
+          {sorted.length > SIGNS_COLLAPSED_COUNT && (
+            <div
+              role="button" tabIndex={0}
+              onClick={() => setShowAll(v => !v)}
+              onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setShowAll(v => !v); } }}
+              style={{ textAlign: "center", padding: "3px 0", cursor: "pointer", userSelect: "none", color: TEXT_LABEL, fontSize: 10 }}
+            >
+              {showAll ? "Show less" : `Show ${hiddenCount} more…`}
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
 /** Per-world bookmarks: add the map's current centre, click to go, double-click the name to rename. */
 function BookmarksBody({ worldKey, viewCenter, onGoTo }: {
   worldKey: string | null;
@@ -208,7 +318,7 @@ function BookmarksBody({ worldKey, viewCenter, onGoTo }: {
 }
 
 export default function WorldTab({
-  selection: sel, signs, spawnPos, playerPos, onGoTo, viewCenter, cam3dAvailable, onCentreOnCam3d, editEpoch,
+  selection: sel, signs, records, spawnPos, playerPos, onGoTo, viewCenter, cam3dAvailable, onCentreOnCam3d, editEpoch,
   worldKey,
 }: WorldTabProps) {
   const { info } = useWorldInfo(editEpoch, 200);
@@ -265,6 +375,12 @@ export default function WorldTab({
       {signs.length > 0 && (
         <Section id="signs" title="Signs" meta={String(signs.length)}>
           <SignsBody signs={signs} viewCenter={viewCenter} worldCentre={worldCentre} onGoTo={onGoTo} />
+        </Section>
+      )}
+
+      {records && (
+        <Section id="cmds" title="Command blocks" meta={String(records.cmds.length)}>
+          <CmdsBody records={records} viewCenter={viewCenter} worldCentre={worldCentre} onGoTo={onGoTo} />
         </Section>
       )}
     </div>

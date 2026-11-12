@@ -4,7 +4,7 @@
  *
  * Block (15.3) is a normal always-on group, pixel-identical to Home/Draw/Sculpt's (see
  * `specs.test.ts`). Flood Fill's limit and the 3D Sculpt brush used to be a contextual `slot` group
- * here; since Stage 16.6 they're the Build slot context panel (`windows/modePanels.tsx`), so this
+ * here; since Stage 34.2 they're the options bar's flood / sculpt contexts (`ribbon/OptionsBarView.tsx`), so this
  * tab's solver input is static.
  */
 import { useMemo, useState } from "react";
@@ -12,7 +12,7 @@ import { contentTier } from "../layout";
 import { tabMetrics, specWidth, solveRow } from "../specs";
 import { useRibbon } from "../context";
 import BlockButton from "../BlockButton";
-import { Cmd, CmdSetting, CmdSmall } from "../Cmd";
+import { Cmd, CmdSetting, CmdSmall, CmdSplit } from "../Cmd";
 import type { CommandId } from "../../commands/meta";
 import {
   Badge, Col, Group, GroupDivider, Row, SliderRow,
@@ -54,8 +54,6 @@ export default function ThreeDTab() {
   const [prevDist, setPrevDist] = useState(p.renderDistance);
   if (prevDist !== p.renderDistance) { setPrevDist(p.renderDistance); setDistDisplay(p.renderDistance); }
 
-  const sunActive = p.shadows3d || p.gpuShadows;
-
   return (
     <>
       {/* ── Mode ──────────────────────────────────────────────────────────── */}
@@ -89,19 +87,31 @@ export default function ThreeDTab() {
       <Group id="lighting" label="Lighting" tier={tier.lighting} declaredWidth={W("lighting")} icon="night">
         <Col style={{ justifyContent: "center", height: GROUP_CONTENT_H }}>
           <CmdSmall id="3d.lighting.night" full badge={<Badge tone="perf" style={{ marginLeft: "auto" }} />} />
-          <CmdSmall id="3d.lighting.shadows" full badge={<Badge tone="perf" style={{ marginLeft: "auto" }} />} />
-          <CmdSmall id="3d.lighting.gpuShadows" full badge={<Badge tone="perf" style={{ marginLeft: "auto" }} />} />
+          <CmdSmall id="3d.lighting.shadows" full />
+          {/* 27.4b: the Sun slider only aims GPU Shadows now (baked shadows have no sun), so it lives
+              in GPU's popup. Settings keeps its own Sun control. */}
+          <CmdSplit id="3d.lighting.gpuShadows" small full menuTitle="GPU Shadows sun angle"
+            badge={<Badge tone="perf" style={{ marginLeft: "auto" }} />}
+            menu={() => (
+              <div style={{ padding: 8 }}>
+                <SliderRow label="Sun" min={0} max={1} step={0.01} accent={SPATIAL}
+                  labelWidth={32} width={120} disabled={!p.gpuShadows}
+                  value={sunDisplay} onChange={setSunDisplay} onCommit={p.commitSunT}
+                  format={v => `${Math.round(v * 100)}%`}
+                  title={p.gpuShadows ? "Sun angle: 0 = sunrise, 0.5 = noon, 1 = sunset" : "Turn on GPU Shadows to use the sun angle"} />
+              </div>
+            )} />
         </Col>
         <Col style={{ justifyContent: "center", height: GROUP_CONTENT_H }}>
-          <SliderRow label="Sun" min={0} max={1} step={0.01} accent={p.gpuShadows ? SPATIAL : AMBER}
-            labelWidth={32} width={68} disabled={!sunActive}
-            value={sunDisplay} onChange={setSunDisplay} onCommit={p.commitSunT}
-            format={v => `${Math.round(v * 100)}%`}
-            title={sunActive ? "Sun angle: 0 = sunrise, 0.5 = noon, 1 = sunset" : "Turn on Shadows or GPU Shadows to use the sun angle"} />
           <SliderRow label="Lamp R" min={2} max={32} accent={AMBER} labelWidth={44} width={68}
             disabled={!p.nightLighting}
             value={lampDisplay} onChange={setLampDisplay} onCommit={p.commitLampRadius}
             title={p.nightLighting ? "Lamp light radius, in blocks" : "Turn on Night Lighting to use the lamp radius"} />
+          {/* Greyed (by the binding) while Shadows is off or GPU overrides it; a click says why. */}
+          <Row style={{ height: SMALL_H }}>
+            <CmdSmall id="3d.lighting.shadowClassic" />
+            <CmdSmall id="3d.lighting.shadowSmooth" />
+          </Row>
           <Row style={{ height: SMALL_H, opacity: p.nightLighting ? 1 : 0.35, pointerEvents: p.nightLighting ? "auto" : "none" }}>
             <CmdSmall id="3d.lighting.legacy" />
             <CmdSmall id="3d.lighting.modern" />
