@@ -8,6 +8,7 @@ import type { Tool } from "../../MapCanvas";
 import { contentTier } from "../layout";
 import { tabMetrics, specWidth, solveRow } from "../specs";
 import { useRibbon } from "../context";
+import { drawShapeApplies, drawSizeApplies } from "../optionsBar";
 import BlockButton from "../BlockButton";
 import { Cmd, CmdDropdown, CmdMenuItem, CmdSetting, CmdSmall, CmdSplit } from "../Cmd";
 import type { CommandId } from "../../commands/meta";
@@ -52,8 +53,9 @@ export default function DrawTab() {
   const shapeArmed = SHAPES.some(s => s.tool === p.tool);
 
   const isSpray = p.tool === "spray";
-  const sizeApplies = p.tool === "brush" || p.tool === "spray" || p.tool === "line";
-  const shapeApplies = !p.isSculptTool && p.tool !== "fill" && p.tool !== "eyedropper";
+  // The same predicates the options bar reads (`ribbon/optionsBar.ts`), so the tab and the bar can't disagree.
+  const sizeApplies = drawSizeApplies(p.tool);
+  const shapeApplies = drawShapeApplies(p.tool);
 
   return (
     <>

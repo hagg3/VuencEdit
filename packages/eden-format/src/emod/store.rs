@@ -1004,9 +1004,15 @@ impl Store {
         self.tail_bytes = 0;
         self.torn = false;
         self.abort_batch();
-        if let Some(final_path) = self.creating.take() {
+        if let Some(final_path) = self.creating.clone() {
             self.file = None;
-            replace_file(&self.path, &final_path)?;
+            if let Err(e) = replace_file(&self.path, &final_path) {
+                // The staged file *is* the committed store: keep it, stay in `creating`, and
+                // reopen it so the Store isn't left dead.
+                self.file = fs::OpenOptions::new().read(true).write(true).open(&self.path).ok();
+                return Err(e.into());
+            }
+            self.creating = None;
             self.path = final_path;
             self.file = Some(fs::OpenOptions::new().read(true).write(true).open(&self.path)?);
         }
@@ -1022,8 +1028,10 @@ impl Store {
     /// `WORLD_HEADER`, `CREATURES`, a non-empty `SIGN_TRAILER`, `PROVENANCE`, `GENERATOR`,
     /// `COLUMN`s by ord, `SUMMARY`, `COMMIT` — conversion's order, so compacting a fresh conversion
     /// reproduces it byte for byte. zstd payloads are copied verbatim after they decode; anything
-    /// else is re-encoded with the store's codec. Reserved types are dropped. Refused while
-    /// damaged, read-only, mid-batch or before the first commit.
+    /// else is re-encoded with the store's codec. Refused while damaged, read-only, mid-batch,
+    /// before the first commit, or while the store holds a record type this build doesn't know
+    /// (types 0 and 10–255: dropping them would lose a newer writer's data; incremental saves keep
+    /// them). `INDEX` (8) is known and never written, so it is still dropped.
     pub fn compact(&mut self) -> Result<()> {
         self.check_writable()?;
         if self.creating.is_some() || self.last_commit.is_none() {
@@ -1034,6 +1042,11 @@ impl Store {
         }
         if self.damaged() {
             return Err(Error::Damaged("store is damaged: compaction is blocked (export first)".into()));
+        }
+        if let Some(t) = (0..=255u8).find(|&t| RecordType::from_u8(t).is_none() && self.latest[t as usize].is_some()) {
+            return Err(Error::Invalid(format!(
+                "compaction refused: the store holds record type {t}, which this build doesn't know (it would be lost)"
+            )));
         }
         let tmp = with_suffix(&self.path, ".compact");
         let res = self.write_compacted(&tmp);

@@ -433,7 +433,7 @@ impl PersistJob {
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         let dest = entry_path(dir, &self.source);
         let tmp = dest.with_extension("vxr.tmp");
-        std::fs::write(&tmp, &out).and_then(|_| std::fs::rename(&tmp, &dest)).map_err(|e| {
+        std::fs::write(&tmp, &out).and_then(|_| crate::rename_logged(&tmp, &dest)).map_err(|e| {
             let _ = std::fs::remove_file(&tmp);
             e.to_string()
         })?;

@@ -19,7 +19,7 @@ export function TextureGroup({ tier, declaredWidth }: { tier?: Tier; declaredWid
             tiers — "Change…"/"Change Texture Pack…" (bind.ts's labelOverride) already says it's
             loaded without needing a badge alongside it. */}
         <CmdSmall id="view.textures.load" full badge={<Badge style={{ marginLeft: "auto" }} />} />
-        {p.texturePackLoaded && <CmdSmall id="view.textures.unload" full />}
+        {p.texturePackPath && <CmdSmall id="view.textures.unload" full />}
       </div>
     </Group>
   );

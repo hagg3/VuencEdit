@@ -114,4 +114,21 @@ export default tseslint.config(
       }],
     },
   },
+  // The options bar (34.2) is held to the same rule. Its popover chrome (`BarPopover.tsx`) is the
+  // one place a raw button primitive is allowed: "More ▾" / "Shape ▾" are not commands.
+  {
+    files: ["src/ribbon/OptionsBarView.tsx"],
+    rules: {
+      "no-restricted-imports": ["error", {
+        paths: [{
+          name: "./primitives",
+          importNames: [
+            "LargeButton", "SmallButton", "IconButton", "CommandButton", "ToggleButton",
+            "SplitButton", "DropdownButton", "MenuItem",
+          ],
+          message: "The options bar renders commands through ribbon/Cmd.tsx (<Cmd id>); add the command to commands/meta.ts + bind.ts.",
+        }],
+      }],
+    },
+  },
 );

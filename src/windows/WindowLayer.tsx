@@ -1,6 +1,6 @@
 /**
  * The layer every floating window lives in (UI redesign r3, Stage 14.3). Absolutely positioned over
- * the **work area** — the box between the ribbon (+ Quick Actions bar) and the status bar, left of
+ * the **work area** — the box between the ribbon (+ options bar) and the status bar, left of
  * the docked sidebar — with `overflow: hidden` and its own stacking context (`z-index: 20`), so no
  * window can escape it or overlap the ribbon, sidebar or status bar.
  *
@@ -9,7 +9,7 @@
  *
  * It measures itself and feeds the size to the store; every window's rendered rect is then derived
  * from its stored anchor for that size (`rectOf`), so the sidebar opening/resizing, the ribbon
- * collapsing, the Quick Actions bar toggling and an OS window resize all reflow every
+ * collapsing, the options bar and an OS window resize all reflow every
  * window with no per-cause code.
  */
 import { useLayoutEffect, useRef, type ReactNode } from "react";

@@ -122,10 +122,16 @@ fn singleton(store: &mut Store, t: RecordType, what: &str) -> Result<Option<Vec<
     }
 }
 
+/// `SIGN_TRAILER`, or empty when absent or undecodable (the store logs the damage; I/O errors still fail).
+fn trailer_or_empty(store: &mut Store) -> Result<Vec<u8>> {
+    Ok(store.read_record(RecordType::SignTrailer)?.1)
+}
+
 /// The exact pre-flight of an own-format export, without decoding any column.
 pub fn preflight_own(store: &mut Store) -> Result<Preflight> {
     let creatures = singleton(store, RecordType::Creatures, "CREATURES")?.map_or(0, |c| c.len()) as u64;
-    let trailer = singleton(store, RecordType::SignTrailer, "SIGN_TRAILER")?.map_or(0, |t| t.len()) as u64;
+    // A damaged trailer degrades to empty (`read_record` already logged the damage).
+    let trailer = trailer_or_empty(store)?.len() as u64;
     let cols = store.columns();
     let n = cols.len() as u64;
     let stride = store.column_len() as u64;
@@ -154,7 +160,7 @@ fn export_own_inner(store: &mut Store, out: &Path, opts: ExportOptions) -> Resul
     }
     let creatures = singleton(store, RecordType::Creatures, "CREATURES")?
         .ok_or_else(|| Error::Damaged("no CREATURES".into()))?;
-    let trailer = singleton(store, RecordType::SignTrailer, "SIGN_TRAILER")?.unwrap_or_default();
+    let trailer = trailer_or_empty(store)?;
     // A malformed PROVENANCE only costs the row order (rows then follow ord order).
     let prov = singleton(store, RecordType::Provenance, "PROVENANCE").ok().flatten().and_then(|p| parse_provenance(&p));
     let generator: Option<[u8; GENERATOR_LEN]> = singleton(store, RecordType::Generator, "GENERATOR")

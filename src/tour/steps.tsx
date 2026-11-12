@@ -175,7 +175,7 @@ export const TOUR_STEPS: TourStep[] = [
     body: (
       <>
         Rectangle <Kbd>S</Kbd>, magic wand <Kbd>W</Kbd> and lasso <Kbd>K</Kbd> select areas.
-        A selection opens the Selection tab and the Quick Actions bar.
+        A selection opens the Selection tab and fills the options bar.
       </>
     ),
   },
@@ -189,12 +189,12 @@ export const TOUR_STEPS: TourStep[] = [
   },
   {
     id: "context-panels",
-    title: "Mode panels",
+    title: "The options bar",
     target: null,
     body: (
       <>
-        Some modes open their own small panel, like the brush shape while sculpting. Its ✕ leaves
-        the mode.
+        The thin bar under the ribbon shows the armed tool's settings: brush sliders while sculpting,
+        placement controls while pasting. Cap Z sits at its right end while Cutaway or Z-slice is on.
       </>
     ),
   },

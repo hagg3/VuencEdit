@@ -8,8 +8,7 @@
  * that isn't already open (each at most once, in the order given), then look again next frame.
  */
 
-import type { CommandPath } from "../commands/meta";
-import type { WinId } from "../windows/windowGeometry";
+import type { BarId, CommandPath } from "../commands/meta";
 
 export interface RevealOpener {
   /** Already showing its popover. Clicking a toggle that's open would *close* it. */
@@ -49,15 +48,15 @@ export function runReveal<T>({ find, openers, nextFrame, onFound, maxTries = 6 }
 }
 
 /**
- * Stage 16.6: some controls live in a **context panel** rather than a ribbon group (a
- * `{ panel }` entry in a command's `also`). ⌘K should flash that panel's copy — instead of
- * switching tabs — when the panel is on screen and the active tab has no control of its own for the
- * command. Returns the panel to reveal into, or null to use the normal tab/group path.
+ * 34.2: some controls live in the **options bar** (a `{ bar }` entry in a command's `path`/`also`).
+ * ⌘K should flash the bar's copy — instead of switching tabs — when the bar is showing that
+ * command's context and the active tab has no control of its own for it. Returns the bar context
+ * to reveal into, or null to use the normal tab/group path.
  */
-export function panelToReveal(
-  places: readonly CommandPath[], activeTab: string, activePanels: readonly WinId[],
-): WinId | null {
+export function barToReveal(
+  places: readonly CommandPath[], activeTab: string, activeBars: readonly BarId[],
+): BarId | null {
   if (places.some(p => "tab" in p && p.tab === activeTab)) return null;
-  for (const p of places) if ("panel" in p && activePanels.includes(p.panel)) return p.panel;
+  for (const p of places) if ("bar" in p && activeBars.includes(p.bar)) return p.bar;
   return null;
 }

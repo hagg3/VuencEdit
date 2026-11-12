@@ -56,4 +56,9 @@ export function optionsBarGroups(tab: RibbonTab): CompactBucket[] {
 /** Every `kind:"setting"` command in the whole registry, tab-independent — the set
  *  `CompactRibbon.tsx`'s widget switch must cover. `compactRibbon.test.ts` checks
  *  `SETTING_WIDGET_IDS` (declared next to the switch) against this. */
-export const SETTING_COMMAND_IDS: readonly CommandId[] = COMMAND_IDS.filter(id => meta(id).kind === "setting");
+export const SETTING_COMMAND_IDS: readonly CommandId[] = COMMAND_IDS.filter(id => {
+  const m = meta(id);
+  // A bar-only setting (Cap Z, Flood limit — `{ bar }` path, 34.2) lives in the contextual options
+  // bar, which the compact ribbon doesn't replace; it has no compact-row slot to cover.
+  return m.kind === "setting" && !("bar" in m.path);
+});

@@ -242,6 +242,7 @@ export default function Sidebar(p: SidebarProps) {
             key={p.worldEpoch}
             selection={p.selection}
             signs={p.signs}
+            records={p.records}
             spawnPos={p.spawnPos}
             playerPos={p.playerPos}
             onGoTo={p.onGoTo}

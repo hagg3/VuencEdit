@@ -50,6 +50,10 @@ export function bindCommands(c: CommandCtx): Record<CommandId, CommandBinding> {
   const act = (run: () => void, enabled: true | string = true): CommandBinding => ({ run, enabled });
   /** Settings/menus: ⌘K reveals them; `run` is never called but must exist. */
   const reveal: CommandBinding = { run: () => {}, enabled: true };
+  // Baked shadows: GPU Shadows overrides them (the backend forces them off), and the style pair is
+  // greyed while they're off.
+  const shadowsOn = p.shadowMode !== "off";
+  const shadowGate: true | string = p.gpuShadows ? "Overridden by GPU Shadows" : true;
   const grow = (d: number) => () => p.setRawBounds(b => {
     if (!b) return null;
     if (d > 0) return { x1: b.x1 - 1, y1: b.y1 - 1, x2: b.x2 + 1, y2: b.y2 + 1 };
@@ -63,6 +67,10 @@ export function bindCommands(c: CommandCtx): Record<CommandId, CommandBinding> {
         : [...p.treeTypes, id],
     ),
   });
+  // The options bar's Cap Z zone (34.2): only meaningful while a sliced view is on.
+  const maxZ = p.world?.max_z ?? 63;
+  const zGate: true | string = p.viewMode === "topdown" ? "Switch to Cutaway or Z-slice first" : true;
+  const stepZ = (d: number) => () => p.commitZSlice(Math.max(0, Math.min(maxZ, p.zSliceZ + d)));
   const picker = (kind: PickerKind, id: CommandId, enabled: true | string = true): CommandBinding =>
     ({ run: () => c.togglePickerFor(kind, id), armed: c.pickerKind === kind, enabled });
   const setPoint = (label: string, pos: { px: number; py: number } | null) =>
@@ -91,6 +99,7 @@ export function bindCommands(c: CommandCtx): Record<CommandId, CommandBinding> {
     "app.diagnostics": act(() => p.setShowDiagnostics(true)),
     "app.about": act(() => p.setShowAbout(true)),
     "app.close": act(() => p.closeWorld()),
+    "app.quit": act(() => p.quitApp()),
     "app.undo": act(() => p.handleUndo(), p.undoDepth > 0 ? true : "Nothing to undo"),
     "app.redo": act(() => p.handleRedo(), p.redoDepth > 0 ? true : "Nothing to redo"),
     "app.commandSearch": act(c.openPalette),
@@ -101,6 +110,7 @@ export function bindCommands(c: CommandCtx): Record<CommandId, CommandBinding> {
     "home.clipboard.paste": tool("paste", clip),
     "home.clipboard.copy": act(() => p.copySelection(), sel),
     "home.clipboard.cut": act(() => p.cutSelection(), sel),
+    "home.clipboard.discard": act(() => p.discardClipboard(), clip),
     "home.clipboard.rotate": act(() => p.rotateClipboard(), clip),
     "home.clipboard.flipX": act(() => p.mirrorClipboardX(), clip),
     "home.clipboard.flipY": act(() => p.mirrorClipboardY(), clip),
@@ -178,6 +188,7 @@ export function bindCommands(c: CommandCtx): Record<CommandId, CommandBinding> {
     "sculpt.brush.radiusUp": act(() => p.setSculptRadius(Math.min(32, p.sculptRadius + 1))),
     "sculpt.brush.strengthDown": act(() => p.setSculptStrength(Math.max(1, p.sculptStrength - 1))),
     "sculpt.brush.strengthUp": act(() => p.setSculptStrength(Math.min(8, p.sculptStrength + 1))),
+    "sculpt.shape.more": { run: () => {}, enabled: p.tool === "rock" || p.tool === "carve" ? true : "Pick Rock or Carve first" },
     "sculpt.falloff.profile": reveal,
     "sculpt.falloff.live": {
       ...flip(p.sculptAccumulate, p.setSculptAccumulate),
@@ -239,6 +250,10 @@ export function bindCommands(c: CommandCtx): Record<CommandId, CommandBinding> {
     "view.mapview.topdown": choose(p.viewMode, "topdown", p.setViewMode),
     "view.mapview.zslice": choose(p.viewMode, "zslice", p.setViewMode),
     "view.mapview.cutaway": choose(p.viewMode, "cutaway", p.setViewMode),
+    "view.mapview.level": { run: () => {}, enabled: zGate },
+    "view.mapview.levelUp": act(stepZ(1), zGate),
+    "view.mapview.levelDown": act(stepZ(-1), zGate),
+    "view.mapview.followSurface": flip(p.followSurface, p.setFollowSurface, p.viewMode === "zslice" ? true : "Switch to Z-slice first"),
     // Tiled is the only render mode now — always armed, nothing to switch.
     "view.render.relief": { run: () => p.setReliefShading(!p.reliefShading), armed: p.reliefShading, enabled: true },
     "view.zoom.fit": act(() => p.onFitMap()),
@@ -265,8 +280,8 @@ export function bindCommands(c: CommandCtx): Record<CommandId, CommandBinding> {
       ...flip(p.showTemplateOverlay, p.setShowTemplateOverlay, p.templateLoaded ? true : "Load the template first"),
       labelOverride: p.showTemplateOverlay ? "Overlay" : undefined,
     },
-    "view.textures.load": { ...act(() => p.openTexturePackFile()), labelOverride: p.texturePackLoaded ? "Change Texture Pack…" : undefined, shortOverride: p.texturePackLoaded ? "Change…" : undefined },
-    "view.textures.unload": { ...act(() => p.unloadTexturePack(), on(p.texturePackLoaded)) },
+    "view.textures.load": { ...act(() => p.openTexturePackFile()), labelOverride: p.texturePackPath ? "Change Texture Pack…" : undefined, shortOverride: p.texturePackPath ? "Change…" : undefined },
+    "view.textures.unload": { ...act(() => p.resetTexturePack(), on(p.texturePackPath !== null)) },
 
     // ── 3D ───────────────────────────────────────────────────────────────────────────────────
     "3d.mode.camera": choose(p.mode3d, "off", p.setMode3d),
@@ -274,6 +289,7 @@ export function bindCommands(c: CommandCtx): Record<CommandId, CommandBinding> {
     "3d.mode.build": choose(p.mode3d, "build", p.setMode3d),
     "3d.mode.sculpt": choose(p.mode3d, "sculpt", p.setMode3d),
     "3d.mode.floodfill": choose(p.mode3d, "floodfill", p.setMode3d),
+    "3d.mode.floodLimit": { run: () => {}, enabled: p.pane3dLive && p.mode3d === "floodfill" ? true : "Turn on 3D Flood Fill first" },
     "3d.mode.autoOrient": flip(p.autoOrient3d, p.setAutoOrient3d),
     "3d.camera.hud": flip(p.show3dHud, p.setShow3dHud),
     "3d.camera.grid": flip(p.show3dGrid, p.setShow3dGrid),
@@ -281,7 +297,9 @@ export function bindCommands(c: CommandCtx): Record<CommandId, CommandBinding> {
     "3d.camera.flySpeed": reveal,
     "3d.camera.distance": reveal,
     "3d.lighting.night": flip(p.nightLighting, p.setNightLighting),
-    "3d.lighting.shadows": { ...flip(p.shadows3d, p.setShadows3d, p.gpuShadows ? "Overridden by GPU Shadows" : true), armed: p.shadows3d && !p.gpuShadows },
+    "3d.lighting.shadows": { ...flip(shadowsOn, v => p.commitShadowMode(v ? p.shadowStyle : "off"), shadowGate), armed: shadowsOn && !p.gpuShadows },
+    "3d.lighting.shadowClassic": choose(p.shadowStyle, "classic", p.commitShadowMode, shadowsOn ? shadowGate : "Turn on Shadows first"),
+    "3d.lighting.shadowSmooth": choose(p.shadowStyle, "smooth", p.commitShadowMode, shadowsOn ? shadowGate : "Turn on Shadows first"),
     "3d.lighting.gpuShadows": flip(p.gpuShadows, p.setGpuShadows),
     "3d.lighting.legacy": choose(p.lightingProfile, "legacy", p.commitLightingProfile, p.nightLighting ? true : "Turn on Night Lighting first"),
     "3d.lighting.modern": choose(p.lightingProfile, "modern", p.commitLightingProfile, p.nightLighting ? true : "Turn on Night Lighting first"),

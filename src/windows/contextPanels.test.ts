@@ -24,18 +24,13 @@ const panel = (h = 80, extra: Partial<WinState> = {}): WinState => ({ ...context
 const wins = (over: Partial<Record<WinId, WinState>>): Record<WinId, WinState> => ({ ...DEF, ...over });
 
 describe("registry", () => {
-  it("the lens is the first context panel, then the three 16.6 mode panels; the other windows aren't", () => {
-    expect(contextIds()).toEqual(["lens", "cutaway", "brushshape", "buildslot"]);
+  it("the lens is the only context panel (34.2 moved the mode panels into the options bar); the other windows aren't", () => {
+    expect(contextIds()).toEqual(["lens"]);
     for (const id of contextIds()) expect(isContextPanel(id)).toBe(true);
     for (const id of ["tools", "view3d", "hotbar"] as const) expect(isContextPanel(id)).toBe(false);
   });
-  it("only the lens is a user toggle; the mode panels follow their mode and have no ⌥ shortcut", () => {
-    for (const id of ["cutaway", "brushshape", "buildslot"] as const) {
-      expect(CONTEXT_PANELS[id]!.userToggle).toBe(false);
-      expect(CONTEXT_PANELS[id]!.resize).toBe("none");
-      const cmd = COMMAND_IDS.find(c => c === `view.windows.${id}`);
-      expect(cmd).toBeUndefined();
-    }
+  it("the lens is a user toggle", () => {
+    expect(CONTEXT_PANELS.lens!.userToggle).toBe(true);
   });
   it("no context panel is in View ▸ Windows except a userToggle one (the lens)", () => {
     for (const id of contextIds()) {

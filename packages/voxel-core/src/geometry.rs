@@ -1,5 +1,5 @@
 //! Live 3D geometry pipeline: per-chunk face-culled/greedy-meshed mesh generation, directional
-//! face-shading, optional night-lighting + sun-shadow previews, and voxel picking (DDA raycast).
+//! face-shading, optional night-lighting + baked top-face shadow previews, and voxel picking (DDA raycast).
 //! This is what a fly-through pane's chunk streaming (`get_chunk_geometry`), the ortho/slab
 //! viewports and block picking all depend on — it is *not* an export module despite the filename it
 //! used to have (`export.rs`); static-format export (OBJ/JSON/VOX) was removed and now lives in the
@@ -12,6 +12,7 @@
 use crate::colors::{block_color, transparent_alpha, BI_NOTSOLID, BI_RAMPORSIDE, BLOCK_INFO};
 use crate::blocks::{fluid_base, fluid_level};
 use crate::mask::SelectionMask;
+use crate::shadow::{self, ShadeGather, ShadowMode};
 use crate::texture::{self, TexturePack};
 use crate::view::{scan_z_ceiling, world_max_z, ViewMeta, VoxelView};
 #[cfg(test)]
@@ -39,6 +40,10 @@ impl<'w, V: VoxelView> ChunkCache<'w, V> {
     pub fn new(world: &'w V) -> Self {
         Self { world, last: Cell::new(None) }
     }
+
+    /// The view this cache reads (for per-chunk hints, e.g. `ShadeGather`'s scan bound).
+    #[inline]
+    pub fn world(&self) -> &'w V { self.world }
 
     /// Identical in result to `get_block_at(self.world, wx, wy, wz)`.
     #[inline]
@@ -161,6 +166,12 @@ pub trait MeshSink {
     /// `a→b` (`nu` = the greedy-merged width in blocks, 1 for a per-block face); V is `row + 1` at
     /// `a`/`b` and `row` at `c`/`d` (a tile reads top→bottom).
     fn quad(&mut self, s: Stream, v: [[f32; 3]; 4], rgba: [f32; 4], uv: Option<(u32, u16)>);
+    /// [`quad`](Self::quad) with U running `nu..0` along `a→b` instead — the tile mirrored. A door's
+    /// back face needs it: it is wound the other way, and without the flip the handle would swap edges.
+    fn quad_mirrored(&mut self, s: Stream, v: [[f32; 3]; 4], rgba: [f32; 4], uv: Option<(u32, u16)>);
+    /// [`quad`](Self::quad) with a colour per corner (Smooth baked shadows), `rgba[k]` for `v[k]`.
+    /// The vertex order and winding are exactly `quad`'s, so a gradient face never flips its diagonal.
+    fn quad_colors(&mut self, s: Stream, v: [[f32; 3]; 4], rgba: [[f32; 4]; 4], uv: Option<(u32, u16)>);
     /// A triangle `v0, v1, v2`; U = 0, 1, ½ and V = `row + 1`, `row + 1`, `row`.
     fn tri(&mut self, s: Stream, v: [[f32; 3]; 3], rgba: [f32; 4], row: Option<u32>);
     /// Capacity hint: at most `n` more quads are coming for `s`.
@@ -204,15 +215,33 @@ impl F32Sink {
     }
 }
 
-impl MeshSink for F32Sink {
-    fn quad(&mut self, s: Stream, v: [[f32; 3]; 4], rgba: [f32; 4], uv: Option<(u32, u16)>) {
+impl F32Sink {
+    fn quad_u(&mut self, s: Stream, v: [[f32; 3]; 4], rgba: [f32; 4], uv: Option<(u32, u16)>, mirror: bool) {
         for k in [0, 1, 3, 1, 2, 3] { self.vert(s, v[k], rgba); }
+        self.quad_uvs(s, uv, mirror);
+    }
+
+    fn quad_uvs(&mut self, s: Stream, uv: Option<(u32, u16)>, mirror: bool) {
         if let Some((row, nu)) = uv {
-            let (v0, v1, nu) = ((row + 1) as f32 / self.ar, row as f32 / self.ar, nu as f32);
-            for f in [0.0, v0, nu, v0, 0.0, v1, nu, v0, nu, v1, 0.0, v1] {
+            let (v0, v1) = ((row + 1) as f32 / self.ar, row as f32 / self.ar);
+            let (ua, ub) = if mirror { (nu as f32, 0.0) } else { (0.0, nu as f32) };
+            for f in [ua, v0, ub, v0, ua, v1, ub, v0, ub, v1, ua, v1] {
                 self.uv[s as usize].extend_from_slice(&f.to_le_bytes());
             }
         }
+    }
+}
+
+impl MeshSink for F32Sink {
+    fn quad(&mut self, s: Stream, v: [[f32; 3]; 4], rgba: [f32; 4], uv: Option<(u32, u16)>) {
+        self.quad_u(s, v, rgba, uv, false);
+    }
+    fn quad_mirrored(&mut self, s: Stream, v: [[f32; 3]; 4], rgba: [f32; 4], uv: Option<(u32, u16)>) {
+        self.quad_u(s, v, rgba, uv, true);
+    }
+    fn quad_colors(&mut self, s: Stream, v: [[f32; 3]; 4], rgba: [[f32; 4]; 4], uv: Option<(u32, u16)>) {
+        for k in [0, 1, 3, 1, 2, 3] { self.vert(s, v[k], rgba[k]); }
+        self.quad_uvs(s, uv, false);
     }
     fn tri(&mut self, s: Stream, v: [[f32; 3]; 3], rgba: [f32; 4], row: Option<u32>) {
         for p in v { self.vert(s, p, rgba); }
@@ -339,15 +368,32 @@ impl CompactSink {
     }
 }
 
-impl MeshSink for CompactSink {
-    fn quad(&mut self, s: Stream, v: [[f32; 3]; 4], rgba: [f32; 4], uv: Option<(u32, u16)>) {
+impl CompactSink {
+    fn quad_u(&mut self, s: Stream, v: [[f32; 3]; 4], rgba: [f32; 4], uv: Option<(u32, u16)>, mirror: bool) {
+        self.quad_u_colors(s, v, [rgba; 4], uv, mirror);
+    }
+
+    fn quad_u_colors(&mut self, s: Stream, v: [[f32; 3]; 4], rgba: [[f32; 4]; 4], uv: Option<(u32, u16)>, mirror: bool) {
         let base = self.acc[s as usize].n;
         let uvs = uv.map(|(row, nu)| {
             let (r0, r1, u1) = (row as u16, (row + 1) as u16, nu * 2);
-            [(0, r1), (u1, r1), (u1, r0), (0, r0)]
+            let (ua, ub) = if mirror { (u1, 0) } else { (0, u1) };
+            [(ua, r1), (ub, r1), (ub, r0), (ua, r0)]
         });
-        for k in 0..4 { self.vert(s, v[k], rgba, uvs.map(|u| u[k])); }
+        for k in 0..4 { self.vert(s, v[k], rgba[k], uvs.map(|u| u[k])); }
         self.acc[s as usize].idx.extend_from_slice(&[base, base + 1, base + 3, base + 1, base + 2, base + 3]);
+    }
+}
+
+impl MeshSink for CompactSink {
+    fn quad(&mut self, s: Stream, v: [[f32; 3]; 4], rgba: [f32; 4], uv: Option<(u32, u16)>) {
+        self.quad_u(s, v, rgba, uv, false);
+    }
+    fn quad_mirrored(&mut self, s: Stream, v: [[f32; 3]; 4], rgba: [f32; 4], uv: Option<(u32, u16)>) {
+        self.quad_u(s, v, rgba, uv, true);
+    }
+    fn quad_colors(&mut self, s: Stream, v: [[f32; 3]; 4], rgba: [[f32; 4]; 4], uv: Option<(u32, u16)>) {
+        self.quad_u_colors(s, v, rgba, uv, false);
     }
     fn tri(&mut self, s: Stream, v: [[f32; 3]; 3], rgba: [f32; 4], row: Option<u32>) {
         let base = self.acc[s as usize].n;
@@ -408,15 +454,17 @@ impl LightingProfile {
 #[derive(Clone, Copy, Default)]
 pub struct LightMode {
     pub night: bool,
-    pub shadows: bool,
-    /// Simulated sun position, 0=sunrise, 0.5=noon, 1=sunset (see `sun_direction`). Inert whenever
-    /// `shadows` is false; `f32::default()` = 0.0 keeps `LightMode::default()` unaffected.
+    /// Baked top-face shadows (see [`crate::shadow`]). `Off` is byte-identical to a build without them.
+    pub shadows: ShadowMode,
+    /// Simulated sun position, 0=sunrise, 0.5=noon, 1=sunset. The mesher no longer reads it (baked
+    /// shadows have no sun direction); it rides along because the frontend's opt-in GPU shadows aim
+    /// their light with it.
     pub sun_t: f32,
     /// Emit **flat, unshaded** vertex colours (raw `block_color`, no per-face SH_* shading) for the
     /// opt-in GPU-shadow path: Three.js then does the directional shading + shadow map from real
     /// vertex normals, so baking any shading here would double up. Face *kind* (top/bottom/side, for
     /// texture selection) is still derived from the SH_* constant — only the brightness multiply is
-    /// skipped. Mutually exclusive with `night`/`shadows` in practice (the frontend clears them).
+    /// skipped. Mutually exclusive with `night`/`shadows` ([`LightMode::resolve`] clears them).
     pub flat: bool,
     /// User-tunable lamp light radius (blocks). `<= 0.0` (the `Default`) falls back to
     /// `profile.default_radius()`, so `LightMode::default()` output stays byte-for-byte the flat
@@ -436,12 +484,12 @@ impl LightMode {
     /// always concrete (clamped, or the profile's default), because the caller also needs it as the
     /// gather radius for the lamp index — and the two must not be allowed to disagree.
     pub fn resolve(
-        night: bool, shadows: bool, sun_t: f32,
+        night: bool, shadows: ShadowMode, sun_t: f32,
         gpu: bool, lamp_radius: Option<f32>, profile: LightingProfile,
     ) -> Self {
         LightMode {
             night: night && !gpu,
-            shadows: shadows && !gpu,
+            shadows: if gpu { ShadowMode::Off } else { shadows },
             sun_t: sun_t.clamp(0.0, 1.0),
             flat: gpu,
             lamp_radius: lamp_radius.unwrap_or_else(|| profile.default_radius()).clamp(1.0, 64.0),
@@ -454,7 +502,6 @@ pub const LAMP_BLOCK_TYPE: u8 = 72; // TYPE_LIGHTBOX
 const LEGACY_LAMP_RADIUS: f32 = 4.0;
 const MODERN_LAMP_RADIUS: f32 = 14.0;
 const NIGHT_AMBIENT: f32 = 0.35;
-const SHADOW_RAY_STEPS: i32 = 24; // unit steps marched toward the sun per voxel
 
 /// Baked-night per-voxel light is snapped to steps of `1/MERGE_LIGHT_STEPS` before anything reads it.
 ///
@@ -470,9 +517,9 @@ const SHADOW_RAY_STEPS: i32 = 24; // unit steps marched toward the sun per voxel
 /// is applied to `lm` itself in the voxel loop, not to the merge key — which keeps `FaceRec`'s
 /// "faces merge only when they render bit-identically" contract exactly as written.
 ///
-/// Only baked-night light is snapped. The day path (`[1,1,1]`) and shadows-only (two-tone
-/// `SUN_LIT`/`SUN_SHADOW`) are already constant-valued and merge perfectly on their own, so leaving
-/// them alone keeps their output byte-for-byte what it was.
+/// Only baked-night light is snapped. The day path (`[1,1,1]`) is constant-valued and merges
+/// perfectly on its own, and a day-shaded top face takes one of at most 101 values (`shade / 255`),
+/// so those are left alone too. A night-shaded top face is snapped like any other night light.
 const MERGE_LIGHT_STEPS: f32 = 32.0;
 
 /// Snap a light triple onto the `MERGE_LIGHT_STEPS` grid. `1.0` and `0.0` are exact grid points, so
@@ -504,12 +551,11 @@ pub struct LightConstants {
     pub lamp_light_radius: f32,
     pub legacy_lamp_radius: f32,
     pub modern_lamp_radius: f32,
-    pub shadow_ray_steps: i32,
 }
 
-/// Exposes the legacy/modern default lamp radii + `SHADOW_RAY_STEPS` to the frontend so the edit-sync
-/// reload radius (FlyView3D: a placed lamp/block can affect neighboring chunks up to these distances
-/// away when night lighting or shadows are on) can't silently drift out of sync with the Rust
+/// Exposes the legacy/modern default lamp radii to the frontend so the edit-sync
+/// reload radius (FlyView3D: a placed lamp can affect neighboring chunks up to this distance
+/// away when night lighting is on) can't silently drift out of sync with the Rust
 /// constants. `lamp_light_radius` is kept as an alias of `legacy_lamp_radius` for callers that haven't
 /// been updated to the per-profile fields yet.
 pub fn light_constants() -> LightConstants {
@@ -517,24 +563,10 @@ pub fn light_constants() -> LightConstants {
         lamp_light_radius: LEGACY_LAMP_RADIUS,
         legacy_lamp_radius: LEGACY_LAMP_RADIUS,
         modern_lamp_radius: MODERN_LAMP_RADIUS,
-        shadow_ray_steps: SHADOW_RAY_STEPS,
     }
 }
-const SUN_SHADOW: f32 = 0.55; // hard shadow multiplier — stays well above black even combined
-                               // with the darkest per-face shade constant (SH_W=0.447)
-const SUN_LIT: f32 = 1.0;
-
-/// Unit vector pointing from a voxel toward the simulated sun. `sun_t` sweeps a half-arc
-/// (sunrise -> noon -> sunset): elevation eases 15°..80°..15° via `sin(pi*t)`, azimuth sweeps
-/// 0..pi (east->west) linearly. There's no night-side sun (no sky dome/moon-shadow concept here —
-/// "night" is a separate ambient toggle), so this deliberately never goes sub-horizon.
-fn sun_direction(sun_t: f32) -> [f32; 3] {
-    let az = std::f32::consts::PI * sun_t;
-    let el = 15.0f32.to_radians() + (std::f32::consts::PI * sun_t).sin() * 65.0f32.to_radians();
-    [el.cos() * az.cos(), el.cos() * az.sin(), el.sin()]
-}
-
-/// 3D DDA (Amanatides–Woo) — marches a ray from `(ox,oy,oz)` in direction `dir` (need not be
+/// 3D DDA (Amanatides–Woo) — used by voxel picking (`pick_block_in`); the sun-shadow ray-march that
+/// shared it is gone (baked shadows are a column gather, `shadow.rs`). Marches a ray from `(ox,oy,oz)` in direction `dir` (need not be
 /// normalized) up to `max_dist` world units, visiting every voxel the ray actually crosses. This is
 /// what makes it safe for a shallow ray: stepping by a fixed unit-length offset each iteration (the
 /// old approach) advances less than 1 unit along any single axis for a diagonal direction, so
@@ -730,9 +762,9 @@ pub fn obj_geometry_region_into<S: MeshSink>(sink: &mut S, world: &impl VoxelVie
     // range — laterals share `wz`, so `gbz == gb` for them — but every neighbour read in the
     // emission loop goes through it so a future lookup can't reintroduce the hole.
     //
-    // Deliberately NOT used by `shadow_at`: the sun raymarch reads the *real* world, so a clipped
-    // render keeps the shadows it would have had unclipped (a ray escaping the band must still be
-    // blocked by the terrain above it).
+    // Deliberately NOT used by the shadow gather: it reads the *real* world (`cache.get`), so a clipped
+    // render keeps the shadows it would have had unclipped (a roof above the band still shades the
+    // floor inside it).
     let gbz = |wx: i32, wy: i32, wz: i32| -> (u8, u8) {
         if wz < sz1 || wz > sz2 { return (0u8, 0u8); }
         gb(wx, wy, wz)
@@ -755,8 +787,6 @@ pub fn obj_geometry_region_into<S: MeshSink>(sink: &mut S, world: &impl VoxelVie
     // the shared paint table, not a dedicated lamp-colour table).
     let lamp_radius = if mode.lamp_radius > 0.0 { mode.lamp_radius } else { mode.profile.default_radius() };
 
-    let sun_dir = sun_direction(mode.sun_t);
-
     // Per-block, per-channel light: Eden's `calcLight` adds each nearby lamp's `colorTable[paint]`
     // (scaled by linear falloff) onto the ambient base independently per R/G/B channel (Terrain.mm
     // `calcLight`/`addlight` keep a `Vector8 lightarray` — one accumulator per channel, not a single
@@ -764,9 +794,12 @@ pub fn obj_geometry_region_into<S: MeshSink>(sink: &mut S, world: &impl VoxelVie
     // red light instead of just a brighter grey. Evaluated once per voxel (not per vertex) — a
     // per-block approximation of the game's per-voxel lightarray grid. Lamp blocks themselves render
     // fullbright, matching the game.
-    let light_at = |wx: i32, wy: i32, wz: i32, bt: u8| -> [f32; 3] {
-        if !mode.night || bt == LAMP_BLOCK_TYPE { return [1.0, 1.0, 1.0]; }
-        let mut l = [NIGHT_AMBIENT; 3];
+    //
+    // `lamp_sum` is the one lamp loop: `init` seeds the accumulators (the ambient for a face's own
+    // light, 0 for the lamp-only term a shaded top face needs). Seeding with the ambient keeps the
+    // float sum order, and so every unshaded byte, exactly what it was before baked shadows.
+    let lamp_sum = |wx: i32, wy: i32, wz: i32, init: f32| -> [f32; 3] {
+        let mut l = [init; 3];
         for (&[lx, ly, lz], &color) in lamps.iter().map(|(p, c)| (p, c)) {
             let dx = (wx - lx) as f32;
             let dy = (wy - ly) as f32;
@@ -779,21 +812,12 @@ pub fn obj_geometry_region_into<S: MeshSink>(sink: &mut S, world: &impl VoxelVie
                 l[2] += contrib * color[2];
             }
         }
-        [l[0].clamp(0.0, 1.5), l[1].clamp(0.0, 1.5), l[2].clamp(0.0, 1.5)]
+        l
     };
-
-    // Directional sun-raycast shadow: march a 3D DDA toward the sun (see `sun_direction`) for
-    // SHADOW_RAY_STEPS world units; if any voxel the ray actually crosses is solid/occluding, the
-    // origin voxel is in shadow. Hard two-tone (SUN_LIT/SUN_SHADOW) — no soft falloff. `sun_dir` is
-    // constant for the whole region, so it's computed once above rather than per voxel.
-    let shadow_at = |wx: i32, wy: i32, wz: i32| -> f32 {
-        if !mode.shadows { return 1.0; }
-        let hit = dda_march(
-            wx as f32 + 0.5, wy as f32 + 0.5, wz as f32 + 0.5,
-            sun_dir, SHADOW_RAY_STEPS as f32,
-            |vx, vy, vz| obj_occludes(gb(vx, vy, vz).0),
-        );
-        if hit.is_some() { SUN_SHADOW } else { SUN_LIT }
+    let light_at = |wx: i32, wy: i32, wz: i32, bt: u8| -> [f32; 3] {
+        if !mode.night || bt == LAMP_BLOCK_TYPE { return [1.0, 1.0, 1.0]; }
+        let l = lamp_sum(wx, wy, wz, NIGHT_AMBIENT);
+        [l[0].clamp(0.0, 1.5), l[1].clamp(0.0, 1.5), l[2].clamp(0.0, 1.5)]
     };
 
     // Directional face-shading baked into vertex colours — replaces normal-based lighting.
@@ -860,7 +884,15 @@ pub fn obj_geometry_region_into<S: MeshSink>(sink: &mut S, world: &impl VoxelVie
             let (rgb2, row_opt) = if let Some(p) = pack {
                 texture::face_color_and_row(p, $btype, $bpaint, fk, $rgb)
             } else { ($rgb, None) };
-            let [r, g, b] = lit_rgb!(rgb2, $sh, $lm);
+            face_paint_row!(rgb2, row_opt, $sh, $lm, $btype)
+        }};
+    }
+    // The stream/colour half of `face_paint!`, for a caller that already chose the tile (a portal's
+    // front face). Keep this the single place that picks the stream and the lit RGBA.
+    macro_rules! face_paint_row {
+        ($rgb2:expr, $row_opt:expr, $sh:expr, $lm:expr, $btype:expr) => {{
+            let row_opt: Option<u32> = $row_opt;
+            let [r, g, b] = lit_rgb!($rgb2, $sh, $lm);
             let bt: u8 = $btype;
             let (stream, a) = if flat && bt == LAMP_BLOCK_TYPE { (Stream::Emissive, 1.0f32) }
                 else if let Some(a) = transparent_alpha(bt) { (Stream::Transparent, a) }
@@ -890,6 +922,20 @@ pub fn obj_geometry_region_into<S: MeshSink>(sink: &mut S, world: &impl VoxelVie
             push_quad_t!($a,$b,$c,$d,$rgb,$sh,$lm,$btype,$bpaint, 1)
         };
     }
+    // A door's back face: same tile, U mirrored (see `MeshSink::quad_mirrored`).
+    macro_rules! push_quad_mirrored {
+        ($a:expr,$b:expr,$c:expr,$d:expr,$rgb:expr,$sh:expr,$lm:expr,$btype:expr,$bpaint:expr) => {{
+            let (stream, rgba, row) = face_paint!($rgb, $sh, $lm, $btype, $bpaint);
+            sink.quad_mirrored(stream, [v3($a), v3($b), v3($c), v3($d)], rgba, row.map(|r| (r, 1)));
+        }};
+    }
+    // A quad with an explicit tile `($rgb2, $row)` — a portal's front face.
+    macro_rules! push_quad_row {
+        ($a:expr,$b:expr,$c:expr,$d:expr,$rgb2:expr,$row:expr,$sh:expr,$lm:expr,$btype:expr) => {{
+            let (stream, rgba, row) = face_paint_row!($rgb2, Some($row), $sh, $lm, $btype);
+            sink.quad(stream, [v3($a), v3($b), v3($c), v3($d)], rgba, row.map(|r| (r, 1)));
+        }};
+    }
 
     // Emission ceiling from the per-chunk top-occupied-band hint (`VoxelView::top_band_hint`),
     // taken as the max over every chunk this region touches — in the live path that is one chunk,
@@ -913,6 +959,41 @@ pub fn obj_geometry_region_into<S: MeshSink>(sink: &mut S, world: &impl VoxelVie
         sz2.min(top)
     };
 
+    // Baked shadows (`shadow.rs`): the gap tables for this box and a ring of 1, built once. `flat`
+    // (GPU shadows) draws unshaded colours, so it never builds one.
+    let shadows = if flat { ShadowMode::Off } else { mode.shadows };
+    let gather = (shadows != ShadowMode::Off)
+        .then(|| ShadeGather::build(&cache, sx1, sy1, sx2, sy2, sz1, ez2, world_max_z(world)));
+    // A top face's light: `(lm_top, corner lights)`. `lm_top` is what a whole-face top (or a ramp /
+    // wedge top that can't blend) renders with; the corner lights exist only for a Smooth face whose
+    // four shades differ. The shade scales the sky part of the light only (`shadow::lit_top`), so at
+    // night a lamp still lights a shaded floor; quantized here at the source, like `lm`, so the
+    // `FaceRec` "merges only when bit-identical" contract holds. Lamp blocks stay fullbright.
+    let top_light = |wx: i32, wy: i32, wz: i32, bt: u8, lm: [f32; 3]| -> ([f32; 3], Option<[[f32; 3]; 4]>) {
+        let Some(g) = gather.as_ref() else { return (lm, None) };
+        if bt == LAMP_BLOCK_TYPE { return (lm, None); }
+        let (lx, ly) = (wx - sx1, wy - sy1);
+        let (classic, corners) = if shadows == ShadowMode::Smooth {
+            match g.corners(lx, ly, wz) {
+                Some(c) => (g.classic(lx, ly, wz), Some(c)),
+                None => return (lm, None),
+            }
+        } else {
+            (g.classic(lx, ly, wz), None)
+        };
+        if corners.is_none() && classic >= 255 { return (lm, None); }
+        let add = if mode.night { lamp_sum(wx, wy, wz, 0.0) } else { [0.0; 3] };
+        let shaded = |sh: u8| {
+            let t = shadow::lit_top(sh, lm, mode.night, NIGHT_AMBIENT, add);
+            if mode.night { quantize_light(t) } else { t }
+        };
+        match corners {
+            Some(c) if c.iter().any(|&k| k != c[0]) => (shaded(classic), Some(c.map(shaded))),
+            Some(c) => (shaded(c[0]), None),
+            None => (shaded(classic), None),
+        }
+    };
+
     for wz in sz1..=ez2 {
         for wy in sy1..=sy2 {
             for wx in sx1..=sx2 {
@@ -927,9 +1008,13 @@ pub fn obj_geometry_region_into<S: MeshSink>(sink: &mut S, world: &impl VoxelVie
                 let face_hidden = |nbt: u8| obj_occludes(nbt) || nbt == bt;
 
                 let is_ramp_or_wedge = matches!(bt, 24..=55);
-                // Ramp/wedge branches below do their own neighbor lookups (their diagonal face is
-                // unconditional, so there's no early-out for them); only plain cubes reuse these.
-                let (n_top, n_bot, n_s, n_n, n_e, n_w) = if is_ramp_or_wedge {
+                // Door slabs (66–70) never fill their cell, so their inner face is never hidden —
+                // like ramps/wedges they do their own lookups and skip the early-out below.
+                let is_door = matches!(bt, 66..=70);
+                // Ramp/wedge/door branches below do their own neighbor lookups (their diagonal /
+                // inner face is unconditional, so there's no early-out for them); only plain cubes
+                // reuse these.
+                let (n_top, n_bot, n_s, n_n, n_e, n_w) = if is_ramp_or_wedge || is_door {
                     (0, 0, 0, 0, 0, 0)
                 } else {
                     (
@@ -944,7 +1029,7 @@ pub fn obj_geometry_region_into<S: MeshSink>(sink: &mut S, world: &impl VoxelVie
                 // Cheap early-out: a plain cube with every face hidden emits nothing, so skip the
                 // lamp/shadow lighting below entirely — that's the expensive part (O(lamps) per voxel
                 // plus a 24-step shadow raymarch), today paid by every voxel even when nothing is drawn.
-                if !is_ramp_or_wedge
+                if !is_ramp_or_wedge && !is_door
                     && face_hidden(n_top) && face_hidden(n_bot)
                     && face_hidden(n_s) && face_hidden(n_n)
                     && face_hidden(n_e) && face_hidden(n_w)
@@ -953,18 +1038,36 @@ pub fn obj_geometry_region_into<S: MeshSink>(sink: &mut S, world: &impl VoxelVie
                 }
 
                 let rgb = block_color(bt, paint, meta.sky);
-                let base_lm = light_at(wx, wy, wz, bt);
-                let shadow = shadow_at(wx, wy, wz);
-                let lm = [base_lm[0] * shadow, base_lm[1] * shadow, base_lm[2] * shadow];
+                let lm = light_at(wx, wy, wz, bt);
                 // Baked-night light varies continuously with distance-to-lamp; snap it so that
                 // near-identical neighbours can fuse in the greedy mesh pass. See MERGE_LIGHT_STEPS.
                 let lm = if mode.night { quantize_light(lm) } else { lm };
+                let (lm_top, top_corners) = top_light(wx, wy, wz, bt, lm);
                 let (x0,x1f) = (wx as f32, wx as f32+1.0);
                 let (y0,y1f) = (wy as f32, wy as f32+1.0);
                 let (z0,z1f) = (wz as f32, wz as f32+1.0);
                 // Eden (X east, Y south, Z up) → Three.js Y-up: (ex, ez, ey).
                 // Eden north = Three.js −Z so the camera faces −Z (north) and east (+X) is on the right.
                 let o = |ex:f32,ey:f32,ez:f32| -> (f32,f32,f32) { (ex,ez,ey) };
+                // A top quad: one light, or (Smooth, differing corners) a colour per corner, each
+                // vertex taking the corner of the cell it sits nearest. The vertex order never changes.
+                macro_rules! push_top_quad {
+                    ($a:expr,$b:expr,$c:expr,$d:expr,$rgb:expr,$btype:expr,$bpaint:expr) => {{
+                        let vs = [$a, $b, $c, $d];
+                        match top_corners {
+                            None => push_quad!(vs[0],vs[1],vs[2],vs[3],$rgb,SH_TOP,lm_top,$btype,$bpaint),
+                            Some(cl) => {
+                                let mut painted = vs.map(|p| {
+                                    let k = (p.0 > x0 + 0.5) as usize * 2 + (p.2 > y0 + 0.5) as usize;
+                                    face_paint!($rgb, SH_TOP, cl[k], $btype, $bpaint)
+                                });
+                                let (stream, _, row) = painted[0];
+                                let rgba = painted.each_mut().map(|p| p.1);
+                                sink.quad_colors(stream, vs.map(v3), rgba, row.map(|r| (r, 1)));
+                            }
+                        }
+                    }};
+                }
 
                 if matches!(bt, 24..=39) {
                     let dir = (bt-24)%4;
@@ -980,25 +1083,25 @@ pub fn obj_geometry_region_into<S: MeshSink>(sink: &mut S, world: &impl VoxelVie
                             if !ss { push_quad!(o(x0,y1f,z0),o(x1f,y1f,z0),o(x1f,y1f,z1f),o(x0,y1f,z1f),rgb,SH_S,lm,bt,paint); }
                             if !sw { push_tri!([o(x0,y0,z0),o(x0,y1f,z0),o(x0,y1f,z1f)],rgb,SH_W,lm,bt,paint); }
                             if !se { push_tri!([o(x1f,y1f,z0),o(x1f,y0,z0),o(x1f,y1f,z1f)],rgb,SH_E,lm,bt,paint); }
-                            push_quad!(o(x0,y0,z0),o(x1f,y0,z0),o(x1f,y1f,z1f),o(x0,y1f,z1f),rgb,SH_TOP,lm,bt,paint);
+                            push_top_quad!(o(x0,y0,z0),o(x1f,y0,z0),o(x1f,y1f,z1f),o(x0,y1f,z1f),rgb,bt,paint);
                         }
                         1 => {
                             if !sw { push_quad!(o(x0,y0,z0),o(x0,y1f,z0),o(x0,y1f,z1f),o(x0,y0,z1f),rgb,SH_W,lm,bt,paint); }
                             if !ss { push_tri!([o(x0,y1f,z0),o(x1f,y1f,z0),o(x0,y1f,z1f)],rgb,SH_S,lm,bt,paint); }
                             if !sn { push_tri!([o(x1f,y0,z0),o(x0,y0,z0),o(x0,y0,z1f)],rgb,SH_N,lm,bt,paint); }
-                            push_quad!(o(x1f,y0,z0),o(x1f,y1f,z0),o(x0,y1f,z1f),o(x0,y0,z1f),rgb,SH_TOP,lm,bt,paint);
+                            push_top_quad!(o(x1f,y0,z0),o(x1f,y1f,z0),o(x0,y1f,z1f),o(x0,y0,z1f),rgb,bt,paint);
                         }
                         2 => {
                             if !sn { push_quad!(o(x1f,y0,z0),o(x0,y0,z0),o(x0,y0,z1f),o(x1f,y0,z1f),rgb,SH_N,lm,bt,paint); }
                             if !se { push_tri!([o(x1f,y0,z0),o(x1f,y1f,z0),o(x1f,y0,z1f)],rgb,SH_E,lm,bt,paint); }
                             if !sw { push_tri!([o(x0,y1f,z0),o(x0,y0,z0),o(x0,y0,z1f)],rgb,SH_W,lm,bt,paint); }
-                            push_quad!(o(x1f,y1f,z0),o(x0,y1f,z0),o(x0,y0,z1f),o(x1f,y0,z1f),rgb,SH_TOP,lm,bt,paint);
+                            push_top_quad!(o(x1f,y1f,z0),o(x0,y1f,z0),o(x0,y0,z1f),o(x1f,y0,z1f),rgb,bt,paint);
                         }
                         _ => {
                             if !se { push_quad!(o(x1f,y1f,z0),o(x1f,y0,z0),o(x1f,y0,z1f),o(x1f,y1f,z1f),rgb,SH_E,lm,bt,paint); }
                             if !sn { push_tri!([o(x1f,y0,z0),o(x0,y0,z0),o(x1f,y0,z1f)],rgb,SH_N,lm,bt,paint); }
                             if !ss { push_tri!([o(x0,y1f,z0),o(x1f,y1f,z0),o(x1f,y1f,z1f)],rgb,SH_S,lm,bt,paint); }
-                            push_quad!(o(x0,y1f,z0),o(x0,y0,z0),o(x1f,y0,z1f),o(x1f,y1f,z1f),rgb,SH_TOP,lm,bt,paint);
+                            push_top_quad!(o(x0,y1f,z0),o(x0,y0,z0),o(x1f,y0,z1f),o(x1f,y1f,z1f),rgb,bt,paint);
                         }
                     }
                 } else if matches!(bt, 40..=55) {
@@ -1016,32 +1119,95 @@ pub fn obj_geometry_region_into<S: MeshSink>(sink: &mut S, world: &impl VoxelVie
                     match dir {
                         0 => { // SE: triangle NE(x1f,y0)-SE(x1f,y1f)-SW(x0,y1f). Diagonal NE↔SW faces NW.
                             if !s_bot { push_tri!([o(x1f,y0,z0),o(x1f,y1f,z0),o(x0,y1f,z0)],rgb,SH_BOT,lm,bt,paint); }
-                            if !s_top { push_tri!([o(x1f,y0,z1f),o(x0,y1f,z1f),o(x1f,y1f,z1f)],rgb,SH_TOP,lm,bt,paint); }
+                            if !s_top { push_tri!([o(x1f,y0,z1f),o(x0,y1f,z1f),o(x1f,y1f,z1f)],rgb,SH_TOP,lm_top,bt,paint); }
                             if !se { push_quad!(o(x1f,y0,z0),o(x1f,y1f,z0),o(x1f,y1f,z1f),o(x1f,y0,z1f),rgb,SH_E,lm,bt,paint); }
                             if !ss { push_quad!(o(x1f,y1f,z0),o(x0,y1f,z0),o(x0,y1f,z1f),o(x1f,y1f,z1f),rgb,SH_S,lm,bt,paint); }
                             push_quad!(o(x1f,y0,z0),o(x0,y1f,z0),o(x0,y1f,z1f),o(x1f,y0,z1f),rgb,(SH_N+SH_W)*0.5,lm,bt,paint);
                         }
                         1 => { // SW: triangle NW(x0,y0)-SW(x0,y1f)-SE(x1f,y1f). Diagonal NW↔SE faces NE.
                             if !s_bot { push_tri!([o(x0,y0,z0),o(x0,y1f,z0),o(x1f,y1f,z0)],rgb,SH_BOT,lm,bt,paint); }
-                            if !s_top { push_tri!([o(x0,y0,z1f),o(x1f,y1f,z1f),o(x0,y1f,z1f)],rgb,SH_TOP,lm,bt,paint); }
+                            if !s_top { push_tri!([o(x0,y0,z1f),o(x1f,y1f,z1f),o(x0,y1f,z1f)],rgb,SH_TOP,lm_top,bt,paint); }
                             if !sw { push_quad!(o(x0,y0,z0),o(x0,y1f,z0),o(x0,y1f,z1f),o(x0,y0,z1f),rgb,SH_W,lm,bt,paint); }
                             if !ss { push_quad!(o(x0,y1f,z0),o(x1f,y1f,z0),o(x1f,y1f,z1f),o(x0,y1f,z1f),rgb,SH_S,lm,bt,paint); }
                             push_quad!(o(x0,y0,z0),o(x1f,y1f,z0),o(x1f,y1f,z1f),o(x0,y0,z1f),rgb,(SH_N+SH_E)*0.5,lm,bt,paint);
                         }
                         2 => { // NW: triangle NE(x1f,y0)-NW(x0,y0)-SW(x0,y1f). Diagonal NE↔SW faces SE.
                             if !s_bot { push_tri!([o(x1f,y0,z0),o(x0,y0,z0),o(x0,y1f,z0)],rgb,SH_BOT,lm,bt,paint); }
-                            if !s_top { push_tri!([o(x1f,y0,z1f),o(x0,y1f,z1f),o(x0,y0,z1f)],rgb,SH_TOP,lm,bt,paint); }
+                            if !s_top { push_tri!([o(x1f,y0,z1f),o(x0,y1f,z1f),o(x0,y0,z1f)],rgb,SH_TOP,lm_top,bt,paint); }
                             if !sn { push_quad!(o(x1f,y0,z0),o(x0,y0,z0),o(x0,y0,z1f),o(x1f,y0,z1f),rgb,SH_N,lm,bt,paint); }
                             if !sw { push_quad!(o(x0,y0,z0),o(x0,y1f,z0),o(x0,y1f,z1f),o(x0,y0,z1f),rgb,SH_W,lm,bt,paint); }
                             push_quad!(o(x1f,y0,z0),o(x0,y1f,z0),o(x0,y1f,z1f),o(x1f,y0,z1f),rgb,(SH_S+SH_E)*0.5,lm,bt,paint);
                         }
                         _ => { // NE: triangle NW(x0,y0)-NE(x1f,y0)-SE(x1f,y1f). Diagonal NW↔SE faces SW.
                             if !s_bot { push_tri!([o(x0,y0,z0),o(x1f,y0,z0),o(x1f,y1f,z0)],rgb,SH_BOT,lm,bt,paint); }
-                            if !s_top { push_tri!([o(x0,y0,z1f),o(x1f,y1f,z1f),o(x1f,y0,z1f)],rgb,SH_TOP,lm,bt,paint); }
+                            if !s_top { push_tri!([o(x0,y0,z1f),o(x1f,y1f,z1f),o(x1f,y0,z1f)],rgb,SH_TOP,lm_top,bt,paint); }
                             if !sn { push_quad!(o(x0,y0,z0),o(x1f,y0,z0),o(x1f,y0,z1f),o(x0,y0,z1f),rgb,SH_N,lm,bt,paint); }
                             if !se { push_quad!(o(x1f,y0,z0),o(x1f,y1f,z0),o(x1f,y1f,z1f),o(x1f,y0,z1f),rgb,SH_E,lm,bt,paint); }
                             push_quad!(o(x0,y0,z0),o(x1f,y1f,z0),o(x1f,y1f,z1f),o(x0,y0,z1f),rgb,(SH_S+SH_W)*0.5,lm,bt,paint);
                         }
+                    }
+                } else if is_door {
+                    // A door is a closed slab, 1/16 thick, lying along one edge of its cell *inside*
+                    // it (Emod's closed pose; the swing animation isn't ours to copy — an editor has
+                    // no player). Each half draws its own tile as a plain 1×1 quad, so the 2-block
+                    // art never stretches. 66–69 face N/E/S/W; the top half (70) takes the facing of
+                    // the bottom half below it. Orphan halves are drawn on purpose, so a stray one
+                    // can be found and deleted.
+                    const T: f32 = 1.0 / 16.0;
+                    let door_dir = |b: u8, below: u8| -> u8 {
+                        if (66..=69).contains(&b) { b - 66 } else if (66..=69).contains(&below) { below - 66 } else { 0 }
+                    };
+                    let dir = door_dir(bt, gb(wx, wy, wz - 1).0);
+                    // Another door half of the same facing at a cell — its slab continues ours.
+                    let continues = |nx: i32, ny: i32, nz: i32, nbt: u8| -> bool {
+                        matches!(nbt, 66..=70) && door_dir(nbt, gb(nx, ny, nz - 1).0) == dir
+                    };
+                    let (bx0, bx1, by0, by1) = match dir {
+                        0 => (x0, x1f, y0, y0 + T),
+                        1 => (x1f - T, x1f, y0, y1f),
+                        2 => (x0, x1f, y1f - T, y1f),
+                        _ => (x0, x0 + T, y0, y1f),
+                    };
+                    // The slab's four side planes, N/E/S/W, in the cube faces' vertex order (so a
+                    // face reads un-mirrored from outside) with their SH_* shade.
+                    let side = |i: u8| -> ([(f32, f32, f32); 4], f32) {
+                        match i {
+                            0 => ([o(bx1,by0,z0),o(bx0,by0,z0),o(bx0,by0,z1f),o(bx1,by0,z1f)], SH_N),
+                            1 => ([o(bx1,by1,z0),o(bx1,by0,z0),o(bx1,by0,z1f),o(bx1,by1,z1f)], SH_E),
+                            2 => ([o(bx0,by1,z0),o(bx1,by1,z0),o(bx1,by1,z1f),o(bx0,by1,z1f)], SH_S),
+                            _ => ([o(bx0,by0,z0),o(bx0,by1,z0),o(bx0,by1,z1f),o(bx0,by0,z1f)], SH_W),
+                        }
+                    };
+                    let nbrs = [(0, -1), (1, 0), (0, 1), (-1, 0)].map(|(dx, dy)| {
+                        let (nx, ny) = (wx + dx, wy + dy);
+                        (nx, ny, gbz(nx, ny, wz).0)
+                    });
+                    // Outward broad face (un-mirrored): hidden by an occluder across that edge.
+                    if !obj_occludes(nbrs[dir as usize].2) {
+                        let ([a, b, c, d], sh) = side(dir);
+                        push_quad!(a,b,c,d,rgb,sh,lm,bt,paint);
+                    }
+                    // Inward broad face: the opposite plane's cube-face winding, with U mirrored so the
+                    // handle stays on the same world edge from both sides (Emod's U flip).
+                    {
+                        let ([a, b, c, d], sh) = side((dir + 2) % 4);
+                        push_quad_mirrored!(a,b,c,d,rgb,sh,lm,bt,paint);
+                    }
+                    // The slab's two end faces (the sides that aren't broad).
+                    for i in [(dir + 1) % 4, (dir + 3) % 4] {
+                        let (nx, ny, nbt) = nbrs[i as usize];
+                        if obj_occludes(nbt) || continues(nx, ny, wz, nbt) { continue; }
+                        let ([a, b, c, d], sh) = side(i);
+                        push_quad!(a,b,c,d,rgb,sh,lm,bt,paint);
+                    }
+                    // Top / bottom: hidden by an occluder, or by the matching half of this door.
+                    let above = gbz(wx, wy, wz + 1).0;
+                    if !obj_occludes(above) && !(bt != 70 && above == 70 && continues(wx, wy, wz + 1, above)) {
+                        push_quad!(o(bx0,by0,z1f),o(bx1,by0,z1f),o(bx1,by1,z1f),o(bx0,by1,z1f),rgb,SH_TOP,lm_top,bt,paint);
+                    }
+                    let below = gbz(wx, wy, wz - 1).0;
+                    if !obj_occludes(below) && !(bt == 70 && matches!(below, 66..=69) && continues(wx, wy, wz - 1, below)) {
+                        push_quad!(o(bx0,by1,z0),o(bx1,by1,z0),o(bx1,by0,z0),o(bx0,by0,z0),rgb,SH_BOT,lm,bt,paint);
                     }
                 } else {
                     // Cube with face culling. Non-fluids reuse the occludes-or-same-type rule; fluids
@@ -1054,6 +1220,18 @@ pub fn obj_geometry_region_into<S: MeshSink>(sink: &mut S, world: &impl VoxelVie
                     // Partial fluids (¾/½/¼, levels 3/2/1) that ARE the surface still sit at a level/4
                     // top (the wavy-water look, mirroring TerrainChunk.mm). Non-fluids: ztop == z1f,
                     // base_fluid None, so the branch collapses to plain occludes-or-same-type culling.
+                    // A portal is still a stone cube, but its one *front* face wears the pack's portal
+                    // art (Emod puts a frame slab there). `portal_front` = (FaceRec dir, colour, row);
+                    // that face is emitted immediately instead of deferred — the merge key (`bt` +
+                    // paint) can't tell it from a stone side of the same block, so merging would
+                    // swallow it into a stone quad. None without portal tiles ⇒ plain stone, as before.
+                    let portal_front = if matches!(bt, 75..=79) {
+                        pack.and_then(|p| texture::portal_front_color_and_row(p, bt, paint, rgb)).map(|(c, r)| {
+                            let below = gb(wx, wy, wz - 1).0;
+                            let i = if bt != 79 { bt - 75 } else if (75..=78).contains(&below) { below - 75 } else { 0 };
+                            ([3u8, 4, 2, 5][i as usize], c, r) // north, east, south, west
+                        })
+                    } else { None };
                     let base_fluid = fluid_base(bt);
                     let fl = fluid_level(bt);
                     let submerged = base_fluid.is_some_and(|bf| fluid_base(n_top) == Some(bf));
@@ -1107,7 +1285,8 @@ pub fn obj_geometry_region_into<S: MeshSink>(sink: &mut S, world: &impl VoxelVie
                     let mut defer = |dir: u8, slice: i32, u: i32, v: i32| {
                         let key_lm = if flat { [1.0f32, 1.0, 1.0] } else {
                             let cap = light_cap[dir as usize];
-                            [lm[0].min(cap), lm[1].min(cap), lm[2].min(cap)]
+                            let l = if dir == 0 { lm_top } else { lm };
+                            [l[0].min(cap), l[1].min(cap), l[2].min(cap)]
                         };
                         let key_lm = [key_lm[0].to_bits(), key_lm[1].to_bits(), key_lm[2].to_bits()];
                         faces.push(FaceRec { dir, slice, bt, paint, lm: key_lm, v, u });
@@ -1116,8 +1295,8 @@ pub fn obj_geometry_region_into<S: MeshSink>(sink: &mut S, world: &impl VoxelVie
                     let top_hidden = obj_occludes(n_top) || n_top == bt
                         || base_fluid.is_some_and(|bf| fluid_base(n_top) == Some(bf));
                     if !top_hidden {
-                        if full_top { defer(0, wz, wx, wy); }
-                        else { push_quad!(o(x0,y0,ztop),o(x1f,y0,ztop),o(x1f,y1f,ztop),o(x0,y1f,ztop),rgb,SH_TOP,lm,bt,paint); }
+                        if full_top && top_corners.is_none() { defer(0, wz, wx, wy); }
+                        else { push_top_quad!(o(x0,y0,ztop),o(x1f,y0,ztop),o(x1f,y1f,ztop),o(x0,y1f,ztop),rgb,bt,paint); }
                     }
                     let bot_hidden = obj_occludes(n_bot) || n_bot == bt
                         || base_fluid.is_some_and(|bf| fluid_base(n_bot) == Some(bf));
@@ -1129,22 +1308,30 @@ pub fn obj_geometry_region_into<S: MeshSink>(sink: &mut S, world: &impl VoxelVie
                     // block. `zb != z0` means a fluid neighbour occluded the lower part of it.
                     let (h_s, zb_s) = lat(n_s, nab_s);
                     if !h_s {
-                        if full_top && zb_s == z0 { defer(2, wy, wx, wz); }
+                        if let Some((_, c, r)) = portal_front.filter(|f| f.0 == 2) {
+                            push_quad_row!(o(x0,y1f,zb_s),o(x1f,y1f,zb_s),o(x1f,y1f,ztop),o(x0,y1f,ztop),c,r,SH_S,lm,bt);
+                        } else if full_top && zb_s == z0 { defer(2, wy, wx, wz); }
                         else { push_quad!(o(x0,y1f,zb_s),o(x1f,y1f,zb_s),o(x1f,y1f,ztop),o(x0,y1f,ztop),rgb,SH_S,lm,bt,paint); }
                     }
                     let (h_n, zb_n) = lat(n_n, nab_n);
                     if !h_n {
-                        if full_top && zb_n == z0 { defer(3, wy, wx, wz); }
+                        if let Some((_, c, r)) = portal_front.filter(|f| f.0 == 3) {
+                            push_quad_row!(o(x1f,y0,zb_n),o(x0,y0,zb_n),o(x0,y0,ztop),o(x1f,y0,ztop),c,r,SH_N,lm,bt);
+                        } else if full_top && zb_n == z0 { defer(3, wy, wx, wz); }
                         else { push_quad!(o(x1f,y0,zb_n),o(x0,y0,zb_n),o(x0,y0,ztop),o(x1f,y0,ztop),rgb,SH_N,lm,bt,paint); }
                     }
                     let (h_e, zb_e) = lat(n_e, nab_e);
                     if !h_e {
-                        if full_top && zb_e == z0 { defer(4, wx, wy, wz); }
+                        if let Some((_, c, r)) = portal_front.filter(|f| f.0 == 4) {
+                            push_quad_row!(o(x1f,y1f,zb_e),o(x1f,y0,zb_e),o(x1f,y0,ztop),o(x1f,y1f,ztop),c,r,SH_E,lm,bt);
+                        } else if full_top && zb_e == z0 { defer(4, wx, wy, wz); }
                         else { push_quad!(o(x1f,y1f,zb_e),o(x1f,y0,zb_e),o(x1f,y0,ztop),o(x1f,y1f,ztop),rgb,SH_E,lm,bt,paint); }
                     }
                     let (h_w, zb_w) = lat(n_w, nab_w);
                     if !h_w {
-                        if full_top && zb_w == z0 { defer(5, wx, wy, wz); }
+                        if let Some((_, c, r)) = portal_front.filter(|f| f.0 == 5) {
+                            push_quad_row!(o(x0,y0,zb_w),o(x0,y1f,zb_w),o(x0,y1f,ztop),o(x0,y0,ztop),c,r,SH_W,lm,bt);
+                        } else if full_top && zb_w == z0 { defer(5, wx, wy, wz); }
                         else { push_quad!(o(x0,y0,zb_w),o(x0,y1f,zb_w),o(x0,y1f,ztop),o(x0,y0,ztop),rgb,SH_W,lm,bt,paint); }
                     }
                 }
@@ -1399,7 +1586,7 @@ mod tests {
         world.bytes[block(3, 5, 3)] = LAMP_BLOCK_TYPE;
 
         let day = side_face_color(&world, 3, 5, 0, 0, LightMode::default());
-        let night = side_face_color(&world, 3, 5, 0, 0, LightMode { night: true, shadows: false, sun_t: 0.0, flat: false, lamp_radius: 0.0, profile: LightingProfile::Legacy });
+        let night = side_face_color(&world, 3, 5, 0, 0, LightMode { night: true, shadows: ShadowMode::Off, sun_t: 0.0, flat: false, lamp_radius: 0.0, profile: LightingProfile::Legacy });
 
         for c in 0..3 {
             assert!(night[c] < day[c], "night lighting should dim an unlit block relative to full daylight");
@@ -1419,7 +1606,7 @@ mod tests {
         world.bytes[block(3, 5, 3)] = LAMP_BLOCK_TYPE;
         world.bytes[paint(3, 5, 3)] = 1; // PAINT_RGB[1] = [255,170,170] — red-dominant
 
-        let night = side_face_color(&world, 3, 5, 0, 0, LightMode { night: true, shadows: false, sun_t: 0.0, flat: false, lamp_radius: 0.0, profile: LightingProfile::Legacy });
+        let night = side_face_color(&world, 3, 5, 0, 0, LightMode { night: true, shadows: ShadowMode::Off, sun_t: 0.0, flat: false, lamp_radius: 0.0, profile: LightingProfile::Legacy });
 
         // A red-dominant lamp should tint the probe's lit colour red-dominant too: the red channel
         // should gain more (relative to its unlit value) than green/blue. Checked via the raw ratio
@@ -1649,7 +1836,7 @@ mod tests {
         let day = obj_geometry_region(&world, world.meta(), None, 3, 5, 6, 5, 0, 0, &[], LightMode::default(), None);
         assert_eq!(quads_in_plane_y(&day, 1.0).len(), 1, "unlit: identical colour, one merged quad");
 
-        let night_mode = LightMode { night: true, shadows: false, sun_t: 0.0, flat: false, lamp_radius: 0.0, profile: LightingProfile::Legacy };
+        let night_mode = LightMode { night: true, shadows: ShadowMode::Off, sun_t: 0.0, flat: false, lamp_radius: 0.0, profile: LightingProfile::Legacy };
         let lamps = scan_lamps(&world, 3, 5, 6, 5, 0, 0, night_mode.profile.default_radius());
         let night = obj_geometry_region(&world, world.meta(), None, 3, 5, 6, 5, 0, 0, &lamps, night_mode, None);
         let top = quads_in_plane_y(&night, 1.0);
@@ -1699,7 +1886,7 @@ mod tests {
             world.bytes[block(x, 5, 2) + 4096] = 9; // PAINT_RGB[9] = white → equal light in all channels
         }
 
-        let mode = LightMode { night: true, shadows: false, sun_t: 0.0, flat: false, lamp_radius: 6.0, profile: LightingProfile::Modern };
+        let mode = LightMode { night: true, shadows: ShadowMode::Off, sun_t: 0.0, flat: false, lamp_radius: 6.0, profile: LightingProfile::Modern };
         let lamps = scan_lamps(&world, 3, 5, 4, 5, 0, 0, mode.lamp_radius);
         let g = obj_geometry_region(&world, world.meta(), None, 3, 5, 4, 5, 0, 0, &lamps, mode, None);
 
@@ -1798,56 +1985,210 @@ mod tests {
         assert_eq!(covered_cells(&top).len(), 4);
     }
 
+    // ── Baked shadows (27.4a) ───────────────────────────────────────────────────────────────────
+
+    /// `(x, y, colour)` of every vertex of the opaque top-face triangles at height `z + 1` whose
+    /// footprint covers the centre of cell `(x, y)` — a merged quad still counts, so a test can ask
+    /// about a cell without caring how it was meshed.
+    fn top_verts(g: &ObjGeometryResult, x: i32, y: i32, z: i32) -> Vec<(f32, f32, [f32; 3])> {
+        let f = |b: &[u8]| -> Vec<f32> { b.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect() };
+        let (p, c) = (f(&g.positions), f(&g.colors));
+        let (cx, cy) = (x as f32 + 0.5, y as f32 + 0.5);
+        let mut out = Vec::new();
+        for t in 0..p.len() / 9 {
+            let vs: Vec<(f32, f32, [f32; 3])> = (0..3).map(|k| {
+                let i = t * 3 + k;
+                (p[i * 3], p[i * 3 + 2], [c[i * 3], c[i * 3 + 1], c[i * 3 + 2]])
+            }).collect();
+            let flat = (0..3).all(|k| p[(t * 3 + k) * 3 + 1] == (z + 1) as f32);
+            let (x0, x1) = (vs.iter().map(|v| v.0).fold(f32::MAX, f32::min), vs.iter().map(|v| v.0).fold(f32::MIN, f32::max));
+            let (y0, y1) = (vs.iter().map(|v| v.1).fold(f32::MAX, f32::min), vs.iter().map(|v| v.1).fold(f32::MIN, f32::max));
+            if flat && x0 <= cx && cx <= x1 && y0 <= cy && cy <= y1 { out.extend(vs); }
+        }
+        out
+    }
+
+    /// The single colour of the top face over cell `(x, y)` at `z` (asserts it is uniform).
+    fn top_color(g: &ObjGeometryResult, x: i32, y: i32, z: i32) -> [f32; 3] {
+        let vs = top_verts(g, x, y, z);
+        assert!(!vs.is_empty(), "no top face over ({x},{y},{z})");
+        assert!(vs.iter().all(|v| v.2 == vs[0].2), "top over ({x},{y},{z}) isn't uniform: {vs:?}");
+        vs[0].2
+    }
+
+    fn mode_of(night: bool, shadows: ShadowMode) -> LightMode {
+        LightMode::resolve(night, shadows, 0.5, false, Some(4.0), LightingProfile::Legacy)
+    }
+
+    /// A stone floor at z 5 over x,y 0..15 and a stone canopy at z 8 over x,y `cx±1`, `cy±1`.
+    fn floor_and_canopy(cx: usize, cy: usize) -> TestWorld {
+        let mut w = make_test_world();
+        for x in 0..16 { for y in 0..16 { w.bytes[block(x, y, 5)] = 2; } }
+        for x in cx - 1..=cx + 1 { for y in cy - 1..=cy + 1 { w.bytes[block(x, y, 8)] = 2; } }
+        w
+    }
+
+    fn mesh(w: &TestWorld, mode: LightMode, lamps: &[([i32; 3], [f32; 3])], z2: i32) -> ObjGeometryResult {
+        obj_geometry_region(w, w.meta(), None, 0, 0, 15, 15, 0, z2, lamps, mode, None)
+    }
+
     #[test]
-    fn shadows_darken_a_block_directly_under_an_overhang_at_high_noon() {
-        let mut world = make_test_world();
-        world.bytes[block(3, 5, 0)] = 2; // probe
-        for z in 1..=10 { world.bytes[block(3, 5, z)] = 2; } // solid overhang directly above
+    fn classic_shades_the_floor_under_a_canopy_and_leaves_open_ground_alone() {
+        let w = floor_and_canopy(6, 6);
+        let off = mesh(&w, mode_of(false, ShadowMode::Off), &[], 63);
+        let classic = mesh(&w, mode_of(false, ShadowMode::Classic), &[], 63);
+        // Under the middle of the canopy: all nine columns cover it at gap 3 → 155/255.
+        let (u, s) = (top_color(&off, 6, 6, 5), top_color(&classic, 6, 6, 5));
+        for c in 0..3 { assert!((s[c] - u[c] * 155.0 / 255.0).abs() < 1e-5, "{s:?} vs {u:?}"); }
+        // Beside it, one ring out: three of nine columns → 255 − 100·48/144 = 222.
+        let edge = top_color(&classic, 8, 6, 5);
+        for c in 0..3 { assert!((edge[c] - u[c] * 222.0 / 255.0).abs() < 1e-5, "{edge:?}"); }
+        // Far from it nothing changes, and side faces are never touched.
+        assert_eq!(top_color(&classic, 13, 13, 5), top_color(&off, 13, 13, 5));
+        assert_eq!(top_color(&classic, 6, 6, 8), top_color(&off, 6, 6, 8), "the canopy's own top is open sky");
+    }
 
-        let unshadowed = side_face_color(&world, 3, 5, 0, 0, LightMode::default());
-        // sun_t=0.5 -> near-overhead (elevation ~80deg), closest analogue to the old vertical scan.
-        let shadowed = side_face_color(&world, 3, 5, 0, 0, LightMode { night: false, shadows: true, sun_t: 0.5, flat: false, lamp_radius: 0.0, profile: LightingProfile::Legacy });
+    #[test]
+    fn smooth_blends_across_a_face_at_the_edge_of_a_canopy() {
+        let w = floor_and_canopy(6, 6); // canopy x,y 5..=7
+        let g = mesh(&w, mode_of(false, ShadowMode::Smooth), &[], 63);
+        let off = mesh(&w, mode_of(false, ShadowMode::Off), &[], 63);
+        let u = top_color(&off, 7, 6, 5)[0];
+        let vs = top_verts(&g, 7, 6, 5);
+        assert_eq!(vs.len(), 6, "a gradient face is a lone 1×1 quad");
+        for (vx, _, c) in &vs {
+            // West corners see x 6..7 (both canopy) → 155; east corners see x 7..8 (half) → 205.
+            let want = if *vx == 7.0 { 155.0 } else { 205.0 } / 255.0;
+            assert!((c[0] - u * want).abs() < 1e-5, "x={vx}: {c:?} want {}", u * want);
+        }
+        // A face wholly under the canopy is uniform and folds back into the greedy merge.
+        assert_eq!(top_verts(&g, 6, 6, 5).len(), 6);
+        assert!(top_color(&g, 6, 6, 5)[0] > 0.0);
+    }
 
+    /// Counts `quad_colors` calls (Smooth's gradient faces) and forwards everything to an `F32Sink`.
+    struct GradientCount { inner: F32Sink, gradients: usize }
+    impl MeshSink for GradientCount {
+        fn quad(&mut self, s: Stream, v: [[f32; 3]; 4], rgba: [f32; 4], uv: Option<(u32, u16)>) { self.inner.quad(s, v, rgba, uv) }
+        fn quad_mirrored(&mut self, s: Stream, v: [[f32; 3]; 4], rgba: [f32; 4], uv: Option<(u32, u16)>) { self.inner.quad_mirrored(s, v, rgba, uv) }
+        fn quad_colors(&mut self, s: Stream, v: [[f32; 3]; 4], rgba: [[f32; 4]; 4], uv: Option<(u32, u16)>) {
+            self.gradients += 1;
+            self.inner.quad_colors(s, v, rgba, uv)
+        }
+        fn tri(&mut self, s: Stream, v: [[f32; 3]; 3], rgba: [f32; 4], row: Option<u32>) { self.inner.tri(s, v, rgba, row) }
+    }
+
+    #[test]
+    fn only_smooth_emits_gradient_quads() {
+        let w = mixed_world(4);
+        let gradients = |mode: ShadowMode| {
+            let mut sink = GradientCount { inner: F32Sink::new(None), gradients: 0 };
+            obj_geometry_region_into(&mut sink, &w, w.meta(), None, 0, 0, 31, 31, 0, 63, &[], mode_of(false, mode), None);
+            sink.gradients
+        };
+        assert_eq!(gradients(ShadowMode::Off), 0);
+        assert_eq!(gradients(ShadowMode::Classic), 0);
+        assert!(gradients(ShadowMode::Smooth) > 0, "the fixture has floating blocks over terrain");
+    }
+
+    /// Per O4 the real world casts: a mesh clipped below the canopy shades the floor exactly like the
+    /// unclipped one.
+    #[test]
+    fn a_camera_band_or_cutaway_cap_does_not_change_the_shade() {
+        let w = floor_and_canopy(6, 6);
+        for mode in [ShadowMode::Classic, ShadowMode::Smooth] {
+            let full = mesh(&w, mode_of(false, mode), &[], 63);
+            let capped = mesh(&w, mode_of(false, mode), &[], 6); // cap = floor + 1: the canopy is gone from the mesh
+            for (x, y) in [(6, 6), (7, 6), (8, 8), (13, 13)] {
+                assert_eq!(top_verts(&full, x, y, 5).iter().map(|v| v.2).collect::<Vec<_>>(),
+                           top_verts(&capped, x, y, 5).iter().map(|v| v.2).collect::<Vec<_>>(), "{mode:?} ({x},{y})");
+            }
+        }
+    }
+
+    /// The ring read: a canopy in the next chunk shades the seam column of this chunk's mesh, and
+    /// removing it restores the unshaded mesh bytes.
+    #[test]
+    fn a_canopy_across_a_chunk_seam_shades_the_neighbour_and_removal_restores_it() {
+        let mut w = TestWorld::new(2, 1, 4);
+        let at = |cx: i32, lx: usize, ly: usize, z: usize| w.chunks[&(cx, 0)] + block(lx, ly, z as i32);
+        let floor: Vec<usize> = (0..16).flat_map(|ly| (12..16).map(move |lx| (lx, ly))).map(|(lx, ly)| at(0, lx, ly, 5)).collect();
+        for i in floor { w.bytes[i] = 2; }
+        let canopy: Vec<usize> = (0..3).flat_map(|lx| (4..7).map(move |ly| (lx, ly))).map(|(lx, ly)| at(1, lx, ly, 8)).collect();
+        let mode = mode_of(false, ShadowMode::Classic);
+        let bare = chunk_geometry(&w, w.meta(), None, &[], 0, 0, mode, None, None, None);
+        for &i in &canopy { w.bytes[i] = 2; }
+        let shaded = chunk_geometry(&w, w.meta(), None, &[], 0, 0, mode, None, None, None);
+        // x 15 / y 5 sees the canopy's x 16 column at 3 of its 9 columns → 222.
+        let (u, s) = (top_color(&bare, 15, 5, 5)[0], top_color(&shaded, 15, 5, 5)[0]);
+        assert!((s - u * 222.0 / 255.0).abs() < 1e-5, "{s} vs {u}");
+        assert_eq!(top_color(&shaded, 13, 5, 5), top_color(&bare, 13, 5, 5), "two blocks in is out of reach");
+        for &i in &canopy { w.bytes[i] = 0; }
+        let restored = chunk_geometry(&w, w.meta(), None, &[], 0, 0, mode, None, None, None);
+        assert!(restored.colors == bare.colors && restored.positions == bare.positions, "no leftover shadow");
+        assert!(shaded.colors != bare.colors);
+    }
+
+    #[test]
+    fn shade_scales_the_sky_and_not_the_lamp_at_night() {
+        let lamps = [([3, 3, 6], [1.0f32, 0.7, 0.4])];
+        let w = floor_and_canopy(3, 3);
+        let w2 = floor_and_canopy(12, 12);
+        let bare = {
+            let mut b = make_test_world();
+            for x in 0..16 { for y in 0..16 { b.bytes[block(x, y, 5)] = 2; } }
+            b
+        };
+        let night = |w: &TestWorld, sh: ShadowMode| mesh(w, mode_of(true, sh), &lamps, 63);
+        let unshaded_near = top_color(&night(&bare, ShadowMode::Classic), 3, 3, 5);
+        let shaded_near = top_color(&night(&w, ShadowMode::Classic), 3, 3, 5);
+        let shaded_far = top_color(&night(&w2, ShadowMode::Classic), 12, 12, 5);
         for c in 0..3 {
-            assert!(shadowed[c] < unshadowed[c], "a block under a solid overhang should be darker at high noon");
-            assert!(shadowed[c] > 0.0, "shadowed colour must have a floor above pure black");
+            assert!(shaded_near[c] > shaded_far[c], "a lamp still lights a shaded floor: {shaded_near:?} vs {shaded_far:?}");
+            assert!(shaded_near[c] <= unshaded_near[c] + 1e-6, "…but never past the unshaded floor");
+        }
+        // Day: a shaded face never exceeds its unshaded colour.
+        let day_bare = top_color(&mesh(&bare, mode_of(false, ShadowMode::Classic), &[], 63), 3, 3, 5);
+        let day_shaded = top_color(&mesh(&w, mode_of(false, ShadowMode::Classic), &[], 63), 3, 3, 5);
+        for c in 0..3 { assert!(day_shaded[c] <= day_bare[c]); }
+            }
+
+    /// With nothing above any face, baked shadows change no byte: positions, UVs and colours are all
+    /// identical across Off, Classic and Smooth (so the greedy merge is untouched).
+    #[test]
+    fn an_unshaded_fixture_meshes_identically_in_every_mode() {
+        // Flat terrain only: any step beside a face shades it (Emod's 3×3), so a raised row would too.
+        let mut w = make_test_world();
+        for x in 0..16 { for y in 0..16 { w.bytes[block(x, y, 5)] = if (x / 3 + y / 5) % 2 == 0 { 2 } else { 1 }; } }
+        let pack = full_pack();
+        for night in [false, true] {
+            let lamps = if night { vec![([5, 5, 7], [1.0f32, 0.7, 0.4])] } else { Vec::new() };
+            for pk in [None, Some(&pack)] {
+                let run = |sh: ShadowMode| obj_geometry_region(&w, w.meta(), pk, 0, 0, 15, 15, 0, 63, &lamps, mode_of(night, sh), None);
+                let off = run(ShadowMode::Off);
+                for sh in [ShadowMode::Classic, ShadowMode::Smooth] {
+                    let g = run(sh);
+                    assert!(g.positions == off.positions && g.uvs == off.uvs && g.colors == off.colors, "night={night} {sh:?}");
+                }
+            }
         }
     }
 
     #[test]
-    fn low_sun_angle_does_not_darken_a_block_with_no_lateral_occluders() {
-        let mut world = make_test_world();
-        world.bytes[block(3, 5, 0)] = 2; // isolated probe, nothing else around
-
-        let unshadowed = side_face_color(&world, 3, 5, 0, 0, LightMode::default());
-        // sun_t=0.0 -> sunrise, low angle, nothing along the ray to occlude it.
-        let lit_at_sunrise = side_face_color(&world, 3, 5, 0, 0, LightMode { night: false, shadows: true, sun_t: 0.0, flat: false, lamp_radius: 0.0, profile: LightingProfile::Legacy });
-
-        assert_eq!(lit_at_sunrise, unshadowed, "an isolated block with no occluders along the ray should stay fully lit");
+    fn gpu_mode_forces_baked_shadows_off() {
+        let m = LightMode::resolve(true, ShadowMode::Smooth, 0.5, true, None, LightingProfile::Modern);
+        assert_eq!(m.shadows, ShadowMode::Off);
+        assert!(!m.night && m.flat);
     }
 
+    /// Shadows never affect what picking sees: `dda_march` survives the ray-march deletion for it.
     #[test]
-    fn shadowed_colour_is_never_pure_black() {
-        let mut world = make_test_world();
-        world.bytes[block(3, 5, 0)] = 2;
-        for z in 1..=10 { world.bytes[block(3, 5, z)] = 2; }
-
-        let shadowed = side_face_color(&world, 3, 5, 0, 0, LightMode { night: false, shadows: true, sun_t: 0.5, flat: false, lamp_radius: 0.0, profile: LightingProfile::Legacy });
-        for c in 0..3 {
-            assert!(shadowed[c] > 0.05, "shadowed voxel colour must stay well above pure black, got {shadowed:?}");
-        }
+    fn picking_still_marches_after_the_sun_ray_march_was_removed() {
+        let mut w = make_test_world();
+        w.bytes[block(3, 5, 10)] = 2;
+        let hit = pick_block_in(&w, 3.5, 5.5, 20.5, 0.0, 0.0, -1.0, 50.0).unwrap().expect("hits the block");
+        assert_eq!((hit.x, hit.y, hit.z, hit.nz), (3, 5, 10, 1));
     }
-
-    #[test]
-    fn sun_direction_is_overhead_at_noon_and_low_angle_at_sunrise_sunset() {
-        let noon = sun_direction(0.5);
-        assert!(noon[2] > 0.9, "sun should be nearly straight up at t=0.5, got {noon:?}");
-        let sunrise = sun_direction(0.0);
-        assert!(sunrise[2] < 0.3, "sun should be low-angle at t=0.0, got {sunrise:?}");
-        let sunset = sun_direction(1.0);
-        assert!(sunset[2] < 0.3, "sun should be low-angle at t=1.0, got {sunset:?}");
-    }
-
 
     /// The index-based lamp gather (`lamps_in_region`) must return exactly the same lamp positions
     /// as the old inline voxel scan for a given radius, and a larger radius must never drop lamps
@@ -1884,7 +2225,7 @@ mod tests {
         world.bytes[block(3, 5, 3)] = LAMP_BLOCK_TYPE;
         world.bytes[block(3, 5, 3) + 4096] = 1; // red-ish paint on the lamp
 
-        let mode = LightMode { night: true, shadows: false, sun_t: 0.0, flat: false, lamp_radius: 5.0, profile: LightingProfile::Legacy };
+        let mode = LightMode { night: true, shadows: ShadowMode::Off, sun_t: 0.0, flat: false, lamp_radius: 5.0, profile: LightingProfile::Legacy };
 
         // Old path: scan the region for lamps.
         let scan = scan_lamps(&world, 0, 0, 15, 15, 0, world_max_z(&world), 5.0);
@@ -1989,6 +2330,183 @@ mod tests {
     }
 
 
+
+    // ---- 27.2c: door slabs + portal fronts ------------------------------------------------------
+
+    /// Each emitted opaque quad as six `((x, y, z), (u, v))` vertices (three-space positions).
+    fn quads_uv(res: &ObjGeometryResult) -> Vec<Vec<((f32, f32, f32), (f32, f32))>> {
+        let f = |b: &[u8]| -> Vec<f32> { b.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect() };
+        let (p, u) = (f(&res.positions), f(&res.uvs));
+        (0..p.len() / 18).map(|q| (0..6).map(|i| {
+            let k = q * 6 + i;
+            ((p[k * 3], p[k * 3 + 1], p[k * 3 + 2]), (u.get(k * 2).copied().unwrap_or(0.0), u.get(k * 2 + 1).copied().unwrap_or(0.0)))
+        }).collect()).collect()
+    }
+
+    /// The atlas row a quad samples, recovered from its V range (`row .. row+1` of `atlas_rows`).
+    fn quad_row(q: &[((f32, f32, f32), (f32, f32))], pack: &TexturePack) -> u32 {
+        let vmax = q.iter().map(|v| (v.1).1).fold(f32::NEG_INFINITY, f32::max);
+        (vmax * pack.atlas_rows as f32).round() as u32 - 1
+    }
+
+    fn mesh_all(world: &TestWorld, pack: Option<&TexturePack>) -> ObjGeometryResult {
+        obj_geometry_region(world, world.meta(), pack, 0, 0, 15, 15, 0, 63, &[], LightMode::default(), None)
+    }
+
+    /// bbox of all vertices as ((min x, max x), (min eden-y, max eden-y), (min z, max z)).
+    fn bbox(res: &ObjGeometryResult) -> ((f32, f32), (f32, f32), (f32, f32)) {
+        let vs: Vec<_> = quads_uv(res).into_iter().flatten().map(|v| v.0).collect();
+        let r = |f: &dyn Fn(&(f32, f32, f32)) -> f32| (vs.iter().map(f).fold(f32::INFINITY, f32::min), vs.iter().map(f).fold(f32::NEG_INFINITY, f32::max));
+        (r(&|v| v.0), r(&|v| v.2), r(&|v| v.1))
+    }
+
+    #[test]
+    fn a_door_is_a_sixteenth_thick_slab_on_its_facings_edge() {
+        let t = 1.0 / 16.0;
+        // 66 north (y = 0), 67 east (x = 1), 68 south (y = 1), 69 west (x = 0).
+        let want = [
+            (66u8, (5.0, 6.0), (5.0, 5.0 + t)),
+            (67, (6.0 - t, 6.0), (5.0, 6.0)),
+            (68, (5.0, 6.0), (6.0 - t, 6.0)),
+            (69, (5.0, 5.0 + t), (5.0, 6.0)),
+        ];
+        for (bt, bx, by) in want {
+            let mut world = make_test_world();
+            world.bytes[block(5, 5, 1)] = bt;
+            let g = mesh_all(&world, None);
+            assert_eq!(g.vertex_count, 6 * 6, "door {bt}: a lone slab has six faces");
+            let (x, y, z) = bbox(&g);
+            assert_eq!((x, y, z), (bx, by, (1.0, 2.0)), "door {bt}");
+        }
+    }
+
+    #[test]
+    fn door_halves_share_no_internal_face_and_orphans_still_draw() {
+        let mut world = make_test_world();
+        world.bytes[block(5, 5, 1)] = 66;
+        world.bytes[block(5, 5, 2)] = 70;
+        let g = mesh_all(&world, None);
+        assert_eq!(g.vertex_count, 10 * 6, "6 + 6 faces − the two that touch");
+        let ((_, _), (y0, y1), (z0, z1)) = bbox(&g);
+        assert_eq!((y0, y1, z0, z1), (5.0, 5.0 + 1.0 / 16.0, 1.0, 3.0), "top half takes the bottom half's facing (north)");
+
+        // The top half reads its facing from the bottom half below, so 70 over 67 still matches.
+        let mut world = make_test_world();
+        world.bytes[block(5, 5, 1)] = 67;
+        world.bytes[block(5, 5, 2)] = 70;
+        assert_eq!(mesh_all(&world, None).vertex_count, 10 * 6);
+
+        for bt in [66u8, 70] {
+            let mut world = make_test_world();
+            world.bytes[block(5, 5, 1)] = bt;
+            assert_eq!(mesh_all(&world, None).vertex_count, 6 * 6, "orphan {bt} draws");
+        }
+    }
+
+    #[test]
+    fn a_solid_neighbour_hides_the_doors_outward_face_and_ends() {
+        let mut world = make_test_world();
+        world.bytes[block(5, 5, 1)] = 66; // north-facing
+        world.bytes[block(5, 4, 1)] = 2;  // stone across its north edge
+        world.bytes[block(4, 5, 1)] = 2;  // stone against its west end
+        let g = obj_geometry_region(&world, world.meta(), None, 5, 5, 5, 5, 1, 1, &[], LightMode::default(), None);
+        assert_eq!(g.vertex_count, 4 * 6, "outward face and west end are hidden");
+    }
+
+    #[test]
+    fn a_doors_back_face_is_mirrored_so_the_handle_stays_on_one_edge() {
+        let pack = full_pack();
+        let mut world = make_test_world();
+        world.bytes[block(5, 5, 1)] = 66;
+        let g = mesh_all(&world, Some(&pack));
+        let broad: Vec<_> = quads_uv(&g).into_iter()
+            .filter(|q| q.iter().map(|v| (v.0).2).fold(f32::NEG_INFINITY, f32::max) - q.iter().map(|v| (v.0).2).fold(f32::INFINITY, f32::min) == 0.0
+                && q.iter().map(|v| (v.0).0).fold(f32::NEG_INFINITY, f32::max) - q.iter().map(|v| (v.0).0).fold(f32::INFINITY, f32::min) == 1.0)
+            .collect();
+        assert_eq!(broad.len(), 2, "outward + inward broad faces");
+        // World x of the u = 1 edge (where the handle is) must agree on both faces.
+        let handle_x: Vec<f32> = broad.iter().map(|q| {
+            let xs: HashSet<u32> = q.iter().filter(|v| (v.1).0 == 1.0).map(|v| (v.0).0.to_bits()).collect();
+            assert_eq!(xs.len(), 1);
+            f32::from_bits(*xs.iter().next().unwrap())
+        }).collect();
+        assert_eq!(handle_x[0], handle_x[1]);
+        let row = pack.name_to_row["door_bottom"];
+        assert!(broad.iter().all(|q| quad_row(q, &pack) == row));
+    }
+
+    #[test]
+    fn a_doors_tile_follows_its_half_and_paint() {
+        let pack = full_pack();
+        let mut world = make_test_world();
+        world.bytes[block(5, 5, 1)] = 66;
+        world.bytes[block(5, 5, 2)] = 70;
+        world.bytes[block(5, 5, 2) + 4096] = 9; // paint the top half
+        let g = mesh_all(&world, Some(&pack));
+        let rows: HashSet<u32> = quads_uv(&g).iter().map(|q| quad_row(q, &pack)).collect();
+        let want: HashSet<u32> = [pack.name_to_row["door_bottom"], pack.name_to_row["door_top"] + pack.gray_row_offset].into_iter().collect();
+        assert_eq!(rows, want, "unpainted bottom = colour tile, painted top = grayscale tile");
+        // Unpainted door tile is finished art: drawn white-ish (shade only), not BLOCK_RGB brown.
+        let c: Vec<f32> = g.colors.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
+        assert!(c[0] == c[1] && c[1] == c[2], "first (unpainted) vertex colour is grey shade, got {:?}", &c[..3]);
+    }
+
+    /// Plane of a quad along its constant axis, for the portal-front tests.
+    fn portal_world(bts: &[(usize, u8)]) -> TestWorld {
+        let mut world = make_test_world();
+        for &(x, bt) in bts { world.bytes[block(x, 5, 1)] = bt; }
+        world
+    }
+
+    #[test]
+    fn a_portals_front_face_wears_the_portal_tile_and_the_rest_stays_stone() {
+        let pack = full_pack();
+        let (stone, pb) = (pack.name_to_row["stone"], pack.name_to_row["portal_bottom"]);
+        // (block, front-plane predicate): north y=5, east x=6, south y=6, west x=5.
+        let cases: [(u8, Box<dyn Fn(&((f32, f32, f32), (f32, f32))) -> bool>); 4] = [
+            (75, Box::new(|v| (v.0).2 == 5.0)), (76, Box::new(|v| (v.0).0 == 6.0)),
+            (77, Box::new(|v| (v.0).2 == 6.0)), (78, Box::new(|v| (v.0).0 == 5.0)),
+        ];
+        for (bt, on_front) in cases {
+            let g = mesh_all(&portal_world(&[(5, bt)]), Some(&pack));
+            let qs = quads_uv(&g);
+            assert_eq!(qs.len(), 6, "portal {bt} is still a cube");
+            let fronts: Vec<_> = qs.iter().filter(|q| quad_row(q, &pack) == pb).collect();
+            assert_eq!(fronts.len(), 1, "portal {bt}: exactly one portal-tile face");
+            assert!(fronts[0].iter().all(|v| on_front(v)), "portal {bt}: on its front plane");
+            assert_eq!(qs.iter().filter(|q| quad_row(q, &pack) == stone).count(), 5);
+        }
+        // The top half takes its facing from the bottom block and the `portal_top` tile.
+        let mut world = portal_world(&[(5, 77)]);
+        world.bytes[block(5, 5, 2)] = 79;
+        let g = mesh_all(&world, Some(&pack));
+        let top_fronts: Vec<_> = quads_uv(&g).into_iter().filter(|q| quad_row(q, &pack) == pack.name_to_row["portal_top"]).collect();
+        assert_eq!(top_fronts.len(), 1);
+        assert!(top_fronts[0].iter().all(|v| (v.0).2 == 6.0), "south, like its bottom half");
+    }
+
+    #[test]
+    fn same_facing_portals_never_merge_their_fronts_into_stone() {
+        let pack = full_pack();
+        let (stone, pb) = (pack.name_to_row["stone"], pack.name_to_row["portal_bottom"]);
+        let g = mesh_all(&portal_world(&[(5, 75), (6, 75)]), Some(&pack));
+        let qs = quads_uv(&g);
+        let width = |q: &[((f32, f32, f32), (f32, f32))]| {
+            q.iter().map(|v| (v.0).0).fold(f32::NEG_INFINITY, f32::max) - q.iter().map(|v| (v.0).0).fold(f32::INFINITY, f32::min)
+        };
+        let fronts: Vec<_> = qs.iter().filter(|q| quad_row(q, &pack) == pb).collect();
+        assert_eq!(fronts.len(), 2, "one front per portal, unmerged");
+        assert!(fronts.iter().all(|q| width(q) == 1.0));
+        // …and the stone faces still merge among themselves: top, bottom, back (3 × 2 wide) + 2 ends.
+        let stones: Vec<_> = qs.iter().filter(|q| quad_row(q, &pack) == stone).collect();
+        assert_eq!(stones.len(), 5);
+        assert!(stones.iter().filter(|q| width(q) == 2.0).count() == 3);
+        // No portal tile in the pack ⇒ the front is an ordinary stone face and merges as before.
+        let bare = TexturePack { name_to_row: [("stone".to_string(), 1u32)].into_iter().collect(), atlas_rows: 3, gray_row_offset: 1, tile: 1, atlas_rgba: vec![255; 12] };
+        let g = mesh_all(&portal_world(&[(5, 75), (6, 75)]), Some(&bare));
+        assert_eq!(quads_uv(&g).len(), 6, "all six faces merge across the pair");
+    }
+
     // ── 18.14: the compact (v2) encoder ─────────────────────────────────────────────────────────
 
     /// Every block family the mesher branches on — cubes, ramps, wedges, full and partial fluids,
@@ -1999,7 +2517,8 @@ mod tests {
         let top = (bands * 16 - 2) as u64;
         let mut seed = 0x9E37_79B9_7F4A_7C15u64;
         let mut rnd = move || { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; seed };
-        const TOPS: [u8; 20] = [1, 2, 3, 7, 24, 29, 34, 39, 40, 45, 50, 55, 20, 59, 60, 61, 58, 21, 73, LAMP_BLOCK_TYPE];
+        const TOPS: [u8; 30] = [1, 2, 3, 7, 24, 29, 34, 39, 40, 45, 50, 55, 20, 59, 60, 61, 58, 21, 73, LAMP_BLOCK_TYPE,
+            66, 67, 68, 69, 70, 75, 76, 77, 78, 79]; // door slabs + portal fronts (the 1/16 grid assert)
         for cx in 0..2 { for cy in 0..2 {
             let base = w.chunks[&(cx, cy)];
             for lx in 0..16usize { for ly in 0..16usize {
@@ -2019,6 +2538,7 @@ mod tests {
     /// A pack naming every texture `BLOCK_FACE_TEX` uses, so real rows (colour and grayscale) come out.
     pub(super) fn full_pack() -> TexturePack {
         let mut names: Vec<&str> = texture::BLOCK_FACE_TEX.iter().flatten().copied().filter(|n| !n.is_empty()).collect();
+        names.extend(["portal_top", "portal_bottom"]); // not in BLOCK_FACE_TEX: the mesher picks the portal front
         names.sort_unstable();
         names.dedup();
         let n = names.len() as u32;
@@ -2051,10 +2571,12 @@ mod tests {
         let top = world_max_z(w);
         let modes = [
             ("day", LightMode::default(), false),
-            ("night", LightMode::resolve(true, false, 0.5, false, Some(6.0), LightingProfile::Legacy), true),
-            ("shadows", LightMode::resolve(false, true, 0.3, false, None, LightingProfile::Legacy), false),
-            ("night+shadows", LightMode::resolve(true, true, 0.8, false, None, LightingProfile::Modern), true),
-            ("gpu", LightMode::resolve(false, false, 0.5, true, None, LightingProfile::Legacy), false),
+            ("night", LightMode::resolve(true, ShadowMode::Off, 0.5, false, Some(6.0), LightingProfile::Legacy), true),
+            ("classic", LightMode::resolve(false, ShadowMode::Classic, 0.3, false, None, LightingProfile::Legacy), false),
+            ("smooth", LightMode::resolve(false, ShadowMode::Smooth, 0.3, false, None, LightingProfile::Legacy), false),
+            ("night+classic", LightMode::resolve(true, ShadowMode::Classic, 0.8, false, None, LightingProfile::Modern), true),
+            ("night+smooth", LightMode::resolve(true, ShadowMode::Smooth, 0.8, false, Some(6.0), LightingProfile::Legacy), true),
+            ("gpu", LightMode::resolve(false, ShadowMode::Off, 0.5, true, None, LightingProfile::Legacy), false),
         ];
         let mut out = Vec::new();
         for (name, mode, night) in modes {
@@ -2151,6 +2673,31 @@ mod tests {
                 assert_eq!(t.iter().flatten().copied().collect::<Vec<f32>>(), f32s(&f.uvs));
             }
         }
+    }
+
+    /// FNV-1a over every byte a mesh ships (all three f32 streams, then the compact encoding).
+    fn mesh_hash(w: &TestWorld, pack: &TexturePack) -> u64 {
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        let mut feed = |b: &[u8]| for &x in b { h = (h ^ x as u64).wrapping_mul(0x0000_0100_0000_01b3); };
+        for (name, mode, lamps, textured, z1, z2) in geometry_cases(w) {
+            if !(name.starts_with("day/") || name.starts_with("night/") || name.starts_with("gpu/")) { continue; }
+            let pk = textured.then_some(pack);
+            let f = obj_geometry_region(w, w.meta(), pk, 0, 0, 31, 31, z1, z2, &lamps, mode, None);
+            for b in [&f.positions, &f.colors, &f.uvs, &f.positions_t, &f.colors_t, &f.uvs_t, &f.positions_e, &f.colors_e, &f.uvs_e] { feed(b); }
+            let mut cs = CompactSink::new([0.0; 3], pk);
+            obj_geometry_region_into(&mut cs, w, w.meta(), pk, 0, 0, 31, 31, z1, z2, &lamps, mode, None);
+            for st in cs.finish().streams.iter() { feed(&st.positions); feed(&st.colors); feed(&st.uvs); feed(&st.indices); }
+        }
+        h
+    }
+
+    /// `ShadowMode::Off` must mesh byte-identically to before baked shadows existed. Captured on the
+    /// pre-27.4a mesher (day, night and GPU cases, textured and not, whole-region and z-banded).
+    #[test]
+    fn off_mode_mesh_hash_is_frozen() {
+        let pack = full_pack();
+        let got = [mesh_hash(&mixed_world(4), &pack), mesh_hash(&mixed_world(16), &pack)];
+        assert_eq!(got, [0x25ca_b7e9_0f95_1739; 2]);
     }
 
     /// Fractional coordinates — partial fluid tops at ¼/½/¾ and the lateral slivers they leave — land

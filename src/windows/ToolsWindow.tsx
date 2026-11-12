@@ -14,21 +14,32 @@ import type { Tool } from "../MapCanvas";
 import { IconButton, MenuItem, Popover } from "../ribbon/primitives";
 import { SPACE, SURFACE } from "../ribbon/tokens";
 import type { IconName } from "../ribbon/icons";
+import { meta, type CommandId } from "../commands/meta";
+import { formatChord } from "../commands/keys";
 import FloatingWindow from "./FloatingWindow";
 import { TOOL_CELL, TOOL_GAP, TOOL_PAD, toolsGridCols } from "./windowGeometry";
 
 const HOLD_MS = 350;
 
-interface Variant {
-  tool: Tool;
-  icon: IconName;
-  label: string;
+/** A variant is a registry command (`kind: "tool"`): the tool, label and shortcut all come from
+ *  `COMMAND_META` so this window can't drift from the ribbon, ⌘K and Help (U-04, 32.1). */
+interface RawVariant { id: CommandId; icon: IconName }
+interface Variant { tool: Tool; icon: IconName; label: string; chord: string }
+
+function variant({ id, icon }: RawVariant): Variant {
+  const m = meta(id);
+  const chord = m.keys?.[0];
+  return { tool: m.tool as Tool, icon, label: m.label, chord: chord ? formatChord(chord) : "" };
 }
+
+const withChord = (v: Variant) => (v.chord ? `${v.label} (${v.chord})` : v.label);
 
 interface Family {
   id: string;
   variants: Variant[];
 }
+
+const family = (id: string, variants: RawVariant[]): Family => ({ id, variants: variants.map(variant) });
 
 /**
  * Illustrator-style tool families: click the button to arm the last-used (or default) variant,
@@ -37,41 +48,29 @@ interface Family {
  * next to the Draw/Sculpt tabs, not a duplicate of them.
  */
 const FAMILIES: Family[] = [
-  { id: "pan", variants: [{ tool: "pan", icon: "pan", label: "Pan" }] },
-  {
-    id: "select",
-    variants: [
-      { tool: "select", icon: "select", label: "Select" },
-      { tool: "wand", icon: "wand", label: "Magic Wand" },
-      { tool: "lasso", icon: "lasso", label: "Lasso" },
-      { tool: "polyselect", icon: "polyselect", label: "Polygon Select" },
-    ],
-  },
-  {
-    id: "draw",
-    variants: [
-      { tool: "pen", icon: "pen", label: "Pen" },
-      { tool: "brush", icon: "brush", label: "Brush" },
-      { tool: "spray", icon: "spray", label: "Spray" },
-    ],
-  },
-  {
-    id: "shape",
-    variants: [
-      { tool: "rect", icon: "rect", label: "Rectangle" },
-      { tool: "ellipse", icon: "ellipse", label: "Ellipse" },
-      { tool: "line", icon: "line", label: "Line" },
-      { tool: "polygon", icon: "polygon", label: "Polygon" },
-    ],
-  },
-  { id: "eyedropper", variants: [{ tool: "eyedropper", icon: "eyedropper", label: "Eyedropper" }] },
-  {
-    id: "fill",
-    variants: [
-      { tool: "fill", icon: "bucket", label: "Fill" },
-      { tool: "poolfill", icon: "poolFill", label: "Pool Fill" },
-    ],
-  },
+  family("pan", [{ id: "home.navigation.pan", icon: "pan" }]),
+  family("select", [
+    { id: "home.navigation.select", icon: "select" },
+    { id: "home.navigation.wand", icon: "wand" },
+    { id: "home.navigation.lasso", icon: "lasso" },
+    { id: "home.navigation.polyselect", icon: "polyselect" },
+  ]),
+  family("draw", [
+    { id: "draw.tools.pen", icon: "pen" },
+    { id: "draw.tools.brush", icon: "brush" },
+    { id: "draw.tools.spray", icon: "spray" },
+  ]),
+  family("shape", [
+    { id: "draw.tools.rect", icon: "rect" },
+    { id: "draw.tools.ellipse", icon: "ellipse" },
+    { id: "draw.tools.line", icon: "line" },
+    { id: "draw.tools.polygon", icon: "polygon" },
+  ]),
+  family("eyedropper", [{ id: "draw.tools.eyedropper", icon: "eyedropper" }]),
+  family("fill", [
+    { id: "draw.tools.fill", icon: "bucket" },
+    { id: "insert.fluids.poolFill", icon: "poolFill" },
+  ]),
 ];
 
 function FamilyButton({
@@ -138,8 +137,8 @@ function FamilyButton({
   };
 
   const title = hasVariants
-    ? `${armed.label} (hold or ↓ for ${family.variants.filter(v => v !== armed).map(v => v.label).join(", ")})`
-    : armed.label;
+    ? `${withChord(armed)}. Hold or ↓ for ${family.variants.filter(v => v !== armed).map(v => v.label).join(", ")}`
+    : withChord(armed);
 
   return (
     <div
@@ -159,7 +158,7 @@ function FamilyButton({
           <div style={{ display: "flex", flexDirection: "column", padding: SPACE.xs, minWidth: 140 }}>
             {family.variants.map(v => (
               <MenuItem
-                key={v.tool} icon={v.icon} label={v.label} active={v.tool === tool}
+                key={v.tool} icon={v.icon} label={v.label} shortcut={v.chord || undefined} active={v.tool === tool}
                 onClick={() => { setTool(v.tool); setLastVariant(v.tool); setOpen(false); }}
               />
             ))}

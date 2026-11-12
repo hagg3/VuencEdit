@@ -40,15 +40,12 @@ export interface ContextPanelDef {
 /**
  * The registry. Order matters: it is the stacking order (earlier = higher up). Adding a panel is a
  * registry entry here + a `defaultWins` entry + a `winLimits` case in `windowGeometry.ts`, then a
- * `<ContextPanel id when=… worldLoaded onExit=…>` in App's `WindowLayer` (16.6 did this for the
- * cutaway/Z-slice, brush-shape and 3D build-slot panels — `windows/modePanels.tsx`).
+ * `<ContextPanel id when=… worldLoaded onExit=…>` in App's `WindowLayer`. (16.6 added three more
+ * for Cutaway / Brush shape / Build slot; 34.2 moved them into the options bar, so the Lens is the
+ * only one left — the framework stays because it is small and tested.)
  */
 export const CONTEXT_PANELS: Partial<Record<WinId, ContextPanelDef>> = {
   lens: { userToggle: true, resize: "both", cue: false },
-  // 16.6: content-sized (`PANEL_SIZES`), so no resize; each follows its mode and plays the `menu` cue.
-  cutaway: { userToggle: false, resize: "none", cue: true },
-  brushshape: { userToggle: false, resize: "none", cue: true },
-  buildslot: { userToggle: false, resize: "none", cue: true },
 };
 
 export function isContextPanel(id: WinId): boolean {

@@ -8,7 +8,7 @@ import { MAX_RENDER_DISTANCE, RD_MIN } from "./renderDistance";
 import type { AtlasData } from "./texturePack";
 import { isTypingTarget, chunkToWorld, worldToChunk, gridDivisions } from "./viewportUtils";
 import { editReloadPlan, shouldReloadChunk, staleBandKeys, bandCovers } from "./flySync";
-import type { WorldMeta } from "./types";
+import type { ShadowMode, WorldMeta } from "./types";
 import { BORDER, FONT, IS_MAC, RADIUS, SMALL_H, SPACE, SURFACE, TEXT_DANGER, TEXT_DIM } from "./ribbon/tokens";
 import { Check, IconButton, SliderRow, SmallButton } from "./ribbon/primitives";
 import { blockDisplayName, skyFogColor, rampFamilyBase, wedgeFamilyBase, rampDirIndex, orientBlockToFacing } from "./blockDefs";
@@ -17,13 +17,14 @@ import { perfCounters, recordGeometryFetchMs, recordFrameMs, recordRenderMs, rec
 import { backoffBudget, backoffRadius, MAX_CONTEXT_LOSSES } from "./gfxBackoff";
 import { GESTURE_MAX_MS, gestureTimedOut } from "./gestureWatchdog";
 import { isDwellIdempotent } from "./drawTools";
+import { RecordOverlay, type OverlayInfo } from "./signOverlay";
 
 // Fog distance scales with the render distance slider (chunk radius × 16 blocks/chunk) so terrain
 // fades out at the edge of what's actually streamed in, instead of a fixed distance that either
 // clips well inside the loaded radius (short) or never fades (long, at high render distance).
 const fogDistances = (radiusChunks: number) => {
   const far = Math.max(20, chunkToWorld(radiusChunks) * 0.9);
-  const near = far * 0.3;
+  const near = far * 0.47; // Emod: near ZFAR−ZFAR/1.6 (54), far ZFAR−30 (115) at ZFAR 145
   return { near, far };
 };
 
@@ -235,12 +236,15 @@ export interface PerfSnapshot {
   contextLossCount: number;
   /** True once the back-off gave up (`MAX_CONTEXT_LOSSES` reached) and disabled the pane. */
   contextDisabled: boolean;
+  /** 3D sign/command-block overlay (27.6b): signs drawn after the z cull, signs the backend hid (air
+   *  anchor / opaque front cell), live text textures and their byte estimate (mips included). */
+  signsDrawn: number; signsHidden: number; signTextures: number; signTexBytes: number;
   /** Pane state at report time (17.1), filled in by the component rather than the scene closure. */
   state: PerfState;
 }
 
 export interface PerfState {
-  camMode: string; interact3d: string; night: boolean; shadows: boolean; gpuShadows: boolean;
+  camMode: string; interact3d: string; night: boolean; shadows: ShadowMode; gpuShadows: boolean;
   lightingProfile: string; cutaway: number | null; texturePack: boolean; suspended: boolean;
   canvasPx: string;
 }
@@ -674,16 +678,17 @@ const FlyView3D = forwardRef<FlyView3DRef, {
   fogEnabled?: boolean;
   /** Night lighting preview — dims ambient, lights up Lamp blocks within reach. Default false. */
   nightLighting?: boolean;
-  /** Directional sun-raycast shadow preview. Default false. */
-  shadows3d?: boolean;
-  /** Simulated sun position driving the shadow direction: 0=sunrise, 0.5=noon, 1=sunset. Default 0.5. */
+  /** Baked shadows under trees/roofs/overhangs (voxel-core `shadow.rs`), off/classic/smooth. GPU
+   *  Shadows overrides it (the backend forces it off). Default "off". */
+  shadowMode?: ShadowMode;
+  /** GPU Shadows' sun position: 0=sunrise, 0.5=noon, 1=sunset. Baked shadows ignore it. Default 0.5. */
   sunT?: number;
   /** Lamp light radius (blocks) for night lighting. Default 4 (the "legacy" profile's default radius). */
   lampRadius?: number;
   /** Which shipped lighting behaviour the falloff curve follows — "legacy" (tight ~4-tile pool,
    * steep falloff) or "modern" ("New Dawn", ~14-tile pool, gradual falloff). Default "legacy". */
   lightingProfile?: LightingProfile;
-  /** Increments whenever nightLighting/shadows3d/sunT changes, forcing a chunk-mesh reload. */
+  /** Increments whenever nightLighting/shadowMode/sunT changes, forcing a chunk-mesh reload. */
   lightEpoch?: number;
   /** Persisted render-distance (chunk radius) to seed the R slider from. Default LOAD_RADIUS. */
   initialRenderDistance?: number;
@@ -776,6 +781,12 @@ const FlyView3D = forwardRef<FlyView3DRef, {
   /** Floor grid visibility (15.8). Default true. */
   showGrid?: boolean;
   onSetShowGrid?: (v: boolean) => void;
+  /** Sign boards, text and the command-block skin (27.6b) — `AppSettings.showSigns`, the same toggle
+   *  as the 2D map's markers. Default true. */
+  showSigns?: boolean;
+  /** Bumps whenever the record set may have changed under the pane (App refetches `get_records`);
+   *  the overlay refetches on it. Stand-in for the backend records seq (27.8a-1). */
+  recordsSeq?: number;
   /** Max distance (blocks) a build-mode break/place may reach (H5, `AppSettings.buildReach`).
    *  Build-mode *hover* picks at the same distance, so the placement outline simply doesn't appear
    *  past the cap and a click there does nothing — the refusal is visible, not silent. Select mode,
@@ -850,13 +861,13 @@ const FlyView3D = forwardRef<FlyView3DRef, {
 }>(function FlyView3D({
   world, editEpoch = 0, lastEdit = null, spawnAt = null, worldLoadToken = 0, onFlyModeChange, onLookChange, onCameraMove, overlays3d = null,
   texturePack = null, texEpoch = 0, fogEnabled = true,
-  nightLighting = false, shadows3d = false, sunT = 0.5, lampRadius = 4, lightingProfile = "legacy", lightEpoch = 0,
+  nightLighting = false, shadowMode = "off", sunT = 0.5, lampRadius = 4, lightingProfile = "legacy", lightEpoch = 0,
   initialRenderDistance, initialFlySpeed, onRenderDistanceChange, onFlySpeedChange, anyModalOpen = false,
   lookSensitivity = 1, dragSensitivity = 1, invertY = false,
   interact3d = "none", onPickSelect, onPickFloodFill, onPickBreak, onPickPlace, onBuildGestureEnd, onPickEyedrop, armedSwatch = null, armedLabel = "",
   onPickBreakBatch, onPickPlaceBatch, onPickFillFace,
   armedBlockType = 0, autoOrient3d = true, onSetAutoOrient3d,
-  sky3d = DEFAULT_SKY3D, onSky3dChange, showHud = true, showGrid = true, onSetShowGrid, buildReach = 64,
+  sky3d = DEFAULT_SKY3D, onSky3dChange, showHud = true, showGrid = true, onSetShowGrid, showSigns = true, recordsSeq = 0, buildReach = 64,
   selectionBounds3d = null, onGizmoRegionChange, onGizmoMoveBlocks,
   moveWithContents = false, setMoveWithContents,
   hotbarSlots, activeBlock, onHotbarSelect, showHotbarOverlay = true,
@@ -1010,21 +1021,6 @@ const FlyView3D = forwardRef<FlyView3DRef, {
   const haloTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => () => { if (haloTimerRef.current) clearTimeout(haloTimerRef.current); }, []);
 
-  // Lamp/shadow reach, fetched once from Rust so the edit-sync reload radius below can't drift out
-  // of sync with voxel-core's LAMP_LIGHT_RADIUS/SHADOW_RAY_STEPS constants. Seeded with those same
-  // values as a fallback in case the fetch hasn't landed yet (a stale/undersized radius for one
-  // frame is harmless — the next edit reloads correctly once the fetch resolves).
-  const lightConstantsRef = useRef({ lampLightRadius: 4.0, shadowRayScan: 24 });
-  useEffect(() => {
-    let cancelled = false;
-    invoke<{ lamp_light_radius: number; shadow_ray_steps: number }>("get_light_constants")
-      .then((c) => {
-        if (cancelled) return;
-        lightConstantsRef.current = { lampLightRadius: c.lamp_light_radius, shadowRayScan: c.shadow_ray_steps };
-      })
-      .catch(() => { /* fall back to the seeded defaults */ });
-    return () => { cancelled = true; };
-  }, []);
 
   const mapW = chunkToWorld(world.width_chunks);
   const mapH = chunkToWorld(world.height_chunks);
@@ -1036,6 +1032,13 @@ const FlyView3D = forwardRef<FlyView3DRef, {
   onLookChangeRef.current = onLookChange;
   const onCameraMoveRef = useRef(onCameraMove);
   onCameraMoveRef.current = onCameraMove;
+  // Sign overlay inputs, read by the scene closure (27.6b).
+  const showSignsRef = useRef(showSigns);
+  showSignsRef.current = showSigns;
+  const viewCapZRef = useRef(viewCapZ);
+  viewCapZRef.current = viewCapZ;
+  const worldLoadTokenRef = useRef(worldLoadToken);
+  worldLoadTokenRef.current = worldLoadToken;
   const anyModalOpenRef = useRef(anyModalOpen);
   anyModalOpenRef.current = anyModalOpen;
 
@@ -1147,8 +1150,8 @@ const FlyView3D = forwardRef<FlyView3DRef, {
   // mount), same pattern as fogEnabledRef.
   const nightLightingRef = useRef(nightLighting);
   nightLightingRef.current = nightLighting;
-  const shadows3dRef = useRef(shadows3d);
-  shadows3dRef.current = shadows3d;
+  const shadowModeRef = useRef(shadowMode);
+  shadowModeRef.current = shadowMode;
   const sunTRef = useRef(sunT);
   sunTRef.current = sunT;
   const lampRadiusRef = useRef(lampRadius);
@@ -1233,6 +1236,10 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     updateGpuLighting: () => void;
     /** Re-query lamp point lights around the camera (GPU night only). */
     refreshNightLights: () => void;
+    /** 27.6b: refetch the sign/command-block overlay. "seq" = the record set changed or the world did
+     *  (invalidates in-flight fetches), "toggle" = `showSigns` flipped, "cull" = the cutaway cap moved,
+     *  "edit" = blocks changed (only refetches when an edit rect is near the camera). */
+    refreshRecords: (reason: "seq" | "toggle" | "cull" | "edit", edits?: EditBounds[] | null) => void;
     refresh: () => void;
     /** H3: re-pick and redraw the placement/select outline immediately, bypassing the hover throttle —
      *  called after every edit so the box never shows a stale pre-edit target. */
@@ -1258,7 +1265,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
   // Live props for the Diagnostics state snapshot — refreshed each render (ref assign, no state).
   const diagStateRef = useRef<() => PerfState>(() => ({} as PerfState));
   diagStateRef.current = () => ({
-    camMode, interact3d, night: nightLighting, shadows: shadows3d, gpuShadows,
+    camMode, interact3d, night: nightLighting, shadows: shadowMode, gpuShadows,
     lightingProfile, cutaway: viewCapZ, texturePack: texturePack != null, suspended,
     canvasPx: `${canvasRef.current?.width ?? 0}x${canvasRef.current?.height ?? 0}`,
   });
@@ -1679,7 +1686,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       nightLights.push(pl);
     }
 
-    // Unit vector pointing toward the sun in THREE space, from sunT. Mirrors Rust's `sun_direction`
+    // Unit vector pointing toward the sun in THREE space, from sunT. (Rust's old `sun_direction` twin went with the baked ray-march)
     // (elevation eases 15°..80°..15° via sin(pi·t); azimuth 0..pi east→west), mapped Eden(x,y,z)→
     // THREE(x,z,y). Used to place the directional light; sunT changes are then just a light move.
     const sunDirThree = (t: number, out: THREE.Vector3) => {
@@ -2039,7 +2046,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       const fetchT0 = performance.now();
       // zMax = the camera band's ceiling (Stage 3); zMin stays 0 — see Z_BAND_ABOVE on why the band
       // is one-sided. `undefined` means "no clip" and is what a 64z world always sends.
-      invoke<ArrayBuffer>("get_chunk_geometry", { cx: cxk, cy: cyk, night: nightLightingRef.current, shadows: shadows3dRef.current, sunT: sunTRef.current, gpu: gpuShadowsRef.current, lampRadius: lampRadiusRef.current, lightingProfile: lightingProfileRef.current, zMax: fetchBand ?? undefined, format: 2 })
+      invoke<ArrayBuffer>("get_chunk_geometry", { cx: cxk, cy: cyk, night: nightLightingRef.current, shadows: shadowModeRef.current, sunT: sunTRef.current, gpu: gpuShadowsRef.current, lampRadius: lampRadiusRef.current, lightingProfile: lightingProfileRef.current, zMax: fetchBand ?? undefined, format: 2 })
         .then((buf) => {
           recordGeometryFetchMs(performance.now() - fetchT0);
           if (disposed) return;
@@ -3603,6 +3610,78 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     // starts it again.
     let sweepInterval = setInterval(streamSweep, STREAM_MS);
 
+    // ---- Sign / command-block overlay (27.6b) ----
+    // The pure half (text layout, texture LRU, mesh building) is `signOverlay.ts`; this is the wiring:
+    // when to refetch `get_record_overlay`, and the z-band cull. One group, never remounted. File axes
+    // -> Three axes (x, z, y) happen inside the module; the camera is passed in file axes (Eden x, y = Three
+    // x, z; file z = Three y), the same space `pick_block` takes.
+    const REC_MOVE_BLOCKS = 2;
+    // The backend's cmd radius is 2x the sign radius (64): an edit within that + 1 can change a skin
+    // face's exposure or bury a sign's front cell.
+    const REC_EDIT_REACH = 65;
+    const recordOverlay = new RecordOverlay({ onChange: () => invalidate() });
+    scene.add(recordOverlay.group);
+    let recGen = 0;            // bumped to orphan any in-flight fetch (seq / toggle / world change)
+    let recInflight = false;
+    let recAgain = false;      // a trigger arrived mid-flight: fetch again when it lands
+    let recLast: { x: number; y: number; z: number } | null = null;
+    let recStale = false;      // a trigger arrived while the pane couldn't fetch (suspended / context lost)
+    const recCull = () => recordOverlay.setCull(zBandTop(), viewCapZRef.current);
+    const recFetch = () => {
+      if (disposed || !showSignsRef.current) return;
+      if (suspendedNow || contextLost) { recStale = true; return; }
+      if (recInflight) { recAgain = true; return; }
+      recStale = false;
+      recInflight = true;
+      recAgain = false;
+      const gen = recGen;
+      const token = worldLoadTokenRef.current;
+      const p = camera.position;
+      recLast = { x: p.x, y: p.z, z: p.y };
+      invoke<OverlayInfo>("get_record_overlay", { cx: p.x, cy: p.z, cz: p.y })
+        .then((info) => {
+          // Stale: a seq/toggle/world change (or unmount) landed while this was in flight.
+          if (disposed || gen !== recGen || token !== worldLoadTokenRef.current || !showSignsRef.current) return;
+          recCull();
+          recordOverlay.apply(info);
+        })
+        .catch(() => {
+          // No world / no records: show nothing rather than the previous world's signs.
+          if (!disposed && gen === recGen) recordOverlay.apply(null);
+        })
+        .finally(() => {
+          recInflight = false;
+          if (recAgain && !disposed) recFetch();
+        });
+    };
+    // Runs inside frame()'s existing 300 ms camera-broadcast throttle (so only while the pane is
+    // actually painting): re-derive the cull, and refetch once the camera has moved >= 2 blocks.
+    // (The result is position-only, so turning the camera alone never needs a refetch.)
+    const recordsTick = () => {
+      if (!showSignsRef.current || suspendedNow || contextLost) return;
+      recCull();
+      const p = camera.position;
+      if (recStale || !recLast || (p.x - recLast.x) ** 2 + (p.z - recLast.y) ** 2 + (p.y - recLast.z) ** 2 >= REC_MOVE_BLOCKS * REC_MOVE_BLOCKS) recFetch();
+    };
+    const refreshRecords = (reason: "seq" | "toggle" | "cull" | "edit", edits?: EditBounds[] | null) => {
+      if (disposed) return;
+      if (reason === "cull") { recCull(); return; }
+      if (reason === "edit") {
+        // Only an edit near the camera can change what the overlay shows.
+        const cx = camera.position.x, cy = camera.position.z;
+        const near = (edits ?? []).some((r) => {
+          const dx = Math.max(r.x - cx, 0, cx - (r.x + r.w)), dy = Math.max(r.y - cy, 0, cy - (r.y + r.h));
+          return dx * dx + dy * dy <= REC_EDIT_REACH * REC_EDIT_REACH;
+        });
+        if (!near) return;
+      }
+      recGen++; // anything in flight predates this change
+      if (!showSignsRef.current) { recordOverlay.apply(null); recordOverlay.group.visible = false; invalidate(); return; }
+      recordOverlay.group.visible = true;
+      recFetch();
+    };
+    if (showSignsRef.current) recFetch();
+
     // ---- WebGL context loss / restore -------------------------------------------------------------
     // A driver can drop the context under memory pressure — the very condition the geometry budget
     // above exists to avoid, so this is the safety net for when it isn't enough. Without a
@@ -3662,6 +3741,8 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       // above changes *what* this reloads (a smaller disc, under a smaller budget) — never whether
       // it reloads at all, which would strand the pane on unrecoverable geometry.
       if (atlasTexRef.current) atlasTexRef.current.needsUpdate = true;
+      // Sign text textures keep their canvas (unlike chunk geometry): just re-upload them.
+      recordOverlay.restoreTextures();
       // A pane suspended while its context was lost stays parked — `setSuspended(false)` restarts
       // the sweep and refetches. Restarting it here would stream geometry into a hidden pane.
       if (suspendedNow) return;
@@ -3879,6 +3960,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       // camera dot. Deliberately slower than the HUD above: a coarse map-dot position doesn't need 10Hz.
       // App keeps it in a ref and moves the dot imperatively (no React state), so it costs no re-render.
       if (now - lastEmitExternalT >= 300) {
+        recordsTick();
         const ex = camera.position.x, ey = camera.position.z;
         // Map-space heading for the view wedge: Eden X is three's X, Eden Y is three's Z.
         camera.getWorldDirection(emitDir);
@@ -4492,6 +4574,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       setSuspended,
       updateGpuLighting: () => applyGpuLighting(),
       refreshNightLights: () => updateNightLights(),
+      refreshRecords,
       refresh: () => invalidate(),
       // H3: force a fresh pick past the hover throttle, so the outline can be told to catch up right
       // after an edit lands instead of waiting for the pointer to move.
@@ -4520,6 +4603,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
         zBand: zBand ?? null,
         contextLossCount,
         contextDisabled: contextGivenUp,
+        ...recordOverlay.stats(),
       }),
     };
 
@@ -4582,6 +4666,8 @@ const FlyView3D = forwardRef<FlyView3DRef, {
       window.removeEventListener("keydown", onAltKey);
       window.removeEventListener("keyup", onAltKey);
       window.removeEventListener("blur", onAltBlur);
+      scene.remove(recordOverlay.group);
+      recordOverlay.dispose();
       // Before the forceContextLoss() below — that fires a webglcontextlost event we must not handle.
       canvas.removeEventListener("webglcontextlost", onContextLost);
       canvas.removeEventListener("webglcontextrestored", onContextRestored);
@@ -4726,24 +4812,39 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     // Same-size worlds keep the scene (init re-runs only on dimension change): drop the previous
     // world's resident meshes and `emptyChunks` markers so nothing stale survives (21.8).
     sceneApi.current?.reloadAllChunks("world");
+    // 27.6b: and the previous world's signs (the fetch is guarded on this token).
+    sceneApi.current?.refreshRecords("seq");
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [worldLoadToken]);
+
+  // Sign overlay (27.6b): the record set changed (App bumps `recordsSeq` whenever it refetches/resets
+  // `records`), or the shared Sign Markers toggle flipped. Skipped on mount: the scene closure already
+  // issued its own first fetch.
+  const recMountedRef = useRef(false);
+  useEffect(() => {
+    if (!recMountedRef.current) return;
+    sceneApi.current?.refreshRecords("seq");
+  }, [recordsSeq]);
+  useEffect(() => {
+    if (!recMountedRef.current) { recMountedRef.current = true; return; }
+    sceneApi.current?.refreshRecords("toggle");
+  }, [showSigns]);
 
   // Edit sync: reload chunk meshes overlapping the last edit's top-down bounds. The rect is always
   // expanded by at least 1 chunk (face culling at a chunk boundary needs the *neighbour*'s mesh
   // rebuilt too, independent of lighting — see the chunkPad comment below), and further when night
-  // lighting or shadows are on: a placed lamp (LAMP_LIGHT_RADIUS) or a new occluder (SHADOW_RAY_STEPS,
-  // the shadow raymarch distance) can visibly affect blocks in the *next* chunk over, so reloading
-  // only the chunk(s) the edit's own bounds touch would leave a lit/shadowed seam at that boundary
-  // until the camera flies away and back. The two halves are **not** reloaded on the same schedule
+  // lighting or baked shadows are on: a placed lamp (the lamp radius) or a new shadow caster (1 block
+  // sideways, diagonals included — voxel-core `shadow.rs`) can visibly affect blocks in the *next*
+  // chunk over, so reloading only the chunk(s) the edit's own bounds touch would leave a lit/shadowed
+  // seam at that boundary until the camera flies away and back. The two halves are **not** reloaded on the same schedule
   // (C3 steps 2–3):
   //
   //   • **core** (the edit's own chunks, usually 1) — immediately. This is the block you just placed
   //     appearing, so it can never be deferred.
   //   • **halo** (everything the reach adds on top) — accumulated and flushed on a trailing
-  //     HALO_FLUSH_MS debounce. With baked shadows on, `shadowRayScan = 24` makes the padded rect
-  //     5×5 = 25 chunks; paying that per *placed block* is the storm that made building on a large
-  //     world feel broken. A build sweep stamps far faster than the debounce, so it now pays the halo
+  //     HALO_FLUSH_MS debounce. With a wide lamp radius the padded rect is 5×5 = 25 chunks (the old
+  //     24-block sun-shadow reach did the same until 27.4b); paying that per *placed block* is the
+  //     storm that made building on a large world feel broken. A build sweep stamps far faster than the debounce, so it now pays the halo
   //     once, after release — which is the "coalesce per gesture" outcome without any gesture
   //     plumbing between the scene closure and this effect: the edit rate *is* the gesture signal.
   //     A lone click pays it 350 ms later; the seam it fixes was never visible sooner than that.
@@ -4753,12 +4854,12 @@ const FlyView3D = forwardRef<FlyView3DRef, {
   useEffect(() => {
     const api = sceneApi.current;
     if (!api || !lastEdit || lastEdit.length === 0) return;
-    // Lamp reach uses the live slider value (not the const) so a wider lamp radius reloads the wider
-    // seam; shadow reach stays the raymarch constant.
-    const reach = Math.max(
-      nightLighting ? lampRadiusRef.current : 0,
-      shadows3d ? lightConstantsRef.current.shadowRayScan : 0,
-    );
+    // 27.6b: an edit near the camera can bury a sign's front cell / expose a command-block face.
+    api.refreshRecords("edit", lastEdit);
+    // Lamp reach uses the live slider value so a wider lamp radius reloads the wider seam. Baked
+    // shadows add no reach, only the corner chunks to the 1-block ring (`editReloadPlan`).
+    const reach = nightLighting ? lampRadiusRef.current : 0;
+    const baked = shadowModeRef.current !== "off" && !gpuShadowsRef.current;
     // Padding is at minimum 1 chunk *regardless* of lighting: face culling for a voxel is decided
     // against its neighbour, so deleting/adding a block at (or near) a chunk boundary changes which
     // faces the *neighbouring* chunk's own mesh should be emitting — that neighbour was never in
@@ -4766,9 +4867,10 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     // reloaded at all. That's the "removing blocks near others leaves a see-through/culled face
     // until the pane is toggled" bug: the halo below is what fixes it (still deferred by
     // HALO_FLUSH_MS, since it isn't the block you just placed — that part shows immediately).
-    // 23.1: with no lighting/shadow reach only the edge-touching face neighbours need a rebuild (face
-    // culling is decided against the neighbour block); no diagonals, nothing for an interior edit.
-    const plans = lastEdit.map((r) => editReloadPlan(r, reach));
+    // 23.1: with no lamp reach only the edge-touching face neighbours need a rebuild (face culling is
+    // decided against the neighbour block), plus the diagonals with baked shadows; nothing for an
+    // interior edit.
+    const plans = lastEdit.map((r) => editReloadPlan(r, reach, baked));
     for (const p of plans) for (const [cx, cy] of p.core) api.reloadChunk(cx, cy);
     if (plans.some((p) => p.halo.length)) {
       const halo = haloKeysRef.current;
@@ -4850,6 +4952,8 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     if (!capMountedRef.current) { capMountedRef.current = true; return; }
     sceneApi.current?.reloadAllChunks("cap", true);
   }, [viewCapZ]);
+  // The overlay hides records above the cutaway cap too (27.6b); mount included, so it's a plain effect.
+  useEffect(() => { sceneApi.current?.refreshRecords("cull"); }, [viewCapZ]);
 
   // Suspend/resume (Stage 4). App keeps this component mounted across the 3D-pane and 3D-window
   // toggles instead of unmounting it, so the WebGL context survives; `suspended` is what makes a
@@ -4861,13 +4965,13 @@ const FlyView3D = forwardRef<FlyView3DRef, {
   // Reload all chunk meshes when the night-lighting/shadow preview toggles change — but NOT in
   // GPU-shadow mode, where geometry is flat and independent of night/shadows/sunT. That's what makes
   // sunT free there: the per-frame sun-follow moves the light; no reload is needed.
-  // 17.6a: baked geometry reads `sunT` only while baked shadows are on, and lamp radius/profile only
-  // while baked night is on (`LightMode` in voxel-core geometry.rs), so a change to an input the
+  // 17.6a: baked geometry never reads `sunT` (baked shadows have no sun direction since 27.4b), and
+  // reads lamp radius/profile only while baked night is on (`LightMode` in voxel-core geometry.rs), so a change to an input the
   // current mode ignores must not restream the disc. `lightKeyRef` holds the last *effective* inputs.
   const lightKeyRef = useRef<string | null>(null);
   useEffect(() => {
     if (!gpuShadowsRef.current) {
-      const key = `${nightLighting}|${shadows3d}|${shadows3d ? sunT : ""}|${nightLighting ? `${lampRadius}|${lightingProfile}` : ""}`;
+      const key = `${nightLighting}|${shadowMode}|${nightLighting ? `${lampRadius}|${lightingProfile}` : ""}`;
       if (key === lightKeyRef.current) return;
       lightKeyRef.current = key;
       sceneApi.current?.reloadAllChunks("light", true);

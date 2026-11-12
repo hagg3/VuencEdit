@@ -22,6 +22,9 @@ pub struct TestWorld {
     /// deliberately wrong ceiling, which is what the hint-contract tests need (a too-high hint must
     /// be invisible; a too-low one must be *visible*, so nobody later "tightens" the contract).
     pub top_band_hint: Option<usize>,
+    /// Per-chunk hint overrides, consulted before `top_band_hint` — for tests where neighbouring
+    /// chunks need different ceilings (a ring read must use the neighbour's own hint).
+    pub chunk_hints: FxHashMap<(i32, i32), usize>,
 }
 
 impl TestWorld {
@@ -48,6 +51,7 @@ impl TestWorld {
             h_chunks,
             sky: 0,
             top_band_hint: None,
+            chunk_hints: FxHashMap::default(),
         }
     }
 
@@ -69,7 +73,7 @@ impl VoxelView for TestWorld {
         Some(&self.bytes[addr..addr + self.chunk_size])
     }
     fn top_band_hint(&self, cx: i32, cy: i32) -> usize {
-        let _ = (cx, cy);
+        if let Some(&h) = self.chunk_hints.get(&(cx, cy)) { return h; }
         self.top_band_hint.unwrap_or_else(|| self.num_bands.saturating_sub(1))
     }
 }

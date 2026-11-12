@@ -8,6 +8,13 @@
 //! ⚠️ That one-tile width is load-bearing for greedy meshing: U may tile by repeating the column
 //! (with `wrapS = RepeatWrapping` on the frontend), but V *selects the row*, so a merged quad may
 //! never grow along V while a pack is loaded. See `geometry::obj_geometry_region`.
+//!
+//! Doors (66–70) and portals (75–79) are the only tiles not in the game's `atlas.png`: the loader
+//! splits a user-supplied tall `door.png` / `portal.png` (height = 2 × width) into
+//! `door_top`/`door_bottom` and `portal_top`/`portal_bottom` tiles. A door block draws a thin slab
+//! with its half; a portal stays a stone cube whose *front* face (chosen by the mesher, see
+//! `portal_front_tile`) wears the portal half. Without them: doors fall back to `wood`, portals to
+//! `stone`.
 
 use std::collections::HashMap;
 
@@ -29,7 +36,7 @@ pub const BLOCK_FACE_TEX: [[&str; 3]; 128] = [
     ["tnt_side", "tnt_side", "tnt_top"],            // 9  TNT
     ["dark_stone", "dark_stone", "dark_stone"],     // 10 DARK_STONE
     ["grass_side", "dirt", "grass_top2"],           // 11 GRASS2
-    ["grass_side", "dirt", "grass_top"],            // 12 GRASS3
+    ["grass_side", "dirt", "grass_flower"],         // 12 GRASS3 (flower patch top; `face_tile` falls back to grass_top)
     ["brick", "brick", "brick"],                    // 13 BRICK
     ["cobblestone", "cobblestone", "cobblestone"],  // 14 COBBLESTONE (Slate)
     ["ice", "ice", "ice"],                          // 15 ICE
@@ -91,11 +98,11 @@ pub const BLOCK_FACE_TEX: [[&str; 3]; 128] = [
     ["lava", "lava", "lava"],                       // 63 LAVA2
     ["lava", "lava", "lava"],                       // 64 LAVA1
     ["firework", "firework", "tnt_top"],            // 65 FIREWORK
-    ["wood", "wood", "wood"],                       // 66 DOOR1
-    ["wood", "wood", "wood"],                       // 67 DOOR2
-    ["wood", "wood", "wood"],                       // 68 DOOR3
-    ["wood", "wood", "wood"],                       // 69 DOOR4
-    ["wood", "wood", "wood"],                       // 70 DOOR_TOP
+    ["door_bottom", "door_bottom", "door_bottom"],     // 66 DOOR1 — slab, lower half (`face_tile` falls back to wood)
+    ["door_bottom", "door_bottom", "door_bottom"],     // 67 DOOR2
+    ["door_bottom", "door_bottom", "door_bottom"],     // 68 DOOR3
+    ["door_bottom", "door_bottom", "door_bottom"],     // 69 DOOR4
+    ["door_top", "door_top", "door_top"],              // 70 DOOR_TOP
     ["cloud", "cloud", "cloud"],                    // 71 GOLDEN_CUBE
     ["lightbox", "lightbox", "lightbox"],           // 72 LIGHTBOX (Lamp)
     ["cloud", "cloud", "cloud"],                    // 73 FLOWER
@@ -182,7 +189,31 @@ pub fn face_tile(pack: &TexturePack, bt: u8, face_kind: u8) -> Option<u32> {
     if (bt as usize) >= BLOCK_FACE_TEX.len() { return None; }
     let tex_name = BLOCK_FACE_TEX[bt as usize][face_kind as usize];
     if tex_name.is_empty() { return None; }
-    pack.name_to_row.get(tex_name).copied()
+    let row = pack.name_to_row.get(tex_name).copied();
+    if row.is_some() { return row; }
+    // Fallbacks for tiles a stock atlas lacks: block 12 keeps its plain grass top, a door slab
+    // draws in `wood` (its pre-27.2c look).
+    let fallback = match tex_name {
+        "grass_flower" => "grass_top",
+        "door_top" | "door_bottom" => "wood",
+        _ => return None,
+    };
+    pack.name_to_row.get(fallback).copied()
+}
+
+/// The atlas row of a portal's front-face art (`portal_bottom` for 75–78, `portal_top` for 79), or
+/// None when the pack has no portal tiles — the front then stays an ordinary stone face. The mesher
+/// picks *which* face is the front (it depends on the block's facing, which `face_tile` can't see).
+pub fn portal_front_tile(pack: &TexturePack, bt: u8) -> Option<u32> {
+    let name = match bt { 75..=78 => "portal_bottom", 79 => "portal_top", _ => return None };
+    pack.name_to_row.get(name).copied()
+}
+
+/// `(vertex_rgb, atlas_row)` for a portal's front face: the portal tile, grayscale × paint when
+/// painted, untinted (white) when not — the tile is finished art. None without portal tiles.
+pub fn portal_front_color_and_row(pack: &TexturePack, bt: u8, paint: u8, fallback_rgb: [u8; 3]) -> Option<([u8; 3], u32)> {
+    let r = portal_front_tile(pack, bt)?;
+    Some(if paint != 0 { (fallback_rgb, r + pack.gray_row_offset) } else { ([255, 255, 255], r) })
 }
 
 /// Returns (vertex_rgb, atlas_row_opt) for a face. The vertex rgb is always the block's
@@ -208,16 +239,78 @@ pub fn face_color_and_row(
         Some(r) if paint != 0 => Some(r + pack.gray_row_offset),
         other => other,
     };
-    // 112–127's colour tiles are the game's finished art (its unpainted look), not a base the block
-    // colour modulates — the approximated BLOCK_RGB would double-tint them. Draw them white.
-    if paint == 0 && row.is_some() && is_new_format_tex_block(bt) {
+    // 112–127's colour tiles (and a door's, when the pack actually has one) are the game's finished
+    // art (its unpainted look), not a base the block colour modulates — the approximated BLOCK_RGB
+    // would double-tint them. Draw them white.
+    if paint == 0 && row.is_some() && tile_is_finished_art(pack, bt) {
         return ([255, 255, 255], row);
     }
     (fallback_rgb, row)
 }
 
-/// Blocks 112–127, whose atlas tiles already carry their colour (see `face_color_and_row`).
-pub fn is_new_format_tex_block(bt: u8) -> bool {
-    (112..=127).contains(&bt)
+/// Blocks whose atlas tile already carries its colour (see `face_color_and_row`): 112–127, and the
+/// door slabs 66–70 *when the pack supplies `door_*`* — a `wood` fallback is a base tile the block
+/// colour modulates, so it keeps today's tint. (Portal fronts go through `portal_front_color_and_row`.)
+pub fn tile_is_finished_art(pack: &TexturePack, bt: u8) -> bool {
+    match bt {
+        112..=127 => true,
+        66..=69 => pack.name_to_row.contains_key("door_bottom"),
+        70 => pack.name_to_row.contains_key("door_top"),
+        _ => false,
+    }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pack(names: &[&str]) -> TexturePack {
+        let n = names.len() as u32;
+        TexturePack {
+            tile: 1,
+            atlas_rgba: vec![255; (2 * n as usize + 1) * 4],
+            atlas_rows: 2 * n + 1,
+            gray_row_offset: n,
+            name_to_row: names.iter().enumerate().map(|(i, s)| (s.to_string(), i as u32 + 1)).collect(),
+        }
+    }
+
+    #[test]
+    fn doors_fall_back_to_wood_and_portals_to_nothing() {
+        let stock = pack(&["wood", "stone"]);
+        for bt in 66..=70 { assert_eq!(face_tile(&stock, bt, 0), Some(1), "door {bt} → wood"); }
+        assert_eq!(portal_front_tile(&stock, 75), None, "no portal art ⇒ the front stays stone");
+        assert_eq!(portal_front_color_and_row(&stock, 79, 0, [1, 2, 3]), None);
+
+        let full = pack(&["wood", "door_bottom", "door_top", "portal_bottom", "portal_top"]);
+        assert_eq!(face_tile(&full, 66, 0), Some(2));
+        assert_eq!(face_tile(&full, 70, 2), Some(3));
+        assert_eq!(portal_front_tile(&full, 78), Some(4));
+        assert_eq!(portal_front_tile(&full, 79), Some(5));
+        assert_eq!(portal_front_tile(&full, 74), None);
+        // A portal's cube faces stay stone in BLOCK_FACE_TEX; only the mesher-picked front differs.
+        assert_eq!(BLOCK_FACE_TEX[75], ["stone", "stone", "stone"]);
+    }
+
+    #[test]
+    fn finished_art_needs_the_tile_to_have_actually_resolved() {
+        let stock = pack(&["wood"]);
+        let full = pack(&["wood", "door_bottom", "door_top"]);
+        assert!(tile_is_finished_art(&stock, 117) && tile_is_finished_art(&full, 112));
+        assert!(!tile_is_finished_art(&stock, 66) && !tile_is_finished_art(&stock, 70), "a wood fallback keeps its tint");
+        assert!(tile_is_finished_art(&full, 66) && tile_is_finished_art(&full, 69) && tile_is_finished_art(&full, 70));
+        assert!(!tile_is_finished_art(&full, 7) && !tile_is_finished_art(&full, 75));
+
+        // Unpainted: white + colour tile; painted: block colour + grayscale tile. Stock: wood, tinted.
+        assert_eq!(face_color_and_row(&full, 66, 0, 0, [9, 9, 9]), ([255, 255, 255], Some(2)));
+        assert_eq!(face_color_and_row(&full, 66, 4, 0, [9, 9, 9]), ([9, 9, 9], Some(2 + full.gray_row_offset)));
+        assert_eq!(face_color_and_row(&stock, 66, 0, 0, [9, 9, 9]), ([9, 9, 9], Some(1)));
+    }
+
+    #[test]
+    fn portal_front_is_white_unpainted_and_gray_times_paint_painted() {
+        let p = pack(&["portal_bottom", "portal_top"]);
+        assert_eq!(portal_front_color_and_row(&p, 76, 0, [5, 6, 7]), Some(([255, 255, 255], 1)));
+        assert_eq!(portal_front_color_and_row(&p, 76, 3, [5, 6, 7]), Some(([5, 6, 7], 1 + p.gray_row_offset)));
+    }
+}

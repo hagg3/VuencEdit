@@ -18,6 +18,7 @@ pub mod export;
 mod fsutil;
 pub mod store;
 
+pub use fsutil::{rename_with_retry, rename_with_retry_counted};
 pub use container::{
     addressable, join_bands, split_bands, Codec, Codecs, RecordType, BAND, COMMIT_LEN, CREATURE_LEN,
     EDEN_DIR_ROW, EDEN_HEADER_LEN, FILE_HEADER_LEN, FMT_VERSION, GENERATOR_LEN, MAGIC, MAX_CREATURE_SLOTS,

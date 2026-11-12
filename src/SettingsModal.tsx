@@ -6,10 +6,11 @@ import { MODAL_TEXT, expBadge, recessedWell } from "./designTokens";
 import { MAX_RENDER_DISTANCE, RD_MIN } from "./renderDistance";
 import { openView3dEverywhere, seedLastLayout } from "./windows/windowSeed";
 import { Check, Segmented, Select, SliderRow } from "./ribbon/primitives";
-import { ACCENT, FONT, ICON, RADIUS } from "./ribbon/tokens";
+import { ACCENT, FONT, ICON, IS_MAC, RADIUS } from "./ribbon/tokens";
 import { Icon } from "./ribbon/icons";
 import { SKY_3D } from "./theme/theme";
 import { SOUND_PACK_OPTIONS, type PackId } from "./sound/packs";
+import type { ShadowMode, ShadowStyle } from "./types";
 import { sfx } from "./sound/sfx";
 import Dialog, { DialogButton } from "./ui/Dialog";
 import { DialogNav, type DialogNavItem } from "./ui/DialogNav";
@@ -39,9 +40,13 @@ export interface AppSettings {
   renderDistance: number;
   /** 3D fly-view fly-speed multiplier (wheel-adjustable in the pane). Persisted. Default 1. */
   flySpeed: number;
-  // Night lighting / Shadows / GPU shadow map are NOT persisted: they're perf-heavy, session-only 3D
-  // view modes that always start off (Ribbon-only toggles; reset on world load/close in App.tsx).
-  /** Simulated sun position driving the shadow direction: 0=sunrise, 0.5=noon, 1=sunset. */
+  // Night lighting / GPU shadow map are NOT persisted: they're perf-heavy, session-only 3D view modes
+  // that always start off (Ribbon-only toggles; reset on world load/close in App.tsx).
+  /** Baked 3D shadows (27.4b): Eden's darkening under trees, roofs and overhangs. Default "classic". */
+  shadowMode: ShadowMode;
+  /** The last non-off `shadowMode`, which the ribbon's Shadows toggle turns back on to. */
+  shadowStyle: ShadowStyle;
+  /** GPU Shadows' sun position: 0=sunrise, 0.5=noon, 1=sunset. */
   sunT: number;
   /** Lamp light radius (blocks) for night lighting in the 3D fly-view. Default 4 (the Legacy profile's default). */
   lampRadius: number;
@@ -115,6 +120,9 @@ export interface AppSettings {
    *  render distance or memory preset back up on a known-software-rendering machine would have that
    *  choice silently reverted the next time the 3D pane mounts. Default false. */
   potatoProfileApplied: boolean;
+  /** Set once the 31.4 installed-RAM check has run (≤ 4 GB and still on the stock preset → Low).
+   *  One shot per install so a later explicit choice of Balanced is never reverted. Default false. */
+  ramPresetChecked: boolean;
   /** UI sound cues (UI redesign r3, Stage 14.12) — completion sounds only, never hover/pointer-rate.
    *  Default true: `{...DEFAULTS, ...parsed}` supplying this to every existing install *is* the
    *  "on by default" decision (§1 "Sounds"), same idiom as `enableFog`'s "matches the game" default. */
@@ -129,6 +137,13 @@ export interface AppSettings {
    *  "Compact"/"Labels" chip and from ⌘K ("Compact Ribbon"), both of which write straight through
    *  `saveSettings` rather than waiting for this modal's Save button. */
   ribbonCompact: boolean;
+  /** macOS-only experiment: hide the traffic lights and draw the custom minimise/maximise/close
+   *  cluster Windows gets (frameless there), to preview it. Ignored off macOS (`windowChrome.ts`).
+   *  Additive — no version bump; the DEFAULTS merge supplies `false`. */
+  previewWindowControls: boolean;
+  /** Sign + command-block markers: the 2D map's diamonds/squares *and* the 3D pane's sign boards,
+   *  text and command-block skin (27.6b) — one toggle for both. Default true. */
+  showSigns: boolean;
   /** Motion preference (UI redesign r3, Stage 14.13): "system" defers to the OS's prefers-reduced-
    *  motion; "reduced"/"full" force it regardless of what the OS reports. Default "system". A JS
    *  gate (`src/theme/motion.ts`'s `useMotionPref`), never a CSS media query — see that file's
@@ -150,13 +165,15 @@ export interface AppSettings {
 export const MEMORY_PRESETS: Record<AppSettings["memoryBudget"], {
   label: string;
   undoBudgetBytes: number;
+  /** Clipboard voxel cap (31.6) — `set_clipboard_cap`. */
+  clipboardCapVoxels: number;
   tileBudgetBytes: number;
   geometryBudgetBytes: number;
   overviewBudgetBytes: number;
 }> = {
-  low:      { label: "Low",      undoBudgetBytes:  48 << 20, tileBudgetBytes: 128 << 20, geometryBudgetBytes:  192 << 20, overviewBudgetBytes: 16 << 20 },
-  balanced: { label: "Balanced", undoBudgetBytes:  96 << 20, tileBudgetBytes: 256 << 20, geometryBudgetBytes:  512 << 20, overviewBudgetBytes: 32 << 20 },
-  high:     { label: "High",     undoBudgetBytes: 256 << 20, tileBudgetBytes: 512 << 20, geometryBudgetBytes: 1024 << 20, overviewBudgetBytes: 64 << 20 },
+  low:      { clipboardCapVoxels: 64 << 20, label: "Low",      undoBudgetBytes:  48 << 20, tileBudgetBytes: 128 << 20, geometryBudgetBytes:  192 << 20, overviewBudgetBytes: 16 << 20 },
+  balanced: { clipboardCapVoxels: 128 << 20, label: "Balanced", undoBudgetBytes:  96 << 20, tileBudgetBytes: 256 << 20, geometryBudgetBytes:  512 << 20, overviewBudgetBytes: 32 << 20 },
+  high:     { clipboardCapVoxels: 256 << 20, label: "High",     undoBudgetBytes: 256 << 20, tileBudgetBytes: 512 << 20, geometryBudgetBytes: 1024 << 20, overviewBudgetBytes: 64 << 20 },
 };
 
 /** Current settings schema version. Bump + add a case to `migrate()` when a stored default must change. */
@@ -175,6 +192,8 @@ export const DEFAULTS: AppSettings = {
   enableFog: true,
   renderDistance: 5,
   flySpeed: 1,
+  shadowMode: "classic",
+  shadowStyle: "classic",
   sunT: 0.5,
   lampRadius: 4,
   lightingProfile: "legacy",
@@ -201,10 +220,13 @@ export const DEFAULTS: AppSettings = {
   tourVersion: 0,
   showPerfHud: false,
   potatoProfileApplied: false,
+  ramPresetChecked: false,
   uiSounds: true,
   uiSoundPack: "classic",
   uiSoundVolume: 0.8,
   ribbonCompact: false,
+  previewWindowControls: false,
+  showSigns: true,
   motion: "system",
 };
 
@@ -521,6 +543,7 @@ export default function SettingsModal({
                 memoryBudget: deviceAwareDefaultMemoryBudget(),
                 tourVersion: cur.tourVersion,
                 potatoProfileApplied: cur.potatoProfileApplied,
+                ramPresetChecked: cur.ramPresetChecked,
                 texturePackPath: cur.texturePackPath,
                 prefabDirectory: cur.prefabDirectory,
               }));
@@ -637,9 +660,25 @@ export default function SettingsModal({
             <Check checked={local.enableFog} onChange={v => set("enableFog", v)} label="" title="Fog in 3D views" />
           </SettingRow>
 
-          {/* Night lighting / Shadows / GPU shadow map are perf-heavy, session-only view modes —
-              they live in the Ribbon's 3D/View Lighting group (⚡ badged) and always start off,
-              so they're deliberately not persisted defaults here. */}
+          {/* Night lighting / GPU shadow map are perf-heavy, session-only view modes — they live in
+              the Ribbon's 3D Lighting group (⚡ badged) and always start off, so they're deliberately
+              not persisted defaults here. Baked shadows are cheap and saved (27.4b). */}
+
+          <SettingRow label="Shadows" description="Darkens the ground under trees, roofs and overhangs, like Eden. Smooth blends the shade across block faces.">
+            <Segmented
+              ariaLabel="Shadows"
+              value={local.shadowMode}
+              onChange={v => {
+                set("shadowMode", v);
+                if (v !== "off") set("shadowStyle", v);
+              }}
+              options={[
+                { id: "off", label: "Off" },
+                { id: "classic", label: "Classic" },
+                { id: "smooth", label: "Smooth" },
+              ]}
+            />
+          </SettingRow>
 
           <SettingRow last label="3D performance HUD" description="Show 3D memory use in the 3D view">
             <Check checked={local.showPerfHud} onChange={v => set("showPerfHud", v)} label="" title="3D performance HUD" />
@@ -773,8 +812,8 @@ export default function SettingsModal({
 
           <PathRow
             label="Texture pack path"
-            description="A ZIP of PNGs for the 3D view and block picker"
-            value={local.texturePackPath} placeholder="Not set"
+            description="A ZIP of PNGs or an atlas image for the 3D view and block picker. Clear to use the built-in pack"
+            value={local.texturePackPath} placeholder="Default (built-in)"
             onBrowse={browseTexturePack} onClear={() => set("texturePackPath", null)}
           />
 
@@ -795,6 +834,16 @@ export default function SettingsModal({
             description="An icon-only ribbon.">
             <Check checked={local.ribbonCompact} onChange={v => set("ribbonCompact", v)} label="" title="Compact ribbon" />
           </SettingRow>
+          {IS_MAC && (
+            <>
+              <SectionHeading>Window</SectionHeading>
+              <SettingRow
+                last label="Preview Windows title-bar controls" badge={<Badge>exp</Badge>}
+                description="Hides the traffic lights and shows the minimise / maximise / close buttons Windows uses instead.">
+                <Check checked={local.previewWindowControls} onChange={v => set("previewWindowControls", v)} label="" title="Preview Windows title-bar controls" />
+              </SettingRow>
+            </>
+          )}
         </>
       )}
     </Dialog>

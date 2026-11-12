@@ -195,7 +195,7 @@ export type AccentName = keyof typeof ACCENTS;
 /** 3D pane sky/fog defaults (Stage 15.8) — the dome's original gradient (horizon #c5d5eb → zenith
  *  #347ee3) and Minecraft-clear-sky fog blue. Canvas/WebGL code, so hexes (not CSS vars); lives here so
  *  `AppSettings` defaults and `FlyView3D` share one source. */
-export const SKY_3D = { zenith: "#347ee3", horizon: "#c5d5eb", fog: "#8cbeff" } as const;
+export const SKY_3D = { zenith: "#317ce2", horizon: "#cddaed", fog: "#c5d2e5" } as const;
 
 export const SCROLLBAR_ROLE = {
   track: SURFACE_ROLES.well.css,
@@ -220,6 +220,8 @@ export const MAP = {
   lensBand: mix(RAMP.mapSelection, RAMP.white, 0.55),
   lensExtrude: mix(RAMP.mapClipboard, RAMP.white, 0.8),
   lensHover: RAMP.mapCleared,
+  /** Command-block marker (27.7): orange, beside the gold sign diamond. */
+  command: mix(RAMP.amber, RAMP.red, 0.45),
 } as const;
 
 /**
@@ -363,7 +365,9 @@ export const TAB = {
 export const BRAND = {
   // A touch darker than the mock's recipe, with a steeper fall-off (user feedback 2026-09-26: the
   // lighter version read as too bright next to the slate chrome).
-  bg: `linear-gradient(180deg, ${mix(RAMP.teal, RAMP.white, 0.88)} 0%, ${mix(RAMP.teal, RAMP.black, 0.84)} 48%, ${mix(RAMP.teal, RAMP.black, 0.58)} 100%)`,
+  // Calmer still (2026-11-12): the teal is deepened toward the slate body so it sits in the chrome
+  // instead of shouting over it; a teal rim + the chevron carry the "this is a menu" read.
+  bg: `linear-gradient(180deg, ${mix(RAMP.teal, RAMP.white, 0.72)} 0%, ${mix(RAMP.teal, RAMP.black, 0.62)} 48%, ${mix(RAMP.teal, RAMP.black, 0.42)} 100%)`,
   shadow: (open: boolean) =>
-    `inset 0 0 0 1px rgba(0,0,0,.4), inset 0 1px 0 rgba(255,255,255,.3), 0 0 ${open ? 10 : 6}px ${rgba(RAMP.teal, open ? 0.5 : 0.32)}`,
+    `inset 0 0 0 1px ${rgba(RAMP.teal, open ? 0.75 : 0.5)}, inset 0 1px 0 rgba(255,255,255,.2), 0 0 ${open ? 9 : 4}px ${rgba(RAMP.teal, open ? 0.4 : 0.18)}`,
 } as const;

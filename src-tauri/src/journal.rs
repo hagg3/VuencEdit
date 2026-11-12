@@ -9,7 +9,9 @@
 //! flags       u32    bit0 (FLAG_COMPRESSED) = record payloads are deflate-compressed
 //! base_len    u64    expected byte length of the base image (sanity check on replay)
 //! base_id     16 B   random per-session id, cross-checked by the caller against a meta sidecar
-//! reserved    8 B    zero
+//! dest_id     u64    save WAL only (29.4 / audit C-03): the destination file's identity when the
+//!                    log was written (`lib.rs` `wal_dest_id`); 0 = unbound (the autosave journal,
+//!                    and every WAL written before 29.4 — those bytes were reserved-zero)
 //! ```
 //!
 //! followed by an append-only stream of records:
@@ -90,16 +92,25 @@ pub(crate) struct JournalHeader {
     pub(crate) flags: u32,
     pub(crate) base_len: u64,
     pub(crate) base_id: [u8; 16],
+    /// The destination file a save WAL belongs to (see the module doc); 0 = unbound. Not a flag:
+    /// a build from before 29.4 reads these bytes as reserved and ignores them, which is the
+    /// pre-29.4 behaviour (length-only matching), not a misread.
+    pub(crate) dest_id: u64,
 }
 
 impl JournalHeader {
     pub(crate) fn new(compressed: bool, base_len: u64, base_id: [u8; 16]) -> Self {
-        Self { flags: if compressed { FLAG_COMPRESSED } else { 0 }, base_len, base_id }
+        Self { flags: if compressed { FLAG_COMPRESSED } else { 0 }, base_len, base_id, dest_id: 0 }
     }
 
     /// The same header with `FLAG_TAIL` set: the journal may hold tail records.
     pub(crate) fn with_tail(self) -> Self {
         Self { flags: self.flags | FLAG_TAIL, ..self }
+    }
+
+    /// The same header bound to a destination file identity (save WAL only).
+    pub(crate) fn with_dest_id(self, dest_id: u64) -> Self {
+        Self { dest_id, ..self }
     }
 
     pub(crate) fn compressed(&self) -> bool {
@@ -112,7 +123,7 @@ impl JournalHeader {
         buf[4..8].copy_from_slice(&self.flags.to_le_bytes());
         buf[8..16].copy_from_slice(&self.base_len.to_le_bytes());
         buf[16..32].copy_from_slice(&self.base_id);
-        // buf[32..40] stays zero (reserved).
+        buf[32..40].copy_from_slice(&self.dest_id.to_le_bytes());
         buf
     }
 
@@ -126,7 +137,8 @@ impl JournalHeader {
         let base_len = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
         let mut base_id = [0u8; 16];
         base_id.copy_from_slice(&bytes[16..32]);
-        Some(Self { flags, base_len, base_id })
+        let dest_id = u64::from_le_bytes(bytes[32..40].try_into().unwrap());
+        Some(Self { flags, base_len, base_id, dest_id })
     }
 }
 

@@ -5,7 +5,7 @@
  */
 import type { ReactNode } from "react";
 import { COMMAND_IDS, GESTURES, HELP_SECTIONS, meta, type HelpSection } from "./meta";
-import { chordParts, type Chord } from "./keys";
+import { chordParts, isMacPlatform, type Chord } from "./keys";
 
 interface Row { keys?: readonly Chord[]; gesture?: string; text: string }
 
@@ -14,7 +14,7 @@ export function shortcutRows(): { section: HelpSection; rows: Row[] }[] {
   const by = new Map<HelpSection, Row[]>(HELP_SECTIONS.map(s => [s, []]));
   for (const id of COMMAND_IDS) {
     const m = meta(id);
-    if (!m.keys?.length) continue;
+    if (!m.keys?.length || (m.macOnly && !isMacPlatform())) continue;
     const section: HelpSection = m.help?.section
       ?? ("tab" in m.path && m.path.tab === "sculpt" ? "Sculpt" : "General");
     by.get(section)!.push({ keys: m.keys, text: m.help?.text ?? m.label });
@@ -35,7 +35,7 @@ export default function ShortcutTable({ Key, Section, RowEl }: {
           <Section key={section} title={section} />,
           ...rows.map((r, i) => (
             <RowEl key={`${section}-${i}`} action={r.text}
-              keys={r.gesture ?? (r.keys ?? []).map((c, j) => (
+              keys={r.gesture ?? (r.keys ?? []).filter(c => !(c.hideOnMac && isMacPlatform())).map((c, j) => (
                 <span key={j}>
                   {j > 0 && " / "}
                   {c.hold && "Hold "}

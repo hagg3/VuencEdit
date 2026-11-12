@@ -17,13 +17,17 @@ import type { ClipboardInfo } from "./types";
 import { RibbonProvider, type PickerKind } from "./ribbon/context";
 import { CommandBindingsProvider, CommandNoticeProvider } from "./ribbon/Cmd";
 import { bindCommands } from "./commands/bind";
-import { meta, type CommandId, type CommandPath } from "./commands/meta";
+import { noteKeyCommand } from "./commands/menuRouting";
+import type { CommandBinding } from "./commands/types";
+import { meta, type BarId, type CommandId, type CommandPath } from "./commands/meta";
 import { matchChord } from "./commands/keys";
 import CommandPalette, { recordCommandUse } from "./commands/CommandPalette";
 import { usePickerHost } from "./picker/PickerHost";
 import { RIBBON_CSS } from "./ribbon/primitives";
-import { panelToReveal, runReveal } from "./ribbon/reveal";
-import { collapseWin, getWindowState } from "./windows/useWindowLayout";
+import { barToReveal, runReveal } from "./ribbon/reveal";
+import { barContext, zoneShown } from "./ribbon/optionsBar";
+import OptionsBar from "./ribbon/OptionsBarView";
+import PanelBoundary from "./PanelBoundary";
 import { SCULPT_TOOL_IDS } from "./ribbon/sculptTools";
 // Registers `window.__harvestRibbonWidths()` in dev only — see the module doc comment (14.7).
 import "./ribbon/widthHarvester";
@@ -242,21 +246,29 @@ export default function Ribbon(p: RibbonProps) {
     return places.find(x => x.tab === activeTabRef.current) ?? places.find(x => tabAvailable(x.tab)) ?? null;
   }, [tabAvailable]);
 
+  // Which options-bar contexts are on screen (⌘K reveal) — the same pure rule the bar itself uses.
+  const barIds: BarId[] = [barContext({
+    tool: p.tool, hasSelection: !!p.rawBounds, hasClipboard: !!p.clipboard, pane3dLive: p.pane3dLive, mode3d: p.mode3d,
+  }), ...(zoneShown(p.viewMode) ? ["zlevel" as const] : [])];
+  const activeBarsRef = useRef<BarId[]>(barIds);
+  const bindingsRef = useRef<Record<CommandId, CommandBinding> | null>(null);
+  useEffect(() => { activeBarsRef.current = barIds; });
+
   /** Show `id`'s control: switch to its tab (preferring a placement on the active one), peek a
    *  collapsed ribbon, open the popup group (or compact overflow) holding it, then flash + focus it. `then` runs once the
    *  control is on screen (the picker path anchors on it). */
   const { onNotice } = p;
   const reveal = useCallback((id: CommandId, then?: (el: HTMLElement) => void) => {
-    // A control that lives in a context panel (16.6) that's on screen: flash it there, expanding the
-    // panel first if it was collapsed, rather than hopping to another ribbon tab.
+    // A control that lives in the options bar (34.2) and whose context is showing: flash the bar's
+    // copy (opening More ▾ / Shape ▾ first if it is folded) rather than hopping to another ribbon tab.
     const m = meta(id);
     if (m.paletteOnly) return; // declares a path but renders no control
-    const panel = panelToReveal([m.path, ...(m.also ?? [])], activeTabRef.current, getWindowState().activeContext);
-    if (panel) {
-      collapseWin(panel, false);
+    const bar = barToReveal([m.path, ...(m.also ?? [])], activeTabRef.current, activeBarsRef.current);
+    if (bar) {
       runReveal<HTMLElement>({
-        find: () => findCmd(id, panel),
-        openers: () => [],
+        find: () => findCmd(id, true),
+        openers: () => [...document.querySelectorAll<HTMLElement>("[data-options-bar] [data-bar-popover] > button")]
+          .map(el => ({ expanded: el.getAttribute("aria-expanded") === "true", click: () => el.click() })),
         nextFrame: cb => { requestAnimationFrame(cb); },
         onFound: el => { flash(el); then?.(el); },
       });
@@ -265,6 +277,12 @@ export default function Ribbon(p: RibbonProps) {
     const place = placementFor(id);
     if (!place) {
       const path = meta(id).path;
+      // A bar-only command whose context isn't showing: say why (its binding's gate), else where it lives.
+      if ("bar" in path) {
+        const b = bindingsRef.current?.[id];
+        onNotice(b && b.enabled !== true ? b.enabled : `${meta(id).label} is in the options bar, which isn't showing it right now.`);
+        return;
+      }
       // A contextual-tab command whose tab isn't showing (e.g. a 3D control with the 3D view shut).
       if ("tab" in path) onNotice(`${meta(id).label} is on the ${path.tab === "paste" ? "Clipboard" : path.tab === "3d" ? "3D" : "Selection"} tab, which isn't showing right now.`);
       return; // app-menu / top-bar commands have nothing to reveal in the body
@@ -300,6 +318,14 @@ export default function Ribbon(p: RibbonProps) {
     ui: { extrudeIgnoreAir, setExtrudeIgnoreAir, plantingTrees, setPlantingTrees },
   }), [p, armTransientTool, togglePickerFor, pickerKind, openPalette, extrudeIgnoreAir, plantingTrees]);
 
+  useEffect(() => { bindingsRef.current = bindings; }, [bindings]);
+
+  // Hand the live bindings to App for the macOS menu bar (34.1); `null` when the ribbon goes away (a
+  // closed world), so the menu falls back to the splash-safe set.
+  const { onBindings } = p;
+  useEffect(() => { onBindings?.(bindings); }, [bindings, onBindings]);
+  useEffect(() => () => onBindings?.(null), [onBindings]);
+
   // ⌘K / Ctrl+K — the one registry-dispatched chord this phase. Capture-phase so it works with a
   // text field focused; inert while any modal (or the palette itself) is up. Ctrl+K is
   // `preventDefault`ed as cheap insurance against a WebView2 accelerator.
@@ -309,6 +335,7 @@ export default function Ribbon(p: RibbonProps) {
       if (!matchChord(e, chord)) return;
       if (document.querySelector('[aria-modal="true"]')) return;
       e.preventDefault(); e.stopPropagation();
+      noteKeyCommand("app.commandSearch"); // the menu's ⌘K accelerator must not echo this
       openPalette();
     };
     window.addEventListener("keydown", onKey, true);
@@ -344,6 +371,9 @@ export default function Ribbon(p: RibbonProps) {
     <RibbonProvider value={{ p, activeTab, setActiveTab, bodyWidth: bodyWidth - fixPx, pickerKind, togglePicker, openAppMenu, armTransientTool, peeking, requestPeek }}>
       <CommandBindingsProvider value={bindings}>
       <CommandNoticeProvider value={p.onNotice}>
+      {/* The options bar (34.2) is a sibling of the ribbon root, not a child: it must not join the
+          root's `zIndex: 100` box or it would cover floating windows. It needs this provider tree for `<Cmd>`. */}
+      <PanelBoundary label="Options bar" kind="dock" topPx={p.barTop}><OptionsBar /></PanelBoundary>
       <div ref={rootRef} className="eden-ribbon" style={{
         position: "fixed", top: 0, left: 0, right: 0, zIndex: 100,
         background: TOPBAR_BG,
@@ -420,13 +450,13 @@ export default function Ribbon(p: RibbonProps) {
 
 /** The on-screen control for a command (the `<Cmd>` wrapper is `display: contents`, so its first
  *  child is the real element). A popup group's popover is portaled, so search the document. */
-function findCmd(id: CommandId, panel?: string): HTMLElement | null {
-  // A command can be marked twice (its ribbon home *and* a context panel's copy, 16.6): inside the
-  // named panel when asked, otherwise the ribbon/popup copy first.
+function findCmd(id: CommandId, inBar = false): HTMLElement | null {
+  // A command can be marked twice (its ribbon home *and* the options bar's copy, 34.2): inside the
+  // bar (or its portaled More / Shape panel) when asked, otherwise the ribbon/popup copy first,
+  // then the bar's.
   const marks = [...document.querySelectorAll(`[data-cmd="${id}"]`)];
-  const mark = panel
-    ? marks.find(m => m.closest(`[data-win="${panel}"]`))
-    : marks.find(m => !m.closest("[data-win]")) ?? marks[0];
+  const inBarEl = (m: Element) => m.closest("[data-options-bar],[data-bar-panel]") != null;
+  const mark = inBar ? marks.find(inBarEl) : marks.find(m => !m.closest("[data-win]") && !inBarEl(m)) ?? marks[0];
   return (mark?.firstElementChild as HTMLElement | null) ?? null;
 }
 
@@ -459,7 +489,7 @@ function UnmarkedButtonCheck({ tab }: { tab: RibbonTab }) {
 /**
  * Total ribbon height, given whether it is collapsed and whether the opt-in compact command-bar
  * body (Stage 14.10, `AppSettings.ribbonCompact`) is showing. App derives every downstream inset
- * (sidebar, floating-window layer, Quick Actions bar) from this — it stays the single source
+ * (sidebar, floating-window layer, options bar) from this — it stays the single source
  * regardless of which body is active.
  */
 export function ribbonHeight(collapsed: boolean, compact: boolean = false): number {

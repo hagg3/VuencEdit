@@ -1,19 +1,10 @@
 /**
- * The Office-2007-style two-pane application menu, replacing the old VuencEdit ▾ and File ▾
- * dropdowns (and their inline `showRecentSub` / `showExportSub` accordions, which are now just
- * the right pane).
+ * The application menu: a ~260 px command column plus a pane used only where it holds data or
+ * controls (Open recent, Save toggles, Export, Properties, About). Other rows are plain commands
+ * whose one-sentence description lives in their tooltip (`TIPS`).
  *
- * Design rule for the right pane: **it is never empty.** Rows with nothing to preview — New,
- * Download, Upload, Help — explain what the command does and what the feature behind it can do,
- * so the pane teaches instead of sitting blank. Rows whose command is destructive or slow
- * (Save, Save As, Export) repeat the action as an explicit button in the pane, because clicking
- * the row itself is not obvious once the row also drives a preview.
- *
- * ⚠️ **The panel is a fixed width** (`MENU_W`), not `minWidth`-to-`maxWidth` elastic. Panes used
- * to be free to be as wide as their content, so the menu changed size as you moved down the
- * command column. The explanatory panes are therefore **plain text lists** (`TextList`), not the
- * two-column icon-card grid they used to be — a card grid needs width the fixed panel no longer
- * has, and none of that chrome carried information the text doesn't.
+ * ⚠️ **The panel is a fixed size** (`MENU_W`×`MENU_H`). Hovering a pane-less row keeps the last
+ * pane showing instead of blanking or resizing the panel.
  */
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
@@ -42,9 +33,21 @@ export type AppMenuRow =
   | "close";
 
 /** Fixed panel geometry — see the ⚠️ note in the file header. */
-const MENU_W = 720;
-const MENU_H = 540;
-const LIST_W = 208;
+const MENU_W = 600;
+const MENU_H = 420;
+const LIST_W = 260;
+
+/** Rows that own a pane (data or controls). Every other row is a plain command with its sentence
+ *  in a tooltip; hovering one leaves the last pane showing so the panel never resizes or blanks. */
+const PANE_ROWS: readonly AppMenuRow[] = ["open", "save", "saveas", "export", "properties", "about"];
+const TIPS: Partial<Record<AppMenuRow, string>> = {
+  new: "Create a new world (Flat, Natural, Classic or TG2). Your open world isn't touched until you confirm.",
+  download: "Browse and download worlds from the Eden servers (2.0+). Browsing uploads nothing.",
+  upload: "Publish the last saved version of this world on the Eden server. Uploads can't be deleted.",
+  settings: "Open Settings.",
+  help: "Shortcuts and tool guides (Help, Guided tour and Diagnostics are in the Help window).",
+  close: "Close this world and free its memory. You'll be asked first if there are unsaved changes.",
+};
 
 export default function AppMenu({
   initialRow, onClose, anchorTop,
@@ -55,6 +58,8 @@ export default function AppMenu({
 }) {
   const { p } = useRibbon();
   const [row, setRow] = useState<AppMenuRow>(initialRow ?? "open");
+  const [paneRow, setPaneRow] = useState<AppMenuRow>(PANE_ROWS.includes(initialRow ?? "open") ? (initialRow ?? "open") : "open");
+  if (PANE_ROWS.includes(row) && row !== paneRow) setPaneRow(row);
   const [infoKey, setInfoKey] = useState(0);
   const panelRef = useRef<HTMLDivElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
@@ -143,7 +148,7 @@ export default function AppMenu({
         ) : (
           <button
             key={r.id} data-row={r.id} role="menuitem" type="button"
-            aria-current={row === r.id} tabIndex={row === r.id ? 0 : -1}
+            title={TIPS[r.id]} aria-current={row === r.id} tabIndex={row === r.id ? 0 : -1}
             aria-disabled={r.disabled || undefined}
             onMouseEnter={() => setRow(r.id)}
             onFocus={() => setRow(r.id)}
@@ -170,8 +175,8 @@ export default function AppMenu({
       </div>
 
       {/* ── Right: contextual pane ────────────────────────────────────────── */}
-      <div data-pane style={{ flex: 1, padding: "16px 20px", overflowY: "auto", minWidth: 0 }}>
-        <Pane row={row} onClose={onClose} infoKey={infoKey} bumpInfo={() => setInfoKey(k => k + 1)} />
+      <div data-pane style={{ flex: 1, padding: "14px 16px", overflowY: "auto", minWidth: 0 }}>
+        <Pane row={paneRow} onClose={onClose} infoKey={infoKey} bumpInfo={() => setInfoKey(k => k + 1)} />
       </div>
     </div>
   );
@@ -183,35 +188,9 @@ function PaneHead({ title, sub }: { title: string; sub?: ReactNode }) {
   return (
     <div style={{ marginBottom: 14 }}>
       <h2 style={{ margin: 0, fontSize: FONT.tab, fontWeight: 600, color: TEXT_ARMED }}>{title}</h2>
-      {sub && <div style={{ marginTop: 4, fontSize: FONT.body, color: TEXT_DIM, lineHeight: 1.5, maxWidth: 620 }}>{sub}</div>}
+      {sub && <div style={{ marginTop: 4, fontSize: FONT.body, color: TEXT_DIM, lineHeight: 1.5, maxWidth: "100%" }}>{sub}</div>}
     </div>
   );
-}
-
-/**
- * The explanatory panes' one presentation: a plain `term — definition` list.
- *
- * This replaced a two-column grid of icon cards. Under the fixed `MENU_W` those cards were both
- * too narrow to read and wider than the pane, and the icons were decorative — none of them named
- * anything the term didn't already say.
- */
-function TextList({ items }: { items: [string, ReactNode][] }) {
-  return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 9, marginBottom: 14 }}>
-      {items.map(([term, def]) => (
-        <div key={term} style={{ fontSize: FONT.body, lineHeight: 1.55, color: TEXT_DIM }}>
-          <span style={{ color: TEXT, fontWeight: 600 }}>{term}</span>
-          <span style={{ color: TEXT_LABEL }}> — </span>
-          {def}
-        </div>
-      ))}
-    </div>
-  );
-}
-
-/** Closing note under a pane's text list — the caveat, not the content. */
-function PaneNote({ children }: { children: ReactNode }) {
-  return <div style={{ fontSize: FONT.label, color: TEXT_LABEL, marginBottom: 14, lineHeight: 1.5 }}>{children}</div>;
 }
 
 function Primary({ label, icon, onClick, disabled, busy, tone = "teal", title, neutral }: {
@@ -259,7 +238,7 @@ function BackupNote({ path, compressed }: { path: string; compressed: boolean })
       : <>This save first copies the current file to <code style={{ color: TEXT }}>.bak</code>: {fmtBytes(st.source_bytes)} more on disk, kept until you delete it.</>;
   }
   if (!text) return null;
-  return <div style={{ fontSize: FONT.label, color: TEXT_LABEL, padding: "2px 0 0 18px", lineHeight: 1.5, maxWidth: 620 }}>{text}</div>;
+  return <div style={{ fontSize: FONT.label, color: TEXT_LABEL, padding: "2px 0 0 18px", lineHeight: 1.5, maxWidth: "100%" }}>{text}</div>;
 }
 
 // ── The panes ─────────────────────────────────────────────────────────────────
@@ -268,23 +247,6 @@ function Pane({ row, onClose, infoKey, bumpInfo }: { row: AppMenuRow; onClose: (
   const { p } = useRibbon();
 
   switch (row) {
-    // ── New ──────────────────────────────────────────────────────────────
-    case "new":
-      return (<>
-        <PaneHead title="New World"
-          sub="Create a new world." />
-        <TextList items={[
-          ["Flat", "A flat slab. Best if you'll build everything yourself."],
-          ["Natural", "Rolling terrain with biomes, coasts and mountains."],
-          ["Classic", "The original Eden terrain generator (v1.7)."],
-          ["TG2", "The Eden 2.0 generator, with nine terrain types."],
-        ]} />
-        <PaneNote>
-          New worlds are 256z unless you pick 64z. Your open world isn't touched until you confirm.
-        </PaneNote>
-        <Primary icon="new" label="New World…" onClick={() => { onClose(); p.setShowNewWorld(true); }} />
-      </>);
-
     // ── Open ─────────────────────────────────────────────────────────────
     case "open":
       return (<>
@@ -315,22 +277,6 @@ function Pane({ row, onClose, infoKey, bumpInfo }: { row: AppMenuRow; onClose: (
         <Primary icon="open" label="Browse for a file…" onClick={() => { onClose(); p.openFile(); }} />
       </>);
 
-    // ── Download ─────────────────────────────────────────────────────────
-    case "download":
-      return (<>
-        <PaneHead title="Download a World"
-          sub="Download worlds from the Eden servers (current 2.2+ and legacy 2.0–2.1)." />
-        <TextList items={[
-          ["Quality sort", "Ranks hand-built worlds above test uploads (experimental)."],
-          ["Date filters", "Find worlds from a given time."],
-          ["Hide junk", "Hides empty and placeholder uploads (experimental)."],
-        ]} />
-        <PaneNote>
-          Connections use plain HTTP. Browsing doesn't upload anything.
-        </PaneNote>
-        <Primary icon="download" label="Browse Online Worlds…" onClick={() => { onClose(); p.setShowWorldBrowser(true); }} />
-      </>);
-
     // ── Save ─────────────────────────────────────────────────────────────
     case "save":
       return (<>
@@ -347,7 +293,7 @@ function Pane({ row, onClose, infoKey, bumpInfo }: { row: AppMenuRow; onClose: (
             hint="The first save over a file keeps a full-size .bak until you delete it. This makes it a smaller .bak.zip, but slower." />
           {p.sourcePath && <BackupNote path={p.sourcePath} compressed={p.backupCompressed} />}
         </div>
-        <div style={{ fontSize: FONT.label, color: TEXT_LABEL, marginBottom: 16, lineHeight: 1.5, maxWidth: 620 }}>
+        <div style={{ fontSize: FONT.label, color: TEXT_LABEL, marginBottom: 16, lineHeight: 1.5, maxWidth: "100%" }}>
           Only edited chunks are rewritten, and saves are crash-safe.
         </div>
         <Primary icon="save" label={p.saving ? "Saving…" : "Save Now"} busy={p.saving}
@@ -369,7 +315,7 @@ function Pane({ row, onClose, infoKey, bumpInfo }: { row: AppMenuRow; onClose: (
             label="Compress the one-time backup"
             hint="Only applies if you save over a file that already exists. A plain .bak is the full size of that file." />
         </div>
-        <div style={{ fontSize: FONT.label, color: TEXT_LABEL, marginBottom: 16, lineHeight: 1.5, maxWidth: 620 }}>
+        <div style={{ fontSize: FONT.label, color: TEXT_LABEL, marginBottom: 16, lineHeight: 1.5, maxWidth: "100%" }}>
           You'll be asked before a file is overwritten. Later saves go to the new file.
         </div>
         <Primary icon="saveAs" label="Choose Location & Save…" disabled={p.saving}
@@ -388,21 +334,6 @@ function Pane({ row, onClose, infoKey, bumpInfo }: { row: AppMenuRow; onClose: (
         </div>
       </>);
 
-    // ── Upload ───────────────────────────────────────────────────────────
-    case "upload":
-      return (<>
-        <PaneHead title="Upload"
-          sub="Publish this world on the Eden server for others to download." />
-        <TextList items={[
-          ["What gets sent", "The saved world file, compressed, plus your preview image. Unsaved edits aren't included. Your local file is not modified and nothing else about your machine is transmitted."],
-          ["Name and description", "The listing name is separate from the world's own name (top bar)."],
-          ["Save first", `Uploading sends the last saved version. Save first (${MOD}S) to include recent edits.`],
-          ["Finding it again", "Uploads can't be deleted, so treat them as permanent."],
-        ]} />
-        <Primary icon="upload" label="Upload This World…" disabled={!p.world}
-          onClick={() => { onClose(); p.setShowUploadModal(true); }} />
-      </>);
-
     // ── Properties ───────────────────────────────────────────────────────
     case "properties":
       return (<>
@@ -415,62 +346,13 @@ function Pane({ row, onClose, infoKey, bumpInfo }: { row: AppMenuRow; onClose: (
         )}
       </>);
 
-    // ── Settings ─────────────────────────────────────────────────────────
-    case "settings":
-      return (<>
-        <PaneHead title="Settings"
-          sub="Quick view toggles. Open Settings for the rest." />
-        <div style={{ display: "flex", flexDirection: "column", gap: 2, marginBottom: 16, maxWidth: 620 }}>
-          <CheckRow label="3D view" checked={p.view3dWindowOpen} onChange={() => p.onToggle3dWindow()}
-            hint="Floating 3D view. Tab swaps it with the map." />
-          <CheckRow label="Docked sidebar" checked={p.sidebarOpen} onChange={() => p.onToggleSidebar()}
-            hint="World navigator, prefab library and undo history." />
-        </div>
-        <Primary icon="settings" label="Open Settings…" onClick={() => { onClose(); p.setShowSettings(true); }} />
-      </>);
-
-    // ── Help ─────────────────────────────────────────────────────────────
-    case "help":
-      return (<>
-        <PaneHead title="Help"
-          sub="Shortcuts and tool guides. The basics:" />
-        <TextList items={[
-          ["Getting around", <>Middle-drag pans from any tool; <Kbd>Space</Kbd> holds pan temporarily. <Kbd>Home</Kbd> fits the whole map, <Kbd>{MOD}±</Kbd> zooms, <Kbd>{MOD}{SHIFT}0</Kbd> zooms to the selection.</>],
-          ["Selecting", <><Kbd>S</Kbd> rectangle, <Kbd>W</Kbd> magic wand, <Kbd>K</Kbd> lasso, <Kbd>J</Kbd> polygon.</>],
-          ["Drawing", <><Kbd>P</Kbd> pen, <Kbd>B</Kbd> brush, <Kbd>L</Kbd> line, <Kbd>R</Kbd> rectangle, <Kbd>E</Kbd> ellipse, <Kbd>G</Kbd> polygon, <Kbd>I</Kbd> eyedropper. Digits <Kbd>1</Kbd>–<Kbd>5</Kbd> arm pinned blocks, <Kbd>6</Kbd>–<Kbd>0</Kbd> recent ones.</>],
-          ["Sculpting", <><Kbd>[</Kbd> / <Kbd>]</Kbd> change radius, with <Kbd>{SHIFT}</Kbd> for strength. Escape mid-stroke reverts the whole stroke as one undo step.</>],
-          ["Undo", <><Kbd>{MOD}Z</Kbd> / <Kbd>{MOD}{SHIFT}Z</Kbd>. The sidebar's History tab lists every step.</>],
-          ["Escape", "Steps back one level per press (paste, shape, selection…)."],
-        ]} />
-        <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
-          <Primary icon="help" label="Open Help" onClick={() => { onClose(); p.setShowHelp(true); }} />
-          <Primary neutral icon="sparkle" label="Guided tour" onClick={() => { onClose(); p.startTour(); }} />
-          <Primary neutral icon="about" label="Open Diagnostics…" onClick={() => { onClose(); p.setShowDiagnostics(true); }} />
-        </div>
-      </>);
-
     // ── About ────────────────────────────────────────────────────────────
     case "about":
       return (<>
         <AboutPanel version={p.appVersion} compact onOpenDiagnostics={() => { onClose(); p.setShowDiagnostics(true); }} />
       </>);
 
-    // ── Close World ──────────────────────────────────────────────────────
-    case "close":
-      return (<>
-        <PaneHead title="Close World"
-          sub="Close this world and free its memory." />
-        <div style={{ fontSize: FONT.body, color: TEXT_DIM, lineHeight: 1.6, maxWidth: 620, marginBottom: 16 }}>
-          You'll be asked first if there are unsaved changes. Autosave is kept, so an accidental close can be recovered.
-        </div>
-        <Primary icon="close" tone="danger" label="Close World" disabled={!p.world}
-          onClick={() => { onClose(); p.closeWorld(); }} />
-      </>);
   }
-}
-
-function Kbd({ children }: { children: ReactNode }) {
-  return <Keycap text={children} small />;
 }
 
 function ExportRow({
@@ -480,7 +362,7 @@ function ExportRow({
   busy?: boolean; disabled?: boolean; badge?: ReactNode;
 }) {
   // Export rows stay cards: unlike the explanatory panes these are *actions*, and each carries its
-  // own button. The layout is column-major so a 476px-wide pane never squeezes the description.
+  // own button. The layout is column-major so a ~340px-wide pane never squeezes the description.
   return (
     <div style={{
       display: "flex", flexDirection: "column", gap: 7, padding: "10px 12px", borderRadius: RADIUS.lg,
@@ -509,10 +391,10 @@ function RenameField({ onRenamed }: { onRenamed: () => void }) {
   const dirty = value.trim() !== (p.world?.name ?? "");
 
   return (
-    <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 16 }}>
-      <span style={{ fontSize: FONT.body, color: TEXT_DIM, width: 52 }}>Name</span>
+    <div style={{ display: "flex", alignItems: "center", flexWrap: "wrap", gap: 8, marginBottom: 16 }}>
+      <span style={{ fontSize: FONT.body, color: TEXT_DIM }}>Name</span>
       <TextField
-        value={value} ariaLabel="World name" width={300}
+        value={value} ariaLabel="World name" width={150}
         title="Letters, numbers, spaces and apostrophes (max 32)"
         onChange={raw => {
           const clean = raw.split("").filter(c => allowed.test(c)).join("").slice(0, 32);

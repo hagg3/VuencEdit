@@ -14,8 +14,7 @@
 import type { IconName } from "../ribbon/icons";
 import type { RibbonTab } from "../ribbon/props";
 import type { Tool } from "../MapCanvas";
-import type { Chord } from "./keys";
-import type { WinId } from "../windows/windowGeometry";
+import { isMacPlatform, type Chord } from "./keys";
 
 export type CommandFamily = "primary" | "warm" | "selection" | "clipboard" | "violet" | "danger";
 
@@ -26,12 +25,16 @@ export type CommandFamily = "primary" | "warm" | "selection" | "clipboard" | "vi
  */
 export type CommandKind = "action" | "tool" | "toggle" | "setting" | "picker" | "menu";
 
+/** The options bar's contexts (`ribbon/optionsBar.ts` owns the rules) plus its pinned Cap Z zone. */
+export type BarId = "paste" | "flood" | "sculpt" | "draw" | "selection" | "idle" | "zlevel";
+
 export type CommandPath =
   | { tab: RibbonTab; group: string }
-  /** A context panel (Stage 16.6) — the control lives in a mode-driven floating panel, not a ribbon
-   *  group. Only ever an `also` placement (the command's `path` stays on a tab); ⌘K reveal flashes
-   *  the panel while it is showing. */
-  | { panel: WinId }
+  /** The contextual options bar (34.2) — the control lives in the bar's left context (or its pinned
+   *  Cap Z zone, `zlevel`), not a ribbon group. An `also` placement for a command the ribbon has
+   *  too, or the `path` of a bar-only command; ⌘K reveal flashes the bar's copy while that context
+   *  is showing. */
+  | { bar: BarId }
   | { menu: "app" | "topbar" | "keyboard" };
 
 /** Help's shortcut-table sections, in display order. */
@@ -57,6 +60,8 @@ export interface CommandMeta {
   kind: CommandKind;
   keys?: readonly Chord[];
   handledBy?: "registry" | "legacy-keydown";
+  /** The chord exists only on macOS (its menu bar carries it): Help doesn't list it elsewhere. */
+  macOnly?: true;
   /** For `kind: "tool"`: the MapCanvas `Tool` it arms (checked against `TOOL_LABELS`). */
   tool?: Tool;
   /** Search synonyms. */
@@ -81,14 +86,14 @@ const insert = (group: string) => ({ tab: "insert", group }) as const;
 const view = (group: string) => ({ tab: "view", group }) as const;
 const d3 = (group: string) => ({ tab: "3d", group }) as const;
 const sel = (group: string) => ({ tab: "selection", group }) as const;
-const panel = (id: WinId) => ({ panel: id }) as const;
+const bar = (id: BarId) => ({ bar: id }) as const;
 const clip = (group: string) => ({ tab: "paste", group }) as const;
 const APP = { menu: "app" } as const;
 const TOPBAR = { menu: "topbar" } as const;
 
 /** Sculpt tool metas — one per tool, sharing a shape. Titles match `ribbon/sculptTools.ts`. */
 const sculptTool = (tool: Tool, label: string, icon: IconName, title: string): CommandMeta => ({
-  label, icon, family: "warm", title, path: sculpt("tools"), also: [panel("buildslot")], kind: "tool", tool, keywords: ["sculpt"],
+  label, icon, family: "warm", title, path: sculpt("tools"), also: [bar("sculpt")], kind: "tool", tool, keywords: ["sculpt"],
 });
 
 export const COMMAND_META = {
@@ -113,9 +118,12 @@ export const COMMAND_META = {
   "app.tour": { label: "Guided Tour", icon: "help", path: APP, kind: "action", keywords: ["onboarding", "tutorial", "tour"] },
   "app.diagnostics": { label: "Diagnostics…", icon: "properties", path: APP, kind: "action", keywords: ["performance", "debug", "report"] },
   "app.about": { label: "About VuencEdit", icon: "about", path: APP, kind: "action" },
+  // ⌘Q (34.1): runs through the window's close guard (unsaved-changes prompt, autosave-on-quit). The macOS
+  // menu bar carries it; there's no Windows/Linux chord, so Help and the menu hide it off-Mac.
+  "app.quit": { label: "Quit VuencEdit", icon: "close", path: APP, kind: "action", keys: [mod("q")], handledBy: "registry", macOnly: true, keywords: ["exit", "close app"] },
   "app.close": { label: "Close World", icon: "close", path: APP, kind: "action", keys: [mod("w")], handledBy: L, help: { section: "File" } },
   "app.undo": { label: "Undo", icon: "undo", path: TOPBAR, kind: "action", keys: [mod("z")], handledBy: L, help: { section: "Editing" } },
-  "app.redo": { label: "Redo", icon: "redo", path: TOPBAR, kind: "action", keys: [mod("z", { shift: true }), mod("y")], handledBy: L, help: { section: "Editing" } },
+  "app.redo": { label: "Redo", icon: "redo", path: TOPBAR, kind: "action", keys: [mod("z", { shift: true }), { ...mod("y"), hideOnMac: true }], handledBy: L, help: { section: "Editing" } },
   "app.commandSearch": { label: "Search Commands", icon: "search", path: TOPBAR, kind: "action", keys: [mod("k")], handledBy: "registry", keywords: ["palette", "find"], help: { section: "General", text: "Search commands (↵ runs, Tab shows it in the ribbon)" } },
   "app.collapseRibbon": { label: "Collapse / Expand Ribbon", icon: "collapse", path: TOPBAR, kind: "toggle", keywords: ["minimize", "hide ribbon"] },
   "app.compactRibbon": { label: "Compact Ribbon (Command Bar)", icon: "collapse", path: TOPBAR, kind: "toggle", keywords: ["icon ribbon", "command bar", "labels", "compact"] },
@@ -124,6 +132,7 @@ export const COMMAND_META = {
   "home.clipboard.paste": { label: "Paste", icon: "paste", family: "clipboard", title: "Click the map to place the clipboard", path: home("clipboard"), also: [clip("place"), sel("modify")], kind: "tool", tool: "paste", keys: [mod("v")], handledBy: L, help: { section: "Editing", text: "Arm paste" } },
   "home.clipboard.copy": { label: "Copy", icon: "copy", family: "clipboard", title: "Copy the selection", path: home("clipboard"), also: [sel("modify")], kind: "action", keys: [mod("c")], handledBy: L, help: { section: "Editing", text: "Copy selection" } },
   "home.clipboard.cut": { label: "Cut", icon: "cut", family: "clipboard", title: "Copy the selection, then clear it (one undo step)", path: home("clipboard"), also: [sel("modify")], kind: "action", keys: [mod("x")], handledBy: L, help: { section: "Editing", text: "Cut selection" } },
+  "home.clipboard.discard": { short: "Discard clipboard", label: "Discard Clipboard", icon: "close", family: "danger", title: "Drop the clipboard, its locked position and Z offset, and leave paste mode", path: bar("paste"), kind: "action", keywords: ["clear clipboard", "drop"] },
   "home.clipboard.rotate": { label: "Rotate", icon: "rotate", family: "clipboard", title: "Rotate the clipboard 90° clockwise", path: home("clipboard"), also: [clip("transform")], kind: "action" },
   "home.clipboard.flipX": { label: "Flip X", icon: "flipX", family: "clipboard", title: "Mirror the clipboard across X", path: home("clipboard"), also: [clip("transform")], kind: "action", keywords: ["mirror"] },
   "home.clipboard.flipY": { label: "Flip Y", icon: "flipY", family: "clipboard", title: "Mirror the clipboard across Y", path: home("clipboard"), also: [clip("transform")], kind: "action", keywords: ["mirror"] },
@@ -178,7 +187,7 @@ export const COMMAND_META = {
   "sculpt.tools.carve": sculptTool("carve", "Carve", "carve", "Cut a rounded hollow into exposed terrain (Radius sets size)"),
   "sculpt.tools.smooth": sculptTool("smooth", "Smooth", "smooth", "Average neighbouring heights"),
   "sculpt.tools.flatten": sculptTool("flatten", "Flatten", "flatten", "Level terrain to the height you click"),
-  "sculpt.tools.slope": sculptTool("slope", "Slope", "slope", "Flatten to a tilted plane (Slope X/Y in the Brush shape panel)"),
+  "sculpt.tools.slope": sculptTool("slope", "Slope", "slope", "Flatten to a tilted plane (Slope X/Y in the options bar)"),
   "sculpt.tools.noise": sculptTool("noise", "Noise", "noise", "Add hills or mountains"),
   "sculpt.tools.thermal": sculptTool("thermal", "Thermal", "thermal", "Slide steep slopes into scree"),
   "sculpt.tools.hydro": sculptTool("hydro", "Hydro", "hydro", "Water erosion that carves channels"),
@@ -187,13 +196,14 @@ export const COMMAND_META = {
   "sculpt.tools.smear": sculptTool("smear", "Smear", "smear", "Drag to pull terrain along with the brush"),
   "sculpt.tools.grab": sculptTool("grab", "Grab", "grab", "Press and drag up or down to pull terrain"),
   "sculpt.tools.stamp": sculptTool("stamp", "Retexture", "stamp", "Repaint the surface by slope"),
-  "sculpt.brush.strength": { label: "Sculpt Strength", icon: "sculpt", family: "warm", path: sculpt("brush"), also: [panel("buildslot")], kind: "setting" },
-  "sculpt.brush.radius": { label: "Sculpt Radius", icon: "sculpt", family: "warm", path: sculpt("brush"), also: [panel("buildslot")], kind: "setting", keywords: ["size"] },
-  "sculpt.brush.softness": { label: "Sculpt Softness", icon: "sculpt", family: "warm", path: sculpt("brush"), also: [panel("buildslot")], kind: "setting", keywords: ["falloff"] },
+  "sculpt.brush.strength": { label: "Sculpt Strength", icon: "sculpt", family: "warm", path: sculpt("brush"), also: [bar("sculpt")], kind: "setting" },
+  "sculpt.brush.radius": { label: "Sculpt Radius", icon: "sculpt", family: "warm", path: sculpt("brush"), also: [bar("sculpt")], kind: "setting", keywords: ["size"] },
+  "sculpt.brush.softness": { label: "Sculpt Softness", icon: "sculpt", family: "warm", path: sculpt("brush"), also: [bar("sculpt")], kind: "setting", keywords: ["falloff"] },
   "sculpt.brush.radiusDown": { label: "Sculpt Radius −1", icon: "shrink", family: "warm", path: sculpt("brush"), kind: "action", keys: [k("[", "sculpt")], handledBy: L, help: { section: "Sculpt", text: "Brush radius down (while a sculpt tool is armed)" }, paletteOnly: true },
   "sculpt.brush.radiusUp": { label: "Sculpt Radius +1", icon: "grow", family: "warm", path: sculpt("brush"), kind: "action", keys: [k("]", "sculpt")], handledBy: L, help: { section: "Sculpt", text: "Brush radius up" }, paletteOnly: true },
   "sculpt.brush.strengthDown": { label: "Sculpt Strength −1", icon: "lower", family: "warm", path: sculpt("brush"), kind: "action", keys: [k("[", "sculpt", { shift: true })], handledBy: L, help: { section: "Sculpt", text: "Strength down" }, paletteOnly: true },
   "sculpt.brush.strengthUp": { label: "Sculpt Strength +1", icon: "raise", family: "warm", path: sculpt("brush"), kind: "action", keys: [k("]", "sculpt", { shift: true })], handledBy: L, help: { section: "Sculpt", text: "Strength up" }, paletteOnly: true },
+  "sculpt.shape.more": { label: "Brush Shape…", icon: "rock", family: "warm", title: "All eight Rock / Carve shape sliders", path: bar("sculpt"), kind: "menu", keywords: ["noisiness", "flatten", "sink", "drape", "strata"] },
   "sculpt.falloff.profile": { label: "Falloff Profile", icon: "smooth", family: "warm", path: sculpt("falloff"), kind: "setting" },
   "sculpt.falloff.live": { short: "Live brush", label: "Live Brush", icon: "sparkle", family: "warm", title: "Shape terrain as you drag. Off: apply the stroke on release.", path: sculpt("falloff"), kind: "toggle", keywords: ["airbrush", "accumulate"] },
   "sculpt.falloff.clip": { short: "In selection", label: "Sculpt in Selection", icon: "select", family: "warm", title: "Only sculpt inside the selection", path: sculpt("falloff"), kind: "toggle", keywords: ["clip", "constrain"] },
@@ -224,6 +234,10 @@ export const COMMAND_META = {
   // ── View ───────────────────────────────────────────────────────────────────────────────────
   "view.mapview.topdown": { short: "Top-down", label: "Top-down View", icon: "topdown", title: "Show the top block of every column", path: view("mapview"), kind: "toggle" },
   "view.mapview.zslice": { short: "Z-Slice", label: "Z-Slice View", icon: "zslice", title: "Show one horizontal layer at a time", path: view("mapview"), kind: "toggle", keywords: ["layer"] },
+  "view.mapview.level": { label: "Cap Z / Slice Level", icon: "zslice", family: "primary", path: bar("zlevel"), kind: "setting", keywords: ["cap", "height", "layer"] },
+  "view.mapview.levelUp": { label: "Cap Z +1", icon: "up", family: "primary", path: bar("zlevel"), kind: "action", keywords: ["slice level"] },
+  "view.mapview.levelDown": { label: "Cap Z −1", icon: "down", family: "primary", path: bar("zlevel"), kind: "action", keywords: ["slice level"] },
+  "view.mapview.followSurface": { short: "Follow surface", label: "Follow Surface", icon: "zoomSel", family: "primary", title: "Keep the slice level pinned to the surface under the cursor", path: bar("zlevel"), kind: "toggle" },
   "view.mapview.cutaway": { short: "Cutaway", label: "Cutaway View", icon: "cutaway", family: "primary", title: "Hide everything above the cap Z. Tools work on the exposed surface.", path: view("mapview"), kind: "toggle", keywords: ["cave", "interior", "cap"] },
   "view.render.relief": { short: "Relief", label: "Render: Relief", icon: "relief", family: "primary", title: "Shade slopes so hills and cliffs stand out", path: view("render"), kind: "toggle", keywords: ["axo", "isometric", "relief", "hillshade", "shading", "terrain"] },
   "view.zoom.fit": { short: "Fit", label: "Fit Map", icon: "fit", title: "Fit the whole world in the viewport", path: view("zoom"), kind: "action", keys: [mod("0"), k("Home")], handledBy: L, help: { section: "Navigation", text: "Fit map to window" } },
@@ -240,8 +254,8 @@ export const COMMAND_META = {
   "view.windows.signs": { short: "Signs", label: "Sign Markers", icon: "signs", title: "Show a marker on the map at each sign's position", path: view("windows"), kind: "toggle" },
   "view.template.load": { short: "Load…", label: "Load Template…", icon: "template", title: "Load the game's Eden.eden for the overlay and Insert ▸ Expand", path: view("template"), kind: "action", keywords: ["eden.eden"] },
   "view.template.overlay": { short: "Overlay", label: "Template Overlay", icon: "fullmap", family: "primary", title: "Show the template's terrain under your world (top-down view only)", path: view("template"), kind: "toggle" },
-  "view.textures.load": { short: "Load…", label: "Load Texture Pack…", icon: "textures", title: "Load block textures from a ZIP of PNGs or an atlas image (experimental)", path: view("textures"), kind: "action", keywords: ["atlas"] },
-  "view.textures.unload": { short: "Unload", label: "Unload Texture Pack", icon: "close", title: "Go back to flat block colours", path: view("textures"), kind: "action" },
+  "view.textures.load": { short: "Load…", label: "Load Texture Pack…", icon: "textures", title: "Replace the built-in block textures with a ZIP of PNGs or an atlas image", path: view("textures"), kind: "action", keywords: ["atlas"] },
+  "view.textures.unload": { short: "Default", label: "Default Texture Pack", icon: "close", title: "Go back to the built-in texture pack", path: view("textures"), kind: "action" },
 
   // ── 3D (contextual) ────────────────────────────────────────────────────────────────────────
   "3d.mode.camera": { short: "Camera", label: "3D: Camera Mode", icon: "camera", family: "violet", title: "Move the camera only", path: d3("mode"), kind: "toggle", keywords: ["orbit"] },
@@ -249,6 +263,7 @@ export const COMMAND_META = {
   "3d.mode.build": { short: "Build", label: "3D: Build Mode", icon: "build", family: "primary", title: "Left-click breaks a block, right-click places one", path: d3("mode"), kind: "toggle", keywords: ["place", "break", "minecraft"] },
   "3d.mode.sculpt": { short: "Sculpt", label: "3D: Sculpt Mode", icon: "sculpt", family: "warm", title: "Hold left to sculpt under the crosshair", path: d3("mode"), kind: "toggle" },
   "3d.mode.floodfill": { short: "Flood Fill", label: "3D: Flood Fill Mode", icon: "floodfill", family: "primary", title: "Click a block face to fill the connected air", path: d3("mode"), kind: "toggle" },
+  "3d.mode.floodLimit": { label: "Flood Fill Limit", icon: "floodfill", family: "primary", title: "Maximum air cells filled per click", path: bar("flood"), kind: "setting", keywords: ["cells", "max"] },
   "3d.mode.autoOrient": { short: "Auto-orient", label: "3D: Auto-orient Blocks", icon: "autoOrient", family: "primary", title: "Turn ramps, wedges and doors to face you when placed", path: d3("mode"), kind: "toggle", paletteOnly: true },
   // Renamed from `3d.slot.block` in 16.6 (the contextual `slot` group became the Build slot panel).
   "3d.block.pick": { short: "Block", label: "3D Build Block…", icon: "block", title: "Block for Build and Flood Fill", path: d3("block"), kind: "picker" },
@@ -257,8 +272,10 @@ export const COMMAND_META = {
   "3d.camera.flySpeed": { label: "Fly Speed", icon: "flySpeed", family: "violet", path: d3("camera"), kind: "setting" },
   "3d.camera.distance": { label: "Render Distance", icon: "renderDistance", family: "violet", path: d3("camera"), kind: "setting", keywords: ["view distance", "chunks"] },
   "3d.lighting.night": { short: "Night", label: "Night Lighting", icon: "night", family: "warm", title: "Light the 3D view with lamps. Slow: rebuilds every loaded chunk.", path: d3("lighting"), kind: "toggle", keywords: ["lamps"] },
-  "3d.lighting.shadows": { short: "Shadows", label: "Baked Shadows", icon: "shadows", family: "warm", title: "Baked sun shadows. Slow: rebuilds chunks, and the Sun slider reloads them.", path: d3("lighting"), kind: "toggle" },
-  "3d.lighting.gpuShadows": { short: "GPU", label: "GPU Shadows", icon: "gpuShadows", family: "violet", title: "Real-time GPU shadows. Slow at high render distance. Replaces baked shadows.", path: d3("lighting"), kind: "toggle" },
+  "3d.lighting.shadows": { short: "Shadows", label: "Shadows", icon: "shadows", family: "warm", title: "Darkens the ground under trees, roofs and overhangs, like Eden.", path: d3("lighting"), kind: "toggle", keywords: ["baked", "shade"] },
+  "3d.lighting.shadowClassic": { short: "Classic", label: "Shadows: Classic", family: "warm", title: "One shade per block face, like Eden 1.x.", path: d3("lighting"), kind: "toggle", keywords: ["baked", "shade"] },
+  "3d.lighting.shadowSmooth": { short: "Smooth", label: "Shadows: Smooth", family: "warm", title: "Shades blend across block faces.", path: d3("lighting"), kind: "toggle", keywords: ["baked", "shade", "soft"] },
+  "3d.lighting.gpuShadows": { short: "GPU", label: "GPU Shadows", icon: "gpuShadows", family: "violet", title: "Real-time GPU shadows from a moving sun (▾ sets the sun angle). Slow at high render distance. Overrides Shadows.", path: d3("lighting"), kind: "toggle", keywords: ["sun"] },
   "3d.lighting.legacy": { short: "Legacy", label: "Lamp Falloff: Legacy", family: "warm", title: "Short, steep lamp light (~4 blocks). Resets Lamp R.", path: d3("lighting"), kind: "toggle" },
   "3d.lighting.modern": { short: "New Dawn", label: "Lamp Falloff: New Dawn", family: "warm", title: "Long, gradual lamp light (~14 blocks). Resets Lamp R.", path: d3("lighting"), kind: "toggle" },
 
@@ -318,7 +335,7 @@ export const GESTURES: readonly Gesture[] = [
   { section: "Navigation", gesture: "Scroll", text: "Zoom in / out (toward cursor)" },
   { section: "Navigation", gesture: "Middle drag", text: "Pan" },
   { section: "Tools", keys: [{ key: " ", hold: true, scope: "global" }], text: "Hold to pan" },
-  { section: "Sculpt", keys: [{ key: "Control", hold: true, scope: "stroke" }], text: "Invert: swap Raise and Lower for this stroke" },
+  { section: "Sculpt", keys: [{ key: isMacPlatform() ? "Meta" : "Control", hold: true, scope: "stroke" }], text: "Invert: swap Raise and Lower for this stroke" },
   { section: "Sculpt", keys: [{ key: "Shift", hold: true, scope: "stroke" }], text: "Smooth while held (any sculpt tool except Grab)" },
   { section: "Blocks", keys: ["1", "2", "3", "4", "5"].map(key => ({ key, scope: "global" as const })), text: "Pinned hotbar slots (also in 3D Build mode)" },
   { section: "Blocks", keys: ["6", "7", "8", "9", "0"].map(key => ({ key, scope: "global" as const })), text: "Recent hotbar slots (also in 3D Build mode)" },

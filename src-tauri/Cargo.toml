@@ -1,6 +1,6 @@
 [package]
 name = "eden-world-editor"
-version = "1.0.21"
+version = "1.0.22"
 description = "Eden world file editor"
 edition = "2021"
 
@@ -46,3 +46,9 @@ crc32fast = "1"
 # the two kernel32 entry points it uses directly (see `working_set`).
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# Hiding the native traffic lights for the Windows title-bar preview (`set_traffic_lights_hidden`).
+# Already in the tree via tao/wry, so this adds no new crate — only the AppKit classes it touches.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSWindow", "NSButton", "NSControl", "NSView", "NSResponder", "NSApplication"] }

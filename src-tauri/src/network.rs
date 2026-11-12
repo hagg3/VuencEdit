@@ -513,10 +513,16 @@ pub(crate) async fn download_world(
             }
         }
     } else {
-        fs::rename(&raw_tmp_path, &tmp_path).map_err(|e| format!("Rename failed: {e}"))?;
+        if let Err(e) = crate::rename_logged(std::path::Path::new(&raw_tmp_path), std::path::Path::new(&tmp_path)) {
+            cleanup(&[&raw_tmp_path, &tmp_path]);
+            return Err(format!("Rename failed: {e}"));
+        }
     }
 
-    fs::rename(&tmp_path, &dest_path).map_err(|e| format!("Rename failed: {e}"))?;
+    if let Err(e) = crate::rename_logged(std::path::Path::new(&tmp_path), std::path::Path::new(&dest_path)) {
+        cleanup(&[&tmp_path]);
+        return Err(format!("Rename failed: {e}"));
+    }
 
     Ok(())
 }

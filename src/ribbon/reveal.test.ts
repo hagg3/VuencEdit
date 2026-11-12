@@ -3,7 +3,7 @@
  * popover (Stage 15.4). Node-only — `runReveal` takes its DOM lookups as arguments.
  */
 import { describe, expect, it } from "vitest";
-import { panelToReveal, runReveal, type RevealOpener } from "./reveal";
+import { barToReveal, runReveal, type RevealOpener } from "./reveal";
 
 /** A fake frame queue: `flush()` runs queued callbacks until none are left. */
 function frames() {
@@ -106,20 +106,23 @@ describe("runReveal", () => {
   });
 });
 
-describe("panelToReveal (Stage 16.6 — controls that live in a context panel)", () => {
-  const places = [{ tab: "sculpt", group: "brush" }, { panel: "buildslot" }] as const;
-  it("flashes the panel when it is on screen and the active tab has no control of its own", () => {
-    expect(panelToReveal(places, "view", ["buildslot"])).toBe("buildslot");
-    expect(panelToReveal(places, "3d", ["cutaway", "buildslot"])).toBe("buildslot");
+describe("barToReveal (34.2 — controls that live in the options bar)", () => {
+  const places = [{ tab: "sculpt", group: "brush" }, { bar: "sculpt" }] as const;
+  it("flashes the bar when it is showing that context and the active tab has no control of its own", () => {
+    expect(barToReveal(places, "view", ["sculpt"])).toBe("sculpt");
+    expect(barToReveal(places, "3d", ["zlevel", "sculpt"])).toBe("sculpt");
   });
   it("the active tab's own control wins", () => {
-    expect(panelToReveal(places, "sculpt", ["buildslot"])).toBeNull();
+    expect(barToReveal(places, "sculpt", ["sculpt"])).toBeNull();
   });
-  it("falls back to the tab path when the panel isn't showing", () => {
-    expect(panelToReveal(places, "view", [])).toBeNull();
-    expect(panelToReveal(places, "view", ["cutaway"])).toBeNull();
+  it("falls back to the tab path when the bar isn't showing that context", () => {
+    expect(barToReveal(places, "view", [])).toBeNull();
+    expect(barToReveal(places, "view", ["zlevel"])).toBeNull();
   });
-  it("a command with no panel placement never reveals into one", () => {
-    expect(panelToReveal([{ tab: "home", group: "clipboard" }], "view", ["buildslot"])).toBeNull();
+  it("a command with no bar placement never reveals into the bar", () => {
+    expect(barToReveal([{ tab: "home", group: "clipboard" }], "view", ["sculpt"])).toBeNull();
+  });
+  it("a bar-only command reveals whenever its context shows", () => {
+    expect(barToReveal([{ bar: "zlevel" }], "home", ["idle", "zlevel"])).toBe("zlevel");
   });
 });

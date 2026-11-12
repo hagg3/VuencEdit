@@ -73,6 +73,7 @@ use std::borrow::Cow;
 use std::fs;
 use eden_format::eden::trailer::{self, Trailer};
 use std::io::{BufWriter, Seek, SeekFrom, Write};
+use std::panic::{self, AssertUnwindSafe};
 use std::sync::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Instant;
 use tauri::Emitter;
@@ -153,6 +154,49 @@ fn temp_world_path() -> std::path::PathBuf {
     // pid-scoped (21.14): `sweep_stale_temps` in another instance must be able to tell this file is
     // owned by a live process.
     std::env::temp_dir().join(format!("vuencedit_{}_{ts}.eden", std::process::id()))
+}
+
+/// The staging temp a load is currently writing/parsing (audit C-10 + P-10). Process-global so
+/// `exit_cleanup` — which can't see `load_world_inner`'s locals, and skips when a load holds the
+/// durability lock — can still delete it on quit. One slot is enough: loads are serialised by
+/// `durability_lock`.
+static STAGING_TEMP: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
+
+fn staging_slot() -> std::sync::MutexGuard<'static, Option<std::path::PathBuf>> {
+    STAGING_TEMP.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Owns a freshly named staging temp for the duration of a load: registers it in `STAGING_TEMP`
+/// and deletes the file on drop (any `?`/error return) unless `release()` hands it to the world.
+struct StagingGuard { path: Option<std::path::PathBuf> }
+
+impl StagingGuard {
+    fn new() -> Self {
+        let path = temp_world_path();
+        *staging_slot() = Some(path.clone());
+        StagingGuard { path: Some(path) }
+    }
+    fn path(&self) -> &std::path::Path { self.path.as_deref().expect("released") }
+    /// The load succeeded: the world now owns the temp (`ws.temp_path`). Deregister, don't delete.
+    fn release(mut self) -> std::path::PathBuf {
+        *staging_slot() = None;
+        self.path.take().expect("released")
+    }
+}
+
+impl Drop for StagingGuard {
+    fn drop(&mut self) {
+        if let Some(p) = self.path.take() {
+            *staging_slot() = None;
+            let _ = fs::remove_file(&p);
+        }
+    }
+}
+
+/// `exit_cleanup`'s half: delete a staging temp a quit interrupted mid-load. Best effort (Windows
+/// refuses while it is still mapped; the next launch's `sweep_stale_temps` covers that).
+fn remove_staging_temp() {
+    if let Some(p) = staging_slot().take() { let _ = fs::remove_file(&p); }
 }
 
 // ── Multi-instance ownership (21.14) ─────────────────────────────────────────
@@ -2431,6 +2475,77 @@ impl LongOps {
     }
 }
 
+/// Hides (or re-shows) macOS's native traffic lights. Backs Settings ▸ Experiments "Preview Windows
+/// title-bar controls": with it on, the top bar draws the custom minimise/maximise/close cluster
+/// Windows gets (`ribbon/WindowControls.tsx`), so the native buttons must get out of the way for a
+/// faithful preview. A no-op everywhere else — Windows is frameless via `tauri.windows.conf.json`,
+/// Linux keeps its native decorations.
+#[tauri::command]
+fn set_traffic_lights_hidden(window: tauri::WebviewWindow, hidden: bool) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        // AppKit is main-thread-only; the raw pointer crosses as a `usize` because `*mut c_void`
+        // isn't `Send`. The window outlives this call (it's the caller's own window).
+        let ptr = window.ns_window().map_err(|e| e.to_string())? as usize;
+        window
+            .run_on_main_thread(move || {
+                use objc2_app_kit::{NSWindow, NSWindowButton};
+                // SAFETY: `ptr` is the live NSWindow tauri handed us, used on the main thread.
+                let ns: &NSWindow = unsafe { &*(ptr as *const NSWindow) };
+                for kind in [
+                    NSWindowButton::CloseButton,
+                    NSWindowButton::MiniaturizeButton,
+                    NSWindowButton::ZoomButton,
+                ] {
+                    if let Some(btn) = ns.standardWindowButton(kind) {
+                        btn.setHidden(hidden);
+                    }
+                }
+            })
+            .map_err(|e| e.to_string())?;
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = (window, hidden);
+    Ok(())
+}
+
+/// Forwards an Edit-menu action to the focused native control (34.1). The macOS menu bar's Edit items
+/// are custom (they run VuencEdit's own Undo / Copy / …), which would otherwise break the native
+/// text editing in every `<input>`: WKWebView's ⌘C/⌘V/⌘Z/⌘A work only because the *predefined* items
+/// send `copy:` etc. down the responder chain. The frontend calls this instead of the map command
+/// when a text field has focus. A no-op elsewhere (Windows has no menu bar).
+#[tauri::command]
+fn native_edit_action(window: tauri::WebviewWindow, action: String) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        if !matches!(action.as_str(), "undo" | "redo" | "cut" | "copy" | "paste" | "selectAll") {
+            return Err(format!("unknown edit action: {action}"));
+        }
+        window
+            .run_on_main_thread(move || {
+                use objc2_app_kit::NSApplication;
+                let Some(mtm) = objc2::MainThreadMarker::new() else { return };
+                // The selector is resolved here (not before the thread hop): `Sel` isn't `Send`.
+                let sel = match action.as_str() {
+                    "undo" => objc2::sel!(undo:),
+                    "redo" => objc2::sel!(redo:),
+                    "cut" => objc2::sel!(cut:),
+                    "copy" => objc2::sel!(copy:),
+                    "paste" => objc2::sel!(paste:),
+                    _ => objc2::sel!(selectAll:),
+                };
+                let app = NSApplication::sharedApplication(mtm);
+                // SAFETY: `sel` is a valid selector from `sel!`; a nil target + nil sender is
+                // AppKit's documented "walk the responder chain from the key window" form.
+                let _ = unsafe { app.sendAction_to_from(sel, None, None) };
+            })
+            .map_err(|e| e.to_string())?;
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = (window, action);
+    Ok(())
+}
+
 #[tauri::command]
 fn cancel_long_op(id: u64, ops: tauri::State<'_, LongOps>) {
     ops.cancel.store(id, std::sync::atomic::Ordering::Relaxed);
@@ -3053,7 +3168,9 @@ impl tauri::ipc::IpcResponse for PreviewData {
 
 #[tauri::command(async)]
 fn load_world(path: String, state: tauri::State<'_, AppState>) -> Result<WorldMeta, String> {
-    load_world_inner(path, &state)
+    let r = load_world_inner(path, &state);
+    mem::relieve_allocator(); // 31.3: the swap frees the previous world's transients
+    r
 }
 
 /// `load_world` without the `tauri::State` wrapper, so tests can drive a real load (sidecar
@@ -3094,20 +3211,21 @@ fn load_world_inner(path: String, state: &AppState) -> Result<WorldMeta, String>
     let mut temp_shared = false;
     let mut staged_identity: Option<FileIdentity> = None;
     let mut emod_session: Option<emod::EmodSession> = None;
-    let (mmap, maybe_temp, was_compressed): (MmapMut, Option<std::path::PathBuf>, bool) = if is_emod {
+    let (mmap, maybe_temp, was_compressed): (MmapMut, Option<StagingGuard>, bool) = if is_emod {
         // 26.4: an own-format export of the store's live state into the private temp (sparse: only
         // occupied bands are written), then the normal parse. The `.emod` itself is only read.
-        let temp_path = temp_world_path();
+        let guard = StagingGuard::new();
+        let temp_path = guard.path().to_path_buf();
         let session = emod::stage_emod(std::path::Path::new(&path), &temp_path)?;
         timing_log!("[LOAD] emod staged  bytes={}B  damaged={}  torn={}  t=+{}µs",
             fs::metadata(&temp_path).map_or(0, |m| m.len()), !session.damage.is_empty(), session.torn, us());
         let (mmap, shared) = match map_staged_temp_ex(&temp_path) {
             Ok(m) => m,
-            Err(e) => { let _ = fs::remove_file(&temp_path); return Err(format!("Failed to map staged file: {e}")); }
+            Err(e) => return Err(format!("Failed to map staged file: {e}")),
         };
         temp_shared = shared;
         emod_session = Some(session);
-        (mmap, Some(temp_path), false)
+        (mmap, Some(guard), false)
     } else if is_zip(&magic) {
         use zip::ZipArchive;
         timing_log!("[LOAD] detected zip archive, decompressing  t=+{}µs", us());
@@ -3121,7 +3239,8 @@ fn load_world_inner(path: String, state: &AppState) -> Result<WorldMeta, String>
         let idx = pick_world_zip_entry(&mut archive);
         let mut entry = archive.by_index(idx)
             .map_err(|e| format!("Failed to read zip entry: {e}"))?;
-        let temp_path = temp_world_path();
+        let guard = StagingGuard::new();
+        let temp_path = guard.path().to_path_buf();
         // A compressed world decompresses to many times its own size — check against the entry's
         // declared uncompressed length, not the archive's, before writing a byte.
         ensure_room_for(&temp_path, entry.size())
@@ -3136,7 +3255,7 @@ fn load_world_inner(path: String, state: &AppState) -> Result<WorldMeta, String>
         let (mmap, shared) = map_staged_temp_ex(&temp_path)
             .map_err(|e| format!("Failed to map temp file: {e}"))?;
         temp_shared = shared;
-        (mmap, Some(temp_path), true)
+        (mmap, Some(guard), true)
     } else {
         // Copy the source into a private temp file and map THAT — never the user's file directly.
         // On Windows a memory-mapped file is locked against replace/delete, so mapping the source
@@ -3146,7 +3265,8 @@ fn load_world_inner(path: String, state: &AppState) -> Result<WorldMeta, String>
         // undefined behaviour of writing over a still-mmapped file on Unix. Because the temp is
         // ours alone, `map_staged_temp` maps it MAP_SHARED — edits land in the temp and stay
         // file-backed and reclaimable rather than piling up as anonymous COW pages.
-        let temp_path = temp_world_path();
+        let guard = StagingGuard::new();
+        let temp_path = guard.path().to_path_buf();
         // Identity before and after the copy (18.9): the recorded `DiskImage` — and through it an
         // autosave Source lineage, whose recovery replays onto this very file — is only sound if the
         // file we staged is the file we then describe. Anything that wrote it mid-copy leaves no image.
@@ -3158,17 +3278,16 @@ fn load_world_inner(path: String, state: &AppState) -> Result<WorldMeta, String>
         let (mmap, shared) = map_staged_temp_ex(&temp_path)
             .map_err(|e| format!("Failed to map staged file: {e}"))?;
         temp_shared = shared;
-        (mmap, Some(temp_path), false)
+        (mmap, Some(guard), false)
     };
     timing_log!("[LOAD] file_mmap  bytes={}B  compressed={}  t=+{}µs", mmap.len(), was_compressed, us());
 
     let mut loaded = match parse_world_inner(mmap) {
         Ok(l) => l,
         Err(e) => {
-            // Parsing failed after we already staged a temp copy (or decompressed one) — the
-            // current session's world is untouched, but the freshly staged temp would otherwise
-            // leak until the next launch's sweep_stale_temps(). Clean it up now.
-            if let Some(p) = maybe_temp { let _ = fs::remove_file(&p); }
+            // The current session's world is untouched; dropping `maybe_temp` (the `StagingGuard`)
+            // deletes the staged copy rather than leaking it until the next launch's sweep.
+            drop(maybe_temp);
             return Err(e);
         }
     };
@@ -3253,7 +3372,7 @@ fn load_world_inner(path: String, state: &AppState) -> Result<WorldMeta, String>
         ws.sculpt_session = None; // any in-flight live-sculpt workspace belongs to the old world
         ws.selection_mask = None; // a wand/lasso shape belongs to the old world's coordinates
         let old_temp = ws.temp_path.take();
-        ws.temp_path = maybe_temp;
+        ws.temp_path = maybe_temp.map(StagingGuard::release);
         ws.temp_shared = temp_shared;
         ws.dirty.clear_all();
         ws.autosave = None; // the new world's autosave lineage starts fresh, not the old one's
@@ -3592,6 +3711,28 @@ fn validate_selection(x1: i32, y1: i32, x2: i32, y2: i32, z_min: i32, z_max: i32
 /// large enough world it overflows i32 (and, cast to usize, sign-extends into a multi-exabyte
 /// allocation request that aborts the process; see audit C3).
 const MAX_CLIPBOARD_VOLUME: i64 = 256 * 1024 * 1024;
+
+/// Clipboard voxel cap (31.6, D3), set per memory preset via `set_clipboard_cap`. Balanced default.
+static CLIPBOARD_VOLUME_CAP: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(128 * 1024 * 1024);
+
+#[tauri::command]
+fn set_clipboard_cap(voxels: i64) {
+    CLIPBOARD_VOLUME_CAP.store(
+        voxels.clamp(16 * 1024 * 1024, MAX_CLIPBOARD_VOLUME),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// `validate_volume` with the per-preset clipboard cap (copy/cut and the paste-side buffers).
+fn validate_clipboard_volume(width: i32, height: i32, depth: i32) -> Result<i64, String> {
+    let vol = width as i64 * height as i64 * depth as i64;
+    let cap = CLIPBOARD_VOLUME_CAP.load(std::sync::atomic::Ordering::Relaxed);
+    if vol > cap {
+        return Err(format!("Selection is {vol} blocks (limit {cap}). Select a smaller region."));
+    }
+    Ok(vol)
+}
 
 /// Computes width*height*depth in i64 and rejects selections whose voxel volume would blow the
 /// transient-buffer budget shared by the clipboard and the undo-snapshot volume guard, before any
@@ -3934,6 +4075,7 @@ fn expand_world_from_template(
     // writer that queued in between (see the RwLock discipline note in CLAUDE.md).
     let ws = read_ws(&state);
     let world = ws.world.as_ref().ok_or("No world loaded")?;
+    refuse_source_overwrite(&ws, &output_path)?;
     let tmpl = ws.template_bytes.as_ref().ok_or("No template loaded")?;
     let tmpl: &[u8] = tmpl.as_ref();
     let tdir = &ws.template_dir;
@@ -3944,10 +4086,51 @@ fn expand_world_from_template(
     )
 }
 
+/// Stage-then-publish wrapper for the two rebuilding writers (audit C-01, 29.1). `write` gets
+/// `<out>.savetmp`; on `Ok` it is `publish`ed over `out`, on `Err` (cancel included) only the temp
+/// is deleted — the destination, which may be the open world's own file, is never truncated.
+fn with_staged_output<T>(
+    output_path: &str, write: impl FnOnce(&str) -> Result<T, String>,
+) -> Result<T, String> {
+    let mut tmp = std::ffi::OsString::from(output_path);
+    tmp.push(".savetmp");
+    let tmp = std::path::PathBuf::from(tmp);
+    let tmp_str = tmp.to_str().ok_or("Output path is not valid UTF-8")?;
+    match write(tmp_str) {
+        Ok(v) => { publish(&tmp, output_path, "finalize output file")?; Ok(v) }
+        Err(e) => { let _ = fs::remove_file(&tmp); Err(e) }
+    }
+}
+
+/// Refuse an output path that names the file the open world was loaded from (C-01).
+fn refuse_source_overwrite(ws: &WorldState, output_path: &str) -> Result<(), String> {
+    let out = std::path::Path::new(output_path);
+    let src = ws.disk_image.as_ref().map(|d| d.path.as_path())
+        .or_else(|| ws.adopted.as_ref().map(|a| a.world_path.as_path()));
+    if src.is_some_and(|p| emod::same_file(p, out)) {
+        return Err("That is the file you currently have open. Choose a different name for the new world.".into());
+    }
+    Ok(())
+}
+
 /// Core expand write loop, factored out of the `#[tauri::command]` wrapper (like
 /// `materialize_flat_chunks_inner`) so tests can drive it without a `tauri::State`/`AppHandle`.
 /// `cancelled` is polled once per template chunk; `on_progress` gets a 0–100 percentage.
 fn expand_world_inner(
+    output_path: &str,
+    world: &LoadedWorld,
+    tmpl: &[u8],
+    tdir: &FxHashMap<(i32, i32), usize>,
+    full_extent: bool,
+    cancelled: impl FnMut() -> bool,
+    on_progress: impl FnMut(u32),
+) -> Result<ExpandResult, String> {
+    with_staged_output(output_path, |tmp| {
+        expand_world_to_file(tmp, world, tmpl, tdir, full_extent, cancelled, on_progress)
+    })
+}
+
+fn expand_world_to_file(
     output_path: &str,
     world: &LoadedWorld,
     tmpl: &[u8],
@@ -3991,6 +4174,8 @@ fn expand_world_inner(
     let total = (user_chunk_list.len() + to_add.len()) as u32;
     let add_count = to_add.len() as u32;
 
+    ensure_room_for(std::path::Path::new(output_path), 192 + total as u64 * chunk_size as u64 + dir_trailer.len() as u64)
+        .map_err(|e| e.to_string())?;
     // Write output file using BufWriter for performance
     let out_file = fs::File::create(output_path)
         .map_err(|e| format!("Cannot create output file: {e}"))?;
@@ -4109,12 +4294,37 @@ fn materialize_flat_chunks_inner<'a>(
     params: &FlatChunkParams,
     dir_trailer: &[u8],
     creature_block: &[u8],
+    cancelled: impl FnMut() -> bool,
+    on_progress: impl FnMut(usize, usize),
+) -> Result<MaterializeResult, String> {
+    with_staged_output(output_path, |tmp| {
+        materialize_flat_chunks_to_file(
+            tmp, chunk_size, header, user_chunks, user_chunk_src, to_add, params,
+            dir_trailer, creature_block, cancelled, on_progress,
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn materialize_flat_chunks_to_file<'a>(
+    output_path: &str,
+    chunk_size: usize,
+    header: &[u8],
+    user_chunks: &[(i32, i32)],
+    user_chunk_src: impl Fn(i32, i32) -> Option<&'a [u8]>,
+    to_add: &[(i32, i32)],
+    params: &FlatChunkParams,
+    dir_trailer: &[u8],
+    creature_block: &[u8],
     mut cancelled: impl FnMut() -> bool,
     mut on_progress: impl FnMut(usize, usize),
 ) -> Result<MaterializeResult, String> {
     let total = (user_chunks.len() + to_add.len()) as u32;
     let add_count = to_add.len() as u32;
 
+    ensure_room_for(std::path::Path::new(output_path),
+        192 + total as u64 * chunk_size as u64 + (creature_block.len() + dir_trailer.len()) as u64)
+        .map_err(|e| e.to_string())?;
     let out_file = fs::File::create(output_path)
         .map_err(|e| format!("Cannot create output file: {e}"))?;
     let mut writer = BufWriter::with_capacity(4 * 1024 * 1024, out_file);
@@ -4219,6 +4429,7 @@ fn materialize_flat_chunks(
     // see the identical rationale on `expand_world_from_template` (audit C3).
     let ws = read_ws(&state);
     let world = ws.world.as_ref().ok_or("No world loaded")?;
+    refuse_source_overwrite(&ws, &output_path)?;
     let chunk_size = world.chunk_size;
     let header = &world.bytes[..192.min(world.bytes.len())];
     let image = world.file_image(); // 27.0b: the trailer as the world saves it
@@ -4774,7 +4985,10 @@ fn zip_file_contents(src: &std::path::Path, dst: &std::path::Path) -> Result<(),
 //   2. Write `<path>.wal`: every span this save will apply, then a commit record, then fsync the WAL
 //      and its parent directory. Nothing has touched the destination yet.
 //   3. Apply the spans in place, fsync the destination.
-//   4. Delete the WAL.
+//   4. Retire the WAL (`retire_wal`: delete it, or zero its magic if the delete fails).
+//
+// The WAL's header binds it to the destination's identity (`wal_dest_id`, 29.4), so a log that
+// outlives its save never replays over a file that has since replaced this one.
 //
 // Crash after 2 and before 4 → the next `load_world` finds a committed WAL and rolls it forward
 // (`recover_wal`); the spans hold exactly the bytes that belong at their offsets, so replaying an
@@ -4798,12 +5012,69 @@ fn wal_path(path: &std::path::Path) -> std::path::PathBuf {
     std::path::PathBuf::from(p)
 }
 
+/// The destination identity a WAL is bound to (29.4 / audit C-03), stored in the journal header's
+/// `dest_id`. Length alone can't tell "the file this log was written for" from "a newer file of the
+/// same length" (a later full save, or the game rewriting it); a stale log replayed over the latter
+/// rolls the covered chunks back with no prompt.
+///
+/// Deliberately narrower than `file_id_of`: the inode alone on Unix, not `(dev, ino)`, because this
+/// must survive the reboot a crash mid-apply often implies, and an external drive can mount with a
+/// different `dev` next time; a false mismatch there refuses a repair the file needs. Windows uses
+/// the creation time, which lives in the file's own metadata. Our in-place applies keep both; every
+/// rename-over (our full save, an atomic writer) changes both. 0 = no identity on this platform,
+/// which the check reads as unbound.
+fn wal_dest_id(md: &fs::Metadata) -> u64 {
+    #[cfg(unix)]
+    { use std::os::unix::fs::MetadataExt; md.ino() }
+    #[cfg(windows)]
+    { use std::os::windows::fs::MetadataExt; md.creation_time() }
+    #[cfg(not(any(unix, windows)))]
+    { let _ = md; 0 }
+}
+
+/// Make sure no `<dest>.wal` can ever replay again: delete it, or, when the delete fails (on
+/// Windows an AV scanner or sync client briefly holding the fresh log is enough), zero its magic so
+/// `wal_validate` rejects it and the next load or save cleans it up. `Ok` when either worked or there
+/// was no log; `Err` only when a possibly-committed log is still on disk, which the caller must
+/// surface (audit C-03: the old `let _ = remove_file` left it there silently).
+fn retire_wal(dest: &std::path::Path) -> Result<(), String> {
+    let wal = wal_path(dest);
+    let unlink = match fs::remove_file(&wal) {
+        Ok(()) => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => e,
+    };
+    let neutralised = fs::OpenOptions::new().write(true).open(&wal)
+        .and_then(|mut f| { f.write_all(&[0u8; 4])?; f.sync_all() });
+    match neutralised {
+        Ok(()) => {
+            timing_log!("[SAVE] save log neutralised (delete failed: {})  wal={:?}", unlink, wal);
+            Ok(())
+        }
+        Err(e) => Err(format!(
+            "VuencEdit couldn't remove its save log {} ({unlink}; clearing it also failed: {e}).",
+            wal.display()
+        )),
+    }
+}
+
+/// `fs::rename` that retries transient Windows failures (AV / indexer holding the file; P-6,
+/// 29.10) via `eden_format::emod::rename_with_retry_counted`, logging one `[SAVE]` line when it
+/// had to retry. Every non-test rename in the app goes through this.
+pub(crate) fn rename_logged(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    let (r, retries) = eden_format::emod::rename_with_retry_counted(from, to);
+    if retries > 0 {
+        timing_log!("[SAVE] rename retried {}× ({}) {:?}", retries, if r.is_ok() { "ok" } else { "gave up" }, to);
+    }
+    r
+}
+
 /// Final step of every stage-then-rename write: rename `tmp` over `dest` (removing `tmp` if that
 /// fails, error `"Failed to {what}: …"`), then fsync the parent so the new name is durable. The one
 /// place a rename retry (P-6) belongs.
 fn publish(tmp: &std::path::Path, dest: impl AsRef<std::path::Path>, what: &str) -> Result<(), String> {
     let dest = dest.as_ref();
-    fs::rename(tmp, dest).map_err(|e| {
+    rename_logged(tmp, dest).map_err(|e| {
         let _ = fs::remove_file(tmp);
         format!("Failed to {what}: {e}")
     })?;
@@ -4871,7 +5142,7 @@ fn apply_spans_in_place(f: &mut fs::File, spans: &[(u64, &[u8])]) -> std::io::Re
 fn recover_wal(dest: &std::path::Path) {
     let wal = wal_path(dest);
     if !wal.exists() { return; }
-    let Ok(dest_len) = fs::metadata(dest).map(|m| m.len()) else {
+    let Ok(dest_md) = fs::metadata(dest) else {
         // Nothing to repair — the destination was renamed or deleted since the crash, so this log
         // can never apply to anything.
         let _ = fs::remove_file(&wal);
@@ -4883,8 +5154,10 @@ fn recover_wal(dest: &std::path::Path) {
     let mut reader = std::io::BufReader::new(file);
 
     // ── Pass 1: validate. The sink does nothing, so the only question this pass answers is whether
-    // the log is ours, intact, and committed.
-    let Some((base_len, summary)) = wal_validate(&mut reader, dest_len) else {
+    // the log is ours, intact, committed, and bound to this very file (29.4: a log left behind for
+    // a file that has since been replaced must not roll the newer one back).
+    let Some((base_len, summary)) = wal_validate(&mut reader, &dest_md) else {
+        drop(reader); // Windows: an open handle blocks the delete
         let _ = fs::remove_file(&wal);
         return;
     };
@@ -4909,7 +5182,10 @@ fn recover_wal(dest: &std::path::Path) {
         _ => return,
     }
     if f.sync_all().is_ok() {
-        let _ = fs::remove_file(&wal);
+        drop(reader);
+        // Repaired. A log that can't be deleted is neutralised; one that can't even be that is still
+        // bound to this file's identity (29.4), so a later replacement of the file refuses it.
+        if let Err(e) = retire_wal(dest) { timing_log!("[LOAD] {}", e); }
     }
 }
 
@@ -4931,13 +5207,21 @@ fn try_incremental_save(state: &AppState, path: &str, backup_compressed: bool) -
     Ok(try_incremental_save_seq(state, path, backup_compressed)?.is_some())
 }
 
-/// `try_incremental_save`, returning the `dirty.seq` the save captured (`Some`) instead of `true`,
-/// which `save_world` hands on to the autosave re-base (18.9).
-fn try_incremental_save_seq(state: &AppState, path: &str, backup_compressed: bool) -> Result<Option<u64>, String> {
+/// A completed incremental save (`try_incremental_save_seq`'s `Some`).
+struct IncrementalSaved {
+    /// The `dirty.seq` the save captured, which `save_world` hands on to the autosave re-base (18.9).
+    seq: u64,
+    /// The file is saved, but its committed log is still on disk (`retire_wal` failed): shown to the
+    /// user rather than swallowed (29.4 / audit C-03).
+    warning: Option<String>,
+}
+
+/// `try_incremental_save`, returning what the save captured (`Some`) instead of `true`.
+fn try_incremental_save_seq(state: &AppState, path: &str, backup_compressed: bool) -> Result<Option<IncrementalSaved>, String> {
     let dest = std::path::Path::new(path);
     let wal = wal_path(dest);
 
-    let (seq_at_capture, span_count) = {
+    let (seq_at_capture, span_count, warning) = {
         let ws = read_ws(state);
         let world = ws.world.as_ref().ok_or("No world loaded")?;
 
@@ -4965,6 +5249,11 @@ fn try_incremental_save_seq(state: &AppState, path: &str, backup_compressed: boo
         if di.len < world.trailer_start || (!trailer_dirty && di.len != image.len()) { return Ok(None); }
         let Ok(md) = fs::metadata(dest) else { return Ok(None) };
         if md.len() != di.len || md.modified().ok() != Some(di.mtime) { return Ok(None); }
+        // Len + mtime alone miss a replacement that keeps both (exFAT/FAT timestamp granularity, SMB,
+        // tools that preserve mtimes): patching our bands onto it would build a hybrid world (audit
+        // C-04). The recorded `file_id` is what tells such a file apart; our own in-place writes
+        // never change it, so this costs nothing on the happy path.
+        if di.identity().check() != BaseStatus::Ok { return Ok(None); }
         // A tail over the journal's cap (an opaque one is never owed, so this is belt and braces)
         // takes the full write.
         if trailer_dirty && image.tail.len() > journal::MAX_TAIL_LEN { return Ok(None); }
@@ -5024,7 +5313,10 @@ fn try_incremental_save_seq(state: &AppState, path: &str, backup_compressed: boo
             let file = fs::File::create(&wal).map_err(|e| format!("Failed to create save log: {e}"))?;
             // `base_len` is the destination's length *before* this save (`di.len`, just checked
             // against the file), not `bytes.len()` — they differ once a save has moved the tail.
-            let mut header = journal::JournalHeader::new(false, di.len, random_base_id());
+            // 29.4: bound to the file it patches (`md`, checked against `di` above), so a log that
+            // outlives this save can never replay over a file that has since replaced it.
+            let mut header = journal::JournalHeader::new(false, di.len, random_base_id())
+                .with_dest_id(wal_dest_id(&md));
             if tail.is_some() { header = header.with_tail(); }
             let mut w = journal::JournalWriter::create_with(file, header)
                 .map_err(|e| format!("Failed to write save log header: {e}"))?;
@@ -5041,8 +5333,9 @@ fn try_incremental_save_seq(state: &AppState, path: &str, backup_compressed: boo
         })();
         if wal_written.is_err() {
             // The destination is still untouched, so the safest response is to leave it that way and
-            // let the caller write the whole world atomically.
-            let _ = fs::remove_file(&wal);
+            // let the caller write the whole world atomically. (A commit record may have reached the
+            // disk before the flush failed; the full save retires the log again before publishing.)
+            let _ = retire_wal(dest);
             return Ok(None);
         }
         if let Some(parent) = dest.parent() { fsync_dir(parent); }
@@ -5058,16 +5351,21 @@ fn try_incremental_save_seq(state: &AppState, path: &str, backup_compressed: boo
             ));
         }
         drop(dest_file); // closed before the stat in `record_full_write` (Windows reports mtime on close)
-        // ── Step 4: the log has served its purpose.
-        let _ = fs::remove_file(&wal);
+        // ── Step 4: the log has served its purpose. The save itself is complete, so a log that
+        // won't go away is a warning, not a failure (29.4 / audit C-03): it stays bound to this
+        // file, but a same-length in-place rewrite by another program would still replay it.
+        let warning = retire_wal(dest).err().map(|e| {
+            timing_log!("[SAVE] {}", e);
+            format!("Saved. {e} Delete it by hand before opening the world in Eden.")
+        });
 
-        (ws.dirty.seq, spans.len() + tail.is_some() as usize)
+        (ws.dirty.seq, spans.len() + tail.is_some() as usize, warning)
     };
     // read guard dropped here.
 
     record_full_write(state, dest, false, seq_at_capture)?;
     timing_log!("[SAVE] incremental  spans={}  dest={:?}", span_count, dest);
-    Ok(Some(seq_at_capture))
+    Ok(Some(IncrementalSaved { seq: seq_at_capture, warning }))
 }
 
 /// Record that `dest` now holds exactly the world that was in memory at the moment `seq_at_capture`
@@ -5101,28 +5399,62 @@ fn record_full_write(
     Ok(())
 }
 
-/// After a seq-clean save to `dest` that wrote the trailer: if sidecars were adopted on load and
-/// `dest` is **their own world** (not a Save As elsewhere, plan §6.2), the save just wrote them in —
-/// return them for `rename_adopted` and end the adoption.
+/// After a seq-clean save to `dest` that wrote the trailer, end a pending adoption and return the
+/// sidecars `rename_adopted` may retire (29.5 / audit C-06):
+///
+/// - **Retire** only when `dest` is a `.eden` whose own sidecar names (`signs::sidecar_paths`) are
+///   the adopted files: the game reads those sidecars for exactly that file, and it now holds the
+///   records. That's the usual ⌘S on the `.eden` they came from (and a Save As onto it).
+/// - **Read-only** for any other source: a `w.emod` or `w.eden.zip` beside the game's `w.eden`
+///   shares its stem (`stem_of`), so it shows those sidecars' records, but its save — which wrote
+///   them into *itself* — ends the adoption without renaming. The game's `w.eden` still relies on them.
+/// - Anything else (a Save As elsewhere) leaves the adoption pending: the source still lacks them.
 pub(crate) fn take_adopted_for(ws: &mut WorldState, dest: &std::path::Path) -> Vec<std::path::PathBuf> {
     if !ws.dirty.trailer_adopt_pending { return Vec::new(); }
-    if !ws.adopted.as_ref().is_some_and(|a| emod::same_file(&a.world_path, dest)) { return Vec::new(); }
+    let Some(a) = ws.adopted.as_ref() else { return Vec::new() };
+    let retire = sidecars_belong_to(dest, &a.files);
+    if !retire && !emod::same_file(&a.world_path, dest) { return Vec::new(); }
     ws.dirty.trailer_adopt_pending = false;
-    ws.adopted.take().map(|a| a.files).unwrap_or_default()
+    let files = ws.adopted.take().map(|a| a.files).unwrap_or_default();
+    if retire { files } else {
+        timing_log!("[SAVE] sidecars written into {:?}; left in place (they belong to a .eden)", dest);
+        Vec::new()
+    }
+}
+
+/// `dest` is a `.eden` (not `.emod`, zip or gz) and every one of `files` is one of its own sidecars.
+fn sidecars_belong_to(dest: &std::path::Path, files: &[std::path::PathBuf]) -> bool {
+    let is_eden = dest.file_name().is_some_and(|n| n.to_string_lossy().to_ascii_lowercase().ends_with(".eden"));
+    let own = signs::sidecar_paths(dest);
+    is_eden && !files.is_empty() && files.iter().all(|f| own.iter().any(|o| emod::same_file(o, f)))
 }
 
 /// Rename each adopted sidecar `<name>.adopted` (Emod's `trailerSaved`), so deleting every sign
-/// later can't bring the sidecar's back on reload. Best-effort: a failed rename is logged, never an
-/// error — the save itself succeeded. Call with no world guard held.
+/// later can't bring the sidecar's back on reload. Never replaces an existing `.adopted` from an
+/// earlier adoption (C-06): the next free `<name>.<n>.adopted` is used instead. Best-effort: a
+/// failed rename is logged, never an error — the save itself succeeded. Call with no world guard held.
 pub(crate) fn rename_adopted(files: &[std::path::PathBuf]) {
     for f in files {
-        let mut to = f.as_os_str().to_owned();
-        to.push(".adopted");
-        match fs::rename(f, &to) {
-            Ok(()) => timing_log!("[SAVE] sidecar {:?} written into the world; renamed .adopted", f),
+        let Some(to) = free_adopted_name(f) else {
+            eprintln!("[SAVE] couldn't find a free .adopted name for {f:?}; left in place");
+            continue;
+        };
+        match rename_logged(f, &to) {
+            Ok(()) => timing_log!("[SAVE] sidecar {:?} written into the world; renamed {:?}", f, to),
             Err(e) => eprintln!("[SAVE] couldn't rename adopted sidecar {f:?}: {e}"),
         }
     }
+}
+
+/// `<f>.adopted`, else `<f>.2.adopted`, `<f>.3.adopted`, … — the first that doesn't exist.
+/// (`symlink_metadata`, so a dangling link counts as taken.)
+fn free_adopted_name(f: &std::path::Path) -> Option<std::path::PathBuf> {
+    (1..1000u32).map(|n| {
+        let mut to = f.as_os_str().to_owned();
+        if n > 1 { to.push(format!(".{n}")); }
+        to.push(".adopted");
+        std::path::PathBuf::from(to)
+    }).find(|p| fs::symlink_metadata(p).is_err())
 }
 
 // ── Undo / Redo helpers ────────────────────────────────────────────────────────
@@ -5264,6 +5596,13 @@ fn diff_span(start_off: u32, pre: &[u8], post: &[u8]) -> Option<ChunkDelta> {
     })
 }
 
+#[cfg(test)]
+thread_local! {
+    /// 29.9b test seam: `Some(n)` makes the next `restore_and_invert` panic after restoring `n`
+    /// chunks (a genuine half-applied undo). Thread-local, so parallel tests don't see it.
+    static RESTORE_PANIC_AFTER: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
 /// Applies each snapshot's delta to `world` (restoring the "before" state it captured) and
 /// returns the inverse — a fresh set of snapshots that would restore the state `world` was in
 /// just before this call. Used by both undo (apply old state, capture new-as-inverse for redo)
@@ -5272,6 +5611,12 @@ fn diff_span(start_off: u32, pre: &[u8], post: &[u8]) -> Option<ChunkDelta> {
 /// needed since we already know exactly which offsets are in play.
 fn restore_and_invert(world: &mut LoadedWorld, entry: &UndoEntry) -> Vec<ChunkSnapshot> {
     entry.chunks.iter().filter_map(|snap| {
+        #[cfg(test)]
+        RESTORE_PANIC_AFTER.with(|c| match c.get() {
+            Some(0) => { c.set(None); panic!("injected restore panic"); }
+            Some(n) => c.set(Some(n - 1)),
+            None => {}
+        });
         let (addr, cend) = world.chunk_range(snap.cx, snap.cy)?;
         match &snap.delta {
             ChunkDelta::Sparse(_) | ChunkDelta::SparseZ(..) => {
@@ -5440,6 +5785,12 @@ impl tauri::ipc::IpcResponse for EditResult {
 // pattern). `undo_edit`/`redo_edit` don't go through it — they restore from their own
 // stack rather than snapshotting a fresh edit — but have no fallible op between their
 // take/reinstall either.
+//
+// Panics (29.9b): every take/reinstall window (`with_edit_inner`, undo/redo, `sculpt_split`'s
+// commit) runs under `catch_unwind`, so a panic becomes an `Err` and never leaves `ws.world = None`.
+// `with_edit_inner` rolls the capture back exactly, *before* reinstalling. Undo/redo/sculpt
+// commit have no pre-image, so they keep the world as is and go through `keep_world_after_panic`
+// (dirty-mark, clear both stacks).
 
 /// Runs an edit against the currently loaded world, owning the take/capture/reinstall sequence.
 /// `patch_rect` bounds the pixels returned to the frontend (some ops widen it past the selection,
@@ -5497,14 +5848,22 @@ where
     let limit = ws.undo_budget.saturating_mul(PREIMAGE_GUARD_FACTOR);
     let mut world = ws.world.take().ok_or("No world loaded")?;
 
+    // 29.9b: a panic in the closure must not leave `ws.world = None` (the release profile unwinds,
+    // and `write_ws` ignores poison, so every later command would see "No world loaded" and Save
+    // would be impossible). `catch_unwind` turns the panic into an `Err` below. The capture survives
+    // it intact, because `EditView::band_bytes_mut` stores a band's pre-image *before* it hands out
+    // the writable slice. So the pre-image covers every byte the closure could have written.
     let mut view = EditView::new(&mut world, limit);
-    let result = edit(&mut view);
+    let result = panic::catch_unwind(AssertUnwindSafe(|| edit(&mut view)))
+        .unwrap_or_else(|p| Err(panic_edit_message(operation, &*p)));
     let cap = view.into_capture();
     mem::PEAKS.edit_preimage.record(cap.captured as u64);
 
-    // A failed or over-limit edit is rolled back **exactly** — every captured band written back —
-    // so it leaves no partial writes behind (before 18.12 an `Err` after the first write left them
-    // in the world with no undo entry, no dirty mark and stale scan ceilings).
+    // A failed, panicked or over-limit edit is rolled back **exactly** (every captured band written
+    // back), so it leaves no partial writes behind. Before 18.12 an `Err` after the first write left
+    // them in the world with no undo entry, no dirty mark and stale scan ceilings. Ordering (29.9b):
+    // the rollback happens *before* the world goes back into `ws`, so no later delta is ever diffed
+    // against half-written bytes. Undo/redo stacks are untouched: nothing was pushed or cleared yet.
     if result.is_err() || cap.tripped {
         let chunks = rollback_capture(&mut world, &cap.pre);
         world.invalidate_derived(&chunks);
@@ -5522,11 +5881,66 @@ where
     captured_chunks.sort_unstable();
     world.invalidate_derived(&captured_chunks);
 
-    let (patch, invalidate) = edit_patch(&world, patch_rect, style, view_lod);
-    let pre_snap = capture_deltas(&world, &cap.pre);
+    // Render + diff run with the world still taken, so they get the same guard. A panic here means
+    // the edit itself succeeded but couldn't be recorded. Without an undo delta, keeping it would
+    // leave bytes the history doesn't know about, so it is rolled back the same way.
+    let rendered = panic::catch_unwind(AssertUnwindSafe(|| {
+        let (patch, invalidate) = edit_patch(&world, patch_rect, style, view_lod);
+        (patch, invalidate, capture_deltas(&world, &cap.pre))
+    }));
+    let (patch, invalidate, pre_snap) = match rendered {
+        Ok(r) => r,
+        Err(p) => {
+            let chunks = rollback_capture(&mut world, &cap.pre);
+            world.invalidate_derived(&chunks);
+            ws.world = Some(world);
+            return Err(panic_edit_message(operation, &*p));
+        }
+    };
     drop(cap);
     ws.world = Some(world);
     finish_edit(ws, operation, group, patch, invalidate, pre_snap)
+}
+
+/// The text of a caught panic's payload (`panic!("literal")` → `&str`, `panic!("{x}")` → `String`).
+fn panic_payload_text(p: &(dyn std::any::Any + Send)) -> &str {
+    p.downcast_ref::<&str>().copied()
+        .or_else(|| p.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("unknown panic")
+}
+
+/// 29.9b: the error a panicked `with_edit*` closure returns once its writes are rolled back.
+fn panic_edit_message(operation: &str, p: &(dyn std::any::Any + Send)) -> String {
+    format!("{operation} hit an internal error and was undone ({}). The world is unchanged.", panic_payload_text(p))
+}
+
+/// 29.9b: what undo, redo and the split sculpt commit do when their byte-writing step panics. Unlike
+/// `with_edit_inner`, they have no copy-on-write pre-image. The bytes may be half-restored, and the
+/// undo/redo entries being applied are already gone. So:
+///  - keep the world, as it is: half an undo beats losing the whole session;
+///  - mark every chunk the step could have touched dirty (every band) and drop its derived caches,
+///    so a save writes those bytes and the map doesn't draw stale terrain;
+///  - clear **both** history stacks. No delta in them can be trusted to describe these bytes, and
+///    a later undo computed against half-written bytes is exactly the corruption this guards;
+///  - clear the lamp index (rebuilt lazily) and the sculpt session, both derived from old bytes.
+fn keep_world_after_panic(
+    ws: &mut WorldState,
+    world: LoadedWorld,
+    chunks: &[(i32, i32)],
+    what: &str,
+    p: &(dyn std::any::Any + Send),
+) -> String {
+    let marks: Vec<(i32, i32, BandMask)> = chunks.iter().map(|&(cx, cy)| (cx, cy, BandMask::ALL)).collect();
+    mark_dirty_chunks(&mut ws.dirty, Some(&world), &marks);
+    ws.clear_undo();
+    ws.clear_redo();
+    ws.lamp_index.clear();
+    ws.sculpt_session = None;
+    ws.world = Some(world);
+    let msg = panic_payload_text(p);
+    timing_log!("[EDIT] {what} panicked ({msg}); world kept, {} chunk(s) marked dirty, history cleared", chunks.len());
+    format!("{what} hit an internal error ({msg}). The world is kept but may be partly changed, \
+             and undo history was cleared. Check the area before saving.")
 }
 
 /// **Test-only oracle** for the differential tests (ROADMAP-EDIT 18.12): the pre-CoW
@@ -6202,7 +6616,9 @@ fn save_world(
     compressed: bool,
     backup_compressed: bool,
     state: tauri::State<'_, AppState>,
-) -> Result<(), String> {
+) -> Result<Option<String>, String> {
+    // `Ok(Some(warning))`: the file is saved, but something the user should hear about went wrong
+    // after it (29.4: the save log couldn't be cleared). The frontend shows it as a toast.
     // The whole save runs under the durability mutex (18.9): an autosave tick can't interleave with
     // it, and the re-base below can't race a tick's discharge.
     let _durable = durability_lock();
@@ -6253,7 +6669,7 @@ fn save_world(
         persist_overview_after_emod_save(&state, saved.seq);
         mem::PEAKS.save_kind.store(4, std::sync::atomic::Ordering::Relaxed);
         mem::PEAKS.save_ms.record(t0.elapsed().as_millis() as u64);
-        return Ok(());
+        return Ok(None);
     }
 
     // Fast path: rewrite only what changed since this file was last written (audit C2 Stage 4). It
@@ -6261,15 +6677,22 @@ fn save_world(
     // stale on-disk image, an externally modified destination, or a dirty set too large to be worth
     // patching. Declining never touches the destination.
     if !compressed {
-        if let Some(seq) = try_incremental_save_seq(&state, &path, backup_compressed)? {
+        if let Some(IncrementalSaved { seq, warning }) = try_incremental_save_seq(&state, &path, backup_compressed)? {
             write_ws(&state).emod = None; // the session now belongs to this `.eden`
             rebase(seq);
             persist_overview_after_save(&state, &dest, seq);
             mem::PEAKS.save_kind.store(1, std::sync::atomic::Ordering::Relaxed);
             mem::PEAKS.save_ms.record(t0.elapsed().as_millis() as u64);
-            return Ok(());
+            return Ok(warning);
         }
     }
+
+    // A full write supersedes any redo log for this destination: once the rename publishes a whole,
+    // self-consistent file, an older log's spans could only *revert* the chunks they cover. So the
+    // log goes *before* publishing (29.4 / audit C-03): deleting it afterwards left a window, and a
+    // silently failed delete left it for good, in which the next open rolled the new file back.
+    // A log that can neither be deleted nor neutralised stops the save with nothing written.
+    retire_wal(&dest).map_err(|e| format!("{e} Nothing was saved; try again in a moment."))?;
 
     let (seq_at_capture, op, snapshot) = {
         let ws = read_ws(&state);
@@ -6311,10 +6734,6 @@ fn save_world(
         }
     }
     drop(op);
-    // A completed full write supersedes any redo log for this destination: `atomic_write`'s rename
-    // published a whole, self-consistent file, so an older log's spans could now only *revert* the
-    // chunks they cover (they hold bytes captured before whatever went into this write).
-    let _ = fs::remove_file(wal_path(&dest));
     let r = record_full_write(&state, &dest, compressed, seq_at_capture);
     if r.is_ok() {
         write_ws(&state).emod = None; // Save As `.eden` from an `.emod` session leaves `.emod` mode
@@ -6323,7 +6742,7 @@ fn save_world(
     }
     mem::PEAKS.save_kind.store(if compressed { 3 } else { 2 }, std::sync::atomic::Ordering::Relaxed);
     mem::PEAKS.save_ms.record(t0.elapsed().as_millis() as u64);
-    r
+    r.map(|()| None)
 }
 
 /// The identity under which the open world's overview raster may be persisted when the world is
@@ -6405,6 +6824,7 @@ fn close_world(state: tauri::State<'_, AppState>) {
     persist_overview_on_close(old_world.as_ref(), old_persist);
     drop(old_world); // release the mmap before deleting its backing temp file
     if let Some(p) = old_temp { let _ = fs::remove_file(&p); }
+    mem::relieve_allocator(); // 31.3
 }
 
 /// Best-effort cleanup on quit (23.10, audit L8): persist the overview raster (synchronously — a
@@ -6413,6 +6833,9 @@ fn close_world(state: tauri::State<'_, AppState>) {
 /// blocks the quit: a save/load holding the durability mutex, or any world guard still held, skips
 /// it entirely and the next launch's sweep reclaims the temp as before.
 fn exit_cleanup(state: &AppState, overview_dir: Option<&std::path::Path>) {
+    // Before the durability try-lock: a quit mid-load finds that lock held and returns early below,
+    // which is exactly when a world-sized staging temp is on disk (audit P-10).
+    remove_staging_temp();
     let _durable = match DURABILITY.try_lock() {
         Ok(g) => g,
         Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
@@ -7019,24 +7442,33 @@ fn rebase_after_save_inner(
 /// forward and change the file. Read-only (pass 1 of `recover_wal` without its deletes), so
 /// `get_autosave_info` can report a Source base as `Changed` before recovery touches anything.
 fn has_committed_wal(dest: &std::path::Path) -> bool {
-    let Ok(dest_len) = fs::metadata(dest).map(|m| m.len()) else { return false };
+    let Ok(dest_md) = fs::metadata(dest) else { return false };
     let Ok(file) = fs::File::open(wal_path(dest)) else { return false };
-    wal_validate(&mut std::io::BufReader::new(file), dest_len).is_some()
+    wal_validate(&mut std::io::BufReader::new(file), &dest_md).is_some()
 }
 
 /// Pass 1 of `recover_wal` (and all of `has_committed_wal`): `Some((base_len, summary))` when the
-/// log is intact, committed, non-empty and belongs to a destination now `dest_len` long. Leaves the
-/// reader wherever pass 1 stopped.
+/// log is intact, committed, non-empty and belongs to the destination `dest_md` describes. Leaves
+/// the reader wherever pass 1 stopped.
 ///
-/// The length rule (27.0b): a log without a tail record needs `dest_len == base_len` (the file's
-/// length never changed). One with a tail also accepts the final length, because the in-place
-/// apply sets it before anything else (`apply_tail_in_place`): a crash after that leaves the file
-/// at its final length with spans still owed, and replaying is what finishes it.
-fn wal_validate(reader: &mut std::io::BufReader<fs::File>, dest_len: u64) -> Option<(u64, journal::ReplaySummary)> {
+/// Belonging is two checks. **Identity** (29.4 / audit C-03): a bound log (`dest_id != 0`) must name
+/// this very file (`wal_dest_id`); anything that replaced it since, our own full save included,
+/// has another one. An unbound log (written before 29.4) falls back to length alone.
+/// **Length** (27.0b): a log without a tail record needs `dest_len == base_len` (the file's length
+/// never changed). One with a tail also accepts the final length, because the in-place apply sets
+/// it before anything else (`apply_tail_in_place`): a crash after that leaves the file at its final
+/// length with spans still owed, and replaying is what finishes it.
+fn wal_validate(reader: &mut std::io::BufReader<fs::File>, dest_md: &fs::Metadata) -> Option<(u64, journal::ReplaySummary)> {
     use std::io::Read as _;
+    let dest_len = dest_md.len();
     let mut hdr = [0u8; journal::HEADER_LEN];
     reader.read_exact(&mut hdr).ok()?;
-    let base_len = journal::JournalHeader::decode(&hdr)?.base_len;
+    let header = journal::JournalHeader::decode(&hdr)?;
+    if header.dest_id != 0 && header.dest_id != wal_dest_id(dest_md) {
+        timing_log!("[LOAD] save log refused: it was written for a file that has since been replaced");
+        return None;
+    }
+    let base_len = header.base_len;
     reader.rewind().ok()?;
     let summary = journal::replay_each(&mut *reader, base_len, |_| Ok::<(), std::convert::Infallible>(())).ok()?;
     let len_ok = dest_len == base_len || summary.tail_end == Some(dest_len);
@@ -7508,27 +7940,36 @@ fn undo_edit_inner(ws: &mut WorldState) -> Result<EditResult, String> {
     let mut affected: Vec<(i32, i32)> = Vec::new();
     let mut written: Vec<(i32, i32, BandMask)> = Vec::new();
 
-    let mut current = Some(entry);
-    while let Some(entry) = current.take() {
-        for s in &entry.chunks { affected.push((s.cx, s.cy)); }
-        let redo_snaps = restore_and_invert(&mut world, &entry);
-        // The inverse names exactly the bytes just rewritten (band-granular dirty marks, 18.13).
-        written.extend(redo_snaps.iter().map(|s| (s.cx, s.cy, s.delta.band_mask())));
-        // Same delta-driven lamp maintenance as `with_edit_inner`: the inverse snapshots hold the
-        // pre-restore bytes and `world` now holds the restored ones (audit H3).
-        apply_lamp_delta(&ws.lamp_index, &world, &redo_snaps);
-        push_undo(&mut ws.redo_stack, &mut ws.redo_bytes, &mut ws.redo_groups, UndoEntry::new(entry.operation, redo_snaps, entry.group), ws.undo_budget);
-        // Continue only for a group whose next entry down matches the same id.
-        if let Some(g) = group {
-            if ws.undo_stack.back().map(|e| e.group) == Some(Some(g)) {
-                current = pop_undo(&mut ws.undo_stack, &mut ws.undo_bytes, &mut ws.undo_groups);
+    // 29.9b: the world is taken for the whole restore, so a panic in it goes through
+    // `keep_world_after_panic`. `affected` is filled *before* each entry is restored, so it always
+    // covers every chunk that could have been written.
+    let run = panic::catch_unwind(AssertUnwindSafe(|| {
+        let mut current = Some(entry);
+        while let Some(entry) = current.take() {
+            for s in &entry.chunks { affected.push((s.cx, s.cy)); }
+            let redo_snaps = restore_and_invert(&mut world, &entry);
+            // The inverse names exactly the bytes just rewritten (band-granular dirty marks, 18.13).
+            written.extend(redo_snaps.iter().map(|s| (s.cx, s.cy, s.delta.band_mask())));
+            // Same delta-driven lamp maintenance as `with_edit_inner`: the inverse snapshots hold the
+            // pre-restore bytes and `world` now holds the restored ones (audit H3).
+            apply_lamp_delta(&ws.lamp_index, &world, &redo_snaps);
+            push_undo(&mut ws.redo_stack, &mut ws.redo_bytes, &mut ws.redo_groups, UndoEntry::new(entry.operation, redo_snaps, entry.group), ws.undo_budget);
+            // Continue only for a group whose next entry down matches the same id.
+            if let Some(g) = group {
+                if ws.undo_stack.back().map(|e| e.group) == Some(Some(g)) {
+                    current = pop_undo(&mut ws.undo_stack, &mut ws.undo_bytes, &mut ws.undo_groups);
+                }
             }
         }
-    }
 
-    // `affected` stays the repaint/hint set; the dirty marks come from what was actually written.
-    mark_dirty_chunks(&mut ws.dirty, Some(&world), &written);
-    let (patch, invalidate) = patch_from_chunk_coords(&world, &affected, ws.map_style(), ws.view_lod);
+        // `affected` stays the repaint/hint set; the dirty marks come from what was actually written.
+        mark_dirty_chunks(&mut ws.dirty, Some(&world), &written);
+        patch_from_chunk_coords(&world, &affected, ws.map_style(), ws.view_lod)
+    }));
+    let (patch, invalidate) = match run {
+        Ok(r) => r,
+        Err(p) => return Err(keep_world_after_panic(ws, world, &affected, "Undo", &*p)),
+    };
     ws.world = Some(world);
 
     Ok(EditResult {
@@ -7557,23 +7998,30 @@ fn redo_edit_inner(ws: &mut WorldState) -> Result<EditResult, String> {
     let mut affected: Vec<(i32, i32)> = Vec::new();
     let mut written: Vec<(i32, i32, BandMask)> = Vec::new();
 
-    let mut current = Some(entry);
-    while let Some(entry) = current.take() {
-        for s in &entry.chunks { affected.push((s.cx, s.cy)); }
-        let undo_snaps = restore_and_invert(&mut world, &entry);
-        written.extend(undo_snaps.iter().map(|s| (s.cx, s.cy, s.delta.band_mask())));
-        apply_lamp_delta(&ws.lamp_index, &world, &undo_snaps); // delta-driven lamp maintenance (audit H3)
-        push_undo(&mut ws.undo_stack, &mut ws.undo_bytes, &mut ws.undo_groups, UndoEntry::new(entry.operation, undo_snaps, entry.group), ws.undo_budget);
-        if let Some(g) = group {
-            if ws.redo_stack.back().map(|e| e.group) == Some(Some(g)) {
-                current = pop_undo(&mut ws.redo_stack, &mut ws.redo_bytes, &mut ws.redo_groups);
+    // 29.9b: same panic guard as undo (see there).
+    let run = panic::catch_unwind(AssertUnwindSafe(|| {
+        let mut current = Some(entry);
+        while let Some(entry) = current.take() {
+            for s in &entry.chunks { affected.push((s.cx, s.cy)); }
+            let undo_snaps = restore_and_invert(&mut world, &entry);
+            written.extend(undo_snaps.iter().map(|s| (s.cx, s.cy, s.delta.band_mask())));
+            apply_lamp_delta(&ws.lamp_index, &world, &undo_snaps); // delta-driven lamp maintenance (audit H3)
+            push_undo(&mut ws.undo_stack, &mut ws.undo_bytes, &mut ws.undo_groups, UndoEntry::new(entry.operation, undo_snaps, entry.group), ws.undo_budget);
+            if let Some(g) = group {
+                if ws.redo_stack.back().map(|e| e.group) == Some(Some(g)) {
+                    current = pop_undo(&mut ws.redo_stack, &mut ws.redo_bytes, &mut ws.redo_groups);
+                }
             }
         }
-    }
 
-    // `affected` stays the repaint/hint set; the dirty marks come from what was actually written.
-    mark_dirty_chunks(&mut ws.dirty, Some(&world), &written);
-    let (patch, invalidate) = patch_from_chunk_coords(&world, &affected, ws.map_style(), ws.view_lod);
+        // `affected` stays the repaint/hint set; the dirty marks come from what was actually written.
+        mark_dirty_chunks(&mut ws.dirty, Some(&world), &written);
+        patch_from_chunk_coords(&world, &affected, ws.map_style(), ws.view_lod)
+    }));
+    let (patch, invalidate) = match run {
+        Ok(r) => r,
+        Err(p) => return Err(keep_world_after_panic(ws, world, &affected, "Redo", &*p)),
+    };
     ws.world = Some(world);
 
     Ok(EditResult {
@@ -7616,7 +8064,7 @@ fn copy_selection_inner(
         let max_z = ws.world.as_ref().map(world_max_z).unwrap_or(63);
         validate_selection(x1, y1, x2, y2, z_min, z_max, max_z)?;
         ws.world.as_ref().ok_or("No world loaded")?;
-        Ok(validate_volume(width, height, depth)? as usize)
+        Ok(validate_clipboard_volume(width, height, depth)? as usize)
     };
     // 18.6: drop the previous clipboard once the request is known-valid and *before* allocating the
     // new buffers, so a re-copy peaks at one clipboard, not old + new. A rejected copy (bad
@@ -7673,76 +8121,27 @@ fn copy_selection_inner(
     Ok(info)
 }
 
-/// Rotate a directional block ID 90° clockwise.
-///
-/// Ramps (24–39): [base+0=S, base+1=W, base+2=N, base+3=E]
-/// Wedges (40–55): [base+0=SE, base+1=SW, base+2=NW, base+3=NE]
-/// Doors (66–69): S/W/N/E order (matching C# DoorSouth=66,DoorWest=67,DoorNorth=68,DoorEast=69).
-/// Portals (75–78): same S/W/N/E order.
-///
-/// Under 90° CW in XY screen space (S→E, E→N, N→W, W→S) the offset shifts by +3 mod 4
-/// for all families (ramps, wedges, doors, portals).
+/// Rotate a directional block ID 90° clockwise — the ID its cell becomes under the clipboard
+/// rotation `(dx,dy) → (dy, w-1-dx)`. The facing tables live in `voxel_core::orient`
+/// (ramps 24–39, wedges 40–55, doors 66–69, portals 75–78); this passes that cell map's matrix.
+/// For every family the offset shifts by +3 mod 4 (S→E→N→W→S).
 #[inline]
 fn rotate_ramp_id_cw(bt: u8) -> u8 {
-    if (24..=55).contains(&bt) {
-        let base = bt & !3;
-        let off  = bt &  3;
-        base | ((off + 3) & 3)
-    } else if (66..=69).contains(&bt) {
-        66 + ((bt - 66 + 3) & 3)
-    } else if (75..=78).contains(&bt) {
-        75 + ((bt - 75 + 3) & 3)
-    } else {
-        bt
-    }
+    voxel_core::orient::transform_id(bt, voxel_core::orient::ROT_CW)
 }
 
-/// Mirror a directional block ID on the X axis (left↔right on the map).
-/// Ramps: S/N unchanged, E(+3)↔W(+1).
-/// Wedges: SE(+0)↔SW(+1), NE(+3)↔NW(+2) — i.e., off ^= 1.
-/// Doors/Portals: S/N unchanged, E↔W.
+/// Mirror a directional block ID on the X axis (left↔right on the map): E↔W, S/N unchanged;
+/// wedges flip their east/west component.
 #[inline]
 fn mirror_ramp_id_x(bt: u8) -> u8 {
-    if (24..=39).contains(&bt) {
-        let base = bt & !3;
-        let off  = bt &  3;
-        base | match off { 1 => 3, 3 => 1, x => x }
-    } else if (40..=55).contains(&bt) {
-        // SE(0)↔SW(1), NW(2)↔NE(3): flip the E/W component → off ^ 1
-        (bt & !3) | ((bt & 3) ^ 1)
-    } else if (66..=69).contains(&bt) {
-        let off = bt - 66;
-        66 + match off { 1 => 3, 3 => 1, x => x }
-    } else if (75..=78).contains(&bt) {
-        let off = bt - 75;
-        75 + match off { 1 => 3, 3 => 1, x => x }
-    } else {
-        bt
-    }
+    voxel_core::orient::transform_id(bt, voxel_core::orient::MIRROR_X)
 }
 
-/// Mirror a directional block ID on the Y axis (top↔bottom on the map).
-/// Ramps: E/W unchanged, S(+0)↔N(+2).
-/// Wedges: SE(+0)↔NE(+3), SW(+1)↔NW(+2) — i.e., off ^= 3.
-/// Doors/Portals: E/W unchanged, S↔N.
+/// Mirror a directional block ID on the Y axis (top↔bottom on the map): S↔N, E/W unchanged;
+/// wedges flip their north/south component.
 #[inline]
 fn mirror_ramp_id_y(bt: u8) -> u8 {
-    if (24..=39).contains(&bt) {
-        let base = bt & !3;
-        let off  = bt &  3;
-        base | match off { 0 => 2, 2 => 0, x => x }
-    } else if (40..=55).contains(&bt) {
-        // SE(0)↔NE(3), SW(1)↔NW(2): flip the N/S component → off ^ 3
-        (bt & !3) | ((bt & 3) ^ 3)
-    } else if (66..=69).contains(&bt) {
-        let off = bt - 66;
-        66 + match off { 0 => 2, 2 => 0, x => x }
-    } else if (75..=78).contains(&bt) {
-        let off = bt - 75;
-        75 + match off { 0 => 2, 2 => 0, x => x }
-    } else {
-        bt
-    }
+    voxel_core::orient::transform_id(bt, voxel_core::orient::MIRROR_Y)
 }
 
 
@@ -8210,7 +8609,7 @@ fn extrude_selection(
         let height = y2 - y1 + 1;
         let depth  = z_max - z_min + 1;
         // Same cap as copy/cut: the two source buffers below are n bytes each (21.11).
-        let n = validate_volume(width, height, depth)? as usize;
+        let n = validate_clipboard_volume(width, height, depth)? as usize;
         let mut src_types  = vec![0u8; n];
         let mut src_paints = vec![0u8; n];
 
@@ -9723,7 +10122,9 @@ fn save_prefab(path: String, state: tauri::State<'_, AppState>) -> Result<Vec<St
     let bytes = serialize_prefab(cb);
     atomic_write(std::path::Path::new(&path), &bytes)?;
     let mut counts = [0u32; 128];
-    for &b in &cb.block_types { counts[b as usize] += 1; }
+    for &b in &cb.block_types {
+        if let Some(c) = counts.get_mut(b as usize) { *c += 1; }
+    }
     Ok(risky_block_warnings(&counts))
 }
 
@@ -9849,7 +10250,7 @@ fn rename_prefab(path: String, new_name: String) -> Result<String, String> {
     let dst = parent.join(format!("{stem}.epfab"));
     if dst == src { return Ok(dst.to_string_lossy().into_owned()); }
     if dst.exists() { return Err(format!("A prefab named “{stem}” already exists")); }
-    fs::rename(src, &dst).map_err(|e| format!("Failed to rename prefab: {e}"))?;
+    rename_logged(src, &dst).map_err(|e| format!("Failed to rename prefab: {e}"))?;
     Ok(dst.to_string_lossy().into_owned())
 }
 
@@ -9910,12 +10311,8 @@ impl tauri::ipc::IpcResponse for TexturePackInfo {
     }
 }
 
-/// Load a texture pack zip and return the atlas RGBA + name→row map.
-/// The pack is stored in AppState (world-independent) and automatically used by subsequent
-/// get_chunk_geometry calls.
-#[tauri::command(async)]
-fn load_texture_pack(path: String, state: tauri::State<'_, AppState>) -> Result<TexturePackInfo, String> {
-    let pack = texturepack::load_pack(&path)?;
+/// Install a freshly loaded pack in AppState and return its atlas payload.
+fn install_texture_pack(pack: texturepack::TexturePack, state: &AppState) -> TexturePackInfo {
     let info = TexturePackInfo {
         rows: pack.atlas_rows,
         tile: pack.tile,
@@ -9923,14 +10320,27 @@ fn load_texture_pack(path: String, state: tauri::State<'_, AppState>) -> Result<
         atlas: pack.atlas_rgba.clone(),
         name_to_row: pack.name_to_row.clone(),
     };
-    write_ws(&state).texture_pack = Some(pack);
-    Ok(info)
+    write_ws(state).texture_pack = Some(pack);
+    info
 }
 
-/// Unload the current texture pack, reverting to flat vertex-color rendering.
+/// Load a texture pack zip and return the atlas RGBA + name→row map.
+/// The pack is stored in AppState (world-independent) and automatically used by subsequent
+/// get_chunk_geometry calls.
 #[tauri::command(async)]
-fn unload_texture_pack(state: tauri::State<'_, AppState>) {
-    write_ws(&state).texture_pack = None;
+fn load_texture_pack(path: String, state: tauri::State<'_, AppState>) -> Result<TexturePackInfo, String> {
+    Ok(install_texture_pack(texturepack::load_pack(&path)?, &state))
+}
+
+/// Load the pack bundled with the app (`default-textures/default.zip`, a Tauri resource) — what
+/// the 3D views and block picker use when the user hasn't chosen their own.
+#[tauri::command(async)]
+fn load_default_texture_pack(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<TexturePackInfo, String> {
+    use tauri::Manager;
+    let path = app.path()
+        .resolve("default-textures/default.zip", tauri::path::BaseDirectory::Resource)
+        .map_err(|e| format!("Failed to resolve the bundled texture pack: {e}"))?;
+    Ok(install_texture_pack(texturepack::load_pack(&path.to_string_lossy())?, &state))
 }
 
 // ── App entry point ────────────────────────────────────────────────────────────
@@ -10878,27 +11288,41 @@ fn sculpt_split(
     // ── Commit: exclusive guard, for the memcpy + bookkeeping only.
     let mut ws = write_ws(state);
     let mut world = ws.world.take().ok_or("No world loaded")?;
-    let pre_snap = if ws.dirty.seq == seq_seen {
-        chunks.commit(&mut world)
-    } else {
-        timing_log!("[SCULPT] world changed during compute (seq {} -> {}) — restamping under the write guard", seq_seen, ws.dirty.seq);
-        drop(chunks);
-        session = SculptSession { group_id: group.unwrap_or(0), fheight: HashMap::new() };
-        let coords = affected_chunk_coords(&world, rect.0, rect.1, rect.2, rect.3);
-        let mut scratch = ChunkScratch::new(&world, &coords);
-        let ran = run_sculpt_flush(&mut scratch, &mut session, args, stamps);
-        mem::PEAKS.sculpt_scratch.record(scratch.buf_len() as u64);
-        if let Err(e) = ran {
-            ws.world = Some(world);
-            return Err(e);
+    let seq_now = ws.dirty.seq;
+    let (style, view_lod) = (ws.map_style(), ws.view_lod);
+    // 29.9b: the world is taken from here to the patch render, so a panic in the commit (or the
+    // restamp) goes through `keep_world_after_panic`. The scratch only ever owns chunks under
+    // `rect`, so `affected_chunk_coords(rect)` covers every chunk the commit could have written.
+    let run = panic::catch_unwind(AssertUnwindSafe(|| -> Result<_, String> {
+        let pre_snap = if seq_now == seq_seen {
+            chunks.commit(&mut world)
+        } else {
+            timing_log!("[SCULPT] world changed during compute (seq {} -> {}) — restamping under the write guard", seq_seen, seq_now);
+            drop(chunks);
+            session = SculptSession { group_id: group.unwrap_or(0), fheight: HashMap::new() };
+            let coords = affected_chunk_coords(&world, rect.0, rect.1, rect.2, rect.3);
+            let mut scratch = ChunkScratch::new(&world, &coords);
+            let ran = run_sculpt_flush(&mut scratch, &mut session, args, stamps);
+            mem::PEAKS.sculpt_scratch.record(scratch.buf_len() as u64);
+            ran?;
+            scratch.into_chunks().commit(&mut world)
+        };
+        // Same ordering rule as `with_edit_inner`: the commit changed bytes, so the scan ceilings over
+        // those chunks must go before the patch is rendered (see `invalidate_derived`).
+        let committed: Vec<(i32, i32)> = pre_snap.iter().map(|s| (s.cx, s.cy)).collect();
+        world.invalidate_derived(&committed);
+        let (patch, invalidate) = edit_patch(&world, rect, style, view_lod);
+        Ok((pre_snap, patch, invalidate))
+    }));
+    let (pre_snap, patch, invalidate) = match run {
+        Ok(Ok(r)) => r,
+        // The restamp failed before its commit: nothing was written.
+        Ok(Err(e)) => { ws.world = Some(world); return Err(e); }
+        Err(p) => {
+            let coords = affected_chunk_coords(&world, rect.0, rect.1, rect.2, rect.3);
+            return Err(keep_world_after_panic(&mut ws, world, &coords, operation, &*p));
         }
-        scratch.into_chunks().commit(&mut world)
     };
-    // Same ordering rule as `with_edit_inner`: the commit changed bytes, so the scan ceilings over
-    // those chunks must go before the patch is rendered (see `invalidate_derived`).
-    let committed: Vec<(i32, i32)> = pre_snap.iter().map(|s| (s.cx, s.cy)).collect();
-    world.invalidate_derived(&committed);
-    let (patch, invalidate) = edit_patch(&world, rect, ws.map_style(), ws.view_lod);
     ws.world = Some(world);
     if sculpt_persists_session(&args.mode, group) {
         ws.sculpt_session = Some(session);
@@ -12041,6 +12465,13 @@ struct MemStats {
     peaks: mem::PeakSnapshot,
 }
 
+/// Installed RAM in bytes (0 = unknown). Lock-free; the frontend picks the stock memory preset
+/// from it once per install (ROADMAP-EDIT 31.4).
+#[tauri::command(async)]
+fn system_ram_bytes() -> u64 {
+    mem::system_memory().total_bytes
+}
+
 #[tauri::command(async)]
 fn mem_stats(state: tauri::State<'_, AppState>) -> MemStats {
     let ws = read_ws(&state);
@@ -12119,6 +12550,8 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            set_traffic_lights_hidden,
+            native_edit_action,
             load_world,
             get_world_info,
             backup_status,
@@ -12128,6 +12561,7 @@ pub fn run() {
             set_view_relief,
             set_view_lod,
             set_undo_budget,
+            set_clipboard_cap,
             set_overview_budget,
             export_png,
             describe_selection,
@@ -12212,6 +12646,7 @@ pub fn run() {
             get_sky_grid,
             set_sky_grid,
             get_records,
+            get_record_overlay,
             pick_block_surface,
             get_cursor_block,
             load_eden_template,
@@ -12222,9 +12657,10 @@ pub fn run() {
             materialize_flat_chunks,
             cancel_materialize,
             load_texture_pack,
-            unload_texture_pack,
+            load_default_texture_pack,
             get_block_tables,
             mem_stats,
+            system_ram_bytes,
             write_text_file,
         ])
         .build(tauri::generate_context!())
@@ -12347,6 +12783,121 @@ fn records_info(world: &LoadedWorld, adopted: Option<&AdoptedSidecars>) -> Recor
         }).collect(),
         adopted: adopted.map(|a| a.counts).unwrap_or_default(),
     }
+}
+
+/// One drawable sign in `get_record_overlay`'s result (27.6a). Coordinates are editor-local blocks
+/// in file axes (x, y horizontal, z height); geometry from `voxel_core::signs`.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OverlaySign {
+    /// Index into `get_records().signs`.
+    i: u32,
+    kind: voxel_core::signs::SignKind,
+    /// The anchor block.
+    pos: [i32; 3],
+    /// The record's face code (0 -x, 1 +x, 3 top, 4 -y, 5 +y) and text direction.
+    a: i32,
+    c: i32,
+    /// The record's paint byte as stored (may be out of 1..=54).
+    b: i32,
+    /// The board colour actually used (`PAINT_RGB[b]`, `b = 2`'s colour when out of range).
+    colour: [u8; 3],
+    text: String,
+    vis: voxel_core::signs::SignVis,
+    boxes: Vec<voxel_core::signs::SignBox>,
+    quad: voxel_core::signs::Quad,
+    font_px: f32,
+}
+
+#[derive(Serialize)]
+struct OverlayCmd {
+    i: u32,
+    pos: [i32; 3],
+    /// Exposed-face bitmask, bit = face code `a` (0 -x, 1 +x, 2 bottom, 3 top, 4 -y, 5 +y).
+    faces: voxel_core::signs::FaceMask,
+}
+
+/// `get_record_overlay`'s result. Only signs that draw are listed (`vis` is always `"drawn"`);
+/// the ones skipped are counted in `hiddenAir` / `hiddenFront`.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OverlayInfo {
+    signs: Vec<OverlaySign>,
+    cmds: Vec<OverlayCmd>,
+    hidden_air: u32,
+    hidden_front: u32,
+    /// A cap cut the nearest-first list short (signs or command blocks).
+    truncated: bool,
+}
+
+const OVERLAY_MAX_SIGNS: usize = 512;
+const OVERLAY_MAX_CMDS: usize = 256;
+
+/// The overlay's data around `(cx, cy, cz)` (editor-local blocks, a camera position): signs within
+/// `radius` and command blocks within `cmd_radius`, nearest first, capped. Read-only.
+fn record_overlay(world: &LoadedWorld, cx: f64, cy: f64, cz: f64, radius: i32, cmd_radius: i32) -> OverlayInfo {
+    use voxel_core::signs as sg;
+    let mut out = OverlayInfo { signs: Vec::new(), cmds: Vec::new(), hidden_air: 0, hidden_front: 0, truncated: false };
+    // An opaque trailer has no parsed records: signs()/cmds() are empty, so this is already the
+    // empty result (never an error).
+    let t = &world.trailer;
+    let d2 = |p: (i32, i32, i32)| {
+        let (dx, dy, dz) = (p.0 as f64 + 0.5 - cx, p.1 as f64 + 0.5 - cy, p.2 as f64 + 0.5 - cz);
+        dx * dx + dy * dy + dz * dz
+    };
+    let (r2, c2) = ((radius as f64).powi(2), (cmd_radius as f64).powi(2));
+
+    let mut sc: Vec<(f64, usize, (i32, i32, i32))> = t.signs().iter().enumerate()
+        .filter(|(_, s)| matches!(s.a, 0 | 1 | 3 | 4 | 5))
+        .map(|(i, s)| { let p = world.record_to_local(s.pos); (d2(p), i, p) })
+        .filter(|&(d, _, _)| d <= r2)
+        .collect();
+    sc.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+    for (_, i, p) in sc {
+        let s = &t.signs()[i];
+        let spec = sg::SignSpec { x: p.0, y: p.1, z: p.2, a: s.a, b: s.b, c: s.c, on_cmd: t.find_cmd(s.pos).is_some() };
+        match sg::sign_visibility(world, &spec) {
+            sg::SignVis::Drawn => {}
+            sg::SignVis::HiddenAir => { out.hidden_air += 1; continue; }
+            sg::SignVis::HiddenFront => { out.hidden_front += 1; continue; }
+            sg::SignVis::Bottom => continue,
+        }
+        if out.signs.len() >= OVERLAY_MAX_SIGNS { out.truncated = true; continue; }
+        let Some(g) = sg::sign_geometry(&spec) else { continue };
+        out.signs.push(OverlaySign {
+            i: i as u32, kind: g.kind, pos: [p.0, p.1, p.2], a: s.a, c: s.c, b: s.b,
+            colour: sg::board_rgb(s.b),
+            text: String::from_utf8_lossy(s.text()).into_owned(),
+            vis: sg::SignVis::Drawn, boxes: g.boxes, quad: g.quad, font_px: g.font_px,
+        });
+    }
+
+    let mut cc: Vec<(f64, usize, (i32, i32, i32))> = t.cmds().iter().enumerate()
+        .map(|(i, c)| { let p = world.record_to_local(c.pos); (d2(p), i, p) })
+        .filter(|&(d, _, _)| d <= c2)
+        .collect();
+    cc.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+    for (_, i, p) in cc {
+        if read_block_abs(world, p.0, p.1, p.2) == 0 { continue; }
+        if out.cmds.len() >= OVERLAY_MAX_CMDS { out.truncated = true; break; }
+        out.cmds.push(OverlayCmd { i: i as u32, pos: [p.0, p.1, p.2], faces: sg::cmd_faces(world, p.0, p.1, p.2) });
+    }
+    out
+}
+
+/// The 3D overlay's records near the camera: drawable signs (boards, posts, text quads, colour) and
+/// command-block skin faces, nearest first (27.6a). `cx/cy/cz` are the camera in editor-local
+/// blocks (the space `get_records` emits); `radiusOverride` replaces the sign radius (32; command
+/// blocks then use twice it, default 64). Read lock only.
+#[tauri::command(async)]
+fn get_record_overlay(state: tauri::State<'_, AppState>, cx: f64, cy: f64, cz: f64, radius_override: Option<i32>) -> Result<OverlayInfo, String> {
+    let ws = read_ws(&state);
+    let world = ws.world.as_ref().ok_or("No world loaded")?;
+    let (r, cr) = match radius_override {
+        Some(r) => { let r = r.clamp(1, 256); (r, r.saturating_mul(2)) }
+        None => (voxel_core::signs::RADIUS, voxel_core::signs::CMD_RADIUS),
+    };
+    Ok(record_overlay(world, cx, cy, cz, r, cr))
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
@@ -13721,6 +14272,92 @@ mod tests {
         assert_eq!(w.top_bands.peek(0, 0), None, "the rolled-back chunk's ceiling was invalidated");
         assert_eq!(w.top_band_hint(0, 0), hint_before, "…and recomputes to the restored bytes");
         assert!(lamps_match_a_rebuild(&ws));
+    }
+
+    /// 29.9b — a closure that writes several bands and then **panics** keeps the world. It is rolled
+    /// back exactly, *before* the world goes back into `ws`, and the history around it is untouched.
+    /// The undo/redo that follow then reproduce the pre-panic states byte for byte. A half-written
+    /// world would make the next delta diff against bytes no entry describes.
+    #[test]
+    fn test_edit_closure_panic_keeps_world_rolled_back() {
+        let mut ws = cow_ws(16);
+        let base = world_bytes(&ws);
+        with_edit(&mut ws, "A", (0, 0, 47, 47), |w| { set_block_abs(w, 5, 5, 100, 9, 0); Ok(()) }).expect("A");
+        let after_a = world_bytes(&ws);
+        with_edit(&mut ws, "B", (0, 0, 47, 47), |w| { set_block_abs(w, 30, 30, 120, 9, 0); Ok(()) }).expect("B");
+        undo_edit_inner(&mut ws).expect("undo B"); // one entry on each stack
+        assert_eq!(world_bytes(&ws), after_a);
+        let (undo_len, redo_len, seq) = (ws.undo_stack.len(), ws.redo_stack.len(), ws.dirty.seq);
+
+        let err = with_edit(&mut ws, "Fill", (0, 0, 47, 47), |w| {
+            for z in [5, 40, 90, 200] { set_block_abs(w, 3, 3, z, 9, 1); }
+            set_block_abs(w, 40, 40, 33, 9, 1);
+            panic!("writer bug");
+        }).err().expect("the panic becomes an Err");
+        assert!(err.contains("Fill") && err.contains("writer bug"), "{err}");
+        assert!(ws.world.is_some(), "the world survived the panic");
+        assert!(world_bytes(&ws) == after_a, "exact rollback");
+        assert_eq!((ws.undo_stack.len(), ws.redo_stack.len()), (undo_len, redo_len), "history untouched");
+        assert_eq!(ws.dirty.seq, seq, "nothing marked dirty");
+        assert!(lamps_match_a_rebuild(&ws));
+
+        // A panic before any write is just as harmless.
+        assert!(with_edit(&mut ws, "Early", (0, 0, 47, 47), |_| panic!("early")).is_err());
+        assert!(world_bytes(&ws) == after_a);
+
+        // The history still lines up with the bytes in both directions.
+        redo_edit_inner(&mut ws).expect("redo B");
+        undo_edit_inner(&mut ws).expect("undo B");
+        assert!(world_bytes(&ws) == after_a);
+        undo_edit_inner(&mut ws).expect("undo A");
+        assert!(world_bytes(&ws) == base, "undo after the panic restores the original bytes");
+    }
+
+    /// 29.9b — a panic halfway through an undo (injected after the first restored chunk) keeps the
+    /// half-restored world. Both stacks are cleared (no delta describes these bytes any more), every
+    /// chunk the entry named is marked dirty, and a fresh edit's undo is exact against the bytes.
+    #[test]
+    fn test_undo_panic_keeps_world_and_clears_history() {
+        let mut ws = cow_ws(16);
+        let base = world_bytes(&ws);
+        // One entry spanning three chunks, placing lamps (72) so the lamp index has work to do.
+        with_edit(&mut ws, "Spread", (0, 0, 47, 47), |w| {
+            set_block_abs(w, 3, 3, 100, 72, 0);
+            set_block_abs(w, 20, 20, 100, 72, 0);
+            set_block_abs(w, 40, 40, 100, 72, 0);
+            Ok(())
+        }).expect("edit");
+        let after = world_bytes(&ws);
+        assert_eq!(ws.undo_stack.back().unwrap().chunks.len(), 3);
+        ws.dirty.since_disk.clear();
+
+        RESTORE_PANIC_AFTER.with(|c| c.set(Some(1)));
+        let err = undo_edit_inner(&mut ws).err().expect("the panic becomes an Err");
+        assert!(err.contains("Undo") && err.contains("injected restore panic"), "{err}");
+        let half = world_bytes(&ws);
+        assert!(half != base && half != after, "a genuine half-restore");
+        assert!(ws.undo_stack.is_empty() && ws.redo_stack.is_empty(), "both stacks cleared");
+        assert_eq!((ws.undo_bytes, ws.redo_bytes, ws.undo_groups, ws.redo_groups), (0, 0, 0, 0));
+        assert_eq!(dirty_chunks(&ws).len(), 3, "every chunk the entry named is dirty");
+        assert!(ws.lamp_index.snapshot().is_empty(), "the lamp index was cleared (rebuilt lazily), not left stale");
+        assert!(undo_edit_inner(&mut ws).is_err() && redo_edit_inner(&mut ws).is_err());
+
+        // Editing goes on normally from the half-restored bytes.
+        with_edit(&mut ws, "Next", (0, 0, 47, 47), |w| { set_block_abs(w, 10, 10, 150, 9, 0); Ok(()) }).expect("edit");
+        undo_edit_inner(&mut ws).expect("undo");
+        assert!(world_bytes(&ws) == half);
+
+        // Redo has the same guard.
+        with_edit(&mut ws, "Again", (0, 0, 47, 47), |w| {
+            set_block_abs(w, 3, 3, 120, 9, 0);
+            set_block_abs(w, 40, 40, 120, 9, 0);
+            Ok(())
+        }).expect("edit");
+        undo_edit_inner(&mut ws).expect("undo");
+        RESTORE_PANIC_AFTER.with(|c| c.set(Some(1)));
+        let err = redo_edit_inner(&mut ws).err().expect("the panic becomes an Err");
+        assert!(err.contains("Redo"), "{err}");
+        assert!(ws.world.is_some() && ws.undo_stack.is_empty() && ws.redo_stack.is_empty());
     }
 
     /// B.6 test 4 — the `top_band_hint` trap. Warm a chunk's ceiling, raise a column far above it
@@ -15364,7 +16001,7 @@ mod tests {
         let base_len = world_bytes(&read_ws(&state)).len() as u64;
         rebase_edit(&state, 0);
         autosave_world_inner(&state, &paths, None, None).expect("tick 1");
-        let seq = try_incremental_save_seq(&state, source.to_str().unwrap(), false).unwrap().expect("incremental");
+        let seq = try_incremental_save_seq(&state, source.to_str().unwrap(), false).unwrap().expect("incremental").seq;
         rebase_after_save_inner(&state, &paths, &source, false, seq);
         rebase_edit(&state, 1);
         autosave_world_inner(&state, &paths, None, None).expect("tick 2");
@@ -15675,6 +16312,28 @@ mod tests {
             "a destination whose length no longer matches our record must decline");
         assert_eq!(fs::read(&dest).unwrap(), longer, "a declined save must not touch the destination");
 
+        // (b2) C-04: same length, same mtime, but a different file (new inode) — a sync client or a
+        // timestamp-preserving copy. Len + mtime match, so only `file_id` can catch it.
+        {
+            fs::write(&dest, &original).unwrap();   // undo (b)'s extension: the file must equal the image
+            let md = fs::metadata(&dest).unwrap();
+            let mtime = md.modified().unwrap();
+            // Re-record the image against the current file so len + mtime + file_id all match,
+            // leaving the inode as the only thing the swap changes.
+            write_ws(&state).disk_image = Some(DiskImage::from_metadata(&dest, &md, false));
+            let swap = dir.join("swap.tmp");
+            fs::write(&swap, &original).unwrap();
+            fs::File::options().write(true).open(&swap).unwrap().set_modified(mtime).unwrap();
+            fs::rename(&swap, &dest).unwrap();
+            let md2 = fs::metadata(&dest).unwrap();
+            assert_eq!((md2.len(), md2.modified().unwrap()), (md.len(), mtime), "test setup: len + mtime must match");
+            if file_id_of(&md2) != file_id_of(&md) {
+                assert!(!try_incremental_save(&state, dest.to_str().unwrap(), false).expect("decline, not error"),
+                    "a replaced file with identical len + mtime must decline on file_id");
+                assert_eq!(fs::read(&dest).unwrap(), original, "a declined save must not touch the destination");
+            }
+        }
+
         // (c) a compressed image can never be patched in place.
         {
             let md = fs::metadata(&dest).unwrap();
@@ -15950,6 +16609,149 @@ mod tests {
         write_test_wal(&dest, base_len + 1, &spans, true);
         recover_wal(&dest);
         assert_eq!(fs::read(&dest).unwrap(), original, "a log that doesn't fit this file must not apply");
+        assert!(!wal_path(&dest).exists());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Stamp `dest_id` into an existing test WAL's header (what `try_incremental_save_seq` writes).
+    fn bind_test_wal(dest: &std::path::Path, dest_id: u64) {
+        let mut f = fs::OpenOptions::new().write(true).open(wal_path(dest)).unwrap();
+        f.seek(SeekFrom::Start(32)).unwrap();
+        f.write_all(&dest_id.to_le_bytes()).unwrap();
+    }
+
+    fn wal_header_of(dest: &std::path::Path) -> [u8; journal::HEADER_LEN] {
+        fs::read(wal_path(dest)).unwrap()[..journal::HEADER_LEN].try_into().unwrap()
+    }
+
+    /// 29.4 / audit C-03: a committed log is matched to its destination by identity, not just
+    /// length. A bound log still repairs the file it was written for (the crash case), but one left
+    /// behind and then outlived by a same-length rewrite of the file (here our own full save, which
+    /// renames a new file in) must neither replay nor make the file look changed to autosave.
+    #[test]
+    fn test_wal_bound_to_its_destination() {
+        let dir = stage4_dir("wal_bound");
+        let original = make_bumpy_world_grid(2, 8, |_, _| 20);
+        let dest = dir.join("world.eden");
+        let base_len = original.len() as u64;
+        let spans = vec![(4096u64, 0, 0, vec![0x5Au8; 32768])];
+        let mut patched = original.clone();
+        patched[4096..4096 + 32768].fill(0x5A);
+
+        // (a) Bound to this very file: rolled forward exactly as before.
+        fs::write(&dest, &original).unwrap();
+        write_test_wal(&dest, base_len, &spans, true);
+        bind_test_wal(&dest, wal_dest_id(&fs::metadata(&dest).unwrap()));
+        assert!(has_committed_wal(&dest));
+        recover_wal(&dest);
+        assert_eq!(fs::read(&dest).unwrap(), patched, "a log bound to this file must repair it");
+        assert!(!wal_path(&dest).exists());
+
+        // (b) The audit's repro: the log outlives its save (a failed unlink), then a full save of the
+        // same length replaces the file. Before 29.4 the length matched and the next open reverted
+        // chunk (0,0) to the log's bytes.
+        fs::write(&dest, &original).unwrap();
+        write_test_wal(&dest, base_len, &spans, true);
+        bind_test_wal(&dest, wal_dest_id(&fs::metadata(&dest).unwrap()));
+        let mut newer = original.clone();
+        newer[4096..4096 + 32768].fill(0x33);
+        let held = dir.join("held"); // keep the old inode alive so the new file can't reuse it
+        fs::hard_link(&dest, &held).unwrap();
+        save_world_inner(&parse_world_inner(mmap_from_bytes(newer.clone())).unwrap(), dest.to_str().unwrap(), false)
+            .expect("full save");
+        assert_eq!(fs::metadata(&dest).unwrap().len(), base_len, "same length: only identity can tell");
+        assert!(!has_committed_wal(&dest), "a log for a replaced file must not count as committed");
+        recover_wal(&dest);
+        assert_eq!(fs::read(&dest).unwrap(), newer, "a log for a replaced file must not roll it back");
+        assert!(!wal_path(&dest).exists(), "and it is discarded");
+        let _ = fs::remove_file(&held);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 29.4 / audit C-03: `retire_wal` deletes the log, or neutralises it when the delete fails (an
+    /// AV scanner holding it on Windows; a read-only directory here), and reports only when the log
+    /// survives as-is. A neutralised log never replays and is cleaned up by the next open.
+    #[cfg(unix)]
+    #[test]
+    fn test_retire_wal_neutralises_or_reports() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = stage4_dir("wal_retire");
+        let original = make_bumpy_world_grid(2, 8, |_, _| 20);
+        let dest = dir.join("world.eden");
+        let spans = vec![(4096u64, 0, 0, vec![0x5Au8; 32768])];
+        let set_mode = |p: &std::path::Path, m: u32| fs::set_permissions(p, fs::Permissions::from_mode(m)).unwrap();
+
+        // No log at all, and a deletable one: both fine.
+        fs::write(&dest, &original).unwrap();
+        assert!(retire_wal(&dest).is_ok());
+        write_test_wal(&dest, original.len() as u64, &spans, true);
+        assert!(retire_wal(&dest).is_ok());
+        assert!(!wal_path(&dest).exists());
+
+        // Undeletable but writable: neutralised.
+        write_test_wal(&dest, original.len() as u64, &spans, true);
+        set_mode(&dir, 0o555);
+        let r = retire_wal(&dest);
+        set_mode(&dir, 0o755); // before any assert, so a failure can't leave an undeletable dir
+        assert!(r.is_ok(), "{r:?}");
+        assert!(wal_path(&dest).exists(), "the delete really did fail");
+        assert_eq!(&wal_header_of(&dest)[0..4], &[0u8; 4], "its magic is zeroed");
+        assert!(!has_committed_wal(&dest));
+        recover_wal(&dest);
+        assert_eq!(fs::read(&dest).unwrap(), original, "a neutralised log never replays");
+        assert!(!wal_path(&dest).exists(), "and the next open removes it");
+
+        // Neither deletable nor writable: reported, log left as it was.
+        write_test_wal(&dest, original.len() as u64, &spans, true);
+        set_mode(&wal_path(&dest), 0o444);
+        set_mode(&dir, 0o555);
+        let r = retire_wal(&dest);
+        set_mode(&dir, 0o755);
+        set_mode(&wal_path(&dest), 0o644);
+        assert!(r.is_err(), "a surviving committed log must be reported");
+        assert!(has_committed_wal(&dest));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 29.4 end to end: an incremental save whose log can't be deleted still succeeds, binds the log
+    /// to the file it patched, and leaves it neutralised, so reopening changes nothing.
+    #[cfg(unix)]
+    #[test]
+    fn test_incremental_save_neutralises_an_undeletable_log() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = stage4_dir("wal_undeletable");
+        let original = make_bumpy_world_grid(2, 8, |_, _| 20);
+        let dest = dir.join("world.eden");
+        let state: AppState = RwLock::new(ws_with_disk_image(original.clone(), &dest));
+        {
+            let mut ws = write_ws(&state);
+            with_edit(&mut ws, "delete", (0, 0, 5, 5), |world| {
+                delete_blocks_inner(world, 0, 0, 5, 5, 0, 63, None);
+                Ok(())
+            }).expect("edit");
+        }
+        // Everything the save creates in the directory exists up front, so only the delete needs
+        // the directory to be writable.
+        make_backup_if_absent(&dest, false).unwrap();
+        fs::write(wal_path(&dest), b"").unwrap();
+        let ino = wal_dest_id(&fs::metadata(&dest).unwrap());
+
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+        let r = try_incremental_save_seq(&state, dest.to_str().unwrap(), false);
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let saved = r.expect("save").expect("eligible");
+        assert!(saved.warning.is_none(), "a neutralised log needs no warning: {:?}", saved.warning);
+        let expected = world_bytes(&read_ws(&state));
+        assert_eq!(fs::read(&dest).unwrap(), expected);
+        let hdr = wal_header_of(&dest);
+        assert_eq!(&hdr[0..4], &[0u8; 4], "neutralised");
+        assert_eq!(u64::from_le_bytes(hdr[32..40].try_into().unwrap()), ino, "bound to the file it patched");
+        recover_wal(&dest);
+        assert_eq!(fs::read(&dest).unwrap(), expected);
         assert!(!wal_path(&dest).exists());
 
         let _ = fs::remove_dir_all(&dir);
@@ -17718,6 +18520,31 @@ mod tests {
     /// The staging pre-flight (H1 Stage 4). The volume-query half is inherently platform-specific
     /// and can only be exercised on the platform running the test; what is pinned here is the
     /// policy around it, which is the part that could refuse a load that should have succeeded.
+    /// C-10/P-10: a dropped guard deletes its temp and clears the slot; `release` keeps the file;
+    /// the exit hook removes a still-registered one.
+    #[test]
+    fn test_staging_guard_lifecycle() {
+        let g = StagingGuard::new();
+        let p = g.path().to_path_buf();
+        fs::write(&p, b"x").unwrap();
+        drop(g);
+        assert!(!p.exists() && staging_slot().is_none());
+
+        let g = StagingGuard::new();
+        let p = g.path().to_path_buf();
+        fs::write(&p, b"x").unwrap();
+        let kept = g.release();
+        assert!(kept.exists() && staging_slot().is_none());
+        fs::remove_file(&kept).unwrap();
+
+        let g = StagingGuard::new();
+        let p = g.path().to_path_buf();
+        fs::write(&p, b"x").unwrap();
+        remove_staging_temp();
+        assert!(!p.exists());
+        drop(g); // already gone: must not panic
+    }
+
     #[test]
     fn test_staging_room_preflight() {
         let tmp = std::env::temp_dir().join("vuencedit_room_check.eden");
@@ -19886,6 +20713,18 @@ mod tests {
         );
         assert!(cancel_result.is_err(), "cancellation must return an error");
         assert!(!cancel_path.exists(), "cancellation must not leave a partial output file");
+
+        // C-01 / 29.1: cancelling over an EXISTING destination (e.g. the open world) leaves it
+        // byte-intact, and no `.savetmp` behind.
+        fs::write(&cancel_path, b"original world").unwrap();
+        let r = materialize_flat_chunks_inner(
+            cancel_path.to_str().unwrap(), chunk_size, &header, &coords, &src, &to_add, &params, &[], &[],
+            || true, |_, _| {},
+        );
+        assert!(r.is_err());
+        assert_eq!(fs::read(&cancel_path).unwrap(), b"original world", "cancel must not touch the destination");
+        assert!(!cancel_path.with_extension("eden.savetmp").exists(), "no stray .savetmp");
+        let _ = fs::remove_file(&cancel_path);
     }
 
     // ── Rock sculpt mode ───────────────────────────────────────────────────────
@@ -20592,6 +21431,55 @@ mod tests {
         assert_eq!((r.signs[0].x, r.signs[0].y, r.signs[0].z, r.signs[0].text.as_str()), (x, y, z, "test"));
     }
 
+    /// 27.6a: `record_overlay` lists drawable signs nearest-first, counts hidden ones, applies
+    /// radius and caps, and an opaque trailer yields the empty result.
+    #[test]
+    fn test_record_overlay_order_hiding_and_caps() {
+        // The grid world is solid up to z = 20 (stone-ish, opaque); the quarry sign's anchor is air.
+        let mut world = parse_world_inner(mmap_from_bytes(trailer_world())).expect("parse");
+        let (mx, my) = (world.min_x * 16, world.min_y * 16);
+        let abs = |x: i32, y: i32, z: i32| trailer::Pos::new(mx + x, my + y, z);
+        // Standing signs on the surface (z = 20, open sky above), at growing distance on x.
+        for x in [10, 2, 6] {
+            world.trailer.add_sign(abs(x, 5, 20), 3, 2, 0, format!("s{x}").as_bytes()).unwrap();
+        }
+        // Buried wall sign (front cell is solid), and one anchored in air.
+        world.trailer.add_sign(abs(4, 4, 10), 5, 2, 0, b"buried").unwrap();
+        world.trailer.add_sign(abs(4, 4, 30), 3, 2, 0, b"air").unwrap();
+        // A command block on the surface.
+        world.trailer.add_cmd(abs(3, 3, 20), b"say hi").unwrap();
+
+        let o = record_overlay(&world, 0.0, 5.0, 21.0, 32, 64);
+        let texts: Vec<&str> = o.signs.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(texts, ["s2", "s6", "s10"], "nearest first, hidden dropped (the quarry sign is in air)");
+        assert!(o.signs.iter().all(|s| s.kind == voxel_core::signs::SignKind::Standing && !s.boxes.is_empty()));
+        assert!(o.hidden_air == 1 && o.hidden_front == 1, "{} {}", o.hidden_air, o.hidden_front);
+        assert_eq!(o.cmds.len(), 1);
+        assert_eq!(o.cmds[0].pos, [3, 3, 20]);
+        assert!(o.cmds[0].faces.has(3) && !o.cmds[0].faces.has(2), "top exposed, bottom buried");
+        assert!(!o.truncated);
+        // Radius: only the closest sign is inside 4 blocks of (2, 5, 21).
+        let near = record_overlay(&world, 2.0, 5.0, 21.0, 3, 64);
+        assert_eq!(near.signs.len(), 1);
+        // Caps: far more standing signs than the limit.
+        for x in 0..32 { for y in 0..32 {
+            let _ = world.trailer.add_sign(abs(x, y, 20), 3, 2, 1, b"x");
+        } }
+        let big = record_overlay(&world, 16.0, 16.0, 21.0, 64, 64);
+        assert_eq!(big.signs.len(), OVERLAY_MAX_SIGNS);
+        assert!(big.truncated);
+        let d = |s: &OverlaySign| (s.pos[0] as f64 + 0.5 - 16.0).powi(2) + (s.pos[1] as f64 + 0.5 - 16.0).powi(2);
+        assert!(big.signs.windows(2).all(|w| d(&w[0]) <= d(&w[1])), "nearest first under the cap");
+
+        // Opaque trailer: empty, not an error.
+        let mut b = trailer_world();
+        b.extend_from_slice(&[1, 2, 3, 4, 5]);
+        let opaque = parse_world_inner(mmap_from_bytes(b)).expect("parse");
+        assert!(!opaque.trailer.parsed());
+        let e = record_overlay(&opaque, 0.0, 0.0, 0.0, 32, 64);
+        assert!(e.signs.is_empty() && e.cmds.is_empty() && !e.truncated);
+    }
+
     /// Plan §3.2's writer table: a world with a touched trailer, saved by every full writer,
     /// reloads with the new trailer and the same head.
     #[test]
@@ -20846,6 +21734,63 @@ mod tests {
             write_ws(s).world = None;
             if let Some(t) = t { let _ = fs::remove_file(t); }
         }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 29.5 / audit C-06: a `w.emod` or `w.eden.zip` beside the game's `w.eden` shares its stem, so it
+    /// adopts `w.eden`'s sidecars — read-only. Its own save ends the adoption without renaming them
+    /// (the game's `w.eden` still relies on them); only a save to the `.eden` they're named for retires
+    /// them, and that never replaces an `.adopted` left by an earlier adoption.
+    #[test]
+    fn test_sidecar_adoption_read_only_for_siblings() {
+        let dir = stage4_dir("sidecar_siblings");
+        let signs = dir.join("signs_w.eden.dat");
+        let cmds = dir.join("cmd_w.eden.dat");
+        fs::write(&signs, b"s").unwrap();
+        fs::write(&cmds, b"c").unwrap();
+        let adopt = |ws: &mut WorldState, from: &str| {
+            ws.dirty.mark_adopted();
+            ws.adopted = Some(AdoptedSidecars {
+                world_path: dir.join(from),
+                files: vec![signs.clone(), cmds.clone()],
+                counts: RecordCounts { signs: 1, cmds: 1 },
+            });
+        };
+        let mut ws = WorldState::new();
+
+        for sibling in ["w.emod", "w.eden.zip", "w.zip"] {
+            adopt(&mut ws, sibling);
+            // Save As elsewhere: still pending.
+            assert!(take_adopted_for(&mut ws, &dir.join("other.eden")).is_empty(), "{sibling}");
+            assert!(ws.dirty.trailer_adopt_pending && ws.adopted.is_some(), "{sibling}");
+            // Its own save: written into itself, adoption over, nothing to rename.
+            assert!(take_adopted_for(&mut ws, &dir.join(sibling)).is_empty(), "{sibling}");
+            assert!(!ws.dirty.trailer_adopt_pending && ws.adopted.is_none(), "{sibling}");
+        }
+
+        // A sibling saved as the `.eden` the sidecars name: that file holds them now, so they retire.
+        adopt(&mut ws, "w.emod");
+        assert_eq!(take_adopted_for(&mut ws, &dir.join("w.eden")), vec![signs.clone(), cmds.clone()]);
+        assert!(!ws.dirty.trailer_adopt_pending);
+
+        // A `.eden` in another folder with the same name isn't theirs.
+        let sub = dir.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        adopt(&mut ws, "w.eden");
+        assert!(take_adopted_for(&mut ws, &sub.join("w.eden")).is_empty());
+        assert!(ws.dirty.trailer_adopt_pending);
+        let files = take_adopted_for(&mut ws, &dir.join("w.eden"));
+        assert_eq!(files.len(), 2);
+
+        // An earlier adoption's `.adopted` (and `.2.adopted`) are kept; this one gets the next name.
+        fs::write(dir.join("signs_w.eden.dat.adopted"), b"old1").unwrap();
+        fs::write(dir.join("signs_w.eden.dat.2.adopted"), b"old2").unwrap();
+        rename_adopted(&files);
+        assert!(!signs.exists() && !cmds.exists());
+        assert_eq!(fs::read(dir.join("signs_w.eden.dat.adopted")).unwrap(), b"old1");
+        assert_eq!(fs::read(dir.join("signs_w.eden.dat.2.adopted")).unwrap(), b"old2");
+        assert_eq!(fs::read(dir.join("signs_w.eden.dat.3.adopted")).unwrap(), b"s");
+        assert_eq!(fs::read(dir.join("cmd_w.eden.dat.adopted")).unwrap(), b"c");
         let _ = fs::remove_dir_all(&dir);
     }
 

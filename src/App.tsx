@@ -1,10 +1,12 @@
 import { encodeU8 } from "./codec";
 import { polygonMask } from "./drawTools";
+import { createSelectionMover } from "./selectionMover";
 import {
   type WorldMeta,
   decodeEditResult, decodePreviewData, decodeSelectionMask,
-  type SelectionInfo, type ClipboardInfo, type ExtrudeAxis, type AutosaveInfo, type SignInfo, type RecordsInfo,
+  type SelectionInfo, type ClipboardInfo, type ExtrudeAxis, type AutosaveInfo, type SignInfo, type CmdInfo, type RecordsInfo,
   type PreviewData, classifyWorldFormat,
+  type ShadowMode, type ShadowStyle, asShadowMode, asShadowStyle,
 } from "./types";
 import ExportPngModal, { type ExportPngOpts } from "./ExportPngModal";
 import { useRecentWorlds, timeAgo } from "./useRecentWorlds";
@@ -22,7 +24,6 @@ import GoToModal from "./GoToModal";
 import Sidebar, { type SidebarTab } from "./Sidebar";
 import ToolsWindow from "./windows/ToolsWindow";
 import HotbarWindow from "./windows/HotbarWindow";
-import { BrushShapePanel, BuildSlotPanel, CutawayPanel } from "./windows/modePanels";
 import LensWindow from "./windows/LensWindow";
 import { lensArmed, lensToggle } from "./lens/lensMode";
 import WindowLayer from "./windows/WindowLayer";
@@ -49,8 +50,8 @@ import DiagnosticsModal from "./DiagnosticsModal";
 import TourOverlay from "./tour/TourOverlay";
 import DoneOutline, { type DoneRect } from "./ui/DoneOutline";
 import { ContextMenu, type ContextMenuItem } from "./ui/ContextMenu";
-import { COMMAND_META } from "./commands/meta";
-import { formatChord } from "./commands/keys";
+import { meta, type CommandId } from "./commands/meta";
+import { formatChord, primaryModDown } from "./commands/keys";
 import { useMotionPref } from "./theme/motion";
 import { TOUR_STEPS, TOUR_VERSION, type TourCtx } from "./tour/steps";
 import AboutModal from "./AboutModal";
@@ -58,7 +59,7 @@ import WorldBrowserModal from "./WorldBrowserModal";
 import UploadModal from "./UploadModal";
 import NewWorldModal from "./NewWorldModal";
 import Ribbon, { ribbonHeight, EDEN_TEAL, type RibbonTab, type MapViewMode } from "./Ribbon";
-import QuickActionsBar, { QUICK_ACTIONS_BAR_H } from "./QuickActionsBar";
+import { barContext } from "./ribbon/optionsBar";
 import SettingsModal, { loadSettings, saveSettings, MEMORY_PRESETS, DEFAULTS as SETTINGS_DEFAULTS, deviceAwareDefaultMemoryBudget, type AppSettings, type SettingsTab } from "./SettingsModal";
 import WorldInfoModal from "./WorldInfoModal";
 import RecoveryModal, { recoveryBasePath } from "./RecoveryModal";
@@ -68,8 +69,10 @@ import { Icon, type IconName } from "./ribbon/icons";
 import {
   SURFACE, BORDER, TEXT, TEXT_DIM, TEXT_LABEL, TEXT_META, TEXT_DANGER, HAIRLINE, TOPBAR_BG,
   ACCENT, FONT, ICON, IS_MAC, RADIUS, SPACE, FOCUS_RING, GRAD_HOVER, GRAD_PRESSED, hexToRgbTriplet,
-  btnBase,
+  btnBase, TOP_BAR_HEIGHT, TOPBAR_BTN_H, OPTIONS_BAR_H,
 } from "./ribbon/tokens";
+import { dragRegion, setWindowControlsPreview, useWindowChrome } from "./windowChrome";
+import WindowControls from "./ribbon/WindowControls";
 import { ACCENTS, RAMP, armedRecipe } from "./theme/theme";
 import { v } from "./theme/cssVars";
 import Dialog, { DialogButton } from "./ui/Dialog";
@@ -78,6 +81,10 @@ import { blockDisplayName, applyBlockTables, orientBlockToFacing, resolveColor, 
 import { Segmented, Swatch } from "./ribbon/primitives";
 import { SCULPT_USES_PALETTE } from "./ribbon/sculptTools";
 import { isTypingTarget, shouldBlurAfterClick, chunkToWorld } from "./viewportUtils";
+import { createNativeMenu, type NativeMenu } from "./nativeMenu";
+import { decideMenuAction, isMenuEcho, noteKeyCommand, type MenuBlock } from "./commands/menuRouting";
+import { menuCommandForKey, SPLASH_SAFE } from "./commands/menuBar";
+import type { CommandBinding } from "./commands/types";
 import { decomposeMask, maskOutline } from "./maskUtils";
 import { sfx } from "./sound/sfx";
 import appIcon from "./assets/app-icon.png";
@@ -141,6 +148,7 @@ setWindowSnap(loadSettings().snapWindows);
 function pushBackendBudgets(preset: AppSettings["memoryBudget"]): void {
   const p = MEMORY_PRESETS[preset];
   invoke("set_undo_budget", { bytes: p.undoBudgetBytes }).catch(() => {});
+  invoke("set_clipboard_cap", { voxels: p.clipboardCapVoxels }).catch(() => {});
   invoke("set_overview_budget", { bytes: p.overviewBudgetBytes }).catch(() => {});
 }
 
@@ -170,6 +178,7 @@ const SCULPT_GESTURE_IDLE_MS = 400;
 /** Stable empty array for the sign-marker prop — a fresh `[]` each render would churn MapCanvas's
  *  prop-mirroring effects on every App re-render (cursor ticks, FPS, …). */
 const NO_SIGNS: SignInfo[] = [];
+const NO_CMDS: CmdInfo[] = [];
 /** Zoom (px per world block) the map is taken to by the World tab's "Go to" (a sign or a place) —
  *  enough to read the immediate surroundings, not so close that you lose the neighbourhood. */
 const SIGN_FOCUS_SCALE = 8;
@@ -571,6 +580,9 @@ function App() {
   // Live mirror of `world` for []-memoized callbacks (undo/redo → applyEditResult).
   const worldRef = useRef<WorldMeta | null>(null);
   useEffect(() => { worldRef.current = world; }, [world]);
+  // World generation (29.7): bumped when a world is loaded and when it is closed. Async replies
+  // (describe_selection, edit results) captured under an older generation are dropped.
+  const worldGenRef = useRef(0);
   // Monotonically increments only on full world load; triggers view+selection reset in MapCanvas.
   const [worldEpoch, setWorldEpoch] = useState(0);
   const mapCanvasRef = useRef<MapCanvasRef>(null);
@@ -588,8 +600,14 @@ function App() {
   const loadingRef = useRef(false);
   const savingRef = useRef(false);
   const fileOpBusy = () => loadingRef.current || savingRef.current;
+  const fileOpBusyRef = useRef(fileOpBusy);
+  fileOpBusyRef.current = fileOpBusy;
   const [saveCompressed, setSaveCompressed] = useState(() => loadSettings().defaultSaveCompressed);
   const [backupCompressed, setBackupCompressed] = useState(() => loadSettings().backupCompressed);
+  // Read through a ref (audit C-08): the keydown effect holds an old `saveWorld` closure, so a
+  // toggle ticked in the Save menu would otherwise not reach a following ⌘S.
+  const backupCompressedRef = useRef(backupCompressed);
+  backupCompressedRef.current = backupCompressed;
   const { recentWorlds, addRecentWorld, removeRecentWorld } = useRecentWorlds();
   /** Splash "More…" disclosure — collapsed shows SPLASH_RECENT_COLLAPSED of the MAX_RECENT entries. */
   const [showAllRecent, setShowAllRecent] = useState(false);
@@ -601,9 +619,13 @@ function App() {
   // `ribbonCollapsed` (a raw localStorage key, per-session UI state) this is a real `AppSettings`
   // field, so it also flows through `applySettings`.
   const [ribbonCompact, setRibbonCompact] = useState(() => loadSettings().ribbonCompact);
+  // Title-bar chrome (windowChrome.ts): drag regions + the frameless window's own controls. The
+  // macOS-only Experiments preview is applied once at startup (it hides the native traffic lights).
+  const windowChrome = useWindowChrome();
+  useEffect(() => { setWindowControlsPreview(loadSettings().previewWindowControls); }, []);
   // The ribbon body is a fixed height now (the drag-resize handle is gone, collapse remains), so
   // this is derived rather than stored. Everything downstream — the
-  // sidebar's `topPx`, the Quick Actions bar's `top` — reads it.
+  // sidebar's `topPx`, the options bar's `top` — reads it.
   const effectiveRibbonHeight = ribbonHeight(ribbonCollapsed, ribbonCompact);
   // Drop the retired `ribbon_body_height` key on first run so it doesn't linger forever.
   useEffect(() => { try { localStorage.removeItem("ribbon_body_height"); } catch { /* ignore */ } }, []);
@@ -628,8 +650,8 @@ function App() {
   const [sidebarWidth, setSidebarWidth] = useState(() => loadSettings().sidebarWidth);
   const [sidebarTab, setSidebarTab] = useState<SidebarTab>(() => loadSettings().sidebarTab);
   const sidebarInsetPx = sidebarOpen ? sidebarWidth : 0;
-  // Set once by the Ribbon on mount (see its `registerTabSetter` prop) so the Quick Actions bar's
-  // "More…" can jump to the Selection tab without lifting the Ribbon's tab state into App.
+  // Set once by the Ribbon on mount (see its `registerTabSetter` prop) so outside chrome
+  // (the selection-bounds flow) can jump to the Selection tab without lifting the Ribbon's tab state into App.
   const ribbonTabSetterRef = useRef<((t: RibbonTab) => void) | null>(null);
   const registerRibbonTabSetter = useCallback((fn: (t: RibbonTab) => void) => { ribbonTabSetterRef.current = fn; }, []);
   const [undoDepth, setUndoDepth] = useState(0);
@@ -898,21 +920,25 @@ function App() {
   }, [mapHost]);
   useEffect(() => { flyView3dRef.current?.exitLook(); }, [placement.main, placement.window]);
   const [fogEnabled, setFogEnabled] = useState(() => loadSettings().enableFog);
-  // Night lighting / shadow previews + the GPU shadow map for FlyView3D (see CLAUDE.md). `lightEpoch`
+  // Night lighting, baked shadows and the GPU shadow map for FlyView3D (see CLAUDE.md). `lightEpoch`
   // bumps whenever the baked ones change, driving a chunk-mesh reload (same mechanism as texEpoch).
-  // These are the perf-heavy 3D lighting modes (⚡ badged in the Ribbon): deliberately **session-only,
-  // always off at startup** (not seeded from persisted settings) and reset off on every world load/
-  // close via `resetHeavyLighting()` — a heavy GPU mode must never silently persist across worlds.
+  // Night lighting and GPU Shadows are the perf-heavy 3D lighting modes (⚡ badged in the Ribbon):
+  // deliberately **session-only, always off at startup** (not seeded from persisted settings) and
+  // reset off on every world load/close via `resetHeavyLighting()` — a heavy GPU mode must never
+  // silently persist across worlds.
   const [nightLighting, setNightLighting] = useState(false);
-  const [shadows3d, setShadows3d] = useState(false);
+  // Baked shadows (27.4b) are Eden's own look and cheap, so unlike the two above they're a saved
+  // setting (default Classic) that survives world loads. `shadowStyle` is the last non-off style, so
+  // the ribbon's Shadows toggle turns back on to Classic or Smooth.
+  const [shadowMode, setShadowMode] = useState<ShadowMode>(() => asShadowMode(loadSettings().shadowMode));
+  const [shadowStyle, setShadowStyle] = useState<ShadowStyle>(() => asShadowStyle(loadSettings().shadowStyle));
   // Opt-in real GPU shadow map (H5) — replaces the baked night/shadow preview with a lit material +
-  // directional sun + shadow map in FlyView3D. Independent of nightLighting/shadows3d; when on it
+  // directional sun + shadow map in FlyView3D. Independent of nightLighting/shadowMode; when on it
   // overrides them. Doesn't drive lightEpoch reloads: FlyView3D rebuilds meshes off the prop change.
   const [gpuShadows, setGpuShadows] = useState(false);
   // resetHeavyLighting() is a plain function called from load/close paths that don't re-run on every
   // render — it reads the live values through refs rather than a stale closure.
   const nightLightingRef = useRef(false); nightLightingRef.current = nightLighting;
-  const shadows3dRef     = useRef(false); shadows3dRef.current     = shadows3d;
   const gpuShadowsRef    = useRef(false); gpuShadowsRef.current    = gpuShadows;
   // Committed sun angle. The drag-time display value lives in the Ribbon (see its zSliceDisplay/
   // sunTDisplay/lampRadiusDisplay local state) so a slider drag re-renders only the Ribbon subtree;
@@ -925,19 +951,23 @@ function App() {
   // radius a switch snaps to; the slider can still override the radius afterward.
   const [lightingProfile, setLightingProfile] = useState<"legacy" | "modern">(() => loadSettings().lightingProfile);
   const [lightEpoch, setLightEpoch] = useState(0);
-  useEffect(() => { setLightEpoch(e => e + 1); }, [nightLighting, shadows3d, sunT, lampRadius, lightingProfile]);
+  useEffect(() => { setLightEpoch(e => e + 1); }, [nightLighting, shadowMode, sunT, lampRadius, lightingProfile]);
   // Force the perf-heavy 3D lighting modes off — called on every world load/close so none of them
   // carry over to a different world (they're Ribbon-only session toggles, never persisted).
   // Turning these off on every world load/close is deliberate (they're perf-heavy and must never
   // silently carry into a new world), but doing it silently reads as the toggle being broken —
   // say so, and only when one was actually on.
   function resetHeavyLighting() {
-    if (nightLightingRef.current || shadows3dRef.current || gpuShadowsRef.current) {
+    if (nightLightingRef.current || gpuShadowsRef.current) {
       showToast("3D lighting was turned off for the new world. Turn it on in the 3D tab.");
     }
     setNightLighting(false);
-    setShadows3d(false);
     setGpuShadows(false);
+  }
+  function commitShadowMode(m: ShadowMode) {
+    setShadowMode(m);
+    if (m !== "off") setShadowStyle(m);
+    saveSettings(m === "off" ? { shadowMode: m } : { shadowMode: m, shadowStyle: m });
   }
   function commitSunT(t: number) {
     setSunT(t);
@@ -1043,6 +1073,26 @@ function App() {
     }
   }, [showToast]);
 
+  // 31.4 — once per install, pick the stock memory preset from installed RAM: ≤ 4 GB and still on
+  // the stock "balanced" → Low. A default, never a clamp: the flag makes it one-shot, so a later
+  // explicit choice (or an install that already chose something else) is left alone. Unknown RAM
+  // (0) changes nothing and retries next launch.
+  useEffect(() => {
+    if (loadSettings().ramPresetChecked) return;
+    invoke<number>("system_ram_bytes").then(total => {
+      if (!total) return;
+      const s = loadSettings();
+      if (s.ramPresetChecked) return;
+      if (total <= 4 * 1024 ** 3 && s.memoryBudget === SETTINGS_DEFAULTS.memoryBudget) {
+        setMemoryBudget("low");
+        pushBackendBudgets("low");
+        saveSettings({ memoryBudget: "low", ramPresetChecked: true });
+      } else {
+        saveSettings({ ramPresetChecked: true });
+      }
+    }).catch(() => {});
+  }, []);
+
   // Shared SettingsModal onSave handler — splash screen and in-editor Settings modals both need
   // the full set of setters applied identically (they drifted once when only one site was updated).
   function applySettings(s: AppSettings) {
@@ -1051,12 +1101,15 @@ function App() {
     setBackupCompressed(s.backupCompressed);
     setFogEnabled(s.enableFog);
     setRibbonCompact(s.ribbonCompact);
+    setWindowControlsPreview(s.previewWindowControls);
     setCheckForUpdatesOnLaunch(s.checkForUpdatesOnLaunch);
     setUiSounds(s.uiSounds);
     setUiSoundPack(s.uiSoundPack);
     setUiSoundVolume(s.uiSoundVolume);
     setMotion(s.motion);
     setSunT(s.sunT);
+    setShadowMode(asShadowMode(s.shadowMode));
+    setShadowStyle(asShadowStyle(s.shadowStyle));
     setLampRadius(s.lampRadius);
     setLightingProfile(s.lightingProfile);
     setRenderDistance(s.renderDistance);
@@ -1069,6 +1122,7 @@ function App() {
     setSky3d({ zenith: s.sky3dZenith, horizon: s.sky3dHorizon, fogColor: s.fog3dColor, fogSoft: s.fog3dSoft });
     setShow3dHud(s.show3dHud);
     setShow3dGrid(s.show3dGrid);
+    setShowSigns(s.showSigns);
     setFloodFillLimit(s.floodFillLimit);
     setBuildReach(s.buildReach);
     setMemoryBudget(s.memoryBudget);
@@ -1076,8 +1130,7 @@ function App() {
     pushBackendBudgets(s.memoryBudget);
     if (s.templatePath !== templatePath) setTemplatePath(s.templatePath);
     if (s.texturePackPath !== texturePackPath) {
-      if (s.texturePackPath) loadTexturePackFile(s.texturePackPath);
-      else unloadTexturePack();
+      loadTexturePackFile(s.texturePackPath);
     }
   }
   const flyActiveRef = useRef(false); // true while FlyView3D fly mode is active — blocks global shortcuts
@@ -1120,10 +1173,17 @@ function App() {
   // Signs (256z-format plan, Phase 4) — fetched once per world load, read-only. Empty for the
   // overwhelming majority of worlds, which have none.
   const [signs, setSigns] = useState<SignInfo[]>([]);
-  // Sign markers on the 2D map. Deliberately session state, not an AppSettings key: it re-arms to
-  // ON for every world opened (see applyLoadedWorld) so signs are never silently missing on a
-  // world you've just opened, while still being switchable off for a session (View ▸ Layout).
-  const [showSigns, setShowSigns] = useState(true);
+  // The rest of `get_records` (27.7): command blocks + trailer status/adopted notice. `signs` stays its own
+  // state so the map/ribbon consumers don't re-render on unrelated record fields.
+  const [records, setRecords] = useState<RecordsInfo | null>(null);
+  // Sign + command-block markers: 2D map markers *and* the 3D pane's boards/text/skin (27.6b), one
+  // toggle (View ▸ Layout "Sign Markers"). Persisted as `AppSettings.showSigns` (default on); it
+  // no longer re-arms per world load.
+  const [showSigns, setShowSigns] = useState(() => loadSettings().showSigns);
+  const commitShowSigns = useCallback((v: boolean) => { setShowSigns(v); saveSettings({ showSigns: v }); }, []);
+  // 27.6b: a local stand-in for the backend records sequence (27.8a-1 hasn't landed). Bumped whenever
+  // `records` is (re)fetched or reset, so the 3D overlay refetches its `get_record_overlay`.
+  const [recordsSeq, setRecordsSeq] = useState(0);
   const cursorWorldRef = useRef<{ wx: number; wy: number }>({ wx: 0, wy: 0 });
 
   // Template overlay state
@@ -1540,12 +1600,14 @@ function App() {
       setSelection(null);
       return;
     }
+    let stale = false;
+    const gen = worldGenRef.current;
     const timer = setTimeout(() => {
       invoke<SelectionInfo>("describe_selection", { ...rawBounds, zMin, zMax })
-        .then(setSelection)
-        .catch((e) => reportError(e));
+        .then((sel) => { if (!stale && gen === worldGenRef.current) setSelection(sel); })
+        .catch((e) => { if (!stale) reportError(e); });
     }, 80);
-    return () => clearTimeout(timer);
+    return () => { stale = true; clearTimeout(timer); };
   }, [rawBounds, zMin, zMax, reportError]);
 
   // Single choke point for dropping the backend selection mask: whenever the committed rect no
@@ -1660,6 +1722,9 @@ function App() {
   const applyEditResult = useCallback(async (
     buf: ArrayBuffer, kind: "edit" | "undo" | "redo" = "edit", opts?: { silent?: boolean; noOutline?: boolean },
   ) => {
+    // 29.7: a reply for an edit that finished after ⌘W (no world open) must not touch the UI or
+    // bump editEpoch — quit would then prompt and autosave with no world.
+    if (!worldRef.current) return;
     const raw = decodeEditResult(buf);
     // The patch is sampled at `patch.lod` (audit M3), so its *world* footprint is its pixel
     // dimensions times that step — every consumer below that speaks world coordinates uses these.
@@ -1758,6 +1823,8 @@ function App() {
   // error chrome, which differ enough between callers (a synchronous fetch vs. a recovery flow with
   // its own dirty-forcing) to stay separate.
   function applyLoadedWorld(data: WorldMeta, path: string | null, opts?: WorldOpenOpts) {
+    worldGenRef.current++;
+    worldRef.current = data;
     // Per-world floating-window layout: path → header identity → the last layout left anywhere. A
     // just-created world skips the identity step (see `pickLayout`'s `fresh`).
     loadWindowLayout(normalizePath(path, IS_WINDOWS), worldIdentity(data, classifyWorldFormat(data)), opts?.fresh);
@@ -1785,10 +1852,9 @@ function App() {
     invoke<[number, number] | null>("get_player_pos")
       .then(pos => setPlayerPos(pos ? { px: pos[0], py: pos[1] } : null))
       .catch(() => setPlayerPos(null));
-    setShowSigns(true); // markers default back on for every newly opened world
     invoke<RecordsInfo>("get_records")
-      .then(r => setSigns(r.signs))
-      .catch(() => setSigns([]));
+      .then(r => { setSigns(r.signs); setRecords(r); setRecordsSeq(n => n + 1); })
+      .catch(() => { setSigns([]); setRecords(null); setRecordsSeq(n => n + 1); });
     // 27.0b: the game's sidecar files were adopted into the world (the world's own records win per
     // kind). Nothing is unsaved yet; the next save writes them in and retires the side files.
     const { signs: adoptedSigns, cmds: adoptedCmds } = data.records_adopted;
@@ -1817,18 +1883,24 @@ function App() {
     savedEpochRef.current = editEpochRef.current;
   }
 
-  async function swapToWorldFile(path: string, opts?: WorldOpenOpts) {
-    if (fileOpBusy()) return; // one load or save at a time (21.3); the overlay says what's running
+  /** Resolves true if the load ran to completion, false if it was refused (busy) or failed. */
+  async function swapToWorldFile(path: string, opts?: WorldOpenOpts): Promise<boolean> {
+    if (fileOpBusy()) { // one load or save at a time (21.3); the overlay says what's running
+      showToast("Another load or save is still running. Try again when it finishes.");
+      return false;
+    }
     loadingRef.current = true;
     const myEpoch = ++loadEpochRef.current;
     setLoading(true);
     setError(null);
     try {
       const data = await invoke<WorldMeta>("load_world", { path });
-      if (loadEpochRef.current !== myEpoch) return;
+      if (loadEpochRef.current !== myEpoch) return false;
       applyLoadedWorld(data, path, opts);
+      return true;
     } catch (e) {
       reportError(e);
+      return false;
     } finally {
       loadingRef.current = false;
       setLoading(false);
@@ -1918,44 +1990,37 @@ function App() {
   // stale bounds would find the source already emptied by the first and overwrite the moved
   // content with air. Extra calls while one is in flight are coalesced into a single pending
   // delta and applied (against the now-current bounds) once the in-flight call finishes.
-  const nudgeBusyRef = useRef(false);
-  const nudgePendingRef = useRef<{ dx: number; dy: number } | null>(null);
-
-  const nudgeSelectionContents = useCallback(async (dx0: number, dy0: number) => {
-    if (nudgeBusyRef.current) {
-      const pending = nudgePendingRef.current;
-      nudgePendingRef.current = { dx: (pending?.dx ?? 0) + dx0, dy: (pending?.dy ?? 0) + dy0 };
-      return;
-    }
-    nudgeBusyRef.current = true;
-    // Drain any deltas that arrive (via the branch above) while a move is in flight, applying
-    // each against the then-current bounds — a loop instead of recursive self-calls so this
-    // stays a single stable closure (recursive useCallback self-reference defeats memoization).
-    let dx = dx0, dy = dy0;
-    for (;;) {
+  // One shared queue for the arrow nudge and the 3D gizmo (see selectionMover.ts): bounds and z
+  // refs are committed synchronously so a queued batch never moves the pre-move box (C-02).
+  const requestSelectionMove = useMemo(() => createSelectionMover({
+    read: () => {
       const bounds = rawBoundsRef.current;
-      if (!bounds) break;
-      try {
-        const result = await invoke<ArrayBuffer>("move_selection", {
-          ...bounds, zMin: zMinRef.current, zMax: zMaxRef.current, dx, dy, dz: 0,
-        });
-        await applyEditResult(result);
-        const moved = { x1: bounds.x1 + dx, y1: bounds.y1 + dy, x2: bounds.x2 + dx, y2: bounds.y2 + dy };
-        // Shape-preserving move: move_selection shifted the backend mask's bbox by (dx,dy) when one
-        // was active. Track it here (before setRawBounds fires the clear-on-reshape effect) so the
-        // shifted mask survives; if no mask is active the ref is null and this is a no-op.
-        if (selectionMaskRectRef.current) selectionMaskRectRef.current = moved;
-        setRawBounds(moved);
-      } catch (e) {
-        reportError(e);
-      }
-      const pending = nudgePendingRef.current;
-      if (!pending) break;
-      nudgePendingRef.current = null;
-      dx = pending.dx; dy = pending.dy;
-    }
-    nudgeBusyRef.current = false;
-  }, [applyEditResult, reportError]);
+      return bounds ? { bounds, zMin: zMinRef.current, zMax: zMaxRef.current } : null;
+    },
+    move: async (s, d) => {
+      const result = await invoke<ArrayBuffer>("move_selection", {
+        ...s.bounds, zMin: s.zMin, zMax: s.zMax, dx: d.dx, dy: d.dy, dz: d.dz,
+      });
+      await applyEditResult(result);
+    },
+    commit: (n) => {
+      // Shape-preserving move: move_selection shifted the backend mask's bbox by the delta when one
+      // was active. Track it here (before setRawBounds fires the clear-on-reshape effect).
+      if (selectionMaskRectRef.current) selectionMaskRectRef.current = n.bounds;
+      rawBoundsRef.current = n.bounds;
+      zMinRef.current = n.zMin;
+      zMaxRef.current = n.zMax;
+      setRawBounds(n.bounds);
+      setZMin(n.zMin);
+      setZMax(n.zMax);
+    },
+    onError: reportError,
+  }), [applyEditResult, reportError]);
+
+  const nudgeSelectionContents = useCallback(
+    (dx: number, dy: number) => requestSelectionMove({ dx, dy, dz: 0 }),
+    [requestSelectionMove],
+  );
 
   // Entry point for both arrow-key nudge and drag-to-move: moves just the selection box by
   // default (E2 — off by default per user feedback), or the box + its blocks when the
@@ -1998,23 +2063,10 @@ function App() {
    *  undoable `move_selection` backend command, then shift rawBounds/zMin/zMax by the same delta —
    *  mirrors `nudgeSelectionContents` above (including the shape-preserving mask-rect bookkeeping),
    *  generalized to a 3-axis delta since the gizmo's Z arrow can move a selection up/down too. */
-  const handleGizmoMoveBlocks = useCallback(async (dx: number, dy: number, dz: number) => {
-    const bounds = rawBoundsRef.current;
-    if (!bounds) return;
-    try {
-      const result = await invoke<ArrayBuffer>("move_selection", {
-        ...bounds, zMin: zMinRef.current, zMax: zMaxRef.current, dx, dy, dz,
-      });
-      await applyEditResult(result);
-      const moved = { x1: bounds.x1 + dx, y1: bounds.y1 + dy, x2: bounds.x2 + dx, y2: bounds.y2 + dy };
-      if (selectionMaskRectRef.current) selectionMaskRectRef.current = moved;
-      setRawBounds(moved);
-      setZMin(z => z + dz);
-      setZMax(z => z + dz);
-    } catch (e) {
-      reportError(e);
-    }
-  }, [applyEditResult, reportError]);
+  const handleGizmoMoveBlocks = useCallback(
+    (dx: number, dy: number, dz: number) => requestSelectionMove({ dx, dy, dz }),
+    [requestSelectionMove],
+  );
 
   async function rotateClipboard() {
     try {
@@ -2026,9 +2078,13 @@ function App() {
     }
   }
 
+  // Naming: "Flip/Mirror X" reflects ACROSS the X axis (the user-facing convention), so it reverses
+  // rows (backend `mirror_clipboard_y`); "Flip/Mirror Y" reflects across the Y axis and reverses
+  // columns (backend `mirror_clipboard_x`, which is named for the coordinate it negates). All
+  // callers (options bar, ribbon, ⌘K) go through these two, so the swap lives only here.
   async function mirrorClipboardX() {
     try {
-      const info = await invoke<ClipboardInfo>("mirror_clipboard_x");
+      const info = await invoke<ClipboardInfo>("mirror_clipboard_y");
       setClipboard(info);
       sfx.play("rotate");
     } catch (e) {
@@ -2038,7 +2094,7 @@ function App() {
 
   async function mirrorClipboardY() {
     try {
-      const info = await invoke<ClipboardInfo>("mirror_clipboard_y");
+      const info = await invoke<ClipboardInfo>("mirror_clipboard_x");
       setClipboard(info);
       sfx.play("rotate");
     } catch (e) {
@@ -2611,7 +2667,10 @@ function App() {
       // The epoch is captured *before* the invoke (21.3 / audit L2), like the autosave timer: an
       // edit that lands while the save runs its post-steps must stay dirty, not be marked saved.
       const epoch = editEpochRef.current;
-      await invoke("save_world", { path, compressed: saveCompressed, backupCompressed });
+      // A non-null reply means the save completed but something after it needs the user's
+      // attention (29.4: its change log couldn't be cleared).
+      const warning = await invoke<string | null>("save_world", { path, compressed: saveCompressed, backupCompressed: backupCompressedRef.current });
+      if (warning) pushToast(warning, "error");
       lastAutosavedEpochRef.current = epoch;
       savedEpochRef.current = epoch;
       setLastSavedAt(Date.now()); // status-bar "Saved" timestamp (Stage 15.6)
@@ -2624,15 +2683,15 @@ function App() {
       savingRef.current = false;
       setSaving(false);
     }
-  }, [saveCompressed, showToast, reportError]);
+  }, [saveCompressed, showToast, pushToast, reportError]);
 
-  const saveWorldAs = useCallback(async () => {
+  const saveWorldAs = useCallback(async (): Promise<boolean> => {
     const chosen = await save({
       filters: [{ name: "Eden World", extensions: ["eden", "zip"] }],
       // An `.emod` source suggests the same name as a `.eden` (never write `.eden` bytes to `.emod`).
       defaultPath: sourcePath?.replace(/\.emod$/i, ".eden") ?? undefined,
     });
-    if (!chosen) return;
+    if (!chosen) return false;
     // Save As is a fresh path choice — silently correct the extension to match the compressed
     // flag rather than warn, since there's no existing file identity to preserve.
     const dot = chosen.lastIndexOf(".");
@@ -2648,7 +2707,7 @@ function App() {
         `${finalPath.slice(finalPath.lastIndexOf("/") + 1)} already exists. Overwrite it?`,
         { title: "Confirm overwrite", kind: "danger", okLabel: "Overwrite" },
       );
-      if (!ok) return;
+      if (!ok) return false;
     }
     const ok = await saveWorld(finalPath);
     if (ok) {
@@ -2658,6 +2717,7 @@ function App() {
       addRecentWorld(finalPath, finalPath.split(/[\\/]/).pop()!.replace(/\.(eden|zip)$/i, ""));
       saveWindowLayoutAs(normalizePath(finalPath, IS_WINDOWS)!); // the copy inherits the window layout
     }
+    return ok;
   }, [sourcePath, saveWorld, saveCompressed, addRecentWorld]);
 
   // 21.15: the root error boundary's Save (RootErrorBoundary.tsx) reaches this after App unmounts.
@@ -2665,7 +2725,7 @@ function App() {
   useEffect(() => {
     registerRootSave(async () => {
       const p = sourcePathRef.current;
-      return p ? saveWorld(p) : (await saveWorldAs(), true);
+      return p ? saveWorld(p) : saveWorldAs();
     });
   }, [saveWorld, saveWorldAs]);
 
@@ -2742,6 +2802,13 @@ function App() {
   useEffect(() => {
     const win = getCurrentWindow();
     const unlisten = win.onCloseRequested(async (event) => {
+      // C-09: a save in flight holds the window open (it would otherwise be offered "discard" and
+      // destroyed mid-save). Wait for it, then re-check dirty: a successful save closes cleanly.
+      if (savingRef.current) {
+        event.preventDefault();
+        while (savingRef.current) await new Promise((r) => setTimeout(r, 100));
+        if (!isDirty()) { win.destroy(); return; }
+      }
       if (!isDirty()) return; // clean — let the close proceed
       event.preventDefault();
       // Best-effort autosave before the confirm prompt: the periodic timer never gets to fire on
@@ -2834,6 +2901,62 @@ function App() {
   useEffect(() => { anyModalOpenRef.current = anyModalOpen; }, [anyModalOpen]);
   const longOpRef = useRef<LongOpState | null>(null);
   useEffect(() => { longOpRef.current = longOp; }, [longOp]);
+
+  // ── macOS menu bar (34.1) ──────────────────────────────────────────────────────────────────────
+  // Built once from the command registry (`nativeMenu.ts`); every item runs through `runMenuCommand`,
+  // which applies the same gates as the keydown handler above, in the same order. The ribbon publishes
+  // its live bindings through `onBindings` (a ref, not state: a setState there would loop); with no
+  // world there is no ribbon, so a small splash-safe set stands in.
+  const quitApp = useCallback(() => { void getCurrentWindow().close(); }, []);
+  const ribbonBindingsRef = useRef<Record<CommandId, CommandBinding> | null>(null);
+  const nativeMenuRef = useRef<NativeMenu | null>(null);
+  const menuBlockRef = useRef<MenuBlock>("none");
+  const splashBindings = useMemo((): Partial<Record<CommandId, CommandBinding>> => ({
+    "app.new": { run: () => setShowNewWorld(true), enabled: true },
+    "app.open": { run: () => { void openFileRef.current(); }, enabled: true },
+    "app.download": { run: () => setShowWorldBrowser(true), enabled: true },
+    "app.settings": { run: () => setShowSettings(true), enabled: true },
+    "app.about": { run: () => setShowAbout(true), enabled: true },
+    // No world to close: ⌘W closes the window, as in any Mac app.
+    "app.close": { run: quitApp, enabled: true },
+    "app.quit": { run: quitApp, enabled: true },
+  } satisfies Partial<Record<CommandId, CommandBinding>>), [quitApp, setShowNewWorld, setShowWorldBrowser, setShowSettings, setShowAbout]);
+  const menuBinding = useCallback((id: CommandId): CommandBinding | undefined =>
+    ribbonBindingsRef.current ? ribbonBindingsRef.current[id] : SPLASH_SAFE.has(id) ? splashBindings[id] : undefined,
+  [splashBindings]);
+  const onRibbonBindings = useCallback((b: Record<CommandId, CommandBinding> | null) => {
+    ribbonBindingsRef.current = b;
+    nativeMenuRef.current?.sync();
+  }, []);
+  const runMenuCommand = useCallback((id: CommandId) => {
+    // A key the legacy handler already ran (a menu accelerator the page didn't swallow) must not run twice.
+    if (isMenuEcho(id)) return;
+    const binding = menuBinding(id);
+    const d = decideMenuAction(
+      id, isTypingTarget(document.activeElement),
+      { blocked: menuBlockRef.current, hasWorld: ribbonBindingsRef.current !== null }, binding,
+    );
+    if (d.kind === "forward") void invoke("native_edit_action", { action: d.action }).catch(() => {});
+    else if (d.kind === "notice") showToast(d.text);
+    else if (d.kind === "run") binding?.run();
+  }, [menuBinding, showToast]);
+  const runMenuCommandRef = useRef(runMenuCommand);
+  const openRecentRef = useRef(openRecent);
+  useEffect(() => { runMenuCommandRef.current = runMenuCommand; openRecentRef.current = openRecent; });
+  useEffect(() => {
+    if (!IS_MAC) return; // Windows is a frameless ribbon app; Linux has no menu today
+    const menu = createNativeMenu({
+      gate: () => ({ blocked: menuBlockRef.current, hasWorld: ribbonBindingsRef.current !== null }),
+      binding: menuBinding,
+      run: (id) => runMenuCommandRef.current(id),
+      openRecent: (path) => { void openRecentRef.current(path); },
+    });
+    nativeMenuRef.current = menu;
+    return () => { menu.dispose(); if (nativeMenuRef.current === menu) nativeMenuRef.current = null; };
+  }, [menuBinding]);
+  const menuBlock: MenuBlock = loading ? "loading" : anyModalOpen ? "modal" : showHelp ? "help" : "none";
+  useEffect(() => { menuBlockRef.current = menuBlock; nativeMenuRef.current?.sync(); }, [menuBlock]);
+  useEffect(() => { nativeMenuRef.current?.setRecent(recentWorlds); }, [recentWorlds]);
 
   // Auto-trigger the onboarding tour the first time a world becomes loaded (new/open/download/
   // recent/recovery — this effect runs after the editor branch has mounted regardless of which
@@ -2930,6 +3053,8 @@ function App() {
       }
       // A modal dialog is open — let it own the keyboard (its own Escape/Enter handling applies).
       if (anyModalOpenRef.current) return;
+      // C-07: no editing shortcuts while a load is parsing (they'd edit the world being replaced).
+      if (loadingRef.current) return;
       const typing = isTypingTarget(e.target);
       // Tab swaps map ⇄ 3D (Stage 14.4) — but Tab is also keyboard focus traversal (the Popover/
       // Segmented keyboard model depends on it), so it swaps ONLY when focus is on the page body,
@@ -3024,7 +3149,7 @@ function App() {
         if (e.key === "k" || e.key === "K") { e.preventDefault(); setTool("lasso"); return; }
         if (e.key === "j" || e.key === "J") { e.preventDefault(); setTool("polyselect"); return; }
         // Delete/Backspace clears the current selection (audit H9) — advertised in tooltips
-        // (Home's Delete button, the Quick Actions bar) since before there was ever a binding.
+        // (Home's Delete button, the options bar) since before there was ever a binding.
         if ((e.key === "Delete" || e.key === "Backspace") && SELECTION_TOOLS.has(appToolRef.current) && rawBoundsRef.current) {
           e.preventDefault();
           void deleteBlocksRef.current();
@@ -3082,13 +3207,17 @@ function App() {
           return;
         }
       }
-      if (!(e.metaKey || e.ctrlKey)) return;
+      if (!primaryModDown(e, IS_MAC)) return;
       // Normalize case: with Shift (⌘⇧Z) or Caps Lock, e.key is uppercase ("Z"), so a bare
       // === "z" comparison silently misses. This was why ⌘⇧Z redo never fired.
       const k = e.key.toLowerCase();
       // In a text field the editing chords belong to the field (native undo/copy/paste/select-all),
       // not the map (21.6).
       if (typing && ["z", "y", "c", "x", "v", "a", "d"].includes(k)) return;
+      // The macOS menu carries this chord as an accelerator too: record that we ran it so the menu's
+      // echo of the same key is dropped (`runMenuCommand`, 250 ms).
+      const menuCmd = menuCommandForKey(e, IS_MAC);
+      if (menuCmd) noteKeyCommand(menuCmd);
       if (k === "z" && !e.shiftKey) { e.preventDefault(); handleUndo(); }
       if ((k === "z" && e.shiftKey) || k === "y") { e.preventDefault(); handleRedo(); }
       if (k === "c") { e.preventDefault(); copySelection(); }
@@ -3163,15 +3292,24 @@ function App() {
   // Menu close effects handled inside Ribbon component
 
   // Template overlay helpers
-  async function loadTexturePackFile(path: string) {
+  /** Load the user's pack at `path`, or the bundled default for `null`. A custom pack that fails
+   *  to load falls back to the default (and forgets the bad path) so the app never ends up with no
+   *  textures. */
+  async function loadTexturePackFile(path: string | null) {
     try {
-      const atlas = decodeAtlas(await invoke<ArrayBuffer>("load_texture_pack", { path }));
+      const buf = path
+        ? await invoke<ArrayBuffer>("load_texture_pack", { path })
+        : await invoke<ArrayBuffer>("load_default_texture_pack");
+      const atlas = decodeAtlas(buf);
       clearSwatchCache();
       setTexturePackInfo(atlas);
       setTexturePackPath(path);
       setTexEpoch(e => e + 1);
       saveSettings({ texturePackPath: path });
-    } catch (e) { reportError(e); }
+    } catch (e) {
+      reportError(e);
+      if (path) await loadTexturePackFile(null);
+    }
   }
 
   async function openTexturePackFile() {
@@ -3186,18 +3324,9 @@ function App() {
     await loadTexturePackFile(selected);
   }
 
-  function unloadTexturePack() {
-    invoke("unload_texture_pack").catch(e => reportError(e));
-    clearSwatchCache();
-    setTexturePackInfo(null);
-    setTexturePackPath(null);
-    setTexEpoch(e => e + 1);
-    saveSettings({ texturePackPath: null });
-  }
-
-  // Auto-load texture pack from settings on startup
+  // Auto-load the user's texture pack from settings on startup (the bundled default if none)
   useEffect(() => {
-    if (texturePackPath) loadTexturePackFile(texturePackPath);
+    loadTexturePackFile(texturePackPath);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -3457,6 +3586,10 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
     const win = getCurrentWindow();
     const unlisten = win.onDragDropEvent((event) => {
       if (event.payload.type !== "drop") return;
+      if (fileOpBusyRef.current()) {
+        showToast("Another load or save is running. Drop the file again when it finishes.");
+        return;
+      }
       const path = event.payload.paths.find((p) => /\.(eden|zip|emod)$/i.test(p));
       if (!path) {
         // 22.8: a dropped prefab goes straight onto the clipboard in paste mode (needs a world to paste into).
@@ -3485,6 +3618,8 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
       });
       if (!ok) return;
     }
+    worldGenRef.current++;                      // 29.7: in-flight replies belong to the closed world
+    worldRef.current = null;
     closeWindowWorld();                         // flush this world's window layout
     invoke("close_world").catch(() => {});      // release backend mmap / undo stack / staged temp
     invoke("discard_autosave").catch(() => {}); // discarded on purpose — nothing to recover
@@ -3504,6 +3639,8 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
     setSpawnPos(null);
     setPlayerPos(null);
     setSigns([]);
+    setRecords(null);
+    setRecordsSeq(n => n + 1);
     setTemplateLoaded(false);
     setShowTemplateOverlay(false);
     resetHeavyLighting();
@@ -3597,6 +3734,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
       spawnPos={spawnPos}
       playerPos={playerPos}
       signs={showSigns ? signs : NO_SIGNS}
+      cmds={showSigns ? (records?.cmds ?? NO_CMDS) : NO_CMDS}
       pasteElevationOffset={pasteElevationOffset}
       onEyedropper={handleEyedropper}
       onPoolFillPick={handlePoolFillPick}
@@ -3629,6 +3767,9 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
   // to re-evaluate when editEpoch itself changes, which already re-renders App.
   const dirty = editEpoch !== savedEpochRef.current;
 
+  // The options bar's left context (34.2). While it is the idle one the bar prints the tool hint
+  // itself, so the status bar drops its copy rather than show it twice.
+  const barCtx = barContext({ tool, hasSelection: !!rawBounds, hasClipboard: !!clipboard, pane3dLive, mode3d });
   const statusBarEl = world ? (
     <div data-tour="status-bar" style={{
       position: "fixed", bottom: 0, left: 0, right: 0, height: STATUS_BAR_HEIGHT, zIndex: 150,
@@ -3692,7 +3833,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
         )}
       </StatusSeg>
       {/* Cap Z / slice Z (Stage 15.6) — only while cutaway/z-slice is active. Same label ternary and
-          accent (ACCENT.primary) as the Cutaway / Z-slice context panel's slider (windows/modePanels.tsx). */}
+          accent (ACCENT.primary) as the options bar's Cap Z zone (ribbon/OptionsBar.tsx). */}
       {(viewMode === "cutaway" || viewMode === "zslice") && (
         <StatusSeg icon="zslice" iconColor={ACCENT.primary} color={ACCENT.primary}>
           {viewMode === "cutaway" ? "Cap Z" : "Z-Slice Level"}{" "}
@@ -3768,7 +3909,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           close-the-loop click, Grab's vertical drag, and the fact that a selection can be dragged
           and resized at all. These two hints are the lowest-priority segments in the bar — the
           first to shrink away at 900px (§5.11's overflow risk note: "world name first"). */}
-      {tool !== "paste" && TOOL_HINTS[tool] && (
+      {tool !== "paste" && TOOL_HINTS[tool] && barCtx !== "idle" && (
         <StatusSeg color={TEXT_DIM} style={{ padding: "0 8px", minWidth: 0, flexShrink: 1 }}>
           <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0 }}>{TOOL_HINTS[tool]}</span>
         </StatusSeg>
@@ -3787,10 +3928,14 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           same picker Home's Block button does. */}
       <ActiveBlockStatusSeg fillBlockType={fillBlockType} fillPaint={fillPaint} texturePack={texturePackInfo} />
       <div style={{ flex: 1, minWidth: 0 }} />
-      <StatusSeg icon="fps" iconColor={ACCENT.primary} color={ACCENT.primary}
-        divider={false} style={{ borderLeft: `1px solid ${HAIRLINE}`, opacity: 0.6, flexShrink: 0 }}>
-        <FpsCounter />
-      </StatusSeg>
+      {/* The FPS loop (rAF + 250 ms timer) is ~7–10 % of a core at idle, so it only runs while the
+          perf HUD is on or Diagnostics is open (Stage 31.1 / P-01). */}
+      {(showPerfHud || showDiagnostics) && (
+        <StatusSeg icon="fps" iconColor={ACCENT.primary} color={ACCENT.primary}
+          divider={false} style={{ borderLeft: `1px solid ${HAIRLINE}`, opacity: 0.6, flexShrink: 0 }}>
+          <FpsCounter />
+        </StatusSeg>
+      )}
     </div>
   ) : null;
 
@@ -3814,11 +3959,11 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
         setFilterBlockType={setFilterBlockType} setFilterPaint={setFilterPaint}
       >
         {/* ── Work area (UI redesign r3, Stage 14.4) ─────────────────────────────
-            The box between the ribbon (+ Quick Actions bar) and the status bar, left of the docked
+            The box between the ribbon (+ options bar) and the status bar, left of the docked
             sidebar. It holds the main viewport plus the floating window layer on top. The map no longer draws under the ribbon and status bar, so "Fit"
             fits the part of the map you can actually see. */}
         <div data-work-area="" style={{
-          position: "absolute", top: effectiveRibbonHeight + QUICK_ACTIONS_BAR_H,
+          position: "absolute", top: effectiveRibbonHeight + OPTIONS_BAR_H,
           left: 0, right: sidebarInsetPx, bottom: STATUS_BAR_HEIGHT,
         }}>
           {/* The main pane shows the map, or the 3D view when swapped (⇄ / Tab). */}
@@ -3861,45 +4006,6 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
               drawActive={["pen", "brush", "rect", "ellipse"].includes(tool)}
               onDrawElevation={handleDrawElevation}
               maxZ={world.max_z}
-            />
-            </PanelBoundary>
-            {/* Mode-driven context panels (16.6) — in registry (= stacking) order. Each exists only while
-                its mode holds; see windows/panelModes.ts and modePanels.tsx. */}
-            <PanelBoundary label="Z-slice panel" slot={2}>
-            <CutawayPanel
-              worldLoaded={world != null} maxZ={world.max_z}
-              viewMode={viewMode} setViewMode={setViewMode}
-              zSliceZ={zSliceZ} commitZSlice={commitZSlice}
-              followSurface={followSurface} setFollowSurface={setFollowSurface}
-            />
-            </PanelBoundary>
-            <PanelBoundary label="Brush panel" slot={3}>
-            <BrushShapePanel
-              worldLoaded={world != null} tool={tool}
-              noiseMode={noiseMode} setNoiseMode={setNoiseMode}
-              noiseFeatureSize={noiseFeatureSize} setNoiseFeatureSize={setNoiseFeatureSize}
-              slopeGradeX={slopeGradeX} setSlopeGradeX={setSlopeGradeX}
-              slopeGradeY={slopeGradeY} setSlopeGradeY={setSlopeGradeY}
-              rockNoisiness={rockNoisiness} setRockNoisiness={setRockNoisiness}
-              rockNoiseRadius={rockNoiseRadius} setRockNoiseRadius={setRockNoiseRadius}
-              rockSmoothing={rockSmoothing} setRockSmoothing={setRockSmoothing}
-              rockMeld={rockMeld} setRockMeld={setRockMeld}
-              rockFlatten={rockFlatten} setRockFlatten={setRockFlatten}
-              rockSink={rockSink} setRockSink={setRockSink}
-              rockDrape={rockDrape} setRockDrape={setRockDrape}
-              rockStrata={rockStrata} setRockStrata={setRockStrata}
-            />
-            </PanelBoundary>
-            <PanelBoundary label="Build panel" slot={4}>
-            <BuildSlotPanel
-              worldLoaded={world != null} pane3dLive={pane3dLive}
-              mode3d={mode3d} setMode3d={setMode3d}
-              tool={tool} setTool={setTool}
-              floodFillLimit={floodFillLimit}
-              setFloodFillLimit={(v) => { setFloodFillLimit(v); saveSettingsDebounced({ floodFillLimit: v }); }}
-              sculptStrength={sculptStrength} setSculptStrength={setSculptStrength}
-              sculptRadius={sculptRadius} setSculptRadius={setSculptRadius}
-              sculptSoftness={sculptSoftness} setSculptSoftness={setSculptSoftness}
             />
             </PanelBoundary>
             <PanelBoundary label="3D window" slot={5}>
@@ -3958,7 +4064,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
               texEpoch={texEpoch}
               fogEnabled={fogEnabled}
               nightLighting={nightLighting}
-              shadows3d={shadows3d}
+              shadowMode={shadowMode}
               sunT={sunT}
               lampRadius={lampRadius}
               lightingProfile={lightingProfile}
@@ -4002,6 +4108,8 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
               showHud={show3dHud}
               showGrid={show3dGrid}
               onSetShowGrid={commitShow3dGrid}
+              showSigns={showSigns}
+              recordsSeq={recordsSeq}
               buildReach={buildReach}
               hotbarSlots={hotbar3dSlots}
               showHotbarOverlay={showHotbarOverlay}
@@ -4146,8 +4254,9 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           setFloodFillLimit={(v) => { setFloodFillLimit(v); saveSettingsDebounced({ floodFillLimit: v }); }}
           nightLighting={nightLighting}
           setNightLighting={setNightLighting}
-          shadows3d={shadows3d}
-          setShadows3d={setShadows3d}
+          shadowMode={shadowMode}
+          shadowStyle={shadowStyle}
+          commitShadowMode={commitShadowMode}
           gpuShadows={gpuShadows}
           setGpuShadows={setGpuShadows}
           sunT={sunT}
@@ -4174,14 +4283,13 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           showTemplateOverlay={showTemplateOverlay}
           setShowTemplateOverlay={setShowTemplateOverlay}
           showSigns={showSigns}
-          setShowSigns={setShowSigns}
-          hasSigns={signs.length > 0}
+          setShowSigns={commitShowSigns}
+          hasSigns={signs.length > 0 || (records?.cmds.length ?? 0) > 0}
           openTemplateFile={openTemplateFile}
-          texturePackLoaded={texturePackInfo !== null}
           texturePackPath={texturePackPath}
           texturePack={texturePackInfo}
           openTexturePackFile={openTexturePackFile}
-          unloadTexturePack={unloadTexturePack}
+          resetTexturePack={() => loadTexturePackFile(null)}
           spawnPos={spawnPos}
           playerPos={playerPos}
           onSetSpawnAtSelection={setSpawnAtSelection}
@@ -4275,6 +4383,8 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           setShowExpandModal={setShowExpandModal}
           setExpandResult={setExpandResult}
           closeWorld={closeWorld}
+          quitApp={quitApp}
+          onBindings={onRibbonBindings}
           setShowHelp={setShowHelp}
           setShowAbout={setShowAbout}
           setShowSettings={setShowSettings}
@@ -4315,6 +4425,14 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           onGenerateWavySurface={handleGenerateWavySurface}
           collapsed={ribbonCollapsed}
           registerTabSetter={registerRibbonTabSetter}
+          barTop={effectiveRibbonHeight}
+          barRightInset={sidebarInsetPx}
+          discardClipboard={() => {
+            setClipboard(null);
+            setLockedPastePos(null);
+            setPasteElevationOffset(0);
+            setTool(t => (t === "paste" ? "pan" : t));
+          }}
           onCollapse={(v) => { setRibbonCollapsed(v); try { localStorage.setItem("ribbon_collapsed", String(v)); } catch {} }}
           compact={ribbonCompact}
           onToggleCompact={(v) => { setRibbonCompact(v); saveSettings({ ribbonCompact: v }); }}
@@ -4340,6 +4458,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           editEpoch={editEpoch}
           worldEpoch={worldEpoch}
           signs={signs}
+          records={records}
           spawnPos={spawnPos}
           playerPos={playerPos}
           onGoTo={goTo}
@@ -4489,7 +4608,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
             bounds={materializeSelection}
             onClose={() => setShowMaterializeModal(false)}
             onMaterialized={async (path) => {
-              await swapToWorldFile(path, { skipRecent: true });
+              if (!(await swapToWorldFile(path, { skipRecent: true }))) return;
               setMaterializeSelection(null);
               setShowMaterializeModal(false);
             }}
@@ -4555,13 +4674,17 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
             actions with no registry entry (Paste Here locks a position before arming paste, the
             3D-camera items) just omit the hint rather than inventing one. */}
         {ctxMenu && (() => {
+          // Labels and shortcut hints come from the registry (U-04); only the "…Here" actions
+          // override the label, since they act at the click point, not on the selection.
+          const lbl = (id: CommandId) => meta(id).label;
+          const chord = (id: CommandId) => { const c = meta(id).keys?.[0]; return c ? formatChord(c) : undefined; };
           const items: ContextMenuItem[] = [];
           items.push({
-            id: "spawn", label: "Set Home Point Here", icon: "home",
+            id: "spawn", label: `${lbl("home.setpoint.home")} Here`, icon: "home",
             onClick: () => { invoke<[number,number]>("set_spawn_pos", { px: Math.round(ctxMenu.wx), py: Math.round(ctxMenu.wy) }).then(([px, py]) => { setSpawnPos({ px, py }); setEditEpoch(e => e + 1); }).catch(e => reportError(e)); },
           });
           items.push({
-            id: "playerStart", label: "Set Player Start Here", icon: "start",
+            id: "playerStart", label: `${lbl("home.setpoint.start")} Here`, icon: "start",
             onClick: () => {
               const px = Math.round(ctxMenu.wx), py = Math.round(ctxMenu.wy);
               invoke("set_player_pos", { px, py })
@@ -4574,13 +4697,13 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
             onClick: () => { void pickBlockAt(ctxMenu.wx, ctxMenu.wy); },
           });
           if (rawBounds) items.push({
-            id: "zoomSel", label: "Zoom to Selection", icon: "zoomSel",
-            shortcut: formatChord(COMMAND_META["view.zoom.selection"].keys[0]),
+            id: "zoomSel", label: lbl("view.zoom.selection"), icon: "zoomSel",
+            shortcut: chord("view.zoom.selection"),
             onClick: () => mapCanvasRef.current?.zoomToBox(rawBounds.x1, rawBounds.y1, rawBounds.x2, rawBounds.y2),
           });
           if (rawBounds) items.push({
-            id: "copy", label: "Copy", icon: "copy", separatorBefore: true,
-            shortcut: formatChord(COMMAND_META["home.clipboard.copy"].keys[0]),
+            id: "copy", label: lbl("home.clipboard.copy"), icon: "copy", separatorBefore: true,
+            shortcut: chord("home.clipboard.copy"),
             onClick: () => copySelection(),
           });
           if (clipboard) items.push({
@@ -4588,17 +4711,17 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
             onClick: () => { setLockedPastePos({ x: Math.round(ctxMenu.wx), y: Math.round(ctxMenu.wy) }); setTool("paste"); },
           });
           if (rawBounds) items.push({
-            id: "fill", label: "Fill Selection", icon: "fill",
+            id: "fill", label: lbl("home.selection.fill"), icon: "fill",
             onClick: () => fillSelection(),
           });
           if (rawBounds) items.push({
-            id: "delete", label: "Delete Blocks", icon: "delete",
-            shortcut: formatChord(COMMAND_META["home.selection.delete"].keys[0]),
+            id: "delete", label: lbl("home.selection.delete"), icon: "delete",
+            shortcut: chord("home.selection.delete"),
             onClick: () => deleteBlocks(),
           });
           if (rawBounds) items.push({
-            id: "clear", label: "Clear Selection", icon: "clear",
-            shortcut: formatChord(COMMAND_META["home.selection.clear"].keys[0]),
+            id: "clear", label: lbl("home.selection.clear"), icon: "clear",
+            shortcut: chord("home.selection.clear"),
             onClick: () => setRawBounds(null),
           });
           if (pane3dLive) {
@@ -4612,54 +4735,22 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
             });
           }
           items.push({
-            id: "toolSelect", label: "Select Tool", icon: "select", separatorBefore: true,
+            id: "toolSelect", label: lbl("home.navigation.select"), icon: "select", separatorBefore: true,
             active: tool === "select",
-            shortcut: formatChord(COMMAND_META["home.navigation.select"].keys[0]),
+            shortcut: chord("home.navigation.select"),
             onClick: () => setTool("select"),
           });
           items.push({
-            id: "toolPen", label: "Pen Tool", icon: "pen", active: tool === "pen",
-            shortcut: formatChord(COMMAND_META["draw.tools.pen"].keys[0]),
+            id: "toolPen", label: lbl("draw.tools.pen"), icon: "pen", active: tool === "pen",
+            shortcut: chord("draw.tools.pen"),
             onClick: () => setTool("pen"),
           });
           items.push({
-            id: "toolPan", label: "Pan Tool", icon: "pan", active: tool === "pan",
+            id: "toolPan", label: lbl("home.navigation.pan"), icon: "pan", active: tool === "pan",
             onClick: () => setTool("pan"),
           });
           return <ContextMenu x={ctxMenu.x} y={ctxMenu.y} items={items} onClose={() => setCtxMenu(null)} />;
         })()}
-
-        {/* Quick Actions — docked flush under the ribbon, always mounted with every control visible
-            (dimmed when inactive) rather than appearing/disappearing with the selection/clipboard.
-            ⚠️ Must stay inside the `world` branch: App has a second return for the splash screen,
-            where this would never render. */}
-        <QuickActionsBar
-          top={effectiveRibbonHeight}
-          rightInset={sidebarInsetPx}
-          rawBounds={rawBounds}
-          clipboard={clipboard}
-          onCopy={copySelection}
-          onCut={cutSelection}
-          onFill={fillSelection}
-          onDelete={() => deleteBlocks()}
-          onDeselect={() => setRawBounds(null)}
-          onPaste={() => setTool("paste")}
-          pasteLocked={lockedPastePos != null && !persistPaste}
-          onConfirmPaste={() => {
-            if (lockedPastePos) { pasteAt(lockedPastePos); setLockedPastePos(null); }
-          }}
-          pasteElevationOffset={pasteElevationOffset}
-          setPasteElevationOffset={setPasteElevationOffset}
-          onRotate={rotateClipboard}
-          onMirrorX={mirrorClipboardX}
-          onMirrorY={mirrorClipboardY}
-          onClearPaste={() => {
-            setClipboard(null);
-            setLockedPastePos(null);
-            setPasteElevationOffset(0);
-            setTool(t => (t === "paste" ? "pan" : t));
-          }}
-        />
 
         <DoneOutline rect={doneRect} mapCanvasRef={mapCanvasRef} />
 
@@ -4731,14 +4822,21 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
 
   return (
     <div
-      {...(IS_MAC ? { "data-tauri-drag-region": true } : null)}
+      {...dragRegion(windowChrome)}
       style={{
         display: "flex", alignItems: "center", justifyContent: "center",
         height: "100vh", minWidth: 0, padding: SPACE.lg * 2, boxSizing: "border-box",
+        // With no OS title bar, the window's top-corner controls (traffic lights on macOS, our own
+        // cluster on Windows) sit in this margin — reserve a top-bar's height so a short window
+        // never slides the card underneath them.
+        ...(windowChrome.dragRegion ? { paddingTop: TOP_BAR_HEIGHT } : null),
         background: `radial-gradient(700px 260px at 50% 0%, rgba(${hexToRgbTriplet(ACCENT.primary)},.10) 0%, rgba(0,0,0,0) 100%), ${RAMP.bg0}`,
       }}
     >
       <style>{SPLASH_CSS}</style>
+      {windowChrome.customControls && (
+        <WindowControls style={{ position: "fixed", top: (TOP_BAR_HEIGHT - TOPBAR_BTN_H) / 2, right: 6, zIndex: 10 }} />
+      )}
 
       {/* The launcher is a centred, size-capped card rather than a full-bleed screen: at the
           window's 1440×900 default the dense layout would otherwise strand most of its width
@@ -4755,7 +4853,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           marked separately since the outer region only covers its own direct background, not the
           card's children. */}
       <div
-        {...(IS_MAC ? { "data-tauri-drag-region": true } : null)}
+        {...dragRegion(windowChrome)}
         style={{
           height: 48, flexShrink: 0, display: "flex", alignItems: "center", gap: SPACE.lg,
           padding: `0 ${SPACE.lg * 2}px`, background: SURFACE.topbar,

@@ -87,7 +87,7 @@ export const TOOL_HINTS: Partial<Record<Tool, string>> = {
   rect: "Drag to size the rectangle",
   ellipse: "Drag to size the ellipse",
   flatten: "Press on a block to level to its height",
-  slope: "The first block you press on anchors the tilted plane (Slope X/Y in the Brush shape panel)",
+  slope: "The first block you press on anchors the tilted plane (Slope X/Y in the options bar)",
   smear: "Drag across terrain to pull height along with the brush, like wet paint",
   poolfill: "Click an empty (air) floor cell inside the selection to bucket-fill the basin",
   materialize: "Drag over empty chunk space, then Materialize it into terrain",
@@ -510,6 +510,8 @@ interface Props {
   /** Sign list from get_records() (256z-format plan, Phase 4) — drawn as small markers when
    *  non-empty. `x`/`y` are already editor-local. */
   signs?: { x: number; y: number; z: number; text: string }[];
+  /** Command blocks from get_records() (27.7): an orange square each, same z-agnostic rule as signs. */
+  cmds?: { x: number; y: number; z: number }[];
   /** Elevation offset applied to paste (shown as label above ghost rect). */
   pasteElevationOffset?: number;
   /** Called when eyedropper tool clicks a world coordinate. */
@@ -550,7 +552,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     lockedPastePos = null,
     drawConfig, onDrawStroke, onSculptStroke, onCancelStroke, drawZOverride = null,
     extrudePreview = null, lastPasteDelta = null, onCursorMove, onMagicWand, onLassoSelect, onPolySelect, selectionMask = null,
-    spawnPos = null, playerPos = null, signs = [],
+    spawnPos = null, playerPos = null, signs = [], cmds = [],
     pasteElevationOffset = 0, onEyedropper, onPoolFillPick,
     cameraPos3d = null, onSetCamera3d,
     showTemplateOverlay = false, onMapContextMenu, onSelectDragUpdate, onSelectionCommitted, onMoveSelection, moveWithContents = false,
@@ -691,6 +693,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   const spawnPosRef         = useRef(spawnPos);
   const playerPosRef        = useRef(playerPos);
   const signsRef            = useRef(signs);
+  const cmdsRef             = useRef(cmds);
   const pasteElevOffsetRef  = useRef(pasteElevationOffset);
   const onEyedropperRef     = useRef(onEyedropper);
   const onPoolFillPickRef   = useRef(onPoolFillPick);
@@ -779,6 +782,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   useEffect(() => { spawnPosRef.current        = spawnPos;            }, [spawnPos]);
   useEffect(() => { playerPosRef.current       = playerPos;           }, [playerPos]);
   useEffect(() => { signsRef.current           = signs;               }, [signs]);
+  useEffect(() => { cmdsRef.current            = cmds;                }, [cmds]);
   useEffect(() => { pasteElevOffsetRef.current = pasteElevationOffset; }, [pasteElevationOffset]);
   useEffect(() => { onEyedropperRef.current    = onEyedropper;        }, [onEyedropper]);
   useEffect(() => { onPoolFillPickRef.current  = onPoolFillPick;      }, [onPoolFillPick]);
@@ -1343,6 +1347,25 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
       }
     }
 
+    // Command-block markers (27.7): an orange square, drawn after the sign diamonds so it wins a tie.
+    {
+      const clist = cmdsRef.current;
+      if (clist.length > 0) {
+        const h = Math.max(3, Math.min(7, scale * 1.0));
+        ctx.save();
+        ctx.fillStyle = rgba(MAP.command, 0.92);
+        ctx.strokeStyle = "rgba(20,16,10,0.85)";
+        ctx.lineWidth = 1;
+        for (const c of clist) {
+          const cx2 = Math.round(c.x * scale + vx);
+          const cy2 = Math.round(c.y * scale + vy);
+          ctx.fillRect(cx2 - h, cy2 - h, h * 2, h * 2);
+          ctx.strokeRect(cx2 - h, cy2 - h, h * 2, h * 2);
+        }
+        ctx.restore();
+      }
+    }
+
     // Paste ghost box — amber when XY is locked, green when hovering. Also the paste lens's ghost
     // subscription notify site (Stage 14.9) — one place computes the ghost's screen rect, whether
     // for drawing or for a subscriber, so the two can never disagree.
@@ -1684,6 +1707,12 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
       drainRef.current();
     }
   }, [draw]);
+
+  // 31.3: free every tile's backing store when the canvas unmounts (world close).
+  useEffect(() => {
+    const tiles = tileCacheRef.current, tpl = templateTileCacheRef.current;
+    return () => { clearTiles(tiles); clearTiles(tpl); };
+  }, []);
 
   // When overlay is toggled, invalidate tile cache so loadTile re-runs and fetches template tiles too
   useEffect(() => {

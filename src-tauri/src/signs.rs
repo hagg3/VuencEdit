@@ -8,9 +8,13 @@
 //! - **The trailer wins per section.** A sidecar is adopted only when the trailer has no records of
 //!   that kind (`Refusal::Exists` otherwise), and only if it's a readable section ≤ 1 MiB that fits
 //!   under the cap. Anything else is ignored and logged; a sidecar never fails a load.
-//! - Adopted records are written into the world by the next save to the world's **own** path,
-//!   which then renames each adopted sidecar `<name>.adopted` (`finish_adoption` in `lib.rs`), so
-//!   deleting every sign later can't bring the sidecar's back on reload.
+//! - Adopted records are written into the world by the next save to the world's **own** path.
+//!   When that file is the `.eden` the sidecars are named for, the save renames each one
+//!   `<name>.adopted` (never replacing an earlier one), so deleting every sign later can't bring
+//!   the sidecar's back on reload (`take_adopted_for` / `rename_adopted` in `lib.rs`).
+//! - **A sibling adopts read-only** (29.5 / audit C-06): `w.emod` and `w.eden.zip` share `w.eden`'s
+//!   stem, so they show its sidecars' records, but their saves never rename the sidecars — the
+//!   game's `w.eden` still relies on them.
 //!
 //! Sidecars sit beside the **source** file (never the staged temp), named from its stem
 //! (`stem_of`, a port of Emod's `WorldSource::stemOf`).

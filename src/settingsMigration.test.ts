@@ -268,9 +268,9 @@ describe("settings v23 migration (Quad retired)", () => {
 describe("3D look prefs (Stage 15.8, additive)", () => {
   it("an existing install gets the original gradient, fog blue, hard fog, HUD and grid on", async () => {
     const s = await load({ settingsVersion: 23 });
-    expect(s.sky3dZenith).toBe("#347ee3");
-    expect(s.sky3dHorizon).toBe("#c5d5eb");
-    expect(s.fog3dColor).toBe("#8cbeff");
+    expect(s.sky3dZenith).toBe("#317ce2");
+    expect(s.sky3dHorizon).toBe("#cddaed");
+    expect(s.fog3dColor).toBe("#c5d2e5");
     expect(s.fog3dSoft).toBe(false);
     expect(s.show3dHud).toBe(true);
     expect(s.show3dGrid).toBe(true);
@@ -318,5 +318,26 @@ describe("settings v25 migration (Inspector tab → World)", () => {
   it("a fresh install opens on World", async () => {
     const s = await load(null);
     expect(s.sidebarTab).toBe("world");
+  });
+});
+
+/**
+ * 27.6b: `showSigns` (the shared 2D-marker / 3D-overlay toggle) became a persisted key, additive —
+ * no version bump; the `{...DEFAULTS, ...parsed}` merge supplies the default-on.
+ */
+describe("showSigns (27.6b, additive)", () => {
+  it("defaults on for a fresh install and for an existing one that never stored it", async () => {
+    expect((await load(null)).showSigns).toBe(true);
+    expect((await load({ settingsVersion: 25 })).showSigns).toBe(true);
+  });
+  it("a stored off survives, and is not reset by a load", async () => {
+    const s = await load({ settingsVersion: 25, showSigns: false });
+    expect(s.showSigns).toBe(false);
+  });
+  it("saveSettings round-trips it", async () => {
+    await load({ settingsVersion: 25 });
+    const mod = await import("./SettingsModal");
+    mod.saveSettings({ showSigns: false });
+    expect(mod.loadSettings().showSigns).toBe(false);
   });
 });

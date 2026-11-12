@@ -19,7 +19,7 @@ import { formatChord } from "../commands/keys";
 import type { Tier } from "./layout";
 import type { IconName } from "./icons";
 import {
-  CommandButton, DropdownButton, IconButton, MenuItem, SmallButton, SplitButton, usePopupGroupClose,
+  CommandButton, DropdownButton, IconButton, MenuItem, SmallButton, SmallSplitButton, SplitButton, usePopupGroupClose,
 } from "./primitives";
 import { ACCENT } from "./tokens";
 
@@ -104,9 +104,13 @@ export function CmdIcon({ id, ...o }: Placement & { id: CommandId }) {
   return <Mark id={id}><IconButton {...r} icon={r.icon ?? "more"} /></Mark>;
 }
 
-/** A split button whose face is `id` and whose menu the tab supplies (usually `CmdMenuItem`s). */
-export function CmdSplit({ id, menuTitle, menu, ...o }: Placement & { id: CommandId; menuTitle: string; menu: () => ReactNode }) {
+/** A split button whose face is `id` and whose menu the tab supplies (usually `CmdMenuItem`s).
+ *  `small` renders it as a small row (`full`/`badge` as on `CmdSmall`) for a column of small buttons. */
+export function CmdSplit({ id, menuTitle, menu, small, full, badge, ...o }: Placement & {
+  id: CommandId; menuTitle: string; menu: () => ReactNode; small?: boolean; full?: boolean; badge?: ReactNode;
+}) {
   const r = resolve(id, useBinding(id), o, usePopupGroupClose(), useContext(NoticeCtx));
+  if (small) return <Mark id={id}><SmallSplitButton {...r} full={full} badge={badge} menuTitle={menuTitle} menu={menu} /></Mark>;
   return <Mark id={id}><SplitButton {...r} icon={r.icon ?? "more"} menuTitle={menuTitle} menu={menu} /></Mark>;
 }
 

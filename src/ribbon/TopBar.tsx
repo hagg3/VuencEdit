@@ -7,14 +7,13 @@
  * over it as the old bright blue pill did.
  */
 import { useRef, type CSSProperties } from "react";
-import appIcon from "../assets/app-icon.png";
 import WorldNamePill from "../WorldNamePill";
 import { sfx } from "../sound/sfx";
 import { useRibbon } from "./context";
 import { Icon } from "./icons";
 import type { RibbonTab } from "./props";
 import {
-  BORDER, CTX_ACCENT, FONT, HAIRLINE, ICON, IS_MAC, MAC_TRAFFIC_LIGHT_CLEARANCE, MOD,
+  BORDER, CTX_ACCENT, FONT, HAIRLINE, ICON, MOD,
   RADIUS, SHIFT,
   TEXT, TEXT_DIM, TEXT_LABEL, TOPBAR_BTN_H, TOP_BAR_HEIGHT, btnBase,
   btnDisabled, hexToRgbTriplet, lighten,
@@ -23,6 +22,8 @@ import { BRAND, RAMP, TAB } from "../theme/theme";
 import { Keycap } from "./primitives";
 import { formatChord } from "../commands/keys";
 import { meta } from "../commands/meta";
+import { dragRegion, useWindowChrome } from "../windowChrome";
+import WindowControls from "./WindowControls";
 
 const searchChord = formatChord(meta("app.commandSearch").keys![0]);
 
@@ -58,6 +59,7 @@ export default function TopBar({
 }) {
   const { p, activeTab, setActiveTab } = useRibbon();
   const stripRef = useRef<HTMLDivElement>(null);
+  const chrome = useWindowChrome();
 
   const show3d = p.pane3dLive;
   const visible: RibbonTab[] = [
@@ -85,36 +87,40 @@ export default function TopBar({
 
   return (
     <div
-      {...(IS_MAC ? { "data-tauri-drag-region": true } : null)}
+      {...dragRegion(chrome)}
       style={{
         height: TOP_BAR_HEIGHT, display: "flex", alignItems: "stretch", gap: 2,
-        padding: IS_MAC ? `0 6px 0 ${MAC_TRAFFIC_LIGHT_CLEARANCE}px` : "0 6px 0 0",
+        padding: `0 6px 0 ${chrome.leftClearance}px`,
         background: "transparent",
       }}
     >
       {/* Brand / application menu — Office 2010's File tab: a permanently accent-filled tab
-          carrying the app's identity (icon + VuencEdit wordmark), lit by a glow that intensifies
+          carrying the app's identity (VuencEdit wordmark; no icon — it smeared on non-hiDPI screens), lit by a glow that intensifies
           while the menu is open. Not `.rbn-btn`; see `.rbn-brand` in RIBBON_CSS. */}
       <button
         className="rbn-brand" type="button" onClick={onToggleMenu}
         title="Application menu"
         aria-haspopup="menu" aria-expanded={menuOpen} aria-label="VuencEdit application menu"
         style={{
-          display: "flex", alignItems: "center", gap: 7, padding: "0 12px 0 9px",
+          display: "flex", alignItems: "center", gap: 7, padding: "0 12px",
           border: "none", cursor: "pointer", outline: "none", flexShrink: 0,
           margin: "3px 6px 3px 4px", borderRadius: RADIUS.md,
           // gloss-lite (Stage 14.2): an opaque accent face with a soft highlight; the glow widens
           // while the menu is open. `filter` in RIBBON_CSS handles hover/press.
           background: BRAND.bg,
           boxShadow: BRAND.shadow(menuOpen),
-          color: RAMP.white, textShadow: "0 1px 0 rgba(0,0,0,.3)",
+          color: RAMP.white, textShadow: "0 1px 1px rgba(0,0,0,.5), 0 0 2px rgba(0,0,0,.25)",
         }}
       >
-        <img src={appIcon} alt="" style={{ width: 20, height: 20, borderRadius: RADIUS.md, imageRendering: "pixelated", flexShrink: 0 }} />
         <span style={{ fontSize: 13, lineHeight: 1, letterSpacing: -0.3, whiteSpace: "nowrap" }}>
           <span style={{ fontWeight: 800 }}>Vuenc</span>
           <span style={{ fontWeight: 400, opacity: 0.88 }}>Edit</span>
         </span>
+        {/* Dropdown chevron — the cue that this opens a menu; flips while it's open. */}
+        <svg width="8" height="5" viewBox="0 0 8 5" aria-hidden="true"
+          style={{ flexShrink: 0, opacity: 0.85, transform: menuOpen ? "rotate(180deg)" : undefined, transition: "transform .12s" }}>
+          <path d="M1 1l3 3 3-3" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+        </svg>
       </button>
 
       {/* Undo / Redo — always visible, per the mockup, and fixed-width (see QAT_W_*). */}
@@ -140,7 +146,7 @@ export default function TopBar({
         )}
       </div>
 
-      <div {...(IS_MAC ? { "data-tauri-drag-region": true } : null)} style={{ flex: 1, minWidth: 8 }} />
+      <div {...dragRegion(chrome)} style={{ flex: 1, minWidth: 8 }} />
 
       {/* Right cluster: ⌘K search · world pill · Help · collapse */}
       <button
@@ -184,6 +190,8 @@ export default function TopBar({
       >
         <Icon name={p.collapsed ? "expandBar" : "collapse"} size={ICON.sm} tone="inherit" />
       </button>
+      {/* Frameless window (Windows, or the macOS preview): our own min/max/close in the corner. */}
+      {chrome.customControls && <><Sep /><WindowControls style={{ marginLeft: -2 }} /></>}
     </div>
   );
 }

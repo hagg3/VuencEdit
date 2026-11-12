@@ -4,8 +4,10 @@
  * re-exports everything here, so App's `import … from "./Ribbon"` is unchanged.
  */
 import type { Tool, SelectionBounds, MaterializeSelectionBounds } from "../MapCanvas";
-import type { SelectionInfo, ClipboardInfo, ExtrudeAxis, WorldMeta, RecentWorld } from "../types";
+import type { SelectionInfo, ClipboardInfo, ExtrudeAxis, WorldMeta, RecentWorld, ShadowMode, ShadowStyle } from "../types";
 import type { SettingsTab } from "../SettingsModal";
+import type { CommandId } from "../commands/meta";
+import type { CommandBinding } from "../commands/types";
 
 export type RibbonTab =
   | "home" | "draw" | "sculpt" | "insert" | "view"
@@ -105,7 +107,8 @@ export interface RibbonProps {
   show3dGrid: boolean; setShow3dGrid: (v: boolean) => void;
   floodFillLimit: number; setFloodFillLimit: (v: number) => void;
   nightLighting: boolean; setNightLighting: (v: boolean) => void;
-  shadows3d: boolean; setShadows3d: (v: boolean) => void;
+  /** Baked shadows (27.4b) and the last non-off style, which the Shadows toggle turns back on to. */
+  shadowMode: ShadowMode; shadowStyle: ShadowStyle; commitShadowMode: (v: ShadowMode) => void;
   gpuShadows: boolean; setGpuShadows: (v: boolean) => void;
   sunT: number; commitSunT: (v: number) => void;
   lampRadius: number; commitLampRadius: (v: number) => void;
@@ -123,10 +126,10 @@ export interface RibbonProps {
   showSigns: boolean; setShowSigns: (v: boolean) => void; hasSigns: boolean;
   openTemplateFile: () => void;
   // Texture pack
-  texturePackLoaded: boolean; texturePackPath: string | null;
+  texturePackPath: string | null;
   texturePack?: import("../texturePack").AtlasData | null;
   openTexturePackFile: () => void;
-  unloadTexturePack: () => void;
+  resetTexturePack: () => void;
   // Set Point — two distinct header fields: `home` (respawn) and `pos` (last-walked).
   spawnPos: { px: number; py: number } | null;
   playerPos: { px: number; py: number } | null;
@@ -170,6 +173,9 @@ export interface RibbonProps {
   arrayRows: number; setArrayRows: (v: number) => void;
   arraySpacingX: number; setArraySpacingX: (v: number) => void;
   arraySpacingY: number; setArraySpacingY: (v: number) => void;
+  /** Drop the clipboard, the locked paste position and the Z offset, and leave paste mode (the
+   *  options bar's "Discard Clipboard"). */
+  discardClipboard: () => void;
   rotateClipboard: () => void; mirrorClipboardX: () => void; mirrorClipboardY: () => void;
   pasteAt: (pos: { x: number; y: number }) => void;
   onSavePrefab: () => void;
@@ -212,6 +218,11 @@ export interface RibbonProps {
   setShowUploadModal: (v: boolean) => void;
   setShowExpandModal: (v: boolean) => void; setExpandResult: (v: null) => void;
   closeWorld: () => void;
+  /** ⌘Q / Quit VuencEdit: closes the window through its close guard (unsaved-changes prompt, autosave-on-quit). */
+  quitApp: () => void;
+  /** Publishes the live command bindings (or `null` when the ribbon unmounts) so App can drive the
+   *  macOS menu bar (34.1). Not state: a setState here would re-render the ribbon in a loop. */
+  onBindings?: (b: Record<CommandId, CommandBinding> | null) => void;
   // Help/About/Settings
   setShowHelp: (v: boolean) => void;
   setShowAbout: (v: boolean) => void;
@@ -231,7 +242,9 @@ export interface RibbonProps {
    *  a settings row, replacing the labelled body. Never the default; persisted via
    *  `AppSettings.ribbonCompact`. */
   compact: boolean; onToggleCompact: (v: boolean) => void;
-  /** Called once on mount with a setter for the active tab, so outside chrome (the Quick Actions
-   *  bar's "More…") can switch tabs without lifting `activeTab` out of the Ribbon. */
+  /** The options bar (34.2) renders inside the Ribbon's providers but docks below it: App's
+   *  effective ribbon height, and the width the docked sidebar takes on the right. */
+  barTop: number; barRightInset: number;
+  /** Called once on mount with a setter for the active tab, so outside chrome (the selection-bounds flow) can switch tabs without lifting `activeTab` out of the Ribbon. */
   registerTabSetter?: (fn: (t: RibbonTab) => void) => void;
 }

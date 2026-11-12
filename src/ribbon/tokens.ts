@@ -27,10 +27,9 @@ export const RIBBON_HEIGHT_COLLAPSED = TOP_BAR_HEIGHT;
 /**
  * macOS only: `tauri.conf.json`'s `titleBarStyle: "Overlay"` removes the native title bar and
  * floats the traffic lights over our own content at `trafficLightPosition` (12,11) — so the top
- * bar itself doubles as the window's title bar there. Windows/Linux keep the OS-drawn title bar
- * untouched (`titleBarStyle`/`hiddenTitle`/`trafficLightPosition` are no-ops off macOS), so this
- * flag must gate every bit of matching frontend behaviour (drag region + left clearance) or those
- * platforms would grow an unwanted draggable strip inside the ribbon.
+ * bar itself doubles as the window's title bar there. Windows is frameless too (its own config,
+ * `tauri.windows.conf.json`) and Linux keeps its OS title bar: which platform gets the drag region,
+ * this clearance, or our own window controls is decided in one place, `src/windowChrome.ts`.
  */
 export const IS_MAC = typeof navigator !== "undefined" && /Mac/.test(navigator.platform);
 /** Clears the traffic-light cluster (starts at x=12, ~52px wide) plus a little breathing room. */
@@ -57,6 +56,9 @@ export const GROUP_LABEL_H = 15;
 
 export const LARGE_H = 76;
 export const SMALL_H = 24;
+/** The options bar's height (34.2) — a fixed 30 px row under the ribbon. Other chrome that docks below it
+ *  (the work area, `LeftToolbar`) offsets by this instead of repeating `SMALL_H + 6`. */
+export const OPTIONS_BAR_H = SMALL_H + 6;
 export const ROW_GAP = 2;
 export const COL_GAP = 2;
 export const GROUP_PAD_X = 7;

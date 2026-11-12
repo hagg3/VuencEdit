@@ -26,7 +26,7 @@ export const SCULPT_PRIMARY: SculptToolDef[] = [
 export const SCULPT_MORE: SculptToolDef[] = [
   { id: "smooth", icon: "smooth", label: "Smooth", title: "Average neighbouring heights" },
   { id: "flatten", icon: "flatten", label: "Flatten", title: "Level terrain to the height you click" },
-  { id: "slope", icon: "slope", label: "Slope", title: "Flatten to a tilted plane (Slope X/Y in the Brush shape panel)" },
+  { id: "slope", icon: "slope", label: "Slope", title: "Flatten to a tilted plane (Slope X/Y in the options bar)" },
   { id: "noise", icon: "noise", label: "Noise", title: "Add hills or mountains" },
   { id: "thermal", icon: "thermal", label: "Thermal", title: "Slide steep slopes into scree" },
   { id: "hydro", icon: "hydro", label: "Hydro", title: "Water erosion that carves channels" },

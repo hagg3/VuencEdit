@@ -40,6 +40,19 @@ export interface RecentWorld { path: string; name: string; timestamp: number; }
  *  than three copies of "max_z === 255 && version is/isn't 5 or 6" that could silently drift. */
 export type WorldFormatClass = "legacy64z" | "newDawn256z" | "newFormat256z";
 
+/** Baked 3D shadows — mirrors voxel-core `shadow::ShadowMode`'s serde form (`get_chunk_geometry`'s
+ *  `shadows` param). Classic = one shade per top face, Smooth = shaded per corner (27.4b). */
+export type ShadowMode = "off" | "classic" | "smooth";
+/** The two "on" styles: what the Shadows toggle turns back on to. */
+export type ShadowStyle = Exclude<ShadowMode, "off">;
+/** Coerce a stored/unknown value; anything unrecognised is the default, Classic. */
+export function asShadowMode(v: unknown): ShadowMode {
+  return v === "off" || v === "smooth" ? v : "classic";
+}
+export function asShadowStyle(v: unknown): ShadowStyle {
+  return v === "smooth" ? v : "classic";
+}
+
 /** `newFormat256z` = 256z but `version` isn't the New Dawn 5/6 you'd expect — the 2026 game
  *  update's variant (16 new block types, signs stored differently), predating the version bump it
  *  should have gotten. Labeled distinctly from "New Dawn 256z" since players associate "New Dawn"

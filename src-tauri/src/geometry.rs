@@ -1,7 +1,7 @@
 //! The Tauri shell around the shared 3D geometry pipeline.
 //!
 //! The pipeline itself — per-chunk face-culled/greedy-meshed mesh generation, directional
-//! face-shading, night-lighting + sun-shadow previews, voxel picking, and the lamp spatial index —
+//! face-shading, night-lighting + baked shadows, voxel picking, and the lamp spatial index —
 //! moved to `voxel-core` (plan PR-C): it is pure voxel work, generic over `VoxelView`, and knows
 //! nothing about worlds, locks or IPC. What stays here is everything that does — the
 //! `RwLock<WorldState>` guards, `LoadedWorld`, the texture pack, the cutaway cap, and the binary
@@ -14,6 +14,7 @@
 use crate::{read_ws, AppState};
 use voxel_core::geometry::{self, CompactGeometry, LightMode, LightingProfile, ObjGeometryResult, PickResult};
 use voxel_core::lamps::{self, LampLight};
+use voxel_core::shadow::ShadowMode;
 
 /// IPC newtype over the crate's mesh result — see the module note on why this exists. One variant
 /// per wire format: `get_chunk_geometry`'s `format` param picks it per call, which is what lets each
@@ -110,10 +111,10 @@ impl tauri::ipc::IpcResponse for ChunkGeometry {
     }
 }
 
-/// Exposes the legacy/modern default lamp radii + the shadow ray length to the frontend so the
-/// edit-sync reload radius (FlyView3D: a placed lamp/block can affect neighboring chunks up to these
-/// distances away when night lighting or shadows are on) can't silently drift out of sync with the
-/// Rust constants.
+/// Exposes the legacy/modern default lamp radii to the frontend so the edit-sync reload radius
+/// (FlyView3D: a placed lamp can affect neighboring chunks up to this distance away when night
+/// lighting is on) can't silently drift out of sync with the Rust constants. Baked shadows need no
+/// constant here: their reach is the fixed 1-block ring in `flySync.ts`'s `editReloadPlan`.
 #[tauri::command]
 pub(crate) fn get_light_constants() -> geometry::LightConstants {
     geometry::light_constants()
@@ -148,6 +149,9 @@ pub(crate) fn pick_block(
 /// is a `reloadAllChunks()` trigger in FlyView3D), which is why the band itself stays an explicit
 /// parameter rather than being derived here too.
 ///
+/// `shadows`: the baked-shadow mode string, `"off" | "classic" | "smooth"` (`ShadowMode`'s serde
+/// form); anything else fails the invoke. `gpu` still forces it off (`LightMode::resolve`).
+///
 /// `format`: 1 (default) = the v1 f32 streams, 2 = the compact indexed v2 (ROADMAP-EDIT 18.14,
 /// ~2.5× smaller). VuencEdit's FlyView3D always asks for 2.
 #[tauri::command(async)]
@@ -155,7 +159,7 @@ pub(crate) fn pick_block(
 pub(crate) fn get_chunk_geometry(
     state: tauri::State<'_, AppState>,
     cx: i32, cy: i32,
-    night: bool, shadows: bool, sun_t: f32,
+    night: bool, shadows: ShadowMode, sun_t: f32,
     gpu: Option<bool>,
     lamp_radius: Option<f32>,
     lighting_profile: Option<LightingProfile>,
@@ -247,5 +251,83 @@ mod tests {
         assert_eq!(lens.len(), 12);
         assert!(lens.iter().all(|l| l % 4 == 0), "every section is a multiple of 4 bytes: {lens:?}");
         assert_eq!(lens.iter().sum::<u64>() as usize, bytes.len() - 4 - hlen);
+    }
+
+    /// FNV-1a over a chunk's compact payload — every stream's positions, colours, uvs and indices.
+    fn mesh_hash(ws: &crate::WorldState, cx: i32, cy: i32, shadows: ShadowMode) -> u64 {
+        let world = ws.world.as_ref().unwrap();
+        let mode = LightMode::resolve(false, shadows, 0.5, false, None, LightingProfile::default());
+        let g = geometry::chunk_geometry_compact(world, world.meta(), None, &[], cx, cy, mode, None, None, None);
+        let mut h: u64 = 0xcbf29ce484222325;
+        for b in g.buffers() { for &x in b.iter() { h = (h ^ x as u64).wrapping_mul(0x100000001b3); } }
+        h
+    }
+
+    /// The stale-shadow gate (plan §5.2, Emod's self-test transposed). A 3×3 leaf canopy placed in
+    /// chunk (1,0) against the seam shades the +x edge column of chunk (0,0)'s floor, so (0,0)'s mesh
+    /// must change; undoing the canopy must restore it exactly. The frontend half — that this edit
+    /// rect's `editReloadPlan` includes (0,0) — is the matching case in `flySync.test.ts`.
+    #[test]
+    fn shadow_canopy_across_seam_remeshes_neighbour() {
+        let mut ws = crate::tests::ws_with(crate::tests::make_bumpy_world_grid(2, 8, |_, _| 10));
+        let h0 = mesh_hash(&ws, 0, 0, ShadowMode::Classic);
+        let h0_smooth = mesh_hash(&ws, 0, 0, ShadowMode::Smooth);
+        let h0_off = mesh_hash(&ws, 0, 0, ShadowMode::Off);
+
+        // Leaves at x 16..=18, y 6..=8, z 14: gap 4 above the z-10 floor. Nothing touches chunk
+        // (0,0)'s own voxels, so face culling can't be what changes its mesh.
+        crate::with_edit(&mut ws, "canopy", (16, 6, 18, 8), |w| {
+            for x in 16..=18 { for y in 6..=8 { voxel_core::view::set_block_abs(w, x, y, 14, 2, 0); } }
+            Ok(())
+        }).unwrap();
+        assert_ne!(mesh_hash(&ws, 0, 0, ShadowMode::Classic), h0, "the canopy must shade chunk (0,0)'s edge");
+        assert_ne!(mesh_hash(&ws, 0, 0, ShadowMode::Smooth), h0_smooth, "…in Smooth too");
+        assert_eq!(mesh_hash(&ws, 0, 0, ShadowMode::Off), h0_off, "with shadows off nothing in (0,0) changes");
+
+        crate::undo_edit_only(&mut ws, None).unwrap();
+        assert_eq!(mesh_hash(&ws, 0, 0, ShadowMode::Classic), h0, "removing the canopy restores the mesh");
+        assert_eq!(mesh_hash(&ws, 0, 0, ShadowMode::Smooth), h0_smooth);
+    }
+
+    /// Plan §5.3's Off / Classic / Smooth cost table on real worlds (27.4b). Not a gate — run by hand:
+    /// `GEOM_BENCH_WORLDS="a.eden:b.eden" cargo test -p eden-world-editor geom_shadow_bench -- --ignored --nocapture`.
+    /// Meshes up to 300 non-empty whole-column chunks per world (day, compact v2, no texture pack),
+    /// each mode timed over the same set, best of 7 passes.
+    #[test]
+    #[ignore]
+    fn geom_shadow_bench() {
+        let Ok(paths) = std::env::var("GEOM_BENCH_WORLDS") else { return };
+        for path in paths.split(':') {
+            let ws = crate::tests::ws_with(std::fs::read(path).expect("read world"));
+            let world = ws.world.as_ref().unwrap();
+            let meta = world.meta();
+            let mode = |s| LightMode::resolve(false, s, 0.5, false, None, LightingProfile::default());
+            let (cw, ch) = (meta.w_chunks as i32, meta.h_chunks as i32);
+            // Spiral-ish: nearest the centre first, so a sparse world still finds its built-up middle.
+            let mut all: Vec<(i32, i32)> = (0..ch).flat_map(|cy| (0..cw).map(move |cx| (cx, cy))).collect();
+            all.sort_by_key(|&(cx, cy)| (cx - cw / 2).pow(2) + (cy - ch / 2).pow(2));
+            let chunks: Vec<(i32, i32)> = all.into_iter()
+                .filter(|&(cx, cy)| geometry::chunk_geometry_compact(world, meta, None, &[], cx, cy, mode(ShadowMode::Off), None, None, None)
+                    .streams.iter().any(|s| s.vertex_count > 0))
+                .take(300).collect();
+            println!("{path}: {} chunks, max_z {}", chunks.len(), voxel_core::view::world_max_z(world));
+            for s in [ShadowMode::Off, ShadowMode::Classic, ShadowMode::Smooth] {
+                let (mut best, mut bytes, mut verts) = (f64::MAX, 0usize, 0u64);
+                for _ in 0..7 {
+                    let t0 = std::time::Instant::now();
+                    let (mut b, mut v) = (0usize, 0u64);
+                    for &(cx, cy) in &chunks {
+                        let g = geometry::chunk_geometry_compact(world, meta, None, &[], cx, cy, mode(s), None, None, None);
+                        b += g.wire_bytes();
+                        v += g.streams.iter().map(|s| s.vertex_count as u64).sum::<u64>();
+                    }
+                    best = best.min(t0.elapsed().as_secs_f64());
+                    (bytes, verts) = (b, v);
+                }
+                let n = chunks.len().max(1) as f64;
+                println!("  {s:?}: {:.3} ms/chunk, {:.1} KiB/chunk, {:.0} verts/chunk",
+                    best * 1e3 / n, bytes as f64 / 1024.0 / n, verts as f64 / n);
+            }
+        }
     }
 }

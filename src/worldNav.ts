@@ -6,7 +6,13 @@
  * `MapCanvasRef.viewCenter()` and `FlyView3DRef.teleport` all share (the backend subtracts the
  * chunk origin before any of them reach the frontend).
  */
-import type { SelectionInfo, SignInfo } from "./types";
+import type { SelectionInfo } from "./types";
+
+/** What the World tab's record lists (signs, command blocks) share: a position, plus searchable text
+ *  (`text` for a sign, `script` for a command block, via the `textOf` accessor). */
+export interface PlacedRecord { x: number; y: number; z: number; }
+type TextOf<T> = (r: T) => string;
+const signText = (r: { text: string }) => r.text;
 
 /** Blocks a selection edits. A shaped selection's mask cells times its depth, never the bounding
  *  box: a lasso over a quarter of its rect is a quarter of the box (audit I-A1, the old
@@ -26,34 +32,40 @@ function foldText(t: string): string {
 
 /** Signs whose text contains every whitespace-separated term of `query`, in any order. An empty
  *  query keeps them all. The input array is never mutated. */
-export function filterSigns(signs: readonly SignInfo[], query: string): SignInfo[] {
+export function filterSigns<T extends PlacedRecord>(
+  signs: readonly T[], query: string, textOf: TextOf<T> = signText as unknown as TextOf<T>,
+): T[] {
   const terms = foldText(query).split(" ").filter(Boolean);
   if (terms.length === 0) return signs.slice();
   return signs.filter((s) => {
-    const t = foldText(s.text);
+    const t = foldText(textOf(s));
     return terms.every((term) => t.includes(term));
   });
 }
 
 /** Horizontal (XY) distance in blocks. Height is left out on purpose: "nearest" means nearest on
  *  the map the user is looking at. */
-export function signDistance(s: SignInfo, centre: { x: number; y: number }): number {
+export function signDistance(s: PlacedRecord, centre: { x: number; y: number }): number {
   return Math.hypot(s.x - centre.x, s.y - centre.y);
 }
 
 /** Empty signs sort after written ones in text order, since "(empty)" isn't something to look up. */
-function compareText(a: SignInfo, b: SignInfo): number {
-  const ea = a.text.trim() === "", eb = b.text.trim() === "";
+function compareText<T>(a: T, b: T, textOf: TextOf<T>): number {
+  const ta = textOf(a), tb = textOf(b);
+  const ea = ta.trim() === "", eb = tb.trim() === "";
   if (ea !== eb) return ea ? 1 : -1;
-  return foldText(a.text).localeCompare(foldText(b.text));
+  return foldText(ta).localeCompare(foldText(tb));
 }
 
 /** A sorted copy. `nearest` orders by distance from `centre` (ties by text, so the order is
  *  stable across re-renders); `text` is alphabetical (ties by distance). */
-export function sortSigns(signs: readonly SignInfo[], mode: SignSort, centre: { x: number; y: number }): SignInfo[] {
+export function sortSigns<T extends PlacedRecord>(
+  signs: readonly T[], mode: SignSort, centre: { x: number; y: number },
+  textOf: TextOf<T> = signText as unknown as TextOf<T>,
+): T[] {
   const keyed = signs.map((s) => ({ s, d: signDistance(s, centre) }));
   keyed.sort(mode === "nearest"
-    ? (a, b) => (a.d - b.d) || compareText(a.s, b.s)
-    : (a, b) => compareText(a.s, b.s) || (a.d - b.d));
+    ? (a, b) => (a.d - b.d) || compareText(a.s, b.s, textOf)
+    : (a, b) => compareText(a.s, b.s, textOf) || (a.d - b.d));
   return keyed.map((k) => k.s);
 }

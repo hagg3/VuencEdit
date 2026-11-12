@@ -8,13 +8,14 @@ export type ChunkXY = [number, number];
 /**
  * Chunks an edit rect must reload.
  *  - `core`: every chunk the rect overlaps (reload immediately).
- *  - `halo`: extra chunks, reloaded on the trailing debounce. With `reachBlocks === 0` (no lamp light /
- *    shadows) this is only the *face-culling* neighbours: the edge-adjacent chunk on a side where the
- *    rect actually touches that chunk edge (no diagonals, nothing for an interior edit). With
- *    lighting/shadow reach it is the full square ring `ceil(reach/16)` chunks wide, since light and
- *    shadow travel diagonally too.
+ *  - `halo`: extra chunks, reloaded on the trailing debounce. With `reachBlocks === 0` (no lamp light)
+ *    this is only the chunks the 1-block ring around the rect reaches: the edge-adjacent chunk on a
+ *    side where the rect touches that chunk edge (face culling, 23.1), plus — with `shadows` on —
+ *    the diagonal chunk where it touches two edges at a corner, since a baked-shadow caster shades
+ *    the 3×3 columns around it (27.4b; voxel-core `shadow.rs`). Nothing for an interior edit. With a
+ *    lamp reach it is the full square ring `ceil(reach/16)` chunks wide, which covers both.
  */
-export function editReloadPlan(r: EditRect, reachBlocks: number): { core: ChunkXY[]; halo: ChunkXY[] } {
+export function editReloadPlan(r: EditRect, reachBlocks: number, shadows = false): { core: ChunkXY[]; halo: ChunkXY[] } {
   const x1 = r.x + Math.max(0, r.w - 1), y1 = r.y + Math.max(0, r.h - 1);
   const cx0 = worldToChunk(r.x), cy0 = worldToChunk(r.y);
   const cx1 = worldToChunk(x1), cy1 = worldToChunk(y1);
@@ -31,10 +32,17 @@ export function editReloadPlan(r: EditRect, reachBlocks: number): { core: ChunkX
   }
   const last = CHUNK_SIZE_BLOCKS - 1;
   const mod = (v: number) => ((v % CHUNK_SIZE_BLOCKS) + CHUNK_SIZE_BLOCKS) % CHUNK_SIZE_BLOCKS;
-  if (mod(r.x) === 0) for (let cy = cy0; cy <= cy1; cy++) halo.push([cx0 - 1, cy]);
-  if (mod(x1) === last) for (let cy = cy0; cy <= cy1; cy++) halo.push([cx1 + 1, cy]);
-  if (mod(r.y) === 0) for (let cx = cx0; cx <= cx1; cx++) halo.push([cx, cy0 - 1]);
-  if (mod(y1) === last) for (let cx = cx0; cx <= cx1; cx++) halo.push([cx, cy1 + 1]);
+  const w = mod(r.x) === 0, e = mod(x1) === last, n = mod(r.y) === 0, s = mod(y1) === last;
+  if (w) for (let cy = cy0; cy <= cy1; cy++) halo.push([cx0 - 1, cy]);
+  if (e) for (let cy = cy0; cy <= cy1; cy++) halo.push([cx1 + 1, cy]);
+  if (n) for (let cx = cx0; cx <= cx1; cx++) halo.push([cx, cy0 - 1]);
+  if (s) for (let cx = cx0; cx <= cx1; cx++) halo.push([cx, cy1 + 1]);
+  if (shadows) {
+    if (n && w) halo.push([cx0 - 1, cy0 - 1]);
+    if (n && e) halo.push([cx1 + 1, cy0 - 1]);
+    if (s && w) halo.push([cx0 - 1, cy1 + 1]);
+    if (s && e) halo.push([cx1 + 1, cy1 + 1]);
+  }
   return { core, halo };
 }
 
