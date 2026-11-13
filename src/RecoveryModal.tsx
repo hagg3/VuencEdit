@@ -7,6 +7,7 @@ import Dialog, { DialogButton } from "./ui/Dialog";
  *  Stage 14.15) — plain `DANGER_HEX` fails AA there. */
 const RED_LIGHT = mix(RAMP.white, DANGER_HEX, 0.5);
 import type { AutosaveInfo } from "./types";
+import { FONT } from "./ribbon/tokens";
 
 /** The world file an autosave builds on (a `.eden` source or an `.emod`), or `null` for a private copy. */
 export function recoveryBasePath(info: AutosaveInfo): string | null {
@@ -86,7 +87,7 @@ export default function RecoveryModal({
       <p style={{ margin: "0 0 8px", color: MODAL_TEXT.secondary, lineHeight: 1.5 }}>
         VuencEdit found autosaved changes from a previous session that wasn't saved before closing.
       </p>
-      <div style={{ background: "rgba(0,0,0,0.25)", borderRadius: 6, padding: "8px 12px", margin: "0 0 16px", fontFamily: "monospace", fontSize: 12 }}>
+      <div style={{ background: "rgba(0,0,0,0.25)", borderRadius: 6, padding: "8px 12px", margin: "0 0 16px", fontFamily: "monospace", fontSize: FONT.body }}>
         <div><span style={{ color: MODAL_TEXT.label }}>World: </span>{info.world_name || "(unnamed)"}</div>
         <div><span style={{ color: MODAL_TEXT.label }}>Autosaved: </span>{when}</div>
         {info.source_path && <div style={{ color: MODAL_TEXT.label, wordBreak: "break-all" }}>{info.source_path}</div>}

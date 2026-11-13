@@ -51,7 +51,6 @@ mod mem;
 #[cfg(test)]
 mod alloc_probe;
 mod emod;
-mod mpworld;
 mod network;
 mod overview;
 mod signs;
@@ -61,7 +60,6 @@ mod worldgen;
 
 use colors::*;
 use geometry::*;
-use mpworld::*;
 use network::*;
 use worldgen::*;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -481,6 +479,7 @@ fn staged_map_mode(path: &std::path::Path) -> MapMode {
 /// runtime with `EACCES` (`ERROR_ACCESS_DENIED` on Windows). Any failure to map shared — including a
 /// filesystem that won't take a writable mapping — falls back to the old `map_copy` behaviour rather
 /// than failing the load.
+#[cfg(test)]
 fn map_staged_temp(path: &std::path::Path) -> std::io::Result<MmapMut> {
     map_staged_temp_ex(path).map(|(m, _)| m)
 }
@@ -1737,8 +1736,8 @@ impl BandMask {
         let (lo, hi) = (lo.min(Self::MAX_BANDS - 1), hi.min(Self::MAX_BANDS - 1));
         BandMask(((1u32 << (hi + 1)) - (1u32 << lo)) as u16)
     }
+    #[cfg(test)]
     fn contains(self, b: usize) -> bool { b < Self::MAX_BANDS && self.0 & (1 << b) != 0 }
-    fn count(self) -> u32 { self.0.count_ones() }
     /// Maximal runs of set bits as inclusive `(first, last)` band pairs, ascending.
     fn runs(self) -> impl Iterator<Item = (usize, usize)> {
         let mut m = self.0 as u32;
@@ -1806,7 +1805,7 @@ fn dirty_spans<'a>(world: &'a LoadedWorld, dirty: &DirtyMap) -> Vec<(u64, i32, i
 /// accounting (`since_base`, reset when a save re-bases a *Source* autosave lineage, 18.9) and
 /// toward a *Clone* lineage's (`since_load`, monotone for the session — see `AutosaveBase`).
 /// `header_*` mirror the four sets for header bytes 0..192, which have no `(cx,cy)` of their own —
-/// `set_spawn_pos`/`rename_world`/`set_sky_grid` write header fields directly and bypass
+/// `set_spawn_pos`/`rename_world` write header fields directly and bypass
 /// `with_edit`, so they mark this explicitly rather than going through `mark_chunks`.
 ///
 /// Each set is band-granular (18.13): a chunk maps to the `BandMask` of bands that changed, and a
@@ -1858,7 +1857,7 @@ pub(crate) struct DirtyState {
 /// `world` is passed explicitly rather than reached through `ws.world` because `undo_edit_inner` /
 /// `redo_edit_inner` have `take()`n it out of the state by the time they call this.
 ///
-/// Header-only writers (`set_spawn_pos`, `set_player_pos`, `rename_world`, `set_sky_grid`) touch
+/// Header-only writers (`set_spawn_pos`, `set_player_pos`, `rename_world`) touch
 /// bytes 0..192 — no chunk's bytes, hence no hint — and correctly call `mark_header` instead.
 fn mark_dirty_chunks(dirty: &mut DirtyState, world: Option<&LoadedWorld>, chunks: &[(i32, i32, BandMask)]) {
     if let Some(w) = world {
@@ -1989,7 +1988,7 @@ impl DiskImage {
     }
 
     fn identity(&self) -> FileIdentity {
-        FileIdentity { path: self.path.clone(), len: self.len, mtime_ns: system_time_ns(self.mtime), file_id: self.file_id }
+        FileIdentity { path: self.path.clone(), len: self.len, mtime_ns: system_time_ns(self.mtime), file_id: self.file_id, content: 0 }
     }
 }
 
@@ -2020,6 +2019,10 @@ pub(crate) struct FileIdentity {
     len: u64,
     mtime_ns: u64,
     file_id: (u64, u64),
+    /// 31.7: a content fingerprint the filesystem can't give — for a zip world, the entry's CRC-32 and
+    /// uncompressed size. 0 for everything else. `check()` ignores it (it only re-stats the file).
+    #[serde(default)]
+    content: u64,
 }
 
 /// Whether an autosave base file still matches its recorded `FileIdentity`. Reported to the
@@ -2044,13 +2047,14 @@ impl FileIdentity {
             len: md.len(),
             mtime_ns: md.modified().map(system_time_ns).unwrap_or(0),
             file_id: file_id_of(md),
+            content: 0,
         }
     }
 
     fn check(&self) -> BaseStatus {
         match fs::metadata(&self.path) {
             Err(_) => BaseStatus::Missing,
-            Ok(md) if FileIdentity::of(&self.path, &md) == *self => BaseStatus::Ok,
+            Ok(md) if FileIdentity { content: self.content, ..FileIdentity::of(&self.path, &md) } == *self => BaseStatus::Ok,
             Ok(_) => BaseStatus::Changed,
         }
     }
@@ -2258,6 +2262,9 @@ pub(crate) struct WorldState {
     /// load/close/recovery and by any successful save to a `.eden`/zip; an in-place `.emod` save
     /// (26.5) re-bases it instead.
     pub(crate) emod: Option<emod::EmodSession>,
+    /// 31.7: the loaded zip's identity (archive stat + entry CRC/size), keying its persisted overview
+    /// raster. Only meaningful while the world is unedited and has no `disk_image`.
+    pub(crate) zip_identity: Option<FileIdentity>,
 }
 
 impl WorldState {
@@ -2297,6 +2304,7 @@ impl WorldState {
             lineage_gen: 0,
             adopted: None,
             emod: None,
+            zip_identity: None,
         }
     }
 
@@ -2473,6 +2481,28 @@ impl LongOps {
         }));
         h
     }
+}
+
+/// Turns WebView2's pinch-zoom back on so a precision-touchpad pinch reaches the page (34.7).
+///
+/// wry ties `IsPinchZoomEnabled` to `zoom_hotkeys_enabled` (off), and with it off Chromium drops
+/// touchpad pinch gestures before the page sees them. With it on, a pinch arrives as a cancelable
+/// Ctrl+wheel event: the map and the Lens turn it into their own zoom, and `installPinchGuard`
+/// (`src/input/wheel.ts`) cancels it everywhere else so the UI itself never page-zooms. Touchscreen
+/// pinch stays off via `touch-action` in `App.css`. The zoom hotkeys (`IsZoomControlEnabled`) stay
+/// off. Best-effort: an older runtime without `ICoreWebView2Settings5` just keeps pinch off.
+#[cfg(windows)]
+fn enable_touchpad_pinch(window: &tauri::WebviewWindow) {
+    let res = window.with_webview(|wv| unsafe {
+        use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Settings5;
+        use windows_core::Interface;
+        let Ok(core) = wv.controller().CoreWebView2() else { return };
+        let Ok(settings) = core.Settings() else { return };
+        if let Ok(s5) = settings.cast::<ICoreWebView2Settings5>() {
+            let _ = s5.SetIsPinchZoomEnabled(true);
+        }
+    });
+    if let Err(e) = res { timing_log!("[INPUT] enable_touchpad_pinch failed: {e}"); }
 }
 
 /// Hides (or re-shows) macOS's native traffic lights. Backs Settings ▸ Experiments "Preview Windows
@@ -3208,9 +3238,10 @@ fn load_world_inner(path: String, state: &AppState) -> Result<WorldMeta, String>
         sweep_orphan_save_temps(std::path::Path::new(&path));
     }
 
-    let mut temp_shared = false;
+    let temp_shared;
     let mut staged_identity: Option<FileIdentity> = None;
     let mut emod_session: Option<emod::EmodSession> = None;
+    let mut zip_identity: Option<FileIdentity> = None;
     let (mmap, maybe_temp, was_compressed): (MmapMut, Option<StagingGuard>, bool) = if is_emod {
         // 26.4: an own-format export of the store's live state into the private temp (sparse: only
         // occupied bands are written), then the normal parse. The `.emod` itself is only read.
@@ -3233,12 +3264,17 @@ fn load_world_inner(path: String, state: &AppState) -> Result<WorldMeta, String>
         // (1-2 GB on a large world) would otherwise be fully resident before extraction even starts
         // (audit P-3). `ZipArchive` only seeks to the central directory; a `BufReader` keeps that cheap.
         let file = fs::File::open(&path).map_err(|e| format!("Failed to read file: {e}"))?;
+        // 31.7: the archive's identity, taken before the read, so a zip rewritten mid-load never gets a key.
+        let zip_stat = file.metadata().ok().map(|md| FileIdentity::of(std::path::Path::new(&path), &md));
         let mut archive = ZipArchive::new(std::io::BufReader::new(file))
             .map_err(|e| format!("Invalid zip archive: {e}"))?;
         if archive.is_empty() { return Err("Zip archive contains no files".into()); }
         let idx = pick_world_zip_entry(&mut archive);
         let mut entry = archive.by_index(idx)
             .map_err(|e| format!("Failed to read zip entry: {e}"))?;
+        // Entry CRC-32 + uncompressed size come from the central directory; the CRC is verified by
+        // the zip reader at the end of the extraction below, so a key is only used if it checked out.
+        zip_identity = zip_stat.map(|mut id| { id.content = (entry.crc32() as u64) | (entry.size() << 32); id });
         let guard = StagingGuard::new();
         let temp_path = guard.path().to_path_buf();
         // A compressed world decompresses to many times its own size — check against the entry's
@@ -3298,7 +3334,7 @@ fn load_world_inner(path: String, state: &AppState) -> Result<WorldMeta, String>
     // view reads tens of MB of `.vxr` instead of every chunk's pages. Only with a proven identity
     // (a non-zip load that didn't change mid-copy); a stale or damaged entry is dropped, never an error.
     // An `.emod` keys it on the `.emod`'s own identity (it never has a `DiskImage`).
-    let overview_id = staged_identity.as_ref().or(emod_session.as_ref().map(|s| &s.file_identity));
+    let overview_id = staged_identity.as_ref().or(emod_session.as_ref().map(|s| &s.file_identity)).or(zip_identity.as_ref());
     if let (Some(id), Some(dir)) = (overview_id, overview::store_dir()) {
         let budget = read_ws(state).overview_budget;
         if let Some(r) = overview::preload(&loaded, id, budget, dir) {
@@ -3387,6 +3423,7 @@ fn load_world_inner(path: String, state: &AppState) -> Result<WorldMeta, String>
             });
         }
         ws.emod = emod_session;
+        ws.zip_identity = zip_identity;
         // Non-zip loads: the staged temp is an exact copy of the source file, which is exactly
         // world.bytes, so the source path is a known-good disk image the instant load succeeds.
         // Zip loads leave this None — there is no uncompressed on-disk image to write into.
@@ -6751,6 +6788,8 @@ fn save_world(
 fn overview_persist_candidate(ws: &WorldState) -> Option<FileIdentity> {
     if !ws.dirty.since_disk.is_empty() { return None; }
     ws.disk_image.as_ref().filter(|d| !d.compressed).map(DiskImage::identity)
+        // 31.7: an unedited zip world (`since_load` is monotone: any chunk edit, even undone, disqualifies).
+        .or_else(|| ws.zip_identity.clone().filter(|_| ws.disk_image.is_none() && ws.dirty.since_load.is_empty()))
         // An unedited `.emod` session (26.4): its raster is keyed on the `.emod` itself.
         .or_else(|| ws.emod.as_ref().map(|e| e.file_identity.clone()))
 }
@@ -6818,6 +6857,7 @@ fn close_world(state: tauri::State<'_, AppState>) {
         ws.lineage_gen += 1;
         ws.adopted = None;
         ws.emod = None;
+        ws.zip_identity = None;
         ws.temp_shared = false;
         (ws.world.take(), ws.temp_path.take(), old_persist)
     };
@@ -12542,6 +12582,12 @@ pub fn run() {
         .setup(|app| {
             // Windows-only, and only when `VUENCEDIT_TRIM=1` — see `working_set`.
             working_set::spawn_idle_trimmer(app.handle().clone());
+            // Windows: let precision-touchpad pinches reach the page as Ctrl+wheel (34.7).
+            #[cfg(windows)]
+            {
+                use tauri::Manager;
+                for w in app.webview_windows().values() { enable_touchpad_pinch(w); }
+            }
             // The persisted overview rasters (18.15), swept in the background.
             {
                 use tauri::Manager;
@@ -12627,7 +12673,6 @@ pub fn run() {
             scatter_paste,
             array_paste,
             get_chunk_geometry,
-            get_light_constants,
             get_lamps_near,
             pick_block,
             set_cursor_lock,
@@ -12639,12 +12684,9 @@ pub fn run() {
             cancel_world_gen,
             preview_classic_world,
             preview_tg2_world,
-            scan_mpworld,
             set_spawn_pos,
             set_player_pos,
             get_player_pos,
-            get_sky_grid,
-            set_sky_grid,
             get_records,
             get_record_overlay,
             pick_block_surface,
@@ -12672,42 +12714,6 @@ pub fn run() {
                 if let Ok(base) = app.path().app_data_dir() { release_autosave_owner(&base); }
             }
         });
-}
-
-// ── Sky grid (Phase 5) ───────────────────────────────────────────────────────
-
-/// Read the 4×4 sky-colour grid from header bytes 132–147.
-/// Returns 16 paint indices (0 = default blue, 1–54 = paint palette).
-#[tauri::command(async)]
-fn get_sky_grid(state: tauri::State<'_, AppState>) -> Result<Vec<u8>, String> {
-    let ws = read_ws(&state);
-    let world = ws.world.as_ref().ok_or("No world loaded")?;
-    if world.bytes.len() < 148 {
-        return Ok(vec![0u8; 16]);
-    }
-    Ok(world.bytes[132..148].to_vec())
-}
-
-/// Write a 4×4 sky-colour grid to header bytes 132–147 and recompute sky majority.
-#[tauri::command(async)]
-fn set_sky_grid(grid: Vec<u8>, state: tauri::State<'_, AppState>) -> Result<(), String> {
-    if grid.len() != 16 { return Err("Expected exactly 16 sky values".into()); }
-    let mut ws = write_ws(&state);
-    let world = ws.world.as_mut().ok_or("No world loaded")?;
-    if world.bytes.len() < 148 { return Err("World header too short".into()); }
-    world.bytes[132..148].copy_from_slice(&grid);
-    // Recompute sky majority so grass tint updates without a reload.
-    let candidates: Vec<u8> = grid.iter().copied().filter(|&b| b != 14).collect();
-    world.sky = if candidates.is_empty() {
-        14
-    } else {
-        let mut counts = [0u32; 256];
-        for &b in &candidates { counts[b as usize] += 1; }
-        counts.iter().enumerate().max_by_key(|(_, &c)| c)
-            .map(|(i, _)| i as u8).unwrap_or(14)
-    };
-    ws.dirty.mark_header();
-    Ok(())
 }
 
 // ── Records: signs + command blocks (27.0b, plan §3.4) ─────────────────────────────
@@ -16385,7 +16391,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// `set_spawn_pos` / `rename_world` / `set_sky_grid` write header bytes only and never dirty a
+    /// `set_spawn_pos` / `rename_world` write header bytes only and never dirty a
     /// chunk, so the header span is the one case where an incremental save has no chunk work at all.
     /// It must still be written — and must not disturb a single byte outside the 192-byte header.
     #[test]

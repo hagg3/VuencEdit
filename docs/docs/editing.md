@@ -6,12 +6,12 @@ subtitle: Draw tools, selections, the Lens, and terrain sculpting.
 
 ## Draw tools
 
-The Draw tab has the everyday tools. The same ones are in the floating Tools window.
+The Draw tab has the everyday tools. The same ones are in the floating Tools window. Size, fill or hollow, and the other options for the active tool are in the options bar under the ribbon.
 
 | Tool | Key | What it does |
 |---|---|---|
 | Pen | <kbd>P</kbd> | One block at a time, freehand |
-| Brush | <kbd>B</kbd> | Freehand at the brush size (1 to 9, square or round) |
+| Brush | <kbd>B</kbd> | Freehand at the brush size (1, 3, 5, 7 or 9 blocks, square or round) |
 | Line | <kbd>L</kbd> | Drag from start to end |
 | Rectangle | <kbd>R</kbd> | Drag a box, filled or hollow |
 | Ellipse | <kbd>E</kbd> | Drag an ellipse, filled or hollow |
@@ -22,7 +22,7 @@ The Draw tab has the everyday tools. The same ones are in the floating Tools win
 
 The stroke stabilizer makes the brush trail the cursor a little, which smooths out a shaky hand. The draw mask limits painting to cells that already hold a block you choose, so you can retexture one material without touching the rest.
 
-Pick the block and paint from the Block button, or press a hotbar key: <kbd>1</kbd> to <kbd>5</kbd> for pinned blocks, <kbd>6</kbd> to <kbd>0</kbd> for recent ones. You can pin a recent block from the Hotbar window.
+Pick the block and paint from the Block button, which has a search box, or press a hotbar key: <kbd>1</kbd> to <kbd>5</kbd> for pinned blocks, <kbd>6</kbd> to <kbd>0</kbd> for recent ones. You can pin a recent block from the Hotbar window.
 
 ## Selections
 
@@ -52,7 +52,7 @@ When you have a selection, the Lens window opens with front and side views of it
 - Draw on the front or side view with the pen, brush, rectangle or ellipse. Each stroke is one undo step.
 - A thin band follows your cursor on the map so you can see which column you're looking at.
 
-The Lens is new in 1.0.18 and still settling. You can turn it off with <kbd>Alt</kbd>+<kbd>P</kbd>, or separately for pastes and for selections in Settings ▸ Layout & windows.
+The Lens was added in 1.0.18 and is still settling. You can turn it off with <kbd>Alt</kbd>+<kbd>P</kbd>, or separately for pastes and for selections in Settings ▸ Layout & windows.
 
 {% include placeholder.html caption="The Lens window showing front and side views of a selection" ratio="16/9" %}
 
@@ -66,16 +66,16 @@ The Lens is new in 1.0.18 and still settling. You can turn it off with <kbd>Alt<
 
 ## Terrain sculpting <span class="tag-exp">experimental</span>
 
-The Sculpt tab has 16 brush tools for reshaping terrain. They work on the map and in the 3D view.
+The Sculpt tab has 15 brush tools for reshaping terrain. They work on the map and in the 3D view.
 
 - **Raise, Lower, Flatten, Slope** are the basics. Flatten levels to the height you click, and Slope flattens to a tilted plane.
 - **Smooth and Sharpen** are opposites. **Terrace** cuts terrain into steps.
 - **Noise** adds hills or mountains.
-- **Erode, Thermal and Hydro** simulate weathering. Hydro carves water channels.
+- **Thermal and Hydro** simulate weathering. Thermal slides steep slopes into scree, and Hydro carves water channels.
 - **Grab and Smear** pull terrain along with the brush.
 - **Retexture** repaints the surface by slope.
 - **Rock and Carve** work on volume, not a height map. Rock fuses a mass into the landscape instead of leaving a seam. Carve digs a rounded hollow into exposed terrain.
 
-Strength, radius, softness and falloff profile are in the Brush and Falloff groups. <kbd>[</kbd> and <kbd>]</kbd> change the radius while a sculpt tool is armed, and <kbd>Shift</kbd>+<kbd>[</kbd> or <kbd>]</kbd> change the strength. Hold <kbd>Ctrl</kbd> or <kbd>⌘</kbd> to swap Raise and Lower for one stroke. Hold <kbd>Shift</kbd> to smooth (any tool except Grab). With Live Brush on, terrain changes as you drag. Off, the stroke applies when you let go.
+Strength, radius, softness and falloff profile are in the Brush and Falloff groups. The options bar has the tool's own settings, such as the Slope angle or the Rock and Carve shape. <kbd>[</kbd> and <kbd>]</kbd> change the radius while a sculpt tool is armed, and <kbd>Shift</kbd>+<kbd>[</kbd> or <kbd>]</kbd> change the strength. Hold <kbd>Ctrl</kbd> or <kbd>⌘</kbd> to swap Raise and Lower for one stroke. Hold <kbd>Shift</kbd> to smooth (any tool except Grab). With Live Brush on, terrain changes as you drag. Off, the stroke applies when you let go.
 
 <kbd>Esc</kbd> mid-stroke on the map reverts the stroke. A finished stroke is one undo step however long you held it. You can limit sculpting to the current selection with Sculpt in Selection.

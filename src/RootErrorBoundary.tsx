@@ -3,6 +3,7 @@ import ErrorBoundary from "./ErrorBoundary";
 import { hasRootSave, runRootSave } from "./rootSave";
 import { RAMP } from "./theme/theme";
 import { btnBase } from "./ribbon/tokens";
+import { FONT } from "./ribbon/tokens";
 
 /** Full-window fallback for a throw in `App` itself (everything inside it has its own smaller
  *  boundary). The world and undo stack live in Rust and are still alive, so this keeps Save
@@ -34,11 +35,11 @@ export function RootFallback({ error, retry }: { error: Error; retry: () => void
       justifyContent: "center", gap: 10, padding: 24, boxSizing: "border-box", textAlign: "center",
       background: RAMP.mapBg, color: RAMP.dim,
     }}>
-      <div style={{ fontSize: 14, fontWeight: 600, color: RAMP.textDanger }}>Something went wrong</div>
-      <div style={{ fontSize: 11, color: RAMP.meta, maxWidth: 420, wordBreak: "break-word" }}>
+      <div style={{ fontSize: FONT.heading, fontWeight: 600, color: RAMP.textDanger }}>Something went wrong</div>
+      <div style={{ fontSize: FONT.label, color: RAMP.meta, maxWidth: 420, wordBreak: "break-word" }}>
         {error.message || String(error)}
       </div>
-      <div style={{ fontSize: 11, color: RAMP.meta, maxWidth: 420 }}>
+      <div style={{ fontSize: FONT.label, color: RAMP.meta, maxWidth: 420 }}>
         {canSave
           ? "Your world and its undo history are still in memory. Save now (Ctrl/⌘+S) before retrying."
           : "No world was open, so there is nothing to save."}

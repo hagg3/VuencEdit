@@ -19,7 +19,7 @@ import {
   Replace, RotateCcw, RotateCw, Rows3, Save, SaveAll, Scissors, Search, Settings, Shuffle, Slash, Snowflake,
   Signpost, Sparkles, SprayCan, Square, SquareDashed, SquareSplitVertical, Stamp, Sun, Target, TriangleAlert,
   TrendingUp, Trash2, TreePine, Triangle, Undo2, Redo2, RefreshCw, Upload, Wand2, Waves, X, ZoomIn,
-  ZoomOut, Zap,
+  ZoomOut, Zap, Activity, Eraser, LockOpen, PackageOpen, ScanEye,
 } from "lucide-react";
 import type { CSSProperties } from "react";
 import { ICON, ICON_TONE, ICON_DANGER, ICON_ACCENT } from "./tokens";
@@ -31,6 +31,7 @@ const MAP = {
   // Navigation / selection tools
   pan: Hand, select: SquareDashed, wand: Wand2, lasso: Lasso, polyselect: Pentagon,
   eyedropper: Pipette, selectAll: Frame,
+  skipAir: Eraser, unlock: LockOpen, diagnostics: Activity, defaultPack: PackageOpen, lens: ScanEye,
   grow: Expand, shrink: Minimize2, clear: X, invert: Shuffle, move: Move,
   // Destructive / fill
   delete: Trash2, fill: PaintBucket, gradient: Blend, replace: Replace, extrude: CopyPlus,

@@ -3,6 +3,7 @@ import ErrorBoundary from "./ErrorBoundary";
 import Dialog, { DialogButton } from "./ui/Dialog";
 import { RAMP } from "./theme/theme";
 import { btnBase } from "./ribbon/tokens";
+import { FONT } from "./ribbon/tokens";
 
 /**
  * Per-piece error containment (21.15). A throw inside the wrapped subtree is replaced by a small
@@ -36,7 +37,7 @@ export function FailureChip(
     <div role="alert" style={{
       position: "absolute", display: "flex", alignItems: "center", gap: 8, padding: "4px 8px",
       maxWidth: 360, boxSizing: "border-box", background: RAMP.chrome, color: RAMP.dim,
-      fontSize: 11, borderRadius: 6, pointerEvents: "auto", zIndex: 30,
+      fontSize: FONT.label, borderRadius: 6, pointerEvents: "auto", zIndex: 30,
       boxShadow: "0 0 0 1px var(--vx-border-outline)", ...style,
     }}>
       <span style={{ color: RAMP.textDanger, fontWeight: 600, flexShrink: 0 }}>{label} failed</span>

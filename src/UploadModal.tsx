@@ -6,6 +6,7 @@ import { MODAL_TEXT } from "./designTokens";
 import { ACCENTS, DANGER_HEX, RAMP, armedRecipe, mix, rgba } from "./theme/theme";
 import { Segmented } from "./ribbon/primitives";
 import Dialog, { DialogButton } from "./ui/Dialog";
+import { FONT } from "./ribbon/tokens";
 
 // Lightened tints for text on the warm modal surface (mechanical hex-literal migration, Stage
 // 14.15) — plain accent/danger hex fails AA there; these clear it with margin.
@@ -107,25 +108,25 @@ export default function UploadModal({ sourcePath, onClose }: Props) {
       <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
         {/* Server selection */}
         <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-          <span style={{ fontSize: 11, color: MODAL_TEXT.secondary, textTransform: "uppercase", letterSpacing: "0.06em" }}>Server</span>
+          <span style={{ fontSize: FONT.label, color: MODAL_TEXT.secondary, textTransform: "uppercase", letterSpacing: "0.06em" }}>Server</span>
           <Segmented<"current" | "legacy">
             ariaLabel="Server" value={server} onChange={setServer}
             options={[{ id: "current", label: "Current" }, { id: "legacy", label: "Legacy" }]}
           />
-          <span style={{ fontSize: 10, color: MODAL_TEXT.label, lineHeight: 1.5 }}>
+          <span style={{ fontSize: FONT.micro, color: MODAL_TEXT.label, lineHeight: 1.5 }}>
             Uploads use plain HTTP and aren't encrypted. Don't upload anything private.
           </span>
         </div>
 
         {/* World file */}
         <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-          <span style={{ fontSize: 11, color: MODAL_TEXT.secondary, textTransform: "uppercase", letterSpacing: "0.06em" }}>World File</span>
+          <span style={{ fontSize: FONT.label, color: MODAL_TEXT.secondary, textTransform: "uppercase", letterSpacing: "0.06em" }}>World File</span>
           {sourcePath ? (
-            <span style={{ color: MODAL_TEXT.secondary, fontSize: 13, wordBreak: "break-all" }}>
+            <span style={{ color: MODAL_TEXT.secondary, fontSize: FONT.tab, wordBreak: "break-all" }}>
               {sourcePath.split(/[\\/]/).pop() ?? sourcePath}
             </span>
           ) : (
-            <span style={{ color: RED_LIGHT, fontSize: 13 }}>
+            <span style={{ color: RED_LIGHT, fontSize: FONT.tab }}>
               Save the world first (Save As…).
             </span>
           )}
@@ -133,12 +134,12 @@ export default function UploadModal({ sourcePath, onClose }: Props) {
 
         {/* Preview image */}
         <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-          <span style={{ fontSize: 11, color: MODAL_TEXT.secondary, textTransform: "uppercase", letterSpacing: "0.06em" }}>Preview Image (required)</span>
+          <span style={{ fontSize: FONT.label, color: MODAL_TEXT.secondary, textTransform: "uppercase", letterSpacing: "0.06em" }}>Preview Image (required)</span>
           <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
             <DialogButton onClick={choosePng} disabled={uploading}>Choose PNG…</DialogButton>
             <DialogButton onClick={useSnapshot} disabled={uploading} title="Render the current map as the preview image">Use map snapshot</DialogButton>
             {imageFilename && (
-              <span style={{ color: GREEN_TEXT, fontSize: 12 }}>✓ {imageFilename}</span>
+              <span style={{ color: GREEN_TEXT, fontSize: FONT.body }}>✓ {imageFilename}</span>
             )}
           </div>
         </div>
@@ -154,7 +155,7 @@ export default function UploadModal({ sourcePath, onClose }: Props) {
                 transition: "width 0.3s",
               }} />
             </div>
-            <span style={{ color: MODAL_TEXT.secondary, fontSize: 12, minWidth: 36 }}>{uploadProgress}%</span>
+            <span style={{ color: MODAL_TEXT.secondary, fontSize: FONT.body, minWidth: 36 }}>{uploadProgress}%</span>
           </div>
         )}
 
@@ -164,7 +165,7 @@ export default function UploadModal({ sourcePath, onClose }: Props) {
             border: `1px solid ${rgba(ACCENTS.clipboard, 0.4)}`,
             borderRadius: 6,
             padding: "6px 10px",
-            fontSize: 13,
+            fontSize: FONT.tab,
             color: GREEN_TEXT,
           }}>
             {result}
@@ -172,7 +173,7 @@ export default function UploadModal({ sourcePath, onClose }: Props) {
         )}
 
         {error && (
-          <span style={{ color: RED_LIGHT, fontSize: 13 }}>{error}</span>
+          <span style={{ color: RED_LIGHT, fontSize: FONT.tab }}>{error}</span>
         )}
       </div>
     </Dialog>

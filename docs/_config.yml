@@ -10,13 +10,14 @@ repository: hagg3/VuencEdit
 
 # Latest release, kept in sync by hand (downloads.js overrides this live via the GitHub API,
 # these are only the no-JS fallback values).
-latest_version: "1.0.18"
+latest_version: "1.0.23"
 
 permalink: pretty
 
 plugins:
   - jekyll-seo-tag
   - jekyll-sitemap
+  - jekyll-feed
 
 exclude:
   - Gemfile
@@ -24,9 +25,11 @@ exclude:
   - vendor
   - node_modules
   - README.md
+  - admin
 
 sass:
   style: compressed
+  sourcemap: never
 
 defaults:
   - scope:

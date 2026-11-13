@@ -1,0 +1,60 @@
+// Help pages only: page list beside the content (docs/_includes/help-sidebar.html).
+.with-sidebar {
+  max-width: $content-max-width;
+  margin: 0 auto;
+  display: flex;
+  align-items: flex-start;
+}
+
+.with-sidebar > .content {
+  flex: 1;
+  min-width: 0;
+  max-width: none;
+  margin: 0;
+}
+
+.sidebar {
+  flex: 0 0 $sidebar-width;
+  position: sticky;
+  top: $navbar-height;
+  padding: 10px 0 10px 8px;
+  font-size: 12px;
+}
+
+.sidebar h4 {
+  margin: 0 0 4px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  color: $text-label;
+}
+
+.sidebar ul {
+  list-style: none;
+  margin: 0 0 12px;
+  padding: 0;
+}
+
+.sidebar li { margin: 0; }
+
+.sidebar a {
+  display: block;
+  padding: 3px 8px;
+  color: $text-dim;
+  border-left: 2px solid transparent;
+}
+
+.sidebar a:hover { color: $text; text-decoration: none; }
+
+.sidebar a.active {
+  color: #fff;
+  font-weight: 700;
+  border-left-color: $accent-primary;
+  background: rgba(255, 255, 255, 0.04);
+}
+
+@media (max-width: $phone) {
+  .with-sidebar { display: block; }
+  .sidebar { position: static; padding: 8px 12px 0; }
+  .sidebar ul { display: flex; flex-wrap: wrap; gap: 0 4px; }
+}

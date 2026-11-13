@@ -10,8 +10,9 @@ The map fills the window. The 3D view, a small tools window and a hotbar float o
 
 A ribbon runs across the top with five tabs: Home, Draw, Sculpt, Insert and View. Three more tabs show up when they apply: 3D while the 3D window is open, Selection while you have a selection, and Clipboard while something is copied. On a narrow window, ribbon groups shrink and then fold into a single dropdown instead of scrolling sideways. There is also an experimental compact ribbon, off by default.
 
-Small panels appear next to your work when a mode needs them: the cutaway or Z-slice level, the brush shape for Noise, Slope, Rock and Carve, the Flood Fill limit, and the 3D sculpt brush.
+An options bar under the ribbon shows the settings for the active tool, such as brush size, paste options, the sculpt brush or the cutaway level. On a Mac the menu bar at the top of the screen has the same commands as the ribbon.
 
+- A trackpad pans with two fingers and zooms with a pinch. A mouse wheel zooms. Settings ▸ Editor ▸ Scrolling can force either.
 - <kbd>⌘K</kbd> (<kbd>Ctrl+K</kbd> on Windows and Linux) searches every command and tells you where it lives in the ribbon.
 - Right-clicking the map opens a menu with the usual actions: set spawn here, copy, paste here, fill or delete the selection, teleport the 3D camera. It works from the keyboard too.
 - A docked sidebar on the right has Inspector, Prefabs and History tabs.
@@ -34,8 +35,6 @@ The map is a zoomable, pannable top-down view, drawn in tiles so big worlds stay
 
 Night lighting, sun shadows and GPU shadows in the 3D view are experimental<span class="tag-exp">exp</span>. They're slow on big worlds and off by default. You can also change the sky colours and hide the grid and HUD.
 
-The old quad view (four panes with front and side slices) is gone. The Lens and the floating 3D window replaced it.
-
 ## Selecting
 
 Drag a rectangle with Select, click with the Magic Wand to flood-select connected blocks, freehand with Lasso, or click points with Polygon Select. Wand, Lasso and Polygon selections keep their real shape, and fill, replace, delete, move, gradient, extrude and copy all respect it. A selection can also grow or shrink by a block, move by dragging inside it, or nudge with the arrow keys.
@@ -48,13 +47,13 @@ The draw tools are Pen, Brush, Spray, Line, Rectangle, Ellipse, Polygon, Fill Bu
 
 On a selection you can fill, replace, delete (with an optional block filter, which can be inverted), extrude along any axis, or run a gradient fill that blends one block into another with ordered dithering instead of visible bands.
 
-The hotbar holds five pinned blocks (keys <kbd>1</kbd> to <kbd>5</kbd>) and five recent ones (<kbd>6</kbd> to <kbd>0</kbd>). A held stroke undoes as one step. Undo has a memory budget, and an edit too big to undo is refused up front and leaves the world alone.
+The block picker has a search box. The hotbar holds five pinned blocks (keys <kbd>1</kbd> to <kbd>5</kbd>) and five recent ones (<kbd>6</kbd> to <kbd>0</kbd>). A held stroke undoes as one step. Undo has a memory budget, and an edit too big to undo is refused up front and leaves the world alone.
 
 The Insert tab has a few extras: tree planting (normal, terrain, pine and tall pine), water and lava flow simulation, pool fill, a wavy water surface, and Materialize, which turns empty chunk space into flat terrain.
 
 ## Terrain sculpting <span class="tag-exp">experimental</span>
 
-Sixteen brush tools: Raise, Lower, Rock, Carve, Smooth, Flatten, Slope, Noise, Erode, Thermal, Hydro, Terrace, Sharpen, Smear, Grab and Retexture. Rock and Carve work on volume rather than a height map. Rock fuses a mass into the terrain so it doesn't sit on top like a pasted object, and Carve digs a rounded hollow without opening a roof or hitting bedrock.
+Fifteen brush tools: Raise, Lower, Rock, Carve, Smooth, Flatten, Slope, Noise, Thermal, Hydro, Terrace, Sharpen, Smear, Grab and Retexture. Rock and Carve work on volume rather than a height map. Rock fuses a mass into the terrain so it doesn't sit on top like a pasted object, and Carve digs a rounded hollow without opening a roof or hitting bedrock.
 
 You pick the falloff profile, radius, strength and softness. With Live Brush on, the terrain changes as you drag. Off, it applies when you let go. Hold <kbd>Ctrl</kbd> or <kbd>⌘</kbd> to swap Raise and Lower, hold <kbd>Shift</kbd> to smooth, and use <kbd>[</kbd> and <kbd>]</kbd> to resize the brush. You can limit a stroke to the current selection, and sculpt in the 3D view as well as on the map.
 
@@ -77,9 +76,9 @@ Prefabs (`.epfab` files) save the clipboard, including its exact shape. The Pref
 
 ## Files and servers
 
-VuencEdit opens and saves `.eden` and `.eden.zip`. The first save over a file keeps a backup next to it. Autosave records only your changes, and if the app crashes there is a recovery prompt on the next launch.
+VuencEdit opens and saves `.eden` and `.eden.zip`, and opens and saves `.emod` files in place (beta). Signs and command blocks show up read-only. The first save over a file keeps a backup next to it. Autosave records only your changes, and if the app crashes there is a recovery prompt on the next launch.
 
-Browse Worlds searches and downloads from the Eden community servers, with preview images, date filters and a sort that pushes junk down. Upload sends a world back with a PNG thumbnail. Export PNG renders the top-down map at one pixel per block.
+Download searches and downloads from the Eden community servers, with preview images, date filters and a sort that pushes junk down. Upload sends a world back with a PNG thumbnail. Export PNG renders the top-down map at one pixel per block.
 
 OBJ, VOX and VMF export, and Minecraft schematic import, were removed. That work continues in [EdenToMC](https://github.com/hagg3/EdenToMC).
 

@@ -18,7 +18,8 @@ import {
   ZOOM_STEP, type ImageGeom, type Layout, type Pt,
 } from "./lensViewMath";
 import { beginFrame, resizeCanvasToContainer } from "../viewportUtils";
-import { ACCENT, FONT, TEXT_META } from "../ribbon/tokens";
+import { ACCENT, FONT, IS_MAC, TEXT_META } from "../ribbon/tokens";
+import { attachWheelGestures } from "../input/wheel";
 import { MAP, RAMP, rgba } from "../theme/theme";
 
 export interface LensViewImage extends ImageGeom {
@@ -566,24 +567,28 @@ const LensView = forwardRef<LensViewHandle, LensViewProps>(function LensView(pro
     requestDraw();
   }
 
-  // Wheel zoom about the cursor. A native non-passive listener: React's wheel handler can't
-  // preventDefault the page scroll.
+  // Wheel + pinch, as on the map (34.7, `input/wheel.ts`): two-finger scroll pans, pinch and
+  // ⌘/Ctrl-scroll zoom about the pointer, a mouse wheel zooms by `ZOOM_STEP` a notch.
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-    const onWheel = (e: WheelEvent) => {
-      const s = propsRef.current.sel, last = lastLayoutRef.current;
-      if (!s || !last) return;
-      e.preventDefault();
-      const prev = s.link.zoom;
-      const want = e.deltaY < 0 ? prev * ZOOM_STEP : prev / ZOOM_STEP;
-      const r = zoomAbout(last.fit, prev, panRef.current, local(e), want);
-      if (r.zoom === prev) return;
-      panRef.current = r.pan;
-      s.link.setZoom(r.zoom, self);
-    };
-    canvas.addEventListener("wheel", onWheel, { passive: false });
-    return () => canvas.removeEventListener("wheel", onWheel);
+    return attachWheelGestures(canvas, IS_MAC, {
+      mouseNotchFactor: ZOOM_STEP,
+      enabled: () => propsRef.current.sel != null && lastLayoutRef.current != null,
+      pan(dx, dy) {
+        panRef.current = { x: panRef.current.x + dx, y: panRef.current.y + dy };
+        requestDraw();
+      },
+      zoom(factor, clientX, clientY) {
+        const s = propsRef.current.sel, last = lastLayoutRef.current;
+        if (!s || !last) return;
+        const prev = s.link.zoom;
+        const r = zoomAbout(last.fit, prev, panRef.current, local({ clientX, clientY }), prev * factor);
+        if (r.zoom === prev) return;
+        panRef.current = r.pan;
+        s.link.setZoom(r.zoom, self);
+      },
+    });
     // Reads refs and the stable `self` token only.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);

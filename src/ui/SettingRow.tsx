@@ -12,21 +12,28 @@ export const rowDivider = `1px solid ${v("border-modalHairline")}`;
 /** Two-column settings row (plan §3.3): label + one-line description on the left, one control
  *  right-aligned. Replaces the old "checkbox + stacked label" rows. */
 export function SettingRow({
-  label, badge, description, children, last, align = "center",
+  label, badge, description, children, last, align = "center", warn,
 }: {
   label: string; badge?: ReactNode; description?: ReactNode; children: ReactNode;
   last?: boolean; align?: CSSProperties["alignItems"];
+  /** Show the description inline (data loss, disk use, side effects). Otherwise a string
+   *  description rides the label's `title` tooltip, which keeps the row one line (26 px, U-11). */
+  warn?: boolean;
 }) {
+  const inline = !!description && (warn || typeof description !== "string");
   return (
     <div style={{
       display: "flex", alignItems: align, justifyContent: "space-between", gap: 16,
-      padding: "9px 0", borderBottom: last ? "none" : rowDivider,
+      padding: "4px 0", minHeight: 26, boxSizing: "border-box", borderBottom: last ? "none" : rowDivider,
     }}>
-      <div style={{ display: "flex", flexDirection: "column", gap: 2, minWidth: 0, flex: 1 }}>
-        <span style={{ fontSize: FONT.body, color: MODAL_TEXT.primary, display: "flex", alignItems: "center" }}>
+      <div style={{ display: "flex", flexDirection: "column", gap: 1, minWidth: 0, flex: 1 }}>
+        <span
+          title={!inline && typeof description === "string" ? description : undefined}
+          style={{ fontSize: FONT.body, color: MODAL_TEXT.primary, display: "flex", alignItems: "center" }}
+        >
           {label}{badge}
         </span>
-        {description && (
+        {inline && (
           <span style={{ fontSize: FONT.label, color: MODAL_TEXT.secondary, lineHeight: 1.4 }}>
             {description}
           </span>
@@ -39,7 +46,7 @@ export function SettingRow({
 
 /** Stacked settings row for controls too wide for `SettingRow`'s right-hand column (a 4-5 option
  *  `Segmented`, a slider): label + one-line description on top, the control underneath. Same
- *  `9px 0` density and hairline divider as `SettingRow`. `label` is optional for a bare slider. */
+ *  `4px 0` density and hairline divider as `SettingRow`. `label` is optional for a bare slider. */
 export function SettingBlock({
   label, badge, description, children, last,
 }: {
@@ -74,7 +81,7 @@ export function SectionHeading({ children, first }: { children: ReactNode; first
   return (
     <div style={{
       fontSize: FONT.label, fontWeight: 700, letterSpacing: "0.08em", textTransform: "uppercase",
-      color: TEXT_LABEL, margin: first ? "0 0 6px" : "16px 0 6px",
+      color: TEXT_LABEL, margin: first ? "0 0 4px" : "10px 0 4px",
     }}>
       {children}
     </div>

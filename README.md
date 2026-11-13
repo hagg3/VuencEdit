@@ -91,19 +91,23 @@ turning on **Settings ▸ 3D performance HUD** before you reproduce it adds a li
 
 ## Building it yourself
 
-You'll need [Rust](https://rustup.rs) (stable) and [Node.js](https://nodejs.org) 18 or newer. On
-Linux you also need the WebKit libraries:
+You'll need [Rust](https://rustup.rs) (stable; `rust-toolchain.toml` selects it) and
+[Node.js](https://nodejs.org) 20.19 or newer (22 recommended; `.nvmrc` pins it). Then install the
+[Tauri prerequisites](https://v2.tauri.app/start/prerequisites/) for your platform: Xcode Command
+Line Tools on macOS, MSVC Build Tools + WebView2 on Windows. On Linux that's:
 
 ```bash
-sudo apt-get install libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+sudo apt-get install build-essential pkg-config libssl-dev libwebkit2gtk-4.1-dev \
+  libappindicator3-dev librsvg2-dev patchelf
 ```
 
-Then:
+Then, from the repo root:
 
 ```bash
-npm install
+npm ci
 npm run tauri dev     # run with hot reload
 npm run tauri build   # installers end up in target/release/bundle/
+npm run check         # type-check, lint and tests (frontend and Rust)
 ```
 
 Pushing a `v*` tag builds all three platforms on GitHub Actions and publishes a draft release.
@@ -121,6 +125,5 @@ rather than JSON. Undo stores compressed per-chunk differences under a memory bu
 Settings. The pure voxel code (colours, rendering, meshing, lighting) lives in a separate
 `voxel-core` crate, which Eden's multiplayer companion app VuencLink also uses.
 
-The file format notes are in `MROB.txt`, and `EdenWorldManipulator2.0/` holds the C# reference
-implementation everything was checked against. The `DOCUMENTATION/` folder has the long version:
-file format, rendering, editing and undo, and a reference for every backend command.
+The long version (file format, rendering, editing and undo, and a reference for every backend
+command) is in the developer docs at `docs/docs/dev/`, also published on the project's docs site.

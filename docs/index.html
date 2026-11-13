@@ -4,23 +4,21 @@ title: Home
 ---
 <div class="content">
 
-  <section style="text-align: center; padding: 20px 0 8px;">
-    <div style="font-size: 40px; letter-spacing: -1px; margin-bottom: 10px;">
-      <span style="font-weight: 800; color: #fff;">Vuenc</span><span style="font-weight: 400; color: #00dde9;">Edit</span>
-    </div>
-    <p class="lede" style="max-width: 620px; margin: 0 auto 6px;">
-      A world editor for <strong style="color:#dfe4e8;">Eden: World Builder</strong>.
+  <section class="hero">
+    <div class="hero-wordmark"><span class="w-vuenc">Vuenc</span><span class="w-edit">Edit</span></div>
+    <p class="lede">
+      A world editor for <strong>Eden: World Builder</strong>.
       Open a <code>.eden</code> file, edit it on a top-down map or in 3D, save it, and upload it back to the Eden servers if you like.
     </p>
-    <span class="beta-chip" style="margin-top: 6px; display: inline-block;">Beta</span>
+    <span class="beta-chip">Beta</span>
 
-    <div class="btn-row" style="justify-content: center;">
+    <div class="btn-row">
       <a class="btn btn-primary" href="{{ '/downloads/' | relative_url }}">Download</a>
       <a class="btn btn-secondary" href="https://github.com/{{ site.repository }}" target="_blank" rel="noopener">View on GitHub</a>
     </div>
   </section>
 
-  {% include screenshot.html src="/assets/img/hero.webp" alt="VuencEdit with a world open: top-down map with floating windows." width="1600" height="945" %}
+  {% include screenshot.html src="/assets/img/hero.webp" alt="VuencEdit with a world open: top-down map with floating windows." width="1400" height="827" %}
 
   <h2>What it does</h2>
   <div class="feature-grid">
@@ -28,7 +26,7 @@ title: Home
       {% include card.html icon=f.icon title=f.title text=f.text exp=f.exp %}
     {% endfor %}
   </div>
-  <p style="text-align: right; margin-top: 4px;"><a href="{{ '/features/' | relative_url }}">All features &rarr;</a></p>
+  <p class="more-link"><a href="{{ '/features/' | relative_url }}">All features &rarr;</a></p>
 
   <h2>World compatibility</h2>
   <p>VuencEdit opens all three world formats the game has used and detects which one a file is. Saving keeps the format it was loaded in.</p>
@@ -50,10 +48,10 @@ title: Home
 
   <hr>
 
-  <section style="text-align: center; padding: 8px 0 4px;">
-    <h2 style="border: none;">Ready to try it?</h2>
+  <section class="cta">
+    <h2>Ready to try it?</h2>
     <p class="lede">Installers for macOS, Windows and Linux.</p>
-    <div class="btn-row" style="justify-content: center;">
+    <div class="btn-row">
       <a class="btn btn-primary" href="{{ '/downloads/' | relative_url }}">Get VuencEdit</a>
     </div>
   </section>

@@ -36,6 +36,8 @@ Eden World Builder's file format has changed twice since launch. VuencEdit works
 - **Saving** writes the world back in the format it was loaded in. It never upgrades or downgrades the height format.
 - **The new block types (112 to 127)** can only be placed on a NewFormat256z world. They sit behind a small disclosure in the block picker so they don't clutter the palette, since most worlds don't use them.
 - **Signs** are read-only. They show as markers on the map (View ▸ Sign Markers) and in the Inspector's Signs section, but VuencEdit can't create or edit sign text.
+- **Command blocks** are read-only too. They show in the Inspector and on the 2D map, and render in the 3D view.
+- **`.emod` files** open and save in place. VuencEdit works on a private copy and appends your changes back to the `.emod`. The game can't open `.emod`, so use Save As to get a `.eden` to play. This is still beta.
 - **Zipped worlds**: `.eden.zip` opens and saves like a plain `.eden`. Settings has an option to save new worlds compressed by default.
 
 ## Which format is my world?

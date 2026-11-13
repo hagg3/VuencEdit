@@ -478,15 +478,6 @@ export function CommandButton({
     : <SmallButton {...rest} full={full} />;
 }
 
-export function ToggleButton(p: CommonBtn & { icon?: IconName; pressed: boolean; full?: boolean }) {
-  const { pressed, ...rest } = p;
-  return (
-    <span style={{ display: "contents" }}>
-      <SmallButton {...rest} active={pressed} />
-    </span>
-  );
-}
-
 /**
  * A large command paired with a narrow `⌄` half that opens a menu — the mockup's Paste and Block
  * buttons. The two halves are separate `<button>`s so the primary action stays one click.
@@ -1266,7 +1257,7 @@ export function Badge({
   );
 }
 
-/** The ribbon's inline field label. Was `<span style={{color: TEXT_DIM, fontSize: 10, width: N}}>`
+/** The ribbon's inline field label. Was `<span style={{color: TEXT_DIM, fontSize: FONT.micro, width: N}}>`
  *  at ~16 sites, with N drawn from eight different values. */
 export function FieldLabel({
   children, width, align = "left", title,

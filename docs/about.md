@@ -41,18 +41,18 @@ The whole app is a beta, so expect rough edges and the occasional bug. A few fea
 <span class="tag-exp">exp</span> in the app and on this site because they're newer, heavier or more
 likely to change:
 
-- Terrain sculpting, all 16 tools.
+- Terrain sculpting, all 15 tools.
 - The 3D view itself, plus its night lighting, baked shadows and GPU shadows.
 - Texture packs.
 - The Eden.eden template overlay and Insert ▸ Expand.
 - The compact ribbon.
 
-The Lens window is also new in 1.0.18, so give it a bit of slack even though it isn't flagged.
+The Lens window is newer than most of the app, so give it a bit of slack even though it isn't flagged.
 Everything else has been in use for a while.
 
 <hr>
 
-<p style="text-align:center; color:#8b959e; font-size:13px;">
+<p class="center dim">
   <a href="{{ '/' | relative_url }}">VuencEdit</a> ·
   <a href="https://github.com/{{ site.repository }}">GitHub</a> ·
   <a href="https://discord.com/invite/rjYXwBC">Discord</a>

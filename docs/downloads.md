@@ -4,7 +4,7 @@ title: Downloads
 subtitle: Installers for macOS, Windows and Linux.
 ---
 
-<p id="release-meta" style="color:#a3adb6; font-size:13px; margin-top:-8px;">v{{ site.latest_version }}</p>
+<p id="release-meta" class="dim">v{{ site.latest_version }}</p>
 
 <div class="callout callout-warm">
   <strong>Beta software.</strong> VuencEdit writes the game's binary world files directly. The
@@ -16,14 +16,14 @@ subtitle: Installers for macOS, Windows and Linux.
   <div class="card download-card" data-platform="mac">
     <div class="platform-name">macOS</div>
     <a class="btn btn-primary" data-suffix="_universal.dmg" href="https://github.com/{{ site.repository }}/releases/latest">Download for macOS</a>
-    <div class="file-meta">VuencEdit_{{ site.latest_version }}_universal.dmg</div>
-    <p style="font-size:12px; color:#a3adb6; margin:0;">Universal build for Apple Silicon and Intel.</p>
+    <div class="file-meta">VuencEdit_…_universal.dmg</div>
+    <p class="dim">Universal build for Apple Silicon and Intel.</p>
   </div>
 
   <div class="card download-card" data-platform="win">
     <div class="platform-name">Windows</div>
     <a class="btn btn-primary" data-suffix="_x64-setup.exe" href="https://github.com/{{ site.repository }}/releases/latest">Download for Windows</a>
-    <div class="file-meta">VuencEdit_{{ site.latest_version }}_x64-setup.exe</div>
+    <div class="file-meta">VuencEdit_…_x64-setup.exe</div>
     <div class="secondary-links">
       or the <a data-suffix="_x64_en-US.msi" href="https://github.com/{{ site.repository }}/releases/latest">.msi installer</a>
     </div>
@@ -32,7 +32,7 @@ subtitle: Installers for macOS, Windows and Linux.
   <div class="card download-card" data-platform="linux">
     <div class="platform-name">Linux</div>
     <a class="btn btn-primary" data-suffix="_amd64.AppImage" href="https://github.com/{{ site.repository }}/releases/latest">Download AppImage</a>
-    <div class="file-meta">VuencEdit_{{ site.latest_version }}_amd64.AppImage</div>
+    <div class="file-meta">VuencEdit_…_amd64.AppImage</div>
     <div class="secondary-links">
       or <a data-suffix="_amd64.deb" href="https://github.com/{{ site.repository }}/releases/latest">.deb</a>
       · <a data-suffix="-1.x86_64.rpm" href="https://github.com/{{ site.repository }}/releases/latest">.rpm</a>
@@ -41,7 +41,7 @@ subtitle: Installers for macOS, Windows and Linux.
 
 </div>
 
-<p style="text-align:center; font-size:13px;">
+<p class="center">
   Other installers and older versions are on the
   <a href="https://github.com/{{ site.repository }}/releases">Releases page</a>.
 </p>

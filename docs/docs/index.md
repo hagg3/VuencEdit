@@ -1,11 +1,22 @@
 ---
 layout: page
-title: Docs
-subtitle: A short manual for the parts of VuencEdit that aren't obvious.
+title: Help
+subtitle: How the less obvious parts of VuencEdit work.
 ---
 
 <div class="doc-grid">
   {% for d in site.data.docs %}
+    <a class="card doc-card" href="{{ d.url | relative_url }}">
+      <h3>{{ d.title }}</h3>
+      <p>{{ d.text }}</p>
+    </a>
+  {% endfor %}
+</div>
+
+## Tutorials
+
+<div class="doc-grid">
+  {% for d in site.data.tutorials %}
     <a class="card doc-card" href="{{ d.url | relative_url }}">
       <h3>{{ d.title }}</h3>
       <p>{{ d.text }}</p>

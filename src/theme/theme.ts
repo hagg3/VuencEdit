@@ -39,6 +39,8 @@ export const RAMP = {
   // Family hues.
   teal: "#00a4ad", amber: "#d98a2b", azure: "#4b8fe8", green: "#3fa85c", violet: "#7c6bd6",
   red: "#c2504f",
+  /** Legible violet for text on dark chrome (the New Dawn "256z" badge); `violet` is the fill hue. */
+  violetText: "#b3a9ea",
   focus: "#eef2f5",
   // Icon + state tones (ribbon icons, danger labels, armed captions).
   iconTone: "#c3ccd2", iconDanger: "#d97570", iconAccent: "#e2a44c",
@@ -127,7 +129,7 @@ export interface SurfaceRole {
 const grad = (a: string, b: string) => `linear-gradient(180deg, ${a} 0%, ${b} 100%)`;
 
 export const SURFACE_ROLES: {
-  readonly [K in "bg0" | "chrome" | "topbar" | "body" | "raised" | "hover" | "pressed" | "popover" | "well" | "modal" | "modalRaised" | "modalNav"]: SurfaceRole
+  readonly [K in "bg0" | "chrome" | "topbar" | "body" | "raised" | "hover" | "pressed" | "popover" | "well" | "modal" | "modalRaised" | "modalNav" | "dangerToast"]: SurfaceRole
 } = {
   bg0: { css: RAMP.bg0, stops: [RAMP.bg0] },
   chrome: { css: RAMP.chrome, stops: [RAMP.chrome] },
@@ -138,6 +140,8 @@ export const SURFACE_ROLES: {
   pressed: { css: grad(RAMP.press0, RAMP.press1), stops: [RAMP.press0, RAMP.press1] },
   popover: { css: grad(RAMP.pop0, RAMP.pop1), stops: [RAMP.pop0, RAMP.pop1] },
   well: { css: "rgba(0,0,0,.30)", stops: [RAMP.black], over: "body", alpha: 0.30 },
+  /** Error toast body — a warm-red slate (rgb 58,28,26 → 38,19,17). */
+  dangerToast: { css: grad("#3a1c1a", "#261311"), stops: ["#3a1c1a", "#261311"] },
   modal: { css: grad(RAMP.modal0, RAMP.modal1), stops: [RAMP.modal0, RAMP.modal1] },
   modalRaised: { css: grad(RAMP.mbtn0, RAMP.mbtn1), stops: [RAMP.mbtn0, RAMP.mbtn1] },
   /** `DialogNav`'s side column (Stage 14.17) — a recessed strip of the modal surface, not a third
@@ -153,6 +157,10 @@ export const BORDER_ROLES = {
   etchDark: "rgba(0,0,0,.35)",
   etchLight: "rgba(255,255,255,.05)",
   modalHairline: "rgba(255,240,225,.09)",
+  /** Selected-swatch ring in the block/paint picker. */
+  selected: "#ffffff",
+  /** Error toast edge. */
+  danger: "rgba(248,113,113,.45)",
 } as const;
 
 export const TEXT_ROLES = {
@@ -165,7 +173,6 @@ export const TEXT_ROLES = {
   /** Only for controls that genuinely can't be used. Exempt from the AA gate (WCAG 1.4.3). */
   disabled: RAMP.disabled,
 } as const;
-export type TextRole = keyof typeof TEXT_ROLES;
 
 export const MODAL_TEXT_ROLES = {
   primary: RAMP.mtext,

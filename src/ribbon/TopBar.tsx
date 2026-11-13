@@ -112,7 +112,7 @@ export default function TopBar({
           color: RAMP.white, textShadow: "0 1px 1px rgba(0,0,0,.5), 0 0 2px rgba(0,0,0,.25)",
         }}
       >
-        <span style={{ fontSize: 13, lineHeight: 1, letterSpacing: -0.3, whiteSpace: "nowrap" }}>
+        <span style={{ fontSize: FONT.tab, lineHeight: 1, letterSpacing: -0.3, whiteSpace: "nowrap" }}>
           <span style={{ fontWeight: 800 }}>Vuenc</span>
           <span style={{ fontWeight: 400, opacity: 0.88 }}>Edit</span>
         </span>

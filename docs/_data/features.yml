@@ -13,7 +13,7 @@
 - icon: "⛰️"
   title: "Terrain sculpting"
   text: >-
-    Sixteen brush tools, from raise and smooth to hydraulic erosion, plus rock and carve, which
+    Fifteen brush tools, from raise and smooth to hydraulic erosion, plus rock and carve, which
     work on volume instead of a height map.
   exp: true
 - icon: "🧊"

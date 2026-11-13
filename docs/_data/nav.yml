@@ -4,7 +4,9 @@
   url: /features/
 - title: Downloads
   url: /downloads/
-- title: Docs
+- title: Help
   url: /docs/
+- title: Blog
+  url: /blog/
 - title: About
   url: /about/
