@@ -7,6 +7,7 @@
 // backdrop scrim, the modal text ramp, and small stateless recipes (the exp badge, the spinner, the
 // well input chrome) that `Dialog`-based bodies still reach for directly.
 import type { CSSProperties } from "react";
+import { FONT } from "./ribbon/tokens";
 import { ACCENTS, MODAL_TEXT_ROLES, RAMP, mix } from "./theme/theme";
 
 /** Modal text ramp (warm). Every step passes AA on both modal surfaces (contrast.test.ts). */
@@ -37,7 +38,7 @@ export const recessedWell: CSSProperties = {
 // across the app (Ribbon, New World, World Browser, app menu) renders identically.
 export function expBadge(extra?: CSSProperties): CSSProperties {
   return {
-    fontSize: 8, color: RAMP.badgeExpModal, background: "rgba(245,158,11,0.12)",
+    fontSize: FONT.nano, color: RAMP.badgeExpModal, background: "rgba(245,158,11,0.12)",
     border: "1px solid rgba(245,158,11,0.3)", borderRadius: 3, padding: "0 3px", lineHeight: "14px",
     ...extra,
   };

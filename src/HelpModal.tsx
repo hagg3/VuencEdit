@@ -6,6 +6,7 @@ import { rgba } from "./theme/theme";
 import { Keycap } from "./ribbon/primitives";
 import Dialog, { DialogButton } from "./ui/Dialog";
 import { DialogNav, type DialogNavItem } from "./ui/DialogNav";
+import { FONT } from "./ribbon/tokens";
 
 function Key({ children }: { children: React.ReactNode }) {
   return <span style={{ marginRight: 2 }}><Keycap text={children} /></span>;
@@ -17,7 +18,7 @@ function Row({ keys, action }: { keys: React.ReactNode; action: string }) {
       <td style={{ padding: "5px 20px 5px 0", whiteSpace: "nowrap", verticalAlign: "middle" }}>
         {keys}
       </td>
-      <td style={{ padding: "5px 0", color: MODAL_TEXT.secondary, fontSize: 13, verticalAlign: "middle" }}>
+      <td style={{ padding: "5px 0", color: MODAL_TEXT.secondary, fontSize: FONT.tab, verticalAlign: "middle" }}>
         {action}
       </td>
     </tr>
@@ -29,7 +30,7 @@ function Section({ title }: { title: string }) {
     <tr>
       <td colSpan={2} style={{
         paddingTop: 16, paddingBottom: 3,
-        fontSize: 10, fontWeight: 700,
+        fontSize: FONT.micro, fontWeight: 700,
         color: MODAL_TEXT.label, letterSpacing: "0.08em",
         textTransform: "uppercase",
       }}>
@@ -78,7 +79,7 @@ function TileName({ name }: { name: string }) {
     <span style={{
       display: "inline-block",
       fontFamily: "ui-monospace, 'SF Mono', monospace",
-      fontSize: 11,
+      fontSize: FONT.label,
       color: ACCENT.primary,
       background: rgba(ACCENT.primary, 0.10),
       border: `1px solid ${rgba(ACCENT.primary, 0.3)}`,
@@ -94,7 +95,7 @@ function TileName({ name }: { name: string }) {
 
 function GettingStartedHelp() {
   return (
-    <div style={{ fontSize: 13, color: MODAL_TEXT.secondary, lineHeight: 1.6 }}>
+    <div style={{ fontSize: FONT.tab, color: MODAL_TEXT.secondary, lineHeight: 1.6 }}>
 
       <div style={sectionHead}>Ribbon tabs</div>
       <p style={{ margin: "4px 0 10px" }}>
@@ -137,7 +138,7 @@ function GettingStartedHelp() {
 
 function TexturePackHelp() {
   return (
-    <div style={{ fontSize: 13, color: MODAL_TEXT.secondary, lineHeight: 1.6 }}>
+    <div style={{ fontSize: FONT.tab, color: MODAL_TEXT.secondary, lineHeight: 1.6 }}>
 
       {/* Format */}
       <div style={sectionHead}>Format</div>
@@ -185,7 +186,7 @@ function TexturePackHelp() {
       <div style={sectionHead}>Tile names</div>
       {TILE_GROUPS.map(g => (
         <div key={g.label} style={{ marginBottom: 8 }}>
-          <div style={{ fontSize: 10, fontWeight: 700, color: MODAL_TEXT.label, letterSpacing: "0.07em", textTransform: "uppercase", marginBottom: 3 }}>
+          <div style={{ fontSize: FONT.micro, fontWeight: 700, color: MODAL_TEXT.label, letterSpacing: "0.07em", textTransform: "uppercase", marginBottom: 3 }}>
             {g.label}
           </div>
           <div style={{ display: "flex", flexWrap: "wrap", gap: 1 }}>
@@ -196,7 +197,7 @@ function TexturePackHelp() {
 
       {/* Face mapping */}
       <div style={{ ...sectionHead, marginTop: 10 }}>Face mapping (selected blocks)</div>
-      <table style={{ borderCollapse: "collapse", fontSize: 12, marginTop: 4 }}>
+      <table style={{ borderCollapse: "collapse", fontSize: FONT.body, marginTop: 4 }}>
         <tbody>
           {[
             ["Grass / Grass2 / Grass3", "Side: grass_side(_color) · Bottom: dirt · Top: grass_top"],
@@ -211,7 +212,7 @@ function TexturePackHelp() {
           ].map(([block, faces]) => (
             <tr key={block}>
               <td style={{ padding: "3px 16px 3px 0", color: MODAL_TEXT.primary, whiteSpace: "nowrap", verticalAlign: "top" }}>{block}</td>
-              <td style={{ padding: "3px 0", color: MODAL_TEXT.secondary, fontSize: 11 }}>{faces}</td>
+              <td style={{ padding: "3px 0", color: MODAL_TEXT.secondary, fontSize: FONT.label }}>{faces}</td>
             </tr>
           ))}
         </tbody>
@@ -222,7 +223,7 @@ function TexturePackHelp() {
 
 function ToolsHelp() {
   return (
-    <div style={{ fontSize: 13, color: MODAL_TEXT.secondary, lineHeight: 1.6 }}>
+    <div style={{ fontSize: FONT.tab, color: MODAL_TEXT.secondary, lineHeight: 1.6 }}>
 
       {/* Sculpt */}
       <div style={sectionHead}>Terrain sculpt</div>
@@ -231,7 +232,7 @@ function ToolsHelp() {
         (the default), terrain changes as you drag, and <Key>Esc</Key> mid-stroke reverts it. With it
         off, the stroke applies on release.
       </p>
-      <table style={{ borderCollapse: "collapse", fontSize: 12, marginTop: 4, marginBottom: 10 }}>
+      <table style={{ borderCollapse: "collapse", fontSize: FONT.body, marginTop: 4, marginBottom: 10 }}>
         <tbody>
           {[
             ["Raise / Lower", "Push terrain up or down by Strength"],
@@ -250,7 +251,7 @@ function ToolsHelp() {
           ].map(([mode, desc]) => (
             <tr key={mode}>
               <td style={{ padding: "3px 16px 3px 0", color: MODAL_TEXT.primary, whiteSpace: "nowrap", verticalAlign: "top" }}>{mode}</td>
-              <td style={{ padding: "3px 0", color: MODAL_TEXT.secondary, fontSize: 11 }}>{desc}</td>
+              <td style={{ padding: "3px 0", color: MODAL_TEXT.secondary, fontSize: FONT.label }}>{desc}</td>
             </tr>
           ))}
         </tbody>
@@ -275,7 +276,7 @@ function ToolsHelp() {
         Open it from View ▸ Windows ▸ 3D View (<Key>{ALT}3</Key>), and swap it with the map using ⇄ or{" "}
         <Key>Tab</Key>. Click the camera pill (top left) or press <Key>Z</Key> to change mode:
       </p>
-      <table style={{ borderCollapse: "collapse", fontSize: 12, marginTop: 4, marginBottom: 10 }}>
+      <table style={{ borderCollapse: "collapse", fontSize: FONT.body, marginTop: 4, marginBottom: 10 }}>
         <tbody>
           {[
             ["Orbit", "Drag to rotate, scroll to zoom"],
@@ -284,7 +285,7 @@ function ToolsHelp() {
           ].map(([mode, desc]) => (
             <tr key={mode}>
               <td style={{ padding: "3px 16px 3px 0", color: MODAL_TEXT.primary, whiteSpace: "nowrap", verticalAlign: "top" }}>{mode}</td>
-              <td style={{ padding: "3px 0", color: MODAL_TEXT.secondary, fontSize: 11 }}>{desc}</td>
+              <td style={{ padding: "3px 0", color: MODAL_TEXT.secondary, fontSize: FONT.label }}>{desc}</td>
             </tr>
           ))}
         </tbody>
@@ -311,7 +312,7 @@ function ToolsHelp() {
 }
 
 const sectionHead: React.CSSProperties = {
-  fontSize: 10, fontWeight: 700, color: MODAL_TEXT.label,
+  fontSize: FONT.micro, fontWeight: 700, color: MODAL_TEXT.label,
   letterSpacing: "0.08em", textTransform: "uppercase",
   marginTop: 14, marginBottom: 2,
 };
@@ -320,7 +321,7 @@ type HelpTab = "start" | "tools" | "shortcuts" | "textures";
 
 const NAV_ITEMS: DialogNavItem[] = [
   { id: "start", icon: "sparkle", label: "Getting started", description: "Ribbon tabs, floating windows, ⌘K" },
-  { id: "tools", icon: "sculpt", label: "Tools", description: "Sculpt, gradient fill and the 3D pane" },
+  { id: "tools", icon: "sculpt", label: "Tools", description: "Sculpt, gradient fill and the 3D view" },
   { id: "shortcuts", icon: "quickActions", label: "Shortcuts", description: "Every keyboard shortcut" },
   { id: "textures", icon: "textures", label: "Textures", description: "Pack format and tile names (experimental)" },
 ];

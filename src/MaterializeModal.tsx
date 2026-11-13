@@ -9,6 +9,7 @@ import { MODAL_TEXT } from "./designTokens";
 import { ACCENTS, DANGER_HEX, RAMP, armedRecipe, mix } from "./theme/theme";
 import { SliderRow } from "./ribbon/primitives";
 import Dialog, { DialogButton } from "./ui/Dialog";
+import { FONT } from "./ribbon/tokens";
 
 // Lightened tints for text sitting directly on the warm modal surface (mechanical hex-literal
 // migration, Stage 14.15) — plain accent/danger hex fails AA there; these clear it with margin.
@@ -115,12 +116,12 @@ export default function MaterializeModal({ world, bounds, onClose, onMaterialize
     <Dialog size="sm" icon="materialize" title="Materialize Chunk Space" onClose={onClose} busy={running} footer={footer}>
       {!running && result === null && (
         <>
-          <div style={{ fontSize: 12, color: MODAL_TEXT.secondary, marginBottom: 14, lineHeight: 1.5 }}>
+          <div style={{ fontSize: FONT.body, color: MODAL_TEXT.secondary, marginBottom: 14, lineHeight: 1.5 }}>
             Writes {nChunks.toLocaleString()} empty chunk{nChunks === 1 ? "" : "s"} as flat terrain to a
             <strong style={{ color: MODAL_TEXT.primary }}> new file</strong>{beyond ? ", growing the map" : ""}. This can't be undone.
           </div>
           <div style={{
-            fontSize: 12, color: RED_LIGHT, background: "rgba(220,38,38,0.12)",
+            fontSize: FONT.body, color: RED_LIGHT, background: "rgba(220,38,38,0.12)",
             border: "1px solid rgba(220,38,38,0.35)", borderRadius: 6, padding: "8px 10px", marginBottom: 16, lineHeight: 1.5,
           }}>
             This <strong>replaces the open world</strong> with the new file, so save your work first.
@@ -137,7 +138,7 @@ export default function MaterializeModal({ world, bounds, onClose, onMaterialize
                 a slab once the world has already been rewritten. Surfacing the resulting z here
                 makes it checkable against a neighbouring column beforehand. */}
             {!depthTooLarge && (
-              <div style={{ fontSize: 11, color: MODAL_TEXT.label, lineHeight: 1.5 }}>
+              <div style={{ fontSize: FONT.label, color: MODAL_TEXT.label, lineHeight: 1.5 }}>
                 Bedrock z0
                 {stoneDepth > 0 && ` · stone z1–${stoneDepth}`}
                 {dirtDepth > 0 && ` · dirt z${1 + stoneDepth}–${surfaceZ - 1}`}
@@ -149,18 +150,18 @@ export default function MaterializeModal({ world, bounds, onClose, onMaterialize
           </div>
 
           {tooLarge && (
-            <div style={{ fontSize: 12, color: RED_LIGHT, marginBottom: 12 }}>
+            <div style={{ fontSize: FONT.body, color: RED_LIGHT, marginBottom: 12 }}>
               Selection too large: {nChunks.toLocaleString()} chunks (limit {MAX_MATERIALIZE_CHUNKS.toLocaleString()}).
             </div>
           )}
           {depthTooLarge && (
-            <div style={{ fontSize: 12, color: RED_LIGHT, marginBottom: 12 }}>
+            <div style={{ fontSize: FONT.body, color: RED_LIGHT, marginBottom: 12 }}>
               Layer depths too large: surface would be at z={surfaceZ} but this world's max z is {world.max_z}.
             </div>
           )}
           {growsBbox && !tooLarge && (
             <div style={{
-              fontSize: 12, marginBottom: 12, lineHeight: 1.5,
+              fontSize: FONT.body, marginBottom: 12, lineHeight: 1.5,
               color: bboxBlowup ? RED_LIGHT : MODAL_TEXT.secondary,
               ...(bboxBlowup ? {
                 background: "rgba(220,38,38,0.12)", border: "1px solid rgba(220,38,38,0.35)",
@@ -178,7 +179,7 @@ export default function MaterializeModal({ world, bounds, onClose, onMaterialize
 
       {running && (
         <>
-          <div style={{ fontSize: 12, color: MODAL_TEXT.secondary, marginBottom: 12 }}>
+          <div style={{ fontSize: FONT.body, color: MODAL_TEXT.secondary, marginBottom: 12 }}>
             Writing chunks… {progress}%
           </div>
           <div style={{ background: RAMP.mbtn1, borderRadius: 4, height: 8, overflow: "hidden" }}>
@@ -188,11 +189,11 @@ export default function MaterializeModal({ world, bounds, onClose, onMaterialize
       )}
 
       {errorMsg && !running && (
-        <div style={{ fontSize: 12, color: RED_LIGHT, marginTop: 8 }}>{errorMsg}</div>
+        <div style={{ fontSize: FONT.body, color: RED_LIGHT, marginTop: 8 }}>{errorMsg}</div>
       )}
 
       {result !== null && !running && (
-        <div style={{ fontSize: 13, color: GREEN_TEXT, marginTop: 12 }}>
+        <div style={{ fontSize: FONT.tab, color: GREEN_TEXT, marginTop: 12 }}>
           Done: {result.chunksAdded.toLocaleString()} chunks added ({result.totalChunks.toLocaleString()} total).
           Reloading…
         </div>

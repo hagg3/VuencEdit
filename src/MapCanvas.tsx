@@ -4,6 +4,8 @@ import { brushFootprint, bresenhamLine, linePixels, polygonPixels, rectPixels, e
 import { type WorldMeta, type PixelPatch, decodePixelPatch } from "./types";
 import { zoomAtPoint, resizeCanvasToContainer, makeSeqGuard, putPatchPixels, beginFrame, cssWidth, cssHeight, isTypingTarget, shouldPasteOnPointerUp, chunkToWorld, worldToChunk, CHUNK_SIZE_BLOCKS, tileWindowFits } from "./viewportUtils";
 import { maskOutline, type OutlinePt } from "./maskUtils";
+import { attachWheelGestures } from "./input/wheel";
+import { IS_MAC } from "./ribbon/tokens";
 import { recordTileFetchMs, recordMapDrawMs, bumpPerf, perfCounters } from "./perfCounters";
 import { MAP, rgba } from "./theme/theme";
 import { sfx, type HoldHandle } from "./sound/sfx";
@@ -2832,25 +2834,30 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     draw();
   }, [draw, notifyCursor]);
 
-  // Native (non-passive) wheel listener so preventDefault actually suppresses the WKWebView's
-  // page-scroll / pinch-zoom. React's synthetic onWheel is registered passively (React 17+), so
-  // e.preventDefault() there is a silent no-op — the zoom still worked but trackpad pinch could
-  // zoom the whole webview underneath it.
+  // Wheel + pinch (34.7, `input/wheel.ts`): two-finger scroll pans, pinch and ⌘/Ctrl-scroll zoom
+  // under the pointer, a mouse wheel zooms (Settings ▸ Editor can force either). Native
+  // non-passive listeners, so preventDefault really stops the webview scrolling / page-zooming.
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-    const handler = (e: WheelEvent) => {
-      e.preventDefault();
-      const lp = toLocal(e.clientX, e.clientY);
-      // Lower bound follows the fit scale so a world too big for MIN_SCALE can still be zoomed
-      // back out to its full extent instead of getting stuck mid-way (see minScaleFor).
-      const min = minScaleFor(cssWidth(canvas), cssHeight(canvas), mapWRef.current, mapHRef.current);
-      viewRef.current = zoomAtPoint(viewRef.current, lp.x, lp.y, e.deltaY, { min, max: MAX_SCALE, factor: 1.1 });
-      notifyZoom(viewRef.current.scale);
-      scheduleEnsureTiles(); // rAF-coalesced; loads new tiles in tiled mode, just draws in full mode
-    };
-    canvas.addEventListener("wheel", handler, { passive: false });
-    return () => canvas.removeEventListener("wheel", handler);
+    return attachWheelGestures(canvas, IS_MAC, {
+      mouseNotchFactor: 1.1,
+      pan(dx, dy) {
+        // Same as a Space-drag pan: move the offset, let ensureTiles load + draw on the next frame.
+        viewRef.current.x += dx;
+        viewRef.current.y += dy;
+        scheduleEnsureTiles();
+      },
+      zoom(factor, clientX, clientY) {
+        const lp = toLocal(clientX, clientY);
+        // Lower bound follows the fit scale so a world too big for MIN_SCALE can still be zoomed
+        // back out to its full extent instead of getting stuck mid-way (see minScaleFor).
+        const min = minScaleFor(cssWidth(canvas), cssHeight(canvas), mapWRef.current, mapHRef.current);
+        viewRef.current = zoomAtPoint(viewRef.current, lp.x, lp.y, factor, { min, max: MAX_SCALE });
+        notifyZoom(viewRef.current.scale);
+        scheduleEnsureTiles(); // rAF-coalesced; loads new tiles in tiled mode, just draws in full mode
+      },
+    });
   }, [scheduleEnsureTiles, toLocal, notifyZoom]);
 
   return (

@@ -53,6 +53,7 @@ import { ContextMenu, type ContextMenuItem } from "./ui/ContextMenu";
 import { meta, type CommandId } from "./commands/meta";
 import { formatChord, primaryModDown } from "./commands/keys";
 import { useMotionPref } from "./theme/motion";
+import { setWheelMode } from "./input/wheel";
 import { TOUR_STEPS, TOUR_VERSION, type TourCtx } from "./tour/steps";
 import AboutModal from "./AboutModal";
 import WorldBrowserModal from "./WorldBrowserModal";
@@ -85,6 +86,7 @@ import { createNativeMenu, type NativeMenu } from "./nativeMenu";
 import { decideMenuAction, isMenuEcho, noteKeyCommand, type MenuBlock } from "./commands/menuRouting";
 import { menuCommandForKey, SPLASH_SAFE } from "./commands/menuBar";
 import type { CommandBinding } from "./commands/types";
+import type { LongOpKind } from "./types";
 import { decomposeMask, maskOutline } from "./maskUtils";
 import { sfx } from "./sound/sfx";
 import appIcon from "./assets/app-icon.png";
@@ -95,13 +97,13 @@ import "./App.css";
  * full shape on the opening event and only the changed fields afterwards; the listener merges
  * them, so `label` and `cancellable` are set for the whole run.
  *
- * `kind` identifies the operation (`"png" | "obj" | "json" | "vox" | "save"`) and is what the
+ * `kind` identifies the operation (`LongOpKind`) and is what the
  * overlay keys its copy off; `total` is in whatever unit that operation counts (rows, bytes,
  * permille), so only `pct` is meaningful across all of them.
  */
 type LongOpState = {
   id: number;
-  kind: string;
+  kind: LongOpKind;
   label?: string;
   phase?: string;
   done?: number;
@@ -644,6 +646,9 @@ function App() {
   // `<html data-motion>`, which is the one thing every motion-gated CSS rule in the app reads.
   const [motion, setMotion] = useState<AppSettings["motion"]>(() => loadSettings().motion);
   useMotionPref(motion);
+  // What scrolling does on the map and the Lens (34.7). A live module-level pref read at event time
+  // (`input/wheel.ts`); written once here and again from the Settings apply path below.
+  useEffect(() => { setWheelMode(loadSettings().wheelMode); }, []);
   // Docked right sidebar (World/Prefabs/History) — see Sidebar.tsx. Width persists via
   // the same debounced-localStorage pattern as other drag-driven values (see saveSettingsDebounced).
   const [sidebarOpen, setSidebarOpen] = useState(() => loadSettings().sidebarOpen);
@@ -1107,6 +1112,7 @@ function App() {
     setUiSoundPack(s.uiSoundPack);
     setUiSoundVolume(s.uiSoundVolume);
     setMotion(s.motion);
+    setWheelMode(s.wheelMode);
     setSunT(s.sunT);
     setShadowMode(asShadowMode(s.shadowMode));
     setShadowStyle(asShadowStyle(s.shadowStyle));
@@ -3777,13 +3783,13 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
       borderTop: `1px solid ${HAIRLINE}`,
       boxShadow: "inset 0 1px 0 rgba(255,255,255,.05)",
       display: "flex", alignItems: "center", overflow: "hidden",
-      fontSize: 10, color: TEXT_LABEL, userSelect: "none",
+      fontSize: FONT.micro, color: TEXT_LABEL, userSelect: "none",
       fontVariantNumeric: "tabular-nums",
     }}>
       {/* Tool chip — coloured by the armed tool's family hue (teal draw/generic, warm sculpt, blue
           selection, green clipboard), matching the ribbon's own family accents. */}
       <StatusSeg icon={TOOL_ICON[tool]} iconColor={toolAccent} color={toolAccent} style={{ minWidth: 0, flexShrink: 0 }}>
-        {tool === "brush" ? `Brush ${brushSize}px`
+        {tool === "brush" ? `Brush ${brushSize} blocks`
           : tool === "paste" && pasteMode !== "normal" ? `Paste (${pasteMode})`
           : TOOL_LABELS[tool]}
       </StatusSeg>
@@ -3836,7 +3842,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           accent (ACCENT.primary) as the options bar's Cap Z zone (ribbon/OptionsBar.tsx). */}
       {(viewMode === "cutaway" || viewMode === "zslice") && (
         <StatusSeg icon="zslice" iconColor={ACCENT.primary} color={ACCENT.primary}>
-          {viewMode === "cutaway" ? "Cap Z" : "Z-Slice Level"}{" "}
+          {viewMode === "cutaway" ? "Cap Z" : "Z slice"}{" "}
           <span style={{ fontWeight: 700 }}>{zSliceZ}</span>
         </StatusSeg>
       )}
@@ -3861,8 +3867,8 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
         );
       })()}
       <StatusSeg icon="history">
-        ↩ <span style={{ color: TEXT_META }}>{undoDepth}</span>
-        {"  "}↪ <span style={{ color: TEXT_META }}>{redoDepth}</span>
+        <Icon name="undo" size={ICON.xs} tone="inherit" style={{ verticalAlign: "-2px" }} /> <span style={{ color: TEXT_META }}>{undoDepth}</span>
+        {"  "}<Icon name="redo" size={ICON.xs} tone="inherit" style={{ verticalAlign: "-2px" }} /> <span style={{ color: TEXT_META }}>{redoDepth}</span>
       </StatusSeg>
       {/* The filter's only other Clear button lives in the Selection tab, which disappears with the
           selection — deselect and the filter (which still gates deletes) became unclearable. */}
@@ -3877,12 +3883,11 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
             onClick={() => { setFilterBlockType(null); setFilterPaint(null); setFilterInvert(false); }}
             title="Clear the replace filter"
             aria-label="Clear replace filter"
+            className="eden-x-btn"
             style={{ background: "none", border: "none", cursor: "pointer", color: ACCENT.warm,
               minWidth: 18, minHeight: 18, display: "flex", alignItems: "center", justifyContent: "center",
-              fontSize: 11, lineHeight: 1, opacity: 0.75 }}
-            onMouseEnter={e => { e.currentTarget.style.opacity = "1"; }}
-            onMouseLeave={e => { e.currentTarget.style.opacity = "0.75"; }}
-          >✕</button>
+              padding: 0 }}
+          ><Icon name="close" size={ICON.xs} tone="inherit" /></button>
         </StatusSeg>
       )}
       {maskEnabled && maskBlockType !== null && (
@@ -4131,7 +4136,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
         <ErrorBoundary label="Ribbon" fallback={(error, retry) => (
           <div style={{
             height: "100%", display: "flex", alignItems: "center", gap: 10, padding: "0 14px",
-            background: RAMP.chrome, color: RAMP.dim, fontSize: 12, overflow: "hidden",
+            background: RAMP.chrome, color: RAMP.dim, fontSize: FONT.body, overflow: "hidden",
           }}>
             <span style={{ color: RAMP.textDanger, fontWeight: 600, flexShrink: 0 }}>Ribbon failed to render</span>
             <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: RAMP.meta }}>
@@ -4495,7 +4500,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
               </>
             }
           >
-            <label style={{ display: "flex", flexDirection: "column", gap: 6, fontSize: 12, color: MODAL_TEXT.secondary }}>
+            <label style={{ display: "flex", flexDirection: "column", gap: 6, fontSize: FONT.body, color: MODAL_TEXT.secondary }}>
               Name
               <input
                 autoFocus
@@ -4504,16 +4509,16 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
                 onKeyDown={(e) => { if (e.key === "Enter") confirmSavePrefab(); }}
                 style={{
                   ...recessedWell, background: v("surface-modalRaised"), borderRadius: 6,
-                  color: MODAL_TEXT.primary, padding: "7px 9px", fontSize: 13, outline: "none",
+                  color: MODAL_TEXT.primary, padding: "7px 9px", fontSize: FONT.tab, outline: "none",
                 }}
               />
             </label>
             {prefabOverwrite ? (
-              <div style={{ fontSize: 11, color: armedRecipe(ACCENTS.warm).text, marginTop: 10 }}>
+              <div style={{ fontSize: FONT.label, color: armedRecipe(ACCENTS.warm).text, marginTop: 10 }}>
                 A prefab with this name already exists. Click Overwrite to replace it.
               </div>
             ) : (
-              <div style={{ fontSize: 11, color: MODAL_TEXT.label, marginTop: 10 }}>
+              <div style={{ fontSize: FONT.label, color: MODAL_TEXT.label, marginTop: 10 }}>
                 Saves to your prefab library and appears in the gallery.
               </div>
             )}
@@ -4632,7 +4637,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           >
             {!expandInProgress && expandResult === null && (
               <>
-                <div style={{ fontSize: 12, color: MODAL_TEXT.secondary, marginBottom: 16, lineHeight: 1.5 }}>
+                <div style={{ fontSize: FONT.body, color: MODAL_TEXT.secondary, marginBottom: 16, lineHeight: 1.5 }}>
                   Fills missing chunks from Eden.eden into a new file (up to ~1 GB). Your edits are kept.
                 </div>
                 <Segmented
@@ -4644,14 +4649,14 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
                     { id: "bounds", label: "Current bounds", title: "Only fill gaps within the world's current extent" },
                   ]}
                 />
-                <div style={{ fontSize: 11, color: MODAL_TEXT.label, marginTop: 8 }}>
+                <div style={{ fontSize: FONT.label, color: MODAL_TEXT.label, marginTop: 8 }}>
                   {expandFullExtent ? "180×180 chunks, ~1 GB." : "Only the gaps inside the world's current extent."}
                 </div>
               </>
             )}
             {expandInProgress && (
               <>
-                <div style={{ fontSize: 12, color: MODAL_TEXT.secondary, marginBottom: 12 }}>
+                <div style={{ fontSize: FONT.body, color: MODAL_TEXT.secondary, marginBottom: 12 }}>
                   Writing chunks… {expandProgress}%
                 </div>
                 <div style={{ background: RAMP.mbtn1, borderRadius: 4, height: 8, overflow: "hidden" }}>
@@ -4660,7 +4665,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
               </>
             )}
             {expandResult !== null && !expandInProgress && (
-              <div style={{ fontSize: 13, color: armedRecipe(ACCENTS.clipboard).text }}>
+              <div style={{ fontSize: FONT.tab, color: armedRecipe(ACCENTS.clipboard).text }}>
                 Done. {expandResult.chunksAdded.toLocaleString()} chunks added
                 ({expandResult.totalChunks.toLocaleString()} total).
               </div>
@@ -4718,6 +4723,11 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
             id: "delete", label: lbl("home.selection.delete"), icon: "delete",
             shortcut: chord("home.selection.delete"),
             onClick: () => deleteBlocks(),
+          });
+          if (world) items.push({
+            id: "selectAll", label: lbl("selection.modify.selectAll"), icon: "selectAll",
+            shortcut: chord("selection.modify.selectAll"),
+            onClick: () => world && setRawBounds({ x1: 0, y1: 0, x2: chunkToWorld(world.width_chunks) - 1, y2: chunkToWorld(world.height_chunks) - 1 }),
           });
           if (rawBounds) items.push({
             id: "clear", label: lbl("home.selection.clear"), icon: "clear",
@@ -4782,11 +4792,11 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
                   style={{
                     padding: "8px 16px", borderRadius: 6,
                     background: isErr
-                      ? "linear-gradient(180deg, rgb(58,28,26) 0%, rgb(38,19,17) 100%)"
+                      ? SURFACE.dangerToast
                       : SURFACE.popover, // slate like every other popover — was the pre-r3 warm glass
-                    boxShadow: `inset 0 1px 0 rgba(255,255,255,.06), 0 8px 20px rgba(0,0,0,.4), 0 0 0 1px ${isErr ? "rgba(248,113,113,.45)" : `rgba(${EDEN_TEAL},.25)`}`,
+                    boxShadow: `inset 0 1px 0 rgba(255,255,255,.06), 0 8px 20px rgba(0,0,0,.4), 0 0 0 1px ${isErr ? BORDER.danger : `rgba(${EDEN_TEAL},.25)`}`,
                     color: isErr ? RAMP.textDanger : RAMP.text,
-                    fontSize: 12, maxWidth: 460,
+                    fontSize: FONT.body, maxWidth: 460,
                     // Info toasts wrap too (22.19): a long one used to run off both screen edges.
                     whiteSpace: "normal", overflowWrap: "anywhere",
                     pointerEvents: isErr ? "auto" : "none",
@@ -4800,13 +4810,14 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
                       onClick={() => dismissToast(t.id)}
                       title="Dismiss"
                       aria-label="Dismiss error"
+                      className="eden-x-btn"
                       style={{
                         background: "none", border: "none", color: RAMP.textDanger, cursor: "pointer",
-                        fontSize: 14, lineHeight: 1, padding: 0, opacity: 0.7,
+                        padding: 0,
                         minWidth: 24, minHeight: 24, display: "flex", alignItems: "center", justifyContent: "center",
                         marginTop: -4, marginRight: -6, marginBottom: -4,
                       }}
-                    >✕</button>
+                    ><Icon name="close" size={ICON.sm} tone="inherit" /></button>
                   )}
                 </div>
               );
@@ -4868,7 +4879,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
             boxShadow: `inset 0 0 0 1px ${BORDER.bevel}, 0 1px 3px rgba(0,0,0,.5)`,
           }}
         />
-        <div style={{ fontSize: 20, letterSpacing: -0.3, lineHeight: 1 }}>
+        <div style={{ fontSize: FONT.display, letterSpacing: -0.3, lineHeight: 1 }}>
           <span style={{ fontWeight: 800, color: RAMP.white }}>Vuenc</span>
           <span style={{ fontWeight: 400, color: ACCENT.primary }}>Edit</span>
         </div>

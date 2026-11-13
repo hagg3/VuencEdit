@@ -89,7 +89,7 @@ export default function AppMenu({
       { kind: "row", id: "open", label: "Open", icon: "open", accel: `${MOD}O`, onActivate: () => { onClose(); p.openFile(); } },
       { kind: "row", id: "download", label: "Download", icon: "download", onActivate: () => { onClose(); p.setShowWorldBrowser(true); } },
       { kind: "sep" },
-      { kind: "row", id: "save", label: "Save", icon: "save", accel: `${MOD}S`, disabled: !p.sourcePath || p.saving, onActivate: () => { if (p.sourcePath && !p.saving) { onClose(); p.saveWorld(p.sourcePath); } } },
+      { kind: "row", id: "save", label: "Save", icon: "save", accel: `${MOD}S`, disabled: p.saving, onActivate: () => { if (!p.saving) { onClose(); if (p.sourcePath) p.saveWorld(p.sourcePath); else p.saveWorldAs(); } } },
       { kind: "row", id: "saveas", label: "Save As", icon: "saveAs", accel: `${MOD}${SHIFT}S`, disabled: p.saving, onActivate: () => { if (!p.saving) { onClose(); p.saveWorldAs(); } } },
       { kind: "sep" },
       { kind: "row", id: "export", label: "Export", icon: "export" },
@@ -283,7 +283,7 @@ function Pane({ row, onClose, infoKey, bumpInfo }: { row: AppMenuRow; onClose: (
         <PaneHead title="Save"
           sub={p.sourcePath
             ? <>Write your changes back to <code style={{ color: TEXT }}>{p.sourcePath}</code>.</>
-            : "This world has never been written to a file. Use Save As to choose a location."} />
+            : "This world has never been written to a file. Saving asks where to put it."} />
         <div style={{ marginBottom: 12 }}>
           <CheckRow checked={p.saveCompressed} onChange={p.setSaveCompressed}
             label="Compressed (.zip container)"
@@ -297,9 +297,9 @@ function Pane({ row, onClose, infoKey, bumpInfo }: { row: AppMenuRow; onClose: (
           Only edited chunks are rewritten, and saves are crash-safe.
         </div>
         <Primary icon="save" label={p.saving ? "Saving…" : "Save Now"} busy={p.saving}
-          disabled={!p.sourcePath || p.saving}
-          title={p.sourcePath ? `Save to ${p.sourcePath}` : "This world has no file yet. Use Save As."}
-          onClick={() => { if (p.sourcePath) { onClose(); p.saveWorld(p.sourcePath); } }} />
+          disabled={p.saving}
+          title={p.sourcePath ? `Save to ${p.sourcePath}` : "This world has no file yet. Choose where to save it."}
+          onClick={() => { onClose(); if (p.sourcePath) p.saveWorld(p.sourcePath); else p.saveWorldAs(); }} />
       </>);
 
     // ── Save As ──────────────────────────────────────────────────────────

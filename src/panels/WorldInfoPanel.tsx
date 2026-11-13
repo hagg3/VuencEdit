@@ -8,6 +8,7 @@ import { PAINT_COLORS } from "../blockDefs";
 import { classifyWorldFormat } from "../types";
 import { MODAL_TEXT } from "../designTokens";
 import { ACCENTS, DANGER_HEX, RAMP, mix } from "../theme/theme";
+import { FONT } from "../ribbon/tokens";
 
 /** Lightened danger tint for text on the warm modal surface (mechanical hex-literal migration,
  *  Stage 14.15) — plain `DANGER_HEX` fails AA there. */
@@ -78,7 +79,7 @@ function Row({ k, v }: { k: string; v: React.ReactNode }) {
 
 const section: React.CSSProperties = { marginBottom: 14 };
 const sectionLabel: React.CSSProperties = {
-  fontSize: 10, fontWeight: 700, letterSpacing: "0.08em",
+  fontSize: FONT.micro, fontWeight: 700, letterSpacing: "0.08em",
   color: MODAL_TEXT.label, textTransform: "uppercase", marginBottom: 6,
   borderBottom: `1px solid ${RAMP.mbtn1}`, paddingBottom: 3,
 };
@@ -110,7 +111,7 @@ export default function WorldInfoPanel({ refreshKey = 0 }: { refreshKey?: number
   const { info, err } = useWorldInfo(refreshKey);
 
   return (
-    <div style={{ color: MODAL_TEXT.primary, fontFamily: "monospace", fontSize: 12 }}>
+    <div style={{ color: MODAL_TEXT.primary, fontFamily: "monospace", fontSize: FONT.body }}>
       {err && <div style={{ color: RED_LIGHT, marginBottom: 12 }}>{err}</div>}
       {!info && !err && <div style={{ color: MODAL_TEXT.label }}>Loading…</div>}
 
@@ -165,7 +166,7 @@ export default function WorldInfoPanel({ refreshKey = 0 }: { refreshKey?: number
                     border: isDefault ? `1px solid ${RAMP.mbtn0}` : "1px solid rgba(255,255,255,0.2)",
                     position: "relative",
                   }}>
-                  <span style={{ position: "absolute", bottom: 0, right: 1, fontSize: 7, color: "rgba(0,0,0,0.5)", lineHeight: 1 }}>{i}</span>
+                  <span style={{ position: "absolute", bottom: 0, right: 1, fontSize: FONT.nano, color: "rgba(0,0,0,0.5)", lineHeight: 1 }}>{i}</span>
                 </div>
               );
             })}

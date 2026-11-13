@@ -2,39 +2,31 @@ import js from "@eslint/js";
 import tseslint from "typescript-eslint";
 import reactHooks from "eslint-plugin-react-hooks";
 
-// Raw colour literals (UI redesign r3, Stage 14.1). Every colour comes from `src/theme/theme.ts`;
-// a `#hex` string literal — or one inside a template literal, i.e. a CSS string — is an error in
-// the directories listed below. The glob grows file by file as Stage 14.15 migrates the rest, so
-// "no new errors" holds for files that haven't been cleaned yet. Deliberately *not* linted: the
-// theme itself, and colour *data* (`blockDefs.ts`, `texturePack.ts`, game paint tables).
+// Raw colour literals (UI redesign r3, Stage 14.1; inverted in Stage 32.3). Every colour comes from
+// `src/theme/theme.ts`; a `#hex` string literal — or one inside a template literal, i.e. a CSS
+// string — is an error in every `src/` file *except* the exempt list below, so new chrome files are
+// clean by default. Exempt by design: the theme itself, colour *data* (`blockDefs.ts`,
+// `texturePack.ts`, game paint tables) and canvas/WebGL code that can't read CSS vars.
 const RAW_HEX_MSG = "Raw colour literal — use a role from src/theme/theme.ts (or a ribbon/tokens re-export).";
 const rawHexRule = ["error",
-  { selector: "Literal[value=/^#[0-9a-fA-F]{3,8}$/]", message: RAW_HEX_MSG },
+  { selector: "Literal[value=/(^|[\\s(,])#[0-9a-fA-F]{3,8}\\b/]", message: RAW_HEX_MSG },
   { selector: "TemplateElement[value.raw=/#[0-9a-fA-F]{3,8}\\b/]", message: RAW_HEX_MSG },
 ];
-export const RAW_HEX_CLEAN_FILES = [
-  "src/ribbon/**/*.{ts,tsx}",
-  "src/windows/**/*.{ts,tsx}",
-  "src/lens/**/*.{ts,tsx}",
-  "src/hotbar/**/*.{ts,tsx}",
-  "src/picker/**/*.{ts,tsx}",
-  "src/commands/**/*.{ts,tsx}",
-  "src/ui/**/*.{ts,tsx}",
-  "src/Ribbon.tsx",
-  "src/designTokens.ts",
-  "src/HelpModal.tsx",
-  "src/SettingsModal.tsx",
-  "src/AppMenu.tsx",
-  "src/NewWorldModal.tsx",
-  "src/WorldBrowserModal.tsx",
-  "src/MaterializeModal.tsx",
-  "src/UploadModal.tsx",
-  "src/RecoveryModal.tsx",
-  "src/DiagnosticsModal.tsx",
-  "src/Modal.tsx",
-  "src/AboutModal.tsx",
-  "src/WorldInfoModal.tsx",
-  "src/panels/**/*.{ts,tsx}",
+// Font sizes come from `FONT` (ribbon/tokens.ts); a numeric `fontSize` literal in chrome is an error.
+const fontSizeRule = {
+  selector: "Property[key.name='fontSize'] > Literal[raw=/^[0-9.]+$/]",
+  message: "Literal fontSize — use FONT.nano/micro/label/body/tab/heading from ribbon/tokens.ts.",
+};
+export const RAW_HEX_EXEMPT_FILES = [
+  "src/theme/**/*.{ts,tsx}",
+  "src/blockDefs.ts",
+  "src/texturePack.ts",
+  "src/MapCanvas.tsx",
+  "src/FlyView3D.tsx",
+  "src/previewCanvas.ts",
+  "src/signOverlay.ts",
+  "src/drawTools*.ts",
+  "src/**/*.test.{ts,tsx}",
 ];
 
 // One slider primitive (Stage 15.5): every single-value slider goes through `SliderRow` and every
@@ -48,7 +40,7 @@ const rangeInputRule = {
 };
 
 export default tseslint.config(
-  { ignores: ["dist/", "src-tauri/", "node_modules/", "uploadcode/", "EdenWorldManipulator2.0/"] },
+  { ignores: ["dist/", "src-tauri/", "node_modules/"] },
   js.configs.recommended,
   ...tseslint.configs.recommended,
   {
@@ -86,13 +78,12 @@ export default tseslint.config(
     rules: { "no-restricted-syntax": rawHexRule },
   },
   {
-    files: RAW_HEX_CLEAN_FILES,
-    ignores: ["src/**/*.test.ts", "src/ribbon/primitives.tsx"],
-    rules: { "no-restricted-syntax": ["error", ...rawHexRule.slice(1), rangeInputRule] },
+    files: ["src/**/*.{ts,tsx}"],
+    ignores: [...RAW_HEX_EXEMPT_FILES, "src/ribbon/primitives.tsx"],
+    rules: { "no-restricted-syntax": ["error", ...rawHexRule.slice(1), fontSizeRule, rangeInputRule] },
   },
   {
-    files: ["src/**/*.{ts,tsx}"],
-    ignores: RAW_HEX_CLEAN_FILES,
+    files: RAW_HEX_EXEMPT_FILES,
     rules: { "no-restricted-syntax": ["error", rangeInputRule] },
   },
   // Command registry lock (UI redesign r3, 14.6; commands sub-plan §4.2): a ribbon tab renders
@@ -106,7 +97,7 @@ export default tseslint.config(
         paths: [{
           name: "../primitives",
           importNames: [
-            "LargeButton", "SmallButton", "IconButton", "CommandButton", "ToggleButton",
+            "LargeButton", "SmallButton", "IconButton", "CommandButton",
             "SplitButton", "DropdownButton", "MenuItem",
           ],
           message: "Ribbon tabs render commands through ribbon/Cmd.tsx (<Cmd id>); add the command to commands/meta.ts + bind.ts.",
@@ -123,7 +114,7 @@ export default tseslint.config(
         paths: [{
           name: "./primitives",
           importNames: [
-            "LargeButton", "SmallButton", "IconButton", "CommandButton", "ToggleButton",
+            "LargeButton", "SmallButton", "IconButton", "CommandButton",
             "SplitButton", "DropdownButton", "MenuItem",
           ],
           message: "The options bar renders commands through ribbon/Cmd.tsx (<Cmd id>); add the command to commands/meta.ts + bind.ts.",

@@ -7,6 +7,7 @@ import { formatHistogram, approxPercentile, perfCounters, resetPerfCounters, REL
 import type { GpuInfo, PerfSnapshot } from "./FlyView3D";
 import type { WorldMeta } from "./types";
 import Dialog, { DialogButton } from "./ui/Dialog";
+import { FONT } from "./ribbon/tokens";
 
 /**
  * `Help ▸ Diagnostics…` — ROADMAP-EDIT Stage 9.5. The plain-text report a confused user pastes
@@ -354,7 +355,7 @@ export default function DiagnosticsModal(props: Props) {
       }
     >
       <div style={{ display: "flex", flexDirection: "column", height: "100%", gap: 8 }}>
-        <div style={{ fontSize: 12, color: MODAL_TEXT.secondary, lineHeight: 1.5 }}>
+        <div style={{ fontSize: FONT.body, color: MODAL_TEXT.secondary, lineHeight: 1.5 }}>
           Paste this into a bug report. Nothing is sent automatically, and it has file names only, not paths or world contents.
         </div>
         <div style={{ display: "flex", gap: 8 }}>
@@ -370,7 +371,7 @@ export default function DiagnosticsModal(props: Props) {
           value={report}
           style={{
             flex: 1, minHeight: 0,
-            fontFamily: "ui-monospace, 'SF Mono', monospace", fontSize: 11.5, lineHeight: 1.5,
+            fontFamily: "ui-monospace, 'SF Mono', monospace", fontSize: FONT.label, lineHeight: 1.5,
             background: "rgba(0,0,0,0.25)", color: MODAL_TEXT.primary,
             border: "1px solid rgba(255,255,255,0.12)", borderRadius: 6, padding: 10,
           }}

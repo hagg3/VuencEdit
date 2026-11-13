@@ -152,7 +152,7 @@ the "accent names the family" rule still hold).
   command column, sidebar tabs, Settings/Help tabs (`glassTab`), History's current entry,
   `MenuItem`/`Select` current option. No accent underline/strip on any current item.
 - **Raw-hex lint.** `no-restricted-syntax` on hex string literals and hex inside template literals,
-  as an error for `RAW_HEX_CLEAN_FILES` (ribbon, windows, `Ribbon.tsx`, `designTokens.ts`, …).
+  as an error in every `src/` file except `RAW_HEX_EXEMPT_FILES` (theme, colour data, canvas/WebGL code), so new chrome is clean by default; a numeric `fontSize` literal is likewise an error (use `FONT.nano…display`).
   Colour *data* (leaf paints, block tables) is exempted with a scoped disable comment.
 - **`Select`** (`ribbon/primitives.tsx`): button + portaled Popover `role="listbox"`; ↓/↑ opens with
   focus on the current option, arrows/Home/End move, Enter picks, Esc/Tab close. Inside a modal pass
@@ -874,7 +874,7 @@ flush against a cool-slate ribbon. It is now built from `ribbon/tokens` +
 **`src/ui/PropertyGrid.tsx`**: `Section` (collapsible header: chevron + title + optional
 mono `meta` on the right, body when open) and `PropRow`/`PropGrid` (label/value rows -
 `TEXT_LABEL` label, right-aligned tabular-nums monospace value). New file, listed in
-`eslint.config.js`'s `RAW_HEX_CLEAN_FILES`: no raw hex. A `Section`'s open/closed state
+`eslint.config.js`'s raw-hex rule: no raw hex. A `Section`'s open/closed state
 persists in one raw localStorage key, `sidebar_sections` (mirrors `ribbon_collapsed`),
 keyed by the `id` prop passed at each call site; a module-level cache means every
 `Section` mounted at once shares one parsed blob instead of each re-reading

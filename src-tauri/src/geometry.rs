@@ -111,15 +111,6 @@ impl tauri::ipc::IpcResponse for ChunkGeometry {
     }
 }
 
-/// Exposes the legacy/modern default lamp radii to the frontend so the edit-sync reload radius
-/// (FlyView3D: a placed lamp can affect neighboring chunks up to this distance away when night
-/// lighting is on) can't silently drift out of sync with the Rust constants. Baked shadows need no
-/// constant here: their reach is the fixed 1-block ring in `flySync.ts`'s `editReloadPlan`.
-#[tauri::command]
-pub(crate) fn get_light_constants() -> geometry::LightConstants {
-    geometry::light_constants()
-}
-
 /// Casts a ray through the voxel grid and returns the first non-air block it enters, or `None`.
 ///
 /// Origin and direction are in **Eden** coords (X east, Y south, Z up) — the caller owns the

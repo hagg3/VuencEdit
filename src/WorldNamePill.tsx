@@ -18,6 +18,7 @@ import {
   ACCENT, BORDER, FONT, ICON, RADIUS, SPACE, SURFACE, TEXT, TEXT_DIM, TEXT_LABEL, TOPBAR_BTN_H,
   btnBase, hexToRgbTriplet,
 } from "./ribbon/tokens";
+import { RAMP } from "./theme/theme";
 import { classifyWorldFormat } from "./types";
 
 const RENAME_ALLOWED = /[A-Za-z0-9' ]/;
@@ -62,7 +63,7 @@ export default function WorldNamePill() {
         <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{w.name || "Untitled"}</span>
         <span style={{
           fontSize: FONT.micro - 1, lineHeight: "12px", padding: "0 4px", borderRadius: RADIUS.sm, flexShrink: 0,
-          color: newDawn ? "#b3a9ea" : TEXT_LABEL,
+          color: newDawn ? RAMP.violetText : TEXT_LABEL,
           background: newDawn ? `rgba(${dawnRgb},.16)` : "rgba(255,255,255,.06)",
           boxShadow: `inset 0 0 0 1px ${newDawn ? `rgba(${dawnRgb},.4)` : "rgba(255,255,255,.12)"}`,
         }}>
@@ -148,7 +149,7 @@ export default function WorldNamePill() {
           <InfoRow k="Size" v={`${w.width_chunks} × ${w.height_chunks} chunks`} />
           <InfoRow k="Blocks" v={`${w.width_chunks * 16} × ${w.height_chunks * 16}`} />
           <InfoRow k="Height" v={`Z 0–${w.max_z}`} />
-          <InfoRow k="Home (respawn)" v={spawnPos ? `${Math.round(spawnPos.px)}, ${Math.round(spawnPos.py)}` : "not set"} />
+          <InfoRow k="Home point" v={spawnPos ? `${Math.round(spawnPos.px)}, ${Math.round(spawnPos.py)}` : "not set"} />
           <InfoRow k="Start (last pos)" v={playerPos ? `${Math.round(playerPos.px)}, ${Math.round(playerPos.py)}` : "not set"} />
           <InfoRow k="File" v={sourcePath ? sourcePath.split("/").pop()! : "never saved"} />
 
