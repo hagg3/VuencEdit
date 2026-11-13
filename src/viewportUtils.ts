@@ -20,24 +20,18 @@ export function chunkToWorld(cCoord: number): number {
 }
 
 /**
- * Zoom a pan/zoom view transform around a local (canvas-space) point — the "zoom toward
- * cursor" formula shared by MapCanvas's wheel handler.
+ * Multiply a pan/zoom view's scale by `factor`, keeping the local (canvas-space) point fixed — the
+ * "zoom toward cursor" formula behind MapCanvas's wheel and pinch. The factor itself comes from
+ * `input/wheel.ts` (`wheelAction`), which knows mouse notches from trackpad pinches.
  */
 export function zoomAtPoint(
   view: ViewTransform,
   localX: number,
   localY: number,
-  deltaY: number,
-  opts: { min: number; max: number; factor: number },
+  factor: number,
+  opts: { min: number; max: number },
 ): ViewTransform {
-  // Scale the zoom step by wheel delta magnitude — a fast wheel flick or big trackpad swipe should
-  // zoom further per event than a slow single notch, instead of the old fixed step regardless of
-  // deltaY. `factor` is calibrated as the zoom multiplier at a typical one-notch deltaY (~100),
-  // clamped so one event can't blow past a reasonable range (fast flicks, big trackpad deltas).
-  const k = Math.log(opts.factor) / 100;
-  const rawF = Math.exp(-deltaY * k);
-  const f = Math.max(1 / (opts.factor * 3), Math.min(opts.factor * 3, rawF));
-  const newScale = Math.max(opts.min, Math.min(opts.max, view.scale * f));
+  const newScale = Math.max(opts.min, Math.min(opts.max, view.scale * factor));
   return {
     scale: newScale,
     x: localX - (localX - view.x) * (newScale / view.scale),

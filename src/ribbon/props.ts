@@ -4,7 +4,7 @@
  * re-exports everything here, so App's `import … from "./Ribbon"` is unchanged.
  */
 import type { Tool, SelectionBounds, MaterializeSelectionBounds } from "../MapCanvas";
-import type { SelectionInfo, ClipboardInfo, ExtrudeAxis, WorldMeta, RecentWorld, ShadowMode, ShadowStyle } from "../types";
+import type { SelectionInfo, ClipboardInfo, ExtrudeAxis, WorldMeta, RecentWorld, ShadowMode, ShadowStyle, LongOpKind } from "../types";
 import type { SettingsTab } from "../SettingsModal";
 import type { CommandId } from "../commands/meta";
 import type { CommandBinding } from "../commands/types";
@@ -203,8 +203,8 @@ export interface RibbonProps {
   // File ops
   sourcePath: string | null; saving: boolean;
   /** `kind` of the long operation currently running (audit C6/M14), or null. One field for what
-   *  used to be three booleans; `"png" | "obj" | "json" | "vox" | "save"`. */
-  longOpKind: string | null;
+   *  used to be three booleans; `LongOpKind`. */
+  longOpKind: LongOpKind | null;
   saveCompressed: boolean; setSaveCompressed: (v: boolean) => void;
   backupCompressed: boolean; setBackupCompressed: (v: boolean) => void;
   recentWorlds: RecentWorld[];

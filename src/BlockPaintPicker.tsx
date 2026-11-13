@@ -2,7 +2,7 @@ import { useState } from "react";
 import {
   BLOCK_DEFS, PAINT_COLORS, resolveColor,
   RAMP_FAMILIES, RAMP_DIRS, WEDGE_FAMILIES, WEDGE_DIRS,
-  rampFamilyBase, wedgeFamilyBase, rampDirIndex, blockDisplayName,
+  rampFamilyBase, wedgeFamilyBase, rampDirIndex, blockDisplayName, searchBlocks,
   doorFamilyBase, portalFamilyBase, DOOR_PORTAL_DIRS,
   EXPANSION_BLOCKS, isExpansionBlock, NEW_FORMAT_BLOCKS, isNewFormatBlock, PARTIAL_WATER, PARTIAL_LAVA, SPECIAL_BLOCKS,
 } from "./blockDefs";
@@ -11,7 +11,8 @@ import {
   ACCENT, TEXT_DIM, TEXT_LABEL, TEXT_ARMED, ARMED_RING, BORDER, DIVIDER,
   btnActive, hexToRgbTriplet,
 } from "./ribbon/tokens";
-import { Select } from "./ribbon/primitives";
+import { Select, TextField } from "./ribbon/primitives";
+import { FONT } from "./ribbon/tokens";
 
 const ACCENT_RGB = hexToRgbTriplet(ACCENT.primary);
 function gradAccent(alpha: number): string {
@@ -49,20 +50,43 @@ export default function BlockPaintPicker({
   // one is already the active selection so its highlight is never hidden behind a closed toggle.
   const newFormatActive = bt !== null && isNewFormatBlock(bt);
   const [newFormatOpen, setNewFormatOpen] = useState(newFormatActive);
+  // U-16: name filter (Enter picks the first match, Esc clears) + a hovered-name footer.
+  const [query, setQuery] = useState("");
+  const [hover, setHover] = useState<string | null>(null);
+  const matches = searchBlocks(query, { includeWedges: isFill, includeNewFormat: allowNewFormat });
+  const matchSet = new Set(matches.map(m => m.type));
+  const dimmed = (type: number) => query.trim() !== "" && !matchSet.has(type);
+  const hoverProps = (label: string) => ({
+    onMouseEnter: () => setHover(label), onMouseLeave: () => setHover(null),
+  });
 
   return (
+    <div>
     <div style={{ display: "flex", alignItems: "flex-start", gap: 10, ...(isFill ? {} : { overflowX: "auto" }) }}>
 
       {/* ── Block column ── */}
       <div style={{ display: "flex", flexDirection: "column", gap: 3, ...(isFill ? {} : { flexShrink: 0 }) }}>
-        <span style={{ color: TEXT_LABEL, fontSize: 11 }}>Block</span>
+        <span style={{ color: TEXT_LABEL, fontSize: FONT.label }}>Block</span>
+        <TextField
+          value={query} onChange={setQuery} ariaLabel="Filter blocks" placeholder="Filter blocks…"
+          style={{ height: 22 }}
+          onKeyDown={e => {
+            e.stopPropagation();
+            if (e.key === "Escape") { if (query) { e.preventDefault(); setQuery(""); } }
+            else if (e.key === "Enter" && matches[0]) {
+              e.preventDefault();
+              onBlockTypeChange(matches[0].type);
+              if (isNewFormatBlock(matches[0].type)) setNewFormatOpen(true);
+            }
+          }}
+        />
 
         {/* Air (fill) / Any (filter) */}
         <div
           title={isFill ? "Air (erase)" : "Any block (no type filter)"}
           onClick={() => onBlockTypeChange(isFill ? 0 : null)}
           style={{
-            fontSize: 10, textAlign: "center", cursor: "pointer",
+            fontSize: FONT.micro, textAlign: "center", cursor: "pointer",
             padding: "1px 0", borderRadius: 2, userSelect: "none",
             border: (isFill ? bt === 0 : bt === null) ? `1px solid ${ARMED_RING}` : `1px solid ${BORDER.hairline}`,
             background: (isFill ? bt === 0 : bt === null)
@@ -94,13 +118,15 @@ export default function BlockPaintPicker({
               <div
                 key={b.type}
                 title={`${b.name} (type ${b.type})`}
+                {...hoverProps(`${blockDisplayName(b.type)} (type ${b.type})`)}
                 onClick={() => onBlockTypeChange(b.type)}
                 style={{
+                  opacity: dimmed(b.type) ? 0.25 : 1,
                   width: 18, height: 18, position: "relative",
                   background: texUrl ? `url(${texUrl}) center/cover` : (isRamp ? "rgba(255,255,255,0.04)" : bg),
                   borderRadius: 2, cursor: "pointer",
                   boxSizing: "border-box",
-                  border: selected ? "2px solid #fff" : "2px solid rgba(255,255,255,0.08)",
+                  border: selected ? `2px solid ${BORDER.selected}` : `2px solid ${BORDER.hairline}`,
                   outline: selected ? `1px solid ${ARMED_RING}` : "none",
                   outlineOffset: 1, overflow: "hidden",
                   imageRendering: texUrl ? "pixelated" : undefined,
@@ -116,7 +142,7 @@ export default function BlockPaintPicker({
                 {isFill && (
                   <span style={{
                     position: "absolute", bottom: 0, left: 1,
-                    fontSize: 8, fontWeight: 700, lineHeight: 1,
+                    fontSize: FONT.nano, fontWeight: 700, lineHeight: 1,
                     color: "rgba(255,255,255,0.65)", textShadow: "0 0 2px rgba(0,0,0,1)",
                     pointerEvents: "none", userSelect: "none",
                   }}>{b.name[0]?.toUpperCase()}</span>
@@ -136,13 +162,15 @@ export default function BlockPaintPicker({
                 <div
                   key={wf.base}
                   title={`${wf.name} (type ${wf.base})`}
+                  {...hoverProps(`${wf.name} (type ${wf.base})`)}
                   onClick={() => onBlockTypeChange(wf.base + rampDirIndex(bt ?? 0))}
                   style={{
+                    opacity: dimmed(wf.base) ? 0.25 : 1,
                     width: 18, height: 18, position: "relative",
                     background: "rgba(255,255,255,0.04)",
                     borderRadius: 2, cursor: "pointer",
                     boxSizing: "border-box",
-                    border: selected ? "2px solid #fff" : "2px solid rgba(255,255,255,0.08)",
+                    border: selected ? `2px solid ${BORDER.selected}` : `2px solid ${BORDER.hairline}`,
                     outline: selected ? `1px solid ${ARMED_RING}` : "none",
                     outlineOffset: 1, overflow: "hidden",
                   }}
@@ -164,12 +192,12 @@ export default function BlockPaintPicker({
           const family = RAMP_FAMILIES.find((f) => f.base === base);
           return (
             <div style={{ display: "flex", alignItems: "center", gap: 3, marginTop: 1 }}>
-              <span style={{ color: TEXT_LABEL, fontSize: 9, minWidth: 20 }}>Dir</span>
+              <span style={{ color: TEXT_LABEL, fontSize: FONT.nano, minWidth: 20 }}>Dir</span>
               {RAMP_DIRS.map((dir, i) => {
                 const active = rampDirIndex(bt) === i;
                 return (
                   <button key={dir} onClick={() => onBlockTypeChange(base + i)} style={{
-                    width: 22, padding: "1px 0", fontSize: 10, cursor: "pointer",
+                    width: 22, padding: "1px 0", fontSize: FONT.micro, cursor: "pointer",
                     background: active ? gradAccent(0.35) : "rgba(255,255,255,0.04)",
                     border: `1px solid ${active ? ARMED_RING : BORDER.hairline}`,
                     color: active ? TEXT_ARMED : TEXT_LABEL, borderRadius: 3,
@@ -186,12 +214,12 @@ export default function BlockPaintPicker({
           const family = WEDGE_FAMILIES.find((f) => f.base === base);
           return (
             <div style={{ display: "flex", alignItems: "center", gap: 3, marginTop: 1 }}>
-              <span style={{ color: TEXT_LABEL, fontSize: 9, minWidth: 20 }}>Apex</span>
+              <span style={{ color: TEXT_LABEL, fontSize: FONT.nano, minWidth: 20 }}>Apex</span>
               {WEDGE_DIRS.map((dir, i) => {
                 const active = rampDirIndex(bt) === i;
                 return (
                   <button key={dir} onClick={() => onBlockTypeChange(base + i)} style={{
-                    width: 26, padding: "1px 0", fontSize: 10, cursor: "pointer",
+                    width: 26, padding: "1px 0", fontSize: FONT.micro, cursor: "pointer",
                     background: active ? gradAccent(0.35) : "rgba(255,255,255,0.04)",
                     border: `1px solid ${active ? ARMED_RING : BORDER.hairline}`,
                     color: active ? TEXT_ARMED : TEXT_LABEL, borderRadius: 3,
@@ -205,12 +233,12 @@ export default function BlockPaintPicker({
         {/* Door orientation selector */}
         {bt !== null && doorFamilyBase(bt) !== null && (
           <div style={{ display: "flex", alignItems: "center", gap: 3, marginTop: 1 }}>
-            <span style={{ color: TEXT_LABEL, fontSize: 9, minWidth: 20 }}>Dir</span>
+            <span style={{ color: TEXT_LABEL, fontSize: FONT.nano, minWidth: 20 }}>Dir</span>
             {DOOR_PORTAL_DIRS.map((dir, i) => {
               const active = bt - 66 === i;
               return (
                 <button key={dir} onClick={() => onBlockTypeChange(66 + i)} style={{
-                  width: 22, padding: "1px 0", fontSize: 10, cursor: "pointer",
+                  width: 22, padding: "1px 0", fontSize: FONT.micro, cursor: "pointer",
                   background: active ? gradAccent(0.35) : "rgba(255,255,255,0.04)",
                   border: `1px solid ${active ? ARMED_RING : BORDER.hairline}`,
                   color: active ? TEXT_ARMED : TEXT_LABEL, borderRadius: 3,
@@ -223,12 +251,12 @@ export default function BlockPaintPicker({
         {/* Portal orientation selector */}
         {bt !== null && portalFamilyBase(bt) !== null && (
           <div style={{ display: "flex", alignItems: "center", gap: 3, marginTop: 1 }}>
-            <span style={{ color: TEXT_LABEL, fontSize: 9, minWidth: 20 }}>Dir</span>
+            <span style={{ color: TEXT_LABEL, fontSize: FONT.nano, minWidth: 20 }}>Dir</span>
             {DOOR_PORTAL_DIRS.map((dir, i) => {
               const active = bt - 75 === i;
               return (
                 <button key={dir} onClick={() => onBlockTypeChange(75 + i)} style={{
-                  width: 22, padding: "1px 0", fontSize: 10, cursor: "pointer",
+                  width: 22, padding: "1px 0", fontSize: FONT.micro, cursor: "pointer",
                   background: active ? gradAccent(0.35) : "rgba(255,255,255,0.04)",
                   border: `1px solid ${active ? ARMED_RING : BORDER.hairline}`,
                   color: active ? TEXT_ARMED : TEXT_LABEL, borderRadius: 3,
@@ -256,12 +284,13 @@ export default function BlockPaintPicker({
             const baseColor = isWater ? "70,135,210" : "255,69,0";
             const selected = bt === b.type;
             return (
-              <div key={b.type} title={b.name} onClick={() => onBlockTypeChange(b.type)}
+              <div key={b.type} title={b.name} {...hoverProps(`${b.name} (type ${b.type})`)} onClick={() => onBlockTypeChange(b.type)}
                 style={{
+                  opacity: dimmed(b.type) ? 0.25 : 1,
                   width: 18, height: 18, position: "relative", overflow: "hidden",
                   borderRadius: 2, cursor: "pointer", boxSizing: "border-box",
                   background: `rgba(${baseColor},0.15)`,
-                  border: selected ? "2px solid #fff" : "2px solid rgba(255,255,255,0.08)",
+                  border: selected ? `2px solid ${BORDER.selected}` : `2px solid ${BORDER.hairline}`,
                   outline: selected ? `1px solid ${ARMED_RING}` : "none", outlineOffset: 1,
                 }}
               >
@@ -280,11 +309,12 @@ export default function BlockPaintPicker({
           {SPECIAL_BLOCKS.map(b => {
             const selected = bt === b.type;
             return (
-              <div key={b.type} title={`${b.name} (type ${b.type})`} onClick={() => onBlockTypeChange(b.type)}
+              <div key={b.type} title={`${b.name} (type ${b.type})`} {...hoverProps(`${b.name} (type ${b.type})`)} onClick={() => onBlockTypeChange(b.type)}
                 style={{
+                  opacity: dimmed(b.type) ? 0.25 : 1,
                   width: 18, height: 18, borderRadius: 2, cursor: "pointer", boxSizing: "border-box",
                   background: `rgb(${b.color[0]},${b.color[1]},${b.color[2]})`,
-                  border: selected ? "2px solid #fff" : "2px solid rgba(255,255,255,0.08)",
+                  border: selected ? `2px solid ${BORDER.selected}` : `2px solid ${BORDER.hairline}`,
                   outline: selected ? `1px solid ${ARMED_RING}` : "none", outlineOffset: 1,
                 }}
               />
@@ -307,8 +337,8 @@ export default function BlockPaintPicker({
             opacity: allowNewFormat ? 1 : 0.4,
           }}
         >
-          <span style={{ color: TEXT_DIM, fontSize: 8 }}>{allowNewFormat && newFormatOpen ? "▼" : "▶"}</span>
-          <span style={{ color: newFormatActive ? TEXT_ARMED : TEXT_DIM, fontSize: 9 }}>
+          <span style={{ color: TEXT_DIM, fontSize: FONT.nano }}>{allowNewFormat && newFormatOpen ? "▼" : "▶"}</span>
+          <span style={{ color: newFormatActive ? TEXT_ARMED : TEXT_DIM, fontSize: FONT.nano }}>
             New (16){newFormatActive ? " •" : ""}
           </span>
         </div>
@@ -317,11 +347,12 @@ export default function BlockPaintPicker({
             {NEW_FORMAT_BLOCKS.map(b => {
               const selected = bt === b.type;
               return (
-                <div key={b.type} title={`${b.name} (${b.type})`} onClick={() => onBlockTypeChange(b.type)}
+                <div key={b.type} title={`${b.name} (${b.type})`} {...hoverProps(`${b.name} (type ${b.type})`)} onClick={() => onBlockTypeChange(b.type)}
                   style={{
+                    opacity: dimmed(b.type) ? 0.25 : 1,
                     width: 18, height: 18, borderRadius: 2, cursor: "pointer", boxSizing: "border-box",
                     background: `rgb(${b.color[0]},${b.color[1]},${b.color[2]})`,
-                    border: selected ? "2px solid #fff" : "2px solid rgba(255,255,255,0.08)",
+                    border: selected ? `2px solid ${BORDER.selected}` : `2px solid ${BORDER.hairline}`,
                     outline: selected ? `1px solid ${ARMED_RING}` : "none", outlineOffset: 1,
                   }}
                 />
@@ -335,7 +366,7 @@ export default function BlockPaintPicker({
 
       {/* ── Paint column ── */}
       <div style={{ display: "flex", flexDirection: "column", gap: 3, ...(isFill ? {} : { flexShrink: 0 }) }}>
-        <span style={{ color: TEXT_LABEL, fontSize: 11 }}>Paint</span>
+        <span style={{ color: TEXT_LABEL, fontSize: FONT.label }}>Paint</span>
         <div style={{ display: "flex", gap: 3 }}>
           {/* "Any paint" toggle (filter mode only) */}
           {!isFill && (
@@ -345,12 +376,12 @@ export default function BlockPaintPicker({
               style={{
                 width: 18, height: 18, flexShrink: 0,
                 borderRadius: 2, cursor: "pointer", boxSizing: "border-box",
-                border: paint === null ? "2px solid #fff" : `2px solid ${BORDER.hairline}`,
+                border: paint === null ? `2px solid ${BORDER.selected}` : `2px solid ${BORDER.hairline}`,
                 outline: paint === null ? `1px solid ${ARMED_RING}` : "none", outlineOffset: 1,
                 display: "flex", alignItems: "center", justifyContent: "center",
                 background: paint === null ? gradAccent(0.25) : "rgba(255,255,255,0.04)",
                 color: paint === null ? TEXT_ARMED : TEXT_DIM,
-                fontSize: 9, lineHeight: 1, userSelect: "none",
+                fontSize: FONT.nano, lineHeight: 1, userSelect: "none",
               }}
             >Any</div>
           )}
@@ -361,10 +392,10 @@ export default function BlockPaintPicker({
             style={{
               width: 18, height: 18, flexShrink: 0,
               background: "transparent", borderRadius: 2, cursor: "pointer", boxSizing: "border-box",
-              border: paint === 0 ? "2px solid #fff" : `2px solid ${BORDER.hairline}`,
+              border: paint === 0 ? `2px solid ${BORDER.selected}` : `2px solid ${BORDER.hairline}`,
               outline: paint === 0 ? `1px solid ${ARMED_RING}` : "none", outlineOffset: 1,
               display: "flex", alignItems: "center", justifyContent: "center",
-              color: TEXT_DIM, fontSize: 11, lineHeight: 1,
+              color: TEXT_DIM, fontSize: FONT.label, lineHeight: 1,
             }}
           >✕</div>
           {/* 9-per-row paint grid */}
@@ -374,13 +405,13 @@ export default function BlockPaintPicker({
               const paintTexUrl = texturePack && bt !== null ? tintedSwatch(bt, pIdx, texturePack) : null;
               return (
                 <div
-                  key={i} title={`Paint colour ${i + 1}`}
+                  key={i} title={`Paint colour ${i + 1}`} {...hoverProps(`Paint ${pIdx}`)}
                   onClick={() => onPaintChange(pIdx)}
                   style={{
                     width: 18, height: 18,
                     background: paintTexUrl ? `url(${paintTexUrl}) center/cover` : `rgb(${r},${g},${b})`,
                     borderRadius: 2, cursor: "pointer", boxSizing: "border-box",
-                    border: paint === pIdx ? "2px solid #fff" : "2px solid rgba(255,255,255,0.08)",
+                    border: paint === pIdx ? `2px solid ${BORDER.selected}` : `2px solid ${BORDER.hairline}`,
                     outline: paint === pIdx ? `1px solid ${ARMED_RING}` : "none", outlineOffset: 1,
                     imageRendering: paintTexUrl ? "pixelated" : undefined,
                   }}
@@ -413,17 +444,21 @@ export default function BlockPaintPicker({
               {selectionExists && (
                 <button
                   onClick={onFill}
-                  style={btnActive(ACCENT.selection, { padding: "2px 10px", fontSize: 12, lineHeight: "20px", whiteSpace: "nowrap", borderRadius: 3 })}
+                  style={btnActive(ACCENT.selection, { padding: "2px 10px", fontSize: FONT.body, lineHeight: "20px", whiteSpace: "nowrap", borderRadius: 3 })}
                   title="Fill every block in the selection with the chosen type and paint"
                 >Fill Selection</button>
               )}
             </div>
-            <div style={{ color: TEXT_DIM, fontSize: 11, whiteSpace: "nowrap" }}>
+            <div style={{ color: TEXT_DIM, fontSize: FONT.label, whiteSpace: "nowrap" }}>
               {blockDisplayName(bt ?? 0)}{(paint ?? 0) > 0 ? <span style={{ color: TEXT_ARMED }}> #{paint}</span> : ""}
             </div>
           </div>
         </>
       )}
+    </div>
+    <div style={{ height: 16, lineHeight: "16px", marginTop: 3, fontSize: FONT.label, color: TEXT_DIM, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+      {hover ?? (query.trim() && !matches.length ? "No matching block" : "\u00A0")}
+    </div>
     </div>
   );
 }

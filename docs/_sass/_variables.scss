@@ -5,6 +5,7 @@
 $surface-topbar: #1b2128;
 $surface-body-top: #2b333c;
 $surface-body-bot: #242b33;
+$surface-page: #1f252c;
 $surface-raised-top: #39434e;
 $surface-raised-bot: #2c343d;
 $surface-well: rgba(0, 0, 0, 0.30);
@@ -32,9 +33,11 @@ $eden-teal-readable: #00dde9; // brighter teal used for the "Edit" half of the w
 $danger: #c2504f;
 
 // Layout
-$content-max-width: 1040px;
-$navbar-height: 48px;
-$beta-strip-height: 28px;
+$content-max-width: 980px;
+$sidebar-width: 180px;
+$phone: 700px;
+$navbar-height: 38px;
+$beta-strip-height: 0px;
 
 // Type
-$font-stack: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+$font-stack: "Lucida Grande", Verdana, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;

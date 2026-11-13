@@ -1,0 +1,15 @@
+---
+layout: page
+title: Blog
+subtitle: Release notes and news about VuencEdit.
+---
+<ul class="post-list">
+  {% for post in site.posts %}
+  <li>
+    <span class="post-meta">{{ post.date | date: "%-d %B %Y" }}</span>
+    <a href="{{ post.url | relative_url }}">{{ post.title }}</a>
+    {% if post.subtitle %}<span class="post-sub">{{ post.subtitle }}</span>{% endif %}
+  </li>
+  {% endfor %}
+</ul>
+<p><a href="{{ '/feed.xml' | relative_url }}">Subscribe via RSS</a></p>

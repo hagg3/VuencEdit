@@ -2,6 +2,7 @@ import { useState } from "react";
 import { MODAL_TEXT } from "./designTokens";
 import { Check } from "./ribbon/primitives";
 import Dialog, { DialogButton } from "./ui/Dialog";
+import { FONT } from "./ribbon/tokens";
 
 export interface ExportPngOpts { selectionOnly: boolean; scale: number }
 
@@ -46,7 +47,7 @@ export default function ExportPngModal({
             <DialogButton key={k} variant={k === scale ? "primary" : "neutral"} onClick={() => setScale(k)}>{k}×</DialogButton>
           ))}
         </div>
-        <div style={{ fontFamily: "monospace", fontSize: 12, color: tooBig ? MODAL_TEXT.secondary : undefined }}>
+        <div style={{ fontFamily: "monospace", fontSize: FONT.body, color: tooBig ? MODAL_TEXT.secondary : undefined }}>
           {ow} × {oh} px{tooBig ? " — too large, lower the scale" : ""}
         </div>
       </div>

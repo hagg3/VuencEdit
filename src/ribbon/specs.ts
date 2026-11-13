@@ -45,7 +45,7 @@ export const TAB_SPECS: Record<RibbonTab, TabSpec> = {
     groups: [
       g("clipboard", "Clipboard", 224, 234, "popup", 0),
       g("navigation", "Navigation", 197, 223, "popup", 1),
-      g("selection", "Selection", 195, 205, "popup", 2),
+      g("selection", "Selection", 221, 231, "popup", 2),
       // Block button (14.5): fixed width by construction, so full = medium.
       g("block", "Block", 134, 134, "popup", 3),
       g("setpoint", "Set Point", 138, 104, "full", 4),

@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { MODAL_TEXT, expBadge, recessedWell } from "./designTokens";
 // M1: shared floor/ceiling with FlyView3D's own in-pane slider and the ribbon 3D tab, so a value set
@@ -6,11 +6,12 @@ import { MODAL_TEXT, expBadge, recessedWell } from "./designTokens";
 import { MAX_RENDER_DISTANCE, RD_MIN } from "./renderDistance";
 import { openView3dEverywhere, seedLastLayout } from "./windows/windowSeed";
 import { Check, Segmented, Select, SliderRow } from "./ribbon/primitives";
-import { ACCENT, FONT, ICON, IS_MAC, RADIUS } from "./ribbon/tokens";
+import { FONT, ICON, IS_MAC, RADIUS } from "./ribbon/tokens";
 import { Icon } from "./ribbon/icons";
 import { SKY_3D } from "./theme/theme";
 import { SOUND_PACK_OPTIONS, type PackId } from "./sound/packs";
 import type { ShadowMode, ShadowStyle } from "./types";
+import type { WheelMode } from "./input/wheel";
 import { sfx } from "./sound/sfx";
 import Dialog, { DialogButton } from "./ui/Dialog";
 import { DialogNav, type DialogNavItem } from "./ui/DialogNav";
@@ -55,6 +56,10 @@ export interface AppSettings {
    *  Switching profiles snaps `lampRadius` to that profile's default (see App.tsx commitLightingProfile).
    *  Default "legacy". */
   lightingProfile: "legacy" | "modern";
+  /** What scrolling does on the map and the Lens (34.7): "auto" pans with a trackpad and zooms with
+   *  a mouse wheel; "pan"/"zoom" force one for devices the detection misreads. Pinch and ⌘/Ctrl-scroll
+   *  always zoom. Default "auto". See `input/wheel.ts`. */
+  wheelMode: WheelMode;
   /** Mouse-look sensitivity multiplier in grabbed-cursor LOOK mode. Default 1 (see FlyView3D's
    *  LOOK_SENS_BASE for the underlying rad/px rate this scales). */
   lookSensitivity: number;
@@ -197,6 +202,7 @@ export const DEFAULTS: AppSettings = {
   sunT: 0.5,
   lampRadius: 4,
   lightingProfile: "legacy",
+  wheelMode: "auto",
   lookSensitivity: 1,
   dragSensitivity: 1,
   invertY: false,
@@ -462,8 +468,9 @@ function PathRow({
 
 interface Props {
   onClose: () => void;
+  /** Called with the freshly persisted settings after every change (apply-immediately, D8). */
   onSave: (s: AppSettings) => void;
-  /** Settings ▸ Layout ▸ Reset window positions — applies immediately (not staged until Save);
+  /** Settings ▸ Layout ▸ Reset window positions — applies immediately;
    *  omitted on the splash screen, where there are no windows to reset. */
   onResetWindows?: () => void;
   /** The Lens's two session flags (20.4): show it while pasting / for selections. Applies
@@ -490,11 +497,43 @@ export default function SettingsModal({
   onClose, onSave, onResetWindows, lensFlags, onLensFlags, initialTab = "general",
 }: Props) {
   const [local, setLocal] = useState<AppSettings>(() => loadSettings());
-  const [resetHint, setResetHint] = useState(false);
   const [tab, setTab] = useState<SettingsTab>(initialTab);
 
+  // D8 (32.6): every row applies immediately — there is no Save/Cancel. `local` is only the live
+  // display state; each change persists + applies through `commit`. Sliders fire per pixel, so a
+  // change settles for 250 ms (state stays live; only the localStorage write + `onSave` fan-out
+  // wait, the `saveSettingsDebounced` idiom), and pending patches accumulate until it fires.
+  const pendingRef = useRef<Partial<AppSettings>>({});
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const onSaveRef = useRef(onSave);
+  onSaveRef.current = onSave;
+  function flush() {
+    if (timerRef.current) { clearTimeout(timerRef.current); timerRef.current = null; }
+    const patch = pendingRef.current;
+    if (Object.keys(patch).length === 0) return;
+    pendingRef.current = {};
+    saveSettings(patch);
+    // Re-read rather than send `local`: the ribbon chip / sidebar write straight through
+    // `saveSettings` while this dialog is open, and a stale snapshot would revert them.
+    onSaveRef.current(loadSettings());
+  }
+  function commit(patch: Partial<AppSettings>, settle = false) {
+    setLocal(s => ({ ...s, ...patch }));
+    pendingRef.current = { ...pendingRef.current, ...patch };
+    if (timerRef.current) clearTimeout(timerRef.current);
+    if (settle) timerRef.current = setTimeout(flush, 250); else flush();
+  }
+  // Unmount (✕, Esc, or the PanelBoundary tearing us down) must not drop a slider change that is
+  // still inside its settle window.
+  useEffect(() => flush, []); // eslint-disable-line react-hooks/exhaustive-deps
+  function close() { flush(); onClose(); }
+
   function set<K extends keyof AppSettings>(key: K, value: AppSettings[K]) {
-    setLocal(s => ({ ...s, [key]: value }));
+    commit({ [key]: value } as Partial<AppSettings>);
+  }
+  /** Slider variant of `set`. */
+  function setLive<K extends keyof AppSettings>(key: K, value: AppSettings[K]) {
+    commit({ [key]: value } as Partial<AppSettings>, true);
   }
 
   async function browsePath() {
@@ -520,46 +559,27 @@ export default function SettingsModal({
     if (selected && !Array.isArray(selected)) set("prefabDirectory", selected);
   }
 
-  function handleSave() {
-    saveSettings(local);
-    onSave(local);
-    onClose();
-  }
-
   return (
     <Dialog
-      size="md" icon="settings" title="Settings" onClose={onClose}
+      size="md" icon="settings" title="Settings" onClose={close}
       nav={<DialogNav items={NAV_ITEMS} value={tab} onChange={id => setTab(id as SettingsTab)} />}
       footer={
-        <>
-          {/* Restores every persisted setting, including ones surfaced in the 3D View tab. Staged
-              like any other edit: it doesn't persist until Save. D0's left-slot convention: a
-              footer child with marginRight:"auto" — no dedicated slot component. */}
-          <div style={{ display: "flex", alignItems: "center", gap: 10, marginRight: "auto" }}>
-            <DialogButton onClick={() => {
-              // Preferences only: tour/profile gates, both paths and the device-aware budget survive.
-              setLocal(cur => ({
-                ...DEFAULTS,
-                memoryBudget: deviceAwareDefaultMemoryBudget(),
-                tourVersion: cur.tourVersion,
-                potatoProfileApplied: cur.potatoProfileApplied,
-                ramPresetChecked: cur.ramPresetChecked,
-                texturePackPath: cur.texturePackPath,
-                prefabDirectory: cur.prefabDirectory,
-              }));
-              setResetHint(true);
-            }}>
-              Reset to defaults
-            </DialogButton>
-            {resetHint && (
-              <span style={{ color: ACCENT.warm, fontSize: FONT.label }}>
-                Defaults restored. Save to apply.
-              </span>
-            )}
-          </div>
-          <DialogButton onClick={onClose}>Cancel</DialogButton>
-          <DialogButton variant="primary" onClick={handleSave}>Save</DialogButton>
-        </>
+        // Restores every persisted preference, applied at once. D0's left-slot convention: a footer
+        // child with marginRight:"auto". No Save/Cancel — closing is ✕/Esc (D8).
+        <DialogButton style={{ marginRight: "auto" }} onClick={() => {
+          // Preferences only: tour/profile gates, both paths and the device-aware budget survive.
+          commit({
+            ...DEFAULTS,
+            memoryBudget: deviceAwareDefaultMemoryBudget(),
+            tourVersion: local.tourVersion,
+            potatoProfileApplied: local.potatoProfileApplied,
+            ramPresetChecked: local.ramPresetChecked,
+            texturePackPath: local.texturePackPath,
+            prefabDirectory: local.prefabDirectory,
+          });
+        }}>
+          Reset to defaults
+        </DialogButton>
       }
     >
       {tab === "general" && (
@@ -585,12 +605,7 @@ export default function SettingsModal({
 
           <SettingRow last label="Memory budget"
             description={
-              <>
-                Higher keeps more undo, map tiles and 3D chunks in memory.
-                {" "}{MEMORY_PRESETS[local.memoryBudget].label} ≈ {MEMORY_PRESETS[local.memoryBudget].undoBudgetBytes / (1 << 20)} MB undo
-                + {MEMORY_PRESETS[local.memoryBudget].tileBudgetBytes / (1 << 20)} MB tiles
-                + {MEMORY_PRESETS[local.memoryBudget].geometryBudgetBytes / (1 << 20)} MB 3D geometry.
-              </>
+              `Higher keeps more undo, map tiles and 3D chunks in memory. ${MEMORY_PRESETS[local.memoryBudget].label} ≈ ${MEMORY_PRESETS[local.memoryBudget].undoBudgetBytes / (1 << 20)} MB undo + ${MEMORY_PRESETS[local.memoryBudget].tileBudgetBytes / (1 << 20)} MB tiles + ${MEMORY_PRESETS[local.memoryBudget].geometryBudgetBytes / (1 << 20)} MB 3D geometry.`
             }>
             <Segmented
               ariaLabel="Memory budget"
@@ -640,7 +655,7 @@ export default function SettingsModal({
             <SliderRow label="" labelWidth={0} width={130}
               value={local.lookSensitivity} min={0.25} max={4} step={0.05}
               format={v => `${v.toFixed(2)}×`}
-              onChange={v => set("lookSensitivity", v)}
+              onChange={v => setLive("lookSensitivity", v)}
             />
           </SettingRow>
 
@@ -648,7 +663,7 @@ export default function SettingsModal({
             <SliderRow label="" labelWidth={0} width={130}
               value={local.dragSensitivity} min={0.25} max={4} step={0.05}
               format={v => `${v.toFixed(2)}×`}
-              onChange={v => set("dragSensitivity", v)}
+              onChange={v => setLive("dragSensitivity", v)}
             />
           </SettingRow>
 
@@ -684,50 +699,47 @@ export default function SettingsModal({
             <Check checked={local.showPerfHud} onChange={v => set("showPerfHud", v)} label="" title="3D performance HUD" />
           </SettingRow>
 
-          <SectionHeading>3D pane sliders</SectionHeading>
+          <SectionHeading>3D view sliders</SectionHeading>
 
-          <SettingRow label="Render distance">
-            <SliderRow label="" labelWidth={0} width={130}
-              value={local.renderDistance} min={RD_MIN} max={MAX_RENDER_DISTANCE} step={1}
-              format={v => `${Math.round(v)} chunks`}
-              onChange={v => set("renderDistance", Math.round(v))}
-            />
-          </SettingRow>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", columnGap: 24 }}>
+            <SliderCell label="Render distance" title="How many chunks around the camera are drawn">
+              <SliderRow label="" labelWidth={0} width={130}
+                value={local.renderDistance} min={RD_MIN} max={MAX_RENDER_DISTANCE} step={1}
+                format={v => `${Math.round(v)} chunks`}
+                onChange={v => setLive("renderDistance", Math.round(v))}
+              />
+            </SliderCell>
+            <SliderCell label="Fly speed">
+              <SliderRow label="" labelWidth={0} width={130}
+                value={local.flySpeed} min={0.1} max={3} step={0.1}
+                format={v => `${v.toFixed(1)}×`}
+                onChange={v => setLive("flySpeed", v)}
+              />
+            </SliderCell>
+            <SliderCell label="Sun angle">
+              <SliderRow label="" labelWidth={0} width={130}
+                value={local.sunT} min={0} max={1} step={0.01}
+                format={v => (v < 0.03 ? "sunrise" : v > 0.97 ? "sunset" : v === 0.5 ? "noon" : v.toFixed(2))}
+                onChange={v => setLive("sunT", v)}
+              />
+            </SliderCell>
+            <SliderCell label="Lamp radius">
+              <SliderRow label="" labelWidth={0} width={130}
+                value={local.lampRadius} min={2} max={32} step={1}
+                format={v => `${Math.round(v)} blocks`}
+                onChange={v => setLive("lampRadius", Math.round(v))}
+              />
+            </SliderCell>
+            <SliderCell label="Build reach" title="How far Build mode can break and place blocks">
+              <SliderRow label="" labelWidth={0} width={130}
+                value={local.buildReach} min={8} max={256} step={8}
+                format={v => `${Math.round(v)} blocks`}
+                onChange={v => setLive("buildReach", Math.round(v))}
+              />
+            </SliderCell>
+          </div>
 
-          <SettingRow label="Fly speed">
-            <SliderRow label="" labelWidth={0} width={130}
-              value={local.flySpeed} min={0.1} max={3} step={0.1}
-              format={v => `${v.toFixed(1)}×`}
-              onChange={v => set("flySpeed", v)}
-            />
-          </SettingRow>
-
-          <SettingRow label="Sun angle">
-            <SliderRow label="" labelWidth={0} width={130}
-              value={local.sunT} min={0} max={1} step={0.01}
-              format={v => (v < 0.03 ? "sunrise" : v > 0.97 ? "sunset" : v === 0.5 ? "noon" : v.toFixed(2))}
-              onChange={v => set("sunT", v)}
-            />
-          </SettingRow>
-
-          <SettingRow label="Lamp radius">
-            <SliderRow label="" labelWidth={0} width={130}
-              value={local.lampRadius} min={2} max={32} step={1}
-              format={v => `${Math.round(v)} blocks`}
-              onChange={v => set("lampRadius", Math.round(v))}
-            />
-          </SettingRow>
-
-          <SettingRow label="Build reach"
-            description="How far Build mode can break and place blocks">
-            <SliderRow label="" labelWidth={0} width={130}
-              value={local.buildReach} min={8} max={256} step={8}
-              format={v => `${Math.round(v)} blocks`}
-              onChange={v => set("buildReach", Math.round(v))}
-            />
-          </SettingRow>
-
-          <SettingRow last label="Lighting profile"
+          <SettingRow warn last label="Lighting profile"
             description="Legacy is short and steep, New Dawn long and gradual. Switching resets Lamp radius.">
             <Segmented
               ariaLabel="Lighting profile"
@@ -755,16 +767,31 @@ export default function SettingsModal({
             <Check checked={local.defaultSaveCompressed} onChange={v => set("defaultSaveCompressed", v)} label="" title="Save compressed by default" />
           </SettingRow>
 
-          <SettingRow last label="Compress backups" description="The first save over a file keeps a backup until you delete it. Compressed backups are much smaller but slower to make.">
+          <SettingRow warn last label="Compress backups" description="The first save over a file keeps a backup until you delete it. Compressed backups are much smaller but slower to make.">
             <Check checked={local.backupCompressed} onChange={v => set("backupCompressed", v)} label="" title="Compress backups" />
           </SettingRow>
 
+          <SectionHeading>Map navigation</SectionHeading>
+          <SettingRow last label="Scrolling"
+            description={`What two-finger scroll or the mouse wheel does on the map and in the Lens. Automatic pans with a trackpad and zooms with a mouse wheel. Pinch and ${IS_MAC ? "⌘" : "Ctrl"}-scroll always zoom.`}>
+            <Segmented
+              ariaLabel="Scrolling"
+              value={local.wheelMode}
+              onChange={v => set("wheelMode", v)}
+              options={[
+                { id: "auto", label: "Automatic" },
+                { id: "pan", label: "Pans" },
+                { id: "zoom", label: "Zooms" },
+              ]}
+            />
+          </SettingRow>
+
           <SectionHeading>Autosave</SectionHeading>
-          <SettingRow last label="Autosave interval" description="How often unsaved work is kept for recovery. 0 turns it off.">
+          <SettingRow warn last label="Autosave interval" description="How often unsaved work is kept for recovery. 0 turns it off.">
             <SliderRow label="" labelWidth={0} width={130}
               value={local.autosaveIntervalMin} min={0} max={15} step={1}
               format={v => (v === 0 ? "Off" : `${Math.round(v)} min`)}
-              onChange={v => set("autosaveIntervalMin", Math.round(v))}
+              onChange={v => setLive("autosaveIntervalMin", Math.round(v))}
             />
           </SettingRow>
         </>
@@ -795,7 +822,7 @@ export default function SettingsModal({
             <SliderRow label="" labelWidth={0} width={130}
               value={local.uiSoundVolume} min={0} max={1} step={0.05}
               format={v => `${Math.round(v * 100)}%`}
-              onChange={v => set("uiSoundVolume", v)}
+              onChange={v => setLive("uiSoundVolume", v)}
             />
           </SettingRow>
         </>
@@ -847,6 +874,18 @@ export default function SettingsModal({
         </>
       )}
     </Dialog>
+  );
+}
+
+/** One cell of the 3D tab's two-column slider grid: a 110 px label, then the slider + value field. */
+function SliderCell({ label, title, children }: { label: string; title?: string; children: ReactNode }) {
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 8, minHeight: 26, padding: "2px 0" }}>
+      <span title={title} style={{ width: 110, flexShrink: 0, fontSize: FONT.body, color: MODAL_TEXT.primary }}>
+        {label}
+      </span>
+      {children}
+    </div>
   );
 }
 

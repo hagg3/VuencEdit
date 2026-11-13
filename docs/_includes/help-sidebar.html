@@ -1,0 +1,18 @@
+<aside class="sidebar">
+  <h4>Help</h4>
+  <ul>
+    {% for d in site.data.docs %}
+      <li><a href="{{ d.url | relative_url }}"{% if page.url == d.url %} class="active"{% endif %}>{{ d.title }}</a></li>
+    {% endfor %}
+  </ul>
+  <h4>Tutorials</h4>
+  <ul>
+    {% for d in site.data.tutorials %}
+      <li><a href="{{ d.url | relative_url }}"{% if page.url == d.url %} class="active"{% endif %}>{{ d.title }}</a></li>
+    {% endfor %}
+  </ul>
+  <h4>Developers</h4>
+  <ul>
+    <li><a href="{{ '/docs/dev/' | relative_url }}">Developer reference</a></li>
+  </ul>
+</aside>

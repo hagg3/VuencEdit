@@ -2,20 +2,20 @@
   position: sticky;
   top: 0;
   z-index: 20;
-  height: $navbar-height;
-  background: $surface-topbar;
+  min-height: $navbar-height;
+  background: linear-gradient(180deg, lighten($surface-topbar, 5%) 0%, $surface-topbar 100%);
   border-bottom: 1px solid $border-outline;
   box-shadow: inset 0 -1px 0 $border-hairline;
 }
 
 .navbar-inner {
   max-width: $content-max-width;
-  height: 100%;
+  min-height: $navbar-height;
   margin: 0 auto;
-  padding: 0 20px;
+  padding: 0 16px;
   display: flex;
   align-items: center;
-  gap: 22px;
+  gap: 14px;
 }
 
 .brand {
@@ -26,14 +26,14 @@
 }
 
 .brand img {
-  width: 24px;
-  height: 24px;
-  border-radius: 6px;
+  width: 20px;
+  height: 20px;
+  border-radius: 3px;
   display: block;
 }
 
 .brand-wordmark {
-  font-size: 16px;
+  font-size: 15px;
   letter-spacing: -0.2px;
 }
 
@@ -54,8 +54,8 @@
   text-transform: uppercase;
   color: #2a1c08;
   background: $accent-warm;
-  border-radius: 999px;
-  padding: 2px 8px;
+  border-radius: 3px;
+  padding: 1px 6px;
   margin-left: 2px;
 }
 
@@ -66,16 +66,22 @@
   flex: 1;
 }
 
+.nav-links {
+  align-self: flex-end;
+}
+
 .nav-links a {
   display: inline-flex;
   align-items: center;
-  height: $navbar-height;
+  height: $navbar-height - 8px;
   padding: 0 12px;
-  font-size: 13px;
-  font-weight: 600;
+  font-size: 12px;
+  font-weight: 700;
   color: $text-dim;
   text-decoration: none;
-  border-bottom: 2px solid transparent;
+  border: 1px solid transparent;
+  border-bottom: 0;
+  border-radius: 3px 3px 0 0;
 }
 
 .nav-links a:hover {
@@ -85,7 +91,11 @@
 
 .nav-links a.active {
   color: #fff;
-  border-bottom-color: $accent-primary;
+  background: $surface-body-bot;
+  border-color: $border-outline;
+  box-shadow: inset 0 1px 0 $accent-primary, inset 0 2px 0 $border-bevel;
+  margin-bottom: -1px;
+  height: $navbar-height - 7px;
 }
 
 .nav-gh {
@@ -110,57 +120,10 @@
   fill: currentColor;
 }
 
-.beta-strip {
-  height: $beta-strip-height;
-  background: rgba($accent-warm, 0.16);
-  border-bottom: 1px solid rgba($accent-warm, 0.35);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-}
-
-.beta-strip-inner {
-  font-size: 12px;
-  color: #f0c98a;
-  text-align: center;
-  padding: 0 16px;
-}
-
-.beta-strip-inner strong {
-  color: #ffd699;
-  font-weight: 700;
-}
-
-// Mobile: collapse nav links to a smaller, scrollable row rather than a hamburger — five
-// items fit even on a narrow phone at this font size.
-@media (max-width: 640px) {
-  .navbar-inner {
-    gap: 12px;
-    padding: 0 12px;
-  }
-
-  .brand-wordmark {
-    font-size: 14px;
-  }
-
-  .nav-links {
-    gap: 0;
-    overflow-x: auto;
-    -ms-overflow-style: none;
-    scrollbar-width: none;
-  }
-
-  .nav-links::-webkit-scrollbar {
-    display: none;
-  }
-
-  .nav-links a {
-    padding: 0 8px;
-    font-size: 12px;
-    white-space: nowrap;
-  }
-
-  .nav-gh span {
-    display: none;
-  }
+@media (max-width: $phone) {
+  .navbar-inner { gap: 8px; padding: 4px 8px 0; flex-wrap: wrap; }
+  .brand-wordmark { font-size: 14px; }
+  .nav-links { order: 3; flex-basis: 100%; flex-wrap: wrap; gap: 0; }
+  .nav-links a { padding: 0 8px; }
+  .nav-gh span { display: none; }
 }

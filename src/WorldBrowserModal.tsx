@@ -299,12 +299,12 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
   const selectedResult = results.find(r => r.id === selectedId) ?? null;
 
   const fl: React.CSSProperties = {
-    fontSize: 9, color: MODAL_TEXT.secondary, textTransform: "uppercase",
+    fontSize: FONT.nano, color: MODAL_TEXT.secondary, textTransform: "uppercase",
     letterSpacing: "0.06em", fontWeight: 600,
   };
   const fi: React.CSSProperties = {
     ...recessedWell,
-    color: MODAL_TEXT.primary, borderRadius: 5, padding: "3px 7px", fontSize: 11,
+    color: MODAL_TEXT.primary, borderRadius: 5, padding: "3px 7px", fontSize: FONT.label,
     colorScheme: "dark",
   } as React.CSSProperties;
 
@@ -347,7 +347,7 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
                 color: MODAL_TEXT.primary,
                 borderRadius: 6,
                 padding: "5px 10px",
-                fontSize: 13,
+                fontSize: FONT.tab,
                 outline: "none",
               }}
             />
@@ -385,12 +385,12 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
                 background: sortBy === m.key ? rgba(ACCENTS.primary, 0.15) : "transparent",
                 border: "1px solid " + (sortBy === m.key ? TEAL_LIGHT : "transparent"),
                 color: sortBy === m.key ? TEAL_LIGHT : MODAL_TEXT.label,
-                padding: "2px 7px", borderRadius: 5, cursor: "pointer", fontSize: 11,
+                padding: "2px 7px", borderRadius: 5, cursor: "pointer", fontSize: FONT.label,
                 display: "flex", alignItems: "center", gap: 4,
               }}>
                 {m.label}
                 {m.key === "quality" && (
-                  <span style={expBadge({ fontSize: 9 })}>exp</span>
+                  <span style={expBadge({ fontSize: FONT.nano })}>exp</span>
                 )}
               </button>
             ))}
@@ -410,12 +410,12 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
               <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
                 <span style={fl}>Date</span>
                 <input type="date" value={fromDate} onChange={e => setFromDate(e.target.value)} style={fi} />
-                <span style={{ color: MODAL_TEXT.secondary, fontSize: 11 }}>→</span>
+                <span style={{ color: MODAL_TEXT.secondary, fontSize: FONT.label }}>→</span>
                 <input type="date" value={toDate} onChange={e => setToDate(e.target.value)} style={fi} />
               </div>
               <Check
                 checked={hideJunk} onChange={setHideJunk}
-                label={<><span style={fl}>Hide junk</span><span style={expBadge({ fontSize: 9, marginLeft: 5 })}>exp</span></>}
+                label={<><span style={fl}>Hide junk</span><span style={expBadge({ fontSize: FONT.nano, marginLeft: 5 })}>exp</span></>}
               />
               {activeFilters > 0 && (
                 <DialogButton
@@ -431,7 +431,7 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
 
         {/* Filter count */}
         {results.length > 0 && filteredResults.length !== results.length && (
-          <div style={{ fontSize: 11, color: MODAL_TEXT.label, textAlign: "right" }}>
+          <div style={{ fontSize: FONT.label, color: MODAL_TEXT.label, textAlign: "right" }}>
             Showing {filteredResults.length} of {results.length}
           </div>
         )}
@@ -442,7 +442,7 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
           {/* Results table */}
           <div style={{ flex: 1, overflowY: "auto", boxShadow: "inset 0 0 0 1px rgba(0,0,0,.4)", borderRadius: 6, minWidth: 0, minHeight: 200 }}>
             {filteredResults.length > 0 ? (
-              <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+              <table style={{ width: "100%", borderCollapse: "collapse", fontSize: FONT.tab }}>
                 <thead>
                   <tr style={{ background: RAMP.modal1, borderBottom: `1px solid ${RAMP.mbtn1}`, position: "sticky", top: 0, zIndex: 1 }}>
                     <th style={{ textAlign: "left", padding: "6px 10px", color: MODAL_TEXT.secondary, fontWeight: 600 }}>Name</th>
@@ -474,7 +474,7 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
                 </tbody>
               </table>
             ) : (
-              <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: 120, color: MODAL_TEXT.secondary, fontSize: 13 }}>
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: 120, color: MODAL_TEXT.secondary, fontSize: FONT.tab }}>
                 {searching ? "Searching…" :
                  browsing || featuredLoading ? "Loading worlds…" :
                  results.length > 0 ? "No results match your filters" :
@@ -515,7 +515,7 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
                     <circle cx="8.5" cy="8.5" r="1.5"/>
                     <polyline points="21 15 16 10 5 21"/>
                   </svg>
-                  <span style={{ fontSize: 11, color: MODAL_TEXT.secondary }}>
+                  <span style={{ fontSize: FONT.label, color: MODAL_TEXT.secondary }}>
                     {previewStatus === "error" ? "No preview available" : "No world selected"}
                   </span>
                 </div>
@@ -562,22 +562,22 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
             }}>
               {selectedResult ? (
                 <>
-                  <div style={{ fontSize: 13, fontWeight: 600, color: MODAL_TEXT.primary, lineHeight: 1.3, wordBreak: "break-word" }}>
+                  <div style={{ fontSize: FONT.tab, fontWeight: 600, color: MODAL_TEXT.primary, lineHeight: 1.3, wordBreak: "break-word" }}>
                     {selectedResult.name}
                   </div>
 
                   <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-                    <span style={{ fontSize: 9, color: MODAL_TEXT.secondary, textTransform: "uppercase", letterSpacing: "0.06em", fontWeight: 600 }}>Date</span>
-                    <span style={{ fontSize: 12, color: MODAL_TEXT.secondary }}>{formatDate(selectedResult.timestamp)}</span>
+                    <span style={{ fontSize: FONT.nano, color: MODAL_TEXT.secondary, textTransform: "uppercase", letterSpacing: "0.06em", fontWeight: 600 }}>Date</span>
+                    <span style={{ fontSize: FONT.body, color: MODAL_TEXT.secondary }}>{formatDate(selectedResult.timestamp)}</span>
                   </div>
 
                   <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-                    <span style={{ fontSize: 9, color: MODAL_TEXT.secondary, textTransform: "uppercase", letterSpacing: "0.06em", fontWeight: 600 }}>ID</span>
-                    <span style={{ fontSize: 11, color: MODAL_TEXT.label, fontVariantNumeric: "tabular-nums" }}>{selectedResult.id}</span>
+                    <span style={{ fontSize: FONT.nano, color: MODAL_TEXT.secondary, textTransform: "uppercase", letterSpacing: "0.06em", fontWeight: 600 }}>ID</span>
+                    <span style={{ fontSize: FONT.label, color: MODAL_TEXT.label, fontVariantNumeric: "tabular-nums" }}>{selectedResult.id}</span>
                   </div>
                 </>
               ) : (
-                <div style={{ fontSize: 12, color: MODAL_TEXT.secondary, textAlign: "center", marginTop: 8 }}>
+                <div style={{ fontSize: FONT.body, color: MODAL_TEXT.secondary, textAlign: "center", marginTop: 8 }}>
                   Select a world to see details
                 </div>
               )}
@@ -589,7 +589,7 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
                 variant="primary"
                 onClick={() => startDownload(false)}
                 disabled={!selectedId || downloading}
-                style={{ width: "100%", fontSize: 13 }}
+                style={{ width: "100%", fontSize: FONT.tab }}
               >
                 Save to File
               </DialogButton>
@@ -621,7 +621,7 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
                       transition: "width 0.2s",
                     }} />
                   </div>
-                  <span style={{ color: MODAL_TEXT.secondary, fontSize: 11, whiteSpace: "nowrap" }}>
+                  <span style={{ color: MODAL_TEXT.secondary, fontSize: FONT.label, whiteSpace: "nowrap" }}>
                     {downloadProgress.total
                       ? `${(downloadProgress.downloaded / 1_048_576).toFixed(1)} / ${(downloadProgress.total / 1_048_576).toFixed(1)} MB`
                       : `${(downloadProgress.downloaded / 1_048_576).toFixed(1)} MB`}
@@ -630,7 +630,7 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
               )}
 
               {error && (
-                <span style={{ color: RED_LIGHT, fontSize: 11 }}>{error}</span>
+                <span style={{ color: RED_LIGHT, fontSize: FONT.label }}>{error}</span>
               )}
             </div>
 

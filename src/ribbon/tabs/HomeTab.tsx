@@ -11,8 +11,8 @@ import { tabMetrics, specWidth, solveRow } from "../specs";
 import { useRibbon } from "../context";
 import BlockButton from "../BlockButton";
 import { Cmd, CmdDropdown, CmdMenuItem, CmdSmall } from "../Cmd";
-import { Col, Group, GroupDivider, MenuSeparator, MoreChevron } from "../primitives";
-import { GROUP_CONTENT_H, ROW_GAP } from "../tokens";
+import { Col, Group, GroupDivider, MenuSeparator, MoreChevron, Row } from "../primitives";
+import { GROUP_CONTENT_H, ROW_GAP, SMALL_H } from "../tokens";
 
 /** Declared widths feed the pure solver (`ribbon/specs.ts`); the dev-mode `ResizeObserver` in `Group` warns on drift. */
 const SPECS = tabMetrics("home");
@@ -71,7 +71,10 @@ export default function HomeTab() {
         <Col style={{ justifyContent: "center", height: GROUP_CONTENT_H }}>
           <CmdSmall id="home.selection.grow" full />
           <CmdSmall id="home.selection.shrink" full />
-          <CmdSmall id="home.selection.clear" full />
+          <Row style={{ height: SMALL_H }}>
+            <CmdSmall id="home.selection.clear" full />
+            <CmdSmall id="selection.modify.selectAll" full iconOnly />
+          </Row>
         </Col>
       </Group>
       <GroupDivider />

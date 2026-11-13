@@ -305,7 +305,7 @@ impl Drop for RasterRow<'_> {
 // fails a load; it is a cache.
 //
 // Layout (little-endian):
-//   "VXR1" · format u32 · len u64 · mtime_ns u64 · file_id (u64, u64)
+//   "VXR1" · format u32 · len u64 · mtime_ns u64 · file_id (u64, u64) · content u64
 //   num_bands u32 · min_x i32 · min_y i32 · w u32 · h u32 · chunks u32 · g u32
 //   path_len u32 · path bytes (the source, for the startup sweep)
 //   payload_len u64 · crc32(payload) u32 · payload = deflate(entries)
@@ -319,7 +319,7 @@ use std::sync::{Mutex, OnceLock};
 const MAGIC: &[u8; 4] = b"VXR1";
 /// ⚠️ Bump on **any** change to what a cell means — `voxel_core::render`'s column scan semantics,
 /// the cell layout here, or slot assignment. A stale format would render the old meaning silently.
-const FORMAT: u32 = 1;
+const FORMAT: u32 = 2;
 /// The whole store is kept under this (oldest `.vxr` by mtime evicted first).
 const STORE_CAP_BYTES: u64 = 256 << 20;
 
@@ -355,6 +355,8 @@ struct Key {
     len: u64,
     mtime_ns: u64,
     file_id: (u64, u64),
+    /// `FileIdentity::content` (a zip entry's CRC-32 + size; 0 otherwise).
+    content: u64,
     num_bands: u32,
     min_x: i32,
     min_y: i32,
@@ -367,7 +369,7 @@ struct Key {
 impl Key {
     fn of(world: &LoadedWorld, r: &OverviewRaster, id: &FileIdentity) -> Self {
         Key {
-            len: id.len, mtime_ns: id.mtime_ns, file_id: id.file_id,
+            len: id.len, mtime_ns: id.mtime_ns, file_id: id.file_id, content: id.content,
             num_bands: world.num_bands as u32,
             min_x: r.min_x, min_y: r.min_y, w: r.w, h: r.h,
             chunks: r.valid.len() as u32, g: r.g,
@@ -419,7 +421,7 @@ impl PersistJob {
         let mut out = Vec::with_capacity(payload.len() + 128 + path_bytes.len());
         out.extend_from_slice(MAGIC);
         for v in [FORMAT] { out.extend_from_slice(&v.to_le_bytes()); }
-        for v in [k.len, k.mtime_ns, k.file_id.0, k.file_id.1] { out.extend_from_slice(&v.to_le_bytes()); }
+        for v in [k.len, k.mtime_ns, k.file_id.0, k.file_id.1, k.content] { out.extend_from_slice(&v.to_le_bytes()); }
         out.extend_from_slice(&k.num_bands.to_le_bytes());
         out.extend_from_slice(&k.min_x.to_le_bytes());
         out.extend_from_slice(&k.min_y.to_le_bytes());
@@ -464,7 +466,7 @@ fn read_header(r: &mut impl Read) -> Option<Header> {
     let mut magic = [0u8; 4];
     r.read_exact(&mut magic).ok()?;
     if &magic != MAGIC || u32_(r)? != FORMAT { return None; }
-    let (len, mtime_ns, f0, f1) = (u64_(r)?, u64_(r)?, u64_(r)?, u64_(r)?);
+    let (len, mtime_ns, f0, f1, content) = (u64_(r)?, u64_(r)?, u64_(r)?, u64_(r)?, u64_(r)?);
     let num_bands = u32_(r)?;
     let (min_x, min_y) = (u32_(r)? as i32, u32_(r)? as i32);
     let (w, h, chunks, g, path_len) = (u32_(r)?, u32_(r)?, u32_(r)?, u32_(r)?, u32_(r)?);
@@ -473,7 +475,7 @@ fn read_header(r: &mut impl Read) -> Option<Header> {
     r.read_exact(&mut p).ok()?;
     let (payload_len, crc) = (u64_(r)?, u32_(r)?);
     Some(Header {
-        key: Key { len, mtime_ns, file_id: (f0, f1), num_bands, min_x, min_y, w, h, chunks, g },
+        key: Key { len, mtime_ns, file_id: (f0, f1), content, num_bands, min_x, min_y, w, h, chunks, g },
         source: PathBuf::from(String::from_utf8(p).ok()?),
         payload_len, crc,
     })
@@ -582,7 +584,7 @@ mod tests {
     use crate::tests::ws_with;
     use crate::{
         parse_world_inner, render_pixels_patch_styled, with_edit, undo_edit_inner, redo_edit_inner,
-        paste_clipboard_at, sculpt_terrain_inner, WorldState, AppState, DiskImage, FileIdentity,
+        paste_clipboard_at, sculpt_terrain_inner, WorldState, AppState, DiskImage, FileIdentity, BaseStatus,
         read_ws, save_world_progress, record_full_write, overview_job_after_save,
         overview_persist_candidate,
     };
@@ -984,6 +986,29 @@ mod tests {
         w2.invalidate_derived(&[(1, 1)]);
         let _ = render_pixels_patch_styled(&w2, 0, 0, 63, 63, MapStyle::default(), 2);
         assert!(PersistJob::capture(&w2, &id2, false).is_some(), "a refill is worth persisting");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 31.7: a zip world is keyed on the archive's stat plus the entry's content fingerprint — the
+    /// same fingerprint preloads, a different one (the archive's entry was replaced) is dropped.
+    #[test]
+    fn test_overview_zip_content_fingerprint_keys_the_entry() {
+        let dir = scratch_dir("zipkey");
+        let store = dir.join("store");
+        let budget = DEFAULT_OVERVIEW_BUDGET;
+        let (state, dest) = saved_world(&dir, budget);
+        let (mut w2, mut id) = reload(&dest);
+        id.content = 0xDEAD_BEEF_0000_1234;
+        w2.ensure_overview(budget).unwrap();
+        let _ = render_pixels_patch_styled(&w2, 0, 0, 63, 63, MapStyle::default(), 2);
+        PersistJob::capture(&w2, &id, true).expect("filled").write(&store).unwrap();
+        assert_eq!(id.check(), BaseStatus::Ok, "check() ignores the content fingerprint");
+        let (w3, _) = reload(&dest);
+        assert!(preload(&w3, &id, budget, &store).is_some(), "same fingerprint preloads");
+        let mut other = id.clone();
+        other.content ^= 1;
+        assert!(preload(&w3, &other, budget, &store).is_none(), "a different entry CRC/size is stale");
+        drop(state);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

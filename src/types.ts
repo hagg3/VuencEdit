@@ -331,7 +331,7 @@ export interface ClipboardInfo {
 }
 
 export type ExtrudeAxis = "z+" | "z-" | "x+" | "x-" | "y+" | "y-";
-export type TreeType = "normal" | "terrain" | "pine" | "tall_pine";
+export type LongOpKind = "png" | "save" | "autosave";
 
 // ---- Signs (256z-format plan, Phase 4) ----
 

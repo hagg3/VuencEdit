@@ -6,10 +6,10 @@
   text: "Draw tools, selections, the Lens, the Insert tab and terrain sculpting."
 - title: "Layout & 3D View"
   url: /docs/layout-and-3d/
-  text: "The floating windows, the 3D view, cutaway, and building in 3D."
+  text: "Floating windows, the options bar, the 3D view, cutaway, and building in 3D."
 - title: "Prefabs & Clipboard"
   url: /docs/prefabs-and-clipboard/
   text: "Copy and paste, paste modes, and the prefab library."
 - title: "World Compatibility"
   url: /docs/world-compatibility/
-  text: "Legacy64z, New Dawn 256z and NewFormat256z, and what each means."
+  text: "Legacy64z, New Dawn 256z and NewFormat256z, signs, command blocks and .emod files."

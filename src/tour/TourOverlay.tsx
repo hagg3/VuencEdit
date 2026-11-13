@@ -241,7 +241,7 @@ export default function TourOverlay({
             ))}
           </div>
         </div>
-        <div id="eden-tour-title" style={{ fontSize: 14, fontWeight: 700, marginBottom: 6 }}>{step.title}</div>
+        <div id="eden-tour-title" style={{ fontSize: FONT.heading, fontWeight: 700, marginBottom: 6 }}>{step.title}</div>
         <div style={{ color: TEXT_DIM, lineHeight: 1.5, marginBottom: SPACE.lg + 6 }}>{step.body}</div>
         <div style={{ display: "flex", alignItems: "center", gap: SPACE.sm }}>
           <button type="button" onClick={() => onClose(false)}

@@ -2464,24 +2464,6 @@ pub(crate) fn tg2_make_classic_gen(g: &mut Tg2Grid, noise: &ClassicNoise, seed: 
 }
 
 // Structures
-pub(crate) fn tg2_make_pyramid(g: &mut Tg2Grid, cx: i32, cz: i32, h: i32) {
-    let th=g.t_height as i32;
-    let starty=th-1; let mut found=false;
-    'f: while starty>5 {
-        for sx in (cx-h)..cx+h { for sz in (cz-h)..cz+h {
-            let bt=g.get(sx,sz,starty);
-            if bt!=4{if bt!=0{return;}found=false;break 'f;}
-        }}
-        found=true; break;
-    }
-    if !found { return; }
-    let mut r=h;
-    for y in starty..starty+h {
-        if y>th-8 { break; }
-        for sx in (cx-r)..cx+r { for sz in (cz-r)..cz+r { g.put(sx,sz,y,14,0); } }
-        r-=1;
-    }
-}
 pub(crate) fn tg2_make_pyramid2(g: &mut Tg2Grid, cx: i32, cz: i32, h: i32, _color: u8, sy: i32) {
     let th=g.t_height as i32;
     let starty=if sy==-1 {

@@ -6,7 +6,9 @@ subtitle: Open a world, move around, and make your first edit.
 
 ## Opening a world
 
-The splash screen has four ways in. **New** makes a world from one of four generators. **Open** loads a `.eden` or `.eden.zip` from disk. **Browse** searches and downloads from the Eden community servers. Once you've opened a few worlds, a Recent Worlds list shows up too. Settings and About are in the same column.
+The splash screen has four ways in. **New** makes a world from one of four generators. **Open** loads a `.eden`, `.eden.zip` or `.emod` from disk. **Download** browses and downloads from the Eden community servers. Once you've opened a few worlds, a Recent Worlds list shows up too. Settings and About are in the same column.
+
+An `.emod` file opens through a private copy and saves back into the same file. The game can't open `.emod`, so use Save As for a `.eden` you can play.
 
 The first time you load a world, a short guided tour points out the main parts of the window. <kbd>Esc</kbd> skips it, and the Guided Tour entry in the application menu replays it.
 
@@ -15,16 +17,18 @@ The first time you load a world, a short guided tour points out the main parts o
 You get a top-down, colour-coded map. Every block type has its own colour, and painted blocks are tinted to match.
 
 - **Middle-drag**, or hold <kbd>Space</kbd> and drag, to pan.
-- **Scroll** to zoom toward the cursor.
+- **Scroll** zooms toward the cursor with a mouse wheel. With a trackpad, two-finger scroll pans and pinch zooms. Settings ▸ Editor ▸ Scrolling overrides the detection.
 - <kbd>Home</kbd> or <kbd>⌘0</kbd> fits the whole world in the window.
 
 The 3D view, a Tools window and a Hotbar float over the map. You can move, resize, collapse or hide them. The [Layout & 3D View]({{ '/docs/layout-and-3d/' | relative_url }}) page covers them.
 
-The ribbon along the top has Home, Draw, Sculpt, Insert and View tabs. A 3D tab appears when the 3D window is open, a Selection tab when you have a selection, and a Clipboard tab when something is copied. If you can't find a command, <kbd>⌘K</kbd> (<kbd>Ctrl+K</kbd> on Windows and Linux) searches all of them.
+The ribbon along the top has Home, Draw, Sculpt, Insert and View tabs. A 3D tab appears when the 3D window is open, a Selection tab when you have a selection, and a Clipboard tab when something is copied. Under the ribbon, the options bar shows the settings for the tool you're using: brush size, fill or hollow, the paste options, the cutaway height. It's always one row, and what doesn't fit folds into a ⋯ menu. On a Mac the menu bar at the top of the screen has the same commands.
+
+If you can't find a command, <kbd>⌘K</kbd> (<kbd>Ctrl+K</kbd> on Windows and Linux) searches all of them.
 
 ## Your first edit
 
-1. Pick a block and paint from the Block button, or press a hotbar key (<kbd>1</kbd> to <kbd>5</kbd> pinned, <kbd>6</kbd> to <kbd>0</kbd> recent).
+1. Pick a block and paint from the Block button (it has a search box), or press a hotbar key (<kbd>1</kbd> to <kbd>5</kbd> pinned, <kbd>6</kbd> to <kbd>0</kbd> recent).
 2. Choose a tool: Pen (<kbd>P</kbd>) for single blocks, Brush (<kbd>B</kbd>) for a bigger footprint, or Rectangle (<kbd>R</kbd>) and Ellipse (<kbd>E</kbd>) for shapes.
 3. Click or drag on the map.
 4. <kbd>⌘Z</kbd> (<kbd>Ctrl+Z</kbd>) undoes it. The History tab in the sidebar lists the steps. A held stroke undoes as one step no matter how long you held the mouse down.

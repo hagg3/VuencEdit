@@ -382,3 +382,22 @@ export function resolveColor(blockType: number, paintByte: number): readonly [nu
   if (newFormat) return newFormat.color;
   return [128, 128, 128];
 }
+
+/** Block-picker text filter (U-16): every pickable block whose display name contains `query`
+ *  (case-insensitive), in picker order. Wedges only in fill mode, new-format only when allowed.
+ *  Empty/blank query → []. The first entry is what Enter picks. */
+export function searchBlocks(
+  query: string, opts: { includeWedges?: boolean; includeNewFormat?: boolean } = {},
+): { type: number; name: string }[] {
+  const q = query.trim().toLowerCase();
+  if (!q) return [];
+  const pool: { type: number; name: string }[] = [
+    ...BLOCK_DEFS.map(b => ({ type: b.type, name: blockDisplayName(b.type) })),
+    ...(opts.includeWedges ? WEDGE_FAMILIES.map(w => ({ type: w.base, name: w.name })) : []),
+    ...PARTIAL_WATER, ...PARTIAL_LAVA, ...SPECIAL_BLOCKS,
+    ...(opts.includeNewFormat ? NEW_FORMAT_BLOCKS : []),
+  ];
+  const seen = new Set<number>();
+  return pool.filter(b => b.name.toLowerCase().includes(q) && !seen.has(b.type) && seen.add(b.type))
+    .map(b => ({ type: b.type, name: b.name }));
+}

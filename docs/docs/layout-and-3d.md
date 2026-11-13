@@ -4,8 +4,6 @@ title: Layout & 3D View
 subtitle: Floating windows, the 3D pane, and building in 3D.
 ---
 
-An older beta had a four-pane "quad view" with front and side slices. It's gone. If you had it on, VuencEdit moves you to the layout below and shows a one-time notice.
-
 ## The layout
 
 The map fills the work area. Four things float over it:
@@ -23,15 +21,19 @@ The sidebar on the right is a separate dock, toggled from View ▸ Windows. It h
 
 {% include placeholder.html caption="The default layout with the 3D, Tools and Hotbar windows floating over the map" ratio="16/9" %}
 
-### Mode panels
+### Options bar
 
-Some modes get their own small panel next to your work instead of crowding the ribbon. They appear when the mode is on and the ✕ leaves the mode:
+A single 30 px row under the ribbon holds the settings for whatever you're doing. It never scrolls or changes height, and anything that doesn't fit folds into a ⋯ menu. What it shows depends on the context:
 
-- the cutaway or Z-slice level, with a Follow surface option
-- the brush shape for Noise, Slope, Rock and Carve
-- the Flood Fill limit and the 3D build block
-- the 3D sculpt brush
+- **Pasting**: confirm or unlock, the height offset, rotate, flip, Skip air, Repeat and Discard.
+- **Sculpting** (on the map or in 3D): a tool picker and the brush sliders. Rock and Carve add a Shape menu.
+- **Drawing**: size, shape, fill or hollow, and height where they apply.
+- **Selection**: Copy, Cut, Fill, Delete and Deselect.
+- **3D Flood Fill**: the fill limit.
 
+The cutaway or Z-slice level sits at the right end of the bar whenever either is on, with a Follow surface option for Z-slice. The ✕ there returns to Top-down.
+
+On a Mac, the menu bar at the top of the screen lists the same commands as the ribbon, with the same shortcuts.
 ## Cutaway and Z-slice
 
 Both live under View ▸ Map view. Z-slice shows a single horizontal layer. Cutaway hides everything above the cap you set, in both the map and the 3D view, so you can work inside a cave or a house without the roof in the way. Drawing, sculpting and the eyedropper act on the surface you can see at the cap, not on what's hidden above it.

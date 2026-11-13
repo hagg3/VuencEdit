@@ -44,14 +44,6 @@ export const CUE_IDS = [
 ] as const;
 export type CueId = (typeof CUE_IDS)[number];
 
-/** Human-readable label for each cue, used only by the (currently unshipped) per-cue byte-budget
- *  table the source mock carried — kept here as the one place a call site could look one up. */
-export const CUE_LABELS: Record<CueId, string> = {
-  tab: "Tab open", menu: "Menu open", copy: "Copy", paste: "Paste", rotate: "Rotate",
-  save: "Save", stroke: "Sculpt stroke end", undo: "Undo", drag: "Drag start (marquee)",
-  drop: "Drag release", error: "Error", nudge: "Paste Z-offset step",
-};
-
 /** A quiet **tick loop** that plays for as long as a gesture is held (window move/resize, selection
  *  drag, paste-ghost drag) — a dry, low, skeuomorphic click repeating like a classic desktop window
  *  drag, not a drone. Each tick is the `voices` burst (offsets `t` relative to the tick). Ticks are

@@ -222,7 +222,6 @@ pub(crate) struct SpanRef<'a> {
 }
 
 impl SpanRef<'_> {
-    #[allow(dead_code)]
     pub(crate) fn is_header(&self) -> bool {
         !self.tail && (self.cx, self.cy) == HEADER_SPAN
     }
@@ -547,11 +546,6 @@ impl<W: Write> JournalWriter<W> {
         &mut self.inner
     }
 
-    /// Unused by Stage 3, whose writers are dropped (closing the file) rather than unwrapped.
-    #[allow(dead_code)]
-    pub(crate) fn into_inner(self) -> W {
-        self.inner
-    }
 }
 
 #[cfg(test)]

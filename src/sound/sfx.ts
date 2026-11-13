@@ -229,17 +229,5 @@ export function preview(cue: CueId, pack: PackId, volume: number) {
   synth(pack, cue, volume);
 }
 
-/** Test-only: restores the module to its just-imported state (fresh settings, dropped context,
- *  zeroed counters). Vitest here is node-environment and never actually constructs an
- *  `AudioContext`, but this keeps the module usable by a future DOM-environment test file without
- *  cross-test leakage. */
-export function _resetForTests() {
-  settings = { enabled: true, pack: "classic", volume: 0.8 };
-  ctx = null;
-  noiseBuf = null;
-  for (const k of Object.keys(lastFireAt)) delete lastFireAt[k as CueId];
-  activeHolds.clear();
-  debugCounters.contextsCreated = 0;
-}
 
 export const sfx = { play, hold, preview, previewHold, configure, debugCounters };

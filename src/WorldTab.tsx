@@ -21,6 +21,7 @@ import {
 } from "./bookmarks";
 import { selectionVolume, filterSigns, sortSigns, signDistance, type SignSort } from "./worldNav";
 import { MAP } from "./theme/theme";
+import { FONT } from "./ribbon/tokens";
 
 export interface WorldTabProps {
   /** Sidebar tab is always mounted, unlike the old floating panel which only mounted while a
@@ -57,7 +58,7 @@ const panelStyle: React.CSSProperties = {
   display: "flex",
   flexDirection: "column",
   gap: 2,
-  fontSize: 12,
+  fontSize: FONT.body,
   color: TEXT,
   userSelect: "none",
 };
@@ -102,7 +103,7 @@ function SignsBody({ signs, viewCenter, worldCentre, onGoTo }: {
   const hiddenCount = sorted.length - visible.length;
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: SPACE.sm, fontSize: 11 }}>
+    <div style={{ display: "flex", flexDirection: "column", gap: SPACE.sm, fontSize: FONT.label }}>
       {/* Typing here is safe: App's global shortcuts bail on `isTypingTarget`. */}
       <TextField
         value={query} onChange={setQuery} ariaLabel="Search signs" placeholder="Search signs…"
@@ -120,7 +121,7 @@ function SignsBody({ signs, viewCenter, worldCentre, onGoTo }: {
         )}
       </div>
       {query.trim() && (
-        <div style={{ color: TEXT_META, fontSize: 10 }}>{sorted.length} of {signs.length} match</div>
+        <div style={{ color: TEXT_META, fontSize: FONT.micro }}>{sorted.length} of {signs.length} match</div>
       )}
       {visible.map((s, i) => (
         <div key={`${s.x},${s.y},${s.z},${i}`}
@@ -137,7 +138,7 @@ function SignsBody({ signs, viewCenter, worldCentre, onGoTo }: {
           <div style={{ color: TEXT, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
             {s.text || <span style={{ color: TEXT_META, fontStyle: "italic" }}>(empty)</span>}
           </div>
-          <div style={{ color: TEXT_LABEL, fontSize: 10, marginTop: 2, fontFamily: PROP_MONO }}>
+          <div style={{ color: TEXT_LABEL, fontSize: FONT.micro, marginTop: 2, fontFamily: PROP_MONO }}>
             ({Math.round(s.x)}, {Math.round(s.y)}, {s.z}) · {Math.round(signDistance(s, centre)).toLocaleString()} blocks · facing {s.c}
           </div>
         </div>
@@ -150,7 +151,7 @@ function SignsBody({ signs, viewCenter, worldCentre, onGoTo }: {
           onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setShowAll(v => !v); } }}
           style={{
             textAlign: "center", padding: "3px 0", cursor: "pointer", userSelect: "none",
-            color: TEXT_LABEL, fontSize: 10,
+            color: TEXT_LABEL, fontSize: FONT.micro,
           }}
         >
           {showAll ? "Show less" : `Show ${hiddenCount} more…`}
@@ -196,14 +197,14 @@ function CmdsBody({ records, viewCenter, worldCentre, onGoTo }: {
   ].filter(Boolean).join(" and ");
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: SPACE.sm, fontSize: 11 }}>
+    <div style={{ display: "flex", flexDirection: "column", gap: SPACE.sm, fontSize: FONT.label }}>
       {records.status === "opaque" && (
-        <div style={{ color: TEXT_META, fontSize: 10 }}>
+        <div style={{ color: TEXT_META, fontSize: FONT.micro }}>
           This world's record data is kept as is and can't be read or edited{records.why ? `: ${records.why}` : "."}
         </div>
       )}
       {adoptedParts && (
-        <div style={{ color: TEXT_META, fontSize: 10 }}>
+        <div style={{ color: TEXT_META, fontSize: FONT.micro }}>
           {adoptedParts} came from the game's side files and will be saved into this world.
         </div>
       )}
@@ -228,7 +229,7 @@ function CmdsBody({ records, viewCenter, worldCentre, onGoTo }: {
             )}
           </div>
           {query.trim() && (
-            <div style={{ color: TEXT_META, fontSize: 10 }}>{sorted.length} of {cmds.length} match</div>
+            <div style={{ color: TEXT_META, fontSize: FONT.micro }}>{sorted.length} of {cmds.length} match</div>
           )}
           {visible.map((c) => (
             <div key={`${c.i}`}
@@ -245,7 +246,7 @@ function CmdsBody({ records, viewCenter, worldCentre, onGoTo }: {
               <div style={{ color: TEXT, fontFamily: PROP_MONO, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                 {scriptPreview(c.script) || <span style={{ color: TEXT_META, fontStyle: "italic" }}>(empty)</span>}
               </div>
-              <div style={{ color: TEXT_LABEL, fontSize: 10, marginTop: 2, fontFamily: PROP_MONO }}>
+              <div style={{ color: TEXT_LABEL, fontSize: FONT.micro, marginTop: 2, fontFamily: PROP_MONO }}>
                 ({Math.round(c.x)}, {Math.round(c.y)}, {c.z}) · {Math.round(signDistance(c, centre)).toLocaleString()} blocks
               </div>
             </div>
@@ -256,7 +257,7 @@ function CmdsBody({ records, viewCenter, worldCentre, onGoTo }: {
               role="button" tabIndex={0}
               onClick={() => setShowAll(v => !v)}
               onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setShowAll(v => !v); } }}
-              style={{ textAlign: "center", padding: "3px 0", cursor: "pointer", userSelect: "none", color: TEXT_LABEL, fontSize: 10 }}
+              style={{ textAlign: "center", padding: "3px 0", cursor: "pointer", userSelect: "none", color: TEXT_LABEL, fontSize: FONT.micro }}
             >
               {showAll ? "Show less" : `Show ${hiddenCount} more…`}
             </div>
@@ -302,7 +303,7 @@ function BookmarksBody({ worldKey, viewCenter, onGoTo }: {
               {b.name}
             </span>
           )}
-          <span style={{ color: TEXT_META, fontFamily: PROP_MONO, fontSize: 10 }}>({b.x}, {b.y})</span>
+          <span style={{ color: TEXT_META, fontFamily: PROP_MONO, fontSize: FONT.micro }}>({b.x}, {b.y})</span>
           {editing === b.id
             ? <SmallButton label="OK" title="Save the new name" onClick={() => finishRename(b.id)} />
             : <SmallButton label="Go to" title="Centre the map (and the 3D view) here" onClick={() => onGoTo(b.x, b.y)} />}

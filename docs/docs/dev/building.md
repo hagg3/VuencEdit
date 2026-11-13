@@ -9,26 +9,29 @@ subtitle: "Building, tests, CI and conventions."
 | Tool | Version |
 |------|---------|
 | [Rust](https://rustup.rs) | stable |
-| [Node.js](https://nodejs.org) | 18 LTS or newer |
+| [Node.js](https://nodejs.org) | 20.19 or newer (22 recommended; `.nvmrc`) |
 
-**Linux only**: install the WebKit dev libraries:
+Plus the [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/): Xcode Command Line
+Tools (macOS), or MSVC Build Tools + WebView2 (Windows). A C compiler is needed on every platform
+(`zstd-sys`). On Linux:
 
 ```bash
-sudo apt-get install libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+sudo apt-get install build-essential pkg-config libssl-dev libwebkit2gtk-4.1-dev \
+  libappindicator3-dev librsvg2-dev patchelf
 ```
 
 ## Dev commands
 
 ```bash
-npm install
+# from the repo root (an npm + Cargo workspace)
+npm ci
 npm run tauri dev        # run the app in dev (Vite HMR + Rust)
-npm run tauri build      # release build, output in src-tauri/target/release/bundle/
+npm run tauri build      # release build, output in target/release/bundle/
 
-cargo build --manifest-path src-tauri/Cargo.toml
-cargo test  --manifest-path src-tauri/Cargo.toml
-npx tsc --noEmit         # type-check the frontend
+cargo test --workspace   # all Rust crates
 npm run lint             # eslint
-npm run test             # vitest (frontend unit tests)
+npm test                 # vitest (frontend unit tests)
+npm run check            # tsc + eslint + vitest + cargo test, in one go
 ```
 
 Add `$HOME/.cargo/bin` to `PATH` if the Rust toolchain isn't found.

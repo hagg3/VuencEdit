@@ -114,9 +114,9 @@ export const COMMAND_META = {
   "app.settings.3d": { label: "Settings: 3D View…", icon: "settings", path: APP, kind: "action", keywords: ["sky","fog","camera","sensitivity"] },
   "app.settings.editor": { label: "Settings: Editor…", icon: "settings", path: APP, kind: "action", keywords: ["autosave","undo","memory","flood fill"] },
   "app.settings.files": { label: "Settings: Files…", icon: "settings", path: APP, kind: "action", keywords: ["texture pack","prefab folder","paths"] },
-  "app.settings.experiments": { label: "Settings: Experiments…", icon: "settings", path: APP, kind: "action", keywords: ["lens","beta","labs"] },
+  "app.settings.experiments": { label: "Settings: Experiments…", icon: "settings", path: APP, kind: "action", keywords: ["beta","labs"] },
   "app.tour": { label: "Guided Tour", icon: "help", path: APP, kind: "action", keywords: ["onboarding", "tutorial", "tour"] },
-  "app.diagnostics": { label: "Diagnostics…", icon: "properties", path: APP, kind: "action", keywords: ["performance", "debug", "report"] },
+  "app.diagnostics": { label: "Diagnostics…", icon: "diagnostics", path: APP, kind: "action", keywords: ["performance", "debug", "report"] },
   "app.about": { label: "About VuencEdit", icon: "about", path: APP, kind: "action" },
   // ⌘Q (34.1): runs through the window's close guard (unsaved-changes prompt, autosave-on-quit). The macOS
   // menu bar carries it; there's no Windows/Linux chord, so Help and the menu hide it off-Mac.
@@ -134,13 +134,13 @@ export const COMMAND_META = {
   "home.clipboard.cut": { label: "Cut", icon: "cut", family: "clipboard", title: "Copy the selection, then clear it (one undo step)", path: home("clipboard"), also: [sel("modify")], kind: "action", keys: [mod("x")], handledBy: L, help: { section: "Editing", text: "Cut selection" } },
   "home.clipboard.discard": { short: "Discard clipboard", label: "Discard Clipboard", icon: "close", family: "danger", title: "Drop the clipboard, its locked position and Z offset, and leave paste mode", path: bar("paste"), kind: "action", keywords: ["clear clipboard", "drop"] },
   "home.clipboard.rotate": { label: "Rotate", icon: "rotate", family: "clipboard", title: "Rotate the clipboard 90° clockwise", path: home("clipboard"), also: [clip("transform")], kind: "action" },
-  "home.clipboard.flipX": { label: "Flip X", icon: "flipX", family: "clipboard", title: "Mirror the clipboard across X", path: home("clipboard"), also: [clip("transform")], kind: "action", keywords: ["mirror"] },
-  "home.clipboard.flipY": { label: "Flip Y", icon: "flipY", family: "clipboard", title: "Mirror the clipboard across Y", path: home("clipboard"), also: [clip("transform")], kind: "action", keywords: ["mirror"] },
+  "home.clipboard.flipX": { label: "Flip X", icon: "flipX", family: "clipboard", title: "Flip the clipboard across X", path: home("clipboard"), also: [clip("transform")], kind: "action", keywords: ["mirror"] },
+  "home.clipboard.flipY": { label: "Flip Y", icon: "flipY", family: "clipboard", title: "Flip the clipboard across Y", path: home("clipboard"), also: [clip("transform")], kind: "action", keywords: ["mirror"] },
   "home.clipboard.mode": { short: "Mode", label: "Paste Mode", icon: "pasteMode", family: "clipboard", title: "Paste mode and options", path: home("clipboard"), kind: "menu" },
   "home.clipboard.modeSingle": { short: "Single", label: "Paste: Single (1×)", icon: "paste", family: "clipboard", title: "One copy per click", path: home("clipboard"), kind: "toggle" },
   "home.clipboard.modeScatter": { short: "Scatter", label: "Paste: Scatter", icon: "sparkle", family: "clipboard", title: "Distribute N copies inside the selection", path: home("clipboard"), kind: "toggle" },
   "home.clipboard.modeArray": { short: "Array", label: "Paste: Array", icon: "quad", family: "clipboard", title: "Grid of copies with fixed spacing", path: home("clipboard"), kind: "toggle" },
-  "home.clipboard.skipAir": { short: "Skip air", label: "Skip Air Blocks", icon: "clear", family: "clipboard", title: "Leave existing blocks where the clipboard holds air", path: home("clipboard"), also: [clip("options")], kind: "toggle", keywords: ["no air", "ignore air"] },
+  "home.clipboard.skipAir": { short: "Skip air", label: "Skip Air Blocks", icon: "skipAir", family: "clipboard", title: "Leave existing blocks where the clipboard holds air", path: home("clipboard"), also: [clip("options")], kind: "toggle", keywords: ["no air", "ignore air"] },
   "home.clipboard.repeat": { short: "Repeat", label: "Repeat on Each Click", icon: "pasteMode", family: "clipboard", title: "Stay in paste mode after placing", path: home("clipboard"), also: [clip("options")], kind: "toggle", keywords: ["persist"] },
   "home.clipboard.followTerrain": { short: "Follow terrain", label: "Follow Terrain", icon: "topdown", family: "clipboard", title: "Place each column on the local surface instead of a fixed Z", path: home("clipboard"), also: [clip("options")], kind: "toggle", keywords: ["terrain paste"] },
 
@@ -159,8 +159,8 @@ export const COMMAND_META = {
 
   "home.block.pick": { short: "Block", label: "Block…", icon: "block", title: "Choose the active block and paint", path: home("block"), kind: "picker", keywords: ["palette", "colour", "paint", "material"] },
 
-  "home.setpoint.home": { short: "Home", label: "Set Home Point", icon: "home", title: "Move the respawn point to the centre of the selection", path: home("setpoint"), kind: "action", keywords: ["spawn", "respawn"] },
-  "home.setpoint.start": { short: "Start", label: "Set Start Point", icon: "start", title: "Move the player start position to the centre of the selection", path: home("setpoint"), kind: "action", keywords: ["player", "position"] },
+  "home.setpoint.home": { short: "Home", label: "Set Home Point", icon: "home", title: "Move the home point to the centre of the selection", path: home("setpoint"), kind: "action", keywords: ["spawn", "respawn"] },
+  "home.setpoint.start": { short: "Start", label: "Set Player Start", icon: "start", title: "Move the player start position to the centre of the selection", path: home("setpoint"), kind: "action", keywords: ["player", "position", "start point"] },
 
   // ── Draw ───────────────────────────────────────────────────────────────────────────────────
   "draw.tools.pen": { label: "Pen", icon: "pen", family: "primary", title: "Freehand, one block wide", path: draw("tools"), kind: "tool", tool: "pen", keys: [k("p")], handledBy: L, keywords: ["pencil", "draw"], help: { section: "Tools" } },
@@ -207,7 +207,7 @@ export const COMMAND_META = {
   "sculpt.falloff.profile": { label: "Falloff Profile", icon: "smooth", family: "warm", path: sculpt("falloff"), kind: "setting" },
   "sculpt.falloff.live": { short: "Live brush", label: "Live Brush", icon: "sparkle", family: "warm", title: "Shape terrain as you drag. Off: apply the stroke on release.", path: sculpt("falloff"), kind: "toggle", keywords: ["airbrush", "accumulate"] },
   "sculpt.falloff.clip": { short: "In selection", label: "Sculpt in Selection", icon: "select", family: "warm", title: "Only sculpt inside the selection", path: sculpt("falloff"), kind: "toggle", keywords: ["clip", "constrain"] },
-  "sculpt.block.pick": { short: "Block", label: "Sculpt Block…", icon: "block", title: "Block for Rock", path: sculpt("block"), kind: "picker" },
+  "sculpt.block.pick": { short: "Block", label: "Sculpt Block…", icon: "block", title: "Block for the Rock tool", path: sculpt("block"), kind: "picker" },
 
   // ── Insert ─────────────────────────────────────────────────────────────────────────────────
   "insert.prefab.load": { short: "Load", label: "Load Prefab…", icon: "prefab", title: "Load a .epfab prefab into the clipboard, ready to paste", path: insert("prefab"), kind: "action", keywords: ["epfab", "import"] },
@@ -246,16 +246,16 @@ export const COMMAND_META = {
   "view.zoom.out": { short: "Out", label: "Zoom Out", icon: "zoomOut", path: view("zoom"), kind: "action", keys: [mod("-")], handledBy: L, help: { section: "Navigation", text: "Zoom out (viewport centre)" } },
   "view.layout.swap": { short: "Swap", label: "Swap Map ⇄ 3D", icon: "swap", family: "violet", title: "Make the 3D view the main pane and put the map in the window", path: view("layout"), kind: "action", keys: [{ key: "Tab", scope: "work-area" }], handledBy: L, help: { section: "Layout & windows", text: "Swap map ⇄ 3D (only while focus is on the map, the 3D view or a window title bar)" } },
   "view.layout.reset": { short: "Reset", label: "Reset Windows", icon: "resetWindows", title: "Move every floating window back to its default place", path: view("layout"), kind: "action" },
-  "view.windows.view3d": { short: "3D", label: "3D View Window", icon: "pane3d", family: "violet", title: "Fly-through 3D view (experimental)", path: view("windows"), kind: "toggle", keys: [alt("Digit3")], handledBy: L, keywords: ["3d", "fly"], help: { section: "Layout & windows", text: "Show / hide the 3D view window" } },
+  "view.windows.view3d": { short: "3D", label: "3D View", icon: "pane3d", family: "violet", title: "Fly-through 3D view (experimental)", path: view("windows"), kind: "toggle", keys: [alt("Digit3")], handledBy: L, keywords: ["3d", "fly"], help: { section: "Layout & windows", text: "Show / hide the 3D view" } },
   "view.windows.tools": { short: "Tools", label: "Tools Window", icon: "toolbar", title: "Quick access to the Pan, Select and Draw tools", path: view("windows"), kind: "toggle", keys: [alt("KeyT")], handledBy: L, help: { section: "Layout & windows", text: "Show / hide the Tools window" } },
   "view.windows.hotbar": { short: "Hotbar", label: "Hotbar Window", icon: "block", title: "Pinned (1–5) and recent (6–0) blocks", path: view("windows"), kind: "toggle", keys: [alt("KeyH")], handledBy: L, keywords: ["palette", "swatches", "recent blocks"], help: { section: "Layout & windows", text: "Show / hide the Hotbar window" } },
-  "view.windows.lens": { short: "Lens", label: "Lens Window", icon: "paste", family: "clipboard", title: "Front, side and top views of the selection or paste", path: view("windows"), kind: "toggle", keys: [alt("KeyP")], handledBy: L, keywords: ["paste", "selection", "elevation", "z range", "buried", "z offset"], help: { section: "Layout & windows", text: "Show / hide the Lens (front, side and top views; appears when you select or paste)" } },
+  "view.windows.lens": { short: "Lens", label: "Lens Window", icon: "lens", family: "clipboard", title: "Front, side and top views of the selection or paste", path: view("windows"), kind: "toggle", keys: [alt("KeyP")], handledBy: L, keywords: ["paste", "selection", "elevation", "z range", "buried", "z offset"], help: { section: "Layout & windows", text: "Show / hide the Lens (front, side and top views; appears when you select or paste)" } },
   "view.windows.sidebar": { label: "Sidebar", icon: "sidebar", title: "Docked right sidebar: World / Prefabs / History", path: view("windows"), kind: "toggle", keywords: ["world", "inspector", "signs", "places", "history", "panel"], paletteOnly: true },
   "view.windows.signs": { short: "Signs", label: "Sign Markers", icon: "signs", title: "Show a marker on the map at each sign's position", path: view("windows"), kind: "toggle" },
   "view.template.load": { short: "Load…", label: "Load Template…", icon: "template", title: "Load the game's Eden.eden for the overlay and Insert ▸ Expand", path: view("template"), kind: "action", keywords: ["eden.eden"] },
   "view.template.overlay": { short: "Overlay", label: "Template Overlay", icon: "fullmap", family: "primary", title: "Show the template's terrain under your world (top-down view only)", path: view("template"), kind: "toggle" },
   "view.textures.load": { short: "Load…", label: "Load Texture Pack…", icon: "textures", title: "Replace the built-in block textures with a ZIP of PNGs or an atlas image", path: view("textures"), kind: "action", keywords: ["atlas"] },
-  "view.textures.unload": { short: "Default", label: "Default Texture Pack", icon: "close", title: "Go back to the built-in texture pack", path: view("textures"), kind: "action" },
+  "view.textures.unload": { short: "Default", label: "Default Texture Pack", icon: "defaultPack", title: "Go back to the built-in texture pack", path: view("textures"), kind: "action" },
 
   // ── 3D (contextual) ────────────────────────────────────────────────────────────────────────
   "3d.mode.camera": { short: "Camera", label: "3D: Camera Mode", icon: "camera", family: "violet", title: "Move the camera only", path: d3("mode"), kind: "toggle", keywords: ["orbit"] },
@@ -268,7 +268,7 @@ export const COMMAND_META = {
   // Renamed from `3d.slot.block` in 16.6 (the contextual `slot` group became the Build slot panel).
   "3d.block.pick": { short: "Block", label: "3D Build Block…", icon: "block", title: "Block for Build and Flood Fill", path: d3("block"), kind: "picker" },
   "3d.camera.hud": { short: "HUD", label: "3D: HUD", icon: "fps", family: "violet", title: "Show the 3D view's overlays and crosshair", path: d3("camera"), kind: "toggle", keywords: ["overlay", "compass", "legend", "hide ui"] },
-  "3d.camera.grid": { short: "Grid", label: "3D: Floor Grid", icon: "tiled", family: "violet", title: "Show the 3D pane's floor grid", path: d3("camera"), kind: "toggle", keywords: ["floor", "guides"] },
+  "3d.camera.grid": { short: "Grid", label: "3D: Floor Grid", icon: "tiled", family: "violet", title: "Show the 3D view's floor grid", path: d3("camera"), kind: "toggle", keywords: ["floor", "guides"] },
   "3d.camera.flySpeed": { label: "Fly Speed", icon: "flySpeed", family: "violet", path: d3("camera"), kind: "setting" },
   "3d.camera.distance": { label: "Render Distance", icon: "renderDistance", family: "violet", path: d3("camera"), kind: "setting", keywords: ["view distance", "chunks"] },
   "3d.lighting.night": { short: "Night", label: "Night Lighting", icon: "night", family: "warm", title: "Light the 3D view with lamps. Slow: rebuilds every loaded chunk.", path: d3("lighting"), kind: "toggle", keywords: ["lamps"] },
@@ -280,7 +280,7 @@ export const COMMAND_META = {
   "3d.lighting.modern": { short: "New Dawn", label: "Lamp Falloff: New Dawn", family: "warm", title: "Long, gradual lamp light (~14 blocks). Resets Lamp R.", path: d3("lighting"), kind: "toggle" },
 
   // ── Selection (contextual) ─────────────────────────────────────────────────────────────────
-  "selection.modify.selectAll": { label: "Select All", icon: "selectAll", family: "selection", title: "Select the whole world", path: sel("modify"), kind: "action", keys: [mod("a")], handledBy: L, help: { section: "Editing", text: "Select whole world" }, paletteOnly: true },
+  "selection.modify.selectAll": { label: "Select All", icon: "selectAll", family: "selection", title: "Select the whole world", path: sel("modify"), also: [home("selection")], kind: "action", keys: [mod("a")], handledBy: L, help: { section: "Editing", text: "Select whole world" } },
   "selection.zrange.range": { label: "Selection Z Range", icon: "zslice", family: "selection", path: sel("zrange"), kind: "setting", keywords: ["height", "min", "max"] },
   "selection.move.mode": { label: "Selection Move Mode", icon: "move", family: "selection", path: sel("move"), kind: "setting", keywords: ["box", "blocks"] },
   "selection.move.left": { label: "Nudge Selection Left", icon: "left", family: "selection", path: sel("move"), kind: "action", keys: [k("ArrowLeft", "select")], handledBy: L, help: { section: "Editing", text: "Nudge the selection left one block (any selection tool)" } },
@@ -301,7 +301,7 @@ export const COMMAND_META = {
 
   // ── Clipboard (contextual) ─────────────────────────────────────────────────────────────────
   "paste.place.confirm": { short: "Confirm", label: "Confirm Paste", icon: "paste", family: "clipboard", path: clip("place"), kind: "action", keywords: ["stamp", "place"] },
-  "paste.place.unlock": { short: "Unlock", label: "Unlock Paste Position", icon: "clear", title: "Release the locked position and pick again", path: clip("place"), kind: "action" },
+  "paste.place.unlock": { short: "Unlock", label: "Unlock Paste Position", icon: "unlock", title: "Release the locked position and pick again", path: clip("place"), kind: "action" },
   "paste.place.offset": { label: "Paste Z Offset", icon: "zslice", family: "clipboard", path: clip("place"), kind: "setting", keywords: ["elevation", "height"] },
   "paste.place.raise": { label: "Raise Paste 1", icon: "raise", family: "clipboard", path: clip("place"), kind: "action", keys: [k("PageUp", "paste")], handledBy: L, help: { section: "Paste mode", text: "Raise paste Z offset (⇧ = +5)" }, paletteOnly: true },
   "paste.place.lower": { label: "Lower Paste 1", icon: "lower", family: "clipboard", path: clip("place"), kind: "action", keys: [k("PageDown", "paste")], handledBy: L, help: { section: "Paste mode", text: "Lower paste Z offset (⇧ = −5)" }, paletteOnly: true },

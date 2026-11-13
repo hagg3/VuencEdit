@@ -12,7 +12,7 @@ import { Select } from "./ribbon/primitives";
  *  (audit H10 step 3). Replaces `chromeButton`, the app-wide warm-brown glass. */
 function panelBtn(extra?: React.CSSProperties): React.CSSProperties {
   return btnBase({
-    padding: "5px 10px", fontSize: 11, borderRadius: RADIUS.md,
+    padding: "5px 10px", fontSize: FONT.label, borderRadius: RADIUS.md,
     display: "flex", alignItems: "center", justifyContent: "center", gap: SPACE.sm,
     ...extra,
   });
@@ -20,6 +20,7 @@ function panelBtn(extra?: React.CSSProperties): React.CSSProperties {
 import { useFocusTrap } from "./Modal";
 import { isTypingTarget } from "./viewportUtils";
 import { decodePreviewData, type ClipboardInfo } from "./types";
+import { FONT } from "./ribbon/tokens";
 
 interface PrefabEntry {
   name: string;
@@ -62,14 +63,14 @@ function Thumbnail({ url, failed, size }: { url: string | null; failed: boolean;
       {url ? (
         <img src={url} alt="" style={{ width: "100%", height: "100%", objectFit: "contain", imageRendering: "pixelated" }} />
       ) : (
-        <span style={{ color: failed ? TEXT_DANGER : TEXT_META, fontSize: 16 }}>{failed ? "!" : "…"}</span>
+        <span style={{ color: failed ? TEXT_DANGER : TEXT_META, fontSize: FONT.glyph }}>{failed ? "!" : "…"}</span>
       )}
     </div>
   );
 }
 
 const iconBtn: React.CSSProperties = {
-  background: "none", border: "none", cursor: "pointer", fontSize: 12, lineHeight: 1,
+  background: "none", border: "none", cursor: "pointer", fontSize: FONT.body, lineHeight: 1,
   padding: "0 4px", flexShrink: 0,
 };
 
@@ -292,19 +293,19 @@ export default function PrefabLibraryPanel({
       onBlur={() => commitRename(entry)}
       style={{
         width: "100%", background: "rgba(0,0,0,0.6)", border: `1px solid ${BORDER.outline}`, borderRadius: 4,
-        color: TEXT, padding: "2px 5px", fontSize: 12, outline: "none",
+        color: TEXT, padding: "2px 5px", fontSize: FONT.body, outline: "none",
       }}
     />
   );
 
   const panelStyle: React.CSSProperties = {
     display: "flex", flexDirection: "column", gap: 8,
-    color: TEXT, fontSize: 12, height: "100%", minHeight: 0,
+    color: TEXT, fontSize: FONT.body, height: "100%", minHeight: 0,
   };
 
   return (
     <div ref={panelRef} role="region" aria-label="Prefab Library" tabIndex={-1} style={panelStyle}>
-      <div style={{ fontSize: 10, color: TEXT_META, wordBreak: "break-all" }}>{dir ?? "…"}</div>
+      <div style={{ fontSize: FONT.micro, color: TEXT_META, wordBreak: "break-all" }}>{dir ?? "…"}</div>
       {entries.length > 0 && (
         <>
           <input
@@ -313,7 +314,7 @@ export default function PrefabLibraryPanel({
             placeholder="Search prefabs…"
             style={{
               background: "rgba(0,0,0,0.4)", border: `1px solid ${BORDER.outline}`, borderRadius: 5,
-              color: TEXT, padding: "5px 8px", fontSize: 11, outline: "none",
+              color: TEXT, padding: "5px 8px", fontSize: FONT.label, outline: "none",
             }}
           />
           <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
@@ -335,15 +336,15 @@ export default function PrefabLibraryPanel({
           </div>
         </>
       )}
-      {error && <div style={{ color: TEXT_DANGER, fontSize: 11 }}>{error}</div>}
+      {error && <div style={{ color: TEXT_DANGER, fontSize: FONT.label }}>{error}</div>}
 
       <div style={{ overflowY: "auto", flex: 1 }}>
         {loading && <div style={{ color: TEXT_LABEL }}>Loading…</div>}
         {!loading && entries.length === 0 && !error && (
-          <div style={{ color: TEXT_META, fontSize: 11 }}>No .epfab files found. Save a prefab from a selection to populate this folder.</div>
+          <div style={{ color: TEXT_META, fontSize: FONT.label }}>No .epfab files found. Save a prefab from a selection to populate this folder.</div>
         )}
         {!loading && entries.length > 0 && shown.length === 0 && (
-          <div style={{ color: TEXT_META, fontSize: 11 }}>No prefabs match “{query}”.</div>
+          <div style={{ color: TEXT_META, fontSize: FONT.label }}>No prefabs match “{query}”.</div>
         )}
 
         {view === "list" && (
@@ -374,7 +375,7 @@ export default function PrefabLibraryPanel({
                     {isRenaming ? renameInputEl(entry) : (
                       <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{entry.name}</span>
                     )}
-                    <span style={{ fontSize: 10, color: TEXT_LABEL }}>{entry.width}×{entry.height}×{entry.depth}</span>
+                    <span style={{ fontSize: FONT.micro, color: TEXT_LABEL }}>{entry.width}×{entry.height}×{entry.depth}</span>
                   </div>
                   <div onClick={(e) => e.stopPropagation()} style={{ paddingRight: 2 }}>{actions(entry)}</div>
                 </div>
@@ -407,7 +408,7 @@ export default function PrefabLibraryPanel({
                 {renaming === entry.path ? (
                   <div onClick={(e) => e.stopPropagation()}>{renameInputEl(entry)}</div>
                 ) : (
-                  <span style={{ fontSize: 10, color: TEXT_DIM, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{entry.name}</span>
+                  <span style={{ fontSize: FONT.micro, color: TEXT_DIM, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{entry.name}</span>
                 )}
               </div>
             ))}

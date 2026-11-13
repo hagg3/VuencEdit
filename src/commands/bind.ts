@@ -143,7 +143,7 @@ export function bindCommands(c: CommandCtx): Record<CommandId, CommandBinding> {
 
     "home.block.pick": picker("block-draw", "home.block.pick"),
 
-    "home.setpoint.home": { ...act(() => p.onSetSpawnAtSelection(), p.selection ? true : NO_SEL), titleOverride: setPoint("respawn point", p.spawnPos) },
+    "home.setpoint.home": { ...act(() => p.onSetSpawnAtSelection(), p.selection ? true : NO_SEL), titleOverride: setPoint("home point", p.spawnPos) },
     "home.setpoint.start": { ...act(() => p.onSetPlayerPosAtSelection(), p.selection ? true : NO_SEL), titleOverride: setPoint("player start position", p.playerPos) },
 
     // ── Draw ─────────────────────────────────────────────────────────────────────────────────

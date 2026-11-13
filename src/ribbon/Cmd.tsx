@@ -13,7 +13,7 @@
  * control with one `querySelector`.
  */
 import { createContext, useContext, type ReactNode } from "react";
-import { COMMAND_META, meta, type CommandFamily, type CommandId } from "../commands/meta";
+import { meta, type CommandFamily, type CommandId } from "../commands/meta";
 import type { CommandBinding } from "../commands/types";
 import { formatChord } from "../commands/keys";
 import type { Tier } from "./layout";
@@ -145,5 +145,3 @@ export function CmdSetting({ id, children }: { id: CommandId; children: ReactNod
   return <Mark id={id}>{children}</Mark>;
 }
 
-/** Dev-only: the ids the registry knows, for the runtime "unmarked button" check. */
-export const KNOWN_IDS: ReadonlySet<string> = new Set(Object.keys(COMMAND_META));

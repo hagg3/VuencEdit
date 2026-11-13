@@ -1,0 +1,18 @@
+- title: "First edit and save"
+  url: /docs/tutorials/first-edit/
+  text: "Open a world, paint a few blocks, undo, and save."
+- title: "Sculpt terrain"
+  url: /docs/tutorials/sculpt-terrain/
+  text: "Raise a hill, smooth it, and add detail with the sculpt brushes."
+- title: "Copy, paste and prefabs"
+  url: /docs/tutorials/copy-paste-prefabs/
+  text: "Copy a structure, stamp it down, and keep it in your prefab library."
+- title: "Generate a world"
+  url: /docs/tutorials/generate-world/
+  text: "Make a new world from a generator and save it."
+- title: "3D view and building in 3D"
+  url: /docs/tutorials/build-in-3d/
+  text: "Fly around, then place and break blocks in the 3D view."
+- title: "Download and upload a world"
+  url: /docs/tutorials/download-upload/
+  text: "Get a world from a community server, and share your own."

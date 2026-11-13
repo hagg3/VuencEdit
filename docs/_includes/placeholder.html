@@ -1,8 +1,11 @@
 <!--
   Zero-image-byte stand-in for a screenshot not yet supplied.
-  Usage: {% raw %}{% include placeholder.html caption="The Draw tab with the block picker open" ratio="16/9" %}{% endraw %}
+  Usage: {% raw %}{% include placeholder.html caption="..." file="tut-sculpt-02-raise.webp" shot="1280x800 window, Sculpt tab, Raise armed" ratio="16/9" %}{% endraw %}
+  file = suggested name under assets/img/help/; shot = what to capture. Both are shown so the page doubles as a shot list.
 -->
 <div class="placeholder-img" style="aspect-ratio: {{ include.ratio | default: '16/9' }};">
   <span class="ph-icon">🖼</span>
   <span class="ph-caption">{{ include.caption | default: "Screenshot coming soon" }}</span>
+  {% if include.file %}<span class="ph-meta"><b>file</b> <code>assets/img/help/{{ include.file }}</code></span>{% endif %}
+  {% if include.shot %}<span class="ph-meta"><b>shot</b> {{ include.shot }}</span>{% endif %}
 </div>

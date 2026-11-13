@@ -34,7 +34,3 @@ The library is the sidebar's Prefabs tab, also reachable from Insert ▸ Prefab.
 Prefab files are gzip-compressed and keep the exact shape you selected. A Lasso or Wand selection stays non-rectangular. You can change the library's folder in Settings ▸ Files.
 
 {% include placeholder.html caption="The Prefabs tab, showing a gallery of saved structures" ratio="4/3" %}
-
-## Export
-
-Export PNG, in the application menu, saves a top-down render of the map at one pixel per block. There's no OBJ, VOX or VMF export and no Minecraft schematic import. Those were removed from this project and live on in [EdenToMC](https://github.com/hagg3/EdenToMC).

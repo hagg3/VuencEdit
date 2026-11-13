@@ -139,7 +139,7 @@ export default function Dialog({
             <div
               style={{
                 flex: 1, minWidth: 0, minHeight: 0, overflow: "auto",
-                padding: "16px 20px", color: MODAL_TEXT.primary, fontSize: FONT.body,
+                padding: "12px 16px", color: MODAL_TEXT.primary, fontSize: FONT.body,
               }}
             >
               {children}

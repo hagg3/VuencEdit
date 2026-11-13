@@ -8,6 +8,7 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import appIcon from "../assets/app-icon.png";
 import { MODAL_TEXT } from "../designTokens";
 import { ACCENTS, DANGER_HEX, RAMP, mix } from "../theme/theme";
+import { FONT } from "../ribbon/tokens";
 
 /** Lightened danger tint for text on the warm modal surface (mechanical hex-literal migration,
  *  Stage 14.15) — plain `DANGER_HEX` fails AA there. */
@@ -90,14 +91,14 @@ export default function AboutPanel({ version, compact, onOpenDiagnostics }: {
             <span style={{ fontWeight: 800, color: RAMP.white, textShadow: "0 -1px 0 rgba(0,0,0,.5)" }}>Vuenc</span>
             <span style={{ fontWeight: 400, color: TEAL_LIGHT, textShadow: "0 -1px 0 rgba(0,0,0,.5)" }}>Edit</span>
           </div>
-          <div style={{ fontSize: 12, color: MODAL_TEXT.label, marginTop: 3 }}>v{version}</div>
+          <div style={{ fontSize: FONT.body, color: MODAL_TEXT.label, marginTop: 3 }}>v{version}</div>
           <div style={{ marginTop: 6, display: "flex", flexDirection: "column", gap: 4, alignItems: compact ? "flex-start" : "center" }}>
             <button
               onClick={checkForUpdates}
               disabled={checkState.kind === "checking"}
               style={{
                 background: "none", border: `1px solid ${RAMP.mbtn0}`, borderRadius: 5,
-                color: TEAL_LIGHT, fontSize: 11, padding: "3px 9px",
+                color: TEAL_LIGHT, fontSize: FONT.label, padding: "3px 9px",
                 cursor: checkState.kind === "checking" ? "default" : "pointer",
                 opacity: checkState.kind === "checking" ? 0.6 : 1,
               }}
@@ -105,13 +106,13 @@ export default function AboutPanel({ version, compact, onOpenDiagnostics }: {
               {checkState.kind === "checking" ? "Checking…" : "Check for updates"}
             </button>
             {checkState.kind === "upToDate" && (
-              <span style={{ fontSize: 11, color: MODAL_TEXT.label }}>You're up to date.</span>
+              <span style={{ fontSize: FONT.label, color: MODAL_TEXT.label }}>You're up to date.</span>
             )}
             {checkState.kind === "error" && (
-              <span style={{ fontSize: 11, color: RED_LIGHT }}>Couldn't check for updates.</span>
+              <span style={{ fontSize: FONT.label, color: RED_LIGHT }}>Couldn't check for updates.</span>
             )}
             {checkState.kind === "available" && (
-              <span style={{ fontSize: 11, color: MODAL_TEXT.label }}>
+              <span style={{ fontSize: FONT.label, color: MODAL_TEXT.label }}>
                 v{checkState.latestVersion} available: <Link href={checkState.releaseUrl}>download</Link>
               </span>
             )}
@@ -120,7 +121,7 @@ export default function AboutPanel({ version, compact, onOpenDiagnostics }: {
       </div>
 
       <div style={{
-        fontSize: 13, color: MODAL_TEXT.secondary, lineHeight: 1.65,
+        fontSize: FONT.tab, color: MODAL_TEXT.secondary, lineHeight: 1.65,
         textAlign: compact ? "left" : "center",
         borderTop: `1px solid ${RAMP.mbtn1}`, paddingTop: 16, width: "100%",
       }}>

@@ -4,6 +4,13 @@
   box-sizing: border-box;
 }
 
+/* No touchscreen pinch-zoom of the whole UI. WebView2's pinch is on for precision touchpads (34.7,
+   lib.rs enable_touchpad_pinch), which would otherwise let a touchscreen pinch scale the page too.
+   Touchpad pinch is not a touch gesture, so this leaves it alone. */
+html {
+  touch-action: pan-x pan-y;
+}
+
 /* Background + text colour come from the theme stylesheet (src/theme/cssVars.ts THEME_CSS). */
 body {
   margin: 0;
@@ -71,7 +78,7 @@ body {
    (this one and the ribbon's blue one) — see the r3 FINDINGS "Two focus rings". */
 
 /* Pressed/clicked feedback for plain dialog & menu buttons (Settings, App menu, World Browser,
-   New World, Schematic Import, Prefab Library, VMF Export, etc.) — these are inline-styled via
+   New World, Prefab Library, etc.) — these are inline-styled via
    designTokens' chromeButton()/chromeButtonAccent()/glassTab() and had no :active state of their
    own, since inline styles can't express pseudo-classes. `filter` (not a background swap) is used
    so the press dims whatever gradient/accent hue a given button already has instead of overwriting
@@ -98,3 +105,7 @@ button:active:not(:disabled):not([aria-disabled="true"]):not(.rbn-btn):not(.rbn-
     to   { opacity: 1; }
   }
 }
+
+/* Bare ✕ buttons (status-bar filter chip, error toast): dimmed until hovered — CSS, not JS handlers. */
+.eden-x-btn { opacity: .75; transition: opacity .09s; }
+.eden-x-btn:hover { opacity: 1; }

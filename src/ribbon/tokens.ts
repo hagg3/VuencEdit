@@ -11,7 +11,7 @@
  *   RIBBON_BODY_HEIGHT = GROUP_PAD_TOP + GROUP_CONTENT_H + GROUP_LABEL_H + GROUP_PAD_BOTTOM
  */
 import type { CSSProperties } from "react";
-import { ACCENTS, DANGER_HEX, FOCUS_HEX, RAMP, TAB, TEXT_ROLES, armedRecipe } from "../theme/theme";
+import { ACCENTS, DANGER_HEX, FOCUS_HEX, RAMP, TEXT_ROLES, armedRecipe } from "../theme/theme";
 import { accentFamily, v } from "../theme/cssVars";
 
 // ── Geometry ──────────────────────────────────────────────────────────────────
@@ -111,7 +111,7 @@ export const COMPACT_BODY_HEIGHT = CMD_BAR_H + OPT_BAR_H;
 // ── Scales (Phase 1; type T.A as of Stage 14.7) ────────────────────────────────
 
 export const RADIUS = { sm: 2, md: 3, lg: 5 } as const;
-export const FONT = { micro: 10, label: 11, body: 12, tab: 13 } as const;
+export const FONT = { nano: 9, micro: 10, label: 11, body: 12, tab: 13, heading: 14, glyph: 16, display: 20 } as const;
 export const ICON = { xs: 12, sm: 14, lg: 24 } as const;
 export const SPACE = { xs: 2, sm: 4, md: 6, lg: 8 } as const;
 
@@ -129,6 +129,7 @@ export const SURFACE = {
   pressed: v("surface-pressed"),
   popover: v("surface-popover"),
   well: v("surface-well"),
+  dangerToast: v("surface-dangerToast"),
 } as const;
 
 export const BORDER = {
@@ -137,6 +138,8 @@ export const BORDER = {
   hairline: v("border-hairline"),
   etchDark: v("border-etchDark"),
   etchLight: v("border-etchLight"),
+  selected: v("border-selected"),
+  danger: v("border-danger"),
 } as const;
 
 // ── Colour ────────────────────────────────────────────────────────────────────
@@ -180,8 +183,6 @@ export const TEXT_ARMED = RAMP.textArmed;
 /** Ring on a *selected* swatch. Deliberately not `FOCUS_RING` — selected ≠ focused. */
 export const ARMED_RING = ACCENT.primary;
 
-/** Active tab (gloss-lite): merges into the body's top surface stop. */
-export const TAB_ACTIVE_TOP = TAB.activeTop;
 export const TAB_ACTIVE_BOT = RAMP.body0;
 
 /** Contextual tab accents. Selection is blue now (it glowed warm while its buttons were green). */
