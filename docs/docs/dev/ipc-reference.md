@@ -2,6 +2,7 @@
 layout: doc
 title: "IPC Reference"
 subtitle: "Every backend command, grouped by subsystem."
+description: "VuencEdit developer reference: Every backend command, grouped by subsystem (Eden: World Builder)."
 ---
 {% raw %}
 Every backend capability is a Tauri command, registered in the

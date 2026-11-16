@@ -2,6 +2,7 @@
 layout: doc
 title: "Frontend"
 subtitle: "The React component map, the ribbon, windows and UI conventions."
+description: "VuencEdit developer reference: The React component map, the ribbon, windows and UI conventions (Eden: World Builder)."
 ---
 {% raw %}
 React 19 + TypeScript, built with Vite 7, styled with Tailwind v4. The frontend

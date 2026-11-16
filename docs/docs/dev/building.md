@@ -2,6 +2,7 @@
 layout: doc
 title: "Building & Testing"
 subtitle: "Building, tests, CI and conventions."
+description: "VuencEdit developer reference: Building, tests, CI and conventions (Eden: World Builder)."
 ---
 {% raw %}
 ## Prerequisites

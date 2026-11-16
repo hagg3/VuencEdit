@@ -10,3 +10,22 @@
 <meta property="og:image" content="{{ '/assets/img/social-preview.jpg' | absolute_url }}">
 <meta name="twitter:image" content="{{ '/assets/img/social-preview.jpg' | absolute_url }}">
 <meta name="twitter:card" content="summary_large_image">
+{% if page.url == "/" %}
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareApplication",
+  "name": "VuencEdit",
+  "alternateName": ["Eden World Editor", "VuencEdit Eden World Builder editor"],
+  "description": {{ site.description | jsonify }},
+  "applicationCategory": "GameApplication",
+  "operatingSystem": "macOS, Windows, Linux",
+  "softwareVersion": {{ site.latest_version | jsonify }},
+  "url": {{ '/' | absolute_url | jsonify }},
+  "downloadUrl": {{ '/downloads/' | absolute_url | jsonify }},
+  "image": {{ '/assets/img/social-preview.jpg' | absolute_url | jsonify }},
+  "codeRepository": "https://github.com/{{ site.repository }}",
+  "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" }
+}
+</script>
+{% endif %}

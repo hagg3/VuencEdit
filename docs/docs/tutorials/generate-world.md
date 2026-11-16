@@ -2,6 +2,7 @@
 layout: doc
 title: Generate a world
 subtitle: Make a new world from a generator and save it.
+description: "Tutorial: generate a new Eden: World Builder world with VuencEdit's Flat, Natural, Classic and Tg2 generators, then save it."
 ---
 
 ## 1. Open New World

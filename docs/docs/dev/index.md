@@ -2,6 +2,7 @@
 layout: page
 title: Developer Reference
 subtitle: How VuencEdit works inside, and what we know about the Eden file format.
+description: "Developer reference for VuencEdit and the Eden: World Builder .eden file format: architecture, rendering, editing and world generation."
 ---
 
 VuencEdit is a [Tauri](https://tauri.app) app: a Rust backend does all the byte-level work over a

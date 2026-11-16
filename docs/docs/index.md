@@ -2,6 +2,7 @@
 layout: page
 title: Help
 subtitle: How the less obvious parts of VuencEdit work.
+description: "VuencEdit help: how to open, edit, sculpt and save Eden: World Builder (.eden) worlds, with step-by-step tutorials."
 ---
 
 <div class="doc-grid">

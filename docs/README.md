@@ -33,7 +33,7 @@ Styles are in `_sass/` (one entry, `assets/css/main.scss`). Colours and sizes ar
 
 ## Screenshot placeholders
 
-`{% raw %}{% include placeholder.html caption="..." file="name.webp" shot="what to capture" %}{% endraw %}` draws a dashed box that shows the suggested file name and the shot to take. The full list is the 35.4 checklist at the end of `TEST WORLDS/website-review-2026-11-13.md`.
+`{% raw %}{% include placeholder.html caption="..." file="name.webp" shot="what to capture" %}{% endraw %}` draws a dashed box that shows the suggested file name and the shot to take.
 
 ## Writing a blog post
 
@@ -48,3 +48,7 @@ Copy `_posts/2026-11-13-welcome-to-the-vuencedit-blog.md` to `_posts/YYYY-MM-DD-
 3. Edit and save; the CMS writes the files. Then review `git diff`, commit and push by hand.
 
 Scope: posts and Help pages only. The Help pages contain `include` tags (screenshot placeholders) that show as plain text in the editor: leave those lines untouched. **Tutorials, Features, Home, Downloads and About are hand-edited** (the placeholder include has no WYSIWYG form). The CMS loads from unpkg, so it needs internet.
+
+## Search (SEO)
+
+Every page sets `description:` in its front matter (the Google snippet, ~150 chars, naming "Eden: World Builder"); without it jekyll-seo-tag falls back to the site-wide description and every page looks the same to Google. The homepage has no `title:` on purpose, so its `<title>` is `VuencEdit | <tagline>` from `_config.yml`; its SoftwareApplication JSON-LD is in `_includes/head.html`. Google Search Console verification goes in `_config.yml` → `webmaster_verifications`.

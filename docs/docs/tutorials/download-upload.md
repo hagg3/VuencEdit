@@ -2,6 +2,7 @@
 layout: doc
 title: Download and upload a world
 subtitle: Get a world from a community server, and share your own.
+description: "Tutorial: download an Eden: World Builder world from a community server with VuencEdit, and upload your own."
 ---
 
 ## Download

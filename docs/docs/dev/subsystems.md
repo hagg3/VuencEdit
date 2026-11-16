@@ -2,6 +2,7 @@
 layout: doc
 title: "Subsystems"
 subtitle: "Texture packs, the template overlay, networking and PNG export."
+description: "VuencEdit developer reference: Texture packs, the template overlay, networking and PNG export (Eden: World Builder)."
 ---
 {% raw %}
 Cross-cutting features that don't belong to a single subsystem page. Rendering,

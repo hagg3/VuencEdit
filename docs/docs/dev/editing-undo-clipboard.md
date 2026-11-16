@@ -2,6 +2,7 @@
 layout: doc
 title: "Editing, Undo & Clipboard"
 subtitle: "The edit pipeline, delta undo, copy and paste, prefabs and sculpting."
+description: "VuencEdit developer reference: The edit pipeline, delta undo, copy and paste, prefabs and sculpting (Eden: World Builder)."
 ---
 {% raw %}
 ## The `with_edit` contract

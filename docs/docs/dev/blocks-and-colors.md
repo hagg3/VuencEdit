@@ -2,6 +2,7 @@
 layout: doc
 title: "Blocks & Colors"
 subtitle: "Block types, the paint palette, and colour tables."
+description: "VuencEdit developer reference: Block types, the paint palette, and colour tables (Eden: World Builder)."
 ---
 {% raw %}
 > **Game-format reference.** The tables here are ported directly from the game's

@@ -2,6 +2,7 @@
 layout: post
 title: VuencEdit release incoming!
 subtitle: Adding the finishing touches
+description: "The first VuencEdit release, a world editor for Eden: World Builder, is almost here."
 ---
 
 After nearly 6 months, we are nearly ready to end the beta and initial development phase of VuencEdit, a world editor for Eden World Builder files. 

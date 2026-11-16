@@ -2,6 +2,7 @@
 layout: page
 title: Features
 subtitle: What VuencEdit does today, section by section.
+description: "Everything VuencEdit can do with Eden: World Builder worlds: map editing, selections, terrain sculpting, a 3D view, world generation, prefabs and texture packs."
 ---
 
 ## Interface

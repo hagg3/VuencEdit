@@ -1,6 +1,7 @@
 ---
 layout: page
 title: About
+description: "About VuencEdit, a community-made world editor for Eden: World Builder: credits, history (Eden World Manipulator, Vuenctools) and backing up your worlds."
 ---
 
 ## Credits

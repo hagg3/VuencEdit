@@ -2,6 +2,7 @@
 layout: doc
 title: First edit and save
 subtitle: Open a world, paint a few blocks, undo, and save.
+description: "Tutorial: open an Eden: World Builder world in VuencEdit, paint a few blocks, undo, and save."
 ---
 
 You'll need a `.eden` file. If you don't have one, make a flat world with New (see [Generate a world]({{ '/docs/tutorials/generate-world/' | relative_url }})).

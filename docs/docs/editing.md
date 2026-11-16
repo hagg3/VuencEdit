@@ -2,6 +2,7 @@
 layout: doc
 title: Editing
 subtitle: Draw tools, selections, the Lens, and terrain sculpting.
+description: "Editing Eden: World Builder worlds in VuencEdit: draw tools, selections, the Lens, and terrain sculpting."
 ---
 
 ## Draw tools

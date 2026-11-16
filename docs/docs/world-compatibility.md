@@ -2,6 +2,7 @@
 layout: doc
 title: World Compatibility
 subtitle: Legacy64z, New Dawn 256z, and NewFormat256z, and what each means for you.
+description: "Which Eden: World Builder world formats VuencEdit opens (Legacy64z, New Dawn 256z, NewFormat256z) and what each means for editing."
 ---
 
 Eden World Builder's file format has changed twice since launch. VuencEdit works out which one a file uses when you open it. You don't have to tell it anything.

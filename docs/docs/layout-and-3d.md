@@ -2,6 +2,7 @@
 layout: doc
 title: Layout & 3D View
 subtitle: Floating windows, the 3D pane, and building in 3D.
+description: "VuencEdit's floating windows and 3D view: fly through an Eden: World Builder world and build in 3D."
 ---
 
 ## The layout

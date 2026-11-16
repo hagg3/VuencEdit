@@ -2,6 +2,7 @@
 layout: doc
 title: Prefabs & Clipboard
 subtitle: Copy, paste, and the prefab library.
+description: "Copy and paste structures between Eden: World Builder worlds with VuencEdit's clipboard and prefab library."
 ---
 
 ## Copy and paste

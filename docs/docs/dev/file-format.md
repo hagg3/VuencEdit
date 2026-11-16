@@ -2,6 +2,7 @@
 layout: doc
 title: "File Format"
 subtitle: "The .eden binary layout, block addressing, saving, and the Eden.eden template."
+description: "The Eden: World Builder .eden file format: binary layout, chunk table, block addressing, saving, and the Eden.eden template."
 ---
 {% raw %}
 > **This page is a game-format reference** that you can use without this editor. The sources

@@ -2,6 +2,7 @@
 layout: doc
 title: "Architecture"
 subtitle: "Tauri shell, process and threading model, IPC design."
+description: "VuencEdit developer reference: Tauri shell, process and threading model, IPC design (Eden: World Builder)."
 ---
 {% raw %}
 ## Stack

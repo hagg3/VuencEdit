@@ -2,6 +2,7 @@
 layout: doc
 title: "2D Rendering"
 subtitle: "The tiled map, Relief shading, the Lens renderers, and HiDPI canvases."
+description: "VuencEdit developer reference: The tiled map, Relief shading, the Lens renderers, and HiDPI canvases (Eden: World Builder)."
 ---
 {% raw %}
 The top-down map and the slice viewports are drawn with the HTML **Canvas 2D**

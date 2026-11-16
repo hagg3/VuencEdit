@@ -2,6 +2,7 @@
 layout: page
 title: Downloads
 subtitle: Installers for macOS, Windows and Linux.
+description: "Download VuencEdit, the free Eden: World Builder world editor, for macOS (universal), Windows and Linux."
 ---
 
 <p id="release-meta" class="dim">v{{ site.latest_version }}</p>

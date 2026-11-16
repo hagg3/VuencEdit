@@ -2,6 +2,7 @@
 layout: doc
 title: Copy, paste and prefabs
 subtitle: Copy a structure, stamp it down, and keep it in your library.
+description: "Tutorial: copy a structure in an Eden: World Builder world, paste it elsewhere, and save it as a VuencEdit prefab."
 ---
 
 ## 1. Select a structure

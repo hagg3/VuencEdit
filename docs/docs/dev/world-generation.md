@@ -2,6 +2,7 @@
 layout: doc
 title: "World Generation"
 subtitle: "The Flat, Natural, Classic and Tg2 generators."
+description: "VuencEdit developer reference: The Flat, Natural, Classic and Tg2 generators (Eden: World Builder)."
 ---
 {% raw %}
 > Partial **game-generator reference.** The Classic and Tg2 generators are ports

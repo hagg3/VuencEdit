@@ -2,6 +2,7 @@
 layout: doc
 title: Sculpt terrain
 subtitle: Raise a hill, smooth it, and add detail.
+description: "Tutorial: sculpt terrain in an Eden: World Builder world with VuencEdit: raise a hill, smooth it, and add detail."
 ---
 
 Sculpting is experimental. Save a copy of your world first, and remember <kbd>⌘Z</kbd> undoes each stroke as one step.

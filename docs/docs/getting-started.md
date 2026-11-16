@@ -2,6 +2,7 @@
 layout: doc
 title: Getting Started
 subtitle: Open a world, move around, and make your first edit.
+description: "Getting started with VuencEdit: open an Eden: World Builder world, move around the map, and make your first edit."
 ---
 
 ## Opening a world

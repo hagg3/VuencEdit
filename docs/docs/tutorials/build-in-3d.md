@@ -2,6 +2,7 @@
 layout: doc
 title: 3D view and building in 3D
 subtitle: Fly around, then place and break blocks.
+description: "Tutorial: fly around an Eden: World Builder world in VuencEdit's 3D view, then place and break blocks."
 ---
 
 The 3D view is experimental. It's off until you open it, so it costs nothing when closed.

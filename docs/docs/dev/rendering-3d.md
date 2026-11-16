@@ -2,6 +2,7 @@
 layout: doc
 title: "3D Rendering"
 subtitle: "Geometry generation, culling, lighting, shadows and picking."
+description: "VuencEdit developer reference: Geometry generation, culling, lighting, shadows and picking (Eden: World Builder)."
 ---
 {% raw %}
 > **Port reference.** This is the intended reference for a web-based Eden World

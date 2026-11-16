@@ -1,7 +1,21 @@
 title: VuencEdit
+# Homepage <title> becomes "VuencEdit | <tagline>" (jekyll-seo-tag); keep the search phrase in it.
+tagline: World Editor for Eden World Builder
 description: >-
-  A world editor for Eden World Builder (.eden) files: top-down map editing, terrain sculpting,
+  VuencEdit is a free world editor and map editor for Eden: World Builder and Eden: Community
+  Edition (.eden files) on macOS, Windows and Linux: top-down map editing, terrain sculpting,
   a 3D view, world generation and prefabs.
+lang: en_US
+author: hagg3
+logo: /assets/img/favicon-180.png
+social:
+  name: VuencEdit
+  links:
+    - https://github.com/hagg3/VuencEdit
+# Google Search Console → Add property → URL prefix "https://hagg3.github.io/VuencEdit/" →
+# "HTML tag" method: paste only the content="…" value here, publish, then click Verify.
+# webmaster_verifications:
+#   google: PASTE_TOKEN_HERE
 url: "https://hagg3.github.io"
 baseurl: "/VuencEdit"
 
