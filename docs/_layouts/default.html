@@ -6,7 +6,14 @@
 <body>
 {% include nav.html %}
 <main>
+{% if page.url contains '/docs/' %}
 {{ content }}
+{% else %}
+<div class="with-aside">
+{{ content }}
+{% include site-aside.html %}
+</div>
+{% endif %}
 </main>
 {% include footer.html %}
 </body>

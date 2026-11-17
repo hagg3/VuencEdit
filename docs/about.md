@@ -45,11 +45,10 @@ spare time, and it may misbehave on a world, platform or game version nobody has
 
 <hr>
 
-## Beta and experimental features
+## Experimental features
 
-The whole app is a beta, so expect rough edges and the occasional bug. A few features are marked
-<span class="tag-exp">exp</span> in the app and on this site because they're newer, heavier or more
-likely to change:
+Expect the occasional rough edge. A few features are marked experimental in the app because they're
+newer, heavier or more likely to change:
 
 - Terrain sculpting, all 15 tools.
 - The 3D view itself, plus its night lighting, baked shadows and GPU shadows.

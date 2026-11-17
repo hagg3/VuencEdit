@@ -58,3 +58,75 @@
   .sidebar { position: static; padding: 8px 12px 0; }
   .sidebar ul { display: flex; flex-wrap: wrap; gap: 0 4px; }
 }
+
+// Site-wide right-hand sidebar (download, news, help, community): _includes/site-aside.html,
+// wired in _layouts/default.html on every page outside /docs/.
+.with-aside {
+  max-width: $content-max-width;
+  margin: 0 auto;
+  display: flex;
+  align-items: flex-start;
+}
+
+.with-aside > .content {
+  flex: 1;
+  min-width: 0;
+  max-width: none;
+  margin: 0;
+}
+
+.site-aside {
+  flex: 0 0 $aside-width;
+  padding: 10px 0 10px 10px;
+  font-size: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.aside-box {
+  background: linear-gradient(180deg, $surface-raised-top 0%, $surface-raised-bot 100%);
+  border: 1px solid $border-outline;
+  border-radius: 3px;
+  box-shadow: inset 0 1px 0 $border-bevel;
+  padding: 8px 10px 10px;
+}
+
+.aside-box p { margin: 0 0 6px; color: $text-dim; }
+.aside-box p:last-child { margin-bottom: 0; }
+
+.aside-title {
+  margin: 0 0 6px;
+  padding: 0;
+  border: none;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  color: $text-label;
+}
+
+.aside-btn { display: flex; justify-content: center; margin-bottom: 6px; }
+.aside-meta { font-size: 11px; color: $text-label; }
+
+.news-item {
+  display: block;
+  padding: 4px 6px;
+  margin: 0 -6px;
+  border-left: 2px solid transparent;
+  color: $text;
+}
+
+.news-item:hover { text-decoration: none; background: rgba(255, 255, 255, 0.04); }
+.news-item.active { border-left-color: $accent-primary; }
+.news-date { display: block; font-size: 10px; color: $text-label; }
+.news-title { display: block; line-height: 1.35; }
+
+.aside-more { margin-top: 6px !important; font-size: 11px; }
+
+.aside-links { list-style: none; margin: 0; padding: 0; }
+.aside-links li { margin: 0 0 3px; }
+
+@media (max-width: $phone) {
+  .with-aside { display: block; }
+  .site-aside { padding: 10px 12px 0; }
+}

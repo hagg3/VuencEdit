@@ -1,14 +1,33 @@
+{% assign this_year = site.time | date: "%Y" %}
 <footer class="site-footer">
   <div class="site-footer-inner">
-    <div>
-      VuencEdit is a community project, not affiliated with or endorsed by Eden World Builder's
-      developer. Based on Eden World Manipulator / Vuenctools, with file-format documentation by
-      Robert Munafo. Beta software, so keep copies of your worlds.
+    <div class="footer-text">
+      <p>
+        &copy; 2026{% if this_year != "2026" %}&ndash;{{ this_year }}{% endif %} hagg3 and contributors.
+        VuencEdit is free software under the
+        <a href="https://github.com/{{ site.repository }}/blob/main/COPYING" target="_blank" rel="noopener">GPL v3</a>;
+        its own code is also available under the
+        <a href="https://github.com/{{ site.repository }}/blob/main/LICENSE" target="_blank" rel="noopener">MIT licence</a>.
+      </p>
+      <p>
+        Eden: World Builder by Ari Ronen. Built on Eden World Manipulator and Vuenctools, with
+        file-format notes by Robert Munafo. Not affiliated with or endorsed by Eden's developer.
+        Provided as-is, so keep copies of your worlds.
+      </p>
+      <p class="footer-links">
+        <a href="{{ '/about/' | relative_url }}">About &amp; credits</a>
+        <a href="{{ '/blog/' | relative_url }}">Blog</a>
+        <a href="https://github.com/{{ site.repository }}/releases" target="_blank" rel="noopener">Releases</a>
+        <a href="https://github.com/{{ site.repository }}/blob/main/NOTICE.md" target="_blank" rel="noopener">Licence notice</a>
+      </p>
     </div>
-    <div class="footer-links">
-      <a href="{{ '/about/' | relative_url }}">About</a>
-      <a href="https://github.com/{{ site.repository }}" target="_blank" rel="noopener">GitHub</a>
-      <a href="https://discord.com/invite/rjYXwBC" target="_blank" rel="noopener">Discord</a>
+    <!-- 88x31 badges: one short label each, never two lines (docs/_tools/make-badges.py). -->
+    <div class="badges">
+      <a href="https://discord.com/invite/rjYXwBC" target="_blank" rel="noopener"><img src="{{ '/assets/img/badges/discord.png' | relative_url }}" width="88" height="31" alt="Discord" title="Join the Eden Discord"></a>
+      <a href="https://hagg3.github.io/edencom/" target="_blank" rel="noopener"><img src="{{ '/assets/img/badges/eden-ce.png' | relative_url }}" width="88" height="31" alt="Eden CE" title="Eden: Community Edition"></a>
+      <a href="https://github.com/{{ site.repository }}" target="_blank" rel="noopener"><img src="{{ '/assets/img/badges/github.png' | relative_url }}" width="88" height="31" alt="GitHub" title="Source on GitHub"></a>
+      <a href="https://github.com/{{ site.repository }}/blob/main/COPYING" target="_blank" rel="noopener"><img src="{{ '/assets/img/badges/gpl.png' | relative_url }}" width="88" height="31" alt="GPLv3" title="Free software, GPL v3"></a>
+      <a href="{{ '/feed.xml' | relative_url }}"><img src="{{ '/assets/img/badges/rss.png' | relative_url }}" width="88" height="31" alt="RSS" title="Blog feed"></a>
     </div>
   </div>
 </footer>

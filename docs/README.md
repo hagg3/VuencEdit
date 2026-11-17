@@ -15,7 +15,9 @@ Jekyll site, copied to the public repo by `publish.sh vuencedit`. This file is i
 | Blog posts | `_posts/YYYY-MM-DD-slug.md`; the `/blog/` index is `blog/index.html`, the feed is `/feed.xml` (jekyll-feed) |
 | Local CMS (private) | `admin/` (see "Local editor" below) |
 | Top nav tabs | `_data/nav.yml` |
-| Footer, beta chip, head tags | `_includes/footer.html`, `_includes/nav.html`, `_includes/head.html` |
+| Footer (copyright, licence, 88×31 badges), nav, head tags | `_includes/footer.html`, `_includes/nav.html`, `_includes/head.html` |
+| Right sidebar (download, news, help, community) on non-Help pages | `_includes/site-aside.html`, wired in `_layouts/default.html` |
+| Footer badges | `assets/img/badges/*.png`, made by `_tools/make-badges.py` (one short label each, never two lines) |
 | Latest version (no-JS fallback) | `_config.yml` → `latest_version` |
 | Site title, description | `_config.yml` |
 

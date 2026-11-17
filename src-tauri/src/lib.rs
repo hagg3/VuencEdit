@@ -1984,9 +1984,25 @@ struct PaintBlock {
 /// non-sculpt edit), `undo_edit_inner`/`redo_edit_inner`, `load_world`'s swap, and `close_world`.
 /// Keyed by a monotonic `group_id` that can never be reused, so an abandoned session (stroke
 /// released with no further calls) is safe to leave until the next non-matching edit reaps it.
+///
+/// `carve_ref` is Carve's own stroke state: the **pre-stroke** surface height of every column any
+/// Carve stamp of this stroke has touched (plus a one-column gradient ring), captured lazily at
+/// the start of each stamp before it writes. Carve cuts against this reference rather than the
+/// live world, so a held click re-stamps the same hollow (idempotent) and a drag cuts an even
+/// trench instead of compounding terraces. The two caches describe the same columns, so a stamp
+/// of one kind invalidates the other: a Carve stamp clears `fheight`, any non-Carve stamp clears
+/// `carve_ref` (a Shift → temporary-Smooth mid-stroke shares the `group_id`). Rock still leaves
+/// no session behind (`sculpt_persists_session`); Carve does, but only when it has a group.
 pub(crate) struct SculptSession {
     pub(crate) group_id: u64,
     pub(crate) fheight: HashMap<(i32, i32), f64>,
+    pub(crate) carve_ref: HashMap<(i32, i32), i32>,
+}
+
+impl SculptSession {
+    pub(crate) fn new(group_id: u64) -> Self {
+        SculptSession { group_id, fheight: HashMap::new(), carve_ref: HashMap::new() }
+    }
 }
 
 /// Bytes in one band (8 KiB: 4 KiB of block bytes, then 4 KiB of paint).
@@ -11093,26 +11109,10 @@ fn box_blur_1d(line: &mut [f32], r: i32) {
 }
 
 /// Classify a new top block by local steepness (max height diff to an 8-neighbour): flat →
-/// grass, moderate → dirt, steep → stone. Shared by the `"stamp"` sculpt mode and Carve's
-/// post-cut floor re-cap.
+/// grass, moderate → dirt, steep → stone. Used by the `"stamp"` sculpt mode.
 #[inline]
 fn classify_by_slope(slope: i32) -> u8 {
     if slope >= 3 { 2 } else if slope == 2 { 3 } else { 8 }
-}
-
-/// Re-texture a column's current surface block per `classify_by_slope`, reading fresh
-/// (post-edit) heights for the column and its 8-neighbourhood. Used by Carve to re-cap an
-/// exposed floor so a cut gully doesn't show raw stone under a grass landscape.
-fn retexture_top(world: &mut impl VoxelViewMut, wx: i32, wy: i32, cap: Option<i32>) {
-    let Some(z) = surface_z_capped(world, wx, wy, cap) else { return };
-    if read_block_abs(world, wx, wy, z) == 1 { return; } // never re-skin Bedrock
-    let mut slope = 0;
-    for ((dx, dy), _) in SCULPT_KERNEL {
-        if let Some(nz) = surface_z_capped(world, wx + dx, wy + dy, cap) {
-            slope = slope.max((nz - z).abs());
-        }
-    }
-    set_block_abs(world, wx, wy, z, classify_by_slope(slope), 0);
 }
 
 /// The XY margin `field_stamp` writes *outside* its nominal `radius` — the wider of the noise
@@ -11159,6 +11159,84 @@ fn sculpt_write_rect(
     )
 }
 
+/// Carve's view of the terrain for one stamp: the stroke's pre-stroke surface heights over the
+/// stamp's write bbox plus a one-column ring, as an exact grid (`href`) and a blurred one (`hb`).
+/// `href` places the terrain SDF (`sd_terr`) and sizes the Z range; `hb` steers the hollow (anchor,
+/// drape frame, gradient) so one tree trunk or spike under the cursor can't. Both index with
+/// `-1..=w` / `-1..=h` relative to the bbox origin.
+struct CarveGrid {
+    gw: usize,
+    gh: usize,
+    href: Vec<i32>,
+    hb: Vec<f32>,
+}
+
+impl CarveGrid {
+    /// Fill `cref` for every column of the padded bbox that it doesn't hold yet (reading the world
+    /// *before* this stamp writes anything), then lift the grids out of it. A column that is
+    /// unloaded takes the mean of the loaded ones (or 1) and is inserted too, so it stays fixed for
+    /// the rest of the stroke.
+    #[allow(clippy::too_many_arguments)]
+    fn capture(
+        world: &impl VoxelView,
+        cref: &mut HashMap<(i32, i32), i32>,
+        x0: i32, y0: i32, x1: i32, y1: i32,
+        cap: Option<i32>,
+        r_xy: f64,
+    ) -> CarveGrid {
+        let gw = (x1 - x0 + 3) as usize;
+        let gh = (y1 - y0 + 3) as usize;
+        let (mut sum, mut n) = (0i64, 0i64);
+        let mut missing: Vec<(i32, i32)> = Vec::new();
+        for wy in (y0 - 1)..=(y1 + 1) {
+            for wx in (x0 - 1)..=(x1 + 1) {
+                if let Some(&z) = cref.get(&(wx, wy)) {
+                    sum += z as i64; n += 1;
+                } else if let Some(z) = surface_z_capped(world, wx, wy, cap) {
+                    cref.insert((wx, wy), z);
+                    sum += z as i64; n += 1;
+                } else {
+                    missing.push((wx, wy));
+                }
+            }
+        }
+        let fallback = if n > 0 { (sum / n) as i32 } else { 1 };
+        for c in missing { cref.insert(c, fallback); }
+
+        let mut href = Vec::with_capacity(gw * gh);
+        for wy in (y0 - 1)..=(y1 + 1) {
+            for wx in (x0 - 1)..=(x1 + 1) { href.push(cref[&(wx, wy)]); }
+        }
+        // Two separable box-blur passes (rows, then columns).
+        let br = (r_xy / 4.0).round().max(1.0) as i32;
+        let mut hb: Vec<f32> = href.iter().map(|&v| v as f32).collect();
+        for row in hb.chunks_mut(gw) { box_blur_1d(row, br); }
+        let mut col = vec![0f32; gh];
+        for ix in 0..gw {
+            for iy in 0..gh { col[iy] = hb[iy * gw + ix]; }
+            box_blur_1d(&mut col, br);
+            for iy in 0..gh { hb[iy * gw + ix] = col[iy]; }
+        }
+        CarveGrid { gw, gh, href, hb }
+    }
+
+    #[inline]
+    fn at(&self, ix: i32, iy: i32) -> usize {
+        let cx = (ix + 1).clamp(0, self.gw as i32 - 1) as usize;
+        let cy = (iy + 1).clamp(0, self.gh as i32 - 1) as usize;
+        cy * self.gw + cx
+    }
+    /// Exact pre-stroke surface z of bbox column `(ix, iy)`.
+    #[inline]
+    fn href(&self, ix: i32, iy: i32) -> i32 { self.href[self.at(ix, iy)] }
+    /// Blurred pre-stroke surface height of bbox column `(ix, iy)`.
+    #[inline]
+    fn hb(&self, ix: i32, iy: i32) -> f64 { self.hb[self.at(ix, iy)] as f64 }
+    fn href_range(&self) -> (i32, i32) {
+        (*self.href.iter().min().unwrap_or(&1), *self.href.iter().max().unwrap_or(&1))
+    }
+}
+
 /// Volumetric Rock/Carve stamp — terrain and the rock mass are two signed-distance fields
 /// combined with a smooth-min/-max fillet (`k`), so the mass fuses into the landscape instead of
 /// sitting on top of it as a seamed object. Rock is a pure union (air → fill only, never
@@ -11176,6 +11254,7 @@ fn field_stamp(
     fill_bt: Option<u8>,
     fill_paint: Option<u8>,
     carve: bool,
+    carve_ref: Option<&mut HashMap<(i32, i32), i32>>,
 ) {
     let max_z = world_max_z(world);
     let cz = surface_z_capped(world, cx, cy, cap).unwrap_or(1);
@@ -11185,7 +11264,9 @@ fn field_stamp(
     let r_z = ((r_xy * flatten).round() as i32).max(1);
     let r_zf = r_z as f64;
     let r_min = r_xy.min(r_zf);
-    let sink = p.sink.clamp(0.0, 1.0);
+    // Carve mirrors Rock's mass about the surface, so `sink` is the fraction of the hollow that
+    // stands *above* ground; at 0 its top would only touch the surface and nothing would be cut.
+    let sink = if carve { p.sink.clamp(0.15, 1.0) } else { p.sink.clamp(0.0, 1.0) };
     let drape = p.drape.clamp(0.0, 1.0);
     let strata = p.strata.clamp(0.0, 2.0);
 
@@ -11225,26 +11306,34 @@ fn field_stamp(
     // cost is losing pixel-exact fidelity to real cliffs *directly under* the stamp in favour of a
     // smooth local-slope estimate; every other design goal (draping over hills, fusing without a
     // seam, no floating mass) is unaffected.
-    let raw_left: Vec<Option<i32>> = (y0..=y1).map(|wy| surface_z_capped(world, x0 - 1, wy, cap)).collect();
-    let raw_right: Vec<Option<i32>> = (y0..=y1).map(|wy| surface_z_capped(world, x1 + 1, wy, cap)).collect();
-    let raw_top: Vec<Option<i32>> = (x0..=x1).map(|wx| surface_z_capped(world, wx, y0 - 1, cap)).collect();
-    let raw_bot: Vec<Option<i32>> = (x0..=x1).map(|wx| surface_z_capped(world, wx, y1 + 1, cap)).collect();
-    // Fallback for an unloaded ring point (near a world/chunk boundary) must itself be
-    // call-invariant — the mean of whatever *other* ring points *were* loaded (or a fixed
-    // constant if none were), never the live (self-referential) `cz`.
-    let ring_mean = {
-        let (mut sum, mut n) = (0i64, 0i64);
-        for v in raw_left.iter().chain(&raw_right).chain(&raw_top).chain(&raw_bot).flatten() {
-            sum += *v as i64; n += 1;
-        }
-        if n > 0 { (sum / n) as i32 } else { 1 }
-    };
     let w = (x1 - x0 + 1) as usize;
     let h = (y1 - y0 + 1) as usize;
-    let h_left: Vec<f32> = raw_left.iter().map(|v| v.unwrap_or(ring_mean) as f32).collect();
-    let h_right: Vec<f32> = raw_right.iter().map(|v| v.unwrap_or(ring_mean) as f32).collect();
-    let h_top: Vec<f32> = raw_top.iter().map(|v| v.unwrap_or(ring_mean) as f32).collect();
-    let h_bot: Vec<f32> = raw_bot.iter().map(|v| v.unwrap_or(ring_mean) as f32).collect();
+    // Carve never reads the outside ring (nor `stable_h`): it cuts against the stroke's exact
+    // pre-stroke heightmap instead (see `CarveGrid`), so the ring is sampled for Rock only.
+    let (h_left, h_right, h_top, h_bot): (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) = if carve {
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+    } else {
+        let raw_left: Vec<Option<i32>> = (y0..=y1).map(|wy| surface_z_capped(world, x0 - 1, wy, cap)).collect();
+        let raw_right: Vec<Option<i32>> = (y0..=y1).map(|wy| surface_z_capped(world, x1 + 1, wy, cap)).collect();
+        let raw_top: Vec<Option<i32>> = (x0..=x1).map(|wx| surface_z_capped(world, wx, y0 - 1, cap)).collect();
+        let raw_bot: Vec<Option<i32>> = (x0..=x1).map(|wx| surface_z_capped(world, wx, y1 + 1, cap)).collect();
+        // Fallback for an unloaded ring point (near a world/chunk boundary) must itself be
+        // call-invariant — the mean of whatever *other* ring points *were* loaded (or a fixed
+        // constant if none were), never the live (self-referential) `cz`.
+        let ring_mean = {
+            let (mut sum, mut n) = (0i64, 0i64);
+            for v in raw_left.iter().chain(&raw_right).chain(&raw_top).chain(&raw_bot).flatten() {
+                sum += *v as i64; n += 1;
+            }
+            if n > 0 { (sum / n) as i32 } else { 1 }
+        };
+        (
+            raw_left.iter().map(|v| v.unwrap_or(ring_mean) as f32).collect(),
+            raw_right.iter().map(|v| v.unwrap_or(ring_mean) as f32).collect(),
+            raw_top.iter().map(|v| v.unwrap_or(ring_mean) as f32).collect(),
+            raw_bot.iter().map(|v| v.unwrap_or(ring_mean) as f32).collect(),
+        )
+    };
     let stable_h = |ix: usize, iy: usize| -> f64 {
         let tx = if w > 1 { ix as f64 / (w - 1) as f64 } else { 0.5 };
         let ty = if h > 1 { iy as f64 / (h - 1) as f64 } else { 0.5 };
@@ -11255,23 +11344,56 @@ fn field_stamp(
     let stable_h_c = |ix: i32, iy: i32| -> f64 {
         stable_h(ix.clamp(0, w as i32 - 1) as usize, iy.clamp(0, h as i32 - 1) as usize)
     };
-    let h_anchor = stable_h((cx - x0) as usize, (cy - y0) as usize);
 
-    // Z bbox, sized from the stable anchor (not live `cz`) so it too is call-invariant.
-    let blob_cz_est = h_anchor + r_zf * (1.0 - sink);
-    let mut z0 = ((blob_cz_est - r_zf - pad as f64).floor() as i32).max(1);
-    let z1 = ((blob_cz_est + r_zf + pad as f64).ceil() as i32).min(max_z);
-    if carve { z0 = z0.max(2); } // never touch bedrock (z<=1)
+    // Carve: capture (lazily, before any write) the pre-stroke surface of every column this stamp
+    // can write plus a one-column ring, into the stroke's `carve_ref`. An ungrouped call has no
+    // stroke, so it gets a throwaway map — i.e. the live world, a one-shot cut.
+    let mut local_ref: HashMap<(i32, i32), i32> = HashMap::new();
+    let carve_grid: Option<CarveGrid> = if carve {
+        let cref = match carve_ref { Some(r) => r, None => &mut local_ref };
+        Some(CarveGrid::capture(world, cref, x0, y0, x1, y1, cap, r_xy))
+    } else {
+        None
+    };
+    // The terrain frame the rock's drape/anchor/gradient read: Rock's outside-ring estimate
+    // (call-invariant, see above), Carve's blurred pre-stroke heightmap.
+    let frame_h = |ix: usize, iy: usize| -> f64 {
+        match &carve_grid { Some(g) => g.hb(ix as i32, iy as i32), None => stable_h(ix, iy) }
+    };
+    let frame_h_c = |ix: i32, iy: i32| -> f64 {
+        match &carve_grid { Some(g) => g.hb(ix, iy), None => stable_h_c(ix, iy) }
+    };
+    let h_anchor = frame_h((cx - x0) as usize, (cy - y0) as usize);
+
+    // Z bbox, sized from the stable anchor (not live `cz`) so it too is call-invariant. Carve
+    // sizes it from the pre-stroke heights instead — the draped hollow on a slope can reach below
+    // the centre anchor's window — and never reaches bedrock (z<=1).
+    let (z0, z1) = match &carve_grid {
+        Some(g) => {
+            let (lo, hi) = g.href_range();
+            (
+                ((lo as f64 - 2.0 * r_zf - pad as f64).floor() as i32).max(2),
+                ((hi as f64 + r_zf + pad as f64).ceil() as i32).min(max_z),
+            )
+        }
+        None => {
+            let blob_cz_est = h_anchor + r_zf * (1.0 - sink);
+            (
+                ((blob_cz_est - r_zf - pad as f64).floor() as i32).max(1),
+                ((blob_cz_est + r_zf + pad as f64).ceil() as i32).min(max_z),
+            )
+        }
+    };
     if z1 < z0 || x1 < x0 || y1 < y0 { return; }
     let d = (z1 - z0 + 1) as usize;
     let idx = |ix: usize, iy: usize, iz: usize| iz * w * h + iy * w + ix;
 
-    // Slope-normalised gradient magnitude of `stable_h`, via central differences.
+    // Slope-normalised gradient magnitude of the frame heights, via central differences.
     let mut grad = vec![0f32; w * h];
     for iy in 0..h {
         for ix in 0..w {
-            let hx = (stable_h_c(ix as i32 + 1, iy as i32) - stable_h_c(ix as i32 - 1, iy as i32)) * 0.5;
-            let hy = (stable_h_c(ix as i32, iy as i32 + 1) - stable_h_c(ix as i32, iy as i32 - 1)) * 0.5;
+            let hx = (frame_h_c(ix as i32 + 1, iy as i32) - frame_h_c(ix as i32 - 1, iy as i32)) * 0.5;
+            let hy = (frame_h_c(ix as i32, iy as i32 + 1) - frame_h_c(ix as i32, iy as i32 - 1)) * 0.5;
             grad[iy * w + ix] = (1.0 + hx * hx + hy * hy).sqrt() as f32;
         }
     }
@@ -11320,15 +11442,24 @@ fn field_stamp(
             let wy = y0 + iy as i32;
             for ix in 0..w {
                 let wx = x0 + ix as i32;
-                let hxy_stable = stable_h(ix, iy);
+                let hxy_stable = frame_h(ix, iy);
 
                 // Terrain-relative vertical frame: near/below the surface the rock's own frame is
                 // locked to local terrain height (base drapes over the slope, from the stable
                 // outside-bbox estimate — see `stable_h` above); well above it, the frame is
-                // world-vertical so the emergent top keeps a free-standing form.
-                let taper = 1.0 - smoothstep01((wz as f64 - hxy_stable) / (1.5 * r_zf));
-                let col_anchor = h_anchor + (hxy_stable - h_anchor) * drape * taper;
-                let blob_cz_col = col_anchor + r_zf * (1.0 - sink);
+                // world-vertical so the emergent top keeps a free-standing form. Carve mirrors
+                // this: the hollow hangs *below* the surface, its rim follows the terrain, and
+                // the deep floor keeps its own shape.
+                let (taper, blob_cz_col);
+                if carve {
+                    taper = 1.0 - smoothstep01((hxy_stable - wz as f64) / (1.5 * r_zf));
+                    let col_anchor = h_anchor + (hxy_stable - h_anchor) * drape * taper;
+                    blob_cz_col = col_anchor - r_zf * (1.0 - sink);
+                } else {
+                    taper = 1.0 - smoothstep01((wz as f64 - hxy_stable) / (1.5 * r_zf));
+                    let col_anchor = h_anchor + (hxy_stable - h_anchor) * drape * taper;
+                    blob_cz_col = col_anchor + r_zf * (1.0 - sink);
+                }
 
                 let dx0 = (wx - cx) as f64 / r_xy;
                 let dy0 = (wy - cy) as f64 / r_xy;
@@ -11349,9 +11480,18 @@ fn field_stamp(
                 }
 
                 let g = (grad[iy * w + ix] as f64).max(0.05);
-                let sd_terr = (wz as f64 - hxy_stable) / g;
-
-                field[idx(ix, iy, iz)] = (if carve { smax(sd_terr, -sd_rock, k) } else { smin(sd_rock, sd_terr, k) }) as f32;
+                field[idx(ix, iy, iz)] = if let Some(cg) = &carve_grid {
+                    // The terrain surface is the top *face* of the exact pre-stroke top block, so
+                    // no solid cell sits on the zero level (that was the half-block that cut the
+                    // top layer of the whole bbox). The `sd_rock <= k` gate is a safety net for a
+                    // stale reference (mixed stroke, restamp): it keeps a cut inside the hollow's
+                    // fillet band. A negative field means "keep".
+                    let sd_terr = (wz as f64 - cg.href(ix as i32, iy as i32) as f64 - 0.5) / g;
+                    if sd_rock <= k { smax(sd_terr, -sd_rock, k) as f32 } else { -1.0 }
+                } else {
+                    let sd_terr = (wz as f64 - hxy_stable) / g;
+                    smin(sd_rock, sd_terr, k) as f32
+                };
             }
         }
     }
@@ -11408,7 +11548,6 @@ fn field_stamp(
     // Step 7 (Carve) — one z-descending pass per column so sky-connectivity is a single boolean:
     // only delete solid cells reachable from open sky (or from another just-deleted cell) without
     // crossing a surviving solid block first. Guarantees no floating roofs and no sealed caves.
-    let mut touched: Vec<(i32, i32)> = Vec::new();
     for iy in 0..h {
         let wy = y0 + iy as i32;
         if let Some([_, cy1, _, cy2]) = clip { if wy < cy1 || wy > cy2 { continue; } }
@@ -11416,13 +11555,25 @@ fn field_stamp(
             let wx = x0 + ix as i32;
             if let Some([cx1, _, cx2, _]) = clip { if wx < cx1 || wx > cx2 { continue; } }
             if mask.is_some_and(|m| !m.contains(wx, wy)) { continue; }
-            // Real (live) surface height, not the stable/smoothed estimate — sky-connectivity
-            // gating is about the actual current world, and unlike the field above this doesn't
-            // feed back into the field's own shape, so it carries no idempotency risk.
+            // Real (live) surface height, not the pre-stroke reference — sky-connectivity gating
+            // is about the actual current world, and unlike the field above this doesn't feed back
+            // into the field's own shape, so it carries no idempotency risk.
             let hxy_live = surface_z_capped(world, wx, wy, cap).unwrap_or(cz);
+            // Under a cutaway the world above the cap is not shown and must not be edited (a cave
+            // ceiling would otherwise be reached as "open sky"), so start at the cap.
+            let top_iz = match cap {
+                Some(c) => {
+                    let zt = z1.min(c);
+                    if zt < z0 { continue; }
+                    (zt - z0) as usize
+                }
+                None => d - 1,
+            };
             let mut open = false;
-            let mut col_touched = false;
-            for iz in (0..d).rev() {
+            // The first (topmost) opaque block this column loses — the new floor takes its block
+            // and paint, so a carved gully keeps the ground's own material.
+            let mut floor: Option<(u8, u8)> = None;
+            for iz in (0..=top_iz).rev() {
                 let wz = z0 + iz as i32;
                 if wz < 2 { break; } // never touch bedrock (z<=1)
                 if wz >= hxy_live { open = true; }
@@ -11430,19 +11581,25 @@ fn field_stamp(
                 if bt_before == 1 { open = false; continue; } // never delete Bedrock
                 let solid_before = bt_before != 0;
                 if field[idx(ix, iy, iz)] >= 0.0 && solid_before && open {
+                    if floor.is_none() && voxel_core::signs::is_opaque(bt_before) {
+                        floor = Some((bt_before, read_paint_abs(world, wx, wy, wz)));
+                    }
                     set_block_abs(world, wx, wy, wz, 0, 0);
-                    col_touched = true;
                 } else if solid_before {
                     open = false;
                 }
             }
-            if col_touched { touched.push((wx, wy)); }
+            // Nothing opaque removed (or nothing removed at all) → leave the floor alone. Never
+            // re-skin Bedrock or a non-opaque new top (water, a plant).
+            if let Some((bt, pnt)) = floor {
+                if let Some(top) = surface_z_capped(world, wx, wy, cap) {
+                    let top_bt = read_block_abs(world, wx, wy, top);
+                    if top_bt != 1 && voxel_core::signs::is_opaque(top_bt) {
+                        set_block_abs(world, wx, wy, top, bt, pnt);
+                    }
+                }
+            }
         }
-    }
-
-    // Re-cap the exposed floor so a carved gully doesn't show raw stone under a grass landscape.
-    for (wx, wy) in touched {
-        retexture_top(world, wx, wy, cap);
     }
 }
 
@@ -11460,7 +11617,7 @@ fn rock_stamp(
     fill_bt: Option<u8>,
     fill_paint: Option<u8>,
 ) {
-    field_stamp(world, cx, cy, radius, p, seed, cap, clip, None, fill_bt, fill_paint, false);
+    field_stamp(world, cx, cy, radius, p, seed, cap, clip, None, fill_bt, fill_paint, false, None);
 }
 
 /// Sculpt terrain at brush positions.
@@ -11609,10 +11766,11 @@ fn sculpt_mode_label(mode: &str) -> String {
         .unwrap_or_else(|| mode.to_string())
 }
 
-/// Rock and Carve write a deterministic volumetric field rather than blending toward a float
-/// target, so they never accumulate into `fheight` and must not leave a session behind.
+/// Rock writes a deterministic volumetric field rather than blending toward a float target, so it
+/// never accumulates into `fheight` and must not leave a session behind. Carve is the exception:
+/// it persists the session (for `carve_ref`, its pre-stroke heightmap) across a stroke's stamps.
 fn sculpt_persists_session(mode: &str, group: Option<u64>) -> bool {
-    group.is_some() && !matches!(mode, "rock" | "carve")
+    group.is_some() && mode != "rock"
 }
 
 /// Pull the float workspace belonging to this stroke out of `ws`, or start a fresh one. Taken out
@@ -11620,7 +11778,7 @@ fn sculpt_persists_session(mode: &str, group: Option<u64>) -> bool {
 fn take_sculpt_session(ws: &mut WorldState, group: Option<u64>) -> SculptSession {
     match ws.sculpt_session.take() {
         Some(s) if Some(s.group_id) == group => s,
-        _ => SculptSession { group_id: group.unwrap_or(0), fheight: HashMap::new() },
+        _ => SculptSession::new(group.unwrap_or(0)),
     }
 }
 
@@ -11784,7 +11942,10 @@ fn sculpt_split(
         } else {
             timing_log!("[SCULPT] world changed during compute (seq {} -> {}) — restamping under the write guard", seq_seen, seq_now);
             drop(chunks);
-            session = SculptSession { group_id: group.unwrap_or(0), fheight: HashMap::new() };
+            // A fresh session on purpose: for Carve this re-captures `carve_ref` from the current
+            // (already-cut-by-someone-else) world, so this one flush can dig a step deeper than the
+            // stroke's own reference. It only fires on a foreign edit mid-stroke; accepted.
+            session = SculptSession::new(group.unwrap_or(0));
             let coords = affected_chunk_coords(&world, rect.0, rect.1, rect.2, rect.3);
             let mut scratch = ChunkScratch::new(&world, &coords);
             let ran = run_sculpt_flush(&mut scratch, &mut session, args, stamps);
@@ -11870,6 +12031,10 @@ fn sculpt_stamp_body(
     x_max: i32,
     y_max: i32,
 ) -> Result<(), String> {
+    // `carve_ref` describes the world as it was before this stroke's Carve stamps; any other mode
+    // may change those heights (a Shift → Smooth mid-stroke shares the group), so drop it. The
+    // Carve arm clears `fheight` for the mirror-image reason. See `SculptSession`.
+    if mode != "carve" { session.carve_ref.clear(); }
     // Pre-read all heights and surface blocks while we have a shared ref. Smooth/erode/
     // thermal read the full 8-neighbourhood, so widen the pre-read beyond the footprint.
     let height_map: HashMap<(i32, i32), (i32, u8, u8)> = {
@@ -12352,7 +12517,9 @@ fn sculpt_stamp_body(
         "rock" | "carve" => {
             // Volumetric: bypasses points/height_map/weight/blend entirely — a 3D density
             // field stamped once around the dial centre (or the footprint's bbox centre when
-            // no dial was supplied). Never touches the float workspace.
+            // no dial was supplied). Rock never touches the float workspace; Carve changes the
+            // heights `fheight` caches, so it drops that cache and cuts against the stroke's
+            // pre-stroke heightmap (`carve_ref`) instead.
             let (rcx, rcy, rr) = match dial {
                 Some((dcx, dcy, dr)) => (dcx, dcy, dr.max(1)),
                 None => (
@@ -12362,7 +12529,12 @@ fn sculpt_stamp_body(
                 ),
             };
             let rp = rock.clone().unwrap_or_default();
-            field_stamp(world, rcx, rcy, rr, &rp, seed, cap, clip_rect, mask.map(|m| &**m), block_type, paint, mode == "carve");
+            let carve = mode == "carve";
+            if carve { session.fheight.clear(); }
+            field_stamp(
+                world, rcx, rcy, rr, &rp, seed, cap, clip_rect, mask.map(|m| &**m), block_type, paint, carve,
+                carve.then_some(&mut session.carve_ref),
+            );
         }
         _ => {}
     }

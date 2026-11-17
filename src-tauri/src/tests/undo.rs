@@ -372,7 +372,7 @@ pub(crate) fn test_cow_edits_match_the_snapshot_oracle() {
         });
         for mode in ["raise", "lower", "smooth", "noise", "flatten"] {
             differential(&format!("sculpt {mode}"), bands, all, &|w| {
-                let mut s = SculptSession { group_id: 0, fheight: HashMap::new() };
+                let mut s = SculptSession::new(0);
                 let stamps = vec![
                     SculptStamp { points: disc_points(14, 14, 6), dial: Some((14, 14, 6)) },
                     SculptStamp { points: disc_points(22, 17, 6), dial: Some((22, 17, 6)) },

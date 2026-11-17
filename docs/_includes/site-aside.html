@@ -1,0 +1,36 @@
+<!-- Right-hand sidebar on every non-Help page (Help pages keep their own page list instead). -->
+<aside class="site-aside">
+  <section class="aside-box">
+    <h2 class="aside-title">Download</h2>
+    <a class="btn btn-primary aside-btn" href="{{ '/downloads/' | relative_url }}">Download VuencEdit</a>
+    <p class="aside-meta">v{{ site.latest_version }} · free<br>macOS · Windows · Linux</p>
+  </section>
+
+  <section class="aside-box aside-news">
+    <h2 class="aside-title">News</h2>
+    {% for post in site.posts limit: 5 %}
+      <a class="news-item{% if page.url == post.url %} active{% endif %}" href="{{ post.url | relative_url }}">
+        <span class="news-date">{{ post.date | date: "%-d %b %Y" }}</span>
+        <span class="news-title">{{ post.title }}</span>
+      </a>
+    {% else %}
+      <p class="aside-meta">No posts yet.</p>
+    {% endfor %}
+    <p class="aside-more"><a href="{{ '/blog/' | relative_url }}">All posts &rarr;</a> · <a href="{{ '/feed.xml' | relative_url }}">RSS</a></p>
+  </section>
+
+  <section class="aside-box">
+    <h2 class="aside-title">Help</h2>
+    <ul class="aside-links">
+      <li><a href="{{ '/docs/getting-started/' | relative_url }}">Getting started</a></li>
+      <li><a href="{{ '/docs/' | relative_url }}">All help pages</a></li>
+      <li><a href="https://github.com/{{ site.repository }}/issues" target="_blank" rel="noopener">Report a bug</a></li>
+    </ul>
+  </section>
+
+  <section class="aside-box">
+    <h2 class="aside-title">Community</h2>
+    <p>Share worlds and ask for help on the <a href="https://discord.com/invite/rjYXwBC" target="_blank" rel="noopener">Eden Discord</a>.</p>
+    <p>Playing on PC or a newer iOS? <a href="https://hagg3.github.io/edencom/" target="_blank" rel="noopener">Eden: Community Edition</a> is the open-source fork of the game, and VuencEdit edits its worlds too.</p>
+  </section>
+</aside>

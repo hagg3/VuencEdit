@@ -218,12 +218,11 @@
 
 // Home hero + helpers that replaced inline styles
 .hero { text-align: center; padding: 8px 0 4px; }
-.hero-wordmark { font-size: 32px; letter-spacing: -1px; margin-bottom: 6px; }
+.hero-wordmark { font-family: $wordmark-font; font-size: 32px; letter-spacing: -0.015em; margin-bottom: 6px; }
 .hero-wordmark .w-vuenc { font-weight: 800; color: #fff; }
 .hero-wordmark .w-edit { font-weight: 400; color: $eden-teal-readable; }
 .hero .lede { max-width: 620px; margin: 0 auto 4px; }
 .hero .btn-row { justify-content: center; }
-.hero .beta-chip { display: inline-block; margin-top: 4px; }
 .cta { text-align: center; }
 .cta h2 { border: none; }
 .cta .btn-row { justify-content: center; }

@@ -34,7 +34,7 @@ The map is a zoomable, pannable top-down view, drawn in tiles so big worlds stay
 - **Build, select and sculpt in 3D.** Build mode breaks and places blocks Minecraft-style, and you can drag to sweep a line. Select mode takes two clicks. Flood Fill fills connected air. Everything goes through the normal undo.
 - **Lens** is a floating window with front, side and top views of your selection or your paste. Details are on the [Editing]({{ '/docs/editing/' | relative_url }}) and [Prefabs & Clipboard]({{ '/docs/prefabs-and-clipboard/' | relative_url }}) pages.
 
-Night lighting, sun shadows and GPU shadows in the 3D view are experimental<span class="tag-exp">exp</span>. They're slow on big worlds and off by default. You can also change the sky colours and hide the grid and HUD.
+Night lighting, sun shadows and GPU shadows in the 3D view are experimental. They're slow on big worlds and off by default. You can also change the sky colours and hide the grid and HUD.
 
 ## Selecting
 
@@ -52,7 +52,7 @@ The block picker has a search box. The hotbar holds five pinned blocks (keys <kb
 
 The Insert tab has a few extras: tree planting (normal, terrain, pine and tall pine), water and lava flow simulation, pool fill, a wavy water surface, and Materialize, which turns empty chunk space into flat terrain.
 
-## Terrain sculpting <span class="tag-exp">experimental</span>
+## Terrain sculpting
 
 Fifteen brush tools: Raise, Lower, Rock, Carve, Smooth, Flatten, Slope, Noise, Thermal, Hydro, Terrace, Sharpen, Smear, Grab and Retexture. Rock and Carve work on volume rather than a height map. Rock fuses a mass into the terrain so it doesn't sit on top like a pasted object, and Carve digs a rounded hollow without opening a roof or hitting bedrock.
 
@@ -83,11 +83,11 @@ Download searches and downloads from the Eden community servers, with preview im
 
 OBJ, VOX and VMF export, and Minecraft schematic import, were removed. That work continues in [EdenToMC](https://github.com/hagg3/EdenToMC).
 
-## Texture packs <span class="tag-exp">experimental</span>
+## Texture packs
 
 Load a ZIP of PNG tiles, or an atlas image, to texture the 3D view and the block picker. The top-down map stays flat-coloured. Tiles are converted to greyscale and tinted by each block's colour, so one pack covers every paint variant.
 
-## Eden.eden template <span class="tag-exp">experimental</span>
+## Eden.eden template
 
 Load the game's `Eden.eden` to show its terrain under your world as an overlay, or use Insert ▸ Expand to grow your world from it.
 

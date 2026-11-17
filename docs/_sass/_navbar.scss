@@ -32,9 +32,12 @@
   display: block;
 }
 
+// Same face as the app's splash title strip (App.tsx: system-ui, 800/400, -0.3px at 20px), so it
+// renders in SF Pro on macOS rather than the body's Lucida Grande.
 .brand-wordmark {
+  font-family: $wordmark-font;
   font-size: 15px;
-  letter-spacing: -0.2px;
+  letter-spacing: -0.015em;
 }
 
 .brand-wordmark .w-vuenc {
@@ -47,17 +50,6 @@
   color: $eden-teal-readable;
 }
 
-.beta-chip {
-  font-size: 10px;
-  font-weight: 700;
-  letter-spacing: 0.4px;
-  text-transform: uppercase;
-  color: #2a1c08;
-  background: $accent-warm;
-  border-radius: 3px;
-  padding: 1px 6px;
-  margin-left: 2px;
-}
 
 .nav-links {
   display: flex;

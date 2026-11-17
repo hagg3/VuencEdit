@@ -63,10 +63,10 @@ The 3D tab has a mode switch:
 
 All of it goes through the same undo as the map, and a sweep or a sculpt stroke is one undo step.
 
-### Lighting <span class="tag-exp">experimental</span>
+### Lighting
 
 Night lighting makes lamp blocks glow in their paint colour. Baked shadows add sun shadows, and the Sun slider moves the sun. GPU shadows are a real-time alternative with point lights. All three can be slow, particularly at a long render distance, so they're off by default. You can pick Legacy or New Dawn lamp falloff, since the two game versions light differently.
 
-### Texture packs <span class="tag-exp">experimental</span>
+### Texture packs
 
 View ▸ Textures loads a ZIP of PNG tiles or an atlas image for the 3D view. The map stays flat-coloured.

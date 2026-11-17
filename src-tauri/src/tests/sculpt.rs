@@ -483,7 +483,7 @@ pub(crate) fn test_scratch_stamp_matches_direct_stamp() {
 
     // Reference: straight at the world.
     let mut direct = parse_world_inner(mmap_from_bytes(base.clone())).expect("parse");
-    let mut sess_a = SculptSession { group_id: 1, fheight: HashMap::new() };
+    let mut sess_a = SculptSession::new(1);
     run_sculpt_flush(&mut direct, &mut sess_a, &args(), &stamps()).expect("direct");
 
     // Through a scratch sized by `sculpt_flush_rect`, then committed.
@@ -491,7 +491,7 @@ pub(crate) fn test_scratch_stamp_matches_direct_stamp() {
     let rect = sculpt_flush_rect(&args(), &stamps()).expect("rect");
     let coords = affected_chunk_coords(&via_scratch, rect.0, rect.1, rect.2, rect.3);
     let mut scratch = ChunkScratch::new(&via_scratch, &coords);
-    let mut sess_b = SculptSession { group_id: 1, fheight: HashMap::new() };
+    let mut sess_b = SculptSession::new(1);
     run_sculpt_flush(&mut scratch, &mut sess_b, &args(), &stamps()).expect("scratch");
     scratch.into_chunks().commit(&mut via_scratch);
 
@@ -518,7 +518,7 @@ pub(crate) fn test_lazy_scratch_matches_reference_across_modes_and_undoes() {
             SculptStamp { points: disc_points(17, 15, 6), dial: Some((17, 15, 6)) },
         ];
         let mut direct = parse_world_inner(mmap_from_bytes(base.clone())).expect("parse");
-        let mut sa = SculptSession { group_id: 1, fheight: HashMap::new() };
+        let mut sa = SculptSession::new(1);
         run_sculpt_flush(&mut direct, &mut sa, &args(), &stamps()).expect("direct");
 
         let mut lazy = parse_world_inner(mmap_from_bytes(base.clone())).expect("parse");
@@ -526,7 +526,7 @@ pub(crate) fn test_lazy_scratch_matches_reference_across_modes_and_undoes() {
         let coords = affected_chunk_coords(&lazy, rect.0, rect.1, rect.2, rect.3);
         let mut scratch = ChunkScratch::new(&lazy, &coords);
         assert_eq!(scratch.buf_len(), 0, "construction copies nothing");
-        let mut sb = SculptSession { group_id: 1, fheight: HashMap::new() };
+        let mut sb = SculptSession::new(1);
         run_sculpt_flush(&mut scratch, &mut sb, &args(), &stamps()).expect("scratch");
         let copied = scratch.buf_len();
         let whole: usize = coords.iter().filter_map(|&(x, y)| lazy.chunk_range(x, y)).map(|(a, e)| e - a).sum();
@@ -598,7 +598,7 @@ pub(crate) fn test_rock_stamp_writes_stay_inside_the_write_rect() {
     )).expect("parse");
     let before = world.bytes.to_vec();
     let rp = RockParams { meld: 3.0, smoothing: 5.0, ..RockParams::default() };
-    field_stamp(&mut world, cx, cy, r, &rp, 7, None, None, None, None, None, false);
+    field_stamp(&mut world, cx, cy, r, &rp, 7, None, None, None, None, None, false, None);
     assert_ne!(world.bytes.to_vec(), before, "the stamp did something");
 
     let rock = Some(rp);

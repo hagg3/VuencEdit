@@ -10,7 +10,13 @@
   font-size: 11px;
   color: $text-label;
   line-height: 1.5;
+  display: flex;
+  align-items: flex-start;
+  gap: 16px;
 }
+
+.footer-text { flex: 1; min-width: 0; }
+.footer-text p { margin: 0 0 6px; }
 
 .site-footer-inner a {
   color: $text-dim;
@@ -20,12 +26,26 @@
   color: $eden-teal-readable;
 }
 
-.footer-links {
-  margin-top: 6px;
-}
-
 .footer-links a:not(:last-child)::after {
   content: "·";
   color: $text-disabled;
   margin: 0 8px;
+}
+
+// 88x31 badges, two per row beside the text; pixel art, so never smoothed.
+.badges {
+  flex: 0 0 auto;
+  display: grid;
+  grid-template-columns: repeat(2, 88px);
+  gap: 4px;
+  padding-top: 2px;
+}
+
+.badges a { display: block; line-height: 0; }
+.badges img { display: block; image-rendering: pixelated; }
+.badges a:hover img { filter: brightness(1.15); }
+
+@media (max-width: $phone) {
+  .site-footer-inner { flex-direction: column; }
+  .badges { grid-template-columns: repeat(auto-fill, 88px); width: 100%; }
 }

@@ -65,7 +65,7 @@ The Lens was added in 1.0.18 and is still settling. You can turn it off with <kb
 - **Expand from Template** grows the world using the Eden.eden template. This one is experimental.
 - **Set Home Point** and **Set Start Point** (Home tab) move the respawn point or player start to the middle of the selection.
 
-## Terrain sculpting <span class="tag-exp">experimental</span>
+## Terrain sculpting
 
 The Sculpt tab has 15 brush tools for reshaping terrain. They work on the map and in the 3D view.
 

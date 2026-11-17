@@ -10,7 +10,6 @@ layout: default
       A free world editor for <strong>Eden: World Builder</strong> and Eden: Community Edition.
       Open a <code>.eden</code> file, edit it on a top-down map or in 3D, save it, and upload it back to the Eden servers if you like.
     </p>
-    <span class="beta-chip">Beta</span>
 
     <div class="btn-row">
       <a class="btn btn-primary" href="{{ '/downloads/' | relative_url }}">Download</a>
@@ -23,7 +22,7 @@ layout: default
   <h2>What it does</h2>
   <div class="feature-grid">
     {% for f in site.data.features %}
-      {% include card.html icon=f.icon title=f.title text=f.text exp=f.exp %}
+      {% include card.html icon=f.icon title=f.title text=f.text %}
     {% endfor %}
   </div>
   <p class="more-link"><a href="{{ '/features/' | relative_url }}">All features &rarr;</a></p>

@@ -557,6 +557,63 @@ pub(crate) fn test_materialize_flat_chunks_adds_only_missing_and_preserves_exist
 
 // ── Rock sculpt mode ───────────────────────────────────────────────────────
 
+/// 64-bit FNV-1a — a hash that is stable across Rust versions (unlike `DefaultHasher`), so the
+/// golden constants below can be pinned in source.
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// Rock's output is pinned byte for byte (R8 test 0): flat ground, a slope and a cone, each with
+/// two seeds, default params plus one non-default set. The Carve fix (R8.1) reworks `field_stamp`
+/// behind `carve`; Rock must not move. If this fails after an intentional Rock change, re-pin the
+/// hashes (the failure message prints the new ones) — otherwise a Rock path was disturbed.
+#[test]
+pub(crate) fn test_rock_output_golden() {
+    let flat = |_: i32, _: i32| 20;
+    let slope = |x: i32, _: i32| 10 + x / 4;
+    let cone = |x: i32, y: i32| {
+        let d = (((x - 48).pow(2) + (y - 48).pow(2)) as f64).sqrt();
+        (30.0 - d * 0.5).max(10.0) as i32
+    };
+    let mut tall = RockParams::default();
+    tall.flatten = 1.2;
+    tall.sink = 0.1;
+    tall.drape = 0.4;
+    let default = RockParams::default();
+    // (name, surface fn, params, seed, expected hash)
+    type Surf<'a> = &'a dyn Fn(i32, i32) -> i32;
+    let cases: [(&str, Surf, &RockParams, u64, u64); 6] = [
+        ("flat/1", &flat, &default, 12345, GOLDEN_ROCK[0]),
+        ("flat/2", &flat, &default, 999, GOLDEN_ROCK[1]),
+        ("slope/1", &slope, &default, 12345, GOLDEN_ROCK[2]),
+        ("slope/2", &slope, &tall, 999, GOLDEN_ROCK[3]),
+        ("cone/1", &cone, &default, 12345, GOLDEN_ROCK[4]),
+        ("cone/2", &cone, &tall, 999, GOLDEN_ROCK[5]),
+    ];
+    let mut got = [0u64; 6];
+    for (i, (_, surf, params, seed, _)) in cases.iter().enumerate() {
+        let mut ws = ws_with(make_bumpy_world_grid(6, 8, surf));
+        let mut w = ws.world.take().unwrap();
+        rock_stamp(&mut w, 48, 48, 6, params, *seed, None, None, None, None);
+        // A second, offset stamp so overlap/union paths are covered too.
+        rock_stamp(&mut w, 54, 46, 5, params, seed ^ 0x55, None, None, None, None);
+        got[i] = fnv1a64(&w.bytes);
+    }
+    let want: Vec<u64> = cases.iter().map(|c| c.4).collect();
+    assert_eq!(got.to_vec(), want, "Rock output changed — new hashes: {got:#018x?}");
+}
+
+/// Pinned by running `test_rock_output_golden` against the pre-R8.1 `field_stamp`.
+const GOLDEN_ROCK: [u64; 6] = [
+    0x4ac84579b5bb44bf, 0xf6fd0e8135973ffd, 0x9f726caa38789207,
+    0x9caf6e7f173755f5, 0xaa3c8d4ba3e5d375, 0x2c3b861fc903fb3d,
+];
+
 /// One rock stamp on flat ground: every solid cell must have at least one face-neighbour
 /// that is also solid (no single-block pepper — the direct anti-peppering assertion) and the
 /// whole solid set must be one 6-connected component (a mass, not a scatter of blobs).
@@ -720,7 +777,7 @@ pub(crate) fn test_rock_no_air_gap_under_mass() {
     let mut w = ws.world.take().unwrap();
     let params = RockParams::default();
     let (cx, cy, r) = (48, 48, 6);
-    field_stamp(&mut w, cx, cy, r, &params, 12345, None, None, None, None, None, false);
+    field_stamp(&mut w, cx, cy, r, &params, 12345, None, None, None, None, None, false, None);
     ws.world = Some(w);
     let world = ws.world.as_ref().unwrap();
 
@@ -759,7 +816,7 @@ pub(crate) fn test_rock_hugs_slope() {
     // Small radius so the padded bbox (incl. its outside-bbox edge samples) stays inside the
     // single 16×16 test chunk.
     let (cx, cy, r) = (8, 8, 3);
-    field_stamp(&mut w, cx, cy, r, &params, 777, None, None, None, None, None, false);
+    field_stamp(&mut w, cx, cy, r, &params, 777, None, None, None, None, None, false, None);
     ws.world = Some(w);
     let world = ws.world.as_ref().unwrap();
 
@@ -787,7 +844,7 @@ pub(crate) fn test_rock_silhouette_not_spherical() {
     let mut w = ws.world.take().unwrap();
     let params = RockParams::default();
     let (cx, cy, r) = (48, 48, 8);
-    field_stamp(&mut w, cx, cy, r, &params, 4242, None, None, None, None, None, false);
+    field_stamp(&mut w, cx, cy, r, &params, 4242, None, None, None, None, None, false, None);
     ws.world = Some(w);
     let world = ws.world.as_ref().unwrap();
 
@@ -833,7 +890,7 @@ pub(crate) fn test_rock_no_floating_components() {
     }}}
 
     let params = RockParams::default();
-    field_stamp(&mut w, 48, 48, 8, &params, 999, None, None, None, None, None, false);
+    field_stamp(&mut w, 48, 48, 8, &params, 999, None, None, None, None, None, false, None);
 
     let mut added: HashSet<(i32, i32, i32)> = HashSet::new();
     for wy in 28..=68 { for wx in 28..=68 { for wz in 1..=63 {
@@ -871,7 +928,7 @@ pub(crate) fn test_carve_only_deletes() {
         before.insert((wx, wy, wz), read_block_abs(&w, wx, wy, wz));
     }}}
     let params = RockParams::default();
-    field_stamp(&mut w, 48, 48, 6, &params, 55, None, None, None, None, None, true);
+    field_stamp(&mut w, 48, 48, 6, &params, 55, None, None, None, None, None, true, None);
     for (&(wx, wy, wz), &bt_before) in &before {
         let bt_after = read_block_abs(&w, wx, wy, wz);
         if bt_before == 0 {
@@ -889,7 +946,7 @@ pub(crate) fn test_carve_no_floating_roof() {
     let mut ws = ws_with(base);
     let mut w = ws.world.take().unwrap();
     let params = RockParams::default();
-    field_stamp(&mut w, 48, 48, 6, &params, 55, None, None, None, None, None, true);
+    field_stamp(&mut w, 48, 48, 6, &params, 55, None, None, None, None, None, true, None);
 
     for wy in 38..=58 { for wx in 38..=58 {
         // Walk down from well above any plausible surface: once solid is seen, everything
@@ -914,9 +971,9 @@ pub(crate) fn test_carve_idempotent() {
     let mut ws = ws_with(base);
     let mut w = ws.world.take().unwrap();
     let params = RockParams::default();
-    field_stamp(&mut w, 48, 48, 6, &params, 321, None, None, None, None, None, true);
+    field_stamp(&mut w, 48, 48, 6, &params, 321, None, None, None, None, None, true, None);
     let once = w.bytes.to_vec();
-    field_stamp(&mut w, 48, 48, 6, &params, 321, None, None, None, None, None, true);
+    field_stamp(&mut w, 48, 48, 6, &params, 321, None, None, None, None, None, true, None);
     let twice = w.bytes.to_vec();
     assert_eq!(once, twice, "re-carving the same cut in place must be a no-op");
 }
@@ -935,7 +992,7 @@ pub(crate) fn test_carve_never_touches_bedrock() {
     let mut params = RockParams::default();
     params.sink = 1.0; // bias the cavity as deep as possible
     params.flatten = 1.5;
-    field_stamp(&mut w, 48, 48, 10, &params, 7, None, None, None, None, None, true);
+    field_stamp(&mut w, 48, 48, 10, &params, 7, None, None, None, None, None, true, None);
     for wy in 34..=62 { for wx in 34..=62 {
         assert_eq!(read_block_abs(&w, wx, wy, 1), 1, "bedrock at ({wx},{wy},1) must survive any carve");
     }}
