@@ -11355,13 +11355,26 @@ fn field_stamp(
     } else {
         None
     };
+    // Carve's frame lift. The blurred heights sit *below* a convex summit (a blur averages in the
+    // lower flanks), which would leave the hollow's top (`anchor + r_z·sink`) under the real
+    // surface face: the summit survives as a pillar, and the sky-connectivity rule shields
+    // everything beneath it. So shift the whole blurred frame up by the constant that makes the
+    // hollow reach the exact surface face under the centre. A constant shift keeps the drape and
+    // gradient (relative quantities) intact; on flat ground `hb == href` and it is zero.
+    let carve_lift = match &carve_grid {
+        Some(g) => {
+            let (icx, icy) = ((cx - x0) as i32, (cy - y0) as i32);
+            (g.href(icx, icy) as f64 + 1.0 - r_zf * sink - g.hb(icx, icy)).max(0.0)
+        }
+        None => 0.0,
+    };
     // The terrain frame the rock's drape/anchor/gradient read: Rock's outside-ring estimate
     // (call-invariant, see above), Carve's blurred pre-stroke heightmap.
     let frame_h = |ix: usize, iy: usize| -> f64 {
-        match &carve_grid { Some(g) => g.hb(ix as i32, iy as i32), None => stable_h(ix, iy) }
+        match &carve_grid { Some(g) => g.hb(ix as i32, iy as i32) + carve_lift, None => stable_h(ix, iy) }
     };
     let frame_h_c = |ix: i32, iy: i32| -> f64 {
-        match &carve_grid { Some(g) => g.hb(ix, iy), None => stable_h_c(ix, iy) }
+        match &carve_grid { Some(g) => g.hb(ix, iy) + carve_lift, None => stable_h_c(ix, iy) }
     };
     let h_anchor = frame_h((cx - x0) as usize, (cy - y0) as usize);
 

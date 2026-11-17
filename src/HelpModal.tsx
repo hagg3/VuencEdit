@@ -200,7 +200,7 @@ function ToolsHelp() {
           {[
             ["Raise / Lower", "Push terrain up or down"],
             ["Rock", "Add a rock mass in the Sculpt block"],
-            ["Carve", "Cut a rounded hollow (never opens a cave roof)"],
+            ["Carve", "Cut a rounded hollow (never opens a cave roof). Hold to keep the same cut; click again to dig deeper. The floor keeps the ground's own block."],
             ["Smooth / Sharpen", "Soften or crisp up bumps"],
             ["Flatten / Slope", "Level to the clicked height, or to a tilted plane"],
             ["Grab / Smear", "Pull terrain up, down or along the stroke"],

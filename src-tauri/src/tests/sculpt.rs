@@ -499,19 +499,65 @@ pub(crate) fn test_scratch_stamp_matches_direct_stamp() {
                "a stamp computed against a scratch must be byte-identical to one computed in place");
 }
 
+/// R8 test 9: Carve cuts against the session's pre-stroke heightmap, so the scratch path must
+/// match the direct path *across flushes that share one session* — the second flush reads the
+/// reference the first one captured. Also covers a repeated stamp (idempotent within the stroke).
+#[test]
+pub(crate) fn test_scratch_carve_matches_direct_across_flushes() {
+    let base = make_bumpy_world_grid(3, 2, |x, y| 20 + ((x / 5 + y / 7) % 4));
+    let args = || SculptArgs {
+        mode: "carve".into(), strength: 3, strength_eff: 3.0, seed: 11,
+        block_type: Some(3), paint: None, freq: None, noise_mode: None,
+        softness: 0.0, profile: "smooth".into(), grab_delta: None,
+        anchor_x: None, anchor_y: None, slope_dx: None, slope_dy: None,
+        smear_dx: None, smear_dy: None, clip_rect: None, mask: None,
+        rock: Some(RockParams::default()), cap: None,
+    };
+    let flush1 = || vec![
+        SculptStamp { points: disc_points(20, 22, 5), dial: Some((20, 22, 5)) },
+        SculptStamp { points: disc_points(24, 22, 5), dial: Some((24, 22, 5)) },
+    ];
+    let flush2 = || vec![
+        SculptStamp { points: disc_points(24, 22, 5), dial: Some((24, 22, 5)) }, // repeat of the last stamp
+        SculptStamp { points: disc_points(28, 23, 5), dial: Some((28, 23, 5)) },
+    ];
+
+    let mut direct = parse_world_inner(mmap_from_bytes(base.clone())).expect("parse");
+    let mut sa = SculptSession::new(1);
+    for stamps in [flush1(), flush2()] {
+        run_sculpt_flush(&mut direct, &mut sa, &args(), &stamps).expect("direct");
+    }
+
+    let mut via_scratch = parse_world_inner(mmap_from_bytes(base.clone())).expect("parse");
+    let mut sb = SculptSession::new(1);
+    for stamps in [flush1(), flush2()] {
+        let rect = sculpt_flush_rect(&args(), &stamps).expect("rect");
+        let coords = affected_chunk_coords(&via_scratch, rect.0, rect.1, rect.2, rect.3);
+        let mut scratch = ChunkScratch::new(&via_scratch, &coords);
+        run_sculpt_flush(&mut scratch, &mut sb, &args(), &stamps).expect("scratch");
+        scratch.into_chunks().commit(&mut via_scratch);
+    }
+
+    assert_ne!(direct.bytes.to_vec(), base[..direct.bytes.len()].to_vec(), "the carve did something");
+    assert_eq!(via_scratch.bytes.to_vec(), direct.bytes.to_vec(),
+               "carve through a scratch must equal carve in place, session shared across flushes");
+    assert_eq!(sa.carve_ref, sb.carve_ref, "both paths capture the same pre-stroke reference");
+}
+
 /// 18.10: the lazy scratch, over several modes, must equal the direct in-place stamp byte for
 /// byte, its undo snapshots must restore the pre-stamp world exactly, and it must copy only the
 /// bands it wrote (construction copies nothing).
 #[test]
 pub(crate) fn test_lazy_scratch_matches_reference_across_modes_and_undoes() {
     let base = make_bumpy_world_grid(2, 8, |x, y| 18 + ((x * 3 + y) % 5));
-    for mode in ["raise", "lower", "smooth", "flatten", "noise", "thermal"] {
+    for mode in ["raise", "lower", "smooth", "flatten", "noise", "thermal", "carve"] {
         let args = || SculptArgs {
             mode: mode.into(), strength: 4, strength_eff: 4.0, seed: 7,
             block_type: None, paint: None, freq: None, noise_mode: None,
             softness: 0.5, profile: "smooth".into(), grab_delta: None,
             anchor_x: None, anchor_y: None, slope_dx: None, slope_dy: None,
-            smear_dx: None, smear_dy: None, clip_rect: None, mask: None, rock: None, cap: None,
+            smear_dx: None, smear_dy: None, clip_rect: None, mask: None,
+            rock: (mode == "carve").then(RockParams::default), cap: None,
         };
         let stamps = || vec![
             SculptStamp { points: disc_points(14, 14, 6), dial: Some((14, 14, 6)) },
@@ -650,6 +696,55 @@ pub(crate) fn test_sculpt_session_cleared_by_undo() {
     assert!(ws.sculpt_session.is_none(), "undo reaps the session it belonged to");
     sculpt(&mut ws, None, "raise", 4, 0.0, Some((8, 8, 3)), gid);
     assert_eq!(world_bytes(&ws), reference, "post-undo stamp re-seeds, no residual carryover");
+}
+
+/// R8 test 7: Carve persists its session (the pre-stroke heightmap), and a mode switch inside one
+/// group (Shift → temporary Smooth mid-stroke) invalidates the cache that mode doesn't own: a
+/// non-carve stamp clears `carve_ref`, a carve stamp clears `fheight`. After the round trip the
+/// final carve must still stay inside its hollow (nothing cut past the fillet band).
+#[test]
+pub(crate) fn test_carve_session_mode_switch() {
+    let gid = Some(900u64);
+    let mut ws = ws_with(make_bumpy_world_grid(4, 2, |_, _| 20));
+    let run = |ws: &mut WorldState, mode: &str, cx: i32, cy: i32| {
+        let args = SculptArgs {
+            mode: mode.into(), strength: 4, strength_eff: 4.0, seed: 5,
+            block_type: None, paint: None, freq: None, noise_mode: None,
+            softness: 0.5, profile: "smooth".into(), grab_delta: None,
+            anchor_x: None, anchor_y: None, slope_dx: None, slope_dy: None,
+            smear_dx: None, smear_dy: None, clip_rect: None, mask: None,
+            rock: Some(RockParams::default()), cap: None,
+        };
+        let stamps = vec![SculptStamp { points: disc_points(cx, cy, 6), dial: Some((cx, cy, 6)) }];
+        run_sculpt_in_guard(ws, "Test", gid, args, stamps).expect("stamp");
+    };
+
+    run(&mut ws, "carve", 30, 30);
+    let s = ws.sculpt_session.as_ref().expect("carve persists a grouped session");
+    assert!(!s.carve_ref.is_empty(), "carve records its pre-stroke reference");
+
+    run(&mut ws, "smooth", 30, 30);
+    let s = ws.sculpt_session.as_ref().expect("smooth persists the session");
+    assert!(s.carve_ref.is_empty(), "a non-carve stamp must clear carve_ref");
+    assert!(!s.fheight.is_empty(), "smooth fills the float workspace");
+
+    let before = ws.world.as_ref().unwrap().bytes.to_vec();
+    run(&mut ws, "carve", 36, 30);
+    let s = ws.sculpt_session.as_ref().expect("carve persists the session again");
+    assert!(s.fheight.is_empty(), "a carve stamp must clear fheight");
+    assert!(!s.carve_ref.is_empty(), "the re-captured reference is back");
+
+    // The post-switch carve may only touch the hollow it was asked for: far columns stay put.
+    let w = ws.world.as_ref().unwrap();
+    let base = parse_world_inner(mmap_from_bytes(before)).expect("parse");
+    let r = 6.0 / 0.7 + 1.0 + 2.0;
+    for y in 8..=56 { for x in 8..=60 {
+        let d = (((x - 36) * (x - 36) + (y - 30) * (y - 30)) as f64).sqrt();
+        if d > r {
+            assert_eq!(surface_z_capped(w, x, y, None), surface_z_capped(&base, x, y, None),
+                       "column ({x},{y}) at distance {d:.1} changed in the post-switch carve");
+        }
+    }}
 }
 
 /// Audit M1 — `sculpt_terrain_batch_inner` (one `with_edit_grouped` call for N stamps) must be

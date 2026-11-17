@@ -341,7 +341,7 @@ function ShapeSliders({ p }: { p: RibbonProps }) {
       {S("Flatten", 0.2, 1.2, 0.05, p.rockFlatten, p.setRockFlatten, f2, "Height-to-width ratio. Lower is flatter.")}
     </BarCol>
     <BarCol>
-      {S("Sink", 0, 1, 0.05, p.rockSink, p.setRockSink, f2, "Fraction of the shape's vertical half-extent buried below the anchor surface")}
+      {S("Sink", 0, 1, 0.05, p.rockSink, p.setRockSink, f2, carve ? "How much of the hollow rises above ground. Lower digs deeper." : "Fraction of the shape's vertical half-extent buried below the anchor surface")}
       {S("Drape", 0, 1, 0.05, p.rockDrape, p.setRockDrape, f2, "How closely the base follows the terrain. 0 is flat, 1 follows it fully.")}
       {S("Strata", 0, 2, 0.1, p.rockStrata, p.setRockStrata, f1, "Horizontal ledges. 0 is none.")}
       <Caption>Radius sets the mass size</Caption>

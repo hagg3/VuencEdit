@@ -964,18 +964,235 @@ pub(crate) fn test_carve_no_floating_roof() {
     }}
 }
 
-/// Carving twice at the same centre/seed is a no-op the second time.
+/// Carve stamp with a stroke reference: pass the same map to repeat/extend one stroke, a fresh map
+/// to start a new one.
+fn carve_stamp(w: &mut LoadedWorld, cx: i32, cy: i32, r: i32, p: &RockParams, seed: u64,
+               cap: Option<i32>, fill_bt: Option<u8>, cref: &mut HashMap<(i32, i32), i32>) {
+    field_stamp(w, cx, cy, r, p, seed, cap, None, None, fill_bt, None, true, Some(cref));
+}
+
+fn top_z(w: &LoadedWorld, x: i32, y: i32) -> i32 {
+    surface_z_capped(w, x, y, None).unwrap_or(0)
+}
+
+/// Every column in `region` whose surface z or surface block/paint differs from `before`'s.
+fn cut_columns(before: &LoadedWorld, after: &LoadedWorld, region: std::ops::RangeInclusive<i32>) -> Vec<(i32, i32)> {
+    let mut v = Vec::new();
+    for y in region.clone() { for x in region.clone() {
+        if top_z(before, x, y) != top_z(after, x, y) { v.push((x, y)); }
+    }}
+    v
+}
+
+/// Fillet radius `field_stamp` derives for `p` at brush radius `r` (mirrors its arithmetic).
+fn stamp_k(p: &RockParams, r: i32) -> f64 {
+    let r_xy = r.max(1) as f64;
+    let r_z = ((r_xy * p.flatten.clamp(0.1, 1.5)).round()).max(1.0);
+    (p.meld.clamp(0.0, 3.0) * 0.3 * r_xy.min(r_z)).clamp(1.0, 14.0)
+}
+
+fn world_from(chunks: i32, bt: u8, h: impl Fn(i32, i32) -> i32) -> LoadedWorld {
+    let mut ws = ws_with(make_bumpy_world_grid(chunks, bt, h));
+    ws.world.take().unwrap()
+}
+
+/// A click on flat stone carves a rounded hollow the size of the brush — not the padded write bbox.
+/// Cause A: the terrain SDF sat on the top block's centre, so every column of the bbox lost a layer.
+#[test]
+pub(crate) fn test_carve_no_square_footprint() {
+    let (cx, cy, r) = (48, 48, 6);
+    let p = RockParams::default();
+    let before = world_from(6, 2, |_, _| 20);
+    let mut w = world_from(6, 2, |_, _| 20);
+    carve_stamp(&mut w, cx, cy, r, &p, 55, None, Some(3), &mut HashMap::new());
+
+    let cut = cut_columns(&before, &w, 8..=88);
+    assert!(top_z(&w, cx, cy) < 20, "the centre must be carved");
+    // The stamp's anisotropy stretches one axis by up to 1/0.7, so the reach is bounded by the
+    // stretched radius plus the fillet, not by the bare radius.
+    let reach = r as f64 / 0.7 + stamp_k(&p, r) + 2.0;
+    for &(x, y) in &cut {
+        let d = (((x - cx).pow(2) + (y - cy).pow(2)) as f64).sqrt();
+        assert!(d <= reach, "column ({x},{y}) changed at distance {d:.1} > {reach:.1}");
+    }
+    let pad = rock_stamp_pad(&p, r);
+    for (dx, dy) in [(-1, -1), (1, -1), (-1, 1), (1, 1)] {
+        let (x, y) = (cx + dx * (r + pad), cy + dy * (r + pad));
+        assert_eq!(top_z(&w, x, y), 20, "bbox corner ({x},{y}) must be untouched");
+    }
+    // Not the old 19×19 square: far fewer columns than the bbox.
+    let bbox = ((2 * (r + pad) + 1) as usize).pow(2);
+    assert!(cut.len() * 2 < bbox, "{} cut columns of a {bbox}-column bbox is still a square", cut.len());
+}
+
+/// The floor keeps the ground's own block and paint, whatever block is armed (cause C).
+#[test]
+pub(crate) fn test_carve_keeps_surface_material() {
+    let p = RockParams::default();
+    let (cx, cy, r) = (48, 48, 6);
+    let run = |w: &mut LoadedWorld, fill: Option<u8>| {
+        carve_stamp(w, cx, cy, r, &p, 55, None, fill, &mut HashMap::new());
+    };
+
+    // Stone world, dirt armed → stone floor.
+    let before = world_from(6, 2, |_, _| 20);
+    let mut w = world_from(6, 2, |_, _| 20);
+    run(&mut w, Some(3));
+    let cut = cut_columns(&before, &w, 30..=66);
+    assert!(cut.len() > 10);
+    for &(x, y) in &cut {
+        assert_eq!(read_block_abs(&w, x, y, top_z(&w, x, y)), 2, "stone ground keeps a stone floor at ({x},{y})");
+    }
+
+    // Grass over dirt → grass floor.
+    let mk_grass = || {
+        let mut w = world_from(6, 3, |_, _| 20);
+        for y in 0..96 { for x in 0..96 { set_block_abs(&mut w, x, y, 20, 8, 0); } }
+        w
+    };
+    let before = mk_grass();
+    let mut w = mk_grass();
+    run(&mut w, Some(2));
+    let cut = cut_columns(&before, &w, 30..=66);
+    assert!(cut.len() > 10);
+    for &(x, y) in &cut {
+        assert_eq!(read_block_abs(&w, x, y, top_z(&w, x, y)), 8, "grass ground keeps a grass floor at ({x},{y})");
+    }
+
+    // Painted top → same paint on the floor.
+    let mk_painted = || {
+        let mut w = world_from(6, 2, |_, _| 20);
+        for y in 0..96 { for x in 0..96 { set_block_abs(&mut w, x, y, 20, 2, 5); } }
+        w
+    };
+    let before = mk_painted();
+    let mut w = mk_painted();
+    run(&mut w, None);
+    let cut = cut_columns(&before, &w, 30..=66);
+    assert!(cut.len() > 10);
+    for &(x, y) in &cut {
+        let z = top_z(&w, x, y);
+        assert_eq!(read_paint_abs(&w, x, y, z), 5, "painted ground keeps its paint at ({x},{y})");
+    }
+
+    // A non-opaque block (a plant) on top of grass is skipped: the floor is still grass.
+    let plant = (1u8..=127).find(|&t| !voxel_core::signs::is_opaque(t)).expect("a non-opaque stock block");
+    let mk_plant = || {
+        let mut w = mk_grass();
+        for y in 0..96 { for x in 0..96 { set_block_abs(&mut w, x, y, 21, plant, 0); } }
+        w
+    };
+    let before = mk_plant();
+    let mut w = mk_plant();
+    run(&mut w, None);
+    let cut = cut_columns(&before, &w, 30..=66);
+    assert!(cut.len() > 10);
+    for &(x, y) in &cut {
+        assert_eq!(read_block_abs(&w, x, y, top_z(&w, x, y)), 8, "a plant over grass leaves a grass floor at ({x},{y})");
+    }
+}
+
+fn cone_world() -> LoadedWorld {
+    world_from(6, 2, |x, y| {
+        let d = (((x - 48).pow(2) + (y - 48).pow(2)) as f64).sqrt();
+        (34.0 - d).max(14.0) as i32
+    })
+}
+
+/// The summit is cut (cause B: the hollow used to land under the real surface), as a bowl rather
+/// than isolated 1-wide shafts.
+#[test]
+pub(crate) fn test_carve_cuts_hilltop() {
+    let (cx, cy, r) = (48, 48, 6);
+    let before = cone_world();
+    let mut w = cone_world();
+    carve_stamp(&mut w, cx, cy, r, &RockParams::default(), 55, None, None, &mut HashMap::new());
+
+    let depth = |x: i32, y: i32| top_z(&before, x, y) - top_z(&w, x, y);
+    assert!(depth(cx, cy) >= 2, "the summit must drop by >= 2, dropped {}", depth(cx, cy));
+
+    let (mut total, mut cut) = (0, 0);
+    for y in (cy - r / 2)..=(cy + r / 2) { for x in (cx - r / 2)..=(cx + r / 2) {
+        if (x - cx).pow(2) + (y - cy).pow(2) > (r / 2).pow(2) { continue; }
+        total += 1;
+        if depth(x, y) > 0 { cut += 1; }
+    }}
+    assert!(cut * 100 >= total * 60, "only {cut}/{total} central columns were cut");
+
+    for y in (cy - 14)..=(cy + 14) { for x in (cx - 14)..=(cx + 14) {
+        let nb = [(1, 0), (-1, 0), (0, 1), (0, -1)].map(|(dx, dy)| depth(x + dx, y + dy)).into_iter().max().unwrap();
+        assert!(depth(x, y) - nb < 3, "column ({x},{y}) is a {}-deep shaft beside neighbours cut {nb}", depth(x, y));
+    }}
+}
+
+/// Re-stamping the same cut inside one stroke (one session / reference) is a no-op: a held click
+/// stops deepening.
 #[test]
 pub(crate) fn test_carve_idempotent() {
-    let base = make_bumpy_world_grid(6, 8, |_, _| 20);
-    let mut ws = ws_with(base);
-    let mut w = ws.world.take().unwrap();
-    let params = RockParams::default();
-    field_stamp(&mut w, 48, 48, 6, &params, 321, None, None, None, None, None, true, None);
-    let once = w.bytes.to_vec();
-    field_stamp(&mut w, 48, 48, 6, &params, 321, None, None, None, None, None, true, None);
-    let twice = w.bytes.to_vec();
-    assert_eq!(once, twice, "re-carving the same cut in place must be a no-op");
+    for mk in [(|| world_from(6, 8, |_, _| 20)) as fn() -> LoadedWorld, cone_world] {
+        let mut w = mk();
+        let p = RockParams::default();
+        let mut cref = HashMap::new();
+        carve_stamp(&mut w, 48, 48, 6, &p, 321, None, None, &mut cref);
+        let once = w.bytes.to_vec();
+        assert!(!cref.is_empty(), "the stamp must record its reference");
+        carve_stamp(&mut w, 48, 48, 6, &p, 321, None, None, &mut cref);
+        assert_eq!(once, w.bytes.to_vec(), "re-carving the same cut in one stroke must be a no-op");
+    }
+}
+
+/// A new stroke (fresh reference = the already-cut world) digs deeper, like Lower, and still never
+/// leaves a floating roof or sealed cave.
+#[test]
+pub(crate) fn test_carve_new_stroke_digs_deeper() {
+    let p = RockParams::default();
+    let mut w = world_from(6, 8, |_, _| 20);
+    carve_stamp(&mut w, 48, 48, 6, &p, 321, None, None, &mut HashMap::new());
+    let first = top_z(&w, 48, 48);
+    carve_stamp(&mut w, 48, 48, 6, &p, 321, None, None, &mut HashMap::new());
+    let second = top_z(&w, 48, 48);
+    assert!(second < first, "a new stroke must dig deeper ({first} -> {second})");
+
+    for wy in 36..=60 { for wx in 36..=60 {
+        let mut seen_solid = false;
+        for wz in (2..=40).rev() {
+            let solid = read_block_abs(&w, wx, wy, wz) != 0;
+            if solid { seen_solid = true; }
+            else if seen_solid { panic!("column ({wx},{wy}) has an air pocket at z={wz}"); }
+        }
+    }}
+}
+
+/// A drag (six stamps, one session) cuts an even trench, not compounding terraces.
+#[test]
+pub(crate) fn test_carve_drag_uniform_depth() {
+    let p = RockParams::default();
+    let mut w = world_from(6, 2, |_, _| 20);
+    let mut cref = HashMap::new();
+    for i in 0..6 { carve_stamp(&mut w, 30 + i * 4, 48, 6, &p, 55, None, None, &mut cref); }
+    // Away from both ends (first/last stamp centres at x = 30 and 50).
+    let depths: Vec<i32> = (38..=42).map(|x| 20 - top_z(&w, x, 48)).collect();
+    let (lo, hi) = (*depths.iter().min().unwrap(), *depths.iter().max().unwrap());
+    assert!(lo >= 1, "the trench centreline must be cut: {depths:?}");
+    assert!(hi - lo <= 1, "trench depth must be even along the drag: {depths:?}");
+}
+
+/// Under a cutaway, solid ground above the cap (a cave ceiling) is never touched.
+#[test]
+pub(crate) fn test_carve_respects_cap() {
+    let p = RockParams::default();
+    let mk = || {
+        let mut w = world_from(6, 2, |_, _| 20);
+        for y in 0..96 { for x in 0..96 { for z in 22..=24 { set_block_abs(&mut w, x, y, z, 2, 0); } } }
+        w
+    };
+    let before = mk();
+    let mut w = mk();
+    carve_stamp(&mut w, 48, 48, 6, &p, 55, Some(21), None, &mut HashMap::new());
+    assert!(w.bytes.to_vec() != before.bytes.to_vec(), "the carve did something under the ceiling");
+    for y in 30..=66 { for x in 30..=66 { for z in 22..=24 {
+        assert_eq!(read_block_abs(&w, x, y, z), 2, "ceiling cell ({x},{y},{z}) above the cap was touched");
+    }}}
 }
 
 /// Carve never deletes Bedrock (type 1) and never touches z <= 1, even when the cavity
