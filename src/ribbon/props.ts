@@ -176,7 +176,7 @@ export interface RibbonProps {
   /** Drop the clipboard, the locked paste position and the Z offset, and leave paste mode (the
    *  options bar's "Discard Clipboard"). */
   discardClipboard: () => void;
-  rotateClipboard: () => void; mirrorClipboardX: () => void; mirrorClipboardY: () => void;
+  rotateClipboard: () => void; rotateClipboardCcw: () => void; mirrorClipboardX: () => void; mirrorClipboardY: () => void;
   pasteAt: (pos: { x: number; y: number }) => void;
   onSavePrefab: () => void;
   onSavePrefabAs: () => void;

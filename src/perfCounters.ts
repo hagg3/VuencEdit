@@ -2,8 +2,7 @@
  * Latency histograms + counters backing the Diagnostics panel (ROADMAP-EDIT Stage 9.4).
  *
  * **Fixed log-ish buckets, never a per-event log** — a ring buffer of individual timings is the
- * thing that turns a diagnostic into a leak (`TEST WORLDS/diagnostics-panel-plan-2026-09-14.md`
- * §1d). Every counter here is a plain integer increment on a call site that already measures time
+ * thing that turns a diagnostic into a leak. Every counter here is a plain integer increment on a call site that already measures time
  * (`performance.now()` around an existing `invoke`, or the frame loop's own `dt`), gated on
  * {@link perfCounters}.enabled so a diagnostic that is off costs one boolean read, not the
  * increment. As of Stage 17.1 sampling is **always on** (`enabled` defaults true and no longer follows

@@ -70,7 +70,7 @@ function Thumbnail({ url, failed, size }: { url: string | null; failed: boolean;
 }
 
 const iconBtn: React.CSSProperties = {
-  background: "none", border: "none", cursor: "pointer", fontSize: FONT.body, lineHeight: 1,
+  background: "none", border: "none", cursor: "default", fontSize: FONT.body, lineHeight: 1,
   padding: "0 4px", flexShrink: 0,
 };
 
@@ -364,7 +364,7 @@ export default function PrefabLibraryPanel({
                   role="button"
                   style={{
                     display: "flex", alignItems: "center", gap: 4, borderRadius: 3, padding: "3px 6px",
-                    cursor: isRenaming ? "default" : "pointer", color: TEXT_DIM,
+                    cursor: "default", color: TEXT_DIM,
                     background: hovered === entry.path ? "rgba(255,255,255,0.08)" : "rgba(255,255,255,0.03)",
                   }}
                 >
@@ -392,7 +392,7 @@ export default function PrefabLibraryPanel({
                 onMouseEnter={() => setHovered(entry.path)}
                 onMouseLeave={() => setHovered((h) => (h === entry.path ? null : h))}
                 title={`${entry.name}: ${entry.width}×${entry.height}×${entry.depth}`}
-                style={{ position: "relative", display: "flex", flexDirection: "column", gap: 3, cursor: "pointer" }}
+                style={{ position: "relative", display: "flex", flexDirection: "column", gap: 3, cursor: "default" }}
                 onClick={() => { if (renaming !== entry.path) handleClick(entry); }}
               >
                 <Thumbnail url={typeof thumbs[entry.path] === "string" ? thumbs[entry.path] : null} failed={thumbs[entry.path] === null} size={64} />

@@ -1,5 +1,5 @@
 /**
- * Context panels (Stage 16.5, plan `ui-polish-r4-plan-2026-09-28.md` §2 16.5). A context panel is a
+ * Context panels (Stage 16.5). A context panel is a
  * floating window that belongs to a **mode**, not to the user's window set: it renders only while its
  * `when` predicate holds (a paste is armed, cutaway is on, a brush tool with shape options is
  * active…), and its ✕ leaves that mode instead of hiding the window. **Pure** — the registry and

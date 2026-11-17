@@ -1,5 +1,5 @@
 //! Baked top-face shadows: a port of Emod's `Classes/Shadow.{h,cpp}` (the *nearest-caster-above*
-//! kernel, 2026-10-23). Plan: `TEST WORLDS/baked-shadows-plan-2026-10-29.md`; **Emod wins on any
+//! kernel, 2026-10-23). **Emod wins on any
 //! disagreement**.
 //!
 //! The shade of a top face comes from the covering columns above it, read straight from voxels when
@@ -104,7 +104,7 @@ impl ShadeGather {
     /// Each column also starts no higher than **its own chunk's** `top_band_hint` ceiling (27.4b —
     /// everything above it is air by contract). ⚠️ For a ring column that is the **neighbour's**
     /// hint, never the mesh's own: a tall tree in the next chunk has to cast, and a hint that is
-    /// too low would hide it, the same correctness trap CLAUDE.md warns about.
+    /// too low would hide it, the same correctness trap as `top_band_hint`.
     pub fn build<V: VoxelView>(cache: &ChunkCache<V>, x0: i32, y0: i32, x1: i32, y1: i32, z1: i32, z2: i32, world_top: i32) -> Self {
         let z1 = z1.max(0);
         let (w_in, d_in) = ((x1 - x0 + 1).max(0), (y1 - y0 + 1).max(0));
@@ -213,7 +213,7 @@ impl ShadeGather {
 ///
 /// `sky` is its own statement so nothing fuses the multiply into the add.
 pub fn lit_top(shade: u8, unshaded: [f32; 3], night: bool, ambient: f32, lamp_add: [f32; 3]) -> [f32; 3] {
-    if shade >= 255 { return unshaded; }
+    if shade == 255 { return unshaded; }
     let s = shade as f32 / 255.0;
     let sky = if night { ambient * s } else { s };
     lamp_add.map(|add| {

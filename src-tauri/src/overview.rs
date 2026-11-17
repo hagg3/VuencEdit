@@ -1,4 +1,4 @@
-//! The overview raster (ROADMAP-EDIT 18.15, `TEST WORLDS/overview-raster-plan-2026-09-30.md`):
+//! The overview raster (ROADMAP-EDIT 18.15):
 //! zoomed-out map tiles served from a small per-chunk summary instead of the world's pages.
 //!
 //! **The problem.** A zoomed-out tile at LOD `L` samples one column every `L` blocks, and every

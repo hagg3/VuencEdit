@@ -1,7 +1,7 @@
 /**
  * Floating-window geometry (UI redesign r3, Stage 14.3). **Pure** — no React, no DOM — so every
  * rule below is unit-tested in node (`windowGeometry.test.ts`, the `ribbon/layout.test.ts` idiom).
- * Behaviour reference: `TEST WORLDS/design-exploration-2026-09/js/mock.js` (`clampWin`,
+ * Behaviour reference: the 2026-09 design mock's `mock.js` (`clampWin`,
  * `defaultWins`, the resize arithmetic, `collapseWin`).
  *
  * Coordinates are **work-area-local** px: (0,0) is the work area's top-left, i.e. the box between

@@ -509,7 +509,7 @@ const NIGHT_AMBIENT: f32 = 0.35;
 /// `f32` triple, every face lands in its own merge group, and greedy meshing degenerates to 1×1 quads
 /// on exactly the chunks that already produce the biggest payloads (audit 2026-08-26 Finding 7).
 /// Measured on a lamp-lit 16×16 interior: night geometry was **6×–118× the day payload**; snapping to
-/// this grid brings it back to ~1.2×–4× (see "Phase 5.3 results" in `TEST WORLDS/fixplan-3d-2026-08-26.md`).
+/// this grid brings it back to ~1.2×–4× (3D fix plan, phase 5.3 results).
 ///
 /// ⚠️ **Quantize once, at the source.** The value stored in `FaceRec::lm` must be the value that is
 /// *rendered*, or merged faces would render as the group head's light while unmerged neighbours
@@ -981,7 +981,7 @@ pub fn obj_geometry_region_into<S: MeshSink>(sink: &mut S, world: &impl VoxelVie
         } else {
             (g.classic(lx, ly, wz), None)
         };
-        if corners.is_none() && classic >= 255 { return (lm, None); }
+        if corners.is_none() && classic == 255 { return (lm, None); }
         let add = if mode.night { lamp_sum(wx, wy, wz, 0.0) } else { [0.0; 3] };
         let shaded = |sh: u8| {
             let t = shadow::lit_top(sh, lm, mode.night, NIGHT_AMBIENT, add);

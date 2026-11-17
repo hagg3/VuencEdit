@@ -94,3 +94,31 @@ describe("no raw checkboxes", () => {
     expect(Object.keys(files).length).toBeGreaterThan(50);
   });
 });
+
+import { confirmKeyAction } from "./confirm";
+
+describe("confirm key policy (34.8)", () => {
+  it("Return never activates a danger action", () => {
+    expect(confirmKeyAction("danger", "Enter", true)).toBe("cancel");
+    expect(confirmKeyAction("danger", "Enter", false)).toBe("cancel");
+  });
+  it("Return confirms neutral dialogs and saves in the unsaved sheet", () => {
+    expect(confirmKeyAction("neutral", "Enter", true)).toBe("ok");
+    expect(confirmKeyAction("unsaved", "Enter", true)).toBe("ok");
+  });
+  it("⌘D is Don't Save on a Mac sheet only", () => {
+    expect(confirmKeyAction("unsaved", "d", true, true)).toBe("discard");
+    expect(confirmKeyAction("unsaved", "d", false, true)).toBeNull();
+    expect(confirmKeyAction("unsaved", "d", true, false)).toBeNull();
+    expect(confirmKeyAction("danger", "d", true, true)).toBeNull();
+  });
+});
+
+describe("unsaved-changes call sites use the sheet (34.8)", () => {
+  const files = import.meta.glob<string>(["../App.tsx"], { query: "?raw", import: "default", eager: true });
+  it("App has no discard-only 'Unsaved changes' danger confirm", () => {
+    const text = Object.values(files)[0];
+    expect(text).not.toMatch(/title: "Unsaved changes", kind: "danger"/);
+    expect(text).toMatch(/ensureSavedOrDiscarded/);
+  });
+});

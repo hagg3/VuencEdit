@@ -73,7 +73,7 @@ export function Section({ id, title, meta, defaultOpen = true, children, style }
         onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggle(); } }}
         style={{
           display: "flex", alignItems: "center", gap: SPACE.sm, minHeight: 26, padding: "4px 2px",
-          cursor: "pointer", userSelect: "none", fontWeight: 700, fontSize: FONT.label,
+          cursor: "default", fontWeight: 700, fontSize: FONT.label,
           letterSpacing: "0.06em", textTransform: "uppercase", color: TEXT_LABEL,
         }}
       >
@@ -109,7 +109,7 @@ export function PropRow({ label, value, title }: PropRowProps) {
       fontSize: FONT.body, lineHeight: "18px",
     }}>
       <span style={{ color: TEXT_LABEL }}>{label}</span>
-      <span style={{
+      <span className="vx-selectable" style={{
         textAlign: "right", fontFamily: PROP_MONO, fontVariantNumeric: "tabular-nums", color: TEXT,
         overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
       }}>{value}</span>

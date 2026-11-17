@@ -385,7 +385,7 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
                 background: sortBy === m.key ? rgba(ACCENTS.primary, 0.15) : "transparent",
                 border: "1px solid " + (sortBy === m.key ? TEAL_LIGHT : "transparent"),
                 color: sortBy === m.key ? TEAL_LIGHT : MODAL_TEXT.label,
-                padding: "2px 7px", borderRadius: 5, cursor: "pointer", fontSize: FONT.label,
+                padding: "2px 7px", borderRadius: 5, cursor: "default", fontSize: FONT.label,
                 display: "flex", alignItems: "center", gap: 4,
               }}>
                 {m.label}
@@ -459,7 +459,7 @@ export default function WorldBrowserModal({ onClose, onOpenWorld }: Props) {
                         onClick={() => setSelectedId(r.id)}
                         style={{
                           background: isSelected ? rgba(ACCENTS.primary, 0.18) : i % 2 === 0 ? "rgba(255,255,255,0.02)" : "transparent",
-                          cursor: "pointer",
+                          cursor: "default",
                           borderBottom: `1px solid ${RAMP.mbtn1}`,
                         }}
                       >

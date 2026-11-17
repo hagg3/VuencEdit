@@ -86,8 +86,8 @@ export default function BlockPaintPicker({
           title={isFill ? "Air (erase)" : "Any block (no type filter)"}
           onClick={() => onBlockTypeChange(isFill ? 0 : null)}
           style={{
-            fontSize: FONT.micro, textAlign: "center", cursor: "pointer",
-            padding: "1px 0", borderRadius: 2, userSelect: "none",
+            fontSize: FONT.micro, textAlign: "center", cursor: "default",
+            padding: "1px 0", borderRadius: 2,
             border: (isFill ? bt === 0 : bt === null) ? `1px solid ${ARMED_RING}` : `1px solid ${BORDER.hairline}`,
             background: (isFill ? bt === 0 : bt === null)
               ? gradAccent(0.25)
@@ -124,7 +124,7 @@ export default function BlockPaintPicker({
                   opacity: dimmed(b.type) ? 0.25 : 1,
                   width: 18, height: 18, position: "relative",
                   background: texUrl ? `url(${texUrl}) center/cover` : (isRamp ? "rgba(255,255,255,0.04)" : bg),
-                  borderRadius: 2, cursor: "pointer",
+                  borderRadius: 2, cursor: "default",
                   boxSizing: "border-box",
                   border: selected ? `2px solid ${BORDER.selected}` : `2px solid ${BORDER.hairline}`,
                   outline: selected ? `1px solid ${ARMED_RING}` : "none",
@@ -144,7 +144,7 @@ export default function BlockPaintPicker({
                     position: "absolute", bottom: 0, left: 1,
                     fontSize: FONT.nano, fontWeight: 700, lineHeight: 1,
                     color: "rgba(255,255,255,0.65)", textShadow: "0 0 2px rgba(0,0,0,1)",
-                    pointerEvents: "none", userSelect: "none",
+                    pointerEvents: "none",
                   }}>{b.name[0]?.toUpperCase()}</span>
                 )}
               </div>
@@ -168,7 +168,7 @@ export default function BlockPaintPicker({
                     opacity: dimmed(wf.base) ? 0.25 : 1,
                     width: 18, height: 18, position: "relative",
                     background: "rgba(255,255,255,0.04)",
-                    borderRadius: 2, cursor: "pointer",
+                    borderRadius: 2, cursor: "default",
                     boxSizing: "border-box",
                     border: selected ? `2px solid ${BORDER.selected}` : `2px solid ${BORDER.hairline}`,
                     outline: selected ? `1px solid ${ARMED_RING}` : "none",
@@ -197,7 +197,7 @@ export default function BlockPaintPicker({
                 const active = rampDirIndex(bt) === i;
                 return (
                   <button key={dir} onClick={() => onBlockTypeChange(base + i)} style={{
-                    width: 22, padding: "1px 0", fontSize: FONT.micro, cursor: "pointer",
+                    width: 22, padding: "1px 0", fontSize: FONT.micro, cursor: "default",
                     background: active ? gradAccent(0.35) : "rgba(255,255,255,0.04)",
                     border: `1px solid ${active ? ARMED_RING : BORDER.hairline}`,
                     color: active ? TEXT_ARMED : TEXT_LABEL, borderRadius: 3,
@@ -219,7 +219,7 @@ export default function BlockPaintPicker({
                 const active = rampDirIndex(bt) === i;
                 return (
                   <button key={dir} onClick={() => onBlockTypeChange(base + i)} style={{
-                    width: 26, padding: "1px 0", fontSize: FONT.micro, cursor: "pointer",
+                    width: 26, padding: "1px 0", fontSize: FONT.micro, cursor: "default",
                     background: active ? gradAccent(0.35) : "rgba(255,255,255,0.04)",
                     border: `1px solid ${active ? ARMED_RING : BORDER.hairline}`,
                     color: active ? TEXT_ARMED : TEXT_LABEL, borderRadius: 3,
@@ -238,7 +238,7 @@ export default function BlockPaintPicker({
               const active = bt - 66 === i;
               return (
                 <button key={dir} onClick={() => onBlockTypeChange(66 + i)} style={{
-                  width: 22, padding: "1px 0", fontSize: FONT.micro, cursor: "pointer",
+                  width: 22, padding: "1px 0", fontSize: FONT.micro, cursor: "default",
                   background: active ? gradAccent(0.35) : "rgba(255,255,255,0.04)",
                   border: `1px solid ${active ? ARMED_RING : BORDER.hairline}`,
                   color: active ? TEXT_ARMED : TEXT_LABEL, borderRadius: 3,
@@ -256,7 +256,7 @@ export default function BlockPaintPicker({
               const active = bt - 75 === i;
               return (
                 <button key={dir} onClick={() => onBlockTypeChange(75 + i)} style={{
-                  width: 22, padding: "1px 0", fontSize: FONT.micro, cursor: "pointer",
+                  width: 22, padding: "1px 0", fontSize: FONT.micro, cursor: "default",
                   background: active ? gradAccent(0.35) : "rgba(255,255,255,0.04)",
                   border: `1px solid ${active ? ARMED_RING : BORDER.hairline}`,
                   color: active ? TEXT_ARMED : TEXT_LABEL, borderRadius: 3,
@@ -288,7 +288,7 @@ export default function BlockPaintPicker({
                 style={{
                   opacity: dimmed(b.type) ? 0.25 : 1,
                   width: 18, height: 18, position: "relative", overflow: "hidden",
-                  borderRadius: 2, cursor: "pointer", boxSizing: "border-box",
+                  borderRadius: 2, cursor: "default", boxSizing: "border-box",
                   background: `rgba(${baseColor},0.15)`,
                   border: selected ? `2px solid ${BORDER.selected}` : `2px solid ${BORDER.hairline}`,
                   outline: selected ? `1px solid ${ARMED_RING}` : "none", outlineOffset: 1,
@@ -312,7 +312,7 @@ export default function BlockPaintPicker({
               <div key={b.type} title={`${b.name} (type ${b.type})`} {...hoverProps(`${b.name} (type ${b.type})`)} onClick={() => onBlockTypeChange(b.type)}
                 style={{
                   opacity: dimmed(b.type) ? 0.25 : 1,
-                  width: 18, height: 18, borderRadius: 2, cursor: "pointer", boxSizing: "border-box",
+                  width: 18, height: 18, borderRadius: 2, cursor: "default", boxSizing: "border-box",
                   background: `rgb(${b.color[0]},${b.color[1]},${b.color[2]})`,
                   border: selected ? `2px solid ${BORDER.selected}` : `2px solid ${BORDER.hairline}`,
                   outline: selected ? `1px solid ${ARMED_RING}` : "none", outlineOffset: 1,
@@ -333,7 +333,7 @@ export default function BlockPaintPicker({
             : "New-format blocks need a 256z world"}
           style={{
             display: "flex", alignItems: "center", gap: 4, marginTop: 2,
-            cursor: allowNewFormat ? "pointer" : "not-allowed", userSelect: "none",
+            cursor: allowNewFormat ? "default" : "not-allowed",
             opacity: allowNewFormat ? 1 : 0.4,
           }}
         >
@@ -350,7 +350,7 @@ export default function BlockPaintPicker({
                 <div key={b.type} title={`${b.name} (${b.type})`} {...hoverProps(`${b.name} (type ${b.type})`)} onClick={() => onBlockTypeChange(b.type)}
                   style={{
                     opacity: dimmed(b.type) ? 0.25 : 1,
-                    width: 18, height: 18, borderRadius: 2, cursor: "pointer", boxSizing: "border-box",
+                    width: 18, height: 18, borderRadius: 2, cursor: "default", boxSizing: "border-box",
                     background: `rgb(${b.color[0]},${b.color[1]},${b.color[2]})`,
                     border: selected ? `2px solid ${BORDER.selected}` : `2px solid ${BORDER.hairline}`,
                     outline: selected ? `1px solid ${ARMED_RING}` : "none", outlineOffset: 1,
@@ -375,13 +375,13 @@ export default function BlockPaintPicker({
               onClick={() => onPaintChange(null)}
               style={{
                 width: 18, height: 18, flexShrink: 0,
-                borderRadius: 2, cursor: "pointer", boxSizing: "border-box",
+                borderRadius: 2, cursor: "default", boxSizing: "border-box",
                 border: paint === null ? `2px solid ${BORDER.selected}` : `2px solid ${BORDER.hairline}`,
                 outline: paint === null ? `1px solid ${ARMED_RING}` : "none", outlineOffset: 1,
                 display: "flex", alignItems: "center", justifyContent: "center",
                 background: paint === null ? gradAccent(0.25) : "rgba(255,255,255,0.04)",
                 color: paint === null ? TEXT_ARMED : TEXT_DIM,
-                fontSize: FONT.nano, lineHeight: 1, userSelect: "none",
+                fontSize: FONT.nano, lineHeight: 1,
               }}
             >Any</div>
           )}
@@ -391,7 +391,7 @@ export default function BlockPaintPicker({
             onClick={() => onPaintChange(0)}
             style={{
               width: 18, height: 18, flexShrink: 0,
-              background: "transparent", borderRadius: 2, cursor: "pointer", boxSizing: "border-box",
+              background: "transparent", borderRadius: 2, cursor: "default", boxSizing: "border-box",
               border: paint === 0 ? `2px solid ${BORDER.selected}` : `2px solid ${BORDER.hairline}`,
               outline: paint === 0 ? `1px solid ${ARMED_RING}` : "none", outlineOffset: 1,
               display: "flex", alignItems: "center", justifyContent: "center",
@@ -410,7 +410,7 @@ export default function BlockPaintPicker({
                   style={{
                     width: 18, height: 18,
                     background: paintTexUrl ? `url(${paintTexUrl}) center/cover` : `rgb(${r},${g},${b})`,
-                    borderRadius: 2, cursor: "pointer", boxSizing: "border-box",
+                    borderRadius: 2, cursor: "default", boxSizing: "border-box",
                     border: paint === pIdx ? `2px solid ${BORDER.selected}` : `2px solid ${BORDER.hairline}`,
                     outline: paint === pIdx ? `1px solid ${ARMED_RING}` : "none", outlineOffset: 1,
                     imageRendering: paintTexUrl ? "pixelated" : undefined,

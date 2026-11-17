@@ -25,10 +25,12 @@ pub const CREATURE_LEN: usize = 60;
 pub const MAX_CREATURE_SLOTS: usize = 400;
 pub const TRAILER_MAX: usize = 1 << 20;
 pub const GENERATOR_LEN: usize = 28;
+pub const SKY_CLOCK_LEN: usize = 16;
+pub const WEATHER_LEN: usize = 32;
 pub const SUMMARY_LEN: usize = 16;
 pub const COMMIT_LEN: usize = 24;
 
-/// Record types 1–9. Types 8 (`INDEX`, never written in v1) and 10–255 are *reserved*: a reader
+/// Record types 1–9, 11, 12. Types 8 (`INDEX`, never written in v1), 10 (`BLOCK_PALETTE`, refused) and 13–255 are *reserved*: a reader
 /// treats such a record as a member of its batch and otherwise ignores it; compaction drops it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u8)]
@@ -42,6 +44,8 @@ pub enum RecordType {
     Commit = 7,
     Index = 8,
     Generator = 9,
+    SkyClock = 11,
+    Weather = 12,
 }
 
 impl RecordType {
@@ -56,6 +60,8 @@ impl RecordType {
             7 => RecordType::Commit,
             8 => RecordType::Index,
             9 => RecordType::Generator,
+            11 => RecordType::SkyClock,
+            12 => RecordType::Weather,
             _ => return None,
         })
     }
@@ -71,6 +77,8 @@ impl RecordType {
             Some(RecordType::Commit) => "COMMIT".into(),
             Some(RecordType::Index) => "INDEX".into(),
             Some(RecordType::Generator) => "GENERATOR".into(),
+            Some(RecordType::SkyClock) => "SKY_CLOCK".into(),
+            Some(RecordType::Weather) => "WEATHER".into(),
             None => format!("type-{t}"),
         }
     }

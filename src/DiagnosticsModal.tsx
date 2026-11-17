@@ -11,10 +11,9 @@ import { FONT } from "./ribbon/tokens";
 
 /**
  * `Help ▸ Diagnostics…` — ROADMAP-EDIT Stage 9.5. The plain-text report a confused user pastes
- * into a bug report, per `TEST WORLDS/windows-3d-lag-report-2026-09-14.md` §0: the shipped build
+ * into a bug report. Motivated by a 2026-09-14 Windows lag report: the shipped build
  * had no readout at all for RSS, page faults, GPU identity, or fetch/frame latency, so a report
- * like "it lags and I get a white screen" could not be triaged past guessing. Read that doc and
- * its design companion (`TEST WORLDS/diagnostics-panel-plan-2026-09-14.md`) before changing what
+ * like "it lags and I get a white screen" could not be triaged past guessing. Keep its rules when changing what
  * this collects — in particular the privacy rule (basenames and sizes, never full paths) and the
  * "sampled on demand, never on a timer" rule (a diagnostic must never itself be a perf problem).
  */

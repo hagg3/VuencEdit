@@ -13,8 +13,8 @@
 //! section in its original slot. A trailer this module can't read is **opaque**: kept verbatim,
 //! every record edit refused with [`Refusal::Opaque`].
 //!
-//! A port of Emod's `Classes/WorldTrailer.{h,cpp}`; the rules are `~/emod/docs/eden-file-format.md`
-//! "The trailer model" (restated in `TEST WORLDS/eden2026-trailer-plan-2026-10-25.md` §2). Names
+//! A port of Emod's `Classes/WorldTrailer.{h,cpp}`; the rules are Emod's `docs/eden-file-format.md`
+//! "The trailer model". Names
 //! are Rust-ier; behaviour isn't different, except that the model also refuses a new sign on the
 //! bottom face (`a = 2`, which the game never writes) and caps command blocks at [`MAX_CMDS`]
 //! (Emod's `CmdTool::MAX_PER_WORLD`, enforced there in the tool).
@@ -728,6 +728,104 @@ impl Trailer {
         Ok(())
     }
 
+    /// Remove several records at once (the app's air rule: a delete over a sign field), reindexing
+    /// once instead of per record. `signs` / `cmds` are indices **as they are now**, strictly
+    /// ascending; returns the removed records in the same order. [`insert_many`](Self::insert_many)
+    /// with the same indices is the exact inverse. Nothing changes on a refusal.
+    pub fn remove_many(&mut self, signs: &[usize], cmds: &[usize]) -> Result<(Vec<Sign>, Vec<Cmd>), Refusal> {
+        self.editable()?;
+        let valid = |ix: &[usize], len: usize| ix.windows(2).all(|w| w[0] < w[1]) && ix.last().is_none_or(|&i| i < len);
+        if !valid(signs, self.signs.len()) || !valid(cmds, self.cmds.len()) {
+            return Err(Refusal::NotFound);
+        }
+        fn take<T>(v: &mut Vec<T>, ix: &[usize]) -> Vec<T> {
+            if ix.is_empty() {
+                return Vec::new();
+            }
+            let mut out = Vec::with_capacity(ix.len());
+            let mut keep = Vec::with_capacity(v.len() - ix.len());
+            let mut next = ix.iter().peekable();
+            for (i, r) in std::mem::take(v).into_iter().enumerate() {
+                if next.next_if_eq(&&i).is_some() {
+                    out.push(r);
+                } else {
+                    keep.push(r);
+                }
+            }
+            *v = keep;
+            out
+        }
+        let (s, c) = (take(&mut self.signs, signs), take(&mut self.cmds, cmds));
+        if !s.is_empty() {
+            self.touch(Kind::Sign);
+        }
+        if !c.is_empty() {
+            self.touch(Kind::Cmd);
+        }
+        if !s.is_empty() || !c.is_empty() {
+            self.reindex();
+        }
+        Ok((s, c))
+    }
+
+    /// Insert several records **as is** at once: each `(i, record)` lands at index `i` of the
+    /// result, `i` strictly ascending (what [`remove_many`](Self::remove_many) returned, zipped
+    /// with its indices). The [`insert_sign_at`](Self::insert_sign_at) /
+    /// [`insert_cmd_at`](Self::insert_cmd_at) rules apply to the batch as a whole; nothing changes
+    /// on a refusal.
+    pub fn insert_many(&mut self, signs: &[(usize, Sign)], cmds: &[(usize, Cmd)]) -> Result<(), Refusal> {
+        self.editable()?;
+        let valid = |ix: &[usize], len: usize| ix.windows(2).all(|w| w[0] < w[1]) && ix.last().is_none_or(|&i| i < len + ix.len());
+        let si: Vec<usize> = signs.iter().map(|(i, _)| *i).collect();
+        let ci: Vec<usize> = cmds.iter().map(|(i, _)| *i).collect();
+        if !valid(&si, self.signs.len()) || !valid(&ci, self.cmds.len()) {
+            return Err(Refusal::NotFound);
+        }
+        let mut seen = std::collections::HashSet::new();
+        if signs.iter().any(|(_, s)| self.find_sign(s.pos, s.a).is_some() || !seen.insert((s.pos, s.a))) {
+            return Err(Refusal::Exists);
+        }
+        let mut seen = std::collections::HashSet::new();
+        if cmds.iter().any(|(_, c)| self.find_cmd(c.pos).is_some() || !seen.insert(c.pos)) {
+            return Err(Refusal::Exists);
+        }
+        if !cmds.is_empty() && self.cmds.len() + cmds.len() > MAX_CMDS {
+            return Err(Refusal::Full);
+        }
+        fn merge<T: Clone>(v: &mut Vec<T>, add: &[(usize, T)]) {
+            if add.is_empty() {
+                return;
+            }
+            let old = std::mem::take(v);
+            let mut out = Vec::with_capacity(old.len() + add.len());
+            let (mut old, mut add) = (old.into_iter(), add.iter().peekable());
+            while out.len() < out.capacity() {
+                match add.next_if(|(i, _)| *i == out.len()) {
+                    Some((_, r)) => out.push(r.clone()),
+                    None => out.push(old.next().expect("indices validated")),
+                }
+            }
+            *v = out;
+        }
+        let snapshot = (self.sections.clone(), self.touched, self.signs.clone(), self.cmds.clone());
+        merge(&mut self.signs, signs);
+        merge(&mut self.cmds, cmds);
+        if !signs.is_empty() {
+            self.touch(Kind::Sign);
+        }
+        if !cmds.is_empty() {
+            self.touch(Kind::Cmd);
+        }
+        if self.rebuilt_len() > MAX_BYTES {
+            (self.sections, self.touched, self.signs, self.cmds) = snapshot;
+            return Err(Refusal::Full);
+        }
+        if !signs.is_empty() || !cmds.is_empty() {
+            self.reindex();
+        }
+        Ok(())
+    }
+
     /// Adopt a 2026-game sidecar (`signs_<world>.eden.dat` / `cmd_<world>.eden.dat`): one bare
     /// section, `MAGIC | u32 version | u32 count` + records, no wrapper and no row tags. Adopted
     /// only when the trailer has no records of that kind yet (the trailer wins: `Exists`); the
@@ -1290,5 +1388,44 @@ mod tests {
         let i = t.add_sign(Pos::new(96, 192, 1), 5, 2, 0, b"").unwrap();
         assert_eq!(t.in_column(6, 12).signs, &[1usize, i][..]);
         assert!(t.anchored_on(Pos::new(0, 0, 0)).is_empty());
+    }
+
+    /// `remove_many` then `insert_many` with the same indices is byte-identical (the app's air
+    /// rule and its undo), refusals change nothing, and both reindex.
+    #[test]
+    fn remove_many_and_insert_many_are_exact_inverses() {
+        let b = three_section_trailer();
+        let mut t = Trailer::load(&b);
+        let (signs, cmds) = t.remove_many(&[0, 2], &[1]).unwrap();
+        assert_eq!(signs.iter().map(|s| s.text()).collect::<Vec<_>>(), [&b"top"[..], b""]);
+        assert_eq!(cmds[0].pos, Pos::new(101, 200, 30));
+        assert_eq!((t.signs().len(), t.cmds().len()), (1, 1));
+        assert!(t.find_sign(Pos::new(100, 200, 31), 3).is_none() && t.find_sign(Pos::new(-5, 17, 0), 0) == Some(0));
+        assert!(t.is_touched());
+
+        // Refusals leave everything as is.
+        let before = t.rebuild();
+        assert_eq!(t.remove_many(&[1, 0], &[]).unwrap_err(), Refusal::NotFound, "not ascending");
+        assert_eq!(t.remove_many(&[5], &[]).unwrap_err(), Refusal::NotFound, "out of range");
+        let dup = [(0, t.signs()[0].clone())];
+        assert_eq!(t.insert_many(&dup, &[]).unwrap_err(), Refusal::Exists);
+        assert_eq!(t.insert_many(&[(9, signs[0].clone())], &[]).unwrap_err(), Refusal::NotFound);
+        assert_eq!(t.rebuild(), before);
+
+        let s: Vec<(usize, Sign)> = [0, 2].into_iter().zip(signs).collect();
+        t.insert_many(&s, &[(1, cmds[0].clone())]).unwrap();
+        assert_eq!(t.rebuild(), b, "byte-identical after the inverse");
+        assert_eq!(t.find_sign(Pos::new(100, 200, 30), 1), Some(2), "reindexed");
+        assert_eq!(t.find_cmd(Pos::new(101, 200, 30)), Some(1));
+
+        // Emptying a section drops it; the inverse brings it back in its slot.
+        let (s, _) = t.remove_many(&[0, 1, 2], &[]).unwrap();
+        assert_eq!(t.section_order(), vec![CMB1, *b"XYZ1"]);
+        t.insert_many(&s.into_iter().enumerate().collect::<Vec<_>>(), &[]).unwrap();
+        assert_eq!(t.rebuild(), b);
+        assert_eq!(t.remove_many(&[], &[]).map(|(s, c)| s.len() + c.len()), Ok(0));
+
+        let mut opaque = Trailer::load(&[1, 2, 3]);
+        assert_eq!(opaque.remove_many(&[], &[]).unwrap_err(), Refusal::Opaque);
     }
 }

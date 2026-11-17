@@ -1,4 +1,4 @@
-//! Opening an `.emod` world (ROADMAP-EDIT 26.4; plan `emod-support-plan-2026-10-24.md` §2.2).
+//! Opening an `.emod` world (ROADMAP-EDIT 26.4).
 //!
 //! VuencEdit never edits an `.emod` in place. Opening one = an **own-format export into the private
 //! staged temp** (`eden_format::emod::export_own`, sparse: only occupied bands are written), then the
@@ -518,7 +518,7 @@ mod tests {
 
     /// The `eden-format` crate's checked-in fixture pack (26.1).
     fn fixture(name: &str) -> Vec<u8> {
-        let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../packages/eden-format/tests/fixtures").join(name);
+        let p = Path::new(eden_format::TEST_FIXTURES_DIR).join(name);
         let raw = std::fs::read(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
         if name.ends_with(".gz") {
             let mut out = Vec::new();
@@ -553,11 +553,12 @@ mod tests {
 
     /// A scratch dir holding `name` (a fixture, ungzipped) as `w.emod`.
     fn scratch(tag: &str, name: &str) -> (PathBuf, PathBuf) {
+        let bytes = fixture(name); // before the dir exists: a missing fixture must not leak a temp dir
         let dir = std::env::temp_dir().join(format!("vuencedit-emod-save-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let src = dir.join("w.emod");
-        std::fs::write(&src, fixture(name)).unwrap();
+        std::fs::write(&src, bytes).unwrap();
         (dir, src)
     }
 
@@ -1008,12 +1009,13 @@ mod tests {
             ("f64-basic.zlib.emod", "f64-basic.eden.gz"),
             ("f256-trailer.none.emod.gz", "f256-trailer.eden.gz"),
         ] {
+            let (emod_bytes, eden_bytes) = (fixture(emod_name), fixture(eden_name));
             let dir = std::env::temp_dir().join(format!("vuencedit-emod-test-{}-{emod_name}", std::process::id()));
             std::fs::create_dir_all(&dir).unwrap();
             let src = dir.join("w.emod");
             let eden = dir.join("w.eden");
-            std::fs::write(&src, fixture(emod_name)).unwrap();
-            std::fs::write(&eden, fixture(eden_name)).unwrap();
+            std::fs::write(&src, emod_bytes).unwrap();
+            std::fs::write(&eden, eden_bytes).unwrap();
             let temp = temp_world_path();
             let s = stage_emod(&src, &temp).unwrap();
             assert!(s.damage.is_empty() && !s.torn);
@@ -1030,10 +1032,11 @@ mod tests {
 
     #[test]
     fn a_two_batch_emod_stages_its_latest_state() {
+        let bytes = fixture("f256-trailer.2batch.emod");
         let dir = std::env::temp_dir().join(format!("vuencedit-emod-2b-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let src = dir.join("w.emod");
-        std::fs::write(&src, fixture("f256-trailer.2batch.emod")).unwrap();
+        std::fs::write(&src, bytes).unwrap();
         let temp = temp_world_path();
         let s = stage_emod(&src, &temp).unwrap();
         let w = parse_file(&temp);
@@ -1052,10 +1055,10 @@ mod tests {
 
     #[test]
     fn a_refused_file_leaves_no_temp() {
+        let mut bytes = fixture("f64-basic.zlib.emod");
         let dir = std::env::temp_dir().join(format!("vuencedit-emod-bad-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let src = dir.join("bad.emod");
-        let mut bytes = fixture("f64-basic.zlib.emod");
         bytes[60] ^= 1; // file-header CRC
         std::fs::write(&src, &bytes).unwrap();
         let temp = temp_world_path();

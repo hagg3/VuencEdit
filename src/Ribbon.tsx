@@ -380,7 +380,6 @@ export default function Ribbon(p: RibbonProps) {
         // A crisp 1px seam to the canvas, not a 12px blur — a docked chrome edge, not a floating card.
         borderBottom: `1px solid ${BORDER.outline}`,
         boxShadow: `0 1px 0 ${BORDER.etchLight}`,
-        userSelect: "none",
       }}>
         <style>{RIBBON_CSS}</style>
 

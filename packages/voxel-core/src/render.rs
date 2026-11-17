@@ -1162,8 +1162,7 @@ pub fn paste_lens(
 //
 // The no-clipboard sibling of `paste_lens`: front/side elevations of a selection footprint plus
 // context columns, full height. Its own function rather than an empty `ClipRef` because the Z
-// window, the meaning of the mask, and the stats all differ (plan: `TEST WORLDS/
-// lens-selection-mode-plan-2026-10-01.md` §1). The column frame and assembly are shared.
+// window, the meaning of the mask, and the stats all differ. The column frame and assembly are shared.
 
 /// A selection as the lens reads it: the bbox, its Z range, and the shaped mask if one applies
 /// (the caller resolves it fail-safe, as every mask-aware command does).

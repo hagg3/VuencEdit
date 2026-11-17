@@ -9,6 +9,7 @@ import type { AtlasData } from "./texturePack";
 import { isTypingTarget, chunkToWorld, worldToChunk, gridDivisions } from "./viewportUtils";
 import { editReloadPlan, shouldReloadChunk, staleBandKeys, bandCovers } from "./flySync";
 import type { ShadowMode, WorldMeta } from "./types";
+import { isMacCtrlMenuPress } from "./input/macCtrlClick";
 import { BORDER, FONT, IS_MAC, RADIUS, SMALL_H, SPACE, SURFACE, TEXT_DANGER, TEXT_DIM } from "./ribbon/tokens";
 import { Check, IconButton, SliderRow, SmallButton } from "./ribbon/primitives";
 import { blockDisplayName, skyFogColor, rampFamilyBase, wedgeFamilyBase, rampDirIndex, orientBlockToFacing } from "./blockDefs";
@@ -34,7 +35,7 @@ const hudBar: CSSProperties = {
   background: SURFACE.popover, borderRadius: RADIUS.lg,
   boxShadow: `inset 0 0 0 1px ${BORDER.outline}, inset 0 1px 0 ${BORDER.bevel}`,
 };
-const colorInput: CSSProperties = { width: 22, height: 18, padding: 0, border: "none", background: "none", cursor: "pointer" };
+const colorInput: CSSProperties = { width: 22, height: 18, padding: 0, border: "none", background: "none", cursor: "default" };
 
 // Local replacement for the retired `glassMenuPanel` — the same slate popover chrome
 // `ribbon/primitives.tsx`'s `Popover` uses (SURFACE.popover material; see its comment at the
@@ -220,8 +221,7 @@ export interface GpuInfo {
   softwareRendering: boolean;
 }
 
-/** Snapshot of `GeomMemHud`'s own counters, taken on demand rather than pushed on a timer — see
- *  `TEST WORLDS/diagnostics-panel-plan-2026-09-14.md` §1c. */
+/** Snapshot of `GeomMemHud`'s own counters, taken on demand rather than pushed on a timer. */
 export interface PerfSnapshot {
   residentBytes: number; jsBytes: number; inflightBytes: number; peakBytes: number;
   maxChunkBytes: number; chunks: number; loadRadius: number;
@@ -2536,7 +2536,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
 
     // Drag-to-look: press on the canvas in *fly* mode to look (look mode uses the grabbed cursor's
     // continuous motion instead). Left button only (button 0) — capturing button 2 is unreliable in
-    // macOS WKWebView (see CLAUDE.md's MapCanvas note) and conflicts with right-click-to-place.
+    // macOS WKWebView (see MapCanvas) and conflicts with right-click-to-place.
     const onCanvasDown = (e: PointerEvent) => {
       // Sculpt mode claims the left button in every camera mode (including fly), so drag-to-look is
       // unavailable while sculpt is armed — the user has look mode + WASD instead. (Documented in the
@@ -3122,6 +3122,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
     };
 
     const onPickDown = (e: PointerEvent) => {
+      if (isMacCtrlMenuPress(e, IS_MAC)) return; // Ctrl+click = context menu, not a stroke (34.10)
       // Idempotent re-arm: a missed release (pointerup off-canvas, pointercancel, focus loss) would
       // otherwise leave the previous hold-repeat interval running forever while this one starts a
       // second, compounding into runaway break/place. Always clear any stale timer before arming —
@@ -5017,7 +5018,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
             background: camMode !== "orbit" ? "rgba(52,211,153,0.18)" : "rgba(131,120,108,0.18)",
             border: `1px solid ${camMode !== "orbit" ? "rgba(52,211,153,0.45)" : "rgba(131,120,108,0.35)"}`,
             color: camMode !== "orbit" ? "#34d399" : "#afa69d",
-            pointerEvents: "auto", cursor: "pointer",
+            pointerEvents: "auto", cursor: "default",
           }}
         >
           {CAM_MODE_LABEL[camMode]}
@@ -5067,7 +5068,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
               // fussy to hit with a mouse too.
               width: 24, height: 24, borderRadius: "50%", border: "1px solid rgba(131,120,108,0.4)",
               background: legendOpen ? "rgba(131,120,108,0.3)" : "rgba(131,120,108,0.12)",
-              color: "#afa69d", fontSize: 11, fontWeight: 700, cursor: "pointer", padding: 0, lineHeight: 1,
+              color: "#afa69d", fontSize: 11, fontWeight: 700, cursor: "default", padding: 0, lineHeight: 1,
             }}
           >?</button>
           {legendOpen && (
@@ -5094,7 +5095,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
                   display: "flex", alignItems: "center", justifyContent: "center",
                   borderRadius: "50%", border: "1px solid rgba(131,120,108,0.4)",
                   background: "rgba(131,120,108,0.12)", color: "#afa69d",
-                  fontSize: 11, lineHeight: 1, cursor: "pointer", padding: 0,
+                  fontSize: 11, lineHeight: 1, cursor: "default", padding: 0,
                 }}
               >×</button>
               <div style={{ fontWeight: 700, color: "#fff", marginBottom: 4, paddingRight: 20 }}>Camera</div>
@@ -5181,7 +5182,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
                   display: "flex", alignItems: "center", justifyContent: "center",
                   width: 14, height: 14, borderRadius: "50%", border: "none", padding: 0,
                   background: rgba(TEXT_DANGER, 0.18), color: TEXT_DANGER, fontSize: FONT.micro, fontWeight: 700,
-                  cursor: "pointer", lineHeight: 1,
+                  cursor: "default", lineHeight: 1,
                 }}
               >!</button>
               {distanceWarnOpen && (
@@ -5331,13 +5332,13 @@ const FlyView3D = forwardRef<FlyView3DRef, {
                 title={b ? `${b.label}${b.paint > 0 ? ` p${b.paint}` : ""} · key ${digit}` : `Empty pin slot ${digit}`}
                 onClick={() => b && onHotbarSelect?.(b.type, b.paint)}
                 style={{
-                  width: 22, height: 22, borderRadius: 3, cursor: b ? "pointer" : "default", flexShrink: 0,
+                  width: 22, height: 22, borderRadius: 3, cursor: "default", flexShrink: 0,
                   position: "relative", background: b ? b.css : "rgba(255,255,255,0.03)",
                   border: active ? "2px solid #fff" : b ? "1px solid rgba(255,255,255,0.18)" : "1px dashed #4b443d",
                   outline: active ? `1px solid ${i < 5 ? "#a78bfa" : "#f472b6"}` : "none", outlineOffset: 1,
                 }}
               >
-                <span style={{ position: "absolute", top: 0, left: 2, fontSize: 10, color: "rgba(255,255,255,0.35)", lineHeight: 1, pointerEvents: "none", userSelect: "none" }}>{digit}</span>
+                <span style={{ position: "absolute", top: 0, left: 2, fontSize: 10, color: "rgba(255,255,255,0.35)", lineHeight: 1, pointerEvents: "none" }}>{digit}</span>
               </div>
             );
           })}
@@ -5367,7 +5368,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
                 onClick={(e) => { e.currentTarget.blur(); onSetInteract3d?.(seg.mode); }}
                 style={{
                   padding: "2px 8px", borderRadius: 4, fontSize: 10, fontWeight: 700, letterSpacing: "0.05em",
-                  cursor: "pointer",
+                  cursor: "default",
                   background: active ? `${seg.accent}2b` : "transparent",
                   border: `1px solid ${active ? seg.accent + "80" : "transparent"}`,
                   color: active ? seg.accent : "#83786c",
@@ -5398,7 +5399,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
                   onClick={(e) => { e.currentTarget.blur(); setBuildShape(s); }}
                   style={{
                     padding: "2px 7px", borderRadius: 4, fontSize: 10, fontWeight: 700, letterSpacing: "0.03em",
-                    cursor: "pointer",
+                    cursor: "default",
                     background: active ? "rgba(245,158,11,0.2)" : "transparent",
                     border: `1px solid ${active ? "rgba(245,158,11,0.5)" : "transparent"}`,
                     color: active ? "#f59e0b" : "#83786c",
@@ -5420,7 +5421,7 @@ const FlyView3D = forwardRef<FlyView3DRef, {
               : "Gizmo arrows relocate the selection's blocks (undoable move_selection). Click to switch to moving the region only. Same toggle as the Selection tab's Move: Box/Contents."}
             style={{
               padding: "2px 8px", borderRadius: 4, fontSize: 10, fontWeight: 700, letterSpacing: "0.03em",
-              pointerEvents: "auto", cursor: "pointer",
+              pointerEvents: "auto", cursor: "default",
               background: moveWithContents ? "rgba(251,191,36,0.18)" : "rgba(131,120,108,0.18)",
               border: `1px solid ${moveWithContents ? "rgba(251,191,36,0.5)" : "rgba(131,120,108,0.35)"}`,
               color: moveWithContents ? "#fbbf24" : "#83786c",

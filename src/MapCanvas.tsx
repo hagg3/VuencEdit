@@ -6,6 +6,7 @@ import { zoomAtPoint, resizeCanvasToContainer, makeSeqGuard, putPatchPixels, beg
 import { maskOutline, type OutlinePt } from "./maskUtils";
 import { attachWheelGestures } from "./input/wheel";
 import { IS_MAC } from "./ribbon/tokens";
+import { isMacCtrlMenuPress } from "./input/macCtrlClick";
 import { recordTileFetchMs, recordMapDrawMs, bumpPerf, perfCounters } from "./perfCounters";
 import { MAP, rgba } from "./theme/theme";
 import { sfx, type HoldHandle } from "./sound/sfx";
@@ -53,7 +54,7 @@ export const TOOL_ICON: Record<Tool, IconName> = {
 
 /**
  * Tool-family hue key for the status bar's tool chip (Stage 14.11) — "an accent names the tool
- * *family*, not the command" (CLAUDE.md "Visual system"). Resolved to an actual hex by the status
+ * *family*, not the command". Resolved to an actual hex by the status
  * bar via `ribbon/tokens`' `ACCENT`, kept as a plain string here so this file (canvas-heavy,
  * imports colours only from `theme/theme`) doesn't gain a second colour source.
  */
@@ -242,13 +243,6 @@ function evictTiles(cache: Map<string, HTMLCanvasElement>, limit: number): void 
 function clearTiles(cache: Map<string, HTMLCanvasElement>): void {
   for (const c of cache.values()) freeTileCanvas(c);
   cache.clear();
-}
-
-/** Remove one tile from the cache, freeing its backing store first (see `freeTileCanvas`). */
-function dropTile(cache: Map<string, HTMLCanvasElement>, key: string): void {
-  const c = cache.get(key);
-  if (c) freeTileCanvas(c);
-  cache.delete(key);
 }
 
 /** Bound on `materializeOccupancyRef` (§2): one entry per queried chunk, cleared only on world
@@ -471,7 +465,8 @@ interface Props {
   onSelectionChange: (bounds: SelectionBounds | null) => void;
   pastePreview: { width: number; height: number } | null;
   clipboardPreviewPixels: { width: number; height: number; lod: number; pixels: Uint8Array } | null;
-  onPasteAt: (pos: { x: number; y: number }) => void;
+  /** `immediate` = ⇧ held: stamp now instead of locking the position first. */
+  onPasteAt: (pos: { x: number; y: number }, immediate?: boolean) => void;
   /** When set, the paste ghost box is fixed here (amber) instead of following the cursor (green). */
   lockedPastePos?: { x: number; y: number } | null;
   /** Draw tool configuration — only read when tool is pen/brush/rect/ellipse. */
@@ -507,7 +502,7 @@ interface Props {
   /** Spawn/home position in editor pixel coords — drawn as a marker on the map. */
   spawnPos?: { px: number; py: number } | null;
   /** Player start position in editor pixel coords — drawn as an orange marker, distinct from the
-   *  teal home marker above (they're two independent header fields; see "Set Point" in CLAUDE.md). */
+   *  teal home marker above (they're two independent header fields). */
   playerPos?: { px: number; py: number } | null;
   /** Sign list from get_records() (256z-format plan, Phase 4) — drawn as small markers when
    *  non-empty. `x`/`y` are already editor-local. */
@@ -571,6 +566,10 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
   const tileCacheRef  = useRef<Map<string, HTMLCanvasElement>>(new Map());
   const templateTileCacheRef = useRef<Map<string, HTMLCanvasElement>>(new Map());
   const pendingRef    = useRef<Set<string>>(new Set());
+  // 23.16: keys whose cached tile is out of date but still drawn until its replacement lands
+  // (`ensureTiles`/`drain` treat them as missing; `loadTile` swaps and unmarks them).
+  const staleTilesRef = useRef<Set<string>>(new Set());
+  const lastWorldEpochRef = useRef<number | null>(null);
   const tileWindowWarnedRef = useRef(false); // one-shot warn for tileWindowFits (Phase 6 guard)
   // Live LRU caps, recomputed by ensureTiles from the current visible tile count (see TILE_CACHE_LIMIT).
   const tileLimitRef  = useRef(TILE_CACHE_LIMIT);
@@ -1568,7 +1567,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
           if (isSculpt) {
             // Falloff-aware brush preview: per-cell alpha from the same dome math the backend
             // applies per stamp, so the ghost actually predicts what a click will do — replaces
-            // the old flat-orange-disc (CLAUDE.md's audit flagged this as no-feedback-at-all).
+            // the old flat-orange-disc (an audit flagged this as no-feedback-at-all).
             const { sculptRadius: radius, sculptSoftness: softness, sculptProfile: profile } = cfg;
             const ringX = pos.x * scale + vx + gs / 2, ringY = pos.y * scale + vy + gs / 2;
             if (gs < 2) {
@@ -1689,7 +1688,10 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
       tc.width  = raw.width;
       tc.height = raw.height;
       putPatchPixels(tc.getContext("2d")!, raw);
+      const old = tileCacheRef.current.get(key);
+      if (old) freeTileCanvas(old);
       tileCacheRef.current.set(key, tc);
+      staleTilesRef.current.delete(key);
       evictTiles(tileCacheRef.current, tileLimitRef.current);
 
       if (traw) {
@@ -1736,7 +1738,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     const q = queueRef.current;
     while (activeRef.current < MAX_CONCURRENT && q.length > 0) {
       const job = q.shift()!;
-      if (tileCacheRef.current.has(job.key) || pendingRef.current.has(job.key)) continue;
+      if ((tileCacheRef.current.has(job.key) && !staleTilesRef.current.has(job.key)) || pendingRef.current.has(job.key)) continue;
       activeRef.current++;
       loadTile(job.key, job.lod, job.x1, job.y1, job.x2, job.y2);
     }
@@ -1807,12 +1809,13 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     templateLimitRef.current = Math.min(Math.max(TEMPLATE_CACHE_LIMIT, needed.size * 2), Math.max(needed.size, templateByteCap));
     evictTiles(tileCacheRef.current, tileLimitRef.current);
     evictTiles(templateTileCacheRef.current, templateLimitRef.current);
+    for (const k of staleTilesRef.current) if (!tileCacheRef.current.has(k)) staleTilesRef.current.delete(k);
 
     draw();
 
     const jobs: TileJob[] = [];
     for (const key of needed) {
-      if (tileCacheRef.current.has(key) || pendingRef.current.has(key)) continue;
+      if ((tileCacheRef.current.has(key) && !staleTilesRef.current.has(key)) || pendingRef.current.has(key)) continue;
       const { tx, ty } = parseTileKey(key);
       jobs.push({
         key,
@@ -1877,8 +1880,8 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
         if (wx >= patch.x + pw || wy >= patch.y + ph || wx + span <= patch.x || wy + span <= patch.y) continue;
         // A tile *finer* than the patch can't be repaired from it — upscaling coarse samples into
         // it would bake wrong pixels into a level the user will see again the moment they zoom in.
-        // Drop it instead; `ensureTiles` re-fetches it at full detail when it's next visible.
-        if (lod < patch.lod) { dropTile(tileCacheRef.current, key); continue; }
+        // Mark it stale instead (23.16): it keeps drawing until `ensureTiles` re-fetches it at full detail.
+        if (lod < patch.lod) { staleTilesRef.current.add(key); continue; }
         const ctx = tc.getContext("2d")!;
         if (lod === patch.lod) {
           // Same sampling grid (the backend floors the patch origin to a multiple of its lod), so
@@ -1909,7 +1912,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
       for (const [key] of tileCacheRef.current) {
         const { wx, wy, span } = parseTileKey(key);
         if (wx < x2 && wx + span > x1 && wy < y2 && wy + span > y1) {
-          dropTile(tileCacheRef.current, key);
+          staleTilesRef.current.add(key); // keeps drawing until the refetch lands (23.16)
         }
       }
       ensureTiles();
@@ -2098,7 +2101,15 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     // lands and re-runs this effect — so wait for that run instead (audit M4).
     if (capPending) return;
     tileEpoch.current.next();
-    clearTiles(tileCacheRef.current);
+    // 23.16: a new world must really clear; any other invalidation (mode, slice, cap, relief)
+    // keeps the old tiles drawing, marked stale, until each replacement lands.
+    if (lastWorldEpochRef.current !== worldEpoch) {
+      clearTiles(tileCacheRef.current);
+      staleTilesRef.current.clear();
+    } else {
+      for (const k of tileCacheRef.current.keys()) staleTilesRef.current.add(k);
+    }
+    lastWorldEpochRef.current = worldEpoch;
     clearTiles(templateTileCacheRef.current);
     pendingRef.current.clear();
     queueRef.current = [];
@@ -2286,6 +2297,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
     }
     if (e.button === 2) return;
     if (e.button !== 0) return;
+    if (isMacCtrlMenuPress(e, IS_MAC)) return; // Ctrl+click = context menu, not a stroke (34.10)
     (e.target as HTMLCanvasElement).setPointerCapture(e.pointerId);
     // Camera icon: clicking near the teal dot starts a drag to teleport the 3D camera.
     {
@@ -2803,7 +2815,7 @@ const MapCanvas = forwardRef<MapCanvasRef, Props>(function MapCanvas(
       return;
     }
     if (shouldPasteOnPointerUp(toolRef.current, startedOnCanvas, e.button)) {
-      onPasteAtRef.current(screenToWorld(e.clientX, e.clientY));
+      onPasteAtRef.current(screenToWorld(e.clientX, e.clientY), e.shiftKey);
     }
   }, [draw, screenToWorld, screenToWorldLoose, fetchMaterializeOccupancy, stopHold]);
 

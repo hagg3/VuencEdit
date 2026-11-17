@@ -2,7 +2,7 @@
  * UI sound engine (UI redesign r3, Stage 14.12). WebAudio-synthesised, zero assets. One
  * `AudioContext`, created lazily on the first cue actually fired (always inside a user gesture —
  * a menu click, a keyboard shortcut, a completed drag — so WKWebView/WebView2 autoplay policies are
- * satisfied without ever needing a dedicated "enable audio" click). See CLAUDE.md §"UI Shell" for
+ * satisfied without ever needing a dedicated "enable audio" click). See the UI shell for
  * the cue-call-site rules this module exists to enforce: fire on completions only, never on hover
  * or at pointer/stamp rate.
  *

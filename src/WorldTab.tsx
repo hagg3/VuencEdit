@@ -60,7 +60,6 @@ const panelStyle: React.CSSProperties = {
   gap: 2,
   fontSize: FONT.body,
   color: TEXT,
-  userSelect: "none",
 };
 
 const fmtCoord = (n: number) => String(Math.round(n));
@@ -108,7 +107,6 @@ function SignsBody({ signs, viewCenter, worldCentre, onGoTo }: {
       <TextField
         value={query} onChange={setQuery} ariaLabel="Search signs" placeholder="Search signs…"
         onKeyDown={(e) => { if (e.key === "Escape") { setQuery(""); e.currentTarget.blur(); e.stopPropagation(); } }}
-        style={{ userSelect: "text" }}
       />
       <div style={{ display: "flex", gap: SPACE.sm, alignItems: "center" }}>
         <SmallButton label="Nearest" title="Closest to the map's centre first"
@@ -133,7 +131,7 @@ function SignsBody({ signs, viewCenter, worldCentre, onGoTo }: {
             padding: "4px 6px", borderRadius: RADIUS.md,
             background: `rgba(${hexToRgbTriplet(ACCENT.warm)},.10)`,
             boxShadow: `inset 0 0 0 1px rgba(${hexToRgbTriplet(ACCENT.warm)},.30)`,
-            cursor: "pointer",
+            cursor: "default",
           }}>
           <div style={{ color: TEXT, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
             {s.text || <span style={{ color: TEXT_META, fontStyle: "italic" }}>(empty)</span>}
@@ -150,7 +148,7 @@ function SignsBody({ signs, viewCenter, worldCentre, onGoTo }: {
           onClick={() => setShowAll(v => !v)}
           onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setShowAll(v => !v); } }}
           style={{
-            textAlign: "center", padding: "3px 0", cursor: "pointer", userSelect: "none",
+            textAlign: "center", padding: "3px 0", cursor: "default",
             color: TEXT_LABEL, fontSize: FONT.micro,
           }}
         >
@@ -216,7 +214,6 @@ function CmdsBody({ records, viewCenter, worldCentre, onGoTo }: {
           <TextField
             value={query} onChange={setQuery} ariaLabel="Search command blocks" placeholder="Search scripts…"
             onKeyDown={(e) => { if (e.key === "Escape") { setQuery(""); e.currentTarget.blur(); e.stopPropagation(); } }}
-            style={{ userSelect: "text" }}
           />
           <div style={{ display: "flex", gap: SPACE.sm, alignItems: "center" }}>
             <SmallButton label="Nearest" title="Closest to the map's centre first"
@@ -241,7 +238,7 @@ function CmdsBody({ records, viewCenter, worldCentre, onGoTo }: {
                 padding: "4px 6px", borderRadius: RADIUS.md,
                 background: `rgba(${hexToRgbTriplet(MAP.command)},.10)`,
                 boxShadow: `inset 0 0 0 1px rgba(${hexToRgbTriplet(MAP.command)},.30)`,
-                cursor: "pointer",
+                cursor: "default",
               }}>
               <div style={{ color: TEXT, fontFamily: PROP_MONO, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                 {scriptPreview(c.script) || <span style={{ color: TEXT_META, fontStyle: "italic" }}>(empty)</span>}
@@ -257,7 +254,7 @@ function CmdsBody({ records, viewCenter, worldCentre, onGoTo }: {
               role="button" tabIndex={0}
               onClick={() => setShowAll(v => !v)}
               onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setShowAll(v => !v); } }}
-              style={{ textAlign: "center", padding: "3px 0", cursor: "pointer", userSelect: "none", color: TEXT_LABEL, fontSize: FONT.micro }}
+              style={{ textAlign: "center", padding: "3px 0", cursor: "default", color: TEXT_LABEL, fontSize: FONT.micro }}
             >
               {showAll ? "Show less" : `Show ${hiddenCount} more…`}
             </div>
@@ -290,8 +287,7 @@ function BookmarksBody({ worldKey, viewCenter, onGoTo }: {
       {list.map(b => (
         <div key={b.id} style={{ display: "flex", alignItems: "center", gap: SPACE.sm, minHeight: 24 }}>
           {editing === b.id ? (
-            <TextField value={draft} onChange={setDraft} ariaLabel="Bookmark name" maxLength={40}
-              style={{ flex: 1, userSelect: "text" }}
+            <TextField value={draft} onChange={setDraft} ariaLabel="Bookmark name" maxLength={40} style={{ flex: 1 }}
               onKeyDown={(e) => {
                 if (e.key === "Enter") finishRename(b.id);
                 else if (e.key === "Escape") { setEditing(null); e.stopPropagation(); }

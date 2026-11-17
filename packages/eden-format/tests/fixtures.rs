@@ -1,5 +1,5 @@
 //! Gate 1 (Emod S.3): the checked-in fixture pack, copied verbatim from
-//! `~/emod/port/tools/fixtures/emod/` (written by `emod.py fixtures-pack`; regenerate there, never
+//! Emod's `port/tools/fixtures/emod/` (written by `emod.py fixtures-pack`; regenerate there, never
 //! hand-edit). Every `.emod` that only `emod.py` wrote — two batches, zlib, raw — reads back to the
 //! state `expected.txt` pins.
 //!

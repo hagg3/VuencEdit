@@ -560,7 +560,7 @@ pub struct WorldMeta {
     pub sky: u8,
     /// Header `version` field (bytes 92–95) — lets the frontend distinguish `NewFormat256z`
     /// (256z, `version` not 5/6 — the 2026 game update) from `NewDawn256z` (256z, `version` 5 or
-    /// 6) without a second `get_world_info` round trip. See CLAUDE.md's "File Format" table.
+    /// 6) without a second `get_world_info` round trip.
     pub version: i32,
     /// Records brought in from the game's `signs_…`/`cmd_….eden.dat` sidecars on this load (27.0b,
     /// plan §6.2): they'll be written into the world on the next save. Zero when nothing was
@@ -773,6 +773,25 @@ impl LoadedWorld {
     /// coordinates. The one conversion helper (plan §8).
     pub(crate) fn record_to_local(&self, p: trailer::Pos) -> (i32, i32, i32) {
         (p.x - self.min_x * 16, p.y - self.min_y * 16, p.z)
+    }
+
+    /// The inverse of `record_to_local`: editor-local block coordinates → a record anchor.
+    #[cfg_attr(not(test), allow(dead_code))] // 27.8b's tools are the first production callers
+    pub(crate) fn local_to_record(&self, x: i32, y: i32, z: i32) -> trailer::Pos {
+        trailer::Pos::new(x + self.min_x * 16, y + self.min_y * 16, z)
+    }
+
+    /// Where a record's anchor block lives: its chunk (absolute chunk coordinates, the
+    /// `chunk_map` key — the same space as `Pos::column`) and the chunk-relative offset of its
+    /// **block-type** byte (`band·8192 + lx·256 + ly·16 + lz`). `None` when the chunk is missing,
+    /// `z` is outside the world's height, or the byte lies past a short chunk's span.
+    pub(crate) fn record_cell(&self, p: trailer::Pos) -> Option<(i32, i32, usize)> {
+        if p.z < 0 || p.z as usize >= self.num_bands * 16 { return None; }
+        let (cx, cy) = p.column();
+        let (addr, end) = self.chunk_range(cx, cy)?;
+        let (lx, ly, z) = (p.x.rem_euclid(16) as usize, p.y.rem_euclid(16) as usize, p.z as usize);
+        let off = (z / 16) * 8192 + lx * 256 + ly * 16 + z % 16;
+        (addr + off < end).then_some((cx, cy, off))
     }
 
     /// Bytes chunk `(cx, cy)` actually owns — `chunk_size` unless the directory says its data is
@@ -1166,6 +1185,10 @@ pub(crate) struct EditView<'w> {
     /// A capture would have exceeded `limit`: every later write is dropped and the edit is rolled
     /// back and refused.
     tripped: bool,
+    /// Every trailer change the closure made, in order (27.8a-1) — see `RecordOp`.
+    rec_log: Vec<RecordOp>,
+    /// The trailer as it was before the closure's first record op: what a failed edit restores.
+    rec_pre: Option<Trailer>,
 }
 
 /// What an `EditView` leaves behind once the closure has run.
@@ -1173,11 +1196,22 @@ struct EditCapture {
     pre: FxHashMap<(i32, i32), BandCopies>,
     captured: usize,
     tripped: bool,
+    rec_log: Vec<RecordOp>,
+    rec_pre: Option<Trailer>,
+}
+
+impl EditCapture {
+    /// Exact rollback of a failed / panicked / over-limit edit: the trailer first (27.8a-1), then
+    /// every captured band. Returns the chunks touched (their derived caches must go).
+    fn roll_back(self, world: &mut LoadedWorld) -> Vec<(i32, i32)> {
+        if let Some(t) = self.rec_pre { world.trailer = t; }
+        rollback_capture(world, &self.pre)
+    }
 }
 
 impl<'w> EditView<'w> {
     pub(crate) fn new(world: &'w mut LoadedWorld, limit: usize) -> Self {
-        EditView { world, pre: FxHashMap::default(), last: None, captured: 0, limit, tripped: false }
+        EditView { world, pre: FxHashMap::default(), last: None, captured: 0, limit, tripped: false, rec_log: Vec::new(), rec_pre: None }
     }
 
     /// An `EditView` with no capture ceiling — for tests that drive a writer directly.
@@ -1185,7 +1219,7 @@ impl<'w> EditView<'w> {
     pub(crate) fn unbounded(world: &'w mut LoadedWorld) -> Self { Self::new(world, usize::MAX) }
 
     fn into_capture(self) -> EditCapture {
-        EditCapture { pre: self.pre, captured: self.captured, tripped: self.tripped }
+        EditCapture { pre: self.pre, captured: self.captured, tripped: self.tripped, rec_log: self.rec_log, rec_pre: self.rec_pre }
     }
 
     /// Test-only raw byte write at absolute offset `abs` (which must lie inside a chunk), captured
@@ -1256,6 +1290,224 @@ impl VoxelViewMut for EditView<'_> {
         Some(&mut self.world.bytes[a + lo..a + hi])
     }
 }
+
+// ── Record lifecycle (27.8a-1): the op log, the air rule, undo/redo replay ─────────────────────
+//
+// ⚠️ Everything between this banner and "end record writers" is the **only** code that mutates
+// `world.trailer` outside load (sidecar adoption), journal replay and tests:
+// `test_trailer_mutators_stay_in_the_funnel` greps for it. A record write anywhere else would
+// change what a save writes with no undo entry, no dirty mark and no `records.seq` bump.
+
+/// One logged trailer change (`stage27-build-plan` §1.1). Every variant carries the record(s) by
+/// value, so applying it backwards is exact: `edit + undo ⇒ Trailer::encode()` byte-identical (T6).
+/// `UndoEntry.records` holds an edit's ops **forward** on both stacks; undo applies them inverted
+/// in reverse order, redo forward in order.
+#[derive(Clone, Debug)]
+pub(crate) enum RecordOp {
+    SignInserted { i: usize, sign: trailer::Sign },
+    SignRemoved { i: usize, sign: trailer::Sign },
+    SignReplaced { i: usize, old: trailer::Sign, new: trailer::Sign },
+    CmdInserted { i: usize, cmd: Box<trailer::Cmd> },
+    CmdRemoved { i: usize, cmd: Box<trailer::Cmd> },
+    CmdReplaced { i: usize, old: Box<trailer::Cmd>, new: Box<trailer::Cmd> },
+    /// The air rule's drops as one op (`Trailer::remove_many`, one reindex for a delete over a
+    /// sign field). Indices are as they were before the removal, ascending.
+    Dropped { signs: Vec<(usize, trailer::Sign)>, cmds: Vec<(usize, trailer::Cmd)> },
+}
+
+/// Undo-budget price of one record (record bytes + index entries + spine), plan §1.2 step 4.
+const UNDO_SIGN_BYTES: usize = 160;
+const UNDO_CMD_BYTES: usize = 560;
+
+impl RecordOp {
+    /// What this op costs on an undo stack.
+    fn undo_bytes(&self) -> usize {
+        match self {
+            RecordOp::SignInserted { .. } | RecordOp::SignRemoved { .. } => UNDO_SIGN_BYTES,
+            RecordOp::SignReplaced { .. } => 2 * UNDO_SIGN_BYTES,
+            RecordOp::CmdInserted { .. } | RecordOp::CmdRemoved { .. } => UNDO_CMD_BYTES,
+            RecordOp::CmdReplaced { .. } => 2 * UNDO_CMD_BYTES,
+            RecordOp::Dropped { signs, cmds } => signs.len() * UNDO_SIGN_BYTES + cmds.len() * UNDO_CMD_BYTES,
+        }
+    }
+
+    /// Apply to `t`, forward (`true`: redo) or as its inverse (`false`: undo).
+    fn apply(&self, t: &mut Trailer, forward: bool) -> Result<(), trailer::Refusal> {
+        use RecordOp::*;
+        match (self, forward) {
+            (SignInserted { i, sign }, true) | (SignRemoved { i, sign }, false) => t.insert_sign_at(*i, sign.clone()),
+            (SignRemoved { i, .. }, true) | (SignInserted { i, .. }, false) => t.remove_sign(*i).map(drop),
+            (SignReplaced { i, new, .. }, true) | (SignReplaced { i, old: new, .. }, false) => t.replace_sign(*i, new.clone()).map(drop),
+            (CmdInserted { i, cmd }, true) | (CmdRemoved { i, cmd }, false) => t.insert_cmd_at(*i, (**cmd).clone()),
+            (CmdRemoved { i, .. }, true) | (CmdInserted { i, .. }, false) => t.remove_cmd(*i).map(drop),
+            (CmdReplaced { i, new, .. }, true) | (CmdReplaced { i, old: new, .. }, false) => t.replace_cmd(*i, (**new).clone()).map(drop),
+            (Dropped { signs, cmds }, true) => {
+                let si: Vec<usize> = signs.iter().map(|(i, _)| *i).collect();
+                let ci: Vec<usize> = cmds.iter().map(|(i, _)| *i).collect();
+                t.remove_many(&si, &ci).map(drop)
+            }
+            (Dropped { signs, cmds }, false) => t.insert_many(signs, cmds),
+        }
+    }
+}
+
+/// Replay an entry's ops: redo applies them in order, undo their inverses in reverse. A refusal
+/// means the trailer no longer matches the history (it can't happen while every write goes
+/// through the funnel): logged and skipped, never a half-failed undo. Returns whether anything
+/// was replayed.
+fn replay_records(t: &mut Trailer, ops: &[RecordOp], forward: bool) -> bool {
+    let mut run = |op: &RecordOp| {
+        if let Err(e) = op.apply(t, forward) {
+            timing_log!("[UNDO] record op {op:?} refused on {} ({e}); skipped", if forward { "redo" } else { "undo" });
+        }
+    };
+    if forward { ops.iter().for_each(&mut run) } else { ops.iter().rev().for_each(&mut run) }
+    !ops.is_empty()
+}
+
+/// What an edit did to the records, on every `EditResult` (plan §3.4 / §1.2 step 5). `seq` is
+/// `DirtyState::records_seq` after the edit: the frontend refetches `get_records` when it moves.
+/// The `dropped_*` counts are the air rule's (explicit removals and undo/redo don't toast, O7).
+#[derive(Serialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RecordChange {
+    pub(crate) seq: u64,
+    pub(crate) dropped_signs: u32,
+    pub(crate) dropped_cmds: u32,
+}
+
+// The record writers a `with_edit*` closure uses (27.8b's tools are the first production callers;
+// 27.8a-2's paste rule the next). Each applies to the world's trailer at once — later reads in the
+// same closure see it — and logs the op; the first one also snapshots the trailer so a failed edit
+// restores it exactly, `is_touched()` included (test 1.5-c). Refusals change nothing and log
+// nothing.
+#[cfg_attr(not(test), allow(dead_code))]
+impl EditView<'_> {
+    fn rec_begin(&mut self) {
+        if self.rec_pre.is_none() {
+            self.rec_pre = Some(self.world.trailer.clone());
+        }
+    }
+
+    pub(crate) fn add_sign(&mut self, anchor: trailer::Pos, a: i32, b: i32, c: i32, text: &[u8]) -> Result<usize, trailer::Refusal> {
+        self.rec_begin();
+        let i = self.world.trailer.add_sign(anchor, a, b, c, text)?;
+        self.rec_log.push(RecordOp::SignInserted { i, sign: self.world.trailer.signs()[i].clone() });
+        Ok(i)
+    }
+
+    pub(crate) fn remove_sign(&mut self, i: usize) -> Result<trailer::Sign, trailer::Refusal> {
+        self.rec_begin();
+        let sign = self.world.trailer.remove_sign(i)?;
+        self.rec_log.push(RecordOp::SignRemoved { i, sign: sign.clone() });
+        Ok(sign)
+    }
+
+    pub(crate) fn set_sign_text(&mut self, i: usize, text: &[u8]) -> Result<(), trailer::Refusal> {
+        self.rec_begin();
+        let old = self.world.trailer.signs().get(i).cloned();
+        self.world.trailer.set_sign_text(i, text)?;
+        let (old, new) = (old.expect("set_sign_text succeeded"), self.world.trailer.signs()[i].clone());
+        self.rec_log.push(RecordOp::SignReplaced { i, old, new });
+        Ok(())
+    }
+
+    pub(crate) fn set_sign_colour(&mut self, i: usize, b: i32) -> Result<(), trailer::Refusal> {
+        self.rec_begin();
+        let old = self.world.trailer.signs().get(i).cloned();
+        self.world.trailer.set_sign_colour(i, b)?;
+        let (old, new) = (old.expect("set_sign_colour succeeded"), self.world.trailer.signs()[i].clone());
+        self.rec_log.push(RecordOp::SignReplaced { i, old, new });
+        Ok(())
+    }
+
+    pub(crate) fn add_cmd(&mut self, block: trailer::Pos, script: &[u8]) -> Result<usize, trailer::Refusal> {
+        self.rec_begin();
+        let i = self.world.trailer.add_cmd(block, script)?;
+        self.rec_log.push(RecordOp::CmdInserted { i, cmd: Box::new(self.world.trailer.cmds()[i].clone()) });
+        Ok(i)
+    }
+
+    pub(crate) fn remove_cmd(&mut self, i: usize) -> Result<trailer::Cmd, trailer::Refusal> {
+        self.rec_begin();
+        let cmd = self.world.trailer.remove_cmd(i)?;
+        self.rec_log.push(RecordOp::CmdRemoved { i, cmd: Box::new(cmd.clone()) });
+        Ok(cmd)
+    }
+
+    pub(crate) fn set_cmd_script(&mut self, i: usize, script: &[u8]) -> Result<(), trailer::Refusal> {
+        self.rec_begin();
+        let old = self.world.trailer.cmds().get(i).cloned();
+        self.world.trailer.set_cmd_script(i, script)?;
+        let (old, new) = (old.expect("set_cmd_script succeeded"), self.world.trailer.cmds()[i].clone());
+        self.rec_log.push(RecordOp::CmdReplaced { i, old: Box::new(old), new: Box::new(new) });
+        Ok(())
+    }
+}
+
+/// The pre-edit byte at chunk-relative offset `off`, if this delta says it changed (`None` =
+/// unchanged by the edit). Called on the raw deltas `finish_edit` holds, before `UndoEntry::new`
+/// compresses them; a dense delta's span may include unchanged bytes, which compare equal.
+fn delta_pre_byte(delta: &ChunkDelta, off: usize, scratch: &mut Vec<u8>) -> Option<u8> {
+    if let Some(pairs) = delta.sparse_pairs() {
+        // Every producer (`band_delta`, `diff_span`) emits pairs in ascending offset order.
+        debug_assert!(pairs.windows(2).all(|w| w[0].0 < w[1].0));
+        let k = pairs.binary_search_by_key(&(off as u32), |&(o, _)| o).ok()?;
+        return Some(pairs[k].1);
+    }
+    let (start, data) = delta.full_bytes(scratch)?;
+    data.get(off.checked_sub(start as usize)?).copied()
+}
+
+/// **The air rule (T5), exact:** drop every sign and command block whose anchor cell went
+/// **non-air → air in this edit**, judged from the edit's own undo deltas (pre byte) against the
+/// world (post byte). Not "is air now": a record already orphaned in air before the edit stays
+/// (Emod fires the same hook on the write). A record whose block was retyped to another non-air
+/// block stays too (T7). Skipped for an opaque trailer (T8: block edits are never refused for it).
+///
+/// Runs in `finish_edit`, i.e. after `with_edit_inner`'s closure **and** after `sculpt_split`'s
+/// commit, so every byte-writing edit gets it with no per-command code. Ops the closure already
+/// did aren't repeated (a removed record is gone). The drops land as one `RecordOp::Dropped` on
+/// `log`; returns `(signs, cmds)` dropped, for O7's toast.
+fn apply_air_rule(world: &mut LoadedWorld, snaps: &[ChunkSnapshot], log: &mut Vec<RecordOp>) -> (u32, u32) {
+    let t = &world.trailer;
+    if !t.parsed() || (t.signs().is_empty() && t.cmds().is_empty()) {
+        return (0, 0);
+    }
+    let mut scratch = Vec::new();
+    let (mut si, mut ci) = (Vec::new(), Vec::new());
+    for snap in snaps {
+        // Chunk-map keys and `Pos::column` are the same space: absolute chunk coordinates.
+        let recs = t.in_column(snap.cx, snap.cy);
+        if recs.is_empty() { continue; }
+        let Some((addr, _)) = world.chunk_range(snap.cx, snap.cy) else { continue };
+        let mut went_air = |p: trailer::Pos| {
+            let Some((cx, cy, off)) = world.record_cell(p) else { return false };
+            debug_assert_eq!((cx, cy), (snap.cx, snap.cy));
+            world.bytes[addr + off] == 0 && delta_pre_byte(&snap.delta, off, &mut scratch).is_some_and(|pre| pre != 0)
+        };
+        si.extend(recs.signs.iter().copied().filter(|&i| went_air(t.signs()[i].pos)));
+        ci.extend(recs.cmds.iter().copied().filter(|&i| went_air(t.cmds()[i].pos)));
+    }
+    if si.is_empty() && ci.is_empty() {
+        return (0, 0);
+    }
+    si.sort_unstable();
+    ci.sort_unstable();
+    match world.trailer.remove_many(&si, &ci) {
+        Ok((signs, cmds)) => {
+            let n = (signs.len() as u32, cmds.len() as u32);
+            log.push(RecordOp::Dropped { signs: si.into_iter().zip(signs).collect(), cmds: ci.into_iter().zip(cmds).collect() });
+            n
+        }
+        Err(e) => {
+            timing_log!("[EDIT] air rule: remove_many refused ({e}); records kept");
+            (0, 0)
+        }
+    }
+}
+
+// ── end record writers ──────────────────────────────────────────────────────────────────────
 
 /// Write every captured pre-band back into `world` — exact rollback of an edit that failed or
 /// tripped — and return the chunks touched (their hints must be invalidated).
@@ -1538,10 +1790,15 @@ pub(crate) struct UndoEntry {
     /// separate; only undo/redo coalescing and the group count key off this. See
     /// `count_undo_groups`, `with_edit_grouped`, `undo_edit_inner`/`redo_edit_inner`.
     pub(crate) group: Option<u64>,
-    /// Total byte cost of `chunks`, computed once here so `push_undo`'s budget accounting is
-    /// O(1) per push instead of re-summing every chunk in the stack on every push (audit M2 —
-    /// this used to make a long sculpt stroke's undo bookkeeping quadratic in stroke length).
+    /// Total byte cost of `chunks` **and** `records`, computed once here so `push_undo`'s budget
+    /// accounting is O(1) per push instead of re-summing every chunk in the stack on every push
+    /// (audit M2 — this used to make a long sculpt stroke's undo bookkeeping quadratic in stroke
+    /// length).
     pub(crate) bytes: usize,
+    /// The edit's trailer ops, **forward**, on both stacks (27.8a-1): undo replays their inverses
+    /// in reverse, redo replays them in order (`replay_records`). Empty for most edits. An entry
+    /// may have records and no chunks (a sign-text edit writes no block bytes).
+    pub(crate) records: Vec<RecordOp>,
 }
 
 impl UndoEntry {
@@ -1549,13 +1806,21 @@ impl UndoEntry {
     /// choke point where `Full` deltas are deflated (audit C1 step 2). Both callers
     /// (`with_edit_inner`, and `undo_edit_inner`/`redo_edit_inner` with their inverses) run every
     /// consumer that needs the raw bytes — `LampIndex::apply_delta`, `DirtyState::mark_chunks` —
-    /// *before* reaching here, so nothing downstream has to know about `FullZ`.
+    /// *before* reaching here, so nothing downstream has to know about `FullZ`. Test-only since
+    /// 27.8a-1: production goes through `with_records`.
+    #[cfg(test)]
     fn new(operation: impl Into<String>, chunks: Vec<ChunkSnapshot>, group: Option<u64>) -> Self {
+        Self::with_records(operation, chunks, group, Vec::new())
+    }
+
+    /// `new` plus the edit's record ops (see `records`): the one constructor production uses.
+    fn with_records(operation: impl Into<String>, chunks: Vec<ChunkSnapshot>, group: Option<u64>, records: Vec<RecordOp>) -> Self {
         let chunks: Vec<ChunkSnapshot> = chunks.into_iter()
             .map(|s| ChunkSnapshot { cx: s.cx, cy: s.cy, delta: s.delta.compressed() })
             .collect();
-        let bytes = chunks.iter().map(chunk_snapshot_bytes).sum();
-        UndoEntry { operation: operation.into(), chunks, group, bytes }
+        let bytes = chunks.iter().map(chunk_snapshot_bytes).sum::<usize>()
+            + records.iter().map(RecordOp::undo_bytes).sum::<usize>();
+        UndoEntry { operation: operation.into(), chunks, group, bytes, records }
     }
 }
 
@@ -1688,6 +1953,13 @@ fn bit_set(bits: &[u8], i: usize) -> bool {
 /// place the fail-safe rect-equality rule is applied; every mask-aware command funnels through it.
 pub(crate) fn active_mask(ws: &WorldState, x1: i32, y1: i32, x2: i32, y2: i32) -> Option<SelectionMask> {
     ws.selection_mask.as_ref().filter(|m| m.matches_rect(x1, y1, x2, y2)).cloned()
+}
+
+/// The mask a sculpt flush should shape-clip to: the stored mask when `clip_rect` is set and the
+/// mask's bbox equals it (the usual `active_mask` rule), else `None` (rect-only).
+fn sculpt_mask(ws: &WorldState, clip_rect: Option<[i32; 4]>) -> Option<std::sync::Arc<SelectionMask>> {
+    let [x1, y1, x2, y2] = clip_rect?;
+    active_mask(ws, x1, y1, x2, y2).map(std::sync::Arc::new)
 }
 
 /// A single block position for the paint_blocks command.
@@ -1841,6 +2113,11 @@ pub(crate) struct DirtyState {
     /// edit from the user's file forever. Never reset (not even by `clear_all`), so a stale capture
     /// from before a world swap can never compare equal to a fresh counter.
     seq: u64,
+    /// Bumped by every trailer change (`mark_trailer`) and nothing else: `EditResult.records.seq`
+    /// and `get_records`' `seq`, which the frontend compares to know when to refetch the records.
+    /// Separate from `seq` on purpose: that one means "something a save owes changed" and gates
+    /// the save/sculpt staleness checks. Never reset, like `seq`.
+    pub(crate) records_seq: u64,
 }
 
 /// Record that `chunks` bytes just changed: mark them dirty for the save/journal machinery **and**
@@ -1893,10 +2170,12 @@ impl DirtyState {
         self.header_load = true;
     }
 
-    /// A record edit (or a replayed tail) changed the trailer: every horizon owes it. Called from
-    /// the `with_edit` funnel and undo/redo when their record op log is non-empty (27.8a).
+    /// A record edit (or a replayed tail) changed the trailer: every horizon owes it, and
+    /// `records_seq` moves so the frontend refetches `get_records`. Called from `finish_edit` and
+    /// undo/redo when their record op log is non-empty (27.8a-1).
     pub(crate) fn mark_trailer(&mut self) {
         self.seq = self.seq.wrapping_add(1);
+        self.records_seq = self.records_seq.wrapping_add(1);
         self.trailer_journal = true;
         self.trailer_disk = true;
         self.trailer_base = true;
@@ -2124,7 +2403,7 @@ impl TemplateSurfaceCache {
     }
 }
 
-/// Where an autosave journal's base image lives (18.9, `TEST WORLDS/autosave-rebase-plan-2026-09-30.md`).
+/// Where an autosave journal's base image lives (ROADMAP-EDIT 18.9).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub(crate) enum AutosaveBase {
@@ -2510,6 +2789,21 @@ fn enable_touchpad_pinch(window: &tauri::WebviewWindow) {
 /// Windows gets (`ribbon/WindowControls.tsx`), so the native buttons must get out of the way for a
 /// faithful preview. A no-op everywhere else — Windows is frameless via `tauri.windows.conf.json`,
 /// Linux keeps its native decorations.
+/// 34.9: while armed (a world is open), stock Quit / Dock › Quit / logout — which reach us as
+/// `ExitRequested { code: None }` and never fire the window's `CloseRequested` — are held and handed to
+/// the frontend as `quit-requested`, so the unsaved-changes sheet can run. Disarmed by default, on
+/// close world, and by the root error boundary, so a frontend that can't answer never wedges the app.
+#[derive(Default)]
+struct QuitGuard(std::sync::atomic::AtomicBool);
+
+/// Pure so it's testable: hold only an OS-initiated exit (`code: None`) while armed.
+fn should_hold_exit(armed: bool, code: Option<i32>) -> bool { armed && code.is_none() }
+
+#[tauri::command]
+fn set_quit_guard(guard: tauri::State<'_, QuitGuard>, armed: bool) {
+    guard.0.store(armed, std::sync::atomic::Ordering::SeqCst);
+}
+
 #[tauri::command]
 fn set_traffic_lights_hidden(window: tauri::WebviewWindow, hidden: bool) -> Result<(), String> {
     #[cfg(target_os = "macos")]
@@ -2537,6 +2831,55 @@ fn set_traffic_lights_hidden(window: tauri::WebviewWindow, hidden: bool) -> Resu
     #[cfg(not(target_os = "macos"))]
     let _ = (window, hidden);
     Ok(())
+}
+
+/// 34.11: shows/clears the dot in the red close button (`NSWindow.setDocumentEdited`). macOS-only;
+/// a no-op elsewhere. The frontend sends the same `dirty` boolean the status bar's Edited/Saved reads.
+#[tauri::command]
+fn set_document_edited(window: tauri::WebviewWindow, edited: bool) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let ptr = window.ns_window().map_err(|e| e.to_string())? as usize;
+        window
+            .run_on_main_thread(move || {
+                use objc2_app_kit::NSWindow;
+                // SAFETY: `ptr` is the live NSWindow tauri handed us, used on the main thread.
+                let ns: &NSWindow = unsafe { &*(ptr as *const NSWindow) };
+                ns.setDocumentEdited(edited);
+            })
+            .map_err(|e| e.to_string())?;
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = (window, edited);
+    Ok(())
+}
+
+/// Maps the raw `AppleActionOnDoubleClick` value to the frontend's action. Absent -> Maximize (the
+/// system default); Fill (macOS 15) has no Tauri equivalent so it zooms.
+fn map_double_click_action(raw: Option<&str>) -> &'static str {
+    match raw {
+        None | Some("Maximize") | Some("Fill") => "zoom",
+        Some("Minimize") => "minimize",
+        Some("None") | Some("Do Nothing") => "none",
+        Some(_) => "zoom",
+    }
+}
+
+/// 34.13: what a title-bar double-click should do per the system preference: "zoom" | "minimize" |
+/// "none". Read per call (the preference can change while running). Always "zoom" off macOS.
+#[tauri::command]
+fn title_double_click_action() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        use objc2_foundation::{NSString, NSUserDefaults};
+        let defaults = NSUserDefaults::standardUserDefaults();
+        let raw = defaults
+            .stringForKey(&NSString::from_str("AppleActionOnDoubleClick"))
+            .map(|s| s.to_string());
+        return map_double_click_action(raw.as_deref()).to_string();
+    }
+    #[cfg(not(target_os = "macos"))]
+    "zoom".to_string()
 }
 
 /// Forwards an Edit-menu action to the focused native control (34.1). The macOS menu bar's Edit items
@@ -2698,7 +3041,7 @@ pub(crate) fn encode_dir_entry(cx: i32, cy: i32, off: u64) -> [u8; 16] {
 }
 
 /// Chunk coordinates Eden can actually index. The game keys its in-memory directory by
-/// `twoToOne(x,z) = (x<<15)|z` (`~/emod/Classes/Util.mm:1053`), which returns its own
+/// `twoToOne(x,z) = (x<<15)|z` (Emod's `Classes/Util.mm:1053`), which returns its own
 /// "invalid/corrupt, skip" sentinel 0 for anything outside this range — so a directory row naming
 /// a chunk outside it is unreachable in-game no matter what the file claims. The game's own reader
 /// (`FileManager::readDirectory`) relies on exactly this to skip a trailing signs section written
@@ -2806,7 +3149,7 @@ fn parse_world_inner(bytes: MmapMut) -> Result<LoadedWorld, String> {
     // corrupt or hostile file — e.g. ptr_offset == 0 — would otherwise make this loop treat the
     // *entire file* as a directory: a 2 GB file yields ~134M entries (2.1 GB `Vec`), touching
     // every page of the mapping before Pass B ever gets a chance to reject it. The real header is
-    // 192 bytes (see CLAUDE.md's file-format table), so a directory can never start before that;
+    // 192 bytes, so a directory can never start before that;
     // cap the entry count defensively at 4M (far more than any real world has chunks) so a bogus
     // offset fails fast with a clear error instead of allocating.
     const MAX_DIR_ENTRIES: usize = 4_000_000;
@@ -2828,7 +3171,7 @@ fn parse_world_inner(bytes: MmapMut) -> Result<LoadedWorld, String> {
     //
     // The game appends a `SGN1` signs section directly after the real chunk directory, using the
     // same 16-byte slot layout with every row's chunk-X tagged `-1` — see
-    // DOCUMENTATION/02-file-format.md and `CHUNK_COORD_LIMIT`'s doc comment. Before this gate
+    // `CHUNK_COORD_LIMIT`'s doc comment. Before this gate
     // existed those rows decoded as chunks at coordinates like `(-1, 1953719668)`, which corrupted
     // the world's reported bounding box (`w_chunks`/`h_chunks`) and everything downstream of it.
     //
@@ -2885,7 +3228,7 @@ fn parse_world_inner(bytes: MmapMut) -> Result<LoadedWorld, String> {
         131072
     } else if let Some(cs) = detect_chunk_size_by_creature_gap(&entries, ptr_offset as u64) {
         // The updated game writes `version` values (2, seen so far) that predate the New Dawn
-        // version field entirely but still uses 256z chunks — see DOCUMENTATION/02-file-format.md
+        // version field entirely but still uses 256z chunks — see `detect_chunk_size_by_creature_gap`
         // "NewFormat256z". The creature-gap test settles this even for a *single*-chunk world,
         // where the min-gap fallback below has no second offset to diff against and would
         // silently default to 32768 (unreadable past z=63).
@@ -4109,7 +4452,7 @@ fn expand_world_from_template(
     // operation already tells the user to save and stop editing before it starts. In exchange the
     // chunk bytes stream straight out of the mmap, so peak RAM is one chunk rather than one world.
     // Nothing inside the loop re-enters the lock — a nested acquire would deadlock behind any
-    // writer that queued in between (see the RwLock discipline note in CLAUDE.md).
+    // writer that queued in between (`std::sync::RwLock` is neither reentrant nor upgradable).
     let ws = read_ws(&state);
     let world = ws.world.as_ref().ok_or("No world loaded")?;
     refuse_source_overwrite(&ws, &output_path)?;
@@ -4226,7 +4569,7 @@ fn expand_world_to_file(
     // This writer previously emitted i16 coords + a u32 offset and aborted above 4 GB, because
     // "Eden writes 64-bit offsets" was proven (the >4 GiB sample worlds exist) while "Eden's own
     // reader honors the full 64-bit field" was not. That second claim is now confirmed from the
-    // game's own source (`~/emod`, the 2.1/64z-era build): `ColumnIndex.chunk_offset` and the
+    // game's own source (Emod, the 2.1/64z-era build): `ColumnIndex.chunk_offset` and the
     // header's `directory_offset` are both `unsigned long long`, and every seek goes through
     // `-[NSFileHandle seekToFileOffset:]` (64-bit) with no narrowing cast anywhere in the offset
     // arithmetic. Caveat of record: that source is the 64z-era build; the shipped 256z binary is
@@ -5774,6 +6117,10 @@ struct EditResult {
     undo_dropped: bool,
     /// See `EditResultHeader::warnings`. Empty for undo/redo.
     warnings: Vec<String>,
+    /// See `EditResultHeader::records`.
+    records: RecordChange,
+    /// See `EditResultHeader::changed_cells`.
+    changed_cells: u64,
 }
 
 #[derive(Serialize)]
@@ -5790,6 +6137,15 @@ struct EditResultHeader {
     /// footprint, a block family suspected of a fixed client-side capacity). The edit already applied;
     /// this doesn't block or undo anything, it just tells the user before they repeat the paste.
     warnings: Vec<String>,
+    /// The records after this edit (27.8a-1): refetch `get_records` when `seq` moved; toast the
+    /// air rule's `dropped_*` counts (always 0 for undo/redo).
+    records: RecordChange,
+    /// 22.3: cells whose block or paint byte this edit changed (`count_changed_cells`). A fresh edit
+    /// with 0 here *and* no record change (`records.seq` unmoved) was a no-op — Delete over air,
+    /// a fill with the block already there — and pushed no undo entry and marked nothing dirty, so
+    /// the frontend must not count it as an unsaved edit. For undo/redo it is summed over the
+    /// group's entries (a cell restored twice counts twice); those always changed something.
+    changed_cells: u64,
 }
 
 impl tauri::ipc::IpcResponse for EditResult {
@@ -5802,6 +6158,8 @@ impl tauri::ipc::IpcResponse for EditResult {
             operation: self.operation,
             undo_dropped: self.undo_dropped,
             warnings: self.warnings,
+            records: self.records,
+            changed_cells: self.changed_cells,
         };
         ipc_envelope_one(&header, self.patch.pixels)
     }
@@ -5896,13 +6254,14 @@ where
     let cap = view.into_capture();
     mem::PEAKS.edit_preimage.record(cap.captured as u64);
 
-    // A failed, panicked or over-limit edit is rolled back **exactly** (every captured band written
-    // back), so it leaves no partial writes behind. Before 18.12 an `Err` after the first write left
+    // A failed, panicked or over-limit edit is rolled back **exactly** (the trailer restored to its
+    // pre-edit snapshot first, 27.8a-1, then every captured band written back), so it leaves no
+    // partial writes behind. Before 18.12 an `Err` after the first write left
     // them in the world with no undo entry, no dirty mark and stale scan ceilings. Ordering (29.9b):
     // the rollback happens *before* the world goes back into `ws`, so no later delta is ever diffed
     // against half-written bytes. Undo/redo stacks are untouched: nothing was pushed or cleared yet.
     if result.is_err() || cap.tripped {
-        let chunks = rollback_capture(&mut world, &cap.pre);
+        let chunks = cap.roll_back(&mut world);
         world.invalidate_derived(&chunks);
         ws.world = Some(world);
         return Err(match result {
@@ -5928,15 +6287,15 @@ where
     let (patch, invalidate, pre_snap) = match rendered {
         Ok(r) => r,
         Err(p) => {
-            let chunks = rollback_capture(&mut world, &cap.pre);
+            let chunks = cap.roll_back(&mut world);
             world.invalidate_derived(&chunks);
             ws.world = Some(world);
             return Err(panic_edit_message(operation, &*p));
         }
     };
-    drop(cap);
+    let rec_log = cap.rec_log;
     ws.world = Some(world);
-    finish_edit(ws, operation, group, patch, invalidate, pre_snap)
+    finish_edit(ws, operation, group, patch, invalidate, pre_snap, rec_log)
 }
 
 /// The text of a caught panic's payload (`panic!("literal")` → `&str`, `panic!("{x}")` → `String`).
@@ -5969,6 +6328,8 @@ fn keep_world_after_panic(
 ) -> String {
     let marks: Vec<(i32, i32, BandMask)> = chunks.iter().map(|&(cx, cy)| (cx, cy, BandMask::ALL)).collect();
     mark_dirty_chunks(&mut ws.dirty, Some(&world), &marks);
+    // Undo/redo may have replayed part of an entry's record ops (27.8a-1): owe the trailer too.
+    if world.trailer.is_touched() { ws.dirty.mark_trailer(); }
     ws.clear_undo();
     ws.clear_redo();
     ws.lamp_index.clear();
@@ -6013,7 +6374,7 @@ where
         .filter_map(|(cx, cy, start_off, pre)| diff_chunk(&world, cx, cy, start_off, &pre))
         .collect();
     ws.world = Some(world);
-    finish_edit(ws, operation, None, patch, invalidate, pre_snap)
+    finish_edit(ws, operation, None, patch, invalidate, pre_snap, Vec::new())
 }
 
 /// A block-type family suspected of a fixed client-side capacity (verified empirically for doors —
@@ -6095,6 +6456,48 @@ fn count_new_block_types(world: &LoadedWorld, snaps: &[ChunkSnapshot]) -> [u32; 
     counts
 }
 
+/// 22.3: how many cells an edit changed — a cell counts once whether its block byte, its paint byte
+/// or both moved. Read from the raw deltas (`Sparse`/`Full`, before `UndoEntry::new` compresses them)
+/// against the post-edit world, like `count_new_block_types`. Every delta in `snaps` changed at least
+/// one byte (`band_delta` drops unchanged chunks), so this is 0 exactly when `snaps` is empty.
+fn count_changed_cells(world: &LoadedWorld, snaps: &[ChunkSnapshot]) -> u64 {
+    const HALF: usize = BAND_SPAN / 2; // block bytes, then the same cells' paint bytes
+    let mut total = 0u64;
+    let mut scratch: Vec<u8> = Vec::new();
+    let mut cells: Vec<u32> = Vec::new();
+    for snap in snaps {
+        match &snap.delta {
+            ChunkDelta::Sparse(_) | ChunkDelta::SparseZ(..) => {
+                let Some(pairs) = snap.delta.sparse_pairs() else { continue };
+                cells.clear();
+                cells.extend(pairs.iter().map(|&(off, _)| {
+                    let off = off as usize;
+                    ((off / BAND_SPAN) * HALF + (off % BAND_SPAN) % HALF) as u32
+                }));
+                cells.sort_unstable();
+                cells.dedup();
+                total += cells.len() as u64;
+            }
+            dense => {
+                let Some((addr, cend)) = world.chunk_range(snap.cx, snap.cy) else { continue };
+                let Some((start_off, data)) = dense.full_bytes(&mut scratch) else { continue };
+                let start = start_off as usize;
+                let end = (start + data.len()).min(cend - addr);
+                let changed = |off: usize| off >= start && off < end && data[off - start] != world.bytes[addr + off];
+                let mut band = start / BAND_SPAN;
+                while band * BAND_SPAN < end {
+                    let base = band * BAND_SPAN;
+                    band += 1;
+                    for i in 0..HALF {
+                        if changed(base + i) || changed(base + HALF + i) { total += 1; }
+                    }
+                }
+            }
+        }
+    }
+    total
+}
+
 /// Human-readable warnings for whichever `RISKY_BLOCK_GROUPS` this edit's footprint exceeded.
 fn risky_block_warnings(counts: &[u32; 128]) -> Vec<String> {
     RISKY_BLOCK_GROUPS.iter().filter_map(|g| {
@@ -6115,6 +6518,10 @@ fn risky_block_warnings(counts: &[u32; 128]) -> Vec<String> {
 /// ⚠️ `patch`/`invalidate` are passed in already rendered: `with_edit_inner` renders them while it
 /// still owns the world, and `sculpt_split` renders them after the commit. Both must have been
 /// produced by `edit_patch` against the *post*-edit world.
+///
+/// `rec_log` is the closure's record ops (27.8a-1; empty for sculpt). The air rule runs here, over
+/// `pre_snap`, so every byte-writing path gets it; its drops join the log. A non-empty log marks
+/// the trailer dirty and pushes an undo entry even when no byte changed.
 fn finish_edit(
     ws: &mut WorldState,
     operation: &str,
@@ -6122,7 +6529,17 @@ fn finish_edit(
     patch: PixelPatch,
     invalidate: bool,
     pre_snap: Vec<ChunkSnapshot>,
+    mut rec_log: Vec<RecordOp>,
 ) -> Result<EditResult, String> {
+    // The air rule (T5) reads the raw deltas, so it runs before `UndoEntry::new` compresses them.
+    let (dropped_signs, dropped_cmds) = match ws.world.as_mut() {
+        Some(w) => apply_air_rule(w, &pre_snap, &mut rec_log),
+        None => (0, 0),
+    };
+    if !rec_log.is_empty() {
+        ws.dirty.mark_trailer();
+    }
+
     // Keep the lamp index (if built) current: a placed/removed lamp must update its bucket or night
     // lighting goes stale. Driven by the undo delta just computed (which lists exactly the changed
     // offsets and their pre-edit values), so this costs O(changed bytes) rather than a full rescan
@@ -6137,12 +6554,16 @@ fn finish_edit(
     let warnings = ws.world.as_ref()
         .map(|w| risky_block_warnings(&count_new_block_types(w, &pre_snap)))
         .unwrap_or_default();
+    let changed_cells = ws.world.as_ref().map_or(0, |w| count_changed_cells(w, &pre_snap));
 
     // Dirty tracking for incremental autosave/save (audit C2): pre_snap is exactly the chunks
     // diff_chunk found to have actually changed, which is more precise than `affected` (a no-op
     // edit over a region touches nothing here).
     let touched: Vec<(i32, i32, BandMask)> = pre_snap.iter().map(|s| (s.cx, s.cy, s.delta.band_mask())).collect();
-    mark_dirty_chunks(&mut ws.dirty, ws.world.as_ref(), &touched);
+    // 22.3: a no-op edit leaves `DirtyState` alone entirely — not even its staleness `seq` moves.
+    if !touched.is_empty() {
+        mark_dirty_chunks(&mut ws.dirty, ws.world.as_ref(), &touched);
+    }
 
     // Budget enforcement at accumulation time (audit C1 step 3). `UndoEntry::new` has already
     // deflated every `Full` delta and priced the entry at its real heap cost, so this is the first
@@ -6153,9 +6574,9 @@ fn finish_edit(
     // *whole* history, because every older entry is a delta that would restore pre-edit bytes over
     // chunks this edit has since changed. The frontend warns loudly (`undo_dropped`).
     let mut undo_dropped = false;
-    if !pre_snap.is_empty() {
+    if !pre_snap.is_empty() || !rec_log.is_empty() {
         let budget = ws.undo_budget;
-        let entry = UndoEntry::new(operation, pre_snap, group);
+        let entry = UndoEntry::with_records(operation, pre_snap, group, rec_log);
         mem::PEAKS.edit_delta.record(entry.bytes as u64);
         if entry.bytes > budget {
             timing_log!("[UNDO] entry ({} bytes) exceeds the {} byte budget — dropping history", entry.bytes, budget);
@@ -6177,6 +6598,8 @@ fn finish_edit(
         operation: operation.into(),
         undo_dropped,
         warnings,
+        records: RecordChange { seq: ws.dirty.records_seq, dropped_signs, dropped_cmds },
+        changed_cells,
     })
 }
 
@@ -7169,8 +7592,7 @@ type AutosaveProgress<'a> = Option<(&'a tauri::AppHandle, &'a LongOps)>;
 /// of already-journalled chunks, which costs a few KB. Clearing one that wasn't written would drop
 /// that edit from crash recovery silently. This replaced a retain-by-written-coords discharge that
 /// had exactly that hole for any chunk re-dirtied during the I/O window — the same hole
-/// `try_incremental_save` was fixed for in audit C2 Stage 4 (see
-/// `TEST WORLDS/archive/c2-stage5-handoff-2026-08-05.md` §"Deviation from the plan"). Over-
+/// `try_incremental_save` was fixed for in audit C2 Stage 4. Over-
 /// approximate is free; under-approximate is data loss.
 fn discharge_autosave_journal(state: &AppState, gen_at_start: u64, lineage: AutosaveLineage, seq_at_capture: u64) {
     let mut ws = write_ws(state);
@@ -7979,6 +8401,8 @@ fn undo_edit_inner(ws: &mut WorldState) -> Result<EditResult, String> {
     let label = entry.operation.clone();
     let mut affected: Vec<(i32, i32)> = Vec::new();
     let mut written: Vec<(i32, i32, BandMask)> = Vec::new();
+    let mut records_changed = false;
+    let mut changed_cells = 0u64;
 
     // 29.9b: the world is taken for the whole restore, so a panic in it goes through
     // `keep_world_after_panic`. `affected` is filled *before* each entry is restored, so it always
@@ -7988,12 +8412,17 @@ fn undo_edit_inner(ws: &mut WorldState) -> Result<EditResult, String> {
         while let Some(entry) = current.take() {
             for s in &entry.chunks { affected.push((s.cx, s.cy)); }
             let redo_snaps = restore_and_invert(&mut world, &entry);
+            // 27.8a-1: the entry's record ops, inverted in reverse. No air rule here (plan §8):
+            // the log already holds every record the edit dropped.
+            records_changed |= replay_records(&mut world.trailer, &entry.records, false);
             // The inverse names exactly the bytes just rewritten (band-granular dirty marks, 18.13).
             written.extend(redo_snaps.iter().map(|s| (s.cx, s.cy, s.delta.band_mask())));
+            changed_cells += count_changed_cells(&world, &redo_snaps);
             // Same delta-driven lamp maintenance as `with_edit_inner`: the inverse snapshots hold the
             // pre-restore bytes and `world` now holds the restored ones (audit H3).
             apply_lamp_delta(&ws.lamp_index, &world, &redo_snaps);
-            push_undo(&mut ws.redo_stack, &mut ws.redo_bytes, &mut ws.redo_groups, UndoEntry::new(entry.operation, redo_snaps, entry.group), ws.undo_budget);
+            // The redo entry carries the same ops, still forward.
+            push_undo(&mut ws.redo_stack, &mut ws.redo_bytes, &mut ws.redo_groups, UndoEntry::with_records(entry.operation, redo_snaps, entry.group, entry.records), ws.undo_budget);
             // Continue only for a group whose next entry down matches the same id.
             if let Some(g) = group {
                 if ws.undo_stack.back().map(|e| e.group) == Some(Some(g)) {
@@ -8004,6 +8433,7 @@ fn undo_edit_inner(ws: &mut WorldState) -> Result<EditResult, String> {
 
         // `affected` stays the repaint/hint set; the dirty marks come from what was actually written.
         mark_dirty_chunks(&mut ws.dirty, Some(&world), &written);
+        if records_changed { ws.dirty.mark_trailer(); }
         patch_from_chunk_coords(&world, &affected, ws.map_style(), ws.view_lod)
     }));
     let (patch, invalidate) = match run {
@@ -8020,6 +8450,8 @@ fn undo_edit_inner(ws: &mut WorldState) -> Result<EditResult, String> {
         operation: label,
         undo_dropped: false,
         warnings: Vec::new(),
+        records: RecordChange { seq: ws.dirty.records_seq, ..Default::default() },
+        changed_cells,
     })
 }
 
@@ -8037,6 +8469,8 @@ fn redo_edit_inner(ws: &mut WorldState) -> Result<EditResult, String> {
     let label = entry.operation.clone();
     let mut affected: Vec<(i32, i32)> = Vec::new();
     let mut written: Vec<(i32, i32, BandMask)> = Vec::new();
+    let mut records_changed = false;
+    let mut changed_cells = 0u64;
 
     // 29.9b: same panic guard as undo (see there).
     let run = panic::catch_unwind(AssertUnwindSafe(|| {
@@ -8044,9 +8478,11 @@ fn redo_edit_inner(ws: &mut WorldState) -> Result<EditResult, String> {
         while let Some(entry) = current.take() {
             for s in &entry.chunks { affected.push((s.cx, s.cy)); }
             let undo_snaps = restore_and_invert(&mut world, &entry);
+            records_changed |= replay_records(&mut world.trailer, &entry.records, true); // 27.8a-1, forward
             written.extend(undo_snaps.iter().map(|s| (s.cx, s.cy, s.delta.band_mask())));
+            changed_cells += count_changed_cells(&world, &undo_snaps);
             apply_lamp_delta(&ws.lamp_index, &world, &undo_snaps); // delta-driven lamp maintenance (audit H3)
-            push_undo(&mut ws.undo_stack, &mut ws.undo_bytes, &mut ws.undo_groups, UndoEntry::new(entry.operation, undo_snaps, entry.group), ws.undo_budget);
+            push_undo(&mut ws.undo_stack, &mut ws.undo_bytes, &mut ws.undo_groups, UndoEntry::with_records(entry.operation, undo_snaps, entry.group, entry.records), ws.undo_budget);
             if let Some(g) = group {
                 if ws.redo_stack.back().map(|e| e.group) == Some(Some(g)) {
                     current = pop_undo(&mut ws.redo_stack, &mut ws.redo_bytes, &mut ws.redo_groups);
@@ -8056,6 +8492,7 @@ fn redo_edit_inner(ws: &mut WorldState) -> Result<EditResult, String> {
 
         // `affected` stays the repaint/hint set; the dirty marks come from what was actually written.
         mark_dirty_chunks(&mut ws.dirty, Some(&world), &written);
+        if records_changed { ws.dirty.mark_trailer(); }
         patch_from_chunk_coords(&world, &affected, ws.map_style(), ws.view_lod)
     }));
     let (patch, invalidate) = match run {
@@ -8072,6 +8509,8 @@ fn redo_edit_inner(ws: &mut WorldState) -> Result<EditResult, String> {
         operation: label,
         undo_dropped: false,
         warnings: Vec::new(),
+        records: RecordChange { seq: ws.dirty.records_seq, ..Default::default() },
+        changed_cells,
     })
 }
 
@@ -9215,10 +9654,10 @@ fn render_clipboard_preview_inner(cb: &Clipboard, sky: u8, lod: u32) -> PreviewD
 //
 // The render is `voxel_core::render::paste_lens`; what lives here is the part that knows what a
 // paste *is* — the per-column base Z, computed with the same code the paste commands write with —
-// and the IPC skin. Sub-plan: `TEST WORLDS/ui-redesign-r3-paste-lens-plan-2026-09-26.md` §2.
+// and the IPC skin.
 
 /// Both elevations of the armed paste, from one call (20.3 §4): the bases are computed once.
-/// ⚠️ Deliberately **not** `Serialize` — see "Binary payloads" in CLAUDE.md (a derive would let
+/// ⚠️ Deliberately **not** `Serialize` — see `impl IpcResponse` below (a derive would let
 /// tauri's blanket impl silently turn this back into base64-in-JSON). Only the headers serialise.
 struct PasteLensPatch {
     front: PasteLensView,
@@ -9357,7 +9796,7 @@ fn render_paste_lens(
 // ── Selection lens (Stage 20.3/20.5) ─────────────────────────────────────────────────────────
 //
 // The no-clipboard mode of the lens: `voxel_core::render::selection_lens` (front + side) and
-// `selection_top`. Plan: `TEST WORLDS/lens-selection-mode-plan-2026-10-01.md` §4.
+// `selection_top`.
 
 /// ⚠️ Deliberately **not** `Serialize` (base64 trap — see `ipc_envelope`). Only the header serialises.
 struct SelectionLensPatch {
@@ -10733,6 +11172,7 @@ fn field_stamp(
     seed: u64,
     cap: Option<i32>,
     clip: Option<[i32; 4]>,
+    mask: Option<&SelectionMask>,
     fill_bt: Option<u8>,
     fill_paint: Option<u8>,
     carve: bool,
@@ -10929,6 +11369,7 @@ fn field_stamp(
                 for ix in 0..w {
                     let wx = x0 + ix as i32;
                     if let Some([cx1, _, cx2, _]) = clip { if wx < cx1 || wx > cx2 { continue; } }
+                    if mask.is_some_and(|m| !m.contains(wx, wy)) { continue; }
                     if field[idx(ix, iy, iz)] < 0.0 && read_block_abs(world, wx, wy, wz) == 0 {
                         set_block_abs(world, wx, wy, wz, bt, pnt);
                         new_cells.insert((wx, wy, wz));
@@ -10974,6 +11415,7 @@ fn field_stamp(
         for ix in 0..w {
             let wx = x0 + ix as i32;
             if let Some([cx1, _, cx2, _]) = clip { if wx < cx1 || wx > cx2 { continue; } }
+            if mask.is_some_and(|m| !m.contains(wx, wy)) { continue; }
             // Real (live) surface height, not the stable/smoothed estimate — sky-connectivity
             // gating is about the actual current world, and unlike the field above this doesn't
             // feed back into the field's own shape, so it carries no idempotency risk.
@@ -11018,7 +11460,7 @@ fn rock_stamp(
     fill_bt: Option<u8>,
     fill_paint: Option<u8>,
 ) {
-    field_stamp(world, cx, cy, radius, p, seed, cap, clip, fill_bt, fill_paint, false);
+    field_stamp(world, cx, cy, radius, p, seed, cap, clip, None, fill_bt, fill_paint, false);
 }
 
 /// Sculpt terrain at brush positions.
@@ -11100,6 +11542,9 @@ struct SculptArgs {
     smear_dx: Option<i32>,
     smear_dy: Option<i32>,
     clip_rect: Option<[i32; 4]>,
+    /// Active wand/lasso mask, only when its bbox equals `clip_rect` (see `active_mask`); `None` →
+    /// rect-only. Arc so each stamp's weight closure shares it instead of cloning 5–122 KB.
+    mask: Option<std::sync::Arc<SelectionMask>>,
     rock: Option<RockParams>,
     cap: Option<i32>,
 }
@@ -11148,7 +11593,7 @@ fn run_sculpt_flush(
     for st in stamps {
         let Some((x1, y1, x2, y2)) = st.bbox() else { continue };
         sculpt_stamp_body(
-            view, session, &st.points, st.dial, a.cap, a.softness, &a.profile, a.clip_rect,
+            view, session, &st.points, st.dial, a.cap, a.softness, &a.profile, a.clip_rect, a.mask.as_ref(),
             a.mode.as_str(), a.strength, a.strength_eff, a.seed, a.block_type, a.paint, a.freq,
             a.noise_mode.as_deref(), a.grab_delta, a.anchor_x, a.anchor_y, a.slope_dx, a.slope_dy,
             a.smear_dx, a.smear_dy, &a.rock, x1, y1, x2, y2,
@@ -11212,10 +11657,10 @@ fn sculpt_terrain(
 ) -> Result<EditResult, String> {
     // Phase 0 — exclusive, but only for as long as it takes to read the flush's inputs out of the
     // state. `view_cap_z` is the only world state the resolution below consults.
-    let cap = {
+    let (cap, mask) = {
         let ws = read_ws(&state);
         if ws.world.is_none() { return Err("No world loaded".into()); }
-        if use_cap.unwrap_or(true) { ws.view_cap_z } else { None }
+        (if use_cap.unwrap_or(true) { ws.view_cap_z } else { None }, sculpt_mask(&ws, clip_rect))
     };
 
     let args = SculptArgs {
@@ -11225,7 +11670,7 @@ fn sculpt_terrain(
         softness: softness.unwrap_or(0.0).clamp(0.0, 1.0),
         profile: profile.unwrap_or_else(|| "smooth".into()),
         mode, seed, block_type, paint, freq, noise_mode, grab_delta, anchor_x, anchor_y,
-        slope_dx, slope_dy, smear_dx, smear_dy, clip_rect, rock, cap,
+        slope_dx, slope_dy, smear_dx, smear_dy, clip_rect, mask, rock, cap,
     };
 
     // Live-stroke batching (row 6): a live 2D stroke ships every stamp centre queued since the last
@@ -11367,7 +11812,7 @@ fn sculpt_split(
     if sculpt_persists_session(&args.mode, group) {
         ws.sculpt_session = Some(session);
     }
-    finish_edit(&mut ws, operation, group, patch, invalidate, pre_snap)
+    finish_edit(&mut ws, operation, group, patch, invalidate, pre_snap, Vec::new())
 }
 
 /// Filled disc footprint around a dial stamp centre — same `(dx² + dy²) <= (r + 0.5)²` convention
@@ -11403,6 +11848,7 @@ fn sculpt_stamp_body(
     softness: f64,
     profile: &str,
     clip_rect: Option<[i32; 4]>,
+    mask: Option<&std::sync::Arc<SelectionMask>>,
     mode: &str,
     strength: i32,
     strength_eff: f64,
@@ -11494,10 +11940,14 @@ fn sculpt_stamp_body(
     // Server-side selection clip: a cell outside `clip_rect` gets weight 0, so blend leaves it at
     // its current height (no-op) — a true per-cell mask that supersedes the frontend point-filter
     // for the batched live path and upgrades the 3D pane's crude centre-in-bounds drop.
+    // When a wand/lasso mask with the same bbox is active, cells whose bit is 0 are skipped too
+    // (shape-clip, not just rect-clip).
     let weight: Box<dyn Fn(i32, i32) -> f64> = if let Some([cx1, cy1, cx2, cy2]) = clip_rect {
         let inner = weight;
+        let mask = mask.cloned();
         Box::new(move |x, y| {
-            if x >= cx1 && x <= cx2 && y >= cy1 && y <= cy2 { inner(x, y) } else { 0.0 }
+            if x >= cx1 && x <= cx2 && y >= cy1 && y <= cy2
+                && mask.as_ref().is_none_or(|m| m.contains(x, y)) { inner(x, y) } else { 0.0 }
         })
     } else {
         weight
@@ -11912,7 +12362,7 @@ fn sculpt_stamp_body(
                 ),
             };
             let rp = rock.clone().unwrap_or_default();
-            field_stamp(world, rcx, rcy, rr, &rp, seed, cap, clip_rect, block_type, paint, mode == "carve");
+            field_stamp(world, rcx, rcy, rr, &rp, seed, cap, clip_rect, mask.map(|m| &**m), block_type, paint, mode == "carve");
         }
         _ => {}
     }
@@ -11983,7 +12433,7 @@ fn sculpt_terrain_inner(
         // is not clipped by cutaway) ignores the cap and targets the true surface.
         cap: if use_cap.unwrap_or(true) { ws.view_cap_z } else { None },
         mode, seed, block_type, paint, freq, noise_mode, grab_delta, anchor_x, anchor_y,
-        slope_dx, slope_dy, smear_dx, smear_dy, clip_rect, rock,
+        slope_dx, slope_dy, smear_dx, smear_dy, clip_rect, mask: sculpt_mask(ws, clip_rect), rock,
     };
     let label = format!("{} ({} pts)", sculpt_mode_label(&args.mode), points.len());
     let stamps = vec![SculptStamp { points, dial }];
@@ -12034,7 +12484,7 @@ fn sculpt_terrain_batch_inner(
         profile: profile.unwrap_or_else(|| "smooth".into()),
         cap: if use_cap.unwrap_or(true) { ws.view_cap_z } else { None },
         mode, seed, block_type, paint, freq, noise_mode, grab_delta, anchor_x, anchor_y,
-        slope_dx, slope_dy, smear_dx, smear_dy, clip_rect, rock,
+        slope_dx, slope_dy, smear_dx, smear_dy, clip_rect, mask: sculpt_mask(ws, clip_rect), rock,
     };
     let label = format!("{} ({} stamps)", sculpt_mode_label(&args.mode), centers.len());
     let r = r.max(0);
@@ -12463,7 +12913,7 @@ fn array_paste(
 
 /// Backs the `Help ▸ Diagnostics…` panel's native-memory section. Sampled on demand only (the
 /// panel's Refresh button) — never on a timer, per the "a diagnostic must never itself be a
-/// performance problem" rule in `TEST WORLDS/diagnostics-panel-plan-2026-09-14.md`.
+/// performance problem" rule.
 ///
 /// Deliberately carries **no path** — the frontend already holds `sourcePath` for the basename it
 /// wants to show, and passing one through here would be one more place to remember the
@@ -12574,6 +13024,7 @@ pub fn run() {
         // the first `State<'_, AppState>` resolution.
         .manage(AppState::new(WorldState::new()))
         .manage(LongOps::default())
+        .manage(QuitGuard::default())
         .manage(ExpandCancel::default())
         .manage(network::NetCancel::default())
         .manage(MaterializeCancel::default())
@@ -12597,6 +13048,9 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             set_traffic_lights_hidden,
+            set_document_edited,
+            title_double_click_action,
+            set_quit_guard,
             native_edit_action,
             load_world,
             get_world_info,
@@ -12708,10 +13162,20 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app, event| {
-            if let tauri::RunEvent::Exit = event {
-                use tauri::Manager;
-                exit_cleanup(&app.state::<AppState>(), overview::store_dir());
-                if let Ok(base) = app.path().app_data_dir() { release_autosave_owner(&base); }
+            use tauri::{Emitter, Manager};
+            match event {
+                tauri::RunEvent::ExitRequested { code, api, .. } => {
+                    let armed = app.state::<QuitGuard>().0.load(std::sync::atomic::Ordering::SeqCst);
+                    if should_hold_exit(armed, code) {
+                        api.prevent_exit();
+                        let _ = app.emit("quit-requested", ());
+                    }
+                }
+                tauri::RunEvent::Exit => {
+                    exit_cleanup(&app.state::<AppState>(), overview::store_dir());
+                    if let Ok(base) = app.path().app_data_dir() { release_autosave_owner(&base); }
+                }
+                _ => {}
             }
         });
 }
@@ -12759,6 +13223,9 @@ struct RecordsInfo {
     cmds: Vec<CmdRecord>,
     /// Records adopted from sidecars on load and not yet saved into the world (plan §6.2).
     adopted: RecordCounts,
+    /// `DirtyState::records_seq` as of this snapshot: the baseline the frontend compares each
+    /// `EditResult.records.seq` against (27.8a-1).
+    seq: u64,
 }
 
 /// The open world's signs and command blocks (replaces `get_signs`). Refetch after any edit whose
@@ -12767,7 +13234,9 @@ struct RecordsInfo {
 fn get_records(state: tauri::State<'_, AppState>) -> Result<RecordsInfo, String> {
     let ws = read_ws(&state);
     let world = ws.world.as_ref().ok_or("No world loaded")?;
-    Ok(records_info(world, ws.adopted.as_ref().filter(|_| ws.dirty.trailer_adopt_pending)))
+    let mut info = records_info(world, ws.adopted.as_ref().filter(|_| ws.dirty.trailer_adopt_pending));
+    info.seq = ws.dirty.records_seq;
+    Ok(info)
 }
 
 fn records_info(world: &LoadedWorld, adopted: Option<&AdoptedSidecars>) -> RecordsInfo {
@@ -12788,6 +13257,7 @@ fn records_info(world: &LoadedWorld, adopted: Option<&AdoptedSidecars>) -> Recor
             CmdRecord { i: i as u32, x, y, z, flags: c.flags, script: lossy(c.script()) }
         }).collect(),
         adopted: adopted.map(|a| a.counts).unwrap_or_default(),
+        seq: 0,
     }
 }
 
@@ -12906,8984 +13376,24 @@ fn get_record_overlay(state: tauri::State<'_, AppState>, cx: f64, cy: f64, cz: f
     Ok(record_overlay(world, cx, cy, cz, r, cr))
 }
 
-// ── Tests ──────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod tests;
 
 #[cfg(test)]
-mod tests {
+mod quit_guard_tests {
     use super::*;
-
-    /// Build an anonymous MmapMut from a byte vector (tests only — no file on disk).
-    fn mmap_from_bytes(data: Vec<u8>) -> MmapMut {
-        let mut m = MmapMut::map_anon(data.len()).expect("anon mmap");
-        m.copy_from_slice(&data);
-        m
-    }
-
-    /// Build the smallest valid .eden binary that exercises the parser and editor:
-    ///   - 4 096-byte header section (pointer-table offset + name + padding)
-    ///   - 32 768-byte chunk block at offset 4 096, chunk coord (0, 0)
-    ///   - 16-byte pointer-table entry at offset 36 864
-    ///
-    /// Test blocks pre-placed (all in column lx=3, ly=5 of chunk (0,0)):
-    ///   z=0  (band 0, lz 0) → Wood  (type 7)   — tests z_min boundary
-    ///   z=17 (band 1, lz 1) → Stone (type 2) + paint byte 5
-    ///   z=48 (band 3, lz 0) → Dirt  (type 3)   — tests z_max boundary
-    ///
-    /// Bystander block (different column, must survive delete):
-    ///   lx=7, ly=2, z=32 (band 2, lz 0) → Grass (type 8)
-    fn make_test_world() -> Vec<u8> {
-        const HEADER: usize = 4096;
-        const CHUNK:  usize = 32768;
-        const ENTRY:  usize = 16;
-
-        let chunk_off:   u32 = HEADER as u32;
-        let ptr_off:     u32 = (HEADER + CHUNK) as u32;
-        let total:       usize = HEADER + CHUNK + ENTRY;
-
-        let mut b = vec![0u8; total];
-
-        // Header: pointer-table offset at bytes 32–35 (little-endian u32)
-        b[32..36].copy_from_slice(&ptr_off.to_le_bytes());
-        // World name at 40–48
-        b[40..49].copy_from_slice(b"TestWorld");
-
-        // Helper: absolute byte index of block at (lx, ly, z) inside the chunk
-        let block = |lx: usize, ly: usize, z: i32| -> usize {
-            let band = (z / 16) as usize;
-            let lz   = (z % 16) as usize;
-            HEADER + band * 8192 + lx * 256 + ly * 16 + lz
-        };
-        let paint = |lx: usize, ly: usize, z: i32| block(lx, ly, z) + 4096;
-
-        // Column under test: lx=3, ly=5
-        b[block(3, 5,  0)] = 7; // Wood  — z_min boundary
-        b[block(3, 5, 17)] = 2; // Stone
-        b[paint(3, 5, 17)] = 5; // paint
-        b[block(3, 5, 48)] = 3; // Dirt  — z_max boundary
-
-        // Bystander: lx=7, ly=2, z=32
-        b[block(7, 2, 32)] = 8; // Grass — must not be touched by delete
-
-        // Pointer-table entry: (cx=0, cy=0) → chunk_off
-        let pe = (HEADER + CHUNK) as usize;
-        b[pe..pe+2].copy_from_slice(&0i16.to_le_bytes());   // cx
-        b[pe+4..pe+6].copy_from_slice(&0i16.to_le_bytes()); // cy
-        b[pe+8..pe+12].copy_from_slice(&chunk_off.to_le_bytes()); // file offset
-
-        b
-    }
-
-    // Byte index of block/paint for lx=3,ly=5 relative to file start (chunk at 4096)
-    const HEADER: usize = 4096;
-    fn blk(lx: usize, ly: usize, z: i32) -> usize {
-        let band = (z / 16) as usize;
-        let lz   = (z % 16) as usize;
-        HEADER + band * 8192 + lx * 256 + ly * 16 + lz
-    }
-    fn pnt(lx: usize, ly: usize, z: i32) -> usize { blk(lx, ly, z) + 4096 }
-
-    /// Lamp buckets are `FxHashSet`s (unordered); tests compare a sorted `Vec`.
-    fn sorted_lamps(s: &FxHashSet<[i32; 3]>) -> Vec<[i32; 3]> {
-        let mut v: Vec<[i32; 3]> = s.iter().copied().collect();
-        v.sort_unstable();
-        v
-    }
-
-    /// `make_test_world()` plus a *second* directory entry for chunk (1, 0) whose offset carries a
-    /// nonzero high word (`chunk_off + 2^32`) — the signature of a chunk stored past the 4 GiB
-    /// mark, as seen on the real corrupted-mosaic worlds in `DIAGNOSE/DIAGNOSIS.md`. Chunk (0, 0)
-    /// still parses normally so the world loads at all; the bogus entry is correctly decoded as a
-    /// >4 GiB offset and then rejected by Pass B for pointing past EOF.
-    fn make_test_world_with_high_offset_entry() -> Vec<u8> {
-        let mut b = make_test_world();
-        let mut entry = vec![0u8; 16];
-        entry[0..4].copy_from_slice(&1i32.to_le_bytes());                      // cx = 1
-        entry[4..8].copy_from_slice(&0i32.to_le_bytes());                      // cy = 0
-        entry[8..16].copy_from_slice(&(HEADER as u64 + (1u64 << 32)).to_le_bytes());
-        b.extend_from_slice(&entry);
-        b
-    }
-
-    /// A directory entry whose high offset word (bytes [12..16]) is nonzero names a chunk stored
-    /// past the 4 GiB mark. Pass B must reject it for pointing past EOF (never inserted into
-    /// `chunk_map`) while the file's other, valid chunk still loads normally.
-    #[test]
-    fn test_parse_rejects_bogus_high_offset_entry_but_loads_valid_chunk() {
-        let world = parse_world_inner(mmap_from_bytes(make_test_world_with_high_offset_entry()))
-            .expect("parse should still succeed");
-        assert!(world.chunk_map.contains_key(&(0, 0)), "the valid chunk must still load");
-        assert!(!world.chunk_map.contains_key(&(1, 0)), "the bogus >4 GiB entry must be excluded");
-    }
-
-    /// Stage 0 originally forced worlds like this into a read-only mode (since lifted once Stages
-    /// 1/3/5 closed the underlying corruption vectors — see the plan doc's "Lift the flag at the
-    /// end of Stage 5" note). Regression guard: editing the valid chunk in a world that carries a
-    /// stray >4 GiB directory entry elsewhere must succeed like any other edit.
-    #[test]
-    fn test_with_edit_succeeds_despite_bogus_high_offset_entry() {
-        let world = parse_world_inner(mmap_from_bytes(make_test_world_with_high_offset_entry()))
-            .expect("parse should still succeed");
-
-        let mut ws = WorldState::new();
-        ws.world = Some(world);
-
-        let result = with_edit(&mut ws, "delete", (0, 0, 15, 15), |world| {
-            delete_blocks_inner(world, 0, 0, 15, 15, 0, 63, None);
-            Ok(())
-        });
-
-        assert!(result.is_ok(), "edit must succeed: {:?}", result.err());
-        assert_eq!(ws.world.as_ref().unwrap().bytes[blk(3, 5, 0)], 0, "chunk (0,0) must have been edited");
-        assert!(!ws.undo_stack.is_empty(), "a normal edit must push an undo entry");
-    }
-
-    // ── Stage 1: chunk-pointer-table decode (DIAGNOSE/DIAGNOSIS.md §5.1) ──────────────────────
-
-    /// Build a minimal multi-chunk world: `n` chunks of `chunk_size` laid out back to back from
-    /// `HEADER`, then an `n`-entry directory at the end. Chunk coords are `(0,0)..(n-1,0)`.
-    /// `version` goes in the header's version field — pass `0` (or anything `< 5`) to force the
-    /// min-gap `chunk_size` fallback, `5` to take the authoritative 256z branch.
-    fn make_multi_chunk_world(n: usize, chunk_size: usize, version: i32) -> Vec<u8> {
-        let dir_off = HEADER + n * chunk_size;
-        let mut b = vec![0u8; dir_off + n * 16];
-        b[32..40].copy_from_slice(&(dir_off as u64).to_le_bytes());
-        b[92..96].copy_from_slice(&version.to_le_bytes());
-        for i in 0..n {
-            let e = dir_off + i * 16;
-            b[e     ..e +  4].copy_from_slice(&(i as i32).to_le_bytes());
-            b[e +  4..e +  8].copy_from_slice(&0i32.to_le_bytes());
-            b[e +  8..e + 16].copy_from_slice(&((HEADER + i * chunk_size) as u64).to_le_bytes());
-        }
-        b
-    }
-
-    /// Overwrite directory entry `i`'s offset field (bytes [8..16]) in a `make_multi_chunk_world`
-    /// fixture. `dir_off` is where the directory starts.
-    fn set_entry_offset(b: &mut [u8], dir_off: usize, i: usize, off: u64) {
-        let e = dir_off + i * 16;
-        b[e + 8..e + 16].copy_from_slice(&off.to_le_bytes());
-    }
-
-    /// §5.1.1 — the entry decode itself, at full width. `i16` coords can't represent Y = 70000
-    /// and a `u32` offset can't represent 0x1_0000_00C0 (the >4 GiB case that started all this),
-    /// so this fails on the pre-Stage-1 decoder in three independent ways.
-    #[test]
-    fn test_decode_dir_entry_full_width() {
-        let mut e = vec![0u8; 16];
-        e[0..4].copy_from_slice(&(-5i32).to_le_bytes());
-        e[4..8].copy_from_slice(&70000i32.to_le_bytes());
-        e[8..16].copy_from_slice(&0x1_0000_00C0u64.to_le_bytes());
-        assert_eq!(decode_dir_entry(&e), (-5, 70000, 0x1_0000_00C0));
-    }
-
-    // ── Stage 4: writer emits the full-width entry (i32/i32/u64) ─────────────────────────────
-
-    /// `encode_dir_entry` must be the exact inverse of `decode_dir_entry` — including the two
-    /// values the pre-Stage-4 `i16`+pad / `u32`+pad encoding could not represent.
-    #[test]
-    fn test_encode_dir_entry_round_trips() {
-        for &(cx, cy, off) in &[
-            (4096i32, 4096i32, 192u64),                 // the ordinary generated-world case
-            (-5, 70000, 0x1_0000_00C0),                 // negative X + >i16 Y + >4 GiB offset
-            (i32::MIN, i32::MAX, u64::MAX),             // field extremes
-        ] {
-            assert_eq!(decode_dir_entry(&encode_dir_entry(cx, cy, off)), (cx, cy, off));
-        }
-    }
-
-    /// For the non-negative, sub-4 GiB values every writer produced before Stage 4, the widened
-    /// encoding must be *byte-identical* to the old `i16 + 2 pad + i16 + 2 pad + u32 + 4 pad`
-    /// form — that byte-compatibility is the whole reason this change can't disturb existing
-    /// worlds, so assert it rather than reasoning about it.
-    #[test]
-    fn test_encode_dir_entry_matches_legacy_bytes_for_small_values() {
-        let (cx, cy, off) = (4096i32, 4123i32, 1_234_567u64);
-        let mut legacy = [0u8; 16];
-        legacy[0..2].copy_from_slice(&(cx as i16).to_le_bytes());
-        legacy[4..6].copy_from_slice(&(cy as i16).to_le_bytes());
-        legacy[8..12].copy_from_slice(&(off as u32).to_le_bytes());
-        assert_eq!(encode_dir_entry(cx, cy, off), legacy);
-    }
-
-    /// End-to-end for the generator writer: `write_world_file` → `parse_world_inner`, pinning the
-    /// `is_chunk_coord` gate's upper edge (`start_cx = 32766` puts the second chunk at the last
-    /// legal X, 32767) and guarding 1c (`off >= 192`): the first chunk must land at exactly 192.
-    #[test]
-    fn test_write_world_file_round_trips_boundary_chunk_coords() {
-        let chunk_size = 32768usize;
-        let (w, h) = (2u32, 1u32);
-        let chunks: Vec<Vec<u8>> = (0..(w * h)).map(|_| vec![0u8; chunk_size]).collect();
-        let path = std::env::temp_dir().join(format!("vuencedit_stage4_{}.eden", std::process::id()));
-        let p = path.to_string_lossy().to_string();
-        worldgen::write_world_file(&p, "bnd", w, h, chunk_size, 32766, 4096, 10, &chunks)
-            .expect("write failed");
-        let bytes = fs::read(&path).expect("read back failed");
-        let _ = fs::remove_file(&path);
-
-        let world = parse_world_inner(mmap_from_bytes(bytes)).expect("parse failed");
-        assert_eq!(world.chunk_map.len(), 2);
-        assert_eq!(world.chunk_map.get(&(32766, 4096)), Some(&192),
-            "the first chunk must land at exactly byte 192 (the real header size)");
-        assert_eq!(world.chunk_map.get(&(32767, 4096)), Some(&(192 + chunk_size)));
-        assert_eq!(world.min_x, 32766, "min_x must reflect the real coord");
-    }
-
-    /// The game's own directory reader keys chunks by `twoToOne(x,z) = (x<<15)|z`, which cannot
-    /// address a negative X — `parse_world_inner` must reject such an entry rather than load a
-    /// chunk the game itself could never find (see `is_chunk_coord`'s doc comment). Superseded
-    /// `test_write_world_file_round_trips_negative_chunk_coords`, which asserted the opposite
-    /// before the coordinate gate existed: no in-range positive coord can distinguish the widened
-    /// i32 encoding from the old i16 one, so re-pointing that test at a positive value would have
-    /// tested nothing new.
-    #[test]
-    fn test_parse_rejects_negative_chunk_coords_the_game_cannot_index() {
-        let chunk_size = 32768usize;
-        let (w, h) = (2u32, 1u32);
-        let chunks: Vec<Vec<u8>> = (0..(w * h)).map(|_| vec![0u8; chunk_size]).collect();
-        let path = std::env::temp_dir().join(format!("vuencedit_stage4_neg_{}.eden", std::process::id()));
-        let p = path.to_string_lossy().to_string();
-        worldgen::write_world_file(&p, "neg", w, h, chunk_size, -3, 4096, 10, &chunks)
-            .expect("write failed");
-        let bytes = fs::read(&path).expect("read back failed");
-        let _ = fs::remove_file(&path);
-
-        assert!(parse_world_inner(mmap_from_bytes(bytes)).is_err(),
-            "a negative chunk X is unaddressable in-game (twoToOne returns 0) and must be rejected");
-    }
-
-    /// §5.1.2 — an entry whose chunk would run past EOF is excluded from `chunk_map` rather than
-    /// admitted and left to produce out-of-bounds (silently-air) reads later.
-    #[test]
-    fn test_parse_rejects_entry_running_past_eof() {
-        let mut b = make_multi_chunk_world(2, 32768, 0);
-        let dir_off = HEADER + 2 * 32768;
-        let len = b.len() as u64;
-        set_entry_offset(&mut b, dir_off, 1, len - 1000); // 1000 bytes of a 32768-byte chunk
-        let world = parse_world_inner(mmap_from_bytes(b)).expect("parse failed");
-        assert!(world.chunk_map.contains_key(&(0, 0)), "the valid chunk must load");
-        assert!(!world.chunk_map.contains_key(&(1, 0)), "an entry running past EOF must be dropped");
-    }
-
-    /// §1.10.2 — the old guard hardcoded `off + 32768 <= len`, so on a 256z world it admitted
-    /// entries within 128 KB of EOF. This offset passes the old 32 KB test and fails the correct
-    /// `chunk_size` one, so it only stays out if the validation really uses the detected size.
-    #[test]
-    fn test_parse_rejects_short_tail_entry_on_256z_world() {
-        let mut b = make_multi_chunk_world(2, 131072, 5);
-        let dir_off = HEADER + 2 * 131072;
-        let len = b.len() as u64;
-        let off = len - 40000;
-        assert!(off + 32768 <= len, "fixture must pass the old hardcoded 32 KB guard");
-        assert!(off + 131072 > len, "fixture must fail the correct chunk_size guard");
-        set_entry_offset(&mut b, dir_off, 1, off);
-        let world = parse_world_inner(mmap_from_bytes(b)).expect("parse failed");
-        assert_eq!(world.chunk_size, 131072);
-        assert!(world.chunk_map.contains_key(&(0, 0)), "the valid chunk must load");
-        assert!(!world.chunk_map.contains_key(&(1, 0)),
-            "an entry with less than chunk_size bytes left must be dropped");
-    }
-
-    /// §5.1.3 — 64z regression. Legacy (`version <= 4`) worlds are the only ones that exercise the
-    /// min-gap fallback, and the widened decode moved it from truncated `usize` chunk_map values
-    /// to Pass A's `u64` offsets. Two chunks 32768 B apart must still resolve to a 4-band 64z world.
-    #[test]
-    fn test_parse_min_gap_fallback_detects_64z() {
-        let world = parse_world_inner(mmap_from_bytes(make_multi_chunk_world(2, 32768, 0)))
-            .expect("parse failed");
-        assert_eq!(world.chunk_size, 32768, "min-gap 32768 must detect a 64z world");
-        assert_eq!(world.num_bands, 4);
-        assert_eq!(world.chunk_map.len(), 2);
-    }
-
-    /// The other half of the fallback: two chunks 131072 B apart with a legacy version field must
-    /// still resolve to a 16-band 256z world.
-    #[test]
-    fn test_parse_min_gap_fallback_detects_256z() {
-        let world = parse_world_inner(mmap_from_bytes(make_multi_chunk_world(2, 131072, 0)))
-            .expect("parse failed");
-        assert_eq!(world.chunk_size, 131072, "min-gap 131072 must detect a 256z world");
-        assert_eq!(world.num_bands, 16);
-        assert_eq!(world.chunk_map.len(), 2);
-    }
-
-    // ── Phase 1 (256z-format plan): post-directory sign trailer + coordinate gate ─────────────
-
-    /// The real 192-byte post-directory trailer found at the end of `TEST WORLDS/quarry.eden`:
-    /// 12 rows, each tagged `x = -1` (`ff ff ff ff`) so the game's own reader skips them. Row 0 is
-    /// a wrapper (`"SGN1"` + length 132); row 1 is the real `SGN1` header (version 1, count 1);
-    /// rows 2–4 are the one sign record's first 36 bytes (position + 3 unknown i32s + start of
-    /// text); rows 5–11 are zero padding to fill the 120-byte record. See the plan doc's Part A.
-    const QUARRY_SIGN_TRAILER: [u8; 192] = {
-        let mut b = [0u8; 192];
-        const ROWS: [[u8; 12]; 5] = [
-            [0x53, 0x47, 0x4e, 0x31, 0x84, 0, 0, 0, 0, 0, 0, 0],            // "SGN1", len 132
-            [0x53, 0x47, 0x4e, 0x31, 1, 0, 0, 0, 1, 0, 0, 0],               // "SGN1", version 1, count 1
-            [0x84, 0xff, 0, 0, 0x2d, 0xfe, 0, 0, 0x20, 0, 0, 0],            // x=65412, y=65069, z=32
-            [4, 0, 0, 0, 9, 0, 0, 0, 1, 0, 0, 0],                           // a=4, b=9, c=1
-            [0x74, 0x65, 0x73, 0x74, 0, 0, 0, 0, 0, 0, 0, 0],               // "test"
-        ];
-        let mut row = 0;
-        while row < 12 {
-            let e = row * 16;
-            b[e] = 0xff; b[e + 1] = 0xff; b[e + 2] = 0xff; b[e + 3] = 0xff;
-            if row < ROWS.len() {
-                let src = &ROWS[row];
-                let mut i = 0;
-                while i < 12 { b[e + 4 + i] = src[i]; i += 1; }
-            }
-            row += 1;
-        }
-        b
-    };
-
-    /// `make_multi_chunk_world` plus `trailer` bytes appended immediately after the real chunk
-    /// directory entries — mirrors how the game itself lays out a trailing `SGN1` section.
-    fn make_world_with_sign_trailer(n: usize, chunk_size: usize, version: i32, trailer: &[u8]) -> Vec<u8> {
-        let mut b = make_multi_chunk_world(n, chunk_size, version);
-        b.extend_from_slice(trailer);
-        b
-    }
-
-    /// Overwrite directory entry `i`'s X/Y coordinate fields in a `make_multi_chunk_world` fixture.
-    fn set_entry_coords(b: &mut [u8], dir_off: usize, i: usize, cx: i32, cy: i32) {
-        let e = dir_off + i * 16;
-        b[e..e + 4].copy_from_slice(&cx.to_le_bytes());
-        b[e + 4..e + 8].copy_from_slice(&cy.to_le_bytes());
-    }
-
-    /// The core regression: a trailing `SGN1` section must never be decoded as chunk rows — this
-    /// is exactly the old failure mode that reported quarry.eden as 4198 × 1,953,719,669 chunks.
-    #[test]
-    fn test_parse_ignores_post_directory_sign_trailer() {
-        let b = make_world_with_sign_trailer(2, 32768, 0, &QUARRY_SIGN_TRAILER);
-        let world = parse_world_inner(mmap_from_bytes(b)).expect("parse failed");
-        assert_eq!(world.chunk_map.len(), 2, "only the two real chunks may be admitted");
-        assert_eq!(world.w_chunks, 2, "the trailer's bogus X=-1 rows must not widen the bbox");
-        assert_eq!(world.h_chunks, 1);
-        assert!(world.chunk_span.is_empty(),
-            "the trailer rows must never be treated as chunks with short spans");
-    }
-
-    /// The trailer bytes themselves must survive parsing verbatim, so a rebuilding writer can
-    /// re-emit the world's real inline sign data instead of silently dropping it.
-    #[test]
-    fn test_parse_preserves_sign_trailer_bytes() {
-        let b = make_world_with_sign_trailer(2, 32768, 0, &QUARRY_SIGN_TRAILER);
-        let world = parse_world_inner(mmap_from_bytes(b)).expect("parse failed");
-        assert_eq!(world.trailer_bytes(), QUARRY_SIGN_TRAILER);
-    }
-
-    /// Ordering regression: the trailer's offset-0/offset-132 rows must be stripped *before*
-    /// `chunk_size` detection runs, or a legacy-version world's min-gap fallback would measure a
-    /// spurious tiny gap against them and misdetect 64z vs 256z.
-    #[test]
-    fn test_parse_min_gap_fallback_ignores_sign_trailer_offsets() {
-        // version 0 forces the min-gap fallback; two real chunks 131072 B apart should read 256z
-        // regardless of the trailer rows' tiny (0- and 132-byte) fake offsets.
-        let b = make_world_with_sign_trailer(2, 131072, 0, &QUARRY_SIGN_TRAILER);
-        let world = parse_world_inner(mmap_from_bytes(b)).expect("parse failed");
-        assert_eq!(world.chunk_size, 131072, "the trailer's fake offsets must not poison min-gap");
-        assert_eq!(world.chunk_map.len(), 2);
-    }
-
-    /// An *interior* out-of-range entry (not part of a trailing run) is corruption, not a sign
-    /// trailer — it must be dropped and never folded into the trailer.
-    #[test]
-    fn test_parse_drops_interior_out_of_range_entry() {
-        let mut b = make_multi_chunk_world(3, 32768, 0);
-        let dir_off = HEADER + 3 * 32768;
-        set_entry_coords(&mut b, dir_off, 1, -1, 999); // middle entry, not the trailing one
-        let world = parse_world_inner(mmap_from_bytes(b)).expect("parse failed");
-        assert_eq!(world.chunk_map.len(), 2, "chunks 0 and 2 must still load");
-        assert!(world.chunk_map.contains_key(&(0, 0)));
-        assert!(world.chunk_map.contains_key(&(2, 0)));
-        assert!(world.trailer_bytes().is_empty(),
-            "an interior corrupt row must be dropped outright, not captured as a trailer");
-    }
-
-    /// 1c: chunk data can never start inside the 192-byte header, mirroring the `ptr_offset >= 192`
-    /// check. An entry pointing at offset 0 (as the real quarry trailer's wrapper row does) must be
-    /// rejected by Pass B even if it somehow carried an in-range coordinate.
-    #[test]
-    fn test_parse_drops_entry_pointing_into_header() {
-        let mut b = make_multi_chunk_world(2, 32768, 0);
-        let dir_off = HEADER + 2 * 32768;
-        set_entry_offset(&mut b, dir_off, 1, 0); // in-range coord, but offset 0 < 192
-        let world = parse_world_inner(mmap_from_bytes(b)).expect("parse failed");
-        assert!(world.chunk_map.contains_key(&(0, 0)));
-        assert!(!world.chunk_map.contains_key(&(1, 0)),
-            "an entry whose offset lands inside the header must be rejected");
-    }
-
-    /// The template-directory reader (1f) must apply the same coordinate gate as the world reader,
-    /// so a corrupt/foreign row in `Eden.eden` can't make `expand_world_from_template` write a
-    /// garbage-RLE chunk at an unaddressable coordinate.
-    #[test]
-    fn test_template_dir_skips_out_of_range_entries() {
-        let dir_off = 32usize;
-        let mut b = vec![0u8; dir_off + 3 * 16];
-        let entry = |b: &mut [u8], i: usize, cx: i32, cy: i32, off: u64| {
-            let e = dir_off + i * 16;
-            b[e..e + 4].copy_from_slice(&cx.to_le_bytes());
-            b[e + 4..e + 8].copy_from_slice(&cy.to_le_bytes());
-            b[e + 8..e + 16].copy_from_slice(&off.to_le_bytes());
-        };
-        entry(&mut b, 0, 4096, 4096, 0);
-        entry(&mut b, 1, -1, 999, 0);   // out of range — must be skipped
-        entry(&mut b, 2, 4097, 4096, 0);
-
-        let dir = decode_template_dir(&b, dir_off);
-        assert_eq!(dir.len(), 2);
-        assert!(dir.contains_key(&(4096, 4096)));
-        assert!(dir.contains_key(&(4097, 4096)));
-        assert!(!dir.contains_key(&(-1, 999)));
-    }
-
-    /// Full round trip: a world carrying the real quarry sign trailer, materialized to a sibling
-    /// file, must reload with that trailer intact — proving `materialize_flat_chunks_inner` re-emits
-    /// it instead of silently dropping the world's inline sign data (1g).
-    #[test]
-    fn test_materialize_preserves_post_directory_trailer() {
-        let b = make_world_with_sign_trailer(1, 32768, 0, &QUARRY_SIGN_TRAILER);
-        let world = parse_world_inner(mmap_from_bytes(b)).expect("parse failed");
-        let chunk_size = world.chunk_size;
-        let header = world.bytes[..192.min(world.bytes.len())].to_vec();
-        let (coords, src) = materialize_src(&world);
-        let params = FlatChunkParams { chunk_size, stone_depth: 1, dirt_depth: 2, surface_z: 4 };
-        let out_path = std::env::temp_dir()
-            .join(format!("vuencedit_materialize_trailer_test_{}.eden", std::process::id()));
-        materialize_flat_chunks_inner(
-            out_path.to_str().unwrap(), chunk_size, &header, &coords, src, &[], &params,
-            &world.trailer_bytes(), &[], || false, |_, _| {},
-        ).expect("materialize must succeed");
-        let out_bytes = fs::read(&out_path).expect("read output");
-        let _ = fs::remove_file(&out_path);
-        let reloaded = parse_world_inner(mmap_from_bytes(out_bytes)).expect("output must parse");
-        assert_eq!(reloaded.trailer_bytes(), QUARRY_SIGN_TRAILER);
-    }
-
-    /// 27.1: the adder specimen's post-directory trailer (80,480 B: `CMB1` then `SGN1`, to EOF)
-    /// must survive a normal save *and* both rebuilding writers. It used to be captured capped at
-    /// 64 KiB, so `expand_world_inner` and `materialize_flat_chunks_inner` wrote a truncated
-    /// trailer (data loss). The specimen is private; the test skips when it's absent.
-    #[test]
-    fn test_adder_trailer_survives_save_expand_and_materialize() {
-        const ADDER_TRAILER_LEN: usize = 80_480;
-        let Some(home) = std::env::var_os("HOME") else { return };
-        let path = std::path::Path::new(&home).join("emod/TESTERS/3 bit adder 1791611312.eden");
-        if !path.exists() {
-            eprintln!("skipping: {path:?} not present");
-            return;
-        }
-        let orig = fs::read(&path).expect("read adder");
-        let expected = &orig[orig.len() - ADDER_TRAILER_LEN..];
-        assert_eq!(&expected[..4], &[0xff; 4], "the trailer starts on a tagged row");
-        assert_eq!(&expected[4..8], b"CMB1", "the adder's first section is CMB1");
-
-        let world = parse_world_inner(map_fixture(&path)).expect("adder must parse");
-        let dir_off = u64::from_le_bytes(orig[32..40].try_into().unwrap()) as usize;
-        assert_eq!(dir_off + 16 * world.chunk_map.len(), orig.len() - ADDER_TRAILER_LEN,
-            "the trailer runs from the end of the real rows to EOF");
-        assert_eq!(world.trailer_bytes().len(), ADDER_TRAILER_LEN, "captured uncapped");
-        assert_eq!(world.trailer_bytes(), expected);
-
-        let tmp = |tag: &str| std::env::temp_dir()
-            .join(format!("vuencedit_adder_trailer_{tag}_{}.eden", std::process::id()));
-        let check = |out: &std::path::Path, what: &str| {
-            let bytes = fs::read(out).expect("read output");
-            let _ = fs::remove_file(out);
-            assert!(bytes.len() >= ADDER_TRAILER_LEN && &bytes[bytes.len() - ADDER_TRAILER_LEN..] == expected,
-                "{what}: the file must end with the full 80,480-byte trailer");
-            let reloaded = parse_world_inner(mmap_from_bytes(bytes)).expect("output must parse");
-            assert_eq!(reloaded.trailer_bytes(), expected, "{what}: trailer reloads intact");
-            assert_eq!(reloaded.chunk_map.len(), world.chunk_map.len(), "{what}: chunks kept");
-        };
-
-        // Normal save: writes the mapping verbatim.
-        let out = tmp("save");
-        save_world_inner(&world, out.to_str().unwrap(), false).expect("save");
-        check(&out, "save");
-
-        // Template expand with an empty template: only the rebuild path runs.
-        let out = tmp("expand");
-        expand_world_inner(out.to_str().unwrap(), &world, &[], &FxHashMap::default(), false,
-            || false, |_| {}).expect("expand");
-        check(&out, "expand");
-
-        // Materialize with nothing to add: same.
-        let out = tmp("materialize");
-        let header = world.bytes[..192].to_vec();
-        let (coords, src) = materialize_src(&world);
-        let params = FlatChunkParams { chunk_size: world.chunk_size, stone_depth: 1, dirt_depth: 2, surface_z: 4 };
-        let (cb_start, cb_end) = creature_block_range(&world);
-        materialize_flat_chunks_inner(
-            out.to_str().unwrap(), world.chunk_size, &header, &coords, src, &[], &params,
-            &world.trailer_bytes(), &world.bytes[cb_start..cb_end], || false, |_, _| {},
-        ).expect("materialize");
-        check(&out, "materialize");
-    }
-
-    // ── Phase 2a (256z-format plan): version-independent creature-gap chunk-size detector ─────
-
-    /// A single-chunk world whose directory sits `gap` bytes after the chunk's nominal end —
-    /// modelling the 400-slot creature block the game reserves immediately before the real
-    /// directory. `version` is deliberately `< 5` so neither the authoritative New Dawn rule nor
-    /// (with only one chunk) the min-gap fallback can resolve `chunk_size` on their own.
-    fn make_single_chunk_world_with_gap(chunk_size: usize, gap: usize, version: i32) -> Vec<u8> {
-        let dir_off = HEADER + chunk_size + gap;
-        let mut b = vec![0u8; dir_off + 16];
-        b[32..40].copy_from_slice(&(dir_off as u64).to_le_bytes());
-        b[92..96].copy_from_slice(&version.to_le_bytes());
-        let e = dir_off;
-        b[e..e + 4].copy_from_slice(&0i32.to_le_bytes());
-        b[e + 4..e + 8].copy_from_slice(&0i32.to_le_bytes());
-        b[e + 8..e + 16].copy_from_slice(&(HEADER as u64).to_le_bytes());
-        b
-    }
-
-    /// The exact scenario the updated game produces: `version` predates the New Dawn version
-    /// field (2, observed in `TEST WORLDS/newblocks`) but the world is 256z, and there is only one
-    /// chunk — the case the min-gap fallback structurally cannot solve.
-    #[test]
-    fn test_creature_gap_detects_256z_on_legacy_version() {
-        let b = make_single_chunk_world_with_gap(131072, 24_000, 2); // 400 slots, the max
-        let world = parse_world_inner(mmap_from_bytes(b)).expect("parse failed");
-        assert_eq!(world.chunk_size, 131072);
-        assert_eq!(world.num_bands, 16);
-    }
-
-    /// A legacy 64z world with a 200-slot (12,000 B) creature block must still resolve to 32768.
-    #[test]
-    fn test_creature_gap_detects_64z_with_200_slots() {
-        let b = make_single_chunk_world_with_gap(32768, 12_000, 0);
-        let world = parse_world_inner(mmap_from_bytes(b)).expect("parse failed");
-        assert_eq!(world.chunk_size, 32768);
-        assert_eq!(world.num_bands, 4);
-    }
-
-    /// A gap that is not a whole number of 60-byte slots for either candidate satisfies neither
-    /// half of the creature-gap test, so detection must fall through to the existing min-gap
-    /// heuristic rather than erroring — exercised here with two real chunks so min-gap has
-    /// something to measure.
-    #[test]
-    fn test_creature_gap_falls_back_to_min_gap_when_neither_matches() {
-        let mut b = make_multi_chunk_world(2, 131072, 0);
-        // Push the directory 37 bytes further out — not a multiple of 60 for either chunk size.
-        let old_dir_off = HEADER + 2 * 131072;
-        let new_dir_off = old_dir_off + 37;
-        b.resize(new_dir_off + 2 * 16, 0);
-        for i in 0..2 {
-            let src = old_dir_off + i * 16;
-            let (cx, cy, off) = decode_dir_entry(&b[src..src + 16].to_vec());
-            let dst = new_dir_off + i * 16;
-            b[dst..dst + 16].copy_from_slice(&encode_dir_entry(cx, cy, off));
-        }
-        b[32..40].copy_from_slice(&(new_dir_off as u64).to_le_bytes());
-        let world = parse_world_inner(mmap_from_bytes(b)).expect("parse failed");
-        assert_eq!(world.chunk_size, 131072, "min-gap fallback must still resolve this correctly");
-    }
-
-    // ── Open work (256z-format plan, item 6): creature-block range + preservation ─────────────
-
-    /// Build a world with `n` real chunks of `chunk_size`, then `creature_bytes` verbatim
-    /// (modelling the reserved creature block), then a directory naming just the `n` chunks.
-    fn make_world_with_creature_block(n: usize, chunk_size: usize, creature_bytes: &[u8]) -> Vec<u8> {
-        let chunks_end = HEADER + n * chunk_size;
-        let dir_off = chunks_end + creature_bytes.len();
-        let mut b = vec![0u8; dir_off + n * 16];
-        b[32..40].copy_from_slice(&(dir_off as u64).to_le_bytes());
-        b[chunks_end..chunks_end + creature_bytes.len()].copy_from_slice(creature_bytes);
-        for i in 0..n {
-            let e = dir_off + i * 16;
-            b[e     ..e +  4].copy_from_slice(&(i as i32).to_le_bytes());
-            b[e +  4..e +  8].copy_from_slice(&0i32.to_le_bytes());
-            b[e +  8..e + 16].copy_from_slice(&((HEADER + i * chunk_size) as u64).to_le_bytes());
-        }
-        b
-    }
-
-    /// `creature_block_range` must recover the exact reserved-gap bytes, not a hardcoded slot
-    /// count — the bug `get_creatures` used to have (always assumed 200 slots / 12,000 B).
-    #[test]
-    fn test_creature_block_range_detects_reserved_gap() {
-        let creature_bytes: Vec<u8> = (0..120u8).cycle().take(180).collect(); // 3 slots × 60 B
-        let b = make_world_with_creature_block(1, 32768, &creature_bytes);
-        let world = parse_world_inner(mmap_from_bytes(b)).expect("parse failed");
-        let (start, end) = creature_block_range(&world);
-        assert_eq!(end - start, creature_bytes.len());
-        assert_eq!(&world.bytes[start..end], &creature_bytes[..]);
-    }
-
-    /// The overwhelming majority of worlds have no creature block at all — the directory follows
-    /// the last chunk immediately, so the range must be empty (`start == end`), not underflow.
-    #[test]
-    fn test_creature_block_range_empty_when_no_gap() {
-        let b = make_multi_chunk_world(2, 131072, 5);
-        let world = parse_world_inner(mmap_from_bytes(b)).expect("parse failed");
-        let (start, end) = creature_block_range(&world);
-        assert_eq!(start, end, "no gap between last chunk and directory");
-    }
-
-    /// `materialize_flat_chunks_inner` must re-emit the source world's creature block verbatim,
-    /// directly before the new directory — mirroring `test_materialize_preserves_post_directory_trailer`
-    /// on the other side of the directory. Before this fix the two rebuilding writers silently
-    /// dropped this reserved space, closing the gap between the last chunk and the directory.
-    #[test]
-    fn test_materialize_preserves_creature_block() {
-        let creature_bytes: Vec<u8> = (0..255u8).cycle().take(600).collect(); // 10 slots × 60 B
-        let b = make_world_with_creature_block(1, 32768, &creature_bytes);
-        let world = parse_world_inner(mmap_from_bytes(b)).expect("parse failed");
-        let chunk_size = world.chunk_size;
-        let header = world.bytes[..192.min(world.bytes.len())].to_vec();
-        let (coords, src) = materialize_src(&world);
-        let params = FlatChunkParams { chunk_size, stone_depth: 1, dirt_depth: 2, surface_z: 4 };
-        let (cb_start, cb_end) = creature_block_range(&world);
-        let creature_block = world.bytes[cb_start..cb_end].to_vec();
-        let out_path = std::env::temp_dir()
-            .join(format!("vuencedit_materialize_creature_test_{}.eden", std::process::id()));
-        materialize_flat_chunks_inner(
-            out_path.to_str().unwrap(), chunk_size, &header, &coords, src, &[], &params,
-            &[], &creature_block, || false, |_, _| {},
-        ).expect("materialize must succeed");
-        let out_bytes = fs::read(&out_path).expect("read output");
-        let _ = fs::remove_file(&out_path);
-        let reloaded = parse_world_inner(mmap_from_bytes(out_bytes)).expect("output must parse");
-        let (rs, re) = creature_block_range(&reloaded);
-        assert_eq!(&reloaded.bytes[rs..re], &creature_bytes[..], "creature block must survive materialize");
-    }
-
-    // ── Phase 3 (256z-format plan): new-format block types 112–127 (placeholder appearance) ────
-
-    /// All four block-indexed tables must agree on covering exactly 128 types (0–111 known,
-    /// 112–127 new-format) — a length mismatch would silently reintroduce the "flood fill errors,
-    /// 3D geometry drops the cell, occlusion is wrong" hazard class for whichever table lagged.
-    #[test]
-    fn test_block_tables_cover_all_128_types() {
-        assert_eq!(BLOCK_RGB.len(), 128);
-        assert_eq!(BLOCK_INFO.len(), 128);
-        assert_eq!(BLOCK_PAINT_SCALE.len(), 128);
-        assert_eq!(crate::texturepack::BLOCK_FACE_TEX.len(), 128);
-        // The 16 are named, distinct materials with hand-picked approximate colours (textures
-        // aren't supported yet). Two sharing a colour would make them indistinguishable on the 2D
-        // map and in the picker, which is the failure this pins; the scale must stay a sane
-        // brightness multiplier.
-        for bt in 112u8..=127 {
-            let rgb = BLOCK_RGB[bt as usize];
-            let dupes = (112u8..=127).filter(|&o| o != bt && BLOCK_RGB[o as usize] == rgb).count();
-            assert_eq!(dupes, 0, "block {bt}'s colour {rgb:?} is shared with another new-format block");
-            let scale = BLOCK_PAINT_SCALE[bt as usize];
-            assert!((0.1..=1.0).contains(&scale), "block {bt}'s paint scale must be in 0.1..=1.0, got {scale}");
-        }
-    }
-
-    /// `flood_fill_3d`'s only block-type validation is `(block_type as usize) >= BLOCK_RGB.len()`
-    /// (the one hard rejection in the whole IPC surface, per the audit) — replicated directly here
-    /// since the command itself takes a `tauri::State` the test build has no harness to construct.
-    /// Growing `BLOCK_RGB` to 128 is what fixes it; this pins that the fix covers the full new range.
-    #[test]
-    fn test_flood_fill_accepts_new_block_types() {
-        for bt in 112usize..=127 {
-            assert!(bt < BLOCK_RGB.len(), "flood_fill_3d must accept new-format block type {bt}");
-        }
-    }
-
-    /// New-format blocks must occlude like a normal solid cube — `BLOCK_INFO[112..=127] == 0` (no
-    /// `BI_NOTSOLID`/`BI_RAMPORSIDE`) — so neighbours cull hidden faces, they cast sun shadows, and
-    /// the 3D geometry pipeline includes them instead of treating them as air-like out-of-range types.
-    #[test]
-    fn test_obj_occludes_treats_new_blocks_as_solid() {
-        for bt in 112u8..=127 {
-            assert!(obj_occludes(bt), "block {bt} must occlude (solid new-format block)");
-        }
-    }
-
-    // ── Stage 3: per-chunk span clamping (DIAGNOSE/DIAGNOSIS.md §1.9, §5.1.4) ─────────────────
-
-    /// A 256z world whose two chunks sit **107,072 B** apart instead of 131,072 — the exact
-    /// spacing anomaly present once in each of the two real >4 GiB worlds. The nominal
-    /// `chunk_size` window of chunk (0,0) therefore overlaps chunk (1,0)'s first 24,000 bytes.
-    fn make_short_span_world() -> Vec<u8> {
-        const SHORT: usize = 107_072;
-        let mut b = make_multi_chunk_world(2, 131072, 5);
-        let dir_off = HEADER + 2 * 131072;
-        set_entry_offset(&mut b, dir_off, 1, (HEADER + SHORT) as u64);
-        b
-    }
-
-    /// §5.1.4 — the span of a chunk cut short by its successor is the real distance between them,
-    /// and a write into the overlap region is dropped rather than scribbled into the neighbour.
-    #[test]
-    fn test_short_chunk_span_clamps_writes() {
-        const SHORT: usize = 107_072;
-        let mut world = parse_world_inner(mmap_from_bytes(make_short_span_world()))
-            .expect("parse failed");
-        assert_eq!(world.chunk_size, 131072);
-        assert_eq!(world.span_of(0, 0), SHORT, "the truncated chunk owns only up to its successor");
-        assert_eq!(world.span_of(1, 0), 131072, "the last chunk still runs to the directory");
-        assert_eq!(world.chunk_span.len(), 1, "only short spans are recorded");
-
-        // z=250 → band 15, which starts 122,880 B into the chunk: past the 107,072-byte span, so
-        // these bytes are chunk (1,0)'s. The write must not land anywhere.
-        let neighbour_before = world.bytes[HEADER + SHORT..HEADER + SHORT + 24_000].to_vec();
-        set_block_abs(&mut world, 3, 5, 250, 2, 7);
-        assert_eq!(
-            world.bytes[HEADER + SHORT..HEADER + SHORT + 24_000],
-            neighbour_before[..],
-            "a write past the short span must not reach the next chunk's bytes",
-        );
-        assert_eq!(read_block_abs(&world, 3, 5, 250), 0, "and it must not read back either");
-
-        // Sanity: the same column *inside* the span still writes normally, so the clamp isn't
-        // just disabling the chunk.
-        set_block_abs(&mut world, 3, 5, 200, 2, 7);
-        assert_eq!(read_block_abs(&world, 3, 5, 200), 2);
-        assert_eq!(read_paint_abs(&world, 3, 5, 200), 7);
-    }
-
-    /// Audit M8 — `read_column_bulk`/`write_column_bulk` must agree with the scalar
-    /// `read_block_abs`/`read_paint_abs`/`set_block_abs` they replace in `copy_selection`/
-    /// `move_selection`'s hot loops, including across a 16-z band boundary (the whole reason for the
-    /// per-band `copy_from_slice` split) and outside any chunk (missing-chunk → 0 / write dropped).
-    #[test]
-    fn test_column_bulk_matches_scalar_band_crossing() {
-        let base = make_multi_chunk_world(1, 131072, 5);
-        let mut world = parse_world_inner(mmap_from_bytes(base.clone())).expect("parse failed");
-        assert_eq!(world.num_bands, 16, "256z world for a real band boundary at z=16");
-
-        // Scribble a distinct (type, paint) at every z in a column spanning two bands (10..=25
-        // crosses the z=16 boundary), plus a neighbouring column, via the scalar path.
-        for z in 0..40 {
-            set_block_abs(&mut world, 5, 5, z, (z % 251 + 1) as u8, (z % 53 + 1) as u8);
-            set_block_abs(&mut world, 6, 5, z, ((z * 3) % 251 + 1) as u8, ((z * 7) % 53 + 1) as u8);
-        }
-
-        for &(wx, wy, z0, depth) in &[(5, 5, 10, 16), (5, 5, 0, 40), (6, 5, 15, 3), (9, 9, 0, 40)] {
-            let mut bulk_bt = vec![0u8; depth as usize];
-            let mut bulk_paint = vec![0u8; depth as usize];
-            read_column_bulk(&world, wx, wy, z0, depth, &mut bulk_bt, &mut bulk_paint);
-            for i in 0..depth {
-                assert_eq!(bulk_bt[i as usize], read_block_abs(&world, wx, wy, z0 + i),
-                    "block mismatch at ({wx},{wy},{}) window z0={z0} depth={depth}", z0 + i);
-                assert_eq!(bulk_paint[i as usize], read_paint_abs(&world, wx, wy, z0 + i),
-                    "paint mismatch at ({wx},{wy},{}) window z0={z0} depth={depth}", z0 + i);
-            }
-        }
-
-        // Write side: bulk-write a band-crossing run to a fresh column and diff the resulting bytes
-        // against an independently-parsed world written the old (scalar) way.
-        let mut bulk_world = parse_world_inner(mmap_from_bytes(base.clone())).expect("parse failed");
-        let mut scalar_world = parse_world_inner(mmap_from_bytes(base)).expect("parse failed");
-        let pattern_bt: Vec<u8> = (0..20).map(|i| (i * 11 % 250 + 1) as u8).collect();
-        let pattern_paint: Vec<u8> = (0..20).map(|i| (i * 5 % 52 + 1) as u8).collect();
-        for (i, (&bt, &pt)) in pattern_bt.iter().zip(pattern_paint.iter()).enumerate() {
-            set_block_abs(&mut scalar_world, 7, 7, 8 + i as i32, bt, pt);
-        }
-        write_column_bulk(&mut bulk_world, 7, 7, 8, 20, &pattern_bt, &pattern_paint);
-        assert_eq!(&bulk_world.bytes[..], &scalar_world.bytes[..],
-            "bulk write must match the scalar set_block_abs loop byte-for-byte");
-    }
-
-    /// Audit M8 — the bulk helpers must fall back to the same clamp-at-span behaviour as
-    /// `read_block_abs`/`set_block_abs` when a run crosses a short chunk span (`DIAGNOSE/
-    /// DIAGNOSIS.md` §1.9): the neighbour's bytes are never touched or read as this chunk's.
-    #[test]
-    fn test_column_bulk_respects_short_chunk_span() {
-        const SHORT: usize = 107_072;
-        let mut world = parse_world_inner(mmap_from_bytes(make_short_span_world()))
-            .expect("parse failed");
-        let neighbour_before = world.bytes[HEADER + SHORT..HEADER + SHORT + 24_000].to_vec();
-
-        // z=250 (band 15) starts past the short span for chunk (0,0); a bulk write covering it
-        // must be silently dropped, exactly like `set_block_abs`.
-        let bt = vec![9u8; 8];
-        let pt = vec![3u8; 8];
-        write_column_bulk(&mut world, 3, 5, 248, 8, &bt, &pt);
-        assert_eq!(
-            world.bytes[HEADER + SHORT..HEADER + SHORT + 24_000],
-            neighbour_before[..],
-            "a bulk write past the short span must not reach the next chunk's bytes",
-        );
-        let mut out_bt = vec![0u8; 8];
-        let mut out_pt = vec![0u8; 8];
-        read_column_bulk(&world, 3, 5, 248, 8, &mut out_bt, &mut out_pt);
-        assert_eq!(out_bt, vec![0u8; 8], "reading past the short span returns 0, not neighbour data");
-        assert_eq!(out_pt, vec![0u8; 8]);
-    }
-
-    /// The undo path must be span-aware too: snapshotting a short chunk at its nominal size would
-    /// pull the neighbour's bytes into this chunk's delta, and restoring would write them back at
-    /// the same wrong address — turning undo itself into the corruption vector.
-    #[test]
-    fn test_snapshot_uses_real_chunk_span() {
-        const SHORT: usize = 107_072;
-        let world = parse_world_inner(mmap_from_bytes(make_short_span_world()))
-            .expect("parse failed");
-        let snaps = snapshot_chunks_full(&world, &[(0, 0), (1, 0)], None);
-        let short = snaps.iter().find(|&(cx, cy, _, _)| (*cx, *cy) == (0, 0)).unwrap();
-        let full  = snaps.iter().find(|&(cx, cy, _, _)| (*cx, *cy) == (1, 0)).unwrap();
-        assert_eq!(short.3.len(), SHORT, "short chunk snapshots only what it owns");
-        assert_eq!(full.3.len(), 131072);
-    }
-
-    /// Round-trip: parse → delete column (3,5) z 0–63 → save to new path →
-    /// reload → verify air + byte-identical header and pointer table.
-    #[test]
-    fn test_save_round_trip() {
-        let original = make_test_world();
-
-        // ── parse ──────────────────────────────────────────────────────────
-        let mut world = parse_world_inner(mmap_from_bytes(original.clone())).expect("parse failed");
-        assert_eq!(world.w_chunks, 1);
-        assert_eq!(world.h_chunks, 1);
-
-        // Pre-conditions: test blocks are present
-        assert_eq!(world.bytes[blk(3, 5,  0)], 7, "Wood pre-delete");
-        assert_eq!(world.bytes[blk(3, 5, 17)], 2, "Stone pre-delete");
-        assert_eq!(world.bytes[pnt(3, 5, 17)], 5, "paint pre-delete");
-        assert_eq!(world.bytes[blk(3, 5, 48)], 3, "Dirt pre-delete");
-        assert_eq!(world.bytes[blk(7, 2, 32)], 8, "bystander pre-delete");
-
-        // ── delete column (px=3, py=5), full z range ───────────────────────
-        delete_blocks_inner(&mut world, 3, 5, 3, 5, 0, 63, None);
-
-        assert_eq!(world.bytes[blk(3, 5,  0)], 0, "Wood post-delete");
-        assert_eq!(world.bytes[blk(3, 5, 17)], 0, "Stone post-delete");
-        assert_eq!(world.bytes[pnt(3, 5, 17)], 0, "paint post-delete");
-        assert_eq!(world.bytes[blk(3, 5, 48)], 0, "Dirt post-delete");
-        assert_eq!(world.bytes[blk(7, 2, 32)], 8, "bystander unchanged after delete");
-
-        // ── save to a temp path (no pre-existing file → no .bak created) ──
-        let tmp = std::env::temp_dir().join("eden_test_round_trip.eden");
-        let tmp_str = tmp.to_str().unwrap();
-        let _ = fs::remove_file(&tmp);
-        save_world_inner(&world, tmp_str, false).expect("save failed");
-        assert!(!std::path::Path::new(&format!("{tmp_str}.bak")).exists(),
-            ".bak should not be created when destination didn't exist");
-
-        // ── reload saved file ───────────────────────────────────────────────
-        let saved_bytes = fs::read(&tmp).expect("read back failed");
-        let world2 = parse_world_inner(mmap_from_bytes(saved_bytes.clone())).expect("re-parse failed");
-
-        // Deleted column reads as air
-        assert_eq!(world2.bytes[blk(3, 5,  0)], 0, "Wood air after reload");
-        assert_eq!(world2.bytes[blk(3, 5, 17)], 0, "Stone air after reload");
-        assert_eq!(world2.bytes[pnt(3, 5, 17)], 0, "paint air after reload");
-        assert_eq!(world2.bytes[blk(3, 5, 48)], 0, "Dirt air after reload");
-
-        // Bystander survives
-        assert_eq!(world2.bytes[blk(7, 2, 32)], 8, "bystander survived save/reload");
-
-        // Header bytes (0 .. HEADER) are byte-identical to original
-        assert_eq!(&original[..HEADER], &saved_bytes[..HEADER],
-            "header section must be byte-identical to original");
-
-        // Pointer-table bytes are byte-identical to original
-        let ptr_off = u32::from_le_bytes(original[32..36].try_into().unwrap()) as usize;
-        assert_eq!(&original[ptr_off..], &saved_bytes[ptr_off..],
-            "pointer table must be byte-identical to original");
-
-        // Sanity: total file size unchanged
-        assert_eq!(original.len(), saved_bytes.len(), "file size must not change");
-
-        let _ = fs::remove_file(&tmp);
-    }
-
-    /// C1 step 2 — a `Full` delta is deflated on the way into an `UndoEntry`, and inflates back to
-    /// exactly the bytes it captured. The dense fallback is the one that costs a whole chunk, and a
-    /// uniformly-filled chunk (the ⌘A-fill shape) is the case that has to compress hard.
-    #[test]
-    fn test_full_delta_is_deflated_and_round_trips() {
-        let mut world = parse_world_inner(mmap_from_bytes(make_test_world())).expect("parse failed");
-        let pre_full = snapshot_chunks_full(&world, &[(0, 0)], None);
-        let original = pre_full[0].3.clone();
-        for b in world.bytes[HEADER..HEADER + 32768].iter_mut() { *b = 0x2A; } // "fill with Stone"
-        let snap = diff_chunk(&world, 0, 0, pre_full[0].2, &pre_full[0].3).expect("dense change diffs");
-        let raw_bytes = chunk_snapshot_bytes(&snap);
-
-        let entry = UndoEntry::new("fill", vec![snap], None);
-        match &entry.chunks[0].delta {
-            ChunkDelta::FullZ(_, z, raw) => {
-                assert_eq!(*raw as usize, original.len(), "raw_len must describe the captured span");
-                assert!(z.len() * 4 < original.len(), "a mostly-empty chunk must deflate hard, got {} of {}",
-                        z.len(), original.len());
-            }
-            other => panic!("a Full delta must be stored deflated, got {}", delta_kind(other)),
-        }
-        assert!(entry.bytes < raw_bytes, "the entry must be priced at its compressed size ({} vs {raw_bytes})", entry.bytes);
-
-        // …and undo still restores the chunk byte-for-byte through the compressed form.
-        restore_and_invert(&mut world, &entry);
-        assert_eq!(&world.bytes[HEADER..HEADER + 32768], &original[..],
-                   "inflating a FullZ delta must restore the exact pre-edit bytes");
-    }
-
-    /// C1 step 2 — an incompressible payload must stay `Full` rather than growing: deflate on random
-    /// bytes emits *more* than it consumed, and paying that (plus an inflate on every undo) for a
-    /// negative saving is the one case where compressing is strictly worse.
-    #[test]
-    fn test_incompressible_delta_stays_uncompressed() {
-        // A deterministic LCG — no rand dependency, and reproducible across runs.
-        let mut seed = 0x2545_F491_4F6C_DD1Du64;
-        let noise: Vec<u8> = (0..40_000).map(|_| {
-            seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; (seed >> 24) as u8
-        }).collect();
-        let snap = ChunkSnapshot { cx: 0, cy: 0, delta: ChunkDelta::Full(0, noise.clone()) };
-        let entry = UndoEntry::new("noise", vec![snap], None);
-        match &entry.chunks[0].delta {
-            ChunkDelta::Full(_, d) => assert_eq!(d, &noise),
-            other => panic!("incompressible payload must stay Full, got {}", delta_kind(other)),
-        }
-    }
-
-    /// C1 step 3 — an entry that alone exceeds the whole undo budget is dropped rather than kept
-    /// (the old `trim_stack` `len() > 1` floor kept it, which is what parked a world-sized
-    /// allocation in RAM for the session). Dropping it must take the *rest* of the history with it:
-    /// every older entry is a delta whose restore would write pre-edit bytes over chunks this edit
-    /// has since changed.
-    #[test]
-    fn test_oversized_undo_entry_drops_history() {
-        let mut ws = ws_with(make_test_world());
-        let rect = (0, 0, 15, 15);
-        // A first edit establishes some history to lose — and fills the chunk with noise, so the next
-        // edit's pre-image is incompressible (a zero pre-image would deflate to almost nothing).
-        let mut seed = 0x2545_F491_4F6C_DD1Du64;
-        with_edit(&mut ws, "first", rect, |w| {
-            for i in HEADER..HEADER + 32768 {
-                seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
-                w.set_byte(i, (seed >> 24) as u8 | 1);
-            }
-            Ok(())
-        }).expect("first edit");
-        assert_eq!(ws.undo_stack.len(), 1);
-
-        // Budget 8 KiB: the pre-image limit (4×) is exactly the chunk's 32 KiB, so the edit runs,
-        // but its ~32 KiB incompressible delta can't fit the budget.
-        ws.undo_budget = 8192;
-        let r = with_edit(&mut ws, "huge", rect, |w| {
-            for i in HEADER..HEADER + 32768 { w.set_byte(i, 0x2A); }
-            Ok(())
-        }).expect("edit itself still applies");
-        assert!(r.undo_dropped, "an over-budget edit must report that its undo was dropped");
-        assert_eq!(r.undo_depth, 0, "…and the whole stack goes with it");
-        assert!(ws.undo_stack.is_empty() && ws.redo_stack.is_empty());
-        assert_eq!(ws.undo_bytes, 0, "the byte counter must be cleared with the stack");
-        assert_eq!(ws.world.as_ref().unwrap().bytes[blk(1, 1, 0)], 0x2A, "the edit itself is not rolled back");
-    }
-
-    // ── Row 18.2: bounded non-z-scoped edit pre-images ─────────────────────────────────────
-
-    /// `n × n` contiguous 64z chunks (32768 B each), chunk (cx, cy) at directory slot `cy * n + cx`.
-    /// Every chunk is empty except a stone floor at z=0 so `surface_z` finds terrain.
-    fn make_grid_world(n: usize) -> Vec<u8> {
-        const CHUNK: usize = 32768;
-        let ptr_off = HEADER + n * n * CHUNK;
-        let mut b = vec![0u8; ptr_off + n * n * 16];
-        b[32..36].copy_from_slice(&(ptr_off as u32).to_le_bytes());
-        b[40..49].copy_from_slice(b"GridWorld");
-        for cy in 0..n {
-            for cx in 0..n {
-                let i = cy * n + cx;
-                let off = HEADER + i * CHUNK;
-                for lx in 0..16 { for ly in 0..16 { b[off + lx * 256 + ly * 16] = 2; } }
-                let pe = ptr_off + i * 16;
-                b[pe..pe + 2].copy_from_slice(&(cx as i16).to_le_bytes());
-                b[pe + 4..pe + 6].copy_from_slice(&(cy as i16).to_le_bytes());
-                b[pe + 8..pe + 12].copy_from_slice(&(off as u32).to_le_bytes());
-            }
-        }
-        b
-    }
-
-    /// 18.12 (B.6 test 3) — the copy-on-write pre-image trips at `PREIMAGE_GUARD_FACTOR × budget`
-    /// of *changed bands*: the edit is refused with a sized message and rolled back exactly, with no
-    /// undo entry and no dirty mark.
-    #[test]
-    fn test_preimage_trip_rolls_back_and_refuses() {
-        let mut ws = ws_with(make_grid_world(2));
-        ws.undo_budget = 3 * 8192 / PREIMAGE_GUARD_FACTOR; // limit = exactly 3 bands
-        let before = world_bytes(&ws);
-        let seq = ws.dirty.seq;
-        let rect = (0, 0, 31, 31);
-        // Five bands: all 4 of chunk (0,0) plus band 0 of chunk (1,0).
-        let err = match with_edit(&mut ws, "trees", rect, |w| {
-            for z in [1, 17, 33, 49] { set_block_abs(w, 3, 3, z, 9, 0); }
-            set_block_abs(w, 20, 3, 1, 9, 0);
-            Ok(())
-        }) {
-            Err(e) => e,
-            Ok(_) => panic!("an over-limit pre-image must be refused"),
-        };
-        assert_eq!(err, preimage_trip_message(3 * 8192));
-        assert!(err.contains("MB") && err.contains("undo limit"), "{err}");
-        assert!(ws.world.is_some(), "the world is reinstalled on refusal");
-        assert_eq!(world_bytes(&ws), before, "exact rollback");
-        assert!(ws.undo_stack.is_empty());
-        assert_eq!(ws.dirty.seq, seq, "a refused edit marks nothing dirty");
-        assert!(ws.dirty.since_disk.is_empty());
-
-        // Three bands is exactly the limit: applies and undoes.
-        with_edit(&mut ws, "trees", rect, |w| {
-            for z in [1, 17, 33] { set_block_abs(w, 3, 3, z, 9, 0); }
-            Ok(())
-        }).expect("at the limit");
-        assert_eq!(ws.undo_stack.len(), 1);
-        undo_edit_inner(&mut ws).expect("undo");
-        assert_eq!(world_bytes(&ws), before);
-    }
-
-    /// 18.12 — the RAM-1 win: a whole-world rect that changes one block needs one band of
-    /// pre-image, so it passes a limit the old rect-sized snapshot (every band of every chunk)
-    /// would have been refused at.
-    #[test]
-    fn test_huge_rect_small_change_fits_a_small_limit() {
-        let mut ws = ws_with(make_grid_world(3));
-        ws.undo_budget = 8192 / PREIMAGE_GUARD_FACTOR; // limit = one band; the rect is 9 × 4 bands
-        let before = world_bytes(&ws);
-        with_edit(&mut ws, "trees", (0, 0, 47, 47), |w| { set_block_abs(w, 40, 40, 20, 9, 0); Ok(()) })
-            .expect("one changed band fits");
-        undo_edit_inner(&mut ws).expect("undo");
-        assert_eq!(world_bytes(&ws), before);
-    }
-
-    #[test]
-    fn test_cow_snapshots_only_the_written_chunks_and_undoes() {
-        let mut ws = ws_with(make_grid_world(3));
-        let before = world_bytes(&ws);
-        let world = ws.world.as_ref().unwrap();
-        let (a0, _) = world.chunk_range(0, 0).unwrap();
-        let (a2, _) = world.chunk_range(2, 2).unwrap();
-        // The rect is the whole 3x3 grid; only the two corners are written.
-        with_edit(&mut ws, "cells", (0, 0, 47, 47), |w| {
-            w.set_byte(a0 + 3, 7);
-            w.set_byte(a2 + 5, 7);
-            Ok(())
-        }).expect("edit");
-        let snapped: Vec<(i32, i32)> = ws.undo_stack.back().unwrap().chunks.iter().map(|s| (s.cx, s.cy)).collect();
-        assert_eq!(snapped, vec![(0, 0), (2, 2)]);
-        undo_edit_inner(&mut ws).expect("undo");
-        assert_eq!(world_bytes(&ws), before, "undo restores the exact pre-edit bytes");
-    }
-
-    // ── Row 18.12: copy-on-write edit pre-image — differential oracle + contract tests ──────────
-
-    /// A `side × side`-chunk world of `bands` bands (4 = 64z, 16 = 256z), terrain to `height(x, y)`
-    /// (clamped to the world), stone under a painted grass top, a lamp on every 11th column.
-    fn cow_world(side: i32, bands: usize, height: impl Fn(i32, i32) -> i32) -> Vec<u8> {
-        const HEADER: usize = 4096;
-        let chunk = bands * 8192;
-        let n = (side * side) as usize;
-        let dir_off = HEADER + n * chunk;
-        let mut b = vec![0u8; dir_off + n * 16];
-        b[32..40].copy_from_slice(&(dir_off as u64).to_le_bytes());
-        b[40..48].copy_from_slice(b"CowTest\0");
-        // version 5 + a 131072 stride = 256z; a legacy version + 32768 = 64z.
-        b[92..96].copy_from_slice(&(if bands == 16 { 5i32 } else { 0 }).to_le_bytes());
-        let top = (bands * 16 - 2) as i32;
-        let mut i = 0usize;
-        for cy in 0..side {
-            for cx in 0..side {
-                let base = HEADER + i * chunk;
-                for lx in 0..16usize {
-                    for ly in 0..16usize {
-                        let (wx, wy) = (cx * 16 + lx as i32, cy * 16 + ly as i32);
-                        let h = height(wx, wy).clamp(1, top);
-                        let at = |z: i32| base + (z / 16) as usize * 8192 + lx * 256 + ly * 16 + (z % 16) as usize;
-                        for z in 1..h { b[at(z)] = 1; }
-                        b[at(h)] = 2;
-                        b[at(h) + 4096] = ((wx + wy) % 9) as u8;
-                        if (wx * 7 + wy) % 11 == 0 { b[at(h + 1)] = LAMP_BLOCK_TYPE; }
-                    }
-                }
-                let e = dir_off + i * 16;
-                b[e..e + 4].copy_from_slice(&cx.to_le_bytes());
-                b[e + 4..e + 8].copy_from_slice(&cy.to_le_bytes());
-                b[e + 8..e + 16].copy_from_slice(&(base as u64).to_le_bytes());
-                i += 1;
-            }
-        }
-        b
-    }
-
-    fn cow_ws(bands: usize) -> WorldState {
-        // 256z: heights 30..69, terrain across bands 1..4. 64z: 8..37, leaving room for canopies.
-        let ws = if bands == 16 {
-            ws_with(cow_world(3, bands, |x, y| 30 + (x * 7 + y * 3) % 40))
-        } else {
-            ws_with(cow_world(3, bands, |x, y| 8 + (x * 7 + y * 3) % 30))
-        };
-        assert_eq!(ws.world.as_ref().unwrap().num_bands, bands, "fixture parsed at the wrong height");
-        let all: Vec<(i32, i32)> = ws.world.as_ref().unwrap().chunk_map.keys().copied().collect();
-        ws.lamp_index.build_now(ws.world.as_ref().unwrap(), &all);
-        ws
-    }
-
-    fn dirty_chunks(ws: &WorldState) -> Vec<(i32, i32)> {
-        let mut v: Vec<_> = ws.dirty.since_disk.keys().copied().collect();
-        v.sort_unstable();
-        v
-    }
-
-    fn lamps_match_a_rebuild(ws: &WorldState) -> bool {
-        let mut got = ws.lamp_index.snapshot();
-        got.retain(|_, v| !v.is_empty());
-        got == build_lamp_index(ws.world.as_ref().unwrap())
-    }
-
-    /// B.6 test 1: run `edit` through the pre-18.12 snapshot path (the oracle, snapshotting the whole
-    /// world) and through the copy-on-write path, from identical worlds, and require identical
-    /// post-edit bytes, patch, dirty chunk set and lamp index; exact undo; exact redo. Deltas are
-    /// compared semantically (apply → same bytes) — CoW may pick `Sparse` where the oracle chose a
-    /// whole-span `Full`.
-    fn differential(label: &str, bands: usize, patch_rect: (i32, i32, i32, i32),
-                    edit: &dyn Fn(&mut EditView) -> Result<(), String>) {
-        let mut old = cow_ws(bands);
-        let mut new = cow_ws(bands);
-        let before = world_bytes(&old);
-        let ro = with_edit_inner_oracle(&mut old, label, (0, 0, 47, 47), patch_rect, None, edit);
-        let rn = with_edit(&mut new, label, patch_rect, edit);
-        let (ro, rn) = match (ro, rn) {
-            (Ok(a), Ok(b)) => (a, b),
-            (Err(a), Err(b)) => {
-                assert_eq!(a, b, "{label}/{bands}: same error on both paths");
-                assert_eq!(world_bytes(&new), before, "{label}/{bands}: a failed CoW edit rolls back exactly");
-                assert!(new.undo_stack.is_empty() && dirty_chunks(&new).is_empty());
-                return;
-            }
-            (a, b) => panic!("{label}/{bands}: paths disagree on success: oracle {:?} vs cow {:?}",
-                             a.map(|_| ()), b.map(|_| ())),
-        };
-        let post = world_bytes(&old);
-        assert!(post != before, "{label}/{bands}: the fixture must actually change something");
-        assert!(world_bytes(&new) == post, "{label}/{bands}: post-edit worlds differ");
-        assert_eq!(ro.patch.pixels, rn.patch.pixels, "{label}/{bands}: patch differs");
-        assert_eq!(ro.invalidate, rn.invalidate);
-        assert_eq!(dirty_chunks(&old), dirty_chunks(&new), "{label}/{bands}: dirty chunk sets differ");
-        assert!(lamps_match_a_rebuild(&new), "{label}/{bands}: lamp index drifted after the edit");
-        assert_eq!(old.undo_stack.len(), 1);
-        assert_eq!(new.undo_stack.len(), 1);
-
-        undo_edit_inner(&mut old).expect("oracle undo");
-        undo_edit_inner(&mut new).expect("cow undo");
-        assert!(world_bytes(&old) == before, "{label}/{bands}: oracle undo inexact");
-        assert!(world_bytes(&new) == before, "{label}/{bands}: cow undo inexact");
-        assert!(lamps_match_a_rebuild(&new), "{label}/{bands}: lamp index drifted after undo");
-        redo_edit_inner(&mut new).expect("cow redo");
-        assert!(world_bytes(&new) == post, "{label}/{bands}: cow redo inexact");
-        assert!(lamps_match_a_rebuild(&new), "{label}/{bands}: lamp index drifted after redo");
-    }
-
-    /// 23.12 — `stamp_columns` (column gather → `write_column_bulk` runs) must match the per-voxel
-    /// loop it replaced byte for byte, and count the same clipped cells: off the west/north edge,
-    /// past the world's east/south edge, below z 0 and above `max_z`, with and without ignore-air,
-    /// a shaped mask, and a per-column `z_base` that sometimes skips a column.
-    #[test]
-    fn test_stamp_columns_matches_per_voxel_reference() {
-        let (w, h, d) = (9, 7, 20);
-        let (cbt, cpt) = cow_clipboard(w, h, d);
-        let mask: Vec<u8> = (0..((w * h + 7) / 8)).map(|i| 0b1011_0111u8.rotate_left(i as u32)).collect();
-        let z_base = |tx: i32, ty: i32, k: i32| -> Option<i32> {
-            if (tx + ty) % 7 == 0 { None } else { Some(k + (tx * 3 + ty) % 9) }
-        };
-        for bands in [4usize, 16] {
-            let max_z = (bands * 16 - 1) as i32;
-            for &(ox, oy) in &[(-4, -3), (20, 20), (43, 44)] {
-                for &k in &[-12, 10, max_z - 8] {
-                    for ignore_air in [false, true] {
-                        for masked in [false, true] {
-                            let include = |dx: i32, dy: i32| !masked || bit_set(&mask, (dy * w + dx) as usize);
-                            let mut fast = cow_ws(bands).world.unwrap();
-                            let mut slow = cow_ws(bands).world.unwrap();
-                            let got = stamp_columns(&mut fast, ox, oy, &cbt, &cpt, w, h, d, ignore_air, max_z,
-                                include, |_, tx, ty| z_base(tx, ty, k));
-                            let (mnx, mny) = slow.chunk_origin();
-                            let mut want = 0u32;
-                            for dy in 0..h { for dx in 0..w {
-                                if !include(dx, dy) { continue; }
-                                let (tx, ty) = (ox + dx, oy + dy);
-                                let on = tx >= 0 && ty >= 0 && slow.has_chunk(tx / 16 + mnx, ty / 16 + mny);
-                                let zb = if on { z_base(tx, ty, k) } else { Some(0) };
-                                let Some(zb) = zb else { continue };
-                                for dz in 0..d {
-                                    let i = ((dz * h + dy) * w + dx) as usize;
-                                    if ignore_air && cbt[i] == 0 { continue; }
-                                    let z = zb + dz;
-                                    if !on || z < 0 || z > max_z { want += 1; continue; }
-                                    set_block_abs(&mut slow, tx, ty, z, cbt[i], cpt[i]);
-                                }
-                            }}
-                            let tag = format!("bands={bands} o=({ox},{oy}) k={k} air={ignore_air} mask={masked}");
-                            assert_eq!(got, want, "{tag}: clipped count");
-                            assert!(fast.bytes[..] == slow.bytes[..], "{tag}: bytes differ");
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    fn cow_clipboard(w: i32, h: i32, d: i32) -> (Vec<u8>, Vec<u8>) {
-        let n = (w * h * d) as usize;
-        let bt: Vec<u8> = (0..n).map(|i| if i % 5 == 0 { 0 } else { [3u8, 7, 13, LAMP_BLOCK_TYPE][i % 4] }).collect();
-        let pt: Vec<u8> = (0..n).map(|i| (i % 11) as u8).collect();
-        (bt, pt)
-    }
-
-    fn cow_sculpt_args(mode: &str) -> SculptArgs {
-        SculptArgs {
-            mode: mode.into(), strength: 4, strength_eff: 4.0, seed: 3,
-            block_type: None, paint: None, freq: None, noise_mode: None,
-            softness: 0.6, profile: "smooth".into(), grab_delta: None,
-            anchor_x: None, anchor_y: None, slope_dx: None, slope_dy: None,
-            smear_dx: None, smear_dy: None, clip_rect: None, rock: None, cap: None,
-        }
-    }
-
-    #[test]
-    fn test_cow_edits_match_the_snapshot_oracle() {
-        for bands in [4usize, 16] {
-            let max_z = (bands * 16 - 1) as i32;
-            let all = (0, 0, 47, 47);
-            differential("delete", bands, (2, 3, 40, 37), &|w| {
-                delete_blocks_inner(w, 2, 3, 40, 37, 20, 50, None); Ok(())
-            });
-            differential("delete over air", bands, (0, 0, 20, 20), &|w| {
-                delete_blocks_inner(w, 0, 0, 20, 20, 0, max_z, None); Ok(())
-            });
-            differential("replace", bands, all, &|w| {
-                replace_blocks_inner(w, 0, 0, 47, 47, 0, max_z, 7, 3, Some(2), None, false, None); Ok(())
-            });
-            differential("replace inverted", bands, (5, 5, 25, 25), &|w| {
-                replace_blocks_inner(w, 5, 5, 25, 25, 25, 45, 13, 0, Some(0), None, true, None); Ok(())
-            });
-            differential("gradient", bands, (4, 4, 30, 30), &|w| {
-                gradient_fill_inner(w, 4, 4, 30, 30, 20, 60, 1, 0, 7, 5, "x", false, None); Ok(())
-            });
-            differential("paint + doors", bands, all, &|w| {
-                for (x, y, z) in [(3, 5, 31), (6, 2, 4), (20, 20, 47), (40, 9, 63.min(max_z - 1))] {
-                    set_block_abs(w, x, y, z, 66, 0);
-                    set_block_abs(w, x, y, z + 1, 70, 0);
-                }
-                set_block_abs(w, 12, 12, 40, LAMP_BLOCK_TYPE, 0);
-                Ok(())
-            });
-            let (cbt, cpt) = cow_clipboard(9, 7, 20);
-            differential("paste", bands, (10, 12, 18, 18), &|w| {
-                paste_clipboard_at(w, 10, 12, &cbt, &cpt, 9, 7, 20, 25, 3, false, max_z, None); Ok(())
-            });
-            differential("paste ignore-air", bands, (10, 12, 18, 18), &|w| {
-                paste_clipboard_at(w, 10, 12, &cbt, &cpt, 9, 7, 20, 25, 3, true, max_z, None); Ok(())
-            });
-            differential("scatter", bands, all, &|w| {
-                for (px, py) in [(1, 1), (14, 30), (35, 36), (40, 2)] {
-                    paste_clipboard_at(w, px, py, &cbt, &cpt, 9, 7, 20, 18, 0, true, max_z, None);
-                }
-                Ok(())
-            });
-            differential("paste terrain", bands, all, &|w| {
-                // Off the west edge and over the world's top, so the clip path runs too.
-                for (px, py, above) in [(-3, 20, true), (30, 30, false), (5, 5, true)] {
-                    paste_terrain_at(w, px, py, &cbt, &cpt, 9, 7, 20, 2, true, max_z, None, None, above);
-                }
-                Ok(())
-            });
-            let (sbt, spt) = cow_clipboard(6, 5, 8);
-            differential("extrude x+", bands, all, &|w| {
-                extrude_write(w, 3, 3, &sbt, &spt, 6, 5, 8, 28, max_z, "x+", 3, false, None); Ok(())
-            });
-            differential("extrude z+", bands, all, &|w| {
-                extrude_write(w, 3, 3, &sbt, &spt, 6, 5, 8, 28, max_z, "z+", 2, true, None); Ok(())
-            });
-            differential("move", bands, all, &|w| {
-                // `move_selection`'s closure shape: read, clear source, write shifted by (+9, +4, +5).
-                let (x1, y1, wd, ht, z0, d) = (4, 4, 10, 8, 26, 20);
-                let mut bt = vec![0u8; (wd * ht * d) as usize];
-                let mut pt = bt.clone();
-                for lx in 0..wd { for ly in 0..ht {
-                    let o = ((lx * ht + ly) * d) as usize;
-                    read_column_bulk(w, x1 + lx, y1 + ly, z0, d, &mut bt[o..o + d as usize], &mut pt[o..o + d as usize]);
-                }}
-                let zeros = vec![0u8; d as usize];
-                for lx in 0..wd { for ly in 0..ht { write_column_bulk(w, x1 + lx, y1 + ly, z0, d, &zeros, &zeros); } }
-                for lx in 0..wd { for ly in 0..ht {
-                    let o = ((lx * ht + ly) * d) as usize;
-                    write_column_bulk(w, x1 + lx + 9, y1 + ly + 4, z0 + 5, d, &bt[o..o + d as usize], &pt[o..o + d as usize]);
-                }}
-                Ok(())
-            });
-            differential("trees", bands, all, &|w| {
-                generate_trees_inner(w, 0, 0, 47, 47, &["normal".to_string(), "pine".to_string(), "tall_pine".to_string()],
-                    0.04, &[], 11, false, None, None);
-                Ok(())
-            });
-            differential("wavy", bands, all, &|w| {
-                generate_wavy_surface_inner(w, 0, 0, 47, 47, max_z, 20, 0, 12.0, 0.5, 5, "fill", None); Ok(())
-            });
-            differential("flow", bands, all, &|w| {
-                let z = surface_z(w, 20, 20).unwrap() + 1;
-                set_block_abs(w, 20, 20, z, fluid_type_for(20, 4), 0);
-                simulate_flow_inner(w, 15, 15, 25, 25, 12, 12, 28, 28, 0, max_z, false, 20, None);
-                Ok(())
-            });
-            differential("pool (unenclosed → Err, rolled back)", bands, (5, 5, 30, 30), &|w| {
-                let z = surface_z(w, 17, 17).unwrap() + 1;
-                set_block_abs(w, 17, 17, z + 3, 7, 0); // a write before the Err: must roll back
-                pool_fill_inner(w, 5, 5, 30, 30, 17, 17, z, max_z.min(z + 30), 20, 0, None)
-            });
-            differential("flood fill", bands, all, &|w| {
-                let z = surface_z(w, 24, 24).unwrap() + 1;
-                let cells = flood_fill_bfs(w, 24, 24, z, 3000)?;
-                for (x, y, z) in cells { set_block_abs(w, x, y, z, 20, 0); }
-                Ok(())
-            });
-            differential("fill surface", bands, all, &|w| {
-                let (cells, _) = surface_region_bfs(w, 9, 9, false, 5000, None)?;
-                for (x, y, z) in cells { set_block_abs(w, x, y, z, 13, 2); }
-                Ok(())
-            });
-            for mode in ["raise", "lower", "smooth", "noise", "flatten"] {
-                differential(&format!("sculpt {mode}"), bands, all, &|w| {
-                    let mut s = SculptSession { group_id: 0, fheight: HashMap::new() };
-                    let stamps = vec![
-                        SculptStamp { points: disc_points(14, 14, 6), dial: Some((14, 14, 6)) },
-                        SculptStamp { points: disc_points(22, 17, 6), dial: Some((22, 17, 6)) },
-                    ];
-                    run_sculpt_flush(w, &mut s, &cow_sculpt_args(mode), &stamps)
-                });
-            }
-        }
-    }
-
-    /// B.6 test 2 — an edit that writes several bands and then fails leaves the world byte-identical,
-    /// its scan ceilings invalidated, no undo entry and no dirty mark. (Before 18.12 the partial
-    /// writes stayed — un-undoable, invisible to the incremental save and the autosave journal.
-    /// Real closures that can do this: a multi-stamp sculpt flush where a later Flatten/Slope stamp
-    /// finds no surface, after earlier stamps wrote.)
-    #[test]
-    fn test_cow_edit_error_rolls_back_exactly() {
-        let mut ws = cow_ws(16);
-        let before = world_bytes(&ws);
-        let seq = ws.dirty.seq;
-        let hint_before = ws.world.as_ref().unwrap().top_band_hint(0, 0);
-        let err = with_edit(&mut ws, "partial", (0, 0, 47, 47), |w| {
-            for z in [5, 40, 90, 200] { set_block_abs(w, 3, 3, z, 9, 1); }
-            set_block_abs(w, 40, 40, 33, 9, 1);
-            Err("stamp 3 found no surface".into())
-        }).err().expect("the closure's error propagates");
-        assert_eq!(err, "stamp 3 found no surface");
-        assert!(world_bytes(&ws) == before, "exact rollback");
-        assert!(ws.undo_stack.is_empty() && ws.redo_stack.is_empty());
-        assert_eq!(ws.dirty.seq, seq);
-        assert!(dirty_chunks(&ws).is_empty());
-        let w = ws.world.as_ref().unwrap();
-        assert_eq!(w.top_bands.peek(0, 0), None, "the rolled-back chunk's ceiling was invalidated");
-        assert_eq!(w.top_band_hint(0, 0), hint_before, "…and recomputes to the restored bytes");
-        assert!(lamps_match_a_rebuild(&ws));
-    }
-
-    /// 29.9b — a closure that writes several bands and then **panics** keeps the world. It is rolled
-    /// back exactly, *before* the world goes back into `ws`, and the history around it is untouched.
-    /// The undo/redo that follow then reproduce the pre-panic states byte for byte. A half-written
-    /// world would make the next delta diff against bytes no entry describes.
-    #[test]
-    fn test_edit_closure_panic_keeps_world_rolled_back() {
-        let mut ws = cow_ws(16);
-        let base = world_bytes(&ws);
-        with_edit(&mut ws, "A", (0, 0, 47, 47), |w| { set_block_abs(w, 5, 5, 100, 9, 0); Ok(()) }).expect("A");
-        let after_a = world_bytes(&ws);
-        with_edit(&mut ws, "B", (0, 0, 47, 47), |w| { set_block_abs(w, 30, 30, 120, 9, 0); Ok(()) }).expect("B");
-        undo_edit_inner(&mut ws).expect("undo B"); // one entry on each stack
-        assert_eq!(world_bytes(&ws), after_a);
-        let (undo_len, redo_len, seq) = (ws.undo_stack.len(), ws.redo_stack.len(), ws.dirty.seq);
-
-        let err = with_edit(&mut ws, "Fill", (0, 0, 47, 47), |w| {
-            for z in [5, 40, 90, 200] { set_block_abs(w, 3, 3, z, 9, 1); }
-            set_block_abs(w, 40, 40, 33, 9, 1);
-            panic!("writer bug");
-        }).err().expect("the panic becomes an Err");
-        assert!(err.contains("Fill") && err.contains("writer bug"), "{err}");
-        assert!(ws.world.is_some(), "the world survived the panic");
-        assert!(world_bytes(&ws) == after_a, "exact rollback");
-        assert_eq!((ws.undo_stack.len(), ws.redo_stack.len()), (undo_len, redo_len), "history untouched");
-        assert_eq!(ws.dirty.seq, seq, "nothing marked dirty");
-        assert!(lamps_match_a_rebuild(&ws));
-
-        // A panic before any write is just as harmless.
-        assert!(with_edit(&mut ws, "Early", (0, 0, 47, 47), |_| panic!("early")).is_err());
-        assert!(world_bytes(&ws) == after_a);
-
-        // The history still lines up with the bytes in both directions.
-        redo_edit_inner(&mut ws).expect("redo B");
-        undo_edit_inner(&mut ws).expect("undo B");
-        assert!(world_bytes(&ws) == after_a);
-        undo_edit_inner(&mut ws).expect("undo A");
-        assert!(world_bytes(&ws) == base, "undo after the panic restores the original bytes");
-    }
-
-    /// 29.9b — a panic halfway through an undo (injected after the first restored chunk) keeps the
-    /// half-restored world. Both stacks are cleared (no delta describes these bytes any more), every
-    /// chunk the entry named is marked dirty, and a fresh edit's undo is exact against the bytes.
-    #[test]
-    fn test_undo_panic_keeps_world_and_clears_history() {
-        let mut ws = cow_ws(16);
-        let base = world_bytes(&ws);
-        // One entry spanning three chunks, placing lamps (72) so the lamp index has work to do.
-        with_edit(&mut ws, "Spread", (0, 0, 47, 47), |w| {
-            set_block_abs(w, 3, 3, 100, 72, 0);
-            set_block_abs(w, 20, 20, 100, 72, 0);
-            set_block_abs(w, 40, 40, 100, 72, 0);
-            Ok(())
-        }).expect("edit");
-        let after = world_bytes(&ws);
-        assert_eq!(ws.undo_stack.back().unwrap().chunks.len(), 3);
-        ws.dirty.since_disk.clear();
-
-        RESTORE_PANIC_AFTER.with(|c| c.set(Some(1)));
-        let err = undo_edit_inner(&mut ws).err().expect("the panic becomes an Err");
-        assert!(err.contains("Undo") && err.contains("injected restore panic"), "{err}");
-        let half = world_bytes(&ws);
-        assert!(half != base && half != after, "a genuine half-restore");
-        assert!(ws.undo_stack.is_empty() && ws.redo_stack.is_empty(), "both stacks cleared");
-        assert_eq!((ws.undo_bytes, ws.redo_bytes, ws.undo_groups, ws.redo_groups), (0, 0, 0, 0));
-        assert_eq!(dirty_chunks(&ws).len(), 3, "every chunk the entry named is dirty");
-        assert!(ws.lamp_index.snapshot().is_empty(), "the lamp index was cleared (rebuilt lazily), not left stale");
-        assert!(undo_edit_inner(&mut ws).is_err() && redo_edit_inner(&mut ws).is_err());
-
-        // Editing goes on normally from the half-restored bytes.
-        with_edit(&mut ws, "Next", (0, 0, 47, 47), |w| { set_block_abs(w, 10, 10, 150, 9, 0); Ok(()) }).expect("edit");
-        undo_edit_inner(&mut ws).expect("undo");
-        assert!(world_bytes(&ws) == half);
-
-        // Redo has the same guard.
-        with_edit(&mut ws, "Again", (0, 0, 47, 47), |w| {
-            set_block_abs(w, 3, 3, 120, 9, 0);
-            set_block_abs(w, 40, 40, 120, 9, 0);
-            Ok(())
-        }).expect("edit");
-        undo_edit_inner(&mut ws).expect("undo");
-        RESTORE_PANIC_AFTER.with(|c| c.set(Some(1)));
-        let err = redo_edit_inner(&mut ws).err().expect("the panic becomes an Err");
-        assert!(err.contains("Redo"), "{err}");
-        assert!(ws.world.is_some() && ws.undo_stack.is_empty() && ws.redo_stack.is_empty());
-    }
-
-    /// B.6 test 4 — the `top_band_hint` trap. Warm a chunk's ceiling, raise a column far above it
-    /// inside one edit, and read the new top back *within the same edit* both through the view and
-    /// through `Deref` to the world. A stale ceiling would report the new blocks as air.
-    #[test]
-    fn test_cow_hint_covers_writes_inside_the_edit() {
-        let mut ws = cow_ws(16);
-        let warmed = ws.world.as_ref().unwrap().top_band_hint(1, 1);
-        assert!(warmed < 10, "fixture terrain must sit well below band 12 (got {warmed})");
-        with_edit(&mut ws, "tower", (16, 16, 31, 31), |w| {
-            set_block_abs(w, 20, 20, 200, 1, 0); // band 12
-            assert_eq!(surface_z(w, 20, 20), Some(200), "through the view");
-            let world: &LoadedWorld = w;
-            assert_eq!(surface_z(world, 20, 20), Some(200), "through Deref to the world");
-            assert_eq!(read_block_abs(world, 20, 20, 200), 1);
-            Ok(())
-        }).expect("edit");
-        let w = ws.world.as_ref().unwrap();
-        assert_eq!(surface_z(w, 20, 20), Some(200), "and after the edit");
-        assert!(w.top_band_hint(1, 1) >= 12);
-    }
-
-    /// B.6 test 5 — compare-before-write: an edit that rewrites every cell to its current value
-    /// captures nothing, keeps no undo entry and marks nothing dirty.
-    #[test]
-    fn test_cow_no_op_edits_capture_nothing() {
-        let mut ws = cow_ws(16);
-        let before = world_bytes(&ws);
-        // Delete over pure air (everything above the terrain).
-        let r = with_edit(&mut ws, "delete air", (0, 0, 47, 47), |w| {
-            delete_blocks_inner(w, 0, 0, 47, 47, 100, 255, None); Ok(())
-        }).expect("air delete");
-        assert!(!r.undo_dropped);
-        // Replace grass with itself, and re-paint a block with its own paint.
-        with_edit(&mut ws, "replace same", (0, 0, 47, 47), |w| {
-            replace_blocks_inner(w, 0, 0, 47, 47, 0, 255, 2, 0, Some(2), Some(0), false, None);
-            let z = surface_z(w, 5, 5).unwrap();
-            let (bt, pt) = get_block_at(w, 5, 5, z);
-            set_block_abs(w, 5, 5, z, bt, pt);
-            Ok(())
-        }).expect("replace same");
-        assert!(world_bytes(&ws) == before);
-        assert!(ws.undo_stack.is_empty(), "no-op edits keep no undo entry");
-        assert!(dirty_chunks(&ws).is_empty(), "…and mark nothing dirty");
-
-        // And the capture itself is empty (not merely diffed away afterwards).
-        let mut world = ws.world.take().unwrap();
-        let mut view = EditView::unbounded(&mut world);
-        delete_blocks_inner(&mut view, 0, 0, 47, 47, 100, 255, None);
-        replace_blocks_inner(&mut view, 0, 0, 47, 47, 0, 255, 2, 0, Some(2), Some(0), false, None);
-        write_column_bulk(&mut view, 7, 7, 120, 16, &[0; 16], &[0; 16]);
-        assert_eq!(view.into_capture().captured, 0, "no band may be captured by a no-op write");
-    }
-
-    /// 18.12 hot-path budget (plan B.7): ⌘A replace on a 64z world, snapshot oracle vs copy-on-write.
-    /// Reports only — `cargo test -p eden-world-editor bench_cow -- --ignored --nocapture`.
-    #[test]
-    #[ignore]
-    fn bench_cow_select_all_replace() {
-        let bytes = make_bumpy_world_grid(32, 3, |x, y| 10 + (x + y) % 30);
-        let run = |oracle: bool| {
-            let mut best = f64::MAX;
-            for _ in 0..5 {
-                let mut ws = ws_with(bytes.clone());
-                let edit = |w: &mut EditView| {
-                    replace_blocks_inner(w, 0, 0, 511, 511, 0, 63, 7, 0, Some(3), None, false, None); Ok(())
-                };
-                let t = std::time::Instant::now();
-                if oracle {
-                    with_edit_inner_oracle(&mut ws, "r", (0, 0, 511, 511), (0, 0, 511, 511), None, edit).unwrap();
-                } else {
-                    with_edit(&mut ws, "r", (0, 0, 511, 511), edit).unwrap();
-                }
-                best = best.min(t.elapsed().as_secs_f64() * 1000.0);
-            }
-            best
-        };
-        let (o, c) = (run(true), run(false));
-        eprintln!("[bench] ⌘A replace 64z 32×32 chunks: oracle {o:.1} ms, cow {c:.1} ms ({:+.0} %)", (c / o - 1.0) * 100.0);
-    }
-
-    #[test]
-    fn test_scatter_placements_are_seeded() {
-        let placements = scatter_placements(0, 0, 200, 200, 5, 42);
-        assert_eq!(placements, scatter_placements(0, 0, 200, 200, 5, 42), "seeded and repeatable");
-        assert_eq!(placements.len(), 5);
-        assert!(placements.iter().all(|&(x, y)| (0..200).contains(&x) && (0..200).contains(&y)));
-        // seed 0 maps to the fixed fallback stream, same as the edit used
-        assert_eq!(scatter_placements(0, 0, 9, 9, 3, 0).len(), 3);
-    }
-
-    #[test]
-    fn test_scatter_and_array_edits_undo_exactly() {
-        let mut ws = ws_with(make_grid_world(4));
-        let before = world_bytes(&ws);
-        let (w, h, d, za) = (3, 3, 2, 1);
-        let bt = vec![13u8; (w * h * d) as usize];
-        let pt = vec![4u8; (w * h * d) as usize];
-        let spots = vec![(5, 5), (30, 14), (50, 50)]; // (30,14): footprint spans chunk seam x 30..32
-        with_edit(&mut ws, "scatter", (0, 0, 63, 63), |world| {
-            let mz = world_max_z(world);
-            for &(px, py) in &spots {
-                paste_clipboard_at(world, px, py, &bt, &pt, w, h, d, za, 0, false, mz, None);
-            }
-            Ok(())
-        }).expect("scatter");
-        let world = ws.world.as_ref().unwrap();
-        for &(px, py) in &spots {
-            assert_eq!(read_block_abs(world, px + 2, py + 2, za + 1), 13, "pasted at {px},{py}");
-        }
-        assert_eq!(read_block_abs(world, 32, 14, za), 13, "seam-straddling cell landed in the neighbour chunk");
-        undo_edit_inner(&mut ws).expect("undo");
-        assert_eq!(world_bytes(&ws), before, "every chunk the paste touched was captured");
-    }
-
-    #[test]
-    fn test_terrain_paste_across_surface_heights_undoes() {
-        // Two 16x16 chunks side by side; chunk (1,0) terrain sits at z=20, chunk (0,0) at z=1.
-        let mut bytes = make_grid_world(2);
-        for lx in 0..16usize { for ly in 0..16usize {
-            let off = HEADER + 32768 * 1; // chunk (1,0) is slot 1
-            bytes[off + lx * 256 + ly * 16 + 4] = 2; // z=4 solid
-            bytes[off + 8192 + lx * 256 + ly * 16 + 4] = 2; // z=20 solid
-        }}
-        let mut ws = ws_with(bytes);
-        let before = world_bytes(&ws);
-        let lo = surface_z(ws.world.as_ref().unwrap(), 10, 2).unwrap() + 1;
-
-        let cb = Clipboard { width: 12, height: 2, depth: 3, z_anchor: 0,
-            block_types: vec![13u8; 72], paints: vec![0u8; 72], mask: None, origin: None };
-        ws.clipboard = Some(cb);
-        paste_terrain_inner(&mut ws, 10, 2, 0, false, true).expect("terrain paste");
-        assert_eq!(ws.undo_stack.len(), 1);
-        assert_eq!(read_block_abs(ws.world.as_ref().unwrap(), 10, 2, lo), 13);
-        undo_edit_inner(&mut ws).expect("undo");
-        assert_eq!(world_bytes(&ws), before);
-    }
-
-    /// Placing more doors than `RISKY_BLOCK_GROUPS`' threshold in one edit footprint surfaces a
-    /// warning (the ComBlock crash writeup); staying under it stays silent, and a different block
-    /// type entirely never warns.
-    #[test]
-    fn test_risky_block_density_warns_on_dense_doors() {
-        let mut ws = ws_with(make_test_world());
-        let rect = (0, 0, 15, 15);
-
-        let door_threshold = RISKY_BLOCK_GROUPS.iter().find(|g| g.name == "doors").unwrap().threshold;
-        let over = (door_threshold + 1) as i32;
-
-        let r = with_edit(&mut ws, "dense doors", rect, |w| {
-            for i in 0..over { set_block_abs(w, i % 16, i / 16, 0, 66, 0); }
-            Ok(())
-        }).expect("edit applies");
-        assert!(r.warnings.iter().any(|w| w.contains("doors")),
-                "placing {over} doors in one footprint must warn");
-
-        let r = with_edit(&mut ws, "sparse doors", rect, |w| {
-            set_block_abs(w, 0, 0, 1, 66, 0);
-            Ok(())
-        }).expect("edit applies");
-        assert!(r.warnings.is_empty(), "a single door must not warn");
-
-        let r = with_edit(&mut ws, "dense non-risky", rect, |w| {
-            for i in 0..over { set_block_abs(w, i % 16, i / 16, 2, 2, 0); } // plain Stone
-            Ok(())
-        }).expect("edit applies");
-        assert!(r.warnings.is_empty(), "a dense placement of a non-risky block type must not warn");
-    }
-
-    /// Doors are placed as two physical blocks — a directional base plus a `DoorTop` one z above it
-    /// (`paint_blocks`'s auto-pairing; paste/gen copy both halves too). The "doors" group only sums
-    /// the base types (66–69), so the density check counts real door objects, not doubled block
-    /// cells. Before this fix the group summed base+top together, so `threshold` real doors reported
-    /// as `2×threshold` and warned at half the intended door count.
-    #[test]
-    fn test_risky_block_density_counts_real_doors_not_paired_blocks() {
-        let door_threshold = RISKY_BLOCK_GROUPS.iter().find(|g| g.name == "doors").unwrap().threshold;
-        let rect = (0, 0, 15, 15);
-
-        let mut ws = ws_with(make_test_world());
-        let r = with_edit(&mut ws, "doors at threshold", rect, |w| {
-            for i in 0..door_threshold as i32 {
-                set_block_abs(w, i % 16, i / 16, 0, 66, 0); // base
-                set_block_abs(w, i % 16, i / 16, 1, 70, 0); // paired DoorTop
-            }
-            Ok(())
-        }).expect("edit applies");
-        assert!(r.warnings.is_empty(), "{door_threshold} real doors (base+paired top) must not warn");
-
-        let mut ws = ws_with(make_test_world());
-        let over = door_threshold as i32 + 1;
-        let r = with_edit(&mut ws, "doors over threshold", rect, |w| {
-            for i in 0..over {
-                set_block_abs(w, i % 16, i / 16, 0, 66, 0);
-                set_block_abs(w, i % 16, i / 16, 1, 70, 0);
-            }
-            Ok(())
-        }).expect("edit applies");
-        assert!(r.warnings.iter().any(|w| w.contains(&format!("{over} doors"))),
-                "must report the real door count ({over}), not doubled by the paired top blocks: {:?}",
-                r.warnings);
-    }
-
-    /// Regression for the `Full`/`FullZ` dense-delta branch of `count_new_block_types`: it must only
-    /// tally cells that actually changed, not every cell in the captured pre-edit span. A `Full`
-    /// delta captures the *whole* chunk once enough of it differs (`diff_span`'s 20% rule) — before
-    /// this fix, any edit that pushed a chunk's delta into `Full` form swept every pre-existing block
-    /// in that chunk into the "just placed" tally, including risky blocks the edit never touched.
-    #[test]
-    fn test_dense_delta_only_counts_changed_cells_not_whole_span() {
-        let mut world = parse_world_inner(mmap_from_bytes(make_test_world())).expect("parse failed");
-
-        // Pre-existing doors from an earlier, unrelated edit — well above the "doors" threshold on
-        // their own, but not part of the edit under test.
-        for i in 0..200i32 {
-            set_block_abs(&mut world, i % 16, i / 16, 0, 66, 0);
-        }
-        let pre_full = snapshot_chunks_full(&world, &[(0, 0)], None);
-
-        // An unrelated large edit in a disjoint z-range — fill enough of the chunk with Stone to
-        // force a Full/dense delta (> 20% of the 32768-byte chunk, i.e. > 6553 changed bytes).
-        for z in 16..48i32 {
-            for x in 0..16i32 {
-                for y in 0..16i32 {
-                    set_block_abs(&mut world, x, y, z, 2, 0); // Stone
-                }
-            }
-        }
-        let snap = diff_chunk(&world, 0, 0, pre_full[0].2, &pre_full[0].3).expect("dense change diffs");
-        assert!(matches!(snap.delta, ChunkDelta::Full(..)), "edit must have produced a Full delta");
-
-        let counts = count_new_block_types(&world, std::slice::from_ref(&snap));
-        assert_eq!(counts[66], 0, "pre-existing, untouched doors must not be tallied as newly placed");
-        assert!(risky_block_warnings(&counts).is_empty(),
-                "a Stone fill must never warn about doors it never touched");
-    }
-
-    /// 13.2 — with relief on, an edited column changes the shade of the samples one LOD step east
-    /// and south of it, so `edit_patch` must grow its rect there. The patch has to match a fresh
-    /// full render over that grown rect, pixel for pixel, at every LOD — otherwise an edit leaves a
-    /// stale-shaded seam beside it until the tile is refetched.
-    #[test]
-    fn test_relief_edit_patch_covers_east_and_south_neighbours() {
-        let mut b = make_test_world();
-        let at = |lx: usize, ly: usize, z: usize| 4096 + (z / 16) * 8192 + lx * 256 + ly * 16 + z % 16;
-        for lx in 0..16 { for ly in 0..16 { for z in 0..=4 { b[at(lx, ly, z)] = 1; } } }
-        for z in 5..=12 { b[at(6, 6, z)] = 1; } // the "edited" column, much higher than its neighbours
-        let world = parse_world_inner(mmap_from_bytes(b)).expect("parse failed");
-        let relief = MapStyle { cap: None, relief: Some(100) };
-
-        for (lod, rect) in [(1u32, (6, 6, 6, 6)), (2, (6, 6, 6, 6)), (4, (4, 4, 7, 7))] {
-            let (p, invalidated) = edit_patch(&world, rect, relief, lod);
-            assert!(!invalidated);
-            let full = render_pixels_patch_styled(&world, 0, 0, 15, 15, relief, lod);
-            // Grown by one step east and south of the (lod-floored) edit rect.
-            let fx = (rect.0 as u32 / lod) * lod;
-            assert_eq!(p.x, fx, "lod {lod}");
-            assert_eq!(p.width, (rect.2 as u32 + lod - fx) / lod + 1, "lod {lod}");
-            assert_eq!(p.height, (rect.3 as u32 + lod - fx) / lod + 1, "lod {lod}");
-            for oy in 0..p.height {
-                for ox in 0..p.width {
-                    let po = ((oy * p.width + ox) * 4) as usize;
-                    let fo = (((p.y / lod + oy) * full.width + p.x / lod + ox) * 4) as usize;
-                    assert_eq!(&p.pixels[po..po + 4], &full.pixels[fo..fo + 4], "lod {lod} ({ox},{oy})");
-                }
-            }
-        }
-        // …and the grown column really is shaded by the edit: the sample east of the column sits
-        // in its shadow, so it differs from the plain render.
-        let plain = render_pixels_patch_styled(&world, 7, 6, 7, 6, MapStyle::default(), 1);
-        let shaded = render_pixels_patch_styled(&world, 7, 6, 7, 6, relief, 1);
-        assert_ne!(plain.pixels, shaded.pixels);
-        // Relief off: no growth — the pre-13.2 rect exactly.
-        let (p, _) = edit_patch(&world, (6, 6, 6, 6), MapStyle::default(), 1);
-        assert_eq!((p.width, p.height), (1, 1));
-    }
-
-    /// C2 — an edit patch larger than `MAX_EDIT_PATCH_PIXELS` ships as an `invalidate` rect with no
-    /// pixels at all, instead of the 243 MB RGBA buffer a ⌘A fill used to build.
-    #[test]
-    fn test_edit_patch_caps_oversized_rect() {
-        let world = parse_world_inner(mmap_from_bytes(make_test_world())).expect("parse failed");
-        // A rect far larger than the cap. `edit_patch` clamps to the world first, so ask it
-        // directly with the cap lowered by raising the LOD instead: at lod 1 this 1-chunk world
-        // can't produce an oversized patch, so drive the arithmetic through the helper's own guard.
-        let (small, invalidated) = edit_patch(&world, (0, 0, 15, 15), MapStyle::default(), 1);
-        assert!(!invalidated && !small.pixels.is_empty(), "a 16×16 patch is nowhere near the cap");
-        assert_eq!((small.width, small.height, small.lod), (16, 16, 1));
-
-        // Same rect against a cap it *does* exceed (a fixture large enough to reach the real
-        // 2 M-pixel ceiling would be a 260 MB world, hence the parameterised cap).
-        let (big, invalidated) = edit_patch_capped(&world, (0, 0, 15, 15), MapStyle::default(), 1, 100);
-        assert!(invalidated, "a patch past the cap must ask the frontend to refetch instead");
-        assert!(big.pixels.is_empty(), "an invalidate patch must carry no pixels at all");
-        assert_eq!((big.x, big.y, big.width, big.height, big.lod), (0, 0, 16, 16, 1),
-                   "…but must still describe the rect to refetch");
-    }
-
-    /// C2/M3 — the patch origin is floored to a multiple of `lod` so the patch point-samples the
-    /// same block grid the LOD tiles do; a patch half a step out of phase cannot be blitted onto
-    /// them. Dimensions must also describe *sampled* pixels, not world blocks.
-    #[test]
-    fn test_edit_patch_lod_aligns_origin_and_samples() {
-        let world = parse_world_inner(mmap_from_bytes(make_test_world())).expect("parse failed");
-        let (p, invalidated) = edit_patch(&world, (5, 6, 12, 12), MapStyle::default(), 4);
-        assert!(!invalidated);
-        assert_eq!((p.x, p.y), (4, 4), "origin must floor to the LOD grid");
-        assert_eq!(p.lod, 4);
-        assert_eq!((p.width, p.height), (3, 3), "(12-4)/4 + 1 sampled pixels per axis");
-        assert_eq!(p.pixels.len(), 3 * 3 * 4);
-        // Same pixels a full-resolution render would show at those sampled coordinates.
-        let full = render_pixels_patch(&world, 4, 4, 12, 12, None);
-        for (oy, ox) in [(0usize, 0usize), (1, 2), (2, 1)] {
-            let a = ((oy * 3) + ox) * 4;
-            let b = (((oy * 4) * 9) + ox * 4) * 4;
-            assert_eq!(&p.pixels[a..a + 4], &full.pixels[b..b + 4], "sample ({ox},{oy}) must match the full render");
-        }
-    }
-
-    /// C3 — the writers stream chunk bytes from the mmap now, so the zero-padding a short-span
-    /// chunk used to get from `Vec::resize` has to come from `write_chunk_padded` instead. Both
-    /// directions matter: a short span pads up to `chunk_size`, and an over-long one (a chunk whose
-    /// successor starts further away than `chunk_size`) truncates rather than desyncing every
-    /// offset after it.
-    #[test]
-    fn test_write_chunk_padded_pads_and_truncates() {
-        let mut out = Vec::new();
-        write_chunk_padded(&mut out, &[1, 2, 3], 10).expect("write");
-        assert_eq!(out, vec![1, 2, 3, 0, 0, 0, 0, 0, 0, 0], "a short span pads out to chunk_size");
-
-        let mut out = Vec::new();
-        write_chunk_padded(&mut out, &[9u8; 20], 8).expect("write");
-        assert_eq!(out, vec![9u8; 8], "an over-long span is clipped to chunk_size");
-
-        // The padding loop steps by an 8 KB zero block; a chunk-sized pad must still be exact.
-        let mut out = Vec::new();
-        write_chunk_padded(&mut out, &[], 32768).expect("write");
-        assert_eq!(out.len(), 32768);
-        assert!(out.iter().all(|&b| b == 0));
-    }
-
-    /// The `(coords, src)` pair `materialize_flat_chunks_inner` now takes (audit C3) — sorted chunk
-    /// coordinates plus a closure borrowing each one's bytes straight out of the world's mapping.
-    fn materialize_src<'a>(world: &'a LoadedWorld) -> (Vec<(i32, i32)>, impl Fn(i32, i32) -> Option<&'a [u8]> + 'a) {
-        let mut coords: Vec<(i32, i32)> = world.chunk_map.keys().copied()
-            .filter(|&(cx, cy)| world.chunk_range(cx, cy).is_some())
-            .collect();
-        coords.sort_unstable();
-        (coords, move |cx, cy| world.chunk_range(cx, cy).map(|(off, cend)| &world.bytes[off..cend]))
-    }
-
-    /// Names a delta's variant for assertion messages (the enum isn't `Debug`).
-    fn delta_kind(d: &ChunkDelta) -> String {
-        match d {
-            ChunkDelta::Sparse(v) => format!("Sparse({} entries)", v.len()),
-            ChunkDelta::Full(_, b) => format!("Full({} bytes)", b.len()),
-            ChunkDelta::FullZ(_, z, raw) => format!("FullZ({} bytes, raw {raw})", z.len()),
-            ChunkDelta::SparseZ(z, n) => format!("SparseZ({} bytes, {n} entries)", z.len()),
-        }
-    }
-
-    /// Delta-undo round trip (D4): `diff_chunk` must pick `Sparse` for a single-byte edit and
-    /// `Full` for a dense one, and `restore_and_invert` must be exactly invertible in both cases
-    /// — including toggling undo→redo→undo again, not just a single pass.
-    #[test]
-    fn test_delta_undo_round_trip() {
-        let mut world = parse_world_inner(mmap_from_bytes(make_test_world())).expect("parse failed");
-        let target = blk(3, 5, 0);
-
-        // ── Sparse case: mutate exactly one byte of a 32 KB chunk ──────────────────────────
-        let pre_full = snapshot_chunks_full(&world, &[(0, 0)], None);
-        let original_val = world.bytes[target];
-        world.bytes[target] = 99;
-
-        let snap = diff_chunk(&world, 0, 0, pre_full[0].2, &pre_full[0].3).expect("changed chunk must diff to Some");
-        match &snap.delta {
-            ChunkDelta::Sparse(pairs) => assert_eq!(pairs.len(), 1, "single-byte edit must diff to one sparse entry"),
-            other => panic!("single-byte edit should not fall back to Full/FullZ: {}", delta_kind(other)),
-        }
-
-        let entry = UndoEntry::new("test", vec![snap], None);
-        let redo_chunks = restore_and_invert(&mut world, &entry);
-        assert_eq!(world.bytes[target], original_val, "undo must restore the original byte");
-
-        let redo_entry = UndoEntry::new("test", redo_chunks, None);
-        let undo_again_chunks = restore_and_invert(&mut world, &redo_entry);
-        assert_eq!(world.bytes[target], 99, "redo must restore the edited byte");
-
-        restore_and_invert(&mut world, &UndoEntry::new("test", undo_again_chunks, None));
-        assert_eq!(world.bytes[target], original_val, "second undo must restore the original byte again");
-
-        // ── Dense case: overwrite the whole file so diff_chunk falls back to Full ──────────
-        let pre_full2 = snapshot_chunks_full(&world, &[(0, 0)], None);
-        for b in world.bytes.iter_mut() { *b = 0xAB; }
-        let snap2 = diff_chunk(&world, 0, 0, pre_full2[0].2, &pre_full2[0].3).expect("dense change must diff to Some");
-        match &snap2.delta {
-            ChunkDelta::Full(_, _) => {}
-            // `diff_chunk` never compresses — `UndoEntry::new` does, on the way onto a stack.
-            other => panic!("dense edit should fall back to Full, got {}", delta_kind(other)),
-        }
-        restore_and_invert(&mut world, &UndoEntry::new("test", vec![snap2], None));
-        assert_eq!(&world.bytes[HEADER..HEADER + 32768], &pre_full2[0].3[..],
-            "Full-delta undo must restore the whole chunk");
-    }
-
-    /// 18.5 — pack/unpack is exact, including unsorted and large-gap offsets.
-    #[test]
-    fn test_sparse_pack_round_trip() {
-        let pairs: Vec<(u32, u8)> = vec![(0, 1), (5, 2), (4, 3), (131_071, 255), (70_000, 0), (70_001, 9)];
-        let z = pack_sparse(&pairs).unwrap();
-        assert_eq!(unpack_sparse(&z, pairs.len() as u32).unwrap(), pairs);
-        assert!(unpack_sparse(&z, 1000).is_none(), "wrong count must fail, not panic");
-        assert_eq!(unpack_sparse(&pack_sparse(&[]).unwrap(), 0).unwrap(), vec![]);
-    }
-
-    /// 18.5 — a ~15% sparse edit is stored as `SparseZ` well under its old 8 B/entry price, the byte
-    /// accounting matches the real payload, and undo/redo/undo round-trips exactly. A tiny edit
-    /// stays plain `Sparse` (packing wouldn't pay for itself).
-    #[test]
-    fn test_sparse_delta_compresses_and_round_trips() {
-        let mut world = parse_world_inner(mmap_from_bytes(make_test_world())).expect("parse failed");
-        let pre_full = snapshot_chunks_full(&world, &[(0, 0)], None);
-        let orig: Vec<u8> = world.bytes[HEADER..HEADER + 32768].to_vec();
-        let mut changed = 0usize;
-        for i in (0..32768).step_by(7) {
-            world.bytes[HEADER + i] = world.bytes[HEADER + i].wrapping_add(1);
-            changed += 1;
-        }
-        let edited: Vec<u8> = world.bytes[HEADER..HEADER + 32768].to_vec();
-        let snap = diff_chunk(&world, 0, 0, pre_full[0].2, &pre_full[0].3).unwrap();
-        assert!(matches!(snap.delta, ChunkDelta::Sparse(ref p) if p.len() == changed),
-            "~14% edit must be Sparse pre-push, got {}", delta_kind(&snap.delta));
-        let old_cost = changed * 8;
-        let entry = UndoEntry::new("t", vec![snap], None);
-        match &entry.chunks[0].delta {
-            ChunkDelta::SparseZ(z, n) => {
-                assert_eq!(*n as usize, changed);
-                assert!(entry.bytes == z.capacity() + 40 && entry.bytes < old_cost / 2,
-                    "SparseZ must be honestly priced and far below 8 B/entry: {} vs {old_cost}", entry.bytes);
-            }
-            other => panic!("expected SparseZ, got {}", delta_kind(other)),
-        }
-        let redo = restore_and_invert(&mut world, &entry);
-        assert_eq!(&world.bytes[HEADER..HEADER + 32768], &orig[..], "undo restores original");
-        let redo_entry = UndoEntry::new("t", redo, None);
-        let undo2 = restore_and_invert(&mut world, &redo_entry);
-        assert_eq!(&world.bytes[HEADER..HEADER + 32768], &edited[..], "redo restores edit");
-        restore_and_invert(&mut world, &UndoEntry::new("t", undo2, None));
-        assert_eq!(&world.bytes[HEADER..HEADER + 32768], &orig[..], "second undo restores original");
-
-        // Tiny edit stays plain Sparse.
-        let one = ChunkDelta::Sparse(vec![(3, 7)]).compressed();
-        assert!(matches!(one, ChunkDelta::Sparse(_)), "1-entry delta must not be packed: {}", delta_kind(&one));
-    }
-
-    /// H1 (3D fly-view build-gesture audit) — `paint_blocks` accepts a `group: Option<u64>` routed
-    /// through `with_edit_grouped`, so a run of stamps sharing one gesture id collapses to a single
-    /// logical undo unit: `count_undo_groups` reports 1, and one `undo_edit` reverts every stamp.
-    /// `paint_blocks` itself takes a `tauri::State` the test build has no harness to construct (see
-    /// `test_flood_fill_accepts_new_block_types`'s comment on the same limitation), so this exercises
-    /// `with_edit_grouped` directly with the same one-block-per-call shape paint_blocks uses.
-    #[test]
-    fn test_paint_blocks_group_collapses_undo() {
-        let mut ws = ws_with(make_bumpy_world_grid(1, 8, |_, _| 20));
-        let group = Some(42u64);
-        for i in 0..5 {
-            let (x, y) = (i, 0);
-            with_edit_grouped(&mut ws, "Paint 1 block", (x, y, x, y), group, |world| {
-                set_block_abs(world, x, y, 21, 2, 0);
-                Ok(())
-            }).expect("grouped stamp");
-        }
-        assert_eq!(count_undo_groups(&ws.undo_stack), 1, "5 same-group stamps must collapse to one undo unit");
-        assert_eq!(ws.undo_stack.len(), 5, "the stack itself still holds one entry per stamp");
-
-        undo_edit_inner(&mut ws).expect("undo the whole gesture");
-        assert!(ws.undo_stack.is_empty(), "one undo must pop every entry in the group");
-        let world = ws.world.as_ref().unwrap();
-        for i in 0..5 {
-            assert_eq!(read_block_abs(world, i, 0, 21), 0, "stamp {i} must be reverted");
-        }
-    }
-
-    /// Sibling of the above: `group: None` (every non-build `paint_blocks` caller) must be unaffected
-    /// — each call is still its own undo entry, no regression for the 2D draw/fill/slice paths.
-    #[test]
-    fn test_paint_blocks_ungrouped_unchanged() {
-        let mut ws = ws_with(make_bumpy_world_grid(1, 8, |_, _| 20));
-        for i in 0..5 {
-            let (x, y) = (i, 0);
-            with_edit_grouped(&mut ws, "Paint 1 block", (x, y, x, y), None, |world| {
-                set_block_abs(world, x, y, 21, 2, 0);
-                Ok(())
-            }).expect("ungrouped stamp");
-        }
-        assert_eq!(count_undo_groups(&ws.undo_stack), 5, "ungrouped stamps must not coalesce");
-        assert_eq!(ws.undo_stack.len(), 5);
-
-        undo_edit_inner(&mut ws).expect("undo one entry");
-        assert_eq!(ws.undo_stack.len(), 4, "an ungrouped undo must pop exactly one entry");
-        let world = ws.world.as_ref().unwrap();
-        assert_eq!(read_block_abs(world, 4, 0, 21), 0, "only the last stamp is reverted");
-        assert_eq!(read_block_abs(world, 0, 0, 21), 2, "earlier stamps are untouched");
-    }
-
-    /// §1a — a fresh edit after an undo must reset `redo_bytes` to 0, not just clear `redo_stack`.
-    /// Before the fix, `ws.clear_redo()` didn't exist and `with_edit_inner` only cleared the
-    /// stack, leaving the byte counter stale for the rest of the session.
-    #[test]
-    fn test_redo_bytes_reset_on_new_edit() {
-        let mut ws = ws_with(make_bumpy_world_grid(1, 8, |_, _| 20));
-        with_edit(&mut ws, "delete", (0, 0, 5, 5), |world| {
-            delete_blocks_inner(world, 0, 0, 5, 5, 0, 63, None);
-            Ok(())
-        }).expect("edit 1");
-        undo_edit_inner(&mut ws).expect("undo");
-        assert!(ws.redo_bytes > 0, "undo must have populated the redo stack's byte total");
-
-        with_edit(&mut ws, "delete", (0, 0, 3, 3), |world| {
-            delete_blocks_inner(world, 0, 0, 3, 3, 0, 63, None);
-            Ok(())
-        }).expect("edit 2");
-        assert_eq!(ws.redo_bytes, 0, "a new edit must reset redo_bytes, not just clear redo_stack");
-        assert!(ws.redo_stack.is_empty());
-    }
-
-    /// §1c — lowering the undo budget via `set_undo_budget` must immediately re-trim both stacks
-    /// to fit, and the cached byte totals must match a fresh re-sum (no drift from the eviction).
-    #[test]
-    fn test_undo_budget_trims_on_lower() {
-        let mut ws = ws_with(make_bumpy_world_grid(1, 8, |_, _| 20));
-        // Many small, distinct edits so the stack has several evictable entries.
-        for i in 0..40 {
-            let z = (i % 20) as i32;
-            with_edit(&mut ws, "raise", (0, 0, 15, 15), |world| {
-                set_block_abs(world, i % 16, (i / 16) % 16, z, 2, 0);
-                Ok(())
-            }).expect("edit");
-        }
-        assert!(ws.undo_stack.len() > 1, "need multiple entries for trimming to be observable");
-
-        let low_budget = 64usize; // far below any real entry — trim_stack's len()>1 floor kicks in
-        trim_stack(&mut ws.undo_stack, &mut ws.undo_bytes, &mut ws.undo_groups, low_budget);
-        ws.undo_budget = low_budget;
-
-        let resummed: usize = ws.undo_stack.iter().map(|e| e.bytes).sum();
-        assert_eq!(ws.undo_bytes, resummed, "cached total must match a fresh re-sum after trimming");
-        assert_eq!(ws.undo_stack.len(), 1, "trims down to the len()>1 floor when every entry alone exceeds budget");
-    }
-
-    /// Phase 4.2 — `WorldState::undo_groups`/`redo_groups` are maintained incrementally by
-    /// `push_undo`/`pop_undo`/`trim_stack`, so they must agree with the `count_undo_groups` walk
-    /// after *every* shape of stack mutation, not just the easy ones. Same idiom as
-    /// `test_snapshot_bytes_matches_real_capacity`: assert the cache against a fresh recomputation.
-    ///
-    /// The sequence deliberately mixes the cases the incremental rule can get almost right:
-    /// two different groups back to back, an ungrouped edit splitting one group id into two
-    /// non-adjacent runs (which must count as **two** units, not one), budget-driven front
-    /// eviction inside a group, and undo/redo moving whole groups between the stacks.
-    #[test]
-    fn test_cached_group_counts_match_the_oracle() {
-        let mut ws = ws_with(make_bumpy_world_grid(1, 8, |_, _| 20));
-        let mut n = 0i32;
-        let mut edit = |ws: &mut WorldState, group: Option<u64>, n: &mut i32| {
-            let (x, y, z) = (*n % 16, (*n / 16) % 16, 21 + *n % 8);
-            *n += 1;
-            with_edit_grouped(ws, "stamp", (x, y, x, y), group, |world| {
-                set_block_abs(world, x, y, z, 2, 0);
-                Ok(())
-            }).expect("edit");
-        };
-        let check = |ws: &WorldState, what: &str| {
-            assert_eq!(ws.undo_groups, count_undo_groups(&ws.undo_stack), "undo_groups after {what}");
-            assert_eq!(ws.redo_groups, count_undo_groups(&ws.redo_stack), "redo_groups after {what}");
-        };
-
-        // Group 1 (3 stamps) → group 2 (2 stamps) → ungrouped → group 1 again (2 stamps).
-        // The trailing run of group 1 is *not* contiguous with the first, so it's its own unit.
-        for _ in 0..3 { edit(&mut ws, Some(1), &mut n); }
-        check(&ws, "one group of 3");
-        assert_eq!(ws.undo_groups, 1);
-        for _ in 0..2 { edit(&mut ws, Some(2), &mut n); }
-        edit(&mut ws, None, &mut n);
-        for _ in 0..2 { edit(&mut ws, Some(1), &mut n); }
-        check(&ws, "mixed grouped/ungrouped pushes");
-        assert_eq!(ws.undo_groups, 4, "group1 | group2 | ungrouped | group1-again");
-        assert_eq!(ws.undo_stack.len(), 8, "the stack still holds one entry per stamp");
-
-        // Undo/redo move whole groups across the stacks, one logical unit at a time.
-        undo_edit_inner(&mut ws).expect("undo the trailing group-1 run");
-        check(&ws, "one undo");
-        assert_eq!((ws.undo_groups, ws.redo_groups), (3, 1));
-        undo_edit_inner(&mut ws).expect("undo the ungrouped edit");
-        check(&ws, "two undos");
-        assert_eq!((ws.undo_groups, ws.redo_groups), (2, 2));
-        redo_edit_inner(&mut ws).expect("redo");
-        check(&ws, "redo");
-        assert_eq!((ws.undo_groups, ws.redo_groups), (3, 1));
-
-        // A fresh edit clears redo — the counter must clear with the stack.
-        edit(&mut ws, None, &mut n);
-        check(&ws, "a new edit clearing redo");
-        assert_eq!(ws.redo_groups, 0);
-
-        // Budget-driven eviction from the *front*: entries leave oldest-first, so a group only
-        // stops counting once its last member is gone. Trim one entry at a time so the boundary
-        // case (evicting the first of a same-group pair) is actually exercised.
-        while ws.undo_stack.len() > 1 {
-            let budget = ws.undo_bytes - ws.undo_stack.front().unwrap().bytes;
-            trim_stack(&mut ws.undo_stack, &mut ws.undo_bytes, &mut ws.undo_groups, budget);
-            check(&ws, "an incremental front eviction");
-        }
-
-        ws.clear_undo();
-        ws.clear_redo();
-        check(&ws, "clear");
-        assert_eq!((ws.undo_groups, ws.redo_groups), (0, 0));
-    }
-
-    /// Phase 4.1, kept through 18.12 — a paint batch's undo must be exactly invertible for every
-    /// block it writes, including across a band boundary: a door base at z=31 (band 1, top lz) whose
-    /// auto-placed top lands at z=32 (band 2), plus a write in band 0 in the same edit. (Before
-    /// 18.12 a hand-derived z range scoped the snapshot and a too-narrow one failed silently; the
-    /// copy-on-write capture has no range to get wrong, and this pins that.)
-    #[test]
-    fn test_paint_z_scoped_undo_restores_writes_outside_the_base_band() {
-        let mut ws = ws_with(make_bumpy_world_grid(1, 8, |_, _| 20));
-        let before = world_bytes(&ws);
-
-        // Same write pattern `paint_blocks`' closure produces for a door batch, with the range it
-        // would have derived. z=4 exercises the low end (band 0) in the same edit.
-        let blocks = vec![
-            PaintBlock { x: 3, y: 5, z: Some(31) },
-            PaintBlock { x: 6, y: 2, z: Some(4) },
-        ];
-        with_edit_grouped(&mut ws, "Paint 2 blocks", (3, 2, 6, 5), Some(7), |world| {
-            for b in &blocks {
-                let z = b.z.unwrap();
-                set_block_abs(world, b.x, b.y, z, 66, 0);
-                set_block_abs(world, b.x, b.y, z + 1, 70, 0);
-            }
-            Ok(())
-        }).expect("z-scoped paint");
-
-        {
-            let world = ws.world.as_ref().unwrap();
-            assert_eq!(read_block_abs(world, 3, 5, 31), 66);
-            assert_eq!(read_block_abs(world, 3, 5, 32), 70, "the top block crosses into band 2");
-            assert_eq!(read_block_abs(world, 6, 2, 4), 66);
-            assert_eq!(read_block_abs(world, 6, 2, 5), 70);
-        }
-
-        undo_edit_inner(&mut ws).expect("undo");
-        assert_eq!(world_bytes(&ws), before,
-                   "undo must restore the world byte-for-byte — including the door top one band \
-                    above the highest block the batch was asked to place");
-    }
-
-    /// §1b — `chunk_snapshot_bytes` must report real heap capacity (post `shrink_to_fit`), not an
-    /// undercount based on `len()` alone: `(u32,u8)` is 8 bytes (align 4, padded), not 5.
-    #[test]
-    fn test_snapshot_bytes_matches_real_capacity() {
-        let mut world = parse_world_inner(mmap_from_bytes(make_test_world())).expect("parse failed");
-        let pre_full = snapshot_chunks_full(&world, &[(0, 0)], None);
-        world.bytes[blk(3, 5, 0)] = 99;
-        world.bytes[blk(7, 2, 10)] = 5;
-        let snap = diff_chunk(&world, 0, 0, pre_full[0].2, &pre_full[0].3).expect("must diff to Some");
-        match &snap.delta {
-            ChunkDelta::Sparse(pairs) => {
-                assert_eq!(pairs.capacity(), pairs.len(), "diff_chunk must shrink_to_fit before it's ever counted");
-                assert_eq!(chunk_snapshot_bytes(&snap), pairs.capacity() * 8 + 40);
-            }
-            other => panic!("two-byte edit should not fall back to Full/FullZ: {}", delta_kind(other)),
-        }
-    }
-
-    /// §5 — `TemplateSurfaceCache` must evict oldest entries once past `TEMPLATE_SURFACE_CACHE_LIMIT`,
-    /// keeping `map`/`order` in lockstep (no leftover key reachable via `get` after eviction).
-    #[test]
-    fn template_surface_cache_evicts_oldest_past_limit() {
-        let mut cache = TemplateSurfaceCache::default();
-        let n = TEMPLATE_SURFACE_CACHE_LIMIT + 100;
-        for i in 0..n {
-            cache.insert((i as i32, 0), Box::new([[0u8; 4]; 256]));
-        }
-        assert_eq!(cache.len(), TEMPLATE_SURFACE_CACHE_LIMIT, "must never exceed the bound");
-        assert!(!cache.contains_key(&(0, 0)), "oldest entries must be evicted first");
-        assert!(cache.contains_key(&((n - 1) as i32, 0)), "most recent entry must survive");
-        cache.clear();
-        assert_eq!(cache.len(), 0, "clear must empty both map and order");
-    }
-
-    /// Audit C2 Stage 1 — `DirtyState.since_disk` must equal the *actual* set of changed chunks
-    /// (+ header) after a scripted mix of edits, undo and redo. This is the test that catches a
-    /// missed hook site: if any of `with_edit_inner` / `undo_edit_inner` / `redo_edit_inner` /
-    /// the header writers forgot to call `mark_chunks`/`mark_header`, the ground-truth diff below
-    /// (computed independently, by comparing bytes) would disagree with `ws.dirty.since_disk`.
-    #[test]
-    fn test_dirty_set_matches_ground_truth() {
-        let original = make_bumpy_world_grid(2, 8, |_, _| 20); // 2×2 chunks: (0,0) (1,0) (0,1) (1,1)
-        let mut ws = ws_with(original.clone());
-
-        // Edit 1: delete a rect that only touches chunk (0,0) — grouped None (immediate undo entry).
-        with_edit(&mut ws, "delete", (0, 0, 5, 5), |world| {
-            delete_blocks_inner(world, 0, 0, 5, 5, 0, 63, None);
-            Ok(())
-        }).expect("delete chunk (0,0)");
-
-        // Edit 2: delete a rect spanning all four chunks.
-        with_edit(&mut ws, "delete", (0, 0, 31, 31), |world| {
-            delete_blocks_inner(world, 0, 0, 31, 31, 0, 63, None);
-            Ok(())
-        }).expect("delete all chunks");
-
-        // Undo the second delete — restores chunks (0,0),(1,0),(0,1),(1,1) again (all still "dirty"
-        // relative to the original on-disk image, since undo doesn't return them to the as-loaded
-        // bytes: chunk (0,0) is still missing edit 1's deletion).
-        undo_edit_inner(&mut ws).expect("undo");
-
-        // Redo it — re-deletes all four chunks.
-        redo_edit_inner(&mut ws).expect("redo");
-
-        // Header-only change: mirrors what set_spawn_pos does (write header bytes, mark dirty).
-        {
-            let world = ws.world.as_mut().unwrap();
-            write_spawn(world, 5.0, 5.0);
-        }
-        ws.dirty.mark_header();
-
-        // ── Ground truth: diff final bytes against the pristine as-loaded copy, chunk by chunk ──
-        let world = ws.world.as_ref().unwrap();
-        let mut expected_chunks: std::collections::HashSet<(i32, i32)> = std::collections::HashSet::new();
-        for (&(cx, cy), _) in world.chunk_map.iter() {
-            let (addr, end) = world.chunk_range(cx, cy).unwrap();
-            if world.bytes[addr..end] != original[addr..end] {
-                expected_chunks.insert((cx, cy));
-            }
-        }
-        let expected_header = world.bytes[0..192] != original[0..192];
-
-        let actual_chunks: std::collections::HashSet<(i32, i32)> =
-            ws.dirty.since_disk.keys().copied().collect();
-        assert_eq!(actual_chunks, expected_chunks,
-            "since_disk must equal the ground-truth changed-chunk set");
-        assert_eq!(ws.dirty.header_disk, expected_header,
-            "header_disk must equal the ground-truth header diff");
-        // Band level (18.13): every band whose bytes actually changed must be in the mask, in every
-        // set. (The mask may over-mark — a `Full` delta covers its lowest..highest band — but never
-        // under-mark: that is data loss.)
-        for set in [&ws.dirty.since_disk, &ws.dirty.since_journal, &ws.dirty.since_base, &ws.dirty.since_load] {
-            assert_bands_cover_diff(world, &original, set);
-        }
-
-        // since_journal and since_base track the same events in Stage 1 (nothing yet clears them
-        // independently), so they must agree with since_disk too.
-        let journal_chunks: std::collections::HashSet<(i32, i32)> =
-            ws.dirty.since_journal.keys().copied().collect();
-        let base_chunks: std::collections::HashSet<(i32, i32)> =
-            ws.dirty.since_base.keys().copied().collect();
-        assert_eq!(journal_chunks, expected_chunks);
-        assert_eq!(base_chunks, expected_chunks);
-        let load_chunks: std::collections::HashSet<(i32, i32)> =
-            ws.dirty.since_load.keys().copied().collect();
-        assert_eq!(load_chunks, expected_chunks);
-        assert_eq!(ws.dirty.header_journal, expected_header);
-        assert_eq!(ws.dirty.header_base, expected_header);
-        assert_eq!(ws.dirty.header_load, expected_header);
-    }
-
-    /// A `WorldState` wired up like a freshly-`load_world`'d one, with a real on-disk staged temp
-    /// (not just an anonymous mapping) — `autosave_world_inner` needs `temp_path` to point at an
-    /// actual file so it can `stage_copy` the autosave base from it.
-    fn ws_with_temp_path(bytes: Vec<u8>, temp_path: &std::path::Path) -> WorldState {
-        fs::write(temp_path, &bytes).expect("stage temp file for test");
-        let mut ws = ws_with(bytes);
-        ws.temp_path = Some(temp_path.to_path_buf());
-        ws
-    }
-
-    /// Like `ws_with_temp_path`, but wired up the way `load_world` actually does it: the temp is
-    /// mapped **MAP_SHARED** via `map_staged_temp`, so edits land in the temp file on disk.
-    ///
-    /// `ws_with_temp_path` writes the temp with `fs::write` and builds the world from `map_anon`,
-    /// which decouples the two by construction — it structurally cannot observe the "the autosave
-    /// base is cloned from a temp that edits are actively mutating" hazard. Only this helper can.
-    fn ws_with_shared_temp(bytes: Vec<u8>, temp_path: &std::path::Path) -> WorldState {
-        fs::write(temp_path, &bytes).expect("stage temp file for test");
-        let mmap = map_staged_temp(temp_path).expect("map staged temp");
-        let mut ws = WorldState::new();
-        ws.world = Some(parse_world_inner(mmap).expect("parse"));
-        ws.temp_path = Some(temp_path.to_path_buf());
-        ws
-    }
-
-    /// §3 ground truth — with the world mapped MAP_SHARED over the staged temp, the autosave base is
-    /// a clone of a file that edits are actively mutating, so it can be captured torn. What keeps
-    /// recovery correct is `autosave_world_inner`'s step-0 ordering: the clone happens *before* the
-    /// tick's spans are captured, and `since_load` is monotone, so every chunk where the temp has
-    /// diverged from the as-loaded image is guaranteed to be in `since_load` (hence in a Clone
-    /// lineage's journal, hence fully overwritten on replay). These fixtures have no `DiskImage`,
-    /// so every tick here takes the Clone lineage.
-    ///
-    /// Asserts both halves: the containment property directly, and that recovery is still
-    /// byte-identical. Reversing step 0 back below the read guard leaves this test's containment
-    /// assertion passing but is exactly the ordering the assertion exists to pin.
-    /// 18.11 — a full save of a MAP_SHARED world is produced by msync + clone/copy of the staged temp
-    /// and must be byte-identical to the old write-through-the-mapping path, including after edits,
-    /// over a pre-existing destination (`.bak` made, no `.savetmp` left behind).
-    #[test]
-    fn test_full_save_from_shared_temp_matches_mapping_write() {
-        let original = make_bumpy_world_grid(2, 8, |_, _| 20);
-        let dir = std::env::temp_dir().join(format!("vuencedit_save_from_temp_{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).expect("create test dir");
-        let staged = dir.join("staged.eden");
-        fs::write(&staged, &original).expect("stage temp");
-        let (mmap, shared) = map_staged_temp_ex(&staged).expect("map staged temp");
-        let mut ws = WorldState::new();
-        ws.world = Some(parse_world_inner(mmap).expect("parse"));
-        ws.temp_path = Some(staged.clone());
-        ws.temp_shared = shared;
-
-        for round in 0..2 {
-            if round == 1 {
-                // Edits (incl. a header write) land in the shared mapping only.
-                with_edit(&mut ws, "delete", (0, 0, 5, 5), |world| {
-                    delete_blocks_inner(world, 0, 0, 5, 5, 0, 63, None);
-                    Ok(())
-                }).expect("edit");
-                write_spawn(ws.world.as_mut().unwrap(), 5.0, 5.0);
-            }
-            let world = ws.world.as_ref().unwrap();
-            let old_path = dir.join(format!("old_{round}.eden"));
-            let new_path = dir.join(format!("new_{round}.eden"));
-            // Pre-existing destination: exercises backup + replace.
-            fs::write(&new_path, b"previous contents").unwrap();
-            save_world_progress(world, old_path.to_str().unwrap(), false, None, None).expect("old-path save");
-            let temp = if ws.temp_shared { ws.temp_path.as_deref() } else { None };
-            save_world_progress(world, new_path.to_str().unwrap(), false, None, temp).expect("temp-path save");
-            let old_bytes = fs::read(&old_path).unwrap();
-            let new_bytes = fs::read(&new_path).unwrap();
-            assert_eq!(&old_bytes[..], &world.bytes[..], "old path must equal the mapping");
-            assert!(old_bytes == new_bytes, "clone/copy save differs from write-through-mapping (round {round})");
-            assert!(dir.join(format!("new_{round}.eden.bak")).exists(), "backup of the previous file");
-            assert!(!dir.join(format!("new_{round}.eden.savetmp")).exists(), "no stray .savetmp");
-        }
-        // Editing after a save must not disturb the already-saved (possibly cloned) destination.
-        let saved_before = fs::read(dir.join("new_1.eden")).unwrap();
-        with_edit(&mut ws, "delete", (16, 0, 20, 5), |world| {
-            delete_blocks_inner(world, 16, 0, 20, 5, 0, 63, None);
-            Ok(())
-        }).expect("edit after save");
-        assert!(saved_before == fs::read(dir.join("new_1.eden")).unwrap(), "saved file changed by a later edit");
-        // A length mismatch (stale temp) must fall back to the mapping write rather than corrupt.
-        let stale = dir.join("stale.eden");
-        fs::write(&stale, b"short").unwrap();
-        let fb = dir.join("fallback.eden");
-        let world = ws.world.as_ref().unwrap();
-        save_world_progress(world, fb.to_str().unwrap(), false, None, Some(&stale)).expect("fallback save");
-        assert!(fs::read(&fb).unwrap() == world.bytes[..], "fallback must write the mapping");
-        drop(ws);
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    /// Every band of `world` that differs from `original` is in `set`'s mask for that chunk, and no
-    /// chunk is marked that didn't change (masks may over-mark bands, never chunks).
-    fn assert_bands_cover_diff(world: &LoadedWorld, original: &[u8], set: &DirtyMap) {
-        for &(cx, cy) in world.chunk_map.keys() {
-            let (addr, end) = world.chunk_range(cx, cy).unwrap();
-            let mask = set.get(&(cx, cy)).copied().unwrap_or_default();
-            let changed = world.bytes[addr..end] != original[addr..end];
-            assert_eq!(mask != BandMask::default(), changed, "chunk ({cx},{cy}) marked iff it changed");
-            for b in 0..(end - addr).div_ceil(BAND_SPAN) {
-                let (lo, hi) = (addr + b * BAND_SPAN, (addr + (b + 1) * BAND_SPAN).min(end));
-                if world.bytes[lo..hi] != original[lo..hi] {
-                    assert!(mask.contains(b), "chunk ({cx},{cy}) band {b} changed but is not in its mask");
-                }
-            }
-        }
-    }
-
-    /// Replay a journal file and return its `(file_off, cx, cy, payload_len)` records.
-    fn journal_records(path: &std::path::Path, base_len: u64) -> Vec<(u64, i32, i32, usize)> {
-        let bytes = fs::read(path).expect("read journal");
-        journal::replay(&bytes, base_len).expect("replay").spans.iter()
-            .map(|s| (s.file_off, s.cx, s.cy, s.payload.len())).collect()
-    }
-
-    #[test]
-    fn test_band_mask_runs_and_range() {
-        assert_eq!(BandMask::default().runs().count(), 0);
-        let m = BandMask::band(2) | BandMask::band(3) | BandMask::band(5) | BandMask::band(15);
-        assert_eq!(m.runs().collect::<Vec<_>>(), vec![(2, 3), (5, 5), (15, 15)]);
-        assert_eq!(BandMask::ALL.runs().collect::<Vec<_>>(), vec![(0, 15)]);
-        assert_eq!(BandMask::range(0, 15), BandMask::ALL);
-        assert_eq!(BandMask::range(3, 5).runs().collect::<Vec<_>>(), vec![(3, 5)]);
-        assert!(BandMask::range(3, 5).contains(4) && !BandMask::range(3, 5).contains(6));
-    }
-
-    #[test]
-    fn test_chunk_delta_band_mask() {
-        let b = BAND_SPAN as u32;
-        let sparse = ChunkDelta::Sparse(vec![(3, 1), (b * 2 + 7, 1), (b * 2 + 9, 1), (b * 5, 1)]);
-        assert_eq!(sparse.band_mask().runs().collect::<Vec<_>>(), vec![(0, 0), (2, 2), (5, 5)]);
-        // A dense delta covers every band its bytes touch, inclusive of the last byte's band.
-        let full = ChunkDelta::Full(b * 3, vec![0; (b * 2) as usize]);
-        assert_eq!(full.band_mask().runs().collect::<Vec<_>>(), vec![(3, 4)]);
-        let full = ChunkDelta::Full(b * 3 + 5, vec![0; b as usize]);
-        assert_eq!(full.band_mask().runs().collect::<Vec<_>>(), vec![(3, 4)]);
-        assert_eq!(ChunkDelta::FullZ(b, vec![], b * 2).band_mask().runs().collect::<Vec<_>>(), vec![(1, 2)]);
-    }
-
-    /// `BandMask::ALL` on a 64z world (4 bands) must clamp to the chunk's real span — no spans past
-    /// `chunk_range`, and `dirty_bytes` counts 4 bands, not 16.
-    #[test]
-    fn test_dirty_spans_clamp_to_the_chunk_span() {
-        let ws = ws_with(make_bumpy_world_grid(2, 8, |_, _| 20));
-        let world = ws.world.as_ref().unwrap();
-        let mut dirty = DirtyMap::default();
-        dirty.insert((1, 0), BandMask::ALL);
-        let (addr, end) = world.chunk_range(1, 0).unwrap();
-        let spans = dirty_spans(world, &dirty);
-        assert_eq!(spans.len(), 1);
-        assert_eq!((spans[0].0 as usize, spans[0].3.len()), (addr, end - addr));
-        assert_eq!(dirty_bytes(world, &dirty), (end - addr) as u64);
-        // A run that starts past the end is skipped rather than slicing out of range.
-        dirty.insert((1, 0), BandMask::band(9));
-        assert!(dirty_spans(world, &dirty).is_empty());
-    }
-
-    /// One block in band 3 of a 256z chunk → one 8 KB journal record, and the incremental save and
-    /// the WAL carry that one band; the saved file still equals a full save.
-    #[test]
-    fn test_band_dirty_one_block_edit_256z() {
-        let dir = stage4_dir("band_one_block");
-        let original = cow_world(2, 16, |x, y| 30 + (x * 7 + y * 3) % 40);
-        let dest = dir.join("world.eden");
-        let mut ws = ws_with_disk_image(original.clone(), &dest);
-        let staged = dir.join("staged.eden");
-        fs::write(&staged, &original).unwrap();
-        ws.temp_path = Some(staged);
-        let state: AppState = RwLock::new(ws);
-        let paths = autosave_paths_at(&dir);
-
-        {
-            let mut ws = write_ws(&state);
-            with_edit(&mut ws, "paint", (3, 3, 3, 3), |world| {
-                set_block_abs(world, 3, 3, 50, 7, 3); // z=50 → band 3
-                Ok(())
-            }).expect("edit");
-            let m = ws.dirty.since_disk[&(0, 0)];
-            assert_eq!(m.runs().collect::<Vec<_>>(), vec![(3, 3)], "a one-block edit dirties exactly band 3");
-            assert_eq!(ws.dirty.since_disk.len(), 1);
-        }
-
-        autosave_world_inner(&state, &paths, None, None).expect("autosave tick");
-        let base_len = read_ws(&state).world.as_ref().unwrap().bytes.len() as u64;
-        let recs = journal_records(&paths.journal, base_len);
-        assert_eq!(recs.len(), 1, "one journal record");
-        assert_eq!((recs[0].1, recs[0].2, recs[0].3), (0, 0, BAND_SPAN), "…covering one 8 KB band of chunk (0,0)");
-
-        // The in-place save: same span, byte-identical result to a full save.
-        assert!(try_incremental_save(&state, dest.to_str().unwrap(), false).expect("incremental save"));
-        let expected = world_bytes(&read_ws(&state));
-        assert_eq!(fs::read(&dest).unwrap(), expected);
-        let full = dir.join("full.eden");
-        save_world_inner(read_ws(&state).world.as_ref().unwrap(), full.to_str().unwrap(), false).expect("full save");
-        assert_eq!(fs::read(&dest).unwrap(), fs::read(&full).unwrap());
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    /// An edit touching bands 2 and 5 only → two runs, two records, and nothing in between.
-    #[test]
-    fn test_band_dirty_two_separate_bands_make_two_records() {
-        let dir = stage4_dir("band_two_runs");
-        let original = cow_world(2, 16, |x, y| 30 + (x * 7 + y * 3) % 40);
-        let staged = dir.join("staged.eden");
-        let paths = autosave_paths_at(&dir);
-        let state: AppState = RwLock::new(ws_with_temp_path(original.clone(), &staged));
-
-        {
-            let mut ws = write_ws(&state);
-            with_edit(&mut ws, "paint", (3, 3, 4, 3), |world| {
-                set_block_abs(world, 3, 3, 40, 7, 3); // band 2
-                set_block_abs(world, 4, 3, 85, 7, 3); // band 5
-                Ok(())
-            }).expect("edit");
-            let m = ws.dirty.since_journal[&(0, 0)];
-            assert_eq!(m.runs().collect::<Vec<_>>(), vec![(2, 2), (5, 5)]);
-        }
-        autosave_world_inner(&state, &paths, None, None).expect("autosave tick");
-        let base_len = read_ws(&state).world.as_ref().unwrap().bytes.len() as u64;
-        let recs = journal_records(&paths.journal, base_len);
-        assert_eq!(recs.len(), 2);
-        let (addr, _) = read_ws(&state).world.as_ref().unwrap().chunk_range(0, 0).unwrap();
-        assert_eq!(recs[0], ((addr + 2 * BAND_SPAN) as u64, 0, 0, BAND_SPAN));
-        assert_eq!(recs[1], ((addr + 5 * BAND_SPAN) as u64, 0, 0, BAND_SPAN));
-
-        // Recovery from those two records reproduces the world.
-        let expected = world_bytes(&read_ws(&state));
-        let fresh: AppState = RwLock::new(WorldState::new());
-        load_autosave_inner(&fresh, &paths).expect("recover");
-        assert!(world_bytes(&read_ws(&fresh)) == expected);
-        if let Some(t) = read_ws(&fresh).temp_path.clone() { let _ = fs::remove_file(t); }
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    /// Undo marks the *inverse's* bands: edit band 3, save, undo → the next incremental save owes
-    /// band 3 of that chunk and nothing else.
-    #[test]
-    fn test_band_dirty_undo_marks_the_inverse_bands() {
-        let dir = stage4_dir("band_undo");
-        let original = cow_world(2, 16, |x, y| 30 + (x * 7 + y * 3) % 40);
-        let dest = dir.join("world.eden");
-        let state: AppState = RwLock::new(ws_with_disk_image(original.clone(), &dest));
-        {
-            let mut ws = write_ws(&state);
-            with_edit(&mut ws, "paint", (3, 3, 3, 3), |world| {
-                set_block_abs(world, 3, 3, 50, 7, 3);
-                Ok(())
-            }).expect("edit");
-        }
-        assert!(try_incremental_save(&state, dest.to_str().unwrap(), false).expect("save"));
-        assert!(read_ws(&state).dirty.since_disk.is_empty());
-
-        undo_edit_inner(&mut write_ws(&state)).expect("undo");
-        {
-            let ws = read_ws(&state);
-            assert_eq!(ws.dirty.since_disk.len(), 1);
-            assert_eq!(ws.dirty.since_disk[&(0, 0)].runs().collect::<Vec<_>>(), vec![(3, 3)],
-                "undo re-dirties exactly the band it rewrote");
-        }
-        assert!(try_incremental_save(&state, dest.to_str().unwrap(), false).expect("save after undo"));
-        assert!(fs::read(&dest).unwrap() == original, "the reverted bytes reach the file");
-        // And redo marks it again.
-        redo_edit_inner(&mut write_ws(&state)).expect("redo");
-        assert_eq!(read_ws(&state).dirty.since_disk[&(0, 0)].runs().collect::<Vec<_>>(), vec![(3, 3)]);
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    /// 23.10: the exit hook releases the world and deletes the staged temp, but never waits on a
-    /// held guard — a busy world is left alone for the next launch's sweep.
-    #[test]
-    fn test_exit_cleanup_removes_temp_unless_busy() {
-        let dir = std::env::temp_dir().join(format!("vuencedit_exit_cleanup_test_{}", std::process::id()));
-        fs::create_dir_all(&dir).expect("create test dir");
-        let staged = dir.join("staged.eden");
-        let state: AppState = RwLock::new(ws_with_shared_temp(make_bumpy_world_grid(2, 2, |_, _| 20), &staged));
-        {
-            let _busy = read_ws(&state);
-            exit_cleanup(&state, None);
-        }
-        assert!(staged.exists(), "a held guard must skip the cleanup, not wait for it");
-        assert!(read_ws(&state).world.is_some());
-        exit_cleanup(&state, None);
-        assert!(!staged.exists(), "the staged temp is deleted on exit");
-        let ws = read_ws(&state);
-        assert!(ws.world.is_none() && ws.temp_path.is_none());
-        drop(ws);
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    /// 23.9: a compressed save deflates from a snapshot taken under the guard, so edits landing
-    /// during the (unguarded) deflate don't reach the file, and the snapshot is removed afterwards.
-    #[test]
-    fn test_compressed_save_deflates_a_snapshot_off_the_guard() {
-        let original = make_bumpy_world_grid(2, 8, |_, _| 20);
-        let dir = std::env::temp_dir().join(format!("vuencedit_save_snapshot_test_{}", std::process::id()));
-        fs::create_dir_all(&dir).expect("create test dir");
-        let staged = dir.join("staged.eden");
-        let dest = dir.join("out.eden.zip");
-        let state: AppState = RwLock::new(ws_with_shared_temp(original, &staged));
-        if staged_map_mode(&staged) != MapMode::Shared { let _ = fs::remove_dir_all(&dir); return; }
-        let delete = |state: &AppState, x0: i32| {
-            with_edit(&mut write_ws(state), "delete", (x0, 0, x0 + 4, 4), |world| {
-                delete_blocks_inner(world, x0, 0, x0 + 4, 4, 0, 63, None);
-                Ok(())
-            }).expect("edit");
-        };
-        delete(&state, 0);
-        let (expected, snap) = {
-            let ws = read_ws(&state);
-            let world = ws.world.as_ref().unwrap();
-            (world_bytes(&ws).to_vec(), snapshot_shared_temp(world, &staged).expect("snapshot"))
-        };
-        let snap_path = snap.0.clone();
-        assert!(snap_path.starts_with(&dir), "the snapshot must sit beside the temp (same volume)");
-        delete(&state, 16); // lands mid-save: must not reach the file
-        let mut f = fs::File::open(&snap.0).unwrap();
-        let len = f.metadata().unwrap().len();
-        write_zip_atomic(&mut f, len, dest.to_str().unwrap(), None).expect("deflate");
-        drop(f);
-        drop(snap);
-        assert!(!snap_path.exists(), "the snapshot must delete itself");
-        let mut zip = zip::ZipArchive::new(fs::File::open(&dest).unwrap()).expect("open zip");
-        let mut got = Vec::new();
-        std::io::Read::read_to_end(&mut zip.by_index(0).unwrap(), &mut got).unwrap();
-        assert!(got == expected, "the zip must hold the world as of the snapshot");
-        assert!(got != world_bytes(&read_ws(&state)), "the later edit must not be in the zip");
-        drop(state);
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn test_shared_temp_divergence_is_covered_by_since_base() {
-        let original = make_bumpy_world_grid(2, 8, |_, _| 20); // 2×2 chunks
-        let dir = std::env::temp_dir().join(format!("vuencedit_shared_temp_test_{}", std::process::id()));
-        fs::create_dir_all(&dir).expect("create test sidecar dir");
-        let staged = dir.join("staged.eden");
-        let paths = autosave_paths_at(&dir);
-
-        let ws = ws_with_shared_temp(original.clone(), &staged);
-        let state: AppState = RwLock::new(ws);
-
-        // Two edits in different chunks, one of them undone (so its final bytes match the original
-        // again while the temp in between did not) — plus a header write.
-        {
-            let mut ws = write_ws(&state);
-            with_edit(&mut ws, "delete", (0, 0, 5, 5), |world| {
-                delete_blocks_inner(world, 0, 0, 5, 5, 0, 63, None);
-                Ok(())
-            }).expect("edit 1");
-            with_edit(&mut ws, "delete", (16, 0, 20, 5), |world| {
-                delete_blocks_inner(world, 16, 0, 20, 5, 0, 63, None);
-                Ok(())
-            }).expect("edit 2");
-            write_spawn(ws.world.as_mut().unwrap(), 5.0, 5.0);
-            ws.dirty.mark_header();
-        }
-        undo_edit_inner(&mut write_ws(&state)).expect("undo edit 2");
-
-        autosave_world_inner(&state, &paths, None, None).expect("autosave tick");
-        assert!(paths.base.exists(), "tick must establish the base image");
-
-        // The mapping really is shared: the edits must be visible in the temp file on disk. A
-        // MAP_PRIVATE fallback (env override, or a full temp volume) leaves the temp equal to
-        // `original` and there is nothing to check — but don't let that silently hollow the test
-        // out, so decide from the mode this machine actually chose.
-        let temp_on_disk = fs::read(&staged).expect("read staged temp");
-        if staged_map_mode(&staged) == MapMode::Shared {
-            assert_ne!(temp_on_disk, original,
-                "MAP_SHARED must write edits through to the staged temp — if this fails, \
-                 map_staged_temp silently fell back to map_copy and §3 buys nothing");
-        }
-        if temp_on_disk != original {
-            let ws = read_ws(&state);
-            let world = ws.world.as_ref().unwrap();
-            for &(cx, cy) in world.chunk_map.keys() {
-                let (addr, end) = world.chunk_range(cx, cy).unwrap();
-                if temp_on_disk[addr..end] != original[addr..end] {
-                    assert!(ws.dirty.since_load.contains_key(&(cx, cy)),
-                        "chunk ({cx},{cy}) diverged in the shared temp but is missing from since_load — \
-                         the autosave base can be torn there with nothing in the journal to repair it");
-                    // Band level (18.13): every diverged band, not just the chunk.
-                    let mask = ws.dirty.since_load[&(cx, cy)];
-                    for b in 0..(end - addr).div_ceil(BAND_SPAN) {
-                        let (lo, hi) = (addr + b * BAND_SPAN, (addr + (b + 1) * BAND_SPAN).min(end));
-                        if temp_on_disk[lo..hi] != original[lo..hi] {
-                            assert!(mask.contains(b), "chunk ({cx},{cy}) band {b} diverged in the shared temp \
-                                but is missing from since_load");
-                        }
-                    }
-                }
-            }
-            if temp_on_disk[0..192] != original[0..192] {
-                assert!(ws.dirty.header_load, "header diverged in the shared temp but header_load is false");
-            }
-        }
-
-        let expected = world_bytes(&read_ws(&state));
-        let fresh: AppState = RwLock::new(WorldState::new());
-        load_autosave_inner(&fresh, &paths).expect("load_autosave_inner");
-        assert_eq!(world_bytes(&read_ws(&fresh)), expected,
-            "recovery from a base cloned out from under live edits must still be byte-identical");
-
-        let recovered_temp = read_ws(&fresh).temp_path.clone().expect("recovery must stage a temp file");
-        let _ = fs::remove_file(&recovered_temp);
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    /// Audit C2 Stage 3 — a scripted mix of a chunk edit, a header edit, and an edit-then-undo,
-    /// autosaved across two ticks (exercising both the first-tick "establish base" path and a
-    /// plain incremental append), must recover byte-identical via `load_autosave_inner` — including
-    /// the header change and the fact that the undone edit's chunk ends up back at its original
-    /// bytes. This is the ground-truth check for the whole base+journal round trip, mirroring
-    /// `test_dirty_set_matches_ground_truth`'s style for Stage 1.
-    #[test]
-    fn test_journaled_autosave_round_trip_with_recovery() {
-        let original = make_bumpy_world_grid(2, 8, |_, _| 20); // 2×2 chunks: (0,0) (1,0) (0,1) (1,1)
-        let dir = std::env::temp_dir().join(format!("vuencedit_autosave_test_{}", std::process::id()));
-        fs::create_dir_all(&dir).expect("create test sidecar dir");
-        let staged = dir.join("staged.eden");
-        let paths = autosave_paths_at(&dir);
-
-        let ws = ws_with_temp_path(original, &staged);
-        let state: AppState = RwLock::new(ws);
-
-        // Tick 1: a single chunk edit, then autosave — establishes the base image + journal.
-        {
-            let mut ws = write_ws(&state);
-            with_edit(&mut ws, "delete", (0, 0, 5, 5), |world| {
-                delete_blocks_inner(world, 0, 0, 5, 5, 0, 63, None);
-                Ok(())
-            }).expect("edit 1");
-        }
-        autosave_world_inner(&state, &paths, None, None).expect("autosave tick 1");
-        assert!(paths.base.exists(), "first tick must establish the base image");
-        assert!(paths.journal.exists(), "first tick must create the journal");
-
-        // Header change (mirrors set_spawn_pos: write header bytes directly, then mark dirty).
-        {
-            let mut ws = write_ws(&state);
-            write_spawn(ws.world.as_mut().unwrap(), 5.0, 5.0);
-            ws.dirty.mark_header();
-        }
-        // Edit-then-undo in a different chunk — still dirty (Stage 1's tracking is conservative),
-        // but its final bytes are back to the pristine original for that chunk.
-        {
-            let mut ws = write_ws(&state);
-            with_edit(&mut ws, "delete", (16, 0, 20, 5), |world| {
-                delete_blocks_inner(world, 16, 0, 20, 5, 0, 63, None);
-                Ok(())
-            }).expect("edit 2");
-        }
-        undo_edit_inner(&mut write_ws(&state)).expect("undo edit 2");
-
-        // Tick 2: incremental append (base already established this session).
-        autosave_world_inner(&state, &paths, Some("source.eden".into()), None).expect("autosave tick 2");
-        assert!(read_ws(&state).dirty.since_journal.is_empty(), "tick 2 must flush everything pending");
-        assert!(!read_ws(&state).dirty.header_journal, "tick 2 must flush the header too");
-
-        let expected = world_bytes(&read_ws(&state));
-
-        // Recover into a brand-new, otherwise-empty WorldState/AppState.
-        let fresh: AppState = RwLock::new(WorldState::new());
-        let meta = load_autosave_inner(&fresh, &paths).expect("load_autosave_inner");
-        assert_eq!(meta.name, "GridTest");
-        let recovered = world_bytes(&read_ws(&fresh));
-        assert_eq!(recovered, expected, "recovered world must be byte-identical to the last-autosaved state");
-
-        let recovered_temp = read_ws(&fresh).temp_path.clone().expect("recovery must stage a temp file");
-        let _ = fs::remove_file(&recovered_temp);
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    /// Audit C2 Stage 3 — when a single tick's pending chunks are large relative to the world (here
-    /// forced by editing 2 of the world's 4 chunks in one tick against a tiny fixture), autosave
-    /// must take the compaction path (`write_fresh_journal` from `since_base`) instead of appending,
-    /// and the resulting journal must still recover byte-identical. A compacted journal also must
-    /// not carry forward stale records: replaying it directly should yield exactly one span per
-    /// distinct dirty chunk, not one per edit.
-    #[test]
-    fn test_autosave_compaction_recovers_and_dedupes_spans() {
-        let original = make_bumpy_world_grid(2, 8, |_, _| 20);
-        let dir = std::env::temp_dir().join(format!("vuencedit_autosave_compact_test_{}", std::process::id()));
-        fs::create_dir_all(&dir).expect("create test sidecar dir");
-        let staged = dir.join("staged.eden");
-        let paths = autosave_paths_at(&dir);
-
-        let ws = ws_with_temp_path(original, &staged);
-        let state: AppState = RwLock::new(ws);
-
-        // Tick 1: touch chunk (0,0) only, establish base + journal.
-        {
-            let mut ws = write_ws(&state);
-            with_edit(&mut ws, "delete", (0, 0, 5, 5), |world| {
-                delete_blocks_inner(world, 0, 0, 5, 5, 0, 63, None);
-                Ok(())
-            }).expect("edit 1");
-        }
-        autosave_world_inner(&state, &paths, None, None).expect("autosave tick 1");
-        let base_len = fs::metadata(&paths.base).unwrap().len();
-
-        // Before tick 2: re-touch chunk (0,0) and touch chunks (1,0) and (0,1). The terrain tops out
-        // at z=20, so each chunk dirties bands 0..=1 (16 KB): 3 chunks × 16 KB exceeds base_len/4
-        // for this small fixture, forcing the compact branch (band-granular since 18.13 — two
-        // chunks' worth no longer does).
-        {
-            let mut ws = write_ws(&state);
-            with_edit(&mut ws, "delete", (0, 0, 8, 8), |world| {
-                delete_blocks_inner(world, 0, 0, 8, 8, 0, 63, None);
-                Ok(())
-            }).expect("edit 2");
-            with_edit(&mut ws, "delete", (16, 0, 20, 5), |world| {
-                delete_blocks_inner(world, 16, 0, 20, 5, 0, 63, None);
-                Ok(())
-            }).expect("edit 3");
-            with_edit(&mut ws, "delete", (0, 16, 5, 20), |world| {
-                delete_blocks_inner(world, 0, 16, 5, 20, 0, 63, None);
-                Ok(())
-            }).expect("edit 4");
-        }
-        autosave_world_inner(&state, &paths, None, None).expect("autosave tick 2 (compaction)");
-
-        let journal_bytes = fs::read(&paths.journal).expect("read compacted journal");
-        let replay = journal::replay(&journal_bytes, base_len).expect("replay compacted journal");
-        assert!(!replay.truncated);
-        let distinct: std::collections::HashSet<(i32, i32)> =
-            replay.spans.iter().map(|s| (s.cx, s.cy)).collect();
-        assert_eq!(replay.spans.len(), distinct.len(),
-            "a compacted journal must carry exactly one span per dirty chunk (here one band run each), not one per edit");
-        assert_eq!(distinct, std::collections::HashSet::from([(0, 0), (1, 0), (0, 1)]));
-
-        let expected = world_bytes(&read_ws(&state));
-        let fresh: AppState = RwLock::new(WorldState::new());
-        load_autosave_inner(&fresh, &paths).expect("load_autosave_inner after compaction");
-        let recovered = world_bytes(&read_ws(&fresh));
-        assert_eq!(recovered, expected, "post-compaction recovery must match the live world");
-
-        let recovered_temp = read_ws(&fresh).temp_path.clone().expect("recovery must stage a temp file");
-        let _ = fs::remove_file(&recovered_temp);
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    /// Audit X-1 — after a manual save the frontend discards the autosave files; the lineage must be
-    /// forgotten with them, or the next tick appends to a deleted journal / journals against a
-    /// deleted base and recovery fails with "Failed to stat autosave base".
-    #[test]
-    fn test_autosave_survives_discard_after_save() {
-        let original = make_bumpy_world_grid(2, 8, |_, _| 20);
-        let dir = std::env::temp_dir().join(format!("vuencedit_autosave_x1_test_{}", std::process::id()));
-        fs::create_dir_all(&dir).expect("create test sidecar dir");
-        let staged = dir.join("staged.eden");
-        let paths = autosave_paths_at(&dir);
-        let state: AppState = RwLock::new(ws_with_temp_path(original, &staged));
-
-        let edit = |x0: i32, x1: i32| {
-            let mut ws = write_ws(&state);
-            with_edit(&mut ws, "delete", (x0, 0, x1, 5), |world| {
-                delete_blocks_inner(world, x0, 0, x1, 5, 0, 63, None);
-                Ok(())
-            }).expect("edit");
-        };
-
-        edit(0, 5);
-        autosave_world_inner(&state, &paths, None, None).expect("tick 1");
-
-        // The manual-save aftermath: the discharge the save records, then the discard command.
-        let seq = read_ws(&state).dirty.seq;
-        let saved = dir.join("saved.eden");
-        fs::write(&saved, world_bytes(&read_ws(&state))).expect("write saved file");
-        record_full_write(&state, &saved, false, seq).expect("record_full_write");
-        discard_autosave_inner(&state, &paths);
-        assert!(!paths.base.exists() && !paths.journal.exists() && !paths.meta.exists());
-
-        edit(16, 20);
-        autosave_world_inner(&state, &paths, None, None).expect("tick after discard must succeed");
-        assert!(paths.journal.exists(), "the tick must re-establish its lineage");
-        // 18.9: the saved file is a known-good image of the world, so the new lineage builds on it
-        // (Source) instead of re-copying the world into `autosave.base.eden`.
-        assert!(!paths.base.exists(), "a Source lineage needs no base clone");
-        assert!(matches!(read_ws(&state).autosave.as_ref().map(|l| &l.base), Some(AutosaveBase::Source(_))));
-
-        let expected = world_bytes(&read_ws(&state));
-        let fresh: AppState = RwLock::new(WorldState::new());
-        load_autosave_inner(&fresh, &paths).expect("recovery after save + discard + edit must load");
-        assert_eq!(world_bytes(&read_ws(&fresh)), expected);
-
-        let recovered_temp = read_ws(&fresh).temp_path.clone().expect("recovery must stage a temp file");
-        let _ = fs::remove_file(&recovered_temp);
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    /// Audit P-1 — the wire format must not have moved when the span capture became a borrow.
-    /// Pins a whole tick's journal file against `journal.rs`'s encode primitives, byte for byte:
-    /// the header flags (compressed), `base_len`, `base_id`, the header span going first under its
-    /// `HEADER_SPAN` sentinel, and each chunk span's absolute offset. Deliberately one dirty chunk,
-    /// so there is no `FxHashSet` iteration order to depend on.
-    #[test]
-    fn test_autosave_journal_is_byte_identical_to_hand_encoded_records() {
-        let original = make_bumpy_world_grid(2, 8, |_, _| 20);
-        let dir = std::env::temp_dir().join(format!("vuencedit_autosave_wire_test_{}", std::process::id()));
-        fs::create_dir_all(&dir).expect("create test sidecar dir");
-        let staged = dir.join("staged.eden");
-        let paths = autosave_paths_at(&dir);
-        let state: AppState = RwLock::new(ws_with_temp_path(original, &staged));
-
-        {
-            let mut ws = write_ws(&state);
-            with_edit(&mut ws, "delete", (0, 0, 5, 5), |world| {
-                delete_blocks_inner(world, 0, 0, 5, 5, 0, 63, None);
-                Ok(())
-            }).expect("edit");
-            write_spawn(ws.world.as_mut().unwrap(), 5.0, 5.0);
-            ws.dirty.mark_header();
-        }
-        autosave_world_inner(&state, &paths, None, None).expect("autosave tick");
-
-        let expected = {
-            let ws = read_ws(&state);
-            let world = ws.world.as_ref().unwrap();
-            let (addr, end) = world.chunk_range(0, 0).expect("chunk (0,0) must exist");
-            let base_id = ws.autosave.as_ref().expect("the tick records its base lineage").base_id;
-            // Every autosave journal carries FLAG_TAIL (27.0b: a later tick may append a tail).
-            let mut buf = journal::JournalHeader::new(true, world.bytes.len() as u64, base_id)
-                .with_tail().encode().to_vec();
-            buf.extend(journal::encode_span_record(
-                0, journal::HEADER_SPAN.0, journal::HEADER_SPAN.1, &world.bytes[0..192], true).unwrap());
-            // Bands 0..=1 only (terrain tops out at z=20): one record per dirty band run, 18.13.
-            let run_end = (addr + 2 * BAND_SPAN).min(end);
-            buf.extend(journal::encode_span_record(
-                addr as u64, 0, 0, &world.bytes[addr..run_end], true).unwrap());
-            buf
-        };
-
-        let actual = fs::read(&paths.journal).expect("read journal");
-        assert_eq!(actual, expected,
-            "the journal wire format must be exactly what journal.rs's encoders produce — the P-1 \
-             capture rewrite changed how the bytes are *reached*, never what is written");
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    /// Audit P-1 — the regression test for the hole the `retain` discharge had: a chunk that was
-    /// both journalled this tick *and* re-dirtied before the discharge landed used to be retained
-    /// out of `since_journal` anyway, so its new bytes were never journalled again and a crash lost
-    /// them silently. `discharge_autosave_journal` must clear **nothing** when `dirty.seq` moved.
-    ///
-    /// Mirrors `test_record_full_write_ignores_a_stale_capture` — the save path's twin of this rule.
-    #[test]
-    fn test_autosave_discharge_ignores_a_stale_capture() {
-        let state: AppState = RwLock::new(ws_with(make_bumpy_world_grid(2, 8, |_, _| 20)));
-        let base_id = random_base_id();
-        let lineage = AutosaveLineage { base_id, base: AutosaveBase::Clone, journal_written: false };
-        let gen = read_ws(&state).lineage_gen;
-
-        // Stand in for a tick that captured the world at `stale`, having flushed chunk (0,0).
-        {
-            let mut ws = write_ws(&state);
-            ws.dirty.mark_chunks([(0, 0)]);
-            ws.dirty.mark_header();
-        }
-        let stale = read_ws(&state).dirty.seq;
-
-        // An edit to the *same* chunk lands during the tick's I/O window. This is the case the old
-        // retain got wrong.
-        {
-            let mut ws = write_ws(&state);
-            with_edit(&mut ws, "delete", (0, 0, 5, 5), |world| {
-                delete_blocks_inner(world, 0, 0, 5, 5, 0, 63, None);
-                Ok(())
-            }).expect("edit landing 'during' the autosave");
-            write_spawn(ws.world.as_mut().unwrap(), 5.0, 5.0);
-            ws.dirty.mark_header();
-        }
-
-        discharge_autosave_journal(&state, gen, lineage, stale);
-
-        let ws = read_ws(&state);
-        assert!(ws.dirty.since_journal.contains_key(&(0, 0)),
-            "a chunk re-dirtied after the capture must stay owed to the journal — clearing it would \
-             drop that edit from crash recovery");
-        assert!(ws.dirty.header_journal, "a header re-written after the capture is still owed too");
-        assert_eq!(ws.autosave.as_ref().map(|l| l.base_id), Some(base_id),
-            "the base lineage is recorded regardless: gating it would make the next tick re-clone a \
-             multi-GB base image for nothing");
-    }
-
-    /// Audit P-1 — the positive half of the discharge rule, so nobody "fixes" the guard above into a
-    /// blanket no-op. Nothing touched the world between capture and discharge, so the journal holds
-    /// everything that was owed and both sets clear.
-    #[test]
-    fn test_autosave_discharge_clears_on_a_matching_capture() {
-        let state: AppState = RwLock::new(ws_with(make_bumpy_world_grid(2, 8, |_, _| 20)));
-        let base_id = random_base_id();
-        let lineage = AutosaveLineage { base_id, base: AutosaveBase::Clone, journal_written: false };
-        let gen = read_ws(&state).lineage_gen;
-        {
-            let mut ws = write_ws(&state);
-            ws.dirty.mark_chunks([(0, 0), (1, 0)]);
-            ws.dirty.mark_header();
-        }
-        let seq = read_ws(&state).dirty.seq;
-
-        discharge_autosave_journal(&state, gen, lineage, seq);
-
-        let ws = read_ws(&state);
-        assert!(ws.dirty.since_journal.is_empty(), "a clean capture discharges every journalled chunk");
-        assert!(!ws.dirty.header_journal);
-        let recorded = ws.autosave.as_ref().expect("lineage recorded");
-        assert_eq!(recorded.base_id, base_id);
-        assert!(recorded.journal_written, "a discharged lineage has a journal on disk");
-        // `since_disk`/`since_base`/`since_load` advance on their own cadence and must be untouched
-        // by a journal flush — the whole reason `DirtyState` carries independent sets.
-        assert_eq!(ws.dirty.since_disk.len(), 2, "a journal flush must not discharge the save path");
-        assert_eq!(ws.dirty.since_base.len(), 2, "nor the base-image compaction accounting");
-        assert_eq!(ws.dirty.since_load.len(), 2);
-        assert!(ws.dirty.header_disk && ws.dirty.header_base && ws.dirty.header_load);
-    }
-
-    // ── 18.9: autosave re-based on the saved file ────────────────────────────────────────────────
-
-    /// A session wired like a non-zip `load_world`: the world file on disk at `<dir>/world.eden`,
-    /// recorded as the `DiskImage`, plus a staged temp for the Clone fallback. The temp is written
-    /// once and never follows edits (the world is an anonymous mapping), i.e. the MAP_PRIVATE shape —
-    /// so any Clone fallback in these tests only recovers correctly if it journals `since_load`.
-    fn rebase_session(name: &str, chunks_side: i32) -> (AppState, std::path::PathBuf, AutosavePaths, std::path::PathBuf) {
-        let dir = stage4_dir(&format!("rebase_{name}"));
-        let bytes = make_bumpy_world_grid(chunks_side, 8, |_, _| 20);
-        let source = dir.join("world.eden");
-        let staged = dir.join("staged.eden");
-        let mut ws = ws_with_disk_image(bytes.clone(), &source);
-        fs::write(&staged, &bytes).expect("stage temp");
-        ws.temp_path = Some(staged);
-        let paths = autosave_paths_at(&dir.join("appdata"));
-        fs::create_dir_all(dir.join("appdata")).unwrap();
-        (RwLock::new(ws), source, paths, dir)
-    }
-
-    /// Delete a 5×5 column stack inside chunk `(cx, 0)`.
-    fn rebase_edit(state: &AppState, cx: i32) {
-        let x0 = cx * 16;
-        let mut ws = write_ws(state);
-        with_edit(&mut ws, "delete", (x0, 0, x0 + 4, 4), |world| {
-            delete_blocks_inner(world, x0, 0, x0 + 4, 4, 0, 63, None);
-            Ok(())
-        }).expect("edit");
-    }
-
-    /// What `save_world` does for a full save, minus the `AppHandle`: write, record, re-base.
-    fn rebase_full_save(state: &AppState, paths: &AutosavePaths, dest: &std::path::Path, compressed: bool) {
-        let seq = read_ws(state).dirty.seq;
-        {
-            let ws = read_ws(state);
-            let world = ws.world.as_ref().unwrap();
-            if compressed {
-                save_world_compressed(world, dest.to_str().unwrap(), false, None).expect("compressed save");
-            } else {
-                save_world_progress(world, dest.to_str().unwrap(), false, None, None).expect("full save");
-            }
-        }
-        record_full_write(state, dest, compressed, seq).expect("record_full_write");
-        rebase_after_save_inner(state, paths, dest, compressed, seq);
-    }
-
-    /// Recover into a fresh state, assert it equals `expected`, and return that state.
-    fn rebase_recover(paths: &AutosavePaths, expected: &[u8]) -> AppState {
-        let fresh: AppState = RwLock::new(WorldState::new());
-        load_autosave_inner(&fresh, paths).expect("recovery");
-        assert!(world_bytes(&read_ws(&fresh)) == expected, "recovered world must equal the last-ticked world");
-        fresh
-    }
-
-    fn rebase_cleanup(fresh: Option<AppState>, dir: &std::path::Path) {
-        if let Some(f) = fresh {
-            if let Some(t) = read_ws(&f).temp_path.clone() { let _ = fs::remove_file(t); }
-        }
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    fn journal_coords(paths: &AutosavePaths, base_len: u64) -> std::collections::HashSet<(i32, i32)> {
-        let bytes = fs::read(&paths.journal).expect("read journal");
-        journal::replay(&bytes, base_len).expect("replay").spans.iter().map(|s| (s.cx, s.cy)).collect()
-    }
-
-    fn meta_base(paths: &AutosavePaths) -> AutosaveBase {
-        let info: AutosaveInfo = serde_json::from_str(&fs::read_to_string(&paths.meta).unwrap()).unwrap();
-        assert_eq!(info.format, 2);
-        info.base.expect("format 2 names its base")
-    }
-
-    /// 18.9 phase 0 — a tick whose I/O straddles a discard must not resurrect the deleted lineage.
-    #[test]
-    fn test_discharge_ignores_a_stale_lineage_generation() {
-        let (state, _src, paths, dir) = rebase_session("stale_gen", 2);
-        rebase_edit(&state, 0);
-        let gen = read_ws(&state).lineage_gen;
-        let seq = read_ws(&state).dirty.seq;
-        discard_autosave_inner(&state, &paths); // lands while the tick is between capture and discharge
-        let lineage = AutosaveLineage { base_id: random_base_id(), base: AutosaveBase::Clone, journal_written: false };
-        discharge_autosave_journal(&state, gen, lineage, seq);
-        let ws = read_ws(&state);
-        assert!(ws.autosave.is_none(), "a discharge from before the discard must not restore its lineage");
-        assert!(ws.dirty.since_journal.contains_key(&(0, 0)), "nor clear what it journalled into deleted files");
-        drop(ws);
-        rebase_cleanup(None, &dir);
-    }
-
-    /// Tests 1 + phase 3: the first tick after a raw load writes no base copy; recovery keeps the
-    /// Source lineage and makes ⌘S an incremental patch of the user's file.
-    #[test]
-    fn test_autosave_source_lineage_needs_no_clone() {
-        let (state, source, paths, dir) = rebase_session("no_clone", 2);
-        rebase_edit(&state, 1);
-        autosave_world_inner(&state, &paths, None, None).expect("tick");
-        assert!(!paths.base.exists(), "a Source lineage must not copy the world");
-        assert!(matches!(meta_base(&paths), AutosaveBase::Source(ref id) if id.path == source));
-        let info = autosave_info_at(&paths).unwrap().expect("offered for recovery");
-        assert_eq!(info.base_status, Some(BaseStatus::Ok));
-
-        let expected = world_bytes(&read_ws(&state));
-        let fresh = rebase_recover(&paths, &expected);
-        {
-            let ws = read_ws(&fresh);
-            assert!(matches!(ws.autosave.as_ref().map(|l| &l.base), Some(AutosaveBase::Source(_))));
-            let disk: std::collections::HashSet<_> = ws.dirty.since_disk.keys().copied().collect();
-            assert_eq!(disk, std::collections::HashSet::from([(1, 0)]), "since_disk = exactly the replayed chunks");
-        }
-        assert!(try_incremental_save(&fresh, source.to_str().unwrap(), false).expect("save after recovery"),
-            "a recovered Source session saves incrementally");
-        assert!(fs::read(&source).unwrap() == expected);
-        rebase_cleanup(Some(fresh), &dir);
-    }
-
-    /// Tests 2 + 4: every save re-bases, so the journal (and any compaction) only ever holds edits
-    /// since the last save — the P-1b regression guard.
-    #[test]
-    fn test_autosave_rebases_on_full_save_and_compaction_is_bounded() {
-        let (state, source, paths, dir) = rebase_session("full", 3); // 9 chunks
-        let base_len = world_bytes(&read_ws(&state)).len() as u64;
-        rebase_edit(&state, 0);
-        autosave_world_inner(&state, &paths, None, None).expect("tick 1");
-        rebase_full_save(&state, &paths, &source, false);
-        assert!(!paths.meta.exists() && !paths.journal.exists(), "the re-base removes the old sidecars");
-        assert!(read_ws(&state).dirty.since_base.is_empty(), "a seq-clean save resets since_base");
-        assert!(read_ws(&state).dirty.since_load.contains_key(&(0, 0)), "since_load is never reset by a save");
-
-        rebase_edit(&state, 1);
-        autosave_world_inner(&state, &paths, None, None).expect("tick after save");
-        assert_eq!(journal_coords(&paths, base_len), std::collections::HashSet::from([(1, 0)]));
-
-        // Three more chunks in one tick push past base_len/4 and force a compaction.
-        { let mut ws = write_ws(&state); ws.dirty.mark_chunks([(0, 1), (1, 1), (2, 1)]); }
-        autosave_world_inner(&state, &paths, None, None).expect("compacting tick");
-        let coords = journal_coords(&paths, base_len);
-        assert!(!coords.contains(&(0, 0)), "compaction must not re-journal a chunk the save already holds");
-        assert_eq!(coords.len(), 4);
-        assert!(!paths.base.exists(), "no base copy at any point");
-
-        let fresh = rebase_recover(&paths, &world_bytes(&read_ws(&state)));
-        rebase_cleanup(Some(fresh), &dir);
-    }
-
-    /// Test 3: the same through an incremental save.
-    #[test]
-    fn test_autosave_rebases_on_incremental_save() {
-        let (state, source, paths, dir) = rebase_session("incr", 2);
-        let base_len = world_bytes(&read_ws(&state)).len() as u64;
-        rebase_edit(&state, 0);
-        autosave_world_inner(&state, &paths, None, None).expect("tick 1");
-        let seq = try_incremental_save_seq(&state, source.to_str().unwrap(), false).unwrap().expect("incremental").seq;
-        rebase_after_save_inner(&state, &paths, &source, false, seq);
-        rebase_edit(&state, 1);
-        autosave_world_inner(&state, &paths, None, None).expect("tick 2");
-        assert_eq!(journal_coords(&paths, base_len), std::collections::HashSet::from([(1, 0)]));
-        let fresh = rebase_recover(&paths, &world_bytes(&read_ws(&state)));
-        rebase_cleanup(Some(fresh), &dir);
-    }
-
-    /// Test 5: an edit landing between the save's capture and its re-base keeps `since_base`.
-    #[test]
-    fn test_rebase_keeps_since_base_when_seq_moved() {
-        let (state, source, paths, dir) = rebase_session("seq_moved", 2);
-        rebase_edit(&state, 0);
-        let seq = read_ws(&state).dirty.seq;
-        {
-            let ws = read_ws(&state);
-            save_world_progress(ws.world.as_ref().unwrap(), source.to_str().unwrap(), false, None, None).unwrap();
-        }
-        rebase_edit(&state, 1); // lands after the capture
-        record_full_write(&state, &source, false, seq).unwrap();
-        rebase_after_save_inner(&state, &paths, &source, false, seq);
-        {
-            let ws = read_ws(&state);
-            assert!(ws.dirty.since_base.contains_key(&(0, 0)) && ws.dirty.since_base.contains_key(&(1, 0)),
-                "a moved seq leaves since_base over-approximate");
-            assert!(matches!(ws.autosave.as_ref().map(|l| &l.base), Some(AutosaveBase::Source(_))),
-                "the lineage is re-based regardless");
-        }
-        autosave_world_inner(&state, &paths, None, None).expect("tick");
-        let fresh = rebase_recover(&paths, &world_bytes(&read_ws(&state)));
-        rebase_cleanup(Some(fresh), &dir);
-    }
-
-    /// Test 6: an external write *during* the session falls back to a Clone; one *after* the last
-    /// tick makes recovery refuse and keep the sidecars.
-    #[test]
-    fn test_autosave_external_modification() {
-        let (state, source, paths, dir) = rebase_session("external", 2);
-        let touch = |p: &std::path::Path| {
-            let mut b = fs::read(p).unwrap();
-            b[200] ^= 0xFF;
-            fs::write(p, &b).unwrap();
-            let f = fs::OpenOptions::new().write(true).open(p).unwrap();
-            f.set_modified(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000)).unwrap();
-        };
-        rebase_edit(&state, 0);
-        autosave_world_inner(&state, &paths, None, None).expect("tick 1");
-        touch(&source);
-        rebase_edit(&state, 1);
-        autosave_world_inner(&state, &paths, None, None).expect("tick after external write");
-        assert_eq!(meta_base(&paths), AutosaveBase::Clone, "a changed source falls back to a clone");
-        assert!(paths.base.exists());
-        let fresh = rebase_recover(&paths, &world_bytes(&read_ws(&state)));
-        rebase_cleanup(Some(fresh), &dir);
-
-        let (state, source, paths, dir) = rebase_session("external_after", 2);
-        rebase_edit(&state, 0);
-        autosave_world_inner(&state, &paths, None, None).expect("tick");
-        touch(&source);
-        assert_eq!(autosave_info_at(&paths).unwrap().unwrap().base_status, Some(BaseStatus::Changed));
-        let fresh: AppState = RwLock::new(WorldState::new());
-        let err = load_autosave_inner(&fresh, &paths).err().expect("must refuse a changed base");
-        assert!(err.contains("changed after this autosave"), "{err}");
-        assert!(paths.meta.exists() && paths.journal.exists(), "sidecars are kept");
-        rebase_cleanup(None, &dir);
-    }
-
-    /// Test 7: a missing source is reported, the sidecars survive, and putting it back recovers.
-    #[test]
-    fn test_autosave_missing_source_then_restored() {
-        let (state, source, paths, dir) = rebase_session("missing", 2);
-        rebase_edit(&state, 0);
-        autosave_world_inner(&state, &paths, None, None).expect("tick");
-        let aside = dir.join("moved.eden");
-        fs::rename(&source, &aside).unwrap();
-        assert_eq!(autosave_info_at(&paths).unwrap().unwrap().base_status, Some(BaseStatus::Missing));
-        let err = load_autosave_inner(&RwLock::new(WorldState::new()), &paths).err().expect("missing base");
-        assert!(err.contains("Can't find"), "{err}");
-        assert!(paths.meta.exists() && paths.journal.exists());
-        fs::rename(&aside, &source).unwrap(); // same inode, len and mtime
-        let fresh = rebase_recover(&paths, &world_bytes(&read_ws(&state)));
-        rebase_cleanup(Some(fresh), &dir);
-    }
-
-    /// Tests 8 + 9: a committed save WAL beside the source means a later save — roll it forward and
-    /// report "changed"; an uncommitted one is discarded and recovery proceeds.
-    #[test]
-    fn test_autosave_source_with_wal() {
-        let (state, source, paths, dir) = rebase_session("wal_commit", 2);
-        rebase_edit(&state, 0);
-        autosave_world_inner(&state, &paths, None, None).expect("tick");
-        let len = fs::metadata(&source).unwrap().len();
-        write_test_wal(&source, len, &[(300, 0, 0, vec![7u8; 16])], true);
-        assert_eq!(autosave_info_at(&paths).unwrap().unwrap().base_status, Some(BaseStatus::Changed));
-        let err = load_autosave_inner(&RwLock::new(WorldState::new()), &paths).err().expect("superseded");
-        assert!(err.contains("changed after this autosave"), "{err}");
-        assert_eq!(&fs::read(&source).unwrap()[300..316], &[7u8; 16], "the WAL was rolled forward");
-        rebase_cleanup(None, &dir);
-
-        let (state, source, paths, dir) = rebase_session("wal_torn", 2);
-        rebase_edit(&state, 0);
-        autosave_world_inner(&state, &paths, None, None).expect("tick");
-        let len = fs::metadata(&source).unwrap().len();
-        write_test_wal(&source, len, &[(300, 0, 0, vec![7u8; 16])], false);
-        assert_eq!(autosave_info_at(&paths).unwrap().unwrap().base_status, Some(BaseStatus::Ok));
-        let fresh = rebase_recover(&paths, &world_bytes(&read_ws(&state)));
-        assert!(!wal_path(&source).exists(), "an uncommitted WAL is discarded");
-        rebase_cleanup(Some(fresh), &dir);
-    }
-
-    /// Tests 10 + 11 (+ 12): no disk image (zip load) → Clone; an uncompressed Save As → Source; a
-    /// compressed save → no lineage → the next tick clones again, from a stale (MAP_PRIVATE-shaped)
-    /// temp, which only recovers because a Clone journals `since_load`.
-    #[test]
-    fn test_autosave_clone_and_source_transitions() {
-        let (state, _source, paths, dir) = rebase_session("transitions", 2);
-        write_ws(&state).disk_image = None; // as after a zip load
-        rebase_edit(&state, 0);
-        autosave_world_inner(&state, &paths, None, None).expect("zip-load tick");
-        assert_eq!(meta_base(&paths), AutosaveBase::Clone);
-        assert!(paths.base.exists());
-
-        let save_as = dir.join("saved_as.eden");
-        rebase_full_save(&state, &paths, &save_as, false);
-        rebase_edit(&state, 1);
-        autosave_world_inner(&state, &paths, None, None).expect("tick after Save As");
-        assert!(matches!(meta_base(&paths), AutosaveBase::Source(ref id) if id.path == save_as));
-        assert!(!paths.base.exists(), "the clone is gone once the lineage is Source");
-        let fresh = rebase_recover(&paths, &world_bytes(&read_ws(&state)));
-        rebase_cleanup(Some(fresh), &dir.join("never")); // keep dir for the rest
-
-        let zip = dir.join("saved.zip");
-        rebase_full_save(&state, &paths, &zip, true);
-        assert!(read_ws(&state).autosave.is_none(), "a compressed save leaves no lineage");
-        rebase_edit(&state, 1);
-        autosave_world_inner(&state, &paths, None, None).expect("tick after compressed save");
-        assert_eq!(meta_base(&paths), AutosaveBase::Clone);
-        let fresh = rebase_recover(&paths, &world_bytes(&read_ws(&state)));
-        rebase_cleanup(Some(fresh), &dir);
-    }
-
-    /// Test 14: a format-1 sidecar from an older build still recovers.
-    #[test]
-    fn test_format_1_autosave_still_recovers() {
-        let (state, _source, paths, dir) = rebase_session("format1", 2);
-        let original = world_bytes(&read_ws(&state));
-        rebase_edit(&state, 0);
-        let expected = world_bytes(&read_ws(&state));
-        fs::write(&paths.base, &original).unwrap();
-        let base_id = [3u8; 16];
-        {
-            let ws = read_ws(&state);
-            let world = ws.world.as_ref().unwrap();
-            let (addr, end) = world.chunk_range(0, 0).unwrap();
-            let spans = [(addr as u64, 0, 0, &world.bytes[addr..end])];
-            write_fresh_journal(&paths.journal, original.len() as u64, base_id, None, None, &spans, None).unwrap();
-        }
-        let json = format!(r#"{{"world_name":"GridTest","source_path":null,"timestamp":0,"format":1,"base_id":{:?}}}"#, base_id);
-        fs::write(&paths.meta, json).unwrap();
-        let info = autosave_info_at(&paths).unwrap().expect("format 1 offered");
-        assert!(info.base.is_none() && info.base_status.is_none());
-        let fresh = rebase_recover(&paths, &expected);
-        rebase_cleanup(Some(fresh), &dir);
-    }
-
-    // ── Audit C2 Stage 4: incremental in-place save ──────────────────────────────────────────────
-
-    /// Per-test scratch directory under the system temp dir, keyed by name *and* pid so a parallel
-    /// `cargo test` run can't have two tests writing the same destination file.
-    fn stage4_dir(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("vuencedit_c2s4_{name}_{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).expect("create Stage 4 test dir");
-        dir
-    }
-
-    /// A `WorldState` wired up like a freshly-`load_world`'d **uncompressed** world: the same bytes
-    /// exist at `dest` on disk and are recorded as the known-good `DiskImage`. That recorded image is
-    /// what makes an incremental save eligible at all, so this mirrors `load_world`'s non-zip branch.
-    fn ws_with_disk_image(bytes: Vec<u8>, dest: &std::path::Path) -> WorldState {
-        fs::write(dest, &bytes).expect("write test destination");
-        let md = fs::metadata(dest).expect("stat test destination");
-        let mut ws = ws_with(bytes);
-        ws.disk_image = Some(DiskImage::from_metadata(dest, &md, false));
-        ws
-    }
-
-    /// Hand-build a `<dest>.wal` the way `try_incremental_save` would, so `recover_wal` can be tested
-    /// against logs this file never actually produces (uncommitted, torn, mismatched).
-    fn write_test_wal(dest: &std::path::Path, base_len: u64, spans: &[(u64, i32, i32, Vec<u8>)], commit: bool) {
-        let f = fs::File::create(wal_path(dest)).expect("create test wal");
-        let mut w = journal::JournalWriter::create(f, base_len, [9u8; 16], false).expect("wal header");
-        for (off, cx, cy, payload) in spans {
-            w.append_span(*off, *cx, *cy, payload).expect("wal span");
-        }
-        if commit { w.append_commit().expect("wal commit"); }
-        w.flush().expect("wal flush");
-    }
-
-    /// A one-chunk edit followed by an incremental save must leave the destination byte-identical to
-    /// what a full `save_world_inner` of the same state would have produced — that equivalence is the
-    /// whole contract, since the fast path is only ever chosen *instead of* the slow one. Also pins
-    /// the surrounding bookkeeping: the `.bak` holds the pre-save file (an APFS clone must not follow
-    /// the in-place writes that come after it), the redo log is cleaned up, and the dirty set and
-    /// disk image are advanced so a follow-up save can be incremental too.
-    #[test]
-    fn test_incremental_save_matches_full_save() {
-        let dir = stage4_dir("match_full");
-        let original = make_bumpy_world_grid(2, 8, |_, _| 20);
-        let dest = dir.join("world.eden");
-        let state: AppState = RwLock::new(ws_with_disk_image(original.clone(), &dest));
-
-        {
-            let mut ws = write_ws(&state);
-            with_edit(&mut ws, "delete", (0, 0, 5, 5), |world| {
-                delete_blocks_inner(world, 0, 0, 5, 5, 0, 63, None);
-                Ok(())
-            }).expect("edit");
-        }
-        assert_eq!(read_ws(&state).dirty.since_disk.len(), 1, "the edit must dirty exactly chunk (0,0)");
-
-        let took_fast_path = try_incremental_save(&state, dest.to_str().unwrap(), false).expect("incremental save");
-        assert!(took_fast_path, "a one-chunk edit on a known-good disk image must be eligible");
-
-        let expected = world_bytes(&read_ws(&state));
-        assert_eq!(fs::read(&dest).unwrap(), expected, "incrementally saved file must match the live world");
-
-        // Byte-identical to the full-write path over the same state.
-        let full = dir.join("full.eden");
-        save_world_inner(read_ws(&state).world.as_ref().unwrap(), full.to_str().unwrap(), false).expect("full save");
-        assert_eq!(fs::read(&full).unwrap(), expected, "full save must match too (sanity)");
-        assert_eq!(fs::read(&dest).unwrap(), fs::read(&full).unwrap(),
-            "incremental and full saves of the same state must be byte-identical");
-
-        // The backup captured the file as it was *before* this save.
-        let bak = dir.join("world.eden.bak");
-        assert!(bak.exists(), "an in-place save must leave a .bak behind");
-        assert_eq!(fs::read(&bak).unwrap(), original,
-            ".bak must hold the pre-save bytes — an in-place write must not bleed through the clone");
-
-        assert!(!wal_path(&dest).exists(), "the redo log must be removed once the save completed");
-        {
-            let ws = read_ws(&state);
-            assert!(ws.dirty.since_disk.is_empty(), "a completed save discharges since_disk");
-            assert!(!ws.dirty.header_disk);
-            let di = ws.disk_image.as_ref().expect("disk image must be re-recorded");
-            let md = fs::metadata(&dest).unwrap();
-            assert_eq!(di.len, md.len());
-            assert_eq!(di.mtime, md.modified().unwrap(), "recorded mtime must match the file we just wrote");
-        }
-
-        // And a second edit + save still works against the freshly recorded image.
-        {
-            let mut ws = write_ws(&state);
-            with_edit(&mut ws, "delete", (16, 0, 20, 5), |world| {
-                delete_blocks_inner(world, 16, 0, 20, 5, 0, 63, None);
-                Ok(())
-            }).expect("edit 2");
-        }
-        assert!(try_incremental_save(&state, dest.to_str().unwrap(), false).expect("incremental save 2"),
-            "the image recorded by the previous incremental save must make the next one eligible");
-        assert_eq!(fs::read(&dest).unwrap(), world_bytes(&read_ws(&state)));
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    /// The eligibility gate exists to catch a destination that something outside this editor (the
-    /// game, a sync client, a second instance) has written since our last save — patching such a file
-    /// would splice our chunks into someone else's world. Both detectors must decline *and* leave the
-    /// destination completely untouched, so the caller's full atomic write is still the only writer.
-    #[test]
-    fn test_incremental_save_declines_on_external_modification() {
-        let dir = stage4_dir("external_mod");
-        let original = make_bumpy_world_grid(2, 8, |_, _| 20);
-        let dest = dir.join("world.eden");
-        let state: AppState = RwLock::new(ws_with_disk_image(original.clone(), &dest));
-
-        {
-            let mut ws = write_ws(&state);
-            with_edit(&mut ws, "delete", (0, 0, 5, 5), |world| {
-                delete_blocks_inner(world, 0, 0, 5, 5, 0, 63, None);
-                Ok(())
-            }).expect("edit");
-        }
-
-        // (a) mtime moved. Asserted by corrupting the *recorded* value rather than touching the file:
-        // exactly equivalent to the file's mtime having moved, but independent of the host
-        // filesystem's timestamp granularity.
-        write_ws(&state).disk_image.as_mut().unwrap().mtime = std::time::SystemTime::UNIX_EPOCH;
-        assert!(!try_incremental_save(&state, dest.to_str().unwrap(), false).expect("decline, not error"),
-            "a destination whose mtime no longer matches our record must decline");
-        assert_eq!(fs::read(&dest).unwrap(), original, "a declined save must not touch the destination");
-        assert!(!wal_path(&dest).exists(), "a declined save must not leave a redo log");
-        assert_eq!(read_ws(&state).dirty.since_disk.len(), 1, "a declined save must not discharge dirty state");
-
-        // (b) length moved (an external truncation or extension).
-        {
-            let md = fs::metadata(&dest).unwrap();
-            let mut di = write_ws(&state);
-            let di = di.disk_image.as_mut().unwrap();
-            di.mtime = md.modified().unwrap();     // restore (a)'s sabotage
-            di.len = md.len();
-        }
-        let mut longer = original.clone();
-        longer.push(0);
-        fs::write(&dest, &longer).unwrap();
-        assert!(!try_incremental_save(&state, dest.to_str().unwrap(), false).expect("decline, not error"),
-            "a destination whose length no longer matches our record must decline");
-        assert_eq!(fs::read(&dest).unwrap(), longer, "a declined save must not touch the destination");
-
-        // (b2) C-04: same length, same mtime, but a different file (new inode) — a sync client or a
-        // timestamp-preserving copy. Len + mtime match, so only `file_id` can catch it.
-        {
-            fs::write(&dest, &original).unwrap();   // undo (b)'s extension: the file must equal the image
-            let md = fs::metadata(&dest).unwrap();
-            let mtime = md.modified().unwrap();
-            // Re-record the image against the current file so len + mtime + file_id all match,
-            // leaving the inode as the only thing the swap changes.
-            write_ws(&state).disk_image = Some(DiskImage::from_metadata(&dest, &md, false));
-            let swap = dir.join("swap.tmp");
-            fs::write(&swap, &original).unwrap();
-            fs::File::options().write(true).open(&swap).unwrap().set_modified(mtime).unwrap();
-            fs::rename(&swap, &dest).unwrap();
-            let md2 = fs::metadata(&dest).unwrap();
-            assert_eq!((md2.len(), md2.modified().unwrap()), (md.len(), mtime), "test setup: len + mtime must match");
-            if file_id_of(&md2) != file_id_of(&md) {
-                assert!(!try_incremental_save(&state, dest.to_str().unwrap(), false).expect("decline, not error"),
-                    "a replaced file with identical len + mtime must decline on file_id");
-                assert_eq!(fs::read(&dest).unwrap(), original, "a declined save must not touch the destination");
-            }
-        }
-
-        // (c) a compressed image can never be patched in place.
-        {
-            let md = fs::metadata(&dest).unwrap();
-            let mut ws = write_ws(&state);
-            ws.disk_image = Some(DiskImage::from_metadata(&dest, &md, true));
-        }
-        assert!(!try_incremental_save(&state, dest.to_str().unwrap(), false).expect("decline, not error"),
-            "a zip on disk is not a patchable image of world.bytes");
-
-        // (d) no recorded image at all (e.g. a freshly recovered autosave, or a Save As to a new path).
-        write_ws(&state).disk_image = None;
-        assert!(!try_incremental_save(&state, dest.to_str().unwrap(), false).expect("decline, not error"),
-            "with no known-good image there is nothing to patch against");
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    /// 21.4 / audit L3: a destination that can't be opened for writing (read-only here; a Windows
-    /// sharing violation in the field) must decline with nothing written and **no WAL** — a committed
-    /// log left behind would replay on the next open, over edits the user may have discarded since.
-    #[test]
-    fn test_incremental_save_unwritable_destination_leaves_no_wal() {
-        let dir = stage4_dir("unwritable_dest");
-        let original = make_bumpy_world_grid(2, 8, |_, _| 20);
-        let dest = dir.join("world.eden");
-        let state: AppState = RwLock::new(ws_with_disk_image(original.clone(), &dest));
-        {
-            let mut ws = write_ws(&state);
-            with_edit(&mut ws, "delete", (0, 0, 5, 5), |world| {
-                delete_blocks_inner(world, 0, 0, 5, 5, 0, 63, None);
-                Ok(())
-            }).expect("edit");
-        }
-
-        let set_readonly = |ro: bool| {
-            let mut perms = fs::metadata(&dest).unwrap().permissions();
-            perms.set_readonly(ro);
-            fs::set_permissions(&dest, perms).unwrap();
-        };
-        set_readonly(true);
-        let result = try_incremental_save(&state, dest.to_str().unwrap(), false);
-        set_readonly(false); // before any assert, so a failure can't leave an undeletable file (Windows)
-
-        assert!(!result.expect("decline, not error"), "an unwritable destination must decline");
-        assert!(!wal_path(&dest).exists(), "a declined save must not leave a redo log");
-        assert_eq!(fs::read(&dest).unwrap(), original, "a declined save must not touch the destination");
-        assert_eq!(read_ws(&state).dirty.since_disk.len(), 1, "a declined save must not discharge dirty state");
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    /// `set_spawn_pos` / `rename_world` write header bytes only and never dirty a
-    /// chunk, so the header span is the one case where an incremental save has no chunk work at all.
-    /// It must still be written — and must not disturb a single byte outside the 192-byte header.
-    #[test]
-    fn test_incremental_save_writes_header_only_change() {
-        let dir = stage4_dir("header_only");
-        let original = make_bumpy_world_grid(2, 8, |_, _| 20);
-        let dest = dir.join("world.eden");
-        let state: AppState = RwLock::new(ws_with_disk_image(original.clone(), &dest));
-
-        {
-            let mut ws = write_ws(&state);
-            write_spawn(ws.world.as_mut().unwrap(), 5.0, 7.0);
-            ws.dirty.mark_header();
-        }
-        assert!(read_ws(&state).dirty.since_disk.is_empty(), "a header write dirties no chunk");
-
-        assert!(try_incremental_save(&state, dest.to_str().unwrap(), false).expect("incremental save"),
-            "a header-only change must still take the fast path");
-
-        let saved = fs::read(&dest).unwrap();
-        let expected = world_bytes(&read_ws(&state));
-        assert_eq!(saved, expected, "the header change must have landed");
-        assert_ne!(saved[0..192], original[0..192], "sanity: the header really did change");
-        assert_eq!(saved[192..], original[192..], "nothing outside the header may be rewritten");
-        assert!(!read_ws(&state).dirty.header_disk, "a completed save discharges header_disk");
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    /// Past roughly half the world, patching stops beating one sequential rewrite, so a ⌘A-scale edit
-    /// must fall back to the full atomic write (the plan's manual check 6) — and, like every other
-    /// decline, must leave the destination untouched on the way out.
-    #[test]
-    fn test_incremental_save_declines_when_dirty_set_too_large() {
-        let dir = stage4_dir("too_large");
-        // Terrain to z=60 so the delete dirties all four bands of every chunk; at z=20 only two
-        // bands per chunk are dirty (18.13) — half the world, under the threshold.
-        let original = make_bumpy_world_grid(2, 8, |_, _| 60);
-        let dest = dir.join("world.eden");
-        let state: AppState = RwLock::new(ws_with_disk_image(original.clone(), &dest));
-
-        {
-            let mut ws = write_ws(&state);
-            with_edit(&mut ws, "delete", (0, 0, 31, 31), |world| {
-                delete_blocks_inner(world, 0, 0, 31, 31, 0, 63, None);
-                Ok(())
-            }).expect("delete everything");
-        }
-        assert_eq!(read_ws(&state).dirty.since_disk.len(), 4, "all four chunks must be dirty");
-
-        assert!(!try_incremental_save(&state, dest.to_str().unwrap(), false).expect("decline, not error"),
-            "4 chunks × 4 bands of a ~132 KB world is past the half-world threshold");
-        assert_eq!(fs::read(&dest).unwrap(), original, "a declined save must not touch the destination");
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    /// Save, undo, save again: the second save must put the *reverted* bytes on disk. Undo bypasses
-    /// `with_edit_inner` entirely, so this is the regression guard for `undo_edit_inner`'s own
-    /// `mark_chunks` hook still feeding the save path (Stage 1's second hook row).
-    #[test]
-    fn test_incremental_save_after_undo_writes_reverted_bytes() {
-        let dir = stage4_dir("after_undo");
-        let original = make_bumpy_world_grid(2, 8, |_, _| 20);
-        let dest = dir.join("world.eden");
-        let state: AppState = RwLock::new(ws_with_disk_image(original.clone(), &dest));
-
-        {
-            let mut ws = write_ws(&state);
-            with_edit(&mut ws, "delete", (0, 0, 5, 5), |world| {
-                delete_blocks_inner(world, 0, 0, 5, 5, 0, 63, None);
-                Ok(())
-            }).expect("edit");
-        }
-        assert!(try_incremental_save(&state, dest.to_str().unwrap(), false).expect("save 1"));
-        assert_ne!(fs::read(&dest).unwrap(), original, "sanity: the edit is on disk");
-
-        undo_edit_inner(&mut write_ws(&state)).expect("undo");
-        assert_eq!(read_ws(&state).dirty.since_disk.len(), 1, "undo must re-dirty the chunk it reverted");
-
-        assert!(try_incremental_save(&state, dest.to_str().unwrap(), false).expect("save 2"));
-        assert_eq!(fs::read(&dest).unwrap(), original,
-            "saving after an undo must write the reverted bytes, restoring the original file exactly");
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    /// A committed redo log is rolled forward on the next open, and — because every span holds the
-    /// exact bytes that belong at its offset, not a delta — replaying one that was already applied
-    /// writes the same bytes again. That idempotency is what makes "crashed somewhere between step 3
-    /// and step 4" a single case rather than a spectrum.
-    #[test]
-    fn test_wal_replay_is_idempotent() {
-        let dir = stage4_dir("wal_idempotent");
-        let original = make_bumpy_world_grid(2, 8, |_, _| 20);
-        let dest = dir.join("world.eden");
-        fs::write(&dest, &original).unwrap();
-        let base_len = original.len() as u64;
-
-        // A span carrying a whole rewritten chunk (0,0), plus a header span — the two span shapes a
-        // real save produces.
-        let chunk = vec![0x5Au8; 32768];
-        let mut header = original[0..192].to_vec();
-        header[40] = b'Z';
-        let spans = vec![
-            (0u64, journal::HEADER_SPAN.0, journal::HEADER_SPAN.1, header.clone()),
-            (4096u64, 0, 0, chunk.clone()),
-        ];
-
-        let mut expected = original.clone();
-        expected[0..192].copy_from_slice(&header);
-        expected[4096..4096 + 32768].copy_from_slice(&chunk);
-
-        write_test_wal(&dest, base_len, &spans, true);
-        recover_wal(&dest);
-        assert_eq!(fs::read(&dest).unwrap(), expected, "a committed log must be rolled forward");
-        assert!(!wal_path(&dest).exists(), "a successfully applied log must be removed");
-
-        // Replay the identical log over the already-repaired file: same result, no drift.
-        write_test_wal(&dest, base_len, &spans, true);
-        recover_wal(&dest);
-        assert_eq!(fs::read(&dest).unwrap(), expected, "replaying an applied log must be a no-op");
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    /// Audit P-2 — `recover_wal` validates in one streaming pass and applies in a second, so that a
-    /// multi-GB uncompressed log never becomes a multi-GB allocation. The two things that split can
-    /// get wrong, and that the single-pass form couldn't: pass 2 must apply *every* span pass 1
-    /// validated (not stop at the first, and not re-order them away from last-write-wins), and a
-    /// pass-2 failure must leave the log on disk so the next open retries.
-    #[test]
-    fn test_wal_two_pass_applies_every_span_in_order_and_keeps_the_log_on_failure() {
-        let dir = stage4_dir("wal_two_pass");
-        let original = make_bumpy_world_grid(2, 8, |_, _| 20);
-        let dest = dir.join("world.eden");
-        let base_len = original.len() as u64;
-
-        // Enough spans that a "applies the first record then stops" bug is unmissable, plus a
-        // deliberate overwrite of an offset an earlier span already wrote — the last-write-wins
-        // semantic has to survive being replayed twice across two passes.
-        let mut spans: Vec<(u64, i32, i32, Vec<u8>)> = Vec::new();
-        let mut expected = original.clone();
-        for i in 0..8u64 {
-            let off = 4096 + i * 4096;
-            let payload = vec![0xA0 + i as u8; 4096];
-            expected[off as usize..off as usize + 4096].copy_from_slice(&payload);
-            spans.push((off, i as i32, 0, payload));
-        }
-        let overwrite = vec![0xFFu8; 4096];
-        expected[4096..4096 + 4096].copy_from_slice(&overwrite);
-        spans.push((4096, 0, 0, overwrite));
-
-        fs::write(&dest, &original).unwrap();
-        write_test_wal(&dest, base_len, &spans, true);
-        recover_wal(&dest);
-        assert_eq!(fs::read(&dest).unwrap(), expected,
-            "every span in a committed log must be applied, with the later span winning the overlap");
-        assert!(!wal_path(&dest).exists(), "a fully applied log must be removed");
-
-        // Pass 2 can't open the destination for writing: the repair must be abandoned *and the log
-        // kept*, because replay is idempotent and the next open is entitled to try again.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::write(&dest, &original).unwrap();
-            write_test_wal(&dest, base_len, &spans, true);
-            let mut perms = fs::metadata(&dest).unwrap().permissions();
-            perms.set_mode(0o444);
-            fs::set_permissions(&dest, perms).unwrap();
-
-            recover_wal(&dest);
-            assert!(wal_path(&dest).exists(),
-                "a log that could not be applied must survive for the next open to retry");
-            assert_eq!(fs::read(&dest).unwrap(), original, "the destination must be untouched");
-
-            // And the retry succeeds once the obstruction is gone — which is the whole point of
-            // keeping it.
-            let mut perms = fs::metadata(&dest).unwrap().permissions();
-            perms.set_mode(0o644);
-            fs::set_permissions(&dest, perms).unwrap();
-            recover_wal(&dest);
-            assert_eq!(fs::read(&dest).unwrap(), expected, "the retry must complete the repair");
-            assert!(!wal_path(&dest).exists());
-        }
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    /// The commit record is the entire basis for "the destination was never touched": a log without
-    /// one was still being written when the crash happened, which is strictly before step 3 begins.
-    /// All three malformed shapes must be discarded with the destination left pristine.
-    #[test]
-    fn test_uncommitted_wal_is_discarded() {
-        let dir = stage4_dir("wal_uncommitted");
-        let original = make_bumpy_world_grid(2, 8, |_, _| 20);
-        let dest = dir.join("world.eden");
-        let base_len = original.len() as u64;
-        let spans = vec![(4096u64, 0, 0, vec![0x5Au8; 32768])];
-
-        // (a) No commit record.
-        fs::write(&dest, &original).unwrap();
-        write_test_wal(&dest, base_len, &spans, false);
-        recover_wal(&dest);
-        assert_eq!(fs::read(&dest).unwrap(), original, "an uncommitted log must not be applied");
-        assert!(!wal_path(&dest).exists(), "an uncommitted log must be discarded");
-
-        // (b) Committed, then torn — a crash while the log itself was being flushed.
-        write_test_wal(&dest, base_len, &spans, true);
-        {
-            let wal = wal_path(&dest);
-            let len = fs::metadata(&wal).unwrap().len();
-            let f = fs::OpenOptions::new().write(true).open(&wal).unwrap();
-            f.set_len(len - 3).unwrap();
-        }
-        recover_wal(&dest);
-        assert_eq!(fs::read(&dest).unwrap(), original, "a torn log must not be partially applied");
-        assert!(!wal_path(&dest).exists());
-
-        // (c) A log belonging to a different file entirely (mismatched base_len).
-        write_test_wal(&dest, base_len + 1, &spans, true);
-        recover_wal(&dest);
-        assert_eq!(fs::read(&dest).unwrap(), original, "a log that doesn't fit this file must not apply");
-        assert!(!wal_path(&dest).exists());
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    /// Stamp `dest_id` into an existing test WAL's header (what `try_incremental_save_seq` writes).
-    fn bind_test_wal(dest: &std::path::Path, dest_id: u64) {
-        let mut f = fs::OpenOptions::new().write(true).open(wal_path(dest)).unwrap();
-        f.seek(SeekFrom::Start(32)).unwrap();
-        f.write_all(&dest_id.to_le_bytes()).unwrap();
-    }
-
-    fn wal_header_of(dest: &std::path::Path) -> [u8; journal::HEADER_LEN] {
-        fs::read(wal_path(dest)).unwrap()[..journal::HEADER_LEN].try_into().unwrap()
-    }
-
-    /// 29.4 / audit C-03: a committed log is matched to its destination by identity, not just
-    /// length. A bound log still repairs the file it was written for (the crash case), but one left
-    /// behind and then outlived by a same-length rewrite of the file (here our own full save, which
-    /// renames a new file in) must neither replay nor make the file look changed to autosave.
-    #[test]
-    fn test_wal_bound_to_its_destination() {
-        let dir = stage4_dir("wal_bound");
-        let original = make_bumpy_world_grid(2, 8, |_, _| 20);
-        let dest = dir.join("world.eden");
-        let base_len = original.len() as u64;
-        let spans = vec![(4096u64, 0, 0, vec![0x5Au8; 32768])];
-        let mut patched = original.clone();
-        patched[4096..4096 + 32768].fill(0x5A);
-
-        // (a) Bound to this very file: rolled forward exactly as before.
-        fs::write(&dest, &original).unwrap();
-        write_test_wal(&dest, base_len, &spans, true);
-        bind_test_wal(&dest, wal_dest_id(&fs::metadata(&dest).unwrap()));
-        assert!(has_committed_wal(&dest));
-        recover_wal(&dest);
-        assert_eq!(fs::read(&dest).unwrap(), patched, "a log bound to this file must repair it");
-        assert!(!wal_path(&dest).exists());
-
-        // (b) The audit's repro: the log outlives its save (a failed unlink), then a full save of the
-        // same length replaces the file. Before 29.4 the length matched and the next open reverted
-        // chunk (0,0) to the log's bytes.
-        fs::write(&dest, &original).unwrap();
-        write_test_wal(&dest, base_len, &spans, true);
-        bind_test_wal(&dest, wal_dest_id(&fs::metadata(&dest).unwrap()));
-        let mut newer = original.clone();
-        newer[4096..4096 + 32768].fill(0x33);
-        let held = dir.join("held"); // keep the old inode alive so the new file can't reuse it
-        fs::hard_link(&dest, &held).unwrap();
-        save_world_inner(&parse_world_inner(mmap_from_bytes(newer.clone())).unwrap(), dest.to_str().unwrap(), false)
-            .expect("full save");
-        assert_eq!(fs::metadata(&dest).unwrap().len(), base_len, "same length: only identity can tell");
-        assert!(!has_committed_wal(&dest), "a log for a replaced file must not count as committed");
-        recover_wal(&dest);
-        assert_eq!(fs::read(&dest).unwrap(), newer, "a log for a replaced file must not roll it back");
-        assert!(!wal_path(&dest).exists(), "and it is discarded");
-        let _ = fs::remove_file(&held);
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    /// 29.4 / audit C-03: `retire_wal` deletes the log, or neutralises it when the delete fails (an
-    /// AV scanner holding it on Windows; a read-only directory here), and reports only when the log
-    /// survives as-is. A neutralised log never replays and is cleaned up by the next open.
-    #[cfg(unix)]
-    #[test]
-    fn test_retire_wal_neutralises_or_reports() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = stage4_dir("wal_retire");
-        let original = make_bumpy_world_grid(2, 8, |_, _| 20);
-        let dest = dir.join("world.eden");
-        let spans = vec![(4096u64, 0, 0, vec![0x5Au8; 32768])];
-        let set_mode = |p: &std::path::Path, m: u32| fs::set_permissions(p, fs::Permissions::from_mode(m)).unwrap();
-
-        // No log at all, and a deletable one: both fine.
-        fs::write(&dest, &original).unwrap();
-        assert!(retire_wal(&dest).is_ok());
-        write_test_wal(&dest, original.len() as u64, &spans, true);
-        assert!(retire_wal(&dest).is_ok());
-        assert!(!wal_path(&dest).exists());
-
-        // Undeletable but writable: neutralised.
-        write_test_wal(&dest, original.len() as u64, &spans, true);
-        set_mode(&dir, 0o555);
-        let r = retire_wal(&dest);
-        set_mode(&dir, 0o755); // before any assert, so a failure can't leave an undeletable dir
-        assert!(r.is_ok(), "{r:?}");
-        assert!(wal_path(&dest).exists(), "the delete really did fail");
-        assert_eq!(&wal_header_of(&dest)[0..4], &[0u8; 4], "its magic is zeroed");
-        assert!(!has_committed_wal(&dest));
-        recover_wal(&dest);
-        assert_eq!(fs::read(&dest).unwrap(), original, "a neutralised log never replays");
-        assert!(!wal_path(&dest).exists(), "and the next open removes it");
-
-        // Neither deletable nor writable: reported, log left as it was.
-        write_test_wal(&dest, original.len() as u64, &spans, true);
-        set_mode(&wal_path(&dest), 0o444);
-        set_mode(&dir, 0o555);
-        let r = retire_wal(&dest);
-        set_mode(&dir, 0o755);
-        set_mode(&wal_path(&dest), 0o644);
-        assert!(r.is_err(), "a surviving committed log must be reported");
-        assert!(has_committed_wal(&dest));
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    /// 29.4 end to end: an incremental save whose log can't be deleted still succeeds, binds the log
-    /// to the file it patched, and leaves it neutralised, so reopening changes nothing.
-    #[cfg(unix)]
-    #[test]
-    fn test_incremental_save_neutralises_an_undeletable_log() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = stage4_dir("wal_undeletable");
-        let original = make_bumpy_world_grid(2, 8, |_, _| 20);
-        let dest = dir.join("world.eden");
-        let state: AppState = RwLock::new(ws_with_disk_image(original.clone(), &dest));
-        {
-            let mut ws = write_ws(&state);
-            with_edit(&mut ws, "delete", (0, 0, 5, 5), |world| {
-                delete_blocks_inner(world, 0, 0, 5, 5, 0, 63, None);
-                Ok(())
-            }).expect("edit");
-        }
-        // Everything the save creates in the directory exists up front, so only the delete needs
-        // the directory to be writable.
-        make_backup_if_absent(&dest, false).unwrap();
-        fs::write(wal_path(&dest), b"").unwrap();
-        let ino = wal_dest_id(&fs::metadata(&dest).unwrap());
-
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
-        let r = try_incremental_save_seq(&state, dest.to_str().unwrap(), false);
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
-
-        let saved = r.expect("save").expect("eligible");
-        assert!(saved.warning.is_none(), "a neutralised log needs no warning: {:?}", saved.warning);
-        let expected = world_bytes(&read_ws(&state));
-        assert_eq!(fs::read(&dest).unwrap(), expected);
-        let hdr = wal_header_of(&dest);
-        assert_eq!(&hdr[0..4], &[0u8; 4], "neutralised");
-        assert_eq!(u64::from_le_bytes(hdr[32..40].try_into().unwrap()), ino, "bound to the file it patched");
-        recover_wal(&dest);
-        assert_eq!(fs::read(&dest).unwrap(), expected);
-        assert!(!wal_path(&dest).exists());
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    /// "Save As to a new path, then ⌘S" (the plan's manual check 5): the first save has no image to
-    /// patch against and must decline to the full write, and recording that write must make the
-    /// *second* save incremental against the new path.
-    #[test]
-    fn test_full_write_establishes_disk_image_for_next_incremental() {
-        let dir = stage4_dir("save_as");
-        let original = make_bumpy_world_grid(2, 8, |_, _| 20);
-        let dest = dir.join("saved-as.eden");
-        let state: AppState = RwLock::new(ws_with(original.clone())); // no disk image: nothing loaded from a file
-
-        {
-            let mut ws = write_ws(&state);
-            with_edit(&mut ws, "delete", (0, 0, 5, 5), |world| {
-                delete_blocks_inner(world, 0, 0, 5, 5, 0, 63, None);
-                Ok(())
-            }).expect("edit 1");
-        }
-
-        assert!(!try_incremental_save(&state, dest.to_str().unwrap(), false).expect("decline, not error"),
-            "a Save As to an unknown path must decline to the full write");
-
-        // What `save_world`'s full-write branch does.
-        let seq = {
-            let ws = read_ws(&state);
-            let seq = ws.dirty.seq;
-            save_world_inner(ws.world.as_ref().unwrap(), dest.to_str().unwrap(), false).expect("full save");
-            seq
-        };
-        record_full_write(&state, &dest, false, seq).expect("record full write");
-        {
-            let ws = read_ws(&state);
-            assert!(ws.dirty.since_disk.is_empty(), "a full write discharges the whole dirty set");
-            assert_eq!(ws.disk_image.as_ref().unwrap().path, dest);
-        }
-
-        {
-            let mut ws = write_ws(&state);
-            with_edit(&mut ws, "delete", (16, 0, 20, 5), |world| {
-                delete_blocks_inner(world, 16, 0, 20, 5, 0, 63, None);
-                Ok(())
-            }).expect("edit 2");
-        }
-        assert!(try_incremental_save(&state, dest.to_str().unwrap(), false).expect("incremental save"),
-            "the image recorded by the full write must make the next save incremental");
-        assert_eq!(fs::read(&dest).unwrap(), world_bytes(&read_ws(&state)));
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    /// `record_full_write`'s `seq` comparison is what stops a save from clearing dirty state it
-    /// didn't actually write — an edit (or a whole world swap) landing between the save's read guard
-    /// and its write guard must invalidate the capture. Every mutator of `DirtyState` therefore has
-    /// to move the counter, `clear_all` included: a world load/close that reset it could otherwise
-    /// let a stale capture compare equal and discharge the *new* world's dirty set.
-    #[test]
-    fn test_dirty_seq_invalidates_a_stale_capture() {
-        let mut d = DirtyState::default();
-
-        let captured = d.seq;
-        d.mark_chunks([(0, 0)]);
-        assert_ne!(d.seq, captured, "mark_chunks must invalidate a capture taken before it");
-
-        let captured = d.seq;
-        d.mark_header();
-        assert_ne!(d.seq, captured, "mark_header must invalidate a capture taken before it");
-
-        let captured = d.seq;
-        d.clear_all();
-        assert_ne!(d.seq, captured, "clear_all (world load/close) must invalidate a capture too");
-    }
-
-    /// A declined incremental save must not have written to the destination — and the one path that
-    /// could violate that is `record_full_write` being reached with a stale `seq`. Exercise that
-    /// branch directly: a capture taken before an edit must record nothing at all.
-    #[test]
-    fn test_record_full_write_ignores_a_stale_capture() {
-        let dir = stage4_dir("stale_capture");
-        let original = make_bumpy_world_grid(2, 8, |_, _| 20);
-        let dest = dir.join("world.eden");
-        let state: AppState = RwLock::new(ws_with_disk_image(original.clone(), &dest));
-
-        let stale = read_ws(&state).dirty.seq;
-        {
-            let mut ws = write_ws(&state);
-            with_edit(&mut ws, "delete", (0, 0, 5, 5), |world| {
-                delete_blocks_inner(world, 0, 0, 5, 5, 0, 63, None);
-                Ok(())
-            }).expect("edit landing 'during' the save");
-        }
-
-        record_full_write(&state, &dest, false, stale).expect("must not error");
-        let ws = read_ws(&state);
-        assert_eq!(ws.dirty.since_disk.len(), 1,
-            "an edit that landed after the capture must stay dirty — clearing it would drop it from the file");
-        // The pre-existing image is left as it was rather than being advanced to describe a file that
-        // doesn't hold that edit, so the next save re-checks it and falls back if it no longer fits.
-        assert_eq!(ws.disk_image.as_ref().unwrap().len, original.len() as u64);
-
-        drop(ws);
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    /// B2 face-fill bucket: `find_connected_face_cells` must follow a contiguous same-type run
-    /// across the clicked face's plane, stop at a differently-typed or disconnected cell, and — the
-    /// case that distinguishes it from a flat 2D flood-fill — refuse to cross into a same-type cell
-    /// whose own face (along the same normal) isn't exposed, since that's a different visible run.
-    #[test]
-    fn test_face_fill_connected_cells() {
-        let mut world = parse_world_inner(mmap_from_bytes(make_test_world())).expect("parse failed");
-
-        // A 3-cell Stone floor at z=10, all with an exposed top face (air at z=11) — one connected run.
-        for lx in 3..=5 {
-            world.bytes[blk(lx, 5, 10)] = 2; // Stone
-        }
-        // Disconnected Stone cell elsewhere — must NOT be swept in.
-        world.bytes[blk(10, 10, 10)] = 2;
-        // Adjacent Stone cell (lx=6) whose top face is covered by another block — same type, but not
-        // the same visible face, so the BFS must stop before it even though it's 4-connected in-plane.
-        world.bytes[blk(6, 5, 10)] = 2;
-        world.bytes[blk(6, 5, 11)] = 2;
-
-        let mut cells = find_connected_face_cells(&world, 3, 5, 10, 0, 0, 1, false, 4_000);
-        cells.sort();
-        assert_eq!(cells, vec![(3, 5, 10), (4, 5, 10), (5, 5, 10)],
-            "must follow the exposed-top-face run and stop at the covered-face and disconnected cells");
-
-        // Seed on air → no match (defensive; the command layer also rejects this before calling in).
-        assert!(find_connected_face_cells(&world, 0, 0, 0, 0, 0, 1, false, 4_000).is_empty());
-    }
-
-    /// export_png's encoder must produce a valid PNG of the right dimensions from a rendered
-    /// full-map RGBA buffer (the Rust-side replacement for the old JS canvas→base64 path).
-    #[test]
-    fn test_export_png_encodes_valid() {
-        let world = parse_world_inner(mmap_from_bytes(make_test_world())).expect("parse failed");
-        let w = (world.w_chunks * 16) as i32;
-        let h = (world.h_chunks * 16) as i32;
-        let patch = render_pixels_patch(&world, 0, 0, w - 1, h - 1, None);
-        let png = encode_rgba_png(&patch.pixels, w as u32, h as u32).expect("encode failed");
-        assert_eq!(&png[..8], &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A], "PNG magic");
-        let img = image::load_from_memory(&png).expect("decode failed");
-        assert_eq!(img.width(), w as u32);
-        assert_eq!(img.height(), h as u32);
-    }
-
-    /// Cutaway view: a cap hides everything above it, so both the top-down render and the
-    /// surface lookup (which is what a z-less draw targets) see the highest block *at or below*
-    /// the cap. The fixture column (3,5) has wood@z0, stone@z17, dirt@z48.
-    #[test]
-    fn test_cutaway_cap_render_and_surface() {
-        let world = parse_world_inner(mmap_from_bytes(make_test_world())).expect("parse failed");
-
-        assert_eq!(surface_z(&world, 3, 5), Some(48), "uncapped surface = the true top block");
-        assert_eq!(surface_z_capped(&world, 3, 5, Some(63)), Some(48), "cap above everything = no change");
-        assert_eq!(surface_z_capped(&world, 3, 5, Some(30)), Some(17), "cap below dirt exposes the stone");
-        assert_eq!(surface_z_capped(&world, 3, 5, Some(10)), Some(0), "cap below stone exposes the wood");
-        assert_eq!(surface_z_capped(&world, 3, 5, Some(0)), Some(0), "cap at the bottom block still finds it");
-
-        let px = |p: &PixelPatch| -> [u8; 3] { [p.pixels[0], p.pixels[1], p.pixels[2]] };
-        let uncapped = render_pixels_patch(&world, 3, 5, 3, 5, None);
-        let capped   = render_pixels_patch(&world, 3, 5, 3, 5, Some(30));
-        let dirt  = block_color(3, 0, world.sky);
-        let stone = block_color(2, 5, world.sky); // the fixture's stone is painted (paint 5)
-        assert_eq!(px(&uncapped), dirt,  "normal render shows the top block (dirt)");
-        assert_eq!(px(&capped),   stone, "cutaway render shows the block under the cap (stone)");
-    }
-
-    /// Set Point writes two *distinct* header fields: Home → `home` (bytes 16–27) and
-    /// Start → `pos` (bytes 4–15). Each must leave the other byte-identical, or "set my start
-    /// position" would silently move the respawn point too (and vice versa).
-    #[test]
-    fn test_set_point_home_and_start_are_independent_fields() {
-        let mut world = parse_world_inner(mmap_from_bytes(make_test_world())).expect("parse failed");
-
-        // Neither field is set in the fixture (all-zero header), so both readers say None.
-        assert_eq!(read_spawn(&world), None, "fresh fixture has no home");
-        assert_eq!(read_player_pos(&world), None, "fresh fixture has no pos");
-
-        // Write only `pos`.
-        let home_before = world.bytes[16..28].to_vec();
-        write_player_pos(&mut world, 3.0, 5.0);
-        assert_eq!(&world.bytes[16..28], &home_before[..], "writing pos must not touch home");
-        let (ppx, ppy) = read_player_pos(&world).expect("pos round-trips");
-        assert_eq!((ppx, ppy), (3.0, 5.0));
-        // Height resolves to one above the column's surface (dirt @ z48 → 50.0), same rule as home.
-        assert_eq!(f32::from_le_bytes(world.bytes[8..12].try_into().unwrap()), 50.0);
-        assert_eq!(read_spawn(&world), None, "home still unset");
-
-        // Write only `home`.
-        let pos_before = world.bytes[4..16].to_vec();
-        write_spawn(&mut world, 7.0, 2.0);
-        assert_eq!(&world.bytes[4..16], &pos_before[..], "writing home must not touch pos");
-        assert_eq!(read_spawn(&world), Some((7.0, 2.0)));
-        assert_eq!(read_player_pos(&world), Some((3.0, 5.0)), "pos survives a home write");
-    }
-
-    /// The binary IPC envelope (audit H2) is the contract `decodeEnvelope` in codec.ts reads back:
-    /// a u32 LE header length, the header JSON, then the bodies concatenated — with the header
-    /// padded so the body starts 4-byte aligned (the JS side takes `Float32Array` *views* over it).
-    #[test]
-    fn test_ipc_envelope_framing() {
-        use tauri::ipc::InvokeResponseBody;
-        let unwrap_raw = |b: InvokeResponseBody| match b {
-            InvokeResponseBody::Raw(v) => v,
-            InvokeResponseBody::Json(_) => panic!("envelope must be a raw body, not JSON"),
-        };
-
-        // Single body: a pixel patch. Header carries the dims, body is exactly the pixels.
-        let patch = PixelPatch { x: 7, y: 9, width: 2, height: 1, lod: 4, pixels: vec![1, 2, 3, 4, 5, 6, 7, 8] };
-        let bytes = unwrap_raw(tauri::ipc::IpcResponse::body(patch).expect("frame failed"));
-        let hlen = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
-        assert_eq!((4 + hlen) % 4, 0, "body must start 4-byte aligned");
-        let hdr: serde_json::Value = serde_json::from_slice(&bytes[4..4 + hlen]).expect("header must be valid JSON");
-        assert_eq!(hdr["x"], 7);
-        assert_eq!(hdr["y"], 9);
-        assert_eq!(hdr["width"], 2);
-        assert_eq!(hdr["height"], 1);
-        assert_eq!(hdr["lod"], 4);
-        assert_eq!(&bytes[4 + hlen..], &[1, 2, 3, 4, 5, 6, 7, 8], "body is the pixels, verbatim");
-
-        // Multiple bodies concatenate in order, and the header's `lens` is what splits them.
-        #[derive(Serialize)]
-        struct H { lens: [u32; 3] }
-        let body = unwrap_raw(
-            ipc_envelope(&H { lens: [4, 0, 8] }, &[&[9u8; 4][..], &[][..], &[3u8; 8][..]]).expect("frame failed"),
-        );
-        let hlen = u32::from_le_bytes(body[..4].try_into().unwrap()) as usize;
-        assert_eq!(body.len(), 4 + hlen + 12);
-        assert_eq!(&body[4 + hlen..4 + hlen + 4], &[9u8; 4]);
-        assert_eq!(&body[4 + hlen + 4..], &[3u8; 8]);
-
-        // `ipc_envelope_one` moves its single body instead of copying it (audit C2) — the framing
-        // it produces must be byte-identical to the copying form, or every JS decoder breaks.
-        let moved = unwrap_raw(ipc_envelope_one(&H { lens: [4, 0, 8] }, vec![7u8; 12]).expect("frame failed"));
-        let copied = unwrap_raw(ipc_envelope(&H { lens: [4, 0, 8] }, &[&[7u8; 12][..]]).expect("frame failed"));
-        assert_eq!(moved, copied, "the moving and copying framings must agree byte-for-byte");
-
-        // A `None` header (the "no selection mask" case) frames as literal JSON null with no body.
-        let none = unwrap_raw(tauri::ipc::IpcResponse::body(
-            SelectionMaskInfo { mask: None, bits: Vec::new() },
-        ).expect("frame failed"));
-        let hlen = u32::from_le_bytes(none[..4].try_into().unwrap()) as usize;
-        assert_eq!(serde_json::from_slice::<serde_json::Value>(&none[4..4 + hlen]).unwrap(), serde_json::Value::Null);
-        assert_eq!(none.len(), 4 + hlen, "no body when there's no mask");
-    }
-
-    /// LOD rendering (audit H6) is *point sampling*, not averaging: pixel (ox,oy) of a lod-N patch
-    /// must be byte-identical to pixel (ox*N, oy*N) of the full-resolution patch over the same
-    /// rect. That pins both the output dimensions and the sampling phase — an off-by-one in either
-    /// would shift the zoomed-out map against the tile grid it's drawn into.
-    #[test]
-    fn test_render_lod_matches_sampled_full_render() {
-        let world = parse_world_inner(mmap_from_bytes(make_test_world())).expect("parse failed");
-        let w = (world.w_chunks * 16) as i32;
-        let h = (world.h_chunks * 16) as i32;
-        let full = render_pixels_patch(&world, 0, 0, w - 1, h - 1, None);
-        assert_eq!(full.lod, 1, "the unscoped renderer is lod 1");
-
-        for lod in [2u32, 4, 8] {
-            let p = render_pixels_patch_lod(&world, 0, 0, w - 1, h - 1, None, lod);
-            assert_eq!(p.lod, lod);
-            assert_eq!(p.width,  (w as u32 - 1) / lod + 1, "lod {lod} width");
-            assert_eq!(p.height, (h as u32 - 1) / lod + 1, "lod {lod} height");
-            for oy in 0..p.height {
-                for ox in 0..p.width {
-                    let lo = ((oy * p.width + ox) * 4) as usize;
-                    let fo = (((oy * lod) * full.width + ox * lod) * 4) as usize;
-                    assert_eq!(&p.pixels[lo..lo + 4], &full.pixels[fo..fo + 4],
-                        "lod {lod} pixel ({ox},{oy}) must be the block at ({},{})", ox * lod, oy * lod);
-                }
-            }
-        }
-
-        // A range whose length isn't a multiple of the step still covers its first sample and
-        // never reads past `x2`: 0..=14 at step 4 samples 0,4,8,12 → 4 pixels.
-        let ragged = render_pixels_patch_lod(&world, 0, 0, 14, 14, None, 4);
-        assert_eq!((ragged.width, ragged.height), (4, 4));
-
-        // Same contract for the z-slice renderer, which shares the tile grid.
-        let zfull = render_zslice_patch_inner(&world, 0, 0, 0, w - 1, h - 1);
-        let zlod  = render_zslice_patch_lod(&world, 0, 0, 0, w - 1, h - 1, 4);
-        assert_eq!((zlod.width, zlod.height), ((w as u32 - 1) / 4 + 1, (h as u32 - 1) / 4 + 1));
-        for oy in 0..zlod.height {
-            for ox in 0..zlod.width {
-                let lo = ((oy * zlod.width + ox) * 4) as usize;
-                let fo = (((oy * 4) * zfull.width + ox * 4) * 4) as usize;
-                assert_eq!(&zlod.pixels[lo..lo + 4], &zfull.pixels[fo..fo + 4], "zslice lod 4 ({ox},{oy})");
-            }
-        }
-
-        // Out-of-range steps clamp rather than producing a degenerate patch.
-        assert_eq!(render_pixels_patch_lod(&world, 0, 0, w - 1, h - 1, None, 0).lod, 1);
-        assert_eq!(render_pixels_patch_lod(&world, 0, 0, w - 1, h - 1, None, 9999).lod, MAX_LOD);
-    }
-
-    /// Backup semantics: first save to an existing path creates path.bak;
-    /// second save does NOT overwrite an already-present .bak.
-    #[test]
-    fn test_backup_semantics() {
-        let world = parse_world_inner(mmap_from_bytes(make_test_world())).expect("parse failed");
-
-        let tmp     = std::env::temp_dir().join("eden_test_backup.eden");
-        let tmp_bak = std::env::temp_dir().join("eden_test_backup.eden.bak");
-        let _ = fs::remove_file(&tmp);
-        let _ = fs::remove_file(&tmp_bak);
-
-        // Write an "existing" file to simulate overwriting a previous save
-        let sentinel = b"original content before first save";
-        fs::write(&tmp, sentinel).unwrap();
-
-        // First save → .bak should capture the pre-save content
-        save_world_inner(&world, tmp.to_str().unwrap(), false).expect("first save failed");
-        assert!(tmp_bak.exists(), ".bak must be created on first save over existing file");
-        assert_eq!(fs::read(&tmp_bak).unwrap(), sentinel,
-            ".bak must contain the pre-save file content");
-
-        // Write something else to the main file to simulate a subsequent edit
-        fs::write(&tmp, b"intermediate content").unwrap();
-
-        // Second save → .bak already exists, must NOT be overwritten
-        save_world_inner(&world, tmp.to_str().unwrap(), false).expect("second save failed");
-        assert_eq!(fs::read(&tmp_bak).unwrap(), sentinel,
-            ".bak must not be overwritten on subsequent saves");
-
-        let _ = fs::remove_file(&tmp);
-        let _ = fs::remove_file(&tmp_bak);
-    }
-
-    /// Audit C2 Stage 5 — `backupCompressed` writes `<path>.bak.zip` capturing the pre-save file,
-    /// not `world.bytes`; a pre-existing plain `.bak` still counts as "already backed up" so
-    /// toggling the setting mid-session doesn't produce two backups.
-    #[test]
-    fn test_compressed_backup_semantics() {
-        let world = parse_world_inner(mmap_from_bytes(make_test_world())).expect("parse failed");
-
-        let tmp = std::env::temp_dir().join(format!("eden_test_zbackup_{}.eden", std::process::id()));
-        let tmp_bak_zip = std::env::temp_dir().join(format!("eden_test_zbackup_{}.eden.bak.zip", std::process::id()));
-        let tmp_bak = std::env::temp_dir().join(format!("eden_test_zbackup_{}.eden.bak", std::process::id()));
-        let _ = fs::remove_file(&tmp);
-        let _ = fs::remove_file(&tmp_bak_zip);
-        let _ = fs::remove_file(&tmp_bak);
-
-        let sentinel = b"original content before first save";
-        fs::write(&tmp, sentinel).unwrap();
-
-        save_world_inner(&world, tmp.to_str().unwrap(), true).expect("first save failed");
-        assert!(tmp_bak_zip.exists(), ".bak.zip must be created when backupCompressed is on");
-        assert!(!tmp_bak.exists(), "a plain .bak must not also be written");
-        let mut zip = zip::ZipArchive::new(fs::File::open(&tmp_bak_zip).unwrap()).expect("open backup zip");
-        assert_eq!(zip.len(), 1);
-        let mut entry = zip.by_index(0).unwrap();
-        let mut contents = Vec::new();
-        std::io::Read::read_to_end(&mut entry, &mut contents).unwrap();
-        assert_eq!(contents, sentinel, ".bak.zip must contain the pre-save file content");
-        drop(entry);
-        drop(zip);
-
-        fs::write(&tmp, b"intermediate content").unwrap();
-        save_world_inner(&world, tmp.to_str().unwrap(), true).expect("second save failed");
-        let mut zip = zip::ZipArchive::new(fs::File::open(&tmp_bak_zip).unwrap()).expect("open backup zip");
-        let mut entry = zip.by_index(0).unwrap();
-        let mut contents = Vec::new();
-        std::io::Read::read_to_end(&mut entry, &mut contents).unwrap();
-        assert_eq!(contents, sentinel, ".bak.zip must not be overwritten on subsequent saves");
-
-        let _ = fs::remove_file(&tmp);
-        let _ = fs::remove_file(&tmp_bak_zip);
-    }
-
-    /// 18.8 — `backup_status` reports exactly what `make_backup_if_absent` will do: the source size
-    /// before a first save, the existing backup afterwards, and the asymmetric "which format counts"
-    /// rule (a `.bak.zip` doesn't satisfy a plain-`.bak` save; a plain `.bak` satisfies both).
-    #[test]
-    fn test_backup_status_matches_backup_rule() {
-        let dir = std::env::temp_dir().join(format!("eden_test_bakstatus_{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        let src = dir.join("w.eden");
-        let path = src.to_str().unwrap().to_string();
-
-        let none = backup_status(path.clone(), false);
-        assert_eq!((none.existing_name, none.source_bytes), (None, 0), "no file ⇒ no backup, nothing to copy");
-
-        fs::write(&src, vec![7u8; 1000]).unwrap();
-        let before = backup_status(path.clone(), true);
-        assert_eq!((before.existing_name, before.source_bytes), (None, 1000));
-
-        make_backup_if_absent(&src, true).unwrap();
-        let zipped = backup_status(path.clone(), true);
-        assert_eq!(zipped.existing_name.as_deref(), Some("w.eden.bak.zip"));
-        assert!(zipped.existing_bytes > 0 && zipped.existing_bytes < 1000, "deflated backup is reported at its own size");
-        assert_eq!(backup_status(path.clone(), false).existing_name, None,
-            "with backupCompressed off a .bak.zip doesn't count — the next save writes a plain .bak");
-
-        make_backup_if_absent(&src, false).unwrap();
-        let plain = backup_status(path.clone(), false);
-        assert_eq!((plain.existing_name.as_deref(), plain.existing_bytes), (Some("w.eden.bak"), 1000));
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    /// Exercise the whole-world procedural generator: it must run without
-    /// panicking (cross-chunk feature writes stay in-bounds), produce a sane
-    /// centre surface, and actually fill terrain blocks in every chunk.
-    #[test]
-    fn natural_generator_fills_terrain() {
-        let (wc, hc) = (3usize, 3usize);
-        let t_height = 64usize;
-        let chunk_size = 32_768usize;
-        let cfg = NaturalConfig {
-            seed: 12345, base_height: 28, roughness: 0.8, erosion: 0.0, terrain_scale: 120.0, extreme: false,
-            water_z: 24, rivers: true, biome: 0, biome_mode: 0, biome_scale: 200.0, snow_caps: true,
-            tree_density_denom: 40, cave_density: 2, cave_style: 0, caverns: true, flood_caves: false,
-            ore_density: 2, vegetation: 2, structures: 2, clouds: true,
-        };
-        let mut chunks: Vec<Vec<u8>> = (0..wc * hc).map(|_| vec![0u8; chunk_size]).collect();
-        let center = generate_natural_world(&mut chunks, wc, hc, &cfg, t_height, &mut |_, _| {});
-
-        assert!(center >= 2 && center < t_height, "centre surface z out of range: {center}");
-
-        // Every chunk has bedrock at z=0 across its whole footprint, and a
-        // non-trivial number of solid blocks above it.
-        for data in &chunks {
-            let mut solid = 0usize;
-            for lx in 0..16 {
-                for ly in 0..16 {
-                    assert_eq!(chunk_get(data, lx, ly, 0), 1, "missing bedrock");
-                    for z in 1..t_height {
-                        if chunk_get(data, lx, ly, z) != 0 { solid += 1; }
-                    }
-                }
-            }
-            assert!(solid > 16 * 16, "chunk looks empty: only {solid} solid blocks");
-        }
-    }
-
-    /// A flat-roughness desert with no water/features should still be valid and
-    /// produce a sand surface (regression guard for biome surface selection).
-    #[test]
-    fn natural_generator_desert_plains() {
-        let (wc, hc) = (2usize, 2usize);
-        let t_height = 64usize;
-        let cfg = NaturalConfig {
-            seed: 7, base_height: 20, roughness: 0.0, erosion: 0.0, terrain_scale: 120.0, extreme: false,
-            water_z: -1, rivers: false, biome: 1, biome_mode: 0, biome_scale: 200.0, snow_caps: false,
-            tree_density_denom: 0, cave_density: 0, cave_style: 0, caverns: false, flood_caves: false,
-            ore_density: 0, vegetation: 0, structures: 0, clouds: false,
-        };
-        let mut chunks: Vec<Vec<u8>> = (0..wc * hc).map(|_| vec![0u8; 32_768]).collect();
-        let center = generate_natural_world(&mut chunks, wc, hc, &cfg, t_height, &mut |_, _| {});
-        // Flat terrain → centre surface should equal base height.
-        assert_eq!(center, 20);
-        assert_eq!(chunk_get(&chunks[0], 8, 8, center as usize), 4, "desert surface must be sand");
-    }
-
-    /// The Classic Hills biome must produce a grass-capped surface (so natural
-    /// decoration works) over a classic stone body, and its classic 3D-noise caves
-    /// must carve open air underground when enabled.
-    #[test]
-    fn natural_classic_biome_grass_cap_and_caves() {
-        let (wc, hc) = (3usize, 3usize);
-        let t_height = 64usize;
-        let base = NaturalConfig {
-            seed: 4242, base_height: 30, roughness: 0.6, erosion: 0.0, terrain_scale: 120.0, extreme: false,
-            water_z: -1, rivers: false, biome: BIOME_CLASSIC, biome_mode: 0, biome_scale: 200.0, snow_caps: false,
-            tree_density_denom: 0, cave_density: 0, cave_style: 1, caverns: false, flood_caves: false,
-            ore_density: 0, vegetation: 0, structures: 0, clouds: false,
-        };
-
-        // Every column's surface is either a grass cap (soil) or a stone cap (rock
-        // outcrop), and always rests on a solid body. Both kinds must appear.
-        let mut chunks: Vec<Vec<u8>> = (0..wc * hc).map(|_| vec![0u8; 32_768]).collect();
-        let cn = ClassicNoise::new(base.seed);
-        let ccfg = classic_cfg_for_natural(&base);
-        generate_natural_world(&mut chunks, wc, hc, &base, t_height, &mut |_, _| {});
-        let (mut grass_caps, mut stone_caps) = (0u32, 0u32);
-        for cy in 0..hc { for cx in 0..wc {
-            for lx in 0..16usize { for ly in 0..16usize {
-                let wx = cx * 16 + lx; let wy = cy * 16 + ly;
-                let h = classic_height(&cn, wx as f64, wy as f64, &ccfg, t_height);
-                let top = chunk_get(&chunks[cy * wc + cx], lx, ly, h);
-                assert!(top == 8 || top == 2, "classic-biome cap must be grass or stone, got {top}");
-                assert_ne!(chunk_get(&chunks[cy * wc + cx], lx, ly, h - 1), 0, "cap must rest on a solid body");
-                if top == 8 { grass_caps += 1; } else { stone_caps += 1; }
-            }}
-        }}
-        assert!(grass_caps > 0, "classic biome should have grassy soil columns");
-        assert!(stone_caps > 0, "classic biome should expose stone outcrops top-down");
-
-        // Classic+ supports standing water (unlike the legacy Classic tab): a low
-        // water level must place water blocks.
-        let mut wet = base; wet.water_z = (base.base_height as i32 + 6).max(1);
-        let mut wch: Vec<Vec<u8>> = (0..wc * hc).map(|_| vec![0u8; 32_768]).collect();
-        generate_natural_world(&mut wch, wc, hc, &wet, t_height, &mut |_, _| {});
-        assert!(count_blocks(&wch, t_height, 20) > 0, "Classic+ with water should place water blocks");
-
-        // Caves on vs off: enabling caves must remove some stone (carve air).
-        let mut caves_off = base; caves_off.cave_density = 0;
-        let mut on = (0..wc * hc).map(|_| vec![0u8; 32_768]).collect::<Vec<_>>();
-        let mut off = (0..wc * hc).map(|_| vec![0u8; 32_768]).collect::<Vec<_>>();
-        let mut on_cfg = base; on_cfg.cave_density = 2;
-        generate_natural_world(&mut on,  wc, hc, &on_cfg,    t_height, &mut |_, _| {});
-        generate_natural_world(&mut off, wc, hc, &caves_off, t_height, &mut |_, _| {});
-        let stone_on  = count_blocks(&on,  t_height, 2);
-        let stone_off = count_blocks(&off, t_height, 2);
-        assert!(stone_on < stone_off, "classic caves should carve stone: on={stone_on} off={stone_off}");
-    }
-
-    /// Snow biome foliage must use the cold palette: white-painted weeds, frosted
-    /// (white / light-gray) tree leaves, and white/blue flowers — never the default
-    /// green / warm paints.
-    #[test]
-    fn natural_snow_foliage_is_cold() {
-        let (wc, hc) = (6usize, 6usize);
-        let t_height = 64usize;
-        let cfg = NaturalConfig {
-            seed: 808, base_height: 28, roughness: 0.5, erosion: 0.0, terrain_scale: 120.0, extreme: false,
-            water_z: -1, rivers: false, biome: 2, biome_mode: 0, biome_scale: 200.0, snow_caps: false,
-            tree_density_denom: 6, cave_density: 0, cave_style: 0, caverns: false, flood_caves: false,
-            ore_density: 0, vegetation: 2, structures: 0, clouds: false,
-        };
-        let mut chunks: Vec<Vec<u8>> = (0..wc * hc).map(|_| vec![0u8; 32_768]).collect();
-        generate_natural_world(&mut chunks, wc, hc, &cfg, t_height, &mut |_, _| {});
-
-        let (mut weeds, mut leaves, mut flowers) = (0u32, 0u32, 0u32);
-        for cy in 0..hc { for cx in 0..wc {
-            let data = &chunks[cy * wc + cx];
-            for lx in 0..16 { for ly in 0..16 { for z in 0..t_height {
-                let bt = chunk_get(data, lx, ly, z);
-                let p = chunk_get_paint(data, lx, ly, z);
-                match bt {
-                    11 => { weeds += 1; assert_eq!(p, 9, "snow weeds must be white"); }
-                    5  => { leaves += 1; assert!(SNOW_LEAF_PAINTS.contains(&p), "snow leaves must be frosted, got paint {p}"); }
-                    73 => { flowers += 1; assert!(SNOW_FLOWER_PAINTS.contains(&p), "snow flowers must be cold, got paint {p}"); }
-                    _ => {}
-                }
-            }}}
-        }}
-        assert!(weeds > 0 && leaves > 0 && flowers > 0,
-            "expected snow weeds ({weeds}), leaves ({leaves}) and flowers ({flowers})");
-    }
-
-    /// Mixed-biome mode must vary the per-column biome across space (and stay
-    /// constant in single mode), and a generated mixed world must contain more
-    /// than one biome's surface material.
-    #[test]
-    fn natural_mixed_biomes_vary() {
-        let cfg = NaturalConfig {
-            seed: 2026, base_height: 30, roughness: 0.6, erosion: 0.0, terrain_scale: 120.0, extreme: false,
-            water_z: -1, rivers: false, biome: 0, biome_mode: 1, biome_scale: 30.0, snow_caps: false,
-            tree_density_denom: 0, cave_density: 0, cave_style: 0, caverns: false, flood_caves: false,
-            ore_density: 0, vegetation: 0, structures: 0, clouds: false,
-        };
-        // biome_at returns several distinct biomes over a wide area (altitude held
-        // constant so this isolates the temperature/moisture blend).
-        let mut seen = HashSet::new();
-        for wy in 0..256i32 {
-            for wx in 0..256i32 {
-                seen.insert(biome_at(wx, wy, cfg.base_height, &cfg, 64));
-            }
-        }
-        assert!(seen.len() >= 2, "mixed mode should yield multiple biomes, got {seen:?}");
-
-        // Single mode is constant regardless of position.
-        let mut single = cfg; single.biome_mode = 0; single.biome = 1;
-        for wy in 0..40i32 {
-            for wx in 0..40i32 {
-                assert_eq!(biome_at(wx, wy, 30, &single, 64), 1, "single mode must be constant");
-            }
-        }
-
-        // A generated mixed world contains both desert sand and grassland grass.
-        let (wc, hc) = (8usize, 8usize);
-        let mut chunks: Vec<Vec<u8>> = (0..wc * hc).map(|_| vec![0u8; 32_768]).collect();
-        generate_natural_world(&mut chunks, wc, hc, &cfg, 64, &mut |_, _| {});
-        assert!(count_blocks(&chunks, 64, 4) > 0, "mixed world should have desert sand");
-        assert!(count_blocks(&chunks, 64, 8) > 0, "mixed world should have grassland grass");
-    }
-
-    /// Erosion is a relief multiplier that only ever *reduces* amplitude (it can
-    /// never add relief), so a strong-erosion world must read flatter than the
-    /// same seed with erosion off — the std-dev of the heightmap drops.
-    #[test]
-    fn natural_erosion_flattens() {
-        let base = NaturalConfig {
-            seed: 31337, base_height: 30, roughness: 1.0, erosion: 0.0, terrain_scale: 90.0, extreme: false,
-            water_z: -1, rivers: false, biome: 0, biome_mode: 0, biome_scale: 200.0, snow_caps: false,
-            tree_density_denom: 0, cave_density: 0, cave_style: 0, caverns: false, flood_caves: false,
-            ore_density: 0, vegetation: 0, structures: 0, clouds: false,
-        };
-        // Standard deviation of terrain_height sampled over a wide region.
-        let relief_std = |cfg: &NaturalConfig| -> f64 {
-            let mut hs = Vec::new();
-            for wy in 0..256i32 { for wx in 0..256i32 {
-                hs.push(terrain_height(wx as f64, wy as f64, cfg, 64) as f64);
-            }}
-            let mean = hs.iter().sum::<f64>() / hs.len() as f64;
-            (hs.iter().map(|h| (h - mean).powi(2)).sum::<f64>() / hs.len() as f64).sqrt()
-        };
-
-        let flat = base; // erosion 0.0
-        let mut rugged = base; rugged.erosion = 1.0; // strong erosion → flatter
-        let s_none = relief_std(&flat);
-        let s_strong = relief_std(&rugged);
-        assert!(s_strong < s_none,
-            "strong erosion should flatten relief: std {s_strong} !< {s_none}");
-    }
-
-    /// The biome-edge dither perturbs each column's climate by a small per-cell
-    /// jitter, so a mixed-mode biome map has *more* short-range boundary flips
-    /// (speckled edges) than the same climate fields evaluated without jitter.
-    #[test]
-    fn natural_biome_band_dithers() {
-        let cfg = NaturalConfig {
-            seed: 5150, base_height: 30, roughness: 0.0, erosion: 0.0, terrain_scale: 120.0, extreme: false,
-            water_z: -1, rivers: false, biome: 0, biome_mode: 1, biome_scale: 24.0, snow_caps: false,
-            tree_density_denom: 0, cave_density: 0, cave_style: 0, caverns: false, flood_caves: false,
-            ore_density: 0, vegetation: 0, structures: 0, clouds: false,
-        };
-        // Surface held at base_height so altitude lapse is zero and this isolates
-        // the temperature/moisture dither. Baseline replicates biome_at's threshold
-        // decision *without* the per-column jitter.
-        let baseline = |wx: i32, wy: i32| -> u8 {
-            let (temp, moist) = biome_climate(wx, wy, &cfg);
-            if temp < -0.28 { 2 } else if temp > 0.18 && moist < -0.05 { 1 } else { 0 }
-        };
-        let count_flips = |f: &dyn Fn(i32, i32) -> u8| -> u32 {
-            let mut flips = 0u32;
-            for wy in 0..256i32 {
-                for wx in 0..255i32 {
-                    if f(wx, wy) != f(wx + 1, wy) { flips += 1; }
-                }
-            }
-            flips
-        };
-        let real = count_flips(&|wx, wy| biome_at(wx, wy, cfg.base_height, &cfg, 64));
-        let plain = count_flips(&baseline);
-        assert!(real > plain,
-            "dither should add boundary speckle: {real} !> {plain}");
-    }
-
-    /// The preview command returns a correctly-sized, non-blank RGB image and
-    /// honours the `max_px` cap.
-    #[test]
-    fn natural_preview_renders() {
-        let img = preview_natural_world(
-            16, 16, false,
-            7, 30, 2, 1, 1, false,
-            "lakes".into(), true,
-            "grassland".into(), 1, 1, true,
-            2, 1, 0, true, false, 1, 1, 1, true,
-            64,
-        ).expect("preview failed");
-        assert!(img.width <= 64 && img.height <= 64, "preview must respect max_px");
-        assert_eq!(img.pixels.len(), (img.width * img.height * 4) as usize, "RGBA buffer size");
-        assert!(img.pixels.iter().any(|&c| c != 0), "preview should not be blank");
-    }
-
-    /// Classic and Tg2 previews render non-blank, correctly-sized RGBA images; the Tg2 shade is
-    /// no longer a constant (a mountainous biome must vary in brightness).
-    #[test]
-    fn classic_and_tg2_previews_render() {
-        let img = preview_classic_world(16, 16, false, 7, 2, 32, 64).expect("classic preview");
-        assert!(img.width <= 64 && img.height <= 64);
-        assert_eq!(img.pixels.len(), (img.width * img.height * 4) as usize);
-        assert!(img.pixels.iter().any(|&c| c != 0));
-        let t = preview_tg2_world(16, 7, 3, 64, None, None, None, None).expect("tg2 preview");
-        assert_eq!(t.pixels.len(), (t.width * t.height * 4) as usize);
-        let lum: std::collections::HashSet<u8> = t.pixels.chunks(4).map(|p| p[0]).collect();
-        assert!(lum.len() > 8, "tg2 preview should be shaded, got {} distinct reds", lum.len());
-    }
-
-    /// A create is atomic: the file only appears complete (no `.tmp` left), and a cancel leaves
-    /// neither the destination nor a temp behind and surfaces as the `Cancelled` error.
-    #[test]
-    fn world_create_is_atomic_and_cancellable() {
-        let p = std::env::temp_dir().join("eden_atomic_create.eden");
-        let ps = p.to_str().unwrap().to_string();
-        let tmp = format!("{ps}.tmp");
-        let _ = fs::remove_file(&p); let _ = fs::remove_file(&tmp);
-        create_classic_world_inner(ps.clone(), "Atomic".into(), 2, 2, false, 7, 2, 0, true, false, 1, true, true, &mut |_, _| {})
-            .expect("create failed");
-        assert!(p.exists() && !std::path::Path::new(&tmp).exists(), "complete file, no temp");
-        let _ = fs::remove_file(&p);
-
-        // Cancel from the first progress callback: generation stops, nothing is written.
-        let r = create_classic_world_inner(ps.clone(), "Atomic".into(), 4, 4, false, 7, 2, 0, true, false, 1, true, true,
-            &mut |_, _| cancel_world_gen());
-        assert_eq!(r.unwrap_err(), GEN_CANCELLED);
-        assert!(!p.exists() && !std::path::Path::new(&tmp).exists(), "cancel leaves no file");
-    }
-
-    /// Steep terrain must expose bare rock at the surface (cliff faces), while
-    /// perfectly flat terrain keeps its soil surface.
-    #[test]
-    fn natural_cliffs_expose_rock() {
-        let t_height = 64usize;
-        // Surface block = first non-air scanning down from the top of a column.
-        let surface_of = |data: &Vec<u8>, lx: usize, ly: usize| -> u8 {
-            for z in (0..t_height).rev() {
-                let b = chunk_get(data, lx, ly, z);
-                if b != 0 { return b; }
-            }
-            0
-        };
-
-        // Jagged, dry grassland → some columns are steep enough to show stone.
-        let jagged = NaturalConfig {
-            seed: 555, base_height: 30, roughness: 1.05, erosion: 0.0, terrain_scale: 60.0, extreme: false,
-            water_z: -1, rivers: false, biome: 0, biome_mode: 0, biome_scale: 200.0, snow_caps: false,
-            tree_density_denom: 0, cave_density: 0, cave_style: 0, caverns: false, flood_caves: false,
-            ore_density: 0, vegetation: 0, structures: 0, clouds: false,
-        };
-        let (wc, hc) = (4usize, 4usize);
-        let mut chunks: Vec<Vec<u8>> = (0..wc * hc).map(|_| vec![0u8; 32_768]).collect();
-        generate_natural_world(&mut chunks, wc, hc, &jagged, t_height, &mut |_, _| {});
-        let mut rock = 0;
-        for cy in 0..hc { for cx in 0..wc {
-            let data = &chunks[cy * wc + cx];
-            for lx in 0..16 { for ly in 0..16 {
-                if surface_of(data, lx, ly) == 2 { rock += 1; }
-            }}
-        }}
-        assert!(rock > 0, "jagged terrain should expose surface rock on cliffs");
-
-        // Flat terrain → centre column surface stays grass, never stone.
-        let mut flat = jagged; flat.roughness = 0.0;
-        let mut fc: Vec<Vec<u8>> = (0..wc * hc).map(|_| vec![0u8; 32_768]).collect();
-        let center = generate_natural_world(&mut fc, wc, hc, &flat, t_height, &mut |_, _| {});
-        assert_eq!(chunk_get(&fc[0], 8, 8, center), 8, "flat terrain centre must stay grass");
-    }
-
-    /// Weeds (block 11) are a solid grass variant and must replace the surface
-    /// block, never stack on top of grass — regression guard for the bug where
-    /// they floated one cell above the grass surface.
-    #[test]
-    fn natural_weeds_flush_with_surface() {
-        let (wc, hc) = (4usize, 4usize);
-        let t_height = 64usize;
-        let cfg = NaturalConfig {
-            seed: 123, base_height: 30, roughness: 0.5, erosion: 0.0, terrain_scale: 110.0, extreme: false,
-            water_z: -1, rivers: false, biome: 0, biome_mode: 0, biome_scale: 200.0, snow_caps: false,
-            tree_density_denom: 0, cave_density: 0, cave_style: 0, caverns: false, flood_caves: false,
-            ore_density: 0, vegetation: 2, structures: 0, clouds: false,
-        };
-        let mut chunks: Vec<Vec<u8>> = (0..wc * hc).map(|_| vec![0u8; 32_768]).collect();
-        generate_natural_world(&mut chunks, wc, hc, &cfg, t_height, &mut |_, _| {});
-
-        let mut weeds = 0usize;
-        for cy in 0..hc {
-            for cx in 0..wc {
-                let data = &chunks[cy * wc + cx];
-                for lx in 0..16 { for ly in 0..16 { for z in 1..t_height {
-                    if chunk_get(data, lx, ly, z) == 11 {
-                        weeds += 1;
-                        // The old bug placed weeds one cell above the grass, so a
-                        // weed sat directly on a grass/weeds block. A flush weed
-                        // replaces the surface and rests on dirt/stone instead.
-                        let below = chunk_get(data, lx, ly, z - 1);
-                        assert!(below != 8 && below != 11,
-                            "weed at local ({lx},{ly},{z}) stacks on grass/weeds ({below}) — should be flush");
-                    }
-                }}}
-            }
-        }
-        assert!(weeds > 0, "expected some weeds to be generated");
-    }
-
-    /// No foliage may share a column with standing water — guards the fix for
-    /// vegetation/tree canopy appearing on or overhanging water.
-    #[test]
-    fn natural_generator_no_foliage_on_water() {
-        let (wc, hc) = (4usize, 4usize);
-        let t_height = 64usize;
-        let cfg = NaturalConfig {
-            seed: 99, base_height: 30, roughness: 0.9, erosion: 0.0, terrain_scale: 90.0, extreme: false,
-            water_z: 26, rivers: true, biome: 0, biome_mode: 0, biome_scale: 200.0, snow_caps: false,
-            tree_density_denom: 8, cave_density: 0, cave_style: 0, caverns: false, flood_caves: false,
-            ore_density: 0, vegetation: 2, structures: 0, clouds: false,
-        };
-        let mut chunks: Vec<Vec<u8>> = (0..wc * hc).map(|_| vec![0u8; 32_768]).collect();
-        generate_natural_world(&mut chunks, wc, hc, &cfg, t_height, &mut |_, _| {});
-
-        let is_foliage = |b: u8| matches!(b, 5 | 6 | 11 | 16 | 73);
-        for cy in 0..hc {
-            for cx in 0..wc {
-                let data = &chunks[cy * wc + cx];
-                for lx in 0..16 {
-                    for ly in 0..16 {
-                        let mut has_water = false;
-                        let mut has_foliage = false;
-                        for z in 0..t_height {
-                            match chunk_get(data, lx, ly, z) {
-                                20 | 15 => has_water = true,
-                                b if is_foliage(b) => has_foliage = true,
-                                _ => {}
-                            }
-                        }
-                        assert!(!(has_water && has_foliage),
-                            "foliage shares a column with water at chunk ({cx},{cy}) local ({lx},{ly})");
-                    }
-                }
-            }
-        }
-    }
-
-    fn classic_cfg(seed: u32, caves: bool, trees: u64) -> ClassicConfig {
-        ClassicConfig {
-            seed, variance: 3.0, base_height: 32, gen_caves: caves, tall_caves: false,
-            tree_spacing: trees, flowers: true, clouds: true,
-        }
-    }
-
-    fn count_blocks(chunks: &[Vec<u8>], t_height: usize, bt: u8) -> usize {
-        let mut n = 0;
-        for data in chunks {
-            for lx in 0..16 { for ly in 0..16 { for z in 0..t_height {
-                if chunk_get(data, lx, ly, z) == bt { n += 1; }
-            }}}
-        }
-        n
-    }
-
-    /// Flowers (block 73) must stay sparse — too many crash the modern game's
-    /// sprite loader — and must be absent entirely when the option is off.
-    #[test]
-    fn classic_flowers_are_sparse() {
-        let (wc, hc) = (4usize, 4usize);
-        let t_height = 64usize;
-
-        let mut on: Vec<Vec<u8>> = (0..wc * hc).map(|_| vec![0u8; 32_768]).collect();
-        generate_classic_world(&mut on, wc, hc, &classic_cfg(2024, true, 0), t_height, &mut |_, _| {});
-        let flowers = count_blocks(&on, t_height, 73);
-        let grass   = count_blocks(&on, t_height, 8);
-        assert!(grass > 0, "expected a grass surface");
-        // Far below the ~25% surface coverage of the old (crashing) decoration.
-        assert!(flowers * 20 < grass, "flowers not sparse: {flowers} flowers vs {grass} grass");
-
-        let mut off_cfg = classic_cfg(2024, true, 0);
-        off_cfg.flowers = false;
-        let mut off: Vec<Vec<u8>> = (0..wc * hc).map(|_| vec![0u8; 32_768]).collect();
-        generate_classic_world(&mut off, wc, hc, &off_cfg, t_height, &mut |_, _| {});
-        assert_eq!(count_blocks(&off, t_height, 73), 0, "flowers present with option off");
-    }
-
-    /// The header `version` field selects the column format the game expects:
-    /// 64z legacy worlds = ≤4, New Dawn 256z worlds = ≥5 (5/6 observed in the wild).
-    /// Writing 4 for a 256z world makes the game misread it as 64z (the
-    /// "legacy-conversion" corruption look).
-    #[test]
-    fn world_file_version_matches_format() {
-        for (extended, want_version, want_stride) in [(false, 4u32, 32_768u64), (true, 5u32, 131_072u64)] {
-            let p = std::env::temp_dir().join(format!("eden_ver_{extended}.eden"));
-            let ps = p.to_str().unwrap().to_string();
-            let _ = fs::remove_file(&p);
-            create_classic_world_inner(
-                ps.clone(), "VerTest".into(),
-                2, 2, extended,
-                7, 2, 0, true, false, 1, true, true,
-                &mut |_, _| {},
-            ).expect("create failed");
-
-            let b = fs::read(&p).expect("read back");
-            let version = u32::from_le_bytes(b[92..96].try_into().unwrap());
-            assert_eq!(version, want_version, "wrong version for extended={extended}");
-
-            // Column stride = gap between the first two directory entries.
-            let diro = u64::from_le_bytes(b[32..40].try_into().unwrap()) as usize;
-            let off0 = u64::from_le_bytes(b[diro + 8..diro + 16].try_into().unwrap());
-            let off1 = u64::from_le_bytes(b[diro + 24..diro + 32].try_into().unwrap());
-            assert_eq!(off1 - off0, want_stride, "wrong column stride for extended={extended}");
-
-            let _ = fs::remove_file(&p);
-        }
-    }
-
-    fn tg2_cfg(seed: u32, terrain_type: u8) -> Tg2Config {
-        Tg2Config {
-            seed, terrain_type, sky_islands: false, struct_freq: 1, clouds: false,
-            amplitude: 1.0, sea_level_off: 0, blend: false,
-            caves: false, tall_caves: false, custom_biomes: [0,6,4,2],
-        }
-    }
-
-    /// A 256z (New Dawn) TG2 world must proportionally fill the taller space —
-    /// its surface should track ~t_height/2 (≈128), not stay pinned near the
-    /// legacy 64z baseline (~32). 64z generation must be unaffected (vs=1.0).
-    #[test]
-    fn tg2_scales_to_extended_height() {
-        let (wc, hc) = (4usize, 4usize);
-        let cfg = tg2_cfg(4242, 0); // Plains: baseline = t_height/2
-
-        let mut c64: Vec<Vec<u8>> = (0..wc * hc).map(|_| vec![0u8; 32_768]).collect();
-        let surf64 = generate_tg2_world(&cfg, wc, hc, 64, &mut c64, &mut |_, _| {});
-
-        let mut c256: Vec<Vec<u8>> = (0..wc * hc).map(|_| vec![0u8; 131_072]).collect();
-        let surf256 = generate_tg2_world(&cfg, wc, hc, 256, &mut c256, &mut |_, _| {});
-
-        assert!((20..45).contains(&surf64), "64z plains surface off baseline: {surf64}");
-        assert!((100..160).contains(&surf256), "256z plains surface did not fill height: {surf256}");
-
-        // The tall world must carry solid terrain well above the legacy 64-block
-        // ceiling (surf64 ≈ baseline already proves the 64z path is unchanged).
-        let mut solid_high = false;
-        'o: for data in &c256 {
-            for lx in 0..16 { for ly in 0..16 {
-                for z in 100..130 { if chunk_get(data, lx, ly, z) != 0 { solid_high = true; break 'o; } }
-            }}
-        }
-        assert!(solid_high, "256z world has no terrain near z=128");
-    }
-
-    /// The biome-blend pass smooths surface seams in *both* directions (it may
-    /// raise low columns and carve high ones), so the average step between
-    /// neighbouring surface heights must drop after blending.
-    #[test]
-    fn tg2_blend_smooths_both_directions() {
-        let (wc, hc) = (6usize, 6usize);
-        let bw = wc * 16;
-        // Build a top-down surface-height map from chunk storage.
-        let surface_map = |chunks: &[Vec<u8>]| -> Vec<i32> {
-            let mut m = vec![0i32; bw * bw];
-            for cy in 0..hc { for cx in 0..wc {
-                let data = &chunks[cy * wc + cx];
-                for ly in 0..16 { for lx in 0..16 {
-                    let mut h = 0i32;
-                    for z in (0..64).rev() { if chunk_get(data, lx, ly, z) != 0 { h = z as i32 + 1; break; } }
-                    let (wx, wyy) = (cx * 16 + lx, cy * 16 + ly);
-                    m[wyy * bw + wx] = h;
-                }}
-            }}
-            m
-        };
-        // Mean absolute height difference to the east/south neighbour.
-        let roughness = |m: &[i32]| -> f64 {
-            let (mut sum, mut cnt) = (0i64, 0i64);
-            for y in 0..bw { for x in 0..bw {
-                let h = m[y * bw + x];
-                if x + 1 < bw { sum += (h - m[y * bw + x + 1]).unsigned_abs() as i64; cnt += 1; }
-                if y + 1 < bw { sum += (h - m[(y + 1) * bw + x]).unsigned_abs() as i64; cnt += 1; }
-            }}
-            sum as f64 / cnt.max(1) as f64
-        };
-
-        let mut plain: Vec<Vec<u8>> = (0..wc * hc).map(|_| vec![0u8; 32_768]).collect();
-        generate_tg2_world(&tg2_cfg(99, 7), wc, hc, 64, &mut plain, &mut |_, _| {});
-
-        let mut blended_cfg = tg2_cfg(99, 7);
-        blended_cfg.blend = true;
-        let mut blended: Vec<Vec<u8>> = (0..wc * hc).map(|_| vec![0u8; 32_768]).collect();
-        generate_tg2_world(&blended_cfg, wc, hc, 64, &mut blended, &mut |_, _| {});
-
-        let r_plain = roughness(&surface_map(&plain));
-        let r_blended = roughness(&surface_map(&blended));
-        assert!(r_blended < r_plain,
-            "blend did not smooth seams: {r_blended} !< {r_plain}");
-    }
-
-    /// The reworked `tg2_make_transition` warps the seam with low-frequency noise,
-    /// so the material boundary between two biomes wanders across rows instead of
-    /// tracing a single straight axis-aligned column.
-    #[test]
-    fn tg2_warped_borders_not_axis_aligned() {
-        let (gsize, th) = (128usize, 64usize);
-        let mut g = Tg2Grid::new(gsize, th, 1.0, 1.0, 0);
-        // Left half: sand (4) at height 20; right half: stone (2) at height 30.
-        for x in 0..64i32 { for z in 0..gsize as i32 {
-            for y in 1..20 { g.put(x, z, y, 4, 0); }
-        }}
-        for x in 64..gsize as i32 { for z in 0..gsize as i32 {
-            for y in 1..30 { g.put(x, z, y, 2, 0); }
-        }}
-        let noise = ClassicNoise::new(777);
-        let (sx, ex) = (48i32, 80i32);
-        tg2_make_transition(&mut g, &noise, 777.0, sx, 0, ex, gsize as i32);
-
-        // For each row, find the first x inside the band whose surface is stone (2).
-        let surface_switch = |g: &Tg2Grid, z: i32| -> i32 {
-            for x in sx..ex {
-                let mut top = 0u8;
-                for y in (1..th as i32).rev() { let b = g.get(x, z, y); if b != 0 { top = b; break; } }
-                if top == 2 { return x; }
-            }
-            ex
-        };
-        let mut switches = std::collections::HashSet::new();
-        for z in 0..gsize as i32 { switches.insert(surface_switch(&g, z)); }
-        assert!(switches.len() >= 3,
-            "transition seam is too straight (axis-aligned): only {} distinct switch columns", switches.len());
-    }
-
-    /// Weeds (block 11) must appear on the surface but stay at most half of the
-    /// ground cover (grass 8 + weeds 11) — too many were never the crash cause
-    /// (flowers were), but the legacy look keeps grass dominant.
-    #[test]
-    fn classic_weeds_present_and_bounded() {
-        let (wc, hc) = (4usize, 4usize);
-        let t_height = 64usize;
-        let mut chunks: Vec<Vec<u8>> = (0..wc * hc).map(|_| vec![0u8; 32_768]).collect();
-        generate_classic_world(&mut chunks, wc, hc, &classic_cfg(2024, true, 0), t_height, &mut |_, _| {});
-        let grass = count_blocks(&chunks, t_height, 8);
-        let weeds = count_blocks(&chunks, t_height, 11);
-        assert!(weeds > 0, "expected some tall grass / weeds on the surface");
-        assert!(weeds <= grass, "weeds ({weeds}) exceed half the ground cover (grass {grass})");
-    }
-
-    /// Tall caves must carve open air higher up (closer to the surface) than the
-    /// shallow legacy cave band, and produce variegated walls (slate, type 14).
-    #[test]
-    fn classic_tall_caves_reach_higher() {
-        let (wc, hc) = (4usize, 4usize);
-        let t_height = 64usize;
-        // Highest *deep* air cell (≥8 below the column's surface, so the legacy
-        // holey dirt skin is excluded and only caves count).
-        let highest_cave_air = |chunks: &[Vec<u8>]| -> i32 {
-            let mut hi = -1i32;
-            for data in chunks {
-                for lx in 0..16 { for ly in 0..16 {
-                    let mut top = 0i32;
-                    for z in 0..t_height { if chunk_get(data, lx, ly, z) != 0 { top = z as i32; } }
-                    for z in (1..=(top - 8).max(0)).rev() {
-                        if chunk_get(data, lx, ly, z as usize) == 0 { if z > hi { hi = z; } break; }
-                    }
-                }}
-            }
-            hi
-        };
-        let mut normal_cfg = classic_cfg(2024, true, 0);
-        normal_cfg.clouds = false; // clouds raise `top` and leak sky air into the measure
-        let mut normal: Vec<Vec<u8>> = (0..wc * hc).map(|_| vec![0u8; 32_768]).collect();
-        generate_classic_world(&mut normal, wc, hc, &normal_cfg, t_height, &mut |_, _| {});
-        let mut tall_cfg = normal_cfg;
-        tall_cfg.tall_caves = true;
-        let mut tall: Vec<Vec<u8>> = (0..wc * hc).map(|_| vec![0u8; 32_768]).collect();
-        generate_classic_world(&mut tall, wc, hc, &tall_cfg, t_height, &mut |_, _| {});
-
-        assert!(highest_cave_air(&tall) > highest_cave_air(&normal),
-            "tall caves ({}) should reach higher than normal caves ({})",
-            highest_cave_air(&tall), highest_cave_air(&normal));
-        // Tall caves use the same materials as normal caves: stone (2) + dark
-        // stone (10) only — no cobblestone/slate (14).
-        assert_eq!(count_blocks(&tall, t_height, 14), 0, "tall caves must not contain slate/cobblestone");
-    }
-
-    /// The classic generator must run cross-chunk without panicking, lay bedrock,
-    /// fill terrain, and produce a grass surface somewhere.
-    #[test]
-    fn classic_generator_fills_terrain() {
-        let (wc, hc) = (3usize, 3usize);
-        let t_height = 64usize;
-        let mut chunks: Vec<Vec<u8>> = (0..wc * hc).map(|_| vec![0u8; 32_768]).collect();
-        let center = generate_classic_world(&mut chunks, wc, hc, &classic_cfg(2024, true, 50), t_height, &mut |_, _| {});
-        assert!(center >= 3 && center < t_height, "centre surface z out of range: {center}");
-
-        let mut grass = 0usize;
-        for data in &chunks {
-            for lx in 0..16 {
-                for ly in 0..16 {
-                    assert_eq!(chunk_get(data, lx, ly, 0), 1, "missing bedrock");
-                    for z in 1..t_height {
-                        if matches!(chunk_get(data, lx, ly, z), 8 | 11) { grass += 1; }
-                    }
-                }
-            }
-        }
-        assert!(grass > 0, "classic terrain produced no grass surface");
-    }
-
-    /// With caves on, the carved 3D-noise tunnels must open at least one interior
-    /// air cell that would be solid stone when caves are disabled.
-    #[test]
-    fn classic_generator_caves_carve_air() {
-        let (wc, hc) = (3usize, 3usize);
-        let t_height = 64usize;
-        let cfg_caves = classic_cfg(555, true, 0);
-        let cfg_solid = classic_cfg(555, false, 0);
-
-        // Heightmap is identical for both (same seed); compare interior fills.
-        let noise = ClassicNoise::new(555);
-        let bw = wc * 16;
-        let mut carved_air = 0usize;
-        for cy in 0..hc {
-            for cx in 0..wc {
-                let mut a = vec![0u8; 32_768];
-                let mut b = vec![0u8; 32_768];
-                let mut heights = vec![0u16; bw * (hc * 16)];
-                for wy in 0..(hc * 16) {
-                    for wx in 0..bw {
-                        heights[wy * bw + wx] = classic_height(&noise, wx as f64, wy as f64, &cfg_caves, t_height) as u16;
-                    }
-                }
-                fill_classic_chunk(&mut a, cx, cy, wc, &heights, &cfg_caves, &noise, t_height);
-                fill_classic_chunk(&mut b, cx, cy, wc, &heights, &cfg_solid, &noise, t_height);
-                for lx in 0..16 {
-                    for ly in 0..16 {
-                        for z in 1..t_height {
-                            if chunk_get(&a, lx, ly, z) == 0 && chunk_get(&b, lx, ly, z) == 2 {
-                                carved_air += 1;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        assert!(carved_air > 0, "caves did not carve any air pockets");
-    }
-
-    /// Every tree trunk must sit on grass (8) or tall grass / weeds (11).
-    #[test]
-    fn classic_trees_only_on_grass() {
-        let (wc, hc) = (4usize, 4usize);
-        let t_height = 64usize;
-        let mut chunks: Vec<Vec<u8>> = (0..wc * hc).map(|_| vec![0u8; 32_768]).collect();
-        generate_classic_world(&mut chunks, wc, hc, &classic_cfg(31337, false, 12), t_height, &mut |_, _| {});
-
-        let water_mask = vec![false; wc * 16 * hc * 16];
-        let gen = WorldGen { chunks: &mut chunks, wc, hc, t_height, water_mask: &water_mask };
-        let mut trunk_bases = 0usize;
-        for wy in 0..(hc * 16) as i32 {
-            for wx in 0..(wc * 16) as i32 {
-                for z in 1..t_height as i32 {
-                    if gen.get(wx, wy, z) == 6 && gen.get(wx, wy, z - 1) != 6 {
-                        // Bottom of a trunk: the block below must be grass/weeds.
-                        let below = gen.get(wx, wy, z - 1);
-                        assert!(below == 8 || below == 11,
-                            "trunk base at ({wx},{wy},{z}) sits on block {below}, not grass/weeds");
-                        trunk_bases += 1;
-                    }
-                }
-            }
-        }
-        assert!(trunk_bases > 0, "no trees were generated to validate");
-    }
-
-    /// Full-file identity: parsing a fixture and saving it back without any edits
-    /// must reproduce the original bytes exactly (not just header + pointer table).
-    #[test]
-    fn test_parse_save_parse_full_identity() {
-        let original = make_test_world();
-        let world = parse_world_inner(mmap_from_bytes(original.clone())).expect("parse failed");
-
-        let tmp = std::env::temp_dir().join("eden_test_full_identity.eden");
-        let _ = fs::remove_file(&tmp);
-        save_world_inner(&world, tmp.to_str().unwrap(), false).expect("save failed");
-
-        let saved_bytes = fs::read(&tmp).expect("read back failed");
-        assert_eq!(original, saved_bytes, "unedited save must be byte-identical to the source file");
-
-        // Re-parsing the saved file must reproduce the same test blocks.
-        let world2 = parse_world_inner(mmap_from_bytes(saved_bytes)).expect("re-parse failed");
-        assert_eq!(world2.bytes[blk(3, 5, 0)], 7, "Wood survives parse->save->parse");
-        assert_eq!(world2.bytes[blk(3, 5, 17)], 2, "Stone survives parse->save->parse");
-        assert_eq!(world2.bytes[pnt(3, 5, 17)], 5, "paint survives parse->save->parse");
-        assert_eq!(world2.bytes[blk(3, 5, 48)], 3, "Dirt survives parse->save->parse");
-        assert_eq!(world2.bytes[blk(7, 2, 32)], 8, "bystander survives parse->save->parse");
-
-        let _ = fs::remove_file(&tmp);
-    }
-
-    /// rotate_ramp_id_cw: offset shifts +3 mod 4 (i.e. -1 mod 4) within each
-    /// directional family, and four rotations return to the original ID.
-    #[test]
-    fn test_rotate_ramp_id_cw_offsets() {
-        // Ramps: base 24 (S/W/N/E = off 0/1/2/3). CW rotation: S->E->N->W->S.
-        assert_eq!(rotate_ramp_id_cw(24), 27, "ramp S -> E");
-        assert_eq!(rotate_ramp_id_cw(27), 26, "ramp E -> N");
-        assert_eq!(rotate_ramp_id_cw(26), 25, "ramp N -> W");
-        assert_eq!(rotate_ramp_id_cw(25), 24, "ramp W -> S");
-
-        // Wedges: base 40 (SE/SW/NW/NE = off 0/1/2/3).
-        assert_eq!(rotate_ramp_id_cw(40), 43);
-        assert_eq!(rotate_ramp_id_cw(43), 42);
-        assert_eq!(rotate_ramp_id_cw(42), 41);
-        assert_eq!(rotate_ramp_id_cw(41), 40);
-
-        // Doors 66-69 and portals 75-78 follow the same +3 mod 4 rule.
-        assert_eq!(rotate_ramp_id_cw(66), 69);
-        assert_eq!(rotate_ramp_id_cw(75), 78);
-
-        // Four rotations is the identity for every family base.
-        for base in [24u8, 28, 32, 36, 40, 44, 48, 52] {
-            let mut bt = base;
-            for _ in 0..4 { bt = rotate_ramp_id_cw(bt); }
-            assert_eq!(bt, base, "4x rotation must return to start for base {base}");
-        }
-
-        // Non-directional block types pass through unchanged.
-        assert_eq!(rotate_ramp_id_cw(2), 2, "stone is not directional");
-        assert_eq!(rotate_ramp_id_cw(0), 0, "air is not directional");
-    }
-
-    /// mirror_ramp_id_x/y: involutions (applying twice returns the original ID)
-    /// and the specific S/W/N/E and SE/SW/NW/NE swaps documented on the functions.
-    #[test]
-    fn test_mirror_ramp_id_offsets() {
-        // X mirror: ramps E(3)<->W(1), S(0)/N(2) unchanged.
-        assert_eq!(mirror_ramp_id_x(24), 24, "ramp S unchanged under X mirror");
-        assert_eq!(mirror_ramp_id_x(26), 26, "ramp N unchanged under X mirror");
-        assert_eq!(mirror_ramp_id_x(25), 27, "ramp W -> E under X mirror");
-        assert_eq!(mirror_ramp_id_x(27), 25, "ramp E -> W under X mirror");
-
-        // Y mirror: ramps S(0)<->N(2), E(3)/W(1) unchanged.
-        assert_eq!(mirror_ramp_id_y(24), 26, "ramp S -> N under Y mirror");
-        assert_eq!(mirror_ramp_id_y(26), 24, "ramp N -> S under Y mirror");
-        assert_eq!(mirror_ramp_id_y(25), 25, "ramp W unchanged under Y mirror");
-
-        // Wedges: X mirror flips the E/W component (off ^ 1); Y mirror flips N/S (off ^ 3).
-        for off in 0u8..4 {
-            let bt = 40 + off;
-            assert_eq!(mirror_ramp_id_x(bt), 40 + (off ^ 1));
-            assert_eq!(mirror_ramp_id_y(bt), 40 + (off ^ 3));
-        }
-
-        // Both mirrors are involutions: applying twice is the identity.
-        for bt in [24u8, 25, 26, 27, 40, 41, 42, 43, 66, 67, 68, 69, 75, 76, 77, 78] {
-            assert_eq!(mirror_ramp_id_x(mirror_ramp_id_x(bt)), bt, "X mirror twice = identity for {bt}");
-            assert_eq!(mirror_ramp_id_y(mirror_ramp_id_y(bt)), bt, "Y mirror twice = identity for {bt}");
-        }
-
-        assert_eq!(mirror_ramp_id_x(2), 2, "stone is not directional");
-    }
-
-    fn make_test_clipboard() -> Clipboard {
-        // 2 (w) x 3 (h) x 1 (depth) clipboard.
-        // Layout (row-major, dy*width+dx):
-        //   dy=0: [ramp-S(24), wedge-SE(40)]
-        //   dy=1: [stone(2),   air(0)]
-        //   dy=2: [ramp-E(27), dirt(3)]
-        let block_types = vec![
-            24, 40,
-            2, 0,
-            27, 3,
-        ];
-        let paints = vec![
-            1, 2,
-            0, 0,
-            3, 4,
-        ];
-        Clipboard { width: 2, height: 3, depth: 1, z_anchor: 10, block_types, paints, mask: None, origin: None }
-    }
-
-    /// rotate_clipboard_inner: dimensions swap (w,h)->(h,w), content transform
-    /// matches (dx,dy)->(dy, old_w-1-dx), and directional IDs are rotated CW.
-    #[test]
-    fn test_rotate_clipboard_inner() {
-        let mut cb = make_test_clipboard();
-        rotate_clipboard_inner(&mut cb);
-
-        assert_eq!(cb.width, 3, "new width = old height");
-        assert_eq!(cb.height, 2, "new height = old width");
-        assert_eq!(cb.z_anchor, 10, "z_anchor untouched by XY rotation");
-
-        // Source (dx=0,dy=0)=ramp-S(24) -> dest (ndx=0, ndy=old_w-1-0=1) -> rotated to ramp-E(27)
-        let at = |cb: &Clipboard, x: usize, y: usize| -> (u8, u8) {
-            let i = y * cb.width as usize + x;
-            (cb.block_types[i], cb.paints[i])
-        };
-        assert_eq!(at(&cb, 0, 1), (27, 1), "ramp-S rotates to ramp-E and keeps its paint");
-        // Source (dx=1,dy=2)=dirt(3) -> dest (ndx=2, ndy=old_w-1-1=0)
-        assert_eq!(at(&cb, 2, 0), (3, 4), "dirt (non-directional) keeps id, moves per rotation, keeps paint");
-
-        // Four rotations restores original dimensions and content.
-        rotate_clipboard_inner(&mut cb);
-        rotate_clipboard_inner(&mut cb);
-        rotate_clipboard_inner(&mut cb);
-        let original = make_test_clipboard();
-        assert_eq!(cb.width, original.width);
-        assert_eq!(cb.height, original.height);
-        assert_eq!(cb.block_types, original.block_types, "4x rotation restores block types");
-        assert_eq!(cb.paints, original.paints, "4x rotation restores paints");
-    }
-
-    /// mirror_clipboard_x_inner / mirror_clipboard_y_inner: dimensions unchanged,
-    /// content reversed along the mirrored axis, directional IDs remapped, involution holds.
-    #[test]
-    fn test_mirror_clipboard_inner() {
-        let mut cb = make_test_clipboard();
-        mirror_clipboard_x_inner(&mut cb);
-        assert_eq!((cb.width, cb.height), (2, 3), "X mirror keeps dimensions");
-        let at = |cb: &Clipboard, x: usize, y: usize| -> (u8, u8) {
-            let i = y * cb.width as usize + x;
-            (cb.block_types[i], cb.paints[i])
-        };
-        // dy=0 row [ramp-S(24), wedge-SE(40)] mirrors to [wedge-SW(41), ramp-S(24)]
-        assert_eq!(at(&cb, 0, 0), (41, 2), "wedge-SE moves to x=0 and mirrors to SW");
-        assert_eq!(at(&cb, 1, 0), (24, 1), "ramp-S moves to x=1, S is unchanged by X mirror");
-
-        // Involution: mirroring twice restores the original.
-        mirror_clipboard_x_inner(&mut cb);
-        let original = make_test_clipboard();
-        assert_eq!(cb.block_types, original.block_types, "2x X-mirror restores block types");
-        assert_eq!(cb.paints, original.paints, "2x X-mirror restores paints");
-
-        let mut cb_y = make_test_clipboard();
-        mirror_clipboard_y_inner(&mut cb_y);
-        assert_eq!((cb_y.width, cb_y.height), (2, 3), "Y mirror keeps dimensions");
-        // dy=0 row moves to dy=2, ramp-S(24) mirrors to ramp-N(26)
-        assert_eq!(at(&cb_y, 0, 2), (26, 1), "ramp-S moves to y=2 and mirrors to N");
-        mirror_clipboard_y_inner(&mut cb_y);
-        assert_eq!(cb_y.block_types, original.block_types, "2x Y-mirror restores block types");
-        assert_eq!(cb_y.paints, original.paints, "2x Y-mirror restores paints");
-    }
-
-    /// 18.6: the in-place mirrors and slice-wise rotate must equal a naive out-of-place reference
-    /// on multi-slice clipboards with odd and even sides (odd = a self-mapped middle row/column
-    /// that is remapped but not swapped) and a footprint mask.
-    #[test]
-    fn test_clipboard_transforms_match_reference() {
-        for &(w, h, d) in &[(1usize, 1usize, 1usize), (3, 5, 4), (4, 6, 3), (5, 2, 2), (2, 5, 1), (7, 7, 2)] {
-            let vol = w * h * d;
-            let mk = || Clipboard {
-                width: w as i32, height: h as i32, depth: d as i32, z_anchor: 0,
-                // Cycle through ramps/wedges/doors/portals/plain so every remap arm is exercised.
-                block_types: (0..vol).map(|i| ((i * 5) % 80) as u8).collect(),
-                paints: (0..vol).map(|i| (i % 251) as u8).collect(),
-                mask: Some((0..(w * h).div_ceil(8)).map(|i| (i as u8).wrapping_mul(37) | 1).collect()), origin: None
-            };
-            let mask_bit = |m: &Option<Vec<u8>>, i: usize| bit_set(m.as_ref().unwrap(), i);
-            let src = mk();
-            let at = |c: &Clipboard, x: usize, y: usize, z: usize| {
-                let i = z * (c.width * c.height) as usize + y * c.width as usize + x;
-                (c.block_types[i], c.paints[i])
-            };
-
-            let mut cb = mk();
-            mirror_clipboard_x_inner(&mut cb);
-            for z in 0..d { for y in 0..h { for x in 0..w {
-                let (bt, p) = at(&src, x, y, z);
-                assert_eq!(at(&cb, w - 1 - x, y, z), (mirror_ramp_id_x(bt), p), "mirror X {w}x{h}x{d} at {x},{y},{z}");
-            }}}
-            for y in 0..h { for x in 0..w {
-                assert_eq!(mask_bit(&cb.mask, y * w + (w - 1 - x)), mask_bit(&src.mask, y * w + x), "mirror X mask");
-            }}
-
-            let mut cb = mk();
-            mirror_clipboard_y_inner(&mut cb);
-            for z in 0..d { for y in 0..h { for x in 0..w {
-                let (bt, p) = at(&src, x, y, z);
-                assert_eq!(at(&cb, x, h - 1 - y, z), (mirror_ramp_id_y(bt), p), "mirror Y {w}x{h}x{d} at {x},{y},{z}");
-            }}}
-            for y in 0..h { for x in 0..w {
-                assert_eq!(mask_bit(&cb.mask, (h - 1 - y) * w + x), mask_bit(&src.mask, y * w + x), "mirror Y mask");
-            }}
-
-            let mut cb = mk();
-            rotate_clipboard_inner(&mut cb);
-            assert_eq!((cb.width as usize, cb.height as usize), (h, w));
-            assert_eq!(cb.block_types.len(), vol);
-            for z in 0..d { for y in 0..h { for x in 0..w {
-                let (bt, p) = at(&src, x, y, z);
-                assert_eq!(at(&cb, y, w - 1 - x, z), (rotate_ramp_id_cw(bt), p), "rotate {w}x{h}x{d} at {x},{y},{z}");
-            }}}
-            for y in 0..h { for x in 0..w {
-                assert_eq!(mask_bit(&cb.mask, (w - 1 - x) * h + y), mask_bit(&src.mask, y * w + x), "rotate mask");
-            }}
-        }
-    }
-
-    /// The sculpt "noise" branch must sample *spatially coherent* noise (fbm/ridged), not
-    /// per-column white noise. Coherence = adjacent columns get near-identical displacements,
-    /// so the mean step between horizontal neighbours is far smaller than the field's range.
-    /// (The old bug applied independent random deltas per column → neighbour steps ≈ the full
-    /// range.) This mirrors exactly how `sculpt_terrain`'s "hills"/"mountains" branches sample.
-    #[test]
-    fn test_sculpt_coherent_noise() {
-        let freq = 1.0 / 24.0; // default feature size 24
-        let so = 13.37;
-        let amp = 6.0;
-        let n = 64;
-
-        // ── Hills (fbm2 ∈ [-1,1]) ──────────────────────────────────────────────
-        let hill = |x: i32, y: i32| (fbm2(x as f64 * freq + so, y as f64 * freq + so, 4) * amp).round() as i32;
-        let mut min_h = i32::MAX;
-        let mut max_h = i32::MIN;
-        let mut neighbour_steps: Vec<i32> = Vec::new();
-        for y in 0..n {
-            for x in 0..n {
-                let v = hill(x, y);
-                min_h = min_h.min(v);
-                max_h = max_h.max(v);
-                if x + 1 < n { neighbour_steps.push((hill(x + 1, y) - v).abs()); }
-            }
-        }
-        let range = (max_h - min_h) as f64;
-        assert!(range >= 2.0, "hills field should actually vary (range {range})");
-        let max_step = *neighbour_steps.iter().max().unwrap();
-        let mean_step = neighbour_steps.iter().sum::<i32>() as f64 / neighbour_steps.len() as f64;
-        // Coherent noise: adjacent columns never jump more than 1 block at this frequency,
-        // and on average barely move — white noise would give steps on the order of `range`.
-        assert!(max_step <= 1, "adjacent hill columns must differ by ≤1 block (got {max_step})");
-        assert!(mean_step < range * 0.25,
-            "mean neighbour step {mean_step:.3} should be « field range {range} for coherent noise");
-
-        // ── Mountains (ridged2 ∈ [0,1]) builds strictly upward ─────────────────
-        for y in 0..n {
-            for x in 0..n {
-                let r = ridged2(x as f64 * freq + so, y as f64 * freq + so, 4);
-                assert!((0.0..=1.0).contains(&r), "ridged2 out of range: {r}");
-            }
-        }
-
-        // ── Falloff primitive: smoothstep is a monotone dome on [0,1] with clamped ends ──
-        assert_eq!(smoothstep01(0.0), 0.0);
-        assert_eq!(smoothstep01(1.0), 1.0);
-        assert_eq!(smoothstep01(-5.0), 0.0, "clamps below 0");
-        assert_eq!(smoothstep01(5.0), 1.0, "clamps above 1");
-        let mut prev = -1.0;
-        for i in 0..=10 {
-            let s = smoothstep01(i as f64 / 10.0);
-            assert!(s >= prev, "smoothstep01 must be monotonically non-decreasing");
-            prev = s;
-        }
-
-        // Every falloff profile is a monotone map from rim(0)→0 to core(1)→1, clamped.
-        for prof in ["smooth", "linear", "sphere", "sharp"] {
-            assert_eq!(falloff_dome(0.0, prof), 0.0, "{prof}: rim weight is 0");
-            assert!((falloff_dome(1.0, prof) - 1.0).abs() < 1e-9, "{prof}: core weight is 1");
-            assert_eq!(falloff_dome(-3.0, prof), 0.0, "{prof}: clamps below 0");
-            assert_eq!(falloff_dome(3.0, prof), 1.0, "{prof}: clamps above 1");
-            let mut last = -1.0;
-            for i in 0..=20 {
-                let v = falloff_dome(i as f64 / 20.0, prof);
-                assert!(v >= last - 1e-12, "{prof}: must be non-decreasing");
-                last = v;
-            }
-        }
-        // Distinct shapes: at the midpoint, sphere bulges above and sharp dips below linear.
-        assert!(falloff_dome(0.5, "sphere") > 0.5, "sphere rises fast off the rim");
-        assert!(falloff_dome(0.5, "sharp") < 0.5, "sharp keeps a wide soft skirt");
-    }
-
-    /// build_lamp_index buckets each lamp under its chunk coord; an empty world → empty index.
-    #[test]
-    fn build_lamp_index_buckets_lamps_by_chunk() {
-        let empty = parse_world_inner(mmap_from_bytes(make_test_world())).expect("parse failed");
-        assert!(build_lamp_index(&empty).is_empty(), "world with no lamps → empty index");
-
-        let mut world = parse_world_inner(mmap_from_bytes(make_test_world())).expect("parse failed");
-        // Place a lamp (type 72) at lx=4, ly=6, z=5 in chunk (0,0).
-        world.bytes[blk(4, 6, 5)] = 72;
-        let index = build_lamp_index(&world);
-        assert_eq!(index.get(&(0, 0)).map(sorted_lamps), Some(vec![[4, 6, 5]]), "lamp bucketed at its chunk with local coords");
-
-        // The band-major linear scan (audit H3) must decode `(lx, ly, lz)` back out of a flat
-        // half-band offset correctly in *every* band, and must never read the paint half — a paint
-        // byte that happens to hold 72 is colour index 72, not a lamp.
-        world.bytes[blk(15, 15, 63)] = 72; // last voxel of the last band
-        world.bytes[blk(0, 0, 16)] = 72;   // first voxel of band 1
-        world.bytes[pnt(1, 1, 20)] = 72;   // paint byte — must be ignored
-        let lamps = sorted_lamps(&build_lamp_index(&world).remove(&(0, 0)).expect("lamps present"));
-        assert_eq!(lamps, vec![[0, 0, 16], [4, 6, 5], [15, 15, 63]],
-                   "every band decoded, paint half-band skipped");
-    }
-
-    /// Reads must be genuinely *shared* — that is the whole point of the `RwLock` (audit C1 step 2):
-    /// `fetch_tile`/`get_cursor_block`/render must keep running while `save_world` holds its guard.
-    /// If `AppState` is ever reverted to a `Mutex`, the second acquisition blocks forever and this
-    /// fails on the timeout instead of silently regressing to the old freeze-during-save behaviour.
-    #[test]
-    fn app_state_readers_do_not_block_each_other() {
-        use std::sync::{mpsc, Arc};
-        let state = Arc::new(AppState::new(WorldState::new()));
-        let held = read_ws(&state); // stands in for a long save holding its read guard
-        let (tx, rx) = mpsc::channel();
-        let other = Arc::clone(&state);
-        let t = std::thread::spawn(move || {
-            let ws = read_ws(&other);
-            tx.send(ws.world.is_none()).unwrap();
-        });
-        assert_eq!(
-            rx.recv_timeout(std::time::Duration::from_secs(5)),
-            Ok(true),
-            "a second reader must acquire while the first still holds its guard",
-        );
-        drop(held);
-        t.join().unwrap();
-    }
-
-    /// Mutate `world.bytes` at `writes` and replay the resulting undo delta into `ws.lamp_index`,
-    /// exactly as `with_edit_inner`/`undo_edit_inner` do. `z_range` picks the snapshot scope, which
-    /// is what decides `Sparse` vs `Full` in `diff_chunk`.
-    fn edit_and_replay_delta(ws: &mut WorldState, z_range: Option<(i32, i32)>, writes: &[(usize, u8)]) {
-        let pre = snapshot_chunks_full(ws.world.as_ref().unwrap(), &[(0, 0)], z_range);
-        for &(off, byte) in writes {
-            ws.world.as_mut().unwrap().bytes[off] = byte;
-        }
-        let world = ws.world.as_ref().unwrap();
-        let snaps: Vec<ChunkSnapshot> = pre.into_iter()
-            .filter_map(|(cx, cy, start, data)| diff_chunk(world, cx, cy, start, &data))
-            .collect();
-        apply_lamp_delta(&ws.lamp_index, world, &snaps);
-    }
-
-    /// The lamp index must follow a placed/removed lamp — the core correctness invariant the
-    /// with_edit/undo/redo hooks rely on. Now driven by the edit's undo delta (audit H3) rather
-    /// than a full chunk rescan, so this also asserts the two agree.
-    #[test]
-    fn lamp_index_delta_tracks_place_and_remove() {
-        let mut ws = WorldState::new();
-        ws.world = Some(parse_world_inner(mmap_from_bytes(make_test_world())).expect("parse failed"));
-        lamp_build_now(&ws.lamp_index, ws.world.as_ref().unwrap());
-        assert!(ws.lamp_index.snapshot().is_empty(), "starts with no lamps");
-
-        edit_and_replay_delta(&mut ws, None, &[(blk(4, 6, 5), 72)]);
-        assert_eq!(ws.lamp_index.snapshot().get(&(0, 0)).map(sorted_lamps), Some(vec![[4, 6, 5]]),
-                   "placed lamp indexed from the delta");
-        assert_eq!(ws.lamp_index.snapshot(), build_lamp_index(ws.world.as_ref().unwrap()),
-                   "delta path agrees with a from-scratch rescan");
-
-        edit_and_replay_delta(&mut ws, None, &[(blk(4, 6, 5), 0)]);
-        assert!(ws.lamp_index.snapshot().get(&(0, 0)).is_none(),
-                "removed lamp drops its chunk bucket");
-    }
-
-    /// A dense edit falls back to `ChunkDelta::Full`; the lamp index must replay that branch too.
-    /// Also pins the paint half-band skip: byte 72 written into a *paint* byte is a colour index,
-    /// not a lamp, and must never enter the index.
-    #[test]
-    fn lamp_index_delta_handles_full_delta_and_skips_paint() {
-        let mut ws = WorldState::new();
-        ws.world = Some(parse_world_inner(mmap_from_bytes(make_test_world())).expect("parse failed"));
-        lamp_build_now(&ws.lamp_index, ws.world.as_ref().unwrap());
-
-        // Fill band 0's entire block half with lamps → 4096 changed bytes over an 8192-byte
-        // band-scoped snapshot, so `diff_chunk` picks `Full` rather than `Sparse`.
-        let writes: Vec<(usize, u8)> = (0..16)
-            .flat_map(|lx| (0..16).flat_map(move |ly| (0..16).map(move |z| (blk(lx, ly, z), 72u8))))
-            .collect();
-        edit_and_replay_delta(&mut ws, Some((0, 15)), &writes);
-        let rescan = build_lamp_index(ws.world.as_ref().unwrap());
-        assert_eq!(rescan.get(&(0, 0)).map(|v| v.len()), Some(4096), "the whole band is lamps");
-        let from_delta = sorted_lamps(&ws.lamp_index.snapshot().remove(&(0, 0)).unwrap());
-        let from_scan = sorted_lamps(rescan.get(&(0, 0)).unwrap());
-        assert_eq!(from_delta, from_scan, "Full-delta replay matches a from-scratch rescan");
-
-        // Paint byte holding 72 must not register as a lamp.
-        edit_and_replay_delta(&mut ws, None, &[(pnt(2, 2, 40), 72)]);
-        assert_eq!(ws.lamp_index.snapshot().get(&(0, 0)).map(|v| v.len()), Some(4096),
-                   "a paint byte of 72 is a colour, not a lamp");
-    }
-
-    /// The core §4 invariant: an edit's delta into a chunk `LampIndex` has never scanned must be
-    /// dropped, not fabricated into a bucket claiming the chunk is fully known — the later
-    /// on-demand scan (triggered by a real region query) is what must see the edit.
-    #[test]
-    fn lamp_delta_dropped_for_unscanned_chunk_then_scan_sees_the_edit() {
-        let mut ws = WorldState::new();
-        ws.world = Some(parse_world_inner(mmap_from_bytes(make_test_world())).expect("parse failed"));
-        // ws.lamp_index starts empty — chunk (0,0) has never been scanned.
-        edit_and_replay_delta(&mut ws, None, &[(blk(4, 6, 5), 72)]);
-        assert!(ws.lamp_index.snapshot().is_empty(),
-                "delta into an unscanned chunk must be dropped, not fabricate a bucket");
-
-        let world = ws.world.as_ref().unwrap();
-        let found = ws.lamp_index.lamps_in_region(world, 0, 0, 15, 15, 5.0);
-        assert_eq!(found, vec![[4, 6, 5]], "on-demand scan re-derives the lamp from truth");
-    }
-
-    /// Once a chunk *has* been scanned (via a real region query), the delta path must track a
-    /// place → undo → redo cycle exactly, agreeing with a from-scratch rescan at every step. Pins
-    /// both delta directions (`with_edit_inner` and `undo_edit_inner`/`redo_edit_inner`) against
-    /// the write-then-apply ordering `apply_delta` relies on.
-    #[test]
-    fn lamp_delta_applied_for_scanned_chunk_matches_rescan() {
-        let mut ws = WorldState::new();
-        ws.world = Some(parse_world_inner(mmap_from_bytes(make_test_world())).expect("parse failed"));
-        {
-            let world = ws.world.as_ref().unwrap();
-            ws.lamp_index.lamps_in_region(world, 0, 0, 15, 15, 1.0); // scans chunk (0,0)
-        }
-        let check = |ws: &WorldState, label: &str| {
-            let mut rescan = scan_chunk_lamps(ws.world.as_ref().unwrap(), 0, 0);
-            rescan.sort_unstable();
-            let from_index = sorted_lamps(&ws.lamp_index.snapshot().remove(&(0, 0)).unwrap_or_default());
-            assert_eq!(from_index, rescan, "{label}: index must match a from-scratch rescan");
-        };
-
-        with_edit(&mut ws, "place lamp", (0, 0, 15, 15), |world| {
-            set_block_abs(world, 4, 6, 5, LAMP_BLOCK_TYPE, 0);
-            Ok(())
-        }).expect("place lamp");
-        check(&ws, "after place");
-
-        undo_edit_inner(&mut ws).expect("undo");
-        check(&ws, "after undo");
-        assert!(ws.lamp_index.snapshot().get(&(0, 0)).is_none(), "lamp gone after undo");
-
-        redo_edit_inner(&mut ws).expect("redo");
-        check(&ws, "after redo");
-        assert_eq!(ws.lamp_index.snapshot().get(&(0, 0)).map(sorted_lamps), Some(vec![[4, 6, 5]]), "lamp back after redo");
-    }
-
-    /// The set-vs-enum design choice §4 hinges on: a chunk with zero lamps must still be marked
-    /// `scanned` (so a later query doesn't rescan it every time), even though it gets no `lamps`
-    /// bucket at all (buckets are only created for non-empty results).
-    #[test]
-    fn lamp_free_chunk_is_marked_scanned_not_rescanned() {
-        let world = parse_world_inner(mmap_from_bytes(make_test_world())).expect("parse failed");
-        let index = LampIndex::default();
-        assert!(index.lamps_in_region(&world, 0, 0, 15, 15, 1.0).is_empty(), "no lamps yet");
-        assert!(index.snapshot().is_empty(), "lamp-free chunk gets no bucket");
-        // A second query over the same region must not need to touch the world again — there's no
-        // way to assert "didn't rescan" directly without instrumentation, so this instead pins the
-        // observable contract: the result is stable and still empty.
-        assert!(index.lamps_in_region(&world, 0, 0, 15, 15, 1.0).is_empty(), "still no lamps");
-    }
-
-    /// `LampIndex::clear` must drop the `scanned` set along with `lamps` — otherwise a chunk that
-    /// was scanned for the old world would be wrongly treated as already-known for a newly loaded
-    /// one sharing the same chunk coords.
-    #[test]
-    fn lamp_index_clear_resets_scanned() {
-        let mut ws = WorldState::new();
-        ws.world = Some(parse_world_inner(mmap_from_bytes(make_test_world())).expect("parse failed"));
-        lamp_build_now(&ws.lamp_index, ws.world.as_ref().unwrap());
-        ws.lamp_index.clear();
-        // A delta into (0,0) after clear must be dropped again — proof `scanned` was reset, not
-        // just `lamps`.
-        edit_and_replay_delta(&mut ws, None, &[(blk(4, 6, 5), 72)]);
-        assert!(ws.lamp_index.snapshot().is_empty(), "clear must reset scanned, not just lamps");
-    }
-
-    /// `LampIndex::lamps_in_region` (on-demand, per-chunk) must return exactly what a full
-    /// `build_lamp_index` scan finds for every populated chunk, once every chunk has been queried.
-    #[test]
-    fn on_demand_scan_matches_full_build() {
-        let mut world = parse_world_inner(mmap_from_bytes(make_test_world())).expect("parse failed");
-        world.bytes[blk(4, 6, 5)] = LAMP_BLOCK_TYPE;
-        world.bytes[blk(0, 0, 16)] = LAMP_BLOCK_TYPE;
-        let full = build_lamp_index(&world);
-
-        let index = LampIndex::default();
-        for &(cx, cy) in world.chunk_map.keys() {
-            let base_x = (cx - world.min_x) * 16;
-            let base_y = (cy - world.min_y) * 16;
-            index.lamps_in_region(&world, base_x, base_y, base_x + 15, base_y + 15, 1.0);
-        }
-        assert_eq!(index.snapshot(), full, "on-demand scan must agree with a from-scratch build");
-    }
-
-    /// 5.2: the `full_box` fast path must not change any result. A wide query scans a box; a
-    /// subsequent query whose box is contained in it takes the no-scan path and must still return
-    /// exactly the lamps a fresh index finds, and a post-`apply_delta` query must see the edit
-    /// (the `lamps` map stays current even when the `todo` sweep is skipped).
-    #[test]
-    fn lamp_full_box_fast_path_preserves_results() {
-        let mut ws = WorldState::new();
-        let mut world = parse_world_inner(mmap_from_bytes(make_test_world())).expect("parse failed");
-        world.bytes[blk(4, 6, 5)] = LAMP_BLOCK_TYPE;
-        ws.world = Some(world);
-        let w = ws.world.as_ref().unwrap();
-
-        // Wide query — scans the whole neighbourhood of chunk (0,0) and records a `full_box`.
-        let wide = ws.lamp_index.lamps_in_region(w, 0, 0, 15, 15, 64.0);
-        // Contained query (radius 1 ⊂ radius 64 box) — must hit the fast path and agree.
-        let mut narrow = ws.lamp_index.lamps_in_region(w, 0, 0, 15, 15, 1.0);
-        let mut fresh = {
-            let idx = LampIndex::default();
-            idx.lamps_in_region(w, 0, 0, 15, 15, 1.0)
-        };
-        narrow.sort_unstable();
-        fresh.sort_unstable();
-        assert_eq!(narrow, fresh, "fast-path result must match a fresh scan");
-        assert!(wide.contains(&[4, 6, 5]), "wide query found the lamp");
-
-        // An edit that removes the lamp, replayed as a delta, must still be visible through the
-        // fast path (chunk (0,0) is already scanned, so `apply_delta` maintains its bucket).
-        edit_and_replay_delta(&mut ws, None, &[(blk(4, 6, 5), 0)]);
-        let w = ws.world.as_ref().unwrap();
-        let after = ws.lamp_index.lamps_in_region(w, 0, 0, 15, 15, 1.0);
-        assert!(after.is_empty(), "fast path must still reflect the removed lamp");
-    }
-
-    // ── Sculpt engine (Pass 1) test fixtures ──────────────────────────────────────
-
-    /// A single-chunk (0,0) test world whose every column (lx,ly) is filled with `surf_bt` from
-    /// z=1 up to `height(lx,ly)` (clamped 1..=63) — a real varied surface for sculpt tests, unlike
-    /// the degenerate single-column `make_test_world`.
-    fn make_bumpy_world<F: Fn(usize, usize) -> i32>(surf_bt: u8, height: F) -> Vec<u8> {
-        const HEADER: usize = 4096;
-        const CHUNK: usize = 32768;
-        const ENTRY: usize = 16;
-        let chunk_off: u32 = HEADER as u32;
-        let ptr_off: u32 = (HEADER + CHUNK) as u32;
-        let mut b = vec![0u8; HEADER + CHUNK + ENTRY];
-        b[32..36].copy_from_slice(&ptr_off.to_le_bytes());
-        b[40..49].copy_from_slice(b"BumpyTest");
-        let block = |lx: usize, ly: usize, z: i32| -> usize {
-            HEADER + (z / 16) as usize * 8192 + lx * 256 + ly * 16 + (z % 16) as usize
-        };
-        for lx in 0..16 {
-            for ly in 0..16 {
-                let h = height(lx, ly).clamp(1, 63);
-                for z in 1..=h { b[block(lx, ly, z)] = surf_bt; }
-            }
-        }
-        let pe = HEADER + CHUNK;
-        b[pe..pe + 2].copy_from_slice(&0i16.to_le_bytes());
-        b[pe + 4..pe + 6].copy_from_slice(&0i16.to_le_bytes());
-        b[pe + 8..pe + 12].copy_from_slice(&chunk_off.to_le_bytes());
-        b
-    }
-
-    /// Like `make_bumpy_world` but a `chunks_side × chunks_side` grid of standard (32 KB) chunks
-    /// at (0..chunks_side, 0..chunks_side), so world coords span `0..chunks_side*16` on each axis.
-    /// Rock/Carve field-fusion tests need this: their terrain estimate is sampled just *outside*
-    /// the stamp's own padded bbox (see `field_stamp`'s `stable_h`), which for anything but a tiny
-    /// radius runs past a single 16×16 chunk's bounds on the single-chunk fixture.
-    pub(crate) fn make_bumpy_world_grid<F: Fn(i32, i32) -> i32>(chunks_side: i32, surf_bt: u8, height: F) -> Vec<u8> {
-        const HEADER: usize = 4096;
-        const CHUNK: usize = 32768;
-        let n = (chunks_side * chunks_side) as usize;
-        let dir_off = HEADER + n * CHUNK;
-        let mut b = vec![0u8; dir_off + n * 16];
-        b[32..40].copy_from_slice(&(dir_off as u64).to_le_bytes());
-        b[40..49].copy_from_slice(b"GridTest\0");
-        let block = |base: usize, lx: usize, ly: usize, z: i32| -> usize {
-            base + (z / 16) as usize * 8192 + lx * 256 + ly * 16 + (z % 16) as usize
-        };
-        let mut i = 0usize;
-        for cy in 0..chunks_side {
-            for cx in 0..chunks_side {
-                let base = HEADER + i * CHUNK;
-                for lx in 0..16usize {
-                    for ly in 0..16usize {
-                        let (wx, wy) = (cx * 16 + lx as i32, cy * 16 + ly as i32);
-                        let h = height(wx, wy).clamp(1, 63);
-                        for z in 1..=h { b[block(base, lx, ly, z)] = surf_bt; }
-                    }
-                }
-                let e = dir_off + i * 16;
-                b[e     ..e +  4].copy_from_slice(&cx.to_le_bytes());
-                b[e +  4..e +  8].copy_from_slice(&cy.to_le_bytes());
-                b[e +  8..e + 16].copy_from_slice(&(base as u64).to_le_bytes());
-                i += 1;
-            }
-        }
-        b
-    }
-
-    pub(crate) fn ws_with(bytes: Vec<u8>) -> WorldState {
-        let mut ws = WorldState::new();
-        ws.world = Some(parse_world_inner(mmap_from_bytes(bytes)).expect("parse"));
-        ws
-    }
-
-    fn world_bytes(ws: &WorldState) -> Vec<u8> {
-        ws.world.as_ref().unwrap().bytes.to_vec()
-    }
-
-    // ── top_band_hint: the per-chunk scan ceiling and its invalidation hook ────────────────
-    //
-    // The hint is an upper bound on "topmost band holding anything", consulted by every top-down
-    // scan (the 2D map render, `surface_z_capped`, the axo raycast, the lamp scan, the 3D mesher).
-    // It exists to stop those scans from touching ~10 pages of pure air per column on a 256z world
-    // — the mechanism behind the Windows working-set blowup (H1). A hint that is too *high* is
-    // merely slower; a hint that is too *low* reports real terrain as air, silently, everywhere.
-    // So the tests that matter are the invalidation ones: an edit that raises terrain into a band
-    // above the stored ceiling must clear it, and so must undoing and redoing that edit.
-
-    /// The staging pre-flight (H1 Stage 4). The volume-query half is inherently platform-specific
-    /// and can only be exercised on the platform running the test; what is pinned here is the
-    /// policy around it, which is the part that could refuse a load that should have succeeded.
-    /// C-10/P-10: a dropped guard deletes its temp and clears the slot; `release` keeps the file;
-    /// the exit hook removes a still-registered one.
-    #[test]
-    fn test_staging_guard_lifecycle() {
-        let g = StagingGuard::new();
-        let p = g.path().to_path_buf();
-        fs::write(&p, b"x").unwrap();
-        drop(g);
-        assert!(!p.exists() && staging_slot().is_none());
-
-        let g = StagingGuard::new();
-        let p = g.path().to_path_buf();
-        fs::write(&p, b"x").unwrap();
-        let kept = g.release();
-        assert!(kept.exists() && staging_slot().is_none());
-        fs::remove_file(&kept).unwrap();
-
-        let g = StagingGuard::new();
-        let p = g.path().to_path_buf();
-        fs::write(&p, b"x").unwrap();
-        remove_staging_temp();
-        assert!(!p.exists());
-        drop(g); // already gone: must not panic
-    }
-
-    #[test]
-    fn test_staging_room_preflight() {
-        let tmp = std::env::temp_dir().join("vuencedit_room_check.eden");
-
-        // The system temp volume must be readable on any platform CI runs on.
-        let free = free_space_bytes(&tmp).expect("temp volume free space must be readable");
-        assert!(free > 0, "a writable temp volume with zero bytes free is not a realistic fixture");
-
-        assert!(ensure_room_for(&tmp, 0).is_ok(), "a zero-byte stage always fits");
-        assert!(ensure_room_for(&tmp, free.saturating_sub(1 << 30)).is_ok(),
-            "a stage comfortably under the free space must be allowed");
-
-        let err = ensure_room_for(&tmp, u64::MAX).expect_err("an impossible stage must be refused");
-        let msg = err.to_string();
-        assert!(msg.contains("not enough free space"), "message must say why: {msg}");
-        assert!(msg.contains("GB") || msg.contains("MB"), "message must quantify it: {msg}");
-
-        // ⚠️ The bias that matters: an unreadable volume proceeds rather than refusing, so a
-        // filesystem that won't report free space can never make a world unopenable.
-        let nowhere = std::path::Path::new("/vuencedit-no-such-volume-0ac1/x.eden");
-        assert_eq!(free_space_bytes(nowhere), None, "an unreadable volume reports nothing");
-        assert!(ensure_room_for(nowhere, u64::MAX).is_ok(), "and \"cannot tell\" means proceed");
-    }
-
-    /// `scan_top_band` is the ground truth the cache memoises. Pin it against a hand-known world
-    /// and against the all-air / missing-chunk cases, which both legitimately answer `0`.
-    #[test]
-    fn test_scan_top_band_matches_the_world() {
-        let ws = ws_with(make_bumpy_world(8, |_, _| 20));
-        let w = ws.world.as_ref().unwrap();
-        assert_eq!(w.scan_top_band(0, 0), 1, "terrain tops out at z=20, which is band 1");
-        assert_eq!(w.scan_top_band(7, 7), 0, "a chunk the world doesn't have is a valid 0");
-
-        let air = ws_with(make_bumpy_world(8, |_, _| 0)); // clamped to 1 => a single z=1 layer
-        assert_eq!(air.world.as_ref().unwrap().scan_top_band(0, 0), 0);
-    }
-
-    /// The cached value must equal the oracle for every chunk, and must be reached lazily: nothing
-    /// is computed until something asks.
-    #[test]
-    fn test_top_band_hint_is_lazy_and_matches_the_oracle() {
-        let ws = ws_with(make_bumpy_world_grid(2, 8, |wx, _| 20 + wx % 30));
-        let w = ws.world.as_ref().unwrap();
-        for cy in 0..2 { for cx in 0..2 {
-            assert_eq!(w.top_bands.peek(cx, cy), None, "({cx},{cy}) must start uncomputed");
-        }}
-        for cy in 0..2 { for cx in 0..2 {
-            assert_eq!(w.top_band_hint(cx, cy), w.scan_top_band(cx, cy));
-            assert_eq!(w.top_bands.peek(cx, cy), Some(w.scan_top_band(cx, cy)), "and be memoised");
-        }}
-    }
-
-    /// Every cached ceiling must agree with the world's actual bytes. This is the invariant the
-    /// whole scheme rests on, and the one that fails *silently* — a stale-low ceiling doesn't
-    /// crash, it just makes terrain disappear from every renderer and from `surface_z`.
-    fn assert_hints_agree_with_world(ws: &WorldState, when: &str) {
-        let w = ws.world.as_ref().unwrap();
-        for &(cx, cy) in w.chunk_map.keys() {
-            if let Some(cached) = w.top_bands.peek(cx, cy) {
-                assert_eq!(cached, w.scan_top_band(cx, cy),
-                    "cached ceiling for chunk ({cx},{cy}) disagrees with the world {when}");
-            }
-        }
-    }
-
-    /// ⚠️ The load-bearing one. An edit that raises terrain into a band *above* the cached ceiling
-    /// must invalidate it — otherwise every renderer and `surface_z` go on reporting the new
-    /// terrain as air for the rest of the session. `with_edit_inner` clears it at the moment the
-    /// bytes change and `mark_dirty_chunks` (from `finish_edit`) clears it again from the precise
-    /// changed set; undo/redo must fire the hook too, since both bypass `with_edit_inner`.
-    #[test]
-    fn test_top_band_hint_invalidated_by_edit_undo_and_redo() {
-        let mut ws = ws_with(make_bumpy_world(8, |_, _| 20));
-        let base_surface = surf(&ws, 3, 3);
-        assert_eq!(base_surface, 20);
-        assert_eq!(ws.world.as_ref().unwrap().top_bands.peek(0, 0), Some(1),
-            "reading the surface computes and caches the ceiling");
-
-        // Raise a single column two bands higher than the cached ceiling.
-        with_edit(&mut ws, "paint", (3, 3, 3, 3), |world| {
-            set_block_abs(world, 3, 3, 50, 8, 0);
-            Ok(())
-        }).expect("edit");
-        assert_hints_agree_with_world(&ws, "after the edit");
-        assert_eq!(surf(&ws, 3, 3), 50, "the raised block must be visible");
-        assert_eq!(ws.world.as_ref().unwrap().top_bands.peek(0, 0), Some(3));
-
-        undo_edit_inner(&mut ws).expect("undo");
-        assert_hints_agree_with_world(&ws, "after undo");
-        assert_eq!(surf(&ws, 3, 3), base_surface);
-
-        redo_edit_inner(&mut ws).expect("redo");
-        assert_hints_agree_with_world(&ws, "after redo");
-        assert_eq!(surf(&ws, 3, 3), 50, "redo restores the raised block, hint and all");
-    }
-
-    /// ⚠️ The ordering half of the same invariant, and a real bug this caught: `with_edit_inner`
-    /// renders the edit's own `PixelPatch` *before* `finish_edit` runs, so clearing the ceiling only
-    /// in `finish_edit` left that patch drawn from a stale one — an edit raising terrain above the
-    /// old ceiling came back invisible in its own patch. The patch must match a render of the
-    /// post-edit world taken with a known-good cache.
-    #[test]
-    fn test_edit_patch_is_rendered_with_a_fresh_scan_ceiling() {
-        let mut ws = ws_with(make_bumpy_world(8, |_, _| 20));
-        assert_eq!(surf(&ws, 3, 3), 20, "warm the ceiling cache at the pre-edit height");
-
-        let result = with_edit(&mut ws, "paint", (0, 0, 15, 15), |world| {
-            set_block_abs(world, 3, 3, 50, 13, 0); // Brick, well above the cached ceiling
-            Ok(())
-        }).expect("edit");
-
-        // A freshly parsed copy of the post-edit bytes has no cache at all, so its render is the
-        // ground truth the edit's own patch has to match.
-        let fresh = ws_with(world_bytes(&ws));
-        let truth = render_pixels_patch(fresh.world.as_ref().unwrap(), 0, 0, 15, 15, None);
-        assert_eq!(result.patch.pixels, truth.pixels,
-            "the edit's own patch must show the block the edit just placed");
-    }
-
-    /// The whole point, end to end: a rendered tile must be byte-identical whether the hint cache
-    /// is cold (every chunk computed on the fly) or warm (every chunk already memoised), and must
-    /// still be identical after an edit that moves the ceiling. This is the app-side companion to
-    /// `voxel-core`'s `hint_tests`, which prove the same thing against a deliberately wrong hint.
-    #[test]
-    fn test_rendered_tile_is_identical_cold_warm_and_after_an_edit() {
-        let mut ws = ws_with(make_bumpy_world_grid(2, 8, |wx, wy| 8 + (wx * 3 + wy) % 40));
-        let render = |ws: &WorldState| {
-            render_pixels_patch(ws.world.as_ref().unwrap(), 0, 0, 31, 31, None).pixels
-        };
-        let cold = render(&ws);
-        let warm = render(&ws); // every hint is now memoised
-        assert_eq!(cold, warm, "warming the hint cache must not change a single pixel");
-
-        with_edit(&mut ws, "paint", (5, 5, 5, 5), |world| {
-            set_block_abs(world, 5, 5, 60, 13, 0);
-            Ok(())
-        }).expect("edit");
-        let after = render(&ws);
-        assert_ne!(after, warm, "the new top block must actually show up");
-
-        // A fresh parse of the same bytes has a cold cache; it must render identically.
-        let fresh = ws_with(world_bytes(&ws));
-        assert_eq!(render(&fresh), after, "post-edit render must match a cold-cache render");
-    }
-
-    /// Filled disc footprint matching the backend's/frontend's `(dx² + dy²) <= (r + 0.5)²`.
-    fn disc_points(cx: i32, cy: i32, r: i32) -> Vec<SculptPoint> {
-        let rr = (r as f64 + 0.5).powi(2);
-        let mut v = Vec::new();
-        for dy in -r..=r {
-            for dx in -r..=r {
-                if ((dx * dx + dy * dy) as f64) <= rr { v.push(SculptPoint { x: cx + dx, y: cy + dy }); }
-            }
-        }
-        v
-    }
-
-    fn surf(ws: &WorldState, x: i32, y: i32) -> i32 {
-        surface_z_capped(ws.world.as_ref().unwrap(), x, y, None).unwrap()
-    }
-
-    /// Convenience wrapper: a "raise"/"smooth" sculpt stamp with explicit points, all the newer
-    /// params defaulted, so each test only spells out what it varies.
-    #[allow(clippy::too_many_arguments)]
-    fn sculpt(
-        ws: &mut WorldState, points: Option<Vec<SculptPoint>>, mode: &str, strength: i32,
-        softness: f64, stamp: Option<(i32, i32, i32)>, group: Option<u64>,
-    ) -> EditResult {
-        let (scx, scy, srad) = match stamp {
-            Some((a, b, c)) => (Some(a), Some(b), Some(c)),
-            None => (None, None, None),
-        };
-        sculpt_terrain_inner(
-            ws, points, mode.into(), strength, 0, None, None, None, None,
-            Some(softness), Some("smooth".into()), None, None, None, scx, scy, srad, None, group,
-            None, None, None, None, None, None, None,
-        ).expect("sculpt")
-    }
-
-    /// Row 6 — the per-stroke float workspace accumulates sub-block deltas across same-group stamps
-    /// instead of rounding them away every call. A soft brush over a flat plateau: the centre
-    /// (weight 1) rises by exactly `strength` per stamp, and — the actual fix — EVERY rim column
-    /// with a non-zero weight rises over the stroke rather than a fixed BAYER threshold freezing
-    /// roughly half of them (the reinforcing-dither stripe pathology).
-    #[test]
-    fn test_residual_accumulates_sub_block_deltas() {
-        let mut ws = ws_with(make_bumpy_world(8, |_, _| 20)); // dead-flat grass plateau at z=20
-        let (cx, cy, r) = (7, 7, 5);
-        let n = 10;
-        let gid = Some(4242u64);
-        for _ in 0..n {
-            sculpt(&mut ws, None, "raise", 1, 1.0, Some((cx, cy, r)), gid);
-        }
-        // Centre: weight 1 → +1/stamp, exactly n.
-        assert_eq!(surf(&ws, cx, cy) - 20, n, "centre rises strength·n with no rounding loss");
-
-        // Every interior rim column (within the disc, weight > 0) must have risen — none frozen.
-        let mut risen = 0;
-        let mut total = 0;
-        for dy in -r..=r {
-            for dx in -r..=r {
-                let d2 = dx * dx + dy * dy;
-                // Interior columns whose weight·n is comfortably ≥ 1 (d ≤ 3, so weight ≳ 0.35);
-                // the outermost ring legitimately rounds to 0 (weight → 0 at the dome edge).
-                if d2 == 0 || d2 > 9 { continue; }
-                total += 1;
-                let rise = surf(&ws, cx + dx, cy + dy) - 20;
-                assert!(rise > 0, "column ({dx},{dy}) frozen — residuals not accumulating");
-                assert!(rise <= n, "column ({dx},{dy}) rose {rise} > strength·n");
-                risen += 1;
-            }
-        }
-        assert_eq!(risen, total, "no interior column may be frozen by a fixed dither threshold");
-    }
-
-    /// Row 6 — `clip_rect` masks stamp cells server-side: a hard raise stamp straddling the rect
-    /// lifts only the columns inside it; columns in the disc but outside the rect are untouched.
-    #[test]
-    fn test_clip_rect_masks_stamp_cells() {
-        let mut ws = ws_with(make_bumpy_world(8, |_, _| 20));
-        // Disc centred at (8,8) r=4; clip to x >= 8 only. Hard brush (softness 0) so weight is 1
-        // inside and the mask is the only thing that can zero a column.
-        sculpt_terrain_inner(
-            &mut ws, None, "raise".into(), 5, 0, None, None, None, None,
-            Some(0.0), Some("smooth".into()), None, None, None, Some(8), Some(8), Some(4), None,
-            Some(9), None, None, None, None, Some([8, 0, 100, 100]), None, None,
-        ).expect("clipped raise");
-        assert_eq!(surf(&ws, 9, 8) - 20, 5, "column inside the clip rect rises by strength");
-        assert_eq!(surf(&ws, 8, 8) - 20, 5, "column on the clip edge (x==8) is inside and rises");
-        assert_eq!(surf(&ws, 6, 8), 20, "column left of the clip rect is masked (unchanged)");
-        assert_eq!(surf(&ws, 5, 8), 20, "another masked column, still pristine");
-    }
-
-    /// Row 6 — the float session is reaped by a foreign edit through `with_edit`. After the delete,
-    /// a same-group stamp must re-seed from the post-delete surface, not resurrect stale heights.
-    #[test]
-    fn test_sculpt_session_cleared_by_foreign_edit() {
-        let mut ws = ws_with(make_bumpy_world(8, |_, _| 20));
-        let gid = Some(555u64);
-        sculpt(&mut ws, None, "raise", 4, 0.0, Some((8, 8, 3)), gid);
-        assert!(ws.sculpt_session.is_some(), "a grouped stroke opens a session");
-        assert_eq!(ws.sculpt_session.as_ref().unwrap().group_id, 555);
-
-        // Foreign edit (group None) through the shared choke point → session must clear.
-        with_edit(&mut ws, "delete", (0, 0, 15, 15), |world| {
-            delete_blocks_inner(world, 0, 0, 15, 15, 0, 255, None);
-            Ok(())
-        }).expect("delete");
-        assert!(ws.sculpt_session.is_none(), "a non-sculpt edit reaps the stale session");
-
-        // The just-deleted footprint has no surface; a fresh same-group stamp re-seeds from the
-        // post-delete world (there's nothing to raise), never from the pre-delete fheight cache.
-        let before = world_bytes(&ws);
-        sculpt(&mut ws, None, "raise", 4, 0.0, Some((8, 8, 3)), gid);
-        assert_eq!(world_bytes(&ws), before, "no surface after delete → nothing resurrected");
-    }
-
-    // ── Audit H1: the sculpt read/write guard split ───────────────────────────────
-
-    /// `ChunkScratch` must behave exactly like the world for reads — including *through* to the
-    /// world for chunks it doesn't own — while keeping every write to itself until `commit`.
-    #[test]
-    fn test_chunk_scratch_isolates_writes_and_falls_through_reads() {
-        let mut world = parse_world_inner(mmap_from_bytes(make_bumpy_world_grid(2, 8, |_, _| 20)))
-            .expect("parse");
-        let before = world.bytes.to_vec();
-
-        // Own chunk (0,0) only. Chunk (1,1) covers world coords 16..31 on both axes.
-        let mut scratch = ChunkScratch::new(&world, &[(0, 0)]);
-        assert_eq!(surface_z_capped(&scratch, 20, 20, None), Some(20), "unowned chunk reads through");
-        assert_eq!(read_block_abs(&scratch, 20, 20, 20), 8, "unowned block reads through");
-
-        set_block_abs(&mut scratch, 4, 5, 30, 2, 7);   // owned → lands in the scratch
-        set_block_abs(&mut scratch, 20, 20, 30, 2, 7); // unowned → dropped
-
-        assert_eq!(read_block_abs(&scratch, 4, 5, 30), 2, "owned write is visible in the scratch");
-        assert_eq!(read_paint_abs(&scratch, 4, 5, 30), 7);
-        assert_eq!(read_block_abs(&scratch, 20, 20, 30), 0, "unowned write is dropped, not applied");
-        assert_eq!(world.bytes.to_vec(), before, "the world is untouched until commit");
-
-        let chunks = scratch.into_chunks();
-        let snaps = chunks.commit(&mut world);
-        assert_eq!(snaps.len(), 1, "exactly the one changed chunk produces a delta");
-        assert_eq!(snaps[0].cx, 0);
-        assert_eq!(read_block_abs(&world, 4, 5, 30), 2, "commit lands the write");
-    }
-
-    /// The split path's delta must be the same delta the in-guard path builds: `commit` diffs the
-    /// scratch against the live chunk, `diff_chunk` diffs a pre-copy against the mutated chunk.
-    /// Both are `diff_span` over the same two byte images, so restoring either must undo the edit.
-    #[test]
-    fn test_scratch_commit_delta_round_trips() {
-        let mut world = parse_world_inner(mmap_from_bytes(make_bumpy_world(8, |_, _| 20)))
-            .expect("parse");
-        let before = world.bytes.to_vec();
-
-        let mut scratch = ChunkScratch::new(&world, &[(0, 0)]);
-        for z in 21..=28 { set_block_abs(&mut scratch, 6, 6, z, 2, 0); }
-        let snaps = scratch.into_chunks().commit(&mut world);
-        assert_ne!(world.bytes.to_vec(), before, "the commit changed the world");
-
-        let entry = UndoEntry::new("scratch", snaps, None);
-        restore_and_invert(&mut world, &entry);
-        assert_eq!(world.bytes.to_vec(), before, "the commit's delta restores the pre-edit world");
-    }
-
-    /// A flush run through a scratch must produce byte-identical output to the same flush run
-    /// straight against the world — the whole premise of computing under the read guard.
-    #[test]
-    fn test_scratch_stamp_matches_direct_stamp() {
-        let base = make_bumpy_world_grid(2, 8, |x, y| 18 + ((x + y) % 5));
-
-        let args = || SculptArgs {
-            mode: "raise".into(), strength: 3, strength_eff: 3.0, seed: 0,
-            block_type: None, paint: None, freq: None, noise_mode: None,
-            softness: 0.6, profile: "smooth".into(), grab_delta: None,
-            anchor_x: None, anchor_y: None, slope_dx: None, slope_dy: None,
-            smear_dx: None, smear_dy: None, clip_rect: None, rock: None, cap: None,
-        };
-        let stamps = || vec![
-            SculptStamp { points: disc_points(12, 12, 5), dial: Some((12, 12, 5)) },
-            SculptStamp { points: disc_points(18, 14, 5), dial: Some((18, 14, 5)) },
-        ];
-
-        // Reference: straight at the world.
-        let mut direct = parse_world_inner(mmap_from_bytes(base.clone())).expect("parse");
-        let mut sess_a = SculptSession { group_id: 1, fheight: HashMap::new() };
-        run_sculpt_flush(&mut direct, &mut sess_a, &args(), &stamps()).expect("direct");
-
-        // Through a scratch sized by `sculpt_flush_rect`, then committed.
-        let mut via_scratch = parse_world_inner(mmap_from_bytes(base)).expect("parse");
-        let rect = sculpt_flush_rect(&args(), &stamps()).expect("rect");
-        let coords = affected_chunk_coords(&via_scratch, rect.0, rect.1, rect.2, rect.3);
-        let mut scratch = ChunkScratch::new(&via_scratch, &coords);
-        let mut sess_b = SculptSession { group_id: 1, fheight: HashMap::new() };
-        run_sculpt_flush(&mut scratch, &mut sess_b, &args(), &stamps()).expect("scratch");
-        scratch.into_chunks().commit(&mut via_scratch);
-
-        assert_eq!(via_scratch.bytes.to_vec(), direct.bytes.to_vec(),
-                   "a stamp computed against a scratch must be byte-identical to one computed in place");
-    }
-
-    /// 18.10: the lazy scratch, over several modes, must equal the direct in-place stamp byte for
-    /// byte, its undo snapshots must restore the pre-stamp world exactly, and it must copy only the
-    /// bands it wrote (construction copies nothing).
-    #[test]
-    fn test_lazy_scratch_matches_reference_across_modes_and_undoes() {
-        let base = make_bumpy_world_grid(2, 8, |x, y| 18 + ((x * 3 + y) % 5));
-        for mode in ["raise", "lower", "smooth", "flatten", "noise", "thermal"] {
-            let args = || SculptArgs {
-                mode: mode.into(), strength: 4, strength_eff: 4.0, seed: 7,
-                block_type: None, paint: None, freq: None, noise_mode: None,
-                softness: 0.5, profile: "smooth".into(), grab_delta: None,
-                anchor_x: None, anchor_y: None, slope_dx: None, slope_dy: None,
-                smear_dx: None, smear_dy: None, clip_rect: None, rock: None, cap: None,
-            };
-            let stamps = || vec![
-                SculptStamp { points: disc_points(14, 14, 6), dial: Some((14, 14, 6)) },
-                SculptStamp { points: disc_points(17, 15, 6), dial: Some((17, 15, 6)) },
-            ];
-            let mut direct = parse_world_inner(mmap_from_bytes(base.clone())).expect("parse");
-            let mut sa = SculptSession { group_id: 1, fheight: HashMap::new() };
-            run_sculpt_flush(&mut direct, &mut sa, &args(), &stamps()).expect("direct");
-
-            let mut lazy = parse_world_inner(mmap_from_bytes(base.clone())).expect("parse");
-            let rect = sculpt_flush_rect(&args(), &stamps()).expect("rect");
-            let coords = affected_chunk_coords(&lazy, rect.0, rect.1, rect.2, rect.3);
-            let mut scratch = ChunkScratch::new(&lazy, &coords);
-            assert_eq!(scratch.buf_len(), 0, "construction copies nothing");
-            let mut sb = SculptSession { group_id: 1, fheight: HashMap::new() };
-            run_sculpt_flush(&mut scratch, &mut sb, &args(), &stamps()).expect("scratch");
-            let copied = scratch.buf_len();
-            let whole: usize = coords.iter().filter_map(|&(x, y)| lazy.chunk_range(x, y)).map(|(a, e)| e - a).sum();
-            assert!(copied < whole, "{mode}: copied {copied} B of {whole} B — must be band-granular");
-            let snaps = scratch.into_chunks().commit(&mut lazy);
-            assert_eq!(lazy.bytes.to_vec(), direct.bytes.to_vec(), "{mode}: lazy != reference");
-
-            let entry = UndoEntry::new("lazy", snaps, None);
-            restore_and_invert(&mut lazy, &entry);
-            assert_eq!(lazy.bytes.to_vec(), base[..lazy.bytes.len()].to_vec(), "{mode}: undo must restore");
-        }
-    }
-
-    /// 18.10 hint safety: a write into a band above the world's `top_band_hint` must be visible to
-    /// the scratch's own `surface_z` (a too-low hint would read it back as air), and a dense write
-    /// must still undo.
-    #[test]
-    fn test_lazy_scratch_hint_covers_own_writes() {
-        let mut world = parse_world_inner(mmap_from_bytes(make_bumpy_world_grid(2, 8, |_, _| 20)))
-            .expect("parse");
-        let before = world.bytes.to_vec();
-        assert_eq!(world.top_band_hint(0, 0), 1, "fixture terrain tops out in band 1");
-        let mut scratch = ChunkScratch::new(&world, &[(0, 0)]);
-        assert_eq!(scratch.top_band_hint(0, 0), 1);
-        set_block_abs(&mut scratch, 3, 3, 50, 2, 1); // band 3
-        assert_eq!(scratch.top_band_hint(0, 0), 3, "hint must rise with the scratch's own writes");
-        assert_eq!(surface_z_capped(&scratch, 3, 3, None), Some(50));
-        assert_eq!(surface_z_capped(&scratch, 4, 3, None), Some(20), "untouched column reads through");
-        assert_eq!(scratch.buf_len(), 8192, "exactly one band copied");
-        // Dense fill of two far-apart bands → Full delta spanning both, still restorable.
-        for lx in 0..16 { for ly in 0..16 {
-            set_block_abs(&mut scratch, lx, ly, 3, 5, 1);
-            set_block_abs(&mut scratch, lx, ly, 50, 5, 1);
-        } }
-        let snaps = scratch.into_chunks().commit(&mut world);
-        assert_eq!(snaps.len(), 1);
-        assert_eq!(read_block_abs(&world, 9, 9, 50), 5);
-        restore_and_invert(&mut world, &UndoEntry::new("hint", snaps, None));
-        assert_eq!(world.bytes.to_vec(), before);
-    }
-
-    /// Rock/Carve write a `rock_stamp_pad` ring *outside* their nominal radius. `sculpt_write_rect`
-    /// must cover it — it sizes both the undo snapshot (which used to miss that ring entirely) and
-    /// the sculpt scratch (which would silently drop those writes).
-    #[test]
-    fn test_sculpt_write_rect_covers_the_rock_pad() {
-        let rock = Some(RockParams::default());
-        let dial = Some((40, 40, 8));
-        let plain = sculpt_write_rect("raise", dial, &rock, 32, 32, 48, 48);
-        assert_eq!(plain, (32, 32, 48, 48), "heightmap modes write only inside their footprint");
-
-        let pad = rock_stamp_pad(&RockParams::default(), 8);
-        assert!(pad >= 1, "the pad is always at least one block");
-        let padded = sculpt_write_rect("rock", dial, &rock, 32, 32, 48, 48);
-        assert_eq!(padded, (40 - 8 - pad, 40 - 8 - pad, 40 + 8 + pad, 40 + 8 + pad));
-        assert_eq!(sculpt_write_rect("carve", dial, &rock, 32, 32, 48, 48), padded,
-                   "carve stamps the same field extent as rock");
-    }
-
-    /// The bound `sculpt_write_rect` promises must actually hold: every cell a rock stamp writes
-    /// has to land inside it, or the sculpt scratch would silently drop part of the stamp and the
-    /// undo snapshot would silently miss it. Run over terrain with real relief, where the
-    /// smooth-min fillet flares the mass outward furthest.
-    #[test]
-    fn test_rock_stamp_writes_stay_inside_the_write_rect() {
-        let (cx, cy, r) = (48, 48, 10);
-        let mut world = parse_world_inner(mmap_from_bytes(
-            make_bumpy_world_grid(7, 8, |x, y| 16 + ((x / 7 + y / 5) % 9)),
-        )).expect("parse");
-        let before = world.bytes.to_vec();
-        let rp = RockParams { meld: 3.0, smoothing: 5.0, ..RockParams::default() };
-        field_stamp(&mut world, cx, cy, r, &rp, 7, None, None, None, None, false);
-        assert_ne!(world.bytes.to_vec(), before, "the stamp did something");
-
-        let rock = Some(rp);
-        let dial = Some((cx, cy, r));
-        let (rx1, ry1, rx2, ry2) = sculpt_write_rect("rock", dial, &rock, cx - r, cy - r, cx + r, cy + r);
-        let side = 7 * 16;
-        for wy in 0..side {
-            for wx in 0..side {
-                let inside = wx >= rx1 && wx <= rx2 && wy >= ry1 && wy <= ry2;
-                if inside { continue; }
-                for z in 0..64 {
-                    assert_eq!(
-                        read_block_abs_bytes(&before, &world, wx, wy, z),
-                        read_block_abs_bytes(&world.bytes, &world, wx, wy, z),
-                        "rock wrote to ({wx},{wy},{z}), outside the rect sculpt_write_rect promised",
-                    );
-                }
-            }
-        }
-    }
-
-    /// Read a block from an arbitrary byte image of `world` (used to compare pre/post images).
-    fn read_block_abs_bytes(bytes: &[u8], world: &LoadedWorld, wx: i32, wy: i32, wz: i32) -> u8 {
-        let cx = wx.div_euclid(16) + world.min_x;
-        let cy = wy.div_euclid(16) + world.min_y;
-        let Some((addr, cend)) = world.chunk_range(cx, cy) else { return 0 };
-        let bi = addr + (wz as usize / 16) * 8192
-            + wx.rem_euclid(16) as usize * 256 + wy.rem_euclid(16) as usize * 16 + wz as usize % 16;
-        if bi < cend { bytes[bi] } else { 0 }
-    }
-
-    /// Row 6 — undo reaps the session (it bypasses `with_edit_inner`). Undoing the owning stroke
-    /// then stamping again same-group equals a fresh single stamp on the pristine world.
-    #[test]
-    fn test_sculpt_session_cleared_by_undo() {
-        let base = make_bumpy_world(8, |_, _| 20);
-        let gid = Some(321u64);
-
-        // Reference: one fresh stamp on a pristine world.
-        let mut refws = ws_with(base.clone());
-        sculpt(&mut refws, None, "raise", 4, 0.0, Some((8, 8, 3)), gid);
-        let reference = world_bytes(&refws);
-
-        // Stamp, undo (reaps session), stamp again same group — must match the reference exactly.
-        let mut ws = ws_with(base.clone());
-        sculpt(&mut ws, None, "raise", 4, 0.0, Some((8, 8, 3)), gid);
-        assert!(ws.sculpt_session.is_some());
-        undo_edit_inner(&mut ws).expect("undo");
-        assert!(ws.sculpt_session.is_none(), "undo reaps the session it belonged to");
-        sculpt(&mut ws, None, "raise", 4, 0.0, Some((8, 8, 3)), gid);
-        assert_eq!(world_bytes(&ws), reference, "post-undo stamp re-seeds, no residual carryover");
-    }
-
-    /// Audit M1 — `sculpt_terrain_batch_inner` (one `with_edit_grouped` call for N stamps) must be
-    /// byte-for-byte equivalent to N sequential same-group `sculpt_terrain_inner` calls (the old
-    /// per-stamp loop). Covers a mode that reads the float session (`raise`) and one that reads a
-    /// wide neighbourhood off the live world each stamp (`smooth`), over overlapping discs so a
-    /// stamp's own prior neighbours are re-read after mutation — the case a naive batch could get
-    /// wrong by reusing a stale `height_map`.
-    #[test]
-    fn test_stamp_batch_matches_sequential_calls() {
-        let base = make_bumpy_world(8, |x, y| 20 + ((x * 7 + y * 3) % 5) as i32);
-        let centers = vec![[6, 6], [8, 6], [7, 8], [9, 9]];
-        let r = 3;
-        let gid = Some(777u64);
-
-        for mode in ["raise", "smooth"] {
-            // Reference: N sequential single-stamp calls sharing one group.
-            let mut seq = ws_with(base.clone());
-            for c in &centers {
-                sculpt_terrain_inner(
-                    &mut seq, None, mode.into(), 3, 0, None, None, None, None,
-                    Some(0.3), Some("smooth".into()), None, None, None,
-                    Some(c[0]), Some(c[1]), Some(r), None, gid,
-                    None, None, None, None, None, None, None,
-                ).expect("sequential stamp");
-            }
-
-            // Batched: one `sculpt_terrain_batch_inner` call over all centres.
-            let mut batch = ws_with(base.clone());
-            sculpt_terrain_batch_inner(
-                &mut batch, centers.clone(), mode.into(), 3, 0, None, None, None, None,
-                Some(0.3), Some("smooth".into()), None, None, None, r, None, gid,
-                None, None, None, None, None, None, None,
-            ).expect("batched stamps");
-
-            assert_eq!(
-                world_bytes(&seq), world_bytes(&batch),
-                "mode {mode}: batched stamps must match N sequential same-group calls exactly"
-            );
-            // One flush = one undo stack entry now, vs. N before — still one logical undo unit
-            // either way (count_undo_groups collapses a same-group run), but the batch path is the
-            // whole point of M1: assert it landed.
-            assert_eq!(batch.undo_stack.len(), 1, "batch commits one UndoEntry for the whole flush");
-            assert_eq!(seq.undo_stack.len(), centers.len(), "sequential calls still push one entry each");
-            assert_eq!(count_undo_groups(&batch.undo_stack), count_undo_groups(&seq.undo_stack),
-                       "same logical undo-group count either way");
-        }
-    }
-
-    // ── Non-rectangular selection (SelectionMask) ─────────────────────────────────
-
-    /// A mask covering exactly the cells in `x1..=x2, y1..=y2` for which `pred(x,y)` holds.
-    fn mask_from<F: Fn(i32, i32) -> bool>(x1: i32, y1: i32, x2: i32, y2: i32, pred: F) -> SelectionMask {
-        let w = x2 - x1 + 1;
-        let h = y2 - y1 + 1;
-        let mut bits = vec![0u8; ((w * h + 7) / 8) as usize];
-        for y in y1..=y2 {
-            for x in x1..=x2 {
-                if pred(x, y) {
-                    let idx = ((y - y1) * w + (x - x1)) as usize;
-                    bits[idx >> 3] |= 1u8 << (idx & 7);
-                }
-            }
-        }
-        SelectionMask { x1, y1, x2, y2, bits }
-    }
-
-    /// The bitset addressing round-trips: `contains` matches the predicate, is false outside the
-    /// bbox, and `count` equals the number of set cells.
-    #[test]
-    fn test_selection_mask_contains_and_count() {
-        let m = mask_from(0, 0, 3, 3, |x, y| x == y); // main diagonal of a 4×4 box
-        assert_eq!(m.count(), 4);
-        assert!(m.contains(0, 0) && m.contains(2, 2) && m.contains(3, 3));
-        assert!(!m.contains(1, 0) && !m.contains(0, 3), "off-diagonal cells are unset");
-        assert!(!m.contains(4, 4) && !m.contains(-1, -1), "outside the bbox is never contained");
-    }
-
-    /// The corruption-critical fail-safe: `active_mask` yields the mask ONLY on an exact bbox match,
-    /// so a stale mask can never mis-filter a selection that has since been reshaped.
-    #[test]
-    fn test_active_mask_fail_safe_rect_equality() {
-        let mut ws = ws_with(make_bumpy_world(8, |_, _| 20));
-        ws.selection_mask = Some(mask_from(2, 2, 5, 5, |x, y| x == y));
-        assert!(active_mask(&ws, 2, 2, 5, 5).is_some(), "exact bbox match resolves the mask");
-        assert!(active_mask(&ws, 2, 2, 5, 6).is_none(), "wrong y2 → rect-only fallback");
-        assert!(active_mask(&ws, 1, 2, 5, 5).is_none(), "wrong x1 → rect-only fallback");
-        assert!(active_mask(&ws, 0, 0, 15, 15).is_none(), "unrelated rect → rect-only fallback");
-        assert!(active_mask(&ws, 2, 2, 5, 5).is_some(), "resolving does not consume the mask");
-    }
-
-    /// A masked delete clears only the shaped cells; unmasked columns inside the same bounding box
-    /// survive — the headline "wand deletes the whole box" fix, at the `_inner` level.
-    #[test]
-    fn test_delete_blocks_respects_mask() {
-        let mut ws = ws_with(make_bumpy_world(8, |_, _| 20)); // every column solid z=1..20
-        let mask = mask_from(4, 4, 7, 7, |x, y| x - 4 == y - 4); // diagonal of the 4×4 box
-        delete_blocks_inner(ws.world.as_mut().unwrap(), 4, 4, 7, 7, 0, 63, Some(&mask));
-        let w = ws.world.as_ref().unwrap();
-        assert_eq!(surface_z_capped(w, 4, 4, None), None, "masked diagonal column is cleared to air");
-        assert_eq!(surface_z_capped(w, 7, 7, None), None, "far masked column is cleared too");
-        assert_eq!(surface_z_capped(w, 5, 4, None), Some(20), "unmasked column inside bbox is untouched");
-        assert_eq!(surface_z_capped(w, 4, 7, None), Some(20), "unmasked bbox corner is untouched");
-    }
-
-    /// A masked fill (`replace_blocks_inner`) re-skins only shaped cells; unmasked cells keep their
-    /// original block. Guards the second edit command that reads the mask.
-    #[test]
-    fn test_replace_blocks_respects_mask() {
-        let mut ws = ws_with(make_bumpy_world(8, |_, _| 20)); // grass (bt 8)
-        let mask = mask_from(4, 4, 7, 7, |x, _| x == 4); // just the left edge column of the box
-        // Fill z=20 only with brick (bt 13, paint 0), no filter.
-        replace_blocks_inner(ws.world.as_mut().unwrap(), 4, 4, 7, 7, 20, 20, 13, 0, None, None, false, Some(&mask));
-        let w = ws.world.as_ref().unwrap();
-        assert_eq!(read_block_abs(w, 4, 5, 20), 13, "masked cell became brick");
-        assert_eq!(read_block_abs(w, 5, 5, 20), 8, "unmasked cell kept grass");
-    }
-
-    /// A masked move relocates only the shaped cells and clears only those source cells; unmasked
-    /// cells inside the bbox (both source and dest) are left exactly as they were.
-    #[test]
-    fn test_move_selection_respects_mask() {
-        let mut ws = ws_with(make_bumpy_world(8, |_, _| 20)); // grass col height 20 everywhere
-        // Mark the block just below the surface so we can identify moved material: set (4,4,10)=stone.
-        set_block_abs(ws.world.as_mut().unwrap(), 4, 4, 10, 2, 0);
-        let mask = mask_from(4, 4, 5, 5, |x, y| x == 4 && y == 4); // only the single corner column
-        // Move the shaped selection +3 in x (dz=0). Reuse the inner move logic via the closure body:
-        // build buf, clear masked source, write masked dest.
-        let (x1, y1) = (4, 4);
-        let (width, height, depth) = (2i32, 2i32, 11i32); // z 0..=10
-        with_edit(&mut ws, "move", (4, 4, 8, 5), |world| {
-            let n = (width * height * depth) as usize;
-            let mut buf_bt = vec![0u8; n];
-            let mut buf_paint = vec![0u8; n];
-            for lz in 0..depth { for ly in 0..height { for lx in 0..width {
-                let idx = (lz * height * width + ly * width + lx) as usize;
-                buf_bt[idx] = read_block_abs(world, x1 + lx, y1 + ly, lz);
-                buf_paint[idx] = read_paint_abs(world, x1 + lx, y1 + ly, lz);
-            }}}
-            for lz in 0..depth { for ly in 0..height { for lx in 0..width {
-                if !mask.contains(x1 + lx, y1 + ly) { continue; }
-                set_block_abs(world, x1 + lx, y1 + ly, lz, 0, 0);
-            }}}
-            for lz in 0..depth { for ly in 0..height { for lx in 0..width {
-                if !mask.contains(x1 + lx, y1 + ly) { continue; }
-                let idx = (lz * height * width + ly * width + lx) as usize;
-                set_block_abs(world, x1 + 3 + lx, y1 + ly, lz, buf_bt[idx], buf_paint[idx]);
-            }}}
-            Ok(())
-        }).expect("masked move");
-        let w = ws.world.as_ref().unwrap();
-        assert_eq!(read_block_abs(w, 4, 4, 10), 0, "masked source column cleared");
-        assert_eq!(read_block_abs(w, 7, 4, 10), 2, "stone moved +3 to the masked dest");
-        assert_eq!(read_block_abs(w, 5, 4, 10), 8, "unmasked neighbour inside bbox untouched");
-    }
-
-    /// A shaped copy stores its footprint, and paste through the shared helper skips unmasked
-    /// columns — a copied L-shape stamps an L, not a filled box.
-    #[test]
-    fn test_masked_clipboard_paste_skips_unmasked() {
-        // Clipboard footprint: 2×2, only the diagonal (0,0) and (1,1) set.
-        let block_types = vec![13u8, 13, 13, 13]; // all brick
-        let paints = vec![0u8; 4];
-        let mut bits = vec![0u8; 1];
-        bits[0] |= 1 << 0; // (dy0,dx0) idx 0
-        bits[0] |= 1 << 3; // (dy1,dx1) idx 3
-        let cb = Clipboard { width: 2, height: 2, depth: 1, z_anchor: 30, block_types, paints, mask: Some(bits), origin: None };
-        assert!(cb.info().masked, "info reflects the footprint");
-
-        let mut ws = ws_with(make_bumpy_world(8, |_, _| 20));
-        let mask = cb.mask.clone();
-        with_edit(&mut ws, "paste", (10, 10, 11, 11), |world| {
-            paste_clipboard_at(world, 10, 10, &cb.block_types, &cb.paints,
-                cb.width, cb.height, cb.depth, cb.z_anchor, 0, false, world_max_z(world), mask.as_deref());
-            Ok(())
-        }).expect("masked paste");
-        let w = ws.world.as_ref().unwrap();
-        assert_eq!(read_block_abs(w, 10, 10, 30), 13, "diagonal cell (0,0) stamped");
-        assert_eq!(read_block_abs(w, 11, 11, 30), 13, "diagonal cell (1,1) stamped");
-        assert_eq!(read_block_abs(w, 11, 10, 30), 0, "off-diagonal (1,0) skipped — shape preserved");
-        assert_eq!(read_block_abs(w, 10, 11, 30), 0, "off-diagonal (0,1) skipped");
-    }
-
-    // ── Paste lens (14.8) ───────────────────────────────────────────────────────────────────
-
-    /// A 5×4×3 clipboard with a mix of air and solids and one column masked out of the footprint.
-    fn lens_test_clipboard(z_anchor: i32) -> Clipboard {
-        let (w, h, d) = (5, 4, 3);
-        let n = (w * h * d) as usize;
-        let block_types = (0..n).map(|i| if i % 4 == 1 { 0 } else { 13 + (i % 3) as u8 }).collect();
-        let paints = (0..n).map(|i| (i % 7) as u8).collect();
-        let mut bits = vec![0xffu8; 3];
-        bits[0] &= !(1 << 6); // (dx 1, dy 1) outside the footprint
-        Clipboard { width: w, height: h, depth: d, z_anchor, block_types, paints, mask: Some(bits), origin: None }
-    }
-
-    /// The lens's terrain-mode bases are the paste's: after a real `paste_terrain`, exactly the
-    /// cells `terrain_paste_base + offset + dz` predicts were written (and nothing else changed),
-    /// and the lens rendered against the pre-paste world counted exactly the solid-over-solid ones.
-    #[test]
-    fn test_terrain_paste_base_matches_paste_terrain() {
-        let heights = |lx: usize, ly: usize| 4 + ((lx * 3 + ly * 5) % 11) as i32;
-        for (ignore_air, above_surface, offset) in [(true, true, -2), (false, false, -1), (false, true, -3)] {
-            let pre_bytes = make_bumpy_world(2, heights);
-            let pre = parse_world_inner(mmap_from_bytes(pre_bytes.clone())).expect("parse");
-            let mut ws = ws_with(pre_bytes);
-            ws.clipboard = Some(lens_test_clipboard(0));
-            let (px, py) = (6, 7);
-
-            let lens = render_paste_lens_inner(&ws, px, py, offset, "terrain", above_surface, ignore_air, 2, None)
-                .expect("lens");
-            let cb = ws.clipboard.as_ref().unwrap();
-            let bases = paste_lens_bases(&pre, cb, px, py, true, offset, above_surface, None);
-            let (w, h, d) = (cb.width as usize, cb.height as usize, cb.depth as usize);
-            let (types, paints) = (cb.block_types.clone(), cb.paints.clone());
-
-            paste_terrain_inner(&mut ws, px, py, offset, ignore_air, above_surface).expect("paste");
-            let post = ws.world.as_ref().unwrap();
-
-            let mut predicted = std::collections::HashSet::new();
-            let mut solid_over_solid = 0u64;
-            for dy in 0..h { for dx in 0..w {
-                let b = bases[dy * w + dx];
-                if b == render::LENS_SKIP { continue; }
-                for dz in 0..d {
-                    let idx = dz * h * w + dy * w + dx;
-                    if ignore_air && types[idx] == 0 { continue; }
-                    let (x, y, z) = (px + dx as i32, py + dy as i32, b + dz as i32);
-                    predicted.insert((x, y, z));
-                    assert_eq!(get_block_at(post, x, y, z), (types[idx], paints[idx]),
-                        "cell ({x},{y},{z}) must hold the pasted block");
-                    if types[idx] != 0 && read_block_abs(&pre, x, y, z) != 0 { solid_over_solid += 1; }
-                }
-            }}
-            for x in 0..16 { for y in 0..16 { for z in 0..64 {
-                if predicted.contains(&(x, y, z)) { continue; }
-                assert_eq!(get_block_at(post, x, y, z), get_block_at(&pre, x, y, z),
-                    "({x},{y},{z}) outside the predicted cells must be untouched");
-            }}}
-            assert!(solid_over_solid > 0, "fixture must actually bury something");
-            assert_eq!(lens.front.header.buried, solid_over_solid, "lens buried count = cells the paste overwrote");
-            // The masked-out column (dx 1, dy 1) is skipped by both.
-            assert_eq!(bases[w + 1], render::LENS_SKIP);
-        }
-    }
-
-    /// Front (X-Z) or side (Y-Z) silhouette of the clipboard as RGBA (alpha 0 = air), the oracle for
-    /// `test_paste_lens_no_terrain_ghost_equals_clipboard_silhouette`. It was the retired
-    /// `render_clipboard_elevation_preview` command's core (20.4). An unmasked column of a shaped
-    /// clipboard reads as air, so the silhouette matches the paste footprint.
-    fn clipboard_silhouette(cb: &Clipboard, sky: u8, view: &str) -> PreviewData {
-        let (w, h, d) = (cb.width as usize, cb.height as usize, cb.depth as usize);
-        let is_front = view != "side";
-        let img_w = if is_front { w } else { h };
-        let mut pixels = vec![0u8; img_w * d * 4];
-        for dz in 0..d {
-            let row = d - 1 - dz; // row 0 = top = highest z
-            for col in 0..img_w {
-                // front: col = dx, scan dy front-to-back; side: col = dy, scan dx left-to-right.
-                let n = if is_front { h } else { w };
-                let hit = (0..n).find_map(|k| {
-                    let i = if is_front { k * w + col } else { col * w + k };
-                    if cb.mask.as_ref().is_some_and(|m| !bit_set(m, i)) { return None; }
-                    let bt = cb.block_types[dz * h * w + i];
-                    if bt != 0 { Some((bt, cb.paints[dz * h * w + i])) } else { None }
-                });
-                if let Some((bt, paint)) = hit {
-                    let [r, g, b] = block_color(bt, paint, sky);
-                    let o = (row * img_w + col) * 4;
-                    pixels[o] = r; pixels[o + 1] = g; pixels[o + 2] = b; pixels[o + 3] = 255;
-                }
-            }
-        }
-        PreviewData { width: img_w as u32, height: d as u32, lod: 1, pixels }
-    }
-
-    /// On an empty world the lens's ghost is the clipboard silhouette, shifted to the
-    /// paste Z — the two renders share axes, handedness and the mask gate.
-    #[test]
-    fn test_paste_lens_no_terrain_ghost_equals_clipboard_silhouette() {
-        let mut ws = ws_with(make_bumpy_world(0, |_, _| 1)); // surf_bt 0 = all air
-        let cb = lens_test_clipboard(20);
-        let (w, h, d) = (cb.width as u32, cb.height as u32, cb.depth as u32);
-        let sil_front = clipboard_silhouette(&cb, 0, "front");
-        let sil_side = clipboard_silhouette(&cb, 0, "side");
-        ws.clipboard = Some(cb);
-        let pair = render_paste_lens_inner(&ws, 3, 4, 5, "normal", false, true, 0, None).expect("lens");
-        for (view, lens, sil, cols) in [("front", &pair.front, sil_front, w), ("side", &pair.side, sil_side, h)] {
-            let hd = &lens.header;
-            assert_eq!((hd.width, sil.width), (cols, cols));
-            assert_eq!((hd.buried, hd.cleared), (0, 0));
-            for col in 0..cols {
-                for srow in 0..d {
-                    let z = 25 + (d - 1 - srow) as i32; // z_anchor 20 + offset 5
-                    let lrow = (hd.z_hi - z) as u32;
-                    let sa = sil.pixels[((srow * cols + col) * 4 + 3) as usize];
-                    let la = lens.pixels[((lrow * hd.width + col) * 4 + 3) as usize];
-                    assert_eq!(la == 255, sa == 255, "{view} col {col} z {z}");
-                }
-            }
-        }
-    }
-
-    /// `PasteLensPatch` frames both views as one binary envelope (header JSON + two raw RGBA
-    /// bodies), never base64, and the two views agree on the Z window and the cell counts.
-    #[test]
-    fn test_render_paste_lens_envelope() {
-        use tauri::ipc::InvokeResponseBody;
-        let mut ws = ws_with(make_bumpy_world(2, |_, _| 10));
-        ws.clipboard = Some(lens_test_clipboard(8));
-        let lens = render_paste_lens_inner(&ws, 2, 2, 0, "normal", false, false, 3, Some(64)).expect("lens");
-        let (f, s) = (&lens.front.header, &lens.side.header);
-        assert_eq!((f.z_lo, f.z_hi), (s.z_lo, s.z_hi), "one Z window for both views");
-        assert_eq!((f.ghost_z_min, f.ghost_z_max), (s.ghost_z_min, s.ghost_z_max));
-        assert_eq!((f.buried, f.cleared, f.floating_cols, f.approx), (s.buried, s.cleared, s.floating_cols, s.approx));
-        let (fl, sl) = (lens.front.pixels.len(), lens.side.pixels.len());
-        let bytes = match tauri::ipc::IpcResponse::body(lens).expect("frame") {
-            InvokeResponseBody::Raw(v) => v,
-            InvokeResponseBody::Json(_) => panic!("lens must be a raw envelope"),
-        };
-        let hlen = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
-        assert_eq!((4 + hlen) % 4, 0);
-        let hdr: serde_json::Value = serde_json::from_slice(&bytes[4..4 + hlen]).unwrap();
-        assert_eq!(hdr["lens"], serde_json::json!([fl, sl]));
-        assert_eq!(bytes.len() - 4 - hlen, fl + sl);
-        for (k, n) in [("front", fl), ("side", sl)] {
-            let v = &hdr[k];
-            assert_eq!((v["width"].as_u64().unwrap() * v["height"].as_u64().unwrap() * 4) as usize, n, "{k}");
-        }
-        let side = &hdr["side"];
-        assert_eq!(side["col_lo"], -1, "side view: y 2 − 3 context columns");
-        assert_eq!(side["footprint_lo"], 2);
-        assert_eq!(side["footprint_hi"], 5);
-        assert_eq!(hdr["front"]["footprint_hi"], 6, "front: x 2 + width 5 − 1");
-        assert!(side["buried"].as_u64().unwrap() > 0 && side["cleared"].as_u64().unwrap() > 0);
-        assert!(render_paste_lens_inner(&ws, 0, 0, 0, "scatter", false, false, 0, None).is_err());
-    }
-
-    /// Frame a `SelectionLensPatch` and split it back into (header JSON, body bytes).
-    fn frame_selection_lens(p: SelectionLensPatch) -> (serde_json::Value, Vec<u8>) {
-        use tauri::ipc::InvokeResponseBody;
-        let bytes = match tauri::ipc::IpcResponse::body(p).expect("frame") {
-            InvokeResponseBody::Raw(v) => v,
-            InvokeResponseBody::Json(_) => panic!("selection lens must be a raw envelope"),
-        };
-        let hlen = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
-        assert_eq!((4 + hlen) % 4, 0);
-        (serde_json::from_slice(&bytes[4..4 + hlen]).unwrap(), bytes[4 + hlen..].to_vec())
-    }
-
-    /// `render_selection_lens` (20.3): front + side in one raw envelope whose `lens` sum is the
-    /// body, full world height, and the stored shaped mask honoured only on an exact bbox match.
-    #[test]
-    fn test_render_selection_lens_envelope() {
-        let mut ws = ws_with(make_bumpy_world(2, |lx, _| 6 + lx as i32));
-        let (hdr, body) = frame_selection_lens(
-            render_selection_lens_inner(&ws, 2, 3, 9, 6, 4, 20, 3, None, false).expect("lens"));
-        let views = hdr["views"].as_array().unwrap();
-        assert_eq!(views.iter().map(|v| v["kind"].as_str().unwrap()).collect::<Vec<_>>(), ["front", "side"]);
-        let lens: Vec<usize> = hdr["lens"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as usize).collect();
-        assert_eq!(lens.iter().sum::<usize>(), body.len());
-        for (v, &n) in views.iter().zip(&lens) {
-            assert_eq!((v["width"].as_u64().unwrap() * v["height"].as_u64().unwrap() * 4) as usize, n);
-            assert_eq!(v["height"], 64, "full height on a 64z world");
-            assert!(v["row_lo"].is_null());
-        }
-        assert_eq!((&views[0]["col_lo"], &views[0]["footprint_lo"], &views[0]["footprint_hi"]), (&(-1).into(), &2.into(), &9.into()));
-        assert_eq!((&views[1]["col_lo"], &views[1]["footprint_lo"], &views[1]["footprint_hi"]), (&0.into(), &3.into(), &6.into()));
-        assert_eq!((&hdr["z_lo"], &hdr["z_hi"]), (&0.into(), &63.into()));
-        // Highest terrain in view: lx up to 9 + 3 context columns → 6 + 12.
-        assert_eq!(hdr["terrain_z_hi"], 18);
-
-        // A stored mask that matches the rect makes masked-out columns see-through; one that
-        // doesn't is ignored (fail-safe), so the render is the plain bbox one.
-        let plain = body;
-        ws.selection_mask = Some(SelectionMask { x1: 2, y1: 3, x2: 9, y2: 6, bits: vec![0; 4] });
-        let (_, masked) = frame_selection_lens(
-            render_selection_lens_inner(&ws, 2, 3, 9, 6, 4, 20, 3, None, false).expect("lens"));
-        assert_ne!(masked, plain, "an all-clear mask leaves no sel hits");
-        ws.selection_mask = Some(SelectionMask { x1: 2, y1: 3, x2: 9, y2: 7, bits: vec![0; 5] });
-        let (_, stale) = frame_selection_lens(
-            render_selection_lens_inner(&ws, 2, 3, 9, 6, 4, 20, 3, None, false).expect("lens"));
-        assert_eq!(stale, plain, "a mismatched mask is ignored");
-
-        assert!(render_selection_lens_inner(&ws, 2, 3, 9, 6, 4, 64, 3, None, false).is_err(), "z past max_z");
-        assert!(render_selection_lens_inner(&ws, 9, 3, 2, 6, 4, 20, 3, None, false).is_err(), "inverted rect");
-    }
-
-    /// `render_selection_lens` with `top: true` (20.5): exactly one "top" view, origin in `row_lo`,
-    /// z range echoed from the selection.
-    #[test]
-    fn test_render_selection_lens_top() {
-        let ws = ws_with(make_bumpy_world(2, |lx, _| 6 + lx as i32));
-        let (hdr, body) = frame_selection_lens(
-            render_selection_lens_inner(&ws, 2, 3, 9, 6, 4, 20, 3, None, true).expect("lens"));
-        let views = hdr["views"].as_array().unwrap();
-        assert_eq!(views.len(), 1);
-        assert_eq!(views[0]["kind"], "top");
-        assert!(views[0]["row_lo"].is_number());
-        let lens: Vec<usize> = hdr["lens"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as usize).collect();
-        assert_eq!(lens.len(), 1);
-        assert_eq!(lens.iter().sum::<usize>(), body.len());
-        assert_eq!((views[0]["width"].as_u64().unwrap() * views[0]["height"].as_u64().unwrap() * 4) as usize, lens[0]);
-        assert_eq!((&hdr["z_lo"], &hdr["z_hi"]), (&4.into(), &20.into()));
-    }
-
-    /// 20.3 §6 measurement: `render_selection_lens` (both flavours) on the largest world in
-    /// `TEST WORLDS/` for a 512², 2048² and whole-world selection. Reports only —
-    /// `cargo test -p eden-world-editor bench_selection_lens -- --ignored --nocapture`.
-    #[test]
-    #[ignore]
-    fn bench_selection_lens() {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../TEST WORLDS");
-        let mut worlds: Vec<_> = fs::read_dir(&dir).expect("TEST WORLDS").filter_map(|e| e.ok())
-            .map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "eden")).collect();
-        worlds.sort_by_key(|p| std::cmp::Reverse(fs::metadata(p).map(|m| m.len()).unwrap_or(0)));
-        for path in worlds.iter().take(2) {
-            let mut ws = WorldState::new();
-            ws.world = Some(parse_world_inner(map_fixture(path)).expect("parse"));
-            let w = ws.world.as_ref().unwrap();
-            let (ww, wh, max_z) = (w.meta().width(), w.meta().height(), world_max_z(w));
-            eprintln!("[bench] {:?}: {ww}×{wh} blocks, max_z {max_z}", path.file_name().unwrap());
-            for side in [512, 2048, i32::MAX] {
-                let (sw, sh) = (side.min(ww), side.min(wh));
-                let (x1, y1) = ((ww - sw) / 2, (wh - sh) / 2);
-                for top in [false, true] {
-                    let mut times = Vec::new();
-                    for _ in 0..4 {
-                        let t = Instant::now();
-                        render_selection_lens_inner(&ws, x1, y1, x1 + sw - 1, y1 + sh - 1, 0, max_z, 2, None, top).expect("lens");
-                        times.push(t.elapsed().as_secs_f64() * 1000.0);
-                    }
-                    let best = times[1..].iter().cloned().fold(f64::MAX, f64::min);
-                    eprintln!("[bench]   {sw}×{sh} {}: first {:.1} ms, warm best {best:.1} ms",
-                        if top { "top" } else { "front+side" }, times[0]);
-                }
-            }
-        }
-    }
-
-    /// Rotating a shaped clipboard 90° CW transforms the footprint with the SAME map as the data, so
-    /// the mask still lines up with the blocks it gates.
-    #[test]
-    fn test_rotate_clipboard_transforms_mask() {
-        // 2(w)×3(h) footprint, only the top-left column (dy0,dx0) set.
-        let mut bits = vec![0u8; 1];
-        bits[0] |= 1 << 0;
-        let mut cb = Clipboard {
-            width: 2, height: 3, depth: 1, z_anchor: 0,
-            block_types: vec![0u8; 6], paints: vec![0u8; 6], mask: Some(bits), origin: None
-        };
-        rotate_clipboard_inner(&mut cb);
-        // After CW: new dims 3(w)×2(h). Old (dx0,dy0) → (ndx=dy=0, ndy=old_w-1-dx=1). New idx = ndy*new_w+ndx = 1*3+0 = 3.
-        assert_eq!(cb.width, 3);
-        assert_eq!(cb.height, 2);
-        let m = cb.mask.unwrap();
-        assert!(bit_set(&m, 3), "the one set column rotated to its new position");
-        assert_eq!(m.iter().map(|b| b.count_ones()).sum::<u32>(), 1, "exactly one cell still set");
-    }
-
-    #[test]
-    fn test_prefab_save_refuses_over_load_cap() {
-        let mk = |w, h, d| Clipboard { width: w, height: h, depth: d, z_anchor: 0,
-            block_types: vec![], paints: vec![], mask: None, origin: None };
-        assert!(check_prefab_savable(&mk(256, 256, 1024)).is_ok(), "exactly 64M voxels is loadable");
-        let err = check_prefab_savable(&mk(256, 256, 1025)).unwrap_err();
-        assert!(err.contains("limited"), "{err}");
-        assert!(check_prefab_savable(&mk(i32::MAX, i32::MAX, i32::MAX)).is_err(), "no i32 overflow");
-    }
-
-    #[test]
-    fn test_sweep_orphan_save_temps_removes_only_temps() {
-        let dir = std::env::temp_dir().join(format!("eden_sweep_{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        let w = dir.join("w.eden");
-        for n in ["w.eden", "w.eden.savetmp", "w.eden.bak.zip.tmp", "w.eden.bak", "other.eden.savetmp"] {
-            fs::write(dir.join(n), b"x").unwrap();
-        }
-        // 21.14: fresh temps (a live sibling's save) survive the production sweep.
-        sweep_orphan_save_temps(&w);
-        assert!(dir.join("w.eden.savetmp").exists() && dir.join("w.eden.bak.zip.tmp").exists());
-        let z = std::time::Duration::ZERO;
-        sweep_orphan_save_temps_aged(&w, z);
-        assert!(w.exists() && dir.join("w.eden.bak").exists() && dir.join("other.eden.savetmp").exists());
-        assert!(!dir.join("w.eden.savetmp").exists() && !dir.join("w.eden.bak.zip.tmp").exists());
-        sweep_orphan_save_temps_aged(&w, z); // idempotent when nothing is there
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn test_temp_owner_pid_parsing() {
-        assert_eq!(temp_owner_pid("vuencedit_1234_999.eden"), Some(1234));
-        assert_eq!(temp_owner_pid("vuencedit_upload_77_5.gz"), Some(77));
-        assert_eq!(temp_owner_pid("vuencedit_1789000000000000000.eden"), None, "legacy name");
-        assert_eq!(temp_owner_pid("vuencedit_upload_1789000000000000000.gz"), None);
-        assert_eq!(temp_owner_pid("vuencedit_stage4_12.eden"), None);
-        assert!(pid_alive(std::process::id()));
-    }
-
-    #[test]
-    fn test_claim_autosave_dir_ownership_and_takeover() {
-        let base = std::env::temp_dir().join(format!("eden_claim_{}", std::process::id()));
-        let _ = fs::remove_dir_all(&base);
-        let live = |p: u32| p == 100 || p == 200;
-        // First instance owns the shared slot; re-claim by itself is stable.
-        assert_eq!(claim_autosave_dir(&base, 100, &live), base);
-        assert_eq!(claim_autosave_dir(&base, 100, &live), base);
-        // A second live instance gets its own dir and the owner file is untouched.
-        let d2 = claim_autosave_dir(&base, 200, &live);
-        assert_eq!(d2, base.join("instance-200"));
-        assert!(d2.is_dir());
-        assert_eq!(read_owner_pid(&base.join("autosave.owner")), Some(100));
-        // Sidecars in the shared slot are not disturbed.
-        fs::write(base.join("autosave.meta.json"), b"{}").unwrap();
-        // Owner dies: next instance takes over (crash recovery keeps working).
-        let live2 = |p: u32| p == 300;
-        assert_eq!(claim_autosave_dir(&base, 300, &live2), base);
-        assert_eq!(read_owner_pid(&base.join("autosave.owner")), Some(300));
-        assert!(base.join("autosave.meta.json").exists());
-        // Dead instance dirs: empty one swept, one with a pending meta kept.
-        fs::create_dir_all(base.join("instance-900")).unwrap();
-        fs::create_dir_all(base.join("instance-901")).unwrap();
-        fs::write(base.join("instance-901").join("autosave.meta.json"), b"{}").unwrap();
-        let _ = claim_autosave_dir(&base, 400, &|p| p == 300 || p == 400);
-        assert!(!base.join("instance-900").exists() && base.join("instance-901").exists());
-        // Corrupt owner file does not wedge the slot.
-        fs::write(base.join("autosave.owner"), b"junk").unwrap();
-        assert_eq!(claim_autosave_dir(&base, 500, &|_| false), base);
-        let _ = fs::remove_dir_all(&base);
-    }
-
-    #[test]
-    fn test_pick_world_zip_entry_prefers_eden_by_name() {
-        use zip::write::{SimpleFileOptions, ZipWriter};
-        let mut buf = std::io::Cursor::new(Vec::new());
-        {
-            let mut z = ZipWriter::new(&mut buf);
-            let o = SimpleFileOptions::default();
-            z.start_file("__MACOSX/", o).unwrap();
-            z.start_file("readme.txt", o).unwrap(); z.write_all(b"hi").unwrap();
-            z.start_file("My World.EDEN", o).unwrap(); z.write_all(b"w").unwrap();
-            z.finish().unwrap();
-        }
-        let mut a = zip::ZipArchive::new(std::io::Cursor::new(buf.into_inner())).unwrap();
-        assert_eq!(pick_world_zip_entry(&mut a), 2);
-        let mut buf2 = std::io::Cursor::new(Vec::new());
-        {
-            let mut z = ZipWriter::new(&mut buf2);
-            z.start_file("only.bin", SimpleFileOptions::default()).unwrap();
-            z.finish().unwrap();
-        }
-        let mut b = zip::ZipArchive::new(std::io::Cursor::new(buf2.into_inner())).unwrap();
-        assert_eq!(pick_world_zip_entry(&mut b), 0, "falls back to the first entry");
-    }
-
-    /// A shaped clipboard survives a prefab serialize→deserialize round trip: EPFAB\x02 carries the
-    /// footprint so a saved prefab pastes the shape, not its bounding box.
-    #[test]
-    fn test_prefab_round_trip_preserves_mask() {
-        // 3(w)×2(h)×1(d) all brick; L-shaped footprint (drop the top-right cell dx2,dy0).
-        let n = 6;
-        let mut bits = vec![0u8; 1];
-        for i in 0..6 { if i != 2 { bits[0] |= 1 << i; } }
-        let cb = Clipboard {
-            width: 3, height: 2, depth: 1, z_anchor: 42,
-            block_types: (0..n).map(|i| 13 + i as u8).collect(),
-            paints: (0..n).map(|i| i as u8).collect(),
-            mask: Some(bits.clone()), origin: None
-        };
-        let round = deserialize_prefab(&serialize_prefab(&cb)).expect("round-trips");
-        assert_eq!(round.width, 3);
-        assert_eq!(round.height, 2);
-        assert_eq!(round.z_anchor, 42);
-        assert_eq!(round.block_types, cb.block_types, "block data intact");
-        assert_eq!(round.paints, cb.paints, "paint data intact");
-        assert_eq!(round.mask, Some(bits), "footprint survived the round trip");
-        assert!(round.info().masked, "reloaded prefab reports as shaped");
-    }
-
-    /// A rectangular clipboard still writes the legacy EPFAB\x01 format (older builds keep reading
-    /// it), and reloads with no mask.
-    #[test]
-    fn test_prefab_rectangular_stays_v1() {
-        let cb = Clipboard {
-            width: 2, height: 2, depth: 1, z_anchor: 0,
-            block_types: vec![13u8; 4], paints: vec![0u8; 4], mask: None, origin: None
-        };
-        let bytes = serialize_prefab(&cb);
-        // Decompress to inspect the version byte.
-        use flate2::read::GzDecoder;
-        use std::io::Read;
-        let mut raw = Vec::new();
-        GzDecoder::new(&bytes[..]).read_to_end(&mut raw).unwrap();
-        assert_eq!(&raw[0..6], b"EPFAB\x01", "maskless prefab stays on v1");
-        let round = deserialize_prefab(&bytes).expect("round-trips");
-        assert_eq!(round.mask, None, "no footprint on a rectangular prefab");
-    }
-
-    /// Shaped-selection consistency pass — a masked clipboard's top-down paste ghost leaves unmasked
-    /// columns fully transparent (alpha 0), so the preview shows only the footprint; a `None` mask
-    /// keeps the full VOID box (prefab-thumbnail parity).
-    #[test]
-    fn test_clipboard_preview_hides_unmasked_cells() {
-        // 2×2×1, all brick, diagonal footprint (0,0)+(1,1).
-        let mut bits = vec![0u8; 1];
-        bits[0] |= 1 << 0; bits[0] |= 1 << 3;
-        let cb = Clipboard { width: 2, height: 2, depth: 1, z_anchor: 0,
-            block_types: vec![13u8; 4], paints: vec![0u8; 4], mask: Some(bits), origin: None };
-        let pd = render_clipboard_preview_inner(&cb, 0, 1);
-        let a = |dx: usize, dy: usize| pd.pixels[(dy * 2 + dx) * 4 + 3];
-        assert_eq!(a(0, 0), 255, "masked block column is opaque");
-        assert_eq!(a(1, 1), 255, "far masked block column is opaque");
-        assert_eq!(a(1, 0), 0, "unmasked column stays transparent (alpha 0)");
-        assert_eq!(a(0, 1), 0, "unmasked column stays transparent");
-
-        // None mask ⇒ every column filled (VOID for the air columns), matching prefab thumbnails.
-        let cb2 = Clipboard { mask: None, ..cb };
-        let pd2 = render_clipboard_preview_inner(&cb2, 0, 1);
-        for i in 0..4 { assert_eq!(pd2.pixels[i * 4 + 3], 255, "None mask fills the whole box"); }
-    }
-
-    /// Row 18.3: `max_side` bounds the preview and samples the right column.
-    #[test]
-    fn test_clipboard_preview_lod_bounded() {
-        // 1024x2x1, brick only in column 0 and column 512 (both on lod-2 sample points).
-        let (w, h) = (1024usize, 2usize);
-        let mut bt = vec![0u8; w * h];
-        bt[0] = 13; bt[512] = 13;
-        let cb = Clipboard { width: w as _, height: h as _, depth: 1, z_anchor: 0,
-            block_types: bt, paints: vec![0u8; w * h], mask: None, origin: None };
-        let full = render_clipboard_preview_inner(&cb, 0, 1);
-        assert_eq!((full.width, full.height), (1024, 2));
-        let pd = render_clipboard_preview_inner(&cb, 0, clipboard_preview_lod(&cb, Some(512), None));
-        assert_eq!((pd.width, pd.height, pd.lod), (512, 1, 2));
-        assert_eq!(pd.pixels.len(), 512 * 4);
-        assert_ne!(&pd.pixels[0..3], &[20, 20, 35], "column 0 is a block");
-        assert_ne!(&pd.pixels[256 * 4..256 * 4 + 3], &[20, 20, 35], "column 512 samples at ox=256");
-        assert_eq!(&pd.pixels[4..7], &[20, 20, 35], "air column stays VOID");
-        // Small clipboard is unaffected by the cap.
-        let small = Clipboard { width: 2, height: 2, depth: 1, z_anchor: 0,
-            block_types: vec![13u8; 4], paints: vec![0u8; 4], mask: None, origin: None };
-        let ps = render_clipboard_preview_inner(&small, 0, clipboard_preview_lod(&small, Some(512), None));
-        assert_eq!((ps.width, ps.height, ps.lod), (2, 2, 1));
-    }
-
-    /// 18.3 follow-up: the paste ghost's pixel budget keeps a city-sized clipboard 1:1 (the long-side
-    /// cap downsampled anything over 512, so the ghost no longer lined up block-for-block), and
-    /// only downsamples past the budget. Caps combine as the coarser of the two.
-    #[test]
-    fn test_clipboard_ghost_pixel_budget() {
-        let clip = |w: usize, h: usize| Clipboard { width: w as _, height: h as _, depth: 1, z_anchor: 0,
-            block_types: vec![13u8; w * h], paints: vec![0u8; w * h], mask: None, origin: None };
-        let city = clip(2000, 1500);
-        assert_eq!(clipboard_preview_lod(&city, None, Some(CLIPBOARD_GHOST_MAX_PX)), 1);
-        let pd = render_clipboard_preview_inner(&city, 0, 1);
-        assert_eq!((pd.width, pd.height, pd.lod), (2000, 1500, 1));
-        assert_eq!(clipboard_preview_lod(&city, Some(512), None), 4, "the old cap would have been 1:4");
-        assert_eq!(clipboard_preview_lod(&city, Some(512), Some(CLIPBOARD_GHOST_MAX_PX)), 4, "coarser cap wins");
-        assert_eq!(clipboard_preview_lod(&city, None, None), 1);
-        // Over budget → smallest pow2 that fits (lod math only — no 4 GB test allocation).
-        let huge = Clipboard { width: 8192, height: 8192, depth: 0, z_anchor: 0,
-            block_types: vec![], paints: vec![], mask: None, origin: None };
-        let lod = clipboard_preview_lod(&huge, None, Some(CLIPBOARD_GHOST_MAX_PX));
-        assert_eq!(lod, 4, "8192² = 64 M px → 2048² at lod 4 (lod 2 would be 16 M px)");
-    }
-
-    /// The ortho front/side selection view (the 2D selection inspector) skips unmasked
-    /// columns, so a masked block *behind* an unmasked column shows through correctly.
-    #[test]
-    fn test_render_selection_view_masks_columns() {
-        // Two adjacent columns at x=4 (front, tall grass to z=20) and x=5 (behind, brick at z=5).
-        // Build so that scanning y reaches x-column blocks; use render_view_front over a 2-wide rect.
-        let mut ws = ws_with(make_bumpy_world(8, |lx, _| if lx == 4 { 20 } else { 0 }));
-        // Put a distinct brick at (5,4,15) — an unmasked (4,4) column must let it show behind.
-        set_block_abs(ws.world.as_mut().unwrap(), 5, 4, 15, 13, 0);
-        let world = ws.world.as_ref().unwrap();
-        // Mask covers the 2×1 rect (4,4)-(5,4) but only selects x=5 (drop the front x=4 column).
-        let mask = mask_from(4, 4, 5, 4, |x, _| x == 5);
-
-        // Front view: pw = 2 (x4,x5), ph over z 0..=20. Column 0 = x4 (masked out → see-through),
-        // column 1 = x5 (masked in). With x4 masked out, the brick behind at x5,z15 renders in col 1.
-        let (pw, _ph, px_masked) = render::view_front(world, world.meta(), 4, 5, 4, 4, 0, 20, 0, Some(&mask));
-        assert_eq!(pw, 2);
-        // Unmasked path: x4 column is a solid grass wall to z=20, occluding nothing behind it in
-        // its own column — but col 0 (x4) should be VOID since x4 is masked *out*.
-        // Row for z=20 is row 0; col 0 pixel:
-        let row_z = |z: i32| (20 - z) as usize;
-        let px = |col: usize, z: i32| { let o = (row_z(z) * pw as usize + col) * 4; [px_masked[o], px_masked[o+1], px_masked[o+2]] };
-        assert_eq!(px(0, 20), [20, 20, 35], "masked-out front column is VOID (see-through)");
-        assert_ne!(px(1, 15), [20, 20, 35], "masked block behind shows through in its column");
-
-        // None mask ⇒ front column x4 renders its grass wall (not VOID) at z=20.
-        let (_pw2, _ph2, px_none) = render::view_front(world, world.meta(), 4, 5, 4, 4, 0, 20, 0, None);
-        let o = (row_z(20) * 2) * 4;
-        assert_ne!([px_none[o], px_none[o+1], px_none[o+2]], [20, 20, 35], "None mask renders the full box");
-    }
-
-    /// The top-down ortho view hides unmasked columns (leaves them VOID) so the floating inspector
-    /// shows the actual footprint, not the enclosing bounding box. Regression for "the top view
-    /// still shows everything in the nearest rectangle".
-    #[test]
-    fn test_render_view_top_masks_columns() {
-        let mut ws = ws_with(make_bumpy_world(8, |_, _| 20)); // every column solid grass to z=20
-        let world = ws.world.as_ref().unwrap();
-        // 2×2 rect (4,4)-(5,5); select only the main diagonal (4,4) and (5,5).
-        let mask = mask_from(4, 4, 5, 5, |x, y| x - 4 == y - 4);
-        let (pw, ph, px_masked) = render::view_top(world, world.meta(), 4, 5, 4, 5, 0, 20, 0, Some(&mask));
-        assert_eq!((pw, ph), (2, 2));
-        let px = |col: usize, row: usize| { let o = (row * pw as usize + col) * 4; [px_masked[o], px_masked[o+1], px_masked[o+2]] };
-        assert_ne!(px(0, 0), [20, 20, 35], "masked-in (4,4) renders its surface block");
-        assert_ne!(px(1, 1), [20, 20, 35], "masked-in (5,5) renders its surface block");
-        assert_eq!(px(1, 0), [20, 20, 35], "unmasked (5,4) is VOID");
-        assert_eq!(px(0, 1), [20, 20, 35], "unmasked (4,5) is VOID");
-
-        // None mask ⇒ the whole 2×2 box renders (no VOID columns).
-        let (_pw2, _ph2, px_none) = render::view_top(world, world.meta(), 4, 5, 4, 5, 0, 20, 0, None);
-        for i in 0..4 { let o = i * 4; assert_ne!([px_none[o], px_none[o+1], px_none[o+2]], [20, 20, 35], "None mask fills every column"); }
-    }
-
-    /// A masked gradient re-skins only shaped columns; unmasked columns inside the bbox keep their
-    /// original block.
-    #[test]
-    fn test_gradient_fill_respects_mask() {
-        let mut ws = ws_with(make_bumpy_world(8, |_, _| 20)); // grass (bt 8) to z=20
-        let mask = mask_from(4, 4, 7, 7, |x, _| x == 4); // left edge column only
-        gradient_fill_inner(ws.world.as_mut().unwrap(), 4, 4, 7, 7, 20, 20, 13, 0, 14, 0, "x", false, Some(&mask));
-        let w = ws.world.as_ref().unwrap();
-        assert!(matches!(read_block_abs(w, 4, 5, 20), 13 | 14), "masked column re-skinned");
-        assert_eq!(read_block_abs(w, 5, 5, 20), 8, "unmasked column kept grass");
-    }
-
-    /// A masked extrude repeats the *shape*: gating is on the source cell, so an x+ copy translates
-    /// only the masked source columns and leaves unmasked destination cells untouched.
-    #[test]
-    fn test_extrude_selection_respects_mask() {
-        let mut ws = ws_with(make_bumpy_world(0, |_, _| 0)); // empty world
-        // Source 2×2 at (4,4); mark only (4,4,10)=stone. Mask selects only that one column.
-        set_block_abs(ws.world.as_mut().unwrap(), 4, 4, 10, 2, 0);
-        set_block_abs(ws.world.as_mut().unwrap(), 5, 4, 10, 3, 0); // dirt in the unmasked column
-        let (width, height, depth) = (2i32, 2i32, 11i32);
-        let mut src_types = vec![0u8; (width * height * depth) as usize];
-        let mut src_paints = vec![0u8; (width * height * depth) as usize];
-        {
-            let world = ws.world.as_ref().unwrap();
-            for dz in 0..depth { for dy in 0..height { for dx in 0..width {
-                let idx = (dz * height * width + dy * width + dx) as usize;
-                src_types[idx] = read_block_abs(world, 4 + dx, 4 + dy, dz);
-                src_paints[idx] = read_paint_abs(world, 4 + dx, 4 + dy, dz);
-            }}}
-        }
-        let mask = mask_from(4, 4, 5, 5, |x, y| x == 4 && y == 4);
-        with_edit(&mut ws, "extrude", (4, 4, 7, 5), |world| {
-            extrude_write(world, 4, 4, &src_types, &src_paints, width, height, depth, 0, 63, "x+", 1, false, Some(&mask));
-            Ok(())
-        }).expect("masked extrude");
-        let w = ws.world.as_ref().unwrap();
-        assert_eq!(read_block_abs(w, 6, 4, 10), 2, "masked source column extruded +2 (stone)");
-        assert_eq!(read_block_abs(w, 7, 4, 10), 0, "unmasked source column not extruded (no dirt copy)");
-    }
-
-    /// A masked tree pass only plants inside the shape. density=1.0 + smart placement over grass;
-    /// the unmasked column stays bare (only surface grass), the masked column grows a trunk above it.
-    #[test]
-    fn test_generate_trees_respects_mask() {
-        let mut ws = ws_with(make_bumpy_world(8, |_, _| 20)); // grass surface z=20 everywhere
-        let mask = mask_from(4, 4, 7, 7, |x, y| x == 4 && y == 4);
-        generate_trees_inner(&mut EditView::unbounded(ws.world.as_mut().unwrap()), 4, 4, 7, 7,
-            &["normal".to_string()], 1.0, &[], 42, true, Some(&mask), None);
-        let w = ws.world.as_ref().unwrap();
-        // A normal tree places a trunk (bt 6) above the surface at the planted column.
-        assert_eq!(read_block_abs(w, 4, 4, 21), 6, "masked column grew a trunk");
-        assert_eq!(read_block_abs(w, 6, 6, 21), 0, "unmasked column stayed bare above the surface");
-    }
-
-    /// A `set_selection_mask` payload of the wrong length is rejected rather than silently producing
-    /// an under-read mask. (Exercises the byte-count guard without a Tauri State harness by mirroring
-    /// its size math.)
-    #[test]
-    fn test_mask_size_guard_math() {
-        // 4×4 bbox needs ceil(16/8) = 2 bytes.
-        let w = 4usize; let h = 4usize;
-        assert_eq!(w.saturating_mul(h).div_ceil(8), 2);
-        // 200×200 needs 5000 bytes.
-        assert_eq!(200usize.saturating_mul(200).div_ceil(8), 5000);
-    }
-
-    /// Task 1 — N overlapping grouped raise stamps undo/redo as ONE unit, byte-exactly, and depths
-    /// count groups not stamps; an ungrouped edit stays its own single group (regression guard).
-    #[test]
-    fn test_grouped_undo_round_trip() {
-        let mut ws = ws_with(make_bumpy_world(2, |lx, ly| 12 + ((lx + ly) % 5) as i32));
-        let before = world_bytes(&ws);
-
-        // 4 overlapping raise stamps sharing one group id.
-        let gid = Some(777u64);
-        for &(cx, cy) in &[(6, 6), (7, 6), (6, 7), (7, 7)] {
-            sculpt(&mut ws, Some(disc_points(cx, cy, 2)), "raise", 3, 0.0, None, gid);
-        }
-        let after = world_bytes(&ws);
-        assert_ne!(before, after, "stamps must change the world");
-        assert_eq!(ws.undo_stack.len(), 4, "each stamp is its own raw undo entry");
-        assert_eq!(count_undo_groups(&ws.undo_stack), 1, "same-group stamps collapse to one group");
-
-        // undo → redo → undo → redo, byte-identical every time (exercises the ordering reasoning).
-        for _ in 0..2 {
-            let r = undo_edit_inner(&mut ws).expect("undo");
-            assert_eq!(world_bytes(&ws), before, "one undo restores the whole stroke");
-            assert_eq!(r.undo_depth, 0, "undo drops exactly one group (was 1 → 0)");
-            let r2 = redo_edit_inner(&mut ws).expect("redo");
-            assert_eq!(world_bytes(&ws), after, "one redo restores the whole stroke");
-            assert_eq!(r2.undo_depth, 1, "redo restores the one group");
-            assert_eq!(ws.undo_stack.len(), 4, "redo restores all 4 raw entries");
-        }
-
-        // Regression: a lone ungrouped edit is exactly one entry / one group and round-trips.
-        undo_edit_inner(&mut ws).expect("undo the group");
-        assert_eq!(world_bytes(&ws), before);
-        let base = world_bytes(&ws);
-        let r = sculpt(&mut ws, Some(disc_points(3, 3, 1)), "raise", 2, 0.0, None, None);
-        assert_eq!(ws.undo_stack.len(), 1, "ungrouped edit = one entry");
-        assert_eq!(r.undo_depth, 1, "ungrouped edit = one group");
-        let post = world_bytes(&ws);
-        assert_ne!(base, post);
-        undo_edit_inner(&mut ws).expect("undo ungrouped");
-        assert_eq!(world_bytes(&ws), base, "ungrouped undo = single entry");
-        redo_edit_inner(&mut ws).expect("redo ungrouped");
-        assert_eq!(world_bytes(&ws), post);
-        assert_eq!(ws.undo_stack.len(), 1);
-    }
-
-    /// 21.9 (audit S2): cancelling a live stroke that pushed nothing must not pop the edit below.
-    #[test]
-    fn test_undo_only_group_refuses_a_foreign_top_entry() {
-        let mut ws = ws_with(make_bumpy_world(2, |lx, ly| 12 + ((lx + ly) % 5) as i32));
-        let base = world_bytes(&ws);
-        sculpt(&mut ws, Some(disc_points(6, 6, 2)), "raise", 3, 0.0, None, Some(5));
-        let after_first = world_bytes(&ws);
-
-        // Stroke 6 changed nothing (no entry); Esc asks to undo group 6 only.
-        let err = undo_edit_only(&mut ws, Some(6)).err().expect("refused");
-        assert_eq!(err, "Nothing to undo");
-        assert_eq!(world_bytes(&ws), after_first, "the previous stroke survives");
-        assert_eq!(ws.undo_stack.len(), 1);
-        assert!(ws.redo_stack.is_empty(), "a refused cancel leaves redo alone");
-
-        // Stroke 7 did change something: its own cancel reverts it, and only it.
-        sculpt(&mut ws, Some(disc_points(7, 7, 2)), "raise", 3, 0.0, None, Some(7));
-        sculpt(&mut ws, Some(disc_points(8, 7, 2)), "raise", 3, 0.0, None, Some(7));
-        undo_edit_only(&mut ws, Some(7)).expect("own group undoes");
-        assert_eq!(world_bytes(&ws), after_first);
-
-        // No group = the plain ⌘Z behaviour.
-        undo_edit_only(&mut ws, None).expect("plain undo");
-        assert_eq!(world_bytes(&ws), base);
-        assert_eq!(undo_edit_only(&mut ws, Some(5)).err().as_deref(), Some("Nothing to undo"));
-    }
-
-    #[test]
-    fn test_undo_stack_labels_collapse_groups() {
-        let mut ws = ws_with(make_bumpy_world(2, |lx, ly| 12 + ((lx + ly) % 5) as i32));
-
-        // 4 stamps sharing one group id must collapse to a single label.
-        let gid = Some(42u64);
-        for &(cx, cy) in &[(6, 6), (7, 6), (6, 7), (7, 7)] {
-            sculpt(&mut ws, Some(disc_points(cx, cy, 2)), "raise", 3, 0.0, None, gid);
-        }
-        assert_eq!(ws.undo_stack.len(), 4);
-        assert_eq!(undo_stack_labels(&ws.undo_stack).len(), 1, "same-group stamps collapse to one label");
-
-        // A subsequent ungrouped edit is its own separate label, appended after the group.
-        sculpt(&mut ws, Some(disc_points(3, 3, 1)), "raise", 2, 0.0, None, None);
-        assert_eq!(undo_stack_labels(&ws.undo_stack).len(), 2, "group + ungrouped edit = 2 labels");
-
-        assert!(undo_stack_labels(&ws.redo_stack).is_empty());
-        undo_edit_inner(&mut ws).expect("undo ungrouped");
-        assert_eq!(undo_stack_labels(&ws.redo_stack).len(), 1, "the undone edit reappears as one redo label");
-    }
-
-    /// Task 2 — per-stamp radial (dial) falloff vs BFS silhouette dome for one isolated disc stamp.
-    /// The two use different distance metrics (8-connected graph distance to the silhouette edge vs
-    /// continuous Euclidean distance from the centre), so the weight fields aren't bit-identical;
-    /// we assert the resulting per-column heights agree within a small tolerance and that both are
-    /// centre-higher-than-rim monotone. Tolerance = 1 block, made attainable by using a modest
-    /// strength (2) so the whole dome spans only ~2 blocks — the max possible disagreement between
-    /// two near-equal weight fields after integer rounding is then one quantization step.
-    #[test]
-    fn test_dial_vs_bfs_falloff_parity() {
-        let (cx, cy, r) = (8, 8, 4);
-        let base = make_bumpy_world(2, |_, _| 15);
-
-        // (a) BFS path: explicit disc points, no stamp centre.
-        let mut ws_a = ws_with(base.clone());
-        sculpt(&mut ws_a, Some(disc_points(cx, cy, r)), "raise", 2, 1.0, None, None);
-        // (b) dial path: no points, stamp centre + radius → backend generates the disc.
-        let mut ws_b = ws_with(base.clone());
-        sculpt(&mut ws_b, None, "raise", 2, 1.0, Some((cx, cy, r)), None);
-
-        for p in &disc_points(cx, cy, r) {
-            let ha = surf(&ws_a, p.x, p.y);
-            let hb = surf(&ws_b, p.x, p.y);
-            assert!((ha - hb).abs() <= 1, "column ({},{}) BFS={ha} dial={hb} differ by >1", p.x, p.y);
-        }
-        // Monotonicity: centre rises strictly more than the rim, both paths.
-        assert!(surf(&ws_a, cx, cy) > surf(&ws_a, cx + r, cy), "BFS centre must exceed rim");
-        assert!(surf(&ws_b, cx, cy) > surf(&ws_b, cx + r, cy), "dial centre must exceed rim");
-        // Dial rim weight is exactly 0 (d == radius) → rim height unchanged.
-        assert_eq!(surf(&ws_b, cx + r, cy), 15, "dial rim (weight 0) leaves terrain untouched");
-    }
-
-    /// Task 4.1 — dithering is deterministic (pure function of (x,y), no hidden RNG) and is fully
-    /// bypassed at softness == 0 (hard brushes round exactly).
-    #[test]
-    fn test_dither_determinism_and_hard_bypass() {
-        let base = make_bumpy_world(2, |lx, ly| 12 + ((lx * 3 + ly) % 7) as i32);
-        let disc = disc_points(8, 8, 5);
-
-        // Two identical soft raise calls from the same start → byte-identical.
-        let mut ws1 = ws_with(base.clone());
-        let mut ws2 = ws_with(base.clone());
-        sculpt(&mut ws1, Some(disc.clone()), "raise", 5, 0.6, None, None);
-        sculpt(&mut ws2, Some(disc.clone()), "raise", 5, 0.6, None, None);
-        assert_eq!(world_bytes(&ws1), world_bytes(&ws2),
-            "identical soft-sculpt calls must be byte-identical (dither is deterministic)");
-
-        // softness == 0 → weight 1 everywhere, plain round, no dither: every column rises by exactly
-        // `strength`. A dithered path would give ±1 here.
-        let base_ws = ws_with(base.clone());
-        let mut ws3 = ws_with(base.clone());
-        sculpt(&mut ws3, Some(disc.clone()), "raise", 5, 0.0, None, None);
-        for p in &disc {
-            assert_eq!(surf(&ws3, p.x, p.y), surf(&base_ws, p.x, p.y) + 5,
-                "hard raise adds exactly strength with no dither at ({},{})", p.x, p.y);
-        }
-    }
-
-    /// Task 4.2 — Smooth iterates `strength` times, so strength 3 flattens a cone toward the local
-    /// average strictly more than strength 1 (from the same input each time).
-    #[test]
-    fn test_smooth_strength_flattens_more() {
-        // A smooth cone peak (avoids the checkerboard pattern that makes undamped Jacobi oscillate
-        // and the linear ramp that is a smoothing fixed point).
-        let cone = |lx: usize, ly: usize| -> i32 {
-            let (dx, dy) = (lx as i32 - 8, ly as i32 - 8);
-            let d = ((dx * dx + dy * dy) as f64).sqrt();
-            15 + (6.0 - d).max(0.0).round() as i32
-        };
-        let base = make_bumpy_world(2, cone);
-        let disc = disc_points(8, 8, 3);
-
-        let range_after = |strength: i32| -> i32 {
-            let mut ws = ws_with(base.clone());
-            sculpt(&mut ws, Some(disc.clone()), "smooth", strength, 0.0, None, None);
-            let hs: Vec<i32> = disc.iter().map(|p| surf(&ws, p.x, p.y)).collect();
-            hs.iter().max().unwrap() - hs.iter().min().unwrap()
-        };
-        let r1 = range_after(1);
-        let r3 = range_after(3);
-        assert!(r3 < r1, "strength 3 smooth must flatten more than strength 1 (r1={r1}, r3={r3})");
-    }
-
-    /// Terrace quantizes every column to the nearest `strength`-block step.
-    #[test]
-    fn test_terrace_quantizes_to_step() {
-        let base = make_bumpy_world(2, |lx, ly| 10 + ((lx * 3 + ly) % 11) as i32);
-        let disc = disc_points(8, 8, 5);
-        let step = 4;
-        let mut ws = ws_with(base.clone());
-        sculpt(&mut ws, Some(disc.clone()), "terrace", step, 0.0, None, None);
-        for p in &disc {
-            let h = surf(&ws, p.x, p.y);
-            assert_eq!(h.rem_euclid(step), 0, "column ({},{}) height {h} isn't a multiple of step {step}", p.x, p.y);
-        }
-    }
-
-    /// Sharpen is the inverse of Smooth: it must widen (not narrow) the height range of a cone.
-    #[test]
-    fn test_sharpen_widens_range() {
-        let cone = |lx: usize, ly: usize| -> i32 {
-            let (dx, dy) = (lx as i32 - 8, ly as i32 - 8);
-            let d = ((dx * dx + dy * dy) as f64).sqrt();
-            15 + (6.0 - d).max(0.0).round() as i32
-        };
-        let base = make_bumpy_world(2, cone);
-        let disc = disc_points(8, 8, 3);
-        let range_before = {
-            let ws = ws_with(base.clone());
-            let hs: Vec<i32> = disc.iter().map(|p| surf(&ws, p.x, p.y)).collect();
-            hs.iter().max().unwrap() - hs.iter().min().unwrap()
-        };
-        let mut ws = ws_with(base.clone());
-        sculpt(&mut ws, Some(disc.clone()), "sharpen", 8, 0.0, None, None);
-        let range_after = {
-            let hs: Vec<i32> = disc.iter().map(|p| surf(&ws, p.x, p.y)).collect();
-            hs.iter().max().unwrap() - hs.iter().min().unwrap()
-        };
-        assert!(range_after > range_before,
-            "sharpen must widen the height range (before={range_before}, after={range_after})");
-    }
-
-    /// Slope levels toward an angled plane through the anchor: with slope_dx=1 (1 block of rise
-    /// per block of X run), a column `dx` blocks east of the anchor lands at `anchor_z + dx`, and
-    /// the anchor column itself is untouched (it's on the plane already).
-    #[test]
-    fn test_slope_tilts_plane_from_anchor() {
-        let base = make_bumpy_world(2, |_, _| 15);
-        let mut ws = ws_with(base);
-        let (ax, ay) = (8, 8);
-        let disc = disc_points(ax, ay, 4);
-        sculpt_terrain_inner(
-            &mut ws, Some(disc.clone()), "slope".into(), 1, 0, None, None, None, None,
-            Some(0.0), Some("smooth".into()), None, Some(ax), Some(ay), None, None, None, None, None,
-            Some(1.0), Some(0.0), None, None, None, None, None,
-        ).expect("slope");
-        assert_eq!(surf(&ws, ax, ay), 15, "anchor column sits on its own plane, unchanged");
-        assert_eq!(surf(&ws, ax + 3, ay), 18, "3 blocks east at slope_dx=1 → anchor height + 3");
-        assert_eq!(surf(&ws, ax - 2, ay), 13, "2 blocks west at slope_dx=1 → anchor height - 2");
-    }
-
-    /// Smear pulls each column's height from `smear_dx/smear_dy` blocks behind it — a flat-out
-    /// step (a cliff) shifts sideways by the smear vector within the brushed footprint, and a
-    /// zero vector is a no-op (nothing to smear without a drag direction).
-    #[test]
-    fn test_smear_advects_height_along_drag() {
-        // A cliff: x < 8 is low (10), x >= 8 is high (20).
-        let base = make_bumpy_world(2, |lx, _| if lx < 8 { 10 } else { 20 });
-        let disc = disc_points(8, 8, 3);
-
-        // Zero vector: no-op regardless of softness.
-        let mut ws0 = ws_with(base.clone());
-        let before = world_bytes(&ws0);
-        sculpt_terrain_inner(
-            &mut ws0, Some(disc.clone()), "smear".into(), 1, 0, None, None, None, None,
-            Some(0.0), Some("smooth".into()), None, None, None, None, None, None, None, None,
-            None, None, Some(0), Some(0), None, None, None,
-        ).expect("smear no-op");
-        assert_eq!(world_bytes(&ws0), before, "zero smear vector must not touch the world");
-
-        // Pull from 2 blocks east (source x+2) with a hard brush: every column in the footprint
-        // takes on its source's height exactly.
-        let mut ws = ws_with(base.clone());
-        sculpt_terrain_inner(
-            &mut ws, Some(disc.clone()), "smear".into(), 1, 0, None, None, None, None,
-            Some(0.0), Some("smooth".into()), None, None, None, None, None, None, None, None,
-            None, None, Some(-2), Some(0), None, None, None,
-        ).expect("smear");
-        // Column x=6 (low side) pulls from x=8 (high side, source = p.x - smear_dx = 6 - (-2) = 8)
-        assert_eq!(surf(&ws, 6, 8), 20, "column at x=6 pulls its source height from x=8");
-        // Column x=10 (high side) pulls from x=12, also high — unaffected in value.
-        assert_eq!(surf(&ws, 10, 8), 20, "column at x=10 pulls its source height from x=12 (same band)");
-    }
-
-    /// Hydro is deterministic: two identical droplet simulations (same seed, same world, same
-    /// params) produce byte-identical results — the RNG-driven start jitter/exploration is seeded.
-    #[test]
-    fn test_hydro_determinism() {
-        let base = make_bumpy_world(2, |lx, ly| 12 + ((lx * 3 + ly) % 7) as i32);
-        let disc = disc_points(8, 8, 5);
-        let mut ws1 = ws_with(base.clone());
-        let mut ws2 = ws_with(base.clone());
-        sculpt(&mut ws1, Some(disc.clone()), "hydro", 4, 0.0, None, None);
-        sculpt(&mut ws2, Some(disc.clone()), "hydro", 4, 0.0, None, None);
-        assert_eq!(world_bytes(&ws1), world_bytes(&ws2),
-            "identical hydro calls must be byte-identical (seeded droplet sim is deterministic)");
-    }
-
-    /// Hydro actually erodes: running it over a broad peak shrinks the peak-to-valley height range
-    /// within the footprint (the peak erodes down and/or valleys fill), vs the untouched world.
-    #[test]
-    fn test_hydro_erodes_a_peak() {
-        // A broad cone peak so many droplets engage the slope.
-        let cone = |lx: usize, ly: usize| -> i32 {
-            let (dx, dy) = (lx as i32 - 8, ly as i32 - 8);
-            let d = ((dx * dx + dy * dy) as f64).sqrt();
-            15 + (24.0 - 4.0 * d).max(0.0).round() as i32
-        };
-        let base = make_bumpy_world(2, cone);
-        let disc = disc_points(8, 8, 5);
-
-        let range = |ws: &WorldState| -> i32 {
-            let hs: Vec<i32> = disc.iter().map(|p| surf(ws, p.x, p.y)).collect();
-            hs.iter().max().unwrap() - hs.iter().min().unwrap()
-        };
-        let before_ws = ws_with(base.clone());
-        let range_before = range(&before_ws);
-
-        let mut ws = ws_with(base.clone());
-        sculpt(&mut ws, Some(disc.clone()), "hydro", 4, 0.0, None, None);
-        let range_after = range(&ws);
-
-        assert!(range_after < range_before,
-            "hydro must reduce the footprint height range (before {range_before}, after {range_after})");
-    }
-
-    /// Commit stays inside the footprint: even though the droplet workspace extends 16 cells past the
-    /// brush, a column strictly outside the footprint's bounding box is byte-identical afterwards,
-    /// while a column inside it changed. This is the regression guard that makes the wider workspace
-    /// safe (§4 "commit inside footprint only").
-    #[test]
-    fn test_hydro_commit_stays_in_footprint() {
-        // Column's full block+paint byte column (all 64 z levels), single-chunk layout.
-        let col_bytes = |bytes: &[u8], lx: usize, ly: usize| -> Vec<u8> {
-            let mut v = Vec::with_capacity(128);
-            for z in 0..64usize {
-                let off = 4096 + (z / 16) * 8192 + lx * 256 + ly * 16 + (z % 16);
-                v.push(bytes[off]);
-                v.push(bytes[off + 4096]);
-            }
-            v
-        };
-        let cone = |lx: usize, ly: usize| -> i32 {
-            let (dx, dy) = (lx as i32 - 8, ly as i32 - 8);
-            let d = ((dx * dx + dy * dy) as f64).sqrt();
-            15 + (18.0 - 3.0 * d).max(0.0).round() as i32
-        };
-        let base = make_bumpy_world(2, cone);
-        let before = base.clone();
-
-        // Footprint bbox is x,y ∈ 5..=11. (2,2) is outside it but well inside the workspace
-        // (footprint − 16 .. footprint + 16); (8,8) is the centre and must change.
-        let mut ws = ws_with(base.clone());
-        sculpt(&mut ws, Some(disc_points(8, 8, 3)), "hydro", 4, 0.0, None, None);
-        let after = world_bytes(&ws);
-
-        assert_eq!(col_bytes(&before, 2, 2), col_bytes(&after, 2, 2),
-            "a column outside the footprint bbox must be untouched by hydro's wider workspace");
-        assert_ne!(col_bytes(&before, 8, 8), col_bytes(&after, 8, 8),
-            "the footprint centre must actually be eroded (otherwise the guard proves nothing)");
-    }
-
-    /// Erosion radius ≥ 2: a single hydro stamp's erosion is spread over a radial brush, so a stamp
-    /// changes a contiguous neighbourhood of columns, not a 1-wide line (the audit's flaw (3)).
-    #[test]
-    fn test_hydro_erosion_spreads_across_columns() {
-        let cone = |lx: usize, ly: usize| -> i32 {
-            let (dx, dy) = (lx as i32 - 8, ly as i32 - 8);
-            let d = ((dx * dx + dy * dy) as f64).sqrt();
-            15 + (20.0 - 4.0 * d).max(0.0).round() as i32
-        };
-        let base = make_bumpy_world(2, cone);
-        let before_ws = ws_with(base.clone());
-        let disc = disc_points(8, 8, 4);
-
-        let mut ws = ws_with(base.clone());
-        sculpt(&mut ws, Some(disc.clone()), "hydro", 4, 0.0, None, None);
-
-        let changed = disc.iter()
-            .filter(|p| surf(&ws, p.x, p.y) != surf(&before_ws, p.x, p.y))
-            .count();
-        assert!(changed >= 2,
-            "erosion-radius brush must change more than one column (changed {changed})");
-    }
-
-    // ── Fluid Flow Toolkit ───────────────────────────────────────────────────────
-
-    /// A level-4 water source on a solid floor spreads laterally exactly 3 cells (¾→½→¼), matching
-    /// the in-game radius — the ¼ ring at distance 3 does not spread a 4th step.
-    #[test]
-    fn test_fluid_field_spread_radius_3() {
-        let mut world = parse_world_inner(mmap_from_bytes(make_test_world())).expect("parse failed");
-
-        // Floor: solid stone across the whole 16×16 chunk at z=0 so nothing falls through.
-        for x in 0..16 { for y in 0..16 { set_block_abs(&mut world, x, y, 0, 2, 0); } }
-
-        let sources = [(8, 8, 1, 20u8, 0u8)];
-        let writes = simulate_fluid_field(&world, 0, 0, 15, 15, 0, 5, &sources, 20, 10_000);
-        let by_pos: HashMap<(i32, i32, i32), (u8, u8)> = writes.into_iter()
-            .map(|(x, y, z, bt, paint)| ((x, y, z), (bt, paint)))
-            .collect();
-
-        assert_eq!(by_pos.get(&(8, 8, 1)), Some(&(20u8, 0u8)), "source stays full");
-        assert_eq!(by_pos.get(&(9, 8, 1)), Some(&(59u8, 0u8)), "radius 1 = ¾");
-        assert_eq!(by_pos.get(&(10, 8, 1)), Some(&(60u8, 0u8)), "radius 2 = ½");
-        assert_eq!(by_pos.get(&(11, 8, 1)), Some(&(61u8, 0u8)), "radius 3 = ¼");
-        assert!(!by_pos.contains_key(&(12, 8, 1)), "¼ must not spread a 4th step");
-    }
-
-    /// The falloff must complete even when the *selection* is drawn tight around the source: seeds are
-    /// scanned only in the seed rect, but the flood runs over the wider (padded) flood rect, so the
-    /// ¾/½/¼ rings still form. Guards the "last 1–2 flow states missing" fix (simulate_flow_inner's
-    /// seed-rect / flood-rect split).
-    #[test]
-    fn test_simulate_flow_spills_past_tight_selection() {
-        let mut world = parse_world_inner(mmap_from_bytes(make_test_world())).expect("parse failed");
-        for x in 0..16 { for y in 0..16 { set_block_abs(&mut world, x, y, 0, 2, 0); } }
-        // Place a single source; the "selection" is the 1×1 cell around it, the flood rect is padded ±3.
-        set_block_abs(&mut world, 8, 8, 1, 20, 0);
-        simulate_flow_inner(&mut EditView::unbounded(&mut world), 8, 8, 8, 8, 5, 5, 11, 11, 0, 5, false, 20, None);
-
-        assert_eq!(get_block_at(&world, 8, 8, 1), (20, 0), "source stays full");
-        assert_eq!(get_block_at(&world, 9, 8, 1), (59, 0), "radius 1 = ¾ (inside the 1×1 selection's spill)");
-        assert_eq!(get_block_at(&world, 10, 8, 1), (60, 0), "radius 2 = ½ spilled past the selection");
-        assert_eq!(get_block_at(&world, 11, 8, 1), (61, 0), "radius 3 = ¼ spilled past the selection");
-    }
-
-    /// `pool_fill` bucket-fills a walled basin flat, softens the rim on the target layer, and never
-    /// leaks through solid walls even though open ground sits just outside them within the selection.
-    #[test]
-    fn test_pool_fill_respects_walls() {
-        let mut world = parse_world_inner(mmap_from_bytes(make_test_world())).expect("parse failed");
-
-        // Floor across the whole chunk.
-        for x in 0..16 { for y in 0..16 { set_block_abs(&mut world, x, y, 0, 2, 0); } }
-        // Wall box: solid perimeter at x=5,x=9 / y=5,y=9, z=1..=3; interior x=6..=8,y=6..=8 stays air.
-        for z in 1..=3 {
-            for x in 5..=9 {
-                set_block_abs(&mut world, x, 5, z, 2, 0);
-                set_block_abs(&mut world, x, 9, z, 2, 0);
-            }
-            for y in 5..=9 {
-                set_block_abs(&mut world, 5, y, z, 2, 0);
-                set_block_abs(&mut world, 9, y, z, 2, 0);
-            }
-        }
-
-        let result = pool_fill_inner(&mut EditView::unbounded(&mut world), 0, 0, 15, 15, 7, 7, 1, 3, 20, 0, None);
-        assert!(result.is_ok(), "enclosed basin should fill cleanly: {result:?}");
-
-        assert_eq!(get_block_at(&world, 7, 7, 1), (20, 0), "lower layer fills flat full-level water");
-        assert_eq!(get_block_at(&world, 6, 6, 2), (20, 0));
-        assert_eq!(get_block_at(&world, 7, 7, 3), (20, 0), "basin centre at the top layer touches no wall — stays full");
-        assert_eq!(get_block_at(&world, 7, 6, 3), (59, 0), "top-layer cell against a wall softens to ¾");
-
-        // Outside the wall, still within the selection rect, must remain untouched — no leak.
-        assert_eq!(get_block_at(&world, 2, 2, 1), (0, 0));
-        assert_eq!(get_block_at(&world, 12, 12, 1), (0, 0));
-    }
-
-    /// `flood_fill_bfs` must never climb above the start plane, must stop at exactly `limit` cells,
-    /// and every cell it returns must be reachable from the start through the ±X/±Y/−Z neighbour rule
-    /// (i.e. contiguous). A walled box with a gap at the top lets air leak upward through the gap —
-    /// asserting no cell above the start Z proves the missing +Z neighbour, not a closed box, is what
-    /// keeps the fill down.
-    #[test]
-    fn test_flood_fill_never_climbs_and_stops_at_limit() {
-        let mut world = parse_world_inner(mmap_from_bytes(make_test_world())).expect("parse failed");
-
-        // Floor at z=0, walls at z=1..=3 around a 3×3 interior (x=6..=8,y=6..=8), open roof at z=4+
-        // (so upward leakage is physically possible — only the neighbour rule prevents it).
-        for x in 0..16 { for y in 0..16 { set_block_abs(&mut world, x, y, 0, 2, 0); } }
-        for z in 1..=3 {
-            for x in 5..=9 {
-                set_block_abs(&mut world, x, 5, z, 2, 0);
-                set_block_abs(&mut world, x, 9, z, 2, 0);
-            }
-            for y in 5..=9 {
-                set_block_abs(&mut world, 5, y, z, 2, 0);
-                set_block_abs(&mut world, 9, y, z, 2, 0);
-            }
-        }
-
-        // Unbounded (small) limit — fills the whole enclosed interior column, never leaking above z=1.
-        let cells = flood_fill_bfs(&world, 7, 7, 1, 1000).expect("bfs failed");
-        assert!(!cells.is_empty());
-        assert!(cells.iter().all(|&(_, _, z)| z <= 1), "fill must never climb above the start plane");
-        assert!(cells.contains(&(7, 7, 1)), "must include the start cell");
-
-        // Exact limit: a generous open world stops precisely at the cap.
-        for x in 0..16 { for y in 0..16 { set_block_abs(&mut world, x, y, 1, 0, 0); } }
-        let capped = flood_fill_bfs(&world, 7, 7, 1, 5).expect("bfs failed");
-        assert_eq!(capped.len(), 5, "must stop at exactly the limit");
-
-        // Contiguity: every cell must be within Manhattan-adjacent reach (through the same neighbour
-        // rule, ignoring +Z) of the start — a BFS frontier can't produce a disconnected cell.
-        let set: HashSet<(i32, i32, i32)> = capped.iter().copied().collect();
-        for &(x, y, z) in &capped {
-            if (x, y, z) == (7, 7, 1) { continue; }
-            let neighbours = [(-1, 0, 0), (1, 0, 0), (0, -1, 0), (0, 1, 0), (0, 0, -1), (0, 0, 1)];
-            let touches_set = neighbours.iter().any(|&(dx, dy, dz)| set.contains(&(x + dx, y + dy, z + dz)));
-            assert!(touches_set, "cell {:?} isn't adjacent to any other flooded cell", (x, y, z));
-        }
-    }
-
-    /// `surface_region_bfs` (shared by fill_surface + magic wand, row 18.7) is read-only, respects the
-    /// paint filter and the cap, and reports seedless columns as errors.
-    #[test]
-    fn test_surface_region_bfs_paint_filter_cap_and_seed_errors() {
-        let world = parse_world_inner(mmap_from_bytes(make_test_world())).expect("parse failed");
-        let mut world = world;
-        for x in 0..16 { for y in 0..16 { set_block_abs(&mut world, x, y, 0, 2, 0); } }
-        // A 3x3 patch with a different paint.
-        for x in 4..=6 { for y in 4..=6 { set_block_abs(&mut world, x, y, 0, 2, 5); } }
-
-        let all = surface_region_bfs(&world, 0, 0, false, 50_000, None).expect("seed ok").0;
-        assert!(all.len() >= 250, "paint-agnostic fill covers the whole same-type surface (got {})", all.len());
-        let painted = surface_region_bfs(&world, 5, 5, true, 50_000, None).expect("seed ok").0;
-        assert_eq!(painted.len(), 9, "paint filter isolates the patch");
-        assert!(painted.iter().all(|&(x, y, z)| (4..=6).contains(&x) && (4..=6).contains(&y) && z == 0));
-        let (capped, truncated) = surface_region_bfs(&world, 0, 0, false, 10, None).expect("seed ok");
-        assert_eq!(capped.len(), 10);
-        assert!(truncated, "a 10-cell cap on a 256-cell region reports truncation");
-        assert!(!surface_region_bfs(&world, 0, 0, false, 50_000, None).unwrap().1, "uncapped run is not truncated");
-        assert!(surface_region_bfs(&world, -1, 0, false, 10, None).is_err(), "out-of-world seed has no surface");
-    }
-
-    /// The wavy-surface quantizer must span all four fluid levels (full/¾/½/¼) as its noise input
-    /// sweeps 0..1, and clamp correctly at the extremes.
-    #[test]
-    fn test_wavy_quantizes_to_four_levels() {
-        let mut levels: HashSet<u8> = HashSet::new();
-        for i in 0..=10 {
-            levels.insert(quantize_wavy_level(i as f64 / 10.0));
-        }
-        assert_eq!(levels, HashSet::from([1u8, 2, 3, 4]), "quantization should span all four fluid levels");
-        assert_eq!(quantize_wavy_level(0.0), 1);
-        assert_eq!(quantize_wavy_level(1.0), 4);
-    }
-
-    // ── Stage 6: acceptance tests against the real >4 GiB fixture worlds ──────────────────────
-    //
-    // Ports the diagnosis's scratchpad oracle scripts (`oracle2.py`/`dirscan.py`/`mask.py`,
-    // DIAGNOSIS.md §5.2) into `#[ignore]`d tests against `DIAGNOSE/*.zip`. Run explicitly with
-    // `cargo test -- --ignored large_world` (or `--ignored` alone). Each fixture is ~5 GB
-    // extracted — see `DIAGNOSE/README.md`.
-    //
-    // Not run in CI: opt-in only, gated on multi-GB files this repo doesn't ship extracted.
-
-    /// Extracts a `DIAGNOSE/*.eden.zip` fixture (if not already extracted) to a sibling `.eden`
-    /// file next to it, and returns that path. Mirrors `load_world`'s own zip-detection/streaming
-    /// extraction (`is_zip` + `zip::ZipArchive`), except the extracted copy is cached on disk
-    /// across test runs instead of going to a throwaway temp file, since re-extracting a 5 GB
-    /// fixture on every `cargo test -- --ignored` run would be painfully slow.
-    fn extract_fixture(zip_path: &std::path::Path) -> std::path::PathBuf {
-        let extracted = zip_path.with_extension(""); // "<name>.eden.zip" -> "<name>.eden"
-        if extracted.exists() {
-            return extracted;
-        }
-        use zip::ZipArchive;
-        let file = fs::File::open(zip_path)
-            .unwrap_or_else(|e| panic!("failed to open fixture {zip_path:?}: {e}"));
-        let mut archive = ZipArchive::new(file)
-            .unwrap_or_else(|e| panic!("invalid zip fixture {zip_path:?}: {e}"));
-        let mut entry = archive.by_index(0).expect("zip fixture has no entries");
-        let mut out = fs::File::create(&extracted)
-            .unwrap_or_else(|e| panic!("failed to create {extracted:?}: {e}"));
-        std::io::copy(&mut entry, &mut out).expect("failed to extract fixture");
-        extracted
-    }
-
-    fn fixture_dir() -> std::path::PathBuf {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../DIAGNOSE")
-    }
-    fn pherbos_zip() -> std::path::PathBuf { fixture_dir().join("Pherbos V5'1'0 1784973077.eden.zip") }
-    fn antibes_zip() -> std::path::PathBuf { fixture_dir().join("Antibes City 64 1784034039.eden.zip") }
-
-    /// Maps a fixture's extracted `.eden` file copy-on-write (`map_copy`).
-    ///
-    /// ⚠️ Deliberately diverges from `load_world`, which maps its staged temp MAP_SHARED via
-    /// `map_staged_temp`. This maps the *shared extracted fixture itself*, not a per-test copy of
-    /// it, so a shared mapping would leak one editing test's mutations into every other test and
-    /// into the on-disk fixture. Keep it `map_copy`.
-    fn map_fixture(path: &std::path::Path) -> MmapMut {
-        let file = fs::File::open(path).unwrap_or_else(|e| panic!("failed to open {path:?}: {e}"));
-        unsafe { MmapOptions::new().map_copy(&file) }
-            .unwrap_or_else(|e| panic!("failed to mmap {path:?}: {e}"))
-    }
-
-    /// Manual regression check against the real specimen that motivated Phase 1 of the 256z-format
-    /// plan: before the post-directory trailer gate, this file reported 4198 × 1,953,719,669
-    /// chunks (the trailing `SGN1` rows decoded as chunks). `TEST WORLDS/` is private and not
-    /// guaranteed present, so this is `#[ignore]`d — run explicitly with
-    /// `cargo test manual_quarry -- --ignored --nocapture`.
-    #[test]
-    #[ignore]
-    fn manual_quarry_eden_dimensions_are_sane() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../TEST WORLDS/quarry.eden");
-        let world = parse_world_inner(map_fixture(&path)).expect("quarry.eden must parse");
-        eprintln!(
-            "quarry.eden: {}x{} chunks, chunk_size={}, trailer={}B, chunk_span short-spans={}",
-            world.w_chunks, world.h_chunks, world.chunk_size, world.trailer_bytes().len(),
-            world.chunk_span.len()
-        );
-        assert!(world.w_chunks < 1000 && world.h_chunks < 1000,
-            "bbox must be sane, not the old 4198 x 1,953,719,669 garbage");
-        assert_eq!(world.chunk_size, 131072, "quarry.eden is a 256z world");
-        assert!(!world.trailer_bytes().is_empty(), "quarry.eden's inline signs section must be captured");
-
-        // Phase 4: the captured trailer must decode to exactly the one real sign record (Part A).
-        let quarry_signs = world.trailer.signs();
-        assert_eq!(quarry_signs.len(), 1);
-        assert_eq!(quarry_signs[0].pos, trailer::Pos::new(65412, 65069, 32));
-        assert_eq!(quarry_signs[0].text(), b"test");
-    }
-
-    /// Manual regression for the *other* Phase-1/2 specimen: the updated game's world, whose
-    /// header `version` (2) predates the New Dawn `>=5` rule despite being 256z. Confirms the
-    /// creature-gap detector (Phase 2a), not luck, is what resolves it.
-    #[test]
-    #[ignore]
-    fn manual_newblocks_world_is_256z_despite_legacy_version() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../TEST WORLDS/newblocks/afwxungtbnunqwgbqcmanznucpwfbmiwrnaqpbgv.eden");
-        let world = parse_world_inner(map_fixture(&path)).expect("newblocks world must parse");
-        eprintln!("newblocks: {}x{} chunks, chunk_size={}", world.w_chunks, world.h_chunks, world.chunk_size);
-        assert_eq!(world.chunk_size, 131072, "must detect 256z despite version=2");
-        assert_eq!(world.num_bands, 16);
-        assert_eq!(world.chunk_map.len(), 3);
-    }
-
-    /// Locates the first differing bytes between two equal-length buffers without doing a
-    /// byte-by-byte scalar scan over gigabytes: compares in 1 MB windows using slice equality
-    /// (an optimized memcmp), and only falls back to a per-byte scan inside a window that
-    /// actually differs. Capped at `max_diffs` positions — the acceptance tests only care whether
-    /// there are zero, one, or "many" differences, never the full list on a 5 GB file.
-    fn diff_positions(a: &[u8], b: &[u8], max_diffs: usize) -> Vec<usize> {
-        assert_eq!(a.len(), b.len(), "buffers must be the same length to diff");
-        const WINDOW: usize = 1 << 20;
-        let mut diffs = Vec::new();
-        let mut i = 0;
-        while i < a.len() && diffs.len() < max_diffs {
-            let end = (i + WINDOW).min(a.len());
-            if a[i..end] != b[i..end] {
-                for j in i..end {
-                    if a[j] != b[j] {
-                        diffs.push(j);
-                        if diffs.len() >= max_diffs { break; }
-                    }
-                }
-            }
-            i = end;
-        }
-        diffs
-    }
-
-    /// §5.2.1 — full-world bedrock sweep. Every non-empty chunk should have bedrock (type 1) at
-    /// z=0 in all 256 columns; chunks that are legitimately all-air are exempted. On `main`
-    /// (pre-Stage-1, truncated u32 offsets) this failed for 3,891/36,660 Pherbos chunks and
-    /// 5,430/38,199 Antibes chunks.
-    ///
-    /// The plan doc's original bar was "0 failures after Stage 1," but running this for real
-    /// against both fixtures (2026-07-30) found a small residual: 446/36,660 Pherbos and
-    /// 35/38,199 Antibes chunks have *partial* (neither 0 nor 256) bedrock@z0 coverage —
-    /// two-plus orders of magnitude below the pre-fix corruption counts, and consistent with
-    /// DIAGNOSIS.md's own control sample (§1.3: 30 known-good, never-truncated Antibes chunks
-    /// already measured only 90% bedrock@z0, not 100%) — i.e. real, player-edited/naturally
-    /// irregular terrain (caves, dug-out floors, floating structures) legitimately breaks a
-    /// "always bedrock-floored" assumption even on correctly-decoded worlds. A strict-zero bar
-    /// was never actually true of this data; asserting it here would make the test flaky against
-    /// the exact thing it's supposed to gate. The bound below (2%, comfortably above what both
-    /// fixtures show today) still fails hard if Stage 1/3 regress and truncation-scale corruption
-    /// returns.
-    fn assert_full_world_bedrock_sweep(world: &LoadedWorld) {
-        let mut failures: Vec<((i32, i32), usize)> = Vec::new();
-        for (&(cx, cy), &addr) in &world.chunk_map {
-            let span = world.span_of(cx, cy);
-            let mut bedrock_count = 0usize;
-            for lx in 0..16usize {
-                for ly in 0..16usize {
-                    let bi = addr + lx * 256 + ly * 16; // band 0, lz 0 => z = 0
-                    if bi - addr < span && world.bytes[bi] == 1 {
-                        bedrock_count += 1;
-                    }
-                }
-            }
-            if bedrock_count != 256 {
-                let end = (addr + span).min(world.bytes.len());
-                let all_air = world.bytes[addr..end].iter().all(|&b| b == 0);
-                if !all_air {
-                    failures.push(((cx, cy), bedrock_count));
-                }
-            }
-        }
-        let total = world.chunk_map.len();
-        let rate = failures.len() as f64 / total as f64;
-        assert!(
-            rate < 0.02,
-            "{}/{} chunks ({:.2}%) failed the bedrock@z0/all-air oracle — over the 2% tolerance \
-             for legitimate terrain irregularity (showing up to 20): {:?}",
-            failures.len(), total, rate * 100.0,
-            &failures[..failures.len().min(20)]
-        );
-    }
-
-    #[test]
-    #[ignore]
-    fn test_full_world_bedrock_sweep_pherbos() {
-        let extracted = extract_fixture(&pherbos_zip());
-        let world = parse_world_inner(map_fixture(&extracted)).expect("parse must succeed");
-        assert_full_world_bedrock_sweep(&world);
-    }
-
-    #[test]
-    #[ignore]
-    fn test_full_world_bedrock_sweep_antibes() {
-        let extracted = extract_fixture(&antibes_zip());
-        let world = parse_world_inner(map_fixture(&extracted)).expect("parse must succeed");
-        assert_full_world_bedrock_sweep(&world);
-    }
-
-    /// §5.2.2 — byte-identical no-op save. Loading a world and saving it back with no edits must
-    /// reproduce the input exactly, proving the Stage 1 fix only changed *interpretation* of the
-    /// directory, not what gets written back.
-    fn assert_noop_save_byte_identical(extracted: &std::path::Path) {
-        let world = parse_world_inner(map_fixture(extracted)).expect("parse must succeed");
-        let out_path = extracted.with_file_name(format!(
-            "{}.noop_save_test.eden",
-            extracted.file_stem().unwrap().to_string_lossy()
-        ));
-        save_world_inner(&world, out_path.to_str().unwrap(), false).expect("save failed");
-        let original = fs::read(extracted).expect("read original fixture");
-        let saved = fs::read(&out_path).expect("read saved output");
-        let diffs = diff_positions(&original, &saved, 20);
-        let _ = fs::remove_file(&out_path);
-        assert!(diffs.is_empty(), "no-op save must be byte-identical; differences at {:?}", diffs);
-    }
-
-    #[test]
-    #[ignore]
-    fn test_noop_save_byte_identical_pherbos() {
-        assert_noop_save_byte_identical(&extract_fixture(&pherbos_zip()));
-    }
-
-    #[test]
-    #[ignore]
-    fn test_noop_save_byte_identical_antibes() {
-        assert_noop_save_byte_identical(&extract_fixture(&antibes_zip()));
-    }
-
-    /// §5.2.3 — edit-locality test. Pherbos chunk (4064, 4000) is one of the chunks a truncated
-    /// u32 offset read used to land inside two unrelated bystanders, (4059, 4032) and
-    /// (4062, 4030) (DIAGNOSIS.md §1.8) — editing it used to corrupt those instead. Set one block
-    /// (avoiding z=0's bedrock so the write is unambiguous), save, and diff against the original:
-    /// exactly 2 changed bytes (type + paint) at the correct address, and zero bytes changed
-    /// anywhere else in the file — including, specifically, in the two bystander chunks.
-    #[test]
-    #[ignore]
-    fn test_edit_locality_pherbos() {
-        let extracted = extract_fixture(&pherbos_zip());
-        let original = fs::read(&extracted).expect("read original fixture");
-        let world = parse_world_inner(map_fixture(&extracted)).expect("parse must succeed");
-
-        let target = (4064i32, 4000i32);
-        let bystanders = [(4059i32, 4032i32), (4062i32, 4030i32)];
-        let &addr = world.chunk_map.get(&target).expect("target chunk must exist");
-        for &b in &bystanders {
-            assert!(world.chunk_map.contains_key(&b), "bystander chunk {:?} must exist", b);
-        }
-        // z=1, band 0, lz=1: offset within chunk = 1. Avoids z=0 (bedrock) so the diff is
-        // unambiguous; block type + paint both change so exactly 2 bytes differ.
-        let expected_type_addr = addr + 1;
-        let expected_paint_addr = expected_type_addr + 4096;
-
-        let mut ws = WorldState::new();
-        let ex = (target.0 - world.min_x) * 16;
-        let ey = (target.1 - world.min_y) * 16;
-        ws.world = Some(world);
-        let result = with_edit(&mut ws, "test-edit-locality", (ex, ey, ex, ey), |w| {
-            set_block_abs(w, ex, ey, 1, 7 /* wood */, 5 /* paint */);
-            Ok(())
-        });
-        assert!(result.is_ok(), "edit must succeed: {:?}", result.err());
-        let world = ws.world.take().unwrap();
-
-        let out_path = extracted.with_file_name(format!(
-            "{}.edit_locality_test.eden",
-            extracted.file_stem().unwrap().to_string_lossy()
-        ));
-        save_world_inner(&world, out_path.to_str().unwrap(), false).expect("save failed");
-        let saved = fs::read(&out_path).expect("read saved output");
-        let diffs = diff_positions(&original, &saved, 20);
-        let _ = fs::remove_file(&out_path);
-        let _ = fs::remove_file(format!("{}.bak", out_path.display()));
-
-        assert_eq!(
-            diffs,
-            vec![expected_type_addr, expected_paint_addr],
-            "expected exactly the type+paint bytes at the target chunk to change"
-        );
-    }
-
-    /// §5.2.4 — undo round-trip. Editing inside a previously-affected chunk and then undoing must
-    /// restore the file to byte-identical-to-before-the-edit.
-    #[test]
-    #[ignore]
-    fn test_undo_round_trip_pherbos() {
-        let extracted = extract_fixture(&pherbos_zip());
-        let original = fs::read(&extracted).expect("read original fixture");
-        let world = parse_world_inner(map_fixture(&extracted)).expect("parse must succeed");
-
-        let target = (4064i32, 4000i32);
-        assert!(world.chunk_map.contains_key(&target), "target chunk must exist");
-
-        let mut ws = WorldState::new();
-        let ex = (target.0 - world.min_x) * 16;
-        let ey = (target.1 - world.min_y) * 16;
-        ws.world = Some(world);
-        let result = with_edit(&mut ws, "test-undo-roundtrip", (ex, ey, ex, ey), |w| {
-            set_block_abs(w, ex, ey, 1, 7, 5);
-            Ok(())
-        });
-        assert!(result.is_ok(), "edit must succeed: {:?}", result.err());
-        let undo_result = undo_edit_inner(&mut ws);
-        assert!(undo_result.is_ok(), "undo must succeed: {:?}", undo_result.err());
-        let world = ws.world.take().unwrap();
-
-        let out_path = extracted.with_file_name(format!(
-            "{}.undo_roundtrip_test.eden",
-            extracted.file_stem().unwrap().to_string_lossy()
-        ));
-        save_world_inner(&world, out_path.to_str().unwrap(), false).expect("save failed");
-        let saved = fs::read(&out_path).expect("read saved output");
-        let diffs = diff_positions(&original, &saved, 20);
-        let _ = fs::remove_file(&out_path);
-        let _ = fs::remove_file(format!("{}.bak", out_path.display()));
-
-        assert!(diffs.is_empty(), "undo must restore byte-identical state; differences at {:?}", diffs);
-    }
-
-    /// `materialize_flat_chunks_inner` must add exactly the requested new chunks (whether an
-    /// in-bounds hole or a coord beyond the source world's current bbox — the writer treats both
-    /// identically, per the plan), never touch the bytes of chunks the user already had, and leave
-    /// no partial output file behind when cancelled mid-write.
-    #[test]
-    fn test_materialize_flat_chunks_adds_only_missing_and_preserves_existing() {
-        let world = parse_world_inner(mmap_from_bytes(make_test_world())).expect("parse failed");
-        let chunk_size = world.chunk_size;
-        let header = world.bytes[..192.min(world.bytes.len())].to_vec();
-
-        let mut user_chunk_list: Vec<(i32, i32, usize)> = world.chunk_map.iter()
-            .map(|(&(cx, cy), &off)| (cx, cy, off))
-            .collect();
-        user_chunk_list.sort_unstable_by_key(|&(cx, cy, _)| (cx, cy));
-        let user_chunk_bytes: Vec<(i32, i32, Vec<u8>)> = user_chunk_list.into_iter()
-            .filter_map(|(cx, cy, _off)| {
-                let (off, cend) = world.chunk_range(cx, cy)?;
-                let mut data = world.bytes[off..cend].to_vec();
-                data.resize(chunk_size, 0);
-                Some((cx, cy, data))
-            })
-            .collect();
-        assert_eq!(user_chunk_bytes.len(), 1, "fixture has exactly one existing chunk, (0,0)");
-        let (coords, src) = materialize_src(&world);
-
-        let params = FlatChunkParams { chunk_size, stone_depth: 1, dirt_depth: 2, surface_z: 4 };
-        // (1, 0): an "in-bounds hole" relative to a hypothetical wider selection; (50, 50): well
-        // beyond the source world's single-chunk bbox. The writer doesn't distinguish the two.
-        let to_add = vec![(1i32, 0i32), (50i32, 50i32)];
-
-        let out_path = std::env::temp_dir()
-            .join(format!("vuencedit_materialize_test_{}.eden", std::process::id()));
-        let result = materialize_flat_chunks_inner(
-            out_path.to_str().unwrap(), chunk_size, &header, &coords, &src, &to_add, &params, &[], &[],
-            || false, |_, _| {},
-        ).expect("materialize must succeed");
-        assert_eq!(result.chunks_added, 2);
-        assert_eq!(result.total_chunks, 3);
-
-        let out_bytes = fs::read(&out_path).expect("read output file");
-        let reloaded = parse_world_inner(mmap_from_bytes(out_bytes)).expect("output must parse");
-        assert_eq!(reloaded.chunk_map.len(), 3, "directory must contain existing ∪ to_add");
-        for &(cx, cy) in &[(0i32, 0i32), (1, 0), (50, 50)] {
-            assert!(reloaded.chunk_map.contains_key(&(cx, cy)), "missing chunk {:?}", (cx, cy));
-        }
-
-        // Existing chunk (0,0) bytes must be byte-identical to the source — never overwritten.
-        let (orig_off, orig_end) = world.chunk_range(0, 0).unwrap();
-        let (new_off, new_end) = reloaded.chunk_range(0, 0).unwrap();
-        assert_eq!(&world.bytes[orig_off..orig_end], &reloaded.bytes[new_off..new_end],
-            "existing chunk (0,0) must be byte-identical, never overwritten by materialize");
-
-        // A freshly-materialized chunk must actually be a real, editable flat chunk, not empty air.
-        let (add_off, _) = reloaded.chunk_range(1, 0).unwrap();
-        assert_eq!(reloaded.bytes[add_off], 1, "materialized hole chunk (1,0) has real bedrock, not silently no-op'd");
-
-        let _ = fs::remove_file(&out_path);
-
-        // Cancellation mid-write must leave no partial file behind.
-        let cancel_path = std::env::temp_dir()
-            .join(format!("vuencedit_materialize_cancel_test_{}.eden", std::process::id()));
-        let mut calls = 0;
-        let cancel_result = materialize_flat_chunks_inner(
-            cancel_path.to_str().unwrap(), chunk_size, &header, &coords, &src, &to_add, &params, &[], &[],
-            || { calls += 1; calls >= 1 }, |_, _| {},
-        );
-        assert!(cancel_result.is_err(), "cancellation must return an error");
-        assert!(!cancel_path.exists(), "cancellation must not leave a partial output file");
-
-        // C-01 / 29.1: cancelling over an EXISTING destination (e.g. the open world) leaves it
-        // byte-intact, and no `.savetmp` behind.
-        fs::write(&cancel_path, b"original world").unwrap();
-        let r = materialize_flat_chunks_inner(
-            cancel_path.to_str().unwrap(), chunk_size, &header, &coords, &src, &to_add, &params, &[], &[],
-            || true, |_, _| {},
-        );
-        assert!(r.is_err());
-        assert_eq!(fs::read(&cancel_path).unwrap(), b"original world", "cancel must not touch the destination");
-        assert!(!cancel_path.with_extension("eden.savetmp").exists(), "no stray .savetmp");
-        let _ = fs::remove_file(&cancel_path);
-    }
-
-    // ── Rock sculpt mode ───────────────────────────────────────────────────────
-
-    /// One rock stamp on flat ground: every solid cell must have at least one face-neighbour
-    /// that is also solid (no single-block pepper — the direct anti-peppering assertion) and the
-    /// whole solid set must be one 6-connected component (a mass, not a scatter of blobs).
-    #[test]
-    fn test_rock_produces_connected_mass() {
-        let base = make_bumpy_world_grid(6, 8, |_, _| 20);
-        let mut ws = ws_with(base);
-        let mut w = ws.world.take().unwrap();
-        let params = RockParams::default();
-        rock_stamp(&mut w, 48, 48, 6, &params, 12345, None, None, None, None);
-        ws.world = Some(w);
-        let world = ws.world.as_ref().unwrap();
-
-        // Collect *added* solid cells written by the stamp within its bbox (pre-existing flat
-        // terrain up to z=20 is already one connected slab everywhere in this fixture, so it must
-        // be excluded or the assertions below would hold vacuously regardless of what Rock did).
-        let mut solid: HashSet<(i32, i32, i32)> = HashSet::new();
-        for wz in 21..=60 {
-            for wy in 38..=58 {
-                for wx in 38..=58 {
-                    if read_block_abs(world, wx, wy, wz) != 0 {
-                        solid.insert((wx, wy, wz));
-                    }
-                }
-            }
-        }
-        assert!(!solid.is_empty(), "rock must place at least some blocks");
-
-        for &(x, y, z) in &solid {
-            let has_neighbour = [(-1,0,0),(1,0,0),(0,-1,0),(0,1,0),(0,0,-1),(0,0,1)]
-                .iter()
-                .any(|(dx, dy, dz)| solid.contains(&(x + dx, y + dy, z + dz)));
-            assert!(has_neighbour, "solid cell {:?} has no face-neighbour — single-block pepper", (x, y, z));
-        }
-
-        // 6-connected flood fill from one solid cell must reach every solid cell.
-        let start = *solid.iter().next().unwrap();
-        let mut seen: HashSet<(i32, i32, i32)> = HashSet::new();
-        let mut queue = VecDeque::new();
-        queue.push_back(start);
-        seen.insert(start);
-        while let Some((x, y, z)) = queue.pop_front() {
-            for (dx, dy, dz) in [(-1,0,0),(1,0,0),(0,-1,0),(0,1,0),(0,0,-1),(0,0,1)] {
-                let n = (x + dx, y + dy, z + dz);
-                if solid.contains(&n) && seen.insert(n) {
-                    queue.push_back(n);
-                }
-            }
-        }
-        assert_eq!(seen.len(), solid.len(), "rock mass must be a single 6-connected component");
-    }
-
-    /// Stamping twice at the same centre/seed on the same ground is a no-op the second time
-    /// (union-only write of a deterministic field) — the world's bytes must be identical.
-    #[test]
-    fn test_rock_is_idempotent() {
-        let base = make_bumpy_world_grid(6, 8, |_, _| 20);
-        let mut ws = ws_with(base);
-        let mut w = ws.world.take().unwrap();
-        let params = RockParams::default();
-        rock_stamp(&mut w, 48, 48, 6, &params, 999, None, None, None, None);
-        let once = w.bytes.to_vec();
-        rock_stamp(&mut w, 48, 48, 6, &params, 999, None, None, None, None);
-        let twice = w.bytes.to_vec();
-        assert_eq!(once, twice, "re-stamping the same rock in place must be a no-op");
-    }
-
-    /// Same seed → identical output; a different seed must change the result (the noise actually
-    /// participates in the field).
-    #[test]
-    fn test_rock_deterministic_by_seed() {
-        let base = make_bumpy_world_grid(6, 8, |_, _| 20);
-        let params = RockParams::default();
-
-        let mut ws1 = ws_with(base.clone());
-        let mut w1 = ws1.world.take().unwrap();
-        rock_stamp(&mut w1, 48, 48, 6, &params, 42, None, None, None, None);
-
-        let mut ws2 = ws_with(base.clone());
-        let mut w2 = ws2.world.take().unwrap();
-        rock_stamp(&mut w2, 48, 48, 6, &params, 42, None, None, None, None);
-        assert_eq!(w1.bytes.to_vec(), w2.bytes.to_vec(), "same seed must give identical output");
-
-        let mut ws3 = ws_with(base);
-        let mut w3 = ws3.world.take().unwrap();
-        rock_stamp(&mut w3, 48, 48, 6, &params, 43, None, None, None, None);
-        assert_ne!(w1.bytes.to_vec(), w3.bytes.to_vec(), "a different seed must change the result");
-    }
-
-    /// Rock only ever turns air into solid — no existing block is ever deleted or changed.
-    #[test]
-    fn test_rock_never_deletes() {
-        let base = make_bumpy_world_grid(6, 8, |_, _| 20);
-        let mut ws = ws_with(base);
-        let mut w = ws.world.take().unwrap();
-        // Snapshot every pre-existing solid column's blocks before the stamp.
-        let mut before: Vec<(i32, i32, i32, u8)> = Vec::new();
-        for wy in 44..=52 { for wx in 44..=52 { for wz in 1..=32 {
-            let bt = read_block_abs(&w, wx, wy, wz);
-            if bt != 0 { before.push((wx, wy, wz, bt)); }
-        }}}
-        let params = RockParams::default();
-        rock_stamp(&mut w, 48, 48, 6, &params, 7, None, None, None, None);
-        for (wx, wy, wz, bt) in before {
-            assert_eq!(read_block_abs(&w, wx, wy, wz), bt,
-                "pre-existing block at ({wx},{wy},{wz}) must survive a rock stamp unchanged");
-        }
-    }
-
-    /// No write ever lands outside the stamp's own bbox (centre ± radius, generously padded for
-    /// blur/anisotropy).
-    #[test]
-    fn test_rock_stays_in_bbox() {
-        let base = make_bumpy_world_grid(6, 8, |_, _| 20);
-        let mut ws = ws_with(base);
-        let mut w = ws.world.take().unwrap();
-        let params = RockParams::default();
-        let (cx, cy, r) = (48, 48, 5);
-        rock_stamp(&mut w, cx, cy, r, &params, 55, None, None, None, None);
-        // Generous margin: flatten <= 1.5, sink <= 1.0, blur pad <= 6.
-        let margin = r + 12;
-        for wy in 8..=88 { for wx in 8..=88 {
-            if wx >= cx - margin && wx <= cx + margin && wy >= cy - margin && wy <= cy + margin { continue; }
-            for wz in 21..=63 {
-                assert_eq!(read_block_abs(&w, wx, wy, wz), 0,
-                    "rock must not write outside its padded bbox at ({wx},{wy},{wz})");
-            }
-        }}
-    }
-
-    /// Larger radius → more solid volume, monotonically.
-    #[test]
-    fn test_rock_scales_with_radius() {
-        let base = make_bumpy_world_grid(6, 8, |_, _| 20);
-        let params = RockParams::default();
-        let volume_for = |r: i32| -> usize {
-            let mut ws = ws_with(base.clone());
-            let mut w = ws.world.take().unwrap();
-            rock_stamp(&mut w, 48, 48, r, &params, 1, None, None, None, None);
-            let mut count = 0;
-            for wy in 8..=88 { for wx in 8..=88 { for wz in 21..=63 {
-                if read_block_abs(&w, wx, wy, wz) != 0 { count += 1; }
-            }}}
-            count
-        };
-        let v4 = volume_for(4);
-        let v8 = volume_for(8);
-        let v16 = volume_for(16);
-        assert!(v8 > v4, "radius 8 must place more blocks than radius 4 (v4={v4}, v8={v8})");
-        assert!(v16 > v8, "radius 16 must place more blocks than radius 8 (v8={v8}, v16={v16})");
-    }
-
-    /// Flat world, one stamp: within the stamp's own footprint, no column may have a solid
-    /// (new) cell above an air cell that itself sits above another solid cell — i.e. no detached
-    /// slab floating over a gap. Directly falsifies the "floating sphere / mushroom" defect: the
-    /// terrain-fused SDF must not leave a column's added mass disconnected from its own base.
-    #[test]
-    fn test_rock_no_air_gap_under_mass() {
-        let base = make_bumpy_world_grid(6, 8, |_, _| 20);
-        let mut ws = ws_with(base);
-        let mut w = ws.world.take().unwrap();
-        let params = RockParams::default();
-        let (cx, cy, r) = (48, 48, 6);
-        field_stamp(&mut w, cx, cy, r, &params, 12345, None, None, None, None, false);
-        ws.world = Some(w);
-        let world = ws.world.as_ref().unwrap();
-
-        // Restrict to the stamp's core footprint, circular, well inside the radius (excludes the
-        // thin rim sliver where a single isolated noise lobe touching only at one z is a
-        // legitimate, not-a-bug, silhouette feature rather than a "mushroom").
-        let margin = r / 2;
-        for wy in (cy - margin)..=(cy + margin) {
-            for wx in (cx - margin)..=(cx + margin) {
-                if (wx - cx).pow(2) + (wy - cy).pow(2) > margin * margin { continue; }
-                let mut seen_air_above_surface = false;
-                for wz in 21..=40 {
-                    let solid = read_block_abs(world, wx, wy, wz) != 0;
-                    if !solid {
-                        seen_air_above_surface = true;
-                    } else if seen_air_above_surface {
-                        panic!("column ({wx},{wy}) has solid block at z={wz} floating over an air gap");
-                    }
-                }
-            }
-        }
-    }
-
-    /// 45°-slope world: a stamp mid-slope must place blocks on both the uphill and downhill
-    /// side, and the mass's base (lowest new block per column) must track local terrain height
-    /// — uphill columns keep a higher base than downhill columns — rather than one flat anchor
-    /// height swallowing the uphill side or floating the downhill side.
-    #[test]
-    fn test_rock_hugs_slope() {
-        // 45° ramp rising with x (chunk-local coords == world coords for the single (0,0) chunk).
-        let orig_h = |wx: i32| -> i32 { (10 + wx).clamp(1, 63) };
-        let base = make_bumpy_world(2, |lx, _ly| orig_h(lx as i32));
-        let mut ws = ws_with(base);
-        let mut w = ws.world.take().unwrap();
-        let params = RockParams::default();
-        // Small radius so the padded bbox (incl. its outside-bbox edge samples) stays inside the
-        // single 16×16 test chunk.
-        let (cx, cy, r) = (8, 8, 3);
-        field_stamp(&mut w, cx, cy, r, &params, 777, None, None, None, None, false);
-        ws.world = Some(w);
-        let world = ws.world.as_ref().unwrap();
-
-        // Base of the *added* mass per column: the lowest new (post-stamp) block strictly above
-        // that column's original terrain height.
-        let new_base = |wx: i32, wy: i32| -> Option<i32> {
-            ((orig_h(wx) + 1)..=63).find(|&wz| read_block_abs(world, wx, wy, wz) != 0)
-        };
-
-        let uphill = new_base(cx + 2, cy);
-        let downhill = new_base(cx - 2, cy);
-        assert!(uphill.is_some(), "uphill side must receive new blocks");
-        assert!(downhill.is_some(), "downhill side must receive new blocks");
-        assert!(uphill.unwrap() > downhill.unwrap(),
-            "mass base must be higher on the uphill side (uphill={:?}, downhill={:?})", uphill, downhill);
-    }
-
-    /// The silhouette (per-column top height of the *added* mass) must deviate from a
-    /// best-fit spherical cap by more than a small threshold — guards the noise/anisotropy/
-    /// strata detail terms (steps 4a/4b/4c) against a regression back to a bald sphere/dome.
-    #[test]
-    fn test_rock_silhouette_not_spherical() {
-        let base = make_bumpy_world_grid(6, 8, |_, _| 20);
-        let mut ws = ws_with(base);
-        let mut w = ws.world.take().unwrap();
-        let params = RockParams::default();
-        let (cx, cy, r) = (48, 48, 8);
-        field_stamp(&mut w, cx, cy, r, &params, 4242, None, None, None, None, false);
-        ws.world = Some(w);
-        let world = ws.world.as_ref().unwrap();
-
-        let mut tops: Vec<(i32, i32, i32)> = Vec::new();
-        for dy in -r..=r {
-            for dx in -r..=r {
-                if dx * dx + dy * dy > r * r { continue; }
-                let (wx, wy) = (cx + dx, cy + dy);
-                if let Some(top) = (1..=63).filter(|&wz| read_block_abs(world, wx, wy, wz) != 0).max() {
-                    if top > 20 { tops.push((dx, dy, top)); }
-                }
-            }
-        }
-        assert!(tops.len() > 8, "need enough sampled columns to judge the silhouette");
-
-        // Best-fit spherical cap: top(dx,dy) ≈ z_apex - sqrt(r_fit² - dx² - dy²). Fit z_apex and
-        // r_fit by least-squares-ish closed form using the apex (max top) and the mean radius at
-        // which height falls to the surface.
-        let z_apex = tops.iter().map(|&(_, _, t)| t).max().unwrap() as f64;
-        let mut sq_dev_sum = 0.0;
-        let mut n = 0.0;
-        for &(dx, dy, top) in &tops {
-            let rr = (dx * dx + dy * dy) as f64;
-            let cap_h = if rr < (r * r) as f64 { z_apex - ((r * r) as f64 - rr).sqrt() } else { 20.0 };
-            let dev = top as f64 - cap_h;
-            sq_dev_sum += dev * dev;
-            n += 1.0;
-        }
-        let rmse = (sq_dev_sum / n).sqrt();
-        assert!(rmse > 0.6, "silhouette must deviate meaningfully from a bald spherical cap (rmse={rmse:.3})");
-    }
-
-    /// Every added cell must be 6-connected to pre-existing terrain (the floater guard, step 8).
-    #[test]
-    fn test_rock_no_floating_components() {
-        let base = make_bumpy_world_grid(6, 8, |_, _| 20);
-        let mut ws = ws_with(base);
-        let mut w = ws.world.take().unwrap();
-
-        let mut pre_existing: HashSet<(i32, i32, i32)> = HashSet::new();
-        for wy in 28..=68 { for wx in 28..=68 { for wz in 1..=63 {
-            if read_block_abs(&w, wx, wy, wz) != 0 { pre_existing.insert((wx, wy, wz)); }
-        }}}
-
-        let params = RockParams::default();
-        field_stamp(&mut w, 48, 48, 8, &params, 999, None, None, None, None, false);
-
-        let mut added: HashSet<(i32, i32, i32)> = HashSet::new();
-        for wy in 28..=68 { for wx in 28..=68 { for wz in 1..=63 {
-            let c = (wx, wy, wz);
-            if read_block_abs(&w, wx, wy, wz) != 0 && !pre_existing.contains(&c) { added.insert(c); }
-        }}}
-        assert!(!added.is_empty(), "rock must place at least some blocks");
-
-        const ADJ6: [(i32, i32, i32); 6] = [(-1,0,0),(1,0,0),(0,-1,0),(0,1,0),(0,0,-1),(0,0,1)];
-        let mut reached: HashSet<(i32, i32, i32)> = HashSet::new();
-        let mut queue: VecDeque<(i32, i32, i32)> = VecDeque::new();
-        for &c in &added {
-            let touches_old = ADJ6.iter().any(|(dx, dy, dz)| pre_existing.contains(&(c.0+dx, c.1+dy, c.2+dz)));
-            if touches_old && reached.insert(c) { queue.push_back(c); }
-        }
-        while let Some(c) = queue.pop_front() {
-            for (dx, dy, dz) in ADJ6 {
-                let n = (c.0+dx, c.1+dy, c.2+dz);
-                if added.contains(&n) && reached.insert(n) { queue.push_back(n); }
-            }
-        }
-        assert_eq!(reached.len(), added.len(), "every added cell must be 6-connected to pre-existing terrain");
-    }
-
-    // ── Carve sculpt mode ──────────────────────────────────────────────────────
-
-    /// Carve never turns air into solid — every changed cell goes solid → air, never the reverse.
-    #[test]
-    fn test_carve_only_deletes() {
-        let base = make_bumpy_world_grid(6, 8, |_, _| 20);
-        let mut ws = ws_with(base);
-        let mut w = ws.world.take().unwrap();
-        let mut before: HashMap<(i32, i32, i32), u8> = HashMap::new();
-        for wy in 44..=52 { for wx in 44..=52 { for wz in 1..=32 {
-            before.insert((wx, wy, wz), read_block_abs(&w, wx, wy, wz));
-        }}}
-        let params = RockParams::default();
-        field_stamp(&mut w, 48, 48, 6, &params, 55, None, None, None, None, true);
-        for (&(wx, wy, wz), &bt_before) in &before {
-            let bt_after = read_block_abs(&w, wx, wy, wz);
-            if bt_before == 0 {
-                assert_eq!(bt_after, 0, "carve must never turn air into solid at ({wx},{wy},{wz})");
-            }
-        }
-    }
-
-    /// No column ends with a solid cell that has air directly below it and continuous air up to
-    /// the sky through the carved region — the sky-connectivity write rule must never open a
-    /// floating roof or a sealed cave.
-    #[test]
-    fn test_carve_no_floating_roof() {
-        let base = make_bumpy_world_grid(6, 8, |_, _| 20);
-        let mut ws = ws_with(base);
-        let mut w = ws.world.take().unwrap();
-        let params = RockParams::default();
-        field_stamp(&mut w, 48, 48, 6, &params, 55, None, None, None, None, true);
-
-        for wy in 38..=58 { for wx in 38..=58 {
-            // Walk down from well above any plausible surface: once solid is seen, everything
-            // below (down to bedrock) must also stay solid — air reappearing beneath solid ground
-            // is a sealed cave or a floating roof, and this world has neither pre-carve.
-            let mut seen_solid = false;
-            for wz in (2..=40).rev() {
-                let solid = read_block_abs(&w, wx, wy, wz) != 0;
-                if solid {
-                    seen_solid = true;
-                } else if seen_solid {
-                    panic!("column ({wx},{wy}) has an air pocket at z={wz} beneath solid ground — sealed cave or floating roof");
-                }
-            }
-        }}
-    }
-
-    /// Carving twice at the same centre/seed is a no-op the second time.
-    #[test]
-    fn test_carve_idempotent() {
-        let base = make_bumpy_world_grid(6, 8, |_, _| 20);
-        let mut ws = ws_with(base);
-        let mut w = ws.world.take().unwrap();
-        let params = RockParams::default();
-        field_stamp(&mut w, 48, 48, 6, &params, 321, None, None, None, None, true);
-        let once = w.bytes.to_vec();
-        field_stamp(&mut w, 48, 48, 6, &params, 321, None, None, None, None, true);
-        let twice = w.bytes.to_vec();
-        assert_eq!(once, twice, "re-carving the same cut in place must be a no-op");
-    }
-
-    /// Carve never deletes Bedrock (type 1) and never touches z <= 1, even when the cavity
-    /// geometry would otherwise reach that low.
-    #[test]
-    fn test_carve_never_touches_bedrock() {
-        let base = make_bumpy_world_grid(6, 2, |_, _| 10);
-        let mut ws = ws_with(base);
-        let mut w = ws.world.take().unwrap();
-        // Lay a bedrock floor under the whole footprint.
-        for wy in 34..=62 { for wx in 34..=62 {
-            set_block_abs(&mut w, wx, wy, 1, 1, 0);
-        }}
-        let mut params = RockParams::default();
-        params.sink = 1.0; // bias the cavity as deep as possible
-        params.flatten = 1.5;
-        field_stamp(&mut w, 48, 48, 10, &params, 7, None, None, None, None, true);
-        for wy in 34..=62 { for wx in 34..=62 {
-            assert_eq!(read_block_abs(&w, wx, wy, 1), 1, "bedrock at ({wx},{wy},1) must survive any carve");
-        }}
-    }
-
-
-    // ── ROADMAP-LINK 21.6: .epfab ORGN provenance + paste placements ───────────────────────
-
-    fn hex_bytes(h: &str) -> Vec<u8> {
-        (0..h.len() / 2).map(|i| u8::from_str_radix(&h[2 * i..2 * i + 2], 16).unwrap()).collect()
-    }
-
-    /// The golden fixture shared byte-for-byte with VuencLink's `prefab_interchange` tests: a 2×1×1
-    /// prefab (types [74,0], paints [5,0], z_anchor 40) + an `ORGN` section.
-    const GOLDEN_V1: &str = "455046414201020000000100000001000000280000004a0005004f52474e150000000a000100f9ffffff2800000002efcdab8967452301";
-    const GOLDEN_V2: &str = "455046414202020000000100000001000000280000004a00050001014f52474e150000000a000100f9ffffff2800000002efcdab8967452301";
-    const GOLDEN_ORGN: &str = "4f52474e150000000a000100f9ffffff2800000002efcdab8967452301";
-
-    fn golden_origin() -> PrefabOrigin {
-        PrefabOrigin { ax: 65546, ay: -7, az: 40, source: 2, rtid: 0x0123_4567_89AB_CDEF }
-    }
-    fn golden_clip(mask: Option<Vec<u8>>, origin: Option<PrefabOrigin>) -> Clipboard {
-        Clipboard {
-            width: 2, height: 1, depth: 1, z_anchor: 40,
-            block_types: vec![74, 0], paints: vec![5, 0], mask, origin,
-        }
-    }
-
-    #[test]
-    fn test_epfab_orgn_golden_fixture() {
-        for (hex, mask) in [(GOLDEN_V1, None), (GOLDEN_V2, Some(vec![0b01u8]))] {
-            let bytes = hex_bytes(hex);
-            let cb = golden_clip(mask.clone(), Some(golden_origin()));
-            assert_eq!(serialize_prefab_raw(&cb), bytes, "serialize == golden bytes");
-            let back = deserialize_prefab(&bytes).expect("golden parses");
-            assert_eq!(back.origin, Some(golden_origin()));
-            assert_eq!((back.width, back.height, back.depth, back.z_anchor), (2, 1, 1, 40));
-            assert_eq!(back.block_types, cb.block_types);
-            assert_eq!(back.paints, cb.paints);
-            assert_eq!(back.mask, mask);
-            // gzip wrapper round-trips too
-            assert_eq!(deserialize_prefab(&serialize_prefab(&cb)).unwrap().origin, Some(golden_origin()));
-            // old-reader shape: strip the section and the prefab is the same with no origin
-            let stripped = &bytes[..bytes.len() - hex_bytes(GOLDEN_ORGN).len()];
-            let old = deserialize_prefab(stripped).expect("stripped parses");
-            assert_eq!(old.origin, None);
-            assert_eq!(old.block_types, cb.block_types);
-            assert_eq!(old.mask, mask);
-            assert_eq!(serialize_prefab_raw(&golden_clip(mask, None)), stripped,
-                "no origin → byte-identical to today's output");
-        }
-    }
-
-    #[test]
-    fn test_epfab_sections_skip_unknown_and_tolerate_truncation() {
-        let mut bytes = hex_bytes(GOLDEN_V1);
-        let orgn = bytes.split_off(bytes.len() - hex_bytes(GOLDEN_ORGN).len());
-        // unknown tag first, then ORGN → still found
-        let mut b = bytes.clone();
-        b.extend_from_slice(b"XXXX");
-        b.extend_from_slice(&3u32.to_le_bytes());
-        b.extend_from_slice(&[1, 2, 3]);
-        b.extend_from_slice(&orgn);
-        assert_eq!(deserialize_prefab(&b).unwrap().origin, Some(golden_origin()));
-        // truncated section → valid prefab, no origin
-        let mut t = bytes.clone();
-        t.extend_from_slice(&orgn[..orgn.len() - 1]);
-        assert_eq!(deserialize_prefab(&t).unwrap().origin, None);
-        // ORGN longer than 21: extra bytes ignored
-        let mut l = bytes.clone();
-        l.extend_from_slice(b"ORGN");
-        l.extend_from_slice(&23u32.to_le_bytes());
-        l.extend_from_slice(&orgn[8..]);
-        l.extend_from_slice(&[9, 9]);
-        assert_eq!(deserialize_prefab(&l).unwrap().origin, Some(golden_origin()));
-    }
-
-    #[test]
-    fn test_clipboard_transforms_drop_origin() {
-        let mut cb = golden_clip(None, Some(golden_origin()));
-        rotate_clipboard_inner(&mut cb);
-        assert_eq!(cb.origin, None);
-        let mut cb = golden_clip(None, Some(golden_origin()));
-        mirror_clipboard_x_inner(&mut cb);
-        assert_eq!(cb.origin, None);
-        let mut cb = golden_clip(None, Some(golden_origin()));
-        mirror_clipboard_y_inner(&mut cb);
-        assert_eq!(cb.origin, None);
-    }
-
-    /// A one-chunk 64z world whose chunk sits at (cx=5, cy=7), so `abs_min_* * 16` is non-zero.
-    fn offset_world_state() -> WorldState {
-        let mut b = make_test_world();
-        let pe = 4096 + 32768;
-        b[pe..pe + 2].copy_from_slice(&5i16.to_le_bytes());
-        b[pe + 4..pe + 6].copy_from_slice(&7i16.to_le_bytes());
-        let ws = ws_with(b);
-        let w = ws.world.as_ref().unwrap();
-        assert_eq!((w.min_x, w.min_y), (5, 7));
-        ws
-    }
-
-    fn rt_clip(rtid: u64, mask: Option<Vec<u8>>) -> Clipboard {
-        Clipboard {
-            width: 4, height: 4, depth: 3, z_anchor: 10,
-            block_types: vec![13; 48], paints: vec![0; 48], mask,
-            origin: Some(PrefabOrigin { ax: 1000, ay: 2000, az: 10, source: 2, rtid }),
-        }
-    }
-
-    /// 23.8: a clipboard transform runs with no world guard held (edits/renders/saves proceed), and
-    /// leaves the clipboard exactly as the old under-the-guard path did.
-    #[test]
-    fn test_clipboard_transform_runs_off_the_world_guard() {
-        let mut ws = offset_world_state();
-        let clip = || {
-            let mut cb = rt_clip(7, Some(vec![0b0000_0001, 0]));
-            cb.width = 3; cb.height = 2; cb.depth = 2; // odd width, non-square: a rotate changes shape
-            cb.block_types = (0..12).map(|i| 24 + i as u8).collect();
-            cb.paints = (0..12).collect();
-            cb
-        };
-        let mut expect = clip();
-        rotate_clipboard_inner(&mut expect);
-        ws.clipboard = Some(clip());
-        let state = RwLock::new(ws);
-        let info = transform_clipboard(&state, |cb| {
-            assert!(state.try_write().is_ok(), "the world guard must be free during the transform");
-            rotate_clipboard_inner(cb);
-        }).expect("rotate");
-        assert_eq!((info.width, info.height), (2, 3));
-        let ws = read_ws(&state);
-        let got = ws.clipboard.as_ref().expect("clipboard restored");
-        assert_eq!((got.width, got.height, got.depth), (expect.width, expect.height, expect.depth));
-        assert_eq!(got.block_types, expect.block_types);
-        assert_eq!(got.paints, expect.paints);
-        assert_eq!(got.mask, expect.mask);
-        assert!(got.origin.is_none());
-        drop(ws);
-        write_ws(&state).clipboard = None;
-        assert_eq!(transform_clipboard(&state, mirror_clipboard_x_inner).err().as_deref(), Some("Clipboard is empty"));
-    }
-
-    /// 22.9: cells that fall off the world (negative origin, past max_z) are counted into one toast
-    /// warning; a fully-inside paste stays silent.
-    #[test]
-    fn test_paste_warns_when_clipped() {
-        let mut ws = offset_world_state();
-        ws.clipboard = Some(rt_clip(99, None));
-        let ok = paste_at_inner(&mut ws, 2, 3, 0, false).expect("paste");
-        assert!(ok.warnings.is_empty(), "an in-bounds paste must not warn: {:?}", ok.warnings);
-        // 2 columns off the west edge → 2 cols × 4 rows × 3 layers = 24 dropped cells.
-        let r = paste_at_inner(&mut ws, -2, 3, 0, false).expect("paste");
-        assert!(r.warnings.iter().any(|w| w.starts_with("24 blocks")), "{:?}", r.warnings);
-        // Entirely above the world: every cell is dropped.
-        let r = paste_at_inner(&mut ws, 2, 3, 100_000, false).expect("paste");
-        assert!(r.warnings.iter().any(|w| w.starts_with("48 blocks")), "{:?}", r.warnings);
-    }
-
-    #[test]
-    fn test_placement_copy_origin_offsets_exactly() {
-        let mut ws = offset_world_state();
-        ws.clipboard = Some(rt_clip(99, None));
-        paste_at_inner(&mut ws, 2, 3, 0, false).expect("paste");
-        assert_eq!(ws.paste_placements, vec![Placement {
-            x: 2, y: 3, z: 10, w: 4, h: 4, d: 3, ax: 1000, ay: 2000, az: 10, rtid: 99,
-        }]);
-        // edit inside the pasted area, then copy a sub-box of it
-        with_edit(&mut ws, "tweak", (3, 4, 3, 4), |w| { set_block_abs(w, 3, 4, 11, 2, 0); Ok(()) }).unwrap();
-        // with_edit is not undo/redo, so the placement survives
-        assert_eq!(ws.paste_placements.len(), 1);
-        let state = RwLock::new(ws);
-        let info = copy_selection_inner(&state, 3, 4, 4, 5, 11, 12).expect("copy");
-        assert_eq!(info.origin, Some(PrefabOrigin { ax: 1001, ay: 2001, az: 11, source: 1, rtid: 99 }));
-        // …and it round-trips through the file codec
-        let cb = state.read().unwrap().clipboard.as_ref().map(serialize_prefab).unwrap();
-        assert_eq!(deserialize_prefab(&cb).unwrap().origin, info.origin);
-
-        // straddling the placement edge → ambiguous → None
-        let info = copy_selection_inner(&state, 1, 3, 3, 4, 10, 10).expect("copy");
-        assert_eq!(info.origin, None);
-        // exceeding the placement in z → None
-        let info = copy_selection_inner(&state, 3, 4, 4, 5, 11, 13).expect("copy");
-        assert_eq!(info.origin, None);
-        // outside every placement → this world's absolute coordinates, source 0
-        let info = copy_selection_inner(&state, 10, 11, 12, 12, 0, 1).expect("copy");
-        assert_eq!(info.origin, Some(PrefabOrigin { ax: 5 * 16 + 10, ay: 7 * 16 + 11, az: 0, source: 0, rtid: 0 }));
-    }
-
-    #[test]
-    fn test_placement_not_recorded_unless_cell_for_cell() {
-        // ignore-air on
-        let mut ws = offset_world_state();
-        ws.clipboard = Some(rt_clip(7, None));
-        paste_at_inner(&mut ws, 2, 3, 0, true).unwrap();
-        assert!(ws.paste_placements.is_empty(), "ignore-air paste must not record");
-        // masked
-        ws.clipboard = Some(rt_clip(7, Some(vec![0xff, 0xff])));
-        paste_at_inner(&mut ws, 2, 3, 0, false).unwrap();
-        assert!(ws.paste_placements.is_empty(), "masked paste must not record");
-        // no rtid
-        ws.clipboard = Some(rt_clip(0, None));
-        paste_at_inner(&mut ws, 2, 3, 0, false).unwrap();
-        assert!(ws.paste_placements.is_empty(), "rtid 0 must not record");
-        // no origin at all
-        let mut cb = rt_clip(7, None);
-        cb.origin = None;
-        ws.clipboard = Some(cb);
-        paste_at_inner(&mut ws, 2, 3, 0, false).unwrap();
-        assert!(ws.paste_placements.is_empty());
-        // clipped by the world edge (paste at x=14, 4 wide, world is 16 wide)
-        ws.clipboard = Some(rt_clip(7, None));
-        paste_at_inner(&mut ws, 14, 3, 0, false).unwrap();
-        assert!(ws.paste_placements.is_empty(), "a clipped paste must not record");
-        // a good one records, and the cap holds at MAX_PLACEMENTS newest-last
-        for i in 0..(MAX_PLACEMENTS as i32 + 3) {
-            let mut cb = rt_clip(100 + i as u64, None);
-            cb.width = 1; cb.height = 1; cb.depth = 1;
-            cb.block_types.truncate(1); cb.paints.truncate(1);
-            ws.clipboard = Some(cb);
-            paste_at_inner(&mut ws, i, 0, 0, false).unwrap();
-        }
-        assert_eq!(ws.paste_placements.len(), MAX_PLACEMENTS);
-        assert_eq!(ws.paste_placements.last().unwrap().rtid, 100 + MAX_PLACEMENTS as u64 + 2);
-    }
-
-    #[test]
-    fn test_undo_and_redo_clear_placements() {
-        let mut ws = offset_world_state();
-        ws.clipboard = Some(rt_clip(5, None));
-        paste_at_inner(&mut ws, 2, 3, 0, false).unwrap();
-        assert_eq!(ws.paste_placements.len(), 1);
-        undo_edit_inner(&mut ws).expect("undo");
-        assert!(ws.paste_placements.is_empty(), "undo clears placements");
-        // redo clears whatever was recorded since too
-        ws.paste_placements.push(Placement { x: 0, y: 0, z: 0, w: 1, h: 1, d: 1, ax: 0, ay: 0, az: 0, rtid: 1 });
-        redo_edit_inner(&mut ws).expect("redo");
-        assert!(ws.paste_placements.is_empty(), "redo clears placements");
-    }
-
-    #[test]
-    fn test_derive_copy_origin_newer_overlap_beats_older_cover() {
-        let older = Placement { x: 0, y: 0, z: 0, w: 10, h: 10, d: 10, ax: 100, ay: 200, az: 5, rtid: 1 };
-        let newer = Placement { x: 4, y: 4, z: 0, w: 3, h: 3, d: 10, ax: 900, ay: 900, az: 5, rtid: 2 };
-        // box inside older, overlapping newer's edge → ambiguous
-        assert_eq!(derive_copy_origin(&[older, newer], 0, 0, 2, 2, 4, 4, 0, 1), None);
-        // box inside older, clear of newer → older's origin
-        let o = derive_copy_origin(&[older, newer], 0, 0, 0, 0, 1, 1, 2, 3).unwrap();
-        assert_eq!((o.ax, o.ay, o.az, o.source, o.rtid), (100, 200, 7, 1, 1));
-    }
-
-
-    // ── 27.0b: the trailer in the world, the file-image seam, sidecars ─────────────────────────
-
-    /// A 2×2-chunk 64z world with the quarry sign trailer after its directory.
-    fn trailer_world() -> Vec<u8> {
-        let mut b = make_bumpy_world_grid(2, 8, |_, _| 20);
-        b.extend_from_slice(&QUARRY_SIGN_TRAILER);
-        b
-    }
-
-    /// Touch the open world's trailer the way a record edit will (27.8a): a model edit plus
-    /// `mark_trailer`. Returns the tail every writer must now produce.
-    fn touch_trailer(ws: &mut WorldState) -> Vec<u8> {
-        let w = ws.world.as_mut().unwrap();
-        let p = trailer::Pos::new(w.min_x * 16 + 3, w.min_y * 16 + 4, 21);
-        w.trailer.add_cmd(p, b"say hi").expect("add a command block");
-        ws.dirty.mark_trailer();
-        let tail = w.trailer_bytes();
-        assert_ne!(tail, QUARRY_SIGN_TRAILER.to_vec());
-        assert_eq!(&tail[4..8], b"CMB1", "a new CMB1 goes before SGN1");
-        tail
-    }
-
-    /// The file a world saves as: head + tail.
-    fn image_bytes(w: &LoadedWorld) -> Vec<u8> {
-        let i = w.file_image();
-        [i.head, &i.tail].concat()
-    }
-
-    fn reload(path: &std::path::Path) -> LoadedWorld {
-        parse_world_inner(mmap_from_bytes(fs::read(path).expect("read output"))).expect("output must parse")
-    }
-
-    /// The load capture keeps a ragged last row (< 16 bytes) instead of dropping it: the trailer is
-    /// everything from the end of the real rows to EOF, and a save writes the file back verbatim.
-    #[test]
-    fn test_trailer_capture_keeps_a_ragged_last_row() {
-        let mut b = trailer_world();
-        b.extend_from_slice(&[1, 2, 3, 4, 5]);
-        let world = parse_world_inner(mmap_from_bytes(b.clone())).expect("parse");
-        assert_eq!(world.chunk_map.len(), 4);
-        assert_eq!(world.trailer_start as usize, b.len() - 192 - 5);
-        assert_eq!(world.trailer_bytes(), b[b.len() - 197..].to_vec(), "the ragged row is part of the trailer");
-        assert!(!world.trailer.parsed(), "a partial row makes it opaque (kept verbatim)");
-        let dir = stage4_dir("ragged");
-        let out = dir.join("out.eden");
-        save_world_inner(&world, out.to_str().unwrap(), false).expect("save");
-        assert_eq!(fs::read(&out).unwrap(), b, "saved verbatim, ragged row included");
-
-        // No tagged rows at all, just a few stray bytes after the directory: still kept.
-        let mut b = make_bumpy_world_grid(2, 8, |_, _| 20);
-        b.extend_from_slice(&[9; 7]);
-        let world = parse_world_inner(mmap_from_bytes(b.clone())).expect("parse");
-        assert_eq!(world.chunk_map.len(), 4);
-        assert_eq!(world.trailer_bytes(), vec![9; 7]);
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    /// The untouched trailer is the file's own bytes; the quarry trailer parses to its one sign.
-    #[test]
-    fn test_untouched_trailer_is_the_files_own_bytes() {
-        let world = parse_world_inner(mmap_from_bytes(trailer_world())).expect("parse");
-        assert!(world.trailer.parsed() && !world.tail_rewritten());
-        assert_eq!(world.trailer.signs().len(), 1);
-        assert!(matches!(world.file_image().tail, Cow::Borrowed(_)), "borrowed from the mapping while untouched");
-        assert_eq!(image_bytes(&world), trailer_world());
-        let r = records_info(&world, None);
-        assert_eq!((r.status, r.signs.len(), r.cmds.len(), r.bytes), ("parsed", 1, 0, 192));
-        let (x, y, z) = world.record_to_local(world.trailer.signs()[0].pos);
-        assert_eq!((r.signs[0].x, r.signs[0].y, r.signs[0].z, r.signs[0].text.as_str()), (x, y, z, "test"));
-    }
-
-    /// 27.6a: `record_overlay` lists drawable signs nearest-first, counts hidden ones, applies
-    /// radius and caps, and an opaque trailer yields the empty result.
-    #[test]
-    fn test_record_overlay_order_hiding_and_caps() {
-        // The grid world is solid up to z = 20 (stone-ish, opaque); the quarry sign's anchor is air.
-        let mut world = parse_world_inner(mmap_from_bytes(trailer_world())).expect("parse");
-        let (mx, my) = (world.min_x * 16, world.min_y * 16);
-        let abs = |x: i32, y: i32, z: i32| trailer::Pos::new(mx + x, my + y, z);
-        // Standing signs on the surface (z = 20, open sky above), at growing distance on x.
-        for x in [10, 2, 6] {
-            world.trailer.add_sign(abs(x, 5, 20), 3, 2, 0, format!("s{x}").as_bytes()).unwrap();
-        }
-        // Buried wall sign (front cell is solid), and one anchored in air.
-        world.trailer.add_sign(abs(4, 4, 10), 5, 2, 0, b"buried").unwrap();
-        world.trailer.add_sign(abs(4, 4, 30), 3, 2, 0, b"air").unwrap();
-        // A command block on the surface.
-        world.trailer.add_cmd(abs(3, 3, 20), b"say hi").unwrap();
-
-        let o = record_overlay(&world, 0.0, 5.0, 21.0, 32, 64);
-        let texts: Vec<&str> = o.signs.iter().map(|s| s.text.as_str()).collect();
-        assert_eq!(texts, ["s2", "s6", "s10"], "nearest first, hidden dropped (the quarry sign is in air)");
-        assert!(o.signs.iter().all(|s| s.kind == voxel_core::signs::SignKind::Standing && !s.boxes.is_empty()));
-        assert!(o.hidden_air == 1 && o.hidden_front == 1, "{} {}", o.hidden_air, o.hidden_front);
-        assert_eq!(o.cmds.len(), 1);
-        assert_eq!(o.cmds[0].pos, [3, 3, 20]);
-        assert!(o.cmds[0].faces.has(3) && !o.cmds[0].faces.has(2), "top exposed, bottom buried");
-        assert!(!o.truncated);
-        // Radius: only the closest sign is inside 4 blocks of (2, 5, 21).
-        let near = record_overlay(&world, 2.0, 5.0, 21.0, 3, 64);
-        assert_eq!(near.signs.len(), 1);
-        // Caps: far more standing signs than the limit.
-        for x in 0..32 { for y in 0..32 {
-            let _ = world.trailer.add_sign(abs(x, y, 20), 3, 2, 1, b"x");
-        } }
-        let big = record_overlay(&world, 16.0, 16.0, 21.0, 64, 64);
-        assert_eq!(big.signs.len(), OVERLAY_MAX_SIGNS);
-        assert!(big.truncated);
-        let d = |s: &OverlaySign| (s.pos[0] as f64 + 0.5 - 16.0).powi(2) + (s.pos[1] as f64 + 0.5 - 16.0).powi(2);
-        assert!(big.signs.windows(2).all(|w| d(&w[0]) <= d(&w[1])), "nearest first under the cap");
-
-        // Opaque trailer: empty, not an error.
-        let mut b = trailer_world();
-        b.extend_from_slice(&[1, 2, 3, 4, 5]);
-        let opaque = parse_world_inner(mmap_from_bytes(b)).expect("parse");
-        assert!(!opaque.trailer.parsed());
-        let e = record_overlay(&opaque, 0.0, 0.0, 0.0, 32, 64);
-        assert!(e.signs.is_empty() && e.cmds.is_empty() && !e.truncated);
-    }
-
-    /// Plan §3.2's writer table: a world with a touched trailer, saved by every full writer,
-    /// reloads with the new trailer and the same head.
-    #[test]
-    fn test_touched_trailer_reaches_every_full_writer() {
-        let dir = stage4_dir("trailer_writers");
-        let mut ws = ws_with(trailer_world());
-        let tail = touch_trailer(&mut ws);
-        let world = ws.world.as_ref().unwrap();
-        let head = world.bytes[..world.trailer_start as usize].to_vec();
-        let check = |w: &LoadedWorld, what: &str| {
-            assert_eq!(w.trailer_bytes(), tail, "{what}: the new trailer");
-            assert_eq!(w.trailer.cmds().len(), 1, "{what}");
-            assert_eq!(w.trailer.signs().len(), 1, "{what}");
-            assert_eq!(w.chunk_map.len(), world.chunk_map.len(), "{what}: chunks kept");
-        };
-
-        // Full write from the mapping.
-        let out = dir.join("full.eden");
-        save_world_inner(world, out.to_str().unwrap(), false).expect("full save");
-        assert_eq!(fs::read(&out).unwrap(), [&head[..], &tail].concat(), "full: head ++ tail");
-        check(&reload(&out), "full");
-
-        // Compressed.
-        let out = dir.join("zipped.eden.zip");
-        save_world_compressed(world, out.to_str().unwrap(), false, None).expect("compressed save");
-        let mut zip = zip::ZipArchive::new(fs::File::open(&out).unwrap()).unwrap();
-        let mut inner = Vec::new();
-        std::io::Read::read_to_end(&mut zip.by_index(0).unwrap(), &mut inner).unwrap();
-        assert_eq!(inner, [&head[..], &tail].concat(), "compressed: head ++ tail");
-
-        // The rebuilding writers.
-        let out = dir.join("expand.eden");
-        expand_world_inner(out.to_str().unwrap(), world, &[], &FxHashMap::default(), false, || false, |_| {})
-            .expect("expand");
-        check(&reload(&out), "expand");
-        let out = dir.join("materialize.eden");
-        let (coords, src) = materialize_src(world);
-        let params = FlatChunkParams { chunk_size: world.chunk_size, stone_depth: 1, dirt_depth: 2, surface_z: 4 };
-        materialize_flat_chunks_inner(out.to_str().unwrap(), world.chunk_size, &world.bytes[..192], &coords, src,
-            &[], &params, &world.file_image().tail, &[], || false, |_, _| {}).expect("materialize");
-        check(&reload(&out), "materialize");
-
-        // The MAP_SHARED clone path (18.11): clone the temp, then patch its tail. The temp itself
-        // keeps its length (T3).
-        let temp = dir.join("staged.eden");
-        fs::write(&temp, trailer_world()).unwrap();
-        let (mmap, _) = map_staged_temp_ex(&temp).unwrap();
-        let mut ws2 = WorldState::new();
-        ws2.world = Some(parse_world_inner(mmap).unwrap());
-        assert_eq!(touch_trailer(&mut ws2), tail);
-        let out = dir.join("cloned.eden");
-        save_world_progress(ws2.world.as_ref().unwrap(), out.to_str().unwrap(), false, None, Some(&temp))
-            .expect("clone save");
-        assert_eq!(fs::read(&out).unwrap(), [&head[..], &tail].concat(), "clone: head ++ tail");
-        assert_eq!(fs::metadata(&temp).unwrap().len(), trailer_world().len() as u64, "the temp never changes length");
-        drop(ws2);
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    /// The incremental save writes the tail through the WAL, and the file's length moves with it:
-    /// grows on an added record, stays eligible for the next save, and shrinks when the trailer
-    /// empties (no trailer at all).
-    #[test]
-    fn test_incremental_save_writes_the_tail() {
-        let dir = stage4_dir("trailer_incremental");
-        let dest = dir.join("world.eden");
-        let state: AppState = RwLock::new(ws_with_disk_image(trailer_world(), &dest));
-        let tail = touch_trailer(&mut write_ws(&state));
-        assert!(try_incremental_save(&state, dest.to_str().unwrap(), false).expect("save"), "a trailer-only save is eligible");
-        let expected = image_bytes(read_ws(&state).world.as_ref().unwrap());
-        assert_eq!(fs::read(&dest).unwrap(), expected);
-        assert!(expected.ends_with(&tail) && expected.len() > trailer_world().len(), "the file grew");
-        assert!(!wal_path(&dest).exists());
-        {
-            let ws = read_ws(&state);
-            assert!(!ws.dirty.trailer_disk, "the save discharged the trailer");
-            assert!(ws.dirty.trailer_load && ws.dirty.trailer_journal && ws.dirty.trailer_base);
-            assert_eq!(ws.disk_image.as_ref().unwrap().len, expected.len() as u64);
-        }
-
-        // A chunk edit next: the new file length is a valid image, so still incremental.
-        {
-            let mut ws = write_ws(&state);
-            with_edit(&mut ws, "delete", (0, 0, 5, 5), |w| { delete_blocks_inner(w, 0, 0, 5, 5, 0, 63, None); Ok(()) })
-                .expect("edit");
-        }
-        assert!(try_incremental_save(&state, dest.to_str().unwrap(), false).expect("save 2"), "eligible at the new length");
-        assert_eq!(fs::read(&dest).unwrap(), image_bytes(read_ws(&state).world.as_ref().unwrap()));
-
-        // Empty the trailer: the file ends at the directory.
-        {
-            let mut ws = write_ws(&state);
-            let w = ws.world.as_mut().unwrap();
-            w.trailer.remove_cmd(0).unwrap();
-            w.trailer.remove_sign(0).unwrap();
-            assert!(w.trailer_bytes().is_empty(), "nothing left: no trailer");
-            ws.dirty.mark_trailer();
-        }
-        assert!(try_incremental_save(&state, dest.to_str().unwrap(), false).expect("save 3"));
-        let ts = read_ws(&state).world.as_ref().unwrap().trailer_start;
-        assert_eq!(fs::metadata(&dest).unwrap().len(), ts, "the file shrank to the end of the directory");
-        assert_eq!(fs::read(&dest).unwrap(), image_bytes(read_ws(&state).world.as_ref().unwrap()));
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    /// A committed WAL with a tail record rolls forward whether the crash left the destination at
-    /// its old length or at its final one (the apply sets the length first), and is discarded at
-    /// any other length.
-    #[test]
-    fn test_wal_tail_recovers_at_either_length() {
-        let dir = stage4_dir("trailer_wal");
-        let base = trailer_world();
-        let ts = base.len() - QUARRY_SIGN_TRAILER.len();
-        let mut ws = ws_with(base.clone());
-        let tail = touch_trailer(&mut ws);
-        let span_off = 4096u64; // somewhere in chunk data
-        let span = vec![0x5a; 64];
-        let mut expected = [&base[..ts], &tail].concat();
-        expected[span_off as usize..span_off as usize + 64].copy_from_slice(&span);
-        let write_wal = |dest: &std::path::Path| {
-            let f = fs::File::create(wal_path(dest)).unwrap();
-            let hdr = journal::JournalHeader::new(false, base.len() as u64, [9; 16]).with_tail();
-            let mut w = journal::JournalWriter::create_with(f, hdr).unwrap();
-            w.append_tail(ts as u64, &tail).unwrap();
-            w.append_span(span_off, 0, 0, &span).unwrap();
-            w.append_commit().unwrap();
-            w.flush().unwrap();
-        };
-        let dest = dir.join("w.eden");
-        for (case, before) in [
-            ("crash before the apply", base.clone()),
-            ("crash after set_len + tail, spans owed", [&base[..ts], &tail].concat()),
-            ("crash after set_len only", { let mut v = base.clone(); v.resize(ts + tail.len(), 0); v }),
-        ] {
-            fs::write(&dest, &before).unwrap();
-            write_wal(&dest);
-            assert!(has_committed_wal(&dest), "{case}");
-            recover_wal(&dest);
-            assert_eq!(fs::read(&dest).unwrap(), expected, "{case}");
-            assert!(!wal_path(&dest).exists(), "{case}: the log is cleaned up");
-        }
-        // Any other length is not this log's destination: discarded, file untouched.
-        let other = [&base[..], &[0u8; 16]].concat();
-        fs::write(&dest, &other).unwrap();
-        write_wal(&dest);
-        assert!(!has_committed_wal(&dest));
-        recover_wal(&dest);
-        assert_eq!(fs::read(&dest).unwrap(), other);
-        assert!(!wal_path(&dest).exists());
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    /// The autosave journal carries the trailer as a tail record, for a Source lineage (the file's
-    /// own length as `base_len`) and a Clone (the temp's), and recovery restores it with
-    /// `trailer_load` set.
-    #[test]
-    fn test_autosave_tail_record_recovers_the_trailer() {
-        for clone in [false, true] {
-            let dir = stage4_dir(if clone { "trailer_autosave_clone" } else { "trailer_autosave_source" });
-            let src = dir.join("w.eden");
-            fs::write(&src, trailer_world()).unwrap();
-            let state: AppState = RwLock::new(WorldState::new());
-            load_world_inner(src.to_str().unwrap().into(), &state).expect("load");
-            if clone {
-                write_ws(&state).disk_image = None; // no Source base: the tick clones the temp
-            }
-            let paths = autosave_paths_at(&dir);
-            let tail = touch_trailer(&mut write_ws(&state));
-            {
-                let mut ws = write_ws(&state);
-                with_edit(&mut ws, "delete", (0, 0, 5, 5), |w| { delete_blocks_inner(w, 0, 0, 5, 5, 0, 63, None); Ok(()) })
-                    .expect("edit");
-            }
-            autosave_world_inner(&state, &paths, None, None).expect("tick");
-            assert!(!read_ws(&state).dirty.trailer_journal, "the tick discharged the trailer");
-            let expected = image_bytes(read_ws(&state).world.as_ref().unwrap());
-
-            let fresh: AppState = RwLock::new(WorldState::new());
-            load_autosave_inner(&fresh, &paths).expect("recovery");
-            {
-                let ws = read_ws(&fresh);
-                let w = ws.world.as_ref().unwrap();
-                assert_eq!(image_bytes(w), expected, "clone={clone}: the recovered world is the ticked one");
-                assert_eq!(w.trailer_bytes(), tail);
-                assert!(ws.dirty.trailer_load && ws.dirty.trailer_disk, "clone={clone}: the replayed trailer is owed");
-            }
-            for s in [&state, &fresh] {
-                let t = read_ws(s).temp_path.clone();
-                write_ws(s).world = None;
-                if let Some(t) = t { let _ = fs::remove_file(t); }
-            }
-            let _ = fs::remove_dir_all(&dir);
-        }
-    }
-
-    /// Sidecar adoption (plan §6.2): the trailer wins per section; adoption owes the trailer to the
-    /// file but doesn't make the world "unsaved"; Save As elsewhere doesn't rename; a save to the
-    /// world's own path writes the records in and renames the adopted sidecar `*.adopted`.
-    #[test]
-    fn test_sidecar_adoption_and_rename_on_save() {
-        let dir = stage4_dir("trailer_sidecars");
-        let src = dir.join("w.eden");
-        fs::write(&src, trailer_world()).unwrap();
-        let section = |magic: &[u8; 4], rec: usize, n: u32| {
-            let mut v = magic.to_vec();
-            v.extend(1u32.to_le_bytes());
-            v.extend(n.to_le_bytes());
-            v.resize(12 + rec * n as usize, 0);
-            v
-        };
-        fs::write(dir.join("signs_w.eden.dat"), section(b"SGN1", trailer::SIGN_LEN, 2)).unwrap();
-        fs::write(dir.join("cmd_w.eden.dat"), section(b"CMB1", trailer::CMD_LEN, 3)).unwrap();
-
-        let state: AppState = RwLock::new(WorldState::new());
-        let meta = load_world_inner(src.to_str().unwrap().into(), &state).expect("load");
-        assert_eq!(meta.records_adopted, RecordCounts { signs: 0, cmds: 3 }, "the world's own SGN1 wins");
-        {
-            let ws = read_ws(&state);
-            let d = &ws.dirty;
-            assert!(d.trailer_disk && d.trailer_journal && d.trailer_base && d.trailer_adopt_pending);
-            assert!(!d.trailer_load, "adoption alone isn't an unsaved change");
-            let r = records_info(ws.world.as_ref().unwrap(), ws.adopted.as_ref());
-            assert_eq!((r.signs.len(), r.cmds.len(), r.adopted.cmds), (1, 3, 3));
-        }
-
-        // Save As elsewhere: written in there, but the sidecar stays (the original still lacks it).
-        let other = dir.join("copy.eden");
-        let seq = read_ws(&state).dirty.seq;
-        save_world_progress(read_ws(&state).world.as_ref().unwrap(), other.to_str().unwrap(), false, None, None).unwrap();
-        record_full_write(&state, &other, false, seq).unwrap();
-        assert_eq!(reload(&other).trailer.cmds().len(), 3);
-        assert!(dir.join("cmd_w.eden.dat").exists(), "Save As elsewhere doesn't rename");
-        assert!(read_ws(&state).dirty.trailer_adopt_pending);
-
-        // Back to its own path (Save As back, a full write): written in, sidecar renamed.
-        let seq = read_ws(&state).dirty.seq;
-        save_world_progress(read_ws(&state).world.as_ref().unwrap(), src.to_str().unwrap(), false, None, None).unwrap();
-        record_full_write(&state, &src, false, seq).unwrap();
-        assert!(!dir.join("cmd_w.eden.dat").exists() && dir.join("cmd_w.eden.dat.adopted").exists());
-        assert!(dir.join("signs_w.eden.dat").exists(), "an ignored sidecar is left alone");
-        assert!(!read_ws(&state).dirty.trailer_adopt_pending);
-
-        // Reload: the records are the world's own now, nothing adopted.
-        let state2: AppState = RwLock::new(WorldState::new());
-        let meta = load_world_inner(src.to_str().unwrap().into(), &state2).expect("reload");
-        assert_eq!(meta.records_adopted, RecordCounts::default());
-        let ws = read_ws(&state2);
-        assert_eq!((ws.world.as_ref().unwrap().trailer.signs().len(), ws.world.as_ref().unwrap().trailer.cmds().len()), (1, 3));
-        drop(ws);
-        for s in [&state, &state2] {
-            let t = read_ws(s).temp_path.clone();
-            write_ws(s).world = None;
-            if let Some(t) = t { let _ = fs::remove_file(t); }
-        }
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    /// 29.5 / audit C-06: a `w.emod` or `w.eden.zip` beside the game's `w.eden` shares its stem, so it
-    /// adopts `w.eden`'s sidecars — read-only. Its own save ends the adoption without renaming them
-    /// (the game's `w.eden` still relies on them); only a save to the `.eden` they're named for retires
-    /// them, and that never replaces an `.adopted` left by an earlier adoption.
-    #[test]
-    fn test_sidecar_adoption_read_only_for_siblings() {
-        let dir = stage4_dir("sidecar_siblings");
-        let signs = dir.join("signs_w.eden.dat");
-        let cmds = dir.join("cmd_w.eden.dat");
-        fs::write(&signs, b"s").unwrap();
-        fs::write(&cmds, b"c").unwrap();
-        let adopt = |ws: &mut WorldState, from: &str| {
-            ws.dirty.mark_adopted();
-            ws.adopted = Some(AdoptedSidecars {
-                world_path: dir.join(from),
-                files: vec![signs.clone(), cmds.clone()],
-                counts: RecordCounts { signs: 1, cmds: 1 },
-            });
-        };
-        let mut ws = WorldState::new();
-
-        for sibling in ["w.emod", "w.eden.zip", "w.zip"] {
-            adopt(&mut ws, sibling);
-            // Save As elsewhere: still pending.
-            assert!(take_adopted_for(&mut ws, &dir.join("other.eden")).is_empty(), "{sibling}");
-            assert!(ws.dirty.trailer_adopt_pending && ws.adopted.is_some(), "{sibling}");
-            // Its own save: written into itself, adoption over, nothing to rename.
-            assert!(take_adopted_for(&mut ws, &dir.join(sibling)).is_empty(), "{sibling}");
-            assert!(!ws.dirty.trailer_adopt_pending && ws.adopted.is_none(), "{sibling}");
-        }
-
-        // A sibling saved as the `.eden` the sidecars name: that file holds them now, so they retire.
-        adopt(&mut ws, "w.emod");
-        assert_eq!(take_adopted_for(&mut ws, &dir.join("w.eden")), vec![signs.clone(), cmds.clone()]);
-        assert!(!ws.dirty.trailer_adopt_pending);
-
-        // A `.eden` in another folder with the same name isn't theirs.
-        let sub = dir.join("sub");
-        fs::create_dir_all(&sub).unwrap();
-        adopt(&mut ws, "w.eden");
-        assert!(take_adopted_for(&mut ws, &sub.join("w.eden")).is_empty());
-        assert!(ws.dirty.trailer_adopt_pending);
-        let files = take_adopted_for(&mut ws, &dir.join("w.eden"));
-        assert_eq!(files.len(), 2);
-
-        // An earlier adoption's `.adopted` (and `.2.adopted`) are kept; this one gets the next name.
-        fs::write(dir.join("signs_w.eden.dat.adopted"), b"old1").unwrap();
-        fs::write(dir.join("signs_w.eden.dat.2.adopted"), b"old2").unwrap();
-        rename_adopted(&files);
-        assert!(!signs.exists() && !cmds.exists());
-        assert_eq!(fs::read(dir.join("signs_w.eden.dat.adopted")).unwrap(), b"old1");
-        assert_eq!(fs::read(dir.join("signs_w.eden.dat.2.adopted")).unwrap(), b"old2");
-        assert_eq!(fs::read(dir.join("signs_w.eden.dat.3.adopted")).unwrap(), b"s");
-        assert_eq!(fs::read(dir.join("cmd_w.eden.dat.adopted")).unwrap(), b"c");
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    /// The Command Block Academy specimen (`TEST WORLDS/academy`, private: skips when absent): the
-    /// `.eden` has no trailer and its records live in the game's sidecars (109 signs, 45 command
-    /// blocks); the `.emod` holds its own (one more sign). Both open with every record; saving the `.eden`
-    /// in place writes them in (`CMB1` first) and retires the sidecars.
-    #[test]
-    fn test_academy_specimen_adopts_and_saves() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../TEST WORLDS/academy");
-        let world = root.join("Command Block Academy.eden");
-        if !world.exists() {
-            eprintln!("skipping: {world:?} not present");
-            return;
-        }
-        let dir = stage4_dir("academy");
-        let src = dir.join("Command Block Academy.eden");
-        for f in ["Command Block Academy.eden", "signs_Command Block Academy.eden.dat", "cmd_Command Block Academy.eden.dat"] {
-            fs::copy(root.join(f), dir.join(f)).unwrap();
-        }
-        let state: AppState = RwLock::new(WorldState::new());
-        let meta = load_world_inner(src.to_str().unwrap().into(), &state).expect("load academy");
-        assert_eq!(meta.records_adopted, RecordCounts { signs: 109, cmds: 45 });
-        {
-            let ws = read_ws(&state);
-            let t = &ws.world.as_ref().unwrap().trailer;
-            assert_eq!(t.section_order(), vec![trailer::CMB1, trailer::SGN1]);
-        }
-        assert!(try_incremental_save(&state, src.to_str().unwrap(), false).expect("save"), "a trailer-only save is incremental");
-        assert!(dir.join("signs_Command Block Academy.eden.dat.adopted").exists());
-        assert!(dir.join("cmd_Command Block Academy.eden.dat.adopted").exists());
-        let state2: AppState = RwLock::new(WorldState::new());
-        let meta = load_world_inner(src.to_str().unwrap().into(), &state2).expect("reload");
-        assert_eq!(meta.records_adopted, RecordCounts::default());
-        {
-            let ws = read_ws(&state2);
-            let t = &ws.world.as_ref().unwrap().trailer;
-            assert!(t.parsed());
-            assert_eq!((t.signs().len(), t.cmds().len()), (109, 45));
-        }
-
-        // The `.emod`: its own SIGN_TRAILER (any sidecar beside it would lose to it).
-        let emod_path = root.join("command block academy.emod");
-        if emod_path.exists() {
-            let e = dir.join("academy.emod");
-            fs::copy(&emod_path, &e).unwrap();
-            let state3: AppState = RwLock::new(WorldState::new());
-            let meta = load_world_inner(e.to_str().unwrap().into(), &state3).expect("load the .emod");
-            assert_eq!(meta.container, "emod");
-            assert_eq!(meta.records_adopted, RecordCounts::default());
-            let ws = read_ws(&state3);
-            let t = &ws.world.as_ref().unwrap().trailer;
-            // Measured 2026-10-25: the .emod has one sign more than the .eden's sidecar (it was
-            // saved from a later session), the same 45 command blocks.
-            assert_eq!((t.signs().len(), t.cmds().len()), (110, 45), "the .emod carries its own records");
-            assert_eq!(t.section_order(), vec![trailer::CMB1, trailer::SGN1]);
-            drop(ws);
-            let t = read_ws(&state3).temp_path.clone();
-            write_ws(&state3).world = None;
-            if let Some(t) = t { let _ = fs::remove_file(t); }
-        }
-        for s in [&state, &state2] {
-            let t = read_ws(s).temp_path.clone();
-            write_ws(s).world = None;
-            if let Some(t) = t { let _ = fs::remove_file(t); }
-        }
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    /// Plan §3.2's guard: no shipping code hands the mapping to a file writer — the file is
-    /// `file_image()` (head + the trailer as it saves). Comment lines and the test module are
-    /// exempt; a new writer that needs the raw temp (e.g. a snapshot) belongs in this allowlist
-    /// with a reason.
     #[test]
-    fn test_no_file_writer_takes_the_raw_mapping() {
-        let forbidden = ["&world.bytes[..]", "&*world.bytes", "write_all(&world.bytes", "(&world.bytes)",
-            "&w.bytes[..]", ", &world.bytes,", "&mut &world.bytes"];
-        for (name, src) in [("lib.rs", include_str!("lib.rs")), ("emod.rs", include_str!("emod.rs")),
-            ("worldgen.rs", include_str!("worldgen.rs")), ("network.rs", include_str!("network.rs"))] {
-            let shipping = src.split("#[cfg(test)]\nmod tests").next().unwrap();
-            for (n, line) in shipping.lines().enumerate() {
-                let code = line.trim_start();
-                if code.starts_with("//") { continue; }
-                for f in forbidden {
-                    assert!(!code.contains(f), "{name}:{}: `{f}` — write through `LoadedWorld::file_image()`", n + 1);
-                }
-            }
-        }
+    fn holds_only_os_exit_while_armed() {
+        assert!(should_hold_exit(true, None));
+        assert!(!should_hold_exit(false, None));
+        assert!(!should_hold_exit(true, Some(0))); // programmatic exit() is never held
+    }
+    #[test]
+    fn guard_arms_and_disarms() {
+        let g = QuitGuard::default();
+        g.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(g.0.load(std::sync::atomic::Ordering::SeqCst));
+        g.0.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(!g.0.load(std::sync::atomic::Ordering::SeqCst));
     }
 }

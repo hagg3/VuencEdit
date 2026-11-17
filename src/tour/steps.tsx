@@ -1,7 +1,7 @@
 /**
  * Onboarding tour content — the only file to edit when adding, reordering or rewording a step.
  * The engine (`TourOverlay.tsx`) is purely declarative over this array: it measures `target`,
- * runs `before` to reveal it, and renders `title`/`body`. See CLAUDE.md's "Onboarding Tour" note.
+ * runs `before` to reveal it, and renders `title`/`body`.
  */
 import type { ReactNode } from "react";
 import type { RibbonTab } from "../ribbon/props";

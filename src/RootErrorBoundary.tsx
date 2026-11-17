@@ -1,4 +1,6 @@
 import { useEffect, useState, type ReactNode } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import { setDocumentEdited } from "./windowChrome";
 import ErrorBoundary from "./ErrorBoundary";
 import { hasRootSave, runRootSave } from "./rootSave";
 import { RAMP } from "./theme/theme";
@@ -17,6 +19,9 @@ export function RootFallback({ error, retry }: { error: Error; retry: () => void
     setStatus("saving");
     try { setStatus((await runRootSave()) ? "saved" : "failed"); } catch { setStatus("failed"); }
   };
+
+  // 34.9: App has unmounted and can't answer `quit-requested` — disarm so ⌘Q / Dock › Quit exit.
+  useEffect(() => { invoke("set_quit_guard", { armed: false }).catch(() => {}); setDocumentEdited(false); }, []);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {

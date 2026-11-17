@@ -80,7 +80,7 @@ export default function HotbarWindow({
             title={`Active block: ${name}. Click to choose a block and paint.`}
             aria-label="Open block & paint picker"
             style={{
-              width: grid.size, height: grid.size, flexShrink: 0, cursor: "pointer",
+              width: grid.size, height: grid.size, flexShrink: 0, cursor: "default",
               display: "flex", alignItems: "center", justifyContent: "center",
               background: SURFACE.well, border: `1px solid rgba(255,255,255,.14)`, borderRadius: RADIUS.md,
               color: TEXT,
@@ -143,7 +143,7 @@ function HotbarCell({
   // Pushed-in current recipe (`currentRow()`, ribbon/tokens — the same "current item" recipe as
   // app-menu rows/sidebar tabs/History's current entry) plus a 2px primary inner ring layered on
   // top (mock `.hb-slot[data-sel]`) — the ring is what a bare `currentRow()` can't express on its
-  // own, since CLAUDE.md's "no accent strips or underlines on current items" rule is about a strip
+  // own, since the "no accent strips or underlines on current items" rule is about a strip
   // *beside* the row, not a ring *around* the selected slot the way an armed tool gets one.
   // Composed manually (not `currentRow({boxShadow: …})`) because that helper's `extra` replaces
   // the shadow outright rather than layering onto it.
@@ -174,7 +174,7 @@ function HotbarCell({
       onMouseLeave={() => onHover(null)}
       style={{
         width: size, height: size, position: "relative", flexShrink: 0,
-        cursor: block ? "pointer" : "default",
+        cursor: "default",
         borderRadius: RADIUS.md,
         display: "flex", alignItems: "center", justifyContent: "center",
         outline: kind === "recent" ? "1px dashed rgba(255,255,255,.16)" : "none", outlineOffset: -3,
@@ -187,7 +187,7 @@ function HotbarCell({
       <span style={{
         position: "absolute", top: 1, left: 3, fontSize: FONT.micro - 1, lineHeight: 1,
         fontFamily: "monospace", color: active ? RAMP.white : "rgba(255,255,255,0.5)", textShadow: "0 1px 1px rgba(0,0,0,.6)",
-        pointerEvents: "none", userSelect: "none",
+        pointerEvents: "none",
       }}>{digit}</span>
       {hovered && block && (
         <div
@@ -197,7 +197,7 @@ function HotbarCell({
             position: "absolute", top: 0, right: 0, width: 12, height: 12,
             borderRadius: `0 ${RADIUS.sm}px 0 ${RADIUS.sm}px`, background: "rgba(0,0,0,0.75)",
             color: RAMP.white, display: "flex", alignItems: "center", justifyContent: "center",
-            fontSize: FONT.micro, cursor: alreadyPinned ? "default" : "pointer",
+            fontSize: FONT.micro, cursor: "default",
           }}
         >
           {kind === "pinned" ? "×" : "↑"}

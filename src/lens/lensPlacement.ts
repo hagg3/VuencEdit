@@ -1,7 +1,7 @@
 /**
  * Pure geometry for the paste lens's attach-to-ghost placement (UI redesign r3, Stage 14.9).
  * No React, no DOM — same idiom as `windows/windowGeometry.ts`, unit-tested in node
- * (`lensPlacement.test.ts`). Behaviour reference: `TEST WORLDS/design-exploration-2026-09/js/mock.js`
+ * (`lensPlacement.test.ts`). Behaviour reference: the 2026-09 design mock's `mock.js`
  * `placeLens`.
  *
  * Coordinates are **work-area-local** px, the same space `windowGeometry.ts`'s `WinState`/`rectOf`

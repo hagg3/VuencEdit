@@ -112,6 +112,7 @@ export function bindCommands(c: CommandCtx): Record<CommandId, CommandBinding> {
     "home.clipboard.cut": act(() => p.cutSelection(), sel),
     "home.clipboard.discard": act(() => p.discardClipboard(), clip),
     "home.clipboard.rotate": act(() => p.rotateClipboard(), clip),
+    "home.clipboard.rotateCcw": act(() => p.rotateClipboardCcw(), clip),
     "home.clipboard.flipX": act(() => p.mirrorClipboardX(), clip),
     "home.clipboard.flipY": act(() => p.mirrorClipboardY(), clip),
     "home.clipboard.mode": { ...reveal, enabled: clip },

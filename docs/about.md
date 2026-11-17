@@ -14,6 +14,15 @@ Eden World Builder was created by Ari Ronen and made open source in 2018.
 
 The [Discord server](https://discord.com/invite/rjYXwBC) for the game and community is the place to ask for help.
 
+## Licence
+
+VuencEdit is free software, and its source is on [GitHub](https://github.com/{{ site.repository }}).
+It ports parts of Eden World Builder's source code, which was released under the GNU GPL v3, so the
+app as a whole is GPL v3. VuencEdit's own code can also be reused under the MIT licence. The
+[licence notice](https://github.com/{{ site.repository }}/blob/main/NOTICE.md) lists which files are
+which. The Eden textures and app icon bundled with the app belong to Ari Ronen / Kingly Games and
+aren't covered by either licence.
+
 <hr>
 
 ## Not affiliated

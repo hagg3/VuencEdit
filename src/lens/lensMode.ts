@@ -1,5 +1,5 @@
 /**
- * Which body the Lens shows (Stage 20.4, `lens-window-plan-2026-10-01.md` D1/D2). **Pure**, tested in
+ * Which body the Lens shows (Stage 20.4). **Pure**, tested in
  * `lensMode.test.ts`; `LensWindow.tsx` and App's ⌥P handler are the callers.
  *
  * Two session-only flags, one per mode: `pasteOn` (`wins.lens.open`, 16.1) and `selOn`

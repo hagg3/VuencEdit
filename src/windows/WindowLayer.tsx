@@ -23,7 +23,7 @@ export const WINDOWS_CSS = `
   box-shadow: var(--vx-pop-shadow), 0 0 0 1px var(--vx-border-outline), inset 0 1px 0 var(--vx-border-bevel); }
 .vx-win[data-moving] { box-shadow: 0 18px 44px rgba(0,0,0,.62), 0 0 0 1px var(--vx-border-outline), 0 0 0 2px rgba(0,164,173,.35); }
 .vx-win-h { height: 22px; flex-shrink: 0; display: flex; align-items: center; gap: 6px; padding: 0 3px 0 7px;
-  cursor: grab; white-space: nowrap; overflow: hidden; user-select: none; touch-action: none;
+  cursor: grab; white-space: nowrap; overflow: hidden; touch-action: none;
   background: var(--vx-surface-body); background-image: linear-gradient(180deg, rgba(255,255,255,.06), rgba(255,255,255,0));
   box-shadow: inset 0 -1px 0 var(--vx-border-outline), inset 0 1px 0 var(--vx-border-bevel); border-radius: 6px 6px 0 0; }
 .vx-win[data-moving] .vx-win-h { cursor: grabbing; }
@@ -31,7 +31,7 @@ export const WINDOWS_CSS = `
 .vx-win-t { font-weight: 600; overflow: hidden; text-overflow: ellipsis; }
 .vx-win-m { overflow: hidden; text-overflow: ellipsis; min-width: 0; }
 .vx-win-b { flex: 1; min-height: 0; position: relative; display: flex; overflow: hidden; border-radius: 0 0 6px 6px; }
-.vx-winbtn { width: 18px; height: 18px; flex-shrink: 0; padding: 0; border: none; cursor: pointer; display: flex;
+.vx-winbtn { width: 18px; height: 18px; flex-shrink: 0; padding: 0; border: none; cursor: default; display: flex;
   align-items: center; justify-content: center; background: transparent; color: var(--vx-text-secondary); }
 .vx-winbtn:hover:not(:disabled) { background: var(--vx-lift-bg); box-shadow: var(--vx-lift-shadow); color: var(--vx-text-primary); }
 .vx-winbtn:active:not(:disabled) { background: rgba(0,0,0,.25); }

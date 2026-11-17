@@ -77,7 +77,7 @@ export default function InsertTab() {
                     on ? p.leafPaints.length > 1 ? p.leafPaints.filter(x => x !== paint) : p.leafPaints
                       : [...p.leafPaints, paint],
                   )}
-                  style={{ display: "flex", cursor: "pointer", flexShrink: 0 }}>
+                  style={{ display: "flex", cursor: "default", flexShrink: 0 }}>
                   <Swatch color={hex} selected={on} />
                 </div>
               );

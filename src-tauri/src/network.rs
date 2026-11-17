@@ -605,7 +605,7 @@ mod tests {
 /// Upload a world file + PNG preview to the Eden server. Generates a client-side UUID (matching
 /// the format the iOS client's `UIDevice.identifierForVendor` produces) and POSTs the multipart
 /// form to `?uuid=<uuid>` directly — no GET round-trip first. Confirmed against the real desktop
-/// client's own traffic 2026-08-18 (see DOCUMENTATION/10-features.md): it also generates its own
+/// client's own traffic 2026-08-18: it also generates its own
 /// UUID client-side rather than fetching one, and sends exactly two parts, `uploaded`/`uploaded2`
 /// (field *names*, not filenames), no third `submit` field.
 /// Progress events are emitted at most once per this many bytes, so a multi-GB upload doesn't
@@ -774,7 +774,7 @@ pub(crate) async fn upload_world(
     let post_url = format!("{}?uuid={}", srv.upload_url, uuid);
 
     // Field *names* must be "uploaded"/"uploaded2" — confirmed 2026-08-18 by capturing the real
-    // desktop client's own upload traffic (see DOCUMENTATION/10-features.md). The PHP endpoint keys
+    // desktop client's own upload traffic. The PHP endpoint keys
     // off the form field name (`$_FILES['uploaded']`), not the filename — the previous
     // "file.bin"/"image.bin" field names meant every VuencEdit-originated upload was silently going
     // to an empty $_FILES slot server-side despite the 200 OK response, since the server's success

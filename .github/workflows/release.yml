@@ -1,5 +1,7 @@
 name: Release
 
+# Source of truth: apps/vuencedit/.github-public/ in the private monorepo (staged by publish.sh).
+
 on:
   push:
     tags:
@@ -40,8 +42,6 @@ jobs:
 
       - name: Rust cache
         uses: swatinem/rust-cache@v2
-        with:
-          workspaces: './src-tauri -> target'
 
       - name: Install Linux dependencies
         if: matrix.platform == 'ubuntu-22.04'
@@ -63,9 +63,9 @@ jobs:
           # patch tauri.conf.json
           sed -i.bak "s/\"version\": \"[^\"]*\"/\"version\": \"$VERSION\"/" src-tauri/tauri.conf.json
           rm -f src-tauri/tauri.conf.json.bak
-          # patch Cargo.toml (first occurrence = the [package] block)
-          sed -i.bak "0,/^version = \"[^\"]*\"/s//version = \"$VERSION\"/" src-tauri/Cargo.toml
-          rm -f src-tauri/Cargo.toml.bak
+          # patch Cargo.toml (first `version =` line = the [package] block). perl, not GNU-only
+          # `sed 0,/re/`, which is a silent no-op on the macOS runner's BSD sed.
+          VERSION="$VERSION" perl -pi -e 'if (!$d && s/^version = "[^"]*"/version = "$ENV{VERSION}"/) { $d = 1 }' src-tauri/Cargo.toml
           echo "Building version $VERSION"
 
       - name: Build Tauri app

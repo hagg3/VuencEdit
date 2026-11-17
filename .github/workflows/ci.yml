@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
 
+# Source of truth: apps/vuencedit/.github-public/ in the private monorepo (staged by publish.sh).
+# Edit it there, not here. This repo is flattened: the Cargo workspace root is the repo root.
+
 jobs:
   frontend:
     runs-on: macos-latest
@@ -27,16 +30,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+      # Workspace root is the repo root, so the default cache config (./target) is correct.
       - uses: swatinem/rust-cache@v2
-        with:
-          workspaces: src-tauri
-      - run: cargo test --manifest-path src-tauri/Cargo.toml
+      # Whole workspace: the app plus the shared voxel-core and eden-format crates.
+      - run: cargo test --workspace
       # Advisory for now — tighten to `-D warnings` once existing lints are cleared.
-      - run: cargo clippy --manifest-path src-tauri/Cargo.toml || true
+      - run: cargo clippy --workspace -- -A clippy::all -D clippy::correctness
 
-  # Windows build gate — the app targets Windows but has only been developed on macOS. This catches
+  # Windows build gate — the app targets Windows but is mostly developed on macOS. This catches
   # platform-specific breakage early (path separators, the save/rename + mmap-lock behaviour, etc.).
-  # windows-latest ships WebView2, so the Tauri Rust deps build without extra setup.
   windows:
     runs-on: windows-latest
     steps:
@@ -50,6 +52,4 @@ jobs:
       - run: npx vite build
       - uses: dtolnay/rust-toolchain@stable
       - uses: swatinem/rust-cache@v2
-        with:
-          workspaces: src-tauri
-      - run: cargo test --manifest-path src-tauri/Cargo.toml
+      - run: cargo test --workspace

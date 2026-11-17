@@ -4,7 +4,7 @@
 
 # VuencEdit
 
-**[Website & support (under construction)](https://hagg3.github.io/VuencEdit/)**
+**[Website & support](https://hagg3.github.io/VuencEdit/)**
 
 VuencEdit is a full-scale world editor for **[Eden: World Builder](https://store.steampowered.com/app/5004190/Eden__World_Builder/)** and **[Eden: Community Edition](https://github.com/hagg3/edencom)** world files. It is written in Rust and is a small, lightweight, cross-platform Tauri program.
 
@@ -127,3 +127,14 @@ Settings. The pure voxel code (colours, rendering, meshing, lighting) lives in a
 
 The long version (file format, rendering, editing and undo, and a reference for every backend
 command) is in the developer docs at `docs/docs/dev/`, also published on the project's docs site.
+
+## Licence
+
+VuencEdit is free software. It ports parts of Eden: World Builder's source code, which Ari Ronen
+released in 2018 under the GNU GPL v3, so VuencEdit as a whole is distributed under the
+[GPL v3](COPYING). VuencEdit's own files, which is most of them, can also be used on their own under the
+[MIT licence](LICENSE). The files that port Eden's code are GPL-only, and
+[`NOTICE.md`](NOTICE.md) lists them.
+
+The bundled Eden textures and app icon are © Ari Ronen / Kingly Games and are not covered by
+either licence. VuencEdit is a fan project, not affiliated with or endorsed by Kingly Games.

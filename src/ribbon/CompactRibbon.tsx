@@ -16,7 +16,7 @@
 import { useCallback, useLayoutEffect, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import type { ExtrudeAxis } from "../types";
 // M1: shared floor/ceiling with FlyView3D's own in-pane slider, the ribbon 3D tab and Settings —
-// see CLAUDE.md "Undo grouping, feedback, and discoverability" (M1). Importing straight from
+// (M1). Importing straight from
 // FlyView3D (not re-declaring) is what keeps this control's range from silently drifting off theirs.
 import { MAX_RENDER_DISTANCE, RD_MIN } from "../renderDistance";
 import { useRibbon, useRibbonProps } from "./context";
@@ -45,7 +45,7 @@ const NEG_AXES: { id: ExtrudeAxis; label: string; title: string }[] = [
 
 const microLabel = {
   fontSize: FONT.micro, color: TEXT_LABEL, textTransform: "uppercase" as const,
-  letterSpacing: ".06em", marginRight: 4, fontWeight: 600, userSelect: "none" as const, whiteSpace: "nowrap" as const,
+  letterSpacing: ".06em", marginRight: 4, fontWeight: 600, whiteSpace: "nowrap" as const,
 };
 
 export default function CompactRibbon({ onOpenSearch }: { onOpenSearch: () => void }) {

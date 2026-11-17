@@ -894,9 +894,11 @@ impl Store {
                 return bad("SIGN_TRAILER must be a multiple of 16, <= 1 MiB")
             }
             RecordType::Generator if n != GENERATOR_LEN => return bad("GENERATOR must be 28 bytes"),
+            RecordType::SkyClock if n != SKY_CLOCK_LEN => return bad("SKY_CLOCK must be 16 bytes"),
+            RecordType::Weather if n != WEATHER_LEN => return bad("WEATHER must be 32 bytes"),
             _ => {}
         }
-        let raw = matches!(t, RecordType::WorldHeader | RecordType::Generator);
+        let raw = is_raw_singleton(t);
         let mut enc = Vec::new();
         let codec = self.codecs.encode(self.codec, data, !raw, &mut enc).map_err(Error::Codec)?;
         if enc.len() > MAX_PAYLOAD as usize {
@@ -1026,11 +1028,11 @@ impl Store {
     /// Rewrites the live state as one batch (seq 1) into `<path>.compact`, fsyncs, renames it over
     /// `path` and reopens. Same `bands` and `created_unix`; ords kept (possibly sparse). Order:
     /// `WORLD_HEADER`, `CREATURES`, a non-empty `SIGN_TRAILER`, `PROVENANCE`, `GENERATOR`,
-    /// `COLUMN`s by ord, `SUMMARY`, `COMMIT` — conversion's order, so compacting a fresh conversion
+    /// `SKY_CLOCK`, `WEATHER`, `COLUMN`s by ord, `SUMMARY`, `COMMIT` — conversion's order, so compacting a fresh conversion
     /// reproduces it byte for byte. zstd payloads are copied verbatim after they decode; anything
     /// else is re-encoded with the store's codec. Refused while damaged, read-only, mid-batch,
     /// before the first commit, or while the store holds a record type this build doesn't know
-    /// (types 0 and 10–255: dropping them would lose a newer writer's data; incremental saves keep
+    /// (types 0, 10 and 13–255: dropping them would lose a newer writer's data; incremental saves keep
     /// them). `INDEX` (8) is known and never written, so it is still dropped.
     pub fn compact(&mut self) -> Result<()> {
         self.check_writable()?;
@@ -1081,13 +1083,15 @@ impl Store {
             RecordType::Creatures,
             RecordType::SignTrailer,
             RecordType::Provenance,
-            RecordType::Generator, // H.4: last of the singletons
+            RecordType::Generator, // H.4
+            RecordType::SkyClock,  // DN.2
+            RecordType::Weather,   // AT.1b: last of the singletons
         ] {
             let Some(i) = self.latest[t as usize] else { continue };
             if t == RecordType::SignTrailer && self.entries[i as usize].aux == 0 {
                 continue; // an empty trailer = none
             }
-            order.push((i, matches!(t, RecordType::WorldHeader | RecordType::Generator)));
+            order.push((i, is_raw_singleton(t)));
         }
         let mut cols: Vec<u32> = self.columns.values().copied().collect();
         cols.sort_by(|&a, &b| col_key_sort(&self.entries[a as usize], &self.entries[b as usize]));
@@ -1176,12 +1180,25 @@ impl Store {
                 errs.push(format!("GENERATOR raw length {n} is not {GENERATOR_LEN}"));
             }
         }
+        for (t, len) in [(RecordType::SkyClock, SKY_CLOCK_LEN), (RecordType::Weather, WEATHER_LEN)] {
+            if let Some(i) = self.latest[t as usize] {
+                let e = self.entries[i as usize];
+                if e.aux as usize != len {
+                    errs.push(format!("{} raw length {} is not {len}", RecordType::name(t as u8), e.aux));
+                }
+                if e.codec != Codec::None as u8 {
+                    errs.push(format!("{} must be codec 0", RecordType::name(t as u8)));
+                }
+            }
+        }
         for t in [
             RecordType::Creatures,
             RecordType::SignTrailer,
             RecordType::Provenance,
             RecordType::Summary,
             RecordType::Generator,
+            RecordType::SkyClock,
+            RecordType::Weather,
         ] {
             let Some(i) = self.latest[t as usize] else { continue };
             let e = self.entries[i as usize];
@@ -1336,4 +1353,9 @@ fn provenance_parses(d: &[u8]) -> bool {
         }
     }
     o == d.len()
+}
+
+/// Singletons stored raw (codec 0): `WORLD_HEADER`, `GENERATOR`, `SKY_CLOCK`, `WEATHER`.
+fn is_raw_singleton(t: RecordType) -> bool {
+    matches!(t, RecordType::WorldHeader | RecordType::Generator | RecordType::SkyClock | RecordType::Weather)
 }

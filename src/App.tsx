@@ -3,7 +3,7 @@ import { polygonMask } from "./drawTools";
 import { createSelectionMover } from "./selectionMover";
 import {
   type WorldMeta,
-  decodeEditResult, decodePreviewData, decodeSelectionMask,
+  decodeEditResult, isNoOpEdit, decodePreviewData, decodeSelectionMask, recordsDroppedMessage,
   type SelectionInfo, type ClipboardInfo, type ExtrudeAxis, type AutosaveInfo, type SignInfo, type CmdInfo, type RecordsInfo,
   type PreviewData, classifyWorldFormat,
   type ShadowMode, type ShadowStyle, asShadowMode, asShadowStyle,
@@ -15,7 +15,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getVersion } from "@tauri-apps/api/app";
 import { open, save } from "@tauri-apps/plugin-dialog";
-import ConfirmHost, { confirmDialog, useConfirmOpen } from "./ui/confirm";
+import ConfirmHost, { confirmDialog, unsavedChangesDialog, useConfirmOpen } from "./ui/confirm";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import MapCanvas, { KEY_ZOOM_STEP, TOOL_LABELS, TOOL_HINTS, TOOL_ICON, TOOL_FAMILY, isSculptTool, type Tool, type ToolFamily, type SelectionBounds, type MapCanvasRef, type MaterializeSelectionBounds } from "./MapCanvas";
@@ -52,6 +52,7 @@ import DoneOutline, { type DoneRect } from "./ui/DoneOutline";
 import { ContextMenu, type ContextMenuItem } from "./ui/ContextMenu";
 import { meta, type CommandId } from "./commands/meta";
 import { formatChord, primaryModDown } from "./commands/keys";
+import { resolvePasteKey } from "./commands/pasteKeys";
 import { useMotionPref } from "./theme/motion";
 import { setWheelMode } from "./input/wheel";
 import { TOUR_STEPS, TOUR_VERSION, type TourCtx } from "./tour/steps";
@@ -72,7 +73,7 @@ import {
   ACCENT, FONT, ICON, IS_MAC, RADIUS, SPACE, FOCUS_RING, GRAD_HOVER, GRAD_PRESSED, hexToRgbTriplet,
   btnBase, TOP_BAR_HEIGHT, TOPBAR_BTN_H, OPTIONS_BAR_H,
 } from "./ribbon/tokens";
-import { dragRegion, setWindowControlsPreview, useWindowChrome } from "./windowChrome";
+import { dragRegion, setDocumentEdited, setWindowControlsPreview, useWindowChrome } from "./windowChrome";
 import WindowControls from "./ribbon/WindowControls";
 import { ACCENTS, RAMP, armedRecipe } from "./theme/theme";
 import { v } from "./theme/cssVars";
@@ -194,7 +195,7 @@ const SIGN_FOCUS_SCALE = 8;
 // which injects that one, isn't mounted before a world is loaded.
 
 /** Size cap on the centred launcher card. Below this the card shrinks to the window (the Tauri
- *  window's own minimum is 900×400, tauri.conf.json). */
+ *  window's own minimum is 900×600, tauri.conf.json). */
 const SPLASH_MAX_W = 900;
 const SPLASH_MAX_H = 550;
 /** Fixed width of the launcher's command column. */
@@ -208,7 +209,7 @@ const SPLASH_CSS = `
   width: 100%; height: 34px; padding: 0 ${SPACE.lg}px;
   background: transparent; border: none; border-radius: ${RADIUS.md}px;
   color: ${TEXT}; font-size: ${FONT.tab}px; text-align: left;
-  cursor: pointer; outline: none; user-select: none;
+  cursor: default; outline: none;
 }
 .spl-row:hover:not([aria-disabled="true"]) {
   background: ${GRAD_HOVER};
@@ -225,7 +226,7 @@ const SPLASH_CSS = `
 .spl-recent-wrap .spl-recent { padding-right: ${SPACE.lg + 52}px; }
 .spl-recent-x {
   position: absolute; top: 50%; right: ${SPACE.md}px; transform: translateY(-50%);
-  background: none; border: none; color: ${TEXT_META}; cursor: pointer; font-size: 12px;
+  background: none; border: none; color: ${TEXT_META}; cursor: default; font-size: 12px;
   width: 24px; height: 24px; border-radius: ${RADIUS.md}px; opacity: 0; outline: none;
 }
 .spl-recent-wrap:hover .spl-recent-x, .spl-recent-x:focus-visible { opacity: 1; }
@@ -236,7 +237,7 @@ const SPLASH_CSS = `
   width: 100%; padding: ${SPACE.md}px ${SPACE.lg}px;
   background: ${SURFACE.raised}; border: none; border-radius: ${RADIUS.md}px;
   box-shadow: inset 0 0 0 1px ${BORDER.outline}, inset 0 1px 0 ${BORDER.bevel};
-  color: ${TEXT}; text-align: left; cursor: pointer; outline: none;
+  color: ${TEXT}; text-align: left; cursor: default; outline: none;
 }
 .spl-recent:hover:not([aria-disabled="true"]) { background: ${GRAD_HOVER}; }
 .spl-recent:active:not([aria-disabled="true"]) { background: ${GRAD_PRESSED}; }
@@ -369,7 +370,7 @@ function LongOpOverlay({ op, blocking, onCancel }: {
             style={{
               marginTop: SPACE.lg + 2, background: "transparent",
               border: `1px solid ${BORDER.bevel}`, borderRadius: RADIUS.md,
-              color: TEXT_DIM, fontSize: FONT.body, padding: "4px 14px", cursor: "pointer",
+              color: TEXT_DIM, fontSize: FONT.body, padding: "4px 14px", cursor: "default",
             }}
           >
             Cancel
@@ -400,7 +401,7 @@ function StatusSeg({
       style={{
       display: "flex", alignItems: "center", gap: 5, padding: "0 10px", height: "100%",
       borderRight: divider ? `1px solid ${HAIRLINE}` : undefined,
-      whiteSpace: "nowrap", color, cursor: onClick ? "pointer" : undefined, ...style,
+      whiteSpace: "nowrap", color, cursor: onClick ? "default" : undefined, ...style,
     }}>
       {icon && <Icon name={icon} size={ICON.xs} tone="inherit" style={{ color: iconColor ?? TEXT_LABEL, flexShrink: 0 }} />}
       {children}
@@ -663,7 +664,7 @@ function App() {
   const [redoDepth, setRedoDepth] = useState(0);
 
   // Onboarding coach-mark tour (src/tour/) — auto-fires once per TOUR_VERSION on the first world
-  // that loads, replayable any time via Help/AppMenu. See CLAUDE.md's "Onboarding Tour" note.
+  // that loads, replayable any time via Help/AppMenu.
   const [tourOpen, setTourOpen] = useState(false);
   const tourCheckedRef = useRef(false);
   const startTour = useCallback(() => setTourOpen(true), []);
@@ -925,7 +926,7 @@ function App() {
   }, [mapHost]);
   useEffect(() => { flyView3dRef.current?.exitLook(); }, [placement.main, placement.window]);
   const [fogEnabled, setFogEnabled] = useState(() => loadSettings().enableFog);
-  // Night lighting, baked shadows and the GPU shadow map for FlyView3D (see CLAUDE.md). `lightEpoch`
+  // Night lighting, baked shadows and the GPU shadow map for FlyView3D. `lightEpoch`
   // bumps whenever the baked ones change, driving a chunk-mesh reload (same mechanism as texEpoch).
   // Night lighting and GPU Shadows are the perf-heavy 3D lighting modes (⚡ badged in the Ribbon):
   // deliberately **session-only, always off at startup** (not seeded from persisted settings) and
@@ -1187,9 +1188,26 @@ function App() {
   // no longer re-arms per world load.
   const [showSigns, setShowSigns] = useState(() => loadSettings().showSigns);
   const commitShowSigns = useCallback((v: boolean) => { setShowSigns(v); saveSettings({ showSigns: v }); }, []);
-  // 27.6b: a local stand-in for the backend records sequence (27.8a-1 hasn't landed). Bumped whenever
-  // `records` is (re)fetched or reset, so the 3D overlay refetches its `get_record_overlay`.
+  // Bumped whenever `records` is (re)fetched or reset, so the 3D overlay refetches its
+  // `get_record_overlay` (27.6b). What *triggers* a refetch after an edit is the backend's own
+  // sequence (27.8a-1): `backendRecordsSeqRef` holds the last one seen (from `get_records` or an
+  // `EditResult`), and `recordsGenRef` drops a refetch that resolves after a world swap.
   const [recordsSeq, setRecordsSeq] = useState(0);
+  const backendRecordsSeqRef = useRef<number | null>(null);
+  const recordsGenRef = useRef(0);
+  const refreshRecords = useCallback(() => {
+    const gen = recordsGenRef.current;
+    invoke<RecordsInfo>("get_records")
+      .then(r => {
+        if (recordsGenRef.current !== gen) return;
+        backendRecordsSeqRef.current = r.seq;
+        setSigns(r.signs); setRecords(r); setRecordsSeq(n => n + 1);
+      })
+      .catch(() => {
+        if (recordsGenRef.current !== gen) return;
+        setSigns([]); setRecords(null); setRecordsSeq(n => n + 1);
+      });
+  }, []);
   const cursorWorldRef = useRef<{ wx: number; wy: number }>({ wx: 0, wy: 0 });
 
   // Template overlay state
@@ -1736,6 +1754,13 @@ function App() {
     // dimensions times that step — every consumer below that speaks world coordinates uses these.
     const editW = raw.patch.width * raw.patch.lod;
     const editH = raw.patch.height * raw.patch.lod;
+    // 22.3: an edit that changed nothing (Delete over air, a fill with the block already there)
+    // pushed no undo entry and marked nothing dirty backend-side. Bumping editEpoch would still
+    // mark the world unsaved (and wake autosave), so it gets a "No change" toast and nothing else.
+    if (kind === "edit" && isNoOpEdit(raw, backendRecordsSeqRef.current)) {
+      if (raw.operation && !opts?.silent) showToast(`No change: ${raw.operation}`);
+      return { x: raw.patch.x, y: raw.patch.y, w: editW, h: editH };
+    }
     // Audit C2: an oversized patch arrives as a rect with no pixels — re-fetch that region through
     // the tile pipeline (bounded by the viewport) instead of blitting a world-sized image, which is
     // exactly what the z-slice branch below has always done.
@@ -1777,8 +1802,19 @@ function App() {
     // RISKY_BLOCK_GROUPS in lib.rs). Advisory only, shown regardless of `silent` since it's a safety
     // signal rather than a routine operation label.
     for (const w of raw.warnings) pushToast(w, "error");
+    // 27.8a-1: the records changed (an edit dropped some, a sign/script edit, or an undo/redo of
+    // either) → refetch them. The ref moves now so a burst of sculpt flushes refetches once.
+    if (raw.records.seq !== backendRecordsSeqRef.current) {
+      backendRecordsSeqRef.current = raw.records.seq;
+      refreshRecords();
+    }
+    // O7: records whose block became air were removed with it. Shown regardless of `silent` (a
+    // sculpt stroke's flushes are silent) — like the warnings above, it isn't a routine label.
+    const undoKey = meta("app.undo").keys?.[0];
+    const dropped = recordsDroppedMessage(raw.records, undoKey ? formatChord(undoKey) : "Undo");
+    if (dropped) pushToast(dropped, "info");
     return { x: raw.patch.x, y: raw.patch.y, w: editW, h: editH };
-  }, [showToast, pushToast]);
+  }, [showToast, pushToast, refreshRecords]);
 
   // 22.4: a live sculpt stroke flushes every ~140 ms; each flush used to toast and restart the
   // completion outline. Flushes now apply silently and fold into this record; one toast + one
@@ -1858,9 +1894,8 @@ function App() {
     invoke<[number, number] | null>("get_player_pos")
       .then(pos => setPlayerPos(pos ? { px: pos[0], py: pos[1] } : null))
       .catch(() => setPlayerPos(null));
-    invoke<RecordsInfo>("get_records")
-      .then(r => { setSigns(r.signs); setRecords(r); setRecordsSeq(n => n + 1); })
-      .catch(() => { setSigns([]); setRecords(null); setRecordsSeq(n => n + 1); });
+    recordsGenRef.current += 1;
+    refreshRecords();
     // 27.0b: the game's sidecar files were adopted into the world (the world's own records win per
     // kind). Nothing is unsaved yet; the next save writes them in and retires the side files.
     const { signs: adoptedSigns, cmds: adoptedCmds } = data.records_adopted;
@@ -1915,12 +1950,7 @@ function App() {
 
   async function openFileAt(path: string, opts?: WorldOpenOpts) {
     if (fileOpBusy()) return; // before the discard prompt, not just inside swapToWorldFile
-    if (world && isDirty()) {
-      const ok = await confirmDialog("You have unsaved changes. Open a new world and discard them?", {
-        title: "Unsaved changes", kind: "danger", okLabel: "Discard changes",
-      });
-      if (!ok) return;
-    }
+    if (world && !(await ensureSavedOrDiscarded())) return;
     await swapToWorldFile(path, opts);
   }
 
@@ -2074,15 +2104,23 @@ function App() {
     [requestSelectionMove],
   );
 
-  async function rotateClipboard() {
+  /** The backend's single `rotate_clipboard` turn is counter-clockwise on the north-up map
+   *  (east → north), so one turn is CCW and clockwise is three. Intermediate states are never
+   *  visible (clipboard transforms are undo-free). */
+  async function rotateClipboardTurns(turns: number) {
+    let info: ClipboardInfo | null = null;
     try {
-      const info = await invoke<ClipboardInfo>("rotate_clipboard");
-      setClipboard(info);
+      for (let i = 0; i < turns; i++) info = await invoke<ClipboardInfo>("rotate_clipboard");
       sfx.play("rotate");
     } catch (e) {
       reportError(e);
+    } finally {
+      // Even after a mid-sequence failure, show whatever orientation the backend actually holds.
+      if (info) setClipboard(info);
     }
   }
+  const rotateClipboard = () => rotateClipboardTurns(3);
+  const rotateClipboardCcw = () => rotateClipboardTurns(1);
 
   // Naming: "Flip/Mirror X" reflects ACROSS the X axis (the user-facing convention), so it reverses
   // rows (backend `mirror_clipboard_y`); "Flip/Mirror Y" reflects across the Y axis and reverses
@@ -2142,7 +2180,7 @@ function App() {
   const pasteAtRef = useRef(pasteAt);
   useEffect(() => { pasteAtRef.current = pasteAt; });
 
-  function handlePasteClick(pos: { x: number; y: number }) {
+  function handlePasteClick(pos: { x: number; y: number }, immediate = false) {
     if (pasteMode === "scatter") {
       handleScatterPaste(pos);
       return;
@@ -2153,6 +2191,10 @@ function App() {
     }
     if (persistPaste) {
       pasteAt(pos);
+    } else if (immediate) {
+      // ⇧-click (D12): stamp where the pointer is, even with a position locked.
+      pasteAt(pos);
+      setLockedPastePos(null);
     } else if (lockedPastePos) {
       pasteAt(lockedPastePos);
       setLockedPastePos(null);
@@ -2735,6 +2777,18 @@ function App() {
     });
   }, [saveWorld, saveWorldAs]);
 
+  /** 34.8: the one unsaved-changes gate (open another world, close world, quit). Clean → true;
+   *  else the Don't Save · Cancel · Save sheet. `false` = stay put: Cancel, a cancelled Save As
+   *  picker, or a failed save — nothing is lost. */
+  async function ensureSavedOrDiscarded(): Promise<boolean> {
+    if (!isDirty()) return true;
+    const choice = await unsavedChangesDialog(worldRef.current?.name ?? "Untitled");
+    if (choice === "discard") return true;
+    if (choice === "cancel") return false;
+    const p = sourcePathRef.current;
+    return p ? saveWorld(p) : saveWorldAs();
+  }
+
   // Upload sends `sourcePath` — the file on disk, not the in-memory world — so unsaved edits
   // would silently upload a stale version. Gate opening the modal on the same `isDirty()` check
   // the close/quit/open-new-world guards use, offering a Save first.
@@ -2803,43 +2857,61 @@ function App() {
       .catch(() => {});
   }, []);
 
-  // Warn before the OS window closes (title-bar close button / ⌘Q) if there are unsaved edits.
-  // preventDefault holds the window open until the user confirms, then destroy() closes it for real.
+  // One quit path (34.9): the title-bar close button, Alt+F4, 34.1's app.quit, and — via the Rust
+  // `quit-requested` event — ⌘Q, Dock › Quit and logout all land in `requestQuit`.
+  const quitBusyRef = useRef(false);
+  const requestQuit = useCallback(async () => {
+    if (quitBusyRef.current) return; // a second ⌘Q while the sheet is up
+    quitBusyRef.current = true;
+    try {
+      const win = getCurrentWindow();
+      // C-09: a save in flight holds the quit (it would otherwise be offered "discard" and
+      // destroyed mid-save). Wait for it, then re-check dirty.
+      while (savingRef.current) await new Promise((r) => setTimeout(r, 100));
+      if (isDirty()) {
+        // Best-effort autosave before the sheet: if the user declines and the app later crashes,
+        // only what changed since this attempt is lost.
+        if (editEpochRef.current !== lastAutosavedEpochRef.current) {
+          const epoch = editEpochRef.current;
+          try {
+            const ran = await invoke<boolean>("autosave_world", { sourcePath: sourcePathRef.current });
+            if (ran) lastAutosavedEpochRef.current = epoch;
+            autosaveFailureCountRef.current = 0;
+          } catch (e) {
+            autosaveFailureCountRef.current += 1;
+            console.warn("Autosave-on-quit failed:", e);
+            if (autosaveFailureCountRef.current >= 2) reportError(e);
+          }
+        }
+        if (!(await ensureSavedOrDiscarded())) return;
+      }
+      await win.destroy();
+    } finally {
+      quitBusyRef.current = false;
+    }
+  }, [isDirty, reportError]);
+  const requestQuitRef = useRef(requestQuit);
+  requestQuitRef.current = requestQuit;
+
   useEffect(() => {
     const win = getCurrentWindow();
-    const unlisten = win.onCloseRequested(async (event) => {
-      // C-09: a save in flight holds the window open (it would otherwise be offered "discard" and
-      // destroyed mid-save). Wait for it, then re-check dirty: a successful save closes cleanly.
-      if (savingRef.current) {
-        event.preventDefault();
-        while (savingRef.current) await new Promise((r) => setTimeout(r, 100));
-        if (!isDirty()) { win.destroy(); return; }
-      }
-      if (!isDirty()) return; // clean — let the close proceed
+    const unClose = win.onCloseRequested((event) => {
       event.preventDefault();
-      // Best-effort autosave before the confirm prompt: the periodic timer never gets to fire on
-      // quit (the window closes before its next tick), so without this a "Quit and discard" decline
-      // followed by a crash mid-relaunch could lose everything since the last periodic tick instead
-      // of just what changed since this attempt.
-      if (editEpochRef.current !== lastAutosavedEpochRef.current) {
-        const epoch = editEpochRef.current;
-        try {
-          const ran = await invoke<boolean>("autosave_world", { sourcePath: sourcePathRef.current });
-          if (ran) lastAutosavedEpochRef.current = epoch;
-          autosaveFailureCountRef.current = 0;
-        } catch (e) {
-          autosaveFailureCountRef.current += 1;
-          console.warn("Autosave-on-quit failed:", e);
-          if (autosaveFailureCountRef.current >= 2) reportError(e);
-        }
-      }
-      const ok = await confirmDialog("You have unsaved changes. Quit and discard them?", {
-        title: "Unsaved changes", kind: "danger", okLabel: "Quit without saving",
-      });
-      if (ok) win.destroy();
+      void requestQuitRef.current();
     });
-    return () => { unlisten.then((f) => f()); };
-  }, [isDirty, reportError]);
+    const unQuit = listen("quit-requested", () => { void requestQuitRef.current(); });
+    return () => { unClose.then((f) => f()); unQuit.then((f) => f()); };
+  }, []);
+
+  // Arm the Rust quit guard while a world is open (clean → requestQuit quits at once). Disarmed
+  // with no world, and by RootErrorBoundary when App itself throws.
+  useEffect(() => {
+    invoke("set_quit_guard", { armed: !!world }).catch(() => {});
+  }, [!!world]);
+
+  // 34.11: the dot in the close button mirrors the status bar's Edited segment (same dirty test).
+  const docEdited = !!world && editEpoch !== savedEpochRef.current;
+  useEffect(() => { setDocumentEdited(docEdited); }, [docEdited]);
 
   async function recoverAutosave() {
     if (!recoveryInfo) return;
@@ -2913,7 +2985,7 @@ function App() {
   // which applies the same gates as the keydown handler above, in the same order. The ribbon publishes
   // its live bindings through `onBindings` (a ref, not state: a setState there would loop); with no
   // world there is no ribbon, so a small splash-safe set stands in.
-  const quitApp = useCallback(() => { void getCurrentWindow().close(); }, []);
+  const quitApp = useCallback(() => { void requestQuitRef.current(); }, []);
   const ribbonBindingsRef = useRef<Record<CommandId, CommandBinding> | null>(null);
   const nativeMenuRef = useRef<NativeMenu | null>(null);
   const menuBlockRef = useRef<MenuBlock>("none");
@@ -3123,6 +3195,16 @@ function App() {
       }
       // Draw tool shortcuts (only when not typing in an input)
       if (!typing && !e.metaKey && !e.ctrlKey) {
+        // Paste-mode keys (D12: R / ⇧R / X / Y) run first, so R rotates instead of arming Rectangle.
+        const pasteCmd = resolvePasteKey(e, { tool: appToolRef.current, hasClipboard: !!clipboardRef.current, typing });
+        if (pasteCmd) {
+          e.preventDefault();
+          if (!e.repeat) {
+            const b = ribbonBindingsRef.current?.[pasteCmd];
+            if (b?.enabled) b.run();
+          }
+          return;
+        }
         // Space = hold-to-pan (the Ribbon has advertised it in a tooltip since the toolbar rewrite,
         // but it was never wired). The armed tool is restored on keyup; `e.repeat` guards against
         // auto-repeat overwriting spaceReturnToolRef with "pan" itself.
@@ -3618,12 +3700,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
 
   async function closeWorld() {
     if (fileOpBusy()) return; // 21.3: a close mid-load would leave the backend on the loaded world
-    if (isDirty()) {
-      const ok = await confirmDialog("You have unsaved changes. Close this world and discard them?", {
-        title: "Unsaved changes", kind: "danger", okLabel: "Discard changes",
-      });
-      if (!ok) return;
-    }
+    if (!(await ensureSavedOrDiscarded())) return;
     worldGenRef.current++;                      // 29.7: in-flight replies belong to the closed world
     worldRef.current = null;
     closeWindowWorld();                         // flush this world's window layout
@@ -3644,6 +3721,8 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
     setTool("pan");
     setSpawnPos(null);
     setPlayerPos(null);
+    recordsGenRef.current += 1;
+    backendRecordsSeqRef.current = null;
     setSigns([]);
     setRecords(null);
     setRecordsSeq(n => n + 1);
@@ -3783,7 +3862,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
       borderTop: `1px solid ${HAIRLINE}`,
       boxShadow: "inset 0 1px 0 rgba(255,255,255,.05)",
       display: "flex", alignItems: "center", overflow: "hidden",
-      fontSize: FONT.micro, color: TEXT_LABEL, userSelect: "none",
+      fontSize: FONT.micro, color: TEXT_LABEL,
       fontVariantNumeric: "tabular-nums",
     }}>
       {/* Tool chip — coloured by the armed tool's family hue (teal draw/generic, warm sculpt, blue
@@ -3793,7 +3872,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           : tool === "paste" && pasteMode !== "normal" ? `Paste (${pasteMode})`
           : TOOL_LABELS[tool]}
       </StatusSeg>
-      {/* World name — priority-first in the overflow order (CLAUDE.md §5.11 risk note): every
+      {/* World name — priority-first in the overflow order: every
           segment after this one may shrink or ellipsize at 900px, this one never does. */}
       {/* flexShrink:0 — never yields width; the lowest-priority segments (tool/selection hint
           text, filter/mask chips) are the ones with flexShrink:1 + minWidth:0, so they're what
@@ -3884,7 +3963,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
             title="Clear the replace filter"
             aria-label="Clear replace filter"
             className="eden-x-btn"
-            style={{ background: "none", border: "none", cursor: "pointer", color: ACCENT.warm,
+            style={{ background: "none", border: "none", cursor: "default", color: ACCENT.warm,
               minWidth: 18, minHeight: 18, display: "flex", alignItems: "center", justifyContent: "center",
               padding: 0 }}
           ><Icon name="close" size={ICON.xs} tone="inherit" /></button>
@@ -4139,7 +4218,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
             background: RAMP.chrome, color: RAMP.dim, fontSize: FONT.body, overflow: "hidden",
           }}>
             <span style={{ color: RAMP.textDanger, fontWeight: 600, flexShrink: 0 }}>Ribbon failed to render</span>
-            <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: RAMP.meta }}>
+            <span className="vx-selectable" style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: RAMP.meta }}>
               {error.message || String(error)}
             </span>
             <button type="button" className="rbn-btn" onClick={retry}
@@ -4351,6 +4430,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           arraySpacingY={arraySpacingY}
           setArraySpacingY={setArraySpacingY}
           rotateClipboard={rotateClipboard}
+          rotateClipboardCcw={rotateClipboardCcw}
           mirrorClipboardX={mirrorClipboardX}
           mirrorClipboardY={mirrorClipboardY}
           pasteAt={pasteAt}
@@ -4804,7 +4884,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
                     animation: "eden-toast-in .15s ease-out",
                   }}
                 >
-                  <span style={{ flex: 1 }}>{t.text}</span>
+                  <span className="vx-selectable" style={{ flex: 1 }}>{t.text}</span>
                   {isErr && (
                     <button
                       onClick={() => dismissToast(t.id)}
@@ -4812,7 +4892,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
                       aria-label="Dismiss error"
                       className="eden-x-btn"
                       style={{
-                        background: "none", border: "none", color: RAMP.textDanger, cursor: "pointer",
+                        background: "none", border: "none", color: RAMP.textDanger, cursor: "default",
                         padding: 0,
                         minWidth: 24, minHeight: 24, display: "flex", alignItems: "center", justifyContent: "center",
                         marginTop: -4, marginRight: -6, marginBottom: -4,
@@ -4902,7 +4982,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
             className="rb"
             onClick={() => setUpdateDismissed(true)}
             style={{
-              marginLeft: "auto", background: "transparent", border: "none", cursor: "pointer",
+              marginLeft: "auto", background: "transparent", border: "none", cursor: "default",
               color: TEXT_DIM, fontSize: FONT.body, padding: `${SPACE.xs}px ${SPACE.sm}px`,
             }}
           >
@@ -4930,7 +5010,7 @@ const handleSelectionChange = useCallback((bounds: SelectionBounds | null) => {
           <SplashCommand icon="about" label="About VuencEdit…" onClick={() => setShowAbout(true)} />
 
           {error && (
-            <p style={{
+            <p className="vx-selectable" style={{
               color: TEXT_DANGER, fontSize: FONT.body, lineHeight: 1.5,
               margin: `${SPACE.lg}px ${SPACE.lg}px 0`,
             }}>

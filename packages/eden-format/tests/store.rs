@@ -211,6 +211,8 @@ fn put_record_validates_lengths() {
         (RecordType::SignTrailer, 17),
         (RecordType::SignTrailer, (1 << 20) + 16),
         (RecordType::Generator, 27),
+        (RecordType::SkyClock, 15),
+        (RecordType::Weather, 31),
     ] {
         assert!(matches!(s.put_record(t, &vec![0u8; n]), Err(Error::Invalid(_))), "{t:?} {n}");
     }
@@ -246,6 +248,37 @@ fn generator_survives_and_compacts_last_of_the_singletons() {
     assert_eq!(&types[..6], &[2, 3, 4, 5, 9, 1], "WORLD_HEADER, CREATURES, SIGN_TRAILER, PROVENANCE, GENERATOR, COLUMN…");
     let g = walk(&f).into_iter().find(|q| q.rtype == 9).unwrap();
     assert_eq!(f[g.off + 5], 0, "GENERATOR is codec 0");
+}
+
+/// SKY_CLOCK (11) and WEATHER (12) are stored raw, survive saves and compaction, and compaction
+/// orders them `GENERATOR, SKY_CLOCK, WEATHER, COLUMN…`.
+#[test]
+fn sky_clock_and_weather_survive_and_compact_after_generator() {
+    let tmp = TempDir::new("skyweather");
+    let p = tmp.path("f256-trailer.emod");
+    std::fs::write(&p, fixture("f256-trailer.2batch.emod")).unwrap();
+    let gen: Vec<u8> = (0..28u8).map(|i| if i < 17 { i + 1 } else { 0 }).collect();
+    let sky: Vec<u8> = (0..16u8).map(|i| if i < 5 { i + 1 } else { 0 }).collect();
+    let wx: Vec<u8> = (0..32u8).map(|i| i ^ 0x5a).collect();
+    let mut s = Store::open_rw(&p).unwrap();
+    s.begin_batch();
+    s.put_record(RecordType::Generator, &gen).unwrap();
+    s.put_record(RecordType::SkyClock, &sky).unwrap();
+    s.put_record(RecordType::Weather, &wx).unwrap();
+    s.commit().unwrap();
+    assert!(s.verify().unwrap().is_empty(), "no reserved-type report for 11/12");
+    s.compact().unwrap();
+    assert_eq!(s.read_record(RecordType::SkyClock).unwrap(), (ReadStatus::Ok, sky));
+    assert_eq!(s.read_record(RecordType::Weather).unwrap(), (ReadStatus::Ok, wx));
+    assert!(s.verify().unwrap().is_empty());
+    drop(s);
+    let f = std::fs::read(&p).unwrap();
+    let types: Vec<u8> = walk(&f).into_iter().map(|q| q.rtype).collect();
+    assert_eq!(&types[..8], &[2, 3, 4, 5, 9, 11, 12, 1]);
+    for t in [11u8, 12] {
+        let r = walk(&f).into_iter().find(|q| q.rtype == t).unwrap();
+        assert_eq!(f[r.off + 5], 0, "type {t} is codec 0");
+    }
 }
 
 /// `OpenOptions::len_limit`: the prefix up to an earlier truncation point opens as that earlier
@@ -285,7 +318,7 @@ fn reserved_types_are_counted_ignored_reported_and_block_compaction() {
     let p = tmp.path("r.emod");
     let mut f = fixture("f256-trailer.2batch.emod");
     let prov = walk(&f).into_iter().find(|q| q.rtype == 5).unwrap();
-    f[prov.off + 4] = 12;
+    f[prov.off + 4] = 13;
     reseal(&mut f, prov);
     std::fs::write(&p, &f).unwrap();
     let mut s = Store::open_rw(&p).unwrap();
@@ -293,10 +326,10 @@ fn reserved_types_are_counted_ignored_reported_and_block_compaction() {
     assert!(!s.has_record(RecordType::Provenance));
     assert_eq!(s.state_digest().unwrap(), expected_for("f256-trailer.2batch.emod").digest, "ignored");
     let v = s.verify().unwrap();
-    assert!(v.len() == 1 && v[0].contains("reserved type 12"), "verify reports it: {v:?}");
+    assert!(v.len() == 1 && v[0].contains("reserved type 13"), "verify reports it: {v:?}");
     // 29.11: compaction refuses (file unchanged) rather than dropping an unknown record.
     let before = std::fs::read(&p).unwrap();
-    assert!(matches!(s.compact(), Err(Error::Invalid(m)) if m.contains("type 12")));
+    assert!(matches!(s.compact(), Err(Error::Invalid(m)) if m.contains("type 13")));
     assert_eq!(std::fs::read(&p).unwrap(), before, "file unchanged");
     assert!(!with_suffix_exists(&p), "no .compact temp left");
 }

@@ -139,7 +139,7 @@ function clamp(v: number, lo: number, hi: number): number {
 // An input-device preference read at event time by every 2D pane, so it lives here rather than
 // being threaded through each window's props. App writes it from `AppSettings.wheelMode`.
 
-let liveMode: WheelMode = "auto";
+let liveMode: WheelMode = "zoom";
 
 export function setWheelMode(mode: WheelMode): void {
   liveMode = mode === "pan" || mode === "zoom" ? mode : "auto";

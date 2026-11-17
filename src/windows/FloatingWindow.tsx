@@ -149,7 +149,7 @@ export default function FloatingWindow({
     if (kind === "resize") startVisuals();
     // Deliberately no preventDefault(): that would suppress the compatibility mousedown, which is
     // what open Popovers listen to for outside-click dismissal. Text selection is already off
-    // (`user-select: none` on the handles) and the drag shield covers everything else.
+    // (the root rule makes chrome unselectable) and the drag shield covers everything else.
   }
 
   function startVisuals() {

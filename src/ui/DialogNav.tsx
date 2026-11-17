@@ -72,7 +72,7 @@ export function DialogNav({
               onClick={() => { if (!selected) sfx.play("tab"); onChange(it.id); }}
               style={{
                 display: "flex", alignItems: "flex-start", gap: 8, textAlign: "left",
-                border: "none", background: "none", cursor: "pointer", outline: "none",
+                border: "none", background: "none", cursor: "default", outline: "none",
                 padding: "6px 8px", borderRadius: RADIUS.md, color: MODAL_TEXT.primary,
                 ...(selected ? currentRow() : null),
               }}

@@ -1,7 +1,7 @@
 // Shared plumbing for the canvas-imperative viewport panes (MapCanvas, the paste lens):
 // pan/zoom math, canvas-to-container sizing, async-fetch staleness guards, and pixel-patch
 // decoding. Pure functions only — both callers manage their own refs/draw loops, so a shared
-// hook would just relocate state without removing duplication. See CLAUDE.md M4.
+// hook would just relocate state without removing duplication.
 
 
 export interface ViewTransform { x: number; y: number; scale: number; }

@@ -21,7 +21,7 @@ pub mod store;
 pub use fsutil::{rename_with_retry, rename_with_retry_counted};
 pub use container::{
     addressable, join_bands, split_bands, Codec, Codecs, RecordType, BAND, COMMIT_LEN, CREATURE_LEN,
-    EDEN_DIR_ROW, EDEN_HEADER_LEN, FILE_HEADER_LEN, FMT_VERSION, GENERATOR_LEN, MAGIC, MAX_CREATURE_SLOTS,
+    EDEN_DIR_ROW, EDEN_HEADER_LEN, FILE_HEADER_LEN, FMT_VERSION, GENERATOR_LEN, SKY_CLOCK_LEN, WEATHER_LEN, MAGIC, MAX_CREATURE_SLOTS,
     MAX_PAYLOAD, RECORD_HEADER_LEN, SUMMARY_LEN, TAG, TRAILER_MAX,
 };
 pub use export::{export_own, preflight_own, ExportOptions, OwnExport, Preflight};

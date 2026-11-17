@@ -8,7 +8,7 @@ import { COMMAND_IDS, COMMAND_META, GESTURES, HELP_SECTIONS, meta, type CommandI
 import { TAB_SPECS } from "../ribbon/specs";
 import { TOOL_LABELS } from "../MapCanvas";
 import {
-  ALL_SCOPES, chordKey, chordToAccelerator, firstAccelerator, formatChord, keyLabel, matchChord, primaryModDown, scopesOverlap, type Chord, type KeyLike,
+  ALL_SCOPES, PASTE_SHADOWS, chordKey, chordToAccelerator, firstAccelerator, formatChord, keyLabel, matchChord, primaryModDown, scopesOverlap, type Chord, type KeyLike,
 } from "./keys";
 import {
   MENU_BAR, MENU_BAR_EXCLUDED, MENU_SAFE_KINDS, SPLASH_SAFE, TEXT_FORWARD, isCheckItem, menuCommandForKey, menuCommandIds,
@@ -134,6 +134,8 @@ describe("shortcut collisions", () => {
         const a = all[i], b = all[j];
         if (a.who === b.who) continue;
         if (chordKey(a.c) === chordKey(b.c) && scopesOverlap(a.c.scope, b.c.scope)) {
+          const pasteVsGlobal = [a.c.scope, b.c.scope].sort().join() === "global,paste";
+          if (pasteVsGlobal && PASTE_SHADOWS.includes(chordKey(a.c))) continue;
           clashes.push(`${formatChord(a.c, true)}: ${a.who} [${a.c.scope}] vs ${b.who} [${b.c.scope}]`);
         }
       }

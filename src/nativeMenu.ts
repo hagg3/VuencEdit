@@ -1,5 +1,5 @@
 /**
- * The macOS menu bar (34.1, `TEST WORLDS/macos-menu-bar-plan-2026-11-10.md`), built in TypeScript from
+ * The macOS menu bar (34.1), built in TypeScript from
  * the command registry with Tauri's JS menu API (`@tauri-apps/api/menu`): labels and accelerators come
  * straight from `meta.ts`, each item's `action` runs in-process, and `setEnabled` / `setChecked` /
  * `setText` keep it current. Rust can't read `meta.ts`, so a Rust-built menu would need codegen or a

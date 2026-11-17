@@ -3,7 +3,7 @@
 //! Ramps (24–39), wedges (40–55), doors (66–69) and portals (75–78) encode a direction in the low
 //! two bits of their ID. A rotate or flip moves the *cells*; the *IDs* must be remapped by the
 //! same map or a staircase ends up climbing the wrong way. The IDs 112–127 (2026 game update)
-//! are plain cubes — no directional family there (checked against `DOCUMENTATION/03`).
+//! are plain cubes — no directional family there.
 //!
 //! **Plane convention** (the editor/file plane, the one `.epfab` cells live in): `+x` = east,
 //! `+y` = south. Families are ordered by offset:

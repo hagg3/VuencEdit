@@ -103,7 +103,7 @@ export default function TopBar({
         aria-haspopup="menu" aria-expanded={menuOpen} aria-label="VuencEdit application menu"
         style={{
           display: "flex", alignItems: "center", gap: 7, padding: "0 12px",
-          border: "none", cursor: "pointer", outline: "none", flexShrink: 0,
+          border: "none", cursor: "default", outline: "none", flexShrink: 0,
           margin: "3px 6px 3px 4px", borderRadius: RADIUS.md,
           // gloss-lite (Stage 14.2): an opaque accent face with a soft highlight; the glow widens
           // while the menu is open. `filter` in RIBBON_CSS handles hover/press.
@@ -278,7 +278,7 @@ function Tab({
   const style: CSSProperties = {
     // Past the search field's own shrink, tabs truncate rather than disappear off the clipped
     // strip (MS ribbon guidelines: scaled-down tab names show truncated text).
-    border: "none", cursor: "pointer", outline: "none", flexShrink: 1, minWidth: 40,
+    border: "none", cursor: "default", outline: "none", flexShrink: 1, minWidth: 40,
     overflow: "hidden", textOverflow: "ellipsis",
     alignSelf: "flex-end", position: "relative",
     height: selected || contextual ? TOP_BAR_HEIGHT - 3 : TOP_BAR_HEIGHT - 10,

@@ -4,10 +4,11 @@
  */
 import { describe, expect, it } from "vitest";
 import conf from "../../src-tauri/tauri.conf.json";
+import winConf from "../../src-tauri/tauri.windows.conf.json";
 import { minRowWidth, rowWidth } from "./layout";
 import type { RibbonTab } from "./props";
 import { rowAvailable, solveRow, TAB_SPECS, tabMetrics } from "./specs";
-import { BLOCK_POPUP_GROUP_W, POPUP_GROUP_W } from "./tokens";
+import { BLOCK_POPUP_GROUP_W, OPTIONS_BAR_H, POPUP_GROUP_W, RIBBON_BODY_HEIGHT, TOP_BAR_HEIGHT } from "./tokens";
 
 describe("specs: block group parity", () => {
   // Home/Draw/3D's Block button is the bare `<BlockButton cmd=… tier={tier.block}
@@ -54,6 +55,18 @@ describe("specs: the ribbon never scrolls (Stage 15.4)", () => {
 
   it("reads a sane minimum window width", () => {
     expect(MIN_WINDOW_W).toBeGreaterThanOrEqual(600);
+  });
+
+  it("the minimum window height leaves the map a usable work area (34.3a, U-03)", () => {
+    // Expanded ribbon (top bar + body) + options bar + status bar (App.tsx STATUS_BAR_HEIGHT 22).
+    const MIN_WINDOW_H: number = conf.app.windows[0].minHeight;
+    // tauri.windows.conf.json replaces the window entry wholesale on Windows, so it must agree.
+    expect(winConf.app.windows[0].minHeight).toBe(MIN_WINDOW_H);
+    expect(winConf.app.windows[0].minWidth).toBe(MIN_WINDOW_W);
+    const chrome = TOP_BAR_HEIGHT + RIBBON_BODY_HEIGHT + OPTIONS_BAR_H + 22;
+    expect(MIN_WINDOW_H).toBeGreaterThanOrEqual(600);
+    // Room for the default Hotbar (64) + an attached Lens (240) without overlapping each other.
+    expect(MIN_WINDOW_H - chrome).toBeGreaterThanOrEqual(400);
   });
 
   it("popup widths are the fixed popup-button box, never a per-group number", () => {

@@ -1,5 +1,5 @@
 /**
- * The Lens (Stage 20.4, `TEST WORLDS/lens-window-plan-2026-10-01.md`; paste mode from UI redesign r3,
+ * The Lens (Stage 20.4; paste mode from UI redesign r3,
  * Stage 14.9). One floating context panel with two bodies:
  *
  * - **Paste mode** (a paste is armed): front + side elevations of the paste at the ghost, with the Z
@@ -557,7 +557,7 @@ function ZoomBadge({ link }: { link: LensLink }) {
       onClick={() => link.setZoom(1, null)}
       title="Reset zoom and pan"
       style={{
-        padding: "1px 5px", fontSize: FONT.micro, cursor: "pointer", borderRadius: 3,
+        padding: "1px 5px", fontSize: FONT.micro, cursor: "default", borderRadius: 3,
         background: "transparent", border: `1px solid ${ACCENT.violet}`, color: ACCENT.violet,
       }}
     ><span ref={textRef}>{link.zoom.toFixed(1)}×</span> ✕</button>

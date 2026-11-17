@@ -2,6 +2,7 @@
 name = "voxel-core"
 version = "0.1.0"
 description = "Eden voxel primitives shared by the vuenc apps"
+license = "GPL-3.0-only"
 edition = "2021"
 
 # Deliberately free of a `tauri` dependency. This crate is pure voxel/colour logic; anything

@@ -7,7 +7,7 @@
  * node — the same reason `ribbon/layout.ts` is pure.
  *
  * Two layers (round-2 DECISIONS #1):
- *   1. `RAMP` — palette A's hexes, verbatim from `TEST WORLDS/design-exploration-2026-09/js/data.js`
+ *   1. `RAMP` — palette A's hexes, verbatim from the 2026-09 design mock's `data.js`
  *      (`P.A`, the `#proposal` page's palette). Nothing outside this file should need a raw hex.
  *   2. Semantic roles (`SURFACE_ROLES`, `TEXT_ROLES`, `ACCENTS`, `MAP`, …) that name what a colour is
  *      *for*. Call sites use roles; a palette change is then an edit here and nowhere else.

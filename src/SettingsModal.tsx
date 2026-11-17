@@ -160,7 +160,7 @@ export interface AppSettings {
  *  `undoBudgetBytes` reaches Rust via `set_undo_budget` and `overviewBudgetBytes` via
  *  `set_overview_budget` (the zoomed-out map's per-chunk raster, 18.15 — it picks the raster's
  *  granularity); `tileBudgetBytes`/`geometryBudgetBytes` stay frontend-side as props into
- *  `MapCanvas`/`FlyView3D`. See CLAUDE.md's memory-efficiency pass notes.
+ *  `MapCanvas`/`FlyView3D`.
  *
  *  `geometryBudgetBytes` replaced the old `vertexBudget` (3D-pane crash fix, Stage 1): a vertex costs
  *  24–36 B depending on stream and texture pack, and a 256z world reaches any vertex count 4× faster
@@ -202,7 +202,7 @@ export const DEFAULTS: AppSettings = {
   sunT: 0.5,
   lampRadius: 4,
   lightingProfile: "legacy",
-  wheelMode: "auto",
+  wheelMode: "zoom",
   lookSensitivity: 1,
   dragSensitivity: 1,
   invertY: false,
@@ -454,7 +454,7 @@ function PathRow({
           <button
             type="button" onClick={onClear} title="Clear" aria-label="Clear this path"
             style={{
-              background: "none", border: "none", color: MODAL_TEXT.secondary, cursor: "pointer",
+              background: "none", border: "none", color: MODAL_TEXT.secondary, cursor: "default",
               padding: "0 4px", display: "flex", flexShrink: 0,
             }}
           >
@@ -701,7 +701,7 @@ export default function SettingsModal({
 
           <SectionHeading>3D view sliders</SectionHeading>
 
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", columnGap: 24 }}>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(290px, 1fr))", columnGap: 24 }}>
             <SliderCell label="Render distance" title="How many chunks around the camera are drawn">
               <SliderRow label="" labelWidth={0} width={130}
                 value={local.renderDistance} min={RD_MIN} max={MAX_RENDER_DISTANCE} step={1}
@@ -880,8 +880,8 @@ export default function SettingsModal({
 /** One cell of the 3D tab's two-column slider grid: a 110 px label, then the slider + value field. */
 function SliderCell({ label, title, children }: { label: string; title?: string; children: ReactNode }) {
   return (
-    <div style={{ display: "flex", alignItems: "center", gap: 8, minHeight: 26, padding: "2px 0" }}>
-      <span title={title} style={{ width: 110, flexShrink: 0, fontSize: FONT.body, color: MODAL_TEXT.primary }}>
+    <div style={{ display: "flex", alignItems: "center", gap: 8, minHeight: 26, padding: "2px 0", minWidth: 0 }}>
+      <span title={title} style={{ width: 100, flexShrink: 0, fontSize: FONT.body, color: MODAL_TEXT.primary }}>
         {label}
       </span>
       {children}

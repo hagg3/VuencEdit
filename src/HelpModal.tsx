@@ -95,7 +95,7 @@ function TileName({ name }: { name: string }) {
 
 function GettingStartedHelp() {
   return (
-    <div style={{ fontSize: FONT.tab, color: MODAL_TEXT.secondary, lineHeight: 1.6 }}>
+    <div className="vx-selectable" style={{ fontSize: FONT.tab, color: MODAL_TEXT.secondary, lineHeight: 1.6 }}>
 
       <div style={sectionHead}>Ribbon tabs</div>
       <p style={{ margin: "4px 0 10px" }}>
@@ -138,7 +138,7 @@ function GettingStartedHelp() {
 
 function TexturePackHelp() {
   return (
-    <div style={{ fontSize: FONT.tab, color: MODAL_TEXT.secondary, lineHeight: 1.6 }}>
+    <div className="vx-selectable" style={{ fontSize: FONT.tab, color: MODAL_TEXT.secondary, lineHeight: 1.6 }}>
 
       {/* Format */}
       <div style={sectionHead}>Format</div>
@@ -223,7 +223,7 @@ function TexturePackHelp() {
 
 function ToolsHelp() {
   return (
-    <div style={{ fontSize: FONT.tab, color: MODAL_TEXT.secondary, lineHeight: 1.6 }}>
+    <div className="vx-selectable" style={{ fontSize: FONT.tab, color: MODAL_TEXT.secondary, lineHeight: 1.6 }}>
 
       {/* Sculpt */}
       <div style={sectionHead}>Terrain sculpt</div>

@@ -26,7 +26,7 @@ import { ICON, ICON_TONE, ICON_DANGER, ICON_ACCENT } from "./tokens";
 
 const MAP = {
   // Clipboard
-  paste: ClipboardPaste, copy: Copy, cut: Scissors, rotate: RotateCw,
+  paste: ClipboardPaste, copy: Copy, cut: Scissors, rotate: RotateCw, rotateCcw: RotateCcw,
   flipX: FlipVertical2, flipY: FlipHorizontal2, pasteMode: Repeat,
   // Navigation / selection tools
   pan: Hand, select: SquareDashed, wand: Wand2, lasso: Lasso, polyselect: Pentagon,

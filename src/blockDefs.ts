@@ -188,7 +188,7 @@ export function isExpansionBlock(blockType: number): boolean {
   return blockType >= 82 && blockType <= 111;
 }
 
-// New-format blocks (112–127): 16 types added by the updated game (see TEST WORLDS/newblocks).
+// New-format blocks (112–127): 16 types added by the updated game.
 // Each colour is the mean of the block's tile in Emod's atlas (mirrors BLOCK_RGB in colors.rs — keep
 // the two in sync, the Rust table is authoritative for rendering and is installed over these by
 // applyBlockTables()).

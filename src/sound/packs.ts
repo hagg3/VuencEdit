@@ -1,6 +1,6 @@
 /**
  * UI sound data — six WebAudio-synthesised packs, ported from the design exploration's
- * `js/sound.js` (see `TEST WORLDS/design-exploration-2026-09/js/sound.js`), with pack ids/labels
+ * `js/sound.js` (from the 2026-09 design mock), with pack ids/labels
  * kept as-is: they are already the neutral names that file's own history moved to (an earlier,
  * differently-branded pack name was retired there — see that directory's planning notes; per UI
  * redesign r3 §1 "Sounds", no such branded reference may ship here in code, comments or UI, so it

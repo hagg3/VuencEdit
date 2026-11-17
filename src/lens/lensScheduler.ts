@@ -1,6 +1,6 @@
 /**
  * Pure request scheduler for the paste lens (UI redesign r3, Stage 14.9) — "one request in flight,
- * latest wins" (CLAUDE.md §"Terrain Sculpt" `accumBusyRef` idiom) plus a parked-failed-key latch
+ * latest wins" (the sculpt path's `accumBusyRef` idiom) plus a parked-failed-key latch
  * (the `SliceViewport` `failedKeyRef` lesson: a persistently failing request must not re-fire in a
  * tight loop). Extracted as a reducer so the policy is unit-testable without timers, `invoke`, or a
  * DOM — `useLensRender.ts` is the only caller, and owns all the I/O.

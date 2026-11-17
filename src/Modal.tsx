@@ -34,7 +34,8 @@ export function useFocusTrap(ref: RefObject<HTMLElement | null>, focusOnMount = 
     if (!el) return;
 
     if (focusOnMount) {
-      const first = el.querySelector<HTMLElement>(FOCUSABLE);
+      // A dialog can name its default button with `data-autofocus` (DialogButton `autoFocus`).
+      const first = el.querySelector<HTMLElement>("[data-autofocus]:not([disabled])") ?? el.querySelector<HTMLElement>(FOCUSABLE);
       (first ?? el).focus();
     }
 

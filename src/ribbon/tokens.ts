@@ -208,11 +208,10 @@ export function btnBase(extra?: CSSProperties): CSSProperties {
     border: "none",
     borderRadius: BTN_RADIUS,
     color: TEXT,
-    cursor: "pointer",
+    cursor: "default",
     outline: "none",
     fontSize: FONT.body,
     whiteSpace: "nowrap",
-    userSelect: "none",
     ...extra,
   };
 }

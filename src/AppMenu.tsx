@@ -156,7 +156,7 @@ export default function AppMenu({
             style={{
               display: "flex", alignItems: "center", gap: 9, textAlign: "left",
               padding: "0 10px", height: 34, borderRadius: 5, border: "none", outline: "none",
-              cursor: r.disabled ? "default" : "pointer", fontSize: FONT.tab,
+              cursor: "default", fontSize: FONT.tab,
               opacity: r.disabled ? 0.4 : 1,
               color: r.danger ? TEXT_DANGER : TEXT,
               // Current row = pushed in (Stage 14.2) — no accent fill or ring.
@@ -264,7 +264,7 @@ function Pane({ row, onClose, infoKey, bumpInfo }: { row: AppMenuRow; onClose: (
                 onClick={() => { onClose(); p.openFileAt(r.path); }}
                 style={{
                   display: "flex", alignItems: "center", gap: 10, padding: "0 10px", height: 34,
-                  background: "none", border: "none", outline: "none", cursor: "pointer",
+                  background: "none", border: "none", outline: "none", cursor: "default",
                   textAlign: "left", color: TEXT, fontSize: FONT.tab,
                 }}>
                 <Icon name="open" size={15} />

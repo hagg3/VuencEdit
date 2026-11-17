@@ -47,6 +47,14 @@ const OVERLAPS: Record<ChordScope, readonly ChordScope[]> = {
   stroke: ["global", "sculpt", "stroke"],
 };
 
+/**
+ * Chords where a `paste`-scope binding deliberately **shadows** a `global` one: App's handler
+ * resolves paste-mode keys first (`commands/pasteKeys.ts`), so the global binding is simply
+ * unreachable while the paste tool is armed. The collision test allows exactly these `chordKey`s.
+ * (Paste-mode R = rotate vs the global R = Rectangle tool.)
+ */
+export const PASTE_SHADOWS: readonly string[] = ["|key:r"];
+
 export function scopesOverlap(a: ChordScope, b: ChordScope): boolean {
   return OVERLAPS[a].includes(b);
 }

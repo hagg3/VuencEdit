@@ -81,7 +81,7 @@ export const RIBBON_CSS = `
 .eden-ribbon .zr-thumb { -webkit-appearance: none; appearance: none; background: transparent; pointer-events: none; }
 .eden-ribbon .zr-thumb::-webkit-slider-thumb {
   -webkit-appearance: none; appearance: none; pointer-events: all;
-  width: 14px; height: 14px; border-radius: 50%; cursor: pointer;
+  width: 14px; height: 14px; border-radius: 50%; cursor: default;
 }
 /* Colour comes from --rbn-pulse, set inline per tab — the pulse used to be hardcoded amber and so
    flashed amber for the green Clipboard tab too. Gated on data-motion="full" (14.13's JS gate) —
@@ -331,7 +331,7 @@ function GroupLabel({ children }: { children: ReactNode }) {
     <div style={{
       height: GROUP_LABEL_H, borderTop: `1px solid ${HAIRLINE}`, paddingTop: 1,
       fontSize: FONT.label, lineHeight: "13px", color: TEXT_LABEL, textAlign: "center",
-      alignSelf: "stretch", userSelect: "none", whiteSpace: "nowrap",
+      alignSelf: "stretch", whiteSpace: "nowrap",
       overflow: "hidden", textOverflow: "ellipsis",
     }}>
       {children}
@@ -917,7 +917,7 @@ export function SliderRow({
 
   return (
     <div title={title} style={{ display: "flex", alignItems: "center", gap: 5, height: SMALL_H, ...(disabled ? btnDisabled : null) }}>
-      <label id={labelId} style={{ color: TEXT_DIM, fontSize: FONT.label, minWidth: labelWidth, userSelect: "none" }}>{label}</label>
+      <label id={labelId} style={{ color: TEXT_DIM, fontSize: FONT.label, minWidth: labelWidth }}>{label}</label>
       <div
         ref={trackRef}
         role="slider"
@@ -931,7 +931,7 @@ export function SliderRow({
         tabIndex={disabled ? -1 : 0}
         style={{
           position: "relative", width: trackWidth, height: SMALL_H, flexShrink: 0,
-          cursor: disabled ? "default" : "pointer", touchAction: "none",
+          cursor: "default", touchAction: "none",
         }}
         onPointerDown={e => {
           if (disabled) return;
@@ -1117,7 +1117,7 @@ export function Caption({ children, tone = TEXT_DIM }: { children: ReactNode; to
     <div style={{
       fontSize: FONT.label, color: tone, textAlign: "center", alignSelf: "stretch",
       fontWeight: 600, height: 13, lineHeight: "13px", overflow: "hidden",
-      textOverflow: "ellipsis", whiteSpace: "nowrap", userSelect: "none",
+      textOverflow: "ellipsis", whiteSpace: "nowrap",
     }}>
       {children}
     </div>
@@ -1264,7 +1264,7 @@ export function FieldLabel({
 }: { children: ReactNode; width?: number; align?: "left" | "right"; title?: string }) {
   return (
     <span title={title} style={{
-      color: TEXT_DIM, fontSize: FONT.label, userSelect: "none", flexShrink: 0,
+      color: TEXT_DIM, fontSize: FONT.label, flexShrink: 0,
       width, textAlign: align, whiteSpace: "nowrap",
     }}>{children}</span>
   );
@@ -1380,8 +1380,7 @@ export function Check({
   return (
     <label title={title} className="vx-chk" style={{
       display: "flex", alignItems: hint ? "flex-start" : "center", gap: 5, height: hint ? undefined : SMALL_H,
-      userSelect: "none",
-      cursor: disabled ? "default" : "pointer", ...(disabled ? btnDisabled : null),
+      cursor: "default", ...(disabled ? btnDisabled : null),
     }}>
       {/* The native input stays (visually hidden, `.vx-chk-in`) for keyboard, focus and screen
           readers; the box next to it is what's drawn. Styles: theme/cssVars.ts. */}

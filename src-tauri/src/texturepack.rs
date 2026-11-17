@@ -473,8 +473,7 @@ mod tests {
 
     #[test]
     fn real_shipped_atlases_load_with_sibling_pickup() {
-        // The shipped atlas.png + atlas2.png live in the repo-root TEST WORLDS/ATLAS folder (the
-        // path predated the monorepo move and had been skipping this test silently).
+        // The shipped atlas.png + atlas2.png live in a private dev-only folder; skips when absent.
         let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../TEST WORLDS/ATLAS");
         let atlas1 = format!("{dir}/atlas.png");
         if !std::path::Path::new(&atlas1).exists() {

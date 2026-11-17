@@ -3,8 +3,7 @@
 //! VuencEdit had no RSS/working-set readout at all before this — `working_set.rs` can *release*
 //! pages on Windows but nothing anywhere reported how many there were, which is exactly the gap
 //! that let the Windows working-set blowup ship silently for months (see that module's own docs)
-//! and is now blocking diagnosis of a second Windows report (`TEST WORLDS/windows-3d-lag-report-
-//! 2026-09-14.md`). This module is the smallest thing that closes it: one process-memory probe and
+//! and is now blocking diagnosis of a second Windows report (2026-09-14). This module is the smallest thing that closes it: one process-memory probe and
 //! one system-memory probe, each a hand-written `extern "system"`/`extern "C"` block matching
 //! `working_set.rs`'s own precedent — **no `sysinfo` or `windows-sys` dependency** for two syscalls.
 //!
@@ -40,7 +39,7 @@ pub struct SystemMemory {
 }
 
 /// Platform state that can explain a throttled or memory-starved machine (ROADMAP-EDIT 17.2, H-E1
-/// and H-D1 in `TEST WORLDS/perf-degradation-investigation-2026-09-29.md`). Every field is
+/// and H-D1 of the 2026-09-29 perf-degradation investigation). Every field is
 /// "unknown" (`None`/0) where the platform doesn't expose it, so the report can say so instead of
 /// guessing. Thermal state and Low Power Mode are deliberately **not** here: on macOS they need
 /// `NSProcessInfo` (an `objc2` dependency), so 17.0 reads `pmset -g therm` by hand instead.

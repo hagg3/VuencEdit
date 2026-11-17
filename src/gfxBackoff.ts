@@ -15,7 +15,7 @@
  * ⚠️ The back-off changes *what* the pane reloads after a restore, never *whether* it reloads.
  * `releaseOnUpload` nulls every chunk attribute's CPU copy on upload, so geometry is unrecoverable
  * after a loss and `onContextRestored` **must** still call `reloadAllChunks()` — the two are
- * load-bearing on each other (see CLAUDE.md, "Resident-memory + context-loss handling").
+ * load-bearing on each other.
  */
 
 /** Losses to recover from before the pane gives up and disables itself for the session. */

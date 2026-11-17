@@ -1,5 +1,5 @@
 /**
- * The macOS menu bar's layout (34.1, `macos-menu-bar-plan-2026-11-10.md` §4) — **structure only**. Label,
+ * The macOS menu bar's layout (34.1) — **structure only**. Label,
  * accelerator, kind and enabled/checked state all come from `meta.ts` / `bind.ts`; this file just says
  * which command goes where. Pure data (no Tauri import) so `commands.test.ts` can guard it in node.
  *

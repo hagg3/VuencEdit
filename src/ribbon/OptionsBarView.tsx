@@ -1,5 +1,5 @@
 /**
- * The contextual options bar (Stage 34.2, plan `options-bar-plan-2026-11-12.md`): one 30 px row
+ * The contextual options bar (Stage 34.2): one 30 px row
  * docked under the ribbon that never hides, scrolls or changes height. A **left context** (paste >
  * 3D flood fill > sculpt > draw > selection > a dim hint) shows the armed tool's settings; a pinned
  * **right zone** carries Cap Z / the slice level whenever Cutaway or Z-slice is on. What doesn't fit
@@ -34,7 +34,7 @@ const TAG_TEXT: Partial<Record<BarContext, string>> = { paste: "Paste", flood: "
 
 const tagStyle = (hue: string): CSSProperties => ({
   fontSize: FONT.micro, fontWeight: 700, letterSpacing: "0.08em", textTransform: "uppercase",
-  color: hue, marginRight: 2, userSelect: "none", whiteSpace: "nowrap", flexShrink: 0,
+  color: hue, marginRight: 2, whiteSpace: "nowrap", flexShrink: 0,
 });
 
 /** Slider recipes (ranges, steps, formats and titles are copied from the retired panels / the Sculpt tab). */
@@ -81,7 +81,7 @@ export default function OptionsBar() {
       position: "fixed", top: p.barTop, left: 0, right: p.barRightInset, zIndex: 60,
       height: OPTIONS_BAR_H, boxSizing: "border-box",
       background: SURFACE.body, borderBottom: `1px solid ${BORDER.hairline}`,
-      boxShadow: `inset 0 1px 0 ${BORDER.bevel}`, userSelect: "none",
+      boxShadow: `inset 0 1px 0 ${BORDER.bevel}`,
     }}>
       <div ref={rowRef} className="rbn-body" style={{
         display: "flex", alignItems: "center", gap: SPACE.sm, height: "100%", padding: `3px ${BAR_PAD / 2}px`,
@@ -134,6 +134,7 @@ function pasteItem(k: string, p: RibbonProps): ReactNode {
       </CmdSetting>
     );
     case "rotate": return <CmdIcon id="home.clipboard.rotate" />;
+    case "rotateCcw": return <CmdIcon id="home.clipboard.rotateCcw" />;
     case "flipX": return <CmdIcon id="home.clipboard.flipX" />;
     case "flipY": return <CmdIcon id="home.clipboard.flipY" />;
     case "skipAir": return <CmdSmall id="home.clipboard.skipAir" check />;

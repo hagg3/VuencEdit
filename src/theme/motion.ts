@@ -8,7 +8,7 @@
  * media query.
  *
  * ⚠️ **This is a JS gate, not a `@media (prefers-reduced-motion)` block, and that is load-bearing.**
- * `DOCUMENTATION/09-frontend.md`'s "Onboarding tour" section records a real WKWebView freeze caused
+ * The onboarding tour hit a real WKWebView freeze caused
  * by exactly that pattern — a `@media (prefers-reduced-motion: reduce) { animation: none !important }`
  * rule inside an injected `<style>` block froze the whole app on a real device with Reduce Motion
  * on, for reasons never fully chased down (the leading suspect is a WKWebView-specific interaction

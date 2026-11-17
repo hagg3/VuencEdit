@@ -3,7 +3,7 @@ import { decodeEnvelope } from "./codec";
 import { putPatchPixels } from "./viewportUtils";
 
 // `ImageData` is a browser global VuencEdit never polyfills in this node-environment vitest suite
-// (see CLAUDE.md's "vitest here is node-environment" note). This is the one piece of its contract
+// (vitest here runs in the node environment). This is the one piece of its contract
 // every call site in this codebase actually depends on: the constructor throws unless
 // `data.length === 4 * width * height` exactly (Chromium/WebKit both enforce this per spec). A
 // bug that hands the constructor the *whole* IPC envelope buffer instead of just the pixel slice

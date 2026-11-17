@@ -1,6 +1,5 @@
 /**
- * The shared dialog chrome (UI redesign r3, Stage 14.17 — `TEST WORLDS/ui-redesign-r3-modals-plan-
- * 2026-09-27.md` §3.2). Wraps `Modal` (backdrop, focus trap, Esc, `role="dialog"` — unchanged) and
+ * The shared dialog chrome (UI redesign r3, Stage 14.17). Wraps `Modal` (backdrop, focus trap, Esc, `role="dialog"` — unchanged) and
  * owns everything visual: a fixed-size frame (`dialogFrame`, never content-driven), a 32px title
  * bar borrowing `windows/FloatingWindow.tsx`'s gradient recipe and CSS var tokens (not the windows
  * framework itself — see the plan's §3.1 "wrong layer/persistence/modality" reasoning), an optional
@@ -47,7 +46,7 @@ function useViewportSize(): { w: number; h: number } {
 }
 
 const DIALOG_CSS = `
-.vx-dlg-x { width: 22px; height: 22px; flex-shrink: 0; padding: 0; border: none; cursor: pointer;
+.vx-dlg-x { width: 22px; height: 22px; flex-shrink: 0; padding: 0; border: none; cursor: default;
   display: flex; align-items: center; justify-content: center; background: transparent;
   color: var(--vx-modal-text-secondary); border-radius: ${RADIUS.sm}px; }
 .vx-dlg-x:hover:not(:disabled) { background: rgba(255,255,255,.08); color: var(--vx-modal-text-primary); }
@@ -170,7 +169,7 @@ const VARIANT_ACCENT: Record<DialogButtonVariant, string | null> = {
 };
 
 export function DialogButton({
-  variant = "neutral", onClick, disabled, title, type = "button", style, children,
+  variant = "neutral", onClick, disabled, title, type = "button", style, autoFocus, children,
 }: {
   variant?: DialogButtonVariant;
   onClick?: () => void;
@@ -178,6 +177,8 @@ export function DialogButton({
   title?: string;
   type?: "button" | "submit";
   style?: CSSProperties;
+  /** Initial focus lands here (the dialog's default button) instead of the ✕. */
+  autoFocus?: boolean;
   children: ReactNode;
 }) {
   const accent = VARIANT_ACCENT[variant];
@@ -185,6 +186,7 @@ export function DialogButton({
   return (
     <button
       type={type} className="vx-dlg-btn" onClick={onClick} disabled={disabled} title={title}
+      data-autofocus={autoFocus ? "" : undefined}
       style={btnBase({
         height: 28, padding: "0 16px", fontSize: FONT.body, fontWeight: 600,
         color: armed ? armed.text : MODAL_TEXT.primary,

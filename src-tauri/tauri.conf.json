@@ -16,7 +16,7 @@
         "width": 1440,
         "height": 900,
         "minWidth": 900,
-        "minHeight": 400,
+        "minHeight": 600,
         "titleBarStyle": "Overlay",
         "hiddenTitle": true,
         "trafficLightPosition": { "x": 12, "y": 11 },
@@ -31,6 +31,7 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "copyright": "Copyright (c) 2026 VuencEdit contributors. GPL-3.0; see NOTICE.md. Eden assets (c) Ari Ronen / Kingly Games.",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -40,7 +41,10 @@
     ],
     "resources": {
       "../eden-leaderboards/*": "eden-leaderboards/",
-      "../default-textures/*": "default-textures/"
+      "../default-textures/*": "default-textures/",
+      "../COPYING": "licenses/COPYING",
+      "../LICENSE": "licenses/LICENSE",
+      "../NOTICE.md": "licenses/NOTICE.md"
     }
   }
 }

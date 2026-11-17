@@ -1,5 +1,5 @@
 /**
- * The contextual options bar's rules (Stage 34.2, plan `options-bar-plan-2026-11-12.md`). **Pure**:
+ * The contextual options bar's rules (Stage 34.2). **Pure**:
  * which left context shows (`barContext`), what each one holds with its *declared* width, the
  * pinned Cap Z zone, and the solver that folds what doesn't fit into a trailing "More" popover
  * (`fitBar`). `OptionsBar.tsx` is the React side; everything here is unit-tested in node.
@@ -109,6 +109,7 @@ export function leftItems(ctx: BarContext, o: { tool: Tool; hasClipboard: boolea
         { key: "offset", w: W.numField, must: true, cmd: "paste.place.offset" },
         { key: "raise", w: W.icon, must: true, cmd: "paste.place.raise" },
         { key: "rotate", w: W.icon, cmd: "home.clipboard.rotate" },
+        { key: "rotateCcw", w: W.icon, cmd: "home.clipboard.rotateCcw" },
         { key: "flipX", w: W.icon, cmd: "home.clipboard.flipX" },
         { key: "flipY", w: W.icon, cmd: "home.clipboard.flipY" },
         { key: "skipAir", w: btn("Skip air ✓"), cmd: "home.clipboard.skipAir" },

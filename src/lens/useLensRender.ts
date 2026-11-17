@@ -5,7 +5,7 @@
  *
  * **Hover-driven origin churn is coalesced to ≤15 Hz** before it ever reaches the scheduler:
  * `MapCanvas`'s ghost subscription can fire far faster than that while the mouse moves over the map
- * (CLAUDE.md §"Copy/Paste System"). The same throttle covers every other input too (elevation
+ * (the paste preview's throttle). The same throttle covers every other input too (elevation
  * offset, mode flags, clipboard identity, `editEpoch`) — none of those change anywhere near 15 Hz in
  * practice, so a single throttle keeps this simple rather than special-casing origin changes.
  */

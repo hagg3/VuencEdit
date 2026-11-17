@@ -143,7 +143,7 @@ function FamilyButton({
   return (
     <div
       ref={ref}
-      style={{ position: "relative", userSelect: "none" }}
+      style={{ position: "relative" }}
       onPointerDown={onPointerDown}
       onPointerUp={onPointerUp}
       onPointerLeave={onPointerLeave}

@@ -6,7 +6,7 @@
  * `useRibbon().pickerKind`/`togglePicker` are unchanged from every tab's point of view.
  *
  * ⚠️ `togglePicker` MUST read `e.currentTarget.getBoundingClientRect()` synchronously inside the
- * event handler, never inside the `setPicker` updater — see CLAUDE.md §"UI Shell" (the StrictMode
+ * event handler, never inside the `setPicker` updater (the StrictMode
  * regression this rule fixed, 2026-08-18: React nulls `event.currentTarget` the instant the handler
  * returns, and a `setState` updater is not guaranteed to run only inside that synchronous window).
  * This code moved verbatim from `Ribbon.tsx` for exactly that reason — don't "clean it up" into the

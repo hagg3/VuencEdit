@@ -1,4 +1,4 @@
-// Shared IPC-shape types, mirroring their Rust counterparts (see CLAUDE.md IPC
+// Shared IPC-shape types, mirroring their Rust counterparts (see the IPC
 // Architecture / Color System). Previously each consumer re-declared these locally,
 // which is exactly the kind of drift that bit the color tables before C6 — declare
 // once here and import everywhere instead.
@@ -35,7 +35,7 @@ export interface WorldMeta {
 
 export interface RecentWorld { path: string; name: string; timestamp: number; }
 
-/** Mirrors CLAUDE.md's "File Format" table's three classes. The one thing every format-labeled
+/** The three world-format classes. The one thing every format-labeled
  *  UI spot (status bar, world pill, Properties) must agree on, so it lives in one place rather
  *  than three copies of "max_z === 255 && version is/isn't 5 or 6" that could silently drift. */
 export type WorldFormatClass = "legacy64z" | "newDawn256z" | "newFormat256z";
@@ -78,7 +78,7 @@ export function decodePixelPatch(buf: IpcBinary): PixelPatch {
   return { ...header, pixels: body };
 }
 
-/** Returned by every editing command (see CLAUDE.md Edit flow). */
+/** Returned by every editing command. */
 export interface EditResult {
   patch: PixelPatch;
   /** Audit C2: the patch would have been larger than the backend's ceiling, so it carries the
@@ -93,12 +93,30 @@ export interface EditResult {
    *  family suspected of a fixed client-side capacity (see the ComBlock crash writeup). The edit
    *  already applied; this is informational only. Empty for undo/redo. */
   warnings: string[];
+  /** 27.8a-1: the records after this edit. Refetch `get_records` when `seq` differs from the last
+   *  one seen; toast the air rule's drops (always 0 for undo/redo). */
+  records: RecordChange;
+  /** 22.3: cells whose block or paint this edit changed. 0 on a fresh edit whose `records.seq`
+   *  didn't move either = a no-op (Delete over air): no undo entry, nothing unsaved. Summed over a
+   *  group's entries for undo/redo. See `isNoOpEdit`. */
+  changed_cells: number;
 }
+
+/** 22.3: a fresh edit that changed no cell and no record — the backend pushed no undo entry and
+ *  marked nothing dirty, so it must not bump `editEpoch` (that would mark the world unsaved). */
+export function isNoOpEdit(r: Pick<EditResult, "changed_cells" | "records">, lastRecordsSeq: number | null): boolean {
+  return r.changed_cells === 0 && r.records.seq === lastRecordsSeq;
+}
+
+/** `EditResult.records` (Rust `RecordChange`). `seq` is the backend's records sequence after the
+ *  edit (never reset, also on `RecordsInfo`); `droppedSigns`/`droppedCmds` count the records the
+ *  edit removed because their block became air (O7's toast). */
+export interface RecordChange { seq: number; droppedSigns: number; droppedCmds: number; }
 
 type EditResultHeader = {
   patch: PixelPatchHeader; invalidate: boolean;
   undo_depth: number; redo_depth: number; operation: string; undo_dropped: boolean;
-  warnings: string[];
+  warnings: string[]; records: RecordChange; changed_cells: number;
 };
 
 export function decodeEditResult(buf: IpcBinary): EditResult {
@@ -111,7 +129,19 @@ export function decodeEditResult(buf: IpcBinary): EditResult {
     operation: header.operation,
     undo_dropped: header.undo_dropped,
     warnings: header.warnings,
+    records: header.records,
+    changed_cells: header.changed_cells,
   };
+}
+
+/** O7: the toast for records an edit dropped — "Removed 12 signs, 1 command block (⌘Z restores)".
+ *  A zero part is left out; `null` when nothing was dropped. */
+export function recordsDroppedMessage(r: RecordChange, undoChord: string): string | null {
+  const parts = [
+    r.droppedSigns > 0 ? `${r.droppedSigns} sign${r.droppedSigns === 1 ? "" : "s"}` : "",
+    r.droppedCmds > 0 ? `${r.droppedCmds} command block${r.droppedCmds === 1 ? "" : "s"}` : "",
+  ].filter(Boolean);
+  return parts.length ? `Removed ${parts.join(", ")} (${undoChord} restores)` : null;
 }
 
 // ---- Preview images (clipboard, prefab and new-world previews) ----
@@ -375,6 +405,9 @@ export interface RecordsInfo {
   cmds: CmdInfo[];
   /** Records brought in from the game's sidecar files on load and not yet saved into the world. */
   adopted: RecordCounts;
+  /** The backend's records sequence at this snapshot (27.8a-1): the baseline `EditResult.records.seq`
+   *  is compared against. */
+  seq: number;
 }
 
 export interface AutosaveInfo {

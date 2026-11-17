@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { decodeGeometry, decodePasteLensPair, decodeSelectionLens } from "./types";
+import { decodeEditResult, decodeGeometry, isNoOpEdit, decodePasteLensPair, decodeSelectionLens, recordsDroppedMessage } from "./types";
 
 // Mirrors `ipc_envelope`'s framing (lib.rs) — same idiom as `codec.test.ts`'s `buildEnvelope`.
 function buildEnvelope(header: unknown, body: Uint8Array): ArrayBuffer {
@@ -12,6 +12,51 @@ function buildEnvelope(header: unknown, body: Uint8Array): ArrayBuffer {
   out.set(body, 4 + hdr.length);
   return out.buffer;
 }
+
+describe("decodeEditResult records (27.8a-1)", () => {
+  it("passes the camelCase RecordChange through", () => {
+    const records = { seq: 7, droppedSigns: 2, droppedCmds: 0 };
+    const header = {
+      patch: { x: 1, y: 2, width: 1, height: 1, lod: 1 }, invalidate: false,
+      undo_depth: 1, redo_depth: 0, operation: "Delete", undo_dropped: false, warnings: [], records,
+    };
+    const r = decodeEditResult(buildEnvelope(header, new Uint8Array(4)));
+    expect(r.records).toEqual(records);
+    expect(r.patch.pixels.length).toBe(4);
+  });
+});
+
+describe("isNoOpEdit (22.3)", () => {
+  const rec = (seq: number) => ({ seq, droppedSigns: 0, droppedCmds: 0 });
+  it("decodes changed_cells", () => {
+    const header = {
+      patch: { x: 0, y: 0, width: 0, height: 0, lod: 1 }, invalidate: false,
+      undo_depth: 0, redo_depth: 0, operation: "Delete", undo_dropped: false, warnings: [],
+      records: rec(3), changed_cells: 0,
+    };
+    expect(decodeEditResult(buildEnvelope(header, new Uint8Array(0))).changed_cells).toBe(0);
+  });
+  it("is a no-op only with no cell and no record change", () => {
+    expect(isNoOpEdit({ changed_cells: 0, records: rec(3) }, 3)).toBe(true);
+    expect(isNoOpEdit({ changed_cells: 5, records: rec(3) }, 3)).toBe(false);
+    // A records-only edit (a sign written onto existing terrain) changes the world.
+    expect(isNoOpEdit({ changed_cells: 0, records: rec(4) }, 3)).toBe(false);
+    // Records baseline unknown → never claim a no-op.
+    expect(isNoOpEdit({ changed_cells: 0, records: rec(3) }, null)).toBe(false);
+  });
+});
+
+describe("recordsDroppedMessage (O7)", () => {
+  it("counts each kind, singular/plural, and leaves a zero part out", () => {
+    expect(recordsDroppedMessage({ seq: 1, droppedSigns: 12, droppedCmds: 1 }, "⌘Z"))
+      .toBe("Removed 12 signs, 1 command block (⌘Z restores)");
+    expect(recordsDroppedMessage({ seq: 1, droppedSigns: 1, droppedCmds: 0 }, "Ctrl+Z"))
+      .toBe("Removed 1 sign (Ctrl+Z restores)");
+    expect(recordsDroppedMessage({ seq: 1, droppedSigns: 0, droppedCmds: 3 }, "⌘Z"))
+      .toBe("Removed 3 command blocks (⌘Z restores)");
+    expect(recordsDroppedMessage({ seq: 1, droppedSigns: 0, droppedCmds: 0 }, "⌘Z")).toBeNull();
+  });
+});
 
 describe("decodePasteLensPair", () => {
   it("round-trips a hand-built render_paste_lens envelope", () => {

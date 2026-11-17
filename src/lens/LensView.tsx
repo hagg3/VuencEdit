@@ -1,5 +1,5 @@
 /**
- * The Lens's image viewer (Stage 20.4, `lens-window-plan-2026-10-01.md` §3): one canvas showing one
+ * The Lens's image viewer (Stage 20.4): one canvas showing one
  * view (an elevation or the Top tab) with its Z ruler and overlays. Used by both Lens modes. Paste
  * mode is fit-only, with the ghost-bottom line. Selection mode adds zoom/pan, the z band and its edge
  * handles, draw-on-elevation, the map-cursor column, extrude bands and the footprint edges.

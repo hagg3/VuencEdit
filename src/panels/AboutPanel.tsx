@@ -17,6 +17,10 @@ const RED_LIGHT = mix(RAMP.white, DANGER_HEX, 0.5);
  *  UI redesign r3, Stage 14.17 D5b) for link/accent text on the warm modal surface. */
 const TEAL_LIGHT = mix(RAMP.white, ACCENTS.primary, 0.5);
 
+/** Public repo. The licence links point at its root files (`COPYING`, `LICENSE`, `NOTICE.md`),
+ *  which `publish.sh` stages from `apps/vuencedit/`. */
+const REPO = "https://github.com/hagg3/VuencEdit";
+
 /** Plain MAJOR.MINOR.PATCH comparison — mirrors `isNewerVersion` in App.tsx (the startup check),
  *  kept as its own small copy here rather than exported/shared since this is the only other
  *  caller and the two are unlikely to drift independently of each other. */
@@ -91,7 +95,7 @@ export default function AboutPanel({ version, compact, onOpenDiagnostics }: {
             <span style={{ fontWeight: 800, color: RAMP.white, textShadow: "0 -1px 0 rgba(0,0,0,.5)" }}>Vuenc</span>
             <span style={{ fontWeight: 400, color: TEAL_LIGHT, textShadow: "0 -1px 0 rgba(0,0,0,.5)" }}>Edit</span>
           </div>
-          <div style={{ fontSize: FONT.body, color: MODAL_TEXT.label, marginTop: 3 }}>v{version}</div>
+          <div className="vx-selectable" style={{ fontSize: FONT.body, color: MODAL_TEXT.label, marginTop: 3 }}>v{version}</div>
           <div style={{ marginTop: 6, display: "flex", flexDirection: "column", gap: 4, alignItems: compact ? "flex-start" : "center" }}>
             <button
               onClick={checkForUpdates}
@@ -99,7 +103,7 @@ export default function AboutPanel({ version, compact, onOpenDiagnostics }: {
               style={{
                 background: "none", border: `1px solid ${RAMP.mbtn0}`, borderRadius: 5,
                 color: TEAL_LIGHT, fontSize: FONT.label, padding: "3px 9px",
-                cursor: checkState.kind === "checking" ? "default" : "pointer",
+                cursor: "default",
                 opacity: checkState.kind === "checking" ? 0.6 : 1,
               }}
             >
@@ -140,6 +144,13 @@ export default function AboutPanel({ version, compact, onOpenDiagnostics }: {
         </p>
         <p style={{ margin: "0 0 10px" }}>
           Eden World Builder was created by Ari Ronen and made open source in 2018.
+        </p>
+        <p style={{ margin: "0 0 10px" }}>
+          VuencEdit is free software under the{" "}
+          <Link href={`${REPO}/blob/main/COPYING`}>GNU GPL v3</Link>; its own code is also{" "}
+          <Link href={`${REPO}/blob/main/LICENSE`}>MIT</Link>.{" "}
+          <Link href={REPO}>Source code</Link> · <Link href={`${REPO}/blob/main/NOTICE.md`}>Licence details</Link>.
+          Eden's textures and icon are © Ari Ronen / Kingly Games. Not affiliated with Kingly Games.
         </p>
         <p style={{ margin: onOpenDiagnostics ? "0 0 10px" : 0 }}>
           For support, visit the{" "}

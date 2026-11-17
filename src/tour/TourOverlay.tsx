@@ -1,7 +1,6 @@
 /**
  * The onboarding-tour engine. Purely presentational over `steps.tsx`'s declarative array — it
- * owns only `stepIndex` and the measured target rect. See CLAUDE.md's "Onboarding Tour" note and
- * `~/.claude/plans/please-plan-an-on-boarding-golden-sutherland.md` for the design rationale.
+ * owns only `stepIndex` and the measured target rect.
  */
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";

@@ -163,7 +163,7 @@ export default function CommandPalette({ bindings, top, onRun, onReveal, onClose
                 onMouseMove={() => { if (i !== cur) setHi(i); }}
                 onClick={() => act(id, "run")}
                 style={{
-                  display: "flex", alignItems: "center", gap: 10, padding: "6px 8px", cursor: "pointer",
+                  display: "flex", alignItems: "center", gap: 10, padding: "6px 8px", cursor: "default",
                   opacity: disabled ? 0.55 : 1,
                 }}
               >

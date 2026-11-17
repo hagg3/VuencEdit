@@ -35,7 +35,6 @@ function SectionLabel({ children }: { children: React.ReactNode }) {
   return (
     <span style={{
       color: TEXT_LABEL, fontWeight: 700, fontSize: FONT.label, letterSpacing: "0.08em",
-      userSelect: "none",
     }}>{children}</span>
   );
 }
@@ -160,7 +159,7 @@ export default function Sidebar(p: SidebarProps) {
         style={{
           position: "fixed", top: p.topPx, right: 0, bottom: p.bottomPx, width: COLLAPSED_RAIL,
           zIndex: 120, display: "flex", flexDirection: "column", alignItems: "center",
-          paddingTop: SPACE.lg, cursor: "pointer",
+          paddingTop: SPACE.lg, cursor: "default",
           background: SURFACE.body,
           boxShadow: `inset 1px 0 0 ${BORDER.outline}, inset 2px 0 0 ${BORDER.bevel}`,
           color: TEXT_DIM,

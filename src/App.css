@@ -11,6 +11,19 @@ html {
   touch-action: pan-x pan-y;
 }
 
+/* Chrome is not text: nothing highlights on a drag across the ribbon, tabs, sidebar or status bar.
+   Copyable values opt back in with .vx-selectable (inputs, textareas and contenteditable always
+   are). The only selection declarations in src/ live here (chrome-conventions.test.ts). */
+/* body, not #root: popovers, the palette and the tour portal into document.body. */
+body {
+  user-select: none;
+  -webkit-user-select: none;
+}
+input, textarea, [contenteditable="true"], .vx-selectable {
+  user-select: text;
+  -webkit-user-select: text;
+}
+
 /* Background + text colour come from the theme stylesheet (src/theme/cssVars.ts THEME_CSS). */
 body {
   margin: 0;

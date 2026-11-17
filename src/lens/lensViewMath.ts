@@ -1,5 +1,5 @@
 /**
- * Coordinate math for `LensView` (Stage 20.4, `lens-window-plan-2026-10-01.md` §3.1). **Pure**, tested
+ * Coordinate math for `LensView` (Stage 20.4). **Pure**, tested
  * in node (`lensViewMath.test.ts`). Everything the old `ElevationPreviewPanel` did inline to map
  * between canvas pixels and world cells lives here, in **block units**: `Layout.scale` is canvas px
  * per world block, so a LOD-sampled image (`colLod` world columns per image column) still maps a

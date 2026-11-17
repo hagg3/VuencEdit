@@ -16,7 +16,9 @@
  * are far apart in the tree and both just need to read it.
  */
 import { useSyncExternalStore } from "react";
+import type { MouseEvent as ReactMouseEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { IS_MAC, MAC_TRAFFIC_LIGHT_CLEARANCE } from "./ribbon/tokens";
 
 export const IS_WINDOWS = typeof navigator !== "undefined" && /Win/.test(navigator.platform);
@@ -57,7 +59,75 @@ export function useWindowChrome(): WindowChrome {
   );
 }
 
-/** Spread onto any empty chrome that should drag the window. */
-export function dragRegion(c: WindowChrome): { "data-tauri-drag-region"?: true } {
-  return c.dragRegion ? { "data-tauri-drag-region": true } : {};
+let lastEdited = false;
+/** 34.11: the dot in the close button (macOS). Deduped on the last value sent. */
+export function setDocumentEdited(edited: boolean) {
+  if (!IS_MAC || edited === lastEdited) return;
+  lastEdited = edited;
+  invoke("set_document_edited", { edited }).catch(() => {});
+}
+
+/** What a title-bar double-click does, per the system preference (`title_double_click_action`). */
+export type DoubleClickAction = "zoom" | "minimize" | "none";
+
+export function parseDoubleClickAction(raw: unknown): DoubleClickAction {
+  return raw === "minimize" || raw === "none" ? raw : "zoom";
+}
+
+export type StripClick = "drag" | "arm-double" | "ignore";
+
+/** Mousedown on the strip: left button, the strip itself (not a child), then click count decides. */
+export function stripMouseDown(e: { button: number; detail: number; target: unknown; currentTarget: unknown }): StripClick {
+  if (e.button !== 0 || e.target !== e.currentTarget) return "ignore";
+  if (e.detail === 1) return "drag";
+  if (e.detail === 2) return "arm-double";
+  return "ignore";
+}
+
+/** Mirrors Tauri's macOS rule: a double-click fires on mouseup, and only if the pointer hasn't moved
+ *  since the second mousedown (so a drag right after a double-click is not a zoom). */
+export function doubleClickFires(
+  up: { button: number; detail: number; clientX: number; clientY: number; target: unknown; currentTarget: unknown },
+  down: { x: number; y: number } | null,
+): boolean {
+  return up.button === 0 && up.detail === 2 && up.target === up.currentTarget
+    && !!down && up.clientX === down.x && up.clientY === down.y;
+}
+
+async function runDoubleClickAction() {
+  let action: DoubleClickAction = "zoom";
+  try { action = parseDoubleClickAction(await invoke("title_double_click_action")); } catch { /* default */ }
+  const w = getCurrentWindow();
+  if (action === "zoom") await w.toggleMaximize();
+  else if (action === "minimize") await w.minimize();
+}
+
+export interface DragRegionProps {
+  "data-tauri-drag-region"?: true;
+  onMouseDown?: (e: ReactMouseEvent<HTMLElement>) => void;
+  onMouseUp?: (e: ReactMouseEvent<HTMLElement>) => void;
+}
+
+let armed: { x: number; y: number } | null = null;
+
+/**
+ * Spread onto any empty chrome that should drag the window. Windows keeps Tauri's attribute (its
+ * double-click = maximise, which Tauri's script already does). On a Mac the handlers replace it,
+ * because Tauri's script always toggles maximise on a double-click, ignoring System Settings.
+ */
+export function dragRegion(c: WindowChrome, mac: boolean = IS_MAC): DragRegionProps {
+  if (!c.dragRegion) return {};
+  if (!mac) return { "data-tauri-drag-region": true };
+  return {
+    onMouseDown: e => {
+      const k = stripMouseDown(e);
+      if (k === "drag") { e.preventDefault(); getCurrentWindow().startDragging().catch(() => {}); }
+      else if (k === "arm-double") { e.preventDefault(); armed = { x: e.clientX, y: e.clientY }; }
+    },
+    onMouseUp: e => {
+      const down = armed;
+      armed = null;
+      if (doubleClickFires(e, down)) void runDoubleClickAction();
+    },
+  };
 }
