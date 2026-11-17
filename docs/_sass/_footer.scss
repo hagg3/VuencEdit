@@ -32,7 +32,7 @@
   margin: 0 8px;
 }
 
-// 88x31 badges, two per row beside the text; pixel art, so never smoothed.
+// 88x31 badges, two per row beside the text; 2x PNGs shown at 88x31.
 .badges {
   flex: 0 0 auto;
   display: grid;
@@ -42,7 +42,7 @@
 }
 
 .badges a { display: block; line-height: 0; }
-.badges img { display: block; image-rendering: pixelated; }
+.badges img { display: block; border-radius: 3px; }
 .badges a:hover img { filter: brightness(1.15); }
 
 @media (max-width: $phone) {

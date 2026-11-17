@@ -8,7 +8,7 @@ description: "Download VuencEdit, the free Eden: World Builder world editor, for
 <p id="release-meta" class="dim">v{{ site.latest_version }}</p>
 
 <div class="callout callout-warm">
-  <strong>Beta software.</strong> VuencEdit writes the game's binary world files directly. The
+  <strong>Warning:</strong> VuencEdit writes the game's binary world files directly. The
   first save over a file keeps a backup next to it, but copy anything you care about yourself first.
 </div>
 
