@@ -877,7 +877,7 @@ export default function SettingsModal({
   );
 }
 
-/** One cell of the 3D tab's two-column slider grid: a 110 px label, then the slider + value field. */
+/** One cell of the 3D tab's two-column slider grid: a 100 px label, then the slider + value field. */
 function SliderCell({ label, title, children }: { label: string; title?: string; children: ReactNode }) {
   return (
     <div style={{ display: "flex", alignItems: "center", gap: 8, minHeight: 26, padding: "2px 0", minWidth: 0 }}>

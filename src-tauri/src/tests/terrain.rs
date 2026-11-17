@@ -942,25 +942,3 @@ pub(crate) fn test_carve_never_touches_bedrock() {
 }
 
 
-
-// PROBE-CARVE (temporary, delete)
-#[test]
-fn probe_carve_footprint() {
-    for (label, surf, hfn) in [("flat stone z20", 2u8, 0), ("hill", 2u8, 1)] {
-        let base = make_bumpy_world_grid(6, surf, |x, y| if hfn == 0 { 20 } else {
-            let d = (((x - 48) * (x - 48) + (y - 48) * (y - 48)) as f64).sqrt(); (28.0 - d * 0.4).round() as i32 });
-        let mut ws = ws_with(base);
-        let mut w = ws.world.take().unwrap();
-        let before: Vec<Option<i32>> = (0..96*96).map(|i| surface_z(&w, i % 96, i / 96)).collect();
-        field_stamp(&mut w, 48, 48, 6, &RockParams::default(), 55, None, None, None, Some(3), None, true);
-        println!("== {label}: radius 6, pad {}", rock_stamp_pad(&RockParams::default(), 6));
-        let mut tops = std::collections::BTreeMap::new();
-        for y in 30..=66 { let mut s = String::new(); for x in 30..=66 {
-            let i = (y * 96 + x) as usize; let a = surface_z(&w, x, y).unwrap(); let b = before[i].unwrap();
-            let t = read_block_abs(&w, x, y, a); *tops.entry(t).or_insert(0) += 1;
-            let dd = b - a; s.push(if dd == 0 { '.' } else if dd < 10 { char::from(b'0' + dd as u8) } else { '#' });
-            s.push(match t { 2 => ' ', 3 => 'd', 8 => 'g', _ => '?' });
-        } println!("{s}"); }
-        println!("top block counts {tops:?}");
-    }
-}

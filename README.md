@@ -30,10 +30,6 @@ Questions, bug reports and screenshots of cool builds are all welcome on the gam
 
 Installers for macOS (universal), Windows and Linux are on the [Releases](../../releases) page.
 
-On macOS the game keeps its worlds in
-`~/Library/Containers/com.manomio.eden/Data/Documents/worlds/`. You can also skip that and grab
-worlds straight from the community servers with **Browse Worlds** on the welcome screen.
-
 ## What you can do with it
 
 **Look around.** The map is colour-coded by block and paint and stays smooth on very large worlds.

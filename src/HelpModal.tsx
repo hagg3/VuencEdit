@@ -1,12 +1,12 @@
 import React, { useState } from "react";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { MODAL_TEXT } from "./designTokens";
 import ShortcutTable from "./commands/ShortcutTable";
-import { ALT, MOD, ACCENT } from "./ribbon/tokens";
+import { ALT, MOD, ACCENT, FONT } from "./ribbon/tokens";
 import { rgba } from "./theme/theme";
 import { Keycap } from "./ribbon/primitives";
 import Dialog, { DialogButton } from "./ui/Dialog";
 import { DialogNav, type DialogNavItem } from "./ui/DialogNav";
-import { FONT } from "./ribbon/tokens";
 
 function Key({ children }: { children: React.ReactNode }) {
   return <span style={{ marginRight: 2 }}><Keycap text={children} /></span>;
@@ -95,42 +95,37 @@ function TileName({ name }: { name: string }) {
 
 function GettingStartedHelp() {
   return (
-    <div className="vx-selectable" style={{ fontSize: FONT.tab, color: MODAL_TEXT.secondary, lineHeight: 1.6 }}>
-
-      <div style={sectionHead}>Ribbon tabs</div>
-      <p style={{ margin: "4px 0 10px" }}>
-        Five tabs hold every tool: <b style={strong}>Home</b>, <b style={strong}>Draw</b>,{" "}
-        <b style={strong}>Sculpt</b>, <b style={strong}>Insert</b> and <b style={strong}>View</b>.{" "}
-        <b style={strong}>3D</b> appears while the 3D view is open, <b style={strong}>Selection</b>{" "}
-        when you have a selection, and <b style={strong}>Clipboard</b> once you've copied something.
-        Arming a tool switches to its tab.
+    <div className="vx-selectable" style={body}>
+      <div style={sectionHead}>Basics</div>
+      <p style={para}>
+        Open a world with <Key>{MOD}O</Key> or start one with <Key>{MOD}N</Key>. Every edit can be
+        undone (<Key>{MOD}Z</Key>). Nothing touches the file until you save (<Key>{MOD}S</Key>).
       </p>
 
-      <div style={sectionHead}>Floating windows</div>
-      <p style={{ margin: "4px 0 10px" }}>
-        <b style={strong}>Tools</b> (<Key>{ALT}T</Key>), <b style={strong}>3D view</b> (<Key>{ALT}3</Key>),{" "}
-        <b style={strong}>Hotbar</b> (<Key>{ALT}H</Key>) and the paste <b style={strong}>Lens</b>{" "}
-        (<Key>{ALT}P</Key>) are floating windows. Drag a title bar to move one, or a corner to resize
-        it. Each world keeps its own layout. <Key>Tab</Key> swaps the map and the 3D view.
+      <div style={sectionHead}>Ribbon</div>
+      <p style={para}>
+        <b style={strong}>Home</b>, <b style={strong}>Draw</b>, <b style={strong}>Sculpt</b>,{" "}
+        <b style={strong}>Insert</b> and <b style={strong}>View</b> are always there.{" "}
+        <b style={strong}>Selection</b>, <b style={strong}>Clipboard</b> and <b style={strong}>3D</b>{" "}
+        appear when you select, copy or open the 3D view.
       </p>
 
       <div style={sectionHead}>Options bar</div>
-      <p style={{ margin: "4px 0 10px" }}>
-        The bar under the ribbon shows the armed tool's settings: the brush for sculpt tools (with a
-        <b style={strong}> Shape</b> menu for Rock and Carve), placement controls while pasting, and the
-        limit for 3D Flood Fill. The level for <b style={strong}>Z-slice</b> and <b style={strong}>Cutaway</b> sits
-        at its right end; its ✕ returns to Top-down. What doesn't fit folds into a <b style={strong}>⋯</b> menu.
+      <p style={para}>
+        The bar under the ribbon shows settings for the current tool. The Z-slice and Cutaway level
+        sits at its right end.
       </p>
 
-      <div style={sectionHead}>Relief shading</div>
-      <p style={{ margin: "4px 0 10px" }}>
-        View ▸ Render ▸ <b style={strong}>Relief</b> shades slopes so hills and cliffs stand out. It
-        only changes the map display, not PNG export.
+      <div style={sectionHead}>Windows</div>
+      <p style={para}>
+        <b style={strong}>Tools</b> (<Key>{ALT}T</Key>), <b style={strong}>3D view</b> (<Key>{ALT}3</Key>),{" "}
+        <b style={strong}>Hotbar</b> (<Key>{ALT}H</Key>) and <b style={strong}>Lens</b> (<Key>{ALT}P</Key>,
+        side views of a selection or paste) float over the map. Each world keeps its own layout.
       </p>
 
       <div style={sectionHead}>Command search</div>
-      <p style={{ margin: "4px 0 10px" }}>
-        <Key>{MOD}K</Key> searches every command. Enter runs it, <Key>Tab</Key> shows it in the ribbon.
+      <p style={para}>
+        <Key>{MOD}K</Key> finds any command. Enter runs it, <Key>Tab</Key> shows where it lives in the ribbon.
       </p>
     </div>
   );
@@ -138,49 +133,22 @@ function GettingStartedHelp() {
 
 function TexturePackHelp() {
   return (
-    <div className="vx-selectable" style={{ fontSize: FONT.tab, color: MODAL_TEXT.secondary, lineHeight: 1.6 }}>
-
-      {/* Format */}
-      <div style={sectionHead}>Format</div>
-      <p style={{ margin: "4px 0 10px" }}>
-        Two inputs are accepted:
+    <div className="vx-selectable" style={body}>
+      <div style={sectionHead}>Loading a pack</div>
+      <p style={para}>
+        <b style={strong}>View ▸ Load Texture Pack…</b> accepts a <b style={strong}>.zip</b> of PNGs
+        named after the tiles below, or a game-style <code>atlas.png</code>.{" "}
+        <b style={strong}>Default Texture Pack</b> switches back. A pack set in{" "}
+        <b style={strong}>Settings ▸ Files</b> loads every launch.
       </p>
       <ul style={{ margin: "0 0 10px", paddingLeft: 18 }}>
+        <li>Tiles can be any size; they're scaled to 32×32. Missing tiles use the flat block colour.</li>
         <li>
-          A <b style={strong}>.zip</b> containing PNG images named after the tile
-          names below (may also bundle <code>atlas.png</code> / <code>atlas2.png</code>).
+          Doors and portals aren't in the atlas: add <code>door.png</code> (32×64) and{" "}
+          <code>portal.png</code> (64×128) to the zip or next to <code>atlas.png</code>.
         </li>
-        <li>
-          A game-style <b style={strong}>atlas image</b> (<code>atlas.png</code>):
-          a vertical strip of square tiles in the original block-texture order. Load it directly.
-        </li>
+        <li>Painted blocks tint a greyscale copy of the tile, like the game, so draw tiles in full colour.</li>
       </ul>
-      <p style={{ margin: "4px 0 10px" }}>
-        <b style={strong}>Doors and portals</b> aren't in the game's atlas. Supply them as tall
-        images, twice as high as wide (<code>door.png</code> 32×64, <code>portal.png</code> 64×128) —
-        in the zip, or <b style={strong}>next to <code>atlas.png</code></b> in the same folder. Each is
-        split into a top and bottom half. Without them, doors use the wood tile and portals the stone tile.
-      </p>
-      <p style={{ margin: "4px 0 10px" }}>
-        Tiles can be any size and are scaled to <b style={strong}>32×32</b>. Missing tiles use the
-        flat block colour.
-      </p>
-
-      {/* Loading */}
-      <div style={sectionHead}>Loading</div>
-      <p style={{ margin: "4px 0 10px" }}>
-        VuencEdit ships with a built-in pack. To use your own, choose{" "}
-        <b style={strong}>View ▸ Load Texture Pack…</b>, or set a path in{" "}
-        <b style={strong}>Settings ▸ Files</b>. <b style={strong}>Default Texture Pack</b> (or clearing
-        the Settings path) switches back. Textures show in the 3D view and the block picker.
-      </p>
-
-      {/* Tinting */}
-      <div style={sectionHead}>Colour tinting</div>
-      <p style={{ margin: "4px 0 10px" }}>
-        <b style={strong}>Unpainted</b> blocks show the tile as drawn. <b style={strong}>Painted</b>{" "}
-        blocks tint a greyscale copy of the tile, as the game does. Draw tiles in full colour.
-      </p>
 
       {/* Tile names */}
       <div style={sectionHead}>Tile names</div>
@@ -195,26 +163,18 @@ function TexturePackHelp() {
         </div>
       ))}
 
-      {/* Face mapping */}
-      <div style={{ ...sectionHead, marginTop: 10 }}>Face mapping (selected blocks)</div>
-      <table style={{ borderCollapse: "collapse", fontSize: FONT.body, marginTop: 4 }}>
+      <div style={{ ...sectionHead, marginTop: 10 }}>Which tile goes where</div>
+      <table style={table}>
         <tbody>
           {[
-            ["Grass / Grass2 / Grass3", "Side: grass_side(_color) · Bottom: dirt · Top: grass_top"],
-            ["Trunk", "Side: tree_side · Top + bottom: tree_vert"],
-            ["TNT", "Side: tnt_side(_color) · Top: tnt_top(_color)"],
-            ["Brick", "All faces: brick(_color)"],
-            ["Doors", "A thin slab on the facing edge: door_bottom (lower block) + door_top (upper block)"],
-            ["Portals", "Stone cube; its front face: portal_bottom (lower block) + portal_top (upper block)"],
-            ["Ramps / Wedges", "Use the same tile as their material (e.g. stone, wood)"],
-            ["Expansion blocks 82–111", "Side + bottom: blocktnt · Top: base material"],
-            ["New-format blocks 112–127", "All faces: their own tile (Emod atlas.png tiles 32–47)"],
-          ].map(([block, faces]) => (
-            <tr key={block}>
-              <td style={{ padding: "3px 16px 3px 0", color: MODAL_TEXT.primary, whiteSpace: "nowrap", verticalAlign: "top" }}>{block}</td>
-              <td style={{ padding: "3px 0", color: MODAL_TEXT.secondary, fontSize: FONT.label }}>{faces}</td>
-            </tr>
-          ))}
+            ["Grass", "Top: grass_top · Side: grass_side · Bottom: dirt"],
+            ["Trunk", "Side: tree_side · Ends: tree_vert"],
+            ["TNT", "Side: tnt_side · Top: tnt_top"],
+            ["Doors / Portals", "door_top + door_bottom, portal_top + portal_bottom"],
+            ["Ramps / Wedges", "Their material's tile"],
+            ["Blocks 82–111", "Side + bottom: blocktnt · Top: base material"],
+            ["Blocks 112–127", "Their own tile on every face"],
+          ].map(([block, faces]) => <TableRow key={block} name={block} desc={faces} />)}
         </tbody>
       </table>
     </div>
@@ -223,91 +183,148 @@ function TexturePackHelp() {
 
 function ToolsHelp() {
   return (
-    <div className="vx-selectable" style={{ fontSize: FONT.tab, color: MODAL_TEXT.secondary, lineHeight: 1.6 }}>
-
-      {/* Sculpt */}
-      <div style={sectionHead}>Terrain sculpt</div>
-      <p style={{ margin: "4px 0 10px" }}>
-        Arm a tool from Sculpt ▸ Tools and drag over terrain. With <b style={strong}>Live brush</b> on
-        (the default), terrain changes as you drag, and <Key>Esc</Key> mid-stroke reverts it. With it
-        off, the stroke applies on release.
+    <div className="vx-selectable" style={body}>
+      <div style={sectionHead}>Draw and select</div>
+      <p style={para}>
+        Draw tools paint the active block on the map. Select with a box, wand, lasso or polygon
+        (Home tab); the Selection tab then fills, replaces, extrudes or moves it, using its exact shape.
       </p>
-      <table style={{ borderCollapse: "collapse", fontSize: FONT.body, marginTop: 4, marginBottom: 10 }}>
+
+      <div style={sectionHead}>Sculpt</div>
+      <p style={para}>
+        Pick a tool on the Sculpt tab and drag over terrain. <Key>[</Key> <Key>]</Key> change the
+        radius. With <b style={strong}>Live brush</b> off, a stroke applies when you let go.
+      </p>
+      <table style={table}>
         <tbody>
           {[
-            ["Raise / Lower", "Push terrain up or down by Strength"],
-            ["Grab", "Drag up or down to pull a dome of terrain"],
-            ["Smooth", "Evens out bumps"],
-            ["Flatten", "Levels terrain to the height you click"],
-            ["Slope", "Flatten tilted to a plane through the clicked anchor (Slope X/Y in the options bar)"],
-            ["Terrace", "Steps terrain into Strength-high terraces"],
-            ["Smear", "Pulls terrain along with the brush"],
-            ["Sharpen", "Crisps terrain (opposite of Smooth)"],
-            ["Noise", "Adds hills or ridged mountains"],
-            ["Thermal / Hydro", "Erosion: slides, then water flow"],
-            ["Retexture", "Repaints by slope (flat: grass, mid: dirt, steep: stone) without changing height"],
-            ["Rock", "Places a rock mass fused into the terrain. Tune it in the Rock shape panel."],
-            ["Carve", "Cuts a rounded hollow. It only removes exposed terrain, so it never opens a cave roof. Tune it in the Carve shape panel."],
-          ].map(([mode, desc]) => (
-            <tr key={mode}>
-              <td style={{ padding: "3px 16px 3px 0", color: MODAL_TEXT.primary, whiteSpace: "nowrap", verticalAlign: "top" }}>{mode}</td>
-              <td style={{ padding: "3px 0", color: MODAL_TEXT.secondary, fontSize: FONT.label }}>{desc}</td>
-            </tr>
-          ))}
+            ["Raise / Lower", "Push terrain up or down"],
+            ["Rock", "Add a rock mass in the Sculpt block"],
+            ["Carve", "Cut a rounded hollow (never opens a cave roof)"],
+            ["Smooth / Sharpen", "Soften or crisp up bumps"],
+            ["Flatten / Slope", "Level to the clicked height, or to a tilted plane"],
+            ["Grab / Smear", "Pull terrain up, down or along the stroke"],
+            ["Terrace", "Cut into steps"],
+            ["Noise", "Add hills or mountains"],
+            ["Thermal / Hydro", "Erosion"],
+            ["Retexture", "Repaint grass, dirt and stone by slope"],
+          ].map(([mode, desc]) => <TableRow key={mode} name={mode} desc={desc} />)}
         </tbody>
       </table>
-      <p style={{ margin: "4px 0 10px" }}>
-        <b style={strong}>Softness</b> fades the effect toward the brush edge: 0 is a hard edge, higher
-        is a softer dome (Profile sets its shape). <b style={strong}>In selection</b> keeps strokes
-        inside the selection.
+      <p style={para}>
+        Rock and Carve have more settings under <b style={strong}>Shape</b> in the options bar.
       </p>
 
-      {/* Gradient fill */}
       <div style={sectionHead}>Gradient fill</div>
-      <p style={{ margin: "4px 0 10px" }}>
-        In the Selection tab, Gradient blends the Write block into the Fade block across the
-        selection, dithered to avoid bands. <b style={strong}>Axis</b> sets the direction: X or Y
-        across the map, Z by height. Only existing blocks change unless <b style={strong}>+Air</b> is on.
+      <p style={para}>
+        Selection tab ▸ Gradient blends the Write block into the Fade block along the chosen axis.
+        Only existing blocks change unless <b style={strong}>+Air</b> is on.
       </p>
+    </div>
+  );
+}
 
-      {/* 3D pane */}
-      <div style={sectionHead}>3D view: camera and build</div>
-      <p style={{ margin: "4px 0 10px" }}>
-        Open it from View ▸ Windows ▸ 3D View (<Key>{ALT}3</Key>), and swap it with the map using ⇄ or{" "}
-        <Key>Tab</Key>. Click the camera pill (top left) or press <Key>Z</Key> to change mode:
+function View3DHelp() {
+  return (
+    <div className="vx-selectable" style={body}>
+      <div style={sectionHead}>Camera</div>
+      <p style={para}>
+        Open with <Key>{ALT}3</Key>. <Key>Tab</Key> swaps it with the map. Press <Key>Z</Key> or
+        click the camera pill to switch modes:
       </p>
-      <table style={{ borderCollapse: "collapse", fontSize: FONT.body, marginTop: 4, marginBottom: 10 }}>
+      <table style={table}>
         <tbody>
           {[
             ["Orbit", "Drag to rotate, scroll to zoom"],
-            ["Look", "WASD to move, the mouse to look. Esc or Z exits."],
-            ["Fly", "WASD to move, left-drag to look"],
-          ].map(([mode, desc]) => (
-            <tr key={mode}>
-              <td style={{ padding: "3px 16px 3px 0", color: MODAL_TEXT.primary, whiteSpace: "nowrap", verticalAlign: "top" }}>{mode}</td>
-              <td style={{ padding: "3px 0", color: MODAL_TEXT.secondary, fontSize: FONT.label }}>{desc}</td>
-            </tr>
-          ))}
+            ["Look", "WASD and the mouse. Esc exits."],
+            ["Fly", "WASD, left-drag to look"],
+          ].map(([mode, desc]) => <TableRow key={mode} name={mode} desc={desc} />)}
         </tbody>
       </table>
-      <p style={{ margin: "4px 0 10px" }}>
-        <b style={strong}>Build mode</b> (3D tab): left-click breaks the block you aim at, right-click
-        places the active block on that face. Drag to break or place a row. Middle-click picks a
-        block. Ramps, wedges and doors face you when placed (turn this off with Auto-orient in the
-        pane's <Key>…</Key> menu). <b style={strong}>Select mode</b>: click two corners to make a 3D
-        selection.
+
+      <div style={sectionHead}>Modes (3D tab)</div>
+      <table style={table}>
+        <tbody>
+          {[
+            ["Build", "Left-click breaks, right-click places, middle-click picks a block"],
+            ["Select", "Click two corners"],
+            ["Sculpt", "Hold left to use the current sculpt tool"],
+            ["Flood Fill", "Click a face to fill the connected air"],
+          ].map(([mode, desc]) => <TableRow key={mode} name={mode} desc={desc} />)}
+        </tbody>
+      </table>
+      <p style={para}>
+        Ramps, wedges and doors face you when placed. Turn that off with Auto-orient in the view's{" "}
+        <Key>…</Key> menu.
       </p>
-      <p style={{ margin: "4px 0 10px" }}>
-        <b style={strong}>Sculpt mode</b>: hold left to sculpt with the current Sculpt tool and brush.
-        An amber disc shows the brush. Drag-to-look is off while sculpting, so use Look mode or WASD.
-        Grab applies on release.
-      </p>
-      <p style={{ margin: "4px 0 10px" }}>
-        <b style={strong}>Night Lighting</b>, <b style={strong}>Shadows</b> and{" "}
-        <b style={strong}>GPU Shadows</b> (3D tab ▸ Lighting) are slow and experimental. They turn off
-        whenever you load a world.
+
+      <div style={sectionHead}>Lighting</div>
+      <p style={para}>
+        Night lighting and GPU shadows are slow and turn off when you load another world.
       </p>
     </div>
+  );
+}
+
+function WebLink({ href, children }: { href: string; children: React.ReactNode }) {
+  return (
+    <a
+      href={href}
+      onClick={e => { e.preventDefault(); void openUrl(href); }}
+      style={{ color: ACCENT.primary, textDecoration: "none" }}
+      onMouseEnter={e => (e.currentTarget.style.textDecoration = "underline")}
+      onMouseLeave={e => (e.currentTarget.style.textDecoration = "none")}
+    >
+      {children}
+    </a>
+  );
+}
+
+const SITE = "https://hagg3.github.io/VuencEdit";
+
+const TUTORIALS: [string, string][] = [
+  ["First edit and save", "first-edit"],
+  ["Sculpt terrain", "sculpt-terrain"],
+  ["Copy, paste and prefabs", "copy-paste-prefabs"],
+  ["Generate a world", "generate-world"],
+  ["3D view and building in 3D", "build-in-3d"],
+  ["Download and upload a world", "download-upload"],
+];
+
+function OnlineHelp() {
+  return (
+    <div className="vx-selectable" style={body}>
+      <div style={sectionHead}>Website</div>
+      <p style={para}>
+        Guides for every part of the app: <WebLink href={`${SITE}/docs/`}>VuencEdit Help</WebLink>
+      </p>
+
+      <div style={sectionHead}>Tutorials</div>
+      <ul style={{ margin: "4px 0 10px", paddingLeft: 18 }}>
+        {TUTORIALS.map(([label, slug]) => (
+          <li key={slug}><WebLink href={`${SITE}/docs/tutorials/${slug}/`}>{label}</WebLink></li>
+        ))}
+      </ul>
+
+      <div style={sectionHead}>Questions and bugs</div>
+      <p style={para}>
+        Ask on the <WebLink href="https://discord.com/invite/rjYXwBC">Discord server</WebLink> or{" "}
+        <WebLink href="https://github.com/hagg3/VuencEdit/issues">open an issue on GitHub</WebLink>.
+      </p>
+    </div>
+  );
+}
+
+const body: React.CSSProperties = { fontSize: FONT.tab, color: MODAL_TEXT.secondary, lineHeight: 1.6 };
+const para: React.CSSProperties = { margin: "4px 0 10px" };
+const table: React.CSSProperties = { borderCollapse: "collapse", fontSize: FONT.body, marginTop: 4, marginBottom: 10 };
+
+function TableRow({ name, desc }: { name: string; desc: string }) {
+  return (
+    <tr>
+      <td style={{ padding: "3px 16px 3px 0", color: MODAL_TEXT.primary, whiteSpace: "nowrap", verticalAlign: "top" }}>{name}</td>
+      <td style={{ padding: "3px 0", color: MODAL_TEXT.secondary, fontSize: FONT.label }}>{desc}</td>
+    </tr>
   );
 }
 
@@ -317,13 +334,15 @@ const sectionHead: React.CSSProperties = {
   marginTop: 14, marginBottom: 2,
 };
 
-type HelpTab = "start" | "tools" | "shortcuts" | "textures";
+type HelpTab = "start" | "tools" | "3d" | "shortcuts" | "textures" | "online";
 
 const NAV_ITEMS: DialogNavItem[] = [
-  { id: "start", icon: "sparkle", label: "Getting started", description: "Ribbon tabs, floating windows, ⌘K" },
-  { id: "tools", icon: "sculpt", label: "Tools", description: "Sculpt, gradient fill and the 3D view" },
+  { id: "start", icon: "sparkle", label: "Getting started", description: "The basics" },
+  { id: "tools", icon: "sculpt", label: "Tools", description: "Draw, select and sculpt" },
+  { id: "3d", icon: "pane3d", label: "3D view", description: "Camera, building, lighting" },
   { id: "shortcuts", icon: "quickActions", label: "Shortcuts", description: "Every keyboard shortcut" },
-  { id: "textures", icon: "textures", label: "Textures", description: "Pack format and tile names (experimental)" },
+  { id: "textures", icon: "textures", label: "Textures", description: "Custom texture packs" },
+  { id: "online", icon: "world", label: "Tutorials", description: "Guides on the website" },
 ];
 
 export default function HelpModal({ onClose, onStartTour }: { onClose: () => void; onStartTour?: () => void }) {
@@ -351,6 +370,10 @@ export default function HelpModal({ onClose, onStartTour }: { onClose: () => voi
         <GettingStartedHelp />
       ) : tab === "tools" ? (
         <ToolsHelp />
+      ) : tab === "3d" ? (
+        <View3DHelp />
+      ) : tab === "online" ? (
+        <OnlineHelp />
       ) : tab === "shortcuts" ? (
         // Generated from the command registry (14.6) — declare a shortcut in
         // `commands/meta.ts` and it appears here; nothing is mirrored by hand any more.
