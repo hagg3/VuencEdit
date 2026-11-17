@@ -30,59 +30,46 @@ Questions, bug reports and screenshots of cool builds are all welcome on the gam
 
 Installers for macOS (universal), Windows and Linux are on the [Releases](../../releases) page.
 
+Please note that the macOS app is not notarized, which means you may get an error like "VuencEdit can't be opened because Apple cannot check it for malicious software" or "VuencEdit is damaged and can't be opened." To open the program, use one of the methods below. You only need to do this once.
+
+macOS 15 Sequoia and later (Open Anyway):
+1. Drag VuencEdit into your Applications folder.
+2. Double-click it. When the warning appears, click Done (not "Move to Trash").
+3. Open System Settings → Privacy & Security.
+4. Scroll down to the Security section. You'll see "VuencEdit was blocked to protect your Mac." Click Open Anyway.
+
+macOS 14 Sonoma and earlier (right-click → Open):
+1. Drag VuencEdit into your Applications folder.
+2. Right-click (or Control-click) the app and choose Open.
+3. In the dialog, click Open.
+
 ## What you can do with it
 
-**Look around.** The map is colour-coded by block and paint and stays smooth on very large worlds.
-Z-Slice shows one layer at a time, and Cutaway hides everything above a height you pick, so you can
-see into caves and buildings. Drawing, sculpting and the eyedropper all work on whatever surface is
-exposed. A 3D view floats over the map as a window: you can orbit, fly, or use Minecraft-style
-mouselook (press **Z** over it to cycle modes), and ⇄ or Tab swaps it with the map so 3D becomes the
-main view. You can break, place, select and sculpt directly in 3D. Night lighting, sun shadows, a
-GPU shadow mode, sky colours and texture packs are all optional and off by default where they cost
-performance.
+**Look around in 2D.** You can easily zoom and pan a top-down 2D map of your world. There are options for z-slice or cutaway so you can see below the surface, and a relief mode to see where the terrain rises and falls.
 
-**Select and edit.** Drag a box, draw a lasso or polygon, or use the Magic Wand to grab every
-connected block of one type. Fill, replace or delete inside a selection, with block and paint
-filters. The draw tools cover pen, brush, spray, line, rectangle, ellipse and polygon, plus gradient
-fills and a draw mask that only paints over a chosen block. The Hotbar window keeps five pinned and
-five recent blocks on the number keys. Everything goes through undo/redo, and a long sculpt or spray
-stroke undoes as a single step.
+**Look around in 3D.** There is a floating window that gives you access to a true 3D-editor style viewport that will let you render the map live in 3D, with textures, optional shaders and a much higher render distance than normal. You can also edit directly in this 3D view.
 
-**Sculpt terrain** *(experimental)*. There are 16 brush tools: Raise, Lower, Grab, Smooth,
-Flatten, Slope, Noise, Erode, Thermal, Hydro, Stamp, Terrace, Sharpen, Smear, Rock and Carve. They
-have soft falloff, hold-to-build, and modifier keys (hold Ctrl/⌘ to invert, Shift to smooth, `[` `]`
-for size). They work on the map and in the 3D view.
+**Select and edit.** You can use a range of tools for making regular and irregular selections. There are also drawing tools for the 2D map.
 
-**Copy, paste and prefabs.** Copy any volume, then rotate, mirror, skip air or conform it to the
-terrain while pasting. You can also scatter copies at random or lay them out in a grid. While a paste
-is armed, a small **paste lens** window shows front and side views of where it will land, with
-buried blocks marked in red. You can save selections as prefabs and paste them back later from the
-Prefab Library. Extrude repeats a selection along any axis.
+**Sculpt terrain**. Axiom-style sculpt tools allow you to build realistic and varied terrain quickly.
 
-**Make new worlds.** New World has four generators. **Flat** is a blank slab. **Natural** has
-biomes, rivers, caves, ores, trees and structures. **Classic** is a faithful port of the game's
-original generator. **Tg2** is a port of Eden 2.0's TerrainGen2. Natural and Tg2 show a live
-preview. All four can write either the legacy 64-high format or the newer 256-high one.
+**Copy, paste and prefabs.** You can copy and paste your selections, with options to rotate/flip before you paste. You can also save copied selections as prefabs to use again later in any world.
 
-**Files and servers.** VuencEdit reads and writes plain `.eden` files and compressed `.eden.zip`
-files. Saves are atomic, so a crash or power cut mid-save can't damage your world. It also keeps a
-recovery journal while you work. You can browse, search and download worlds from the Eden
-community servers, upload your own with a thumbnail, and export the map as a PNG. For sparse worlds,
-the game's bundled `Eden.eden` template can be drawn behind your edits, or baked into the world to
-fill it out *(experimental)*.
+**Generate worlds.** You can create new worlds with a variety of options for specifiying dimensions, or whether you want terrain. A range of terrain options are included (classic, new or custom terrain).
 
-Most of this lives on the ribbon (Home, Selection, Clipboard, Draw, Sculpt, Insert, View and 3D).
-If you can't find something, press **⌘K** (**Ctrl+K** on Windows/Linux) and type what you're
-after. It searches every command and shows where each one lives and its shortcut. **?** opens the
-full shortcut list.
+**Shared worlds.** There is a shared worlds browser, so you can upload and download worlds to and from the same in-game list that you are used to.
+
+Most features live on the ribbon. 
+
+Most of this lives on the ribbon (Home, Selection, Clipboard, Draw, Sculpt, Insert, View and 3D). If you can't find something, press **⌘K** (**Ctrl+K**) and type what you're
+after.
 
 ## Something went wrong?
 
 If it's slow, crashes or draws something odd (especially in the 3D view), open
 **Help ▸ Diagnostics…**, click **Refresh**, then **Copy to clipboard** or **Save as .txt…**. Post
 that along with what you were doing on [Discord](http://discord.gg/rjYXwBC) or in a GitHub issue.
-The report covers memory use, your GPU, and loading/frame timings. It doesn't include your folders or
-world contents, and nothing is sent anywhere unless you post it yourself. If the problem is in 3D,
+The report covers memory use, your GPU, and loading/frame timings. It doesn't include your folders or world contents, and nothing is sent anywhere unless you post it yourself. If the problem is in 3D,
 turning on **Settings ▸ 3D performance HUD** before you reproduce it adds a live readout to the pane.
 
 ## Building it yourself
