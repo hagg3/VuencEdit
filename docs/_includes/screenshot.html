@@ -2,11 +2,4 @@
   A real, already-optimized image (hero + anything supplied later).
   Usage: {% raw %}{% include screenshot.html src="/assets/img/hero.webp" alt="..." width="1600" height="1134" lazy=true %}{% endraw %}
 -->
-<img
-  src="{{ include.src | relative_url }}"
-  alt="{{ include.alt }}"
-  width="{{ include.width }}"
-  height="{{ include.height }}"
-  {% if include.lazy %}loading="lazy"{% endif %}
-  class="shot"
->
+<img src="{{ include.src | relative_url }}" alt="{{ include.alt }}" width="{{ include.width }}" height="{{ include.height }}"{% if include.lazy %} loading="lazy"{% endif %} class="shot">
